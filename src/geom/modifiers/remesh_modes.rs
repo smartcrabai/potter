@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/modifiers/intern/MOD_remesh.cc, SPDX-FileCopyrightText: 2011 by Nicholas Bishop., GPL-2.0-or-later.
+
 //! Parameter adapter for Blender's voxel and octree-style Remesh modifier modes.
 
 use std::collections::{BTreeSet, HashMap};

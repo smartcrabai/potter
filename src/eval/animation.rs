@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/blenkernel/intern/fcurve.cc, SPDX-FileCopyrightText: 2009 Blender Authors, Joshua Leung. All rights reserved., GPL-2.0-or-later.
+
 use std::collections::BTreeMap;
 
 use glam::{DQuat, EulerRot};

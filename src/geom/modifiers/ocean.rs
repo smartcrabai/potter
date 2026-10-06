@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/modifiers/intern/MOD_ocean.cc, SPDX-FileCopyrightText: Blender Authors, GPL-2.0-or-later.
+//   source/blender/blenkernel/intern/ocean.cc, source/blender/blenlib/intern/rand.cc, source/blender/blenlib/BLI_rand.h, SPDX-FileCopyrightText: 2001-2002 NaN Holding BV. All rights reserved., GPL-2.0-or-later.
+//   source/blender/blenlib/BLI_hash.h, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
+
 //! Seeded Tessendorf-style ocean spectrum and inverse FFT evaluation.
 
 use std::f64::consts::TAU;

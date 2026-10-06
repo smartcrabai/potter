@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/modifiers/intern/MOD_meshdeform.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
+//   source/blender/modifiers/intern/MOD_laplaciandeform.cc, SPDX-FileCopyrightText: 2013 Blender Authors, GPL-2.0-or-later.
+//   source/blender/modifiers/intern/MOD_surfacedeform.cc, SPDX-FileCopyrightText: 2017 Blender Authors, GPL-2.0-or-later.
+
 //! Bound surface, cage, and Laplacian deformation modifiers.
 
 use std::collections::{BTreeMap, HashMap};

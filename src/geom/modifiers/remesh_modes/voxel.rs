@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/blenkernel/intern/mesh_remesh_voxel.cc, SPDX-FileCopyrightText: 2019 Blender Authors, GPL-2.0-or-later.
+//
+// Portions derived from OpenVDB (https://github.com/AcademySoftwareFoundation/openvdb):
+//   openvdb/openvdb/tools/MeshToVolume.h, openvdb/openvdb/tools/VolumeToMesh.h, SPDX-FileCopyrightText: Copyright Contributors to the OpenVDB Project, Apache-2.0.
+
 //! Blender-compatible voxel remeshing using a float32 level set and uniform volume meshing.
 //!
 //! The conversion follows `OpenVDB`'s `meshToLevelSet` narrow-band distance construction and

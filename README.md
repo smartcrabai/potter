@@ -18,3 +18,7 @@ pot schema --kind capabilities --json   # List of supported/unsupported features
 ```
 
 The authoritative sources for supported and unsupported features are `pot schema --kind capabilities --json` and `pot inspect <scene> --features --json`.
+
+## License
+
+potter is licensed under the GNU General Public License v3.0 or later ([LICENSE](LICENSE)). Parts of the modifier, constraint, animation, and remesh evaluators are derived from [Blender](https://www.blender.org) (GPL-2.0-or-later) and [OpenVDB](https://www.openvdb.org) (Apache-2.0); affected source files name their upstream origin and copyright holders in their headers.

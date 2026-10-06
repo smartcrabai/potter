@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/bmesh/tools/bmesh_decimate_collapse.cc, source/blender/bmesh/tools/bmesh_decimate_dissolve.cc, source/blender/bmesh/tools/bmesh_decimate_unsubdivide.cc, source/blender/bmesh/intern/bmesh_polygon.cc, source/blender/bmesh/operators/bmo_dissolve.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
+//   source/blender/modifiers/intern/MOD_decimate.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glam::{DVec3, Vec3};

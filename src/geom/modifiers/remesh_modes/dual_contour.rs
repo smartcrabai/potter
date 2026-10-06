@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   intern/dualcon/intern/octree.cpp, SPDX-FileCopyrightText: 2011-2023 Blender Authors, GPL-2.0-or-later.
+//   intern/dualcon/intern/Projections.cpp, SPDX-FileCopyrightText: 2002-2022 Blender Authors, GPL-2.0-or-later.
+
 //! Uniform-depth dual-contouring implementation used by the octree Remesh modes.
 
 use glam::{DVec3, Vec3};

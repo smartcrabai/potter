@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/blenkernel/intern/constraint.cc, source/blender/blenkernel/intern/armature_deform.cc, source/blender/ikplugin/intern/iksolver_plugin.cc, SPDX-FileCopyrightText: 2001-2002 NaN Holding BV. All rights reserved., GPL-2.0-or-later.
+//   source/blender/blenkernel/intern/armature_update.cc, SPDX-FileCopyrightText: 2015 Blender Authors, GPL-2.0-or-later.
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,

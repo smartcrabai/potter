@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/bmesh/operators/bmo_primitive.cc, source/blender/bmesh/operators/bmo_subdivide.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
+
 //! Persistent polygon meshes, Blender-default primitives, triangulation, and bounds.
 //!
 //! The public [`Mesh`] stores stable `u32` IDs independently for vertices, edges, and

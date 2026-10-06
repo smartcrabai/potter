@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Relicensed potter under GPL-3.0-or-later (previously Apache-2.0) because evaluators include code derived from Blender (GPL-2.0-or-later); source files derived from Blender or OpenVDB now carry upstream attribution headers.
 - Blender export preserves exact mesh element and loop order, custom attributes and normals, and bit-exact object world matrices; the realistic Boolean/Decimate/Solidify stack now matches at each modifier prefix, with a Blender-gated non-natural edge-order round trip regression.
 - `pot render` treats an enabled but empty sequencer as a no-op, uses the scene camera, and ignores unsupported audio codecs for image output; Blender-import regressions cover default-scene rendering and strict feature errors on the realistic scene.
 - Blender round trips preserve world display/background colors, area-light shape and dimensions, curve resolution and material slots, and per-view hide state independently from global visibility flags.

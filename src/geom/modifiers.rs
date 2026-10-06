@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   source/blender/modifiers/intern/MOD_array.cc, source/blender/modifiers/intern/MOD_displace.cc, source/blender/modifiers/intern/MOD_smooth.cc, source/blender/modifiers/intern/MOD_solidify.cc, source/blender/modifiers/intern/MOD_subsurf.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
+//   source/blender/modifiers/intern/MOD_solidify_extrude.cc, source/blender/bmesh/tools/bmesh_bevel.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
+//   source/blender/blenlib/intern/math_matrix_c.cc, SPDX-FileCopyrightText: 2001-2002 NaN Holding BV. All rights reserved., GPL-2.0-or-later.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glam::{DMat4, DVec3};

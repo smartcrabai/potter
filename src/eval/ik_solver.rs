@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from Blender (https://www.blender.org):
+//   intern/iksolver/intern/IK_QJacobianSolver.cpp, intern/iksolver/intern/IK_QJacobian.cpp, intern/iksolver/intern/IK_QSegment.cpp, intern/iksolver/intern/IK_Math.h, SPDX-FileCopyrightText: 2001-2002 NaN Holding BV. All rights reserved., GPL-2.0-or-later.
+
 //! Blender legacy `QJacobian` pseudo-inverse updates.
 //!
 //! The incoming Jacobian contains unweighted geometric derivatives. `QJacobian` scales each `DoF`

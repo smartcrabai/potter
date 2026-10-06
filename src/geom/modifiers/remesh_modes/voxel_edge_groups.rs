@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Portions derived from OpenVDB (https://github.com/AcademySoftwareFoundation/openvdb):
+//   openvdb/openvdb/tools/VolumeToMesh.h, SPDX-FileCopyrightText: Copyright Contributors to the OpenVDB Project, Apache-2.0.
+
 // OpenVDB v12.0.1 VolumeToMesh.h sEdgeGroupTable, Apache-2.0.
 pub(super) const AMBIGUOUS_FACE: [u8; 256] = [
     0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 5, 1, 0, 4, 0, 0, 0, 4, 0, 0, 0,

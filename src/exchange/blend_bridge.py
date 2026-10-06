@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """JSON bridge for the pinned headless Blender adapter.
 
 This script deliberately never executes scripts found in an input .blend. Unknown Blender
