@@ -18,7 +18,7 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 exr = "1.74"
 flate2 = "1.1"
-fs4 = { version = "0.13", features = ["sync"] }
+fs4 = { version = "1.0", features = ["sync"] }
 glam = { version = "0.30", features = ["serde"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = [
