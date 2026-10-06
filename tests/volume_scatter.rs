@@ -22,7 +22,12 @@ fn pot(args: &[&str]) -> Result<Value, Box<dyn Error>> {
 
 fn png_pixels(path: &Path) -> Result<(u32, u32, Vec<u8>), Box<dyn Error>> {
     let mut reader = png::Decoder::new(Cursor::new(fs::read(path)?)).read_info()?;
-    let mut pixels = vec![0; reader.output_buffer_size()];
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size overflow")?
+    ];
     let info = reader.next_frame(&mut pixels)?;
     pixels.truncate(info.buffer_size());
     if info.color_type != png::ColorType::Rgba {

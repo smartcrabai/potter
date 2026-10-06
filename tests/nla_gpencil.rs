@@ -4,7 +4,7 @@
     reason = "asserting exact deterministic animation values"
 )]
 
-use std::{collections::BTreeSet, error::Error, fs, path::Path, process::Command};
+use std::{collections::BTreeSet, error::Error, fs, io::Cursor, path::Path, process::Command};
 
 use potter::{
     eval::{EvaluationContext, Snapshot},
@@ -219,8 +219,13 @@ fn grease_pencil_svg_round_trip_and_pdf_xref_are_valid() -> Result<(), Box<dyn E
         .args(["--overwrite", "--json"]);
     run_ok(render_preview)?;
     let preview_bytes = fs::read(preview.join("front.png"))?;
-    let mut png_reader = png::Decoder::new(preview_bytes.as_slice()).read_info()?;
-    let mut pixel_bytes = vec![0; png_reader.output_buffer_size()];
+    let mut png_reader = png::Decoder::new(Cursor::new(preview_bytes.as_slice())).read_info()?;
+    let mut pixel_bytes = vec![
+        0;
+        png_reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size overflow")?
+    ];
     let image_info = png_reader.next_frame(&mut pixel_bytes)?;
     let channels = match image_info.color_type {
         png::ColorType::Rgba => 4,

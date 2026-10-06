@@ -3,7 +3,7 @@
     reason = "asserting exact deterministic color values"
 )]
 
-use std::{error::Error, fs, path::Path};
+use std::{error::Error, fs, io::BufReader, path::Path};
 
 use assert_cmd::Command;
 
@@ -49,9 +49,16 @@ fn render(scene: &Path, output: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
             std::io::Error::other(String::from_utf8_lossy(&result.stdout).into_owned()).into(),
         );
     }
-    let decoder = png::Decoder::new(fs::File::open(output.join("frame_0001.png"))?);
+    let decoder = png::Decoder::new(BufReader::new(fs::File::open(
+        output.join("frame_0001.png"),
+    )?));
     let mut reader = decoder.read_info()?;
-    let mut pixels = vec![0; reader.output_buffer_size()];
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size overflow")?
+    ];
     reader.next_frame(&mut pixels)?;
     Ok(pixels)
 }

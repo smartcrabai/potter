@@ -395,7 +395,7 @@ fn sequencer_render_writes_crossfade_frame_and_frame_aligned_audio() {
     let frame_bytes = fs::read(frame_path).unwrap();
     let decoder = png::Decoder::new(Cursor::new(frame_bytes));
     let mut reader = decoder.read_info().unwrap();
-    let mut pixels = vec![0_u8; reader.output_buffer_size()];
+    let mut pixels = vec![0_u8; reader.output_buffer_size().unwrap()];
     let info = reader.next_frame(&mut pixels).unwrap();
     assert_eq!(info.width, 1);
     assert_eq!(info.height, 1);

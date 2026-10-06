@@ -56,7 +56,12 @@ fn apply_operations(scene: &Path, operations: &[Value]) -> Result<Value, Box<dyn
 
 fn decode_rgba(image: &[u8]) -> Result<(u32, u32, Vec<u8>), Box<dyn Error>> {
     let mut reader = png::Decoder::new(Cursor::new(image)).read_info()?;
-    let mut pixels = vec![0; reader.output_buffer_size()];
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size overflow")?
+    ];
     let info = reader.next_frame(&mut pixels)?;
     if info.color_type != png::ColorType::Rgba {
         return Err("renderer PNG is not RGBA".into());

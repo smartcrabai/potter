@@ -3,7 +3,7 @@
     reason = "format fixture setup uses fixed valid images"
 )]
 
-use std::{error::Error, fs, path::Path, process::Output};
+use std::{error::Error, fs, io::BufReader, path::Path, process::Output};
 
 use assert_cmd::Command;
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb, Rgba};
@@ -281,12 +281,17 @@ fn jpeg_base_color_texture_appears_in_beauty_preview() -> Result<(), Box<dyn Err
         String::from_utf8_lossy(&preview.stdout)
     );
     let file = fs::File::open(output_dir.join("top.png"))?;
-    let mut decoder = png::Decoder::new(file);
+    let mut decoder = png::Decoder::new(BufReader::new(file));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info()?;
     let width = reader.info().width;
     let height = reader.info().height;
-    let mut bytes = vec![0; reader.output_buffer_size()];
+    let mut bytes = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size overflow")?
+    ];
     let frame = reader.next_frame(&mut bytes)?;
     let center = (height as usize / 2 * width as usize + width as usize / 2)
         * match frame.color_type {

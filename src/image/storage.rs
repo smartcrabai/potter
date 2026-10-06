@@ -774,7 +774,13 @@ pub fn decode_png_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     let width = reader.info().width;
     let height = reader.info().height;
     checked_pixel_count(width, height)?;
-    let mut buffer = vec![0_u8; reader.output_buffer_size()];
+    let buffer_size = reader.output_buffer_size().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "PNG output buffer exceeds platform limits",
+        )
+    })?;
+    let mut buffer = vec![0_u8; buffer_size];
     let frame = reader.next_frame(&mut buffer).map_err(|error| {
         PotError::new(
             ErrorCode::InvalidArgument,
@@ -803,7 +809,15 @@ fn decode_png(bytes: &[u8], colorspace: ImageColorspace) -> Result<(u32, u32, Ve
     let width = reader.info().width;
     let height = reader.info().height;
     let pixel_count = checked_pixel_count(width, height)?;
-    let mut buffer = vec![0_u8; reader.output_buffer_size()];
+    let buffer_size = reader.output_buffer_size().ok_or_else(|| {
+        encoding_error(
+            ErrorCode::LimitExceeded,
+            "png",
+            "invalid_data",
+            "PNG output buffer exceeds platform limits",
+        )
+    })?;
+    let mut buffer = vec![0_u8; buffer_size];
     let frame = reader.next_frame(&mut buffer).map_err(|error| {
         PotError::with_details(
             ErrorCode::InvalidArgument,

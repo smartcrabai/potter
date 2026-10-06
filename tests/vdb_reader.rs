@@ -4,6 +4,7 @@ use std::{
     env,
     error::Error,
     fs,
+    io::BufReader,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Command,
@@ -312,9 +313,14 @@ fn assert_close(actual: f64, expected: f64, tolerance: f64) {
 }
 
 fn read_png(path: &Path) -> Result<(u32, u32, Vec<u8>), Box<dyn Error>> {
-    let decoder = png::Decoder::new(fs::File::open(path)?);
+    let decoder = png::Decoder::new(BufReader::new(fs::File::open(path)?));
     let mut reader = decoder.read_info()?;
-    let mut bytes = vec![0; reader.output_buffer_size()];
+    let mut bytes = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size overflow")?
+    ];
     let info = reader.next_frame(&mut bytes)?;
     bytes.truncate(info.buffer_size());
     Ok((info.width, info.height, bytes))

@@ -403,7 +403,12 @@ fn output_file_node_writes_a_numeric_png_and_preserves_its_image() -> Result<(),
     }
     let decoder = png::Decoder::new(Cursor::new(fs::read(path)?));
     let mut reader = decoder.read_info()?;
-    let mut bytes = vec![0; reader.output_buffer_size()];
+    let mut bytes = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size overflow")?
+    ];
     reader.next_frame(&mut bytes)?;
     assert_eq!(&bytes[..4], &[51, 102, 153, 128]);
     Ok(())
