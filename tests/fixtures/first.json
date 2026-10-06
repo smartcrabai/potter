@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "base_revision": 0,
+  "operations": [
+    {
+      "op": "material.create",
+      "id": "clay",
+      "name": "Clay",
+      "base_color": [0.65, 0.32, 0.18, 1],
+      "metallic": 0,
+      "roughness": 0.8
+    },
+    {
+      "op": "node.create",
+      "id": "assembly",
+      "kind": "group"
+    },
+    {
+      "op": "node.create",
+      "id": "body",
+      "name": "Body",
+      "kind": "box",
+      "parent": "assembly",
+      "tags": ["body"],
+      "params": {"size": 1},
+      "transform": {"translation": [0, 0, 0.4], "scale": [1, 0.6, 0.8]},
+      "material": "clay"
+    }
+  ]
+}

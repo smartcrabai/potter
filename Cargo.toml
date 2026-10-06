@@ -1,0 +1,93 @@
+[package]
+description = ""
+edition = "2024"
+license = "Apache-2.0"
+name = "potter"
+repository = "https://github.com/smartcrabai/potter"
+version = "0.1.0"
+
+[lib]
+name = "potter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pot"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+exr = "1.74"
+flate2 = "1.1"
+fs4 = { version = "0.13", features = ["sync"] }
+glam = { version = "0.30", features = ["serde"] }
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = [
+  "bmp",
+  "hdr",
+  "jpeg",
+  "tga",
+  "tiff",
+  "webp",
+] }
+lz4_flex = "0.12"
+png = "0.17"
+robust = "1.2"
+ruzstd = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+jsonschema = "0.33"
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+[lints.clippy]
+allow_attributes = "deny"
+dbg_macro = "deny"
+expect_used = "deny"
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+many_single_char_names = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+suboptimal_flops = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[workspace.metadata.dist]
+cargo-dist-version = ""
+ci = "github"
+install-path = "CARGO_HOME"
+installers = ["shell", "homebrew"]
+publish-jobs = ["homebrew"]
+tap = "smartcrabai/homebrew-tap"
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
+
+[profile.dist]
+inherits = "release"
