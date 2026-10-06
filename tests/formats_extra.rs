@@ -121,7 +121,9 @@ fn blender_executable() -> Option<PathBuf> {
     }) {
         return Some(path);
     }
-    usable(PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender"))
+    usable(PathBuf::from(
+        "/Applications/Blender.app/Contents/MacOS/Blender",
+    ))
 }
 
 fn assert_blender_import(
