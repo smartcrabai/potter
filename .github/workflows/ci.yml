@@ -8,6 +8,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # About 16 minutes with warm caches; a hung Blender test should not hold the runner for 6 hours.
+    timeout-minutes: 45
     env:
       # The .blend adapter accepts only Blender 5.2.x.
       BLENDER_VERSION: 5.2.2
