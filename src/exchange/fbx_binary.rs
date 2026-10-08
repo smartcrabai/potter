@@ -356,19 +356,30 @@ fn encode_node(node: &Node, parent: Option<&str>, wide: bool, output: &mut Vec<u
 fn binary_object_name_arg(node: &Node, index: usize, arg: &Arg) -> Arg {
     if index == 1
         && let Some((class, name)) = arg.value.split_once("::")
-        && class == node.name
     {
         let binary_class = match class {
             "AnimationStack" => "AnimStack",
             "AnimationLayer" => "AnimLayer",
             "AnimationCurveNode" => "AnimCurveNode",
             "AnimationCurve" => "AnimCurve",
+            "SubDeformer" => "Deformer",
             class => class,
         };
-        return Arg {
-            value: format!("{name}\0\x01{binary_class}"),
-            is_string: true,
-        };
+        if class == node.name
+            || binary_class == node.name
+            || matches!(
+                (class, node.name.as_str()),
+                ("AnimStack", "AnimationStack")
+                    | ("AnimLayer", "AnimationLayer")
+                    | ("AnimCurveNode", "AnimationCurveNode")
+                    | ("AnimCurve", "AnimationCurve")
+            )
+        {
+            return Arg {
+                value: format!("{name}\0\x01{binary_class}"),
+                is_string: true,
+            };
+        }
     }
     arg.clone()
 }
@@ -443,6 +454,10 @@ fn encode_array(args: &[Arg], element_type: char, output: &mut Vec<u8>) -> Resul
 }
 
 fn property_kind(node: &Node, index: usize, parent: Option<&str>) -> Result<char> {
+    if parent == Some("Objects") && index < 3 {
+        return Ok(if index == 0 { 'L' } else { 'S' });
+    }
+
     let arg = node.args.get(index).ok_or_else(|| {
         PotError::new(ErrorCode::InternalError, "FBX property argument is missing")
     })?;
@@ -456,7 +471,7 @@ fn property_kind(node: &Node, index: usize, parent: Option<&str>) -> Result<char
         node.name.as_str(),
         "Model"
             | "Geometry"
-            | "Material"
+            | "Deformer"
             | "AnimationStack"
             | "AnimationLayer"
             | "AnimationCurveNode"
@@ -525,7 +540,7 @@ fn property_kind(node: &Node, index: usize, parent: Option<&str>) -> Result<char
 
 fn array_type(parent: &str) -> char {
     match parent {
-        "PolygonVertexIndex" | "Materials" | "KeyAttrFlags" | "KeyAttrRefCount" => 'i',
+        "PolygonVertexIndex" | "Materials" | "Indexes" | "KeyAttrFlags" | "KeyAttrRefCount" => 'i',
         "KeyTime" => 'l',
         "KeyValueFloat" | "KeyAttrDataFloat" => 'f',
         _ => 'd',

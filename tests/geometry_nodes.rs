@@ -155,7 +155,10 @@ fn seeded_distribution_is_repeatable_and_instances_are_realized_with_paths() {
     let first = evaluate(&doc);
     let second = evaluate(&doc);
     assert_eq!(first.mesh, second.mesh);
-    assert!(!first.instance_paths.is_empty());
+    assert!(
+        !first.instance_paths.is_empty(),
+        "point distribution produced no instances"
+    );
     assert_eq!(first.instance_paths.len(), first.mesh.faces.len() / 6);
 }
 
@@ -266,7 +269,7 @@ fn graph_operations_update_interface_and_remove_links_with_nodes() {
             json!({"op":"graph.delete","target":{"id":"geo"}}),
         ],
     );
-    assert!(doc.node_groups.is_empty());
+    assert!(doc.node_groups.is_empty(), "{:?}", doc.node_groups);
 }
 
 #[test]
@@ -574,7 +577,10 @@ fn distribute_points_minimum_distance_is_repeatable_and_enforced() {
     let first = evaluate(&doc).mesh;
     let second = evaluate(&doc).mesh;
     assert_eq!(first, second);
-    assert!(!first.vertices.is_empty());
+    assert!(
+        !first.vertices.is_empty(),
+        "point distribution produced no vertices"
+    );
     for (index, point) in first.vertices.iter().enumerate() {
         for other in &first.vertices[index + 1..] {
             assert!(point.co.distance(other.co) >= 0.6);

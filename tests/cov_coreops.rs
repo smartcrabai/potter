@@ -141,7 +141,10 @@ fn history_undo_redo_cover_steps_revisions_and_branch_errors() {
     let revision_two = entries.iter().find(|entry| entry["revision"] == 2).unwrap();
     assert_eq!(revision_two["kind"], "apply");
     assert_eq!(revision_two["operations"][0]["op"], "node.create");
-    assert!(!revision_two["scene_hash"].as_str().unwrap().is_empty());
+    assert!(
+        !revision_two["scene_hash"].as_str().unwrap().is_empty(),
+        "scene hash should not be empty"
+    );
 
     let undo = command_output("undo", &scene, &["--base-revision", "2"]);
     assert!(undo.status.success());

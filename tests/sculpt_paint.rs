@@ -188,7 +188,10 @@ fn sculpt_voxel_remesh_replaces_source_geometry() -> Result<(), Box<dyn Error>> 
     let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     let mesh = &document["data_blocks"]["body_mesh"]["mesh"];
     assert_ne!(mesh["vertices"].as_array().unwrap().len(), 8);
-    assert!(!mesh["faces"].as_array().unwrap().is_empty());
+    assert!(
+        !mesh["faces"].as_array().unwrap().is_empty(),
+        "voxel remesh produced no faces"
+    );
     assert!(document["data_blocks"]["body_mesh"]["descriptor"].is_null());
     Ok(())
 }

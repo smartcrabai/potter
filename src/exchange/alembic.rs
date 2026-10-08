@@ -215,7 +215,7 @@ pub(crate) fn export(
                     "Alembic evaluated mesh is missing",
                 )
             })?;
-            meshes.insert(id.clone(), mesh_sample(source)?);
+            meshes.insert(id.clone(), mesh_sample(source, allow_lossy)?);
         }
         sampled.push(FrameSample {
             seconds: *frame / rate,
@@ -413,7 +413,7 @@ fn sample_frames(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<f64>> {
     Ok(frames)
 }
 
-fn mesh_sample(mesh: &Mesh) -> Result<MeshSample> {
+fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
     let positions = mesh
         .vertices
         .iter()
@@ -441,7 +441,9 @@ fn mesh_sample(mesh: &Mesh) -> Result<MeshSample> {
         faces.push(indices);
     }
     for attribute in mesh.attributes.keys() {
-        if !matches!(attribute.as_str(), "uv_map" | "alembic_normals") {
+        let supported_attribute = matches!(attribute.as_str(), "uv_map" | "alembic_normals")
+            || (allow_lossy && attribute == "vertex_groups");
+        if !supported_attribute {
             return Err(unsupported(
                 "mesh.attribute",
                 format!("Alembic export does not represent mesh attribute `{attribute}`"),

@@ -1,4 +1,10 @@
-use std::{error::Error, fs, io::Cursor, path::Path, process::Output};
+use std::{
+    error::Error,
+    fs,
+    io::{BufReader, Cursor},
+    path::Path,
+    process::Output,
+};
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -78,7 +84,7 @@ fn top_preview_is_pickable_and_stale_after_an_edit() -> Result<(), Box<dyn Error
     let preview_record = preview_json["result"]["previews"][0].clone();
     assert_eq!(preview_record["view"], "top");
     assert_eq!(preview_record["width"], 128);
-    let png_reader = png::Decoder::new(fs::File::open(&image_path)?).read_info()?;
+    let png_reader = png::Decoder::new(BufReader::new(fs::File::open(&image_path)?)).read_info()?;
     assert_eq!(png_reader.info().width, 128);
     assert_eq!(png_reader.info().height, 128);
 
@@ -397,11 +403,18 @@ fn render_uses_scene_settings_for_png_and_linear_exr_sequences() -> Result<(), B
         .arg("--json")
         .output()?;
     assert_success(&png_output)?;
-    let mut png_reader =
-        png::Decoder::new(fs::File::open(png_dir.join("frame_0001.png"))?).read_info()?;
+    let mut png_reader = png::Decoder::new(BufReader::new(fs::File::open(
+        png_dir.join("frame_0001.png"),
+    )?))
+    .read_info()?;
     assert_eq!(png_reader.info().width, 64);
     assert_eq!(png_reader.info().height, 48);
-    let mut pixels = vec![0; png_reader.output_buffer_size()];
+    let mut pixels = vec![
+        0;
+        png_reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size is unknown")?
+    ];
     let frame_info = png_reader.next_frame(&mut pixels)?;
     assert_eq!(frame_info.color_type, png::ColorType::Rgba);
     assert_eq!(pixels.get(3), Some(&0));
@@ -559,7 +572,12 @@ fn render_path_image(
 
 fn decode_rgba(image: &[u8]) -> Result<(u32, u32, Vec<u8>), Box<dyn Error>> {
     let mut reader = png::Decoder::new(Cursor::new(image)).read_info()?;
-    let mut pixels = vec![0; reader.output_buffer_size()];
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or("PNG output buffer size is unknown")?
+    ];
     let info = reader.next_frame(&mut pixels)?;
     if info.color_type != png::ColorType::Rgba {
         return Err("renderer PNG is not RGBA".into());

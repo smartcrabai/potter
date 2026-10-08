@@ -1044,10 +1044,6 @@ fn geometry_triangles(geometry: &Value) -> Vec<[DVec3; 3]> {
     triangles
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "an exact zero winding identifies a degenerate projected face"
-)]
 fn triangulate_face(indices: &[usize], points: &[DVec3], triangles: &mut Vec<[DVec3; 3]>) {
     let mut normal = DVec3::ZERO;
     for index in 0..indices.len() {

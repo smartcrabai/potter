@@ -397,7 +397,8 @@ fn lossy_export_requires_explicit_permission_and_reports_losses() -> Result<(), 
         !result["result"]["losses"]
             .as_array()
             .ok_or("losses missing")?
-            .is_empty()
+            .is_empty(),
+        "STL export should report losses"
     );
     assert!(!output_path.exists());
     Ok(())

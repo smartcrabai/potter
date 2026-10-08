@@ -509,7 +509,10 @@ fn blender_external_assets_copy_link_and_roundtrip() -> Result<(), Box<dyn Error
             "strict Blender export",
         )?;
         assert_eq!(exported["ok"], true);
-        assert!(!exported["result"]["files"].as_array().unwrap().is_empty());
+        assert!(
+            !exported["result"]["files"].as_array().unwrap().is_empty(),
+            "Blender export produced no files"
+        );
         verify_export(&blender, &output_blend, &expected, case, &case_root)?;
     }
 

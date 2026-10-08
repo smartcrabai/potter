@@ -2654,7 +2654,7 @@ fn nearest_untyped_attribute_value(
         }
     }
     let (nearest_distance, nearest_value) = nearest?;
-    if nearest_distance <= f64::EPSILON {
+    if nearest_distance <= f64::EPSILON || second.is_none() {
         return Some(nearest_value.clone());
     }
     let (second_distance, second_value) = second?;
@@ -2702,7 +2702,19 @@ fn interpolate_legacy_attribute(
     let mut additions = Vec::new();
     for id in ids {
         let key = format!("{key_prefix}{id}");
-        if current_values.contains_key(&key) {
+        let has_current_value = current_values.get(&key).is_some_and(|value| {
+            domain_name != "corner"
+                || target
+                    .faces
+                    .iter()
+                    .find(|face| face.id == id)
+                    .is_some_and(|face| {
+                        value
+                            .as_array()
+                            .is_some_and(|corners| corners.len() == face.vertices.len())
+                    })
+        });
+        if has_current_value {
             continue;
         }
         let value = match domain_name {

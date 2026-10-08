@@ -524,10 +524,10 @@ Common format:
   "warnings": [],
   "error": {
     "code": "INVALID_OPERATION",
-    "message": "box size components must be greater than zero",
+    "message": "parameter is outside its valid range",
     "details": {
       "operation_index": 0,
-      "pointer": "/operations/0/params/size/0"
+      "pointer": "/operations/0/params/size"
     }
   }
 }

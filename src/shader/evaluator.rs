@@ -1114,14 +1114,15 @@ impl Evaluator<'_, '_, '_, '_> {
             "SUBTRACT" => first - second,
             "MULTIPLY" => first * second,
             "DIVIDE" => {
-                if second.abs() <= f64::EPSILON {
+                if crate::float::equal_f64(second, 0.0) {
                     0.0
                 } else {
                     first / second
                 }
             }
             "MULTIPLY_ADD" => first * second + third,
-            "POWER" => first.powf(second),
+            "POWER" if first >= 0.0 || second.fract() == 0.0 => first.powf(second),
+            "POWER" => 0.0,
             "SINE" => first.sin(),
             "COSINE" => first.cos(),
             "TANGENT" => first.tan(),
@@ -1131,7 +1132,10 @@ impl Evaluator<'_, '_, '_, '_> {
             "MAXIMUM" => first.max(second),
             "LESS_THAN" => f64::from(first < second),
             "GREATER_THAN" => f64::from(first > second),
-            "COMPARE" => f64::from((first - second).abs() <= 1.0e-6),
+            "COMPARE" => {
+                let epsilon = self.scalar_input(id, &["Value_002", "Value_003"], 0.001)?;
+                f64::from((first - second).abs() <= epsilon.max(0.0))
+            }
             "PINGPONG" => {
                 let scale = second.abs().max(f64::MIN_POSITIVE);
                 let value = first.rem_euclid(2.0 * scale);

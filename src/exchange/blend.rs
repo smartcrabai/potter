@@ -9716,7 +9716,10 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert!((reopened_clip.tracking.camera.sensor_width_mm - 36.0).abs() <= 1.0e-6);
         assert!((reopened_clip.tracking.camera.k2 + 0.02).abs() <= 1.0e-6);
         assert!((reopened_clip.tracking.camera.k3 - 0.003).abs() <= 1.0e-6);
-        assert!(reopened_clip.tracking.reconstruction.cameras.is_empty());
+        assert!(
+            reopened_clip.tracking.reconstruction.cameras.is_empty(),
+            "reconstruction cameras must not survive the round trip"
+        );
         assert!(!reopened_clip.tracking.reconstruction.is_valid);
         Ok(())
     }

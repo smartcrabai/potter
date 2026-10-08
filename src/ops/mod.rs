@@ -1896,16 +1896,8 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.doc.materials.is_empty());
-        assert!(
-            outcome
-                .doc
-                .nodes
-                .values()
-                .next()
-                .unwrap()
-                .materials
-                .is_empty()
-        );
+        let node_materials = &outcome.doc.nodes.values().next().unwrap().materials;
+        assert!(node_materials.is_empty(), "{node_materials:?}");
         assert_eq!(outcome.changes["materials"]["created"], json!([]));
         assert_eq!(outcome.changes["materials"]["deleted"], json!([]));
         let reassigned = apply_batch(
@@ -2209,7 +2201,7 @@ mod tests {
             assert_eq!(node.primitive.as_deref(), Some(primitive));
             let data_id = node.data.as_ref().unwrap();
             let mesh = outcome.doc.data_blocks[data_id].mesh.as_ref().unwrap();
-            assert!(!mesh.vertices.is_empty());
+            assert!(!mesh.vertices.is_empty(), "primitive mesh has no vertices");
         }
     }
 

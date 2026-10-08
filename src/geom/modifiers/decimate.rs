@@ -1308,7 +1308,7 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
             (edge.active && edge.input_loose && counts[index] == 0).then_some(edge.vertices)
         })
         .collect();
-    let points = model.points.iter().map(glam::Vec3::as_dvec3).collect();
+    let points = model.points.iter().map(|point| point.as_dvec3()).collect();
     decimate_compact(points, polygons, loose, &mesh.attributes)
 }
 

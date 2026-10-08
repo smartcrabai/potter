@@ -560,8 +560,8 @@ fn voxel_remesh_produces_watertight_surface_near_source_bounds() -> Result<(), B
         .as_array()
         .ok_or("missing remesh vertices")?;
     let faces = mesh["faces"].as_array().ok_or("missing remesh faces")?;
-    assert!(!vertices.is_empty());
-    assert!(!faces.is_empty());
+    assert!(!vertices.is_empty(), "remesh produced no vertices");
+    assert!(!faces.is_empty(), "remesh produced no faces");
     let mut bounds = [[f64::INFINITY; 3], [f64::NEG_INFINITY; 3]];
     for vertex in vertices {
         let co = vertex["co"].as_array().ok_or("invalid remesh vertex")?;

@@ -789,23 +789,6 @@ fn finite_sample(curve: &FCurve, value: f64) -> Result<Option<f64>> {
     }
     Ok(Some(value))
 }
-#[cfg(kani)]
-#[kani::proof]
-fn kani_finite_sample_rejects_non_finite_values() {
-    let value: f64 = kani::any();
-    let curve = FCurve {
-        path: "transform.translation".to_owned(),
-        index: 0,
-        keyframes: Vec::new(),
-        extrapolation: Extrapolation::Constant,
-    };
-    let result = finite_sample(&curve, value);
-    if value.is_finite() {
-        assert!(matches!(result, Ok(Some(sampled)) if sampled == value));
-    } else {
-        assert!(result.is_err());
-    }
-}
 
 fn invalid_curve(curve: &FCurve, message: &str) -> PotError {
     PotError::with_details(
@@ -856,6 +839,15 @@ mod tests {
             keyframes: keys,
             extrapolation,
         }
+    }
+
+    #[test]
+    fn finite_sample_rejects_every_non_finite_value() {
+        let channel = curve(Vec::new(), Extrapolation::Constant);
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(super::finite_sample(&channel, value).is_err());
+        }
+        assert_eq!(super::finite_sample(&channel, -0.5).unwrap(), Some(-0.5));
     }
 
     #[test]

@@ -157,7 +157,7 @@ fn text_update_uses_variable_width_hershey_glyphs() {
     let bounds = snapshot.nodes[&label_id].bounds.unwrap();
     let mesh = &snapshot.meshes[&label_id];
     assert!(bounds.size().x > 1.0);
-    assert!(!mesh.faces.is_empty());
+    assert!(!mesh.faces.is_empty(), "text mesh has no faces");
     assert!(
         mesh.vertices
             .iter()
@@ -206,7 +206,7 @@ fn built_in_hershey_font_covers_printable_ascii() {
         ..TextObjectData::default()
     };
     let mesh = evaluate_text(&text).unwrap();
-    assert!(!mesh.faces.is_empty());
+    assert!(!mesh.faces.is_empty(), "font generated no faces");
     assert!(mesh.validate().is_ok());
 }
 
@@ -227,7 +227,7 @@ fn hair_curves_evaluate_to_loose_line_edges() {
     let mesh = evaluate_hair_curves(&hair).unwrap();
     assert_eq!(mesh.vertices.len(), 5);
     assert_eq!(mesh.edges.len(), 3);
-    assert!(mesh.faces.is_empty());
+    assert!(mesh.faces.is_empty(), "{:?}", mesh.faces);
     assert!(mesh.validate().is_ok());
 }
 #[test]
@@ -268,7 +268,7 @@ fn snapshot_evaluates_hair_curves_as_lines() {
     let mesh = &snapshot.meshes[&node_id];
     assert_eq!(mesh.vertices.len(), 2);
     assert_eq!(mesh.edges.len(), 1);
-    assert!(mesh.faces.is_empty());
+    assert!(mesh.faces.is_empty(), "{:?}", mesh.faces);
 }
 
 #[test]

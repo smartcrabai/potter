@@ -134,7 +134,7 @@ fn create_rigid_body(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
     check_fields(engine, operation, FIELDS, &["target", "type"])?;
     let node_id =
         super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "rigid body")?;
+    let node = physics_node(engine, &node_id, "rigid body", "/target/id")?;
     if node.rigid_body.is_some() {
         return Err(engine.error(
             ErrorCode::IdExists,
@@ -171,7 +171,7 @@ fn update_rigid_body(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
     )?;
     let node_id =
         super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "rigid body")?;
+    let node = physics_node(engine, &node_id, "rigid body", "/target/id")?;
     let before = node.rigid_body.clone().ok_or_else(|| {
         engine.error(
             ErrorCode::TargetNotFound,
@@ -197,7 +197,7 @@ fn delete_rigid_body(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
     check_fields(engine, operation, &["op", "target"], &["target"])?;
     let node_id =
         super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "rigid body")?;
+    let node = physics_node(engine, &node_id, "rigid body", "/target/id")?;
     if node.rigid_body.is_none() {
         return Err(engine.error(
             ErrorCode::TargetNotFound,
@@ -217,7 +217,7 @@ fn create_force_field(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
     check_fields(engine, operation, FIELDS, &["target", "type"])?;
     let node_id =
         super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "force field")?;
+    let node = physics_node(engine, &node_id, "force field", "/target/id")?;
     if node.kind != "empty" {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -251,7 +251,7 @@ fn update_force_field(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
     )?;
     let node_id =
         super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "force field")?;
+    let node = physics_node(engine, &node_id, "force field", "/target/id")?;
     if node.kind != "empty" {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -284,7 +284,7 @@ fn delete_force_field(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
     check_fields(engine, operation, &["op", "target"], &["target"])?;
     let node_id =
         super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &node_id, "force field")?;
+    let node = physics_node(engine, &node_id, "force field", "/target/id")?;
     if node.force_field.is_none() {
         return Err(engine.error(
             ErrorCode::TargetNotFound,
@@ -414,12 +414,12 @@ fn validate_force_field(engine: &Engine<'_>, field: &ForceField) -> Result<()> {
     Ok(())
 }
 
-fn physics_node(engine: &Engine<'_>, id: &Id, label: &str) -> Result<Node> {
+fn physics_node(engine: &Engine<'_>, id: &Id, label: &str, pointer: &str) -> Result<Node> {
     engine.doc.nodes.get(id).cloned().ok_or_else(|| {
         engine.error(
             ErrorCode::TargetNotFound,
             format!("{label} Object was not found"),
-            "/target/id",
+            pointer,
         )
     })
 }
@@ -505,7 +505,7 @@ fn apply_physics_system(
     };
     let target =
         super::target_id_value(engine, operation.get("target"), "/target", TARGET_ID_POLICY)?;
-    let node = physics_node(engine, &target, "physics")?;
+    let node = physics_node(engine, &target, "physics", "/target/id")?;
     validate_system_target(engine, &target, &node)?;
     let current = node.properties.get(property);
 
@@ -679,7 +679,7 @@ pub(super) fn create_linked_modifier_settings(
             "/params/settings_id",
         ));
     }
-    let node = physics_node(engine, target, "modifier physics")?;
+    let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     validate_system_target(engine, target, &node)?;
     validate_physics_settings(engine, system, &settings)?;
     validate_physics_references(engine, system, target, &settings)?;
@@ -757,7 +757,7 @@ pub(super) fn update_linked_modifier_settings(
     let mut settings = params.clone();
     settings.remove("settings_id");
     let property = physics_property(system);
-    let node = physics_node(engine, target, "modifier physics")?;
+    let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     let is_particle_registry_entry = system == "particle_emitter"
         && node
             .properties
@@ -996,7 +996,12 @@ fn validate_physics_references(
                 "/settings/instance_object",
             ));
         }
-        let instance = physics_node(engine, &instance_id, "particle instance")?;
+        let instance = physics_node(
+            engine,
+            &instance_id,
+            "particle instance",
+            "/settings/instance_object",
+        )?;
         validate_system_target(engine, &instance_id, &instance)?;
     }
     if system == "particle_emitter"
@@ -1052,7 +1057,12 @@ fn validate_physics_references(
                     &format!("/settings/brushes/{index}"),
                 ));
             }
-            let brush = physics_node(engine, &brush_id, "dynamic-paint brush")?;
+            let brush = physics_node(
+                engine,
+                &brush_id,
+                "dynamic-paint brush",
+                &format!("/settings/brushes/{index}"),
+            )?;
             if brush
                 .properties
                 .get("physics_dynamic_paint")

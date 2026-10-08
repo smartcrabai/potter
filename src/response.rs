@@ -105,7 +105,7 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.scene.as_ref().map(|scene| scene.revision), Some(7));
         assert_eq!(response.result, json!({"items":[1,2]}));
-        assert!(response.warnings.is_empty());
+        assert!(response.warnings.is_empty(), "{:?}", response.warnings);
         assert!(response.error.is_none());
         assert_eq!(response.exit_code(), 0);
     }
@@ -122,7 +122,7 @@ mod tests {
         assert!(!response.ok);
         assert!(response.scene.is_none());
         assert_eq!(response.result, json!({"current_revision":9}));
-        assert!(response.warnings.is_empty());
+        assert!(response.warnings.is_empty(), "{:?}", response.warnings);
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some(ErrorCode::RevisionConflict)
@@ -133,5 +133,16 @@ mod tests {
         assert_eq!(response.command, None);
         assert_eq!(response.result, serde_json::Value::Null);
         assert_eq!(response.exit_code(), 2);
+    }
+
+    #[test]
+    fn emit_returns_the_envelope_exit_code_in_json_and_text_modes() {
+        let success = Envelope::success("inspect", None, json!({}));
+        assert_eq!(success.emit(true), 0);
+        assert_eq!(success.emit(false), 0);
+
+        let failure = Envelope::failure(None, PotError::new(ErrorCode::SceneBusy, "busy"));
+        assert_eq!(failure.emit(true), 5);
+        assert_eq!(failure.emit(false), 5);
     }
 }

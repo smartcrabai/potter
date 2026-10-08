@@ -49,7 +49,7 @@ fn metaball_ball_surface_bounds_approximate_its_diameter() {
     for axis in 0..3 {
         assert!((bounds.size()[axis] - 2.5).abs() <= 0.1);
     }
-    assert!(!mesh.faces.is_empty());
+    assert!(!mesh.faces.is_empty(), "metaball produced no surface");
 }
 
 #[test]
@@ -154,11 +154,11 @@ fn geometry_operations_evaluate_metaballs_points_and_volume_bounds() {
     );
     let snapshot = evaluated(&doc);
     let metaball = &snapshot.meshes[&Id::new("blob").unwrap()];
-    assert!(!metaball.faces.is_empty());
+    assert!(!metaball.faces.is_empty(), "metaball produced no surface");
 
     let points = &snapshot.meshes[&Id::new("points").unwrap()];
     assert_eq!(points.vertices.len(), 1);
-    assert!(points.faces.is_empty());
+    assert!(points.faces.is_empty(), "{:?}", points.faces);
     assert_eq!(points.vertices[0].id, 17);
     assert_eq!(
         points.attributes["point_radius"]["values"]["v17"],
@@ -231,6 +231,9 @@ fn volume_object_modifier_extracts_a_mesh() {
         ]),
     );
     let extracted = &evaluated(&doc).meshes[&Id::new("surface").unwrap()];
-    assert!(!extracted.faces.is_empty());
+    assert!(
+        !extracted.faces.is_empty(),
+        "volume conversion produced no faces"
+    );
     assert!((extracted.bounds().unwrap().size().y).abs() < 1.0e-12);
 }

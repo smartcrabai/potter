@@ -237,7 +237,7 @@ mod tests {
         };
         let result = remesh_modifier(&source, &modifier)?;
         assert!(result.validate().is_ok());
-        assert!(!result.faces.is_empty());
+        assert!(!result.faces.is_empty(), "remesh produced no faces");
         Ok(())
     }
 }

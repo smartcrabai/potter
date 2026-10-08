@@ -2574,12 +2574,11 @@ fn math_value(operation: &str, a: f64, b: f64, c: f64) -> Result<f64> {
         "SUBTRACT" => a - b,
         "MULTIPLY" => a * b,
         "MULTIPLY_ADD" => a.mul_add(b, c),
-        "DIVIDE" if !crate::float::equal_f64(b, 0.0) => a / b,
-        "DIVIDE" => return Err(evaluation("division by zero in math field")),
-        "POWER" => a.powf(b),
-        "LOGARITHM" => a.log(b),
-        "SQRT" => a.sqrt(),
-        "INVERSE_SQRT" | "INV_SQRT" => 1.0 / a.sqrt(),
+        "DIVIDE" => safe_divide(a, b),
+        "POWER" => safe_power(a, b),
+        "LOGARITHM" => safe_log(a, b),
+        "SQRT" => safe_sqrt(a),
+        "INVERSE_SQRT" | "INV_SQRT" => safe_divide(1.0, safe_sqrt(a)),
         "ABSOLUTE" => a.abs(),
         "EXPONENT" => a.exp(),
         "MINIMUM" => a.min(b),
@@ -2598,9 +2597,9 @@ fn math_value(operation: &str, a: f64, b: f64, c: f64) -> Result<f64> {
                 0.0
             }
         }
-        "SIGN" => a.signum(),
+        "SIGN" => blender_sign(a),
         "COMPARE" => {
-            if (a - b).abs() <= c.abs() {
+            if (a - b).abs() <= c.max(0.0) {
                 1.0
             } else {
                 0.0
@@ -2608,31 +2607,28 @@ fn math_value(operation: &str, a: f64, b: f64, c: f64) -> Result<f64> {
         }
         "SMOOTH_MIN" => smooth_min(a, b, c),
         "SMOOTH_MAX" => -smooth_min(-a, -b, c),
-        "ROUND" => a.round(),
+        "ROUND" => (a + 0.5).floor(),
         "FLOOR" => a.floor(),
         "CEIL" => a.ceil(),
         "TRUNC" => a.trunc(),
         "FRACT" => a - a.floor(),
-        "MODULO" if !crate::float::equal_f64(b, 0.0) => a.rem_euclid(b),
-        "FLOORED_MODULO" if !crate::float::equal_f64(b, 0.0) => a - b * (a / b).floor(),
-        "MODULO" | "FLOORED_MODULO" => return Err(evaluation("modulo by zero in math field")),
-        "WRAP" if !crate::float::equal_f64(b, c) => {
-            let (low, high) = if b < c { (b, c) } else { (c, b) };
-            low + (a - low).rem_euclid(high - low)
-        }
-        "WRAP" => return Err(evaluation("math wrap bounds must differ")),
-        "SNAP" if !crate::float::equal_f64(b, 0.0) => (a / b).round() * b,
-        "SNAP" => return Err(evaluation("math snap increment must not be zero")),
-        "PINGPONG" if !crate::float::equal_f64(b, 0.0) => {
+        "MODULO" => safe_modulo(a, b),
+        "FLOORED_MODULO" => safe_floored_modulo(a, b),
+        "WRAP" => blender_wrap(a, b, c),
+        "SNAP" => (safe_divide(a, b)).floor() * b,
+        "PINGPONG" => {
             let length = b.abs();
-            length - ((a.rem_euclid(2.0 * length)) - length).abs()
+            if crate::float::equal_f64(length, 0.0) {
+                0.0
+            } else {
+                length - ((a.rem_euclid(2.0 * length)) - length).abs()
+            }
         }
-        "PINGPONG" => 0.0,
         "SINE" => a.sin(),
         "COSINE" => a.cos(),
         "TANGENT" => a.tan(),
-        "ARCSINE" | "ASIN" => a.asin(),
-        "ARCCOSINE" | "ACOS" => a.acos(),
+        "ARCSINE" | "ASIN" => a.clamp(-1.0, 1.0).asin(),
+        "ARCCOSINE" | "ACOS" => a.clamp(-1.0, 1.0).acos(),
         "ARCTANGENT" | "ATAN" => a.atan(),
         "ARCTAN2" | "ARCTAN_2" => a.atan2(b),
         "SINH" => a.sinh(),
@@ -2655,12 +2651,79 @@ fn math_value(operation: &str, a: f64, b: f64, c: f64) -> Result<f64> {
     }
 }
 
+fn safe_divide(a: f64, b: f64) -> f64 {
+    if crate::float::equal_f64(b, 0.0) {
+        0.0
+    } else {
+        a / b
+    }
+}
+
+/// Blender's `safe_logf`: non-positive operands and a unit base give zero.
+fn safe_log(value: f64, base: f64) -> f64 {
+    if value > 0.0 && base > 0.0 {
+        safe_divide(value.ln(), base.ln())
+    } else {
+        0.0
+    }
+}
+
+fn safe_sqrt(value: f64) -> f64 {
+    if value > 0.0 { value.sqrt() } else { 0.0 }
+}
+
+/// C `fmod` (the sign follows the dividend); a zero divisor gives zero.
+fn safe_modulo(a: f64, b: f64) -> f64 {
+    if crate::float::equal_f64(b, 0.0) {
+        0.0
+    } else {
+        a % b
+    }
+}
+
+fn safe_floored_modulo(a: f64, b: f64) -> f64 {
+    if crate::float::equal_f64(b, 0.0) {
+        0.0
+    } else {
+        a - b * (a / b).floor()
+    }
+}
+
+/// Blender's `safe_powf`: a negative base is only raised to integer exponents.
+fn safe_power(a: f64, b: f64) -> f64 {
+    if a >= 0.0 || b.fract() == 0.0 {
+        a.powf(b)
+    } else {
+        0.0
+    }
+}
+
+fn blender_sign(value: f64) -> f64 {
+    if value > 0.0 {
+        1.0
+    } else if value < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// Blender's `wrap_f(value, max, min)`; a zero range yields `min`.
+fn blender_wrap(value: f64, max: f64, min: f64) -> f64 {
+    let range = max - min;
+    if crate::float::equal_f64(range, 0.0) {
+        min
+    } else {
+        value - range * ((value - min) / range).floor()
+    }
+}
+
 fn smooth_min(a: f64, b: f64, width: f64) -> f64 {
-    if width <= 0.0 {
+    if width == 0.0 {
         return a.min(b);
     }
-    let factor = ((width - (a - b).abs()) / width).clamp(0.0, 1.0);
-    a.min(b) - factor * factor * width * 0.25
+    let h = (width - (a - b).abs()).max(0.0) / width;
+    a.min(b) - h * h * h * width * (1.0 / 6.0)
 }
 
 fn vector_math_value(
@@ -2699,19 +2762,15 @@ fn vector_math_value(
         "SUBTRACT" => first - second,
         "MULTIPLY" => first * second,
         "POWER" => DVec3::new(
-            first.x.powf(second.x),
-            first.y.powf(second.y),
-            first.z.powf(second.z),
+            safe_power(first.x, second.x),
+            safe_power(first.y, second.y),
+            safe_power(first.z, second.z),
         ),
-        "DIVIDE" => {
-            if crate::float::equal_f64(second.x, 0.0)
-                || crate::float::equal_f64(second.y, 0.0)
-                || crate::float::equal_f64(second.z, 0.0)
-            {
-                return Err(evaluation("division by zero in vector math field"));
-            }
-            first / second
-        }
+        "DIVIDE" => DVec3::new(
+            safe_divide(first.x, second.x),
+            safe_divide(first.y, second.y),
+            safe_divide(first.z, second.z),
+        ),
         "CROSS_PRODUCT" => first.cross(second),
         "PROJECT" if second.length_squared() > 0.0 => first.project_onto(second),
         "PROJECT" => DVec3::ZERO,
@@ -2743,54 +2802,27 @@ fn vector_math_value(
         "MAXIMUM" => first.max(second),
         "FLOOR" => first.floor(),
         "CEIL" => first.ceil(),
-        "ROUND" => first.round(),
+        "ROUND" => per_axis(first, |value| (value + 0.5).floor()),
         "FRACTION" => first - first.floor(),
-        "MODULO" => {
-            if crate::float::equal_f64(second.x, 0.0)
-                || crate::float::equal_f64(second.y, 0.0)
-                || crate::float::equal_f64(second.z, 0.0)
-            {
-                return Err(evaluation("modulo by zero in vector math field"));
-            }
-            DVec3::new(
-                first.x.rem_euclid(second.x),
-                first.y.rem_euclid(second.y),
-                first.z.rem_euclid(second.z),
-            )
-        }
-        "SNAP" => {
-            if crate::float::equal_f64(second.x, 0.0)
-                || crate::float::equal_f64(second.y, 0.0)
-                || crate::float::equal_f64(second.z, 0.0)
-            {
-                return Err(evaluation("vector snap increment must not be zero"));
-            }
-            DVec3::new(
-                (first.x / second.x).round() * second.x,
-                (first.y / second.y).round() * second.y,
-                (first.z / second.z).round() * second.z,
-            )
-        }
-        "WRAP" => {
-            let wrap = |value: f64, low: f64, high: f64| {
-                let low = low.min(high);
-                let range = (high - low).abs();
-                if crate::float::equal_f64(range, 0.0) {
-                    low
-                } else {
-                    low + (value - low).rem_euclid(range)
-                }
-            };
-            DVec3::new(
-                wrap(first.x, second.x, third.x),
-                wrap(first.y, second.y, third.y),
-                wrap(first.z, second.z, third.z),
-            )
-        }
+        "MODULO" => DVec3::new(
+            safe_modulo(first.x, second.x),
+            safe_modulo(first.y, second.y),
+            safe_modulo(first.z, second.z),
+        ),
+        "SNAP" => DVec3::new(
+            safe_divide(first.x, second.x).floor() * second.x,
+            safe_divide(first.y, second.y).floor() * second.y,
+            safe_divide(first.z, second.z).floor() * second.z,
+        ),
+        "WRAP" => DVec3::new(
+            blender_wrap(first.x, second.x, third.x),
+            blender_wrap(first.y, second.y, third.y),
+            blender_wrap(first.z, second.z, third.z),
+        ),
         "SINE" => DVec3::new(first.x.sin(), first.y.sin(), first.z.sin()),
         "COSINE" => DVec3::new(first.x.cos(), first.y.cos(), first.z.cos()),
         "TANGENT" => DVec3::new(first.x.tan(), first.y.tan(), first.z.tan()),
-        "SIGN" => first.signum(),
+        "SIGN" => per_axis(first, blender_sign),
         "MULTIPLY_ADD" => first * second + third,
         other => {
             return Err(PotError::with_details(
@@ -2805,6 +2837,10 @@ fn vector_math_value(
     } else {
         Err(evaluation("vector math produced a non-finite value"))
     }
+}
+
+fn per_axis(value: DVec3, f: impl Fn(f64) -> f64) -> DVec3 {
+    DVec3::new(f(value.x), f(value.y), f(value.z))
 }
 
 fn random_i64_inclusive(state: &mut u64, minimum: i64, maximum: i64) -> Result<i64> {

@@ -178,7 +178,11 @@ fn apply_as_shape_key_captures_topology_preserving_output_and_removes_modifier()
     let shape_keys = data.shape_keys.as_ref().ok_or("shape key data missing")?;
     let key = &shape_keys.keys[&Id::new("baked_wave")?];
     assert_eq!(key.name, "Baked Wave");
-    assert!(doc.nodes[&Id::new("subject")?].modifiers.is_empty());
+    assert!(
+        doc.nodes[&Id::new("subject")?].modifiers.is_empty(),
+        "{:?}",
+        doc.nodes[&Id::new("subject")?].modifiers
+    );
     assert!(key.positions.iter().any(|(id, position)| {
         shape_keys.basis.get(id).is_some_and(|basis| {
             DVec3::from_array(*position).distance(DVec3::from_array(*basis)) > 1.0e-6

@@ -586,7 +586,7 @@ mod tests {
             assert!((bounds.min[axis] + 1.0).abs() <= 0.05);
             assert!((bounds.max[axis] - 1.0).abs() <= 0.05);
         }
-        assert!(!mesh.faces.is_empty());
+        assert!(!mesh.faces.is_empty(), "metaball produced no faces");
         mesh.validate().unwrap();
     }
 
@@ -616,7 +616,10 @@ mod tests {
         assert_ne!(combined_mesh, positive_mesh);
         assert!(combined_mesh.validate().is_ok());
         positive.elements[0].negative = true;
-        assert!(to_mesh(&positive).unwrap().faces.is_empty());
+        assert!(
+            to_mesh(&positive).unwrap().faces.is_empty(),
+            "a lone negative element must produce no surface"
+        );
     }
 
     proptest! {

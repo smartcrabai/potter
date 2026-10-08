@@ -328,7 +328,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     if modifier_type == "volume_displace" {
         validate_volume_displace_params(engine, &params)?;
     } else if is_attribute_modifier_type(&modifier_type) {
-        validate_attribute_modifier_params(&modifier_type, &params)?;
+        validate_attribute_modifier_params(engine, &modifier_type, &params, "/params")?;
     }
     validate_particle_modifier_params(engine, &modifier_type, &params)?;
     let mut changed = false;
@@ -466,7 +466,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             if modifier_type == "volume_displace" {
                 validate_volume_displace_params(engine, &params)?;
             } else if is_attribute_modifier_type(modifier_type) {
-                validate_attribute_modifier_params(modifier_type, &params)?;
+                validate_attribute_modifier_params(engine, modifier_type, &params, "/set/params")?;
             }
             validate_particle_modifier_params(engine, modifier_type, &params)?;
             Some(super::physics::update_linked_modifier_settings(
@@ -1471,6 +1471,35 @@ fn is_attribute_modifier_type(modifier_type: &str) -> bool {
 }
 
 fn validate_attribute_modifier_params(
+    engine: &Engine<'_>,
+    modifier_type: &str,
+    params: &Map<String, Value>,
+    base_pointer: &str,
+) -> Result<()> {
+    validate_attribute_modifier_params_inner(modifier_type, params).map_err(|error| {
+        let Some(parameter) = error.details.get("parameter").and_then(Value::as_str) else {
+            return error;
+        };
+        let Some(mut details) = error.details.as_object().cloned() else {
+            return error;
+        };
+        details.insert("operation_index".to_owned(), json!(engine.operation_index));
+        details.insert(
+            "pointer".to_owned(),
+            json!(operation_pointer(
+                engine.operation_index,
+                &format!(
+                    "{}/{}",
+                    base_pointer.trim_start_matches('/'),
+                    super::pointer_escape(parameter)
+                )
+            )),
+        );
+        PotError::with_details(error.code, error.message, Value::Object(details))
+    })
+}
+
+fn validate_attribute_modifier_params_inner(
     modifier_type: &str,
     params: &Map<String, Value>,
 ) -> Result<()> {
@@ -2323,17 +2352,15 @@ fn validate_particle_modifier_params(
             "/params/space",
         ));
     }
-    for field in ["vertex_group"] {
-        if params
-            .get(field)
-            .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
-        {
-            return Err(engine.error(
-                ErrorCode::InvalidOperation,
-                format!("{modifier_type} `{field}` must be a non-empty group name"),
-                &format!("/params/{field}"),
-            ));
-        }
+    if params
+        .get("vertex_group")
+        .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("{modifier_type} `vertex_group` must be a non-empty group name"),
+            "/params/vertex_group",
+        ));
     }
     Ok(())
 }

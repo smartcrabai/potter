@@ -5,7 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -129,10 +128,12 @@ impl Project {
             .truncate(false)
             .open(lock_path)
             .map_err(|error| PotError::io(&error))?;
-        match file.try_lock_exclusive() {
-            Ok(true) => Ok(file),
-            Ok(false) => Err(PotError::new(ErrorCode::SceneBusy, "scene is busy")),
-            Err(error) => Err(PotError::io(&error)),
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(PotError::new(ErrorCode::SceneBusy, "scene is busy"))
+            }
+            Err(std::fs::TryLockError::Error(error)) => Err(PotError::io(&error)),
         }
     }
 

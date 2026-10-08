@@ -11,11 +11,12 @@ use crate::{
     geom::Mesh,
     model::{
         Action, ArmatureData, CameraData, CameraProjection, DataBlock, FCurve, Id, Interpolation,
-        Keyframe, LightData, LightType, Material, Node, SceneDoc, Transform,
+        Keyframe, LightData, LightType, Material, Modifier, Node, PoseBone, SceneDoc, ShapeKeyData,
+        Transform, VertexGroup,
     },
 };
 use glam::{DMat4, DQuat, DVec3, EulerRot};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const USDA_HEADER: &str = "#usda 1.0";
 
@@ -75,7 +76,14 @@ pub(crate) fn export_usda_with_root(
         line(&mut text, &format!("    endTimeCode = {}", scene.frame_end));
     }
     text.push_str(")\n\n");
-    text.push_str("def Xform \"Scene\"\n{\n");
+    let scene_root_kind = if doc.nodes.values().any(|node| node.kind == "armature") {
+        "SkelRoot"
+    } else {
+        "Xform"
+    };
+    text.push_str("def ");
+    text.push_str(scene_root_kind);
+    text.push_str(" \"Scene\"\n{\n");
     line(
         &mut text,
         &format!(
@@ -128,7 +136,7 @@ pub(crate) fn export_usda_with_root(
             quote(&collections_json)?
         ),
     );
-    text.push_str("    double3 xformOp:translate = (0, 0, 0)\n    quatd xformOp:orient = (1, (0, 0, 0))\n    double3 xformOp:scale = (1, 1, 1)\n    uniform token[] xformOpOrder = [\"xformOp:translate\", \"xformOp:orient\", \"xformOp:scale\"]\n");
+    text.push_str("    double3 xformOp:translate = (0, 0, 0)\n    quatd xformOp:orient = (1, 0, 0, 0)\n    double3 xformOp:scale = (1, 1, 1)\n    uniform token[] xformOpOrder = [\"xformOp:translate\", \"xformOp:orient\", \"xformOp:scale\"]\n");
     if let Some(roots) = children.get(&None) {
         for id in roots {
             write_node(&mut text, doc, snapshot, id, &children, &evaluated, 1)?;
@@ -374,7 +382,7 @@ fn write_node(
     line(
         output,
         &format!(
-            "{}quatd xformOp:orient = ({}, ({}, {}, {}))",
+            "{}quatd xformOp:orient = ({}, {}, {}, {})",
             spaces(child_depth),
             number(qw)?,
             number(qx)?,
@@ -551,8 +559,27 @@ fn write_mesh(
             "USD mesh vertex count changed during export",
         ));
     }
-    indent(output, depth);
-    line(output, "def Mesh \"Geometry\"");
+    let has_skel_binding = node
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.enabled && modifier.modifier_type == "armature")
+        || node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|data| data.shape_keys.as_ref())
+            .is_some_and(|shape_keys| !shape_keys.keys.is_empty());
+    if has_skel_binding {
+        indent(output, depth);
+        line(output, "def Mesh \"Geometry\" (");
+        indent(output, depth + 1);
+        line(output, "prepend apiSchemas = [\"SkelBindingAPI\"]");
+        indent(output, depth);
+        line(output, ")");
+    } else {
+        indent(output, depth);
+        line(output, "def Mesh \"Geometry\"");
+    }
     indent(output, depth);
     line(output, "{");
     let d = depth + 1;
@@ -789,7 +816,7 @@ fn write_skin_binding(
             "USD skin Data-Block has no source mesh",
         )
     })?;
-    let joint_ids = armature.bones.keys().cloned().collect::<Vec<_>>();
+    let joint_ids = ordered_bone_ids(armature)?;
     let joint_indices = joint_ids
         .iter()
         .enumerate()
@@ -854,7 +881,7 @@ fn write_skin_binding(
             weight_values.push(number(weight)?);
         }
     }
-    let skeleton_path = format!("{}/Rig/Skeleton", node_prim_path(doc, &armature_id)?);
+    let skeleton_path = format!("{}/Skeleton", node_prim_path(doc, &armature_id)?);
     line(
         output,
         &format!("{}rel skel:skeleton = <{}>", spaces(depth), skeleton_path),
@@ -862,21 +889,37 @@ fn write_skin_binding(
     line(
         output,
         &format!(
-            "{}int[] primvars:skel:jointIndices = [{}] (elementSize = {}, interpolation = \"vertex\")",
+            "{}int[] primvars:skel:jointIndices = [{}] (",
             spaces(depth),
-            joint_values.join(", "),
-            element_size
+            joint_values.join(", ")
         ),
     );
     line(
         output,
+        &format!("{}elementSize = {}", spaces(depth + 1), element_size),
+    );
+    line(
+        output,
+        &format!("{}interpolation = \"vertex\"", spaces(depth + 1)),
+    );
+    line(output, &format!("{})", spaces(depth)));
+    line(
+        output,
         &format!(
-            "{}float[] primvars:skel:jointWeights = [{}] (elementSize = {}, interpolation = \"vertex\")",
+            "{}float[] primvars:skel:jointWeights = [{}] (",
             spaces(depth),
-            weight_values.join(", "),
-            element_size
+            weight_values.join(", ")
         ),
     );
+    line(
+        output,
+        &format!("{}elementSize = {}", spaces(depth + 1), element_size),
+    );
+    line(
+        output,
+        &format!("{}interpolation = \"vertex\"", spaces(depth + 1)),
+    );
+    line(output, &format!("{})", spaces(depth)));
     let armature_world = snapshot
         .nodes
         .get(&armature_id)
@@ -1042,15 +1085,55 @@ fn write_shape_targets(
     Ok(())
 }
 
+fn ordered_bone_ids(armature: &ArmatureData) -> Result<Vec<Id>> {
+    fn visit(bone_id: &Id, children: &BTreeMap<Id, Vec<Id>>, ordered: &mut Vec<Id>) {
+        ordered.push(bone_id.clone());
+        if let Some(child_ids) = children.get(bone_id) {
+            for child_id in child_ids {
+                visit(child_id, children, ordered);
+            }
+        }
+    }
+    let mut children = BTreeMap::<Id, Vec<Id>>::new();
+    let mut roots = Vec::new();
+    for (bone_id, bone) in &armature.bones {
+        if let Some(parent_id) = &bone.parent {
+            if !armature.bones.contains_key(parent_id) {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "USD armature parent bone is missing",
+                ));
+            }
+            children
+                .entry(parent_id.clone())
+                .or_default()
+                .push(bone_id.clone());
+        } else {
+            roots.push(bone_id.clone());
+        }
+    }
+    let mut ordered = Vec::with_capacity(armature.bones.len());
+    for root_id in roots {
+        visit(&root_id, &children, &mut ordered);
+    }
+    if ordered.len() != armature.bones.len() {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "USD armature contains a bone cycle",
+        ));
+    }
+    Ok(ordered)
+}
+
 fn write_skeleton(output: &mut String, armature: &ArmatureData, depth: usize) -> Result<()> {
     let matrices = crate::eval::rig::evaluate_bone_matrices(armature, &BTreeMap::new())?;
+    let joint_ids = ordered_bone_ids(armature)?;
     let mut paths = BTreeMap::<Id, String>::new();
-    for bone_id in armature.bones.keys() {
+    for bone_id in &joint_ids {
         joint_path(armature, bone_id, &mut paths, &mut BTreeSet::new())?;
     }
-    let joints = armature
-        .bones
-        .keys()
+    let joints = joint_ids
+        .iter()
         .map(|bone_id| {
             paths
                 .get(bone_id)
@@ -1058,10 +1141,13 @@ fn write_skeleton(output: &mut String, armature: &ArmatureData, depth: usize) ->
                 .ok_or_else(|| PotError::new(ErrorCode::InternalError, "USD joint path is missing"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let rest = armature
-        .bones
+    let rest = joint_ids
         .iter()
-        .map(|(bone_id, bone)| {
+        .map(|bone_id| {
+            let bone = armature
+                .bones
+                .get(bone_id)
+                .ok_or_else(|| PotError::new(ErrorCode::InternalError, "USD bone disappeared"))?;
             let rest = matrices
                 .get(bone_id)
                 .ok_or_else(|| {
@@ -1085,9 +1171,8 @@ fn write_skeleton(output: &mut String, armature: &ArmatureData, depth: usize) ->
             matrix4d(local)
         })
         .collect::<Result<Vec<_>>>()?;
-    let bind = armature
-        .bones
-        .keys()
+    let bind = joint_ids
+        .iter()
         .map(|bone_id| {
             let matrix = matrices.get(bone_id).ok_or_else(|| {
                 PotError::new(
@@ -1106,14 +1191,10 @@ fn write_skeleton(output: &mut String, armature: &ArmatureData, depth: usize) ->
         )
     })?;
     indent(output, depth);
-    line(output, "def SkelRoot \"Rig\"");
+    line(output, "def Skeleton \"Skeleton\"");
     indent(output, depth);
     line(output, "{");
-    indent(output, depth + 1);
-    line(output, "def Skeleton \"Skeleton\"");
-    indent(output, depth + 1);
-    line(output, "{");
-    let skeleton_depth = depth + 2;
+    let skeleton_depth = depth + 1;
     line(
         output,
         &format!(
@@ -1146,8 +1227,6 @@ fn write_skeleton(output: &mut String, armature: &ArmatureData, depth: usize) ->
             quote(&metadata)?
         ),
     );
-    indent(output, depth + 1);
-    line(output, "}");
     indent(output, depth);
     line(output, "}");
     Ok(())
@@ -1589,7 +1668,7 @@ fn write_animation(output: &mut String, doc: &SceneDoc, node: &Node, depth: usiz
                 _ => {
                     let [x, y, z, w] = value.rotation;
                     format!(
-                        "({}, ({}, {}, {}))",
+                        "({}, {}, {}, {})",
                         number(w)?,
                         number(x)?,
                         number(y)?,
@@ -1626,7 +1705,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<SceneDoc> {
     let roots = parse_prims(&tokens, 0, tokens.len())?;
     let root = roots
         .iter()
-        .find(|prim| prim.kind == "Xform" && prim.name == "Scene");
+        .find(|prim| (prim.kind == "Xform" || prim.kind == "SkelRoot") && prim.name == "Scene");
     let mut doc = SceneDoc::new(scene_id);
     let mut used_nodes = BTreeSet::<Id>::new();
     let mut used_data = BTreeSet::<Id>::new();
@@ -1849,6 +1928,17 @@ fn import_node_tree(
             .iter()
             .find(|child| child.kind.ends_with("Light"))
     };
+    let kind = property_string(prim, "potter:kind").unwrap_or_else(|| {
+        if mesh_prim.is_some() {
+            "mesh".to_owned()
+        } else if camera_prim.is_some() {
+            "camera".to_owned()
+        } else if light_prim.is_some() {
+            "light".to_owned()
+        } else {
+            "empty".to_owned()
+        }
+    });
     let mut data_id = None;
     let mut node_materials = Vec::new();
     if let Some(mesh_prim) = mesh_prim {
@@ -1865,12 +1955,16 @@ fn import_node_tree(
             )
         })?;
         let mesh_id = import_id(None, &format!("{}_mesh", id.as_str()), used_data)?;
+        let (shape_keys, vertex_groups, vertex_weights) = import_deformation(mesh_prim, &mesh)?;
         doc.data_blocks.insert(
             mesh_id.clone(),
             DataBlock {
                 data_type: "mesh".to_owned(),
                 descriptor: None,
                 mesh: Some(mesh),
+                shape_keys,
+                vertex_groups,
+                vertex_weights,
                 camera: None,
                 light: None,
                 ..DataBlock::default()
@@ -1941,6 +2035,31 @@ fn import_node_tree(
         );
         data_id = Some(block_id);
     }
+    if kind == "armature" {
+        let encoded = prim
+            .descendants()
+            .into_iter()
+            .find(|child| child.kind == "Skeleton")
+            .and_then(|skeleton| property_string(skeleton, "potter:armature"))
+            .ok_or_else(|| import_error("USD armature has no Potter skeleton metadata"))?;
+        let armature = serde_json::from_str::<ArmatureData>(&encoded).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                "USD armature metadata is invalid",
+                json!({"reason":error.to_string()}),
+            )
+        })?;
+        let armature_data_id = import_id(None, &format!("{}_armature", id.as_str()), used_data)?;
+        doc.data_blocks.insert(
+            armature_data_id.clone(),
+            DataBlock {
+                data_type: "armature".to_owned(),
+                armature: Some(armature),
+                ..DataBlock::default()
+            },
+        );
+        data_id = Some(armature_data_id);
+    }
     let transform = import_transform(prim)?;
     let parent_inverse = if let Some(raw) = prim.properties.get("potter:parentInverse") {
         let values = scan_numbers(raw)?;
@@ -1955,17 +2074,30 @@ fn import_node_tree(
     } else {
         None
     };
-    let kind = property_string(prim, "potter:kind").unwrap_or_else(|| {
-        if mesh_prim.is_some() {
-            "mesh".to_owned()
-        } else if camera_prim.is_some() {
-            "camera".to_owned()
-        } else if light_prim.is_some() {
-            "light".to_owned()
-        } else {
-            "empty".to_owned()
-        }
-    });
+    let modifiers = property_string(prim, "potter:modifiers")
+        .map(|encoded| {
+            serde_json::from_str::<Vec<Modifier>>(&encoded).map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    "USD modifier metadata is invalid",
+                    json!({"reason":error.to_string()}),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let pose = property_string(prim, "potter:pose")
+        .map(|encoded| {
+            serde_json::from_str::<BTreeMap<Id, PoseBone>>(&encoded).map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    "USD armature pose metadata is invalid",
+                    json!({"reason":error.to_string()}),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     let tags = property_strings(prim, "potter:tags").unwrap_or_default();
     let mut node = Node {
         name: property_string(prim, "potter:name").unwrap_or_else(|| prim.name.clone()),
@@ -1977,12 +2109,13 @@ fn import_node_tree(
         transform,
         data: data_id,
         materials: node_materials,
-        modifiers: Vec::new(),
+        modifiers,
         visible: property_bool(prim, "potter:visible").unwrap_or(true),
         render_visible: property_bool(prim, "potter:renderVisible").unwrap_or(true),
         selectable: property_bool(prim, "potter:selectable").unwrap_or(true),
         action: None,
         properties: serde_json::Map::new(),
+        pose,
         ..Node::default()
     };
     if let Some(encoded) = property_string(prim, "potter:action") {
@@ -2031,6 +2164,11 @@ fn import_node_tree(
 }
 
 type ImportedMesh = (Vec<[f64; 3]>, Vec<Vec<usize>>);
+type UsdDeformation = (
+    Option<ShapeKeyData>,
+    Vec<VertexGroup>,
+    BTreeMap<u32, BTreeMap<Id, f64>>,
+);
 
 fn import_mesh(prim: &Prim) -> Result<ImportedMesh> {
     let point_values = property_numbers(prim, "points")
@@ -2083,6 +2221,99 @@ fn import_mesh(prim: &Prim) -> Result<ImportedMesh> {
         offset = end;
     }
     Ok((points, faces))
+}
+fn import_deformation(prim: &Prim, mesh: &Mesh) -> Result<UsdDeformation> {
+    let Some(encoded) = property_string(prim, "potter:deformation") else {
+        return Ok((None, Vec::new(), BTreeMap::new()));
+    };
+    let metadata = serde_json::from_str::<Value>(&encoded).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::ImportFailed,
+            "USD deformation metadata is invalid",
+            json!({"reason":error.to_string()}),
+        )
+    })?;
+    let source_vertex_ids = metadata["vertex_ids"]
+        .as_array()
+        .ok_or_else(|| import_error("USD deformation vertex IDs are missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or_else(|| import_error("USD deformation vertex ID is invalid"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if source_vertex_ids.len() != mesh.vertices.len() {
+        return Err(import_error(
+            "USD deformation vertex IDs do not match mesh point count",
+        ));
+    }
+    let mut vertex_id_map = BTreeMap::new();
+    for (source_id, vertex) in source_vertex_ids.iter().zip(&mesh.vertices) {
+        if vertex_id_map.insert(*source_id, vertex.id).is_some() {
+            return Err(import_error("USD deformation vertex IDs are duplicated"));
+        }
+    }
+    let remap_positions = |positions: BTreeMap<u32, [f64; 3]>| {
+        positions
+            .into_iter()
+            .map(|(source_id, position)| {
+                vertex_id_map
+                    .get(&source_id)
+                    .copied()
+                    .map(|vertex_id| (vertex_id, position))
+                    .ok_or_else(|| import_error("USD deformation references a missing vertex"))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+    };
+    let mut shape_keys = serde_json::from_value::<Option<ShapeKeyData>>(
+        metadata["shape_keys"].clone(),
+    )
+    .map_err(|error| {
+        PotError::with_details(
+            ErrorCode::ImportFailed,
+            "USD shape-key metadata is invalid",
+            json!({"reason":error.to_string()}),
+        )
+    })?;
+    if let Some(shape_keys) = &mut shape_keys {
+        shape_keys.basis = remap_positions(std::mem::take(&mut shape_keys.basis))?;
+        for key in shape_keys.keys.values_mut() {
+            key.positions = remap_positions(std::mem::take(&mut key.positions))?;
+        }
+    }
+    let vertex_groups = serde_json::from_value::<Vec<VertexGroup>>(
+        metadata["vertex_groups"].clone(),
+    )
+    .map_err(|error| {
+        PotError::with_details(
+            ErrorCode::ImportFailed,
+            "USD vertex-group metadata is invalid",
+            json!({"reason":error.to_string()}),
+        )
+    })?;
+    let source_weights = serde_json::from_value::<BTreeMap<u32, BTreeMap<Id, f64>>>(
+        metadata["vertex_weights"].clone(),
+    )
+    .map_err(|error| {
+        PotError::with_details(
+            ErrorCode::ImportFailed,
+            "USD vertex-weight metadata is invalid",
+            json!({"reason":error.to_string()}),
+        )
+    })?;
+    let vertex_weights = source_weights
+        .into_iter()
+        .map(|(source_id, weights)| {
+            vertex_id_map
+                .get(&source_id)
+                .copied()
+                .map(|vertex_id| (vertex_id, weights))
+                .ok_or_else(|| import_error("USD weights reference a missing vertex"))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok((shape_keys, vertex_groups, vertex_weights))
 }
 
 fn import_camera(prim: &Prim) -> Result<CameraData> {

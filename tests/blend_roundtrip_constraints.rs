@@ -1686,13 +1686,15 @@ fn round_trip_constraint(kind: &str) -> TestResult {
         !before["clip"]["camera_tracks"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "Blender camera tracks are missing"
     );
     assert!(
         !before["clip"]["reconstruction_frames"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "Blender reconstruction frames are missing"
     );
     let mix_mode_defaults = before["mix_mode_defaults"]
         .as_object()

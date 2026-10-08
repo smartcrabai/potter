@@ -1,8 +1,4 @@
 #![expect(clippy::unwrap_used, reason = "integration test setup")]
-#![expect(
-    clippy::float_cmp,
-    reason = "asserting exact deterministic shader values"
-)]
 
 use std::collections::BTreeMap;
 

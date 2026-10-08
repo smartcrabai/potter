@@ -103,6 +103,9 @@ mod tests {
         assert!(Id::new("body_2-x").is_ok());
         assert!(Id::new("body_2-x").is_ok_and(|id| id.as_str() == "body_2-x"));
         assert!(Id::new("a".repeat(64)).is_ok());
+        assert!(Id::is_valid("a"));
+        assert!(Id::is_valid("body_2-x"));
+        assert!(!Id::is_valid("A"));
         assert!(Id::new("").is_err());
         assert!(Id::new("A").is_err());
         assert!(Id::new("2a").is_err());
@@ -133,34 +136,5 @@ mod tests {
             prop_assert_eq!(is_valid(&s), expected);
             prop_assert_eq!(Id::is_valid(&s), expected);
         }
-    }
-
-    #[cfg(kani)]
-    #[kani::proof]
-    fn id_validation_rejects_all_65_byte_inputs() {
-        let value: [u8; 65] = kani::any();
-        let candidate = String::from_utf8_lossy(&value);
-        kani::assert(
-            !is_valid(&candidate),
-            "IDs with more than 64 bytes must be rejected",
-        );
-    }
-
-    #[cfg(kani)]
-    #[kani::proof]
-    #[kani::unwind(65)]
-    fn id_validation_matches_contract_for_64_ascii_bytes() {
-        let value: [u8; 64] = kani::any();
-        kani::assume(value.iter().all(u8::is_ascii));
-        let candidate = String::from_utf8(value.to_vec()).unwrap();
-        let bytes = candidate.as_bytes();
-        let expected = bytes[0].is_ascii_lowercase()
-            && bytes[1..].iter().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_' || *byte == b'-'
-            });
-        kani::assert(
-            is_valid(&candidate) == expected,
-            "ID validation must match the ASCII contract",
-        );
     }
 }

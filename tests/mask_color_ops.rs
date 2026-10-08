@@ -1,4 +1,3 @@
-#![expect(clippy::float_cmp, reason = "asserting stable scene color settings")]
 #![expect(clippy::unwrap_used, reason = "small operation error assertions")]
 
 use std::error::Error;

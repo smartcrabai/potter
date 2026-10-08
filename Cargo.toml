@@ -1,5 +1,5 @@
 [package]
-description = ""
+description = "Headless, AI-friendly 3D creation CLI with Blender-compatible modeling, evaluation, and .blend exchange"
 edition = "2024"
 license = "GPL-3.0-or-later"
 name = "potter"
@@ -18,8 +18,7 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 exr = "1.74"
 flate2 = "1.1"
-fs4 = { version = "0.13", features = ["sync"] }
-glam = { version = "0.30", features = ["serde"] }
+glam = { version = "0.33", features = ["serde"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = [
   "bmp",
@@ -29,20 +28,20 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
   "webp",
 ] }
-lz4_flex = "0.12"
-png = "0.17"
+lz4_flex = "0.14"
+png = "0.18"
 robust = "1.2"
 ruzstd = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-sha2 = "0.10"
+sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
-assert_cmd = "2"
-jsonschema = "0.33"
-proptest = "1"
-tempfile = "3"
+assert_cmd = "=2.2.2"
+jsonschema = "=0.58.5"
+proptest = "=1.11.0"
+tempfile = "=3.27.0"
 
 [profile.release]
 codegen-units = 1

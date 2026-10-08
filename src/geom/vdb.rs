@@ -1515,6 +1515,8 @@ fn limit_error(message: impl Into<String>) -> PotError {
     )
 }
 
+const TRUNCATED_ARCHIVE: &str = "VDB archive is truncated";
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -1526,14 +1528,16 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, count: usize) -> Result<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(count)
-            .ok_or_else(|| import_error("VDB byte offset overflow"))?;
+        let end = checked_take_end(self.position, count, self.bytes.len()).map_err(|error| {
+            import_error(match error {
+                TakeEndError::OffsetOverflow => "VDB byte offset overflow",
+                TakeEndError::Truncated => TRUNCATED_ARCHIVE,
+            })
+        })?;
         let value = self
             .bytes
             .get(self.position..end)
-            .ok_or_else(|| import_error("VDB archive is truncated"))?;
+            .ok_or_else(|| import_error(TRUNCATED_ARCHIVE))?;
         self.position = end;
         Ok(value)
     }
@@ -1546,7 +1550,7 @@ impl<'a> Cursor<'a> {
         self.take(1)?
             .first()
             .copied()
-            .ok_or_else(|| import_error("VDB archive is truncated"))
+            .ok_or_else(|| import_error(TRUNCATED_ARCHIVE))
     }
 
     fn read_u32(&mut self) -> Result<u32> {
@@ -1632,12 +1636,44 @@ impl<'a> Cursor<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TakeEndError {
+    OffsetOverflow,
+    Truncated,
+}
+/// End offset of a `count`-byte read at `position`, or why the read is invalid.
+fn checked_take_end(
+    position: usize,
+    count: usize,
+    length: usize,
+) -> std::result::Result<usize, TakeEndError> {
+    let end = position
+        .checked_add(count)
+        .ok_or(TakeEndError::OffsetOverflow)?;
+    if end > length {
+        return Err(TakeEndError::Truncated);
+    }
+    Ok(end)
+}
+
 #[cfg(kani)]
 #[kani::proof]
-fn offset_range_addition_is_checked() {
-    let mut cursor = Cursor::new(&[]);
-    cursor.position = usize::MAX;
-    assert!(cursor.take(1).is_err());
+fn take_end_is_checked_and_within_the_buffer() {
+    let position: usize = kani::any();
+    let count: usize = kani::any();
+    let length: usize = kani::any();
+    match checked_take_end(position, count, length) {
+        Ok(end) => {
+            assert!(position.checked_add(count) == Some(end));
+            assert!(end <= length);
+        }
+        Err(TakeEndError::OffsetOverflow) => {
+            assert!(position.checked_add(count).is_none());
+        }
+        Err(TakeEndError::Truncated) => {
+            assert!(matches!(position.checked_add(count), Some(end) if end > length));
+        }
+    }
 }
 
 #[cfg(test)]

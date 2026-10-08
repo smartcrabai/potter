@@ -732,7 +732,8 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
         !frame["deformed_meshes"]["cloth"]["vertices"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "cloth deformation produced no vertices"
     );
     assert_eq!(frame["particles"]["emitter"].as_array().unwrap().len(), 2);
     assert_eq!(
@@ -743,7 +744,8 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
         !frame["deformed_meshes"]["domain"]["faces"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "fluid conversion produced no faces"
     );
     let colors = frame["paint_colors"]["canvas"].as_array().unwrap();
     assert!(colors.iter().any(|color| color[3].as_f64().unwrap() > 0.0));

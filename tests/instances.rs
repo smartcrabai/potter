@@ -1,8 +1,4 @@
 #![expect(clippy::unwrap_used, reason = "integration test setup")]
-#![expect(
-    clippy::float_cmp,
-    reason = "asserting exact deterministic transform values"
-)]
 
 use serde_json::{Value, json};
 

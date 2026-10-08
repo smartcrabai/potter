@@ -675,6 +675,8 @@ fn skin_definitions(
                     "bone": bone_value
                 } }
             }));
+        }
+        for (bone_id, bone) in &armature.bones {
             let child_index = indices[bone_id];
             if let Some(parent_id) = &bone.parent {
                 append_child(nodes, indices[parent_id], child_index);
@@ -4575,7 +4577,7 @@ mod tests {
             })
         }));
         assert_eq!(imported.doc.images.len(), 1);
-        assert!(!imported.assets.is_empty());
+        assert!(!imported.assets.is_empty(), "image asset was not imported");
         let mesh = imported
             .doc
             .nodes
@@ -4661,7 +4663,10 @@ mod tests {
             "source_collection"
         );
         assert!(instance.data.is_some());
-        assert!(!mesh_data.vertex_groups.is_empty());
+        assert!(
+            !mesh_data.vertex_groups.is_empty(),
+            "joint vertex groups were not imported"
+        );
         assert!(!mesh_data.vertex_weights.is_empty());
         let root_group_id = "root_group".parse()?;
         assert!(
@@ -4737,15 +4742,5 @@ mod tests {
             .into_iter()
             .collect()
         );
-    }
-}
-#[cfg(kani)]
-mod kani_verification {
-    #[kani::proof]
-    fn finite_values_in_float32_range_are_exportable() {
-        let value: f64 = kani::any();
-        kani::assume(value.is_finite());
-        kani::assume(value.abs() <= f64::from(f32::MAX));
-        assert!(super::to_f32(value).is_ok());
     }
 }

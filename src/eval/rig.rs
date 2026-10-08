@@ -4129,6 +4129,12 @@ fn follow_track_matrix(
     image[1] /= clip_height;
     if param_bool(&constraint.params, "use_undistorted_position", false)? {
         let intrinsics = &clip.tracking.camera;
+        // Blender's radial coefficients operate in focal-length camera coordinates.
+        let focal_per_image_width = if intrinsics.units == "PIXELS" {
+            intrinsics.focal_mm / clip_width
+        } else {
+            intrinsics.focal_mm / intrinsics.sensor_width_mm
+        };
         image = crate::tracking::LensDistortion {
             k1: intrinsics.k1,
             k2: intrinsics.k2,
@@ -4136,7 +4142,10 @@ fn follow_track_matrix(
             p1: 0.0,
             p2: 0.0,
             center: intrinsics.principal,
-            scale: [0.5, 0.5],
+            scale: [
+                focal_per_image_width,
+                focal_per_image_width * clip_width / clip_height * intrinsics.pixel_aspect,
+            ],
         }
         .undistort(image)
         .map_err(|error| evaluation_error(error.message))?;

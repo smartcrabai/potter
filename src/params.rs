@@ -252,3 +252,206 @@ fn value_matches_type(value: &Value, expected: &str) -> bool {
 fn escape_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "tests")]
+
+    use serde_json::{Map, Value, json};
+
+    use super::{
+        ParameterFamily, default_value, is_id_reference_parameter, params_schema, type_names,
+        type_spec, type_specs, validate_params, validate_value,
+    };
+
+    #[test]
+    fn schema_lookup_preserves_modifier_and_constraint_contracts() {
+        let modifier_names = type_names(ParameterFamily::Modifier);
+        assert!(modifier_names.contains(&"data_transfer"));
+        assert!(modifier_names.contains(&"bevel"));
+        let constraint_names = type_names(ParameterFamily::Constraint);
+        assert!(constraint_names.contains(&"copy_location"));
+
+        let specifications = type_specs(ParameterFamily::Modifier).unwrap();
+        assert!(specifications.contains_key("data_transfer"));
+        assert!(type_spec(ParameterFamily::Modifier, "missing").is_none());
+
+        let schema = params_schema(ParameterFamily::Modifier, "data_transfer").unwrap();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"],
+            type_spec(ParameterFamily::Modifier, "data_transfer").unwrap()["properties"]
+        );
+        assert_eq!(
+            schema["required"],
+            type_spec(ParameterFamily::Modifier, "data_transfer").unwrap()["required"]
+        );
+
+        assert_eq!(
+            default_value(
+                ParameterFamily::Modifier,
+                "data_transfer",
+                "show_in_editmode"
+            )
+            .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(default_value(ParameterFamily::Modifier, "data_transfer", "missing").is_none());
+    }
+
+    #[test]
+    fn id_reference_detection_finds_nested_patterns_without_matching_unrelated_parameters() {
+        assert!(is_id_reference_parameter(
+            ParameterFamily::Modifier,
+            "data_transfer",
+            "object"
+        ));
+        assert!(!is_id_reference_parameter(
+            ParameterFamily::Modifier,
+            "data_transfer",
+            "show_in_editmode"
+        ));
+        assert!(!is_id_reference_parameter(
+            ParameterFamily::Modifier,
+            "missing",
+            "object"
+        ));
+    }
+
+    #[test]
+    fn parameter_validation_reports_required_values_and_escaped_unknown_names() {
+        let required_error = validate_params(
+            ParameterFamily::Modifier,
+            "mesh_cache",
+            &Map::new(),
+            "/modifiers",
+        )
+        .unwrap_err();
+        assert_eq!(required_error.pointer, "/modifiers/resource");
+        assert!(
+            required_error
+                .message
+                .contains("requires parameter `resource`")
+        );
+
+        let mut parameters = Map::new();
+        parameters.insert("missing~/value".to_owned(), json!(1));
+        let unknown_error = validate_params(
+            ParameterFamily::Modifier,
+            "data_transfer",
+            &parameters,
+            "/modifiers/data_transfer/params",
+        )
+        .unwrap_err();
+        assert_eq!(
+            unknown_error.pointer,
+            "/modifiers/data_transfer/params/missing~0~1value"
+        );
+        assert!(unknown_error.message.contains("unknown modifier parameter"));
+    }
+
+    #[test]
+    fn value_validation_matches_declared_types_and_one_of_alternatives() {
+        let type_cases = [
+            ("null", Value::Null, json!(false)),
+            ("boolean", json!(true), Value::Null),
+            ("integer", json!(2), json!(2.5)),
+            ("number", json!(2.5), json!("2.5")),
+            ("string", json!("name"), json!(2)),
+            ("array", json!([]), json!({})),
+            ("object", json!({}), json!([])),
+        ];
+        for (expected, valid, invalid) in type_cases {
+            let schema = json!({"type":expected});
+            assert!(validate_value(&valid, &schema).is_ok(), "{expected}");
+            assert!(validate_value(&invalid, &schema).is_err(), "{expected}");
+        }
+        let integer = json!({"type":"integer"});
+        assert!(validate_value(&json!(-2), &integer).is_ok());
+        assert!(validate_value(&json!(u64::MAX), &integer).is_ok());
+
+        let union = json!({"type":["string","null"]});
+        assert!(validate_value(&Value::Null, &union).is_ok());
+        assert!(validate_value(&json!("name"), &union).is_ok());
+        assert!(validate_value(&json!(true), &union).is_err());
+
+        let one_of = json!({
+            "oneOf":[
+                {"type":"string","pattern":"^[a-z][a-z0-9_-]{0,63}$"},
+                {"type":"null"}
+            ]
+        });
+        assert!(validate_value(&json!("node_1"), &one_of).is_ok());
+        assert!(validate_value(&Value::Null, &one_of).is_ok());
+        assert!(validate_value(&json!("Not an ID"), &one_of).is_err());
+    }
+
+    #[test]
+    fn value_validation_enforces_enum_and_numeric_boundaries() {
+        let enumeration = json!({"enum":["REPLACE","ADD"]});
+        assert!(validate_value(&json!("REPLACE"), &enumeration).is_ok());
+        assert!(validate_value(&json!("MULTIPLY"), &enumeration).is_err());
+        assert!(validate_value(&json!(["REPLACE", "ADD"]), &enumeration).is_ok());
+        assert!(validate_value(&json!(["REPLACE", "MULTIPLY"]), &enumeration).is_err());
+
+        let bounded = json!({"type":"number","minimum":0.0,"maximum":1.0});
+        assert!(validate_value(&json!(0.0), &bounded).is_ok());
+        assert!(validate_value(&json!(1.0), &bounded).is_ok());
+        assert!(validate_value(&json!(-0.1), &bounded).is_err());
+        assert!(validate_value(&json!(1.1), &bounded).is_err());
+    }
+
+    #[test]
+    fn value_validation_enforces_string_and_array_size_boundaries() {
+        let text = json!({"type":"string","minLength":2});
+        assert!(validate_value(&json!("éx"), &text).is_ok());
+        assert!(validate_value(&json!("x"), &text).is_err());
+
+        let array = json!({
+            "type":"array",
+            "minItems":2,
+            "maxItems":3,
+            "items":{"type":"string"}
+        });
+        assert!(validate_value(&json!(["a", "b"]), &array).is_ok());
+        assert!(validate_value(&json!(["a", "b", "c"]), &array).is_ok());
+        assert!(validate_value(&json!(["a"]), &array).is_err());
+        assert!(validate_value(&json!(["a", "b", "c", "d"]), &array).is_err());
+        assert!(validate_value(&json!(["a", 1]), &array).is_err());
+    }
+}
+
+#[cfg(kani)]
+mod kani_verification {
+    use serde_json::Value;
+
+    use super::value_matches_type;
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn signed_json_integers_are_integers_and_numbers_only() {
+        let value = Value::from(kani::any::<i64>());
+        assert!(value_matches_type(&value, "integer"));
+        assert!(value_matches_type(&value, "number"));
+        assert!(!value_matches_type(&value, "string"));
+        assert!(!value_matches_type(&value, "boolean"));
+        assert!(!value_matches_type(&value, "null"));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn float_backed_json_numbers_are_never_integers() {
+        let float: f64 = kani::any();
+        kani::assume(float.is_finite());
+        let number = match serde_json::Number::from_f64(float) {
+            Some(number) => number,
+            None => {
+                kani::assert(false, "finite floats must convert to JSON numbers");
+                return;
+            }
+        };
+        let value = Value::Number(number);
+        assert!(value_matches_type(&value, "number"));
+        assert!(!value_matches_type(&value, "integer"));
+    }
+}

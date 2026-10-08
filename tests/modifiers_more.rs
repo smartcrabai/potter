@@ -258,7 +258,7 @@ fn mask_drops_faces_that_use_vertices_outside_the_group() {
         &[modifier("mask", json!({"vertex_group":"handle"}))],
     )
     .unwrap();
-    assert!(result.faces.is_empty());
+    assert!(result.faces.is_empty(), "{:?}", result.faces);
 }
 #[test]
 fn boolean_modifier_apply_resolves_scene_object_operand() -> Result<(), Box<dyn std::error::Error>>
@@ -406,7 +406,7 @@ fn mask_threshold_uses_a_strict_weight_cutoff() {
     )
     .unwrap();
     assert_eq!(retained.faces.len(), 1);
-    assert!(excluded.faces.is_empty());
+    assert!(excluded.faces.is_empty(), "{:?}", excluded.faces);
 }
 
 #[test]

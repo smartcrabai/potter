@@ -1226,6 +1226,7 @@ fn constraint_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
     let mut params = read_params(engine, operation.get("params"), "params")?;
     apply_constraint_defaults(kind, &mut params);
     validate_constraint_parameter_map(engine, kind, &params, "/params")?;
+    validate_constraint_params(engine, kind, &params, "params")?;
     if let Some(key) = constraint_target_param(kind)
         && params.contains_key(key)
     {
@@ -1477,6 +1478,7 @@ fn constraint_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
             "set",
         ));
     }
+    validate_constraint_params(engine, next.constraint_type, &next.params, "set/params")?;
     validate_constraint_reference(
         engine,
         &owner_id,
@@ -2878,7 +2880,7 @@ fn validate_constraint_params(
                 ));
             }
         }
-        if let Some(value) = params.get("pole_target") {
+        if let Some(value) = params.get("pole_target").filter(|value| !value.is_null()) {
             let raw_id = string_value(engine, value, &format!("{field}/pole_target"))?;
             let pole_target = Id::new(raw_id).map_err(|_| {
                 invalid(
@@ -2903,98 +2905,79 @@ fn validate_constraint_params(
             | ConstraintType::LockedTrack
             | ConstraintType::StretchTo
     ) {
-        for axis in ["track_axis", "up_axis", "lock_axis"] {
-            if let Some(value) = params.get(axis) {
-                let axis_value = string_value(engine, value, &format!("{field}/{axis}"))?;
-                if !["x", "y", "z", "-x", "-y", "-z"].contains(&axis_value.as_str()) {
-                    return Err(invalid(
-                        engine,
-                        "axis must be one of x, y, z, -x, -y, -z",
-                        &format!("{field}/{axis}"),
-                    ));
-                }
+        if let Some(value) = params.get("track_axis") {
+            let axis = string_value(engine, value, &format!("{field}/track_axis"))?;
+            if ![
+                "TRACK_X",
+                "TRACK_Y",
+                "TRACK_Z",
+                "TRACK_NEGATIVE_X",
+                "TRACK_NEGATIVE_Y",
+                "TRACK_NEGATIVE_Z",
+            ]
+            .contains(&axis.as_str())
+            {
+                return Err(invalid(
+                    engine,
+                    "track_axis is not a Blender track-axis identifier",
+                    &format!("{field}/track_axis"),
+                ));
+            }
+        }
+        if kind == ConstraintType::TrackTo
+            && let Some(value) = params.get("up_axis")
+        {
+            let axis = string_value(engine, value, &format!("{field}/up_axis"))?;
+            if !["UP_X", "UP_Y", "UP_Z"].contains(&axis.as_str()) {
+                return Err(invalid(
+                    engine,
+                    "up_axis is not a Blender up-axis identifier",
+                    &format!("{field}/up_axis"),
+                ));
+            }
+        }
+        if kind == ConstraintType::LockedTrack
+            && let Some(value) = params.get("lock_axis")
+        {
+            let axis = string_value(engine, value, &format!("{field}/lock_axis"))?;
+            if !["LOCK_X", "LOCK_Y", "LOCK_Z"].contains(&axis.as_str()) {
+                return Err(invalid(
+                    engine,
+                    "lock_axis is not a Blender lock-axis identifier",
+                    &format!("{field}/lock_axis"),
+                ));
             }
         }
     }
     if kind == ConstraintType::Transformation {
-        for key in ["from", "to"] {
+        for key in ["map_from", "map_to"] {
             let value = params.get(key).ok_or_else(|| {
                 invalid(
                     engine,
-                    "transformation constraint requires from and to channels",
+                    "transformation constraint mapping type is required",
                     &format!("{field}/{key}"),
                 )
             })?;
-            let channel = string_value(engine, value, &format!("{field}/{key}"))?;
-            if ![
-                "location_x",
-                "location_y",
-                "location_z",
-                "rotation_x",
-                "rotation_y",
-                "rotation_z",
-                "scale_x",
-                "scale_y",
-                "scale_z",
-            ]
-            .contains(&channel.as_str())
-            {
+            let mapping = string_value(engine, value, &format!("{field}/{key}"))?;
+            if !["LOCATION", "ROTATION", "SCALE"].contains(&mapping.as_str()) {
                 return Err(invalid(
                     engine,
-                    "transformation channel is unsupported",
+                    "transformation mapping type is unsupported",
                     &format!("{field}/{key}"),
                 ));
             }
-        }
-        for key in ["from_min", "from_max", "to_min", "to_max"] {
-            if !params.contains_key(key) {
-                return Err(invalid(
-                    engine,
-                    "transformation constraint requires explicit input and output ranges",
-                    &format!("{field}/{key}"),
-                ));
-            }
-            finite_value(
-                engine,
-                params.get(key).ok_or_else(|| {
-                    invalid(engine, "range value is required", &format!("{field}/{key}"))
-                })?,
-                &format!("{field}/{key}"),
-            )?;
-        }
-        let from_min = params
-            .get("from_min")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let from_max = params
-            .get("from_max")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        if (from_min - from_max).abs() <= f64::EPSILON {
-            return Err(invalid(
-                engine,
-                "transformation input range must have nonzero width",
-                &format!("{field}/from_max"),
-            ));
         }
     }
     if kind == ConstraintType::StretchTo
         && let Some(value) = params.get("rest_length")
     {
-        let length = ranged_number(
+        ranged_number(
             engine,
             value,
             0.0,
             f64::MAX,
             &format!("{field}/rest_length"),
         )?;
-        if length <= 0.0 {
-            return Err(invalid(
-                engine,
-                "rest_length must be greater than zero",
-                &format!("{field}/rest_length"),
-            ));
-        }
     }
     if matches!(kind, ConstraintType::Floor | ConstraintType::Shrinkwrap)
         && let Some(value) = params.get("offset")
@@ -3282,31 +3265,33 @@ fn validate_tracking_constraint_params(
         ConstraintType::FollowTrack => {
             let clip = clip_for_param("clip")?;
             let track_id = required_string("track")?;
-            if !clip
+            let track = clip
                 .tracking
                 .tracks
                 .iter()
-                .any(|track| track.id == track_id)
-            {
-                return Err(engine.error(
-                    ErrorCode::TargetNotFound,
-                    "Follow Track track was not found",
-                    &pointer(engine, &format!("{field}/track")),
-                ));
-            }
-            if let Some(object_id) = params.get("object").filter(|value| !value.is_null()) {
-                let object_id = string_value(engine, object_id, &format!("{field}/object"))?;
-                let object = clip
-                    .tracking
-                    .objects
-                    .iter()
-                    .find(|object| object.id == object_id);
-                if object.is_none_or(|object| !object.tracks.iter().any(|id| id == &track_id)) {
-                    return Err(engine.error(
+                .find(|track| track.id == track_id || track.name == track_id)
+                .ok_or_else(|| {
+                    engine.error(
                         ErrorCode::TargetNotFound,
-                        "Follow Track object must contain the selected tracking track",
-                        &pointer(engine, &format!("{field}/object")),
-                    ));
+                        "Follow Track track was not found",
+                        &pointer(engine, &format!("{field}/track")),
+                    )
+                })?;
+            if let Some(object_value) = params.get("object").filter(|value| !value.is_null()) {
+                let object_id = string_value(engine, object_value, &format!("{field}/object"))?;
+                if !object_id.is_empty() {
+                    let object = clip
+                        .tracking
+                        .objects
+                        .iter()
+                        .find(|object| object.id == object_id || object.name == object_id);
+                    if object.is_none_or(|object| !object.tracks.iter().any(|id| id == &track.id)) {
+                        return Err(engine.error(
+                            ErrorCode::TargetNotFound,
+                            "Follow Track object must contain the selected tracking track",
+                            &pointer(engine, &format!("{field}/object")),
+                        ));
+                    }
                 }
             }
             let camera_id = node_param("camera", true)?;

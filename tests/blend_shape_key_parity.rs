@@ -176,10 +176,6 @@ fn assert_nearest_parity(actual: &[[f64; 3]], expected: &[[f64; 3]], label: &str
 }
 
 #[test]
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender shape-key slider bounds are checked exactly for serialization parity"
-)]
 fn blender_key_action_deforms_surface_target_and_bound_object() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
         eprintln!("Skipping shape-key parity: no Blender executable was found");

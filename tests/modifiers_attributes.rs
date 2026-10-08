@@ -1,8 +1,3 @@
-#![expect(
-    clippy::float_cmp,
-    reason = "deterministic attribute modifier fixtures"
-)]
-
 use std::{
     collections::BTreeMap,
     env,

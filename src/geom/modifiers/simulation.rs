@@ -1400,7 +1400,10 @@ mod tests {
             1.0,
             24.0,
         )?;
-        assert!(no_parents.vertices.is_empty());
+        assert!(
+            no_parents.vertices.is_empty(),
+            "particles without parents must produce no vertices"
+        );
         Ok(())
     }
 

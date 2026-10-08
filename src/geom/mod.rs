@@ -1993,7 +1993,10 @@ mod tests {
     fn bounds_and_triangulation_cover_empty_and_degenerate_meshes() {
         let empty = Mesh::new();
         assert!(empty.bounds().is_none());
-        assert!(empty.triangulate().unwrap().is_empty());
+        assert!(
+            empty.triangulate().unwrap().is_empty(),
+            "an empty mesh has no triangles"
+        );
 
         let collinear = Mesh::from_positions_and_faces(
             vec![DVec3::ZERO, DVec3::X, DVec3::new(2.0, 0.0, 0.0)],
@@ -2065,5 +2068,58 @@ mod tests {
             let mesh = Mesh::from_positions_and_faces(positions, vec![polygon]).unwrap();
             prop_assert_eq!(mesh.triangulate().unwrap().len(), count - 2);
         }
+    }
+}
+
+#[cfg(kani)]
+mod kani_verification {
+    use super::{cyclic_pairs, edge_key, validate_radial_count};
+
+    #[kani::proof]
+    fn edge_key_is_canonical_and_direction_independent() {
+        let first: u32 = kani::any();
+        let second: u32 = kani::any();
+        let key = edge_key(first, second);
+
+        kani::assert(
+            key.0 == first.min(second),
+            "edge keys store the smaller ID first",
+        );
+        kani::assert(
+            key.1 == first.max(second),
+            "edge keys store the larger ID second",
+        );
+        kani::assert(
+            key == edge_key(second, first),
+            "reversing endpoints preserves the edge key",
+        );
+    }
+
+    #[kani::proof]
+    fn radial_count_validation_matches_the_minimum_topology() {
+        let count: u32 = kani::any();
+
+        kani::assert(
+            validate_radial_count(count, "radial count").is_ok() == (count >= 3),
+            "radial counts below three are rejected and all larger counts are accepted",
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn cyclic_pairs_cover_each_edge_and_wrap_once() {
+        let vertices: [u32; 4] = kani::any();
+        let mut pairs = cyclic_pairs(&vertices);
+
+        for index in 0..vertices.len() {
+            kani::assert(
+                pairs.next() == Some([vertices[index], vertices[(index + 1) % vertices.len()]]),
+                "cyclic pairs preserve vertex order and wrap the final edge",
+            );
+        }
+        kani::assert(
+            pairs.next().is_none(),
+            "each polygon edge is emitted exactly once",
+        );
     }
 }

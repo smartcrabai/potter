@@ -6,7 +6,6 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-use fs4::fs_std::FileExt;
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -525,7 +524,7 @@ fn readers_succeed_during_writer_lock_and_writers_fail_fast() -> Result<(), Box<
         .read(true)
         .write(true)
         .open(scene.join(".potter/lock"))?;
-    assert!(lock.try_lock_exclusive()?);
+    lock.try_lock()?;
 
     let reader = pot().arg("validate").arg(&scene).arg("--json").output()?;
     assert!(

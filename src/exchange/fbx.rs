@@ -538,7 +538,7 @@ pub(crate) fn export_with_root(
         writeln!(output, "\tC: \"OO\",{},{}", skin.id, skin.geometry).map_err(write_error)?;
         for cluster in &skin.clusters {
             writeln!(output, "\tC: \"OO\",{},{}", cluster.id, skin.id).map_err(write_error)?;
-            writeln!(output, "\tC: \"OO\",{},{}", cluster.id, cluster.bone_model)
+            writeln!(output, "\tC: \"OO\",{},{}", cluster.bone_model, cluster.id)
                 .map_err(write_error)?;
         }
     }

@@ -656,7 +656,8 @@ fn blender_libraries_link_overrides_and_nested_dependencies_round_trip()
         !inspected["result"]["libraries"]
             .as_object()
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "nested library list is empty"
     );
 
     let revision = imported["result"]["candidate_revision"].as_u64().unwrap();
@@ -701,8 +702,14 @@ fn blender_libraries_link_overrides_and_nested_dependencies_round_trip()
     assert_eq!(actual["linked_material"], true);
     assert_eq!(actual["collection_linked"], true);
     assert_eq!(actual["override_location"], json!([7.0, 8.0, 9.0]));
-    assert!(!actual["libraries"].as_array().unwrap().is_empty());
-    assert!(!actual["nested_libraries"].as_array().unwrap().is_empty());
+    assert!(
+        !actual["libraries"].as_array().unwrap().is_empty(),
+        "reopened library list is empty"
+    );
+    assert!(
+        !actual["nested_libraries"].as_array().unwrap().is_empty(),
+        "reopened nested library list is empty"
+    );
     assert!(
         root.join("library_roundtrip_assets/nested/lib2.blend")
             .is_file()
