@@ -1,11 +1,8 @@
-use std::{
-    collections::BTreeMap,
-    env,
-    error::Error,
-    fs, io,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::BTreeMap, error::Error, fs, io, path::Path, process::Command};
+
+#[path = "common/blender_file.rs"]
+mod blender_file;
+use blender_file::blender_executable;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -135,22 +132,6 @@ fn primitive_cases() -> Vec<PrimitiveCase> {
             params: json!({"x_subdivisions":3,"y_subdivisions":2,"size":2.25}),
         },
     ]
-}
-
-fn blender_executable() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("POTTER_BLENDER") {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    if let Some(path) = env::var_os("PATH")
-        && let Some(path) = env::split_paths(&path)
-            .map(|directory| directory.join("blender"))
-            .find(|path| path.is_file())
-    {
-        return Some(path);
-    }
-    let path = PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender");
-    path.is_file().then_some(path)
 }
 
 fn run_blender_fixture(blender: &Path, root: &Path, cases: &[PrimitiveCase]) -> TestResult<Value> {

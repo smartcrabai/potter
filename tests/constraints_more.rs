@@ -1,10 +1,4 @@
-use std::{
-    env,
-    error::Error,
-    fs, io,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{error::Error, fs, io, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, DVec3};
 use potter::{
@@ -15,37 +9,16 @@ use potter::{
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
+#[path = "common/blender_checked.rs"]
+mod blender_checked;
+#[path = "common/process.rs"]
+mod process;
+use blender_checked::blender_executable;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
-}
-fn blender_executable() -> Option<PathBuf> {
-    fn usable(path: PathBuf) -> Option<PathBuf> {
-        if !path.is_file() {
-            return None;
-        }
-        Command::new(&path)
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|_| path)
-    }
-    if let Some(path) = env::var_os("POTTER_BLENDER") {
-        return usable(PathBuf::from(path));
-    }
-    if let Some(path) = env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|directory| directory.join("blender"))
-            .find_map(usable)
-    }) {
-        return Some(path);
-    }
-    usable(PathBuf::from(
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-    ))
 }
 
 fn apply(project: &Path, operations: &Value) -> TestResult {

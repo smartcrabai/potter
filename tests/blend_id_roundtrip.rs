@@ -2,41 +2,24 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     error::Error,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output},
 };
+
+#[path = "common/blender_checked.rs"]
+mod blender_checked;
+#[path = "common/process.rs"]
+mod process;
+
+use blender_checked::blender_executable;
 
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
-}
-
-fn blender_executable() -> Option<PathBuf> {
-    fn usable(path: PathBuf) -> Option<PathBuf> {
-        path.is_file()
-            .then(|| Command::new(&path).arg("--version").output().ok())
-            .flatten()
-            .filter(|output| output.status.success())
-            .map(|_| path)
-    }
-
-    if let Some(path) = env::var_os("POTTER_BLENDER") {
-        return usable(PathBuf::from(path));
-    }
-    if let Some(path) = env::split_paths(&env::var_os("PATH")?)
-        .map(|dir| dir.join("blender"))
-        .find_map(usable)
-    {
-        return Some(path);
-    }
-    usable(PathBuf::from(
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-    ))
 }
 
 fn run_ok(command: &mut Command, operation: &str) -> Result<Output, Box<dyn Error>> {

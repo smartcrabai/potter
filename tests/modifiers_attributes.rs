@@ -1,11 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    env,
-    error::Error,
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::BTreeMap, error::Error, fs, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, DVec3};
 use potter::{
@@ -22,6 +15,10 @@ use potter::{
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
+#[path = "common/blender_file.rs"]
+mod blender_file;
+
+use blender_file::blender_executable;
 
 #[expect(
     clippy::needless_pass_by_value,
@@ -597,22 +594,6 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
         json!("modifier.vertex_weight_edit.texture_type")
     );
     Ok(())
-}
-
-fn blender_executable() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("POTTER_BLENDER") {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    if let Some(path) = env::var_os("PATH")
-        && let Some(path) = env::split_paths(&path)
-            .map(|directory| directory.join("blender"))
-            .find(|path| path.is_file())
-    {
-        return Some(path);
-    }
-    let path = PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender");
-    path.is_file().then_some(path)
 }
 
 fn vertex_weights(mesh: &Mesh, group: &str) -> Result<Vec<f64>, Box<dyn Error>> {

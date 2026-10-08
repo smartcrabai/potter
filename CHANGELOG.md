@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- CI installs Blender 5.2.2 on Linux and runs tests with `POTTER_REQUIRE_BLENDER=1`, which turns a missing Blender into a test failure instead of a skip; all Blender-gated tests share one discovery helper. `rust-toolchain.toml` pins Rust 1.99.0 so clippy no longer depends on the runner image's Rust (1.98.0 runners flagged `clippy::float_cmp` in `tests/instances.rs`). The TARGET_PROJECT boundary regression pins Potter's hit because Blender 5.2.2 reads uninitialized boundary data there (x=0.4463836 on macOS arm64, 0.65 on Linux x86-64), and Remesh vertex parity allows 2.5e-5 for platform-dependent float32 SHARP QEF rounding.
 - Relicensed potter under GPL-3.0-or-later (previously Apache-2.0) because evaluators include code derived from Blender (GPL-2.0-or-later); source files derived from Blender or OpenVDB now carry upstream attribution headers.
 - Geometry Nodes and shader Math/Vector Math follow Blender's safe-math semantics: divide/modulo/snap/sqrt/log out of domain return 0, wrap with equal bounds returns min, `sign(0)` is 0, ROUND is `floor(x + 0.5)`, MODULO is `fmod`, smooth min/max use Blender's cubic curve, COMPARE uses `|a - b| <= max(epsilon, 0)` (shader default epsilon 0.001), and vector WRAP no longer collapses to 0; a Blender 5.2.2 oracle covers 144 cases.
 - Mesh edits (split, subdivide, dissolve, bevel, fill, merge) carry a single-source attribute value onto new elements and recompute corner values when a face's corner count changes.
@@ -8,7 +9,7 @@
 - Follow Track validation accepts Blender's empty camera-object default and resolves track/object references by Blender name or Potter ID.
 - USD export writes Blender-parseable quaternions/primvars and a valid SkelRoot joint order and preserves imported armature/deformer metadata; glTF adds joint nodes before parenting; FBX links skin clusters in the correct direction and binary FBX encodes Deformer properties, SubDeformer names, and Indexes arrays so Blender imports rigs and shape keys; Alembic allows evaluated vertex-group metadata only with lossy export.
 - Binary FBX object records use the required int64 ID and two strings for every object type, fixing Blender import of scenes with materials.
-- Dependencies: png 0.18, glam 0.33, sha2 0.11, lz4_flex 0.14; scene locking uses `std::fs::File::try_lock` instead of `fs4`. Tests that need Blender skip cleanly when it is not installed (Linux CI).
+- Dependencies: png 0.18, glam 0.33, sha2 0.11, lz4_flex 0.14; scene locking uses `std::fs::File::try_lock` instead of `fs4`. Tests that need Blender skip cleanly when it is not installed.
 - Blender export preserves exact mesh element and loop order, custom attributes and normals, and bit-exact object world matrices; the realistic Boolean/Decimate/Solidify stack now matches at each modifier prefix, with a Blender-gated non-natural edge-order round trip regression.
 - `pot render` treats an enabled but empty sequencer as a no-op, uses the scene camera, and ignores unsupported audio codecs for image output; Blender-import regressions cover default-scene rendering and strict feature errors on the realistic scene.
 - Blender round trips preserve world display/background colors, area-light shape and dimensions, curve resolution and material slots, and per-view hide state independently from global visibility flags.

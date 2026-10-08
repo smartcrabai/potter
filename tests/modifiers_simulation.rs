@@ -8,6 +8,10 @@ use std::{
 use glam::{DMat4, DQuat, DVec3, EulerRot};
 use serde_json::{Map, Value, json};
 use tempfile::tempdir;
+#[path = "common/blender_file.rs"]
+mod blender_file;
+
+use blender_file::blender_executable;
 
 const MODIFIER_POSITION_TOLERANCE: f64 = 1.0e-4;
 const FACE_DISTRIBUTION_TOLERANCE: f64 = 0.03;
@@ -144,21 +148,6 @@ fn physics_operations_create_stack_entries_linked_to_their_settings() -> Result<
     Ok(())
 }
 
-fn blender_executable() -> Option<std::path::PathBuf> {
-    if let Some(path) = std::env::var_os("POTTER_BLENDER") {
-        let path = std::path::PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    if let Some(paths) = std::env::var_os("PATH")
-        && let Some(path) = std::env::split_paths(&paths)
-            .map(|directory| directory.join("blender"))
-            .find(|path| path.is_file())
-    {
-        return Some(path);
-    }
-    let path = std::path::PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender");
-    path.is_file().then_some(path)
-}
 fn injected_particles(states: &Value) -> Result<Vec<potter::sim::ParticleState>, Box<dyn Error>> {
     let states = states
         .as_array()

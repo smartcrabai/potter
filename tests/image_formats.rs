@@ -10,6 +10,11 @@ use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb, Rgba};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+#[path = "common/blender_checked.rs"]
+mod blender_checked;
+#[path = "common/process.rs"]
+mod process;
+use blender_checked::blender_executable;
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -394,33 +399,6 @@ fn half_float_exr_samples_decode_into_f64_pixels() -> Result<(), Box<dyn Error>>
     );
     assert_pixel(&scene, "half_exr", [0.5, 0.2, 0.1, 0.5], 0.002)?;
     Ok(())
-}
-
-fn blender_executable() -> Option<std::path::PathBuf> {
-    fn usable(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
-        if !path.is_file() {
-            return None;
-        }
-        let output = std::process::Command::new(&path)
-            .arg("--version")
-            .output()
-            .ok()?;
-        output.status.success().then_some(path)
-    }
-
-    if let Some(path) = std::env::var_os("POTTER_BLENDER") {
-        return usable(std::path::PathBuf::from(path));
-    }
-    if let Some(paths) = std::env::var_os("PATH")
-        && let Some(path) = std::env::split_paths(&paths)
-            .map(|directory| directory.join("blender"))
-            .find_map(usable)
-    {
-        return Some(path);
-    }
-    usable(std::path::PathBuf::from(
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-    ))
 }
 
 fn contains_image_reference(value: &Value, image_id: &str) -> bool {

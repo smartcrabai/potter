@@ -1,7 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "Blender integration fixture setup")]
 
 use std::{
-    env,
     error::Error,
     fs,
     io::BufReader,
@@ -15,6 +14,10 @@ use potter::geom::vdb::VdbVolume;
 use proptest::{prelude::*, test_runner::TestRunner};
 use serde_json::{Value, json};
 use tempfile::tempdir;
+#[path = "common/blender_file.rs"]
+mod blender_file;
+
+use blender_file::blender_executable;
 
 const FIXTURE_SCRIPT: &str = r#"
 import bpy
@@ -240,24 +243,6 @@ for compression in ("NONE", "ZIP", "BLOSC"):
 with open(os.path.join(root, "mantaflow_expected.json"), "w", encoding="utf-8") as output:
     json.dump(rows, output)
 "#;
-
-fn blender_executable() -> Option<PathBuf> {
-    fn usable(path: PathBuf) -> Option<PathBuf> {
-        path.is_file().then_some(path)
-    }
-    if let Some(path) = env::var_os("POTTER_BLENDER") {
-        return usable(PathBuf::from(path));
-    }
-    if let Some(path) = env::split_paths(&env::var_os("PATH")?)
-        .map(|directory| directory.join("blender"))
-        .find_map(usable)
-    {
-        return Some(path);
-    }
-    usable(PathBuf::from(
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-    ))
-}
 
 fn run_ok(command: &mut Command, label: &str) -> Result<std::process::Output, Box<dyn Error>> {
     let output = command.output()?;

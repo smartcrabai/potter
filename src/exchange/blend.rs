@@ -6839,6 +6839,10 @@ mod tests {
         match resolve_blender(None) {
             Ok(blender) => Some(blender),
             Err(error) => {
+                assert!(
+                    std::env::var_os("POTTER_REQUIRE_BLENDER").is_none_or(|value| value.is_empty()),
+                    "POTTER_REQUIRE_BLENDER is set but Blender was not found: {error}"
+                );
                 eprintln!("skipping Blender integration test: {error}");
                 None
             }
