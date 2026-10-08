@@ -4,12 +4,16 @@
 )]
 
 use std::{
-    env,
     error::Error,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output},
 };
+
+#[path = "common/blender_file.rs"]
+mod blender_file;
+
+use blender_file::blender_executable;
 
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -266,24 +270,6 @@ with open(output, "w", encoding="utf-8") as handle:
     json.dump(dict(linked_state, libraries=libraries, nested_libraries=nested_libraries), handle)
 print("LIBRARY_REOPEN_OK")
 "#;
-
-fn blender_executable() -> Option<PathBuf> {
-    fn usable(path: PathBuf) -> Option<PathBuf> {
-        path.is_file().then_some(path)
-    }
-    if let Some(path) = env::var_os("POTTER_BLENDER") {
-        return usable(PathBuf::from(path));
-    }
-    if let Some(path) = env::split_paths(&env::var_os("PATH")?)
-        .map(|directory| directory.join("blender"))
-        .find_map(usable)
-    {
-        return Some(path);
-    }
-    usable(PathBuf::from(
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-    ))
-}
 
 fn run(command: &mut Command, label: &str) -> Result<Output, Box<dyn Error>> {
     let output = command.output()?;

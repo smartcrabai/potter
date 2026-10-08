@@ -9,6 +9,10 @@ use std::{error::Error, fs, path::Path, process::Output};
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+#[path = "common/blender_file.rs"]
+mod blender_file;
+
+use blender_file::blender_executable;
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -377,6 +381,10 @@ fn every_export_catalog_format_handles_the_spec_box_or_reports_loss() {
         let output_path = directory
             .path()
             .join(format!("spec_box_{format}.{extension}"));
+        if format == "blend" && blender_executable().is_none() {
+            eprintln!("skipping .blend export check: Blender is unavailable");
+            continue;
+        }
         let output = pot()
             .arg("export")
             .arg(&scene)
@@ -396,10 +404,6 @@ fn every_export_catalog_format_handles_the_spec_box_or_reports_loss() {
             );
         } else {
             let details = &response["error"]["details"];
-            if format == "blend" && response["error"]["code"] == "BLENDER_NOT_FOUND" {
-                eprintln!("skipping .blend export check: Blender is unavailable");
-                continue;
-            }
             let losses = details["result"]["losses"]
                 .as_array()
                 .or_else(|| details["losses"].as_array())

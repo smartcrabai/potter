@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output},
 };
 
@@ -13,6 +13,10 @@ use potter::{
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
+#[path = "common/blender_file.rs"]
+mod blender_file;
+
+use blender_file::blender_executable;
 
 fn init(scene: &Path) -> Result<(), Box<dyn Error>> {
     let output = Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -447,7 +451,11 @@ fn match_vertex_positions(
     expected: &[DVec3],
     context: &str,
 ) -> (Vec<usize>, f64) {
-    const TOLERANCE: f64 = 1.1e-5;
+    // Blender's Remesh SHARP mode solves the dual-contouring QEF in float32
+    // (`intern/dualcon/intern/octree.cpp` `minimize`), and its rounding differs between Blender
+    // builds: SHARP vertices reach ~8e-6 on macOS arm64 and ~1.3e-5 on Linux x86-64, while
+    // BLOCKS, SMOOTH, and VOXEL stay below 1e-6.
+    const TOLERANCE: f64 = 2.5e-5;
     fn assign(
         actual_index: usize,
         candidates: &[Vec<(usize, f64)>],
@@ -1191,21 +1199,6 @@ fn ocean_fft_is_seeded_and_choppiness_changes_the_surface() -> Result<(), Box<dy
     assert!(generated.attributes.contains_key("ocean_normal"));
     assert!(generated.attributes.contains_key("foam"));
     Ok(())
-}
-
-fn blender_executable() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("POTTER_BLENDER") {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    if let Some(path) = std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|directory| directory.join("blender"))
-        .find(|path| path.is_file())
-    {
-        return Some(path);
-    }
-    let bundled = PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender");
-    bundled.is_file().then_some(bundled)
 }
 
 fn blender_script_json(

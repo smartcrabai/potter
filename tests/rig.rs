@@ -8,6 +8,9 @@ use potter::{
 use proptest::{prelude::*, test_runner::TestCaseError};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
+#[path = "common/blender_file.rs"]
+mod blender_file;
+use blender_file::blender_executable;
 
 type IntegrationResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -220,22 +223,6 @@ for case in cases:
 with open(os.path.join(fixture_root, "ik_poses.json"), "w", encoding="utf-8") as output:
     json.dump({"version": list(bpy.app.version), "poses": poses}, output)
 "#;
-
-fn blender_executable() -> Option<std::path::PathBuf> {
-    fn usable(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
-        path.is_file().then_some(path)
-    }
-    if let Some(path) = std::env::var_os("POTTER_BLENDER") {
-        return usable(path.into());
-    }
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join("blender"))
-                .find_map(usable)
-        })
-        .or_else(|| usable("/Applications/Blender.app/Contents/MacOS/Blender".into()))
-}
 
 fn blender_ik_poses(blender: &Path, root: &Path, cases: &Value) -> IntegrationResult<Value> {
     fs::write(root.join("ik_cases.json"), serde_json::to_vec(cases)?)?;

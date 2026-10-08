@@ -1,4 +1,8 @@
-use std::{collections::HashMap, env, error::Error, fs, path::PathBuf, process::Command};
+use std::{collections::HashMap, error::Error, fs, process::Command};
+
+#[path = "common/blender_file.rs"]
+mod blender_file;
+use blender_file::blender_executable;
 
 use glam::DVec3;
 use potter::{
@@ -72,22 +76,6 @@ with open(os.path.join(root, "expected.json"), "w", encoding="utf-8") as output:
     json.dump(expected, output, separators=(",", ":"))
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "source.blend"))
 "#;
-
-fn blender_executable() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("POTTER_BLENDER") {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    if let Some(path) = env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|directory| directory.join("blender"))
-            .find(|path| path.is_file())
-    }) {
-        return Some(path);
-    }
-    let path = PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender");
-    path.is_file().then_some(path)
-}
 
 fn run_pot(args: &[&str]) -> TestResult<Value> {
     let output = Command::new(env!("CARGO_BIN_EXE_pot"))

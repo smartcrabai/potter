@@ -1,12 +1,16 @@
 #![expect(clippy::unwrap_used, reason = "Blender integration fixture setup")]
 
 use std::{
-    env,
     error::Error,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
+
+#[path = "common/blender_file.rs"]
+mod blender_file;
+
+use blender_file::blender_executable;
 
 use potter::hash;
 use serde_json::{Value, json};
@@ -168,24 +172,6 @@ with open(output, "w", encoding="utf-8") as handle:
     json.dump({"objects": objects, "volumes": volumes, "texts": texts, "strips": strips}, handle)
 print("REOPEN_OK")
 "#;
-
-fn blender_executable() -> Option<PathBuf> {
-    fn usable(path: PathBuf) -> Option<PathBuf> {
-        path.is_file().then_some(path)
-    }
-    if let Some(path) = env::var_os("POTTER_BLENDER") {
-        return usable(PathBuf::from(path));
-    }
-    if let Some(path) = env::split_paths(&env::var_os("PATH")?)
-        .map(|directory| directory.join("blender"))
-        .find_map(usable)
-    {
-        return Some(path);
-    }
-    usable(PathBuf::from(
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-    ))
-}
 
 fn run_ok(command: &mut Command, label: &str) -> Result<Output, Box<dyn Error>> {
     let output = command.output()?;
