@@ -74,7 +74,8 @@ too_many_lines = "allow"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.metadata.dist]
-cargo-dist-version = ""
+allow-dirty = ["ci"]
+cargo-dist-version = "0.33.0"
 ci = "github"
 install-path = "CARGO_HOME"
 installers = ["shell", "homebrew"]
