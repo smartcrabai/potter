@@ -625,3 +625,325 @@ fn write_atomic_bytes(
         PotError::io(&error)
     })
 }
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "store persistence tests use concise fixtures"
+    )]
+
+    use std::{collections::BTreeMap, fs};
+
+    use serde_json::{Value, json};
+    use tempfile::tempdir;
+
+    use crate::{
+        error::ErrorCode,
+        model::{
+            Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, MAX_REVISION,
+            SceneDoc,
+        },
+    };
+
+    use super::Project;
+
+    fn asset(bytes: &[u8]) -> (String, BTreeMap<String, Vec<u8>>) {
+        let digest = crate::hash::sha256(bytes);
+        (digest.clone(), BTreeMap::from([(digest, bytes.to_vec())]))
+    }
+
+    fn asset_uri(digest: &str, filename: &str) -> String {
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        format!("assets/sha256/{hex}/{filename}")
+    }
+
+    fn candidate_with_resource(
+        project: &Project,
+        digest: &str,
+        uri: &str,
+        image: Option<Image>,
+    ) -> SceneDoc {
+        let mut candidate = project.doc().clone();
+        candidate.resources.insert(
+            Id::from_static("resource"),
+            json!({"hash":digest,"uri":uri,"kind":"binary"}),
+        );
+        if let Some(image) = image {
+            candidate.images.insert(Id::from_static("image"), image);
+        }
+        candidate
+    }
+
+    fn packed_image(blob: Option<String>, tiles: Vec<ImageTile>) -> Image {
+        Image {
+            name: "Packed".to_owned(),
+            source: ImageSource::Packed,
+            colorspace: ImageColorspace::Srgb,
+            width: 1,
+            height: 1,
+            tiles,
+            blob,
+            source_path: None,
+            source_hash: None,
+            alpha_mode: ImageAlphaMode::Straight,
+        }
+    }
+
+    #[test]
+    fn resource_alias_stages_only_the_named_asset_file() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let mut project = Project::init(&scene).unwrap();
+        let bytes = b"resource payload";
+        let (digest, staged) = asset(bytes);
+        let uri = asset_uri(&digest, "resource.bin");
+        let candidate = candidate_with_resource(&project, &digest, &uri, None);
+
+        project
+            .commit_with_assets(candidate, json!([]), json!({}), &staged)
+            .unwrap();
+
+        let alias = scene.join(&uri);
+        let canonical = scene.join(format!(
+            "assets/sha256/{}/blob",
+            digest.strip_prefix("sha256:").unwrap()
+        ));
+        assert_eq!(fs::read(alias).unwrap(), bytes);
+        assert!(!canonical.exists());
+    }
+
+    #[test]
+    fn resource_with_external_uri_still_stages_content_addressed_blob() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let mut project = Project::init(&scene).unwrap();
+        let bytes = b"external resource payload";
+        let (digest, staged) = asset(bytes);
+        let candidate =
+            candidate_with_resource(&project, &digest, "file:///external/resource.bin", None);
+
+        project
+            .commit_with_assets(candidate, json!([]), json!({}), &staged)
+            .unwrap();
+
+        let canonical = scene.join(format!(
+            "assets/sha256/{}/blob",
+            digest.strip_prefix("sha256:").unwrap()
+        ));
+        assert_eq!(fs::read(canonical).unwrap(), bytes);
+    }
+
+    #[test]
+    fn image_blob_reference_stages_canonical_blob_even_with_resource_alias() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let mut project = Project::init(&scene).unwrap();
+        let bytes = crate::image::encode_pixels(1, 1, &[[0.1, 0.2, 0.3, 1.0]]).unwrap();
+        let (digest, staged) = asset(&bytes);
+        let uri = asset_uri(&digest, "resource.bin");
+        let candidate = candidate_with_resource(
+            &project,
+            &digest,
+            &uri,
+            Some(packed_image(Some(digest.clone()), Vec::new())),
+        );
+
+        project
+            .commit_with_assets(candidate, json!([]), json!({}), &staged)
+            .unwrap();
+
+        let canonical = scene.join(format!(
+            "assets/sha256/{}/blob",
+            digest.strip_prefix("sha256:").unwrap()
+        ));
+        assert_eq!(fs::read(canonical).unwrap(), bytes);
+    }
+
+    #[test]
+    fn image_tile_reference_stages_canonical_blob_even_with_resource_alias() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let mut project = Project::init(&scene).unwrap();
+        let tile_bytes = crate::image::encode_pixels(1, 1, &[[1.0, 0.0, 0.0, 1.0]]).unwrap();
+        let (digest, mut staged) = asset(&tile_bytes);
+        let base_bytes = crate::image::encode_pixels(1, 1, &[[0.0, 1.0, 0.0, 1.0]]).unwrap();
+        let base_digest = crate::hash::sha256(&base_bytes);
+        staged.insert(base_digest.clone(), base_bytes);
+        let uri = asset_uri(&digest, "resource.bin");
+        let candidate = candidate_with_resource(
+            &project,
+            &digest,
+            &uri,
+            Some(packed_image(
+                Some(base_digest),
+                vec![ImageTile {
+                    number: 1002,
+                    width: 1,
+                    height: 1,
+                    blob: digest.clone(),
+                }],
+            )),
+        );
+
+        project
+            .commit_with_assets(candidate, json!([]), json!({}), &staged)
+            .unwrap();
+
+        let canonical = scene.join(format!(
+            "assets/sha256/{}/blob",
+            digest.strip_prefix("sha256:").unwrap()
+        ));
+        assert_eq!(fs::read(canonical).unwrap(), tile_bytes);
+    }
+
+    #[test]
+    fn resource_uri_must_name_one_file_inside_its_hash_directory() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let mut project = Project::init(&scene).unwrap();
+        let (digest, staged) = asset(b"resource payload");
+        let uri = asset_uri(&digest, "..");
+        let candidate = candidate_with_resource(&project, &digest, &uri, None);
+
+        let error = project
+            .commit_with_assets(candidate, json!([]), json!({}), &staged)
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::SceneInvalid);
+    }
+
+    #[test]
+    fn corrupted_existing_image_blob_is_rejected() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let mut project = Project::init(&scene).unwrap();
+        let (digest, staged) = asset(b"expected image payload");
+        let canonical = scene.join(format!(
+            "assets/sha256/{}/blob",
+            digest.strip_prefix("sha256:").unwrap()
+        ));
+        fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        fs::write(&canonical, b"corrupted payload").unwrap();
+        let mut candidate = project.doc().clone();
+        candidate.images.insert(
+            Id::from_static("image"),
+            packed_image(Some(digest), Vec::new()),
+        );
+
+        let error = project
+            .commit_with_assets(candidate, json!([]), json!({}), &staged)
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ValidationFailed);
+        assert_eq!(fs::read(canonical).unwrap(), b"corrupted payload");
+        assert_eq!(project.doc().revision, 0);
+    }
+
+    #[test]
+    fn corrupted_existing_resource_asset_is_rejected() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let mut project = Project::init(&scene).unwrap();
+        let (digest, staged) = asset(b"expected resource payload");
+        let uri = asset_uri(&digest, "resource.bin");
+        let destination = scene.join(&uri);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"corrupted payload").unwrap();
+        let candidate = candidate_with_resource(&project, &digest, &uri, None);
+
+        let error = project
+            .commit_with_assets(candidate, json!([]), json!({}), &staged)
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ValidationFailed);
+        assert_eq!(fs::read(destination).unwrap(), b"corrupted payload");
+        assert_eq!(project.doc().revision, 0);
+    }
+
+    #[test]
+    fn commit_rejects_the_json_safe_revision_limit() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let project = Project::init(&scene).unwrap();
+        let mut snapshot: Value =
+            serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+        snapshot["revision"] = json!(MAX_REVISION);
+        fs::write(
+            scene.join("scene.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        drop(project);
+
+        let mut project = Project::open_exclusive(&scene).unwrap();
+        let candidate = project.doc().clone();
+        let error = project
+            .commit_import(candidate, json!([]), json!({}))
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::LimitExceeded);
+    }
+
+    #[test]
+    fn history_scene_hash_changes_with_scene_contents() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let mut project = Project::init(&scene).unwrap();
+        let initial_hash = project.history_records().unwrap()[0].1.scene_hash.clone();
+        let mut candidate = project.doc().clone();
+        candidate
+            .scenes
+            .get_mut(&Id::from_static("scene_main"))
+            .unwrap()
+            .name = "Changed".to_owned();
+
+        project
+            .commit_import(candidate, json!([]), json!({}))
+            .unwrap();
+
+        let records = project.history_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0].1.scene_hash, initial_hash);
+    }
+
+    #[test]
+    fn history_records_reject_malformed_content_hashes() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let project = Project::init(&scene).unwrap();
+        let mut snapshot: Value =
+            serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+        snapshot["history"]["head"] = Value::String("sha256:abc".to_owned());
+        fs::write(
+            scene.join("scene.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        drop(project);
+
+        let opened = Project::open(&scene).unwrap();
+        let error = opened.history_records().unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn dropping_project_releases_the_exclusive_writer_lock() {
+        let directory = tempdir().unwrap();
+        let scene = directory.path().join("scene");
+        let project = Project::init(&scene).unwrap();
+        let busy = Project::open_exclusive(&scene).err().unwrap();
+        assert_eq!(busy.code, ErrorCode::SceneBusy);
+
+        drop(project);
+
+        assert!(Project::open_exclusive(&scene).is_ok());
+    }
+
+    // Equivalent/unreachable mutants: sha256 always emits a strict digest, so malformed
+    // staged keys still fail hash equality with InternalError regardless of the hex-format
+    // checks. Path::file_name omits "", ".", and "..", so widening the basename filter's
+    // `&&` operators cannot change accepted names; normal .blend import exercises and catches
+    // the `!=` comparison mutants. Dropping Project's File releases the OS lock without an
+    // explicit unlock call.
+}
