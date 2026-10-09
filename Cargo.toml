@@ -39,7 +39,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 assert_cmd = "=2.2.2"
-jsonschema = "=0.58.5"
+jsonschema = "=0.58.6"
 proptest = "=1.11.0"
 tempfile = "=3.27.0"
 
