@@ -5,7 +5,7 @@ mod blender_file;
 use blender_file::blender_executable;
 
 use glam::DVec3;
-use potter::{
+use potter_core::{
     error::ErrorCode,
     eval::{EvaluationContext, Snapshot},
     geom::Mesh,
@@ -258,7 +258,7 @@ fn disable_other_modifier_stacks(document: &mut SceneDoc, enabled_node: &Id) {
 }
 
 fn assert_catalog_gate() -> TestResult<()> {
-    let catalog = potter::catalog::feature_catalog();
+    let catalog = potter_core::catalog::feature_catalog();
     let row = catalog["features"]
         .as_array()
         .and_then(|features| {

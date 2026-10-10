@@ -142,7 +142,7 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
             assert!(result.get("catalog").is_none());
         }
     }
-    let schema = potter::schema::schema("operations", None)?;
+    let schema = potter_core::schema::schema("operations", None)?;
     let validator = jsonschema::validator_for(&schema)?;
     for batch in [
         serde_json::from_str::<Value>(include_str!("fixtures/first.json"))?,
@@ -153,7 +153,7 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
             "example operation batch should validate: {batch}"
         );
     }
-    for name in potter::ops::OP_NAMES {
+    for name in potter_core::ops::OP_NAMES {
         let output = run(&["schema", "--kind", "operations", "--op", name, "--json"]);
         let schema = value(&output)["result"]["schema"].clone();
         let _validator = jsonschema::validator_for(&schema)?;
@@ -195,24 +195,24 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
         "scene_id":"scene_main",
         "view_layer":"view_main"
     })));
-    let features = potter::catalog::feature_catalog();
+    let features = potter_core::catalog::feature_catalog();
     for feature in features["features"].as_array().unwrap() {
         for operation in feature["pot_ops"].as_array().unwrap() {
             let operation = operation.as_str().unwrap();
             assert!(
-                potter::ops::OP_NAMES.contains(&operation),
+                potter_core::ops::OP_NAMES.contains(&operation),
                 "catalog operation must be registered: {operation}"
             );
         }
     }
-    let doc = potter::model::SceneDoc::new("dispatch-test".to_owned());
-    for operation in potter::ops::OP_NAMES {
+    let doc = potter_core::model::SceneDoc::new("dispatch-test".to_owned());
+    for operation in potter_core::ops::OP_NAMES {
         let batch = json!({
             "schema_version": 1,
             "base_revision": 0,
             "operations": [{"op": operation}]
         });
-        let error = potter::ops::apply_batch(&doc, &batch).unwrap_err();
+        let error = potter_core::ops::apply_batch(&doc, &batch).unwrap_err();
         assert_ne!(
             error.message,
             format!("unsupported operation `{operation}`"),
@@ -242,7 +242,7 @@ fn collection_parent_cycles_and_view_layer_exclusions_are_cli_visible() {
             ]
         }),
     );
-    let catalog = potter::catalog::feature_catalog();
+    let catalog = potter_core::catalog::feature_catalog();
     assert_eq!(
         catalog["features"]
             .as_array()
@@ -333,7 +333,7 @@ fn tracking_masks_and_sequencer_operations_run_through_cli() {
         "color_strip"
     );
 
-    let catalog = potter::catalog::feature_catalog();
+    let catalog = potter_core::catalog::feature_catalog();
     let rows = catalog["features"].as_array().unwrap();
     for supported in ["tracking", "tracking.object_solve", "mask", "sequencer"] {
         assert_eq!(
@@ -830,7 +830,7 @@ fn assets_check_rehashes_external_resources() {
     init(&scene);
     let asset = directory.path().join("texture.bin");
     fs::write(&asset, b"changed bytes").unwrap();
-    let expected_hash = potter::hash::sha256(b"original bytes");
+    let expected_hash = potter_core::hash::sha256(b"original bytes");
     let asset_uri = asset.to_string_lossy().into_owned();
     let scene_file = scene.join("scene.json");
     let mut document: Value = serde_json::from_slice(&fs::read(&scene_file).unwrap()).unwrap();
@@ -948,7 +948,7 @@ fn unsupported_bake_kinds_fail_honestly() {
 
 #[test]
 fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
-    let catalog = potter::catalog::feature_catalog();
+    let catalog = potter_core::catalog::feature_catalog();
     let features = catalog["features"]
         .as_array()
         .expect("catalog features are an array");
@@ -974,7 +974,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
                         .as_str()
                         .expect("catalog operation names are strings");
                     assert!(
-                        potter::ops::OP_NAMES.contains(&operation),
+                        potter_core::ops::OP_NAMES.contains(&operation),
                         "{feature_id} lists unknown operation {operation}"
                     );
                 }

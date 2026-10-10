@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use glam::DVec3;
-use potter::{
+use potter_core::{
     error::ErrorCode,
     graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
     image::{ImageData, ImageInterpolation, ImageTileData},

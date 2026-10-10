@@ -680,7 +680,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         assert_physics_settings(settings, &expected["settings"][case_name], case_name);
     }
 
-    let catalog = potter::catalog::feature_catalog();
+    let catalog = potter_core::catalog::feature_catalog();
     let parity_feature = catalog["features"]
         .as_array()
         .unwrap()

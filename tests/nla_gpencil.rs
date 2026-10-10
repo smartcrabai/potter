@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, error::Error, fs, io::Cursor, path::Path, process::Command};
 
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     model::SceneDoc,
     ops::apply_batch,
@@ -48,7 +48,8 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
     )
     .unwrap();
     assert!(
-        (blended.nodes[&potter::model::Id::new("animated").unwrap()].world_matrix[12] - 4.5).abs()
+        (blended.nodes[&potter_core::model::Id::new("animated").unwrap()].world_matrix[12] - 4.5)
+            .abs()
             < 1.0e-9
     );
     doc = apply(
@@ -58,7 +59,7 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
             {"op":"nla.strip_update","target":{"id":"animated"},"track":"track_main","strip":"strip_offset","set":{"influence":0.25}}
         ]),
     );
-    let node_id = potter::model::Id::new("animated").unwrap();
+    let node_id = potter_core::model::Id::new("animated").unwrap();
     assert_eq!(doc.nodes[&node_id].nla_tracks[0].name, "Main Updated");
     let updated = Snapshot::evaluate(
         &doc,
@@ -105,7 +106,7 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
             {"op":"scene.marker_add","id":"marker_review","name":"Review","frame":6.0}
         ]),
     );
-    let action_id = potter::model::Id::new("active").unwrap();
+    let action_id = potter_core::model::Id::new("active").unwrap();
     assert_eq!(doc.actions[&action_id].slots[0].node.as_str(), "animated");
     assert_eq!(doc.scenes[&doc.active_scene].markers[0].frame, 6.0);
     let before = [1.0, 6.0, 11.0].map(|frame| {
@@ -117,7 +118,7 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
             },
         )
         .unwrap()
-        .nodes[&potter::model::Id::new("animated").unwrap()]
+        .nodes[&potter_core::model::Id::new("animated").unwrap()]
             .world_matrix[12]
     });
     doc = apply(
@@ -128,7 +129,7 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
         ]),
     );
     assert!(
-        doc.nodes[&potter::model::Id::new("animated").unwrap()]
+        doc.nodes[&potter_core::model::Id::new("animated").unwrap()]
             .action
             .is_none()
     );
@@ -146,7 +147,7 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
             },
         )
         .unwrap()
-        .nodes[&potter::model::Id::new("animated").unwrap()]
+        .nodes[&potter_core::model::Id::new("animated").unwrap()]
             .world_matrix[12]
     });
     for (before, after) in before.into_iter().zip(after) {
@@ -282,7 +283,7 @@ fn grease_pencil_svg_round_trip_and_pdf_xref_are_valid() -> Result<(), Box<dyn E
             "--json",
         ]);
     run_ok(import_svg)?;
-    let imported = potter::store::Project::open(&imported_scene)?;
+    let imported = potter_core::store::Project::open(&imported_scene)?;
     let imported_gp = imported
         .doc()
         .data_blocks
@@ -297,7 +298,7 @@ fn grease_pencil_svg_round_trip_and_pdf_xref_are_valid() -> Result<(), Box<dyn E
         .next()
         .ok_or_else(|| std::io::Error::other("imported Grease Pencil stroke is missing"))?;
     assert_eq!(imported_stroke.points.len(), 3);
-    let source = potter::store::Project::open(&source_scene)?;
+    let source = potter_core::store::Project::open(&source_scene)?;
     let source_gp = source
         .doc()
         .data_blocks

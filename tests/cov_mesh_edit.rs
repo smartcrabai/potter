@@ -12,7 +12,7 @@ use std::{
 };
 
 use glam::DVec3;
-use potter::{
+use potter_core::{
     error::ErrorCode,
     geom::{BoxParams, Mesh, PlaneParams, edit},
 };

@@ -1,7 +1,7 @@
 use std::{error::Error, fs, io, path::Path, process::Command};
 
 use glam::{DMat4, DVec3};
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     model::{Id, SceneDoc},
 };
@@ -622,7 +622,7 @@ fn rig_generate_basic_human_creates_scaled_deform_and_control_rigs() -> Integrat
         .ok_or_else(|| io::Error::other("armature node is missing"))?;
     assert_eq!(node.constraints.len(), 4);
     assert!(node.constraints.iter().all(|constraint| {
-        constraint.constraint_type == potter::model::ConstraintType::Ik && constraint.enabled
+        constraint.constraint_type == potter_core::model::ConstraintType::Ik && constraint.enabled
     }));
     let hand_target = Id::new("rig_arm_hand_ik_l")?;
     assert!(document.nodes.contains_key(&hand_target));
@@ -1444,7 +1444,7 @@ fn constraint_update_reassigns_pose_bone_owner_and_rejects_missing_bones() -> In
          "type":"copy_location","constraint_target":"goal","owner_bone":"tip"}
     ]))?;
     let document: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    let updated = potter::ops::apply_batch(
+    let updated = potter_core::ops::apply_batch(
         &document,
         &json!({
             "schema_version":1,
@@ -1469,7 +1469,7 @@ fn constraint_update_reassigns_pose_bone_owner_and_rejects_missing_bones() -> In
         .ok_or_else(|| io::Error::other("updated pose-bone constraint is missing"))?;
     assert_eq!(constraint.owner_bone, Some(Id::new("root")?));
 
-    let Err(error) = potter::ops::apply_batch(
+    let Err(error) = potter_core::ops::apply_batch(
         &updated.doc,
         &json!({
             "schema_version":1,
@@ -1482,7 +1482,7 @@ fn constraint_update_reassigns_pose_bone_owner_and_rejects_missing_bones() -> In
     ) else {
         return Err(io::Error::other("constraint accepted a missing owner bone").into());
     };
-    assert_eq!(error.code, potter::error::ErrorCode::TargetNotFound);
+    assert_eq!(error.code, potter_core::error::ErrorCode::TargetNotFound);
     Ok(())
 }
 

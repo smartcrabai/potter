@@ -5,7 +5,7 @@ mod blender_file;
 use blender_file::blender_executable;
 
 use glam::DVec3;
-use potter::{eval::Snapshot, model::SceneDoc};
+use potter_core::{eval::Snapshot, model::SceneDoc};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -279,13 +279,13 @@ fn gear_bevel_array_subdivision_weighted_normal_stack_stops_at_unsupported_blend
     );
     let cap_only = Snapshot::evaluate_nodes_with_cache(
         &document,
-        &potter::eval::EvaluationContext::default(),
+        &potter_core::eval::EvaluationContext::default(),
         None,
         &std::collections::BTreeSet::from([cap_id.clone()]),
     )?;
     assert!(cap_only.meshes.contains_key(&cap_id));
     assert!(!cap_only.meshes.contains_key(&gear_id));
-    let feature_catalog = potter::catalog::feature_catalog();
+    let feature_catalog = potter_core::catalog::feature_catalog();
     let bevel_corner_feature = feature_catalog["features"]
         .as_array()
         .and_then(|features| {
@@ -345,14 +345,14 @@ fn gear_bevel_array_subdivision_weighted_normal_stack_stops_at_unsupported_blend
         }
         let snapshot = match Snapshot::evaluate(
             &prefix_document,
-            &potter::eval::EvaluationContext::default(),
+            &potter_core::eval::EvaluationContext::default(),
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 assert_eq!(index, 1, "the source prefix must remain evaluable");
                 assert_eq!(
                     error.code,
-                    potter::error::ErrorCode::UnsupportedFeature,
+                    potter_core::error::ErrorCode::UnsupportedFeature,
                     "the first modifier prefix must use a typed feature gate"
                 );
                 assert_eq!(

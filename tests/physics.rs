@@ -28,7 +28,7 @@ fn init_scene(scene: &Path) {
 }
 
 fn apply(scene: &Path, batch: &Value) {
-    let schema = potter::schema::schema("operations", None).unwrap();
+    let schema = potter_core::schema::schema("operations", None).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     assert!(
         validator.is_valid(batch),
@@ -262,8 +262,8 @@ fn same_seed_has_same_bake_hash_and_settings_change_the_cache_key() {
     let first_manifest = fs::read(first.join("manifest.json")).unwrap();
     let second_manifest = fs::read(second.join("manifest.json")).unwrap();
     assert_eq!(
-        potter::hash::sha256(&first_manifest),
-        potter::hash::sha256(&second_manifest)
+        potter_core::hash::sha256(&first_manifest),
+        potter_core::hash::sha256(&second_manifest)
     );
     let first_key = json(&first_output)["result"]["cache_keys"][0]
         .as_str()
@@ -454,7 +454,7 @@ fn fluid_smoke_and_fire_remain_honestly_unsupported() {
 #[test]
 fn cloth_keeps_a_pinned_corner_and_bounds_spring_lengths() {
     use glam::DVec3;
-    use potter::geom::{GridParams, Mesh};
+    use potter_core::geom::{GridParams, Mesh};
 
     let mut mesh = Mesh::grid(GridParams {
         size_x: 2.0,
@@ -470,7 +470,7 @@ fn cloth_keeps_a_pinned_corner_and_bounds_spring_lengths() {
         .iter()
         .map(|vertex| vertex.co)
         .collect::<Vec<_>>();
-    let output = potter::sim::cloth::simulate(
+    let output = potter_core::sim::cloth::simulate(
         &mesh,
         &json!({"pin_group":"pin","substeps":4,"iterations":12}),
         8.0,
@@ -494,7 +494,7 @@ fn cloth_keeps_a_pinned_corner_and_bounds_spring_lengths() {
 #[test]
 fn soft_body_sphere_rebounds_while_preserving_volume() {
     use glam::DVec3;
-    use potter::geom::{Mesh, UvSphereParams};
+    use potter_core::geom::{Mesh, UvSphereParams};
 
     fn volume(mesh: &Mesh, positions: &[DVec3]) -> f64 {
         let indices = mesh
@@ -536,7 +536,7 @@ fn soft_body_sphere_rebounds_while_preserving_volume() {
         DVec3::new(0.0, 10.0, -2.0),
     ]];
     let settings = json!({"substeps":4,"iterations":12,"volume_stiffness":0.9,"restitution":0.4});
-    let frame_12 = potter::sim::softbody::simulate(
+    let frame_12 = potter_core::sim::softbody::simulate(
         &sphere,
         &settings,
         12.0,
@@ -545,7 +545,7 @@ fn soft_body_sphere_rebounds_while_preserving_volume() {
         &collider,
     )
     .unwrap();
-    let frame_13 = potter::sim::softbody::simulate(
+    let frame_13 = potter_core::sim::softbody::simulate(
         &sphere,
         &settings,
         13.0,
@@ -571,13 +571,13 @@ fn soft_body_sphere_rebounds_while_preserving_volume() {
 #[test]
 fn particles_are_seeded_and_emitted_at_rate_times_frames() {
     use glam::{DMat4, DVec3};
-    use potter::geom::Mesh;
+    use potter_core::geom::Mesh;
 
     let emitter =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
             .unwrap();
     let settings = json!({"rate":3,"lifetime":20,"speed":1,"source":"faces"});
-    let first = potter::sim::particles::simulate(
+    let first = potter_core::sim::particles::simulate(
         &emitter,
         &settings,
         DMat4::IDENTITY,
@@ -589,7 +589,7 @@ fn particles_are_seeded_and_emitted_at_rate_times_frames() {
         &[],
     )
     .unwrap();
-    let second = potter::sim::particles::simulate(
+    let second = potter_core::sim::particles::simulate(
         &emitter,
         &settings,
         DMat4::IDENTITY,
@@ -604,20 +604,20 @@ fn particles_are_seeded_and_emitted_at_rate_times_frames() {
     assert_eq!(first.len(), 12);
     assert_eq!(first, second);
     assert_eq!(
-        potter::hash::sha256(&serde_json::to_vec(&first).unwrap()),
-        potter::hash::sha256(&serde_json::to_vec(&second).unwrap())
+        potter_core::hash::sha256(&serde_json::to_vec(&first).unwrap()),
+        potter_core::hash::sha256(&serde_json::to_vec(&second).unwrap())
     );
 }
 
 #[test]
 fn sph_liquid_column_collapses_inside_its_domain() {
     use glam::{DMat4, DVec3};
-    use potter::geom::{BoxParams, Mesh};
+    use potter_core::geom::{BoxParams, Mesh};
 
     let domain = Mesh::box_mesh(BoxParams::default()).unwrap();
     let bounds = domain.bounds().unwrap();
     let settings = json!({"resolution":4,"particle_radius":0.1});
-    let initial = potter::sim::fluid::simulate(
+    let initial = potter_core::sim::fluid::simulate(
         &domain,
         &settings,
         DMat4::IDENTITY,
@@ -628,7 +628,7 @@ fn sph_liquid_column_collapses_inside_its_domain() {
         &[],
     )
     .unwrap();
-    let collapsed = potter::sim::fluid::simulate(
+    let collapsed = potter_core::sim::fluid::simulate(
         &domain,
         &settings,
         DMat4::IDENTITY,
@@ -654,7 +654,7 @@ fn sph_liquid_column_collapses_inside_its_domain() {
 #[test]
 fn dynamic_paint_colors_only_vertices_inside_brush_radius() {
     use glam::{DMat4, DVec3};
-    use potter::geom::{Mesh, Vertex};
+    use potter_core::geom::{Mesh, Vertex};
 
     let canvas = Mesh {
         vertices: vec![
@@ -673,7 +673,7 @@ fn dynamic_paint_colors_only_vertices_inside_brush_radius() {
         ],
         ..Mesh::default()
     };
-    let colors = potter::sim::dynamic_paint::paint(
+    let colors = potter_core::sim::dynamic_paint::paint(
         &canvas,
         DMat4::IDENTITY,
         &[DVec3::ZERO],
@@ -838,7 +838,7 @@ fn physics_operations_reject_invalid_settings_with_parameter_pointers() {
             "base_revision":0,
             "operations":operations
         });
-        let schema = potter::schema::schema("operations", None).unwrap();
+        let schema = potter_core::schema::schema("operations", None).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.is_valid(&batch), "{batch}");
 

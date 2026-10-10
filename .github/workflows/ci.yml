@@ -29,22 +29,22 @@ jobs:
 
       - name: Lint Cargo.toml
         shell: bash
-        run: taplo lint Cargo.toml
+        run: taplo lint Cargo.toml crates/*/Cargo.toml
 
       - name: Check Cargo.toml formatting
         shell: bash
-        run: taplo fmt --check --option reorder_keys=true Cargo.toml
+        run: taplo fmt --check --option reorder_keys=true Cargo.toml crates/*/Cargo.toml
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Check formatting
         shell: bash
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run cargo check
         shell: bash
-        run: cargo check --all-features
+        run: cargo check --workspace --all-features
 
       - name: Cache Blender
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -69,11 +69,11 @@ jobs:
         shell: bash
         env:
           POTTER_REQUIRE_BLENDER: "1"
-        run: cargo test --all-features
+        run: cargo test --workspace --all-features
 
       - name: Run clippy
         shell: bash
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 
   automerge:

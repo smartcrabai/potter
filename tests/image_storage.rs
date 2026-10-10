@@ -5,7 +5,7 @@
 
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
 
-use potter::{
+use potter_core::{
     error::ErrorCode,
     hash,
     image::{

@@ -5,7 +5,7 @@ mod blender_file;
 use blender_file::blender_executable;
 
 use glam::DVec3;
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::Mesh,
     model::SceneDoc,

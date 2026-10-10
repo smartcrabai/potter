@@ -10,7 +10,7 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-use potter::{
+use potter_core::{
     geom::{Mesh, sculpt},
     hash::{canonicalize, sha256},
 };
@@ -73,7 +73,7 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
     let drawn_document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     assert!(drawn_document["data_blocks"]["body_mesh"]["descriptor"].is_null());
     assert!(drawn_document["nodes"]["body"]["primitive"].is_null());
-    let original = Mesh::box_mesh(potter::geom::BoxParams::default())?;
+    let original = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
     let original_v6 = original
         .vertices
         .iter()
@@ -275,7 +275,7 @@ fn sculpt_shared_data_requires_scope_and_single_user_isolates_stroke() -> Result
 
 #[test]
 fn sculpt_symmetry_and_seed_are_deterministic() -> Result<(), Box<dyn Error>> {
-    let base = Mesh::box_mesh(potter::geom::BoxParams::default())?;
+    let base = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
     let stroke = |symmetry: &[&str], seed| sculpt::Stroke {
         brush: sculpt::Brush::Draw,
         samples: vec![sculpt::StrokeSample {

@@ -2,14 +2,14 @@
 
 use serde_json::{Value, json};
 
-use potter::{
+use potter_core::{
     error::ErrorCode,
     eval::{EvaluationContext, Snapshot},
     model::{Id, SceneDoc},
     ops::apply_batch,
 };
 
-fn apply(doc: &SceneDoc, operations: &Value) -> potter::error::Result<SceneDoc> {
+fn apply(doc: &SceneDoc, operations: &Value) -> potter_core::error::Result<SceneDoc> {
     let batch = json!({
         "schema_version": 1,
         "base_revision": doc.revision,

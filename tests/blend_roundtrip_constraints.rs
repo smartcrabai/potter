@@ -13,7 +13,7 @@ use std::{
     sync::Mutex,
 };
 
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     model::{Id, SceneDoc},
 };
@@ -1177,7 +1177,7 @@ fn flatten_matrix_rows(matrix: &Value, context: &str) -> TestResult<Vec<Value>> 
     Ok(values)
 }
 fn assert_curve_point_sets(
-    actual: &potter::geom::Mesh,
+    actual: &potter_core::geom::Mesh,
     expected: &Value,
     context: &str,
 ) -> TestResult {
@@ -1260,7 +1260,7 @@ fn assert_matrix_changed(first: &[Value], last: &[Value], context: &str) {
 
 fn assert_constraint_options(
     doc: &SceneDoc,
-    constraint: &potter::model::Constraint,
+    constraint: &potter_core::model::Constraint,
     settings: &Value,
     context: &str,
 ) -> TestResult {
@@ -1414,7 +1414,10 @@ fn assert_constraint_options(
     Ok(())
 }
 
-fn node_named<'a>(doc: &'a SceneDoc, name: &str) -> TestResult<(&'a Id, &'a potter::model::Node)> {
+fn node_named<'a>(
+    doc: &'a SceneDoc,
+    name: &str,
+) -> TestResult<(&'a Id, &'a potter_core::model::Node)> {
     doc.nodes
         .iter()
         .find(|(_, node)| node.name == name)
@@ -2698,7 +2701,10 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
         )
         .err()
         .ok_or("IK X/Z Swing ellipse limits unexpectedly evaluated")?;
-        assert_eq!(error.code, potter::error::ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.code,
+            potter_core::error::ErrorCode::UnsupportedFeature
+        );
         assert_eq!(
             error.details["feature_id"],
             json!("constraint.ik.swing_ellipse_limit")

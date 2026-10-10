@@ -4,10 +4,10 @@
 )]
 
 use glam::{DQuat, DVec3, EulerRot};
-use potter::geom::{
+use potter_core::geom::{
     BoxParams, CylinderParams, Mesh, boolean::boolean_mesh, modifiers::evaluate_modifiers,
 };
-use potter::model::{Id, Modifier};
+use potter_core::model::{Id, Modifier};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
@@ -19,7 +19,7 @@ fn modifier(modifier_type: &str, params: Value) -> Modifier {
         enabled: true,
         params: serde_json::from_value(params).unwrap(),
         binding_data: None,
-        runtime: potter::model::ModifierRuntime::default(),
+        runtime: potter_core::model::ModifierRuntime::default(),
     }
 }
 

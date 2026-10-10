@@ -1,0 +1,24 @@
+[package]
+description = "Agent workflows behind `pot workflow`, driven by jcode agents"
+edition.workspace = true
+license.workspace = true
+name = "potter-workflow"
+publish = false
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+jcode-sdk.workspace = true
+potter-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+
+[lints]
+workspace = true

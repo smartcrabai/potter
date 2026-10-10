@@ -235,9 +235,9 @@ fn blender_key_action_deforms_surface_target_and_bound_object() -> Result<(), Bo
     let bound_id = mappings["Object:Plane_SurfaceDeform_Bound"]
         .as_str()
         .ok_or("bound object mapping was missing")?;
-    let scene: potter::model::SceneDoc =
+    let scene: potter_core::model::SceneDoc =
         serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    let bound_node = &scene.nodes[&potter::model::Id::new(bound_id.to_owned())?];
+    let bound_node = &scene.nodes[&potter_core::model::Id::new(bound_id.to_owned())?];
     let modifier = bound_node
         .modifiers
         .first()
@@ -253,7 +253,7 @@ fn blender_key_action_deforms_surface_target_and_bound_object() -> Result<(), Bo
         modifier_state.get("binding_data").is_some(),
         "Surface Deform binding was not imported"
     );
-    let target_node = &scene.nodes[&potter::model::Id::new(target_id.to_owned())?];
+    let target_node = &scene.nodes[&potter_core::model::Id::new(target_id.to_owned())?];
     let shape_keys = scene.data_blocks[target_node.data.as_ref().ok_or("target data missing")?]
         .shape_keys
         .as_ref()
@@ -286,15 +286,15 @@ fn blender_key_action_deforms_surface_target_and_bound_object() -> Result<(), Bo
             .contains("key_blocks[\"MutedCurve\"].value"),
         "muted shape-key animation curve was not imported"
     );
-    let snapshot = potter::eval::Snapshot::evaluate(
+    let snapshot = potter_core::eval::Snapshot::evaluate(
         &scene,
-        &potter::eval::EvaluationContext {
+        &potter_core::eval::EvaluationContext {
             frame: Some(FRAME),
-            ..potter::eval::EvaluationContext::default()
+            ..potter_core::eval::EvaluationContext::default()
         },
     )?;
-    let target_mesh = &snapshot.meshes[&potter::model::Id::new(target_id.to_owned())?];
-    let bound_mesh = &snapshot.meshes[&potter::model::Id::new(bound_id.to_owned())?];
+    let target_mesh = &snapshot.meshes[&potter_core::model::Id::new(target_id.to_owned())?];
+    let bound_mesh = &snapshot.meshes[&potter_core::model::Id::new(bound_id.to_owned())?];
     let target_actual: Vec<_> = target_mesh
         .vertices
         .iter()
@@ -315,19 +315,21 @@ fn blender_key_action_deforms_surface_target_and_bound_object() -> Result<(), Bo
         &expected_positions(&expected["bound"])?,
         "Surface Deform result",
     );
-    let snapshot_nine = potter::eval::Snapshot::evaluate(
+    let snapshot_nine = potter_core::eval::Snapshot::evaluate(
         &scene,
-        &potter::eval::EvaluationContext {
+        &potter_core::eval::EvaluationContext {
             frame: Some(9.0),
-            ..potter::eval::EvaluationContext::default()
+            ..potter_core::eval::EvaluationContext::default()
         },
     )?;
-    let target_nine: Vec<_> = snapshot_nine.meshes[&potter::model::Id::new(target_id.to_owned())?]
+    let target_nine: Vec<_> = snapshot_nine.meshes
+        [&potter_core::model::Id::new(target_id.to_owned())?]
         .vertices
         .iter()
         .map(|vertex| vertex.co.to_array())
         .collect();
-    let bound_nine: Vec<_> = snapshot_nine.meshes[&potter::model::Id::new(bound_id.to_owned())?]
+    let bound_nine: Vec<_> = snapshot_nine.meshes
+        [&potter_core::model::Id::new(bound_id.to_owned())?]
         .vertices
         .iter()
         .map(|vertex| vertex.co.to_array())

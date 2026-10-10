@@ -132,12 +132,12 @@ fn bounds(scene: &Path, frame: f64) -> Result<Value, Box<dyn Error>> {
 }
 
 fn mesh_positions(scene: &Path, frame: f64) -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
-    let project = potter::store::Project::open(scene)?;
-    let snapshot = potter::eval::Snapshot::evaluate_with_cache(
+    let project = potter_core::store::Project::open(scene)?;
+    let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
         project.doc(),
-        &potter::eval::EvaluationContext {
+        &potter_core::eval::EvaluationContext {
             frame: Some(frame),
-            ..potter::eval::EvaluationContext::default()
+            ..potter_core::eval::EvaluationContext::default()
         },
         Some(project.path()),
     )?;
@@ -210,7 +210,7 @@ fn mesh_sequence_cache_samples_and_interpolates_exported_alembic_meshes()
             {"op":"modifier.create", "target":{"id":"body"}, "id":"cache", "type":"mesh_sequence_cache", "params":{"resource":"cache", "object_path":"/root/body/geometry", "read_data":["VERT","POLY","UV","COLOR"], "use_vertex_interpolation":true}}
         ]),
     )?;
-    let archive_hash = potter::hash::sha256(&fs::read(&archive)?);
+    let archive_hash = potter_core::hash::sha256(&fs::read(&archive)?);
     let hash_hex = archive_hash.strip_prefix("sha256:").unwrap_or_default();
     let asset_uri = format!("assets/sha256/{hash_hex}/animated.abc");
     let asset_path = target.join(&asset_uri);
@@ -251,7 +251,7 @@ fn mesh_sequence_cache_reports_missing_and_changed_external_files() -> Result<()
     let archive = temporary.path().join("animated.abc");
     export_animated_cache(&source, &archive)?;
     let original = fs::read(&archive)?;
-    let expected_hash = potter::hash::sha256(&original);
+    let expected_hash = potter_core::hash::sha256(&original);
 
     let missing_scene = temporary.path().join("missing.pot");
     init(&missing_scene)?;
@@ -312,7 +312,7 @@ fn mesh_sequence_cache_vertex_only_read_rejects_count_mismatches() -> Result<(),
 
 #[test]
 fn mesh_sequence_cache_schema_describes_modifier_parameters() -> Result<(), Box<dyn Error>> {
-    let schema = potter::schema::schema("operations", Some("modifier.create"))?;
+    let schema = potter_core::schema::schema("operations", Some("modifier.create"))?;
     let cache_params = schema
         .get("allOf")
         .and_then(Value::as_array)

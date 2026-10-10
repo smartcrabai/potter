@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, error::Error, fs, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, DVec3};
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
         Mesh,
@@ -26,7 +26,7 @@ use blender_file::blender_executable;
 )]
 fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
-        id: potter::model::Id::new("test_modifier")?,
+        id: potter_core::model::Id::new("test_modifier")?,
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
@@ -35,7 +35,7 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
             .ok_or("modifier params must be an object")?
             .clone(),
         binding_data: None,
-        runtime: potter::model::ModifierRuntime::default(),
+        runtime: potter_core::model::ModifierRuntime::default(),
     })
 }
 
@@ -573,7 +573,7 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
         Snapshot::evaluate_with_cache(&doc, &EvaluationContext::default(), Some(&scene))?;
     let body = snapshot
         .meshes
-        .get(&potter::model::Id::new("body")?)
+        .get(&potter_core::model::Id::new("body")?)
         .ok_or("evaluated body mesh missing")?;
     let weights = vertex_weights(body, "A")?;
     assert_eq!(weights, [0.25, 0.5, 0.75, 1.0]);
@@ -2025,7 +2025,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 Mesh::default(),
                 DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
                 Some(CameraData {
-                    projection: potter::model::CameraProjection::Orthographic,
+                    projection: potter_core::model::CameraProjection::Orthographic,
                     ortho_scale: 3.5,
                     ..CameraData::default()
                 }),
@@ -2068,7 +2068,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 Mesh::default(),
                 DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
                 Some(CameraData {
-                    projection: potter::model::CameraProjection::Orthographic,
+                    projection: potter_core::model::CameraProjection::Orthographic,
                     ortho_scale: 3.5,
                     ..CameraData::default()
                 }),

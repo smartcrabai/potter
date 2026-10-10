@@ -3,7 +3,7 @@
     reason = "asserting exact identity of display transforms"
 )]
 
-use potter::color::{ColorManagement, ViewTransform, linear_to_srgb};
+use potter_core::color::{ColorManagement, ViewTransform, linear_to_srgb};
 use proptest::prelude::*;
 
 proptest! {

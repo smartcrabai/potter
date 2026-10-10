@@ -10,7 +10,7 @@ use std::{
 };
 
 use glam::{DMat4, DQuat, DVec3};
-use potter::{
+use potter_core::{
     model::{
         CameraIntrinsics, Id, MovieClip, MovieTracking, ReconstructedPoint, Reconstruction,
         SceneDoc, SolvedCamera, TrackingMarker, TrackingTrack,
@@ -327,7 +327,7 @@ fn tracking_and_action_constraints_accept_valid_references_and_boundaries() {
     assert_eq!(owner_constraints[2].params["frame_end"], 1_048_574);
     assert_eq!(
         document.nodes[&Id::new("camera").unwrap()].constraints[0].constraint_type,
-        potter::model::ConstraintType::CameraSolver
+        potter_core::model::ConstraintType::CameraSolver
     );
 }
 

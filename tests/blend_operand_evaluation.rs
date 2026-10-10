@@ -1,7 +1,7 @@
 use std::{collections::HashMap, error::Error, fs, path::Path};
 
 use glam::DVec3;
-use potter::{
+use potter_core::{
     error::ErrorCode,
     eval::{EvaluationContext, Snapshot},
     geom::Mesh,
@@ -637,7 +637,7 @@ fn blender_object_mesh_operands_use_same_frame_evaluated_geometry() -> TestResul
             .cloned()
             .ok_or("Boolean cycle operand parameters are invalid")?,
         binding_data: None,
-        runtime: potter::model::ModifierRuntime::default(),
+        runtime: potter_core::model::ModifierRuntime::default(),
     });
     let cycle_error = Snapshot::evaluate(
         &cyclic_document,

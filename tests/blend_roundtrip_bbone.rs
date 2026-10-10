@@ -11,7 +11,7 @@ use std::{
     sync::Mutex,
 };
 
-use potter::model::SceneDoc;
+use potter_core::model::SceneDoc;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_checked.rs"]
