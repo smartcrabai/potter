@@ -12,10 +12,6 @@ Worktrees: `../jcode-pr-1775` (branch `sdk-stop-daemon-on-failed-launch`), `../j
 
 - [ ] Known gap until #1777 is released: the `JCODE_NO_AUTO_UPDATE` override does not stop updates when `jcode` is a source build (only `--no-update` on the bridge does, and the SDK fixes the bridge argv).
 
-## Release
-
-- [ ] Only debug builds were verified locally for `x86_64`/`aarch64` Linux and `x86_64`/`aarch64` Windows (the macOS `dist build` artifact was verified). Confirm the optimized `dist` builds on the first release CI run.
-
 ## Ideas (not decided)
 
 - Count `stalled` by whether previous findings get resolved instead of by the finding count: a run that fixed one finding per review still stopped as `stalled`.
