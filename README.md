@@ -10,8 +10,27 @@ The name potter means "a person who makes objects from clay." It is a headless, 
 
 Normal processing uses potter's own engine. Headless Blender 5.2.x is used only for .blend import/export.
 
+## Install
+
+macOS and Linux:
+
 ```sh
-cargo build --release   # target/release/pot
+brew install smartcrabai/tap/potter
+# or
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/smartcrabai/potter/releases/latest/download/potter-installer.sh | sh
+```
+
+- Windows: download `potter-x86_64-pc-windows-msvc.zip` or `potter-aarch64-pc-windows-msvc.zip` from the [latest release](https://github.com/smartcrabai/potter/releases/latest) and put `pot.exe` on `PATH`.
+- From source: `cargo install --git https://github.com/smartcrabai/potter --locked` (CI builds with Rust 1.99, pinned in `rust-toolchain.toml`).
+
+Optional dependencies:
+
+- Blender 5.2.x, only for `.blend` import/export. Found via `--blender <path>`, `POTTER_BLENDER`, `PATH`, then `/Applications/Blender.app`.
+- `jcode` on `PATH` with a provider login, only for `pot workflow`.
+
+## Usage
+
+```sh
 pot init ./scene --json
 pot apply ./scene --file ops.json --preview iso --json
 pot schema --kind capabilities --json   # List of supported/unsupported features (not_supported includes a reason)
