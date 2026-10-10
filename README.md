@@ -19,12 +19,33 @@ pot schema --kind capabilities --json   # List of supported/unsupported features
 
 The authoritative sources for supported and unsupported features are `pot schema --kind capabilities --json` and `pot inspect <scene> --features --json`.
 
+## Agent workflows (`pot workflow`)
+
+`pot workflow` runs multi-agent workflows on top of potter, driven by [jcode](https://github.com/1jehuang/jcode) agents through `jcode-sdk`. It needs `jcode` on PATH with a provider login.
+
+```sh
+pot workflow -h                           # list available workflows
+pot workflow refine -i chair.jpg -i chair-side.jpg
+```
+
+### `refine`
+
+A modeler agent builds a model from the reference images (`-i/--image`, repeatable), potter renders it from several views, a fresh reviewer agent lists what blocks acceptance, and the modeler repairs exactly those findings. The loop is built to converge:
+
+- The reviewer reports only blocking findings: render problems, missing or extra parts, wrong basic shape, proportions off by roughly 15% or more, misplaced or detached parts, and clearly wrong colors. Smaller differences, shading or shadow artifacts, and unseen sides are recorded as `non_findings` and never block.
+- Findings keep stable IDs (`F1`, `F2`, …). Each follow-up review sees the previous review and the modeler's fix report, must mark every previous finding `resolved` or `persists`, may not raise decided non-findings again, and adds new findings only for blocking problems such as regressions. The modeler may report a finding as `blocked` instead of faking a fix, and the reviewer can accept that as a non-finding.
+- A deterministic geometry check passes mesh parts that touch neither the ground nor the grounded assembly, with their gap in meters, to the reviewer.
+- The loop stops as `converged` (no findings, exit 0), `stalled` (the finding count did not beat the best review for `--stall-limit` consecutive reviews, default 2), or `max_iterations_reached` (`--max-iterations`, default 5); both non-converged statuses exit 2.
+
+Output goes to `-o/--out` (default `<first image stem>-refine`, numbered when taken): the potter project in `<out>/scene` and each iteration's renders, `review.json`, and `fix-report.json` in `<out>/iter-NN/`. stdout is one JSON line with `status`, `iterations`, and `remaining_findings`; with `--json` it is a `pot` response envelope carrying that summary as `result`, and errors become `INTERNAL_ERROR` envelopes.
+
 ## Repository layout
 
 | Path | Package | Role |
 | --- | --- | --- |
 | `src/`, `tests/` | `potter` | the `pot` binary (argument parsing, `--json` envelopes) and its end-to-end tests |
 | `crates/potter-core/` | `potter-core` | engine library: scene model, evaluation, rendering, exchange, and the typed command layer |
+| `crates/potter-workflow/` | `potter-workflow` | `pot workflow` agent workflows (jcode) |
 
 ## License
 

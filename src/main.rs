@@ -1,11 +1,12 @@
 use std::ffi::OsString;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use potter_core::{
     cli::CliCommand,
     error::{ErrorCode, PotError},
     response::Envelope,
 };
+use potter_workflow::Workflow;
 use serde_json::json;
 
 #[derive(Debug, Parser)]
@@ -17,9 +18,18 @@ use serde_json::json;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: CliCommand,
+    command: Command,
     #[arg(long, global = true, help = "Print one JSON response envelope.")]
     json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(flatten)]
+    Scene(CliCommand),
+    /// Run an agent workflow.
+    #[command(subcommand, arg_required_else_help = true)]
+    Workflow(Workflow),
 }
 
 fn main() {
@@ -34,7 +44,10 @@ where
     let arguments: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let json_output = arguments.iter().any(|arg| arg == "--json");
     match Cli::try_parse_from(arguments) {
-        Ok(cli) => cli.command.execute().emit(cli.json),
+        Ok(cli) => match cli.command {
+            Command::Scene(command) => command.execute().emit(cli.json),
+            Command::Workflow(workflow) => potter_workflow::run(workflow, cli.json),
+        },
         Err(error)
             if matches!(
                 error.kind(),
