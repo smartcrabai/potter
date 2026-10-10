@@ -63,7 +63,7 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
   "webp",
 ] }
-jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "b6c63ff04ca6786d4d328a086d7f3ac06d6fb578" }
+jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "29d17a9aee1851d90d8a7a061d4535e2d1864994" }
 jsonschema = "=0.58.6"
 lz4_flex = "0.14"
 png = "0.18"
