@@ -68,6 +68,11 @@ Output goes to `-o/--out` (default `<first image stem>-refine`, numbered when ta
 | `crates/potter-core/` | `potter-core` | engine library: scene model, evaluation, rendering, exchange, and the typed command layer |
 | `crates/potter-workflow/` | `potter-workflow` | `pot workflow` agent workflows (jcode) |
 
+## Support
+
+If you find potter useful, consider [sponsoring smartcrabai](https://github.com/sponsors/smartcrabai)
+to support its development and maintenance.
+
 ## License
 
 potter is licensed under the GNU General Public License v3.0 or later ([LICENSE](LICENSE)). Parts of the modifier, constraint, animation, and remesh evaluators are derived from [Blender](https://www.blender.org) (GPL-2.0-or-later) and [OpenVDB](https://www.openvdb.org) (Apache-2.0); affected source files name their upstream origin and copyright holders in their headers.
