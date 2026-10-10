@@ -64,6 +64,11 @@ pub struct Args {
     /// Model ID used for the modeler and each reviewer [default: the jcode default].
     #[arg(long, value_name = "ID")]
     model: Option<String>,
+
+    /// jcode provider that serves --model, e.g. openai, openai-api, claude-oauth, copilot,
+    /// openrouter [default: inferred from the model ID].
+    #[arg(long, value_name = "NAME", requires = "model")]
+    provider: Option<String>,
 }
 
 fn parse_view(view: &str) -> Result<String, String> {
@@ -257,7 +262,12 @@ pub(crate) fn run(args: Args) -> anyhow::Result<crate::Finished> {
     let scene = std::fs::canonicalize(&scene)
         .with_context(|| format!("resolving scene path {}", scene.display()))?;
 
-    let mut agents = JcodeAgents::new(client, reviewer_client, scene.clone(), args.model)?;
+    // jcode routes `<provider>:<model>` to that provider; bare IDs are routed by name.
+    let model = match (args.provider, args.model) {
+        (Some(provider), Some(model)) => Some(format!("{provider}:{model}")),
+        (_, model) => model,
+    };
+    let mut agents = JcodeAgents::new(client, reviewer_client, scene.clone(), model)?;
     let outcome = refine_loop(
         &mut agents,
         &reference_images,
