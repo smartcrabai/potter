@@ -61,14 +61,14 @@ pub struct Args {
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
     stall_limit: u64,
 
-    /// Model ID used for the modeler and each reviewer [default: the jcode default].
-    #[arg(long, value_name = "ID")]
-    model: Option<String>,
-
     /// jcode provider that serves --model, e.g. openai, openai-api, claude-oauth, copilot,
-    /// openrouter [default: inferred from the model ID].
-    #[arg(long, value_name = "NAME", requires = "model")]
-    provider: Option<String>,
+    /// openrouter.
+    #[arg(short = 'p', long, value_name = "NAME")]
+    provider: String,
+
+    /// Model ID used for the modeler and each reviewer.
+    #[arg(short = 'm', long, value_name = "ID")]
+    model: String,
 }
 
 fn parse_view(view: &str) -> Result<String, String> {
@@ -262,11 +262,8 @@ pub(crate) fn run(args: Args) -> anyhow::Result<crate::Finished> {
     let scene = std::fs::canonicalize(&scene)
         .with_context(|| format!("resolving scene path {}", scene.display()))?;
 
-    // jcode routes `<provider>:<model>` to that provider; bare IDs are routed by name.
-    let model = match (args.provider, args.model) {
-        (Some(provider), Some(model)) => Some(format!("{provider}:{model}")),
-        (_, model) => model,
-    };
+    // jcode routes `<provider>:<model>` to that provider.
+    let model = format!("{}:{}", args.provider, args.model);
     let mut agents = JcodeAgents::new(client, reviewer_client, scene.clone(), model)?;
     let outcome = refine_loop(
         &mut agents,
@@ -309,7 +306,7 @@ struct JcodeAgents {
     reviewer: JcodeClient,
     modeler_session: String,
     scene: PathBuf,
-    model: Option<String>,
+    model: String,
 }
 
 impl JcodeAgents {
@@ -317,7 +314,7 @@ impl JcodeAgents {
         modeler: JcodeClient,
         reviewer: JcodeClient,
         scene: PathBuf,
-        model: Option<String>,
+        model: String,
     ) -> anyhow::Result<Self> {
         let modeler_session = create_session(&modeler, &scene, prompts::modeler_system())?;
         let tool_definitions = potter_bridge::tool_definitions()?;
@@ -335,7 +332,7 @@ impl JcodeAgents {
                 },
             )
             .context("configuring modeler tools")?;
-        set_model(&modeler, &modeler_session, model.as_deref())?;
+        set_model(&modeler, &modeler_session, &model)?;
 
         Ok(Self {
             modeler,
@@ -383,7 +380,7 @@ impl Agents for JcodeAgents {
                 },
             )
             .context("disabling tools for reviewer")?;
-        set_model(&self.reviewer, &reviewer_session, self.model.as_deref())?;
+        set_model(&self.reviewer, &reviewer_session, &self.model)?;
 
         Ok(self
             .reviewer
@@ -689,12 +686,10 @@ fn create_session(
     Ok(session.session_id)
 }
 
-fn set_model(client: &JcodeClient, session_id: &str, model: Option<&str>) -> anyhow::Result<()> {
-    if let Some(model) = model {
-        client
-            .set_model(session_id, model)
-            .with_context(|| format!("setting session model to {model}"))?;
-    }
+fn set_model(client: &JcodeClient, session_id: &str, model: &str) -> anyhow::Result<()> {
+    client
+        .set_model(session_id, model)
+        .with_context(|| format!("setting session model to {model}"))?;
     Ok(())
 }
 
