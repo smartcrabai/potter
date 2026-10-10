@@ -29,6 +29,23 @@ fn refine_requires_an_image() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn refine_provider_requires_a_model() -> Result<(), Box<dyn Error>> {
+    let output = pot()
+        .args([
+            "workflow",
+            "refine",
+            "-i",
+            "front.png",
+            "--provider",
+            "openai",
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr)?.contains("--model"));
+    Ok(())
+}
+
+#[test]
 fn refine_checks_every_image_before_creating_output() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let first = directory.path().join("front.png");

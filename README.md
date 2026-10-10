@@ -58,6 +58,8 @@ A modeler agent builds a model from the reference images (`-i/--image`, repeatab
 
 Output goes to `-o/--out` (default `<first image stem>-refine`, numbered when taken): the potter project in `<out>/scene` and each iteration's renders, `review.json`, and `fix-report.json` in `<out>/iter-NN/`. stdout is one JSON line with `status`, `iterations`, and `remaining_findings`; with `--json` it is a `pot` response envelope carrying that summary as `result`, and errors become `INTERNAL_ERROR` envelopes.
 
+Every agent uses jcode's default model unless `--model <ID>` is given. `--provider <NAME>` (requires `--model`) picks the jcode provider that serves that model, e.g. `--provider openai --model gpt-5.5`; without it jcode infers the provider from the model ID.
+
 ## Repository layout
 
 | Path | Package | Role |
