@@ -1,7 +1,7 @@
 use std::{error::Error, fs, path::Path, process::Command};
 
 use glam::{DMat4, DVec3};
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     model::{Id, SceneDoc},
 };
@@ -245,7 +245,10 @@ fn mesh_center(snapshot: &Snapshot, node_id: &str) -> TestResult<DVec3> {
     Ok(total / mesh.vertices.len() as f64)
 }
 
-fn mesh_data<'a>(doc: &'a SceneDoc, node_id: &str) -> TestResult<&'a potter::model::DataBlock> {
+fn mesh_data<'a>(
+    doc: &'a SceneDoc,
+    node_id: &str,
+) -> TestResult<&'a potter_core::model::DataBlock> {
     let id = Id::new(node_id.to_owned())?;
     let node = doc.nodes.get(&id).ok_or("mesh node missing")?;
     let data_id = node.data.as_ref().ok_or("mesh data reference missing")?;

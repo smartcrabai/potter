@@ -2,7 +2,7 @@
 
 use std::{fs, io::Cursor};
 
-use potter::{
+use potter_core::{
     eval::EvaluationContext,
     mask::{ControlPoint, Mask, MaskSpline},
     media::{AudioBuffer, decode_wav, encode_wav},
@@ -76,7 +76,7 @@ fn effect_strip_operations_preserve_inputs_and_reject_missing_inputs() {
         .sequencer
         .strips;
     let blend = strips.iter().find(|strip| strip.id == "blend").unwrap();
-    assert_eq!(blend.effect, Some(potter::sequencer::EffectType::Add));
+    assert_eq!(blend.effect, Some(potter_core::sequencer::EffectType::Add));
     assert_eq!(blend.inputs, vec!["left".to_owned(), "right".to_owned()]);
 
     let invalid = json!({
@@ -88,7 +88,7 @@ fn effect_strip_operations_preserve_inputs_and_reject_missing_inputs() {
         }]
     });
     let error = apply_batch(&document, &invalid).unwrap_err();
-    assert_eq!(error.code, potter::error::ErrorCode::InvalidOperation);
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidOperation);
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn sequencer_strip_update_rejects_input_dependency_cycles() {
         }]
     });
     let error = apply_batch(&document, &update).unwrap_err();
-    assert_eq!(error.code, potter::error::ErrorCode::InvalidOperation);
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidOperation);
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn strip_operations_reject_nonmonotonic_modifier_curves() {
         }]
     });
     let error = apply_batch(&document, &batch).unwrap_err();
-    assert_eq!(error.code, potter::error::ErrorCode::InvalidOperation);
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidOperation);
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn strip_delete_rejects_strips_with_live_effect_dependents() {
         "operations": [{"op": "sequencer.strip_delete", "id": "source"}]
     });
     let error = apply_batch(&document, &delete).unwrap_err();
-    assert_eq!(error.code, potter::error::ErrorCode::InvalidOperation);
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidOperation);
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn mask_operation_stores_a_rasterizable_spline() {
     let mask = outcome
         .doc
         .masks
-        .get(&potter::model::Id::new("subject".to_owned()).unwrap())
+        .get(&potter_core::model::Id::new("subject".to_owned()).unwrap())
         .unwrap()
         .clone();
     let image = mask.rasterize(10, 10, 1.0).unwrap();
@@ -240,11 +240,11 @@ fn audio_mix_follows_source_frame_retiming_keys() {
         samples: source_samples,
     };
     let keys = [
-        potter::sequencer::RetimingKey {
+        potter_core::sequencer::RetimingKey {
             frame: 0.0,
             source_frame: 1.0,
         },
-        potter::sequencer::RetimingKey {
+        potter_core::sequencer::RetimingKey {
             frame: 1.0,
             source_frame: 2.0,
         },
@@ -296,11 +296,11 @@ fn strip_frame_bounds_and_retiming_map_timeline_to_source_frames() {
         frame_start: 10.0,
         length: 8.0,
         retiming_keys: vec![
-            potter::sequencer::RetimingKey {
+            potter_core::sequencer::RetimingKey {
                 frame: 10.0,
                 source_frame: 5.0,
             },
-            potter::sequencer::RetimingKey {
+            potter_core::sequencer::RetimingKey {
                 frame: 14.0,
                 source_frame: 13.0,
             },

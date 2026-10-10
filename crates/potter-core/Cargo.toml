@@ -1,0 +1,30 @@
+[package]
+description = "potter's engine: scene model, Blender-compatible evaluation, rendering, exchange, and the typed command layer behind `pot`"
+edition.workspace = true
+license.workspace = true
+name = "potter-core"
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+clap.workspace = true
+exr.workspace = true
+flate2.workspace = true
+glam.workspace = true
+hex.workspace = true
+image.workspace = true
+lz4_flex.workspace = true
+png.workspace = true
+robust.workspace = true
+ruzstd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

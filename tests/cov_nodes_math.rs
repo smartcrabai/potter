@@ -9,7 +9,7 @@ mod blender_file;
 
 use std::process::Command;
 
-use potter::{
+use potter_core::{
     error::ErrorCode,
     graph::{self, GraphKind, GraphLink, GraphNode, NodeGroup},
     model::{Id, Material, Registry},
@@ -705,7 +705,7 @@ fn link(group: &mut NodeGroup, from: &str, from_socket: &str, to: &str, to_socke
     });
 }
 
-fn evaluate_geometry_case(case: &NodeCase) -> potter::error::Result<Value> {
+fn evaluate_geometry_case(case: &NodeCase) -> potter_core::error::Result<Value> {
     let mut group = NodeGroup::new("Math parity", GraphKind::Geometry);
     let is_math = case.kind == "math";
     add_node(
@@ -748,7 +748,7 @@ fn evaluate_geometry_case(case: &NodeCase) -> potter::error::Result<Value> {
     Ok(evaluation.mesh.attributes[&case.id]["data"][0].clone())
 }
 
-fn evaluate_shader_case(case: &NodeCase) -> potter::error::Result<Value> {
+fn evaluate_shader_case(case: &NodeCase) -> potter_core::error::Result<Value> {
     let mut group = NodeGroup::new("Shader math parity", GraphKind::Shader);
     let node_type = if case.kind == "math" {
         "ShaderNodeMath"
@@ -928,7 +928,7 @@ fn compare_cases(
     cases: &[NodeCase],
     expected: &Map<String, Value>,
     prefix: &str,
-    evaluate: impl Fn(&NodeCase) -> potter::error::Result<Value>,
+    evaluate: impl Fn(&NodeCase) -> potter_core::error::Result<Value>,
     include: impl Fn(&NodeCase) -> bool,
 ) {
     let mut mismatches = Vec::new();
@@ -1034,7 +1034,7 @@ fn shader_surface_with_node(
     properties: Value,
     output: &str,
     target: &str,
-) -> potter::error::Result<potter::shader::BsdfParams> {
+) -> potter_core::error::Result<potter_core::shader::BsdfParams> {
     let mut group = NodeGroup::new("Shader node", GraphKind::Shader);
     add_node(&mut group, "node", node_type, inputs, properties);
     add_node(

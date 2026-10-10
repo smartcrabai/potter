@@ -596,7 +596,7 @@ fn assert_flat_float_arrays(actual: &[Value], expected: &[Value], context: &str,
     }
 }
 
-fn modifier_attribute(mesh: &potter::geom::Mesh, group: &str) -> Vec<Value> {
+fn modifier_attribute(mesh: &potter_core::geom::Mesh, group: &str) -> Vec<Value> {
     let values = mesh
         .attributes
         .get("vertex_groups")
@@ -614,7 +614,7 @@ fn modifier_attribute(mesh: &potter::geom::Mesh, group: &str) -> Vec<Value> {
         .collect()
 }
 
-fn modifier_uvs(mesh: &potter::geom::Mesh, layer: &str) -> Vec<Value> {
+fn modifier_uvs(mesh: &potter_core::geom::Mesh, layer: &str) -> Vec<Value> {
     let entries = mesh.attributes.get("uv_map").and_then(Value::as_array);
     let mut result = Vec::new();
     for face in &mesh.faces {
@@ -633,7 +633,7 @@ fn modifier_uvs(mesh: &potter::geom::Mesh, layer: &str) -> Vec<Value> {
     result
 }
 
-fn modifier_normals(mesh: &potter::geom::Mesh) -> Vec<Value> {
+fn modifier_normals(mesh: &potter_core::geom::Mesh) -> Vec<Value> {
     let Some(values) = mesh
         .attributes
         .get("custom_normal")
@@ -655,7 +655,7 @@ fn modifier_normals(mesh: &potter::geom::Mesh) -> Vec<Value> {
 fn blender_quantize_loop_normals(
     blender: &Path,
     root: &Path,
-    mesh: &potter::geom::Mesh,
+    mesh: &potter_core::geom::Mesh,
     normals: &[Value],
 ) -> Result<Vec<Value>, Box<dyn Error>> {
     let vertex_indices = mesh
@@ -738,8 +738,8 @@ fn blender_quantize_loop_normals(
 fn assert_attribute_case(
     blender: &Path,
     root: &Path,
-    scene: &potter::model::SceneDoc,
-    snapshot: &potter::eval::Snapshot,
+    scene: &potter_core::model::SceneDoc,
+    snapshot: &potter_core::eval::Snapshot,
     mappings: &serde_json::Map<String, Value>,
     expected: &Value,
     name: &str,
@@ -747,7 +747,7 @@ fn assert_attribute_case(
     let owner_id = mappings[&format!("Object:{name}")]
         .as_str()
         .ok_or("object mapping did not contain a string ID")?;
-    let owner_key = potter::model::Id::new(owner_id.to_owned())?;
+    let owner_key = potter_core::model::Id::new(owner_id.to_owned())?;
     let node = &scene.nodes[&owner_key];
     let modifier = node
         .modifiers
@@ -941,10 +941,12 @@ fn blender_attribute_deformation_modifiers_round_trip_attributes_and_settings()
         "attribute modifier fixture import reported losses: {losses:?}"
     );
     let mappings = imported["result"]["id_mappings"].as_object().unwrap();
-    let scene: potter::model::SceneDoc =
+    let scene: potter_core::model::SceneDoc =
         serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    let snapshot =
-        potter::eval::Snapshot::evaluate(&scene, &potter::eval::EvaluationContext::default())?;
+    let snapshot = potter_core::eval::Snapshot::evaluate(
+        &scene,
+        &potter_core::eval::EvaluationContext::default(),
+    )?;
     for name in [
         "OwnerWeightEdit",
         "OwnerWeightMix",
@@ -1188,7 +1190,7 @@ fn remesh_polygons(value: &Value) -> Vec<Vec<usize>> {
         .collect()
 }
 
-fn assert_remesh_geometry(mesh: &potter::geom::Mesh, expected: &Value, mode: &str) {
+fn assert_remesh_geometry(mesh: &potter_core::geom::Mesh, expected: &Value, mode: &str) {
     let expected_positions = as_points(expected["positions"].as_array().unwrap());
     let expected_polygons = remesh_polygons(&expected["polygons"]);
     assert_eq!(
@@ -1337,12 +1339,12 @@ fn blender_dual_contour_remesh_modes_and_ocean_round_trip_depsgraph_geometry()
         imported["result"]["losses"]
     );
     let mappings = imported["result"]["id_mappings"].as_object().unwrap();
-    let scene: potter::model::SceneDoc =
+    let scene: potter_core::model::SceneDoc =
         serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     let evaluation_scene = scene.clone();
     for mode in ["VOXEL", "BLOCKS", "SMOOTH", "SHARP"] {
         let name = format!("OwnerRemesh{mode}");
-        let id = potter::model::Id::new(
+        let id = potter_core::model::Id::new(
             mappings[&format!("Object:{name}")]
                 .as_str()
                 .unwrap()
@@ -1355,13 +1357,13 @@ fn blender_dual_contour_remesh_modes_and_ocean_round_trip_depsgraph_geometry()
         );
         assert_eq!(modifier.params["mode"], json!(mode), "{name}: remesh mode");
     }
-    let snapshot = potter::eval::Snapshot::evaluate(
+    let snapshot = potter_core::eval::Snapshot::evaluate(
         &evaluation_scene,
-        &potter::eval::EvaluationContext::default(),
+        &potter_core::eval::EvaluationContext::default(),
     )?;
     for mode in ["VOXEL", "BLOCKS", "SMOOTH", "SHARP"] {
         let name = format!("OwnerRemesh{mode}");
-        let id = potter::model::Id::new(
+        let id = potter_core::model::Id::new(
             mappings[&format!("Object:{name}")]
                 .as_str()
                 .unwrap()
@@ -1374,7 +1376,7 @@ fn blender_dual_contour_remesh_modes_and_ocean_round_trip_depsgraph_geometry()
         assert_remesh_geometry(mesh, &before[&format!("Remesh{mode}")], mode);
     }
     let ocean_id =
-        potter::model::Id::new(mappings["Object:OwnerOcean"].as_str().unwrap().to_owned())?;
+        potter_core::model::Id::new(mappings["Object:OwnerOcean"].as_str().unwrap().to_owned())?;
     let ocean_modifier = scene.nodes[&ocean_id].modifiers.first().unwrap();
     assert_eq!(ocean_modifier.modifier_type, "ocean");
     assert_eq!(ocean_modifier.params["geometry_mode"], json!("GENERATE"));
@@ -1609,13 +1611,13 @@ with open(path,'w',encoding='utf-8') as output:
 ";
 
 fn move_shape_key_basis(
-    scene: &mut potter::model::SceneDoc,
+    scene: &mut potter_core::model::SceneDoc,
     mappings: &serde_json::Map<String, Value>,
     object_name: &str,
     vertex_index: u32,
     offset: [f64; 3],
 ) -> Result<(), Box<dyn Error>> {
-    let object_id = potter::model::Id::new(
+    let object_id = potter_core::model::Id::new(
         mappings[&format!("Object:{object_name}")]
             .as_str()
             .ok_or("object mapping did not contain a string ID")?
@@ -1656,9 +1658,9 @@ fn move_shape_key_basis(
 }
 
 fn moved_bound_scene(
-    scene: &potter::model::SceneDoc,
+    scene: &potter_core::model::SceneDoc,
     mappings: &serde_json::Map<String, Value>,
-) -> Result<potter::model::SceneDoc, Box<dyn Error>> {
+) -> Result<potter_core::model::SceneDoc, Box<dyn Error>> {
     let mut moved = scene.clone();
     move_shape_key_basis(&mut moved, mappings, "SurfaceTarget", 2, [0.0, 0.0, 0.45])?;
     move_shape_key_basis(&mut moved, mappings, "SurfaceTarget", 2, [0.12, 0.0, 0.45])?;
@@ -1724,9 +1726,11 @@ fn blender_native_bound_deform_payloads_follow_deformed_bind_targets_and_anchors
         !String::from_utf8_lossy(&scene_bytes).contains("<bpy_"),
         "bound-deform imported project contains an unnormalized Blender RNA repr",
     );
-    let scene: potter::model::SceneDoc = serde_json::from_slice(&scene_bytes)?;
-    let baseline =
-        potter::eval::Snapshot::evaluate(&scene, &potter::eval::EvaluationContext::default())?;
+    let scene: potter_core::model::SceneDoc = serde_json::from_slice(&scene_bytes)?;
+    let baseline = potter_core::eval::Snapshot::evaluate(
+        &scene,
+        &potter_core::eval::EvaluationContext::default(),
+    )?;
     for (name, target_name, expected_type) in [
         ("OwnerSurfaceDeform", "SurfaceTarget", "surface_deform"),
         ("OwnerMeshDeform", "MeshTarget", "mesh_deform"),
@@ -1736,7 +1740,7 @@ fn blender_native_bound_deform_payloads_follow_deformed_bind_targets_and_anchors
             "laplacian_deform",
         ),
     ] {
-        let owner_id = potter::model::Id::new(
+        let owner_id = potter_core::model::Id::new(
             mappings[&format!("Object:{name}")]
                 .as_str()
                 .unwrap()
@@ -1822,14 +1826,16 @@ fn blender_native_bound_deform_payloads_follow_deformed_bind_targets_and_anchors
         1.0e-3,
     );
     let moved = moved_bound_scene(&scene, mappings)?;
-    let moved_snapshot =
-        potter::eval::Snapshot::evaluate(&moved, &potter::eval::EvaluationContext::default())?;
+    let moved_snapshot = potter_core::eval::Snapshot::evaluate(
+        &moved,
+        &potter_core::eval::EvaluationContext::default(),
+    )?;
     for name in [
         "OwnerSurfaceDeform",
         "OwnerMeshDeform",
         "OwnerLaplacianDeform",
     ] {
-        let id = potter::model::Id::new(
+        let id = potter_core::model::Id::new(
             mappings[&format!("Object:{name}")]
                 .as_str()
                 .unwrap()
@@ -2140,13 +2146,13 @@ fn blender_mesh_cache_pc2_mdd_and_alembic_sequence_round_trip_resources()
         !String::from_utf8_lossy(&scene_bytes).contains("<bpy_"),
         "cache imported project contains an unnormalized Blender RNA repr",
     );
-    let scene: potter::model::SceneDoc =
+    let scene: potter_core::model::SceneDoc =
         serde_json::from_slice(&scene_bytes).map_err(|error| -> Box<dyn Error> {
             format!("imported cache scene.json malformed: {error}").into()
         })?;
-    let snapshot = potter::eval::Snapshot::evaluate_with_cache(
+    let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
         &scene,
-        &potter::eval::EvaluationContext {
+        &potter_core::eval::EvaluationContext {
             frame: Some(2.0),
             ..Default::default()
         },
@@ -2157,7 +2163,7 @@ fn blender_mesh_cache_pc2_mdd_and_alembic_sequence_round_trip_resources()
         ("OwnerMeshCacheMDD", "mesh_cache"),
         ("OwnerMeshSequenceCache", "mesh_sequence_cache"),
     ] {
-        let id = potter::model::Id::new(
+        let id = potter_core::model::Id::new(
             mappings[&format!("Object:{name}")]
                 .as_str()
                 .unwrap()
@@ -2177,7 +2183,7 @@ fn blender_mesh_cache_pc2_mdd_and_alembic_sequence_round_trip_resources()
         assert!(
             scene
                 .resources
-                .contains_key(&potter::model::Id::new(resource_id.to_owned())?),
+                .contains_key(&potter_core::model::Id::new(resource_id.to_owned())?),
             "{name}: registered cache resource missing"
         );
         if expected_type == "mesh_cache" {
@@ -2239,7 +2245,7 @@ fn blender_mesh_cache_pc2_mdd_and_alembic_sequence_round_trip_resources()
         "OwnerMeshCacheMDD",
         "OwnerMeshSequenceCache",
     ] {
-        let id = potter::model::Id::new(
+        let id = potter_core::model::Id::new(
             mappings[&format!("Object:{name}")]
                 .as_str()
                 .unwrap()

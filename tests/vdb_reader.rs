@@ -10,7 +10,7 @@ use std::{
 };
 
 use glam::DVec3;
-use potter::geom::vdb::VdbVolume;
+use potter_core::geom::vdb::VdbVolume;
 use proptest::{prelude::*, test_runner::TestRunner};
 use serde_json::{Value, json};
 use tempfile::tempdir;

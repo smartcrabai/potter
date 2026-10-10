@@ -1,7 +1,7 @@
 use std::{error::Error, fs, io, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, DVec3};
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     model::{Id, ReconstructedPoint, SceneDoc, TrackingMarker},
     ops,
@@ -60,7 +60,7 @@ fn evaluated_matrix(project: &Path, node: &str) -> TestResult<DMat4> {
     let snapshot = Snapshot::evaluate(&document, &EvaluationContext::default())?;
     let matrix = snapshot
         .nodes
-        .get(&potter::model::Id::new(node.to_owned())?)
+        .get(&potter_core::model::Id::new(node.to_owned())?)
         .map(|evaluated| DMat4::from_cols_array(&evaluated.world_matrix))
         .ok_or_else(|| format!("evaluated world matrix for {node} is missing"))?;
     Ok(matrix)
@@ -118,7 +118,7 @@ fn object_reprojection_errors(
             let camera = CameraModel {
                 matrix: solved_camera.matrix,
             };
-            let camera_world = DMat4::from_cols_array(&potter::tracking::camera_world_matrix(
+            let camera_world = DMat4::from_cols_array(&potter_core::tracking::camera_world_matrix(
                 &camera,
                 &clip.tracking.camera,
                 width,
@@ -229,7 +229,7 @@ fn tracking_solve_object_persists_rigid_poses_from_camera_reconstruction() -> Te
                 image: camera.project(*point)?,
             })
         })
-        .collect::<potter::error::Result<Vec<_>>>()?;
+        .collect::<potter_core::error::Result<Vec<_>>>()?;
     let expected = DMat4::from_scale_rotation_translation(
         DVec3::splat(1.0),
         DQuat::from_euler(glam::EulerRot::XYZ, 0.06, -0.1, 0.18),
@@ -348,7 +348,7 @@ fn tracking_solve_object_persists_rigid_poses_from_camera_reconstruction() -> Te
             .find(|camera| camera.frame == frame)
             .ok_or_else(|| io::Error::other("solved camera frame is missing"))?;
         Ok(DMat4::from_cols_array(
-            &potter::tracking::camera_world_matrix(
+            &potter_core::tracking::camera_world_matrix(
                 &CameraModel {
                     matrix: camera.matrix,
                 },
@@ -459,7 +459,7 @@ fn tracking_solve_object_persists_rigid_poses_from_camera_reconstruction() -> Te
         .iter()
         .find(|camera| camera.frame == 2)
         .ok_or_else(|| io::Error::other("frame-2 solved camera is missing"))?;
-    let camera_world = DMat4::from_cols_array(&potter::tracking::camera_world_matrix(
+    let camera_world = DMat4::from_cols_array(&potter_core::tracking::camera_world_matrix(
         &CameraModel {
             matrix: solved_camera.matrix,
         },
@@ -1504,19 +1504,21 @@ with open(os.path.join(root, "tracking_expected.json"), "w", encoding="utf-8") a
             .iter()
             .find(|marker| marker["frame"] == 1)
             .ok_or_else(|| io::Error::other("frame-1 object marker is missing"))?;
-        clip.tracking.tracks.push(potter::model::TrackingTrack {
-            id: id.clone(),
-            name: id,
-            markers: vec![TrackingMarker {
-                frame: 1.0,
-                co: [
-                    first["co"][0].as_f64().ok_or("invalid object marker")? * f64::from(width),
-                    (1.0 - first["co"][1].as_f64().ok_or("invalid object marker")?)
-                        * f64::from(height),
-                ],
-                ..TrackingMarker::default()
-            }],
-        });
+        clip.tracking
+            .tracks
+            .push(potter_core::model::TrackingTrack {
+                id: id.clone(),
+                name: id,
+                markers: vec![TrackingMarker {
+                    frame: 1.0,
+                    co: [
+                        first["co"][0].as_f64().ok_or("invalid object marker")? * f64::from(width),
+                        (1.0 - first["co"][1].as_f64().ok_or("invalid object marker")?)
+                            * f64::from(height),
+                    ],
+                    ..TrackingMarker::default()
+                }],
+            });
     }
     for (id, camera_track) in camera_track_ids.iter().zip(
         expected["camera_tracks"]
@@ -2173,7 +2175,10 @@ fn transform_cache_usd_reports_its_unsupported_feature_id() -> TestResult {
     let error = Snapshot::evaluate(&document, &EvaluationContext::default())
         .err()
         .ok_or_else(|| io::Error::other("USD Transform Cache evaluation unexpectedly succeeded"))?;
-    assert_eq!(error.code, potter::error::ErrorCode::UnsupportedFeature);
+    assert_eq!(
+        error.code,
+        potter_core::error::ErrorCode::UnsupportedFeature
+    );
     assert_eq!(
         error.details.get("feature_id").and_then(Value::as_str),
         Some("constraint.transform_cache.usd")

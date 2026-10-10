@@ -9,7 +9,7 @@ use std::{
 mod blender_file;
 use blender_file::blender_executable;
 
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     model::{Id, SceneDoc},
 };

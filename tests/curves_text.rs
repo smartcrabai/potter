@@ -1,7 +1,7 @@
 #![expect(clippy::unwrap_used, reason = "integration tests")]
 #![expect(clippy::float_cmp, reason = "geometry assertions use analytic values")]
 
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{curve::evaluate_hair_curves, text::evaluate_text},
     model::{DataBlock, HairCurve, HairCurvesData, Id, Node, SceneDoc, TextObjectData},
@@ -294,7 +294,10 @@ fn unsupported_curve_taper_reports_feature_id() {
         }),
     )
     .unwrap_err();
-    assert_eq!(error.code, potter::error::ErrorCode::UnsupportedFeature);
+    assert_eq!(
+        error.code,
+        potter_core::error::ErrorCode::UnsupportedFeature
+    );
     assert_eq!(error.details["feature_id"], "curve.taper_object");
 }
 #[test]
@@ -323,7 +326,10 @@ fn unsupported_multiple_fill_contours_report_feature_id() {
         }),
     )
     .unwrap_err();
-    assert_eq!(error.code, potter::error::ErrorCode::UnsupportedFeature);
+    assert_eq!(
+        error.code,
+        potter_core::error::ErrorCode::UnsupportedFeature
+    );
     assert_eq!(error.details["feature_id"], "curve.fill.multiple_contours");
 }
 

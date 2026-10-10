@@ -4,7 +4,7 @@
     reason = "asserting exact deterministic geometry values"
 )]
 
-use potter::{
+use potter_core::{
     error::ErrorCode,
     eval::{EvaluationContext, Snapshot},
     geom::primitive,
@@ -56,7 +56,7 @@ fn evaluate(doc: &SceneDoc) -> GraphEvaluation {
     .unwrap()
 }
 
-fn evaluate_primitive_node(node_type: &str, inputs: Value) -> potter::geom::Mesh {
+fn evaluate_primitive_node(node_type: &str, inputs: Value) -> potter_core::geom::Mesh {
     let mut primitive = json!({"id": "primitive", "type": node_type});
     primitive["inputs"] = inputs;
     let doc = graph_with_nodes(

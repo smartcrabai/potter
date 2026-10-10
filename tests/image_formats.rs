@@ -65,10 +65,13 @@ fn save_png(path: &Path, pixel: [u8; 3]) -> Result<(), Box<dyn Error>> {
 
 fn image_pixel(scene: &Path, id: &str) -> Result<[f64; 4], Box<dyn Error>> {
     let scene_doc: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let image: potter::model::Image = serde_json::from_value(scene_doc["images"][id].clone())?;
-    let data =
-        potter::image::load_image_data(&image, scene, potter::image::ImageInterpolation::Closest)?;
-    Ok(potter::image::sample(&data, [0.5, 0.5], 0))
+    let image: potter_core::model::Image = serde_json::from_value(scene_doc["images"][id].clone())?;
+    let data = potter_core::image::load_image_data(
+        &image,
+        scene,
+        potter_core::image::ImageInterpolation::Closest,
+    )?;
+    Ok(potter_core::image::sample(&data, [0.5, 0.5], 0))
 }
 fn assert_pixel(
     scene: &Path,
@@ -635,7 +638,7 @@ proptest! {
         }
         prop_assume!(cut < bytes.len());
         let result = std::panic::catch_unwind(|| {
-            potter::image::decode_pixels(&bytes[..cut], potter::model::ImageColorspace::Srgb)
+            potter_core::image::decode_pixels(&bytes[..cut], potter_core::model::ImageColorspace::Srgb)
         });
         let decoded = result.expect("decoder did not panic");
         let Err(error) = decoded else {

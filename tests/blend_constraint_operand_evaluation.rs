@@ -1,7 +1,7 @@
 use std::{error::Error, fs, path::Path};
 
 use glam::DVec3;
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::Mesh,
     model::{Id, SceneDoc},
@@ -158,7 +158,10 @@ fn run_blender(blender: &Path, root: &Path) -> TestResult {
     )
 }
 
-fn node_named<'a>(doc: &'a SceneDoc, name: &str) -> TestResult<(&'a Id, &'a potter::model::Node)> {
+fn node_named<'a>(
+    doc: &'a SceneDoc,
+    name: &str,
+) -> TestResult<(&'a Id, &'a potter_core::model::Node)> {
     doc.nodes
         .iter()
         .find(|(_, node)| node.name == name)

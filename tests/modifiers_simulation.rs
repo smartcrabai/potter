@@ -148,7 +148,9 @@ fn physics_operations_create_stack_entries_linked_to_their_settings() -> Result<
     Ok(())
 }
 
-fn injected_particles(states: &Value) -> Result<Vec<potter::sim::ParticleState>, Box<dyn Error>> {
+fn injected_particles(
+    states: &Value,
+) -> Result<Vec<potter_core::sim::ParticleState>, Box<dyn Error>> {
     let states = states
         .as_array()
         .ok_or("Blender particle states are missing")?;
@@ -174,12 +176,12 @@ fn injected_particles(states: &Value) -> Result<Vec<potter::sim::ParticleState>,
                 .as_str()
                 .ok_or("Blender particle life state is missing")?
             {
-                "ALIVE" => potter::sim::ParticleLifeState::Alive,
-                "DEAD" => potter::sim::ParticleLifeState::Dead,
-                "UNBORN" => potter::sim::ParticleLifeState::Unborn,
+                "ALIVE" => potter_core::sim::ParticleLifeState::Alive,
+                "DEAD" => potter_core::sim::ParticleLifeState::Dead,
+                "UNBORN" => potter_core::sim::ParticleLifeState::Unborn,
                 state => return Err(format!("unknown Blender particle state `{state}`").into()),
             };
-            Ok(potter::sim::ParticleState {
+            Ok(potter_core::sim::ParticleState {
                 position,
                 birth_position,
                 normal,
@@ -190,7 +192,7 @@ fn injected_particles(states: &Value) -> Result<Vec<potter::sim::ParticleState>,
                 death_frame,
                 life_state,
                 size,
-                ..potter::sim::ParticleState::default()
+                ..potter_core::sim::ParticleState::default()
             })
         })
         .collect()
@@ -608,7 +610,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let explode_particles = injected_particles(&blender["explode_particle_states"])?;
     assert_eq!(instance_particles.len(), 1);
     assert_eq!(explode_particles.len(), 2);
-    let instance_source = potter::geom::Mesh::from_positions_and_faces(
+    let instance_source = potter_core::geom::Mesh::from_positions_and_faces(
         vec![
             DVec3::new(-0.7, -0.3, 0.1),
             DVec3::new(1.1, -0.2, 0.0),
@@ -623,7 +625,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let instance_columns: [f64; 16] =
         serde_json::from_value(blender["instance_world_matrix"].clone())?;
     let instance_world = DMat4::from_cols_array(&instance_columns);
-    let direct_instance = potter::geom::modifiers::simulation::particle_instance(
+    let direct_instance = potter_core::geom::modifiers::simulation::particle_instance(
         &instance_source,
         &instance_particles,
         emitter_world,
@@ -656,7 +658,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         instance_error <= MODIFIER_POSITION_TOLERANCE,
         "particle instance per-vertex error {instance_error} exceeds {MODIFIER_POSITION_TOLERANCE}; Potter={direct_instance_points:?}; Blender={blender_instance_points:?}; particles={instance_particles:?}",
     );
-    let direct_local_instance = potter::geom::modifiers::simulation::particle_instance(
+    let direct_local_instance = potter_core::geom::modifiers::simulation::particle_instance(
         &instance_source,
         &instance_particles,
         emitter_world,
@@ -683,7 +685,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         local_error <= MODIFIER_POSITION_TOLERANCE,
         "LOCAL particle instance per-vertex error {local_error} exceeds {MODIFIER_POSITION_TOLERANCE}; Potter={direct_local_points:?}; Blender={blender_local_points:?}; particle={instance_particles:?}",
     );
-    let direct_child_instance = potter::geom::modifiers::simulation::particle_instance(
+    let direct_child_instance = potter_core::geom::modifiers::simulation::particle_instance(
         &instance_source,
         &instance_and_children,
         emitter_world,
@@ -720,7 +722,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         ("dead_particle_states", "dead_instance_points", true, false),
     ] {
         let lifecycle_particles = injected_particles(&blender[states_key])?;
-        let lifecycle_instance = potter::geom::modifiers::simulation::particle_instance(
+        let lifecycle_instance = potter_core::geom::modifiers::simulation::particle_instance(
             &instance_source,
             &lifecycle_particles,
             emitter_world,
@@ -755,7 +757,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
             "{states_key} per-vertex instance error {lifecycle_error} exceeds {MODIFIER_POSITION_TOLERANCE}; Potter={lifecycle_points:?}, Blender={blender_lifecycle_points:?}, states={lifecycle_particles:?}",
         );
     }
-    let Err(path_error) = potter::geom::modifiers::simulation::particle_instance(
+    let Err(path_error) = potter_core::geom::modifiers::simulation::particle_instance(
         &instance_source,
         &instance_particles,
         emitter_world,
@@ -768,13 +770,13 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     };
     assert_eq!(
         path_error.code,
-        potter::error::ErrorCode::UnsupportedFeature
+        potter_core::error::ErrorCode::UnsupportedFeature
     );
     assert_eq!(
         path_error.details["feature_id"],
         "modifier.particle_instance.use_path"
     );
-    let catalog = potter::catalog::feature_catalog();
+    let catalog = potter_core::catalog::feature_catalog();
     let path_feature = catalog["features"]
         .as_array()
         .and_then(|features| {
@@ -809,7 +811,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let exploder_columns: [f64; 16] =
         serde_json::from_value(blender["exploder_world_matrix"].clone())?;
     let exploder_world = DMat4::from_cols_array(&exploder_columns);
-    let direct_explode = potter::geom::modifiers::simulation::explode(
+    let direct_explode = potter_core::geom::modifiers::simulation::explode(
         &explode_source,
         &explode_particles,
         exploder_world,
@@ -848,7 +850,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let cube_columns: [f64; 16] =
         serde_json::from_value(blender["cube_exploder_world_matrix"].clone())?;
     let cube_world = DMat4::from_cols_array(&cube_columns);
-    let cube_source = potter::geom::Mesh::from_positions_and_faces(
+    let cube_source = potter_core::geom::Mesh::from_positions_and_faces(
         vec![
             DVec3::new(-1.0, -1.0, -1.0),
             DVec3::new(1.0, -1.0, -1.0),
@@ -946,7 +948,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         cube_masks, blender_cube_masks,
         "face split masks must match Blender's particle-owner classification",
     );
-    let cube_explode = potter::geom::modifiers::simulation::explode(
+    let cube_explode = potter_core::geom::modifiers::simulation::explode(
         &cube_source,
         &cube_particles,
         cube_world,
@@ -1109,7 +1111,7 @@ with open(os.path.join(root, 'particle_emission.json'), 'w', encoding='utf-8') a
         "particle emission fixture",
     )?;
     let blender_frames: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
-    let mesh = potter::geom::Mesh::from_positions_and_faces(
+    let mesh = potter_core::geom::Mesh::from_positions_and_faces(
         vec![
             DVec3::new(-5.0, -2.0, 0.0),
             DVec3::new(-1.0, -2.0, 0.0),
@@ -1145,7 +1147,7 @@ with open(os.path.join(root, 'particle_emission.json'), 'w', encoding='utf-8') a
         let blender_frame = &blender_frames[frame_number.to_string()];
         let blender_positions = blender_points(&blender_frame["positions"])?;
         let blender_velocities = blender_points(&blender_frame["velocities"])?;
-        let potter_particles = potter::sim::particles::simulate(
+        let potter_particles = potter_core::sim::particles::simulate(
             &mesh,
             &settings,
             emitter_world,
@@ -1256,7 +1258,7 @@ with open(os.path.join(root, 'particle_emission.json'), 'w', encoding='utf-8') a
     Ok(())
 }
 
-fn mean_z(mesh: &potter::geom::Mesh) -> Result<f64, Box<dyn Error>> {
+fn mean_z(mesh: &potter_core::geom::Mesh) -> Result<f64, Box<dyn Error>> {
     let vertex_count = u32::try_from(mesh.vertices.len())?;
     if vertex_count == 0 {
         return Err("cloth mesh has no vertices".into());
@@ -1419,7 +1421,7 @@ fn subdivision_surface_matches_blender_for_cube_plane_and_creased_open_grid()
         eprintln!("skipping subdivision Blender parity; Blender is unavailable");
         return Ok(());
     };
-    let plane = potter::geom::Mesh::from_positions_and_faces(
+    let plane = potter_core::geom::Mesh::from_positions_and_faces(
         vec![
             DVec3::new(-1.5, -0.75, 0.0),
             DVec3::new(1.5, -0.75, 0.0),
@@ -1428,7 +1430,7 @@ fn subdivision_surface_matches_blender_for_cube_plane_and_creased_open_grid()
         ],
         vec![vec![0, 1, 2, 3]],
     )?;
-    let cube = potter::geom::Mesh::from_positions_and_faces(
+    let cube = potter_core::geom::Mesh::from_positions_and_faces(
         vec![
             DVec3::new(-1.0, -1.5, -0.7),
             DVec3::new(1.0, -1.5, -0.7),
@@ -1448,7 +1450,7 @@ fn subdivision_surface_matches_blender_for_cube_plane_and_creased_open_grid()
             vec![3, 0, 4, 7],
         ],
     )?;
-    let mut open_grid = potter::geom::Mesh::grid(potter::geom::GridParams {
+    let mut open_grid = potter_core::geom::Mesh::grid(potter_core::geom::GridParams {
         size_x: 2.0,
         size_y: 1.5,
         x_subdivisions: 3,
@@ -1662,17 +1664,17 @@ with open(os.path.join(root, 'subdivision_expected.json'), 'w', encoding='utf-8'
     let expected: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
     for (name, mesh, use_render_levels, params) in cases {
         let params: Map<String, Value> = serde_json::from_value(params)?;
-        let mut modifier = potter::model::Modifier {
-            id: potter::model::Id::new("subdivision".to_owned())?,
+        let mut modifier = potter_core::model::Modifier {
+            id: potter_core::model::Id::new("subdivision".to_owned())?,
             modifier_type: "subdivision".to_owned(),
             name: "Subdivision".to_owned(),
             enabled: true,
             params,
             binding_data: None,
-            runtime: potter::model::ModifierRuntime::default(),
+            runtime: potter_core::model::ModifierRuntime::default(),
         };
         modifier.runtime.use_render_levels = use_render_levels;
-        let evaluated = potter::geom::modifiers::evaluate_modifiers(&mesh, &[modifier])?;
+        let evaluated = potter_core::geom::modifiers::evaluate_modifiers(&mesh, &[modifier])?;
         let blender_positions = blender_points(&expected[name]["points"])?;
         assert_eq!(
             evaluated.vertices.len(),
@@ -1829,13 +1831,13 @@ with open(os.path.join(root, 'cloth_stack.json'), 'w', encoding='utf-8') as outp
         ]),
         0,
     )?;
-    let document: potter::model::SceneDoc =
+    let document: potter_core::model::SceneDoc =
         serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let snapshot = potter::eval::Snapshot::evaluate(
+    let snapshot = potter_core::eval::Snapshot::evaluate(
         &document,
-        &potter::eval::EvaluationContext {
+        &potter_core::eval::EvaluationContext {
             frame: Some(1.0),
-            ..potter::eval::EvaluationContext::default()
+            ..potter_core::eval::EvaluationContext::default()
         },
     )?;
     for (potter_id, blender_key) in [
@@ -1844,7 +1846,7 @@ with open(os.path.join(root, 'cloth_stack.json'), 'w', encoding='utf-8') as outp
     ] {
         let mesh = snapshot
             .meshes
-            .get(&potter::model::Id::new(potter_id.to_owned())?)
+            .get(&potter_core::model::Id::new(potter_id.to_owned())?)
             .ok_or("evaluated cloth mesh is missing")?;
         let expected = &blender_values["frame_one"][blender_key];
         assert_eq!(
@@ -1877,11 +1879,11 @@ with open(os.path.join(root, 'cloth_stack.json'), 'w', encoding='utf-8') as outp
             "{potter_id} frame-one centroid: Potter={centroid_z}, Blender={blender_centroid}",
         );
     }
-    let snapshot_nine = potter::eval::Snapshot::evaluate(
+    let snapshot_nine = potter_core::eval::Snapshot::evaluate(
         &document,
-        &potter::eval::EvaluationContext {
+        &potter_core::eval::EvaluationContext {
             frame: Some(9.0),
-            ..potter::eval::EvaluationContext::default()
+            ..potter_core::eval::EvaluationContext::default()
         },
     )?;
     // Blender's implicit cloth solver is not numerically equivalent to Potter's XPBD
@@ -1893,7 +1895,7 @@ with open(os.path.join(root, 'cloth_stack.json'), 'w', encoding='utf-8') as outp
     ] {
         let mesh = snapshot_nine
             .meshes
-            .get(&potter::model::Id::new(potter_id.to_owned())?)
+            .get(&potter_core::model::Id::new(potter_id.to_owned())?)
             .ok_or("frame-nine cloth mesh is missing")?;
         let expected = &blender_values["frame_nine"][blender_key];
         assert_eq!(mesh.vertices.len(), expected["vertex_count"]);
@@ -1947,7 +1949,8 @@ with open(os.path.join(root, 'cloth_stack.json'), 'w', encoding='utf-8') as outp
             "{potter_id} frame-nine Z-bounds error {bounds_error} exceeds {CLOTH_BOUNDS_TOLERANCE}",
         );
         if potter_id == "a_subdivision_first" {
-            let frame_one_mesh = &snapshot.meshes[&potter::model::Id::new(potter_id.to_owned())?];
+            let frame_one_mesh =
+                &snapshot.meshes[&potter_core::model::Id::new(potter_id.to_owned())?];
             let pinned_vertex_error = actual_points[0].distance(frame_one_mesh.vertices[0].co);
             assert!(
                 pinned_vertex_error <= 1.0e-8,
@@ -1963,8 +1966,9 @@ with open(os.path.join(root, 'cloth_stack.json'), 'w', encoding='utf-8') as outp
         blender_order_difference > CLOTH_ORDER_TOLERANCE,
         "Blender fixture must make stack order observable, observed {blender_order_difference}",
     );
-    let first = &snapshot_nine.meshes[&potter::model::Id::new("a_subdivision_first".to_owned())?];
-    let second = &snapshot_nine.meshes[&potter::model::Id::new("b_cloth_first".to_owned())?];
+    let first =
+        &snapshot_nine.meshes[&potter_core::model::Id::new("a_subdivision_first".to_owned())?];
+    let second = &snapshot_nine.meshes[&potter_core::model::Id::new("b_cloth_first".to_owned())?];
     let first_points = first
         .vertices
         .iter()
@@ -1980,7 +1984,7 @@ with open(os.path.join(root, 'cloth_stack.json'), 'w', encoding='utf-8') as outp
         potter_order_difference > CLOTH_ORDER_TOLERANCE,
         "Potter stack order must change evaluated positions, observed {potter_order_difference}",
     );
-    let catalog = potter::catalog::feature_catalog();
+    let catalog = potter_core::catalog::feature_catalog();
     let cloth_parity = catalog["features"]
         .as_array()
         .and_then(|features| {
@@ -2114,16 +2118,16 @@ fn volume_displace_resamples_inline_density_with_object_texture_mapping()
         ]),
         0,
     )?;
-    let document: potter::model::SceneDoc =
+    let document: potter_core::model::SceneDoc =
         serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     let node = document
         .nodes
-        .get(&potter::model::Id::new("density".to_owned())?)
+        .get(&potter_core::model::Id::new("density".to_owned())?)
         .ok_or("volume object is missing")?;
     let data_id = node.data.as_ref().ok_or("volume Data-Block is missing")?;
-    let snapshot = potter::eval::Snapshot::evaluate_with_cache(
+    let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
         &document,
-        &potter::eval::EvaluationContext::default(),
+        &potter_core::eval::EvaluationContext::default(),
         Some(&scene),
     )?;
     let values = snapshot
@@ -2276,18 +2280,20 @@ baseline_evaluated.to_mesh_clear()
         "VDB density fixture generation",
     )?;
     let blender_expected: Value = serde_json::from_slice(&fs::read(&blender_expected_path)?)?;
-    let decoded = potter::geom::vdb::VdbVolume::read(&fs::read(&vdb_path)?)
+    let decoded = potter_core::geom::vdb::VdbVolume::read(&fs::read(&vdb_path)?)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let volume = potter::geom::volume::VolumeData {
-        source: potter::geom::volume::VolumeSource::File(potter::geom::volume::VolumeFileSource {
-            format: "vdb".to_owned(),
-            content_ref: Some("asset://density".to_owned()),
-            grid_names: vec!["density".to_owned()],
-            bounds_min: None,
-            bounds_max: None,
-        }),
+    let volume = potter_core::geom::volume::VolumeData {
+        source: potter_core::geom::volume::VolumeSource::File(
+            potter_core::geom::volume::VolumeFileSource {
+                format: "vdb".to_owned(),
+                content_ref: Some("asset://density".to_owned()),
+                grid_names: vec!["density".to_owned()],
+                bounds_min: None,
+                bounds_max: None,
+            },
+        ),
         decoded_vdb: Some(std::sync::Arc::new(decoded)),
-        ..potter::geom::volume::VolumeData::default()
+        ..potter_core::geom::volume::VolumeData::default()
     };
     let pixels = (0_u32..3)
         .flat_map(|y| {
@@ -2301,12 +2307,12 @@ baseline_evaluated.to_mesh_clear()
             })
         })
         .collect::<Vec<_>>();
-    let image = potter::image::ImageData {
+    let image = potter_core::image::ImageData {
         width: 4,
         height: 3,
         pixels,
         tiles: std::collections::BTreeMap::new(),
-        interpolation: potter::image::ImageInterpolation::Linear,
+        interpolation: potter_core::image::ImageInterpolation::Linear,
     };
     let mapping_columns: [f64; 16] =
         serde_json::from_value(blender_expected["mapping_world"].clone())?;
@@ -2318,7 +2324,7 @@ baseline_evaluated.to_mesh_clear()
         ("texture_mid_level".into(), json!([0.5, 0.5, 0.5])),
         ("texture_sample_radius".into(), json!(1.0)),
     ]);
-    let displaced = potter::geom::modifiers::simulation::displace_volume(
+    let displaced = potter_core::geom::modifiers::simulation::displace_volume(
         &volume,
         &volume_params,
         "IMAGE",
@@ -2357,8 +2363,8 @@ baseline_evaluated.to_mesh_clear()
     };
     assert_eq!(
         displaced.source,
-        potter::geom::volume::VolumeSource::Generated(
-            potter::geom::volume::VolumeGeneratedSource {
+        potter_core::geom::volume::VolumeSource::Generated(
+            potter_core::geom::volume::VolumeGeneratedSource {
                 algorithm: "volume_displace_vdb".to_owned(),
             },
         )
@@ -2389,22 +2395,22 @@ baseline_evaluated.to_mesh_clear()
             }
         }
     }
-    let inline_volume = potter::geom::volume::VolumeData {
-        source: potter::geom::volume::VolumeSource::Generated(
-            potter::geom::volume::VolumeGeneratedSource {
+    let inline_volume = potter_core::geom::volume::VolumeData {
+        source: potter_core::geom::volume::VolumeSource::Generated(
+            potter_core::geom::volume::VolumeGeneratedSource {
                 algorithm: "inline_fixture".to_owned(),
             },
         ),
-        grids: vec![potter::geom::volume::VolumeGrid {
+        grids: vec![potter_core::geom::volume::VolumeGrid {
             dims: [4, 3, 3],
             voxel_size: 1.0,
             origin: DVec3::ZERO,
             values: Some(inline_values),
-            ..potter::geom::volume::VolumeGrid::default()
+            ..potter_core::geom::volume::VolumeGrid::default()
         }],
-        ..potter::geom::volume::VolumeData::default()
+        ..potter_core::geom::volume::VolumeData::default()
     };
-    let inline_displaced = potter::geom::modifiers::simulation::displace_volume(
+    let inline_displaced = potter_core::geom::modifiers::simulation::displace_volume(
         &inline_volume,
         &volume_params,
         "IMAGE",
@@ -2424,9 +2430,9 @@ baseline_evaluated.to_mesh_clear()
             .as_deref()
             .ok_or("displaced inline samples are missing")?,
     );
-    let potter_mesh = potter::geom::volume::volume_to_mesh(&displaced, 0.25)
+    let potter_mesh = potter_core::geom::volume::volume_to_mesh(&displaced, 0.25)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let baseline_mesh = potter::geom::volume::volume_to_mesh(&volume, 0.25)
+    let baseline_mesh = potter_core::geom::volume::volume_to_mesh(&volume, 0.25)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let potter_points = potter_mesh
         .vertices

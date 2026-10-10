@@ -10,7 +10,7 @@ use std::{
 };
 
 use glam::DVec3;
-use potter::{
+use potter_core::{
     error::ErrorCode,
     eval::{EvaluationContext, Snapshot},
     geom::Mesh,
@@ -74,7 +74,7 @@ fn command_output(command: &str, scene: &Path, arguments: &[&str]) -> Output {
         .unwrap()
 }
 
-fn apply_doc(doc: &SceneDoc, operations: &Value) -> potter::ops::ApplyOutcome {
+fn apply_doc(doc: &SceneDoc, operations: &Value) -> potter_core::ops::ApplyOutcome {
     ops::apply_batch(
         doc,
         &json!({

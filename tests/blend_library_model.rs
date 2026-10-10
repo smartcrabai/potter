@@ -5,7 +5,7 @@
 
 use std::{fs, path::Path, process::Command};
 
-use potter::hash;
+use potter_core::hash;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 

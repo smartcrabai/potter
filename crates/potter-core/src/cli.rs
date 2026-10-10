@@ -1,28 +1,11 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde_json::json;
+use clap::{Args, Subcommand, ValueEnum};
 
-use crate::{
-    commands,
-    error::{ErrorCode, PotError},
-    response::Envelope,
-};
+use crate::{commands, response::Envelope};
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "pot",
-    version,
-    about = "Headless, JSON-driven scene editor",
-    long_about = "Create, inspect, edit, validate, render, and exchange Blender-compatible scenes through typed JSON."
-)]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: CliCommand,
-    #[arg(long, global = true, help = "Print one JSON response envelope.")]
-    pub json: bool,
-}
-
+/// The scene commands of `pot`. The `pot` binary parses them as top-level subcommands and owns
+/// argument parsing and `--json` envelope emission.
 #[derive(Debug, Subcommand)]
 pub enum CliCommand {
     #[command(about = "Create a new project scene.")]
@@ -391,50 +374,7 @@ fn parse_pixel(value: &str) -> std::result::Result<(u32, u32), String> {
     Ok((x, y))
 }
 
-pub fn run<I, T>(args: I) -> i32
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
-{
-    let arguments: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    let json_output = arguments.iter().any(|arg| arg == "--json");
-    match Cli::try_parse_from(arguments) {
-        Ok(cli) => {
-            let command_name = cli.command.name().to_owned();
-            let command_result = dispatch(cli.command);
-            match command_result {
-                Ok((scene, result)) => {
-                    Envelope::success(command_name, scene, result).emit(cli.json)
-                }
-                Err(error) => Envelope::failure(Some(command_name), error).emit(cli.json),
-            }
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-            ) =>
-        {
-            i32::from(error.print().is_err())
-        }
-        Err(error) if json_output => Envelope::failure(
-            None,
-            PotError::with_details(
-                ErrorCode::InvalidArgument,
-                error.to_string(),
-                json!({ "kind": format!("{:?}", error.kind()) }),
-            ),
-        )
-        .emit(true),
-        Err(error) => {
-            let code = error.exit_code();
-            if error.print().is_err() { 1 } else { code }
-        }
-    }
-}
-
 impl CliCommand {
-    #[must_use]
     fn name(&self) -> &'static str {
         match self {
             Self::Init(_) => "init",
@@ -452,6 +392,16 @@ impl CliCommand {
             Self::Bake(_) => "bake",
             Self::Assets(_) => "assets",
             Self::Schema(_) => "schema",
+        }
+    }
+
+    /// Runs the command and wraps its outcome in the response envelope `pot` prints.
+    #[must_use]
+    pub fn execute(self) -> Envelope {
+        let name = self.name();
+        match dispatch(self) {
+            Ok((scene, result)) => Envelope::success(name, scene, result),
+            Err(error) => Envelope::failure(Some(name.to_owned()), error),
         }
     }
 }
@@ -475,22 +425,5 @@ fn dispatch(
         CliCommand::Bake(args) => commands::bake::run(args),
         CliCommand::Assets(args) => commands::assets::run(args),
         CliCommand::Schema(args) => commands::schema::run(&args),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::run;
-
-    #[test]
-    fn help_and_version_succeed_even_with_json_flag() {
-        assert_eq!(run(["pot", "--help", "--json"]), 0);
-        assert_eq!(run(["pot", "--version", "--json"]), 0);
-    }
-
-    #[test]
-    fn unknown_flag_is_invalid_argument_when_json_requested() {
-        assert_eq!(run(["pot", "init", "scene", "--unknown", "--json"]), 2);
     }
 }

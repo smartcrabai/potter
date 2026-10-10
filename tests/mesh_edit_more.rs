@@ -2,7 +2,7 @@
 
 use std::{error::Error, fs, path::Path, process::Command};
 
-use potter::geom::{BoxParams, Mesh, PlaneParams, edit};
+use potter_core::geom::{BoxParams, Mesh, PlaneParams, edit};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};

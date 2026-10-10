@@ -2,7 +2,7 @@
 
 use std::{error::Error, fs, path::Path, process::Command};
 
-use potter::{
+use potter_core::{
     hash,
     model::{Id, Node, SceneDoc, Transform},
     store::{HistoryDirection, Project},

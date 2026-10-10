@@ -2,7 +2,7 @@ use std::{error::Error, fs, io::BufReader, path::Path};
 
 use assert_cmd::Command;
 
-use potter::{
+use potter_core::{
     color::{ColorManagement, ViewTransform, linear_to_srgb},
     compositor::{BlendMode, Image, gaussian_blur, mix_rgb},
 };

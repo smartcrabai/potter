@@ -263,7 +263,7 @@ fn assert_mesh_matches_blender(case: &PrimitiveCase, expected: &Value) -> TestRe
         .get(case.name)
         .ok_or_else(|| io::Error::other(format!("{} Blender geometry is missing", case.name)))?;
     let blender_positions = positions(&blender["vertices"], case.name)?;
-    let actual = potter::geom::primitive(case.kind, &case.params)?;
+    let actual = potter_core::geom::primitive(case.kind, &case.params)?;
     assert_eq!(
         actual.vertices.len(),
         blender_positions.len(),

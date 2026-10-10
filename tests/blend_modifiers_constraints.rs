@@ -1300,9 +1300,9 @@ fn assert_skin_branch_round_trip(
     mappings: &serde_json::Map<String, Value>,
     before_geometry: &Value,
 ) -> Result<(), Box<dyn Error>> {
-    let scene: potter::model::SceneDoc =
+    let scene: potter_core::model::SceneDoc =
         serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    let owner_key = potter::model::Id::new(owner_id.to_owned())?;
+    let owner_key = potter_core::model::Id::new(owner_id.to_owned())?;
     let modifier = scene.nodes[&owner_key].modifiers.first().unwrap();
     assert_eq!(modifier.modifier_type, "skin", "{}", case["name"]);
     for (key, value) in case["expected"].as_object().unwrap() {
@@ -1330,7 +1330,7 @@ fn assert_skin_branch_round_trip(
         "modifier.skin.branch_hull"
     );
 
-    let feature_catalog = potter::catalog::feature_catalog();
+    let feature_catalog = potter_core::catalog::feature_catalog();
     let branch_feature = feature_catalog["features"]
         .as_array()
         .unwrap()
@@ -1478,9 +1478,9 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(feature_id) = case["unsupported_feature_id"].as_str() {
-        let scene: potter::model::SceneDoc =
+        let scene: potter_core::model::SceneDoc =
             serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-        let owner_key = potter::model::Id::new(owner_id.to_owned())?;
+        let owner_key = potter_core::model::Id::new(owner_id.to_owned())?;
         let modifier = scene.nodes[&owner_key].modifiers.first().unwrap();
         assert_eq!(modifier.modifier_type, "decimate", "{case_name}");
         for (key, value) in case["expected"].as_object().unwrap() {
@@ -1510,7 +1510,7 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
             response["error"]["details"]["feature_id"], feature_id,
             "{case_name}"
         );
-        let catalog = potter::catalog::feature_catalog();
+        let catalog = potter_core::catalog::feature_catalog();
         let feature = catalog["features"]
             .as_array()
             .unwrap()
@@ -1599,12 +1599,14 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
         );
         assert_eq!(before_geometry["volume_grid_names"], json!(["density"]));
         assert_eq!(before_geometry["volume_grid_types"], json!(["FLOAT"]));
-        let scene: potter::model::SceneDoc =
+        let scene: potter_core::model::SceneDoc =
             serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-        let owner_key = potter::model::Id::new(owner_id.to_owned())?;
+        let owner_key = potter_core::model::Id::new(owner_id.to_owned())?;
         let data_id = scene.nodes.get(&owner_key).unwrap().data.as_ref().unwrap();
-        let snapshot =
-            potter::eval::Snapshot::evaluate(&scene, &potter::eval::EvaluationContext::default())?;
+        let snapshot = potter_core::eval::Snapshot::evaluate(
+            &scene,
+            &potter_core::eval::EvaluationContext::default(),
+        )?;
         let volume = snapshot.volume_data.get(data_id).unwrap();
         let grid = volume.grids.first().unwrap();
         assert_json_value(
@@ -1628,8 +1630,8 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
             &format!("{case_name}.volume_bounds"),
         );
         let samples = [
-            potter::geom::volume::sample_density_checked(DVec3::ZERO, volume)?,
-            potter::geom::volume::sample_density_checked(DVec3::new(1.5, 0.0, 0.0), volume)?,
+            potter_core::geom::volume::sample_density_checked(DVec3::ZERO, volume)?,
+            potter_core::geom::volume::sample_density_checked(DVec3::new(1.5, 0.0, 0.0), volume)?,
         ];
         for (index, (actual, expected)) in samples
             .iter()

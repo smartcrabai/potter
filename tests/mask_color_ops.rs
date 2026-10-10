@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use potter::{
+use potter_core::{
     error::ErrorCode,
     model::{Id, SceneDoc},
     ops::apply_batch,
@@ -134,7 +134,7 @@ fn color_operations_apply_transform_settings_and_validate_gamma_and_curve()
     let scene = &updated.doc.scenes[&updated.doc.active_scene];
     assert_eq!(
         scene.color_management.view_transform,
-        potter::color::ViewTransform::Raw
+        potter_core::color::ViewTransform::Raw
     );
     assert_eq!(scene.color_management.exposure, 1.0);
     assert_eq!(scene.color_management.gamma, 2.0);

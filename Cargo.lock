@@ -1393,11 +1393,29 @@ dependencies = [
  "assert_cmd",
  "clap",
  "exr",
- "flate2",
  "glam",
  "hex",
  "image",
  "jsonschema",
+ "png",
+ "potter-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "potter-core"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "exr",
+ "flate2",
+ "glam",
+ "hex",
+ "image",
  "lz4_flex",
  "png",
  "proptest",

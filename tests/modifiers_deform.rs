@@ -6,7 +6,7 @@ use std::{
 };
 
 use glam::DVec3;
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{BoxParams, GridParams, Mesh, UvSphereParams, modifiers::evaluate_modifiers},
     model::{Id, Modifier, SceneDoc},
@@ -67,7 +67,7 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         enabled: true,
         params: serde_json::from_value(params)?,
         binding_data: None,
-        runtime: potter::model::ModifierRuntime::default(),
+        runtime: potter_core::model::ModifierRuntime::default(),
     })
 }
 
@@ -558,7 +558,7 @@ fn blender_remesh_supported_modes_match_exact_geometry_and_voxel_adaptivity_is_g
             .ok_or("nonzero VOXEL adaptivity unexpectedly succeeded")?;
     assert_eq!(
         voxel_adaptivity_error.code,
-        potter::error::ErrorCode::UnsupportedFeature
+        potter_core::error::ErrorCode::UnsupportedFeature
     );
     assert_eq!(
         voxel_adaptivity_error
@@ -567,7 +567,7 @@ fn blender_remesh_supported_modes_match_exact_geometry_and_voxel_adaptivity_is_g
             .and_then(Value::as_str),
         Some("modifier.remesh.voxel_adaptivity")
     );
-    let catalog = potter::catalog::feature_catalog();
+    let catalog = potter_core::catalog::feature_catalog();
     let features = catalog["features"]
         .as_array()
         .ok_or("feature catalog rows are missing")?;
@@ -1030,7 +1030,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
             })
             .collect()
     };
-    let feature_catalog = potter::catalog::feature_catalog();
+    let feature_catalog = potter_core::catalog::feature_catalog();
     let open_surface_feature = feature_catalog["features"]
         .as_array()
         .and_then(|features| {
@@ -1062,7 +1062,10 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                 let error = evaluate_modifiers(&input, &[modifier("remesh", params)?])
                     .err()
                     .ok_or_else(|| format!("{context}: open Suzanne unexpectedly succeeded"))?;
-                assert_eq!(error.code, potter::error::ErrorCode::UnsupportedFeature);
+                assert_eq!(
+                    error.code,
+                    potter_core::error::ErrorCode::UnsupportedFeature
+                );
                 assert_eq!(
                     error.details.get("feature_id").and_then(Value::as_str),
                     Some("modifier.remesh.open_nonmanifold"),
@@ -1844,7 +1847,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                 "wave_direction":0.4,"choppiness":choppiness
             }))?,
             binding_data: None,
-            runtime: potter::model::ModifierRuntime::default(),
+            runtime: potter_core::model::ModifierRuntime::default(),
         };
         let output = evaluate_modifiers(&source, &[modifier])?;
         Ok(output.vertices.iter().map(|vertex| vertex.co).collect())

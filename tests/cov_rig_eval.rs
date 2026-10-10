@@ -13,7 +13,7 @@ mod blender_file;
 use std::{error::Error, fs, io, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, EulerRot};
-use potter::{
+use potter_core::{
     eval::{EvaluationContext, Snapshot},
     model::{Id, ReconstructedPoint, SceneDoc, TrackingMarker},
     ops,
@@ -796,7 +796,7 @@ fn follow_track_reports_missing_reconstruction_marker_and_clip_data() -> TestRes
         .disabled = true;
     let error = Snapshot::evaluate(&doc, &EvaluationContext::default())
         .expect_err("disabled markers have no sample");
-    assert_eq!(error.code, potter::error::ErrorCode::EvaluationFailed);
+    assert_eq!(error.code, potter_core::error::ErrorCode::EvaluationFailed);
     assert_eq!(
         error.message,
         "follow-track constraint has no enabled markers"
@@ -823,7 +823,7 @@ fn follow_track_reports_missing_reconstruction_marker_and_clip_data() -> TestRes
         .insert("track".to_owned(), json!("absent"));
     let error = Snapshot::evaluate(&doc, &EvaluationContext::default())
         .expect_err("unknown tracks are rejected");
-    assert_eq!(error.code, potter::error::ErrorCode::EvaluationFailed);
+    assert_eq!(error.code, potter_core::error::ErrorCode::EvaluationFailed);
     assert_eq!(
         error.message,
         "Follow Track constraint track does not exist"
@@ -842,7 +842,7 @@ fn follow_track_reports_missing_reconstruction_marker_and_clip_data() -> TestRes
         .insert("use_3d_position".to_owned(), json!(true));
     let error = Snapshot::evaluate(&doc, &EvaluationContext::default())
         .expect_err("3D sampling requires a reconstructed point");
-    assert_eq!(error.code, potter::error::ErrorCode::EvaluationFailed);
+    assert_eq!(error.code, potter_core::error::ErrorCode::EvaluationFailed);
     assert_eq!(
         error.message,
         "Follow Track 3D position requires a reconstructed point for its track"
@@ -860,7 +860,7 @@ fn follow_track_reports_missing_reconstruction_marker_and_clip_data() -> TestRes
     clip.height = 0;
     let error = Snapshot::evaluate(&doc, &EvaluationContext::default())
         .expect_err("2D sampling requires image dimensions");
-    assert_eq!(error.code, potter::error::ErrorCode::EvaluationFailed);
+    assert_eq!(error.code, potter_core::error::ErrorCode::EvaluationFailed);
     assert_eq!(
         error.message,
         "Follow Track requires movie-clip image dimensions for 2D marker sampling"
@@ -881,7 +881,7 @@ fn follow_track_reports_missing_reconstruction_marker_and_clip_data() -> TestRes
         .insert("frame_method".to_owned(), json!("INVALID"));
     let error = Snapshot::evaluate(&doc, &EvaluationContext::default())
         .expect_err("unknown frame methods are rejected");
-    assert_eq!(error.code, potter::error::ErrorCode::EvaluationFailed);
+    assert_eq!(error.code, potter_core::error::ErrorCode::EvaluationFailed);
     assert_eq!(error.message, "Follow Track frame_method is invalid");
     let mut doc = ops::apply_batch(
         &SceneDoc::new("00000000-0000-4000-8000-000000000002".to_owned()),
@@ -900,7 +900,7 @@ fn follow_track_reports_missing_reconstruction_marker_and_clip_data() -> TestRes
         .active_clip = None;
     let error = Snapshot::evaluate(&doc, &EvaluationContext::default())
         .expect_err("active clip selection requires a configured clip");
-    assert_eq!(error.code, potter::error::ErrorCode::EvaluationFailed);
+    assert_eq!(error.code, potter_core::error::ErrorCode::EvaluationFailed);
     assert_eq!(
         error.message,
         "constraint use_active_clip requires an active scene movie clip"
