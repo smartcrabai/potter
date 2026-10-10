@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- `pot workflow refine --provider <NAME>` picks the jcode provider that serves `--model` (sent to jcode as `<NAME>:<ID>`, e.g. `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`); it requires `--model`, and without it jcode still infers the provider from the model ID.
+- `pot workflow refine` now requires `-p/--provider <NAME>` and `-m/--model <ID>`, sent to jcode as `<NAME>:<ID>` (examples: `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`) for the modeler and every reviewer; agents no longer fall back to jcode's default model.
 
 ## 0.1.1 - 2026-10-10
 - The repository is now a workspace: the engine library moved to `crates/potter-core` (crate `potter_core`, including the typed command layer `potter_core::cli::CliCommand::execute`), the root `potter` package is the `pot` binary only (argument parsing, `--json` envelopes) with the end-to-end tests in `tests/`, and shared package metadata, dependencies, and lints live in `[workspace.package]`, `[workspace.dependencies]`, and `[workspace.lints]`. Release artifacts (`potter-<target>`, `potter.rb`, `potter-installer.sh`) are unchanged; CI runs fmt/check/test/clippy with `--workspace`.

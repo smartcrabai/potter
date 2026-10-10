@@ -29,19 +29,14 @@ fn refine_requires_an_image() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn refine_provider_requires_a_model() -> Result<(), Box<dyn Error>> {
+fn refine_requires_provider_and_model() -> Result<(), Box<dyn Error>> {
     let output = pot()
-        .args([
-            "workflow",
-            "refine",
-            "-i",
-            "front.png",
-            "--provider",
-            "openai",
-        ])
+        .args(["workflow", "refine", "-i", "front.png"])
         .output()?;
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8(output.stderr)?.contains("--model"));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("--provider"), "{stderr}");
+    assert!(stderr.contains("--model"), "{stderr}");
     Ok(())
 }
 
@@ -54,7 +49,7 @@ fn refine_checks_every_image_before_creating_output() -> Result<(), Box<dyn Erro
     let out = directory.path().join("out");
 
     let output = pot()
-        .args(["workflow", "refine", "-i"])
+        .args(["workflow", "refine", "-p", "openai", "-m", "gpt-5.5", "-i"])
         .arg(&first)
         .arg("--image")
         .arg(&second)
@@ -75,7 +70,9 @@ fn refine_errors_are_envelopes_with_json() -> Result<(), Box<dyn Error>> {
     let image = directory.path().join("side.bmp");
 
     let output = pot()
-        .args(["workflow", "refine", "--json", "-i"])
+        .args([
+            "workflow", "refine", "--json", "-p", "openai", "-m", "gpt-5.5", "-i",
+        ])
         .arg(&image)
         .output()?;
 
