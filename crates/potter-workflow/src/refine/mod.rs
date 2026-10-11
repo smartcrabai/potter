@@ -230,10 +230,6 @@ pub(crate) fn run(args: Args) -> anyhow::Result<crate::Finished> {
     let client = JcodeClient::launch(LaunchOptions {
         working_dir: Some(cwd),
         client_name: concat!("potter-workflow-refine/", env!("CARGO_PKG_VERSION")).into(),
-        // A fresh private home has no cached jcode build, so the auto-updater would download the
-        // latest release and restart the runtime mid-turn: the turn drops with "harness connection
-        // closed" and the restarted server outlives this process.
-        env: [("JCODE_NO_AUTO_UPDATE".into(), "1".into())].into(),
         ..LaunchOptions::default()
     })
     .context("launching private jcode runtime")?;
