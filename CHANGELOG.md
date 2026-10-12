@@ -2,6 +2,9 @@
 
 ## Unreleased
 - `pot workflow refine` now requires `-p/--provider <NAME>` and `-m/--model <ID>`, sent to jcode as `<NAME>:<ID>` (examples: `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`) for the modeler and every reviewer; agents no longer fall back to jcode's default model.
+- `pot workflow refine` counts a review as progress only when it resolves a finding for the first time and reopens none, so a run that fixes one finding per review while the reviewer finds another no longer stops as `stalled`; the reviewer gets every resolved finding and reports one that reappears as `reopened` under its original ID.
+- `pot workflow refine` downscales every reference image to at most 1568 px on the longer edge and sends it as lossy WebP (quality 85), keeping large photos within provider image limits; this adds the `webp` crate (static libwebp).
+- The `pot workflow refine` floating-part check now covers every visible part with evaluated bounds (curves, surfaces, text, metaballs, point clouds, volumes, collection instances), not only meshes, so a mesh resting on a curve is no longer reported as floating.
 
 ## 0.1.1 - 2026-10-10
 - The repository is now a workspace: the engine library moved to `crates/potter-core` (crate `potter_core`, including the typed command layer `potter_core::cli::CliCommand::execute`), the root `potter` package is the `pot` binary only (argument parsing, `--json` envelopes) with the end-to-end tests in `tests/`, and shared package metadata, dependencies, and lints live in `[workspace.package]`, `[workspace.dependencies]`, and `[workspace.lints]`. Release artifacts (`potter-<target>`, `potter.rb`, `potter-installer.sh`) are unchanged; CI runs fmt/check/test/clippy with `--workspace`.

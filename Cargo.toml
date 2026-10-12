@@ -57,8 +57,10 @@ glam = { version = "0.34", features = ["serde"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = [
   "bmp",
+  "gif",
   "hdr",
   "jpeg",
+  "png",
   "tga",
   "tiff",
   "webp",
@@ -77,6 +79,7 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.11"
 tempfile = "=3.27.0"
 uuid = { version = "1", features = ["v4", "serde"] }
+webp = { version = "0.3", default-features = false }
 
 [workspace.lints.clippy]
 allow_attributes = "deny"

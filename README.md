@@ -49,12 +49,12 @@ pot workflow refine -p openai -m gpt-5.5 -i chair.jpg -i chair-side.jpg
 
 ### `refine`
 
-A modeler agent builds a model from the reference images (`-i/--image`, repeatable), potter renders it from several views, a fresh reviewer agent lists what blocks acceptance, and the modeler repairs exactly those findings. The loop is built to converge:
+A modeler agent builds a model from the reference images (`-i/--image`, repeatable; each is downscaled to at most 1568 px on the longer edge and sent as lossy WebP), potter renders it from several views, a fresh reviewer agent lists what blocks acceptance, and the modeler repairs exactly those findings. The loop is built to converge:
 
 - The reviewer reports only blocking findings: render problems, missing or extra parts, wrong basic shape, proportions off by roughly 15% or more, misplaced or detached parts, and clearly wrong colors. Smaller differences, shading or shadow artifacts, and unseen sides are recorded as `non_findings` and never block.
-- Findings keep stable IDs (`F1`, `F2`, …). Each follow-up review sees the previous review and the modeler's fix report, must mark every previous finding `resolved` or `persists`, may not raise decided non-findings again, and adds new findings only for blocking problems such as regressions. The modeler may report a finding as `blocked` instead of faking a fix, and the reviewer can accept that as a non-finding.
-- A deterministic geometry check passes mesh parts that touch neither the ground nor the grounded assembly, with their gap in meters, to the reviewer.
-- The loop stops as `converged` (no findings, exit 0), `stalled` (the finding count did not beat the best review for `--stall-limit` consecutive reviews, default 2), or `max_iterations_reached` (`--max-iterations`, default 5); both non-converged statuses exit 2.
+- Findings keep stable IDs (`F1`, `F2`, …). Each follow-up review sees the previous review, the modeler's fix report, and every finding resolved so far, must mark every previous finding `resolved` or `persists`, reports a resolved finding that is visible again as `reopened` under its original ID, may not raise decided non-findings again, and adds new findings only for blocking problems such as regressions. The modeler may report a finding as `blocked` instead of faking a fix, and the reviewer can accept that as a non-finding.
+- A deterministic geometry check passes visible parts with evaluated bounds (meshes, curves, surfaces, text, metaballs, point clouds, volumes, collection instances) that touch neither the ground nor the grounded assembly, with their gap in meters, to the reviewer. Grease Pencil strokes are not checked.
+- The loop stops as `converged` (no findings, exit 0), `stalled` (`--stall-limit` consecutive reviews, default 2, that resolved no finding for the first time or reopened one), or `max_iterations_reached` (`--max-iterations`, default 5); both non-converged statuses exit 2.
 
 Output goes to `-o/--out` (default `<first image stem>-refine`, numbered when taken): the potter project in `<out>/scene` and each iteration's renders, `review.json`, and `fix-report.json` in `<out>/iter-NN/`. stdout is one JSON line with `status`, `iterations`, and `remaining_findings`; with `--json` it is a `pot` response envelope carrying that summary as `result`, and errors become `INTERNAL_ERROR` envelopes.
 

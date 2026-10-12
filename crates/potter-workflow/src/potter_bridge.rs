@@ -97,16 +97,23 @@ pub fn render_views(
     Ok(RenderOutput { pngs, warnings })
 }
 
-/// A mesh part connected neither to the ground plane (z = 0) nor to any part that is; `gap` is its
-/// distance in meters to that grounded assembly.
+/// A visible part connected neither to the ground plane (z = 0) nor to any part that is; `gap` is
+/// its distance in meters to that grounded assembly.
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub struct FloatingPart {
     pub id: String,
     pub gap: f64,
 }
 
-/// Lists mesh parts disconnected from the grounded model by comparing the world bounds reported by
-/// `pot inspect`. Bounds closer than 0.5% of the model's bounding diagonal count as touching.
+/// Lists visible parts disconnected from the grounded model by comparing the world bounds
+/// reported by `pot inspect`. Bounds closer than 0.5% of the model's bounding diagonal count as
+/// touching.
+///
+/// A node is a part when it has evaluated bounds, which is what the preview draws: meshes and
+/// mesh-backed data (curves, surfaces, text, metaballs, point clouds), volumes, and collection
+/// instances. Cameras, lights, armatures, and empties without an instanced collection have null
+/// bounds and are skipped. Grease Pencil strokes are drawn by the preview, but `pot inspect`
+/// reports null bounds for them, so they are not checked.
 ///
 /// # Errors
 ///
@@ -129,7 +136,6 @@ pub fn floating_parts(scene: &Path) -> anyhow::Result<Vec<FloatingPart>> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("mesh"))
         // The preview does not render hidden nodes, so they neither float nor ground anything.
         .filter(|item| item.get("visible").and_then(Value::as_bool) != Some(false))
         .filter_map(|item| {
@@ -535,6 +541,49 @@ mod tests {
             [FloatingPart {
                 id: "rail".to_owned(),
                 gap: 0.05
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn floating_parts_counts_curves_the_preview_draws() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let scene = directory.path().join("scene");
+        init_scene(&scene)?;
+        let part = |id: &str, translation: [f64; 3], scale: [f64; 3]| {
+            json!({"op": "node.create", "id": id, "kind": "box", "params": {"size": 1},
+                   "transform": {"translation": translation, "scale": scale}})
+        };
+        let tube = |id: &str, from: [f64; 3], to: [f64; 3], visible: bool| {
+            json!({"op": "curve.create", "id": id, "dimensions": "three_d", "visible": visible,
+                   "bevel_depth": 0.05, "bevel_resolution": 8,
+                   "splines": [{"type": "poly", "order": 2, "cyclic": false, "resolution": 1,
+                                "use_endpoint": true,
+                                "points": [{"co": from}, {"co": to}]}]})
+        };
+        let batch = json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                part("base", [0.0, 0.0, 0.25], [1.0, 1.0, 0.5]),
+                // A bevelled curve on the ground: the preview draws it, so it grounds `post`.
+                tube("rail", [2.0, -0.5, 0.05], [2.0, 0.5, 0.05], true),
+                part("post", [2.0, 0.0, 0.2], [0.2, 0.2, 0.2]),
+                // Floats with nothing beneath it, so it is reported.
+                tube("bridge", [-2.0, -0.5, 1.0], [-2.0, 0.5, 1.0], true),
+                // Hidden curves are not drawn, so they are not reported.
+                tube("hidden_wire", [0.0, 0.0, 3.0], [0.0, 1.0, 3.0], false),
+            ]
+        });
+        let applied = execute_tool(&scene, "pot_apply", &json!({"batch": batch}));
+        assert!(applied.error.is_none(), "{}", applied.output);
+
+        assert_eq!(
+            floating_parts(&scene)?,
+            [FloatingPart {
+                id: "bridge".to_owned(),
+                gap: 0.95
             }]
         );
         Ok(())

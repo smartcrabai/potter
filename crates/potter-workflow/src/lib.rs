@@ -7,6 +7,7 @@ use potter_core::{
 use serde_json::Value;
 
 mod potter_bridge;
+mod reference_image;
 mod refine;
 
 /// One variant per workflow. Leave variants undocumented: the workflow's `Args` doc comment
