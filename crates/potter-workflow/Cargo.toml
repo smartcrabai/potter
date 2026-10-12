@@ -11,11 +11,13 @@ version.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
+image.workspace = true
 jcode-sdk.workspace = true
 potter-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+webp.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true

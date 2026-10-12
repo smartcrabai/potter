@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::potter_bridge;
+use crate::reference_image::load_references;
 use potter_core::cli::PreviewMode;
 
 mod prompts;
@@ -57,7 +58,7 @@ pub struct Args {
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     max_iterations: u64,
 
-    /// Stop as `stalled` after this many consecutive reviews without fewer findings than the best review so far.
+    /// Stop as `stalled` after this many consecutive reviews that resolve no new finding or reopen one.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
     stall_limit: u64,
 
@@ -106,7 +107,7 @@ struct Review {
     non_findings: Vec<NonFinding>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Finding {
     id: String,
@@ -121,10 +122,13 @@ struct Finding {
 #[serde(rename_all = "snake_case")]
 enum FindingStatus {
     New,
+    /// Still open in the previous review, under its previous ID.
     Persists,
+    /// Resolved by an earlier review and visible again, under its original ID.
+    Reopened,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FindingCategory {
     RenderProblem,
@@ -182,20 +186,21 @@ struct ReviewHistory<'a> {
     modeler_report: &'a FixReport,
     /// Every non-finding from every earlier review, so a decision outlives the review after it.
     decided_non_findings: &'a [NonFinding],
+    /// Findings resolved by earlier reviews, as last reported, so a reopened one keeps its ID.
+    resolved_findings: &'a [Finding],
 }
 
-/// Loop monitor: counts consecutive reviews that fail to report fewer findings than the best
-/// review so far.
+/// Loop monitor: counts consecutive reviews that make no progress. A review makes progress when it
+/// resolves a finding for the first time and reopens none.
 #[derive(Default)]
 struct Progress {
-    fewest: Option<usize>,
     stale_reviews: u64,
 }
 
 impl Progress {
-    fn record(&mut self, findings: usize) -> u64 {
-        if self.fewest.is_none_or(|fewest| findings < fewest) {
-            self.fewest = Some(findings);
+    /// Returns the number of consecutive reviews without progress, including this one.
+    fn record(&mut self, newly_resolved: usize, reopened: usize) -> u64 {
+        if newly_resolved > 0 && reopened == 0 {
             self.stale_reviews = 0;
         } else {
             self.stale_reviews += 1;
@@ -204,15 +209,58 @@ impl Progress {
     }
 }
 
-/// Gives every finding a stable ID: a `persists` finding keeps its previous ID, anything else
-/// (new, unknown, or duplicated IDs) gets the next `F<n>`.
-fn assign_finding_ids(findings: &mut [Finding], previous: &[Finding], last_id: &mut u32) {
+/// Stores the previous findings that `review` resolves and returns how many were resolved for the
+/// first time. IDs unknown to the previous review, and IDs the review still reports, do not count.
+/// A resolved finding is kept as its latest report, so a later reopen can refer back to it.
+fn record_resolved(
+    review: &Review,
+    previous: &[Finding],
+    resolved_findings: &mut Vec<Finding>,
+) -> usize {
+    let mut first_resolutions = 0;
+    for id in &review.resolved {
+        let Some(old) = previous.iter().find(|finding| finding.id == *id) else {
+            continue;
+        };
+        if review.findings.iter().any(|finding| finding.id == *id) {
+            continue;
+        }
+        if let Some(stored) = resolved_findings
+            .iter_mut()
+            .find(|finding| finding.id == *id)
+        {
+            *stored = old.clone();
+        } else {
+            resolved_findings.push(old.clone());
+            first_resolutions += 1;
+        }
+    }
+    first_resolutions
+}
+
+/// Gives every finding a stable ID. A `persists` or `reopened` finding keeps its previous ID when
+/// the previous review reported it (persists) or an earlier review resolved it (reopened).
+/// Anything else (new, unknown, or duplicated IDs) gets the next `F<n>`.
+fn assign_finding_ids(
+    findings: &mut [Finding],
+    previous: &[Finding],
+    resolved_findings: &[Finding],
+    last_id: &mut u32,
+) {
     let mut carried_ids = HashSet::new();
     for finding in findings {
-        let carried = finding.status == FindingStatus::Persists
-            && previous.iter().any(|old| old.id == finding.id)
+        let open = previous.iter().any(|old| old.id == finding.id);
+        let was_resolved = resolved_findings.iter().any(|old| old.id == finding.id);
+        let carried = finding.status != FindingStatus::New
+            && (open || was_resolved)
             && carried_ids.insert(finding.id.clone());
-        if !carried {
+        if carried {
+            finding.status = if open {
+                FindingStatus::Persists
+            } else {
+                FindingStatus::Reopened
+            };
+        } else {
             *last_id += 1;
             finding.id = format!("F{last_id}");
             finding.status = FindingStatus::New;
@@ -460,6 +508,7 @@ fn refine_loop(
     let mut last_finding_id = 0;
     let mut history: Option<(Review, FixReport)> = None;
     let mut decided_non_findings = Vec::new();
+    let mut resolved_findings = Vec::new();
 
     for iteration in 1..=settings.max_iterations {
         iterations = iteration;
@@ -489,6 +538,7 @@ fn refine_loop(
                     previous_review,
                     modeler_report,
                     decided_non_findings: &decided_non_findings,
+                    resolved_findings: &resolved_findings,
                 })
             })
             .transpose()?;
@@ -504,13 +554,20 @@ fn refine_loop(
         assign_finding_ids(
             &mut review.findings,
             previous_findings,
+            &resolved_findings,
             &mut last_finding_id,
         );
+        let newly_resolved = record_resolved(&review, previous_findings, &mut resolved_findings);
+        let reopened = review
+            .findings
+            .iter()
+            .filter(|finding| finding.status == FindingStatus::Reopened)
+            .count();
         decided_non_findings.extend(review.non_findings.iter().cloned());
 
         remaining_findings = review.findings.len();
         eprintln!(
-            "iteration {iteration}: {remaining_findings} finding(s), {} resolved, {} non-finding(s), {} floating part(s)",
+            "iteration {iteration}: {remaining_findings} finding(s), {} resolved, {reopened} reopened, {} non-finding(s), {} floating part(s)",
             review.resolved.len(),
             review.non_findings.len(),
             floating_parts.len()
@@ -524,7 +581,13 @@ fn refine_loop(
             status = Status::Converged;
             break;
         }
-        if progress.record(remaining_findings) >= settings.stall_limit {
+        // The first review is the baseline: it has no earlier findings to resolve.
+        let stale_reviews = if history.is_some() {
+            progress.record(newly_resolved, reopened)
+        } else {
+            0
+        };
+        if stale_reviews >= settings.stall_limit {
             status = Status::Stalled;
             break;
         }
@@ -575,7 +638,7 @@ fn review_schema() -> Value {
                     "required": ["id", "status", "category", "views", "description", "fix"],
                     "properties": {
                         "id": { "type": "string" },
-                        "status": { "type": "string", "enum": ["new", "persists"] },
+                        "status": { "type": "string", "enum": ["new", "persists", "reopened"] },
                         "category": {
                             "type": "string",
                             "enum": [
@@ -635,31 +698,6 @@ fn fix_report_schema() -> Value {
             }
         }
     })
-}
-
-fn load_references(paths: &[PathBuf]) -> anyhow::Result<Vec<(String, String)>> {
-    paths
-        .iter()
-        .map(|path| {
-            let extension = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(str::to_ascii_lowercase);
-            let media_type = match extension.as_deref() {
-                Some("png") => "image/png",
-                Some("jpg" | "jpeg") => "image/jpeg",
-                Some("webp") => "image/webp",
-                Some("gif") => "image/gif",
-                _ => bail!(
-                    "unsupported reference image extension for {} (expected png, jpg, jpeg, webp, or gif)",
-                    path.display()
-                ),
-            };
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("reading reference image {}", path.display()))?;
-            Ok((media_type.to_owned(), STANDARD.encode(bytes)))
-        })
-        .collect()
 }
 
 fn encode_png(path: &Path) -> anyhow::Result<(String, String)> {
@@ -752,41 +790,46 @@ mod tests {
     }
 
     #[test]
-    fn persisting_findings_keep_ids_and_everything_else_gets_fresh_ones() {
+    fn carried_findings_keep_ids_and_everything_else_gets_fresh_ones() {
         let previous = [
             finding("F1", FindingStatus::New),
             finding("F2", FindingStatus::New),
         ];
+        let resolved = [finding("F3", FindingStatus::Persists)];
         let mut current = [
             finding("F2", FindingStatus::Persists),
-            finding("F9", FindingStatus::Persists),
+            finding("F3", FindingStatus::Persists),
+            finding("F9", FindingStatus::Reopened),
             finding("new", FindingStatus::New),
             finding("F2", FindingStatus::Persists),
+            finding("F3", FindingStatus::Reopened),
         ];
-        let mut last_id = 2;
-        assign_finding_ids(&mut current, &previous, &mut last_id);
+        let mut last_id = 3;
+        assign_finding_ids(&mut current, &previous, &resolved, &mut last_id);
 
         let ids: Vec<_> = current.iter().map(|f| (f.id.as_str(), f.status)).collect();
         assert_eq!(
             ids,
             [
                 ("F2", FindingStatus::Persists),
-                ("F3", FindingStatus::New),
+                ("F3", FindingStatus::Reopened),
                 ("F4", FindingStatus::New),
                 ("F5", FindingStatus::New),
+                ("F6", FindingStatus::New),
+                ("F7", FindingStatus::New),
             ]
         );
-        assert_eq!(last_id, 5);
+        assert_eq!(last_id, 7);
     }
 
     #[test]
-    fn progress_counts_reviews_since_the_fewest_findings() {
+    fn progress_resets_only_on_a_first_resolution_without_reopens() {
         let mut progress = Progress::default();
-        let stale: Vec<_> = [5, 4, 4, 6, 3, 3]
+        let stale: Vec<_> = [(1, 0), (0, 0), (1, 1), (0, 0), (2, 0), (1, 0)]
             .into_iter()
-            .map(|findings| progress.record(findings))
+            .map(|(newly_resolved, reopened)| progress.record(newly_resolved, reopened))
             .collect();
-        assert_eq!(stale, [0, 0, 1, 2, 0, 1]);
+        assert_eq!(stale, [0, 1, 2, 3, 0, 0]);
     }
 
     struct ScriptedAgents {
@@ -1059,6 +1102,117 @@ mod tests {
         assert_eq!(agents.build_count, 1);
         assert_eq!(agents.review_prompts.len(), 3);
         assert_eq!(agents.fix_prompts.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn refine_loop_keeps_going_while_each_review_resolves_a_new_finding() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let scene = test_scene(temp.path())?;
+        let out = temp.path().join("out");
+        let views = vec!["front".to_owned()];
+        let settings = LoopSettings {
+            scene: &scene,
+            out: &out,
+            views: &views,
+            mode: potter_core::cli::PreviewMode::Solid,
+            size: 64,
+            max_iterations: 4,
+            stall_limit: 2,
+        };
+        let mut agents = ScriptedAgents::new(vec![
+            scripted_review(vec![scripted_finding("a", "new")], &[])?,
+            scripted_review(vec![scripted_finding("b", "new")], &["F1"])?,
+            scripted_review(vec![scripted_finding("c", "new")], &["F2"])?,
+            scripted_review(vec![scripted_finding("d", "new")], &["F3"])?,
+        ]);
+
+        let outcome = refine_loop(&mut agents, &references(), &settings)?;
+
+        assert_eq!(outcome.status, Status::MaxIterationsReached);
+        assert_eq!(outcome.iterations, 4);
+        assert_eq!(outcome.remaining_findings, 1);
+        assert_eq!(agents.fix_prompts.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn refine_loop_reopen_blocks_progress_even_with_a_resolution() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let scene = test_scene(temp.path())?;
+        let out = temp.path().join("out");
+        let views = vec!["front".to_owned()];
+        let settings = LoopSettings {
+            scene: &scene,
+            out: &out,
+            views: &views,
+            mode: potter_core::cli::PreviewMode::Solid,
+            size: 64,
+            max_iterations: 5,
+            stall_limit: 2,
+        };
+        let mut agents = ScriptedAgents::new(vec![
+            scripted_review(vec![scripted_finding("a", "new")], &[])?,
+            scripted_review(vec![scripted_finding("b", "new")], &["F1"])?,
+            scripted_review(
+                vec![
+                    scripted_finding("F1", "reopened"),
+                    scripted_finding("c", "new"),
+                ],
+                &["F2"],
+            )?,
+            scripted_review(
+                vec![
+                    scripted_finding("F1", "persists"),
+                    scripted_finding("F3", "persists"),
+                ],
+                &[],
+            )?,
+        ]);
+
+        let outcome = refine_loop(&mut agents, &references(), &settings)?;
+
+        assert_eq!(outcome.status, Status::Stalled);
+        assert_eq!(outcome.iterations, 4);
+        assert_eq!(outcome.remaining_findings, 2);
+        assert_eq!(agents.fix_prompts.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn refine_loop_re_resolving_a_reopened_finding_is_not_progress() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let scene = test_scene(temp.path())?;
+        let out = temp.path().join("out");
+        let views = vec!["front".to_owned()];
+        let settings = LoopSettings {
+            scene: &scene,
+            out: &out,
+            views: &views,
+            mode: potter_core::cli::PreviewMode::Solid,
+            size: 64,
+            max_iterations: 5,
+            stall_limit: 2,
+        };
+        let mut agents = ScriptedAgents::new(vec![
+            scripted_review(vec![scripted_finding("a", "new")], &[])?,
+            scripted_review(vec![scripted_finding("b", "new")], &["F1"])?,
+            scripted_review(
+                vec![
+                    scripted_finding("F1", "reopened"),
+                    scripted_finding("F2", "persists"),
+                ],
+                &[],
+            )?,
+            scripted_review(vec![scripted_finding("F2", "persists")], &["F1"])?,
+        ]);
+
+        let outcome = refine_loop(&mut agents, &references(), &settings)?;
+
+        assert_eq!(outcome.status, Status::Stalled);
+        assert_eq!(outcome.iterations, 4);
+        assert_eq!(outcome.remaining_findings, 1);
+        assert_eq!(agents.fix_prompts.len(), 3);
         Ok(())
     }
 

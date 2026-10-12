@@ -47,6 +47,7 @@ pub(crate) fn reviewer_system() -> &'static str {
      When a previous review and the modeler's report on it are provided:\n\
      - Account for every previous finding exactly once: list its id in `resolved` when the current renders show it fixed, otherwise report it again with status `persists` and the same id. A finding the modeler reported as blocked becomes an accepted_blocker non-finding when the reason is valid.\n\
      - Every entry in `decided_non_findings` is decided: do not raise it as a finding again.\n\
+     - Every entry in `resolved_findings` was fixed in an earlier review: when its problem is visible again in the current renders, report it with status `reopened` and its original id instead of a new finding.\n\
      - Report a new finding (status `new`, id `new`) only for a blocking problem visible in the current renders, including a regression caused by the last repair. Never replace resolved findings with new nitpicks.\n\n\
      Every finding names the render views that show it and gives one concrete fix. Answer with JSON only, matching the requested schema."
 }
@@ -83,7 +84,7 @@ pub(crate) fn review(
         || "This is the first review.".to_owned(),
         |previous| {
             format!(
-                "Previous review, the modeler's report on it, and every non-finding decided so far (JSON):\n{previous}"
+                "Previous review, the modeler's report on it, every non-finding decided so far, and every finding resolved so far (JSON):\n{previous}"
             )
         },
     );
