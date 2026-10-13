@@ -71,7 +71,7 @@ lz4_flex = "0.14"
 png = "0.18"
 potter-core = { path = "crates/potter-core" }
 potter-workflow = { path = "crates/potter-workflow" }
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 robust = "1.2"
 ruzstd = "0.9"
 serde = { version = "1", features = ["derive"] }
