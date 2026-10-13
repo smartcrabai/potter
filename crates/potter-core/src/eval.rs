@@ -1121,12 +1121,12 @@ impl Snapshot {
                             json!({ "data": data_id }),
                         )
                     })?;
-                    let evaluated =
+                    let (evaluated, bounds) =
                         evaluate_grease_pencil(grease_pencil, &doc.materials, matrix, frame)?;
                     if !evaluated.is_empty() {
                         strokes.insert(id.clone(), evaluated);
                     }
-                    None
+                    bounds
                 } else {
                     None
                 }
@@ -3609,7 +3609,7 @@ fn evaluate_grease_pencil(
     materials: &crate::model::Registry<crate::model::Material>,
     matrix: DMat4,
     frame: f64,
-) -> Result<Vec<EvaluatedStroke>> {
+) -> Result<(Vec<EvaluatedStroke>, Option<Aabb>)> {
     let scale = matrix
         .x_axis
         .truncate()
@@ -3617,6 +3617,7 @@ fn evaluate_grease_pencil(
         .max(matrix.y_axis.truncate().length())
         .max(matrix.z_axis.truncate().length());
     let mut output = Vec::new();
+    let mut bounds: Option<Aabb> = None;
     for layer in data
         .layers
         .iter()
@@ -3653,19 +3654,28 @@ fn evaluate_grease_pencil(
                 material_color[2],
                 material_color[3] * layer.opacity * mean_opacity,
             ];
-            let points_world = stroke
-                .points
-                .iter()
-                .map(|point| {
-                    let position = glam::DVec3::from_array(point.position);
-                    matrix.transform_point3(position).to_array()
-                })
-                .collect::<Vec<_>>();
-            let radius = stroke
-                .points
-                .iter()
-                .map(|point| point.radius * scale)
-                .collect::<Vec<_>>();
+            let mut points_world = Vec::with_capacity(stroke.points.len());
+            let mut radius = Vec::with_capacity(stroke.points.len());
+            for point in &stroke.points {
+                let position = matrix.transform_point3(DVec3::from_array(point.position));
+                let effective_radius = point.radius * scale;
+                let radius_extent = DVec3::splat(effective_radius);
+                let lower = position - radius_extent;
+                let upper = position + radius_extent;
+                let point_min = lower.min(upper);
+                let point_max = lower.max(upper);
+                if let Some(bounds) = &mut bounds {
+                    bounds.min = bounds.min.min(point_min);
+                    bounds.max = bounds.max.max(point_max);
+                } else {
+                    bounds = Some(Aabb {
+                        min: point_min,
+                        max: point_max,
+                    });
+                }
+                points_world.push(position.to_array());
+                radius.push(effective_radius);
+            }
             if color.iter().any(|value| !value.is_finite())
                 || points_world
                     .iter()
@@ -3686,7 +3696,7 @@ fn evaluate_grease_pencil(
             });
         }
     }
-    Ok(output)
+    Ok((output, bounds))
 }
 
 fn mesh_bounds(mesh: &Mesh, matrix: DMat4) -> Result<Option<Aabb>> {
@@ -3748,10 +3758,274 @@ mod tests {
 
     use crate::{
         geom::{BoxParams, Mesh},
-        model::{DataBlock, Id, Node, SceneDoc, Transform},
+        model::{
+            DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
+            GreasePencilStroke, Id, Node, SceneDoc, Transform,
+        },
     };
 
     use super::{EvaluationContext, Snapshot};
+
+    fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {
+        let data_id = Id::new("grease_pencil_data").unwrap();
+        let node_id = Id::new("grease_pencil_node").unwrap();
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "grease_pencil".to_owned(),
+                grease_pencil: Some(data),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "Grease Pencil".to_owned(),
+                kind: "grease_pencil".to_owned(),
+                transform,
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        (doc, node_id)
+    }
+
+    fn grease_pencil_layer(
+        id: &str,
+        visible: bool,
+        opacity: f64,
+        frames: Vec<GreasePencilFrame>,
+    ) -> GreasePencilLayer {
+        GreasePencilLayer {
+            id: Id::new(id).unwrap(),
+            name: id.to_owned(),
+            opacity,
+            visible,
+            frames,
+        }
+    }
+
+    fn grease_pencil_frame(frame: f64, strokes: Vec<GreasePencilStroke>) -> GreasePencilFrame {
+        GreasePencilFrame { frame, strokes }
+    }
+
+    fn grease_pencil_stroke(id: &str, points: &[([f64; 3], f64)]) -> GreasePencilStroke {
+        GreasePencilStroke {
+            id: Id::new(id).unwrap(),
+            points: points
+                .iter()
+                .map(|(position, radius)| GreasePencilPoint {
+                    position: *position,
+                    pressure: 1.0,
+                    radius: *radius,
+                    opacity: 1.0,
+                    time: 0.0,
+                })
+                .collect(),
+            material: None,
+            cyclic: false,
+            fill: None,
+        }
+    }
+
+    fn assert_vec3_near(actual: DVec3, expected: DVec3) {
+        for (actual, expected) in actual.to_array().into_iter().zip(expected.to_array()) {
+            assert!(
+                (actual - expected).abs() <= 1e-9,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluates_grease_pencil_bounds_from_world_stroke_radii() {
+        let actual_strokes = vec![
+            grease_pencil_stroke("first", &[([0.0, 0.0, 0.0], 0.5), ([1.0, 2.0, -1.0], 0.25)]),
+            grease_pencil_stroke(
+                "second",
+                &[([3.0, -1.0, 2.0], 0.75), ([2.0, 0.0, 0.0], 0.1)],
+            ),
+            grease_pencil_stroke(
+                "zero_radius",
+                &[([5.0, 4.0, 2.0], 0.0), ([0.0, 0.0, 0.0], 0.0)],
+            ),
+        ];
+        let data = GreasePencilData {
+            layers: vec![
+                grease_pencil_layer(
+                    "visible",
+                    true,
+                    1.0,
+                    vec![
+                        grease_pencil_frame(
+                            0.0,
+                            vec![grease_pencil_stroke(
+                                "older",
+                                &[
+                                    ([-100.0, -100.0, -100.0], 1.0),
+                                    ([-99.0, -99.0, -99.0], 1.0),
+                                ],
+                            )],
+                        ),
+                        grease_pencil_frame(1.0, actual_strokes),
+                        grease_pencil_frame(
+                            2.0,
+                            vec![grease_pencil_stroke(
+                                "future",
+                                &[([100.0, 100.0, 100.0], 1.0), ([101.0, 101.0, 101.0], 1.0)],
+                            )],
+                        ),
+                    ],
+                ),
+                grease_pencil_layer(
+                    "invisible",
+                    false,
+                    1.0,
+                    vec![grease_pencil_frame(
+                        1.0,
+                        vec![grease_pencil_stroke(
+                            "hidden",
+                            &[([200.0, 200.0, 200.0], 1.0), ([201.0, 201.0, 201.0], 1.0)],
+                        )],
+                    )],
+                ),
+                grease_pencil_layer(
+                    "transparent",
+                    true,
+                    0.0,
+                    vec![grease_pencil_frame(
+                        1.0,
+                        vec![grease_pencil_stroke(
+                            "transparent_stroke",
+                            &[([300.0, 300.0, 300.0], 1.0), ([301.0, 301.0, 301.0], 1.0)],
+                        )],
+                    )],
+                ),
+            ],
+        };
+        let transform = Transform::from_rotation_deg([10.0, -2.0, 5.0], [0.0; 3], [2.0, 3.0, 4.0]);
+        let (doc, node_id) = grease_pencil_scene(data, transform);
+        let snapshot = Snapshot::evaluate(
+            &doc,
+            &EvaluationContext {
+                frame: Some(1.5),
+                ..EvaluationContext::default()
+            },
+        )
+        .unwrap();
+
+        let evaluated = snapshot.nodes.get(&node_id).unwrap();
+        let bounds = evaluated.bounds.unwrap();
+        assert_vec3_near(bounds.min, DVec3::new(8.0, -8.0, 0.0));
+        assert_vec3_near(bounds.max, DVec3::new(20.0, 10.0, 16.0));
+        assert_vec3_near(
+            DVec3::from_array(evaluated.dimensions.unwrap()),
+            DVec3::new(12.0, 18.0, 16.0),
+        );
+        assert_eq!(snapshot.strokes.get(&node_id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn grease_pencil_without_evaluated_strokes_has_no_bounds() {
+        let cases = [
+            ("empty", GreasePencilData { layers: Vec::new() }, 1.0),
+            (
+                "invisible",
+                GreasePencilData {
+                    layers: vec![grease_pencil_layer(
+                        "invisible",
+                        false,
+                        1.0,
+                        vec![grease_pencil_frame(
+                            1.0,
+                            vec![grease_pencil_stroke(
+                                "hidden",
+                                &[([0.0, 0.0, 0.0], 1.0), ([1.0, 1.0, 1.0], 1.0)],
+                            )],
+                        )],
+                    )],
+                },
+                1.0,
+            ),
+            (
+                "zero_opacity",
+                GreasePencilData {
+                    layers: vec![grease_pencil_layer(
+                        "transparent",
+                        true,
+                        0.0,
+                        vec![grease_pencil_frame(
+                            1.0,
+                            vec![grease_pencil_stroke(
+                                "transparent_stroke",
+                                &[([0.0, 0.0, 0.0], 1.0), ([1.0, 1.0, 1.0], 1.0)],
+                            )],
+                        )],
+                    )],
+                },
+                1.0,
+            ),
+            (
+                "future_only",
+                GreasePencilData {
+                    layers: vec![grease_pencil_layer(
+                        "future",
+                        true,
+                        1.0,
+                        vec![grease_pencil_frame(
+                            2.0,
+                            vec![grease_pencil_stroke(
+                                "future_stroke",
+                                &[([0.0, 0.0, 0.0], 1.0), ([1.0, 1.0, 1.0], 1.0)],
+                            )],
+                        )],
+                    )],
+                },
+                1.0,
+            ),
+            (
+                "one_point",
+                GreasePencilData {
+                    layers: vec![grease_pencil_layer(
+                        "short",
+                        true,
+                        1.0,
+                        vec![grease_pencil_frame(
+                            1.0,
+                            vec![grease_pencil_stroke(
+                                "short_stroke",
+                                &[([0.0, 0.0, 0.0], 1.0)],
+                            )],
+                        )],
+                    )],
+                },
+                1.0,
+            ),
+        ];
+
+        for (case, data, frame) in cases {
+            let (doc, node_id) = grease_pencil_scene(data, Transform::default());
+            let snapshot = Snapshot::evaluate(
+                &doc,
+                &EvaluationContext {
+                    frame: Some(frame),
+                    ..EvaluationContext::default()
+                },
+            )
+            .unwrap();
+            let evaluated = snapshot.nodes.get(&node_id).unwrap();
+            assert!(evaluated.bounds.is_none(), "{case} unexpectedly has bounds");
+            assert!(
+                evaluated.dimensions.is_none(),
+                "{case} unexpectedly has dimensions"
+            );
+            assert!(
+                !snapshot.strokes.contains_key(&node_id),
+                "{case} has strokes"
+            );
+        }
+    }
 
     #[test]
     fn evaluates_world_matrix_and_transformed_mesh_bounds() {

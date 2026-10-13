@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Grease Pencil nodes now expose world-space `bounds` and `dimensions` including stroke thickness in `pot inspect`. The `pot workflow refine` floating-part check detects detached drawings and recognizes meshes supported by grounded strokes; empty drawings and invisible layers have no bounds.
+
 ## 0.2.0 - 2026-10-13
 - `pot workflow refine` now requires `-p/--provider <NAME>` and `-m/--model <ID>`, sent to jcode as `<NAME>:<ID>` (examples: `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`) for the modeler and every reviewer; agents no longer fall back to jcode's default model.
 - `pot workflow refine` counts a review as progress only when it resolves a finding for the first time and reopens none, so a run that fixes one finding per review while the reviewer finds another no longer stops as `stalled`; the reviewer gets every resolved finding and reports one that reappears as `reopened` under its original ID.

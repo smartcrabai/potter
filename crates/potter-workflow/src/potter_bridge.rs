@@ -97,8 +97,8 @@ pub fn render_views(
     Ok(RenderOutput { pngs, warnings })
 }
 
-/// A visible part connected neither to the ground plane (z = 0) nor to any part that is; `gap` is
-/// its distance in meters to that grounded assembly.
+/// A visible bounds-backed part, including Grease Pencil drawings, connected neither to the ground
+/// plane (z = 0) nor to any part that is; `gap` is its distance in meters to that grounded assembly.
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub struct FloatingPart {
     pub id: String,
@@ -110,10 +110,9 @@ pub struct FloatingPart {
 /// touching.
 ///
 /// A node is a part when it has evaluated bounds, which is what the preview draws: meshes and
-/// mesh-backed data (curves, surfaces, text, metaballs, point clouds), volumes, and collection
-/// instances. Cameras, lights, armatures, and empties without an instanced collection have null
-/// bounds and are skipped. Grease Pencil strokes are drawn by the preview, but `pot inspect`
-/// reports null bounds for them, so they are not checked.
+/// mesh-backed data (curves, surfaces, text, metaballs, point clouds), volumes, collection
+/// instances, and Grease Pencil strokes including their radii. Cameras, lights, armatures, and
+/// empties without an instanced collection have no bounds and are skipped.
 ///
 /// # Errors
 ///
@@ -584,6 +583,66 @@ mod tests {
             [FloatingPart {
                 id: "bridge".to_owned(),
                 gap: 0.95
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn floating_parts_counts_grease_pencil_strokes_the_preview_draws() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let scene = directory.path().join("scene");
+        init_scene(&scene)?;
+        let stroke = |drawing: &str, layer: &str, id: &str, x: f64| {
+            json!({
+                "op": "grease_pencil.stroke_add",
+                "target": {"id": drawing},
+                "layer": layer,
+                "frame": 1.0,
+                "id": id,
+                "points": [
+                    {"position": [x, -0.5, 0.125], "pressure": 1.0, "radius": 0.125, "opacity": 1.0, "time": 0.0},
+                    {"position": [x, 0.5, 0.125], "pressure": 1.0, "radius": 0.125, "opacity": 1.0, "time": 1.0}
+                ]
+            })
+        };
+        let batch = json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op": "node.create", "id": "grounded_stroke", "kind": "grease_pencil"},
+                {"op": "grease_pencil.layer_create", "target": {"id": "grounded_stroke"}, "id": "ink", "name": "Ink"},
+                {"op": "grease_pencil.frame_add", "target": {"id": "grounded_stroke"}, "layer": "ink", "frame": 1.0},
+                stroke("grounded_stroke", "ink", "grounded", 0.0),
+                // This mesh touches the stroke's radius-backed bounds, its only support.
+                {"op": "node.create", "id": "supported_mesh", "kind": "box", "params": {"size": 1},
+                 "transform": {"translation": [0.0, 0.0, 0.375], "scale": [0.25, 0.25, 0.25]}},
+                {"op": "node.create", "id": "floating_stroke", "kind": "grease_pencil",
+                 "transform": {"translation": [0.0, 0.0, 0.875]}},
+                {"op": "grease_pencil.layer_create", "target": {"id": "floating_stroke"}, "id": "ink", "name": "Ink"},
+                {"op": "grease_pencil.frame_add", "target": {"id": "floating_stroke"}, "layer": "ink", "frame": 1.0},
+                stroke("floating_stroke", "ink", "floating", 4.0),
+                {"op": "node.create", "id": "hidden_stroke", "kind": "grease_pencil", "visible": false,
+                 "transform": {"translation": [0.0, 0.0, 0.875]}},
+                {"op": "grease_pencil.layer_create", "target": {"id": "hidden_stroke"}, "id": "ink", "name": "Ink"},
+                {"op": "grease_pencil.frame_add", "target": {"id": "hidden_stroke"}, "layer": "ink", "frame": 1.0},
+                stroke("hidden_stroke", "ink", "hidden", 8.0),
+                {"op": "node.create", "id": "empty_drawing", "kind": "grease_pencil"},
+                {"op": "node.create", "id": "hidden_layer_drawing", "kind": "grease_pencil",
+                 "transform": {"translation": [0.0, 0.0, 0.875]}},
+                {"op": "grease_pencil.layer_create", "target": {"id": "hidden_layer_drawing"}, "id": "ink", "name": "Ink", "visible": false},
+                {"op": "grease_pencil.frame_add", "target": {"id": "hidden_layer_drawing"}, "layer": "ink", "frame": 1.0},
+                stroke("hidden_layer_drawing", "ink", "hidden_layer", 12.0)
+            ]
+        });
+        let applied = execute_tool(&scene, "pot_apply", &json!({"batch": batch}));
+        assert!(applied.error.is_none(), "{}", applied.output);
+
+        assert_eq!(
+            floating_parts(&scene)?,
+            [FloatingPart {
+                id: "floating_stroke".to_owned(),
+                gap: 0.875
             }]
         );
         Ok(())
