@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-13
 - `pot workflow refine` now requires `-p/--provider <NAME>` and `-m/--model <ID>`, sent to jcode as `<NAME>:<ID>` (examples: `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`) for the modeler and every reviewer; agents no longer fall back to jcode's default model.
 - `pot workflow refine` counts a review as progress only when it resolves a finding for the first time and reopens none, so a run that fixes one finding per review while the reviewer finds another no longer stops as `stalled`; the reviewer gets every resolved finding and reports one that reappears as `reopened` under its original ID.
 - `pot workflow refine` downscales every reference image to at most 1568 px on the longer edge and sends it as lossy WebP (quality 85), keeping large photos within provider image limits; this adds the `webp` crate (static libwebp).
