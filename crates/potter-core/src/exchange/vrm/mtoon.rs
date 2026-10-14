@@ -66,11 +66,11 @@ pub(super) fn v1(
     });
     if let Some(texture) = &mtoon.shade_multiply_texture {
         value["shadeMultiplyTexture"] =
-            texture_export.texture_info_for_vrm(texture, doc, root_path, binary, views)?;
+            texture_export.texture_info(texture, doc, root_path, binary, views)?;
     }
     if let Some(shift) = &mtoon.shading_shift_texture {
         let mut info =
-            texture_export.texture_info_for_vrm(&shift.texture, doc, root_path, binary, views)?;
+            texture_export.texture_info(&shift.texture, doc, root_path, binary, views)?;
         info["scale"] = json!(shift.scale);
         value["shadingShiftTexture"] = info;
     }
@@ -87,8 +87,7 @@ pub(super) fn v1(
         ),
     ] {
         if let Some(texture) = texture {
-            value[key] =
-                texture_export.texture_info_for_vrm(texture, doc, root_path, binary, views)?;
+            value[key] = texture_export.texture_info(texture, doc, root_path, binary, views)?;
         }
     }
     Ok(value)
@@ -363,7 +362,7 @@ fn add_texture(
 ) -> Result<()> {
     let index = if let Some(channel) = remap_channel {
         texture_export
-            .texture_info_remapped_for_vrm(texture, channel, doc, root_path, binary, views)?
+            .texture_info_channel(texture, Some(channel), doc, root_path, binary, views)?
             .get("index")
             .and_then(Value::as_u64)
             .and_then(|index| usize::try_from(index).ok())

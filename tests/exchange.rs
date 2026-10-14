@@ -335,8 +335,8 @@ fn append_remaps_colliding_ids_and_dry_run_does_not_commit() -> Result<(), Box<d
     assert_ne!(mapped, "body");
     let document: Value = serde_json::from_slice(&fs::read(target.join("scene.json"))?)?;
     assert!(document["nodes"].get(mapped).is_some());
-    // The exported box splits each of its six faces into four normal-split corners (24 vertices).
-    assert_eq!(vertex_count(&target)?, 8 + 24);
+    // The exporter splits the box's vertices per normal; the importer welds those copies back to 8.
+    assert_eq!(vertex_count(&target)?, 8 + 8);
     Ok(())
 }
 
@@ -518,5 +518,84 @@ fn glb_emissive_strength_is_omitted_when_inert_and_round_trips_through_extras()
     assert_eq!(scene["materials"]["inert"]["emission_strength"], 2.5);
     assert_eq!(scene["materials"]["unit"]["emission_strength"], 1.0);
     assert_eq!(scene["materials"]["glow"]["emission_strength"], 2.5);
+    Ok(())
+}
+
+fn rigged_shape_key_scene(scene: &Path, posed: bool) -> Result<(), Box<dyn Error>> {
+    let init = pot()
+        .args(["init", scene.to_str().unwrap(), "--json"])
+        .output()?;
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stdout)
+    );
+    let weights: Vec<Value> = (0..8)
+        .map(|vertex_id| json!({"vertex_id": vertex_id, "weight": 1.0}))
+        .collect();
+    let mut operations = vec![
+        json!({"op":"node.create","id":"body","kind":"box","params":{"size":2.0}}),
+        json!({"op":"node.create","id":"rig","name":"Rig","kind":"armature"}),
+        json!({"op":"bone.create","target":{"id":"rig"},"id":"root","name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,0.0,1.0]}),
+        json!({"op":"vertex_group.create","target":{"id":"body"},"id":"root_group","name":"Root"}),
+        json!({"op":"vertex_group.assign","target":{"id":"body"},"group_id":"root_group","weights":weights}),
+        json!({"op":"modifier.create","target":{"id":"body"},"id":"armature","type":"armature","params":{"object":"rig","use_vertex_groups":true}}),
+        json!({"op":"shape_key.create","target":{"id":"body"},"id":"lift","name":"Lift","positions":{"0":[-1.0,-1.0,1.5]}}),
+    ];
+    if posed {
+        let half_turn = std::f64::consts::FRAC_1_SQRT_2;
+        operations.push(json!({"op":"pose.set","target":{"id":"rig"},"bone_id":"root","set":{"rotation":[0.0,0.0,half_turn,half_turn]}}));
+    }
+    let operations_path = scene.with_extension("operations.json");
+    fs::write(
+        &operations_path,
+        serde_json::to_vec(
+            &json!({"schema_version": 1, "base_revision": 0, "operations": operations}),
+        )?,
+    )?;
+    let applied = pot()
+        .args(["apply", scene.to_str().unwrap(), "--file"])
+        .arg(&operations_path)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    Ok(())
+}
+
+#[test]
+fn glb_refuses_posed_armature_under_shape_keys_and_exports_at_rest() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let rest = directory.path().join("rest");
+    rigged_shape_key_scene(&rest, false)?;
+    export(&rest, "glb", &directory.path().join("rest.glb"))?;
+
+    let posed = directory.path().join("posed");
+    rigged_shape_key_scene(&posed, true)?;
+    let output = pot()
+        .args([
+            "export",
+            posed.to_str().unwrap(),
+            "--format",
+            "glb",
+            "--out",
+        ])
+        .arg(directory.path().join("posed.glb"))
+        .arg("--json")
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "a posed armature under shape keys must not export as glb"
+    );
+    let failure = json(&output)?;
+    assert_eq!(failure["ok"], false);
+    assert_eq!(failure["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        failure["error"]["details"]["feature_id"],
+        "rig.skin_shape_key_pose"
+    );
     Ok(())
 }
