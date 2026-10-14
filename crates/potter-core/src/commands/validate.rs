@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ValidateArgs,
-    commands::{export::avatar_settings_loss, util::exchange_format_name},
+    commands::util::exchange_format_name,
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot},
     model::AvatarVersion,
@@ -44,25 +44,6 @@ pub fn run(args: ValidateArgs) -> Result<(Option<SceneInfo>, Value)> {
                 Err(error) => append_vrm_preflight_error(&mut report, format, &error)?,
             }
         }
-    } else if format == Some("blend")
-        && let Some(loss) = avatar_settings_loss(project.doc(), "blend")
-    {
-        let loss_value = serde_json::to_value(&loss).map_err(PotError::internal_json)?;
-        report.value["losses"]
-            .as_array_mut()
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InternalError,
-                    "validation report losses are not an array",
-                )
-            })?
-            .push(loss_value);
-        append_issue(
-            &mut report,
-            "UNREPRESENTABLE_FEATURE",
-            &loss.reason,
-            json!({"feature_id":loss.feature_id,"suggestion":loss.suggestion}),
-        )?;
     }
     let scene = project.info()?;
     if args.strict && (report.has_errors || report.has_warnings) {

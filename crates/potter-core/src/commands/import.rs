@@ -555,6 +555,7 @@ fn append_graph(imported: &mut SceneDoc, base: &SceneDoc, source_path: &Path) ->
     }
     imported.active_scene = base.active_scene.clone();
     imported.scenes = base.scenes.clone();
+    imported.avatar.clone_from(&base.avatar);
     imported.collections = merged_collections;
     imported.nodes = merged_nodes;
     imported.data_blocks = merged_data;

@@ -57,6 +57,10 @@ pub fn scene_changes(before: &SceneDoc, after: &SceneDoc) -> Result<Value> {
             registry_changes(&before[registry], &after[registry]),
         );
     }
+    changes.insert(
+        "avatar".to_owned(),
+        json!({"updated": before["avatar"] != after["avatar"]}),
+    );
     Ok(Value::Object(changes))
 }
 
