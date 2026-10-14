@@ -584,7 +584,9 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
             .cloned();
         if let Some(entry) = entry {
             let format_losses = if format == "blend" {
-                crate::exchange::blend::export_losses(doc)
+                let mut losses = crate::exchange::blend::export_losses(doc);
+                losses.extend(crate::commands::export::avatar_settings_loss(doc, "blend"));
+                losses
             } else {
                 crate::commands::export::export_losses(doc, format)
             };

@@ -432,52 +432,36 @@ pub enum AvatarVersion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AvatarFeatureDescriptor {
     pub feature_id: &'static str,
-    pub vrm_1_0: bool,
-    pub vrm_0_x: bool,
     pub limitation: &'static str,
 }
 
 pub const AVATAR_FEATURE_DESCRIPTORS: &[AvatarFeatureDescriptor] = &[
     AvatarFeatureDescriptor {
         feature_id: "humanoid",
-        vrm_1_0: true,
-        vrm_0_x: true,
         limitation: "VRM 0.x uses its legacy human-bone array.",
     },
     AvatarFeatureDescriptor {
         feature_id: "metadata",
-        vrm_1_0: true,
-        vrm_0_x: true,
         limitation: "VRM 0.x has fewer permission and licensing fields; explicit legacy overrides are available.",
     },
     AvatarFeatureDescriptor {
         feature_id: "expressions",
-        vrm_1_0: true,
-        vrm_0_x: true,
         limitation: "VRM 0.x texture-transform binds require MToon settings and no metallic/roughness maps or shader graph.",
     },
     AvatarFeatureDescriptor {
         feature_id: "first_person",
-        vrm_1_0: true,
-        vrm_0_x: true,
         limitation: "VRM 0.x uses firstPersonFlag mesh annotations.",
     },
     AvatarFeatureDescriptor {
         feature_id: "look_at",
-        vrm_1_0: true,
-        vrm_0_x: true,
         limitation: "VRM 0.x stores look-at controls in legacy firstPerson fields.",
     },
     AvatarFeatureDescriptor {
         feature_id: "spring_bone",
-        vrm_1_0: true,
-        vrm_0_x: true,
         limitation: "VRM 0.x supports sphere colliders and group-wide joint settings only.",
     },
     AvatarFeatureDescriptor {
         feature_id: "mtoon",
-        vrm_1_0: true,
-        vrm_0_x: true,
         limitation: "VRM 0.x uses legacy materialProperties.",
     },
 ];
@@ -792,7 +776,7 @@ pub fn validate_avatar_settings(doc: &SceneDoc, settings: &AvatarSettings) -> Re
                 "/avatar/mtoon",
             ));
         }
-        validate_mtoon(doc, mtoon)?;
+        validate_mtoon(doc, material, mtoon)?;
     }
     Ok(())
 }
@@ -1317,11 +1301,12 @@ fn spring_chains_overlap(doc: &SceneDoc, left: &AvatarSpring, right: &AvatarSpri
         })
 }
 
-fn validate_mtoon(doc: &SceneDoc, material: &AvatarMtoon) -> Result<()> {
+fn validate_mtoon(doc: &SceneDoc, material_id: &Id, material: &AvatarMtoon) -> Result<()> {
+    let pointer = |field: &str| format!("/avatar/mtoon/{material_id}/{field}");
     if !(-9..=9).contains(&material.render_queue_offset_number) {
         return Err(avatar_error(
             "MToon render_queue_offset_number must be between -9 and 9.",
-            "/avatar/mtoon",
+            &pointer("render_queue_offset_number"),
         ));
     }
     for (values, label) in [
@@ -1333,7 +1318,7 @@ fn validate_mtoon(doc: &SceneDoc, material: &AvatarMtoon) -> Result<()> {
         ),
         (&material.outline_color_factor, "outline_color_factor"),
     ] {
-        finite_color(values, label)?;
+        finite_color(values, &pointer(label))?;
     }
     for (value, min, max, field) in [
         (
@@ -1378,7 +1363,7 @@ fn validate_mtoon(doc: &SceneDoc, material: &AvatarMtoon) -> Result<()> {
             min,
             max,
             "MToon setting is outside its official range.",
-            field,
+            &pointer(field),
         )?;
     }
     for (value, field) in [
@@ -1400,30 +1385,30 @@ fn validate_mtoon(doc: &SceneDoc, material: &AvatarMtoon) -> Result<()> {
             "uv_animation_rotation_speed_factor",
         ),
     ] {
-        finite(value, "MToon setting must be finite.", field)?;
+        finite(value, "MToon setting must be finite.", &pointer(field))?;
     }
     if let Some(texture) = &material.shade_multiply_texture {
-        validate_texture(doc, texture, "/avatar/mtoon/shade_multiply_texture")?;
+        validate_texture(doc, texture, &pointer("shade_multiply_texture"))?;
     }
     if let Some(texture) = &material.shading_shift_texture {
-        validate_texture(doc, &texture.texture, "/avatar/mtoon/shading_shift_texture")?;
+        validate_texture(doc, &texture.texture, &pointer("shading_shift_texture"))?;
         finite(
             texture.scale,
             "MToon shading shift texture scale must be finite.",
-            "/avatar/mtoon/shading_shift_texture/scale",
+            &pointer("shading_shift_texture/scale"),
         )?;
     }
     if let Some(texture) = &material.matcap_texture {
-        validate_texture(doc, texture, "/avatar/mtoon/matcap_texture")?;
+        validate_texture(doc, texture, &pointer("matcap_texture"))?;
     }
     if let Some(texture) = &material.rim_multiply_texture {
-        validate_texture(doc, texture, "/avatar/mtoon/rim_multiply_texture")?;
+        validate_texture(doc, texture, &pointer("rim_multiply_texture"))?;
     }
     if let Some(texture) = &material.outline_width_multiply_texture {
-        validate_texture(doc, texture, "/avatar/mtoon/outline_width_multiply_texture")?;
+        validate_texture(doc, texture, &pointer("outline_width_multiply_texture"))?;
     }
     if let Some(texture) = &material.uv_animation_mask_texture {
-        validate_texture(doc, texture, "/avatar/mtoon/uv_animation_mask_texture")?;
+        validate_texture(doc, texture, &pointer("uv_animation_mask_texture"))?;
     }
     Ok(())
 }
@@ -1438,14 +1423,14 @@ fn validate_texture(doc: &SceneDoc, texture: &TextureRef, pointer: &str) -> Resu
     Ok(())
 }
 
-fn finite_color(values: &[f64; 3], name: &str) -> Result<()> {
+fn finite_color(values: &[f64; 3], pointer: &str) -> Result<()> {
     for value in values {
         finite_range(
             *value,
             0.0,
             1.0,
             "MToon color factors must be finite and between 0 and 1.",
-            name,
+            pointer,
         )?;
     }
     Ok(())

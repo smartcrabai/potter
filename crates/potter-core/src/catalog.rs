@@ -1949,28 +1949,10 @@ pub fn feature_catalog() -> Value {
                     descriptor.feature_id,
                     "Avatar",
                     &["avatar.update", "avatar.clear"],
-                    [
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
-                        false,
-                        descriptor.vrm_1_0 || descriptor.vrm_0_x,
-                    ],
+                    [true, true, true, false, false, false, true],
                 );
                 row["reason"] = json!(format!(
-                    "VRM 1.0 export: {}; VRM 0.x export: {}; {}",
-                    if descriptor.vrm_1_0 {
-                        "supported"
-                    } else {
-                        "not supported"
-                    },
-                    if descriptor.vrm_0_x {
-                        "supported"
-                    } else {
-                        "not supported"
-                    },
+                    "VRM 1.0 and 0.x export: supported; {}",
                     descriptor.limitation
                 ));
                 row
@@ -2092,8 +2074,8 @@ pub fn formats_catalog() -> Value {
                 "Only the adapter's implemented GLTF feature subset is supported; unsupported source features are rejected or reported as losses.",
             ],
         ),
-        vrm_format_row("vrm", true),
-        vrm_format_row("vrm0", false),
+        vrm_format_row("vrm"),
+        vrm_format_row("vrm0"),
         format_row(
             "obj",
             [true, true],
@@ -2266,8 +2248,7 @@ pub fn formats_catalog() -> Value {
     json!({"catalog_version":1,"formats":formats})
 }
 
-fn vrm_format_row(format: &str, vrm_1_0: bool) -> Value {
-    let version = if vrm_1_0 { "VRM 1.0" } else { "VRM 0.x" };
+fn vrm_format_row(format: &str) -> Value {
     let mut row = format_row(
         format,
         [false, true],
@@ -2285,39 +2266,13 @@ fn vrm_format_row(format: &str, vrm_1_0: bool) -> Value {
             "Settings not representable by this VRM version are rejected during validation and export.",
         ],
     );
-    let descriptors = crate::model::AVATAR_FEATURE_DESCRIPTORS;
     let mut features = row["features"].as_array().cloned().unwrap_or_default();
     features.extend(
-        descriptors
+        crate::model::AVATAR_FEATURE_DESCRIPTORS
             .iter()
-            .filter(|descriptor| {
-                if vrm_1_0 {
-                    descriptor.vrm_1_0
-                } else {
-                    descriptor.vrm_0_x
-                }
-            })
             .map(|descriptor| json!(descriptor.feature_id)),
     );
     row["features"] = Value::Array(features);
-    let limitations = descriptors
-        .iter()
-        .filter(|descriptor| {
-            if vrm_1_0 {
-                !descriptor.vrm_1_0
-            } else {
-                !descriptor.vrm_0_x
-            }
-        })
-        .map(|descriptor| format!("{}: {}", descriptor.feature_id, descriptor.limitation))
-        .collect::<Vec<_>>();
-    if !limitations.is_empty() {
-        let mut loss_conditions = vec![json!(format!(
-            "Configured {version} settings with unsupported features are rejected instead of silently omitted."
-        ))];
-        loss_conditions.extend(limitations.into_iter().map(|limitation| json!(limitation)));
-        row["loss_conditions"] = Value::Array(loss_conditions);
-    }
     row
 }
 

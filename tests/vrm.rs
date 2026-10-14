@@ -3651,3 +3651,100 @@ fn vrm_caps_skin_influences_at_four_while_glb_keeps_second_joint_set() -> TestRe
     );
     Ok(())
 }
+
+#[test]
+fn append_import_keeps_base_avatar_and_reports_it_unchanged() -> TestResult {
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    let base_avatar = scene_avatar(&project)?;
+    let (_source_directory, source) = plain_skinned_box(false, false)?;
+    let source_glb = directory.path().join("hat.glb");
+    let exported = pot()
+        .arg("export")
+        .arg(&source)
+        .args(["--format", "glb", "--out"])
+        .arg(&source_glb)
+        .arg("--json")
+        .output()?;
+    assert!(exported.status.success());
+    let base_revision = revision(&project)?;
+    let imported = pot()
+        .arg("import")
+        .arg(&project)
+        .arg("--file")
+        .arg(&source_glb)
+        .args(["--format", "glb", "--base-revision"])
+        .arg(base_revision.to_string())
+        .args(["--mode", "append", "--json"])
+        .output()?;
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stdout)
+    );
+    let result = cli_json(&imported)?;
+    assert_eq!(result["result"]["changes"]["avatar"]["updated"], false);
+    assert_eq!(scene_avatar(&project)?, base_avatar);
+    export(&project, "vrm", &directory.path().join("after-append.vrm"))?;
+    Ok(())
+}
+
+#[test]
+fn undo_reports_avatar_changes_in_changes() -> TestResult {
+    let (_directory, project) = new_fixture(FixtureOptions::default())?;
+    let base_revision = revision(&project)?;
+    apply_success(&project, base_revision, &[json!({"op": "avatar.clear"})])?;
+    let output = pot()
+        .arg("undo")
+        .arg(&project)
+        .args([
+            "--base-revision",
+            &(base_revision + 1).to_string(),
+            "--json",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        cli_json(&output)?["result"]["changes"]["avatar"]["updated"],
+        true
+    );
+    assert!(scene_avatar(&project)?.is_object());
+    Ok(())
+}
+
+#[test]
+fn mtoon_validation_pointers_name_the_material_and_field_through_apply() -> TestResult {
+    let (_directory, project) = new_fixture(FixtureOptions::default())?;
+    let base_revision = revision(&project)?;
+
+    let mut range = avatar_settings(FixtureOptions::default())["mtoon"].clone();
+    range["skin_material"]["shading_toony_factor"] = json!(2.0);
+    let output = apply_batch(
+        &project,
+        base_revision,
+        &[json!({"op": "avatar.update", "set": {"mtoon": range}})],
+    )?;
+    let envelope = assert_failure(&output, "INVALID_OPERATION")?;
+    assert_eq!(
+        envelope["error"]["details"]["pointer"],
+        "/operations/0/set/mtoon/skin_material/shading_toony_factor"
+    );
+
+    let mut texture = avatar_settings(FixtureOptions::default())["mtoon"].clone();
+    texture["skin_material"]["matcap_texture"] = json!({"image": "missing_matcap"});
+    let output = apply_batch(
+        &project,
+        base_revision,
+        &[json!({"op": "avatar.update", "set": {"mtoon": texture}})],
+    )?;
+    let envelope = assert_failure(&output, "INVALID_OPERATION")?;
+    assert_eq!(
+        envelope["error"]["details"]["pointer"],
+        "/operations/0/set/mtoon/skin_material/matcap_texture"
+    );
+    assert_eq!(revision(&project)?, base_revision);
+    Ok(())
+}
