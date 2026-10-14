@@ -111,7 +111,7 @@ export const BONE_HEADS = {
   head: [0, 0, 1.7],
   shoulder_l: [0, 0, 1.5],
   upper_arm_l: [0.25, 0, 1.5],
-  forearm_l: [0.65, 0, 1.5],
+  forearm_l: [0.65, 0.025, 1.5],
   hand_l: [1.0, 0, 1.5],
   thigh_l: [0.15, 0, 0.9],
   shin_l: [0.15, -0.025, 0.5],

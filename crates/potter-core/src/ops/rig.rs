@@ -733,13 +733,13 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
                 format!("upper_arm.{suffix}"),
                 format!("shoulder_{side}"),
                 [0.25 * sign, 0.0, 1.5],
-                [0.65 * sign, -0.025, 1.5],
+                [0.65 * sign, 0.025, 1.5],
             ),
             (
                 format!("forearm_{side}"),
                 format!("forearm.{suffix}"),
                 format!("upper_arm_{side}"),
-                [0.65 * sign, -0.025, 1.5],
+                [0.65 * sign, 0.025, 1.5],
                 [1.0 * sign, 0.0, 1.5],
             ),
             (
@@ -800,9 +800,9 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
             (
                 format!("elbow_pole_{side}"),
                 format!("elbow_pole.{suffix}"),
-                [0.65 * sign, -1.0, 1.5],
-                [0.65 * sign, -1.25, 1.5],
-                [0.65 * sign, -1.0, 1.5],
+                [0.65 * sign, 1.0, 1.5],
+                [0.65 * sign, 1.25, 1.5],
+                [0.65 * sign, 1.0, 1.5],
             ),
             (
                 format!("foot_ik_{side}"),
@@ -822,7 +822,7 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
             append_human_bone(&mut plan, &role, &name, None, head, tail, scale, false)?;
             append_rig_controller(&mut plan, armature_id, &role, &name, translation, scale)?;
         }
-        // The right rest frame reverses local X, so its shared -Y pole needs a half-turn.
+        // Arm poles point backward (+Y) so elbows bend behind the body; the left pole needs a half-turn.
         append_human_ik_constraint(
             &mut plan,
             &format!("ik_arm_{side}"),
@@ -832,9 +832,9 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
             &format!("hand_{side}"),
             3,
             if side == "r" {
-                std::f64::consts::PI
-            } else {
                 0.0
+            } else {
+                std::f64::consts::PI
             },
         )?;
         // The thigh rest frame needs a 90-degree offset to align its up axis with the -Y knee pole.

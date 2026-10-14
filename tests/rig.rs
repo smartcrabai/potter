@@ -781,11 +781,11 @@ fn rig_generate_basic_human_creates_scaled_deform_and_control_rigs() -> Integrat
             (
                 format!("upper_arm_{side}"),
                 DVec3::new(0.5 * sign, 0.0, 3.0),
-                DVec3::new(1.3 * sign, -0.05, 3.0),
+                DVec3::new(1.3 * sign, 0.05, 3.0),
             ),
             (
                 format!("forearm_{side}"),
-                DVec3::new(1.3 * sign, -0.05, 3.0),
+                DVec3::new(1.3 * sign, 0.05, 3.0),
                 DVec3::new(2.0 * sign, 0.0, 3.0),
             ),
             (
@@ -869,7 +869,7 @@ fn rig_generate_basic_human_creates_scaled_deform_and_control_rigs() -> Integrat
     let moved_arm = Snapshot::evaluate(&moved_arm_document, &EvaluationContext::default())?;
     assert_vec3_close(
         bone_endpoint(&moved_arm, "arm", "hand_l", 0.5)?,
-        DVec3::new(2.300_058, 0.000_012, 3.100_003),
+        DVec3::new(2.300_058, -0.000_012, 3.100_003),
         1.0e-4,
     );
     assert!(
@@ -879,6 +879,40 @@ fn rig_generate_basic_human_creates_scaled_deform_and_control_rigs() -> Integrat
             .zip(bone_matrix(&constrained, "arm", "upper_arm_l")?.to_cols_array())
             .any(|(moved, rest)| (moved - rest).abs() > 1.0e-3),
         "moving the hand IK target did not deform the generated arm"
+    );
+    let left_elbow = bone_endpoint(
+        &moved_arm,
+        "arm",
+        "upper_arm_l",
+        DVec3::new(0.8, 0.05, 0.0).length(),
+    )?;
+    assert!(
+        left_elbow.y > 0.0,
+        "left elbow must bend backward (+Y): {left_elbow:?}"
+    );
+
+    let mut moved_right_document = document.clone();
+    let moved_right_target = moved_right_document
+        .nodes
+        .get_mut(&Id::new("rig_arm_hand_ik_r")?)
+        .ok_or_else(|| io::Error::other("generated right hand IK target is missing"))?;
+    moved_right_target.transform.translation[0] += 0.2;
+    moved_right_target.transform.translation[2] += 0.1;
+    let moved_right = Snapshot::evaluate(&moved_right_document, &EvaluationContext::default())?;
+    let right_elbow = bone_endpoint(
+        &moved_right,
+        "arm",
+        "upper_arm_r",
+        DVec3::new(-0.8, 0.05, 0.0).length(),
+    )?;
+    assert!(
+        right_elbow.y > 0.0,
+        "right elbow must bend backward (+Y): {right_elbow:?}"
+    );
+    assert_vec3_close(
+        bone_endpoint(&moved_right, "arm", "hand_r", 0.5)?,
+        DVec3::new(-2.3, 0.0, 3.1),
+        1.0e-4,
     );
 
     let hand_target = Id::new("rig_arm_hand_ik_l")?;
