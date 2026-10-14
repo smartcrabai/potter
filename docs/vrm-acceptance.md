@@ -12,9 +12,14 @@ Potter is responsible for authoring and export fidelity. Tracking capture, retar
 
 VSeeFace supports VRM 0.x only. Do not give it a VRM 1.0 file.
 
-### Consumer fix
+### Consumer fixes
 
-`@pixiv/three-vrm` 3.5.5 applies a VRM 1.0 `materialColorBinds` / `textureTransformBinds` entry once per mesh that uses the material, so a material shared by N meshes moves N times. The harness patches the loader to bind each material instance once. Potter's output keeps one bind per material, as the VRM 1.0 specification defines; the exporter does not compensate.
+The harness patches `@pixiv/three-vrm` 3.5.5 (`tests/vrm-consumer/patches/`) where it deviates from the VRM 1.0 specification. Potter's output follows the specification; the exporter does not compensate.
+
+- `materialColorBinds` / `textureTransformBinds` are applied once per mesh that uses the material, so a material shared by N meshes moves N times. The patch binds each material instance once.
+- Bone look-at selects `rangeMapVerticalUp` when looking down and `rangeMapVerticalDown` when looking up. The patch selects the maps as `lookAt.md` defines.
+
+Known unpatched gap: `VRMUtils.rotateVRM0` rotates the scene but not VRM 0.x world `gravityDir`, so sideways spring gravity in a VRM 0.x file points the opposite way in three-vrm. Potter writes `gravityDir` the way UniVRM migrates it (VRM 0.x `(x, y, z)` = VRM 1.0 `(-x, y, z)`), and the harness asserts three-vrm's raw value.
 
 ## Automated acceptance
 
