@@ -3,7 +3,10 @@ pub(crate) use mtoon::uv_textures;
 
 use glam::{DMat4, DVec3};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -126,7 +129,11 @@ fn validate_vrm_frame_maps(
 ) -> Result<()> {
     if let Some(spring) = &avatar.spring_bone {
         for collider in &spring.colliders {
-            let matrix = frame_matrix(frames, &collider.node)?;
+            let matrix = frame_matrix(
+                &frames.node_offset_matrices,
+                &frames.bone_offset_matrices,
+                &collider.node,
+            )?;
             let (offset, radius) = match &collider.shape {
                 AvatarSpringColliderShape::Sphere { offset, radius }
                 | AvatarSpringColliderShape::Capsule { offset, radius, .. } => (offset, radius),
@@ -157,7 +164,11 @@ fn validate_vrm_frame_maps(
         for chain in &spring.springs {
             let mut chain_scale = None;
             for joint in &chain.joints {
-                let matrix = frame_matrix(frames, &joint.node)?;
+                let matrix = frame_matrix(
+                    &frames.node_offset_matrices,
+                    &frames.bone_offset_matrices,
+                    &joint.node,
+                )?;
                 if joint.hit_radius > 0.0 {
                     let scale = uniform_frame_scale(&matrix, "spring joint hit radius")?;
                     if version == AvatarVersion::V0
@@ -179,7 +190,8 @@ fn validate_vrm_frame_maps(
             .get("head")
             .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "avatar head bone is missing"))?;
         let matrix = frame_matrix(
-            frames,
+            &frames.node_offset_matrices,
+            &frames.bone_offset_matrices,
             &AvatarNodeRef {
                 node: avatar.armature.clone(),
                 bone: Some(head.clone()),
@@ -198,31 +210,15 @@ fn validate_vrm_frame_maps(
     Ok(())
 }
 
-fn frame_matrix(frames: &super::gltf::VrmFrameMaps, reference: &AvatarNodeRef) -> Result<DMat4> {
-    let matrix = if let Some(bone) = &reference.bone {
-        frames
-            .bone_offset_matrices
-            .get(&(reference.node.clone(), bone.clone()))
-    } else {
-        frames.node_offset_matrices.get(&reference.node)
-    };
-    matrix.copied().ok_or_else(|| {
-        unsupported_export(
-            "vrm.local_frame",
-            "A VRM attachment references a node or bone without a normalized local-frame mapping.",
-        )
-    })
-}
-fn frame_matrix_from_mappings(
-    mappings: &VrmWriterMappings<'_>,
+fn frame_matrix(
+    node_matrices: &BTreeMap<Id, DMat4>,
+    bone_matrices: &BTreeMap<(Id, Id), DMat4>,
     reference: &AvatarNodeRef,
 ) -> Result<DMat4> {
     let matrix = if let Some(bone) = &reference.bone {
-        mappings
-            .bone_offset_matrices
-            .get(&(reference.node.clone(), bone.clone()))
+        bone_matrices.get(&(reference.node.clone(), bone.clone()))
     } else {
-        mappings.node_offset_matrices.get(&reference.node)
+        node_matrices.get(&reference.node)
     };
     matrix.copied().ok_or_else(|| {
         unsupported_export(
@@ -237,9 +233,13 @@ fn map_local_vector(
     reference: &AvatarNodeRef,
     vector: [f64; 3],
 ) -> Result<[f64; 3]> {
-    Ok(frame_matrix_from_mappings(mappings, reference)?
-        .transform_vector3(DVec3::from_array(vector))
-        .to_array())
+    Ok(frame_matrix(
+        mappings.node_offset_matrices,
+        mappings.bone_offset_matrices,
+        reference,
+    )?
+    .transform_vector3(DVec3::from_array(vector))
+    .to_array())
 }
 
 fn map_local_point(
@@ -247,9 +247,13 @@ fn map_local_point(
     reference: &AvatarNodeRef,
     point: [f64; 3],
 ) -> Result<[f64; 3]> {
-    Ok(frame_matrix_from_mappings(mappings, reference)?
-        .transform_point3(DVec3::from_array(point))
-        .to_array())
+    Ok(frame_matrix(
+        mappings.node_offset_matrices,
+        mappings.bone_offset_matrices,
+        reference,
+    )?
+    .transform_point3(DVec3::from_array(point))
+    .to_array())
 }
 
 fn map_local_radius(
@@ -261,7 +265,12 @@ fn map_local_radius(
     if radius == 0.0 {
         return Ok(0.0);
     }
-    let scale = uniform_frame_scale(&frame_matrix_from_mappings(mappings, reference)?, label)?;
+    let matrix = frame_matrix(
+        mappings.node_offset_matrices,
+        mappings.bone_offset_matrices,
+        reference,
+    )?;
+    let scale = uniform_frame_scale(&matrix, label)?;
     let mapped_radius = radius * scale;
     if !mapped_radius.is_finite() {
         return Err(unsupported_export(
@@ -528,14 +537,6 @@ fn validate_v0_meta_settings(meta: &AvatarMeta) -> Result<V0MetaPolicy<'_>> {
         return Err(unsupported_export(
             "vrm.v0.meta_license",
             "Set meta.legacy.license_name to map redistribution and modification rights to VRM 0.x.",
-        ));
-    }
-    if meta.other_license_url.is_some()
-        && legacy.and_then(|legacy| legacy.license_name) != Some(AvatarLegacyLicenseName::Other)
-    {
-        return Err(unsupported_export(
-            "vrm.v0.meta_license",
-            "VRM 0.x can represent an additional license URL only with legacy license_name `other`.",
         ));
     }
     let license = legacy
@@ -1372,7 +1373,7 @@ fn vrm1_extension(
             .as_object()
             .is_some_and(|value| value.len() > 1)
         {
-            extension_root(root, "VRMC_springBone", spring_extension)?;
+            set_root_extension(root, "VRMC_springBone", spring_extension)?;
             mark_extension_used(root, "VRMC_springBone")?;
         }
     }
@@ -1382,8 +1383,6 @@ fn vrm1_extension(
             material_id,
             mtoon,
             doc,
-            mappings,
-            root,
             root_path,
             texture_export,
             binary,
@@ -1461,16 +1460,15 @@ fn vrm1_meta(
     if !meta.references.is_empty() {
         value["references"] = json!(meta.references);
     }
+    if let Some(thumbnail) = &meta.thumbnail
+        && !doc.images.contains_key(thumbnail)
+    {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "VRM thumbnail image is missing",
+        ));
+    }
     if let Some(thumbnail) = &meta.thumbnail {
-        let thumbnail_image = doc.images.get(thumbnail).ok_or_else(|| {
-            PotError::new(ErrorCode::SceneInvalid, "VRM thumbnail image is missing")
-        })?;
-        if thumbnail_image.width != thumbnail_image.height {
-            return Err(unsupported_export(
-                "vrm.v1.thumbnail_aspect",
-                "VRM 1.0 requires a square thumbnail image; resize the thumbnail or export without one.",
-            ));
-        }
         let image = texture_export.export_image_index(
             thumbnail,
             ImageInterpolation::Linear,
@@ -1491,12 +1489,12 @@ fn human_bones(
 ) -> Result<Value> {
     let mut bones = serde_json::Map::new();
     for (role, bone_id) in &avatar.humanoid {
-        let (target_role, mapped_id) = if version == AvatarVersion::V0 {
-            legacy_humanoid_role(role, bone_id)
+        let target_role = if version == AvatarVersion::V0 {
+            legacy_humanoid_role(role)
         } else {
-            (role.as_str(), bone_id)
+            role.as_str()
         };
-        let index = index_for_bone(mappings, &avatar.armature, mapped_id, target_role)?;
+        let index = index_for_bone(mappings, &avatar.armature, bone_id, target_role)?;
         if version == AvatarVersion::V1 {
             bones.insert(target_role.to_owned(), json!({ "node": index }));
         } else {
@@ -1507,16 +1505,6 @@ fn human_bones(
         }
     }
     if version == AvatarVersion::V0 {
-        for required in ["chest", "neck"] {
-            if !bones.contains_key(required) {
-                return Err(unsupported_export(
-                    "vrm.v0.humanoid_required_bone",
-                    &format!(
-                        "VRM 0.x requires the `{required}` humanoid bone; map it in avatar.humanoid."
-                    ),
-                ));
-            }
-        }
         Ok(Value::Array(
             bones.into_iter().map(|(_, value)| value).collect(),
         ))
@@ -1525,15 +1513,15 @@ fn human_bones(
     }
 }
 
-fn legacy_humanoid_role<'a>(role: &'a str, bone_id: &'a Id) -> (&'a str, &'a Id) {
+fn legacy_humanoid_role(role: &str) -> &str {
     match role {
-        "leftThumbMetacarpal" => ("leftThumbProximal", bone_id),
-        "leftThumbProximal" => ("leftThumbIntermediate", bone_id),
-        "leftThumbDistal" => ("leftThumbDistal", bone_id),
-        "rightThumbMetacarpal" => ("rightThumbProximal", bone_id),
-        "rightThumbProximal" => ("rightThumbIntermediate", bone_id),
-        "rightThumbDistal" => ("rightThumbDistal", bone_id),
-        _ => (role, bone_id),
+        "leftThumbMetacarpal" => "leftThumbProximal",
+        "leftThumbProximal" => "leftThumbIntermediate",
+        "leftThumbDistal" => "leftThumbDistal",
+        "rightThumbMetacarpal" => "rightThumbProximal",
+        "rightThumbProximal" => "rightThumbIntermediate",
+        "rightThumbDistal" => "rightThumbDistal",
+        _ => role,
     }
 }
 
@@ -1837,8 +1825,6 @@ fn vrm0_extension(
         extension["materialProperties"] = Value::Array(vrm0_material_properties(
             doc,
             avatar,
-            mappings,
-            root,
             root_path,
             texture_export,
             binary,
@@ -1995,7 +1981,11 @@ fn vrm0_expressions(
             .morph_target_binds
             .iter()
             .map(|bind| {
-                let mesh = unique_legacy_mesh_index(mappings, &bind.node)?;
+                let mesh = index_for(
+                    mappings.node_mesh_indices,
+                    &bind.node,
+                    "legacy expression mesh",
+                )?;
                 let index = morph_index(doc, mappings, root, &bind.node, &bind.shape_key)?;
                 Ok(json!({ "mesh": mesh, "index": index, "weight": bind.weight * 100.0 }))
             })
@@ -2109,10 +2099,12 @@ fn vrm0_spring_bone(
             first.hit_radius,
             "spring joint hit radius",
         )?;
+        // VRM 0.x vectors are Unity-space and the model faces -Z: store z-reflect(Rot_Y180(glTF dir)).
+        let g = super::gltf::axis_to_gltf(first.gravity_dir);
         let mut group = json!({
             "stiffiness": first.stiffness,
             "gravityPower": first.gravity_power,
-            "gravityDir": legacy_vec3(super::gltf::axis_to_gltf(first.gravity_dir)),
+            "gravityDir": legacy_z_reflected_vec3([-g[0], g[1], -g[2]]),
             "dragForce": first.drag_force,
             "hitRadius": hit_radius,
             "bones": bones,
@@ -2184,8 +2176,6 @@ fn legacy_collider_groups(
 fn vrm0_material_properties(
     doc: &SceneDoc,
     avatar: &AvatarSettings,
-    mappings: &VrmWriterMappings<'_>,
-    root: &Value,
     root_path: &Path,
     texture_export: &mut TextureExport,
     binary: &mut Vec<u8>,
@@ -2196,12 +2186,9 @@ fn vrm0_material_properties(
         .map(|(material_id, material)| {
             if let Some(mtoon) = avatar.mtoon.get(material_id) {
                 mtoon::v0(
-                    material_id,
                     material,
                     mtoon,
                     doc,
-                    mappings,
-                    root,
                     root_path,
                     texture_export,
                     binary,
@@ -2310,24 +2297,6 @@ fn morph_index(
 fn mesh_node_index(mappings: &VrmWriterMappings<'_>, node_id: &Id, what: &str) -> Result<usize> {
     let _ = index_for(mappings.node_mesh_indices, node_id, what)?;
     index_for(mappings.node_indices, node_id, what)
-}
-fn unique_legacy_mesh_index(mappings: &VrmWriterMappings<'_>, node_id: &Id) -> Result<usize> {
-    let mesh_index = index_for(
-        mappings.node_mesh_indices,
-        node_id,
-        "legacy expression mesh",
-    )?;
-    if mappings
-        .node_mesh_indices
-        .iter()
-        .any(|(other, index)| other != node_id && *index == mesh_index)
-    {
-        return Err(unsupported_export(
-            "vrm.v0.expression_shared_mesh",
-            "VRM 0.x morph binds address glTF meshes, so a bind cannot target only one of multiple nodes sharing that mesh; make the target mesh unique or export VRM 1.0.",
-        ));
-    }
-    Ok(mesh_index)
 }
 
 fn index_for<T>(mapping: &std::collections::BTreeMap<Id, T>, id: &Id, what: &str) -> Result<T>
@@ -2464,10 +2433,6 @@ fn set_root_extension(root: &mut Value, name: &str, extension: Value) -> Result<
     })?;
     extensions.insert(name.to_owned(), extension);
     Ok(())
-}
-
-fn extension_root(root: &mut Value, name: &str, extension: Value) -> Result<()> {
-    set_root_extension(root, name, extension)
 }
 
 fn set_material_extension(

@@ -8,7 +8,7 @@ use crate::{
     model::{AvatarMtoon, AvatarOutlineWidthMode, Id, Material, SceneDoc, TextureRef},
 };
 
-use super::super::gltf::{TextureExport, VrmWriterMappings, unsupported_export};
+use super::super::gltf::{TextureExport, unsupported_export};
 
 pub(crate) fn uv_textures(mtoon: &AvatarMtoon) -> impl Iterator<Item = &TextureRef> {
     [
@@ -33,8 +33,6 @@ pub(super) fn v1(
     material_id: &Id,
     mtoon: &AvatarMtoon,
     doc: &SceneDoc,
-    _mappings: &VrmWriterMappings<'_>,
-    _root: &Value,
     root_path: &Path,
     texture_export: &mut TextureExport,
     binary: &mut Vec<u8>,
@@ -97,19 +95,16 @@ pub(super) fn v1(
 }
 
 pub(super) fn v0(
-    _material_id: &Id,
     material: &Material,
     mtoon: &AvatarMtoon,
     doc: &SceneDoc,
-    _mappings: &VrmWriterMappings<'_>,
-    _root: &Value,
     root_path: &Path,
     texture_export: &mut TextureExport,
     binary: &mut Vec<u8>,
     views: &mut Vec<Value>,
 ) -> Result<Value> {
     validate_v0(material, mtoon)?;
-    let (blend_mode, queue, alpha_tag, keyword) = alpha_properties(material)?;
+    let (blend_mode, queue, alpha_tag, keyword) = alpha_properties(material, mtoon)?;
     let (legacy_shade_shift, legacy_shade_toony) = legacy_shading_values(mtoon)?;
     let float_properties = json!({
         "_MToonVersion": 39.0,
@@ -307,7 +302,7 @@ pub(super) fn v0(
 }
 
 pub(super) fn validate_v0(material: &Material, mtoon: &AvatarMtoon) -> Result<()> {
-    alpha_properties(material)?;
+    alpha_properties(material, mtoon)?;
     validate_transmission(material)?;
     if mtoon.shading_shift_texture.is_some() {
         return Err(unsupported_export(
@@ -385,10 +380,14 @@ fn add_texture(
     Ok(())
 }
 
-fn alpha_properties(material: &Material) -> Result<(f64, i32, &'static str, &'static str)> {
+fn alpha_properties(
+    material: &Material,
+    mtoon: &AvatarMtoon,
+) -> Result<(f64, i32, &'static str, &'static str)> {
     let (blend_mode, queue, alpha_tag, keyword) = match material.alpha_mode.as_str() {
         "opaque" => (0.0, 2000, "Opaque", ""),
         "clip" => (1.0, 2450, "TransparentCutout", "_ALPHATEST_ON"),
+        "blend" if mtoon.transparent_with_z_write => (3.0, 2501, "Transparent", "_ALPHABLEND_ON"),
         "blend" => (2.0, 3000, "Transparent", "_ALPHABLEND_ON"),
         _ => {
             return Err(unsupported_export(
