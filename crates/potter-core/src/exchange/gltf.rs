@@ -484,16 +484,18 @@ fn validate_skin_shape_key_rest(
     Ok(())
 }
 
-fn append_skin_attributes(
+/// Deform-bone influences per exported vertex as (joint index, weight), sorted by joint index.
+/// The glTF writer and VRM preflight share this so `validate --format vrm|vrm0` reports the same
+/// failures: every skinned vertex needs weight, and VRM also caps influences at four.
+fn skin_influences(
+    node_id: &Id,
     data_block: &DataBlock,
     mesh: &Mesh,
     source_vertex_indices: &[usize],
     binding: &SkinBinding,
     doc: &SceneDoc,
-    binary: &mut Vec<u8>,
-    views: &mut Vec<Value>,
-    accessors: &mut Vec<Value>,
-) -> Result<Vec<(usize, usize)>> {
+    vrm: bool,
+) -> Result<Vec<Vec<(usize, f64)>>> {
     let armature_node = doc
         .nodes
         .get(&binding.armature_node)
@@ -533,7 +535,9 @@ fn append_skin_attributes(
         .collect::<BTreeSet<_>>();
     let mut vertex_influences =
         Vec::<Vec<(usize, f64)>>::with_capacity(source_vertex_indices.len());
-    let mut max_influences = 0_usize;
+    // Keyed by source vertex: one source vertex can appear in several split output vertices.
+    let mut unweighted = BTreeSet::<u32>::new();
+    let mut over_limit = BTreeMap::<u32, usize>::new();
     for source_index in source_vertex_indices {
         let vertex = mesh.vertices.get(*source_index).ok_or_else(|| {
             PotError::new(
@@ -564,17 +568,70 @@ fn append_skin_attributes(
             }
         }
         influences.sort_by_key(|(joint_index, _)| *joint_index);
-        max_influences = max_influences.max(influences.len());
+        if influences.is_empty() {
+            unweighted.insert(vertex.id);
+        }
+        if vrm && influences.len() > 4 {
+            over_limit.insert(vertex.id, influences.len());
+        }
         vertex_influences.push(influences);
     }
+    if let Some(first) = unweighted.first() {
+        let reason = format!(
+            "skinned mesh `{node_id}` has {} vertices with no weight on a deform bone (first vertex {first}); weight every vertex to a deform bone or remove the armature modifier",
+            unweighted.len()
+        );
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            &reason,
+            json!({
+                "feature_id": "mesh.skin_unweighted_vertex",
+                "status": "not_supported",
+                "reason": &reason,
+                "node": node_id,
+                "count": unweighted.len(),
+                "first_vertex": first,
+            }),
+        ));
+    }
+    if let Some((first, _)) = over_limit.first_key_value() {
+        let max_influences = over_limit.values().copied().max().unwrap_or_default();
+        let reason = format!(
+            "VRM skins allow at most 4 bone influences per vertex; skinned mesh `{node_id}` has {} vertices with up to {max_influences} (first vertex {first}); limit each vertex to its 4 strongest deform-bone weights",
+            over_limit.len()
+        );
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            &reason,
+            json!({
+                "feature_id": "vrm.skin_influence_limit",
+                "status": "not_supported",
+                "reason": &reason,
+                "node": node_id,
+                "count": over_limit.len(),
+                "first_vertex": first,
+                "max_influences": max_influences,
+            }),
+        ));
+    }
+    Ok(vertex_influences)
+}
+
+fn append_skin_attributes(
+    vertex_influences: &[Vec<(usize, f64)>],
+    binary: &mut Vec<u8>,
+    views: &mut Vec<Value>,
+    accessors: &mut Vec<Value>,
+) -> Result<Vec<(usize, usize)>> {
+    let max_influences = vertex_influences.iter().map(Vec::len).max().unwrap_or(0);
     let set_count = max_influences.div_ceil(4).max(1);
     let mut joint_sets = (0..set_count)
-        .map(|_| Vec::<[u16; 4]>::with_capacity(source_vertex_indices.len()))
+        .map(|_| Vec::<[u16; 4]>::with_capacity(vertex_influences.len()))
         .collect::<Vec<_>>();
     let mut weight_sets = (0..set_count)
-        .map(|_| Vec::<[f32; 4]>::with_capacity(source_vertex_indices.len()))
+        .map(|_| Vec::<[f32; 4]>::with_capacity(vertex_influences.len()))
         .collect::<Vec<_>>();
-    for influences in &vertex_influences {
+    for influences in vertex_influences {
         let total = influences.iter().map(|(_, weight)| *weight).sum::<f64>();
         if !total.is_finite() {
             return Err(PotError::new(
@@ -2341,6 +2398,19 @@ pub(crate) fn validate_vrm_mesh_references(
             .copied()
             .unwrap_or(DVec3::ONE);
         let export = mesh_export_layout(mesh, data_block, scale, avatar_basis(version))?;
+        if let (Some(data_id), Some(data_block)) = (node.data.as_ref(), data_block)
+            && let Some(binding) = data_skin_bindings.get(data_id)
+        {
+            skin_influences(
+                node_id,
+                data_block,
+                mesh,
+                &export.layout.source_vertex_indices,
+                binding,
+                doc,
+                true,
+            )?;
+        }
         for material_id in used_material_ids(node, mesh, data_block.is_none())? {
             validate_mesh_material_uv(doc, material_id, Some(avatar), export.layout.uvs.is_some())?;
         }
@@ -2674,16 +2744,17 @@ fn export_with_root_inner(
         if let (Some(data_id), Some(data_block)) = (data_id, data_block)
             && let Some(binding) = data_skin_bindings.get(data_id)
         {
-            let accessors_for_sets = append_skin_attributes(
+            let influences = skin_influences(
+                node_id,
                 data_block,
                 mesh,
                 &layout.source_vertex_indices,
                 binding,
                 doc,
-                &mut binary,
-                &mut views,
-                &mut accessors,
+                vrm.is_some(),
             )?;
+            let accessors_for_sets =
+                append_skin_attributes(&influences, &mut binary, &mut views, &mut accessors)?;
             for (set_index, (joints_accessor, weights_accessor)) in
                 accessors_for_sets.into_iter().enumerate()
             {

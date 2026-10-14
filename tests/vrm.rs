@@ -3515,3 +3515,139 @@ fn vrm_emissive_strength_extension_is_present_only_when_it_changes_shading() -> 
     }
     Ok(())
 }
+
+/// Four extra deform bones, each weighting vertex 0 of `body`; with its base group that is five influences.
+fn extra_influence_operations() -> Vec<Value> {
+    let mut operations = Vec::new();
+    for (name, x) in [
+        ("extra_1", 0.5),
+        ("extra_2", 0.6),
+        ("extra_3", 0.7),
+        ("extra_4", 0.8),
+    ] {
+        operations.push(json!({"op": "bone.create", "target": {"id": "arm"}, "id": name, "name": name, "head": [x, 0.0, 0.0], "tail": [x, 0.0, 0.2]}));
+        operations.push(json!({"op": "vertex_group.create", "target": {"id": "body"}, "id": name, "name": name}));
+        operations.push(json!({"op": "vertex_group.assign", "target": {"id": "body"}, "group_id": name, "weights": [{"vertex_id": 0, "weight": 0.25}]}));
+    }
+    operations
+}
+
+/// Skinned box without avatar settings, so glb export reaches the skin writer.
+fn plain_skinned_box(
+    extra_influences: bool,
+    unweighted_vertex: bool,
+) -> TestResult<(TempDir, std::path::PathBuf)> {
+    let (directory, project) = init_project()?;
+    let mut operations = vec![
+        json!({"op": "node.create", "id": "arm", "kind": "armature"}),
+        json!({"op": "bone.create", "target": {"id": "arm"}, "id": "root", "name": "root", "head": [0.0, 0.0, 0.0], "tail": [0.0, 0.0, 1.0]}),
+        json!({"op": "node.create", "id": "body", "kind": "box", "params": {"size": 1.0}}),
+        json!({"op": "vertex_group.create", "target": {"id": "body"}, "id": "root", "name": "root"}),
+        json!({"op": "vertex_group.assign", "target": {"id": "body"}, "group_id": "root", "weights": (0..8).map(|vertex_id| json!({"vertex_id": vertex_id, "weight": 1.0})).collect::<Vec<_>>()}),
+        json!({"op": "modifier.create", "target": {"id": "body"}, "id": "skin", "type": "armature", "params": {"object": "arm", "use_vertex_groups": true}}),
+    ];
+    if extra_influences {
+        operations.extend(extra_influence_operations());
+    }
+    if unweighted_vertex {
+        operations.push(json!({"op": "vertex_group.remove", "target": {"id": "body"}, "group_id": "root", "vertex_ids": [0]}));
+    }
+    apply_success(&project, revision(&project)?, &operations)?;
+    Ok((directory, project))
+}
+
+#[test]
+fn skinned_vertex_without_deform_weight_is_rejected_in_every_export_format() -> TestResult {
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    apply_success(
+        &project,
+        revision(&project)?,
+        &[
+            json!({"op": "vertex_group.remove", "target": {"id": "body"}, "group_id": "hips", "vertex_ids": [0]}),
+        ],
+    )?;
+    for format in ["vrm", "vrm0"] {
+        let output_path = directory.path().join(format!("unweighted-{format}.vrm"));
+        let failure = assert_validate_export_preflight(
+            &project,
+            format,
+            &output_path,
+            "mesh.skin_unweighted_vertex",
+        )?;
+        assert_eq!(failure["error"]["details"]["node"], "body");
+        assert_eq!(failure["error"]["details"]["count"], 1);
+        assert_eq!(failure["error"]["details"]["first_vertex"], 0);
+        assert!(
+            !output_path.exists(),
+            "failed VRM export created an output file"
+        );
+    }
+    let (_plain_directory, plain) = plain_skinned_box(false, true)?;
+    let glb_path = directory.path().join("unweighted.glb");
+    let failure = export_failure(&plain, "glb", &glb_path)?;
+    assert_eq!(
+        failure["error"]["details"]["feature_id"],
+        "mesh.skin_unweighted_vertex"
+    );
+    assert_eq!(failure["error"]["details"]["node"], "body");
+    assert_eq!(failure["error"]["details"]["count"], 1);
+    assert!(
+        !glb_path.exists(),
+        "failed glb export created an output file"
+    );
+    Ok(())
+}
+
+#[test]
+fn vrm_caps_skin_influences_at_four_while_glb_keeps_second_joint_set() -> TestResult {
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    apply_success(&project, revision(&project)?, &extra_influence_operations())?;
+    for format in ["vrm", "vrm0"] {
+        let output_path = directory
+            .path()
+            .join(format!("five-influences-{format}.vrm"));
+        let failure = assert_validate_export_preflight(
+            &project,
+            format,
+            &output_path,
+            "vrm.skin_influence_limit",
+        )?;
+        assert_eq!(failure["error"]["details"]["node"], "body");
+        assert_eq!(failure["error"]["details"]["count"], 1);
+        assert_eq!(failure["error"]["details"]["first_vertex"], 0);
+        assert_eq!(failure["error"]["details"]["max_influences"], 5);
+    }
+    let (_plain_directory, plain) = plain_skinned_box(true, false)?;
+    let glb_path = directory.path().join("five-influences.glb");
+    let output = pot()
+        .arg("export")
+        .arg(&plain)
+        .args(["--format", "glb", "--out"])
+        .arg(&glb_path)
+        .arg("--json")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "glb export rejected five influences: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let glb = parse_glb(&glb_path)?;
+    let root = &glb.json;
+    let body = gltf_node_index(root, "body");
+    let primitive = &root["meshes"][usize_field(&root["nodes"][body]["mesh"])]["primitives"][0];
+    assert!(primitive["attributes"]["JOINTS_1"].is_number());
+    assert!(primitive["attributes"]["WEIGHTS_1"].is_number());
+    let weights0 = accessor_matrix(&glb, usize_field(&primitive["attributes"]["WEIGHTS_0"]))?;
+    let weights1 = accessor_matrix(&glb, usize_field(&primitive["attributes"]["WEIGHTS_1"]))?;
+    assert_eq!(weights0.len(), weights1.len());
+    for (first, second) in weights0.iter().zip(&weights1) {
+        let total: f64 = first.iter().chain(second).sum();
+        assert!((total - 1.0).abs() <= 1.0e-6, "skin weights sum to {total}");
+    }
+    assert!(
+        weights1.iter().flatten().any(|weight| *weight > 0.0),
+        "five-influence vertex lost its second joint set"
+    );
+    Ok(())
+}
