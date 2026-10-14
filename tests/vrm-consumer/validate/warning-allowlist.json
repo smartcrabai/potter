@@ -1,6 +1,7 @@
 [
   {
     "code": "INVALID_EXTENSION_NAME_FORMAT",
+    "file": "v0.vrm",
     "pointer": "^/extensionsUsed/\\d+$",
     "reason": "v0.vrm only: extensionsUsed[2] is \"VRM\", the unprefixed extension name mandated by the VRM 0.x spec. The glTF validator's vendor-prefix name rule does not apply to it. Not a producer defect."
   },

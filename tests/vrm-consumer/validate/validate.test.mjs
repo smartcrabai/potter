@@ -29,6 +29,13 @@ test("classifyWarnings: only warnings count, pointer regex is applied, hits are 
   assert.deepEqual(unallowed.map((m) => `${m.code} ${m.pointer}`), ["A /nodes/10", "B /nodes/0"]);
 });
 
+test("classifyWarnings: an entry with a file applies only to that fixture", () => {
+  const entries = [{ code: "A", pointer: "^/x$", reason: "r", file: "v0.vrm" }];
+  const messages = [warning("A", "/x")];
+  assert.deepEqual(classifyWarnings(messages, entries, "v0.vrm").hits, [1]);
+  assert.deepEqual(classifyWarnings(messages, entries, "v1.vrm").unallowed.map((m) => m.code), ["A"]);
+});
+
 test("validateAllowlistEntries rejects missing or empty reasons and bad regexes", () => {
   assert.doesNotThrow(() => validateAllowlistEntries([{ code: "A", pointer: "^/a$", reason: "because" }]));
   assert.throws(() => validateAllowlistEntries([{ code: "A", pointer: "^/a$", reason: "  " }]), /reason is required/);

@@ -297,9 +297,9 @@ const LOOKAT_BONE = {
   lookAtType: 'bone',
   offsetFromHeadBone: [0, -0.08, 0.06],
   rangeMapHorizontalInner: { inputMaxValue: 30, outputScale: 10 },
-  rangeMapHorizontalOuter: { inputMaxValue: 30, outputScale: 10 },
-  rangeMapVerticalDown: { inputMaxValue: 30, outputScale: 10 },
-  rangeMapVerticalUp: { inputMaxValue: 30, outputScale: 10 },
+  rangeMapHorizontalOuter: { inputMaxValue: 30, outputScale: 8 },
+  rangeMapVerticalDown: { inputMaxValue: 30, outputScale: 6 },
+  rangeMapVerticalUp: { inputMaxValue: 30, outputScale: 4 },
 };
 export const LOOKAT = {
   v1Full: LOOKAT_BONE,
@@ -308,9 +308,9 @@ export const LOOKAT = {
     lookAtType: 'expression',
     offsetFromHeadBone: [0, -0.08, 0.06],
     rangeMapHorizontalInner: { inputMaxValue: 30, outputScale: 1 },
-    rangeMapHorizontalOuter: { inputMaxValue: 30, outputScale: 1 },
-    rangeMapVerticalDown: { inputMaxValue: 30, outputScale: 1 },
-    rangeMapVerticalUp: { inputMaxValue: 30, outputScale: 1 },
+    rangeMapHorizontalOuter: { inputMaxValue: 30, outputScale: 0.8 },
+    rangeMapVerticalDown: { inputMaxValue: 30, outputScale: 0.6 },
+    rangeMapVerticalUp: { inputMaxValue: 30, outputScale: 0.4 },
   },
 };
 

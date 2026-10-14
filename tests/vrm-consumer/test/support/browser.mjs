@@ -59,8 +59,6 @@ export async function openHarness() {
   const browser = await chromium.launch({ headless: true, args });
   try {
     const page = await browser.newPage();
-    const errors = [];
-    page.on('pageerror', (err) => errors.push(err.message));
     await page.route(`${origin}/**`, serve);
     await page.goto(`${origin}/harness/index.html`);
     await page.waitForFunction(() => window.potterReady === true || window.potterError, null, { timeout: 60_000 });
@@ -68,7 +66,6 @@ export async function openHarness() {
     if (error) throw new Error(`harness failed to start: ${error}`);
     return {
       page,
-      errors,
       async close() {
         await browser.close();
       },
