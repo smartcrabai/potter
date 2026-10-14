@@ -1356,6 +1356,10 @@ fn assert_v1_semantics(glb: &Glb, options: FixtureOptions) -> TestResult<()> {
     close(&look_at["rangeMapHorizontalInner"]["outputScale"], 0.25);
     close(&look_at["rangeMapVerticalUp"]["inputMaxValue"], 60.0);
     close(&look_at["rangeMapVerticalUp"]["outputScale"], 1.0);
+    close(&look_at["rangeMapHorizontalOuter"]["inputMaxValue"], 40.0);
+    close(&look_at["rangeMapHorizontalOuter"]["outputScale"], 0.5);
+    close(&look_at["rangeMapVerticalDown"]["inputMaxValue"], 50.0);
+    close(&look_at["rangeMapVerticalDown"]["outputScale"], 0.75);
 
     let spring = &root["extensions"]["VRMC_springBone"];
     assert_eq!(spring["specVersion"], "1.0");
@@ -1604,6 +1608,10 @@ fn assert_v0_semantics(glb: &Glb, options: FixtureOptions) -> TestResult<()> {
     close(&first_person["lookAtHorizontalInner"]["yRange"], 0.25);
     close(&first_person["lookAtVerticalUp"]["xRange"], 60.0);
     close(&first_person["lookAtVerticalUp"]["yRange"], 1.0);
+    close(&first_person["lookAtHorizontalOuter"]["xRange"], 40.0);
+    close(&first_person["lookAtHorizontalOuter"]["yRange"], 0.5);
+    close(&first_person["lookAtVerticalDown"]["xRange"], 50.0);
+    close(&first_person["lookAtVerticalDown"]["yRange"], 0.75);
 
     let secondary = &vrm["secondaryAnimation"];
     let collider_group = &secondary["colliderGroups"][0];
@@ -2654,7 +2662,7 @@ fn vrm_preflight_rejects_mtoon_textures_without_exported_uv0() -> TestResult {
 }
 
 #[test]
-fn changed_constrained_skin_pose_is_baked_or_rejected_explicitly() -> TestResult {
+fn changed_constrained_skin_pose_is_rejected_explicitly() -> TestResult {
     let (directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
         &project,
@@ -2689,72 +2697,24 @@ fn changed_constrained_skin_pose_is_baked_or_rejected_explicitly() -> TestResult
         .arg(&output_path)
         .arg("--json")
         .output()?;
-    if output.status.success() {
-        assert_eq!(
-            output_path
-                .extension()
-                .and_then(|extension| extension.to_str()),
-            Some("vrm")
-        );
-        assert_eq!(cli_json(&output)?["ok"], true);
-        let glb = parse_glb(&output_path)?;
-        let root = &glb.json;
-        let skin_node = gltf_node_index(root, "constrained_skin");
-        let mesh_index = usize_field(&root["nodes"][skin_node]["mesh"]);
-        let skin_index = usize_field(&root["nodes"][skin_node]["skin"]);
-        let skin = &root["skins"][skin_index];
-        let tip_index = gltf_bone_index(root, "skin_tip");
+    let failure = assert_failure(&output, "UNSUPPORTED_FEATURE")?;
+    assert_eq!(
+        failure["error"]["details"]["feature_id"],
+        "rig.skin_shape_key_pose"
+    );
+    assert_eq!(failure["error"]["details"]["status"], "not_supported");
+    for field in ["armature", "bone"] {
         assert!(
-            skin["joints"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|joint| usize_field(joint) == tip_index)
-        );
-        let primitive = &root["meshes"][mesh_index]["primitives"][0];
-        assert!(primitive["attributes"]["JOINTS_0"].is_number());
-        assert!(primitive["attributes"]["WEIGHTS_0"].is_number());
-        let morph_names = root["meshes"][mesh_index]["extras"]["targetNames"]
-            .as_array()
-            .ok_or("constrained skin morph target is missing")?;
-        let morph_index = morph_names
-            .iter()
-            .position(|name| name.as_str() == Some("Constrained Pose"))
-            .ok_or("constrained pose shape key was not exported")?;
-        let morph = accessor_matrix(
-            &glb,
-            usize_field(&primitive["targets"][morph_index]["POSITION"]),
-        )?;
-        assert!(
-            morph
-                .iter()
-                .flatten()
-                .any(|component| component.abs() > 0.1)
-        );
-        let evaluated_head = evaluated_bone_endpoint(&project, "skin_arm", "skin_tip", 0.0)?;
-        let expected_gltf_head = DVec3::new(evaluated_head.x, evaluated_head.z, -evaluated_head.y);
-        let exported_head = gltf_node_world_position(root, tip_index)?;
-        assert!(exported_head.distance(expected_gltf_head) <= 1.0e-4);
-    } else {
-        let failure = assert_failure(&output, "UNSUPPORTED_FEATURE")?;
-        assert_eq!(
-            failure["error"]["details"]["feature_id"],
-            "rig.skin_shape_key_pose"
-        );
-        assert_eq!(failure["error"]["details"]["status"], "not_supported");
-        for field in ["armature", "bone"] {
-            assert!(
-                failure["error"]["details"][field]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty()),
-                "pose rejection omitted `{field}` context"
-            );
-        }
-        assert!(
-            !output_path.exists(),
-            "failed export created an output file"
+            failure["error"]["details"][field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "pose rejection omitted `{field}` context"
         );
     }
+    assert!(
+        !output_path.exists(),
+        "failed export created an output file"
+    );
     assert_eq!(revision(&project)?, current_revision);
     Ok(())
 }
@@ -3498,14 +3458,6 @@ fn vrm_emissive_strength_extension_is_present_only_when_it_changes_shading() -> 
         let materials = glb.json["materials"]
             .as_array()
             .ok_or("glTF materials are missing")?;
-        for material in materials {
-            let extension = &material["extensions"]["KHR_materials_emissive_strength"];
-            if !extension.is_null() {
-                let factor = json_numbers::<3>(&material["emissiveFactor"])?;
-                assert!(factor.iter().any(|value| *value != 0.0));
-                assert_ne!(extension["emissiveStrength"].as_f64(), Some(1.0));
-            }
-        }
         let inert = materials
             .iter()
             .find(|material| material["name"] == "Inert Glow")

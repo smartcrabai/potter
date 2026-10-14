@@ -399,14 +399,12 @@ fn every_export_catalog_format_handles_the_spec_box_or_reports_loss() {
             .output()
             .unwrap();
         let response = value(&output);
-        if output.status.success() {
-            assert_eq!(response["result"]["format"], format);
-            assert!(
-                output_path.is_file(),
-                "{format} export did not create its output"
-            );
-        } else if matches!(format, "vrm" | "vrm0") {
+        if matches!(format, "vrm" | "vrm0") {
             // VRM needs avatar settings the plain box does not have; the rejection must say so.
+            assert!(
+                !output.status.success(),
+                "{format} exported a scene without avatar settings"
+            );
             assert_eq!(
                 response["error"]["details"]["feature_id"], "vrm.avatar_settings",
                 "{format} must reject a scene without avatar settings with a typed error"
@@ -414,6 +412,12 @@ fn every_export_catalog_format_handles_the_spec_box_or_reports_loss() {
             assert!(
                 !output_path.exists(),
                 "{format} wrote output despite rejection"
+            );
+        } else if output.status.success() {
+            assert_eq!(response["result"]["format"], format);
+            assert!(
+                output_path.is_file(),
+                "{format} export did not create its output"
             );
         } else {
             let details = &response["error"]["details"];
