@@ -238,7 +238,7 @@ describe('check 6: bone look-at rotates eyes, expression look-at drives look wei
       approx(await weight('lookLeft'), yawDeg > 0 ? rangeValue(spec.rangeMapHorizontalOuter, yawDeg) : 0, TOL.weight, 'lookLeft');
       approx(await weight('lookRight'), yawDeg < 0 ? rangeValue(spec.rangeMapHorizontalOuter, yawDeg) : 0, TOL.weight, 'lookRight');
       approx(await weight('lookDown'), pitchDeg > 0 ? rangeValue(spec.rangeMapVerticalDown, pitchDeg) : 0, TOL.weight, 'lookDown');
-      approx(await weight('lookUp'), pitchDeg < 0 ? rangeValue(spec.rangeMapVerticalDown, pitchDeg) : 0, TOL.weight, 'lookUp');
+      approx(await weight('lookUp'), pitchDeg < 0 ? rangeValue(spec.rangeMapVerticalUp, pitchDeg) : 0, TOL.weight, 'lookUp');
     });
   }
 

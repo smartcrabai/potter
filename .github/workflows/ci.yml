@@ -97,6 +97,12 @@ jobs:
           cache: npm
           cache-dependency-path: tests/vrm-consumer/package-lock.json
 
+      - name: Cache VRM schemas
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: tests/vrm-consumer/.cache/schema
+          key: vrm-schema-${{ hashFiles('tests/vrm-consumer/schema/schemas.lock.json') }}
+
       - name: Install consumer dependencies
         shell: bash
         working-directory: tests/vrm-consumer

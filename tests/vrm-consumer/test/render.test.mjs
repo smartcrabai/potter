@@ -47,6 +47,7 @@ test('3 MASK material: alpha < cutoff leaves holes, alpha >= cutoff is drawn', a
   assert.ok(r.hole > 0, `no hole texels in view: ${j(r)}`);
   assert.equal(r.visibleHole, 0, `holes drawn: ${j(r)}`);
   assert.ok(r.solid > 0 && r.visibleSolid === r.solid, `solid texels visible ${r.visibleSolid}/${r.solid}: ${j(r)}`);
+  assert.equal(r.frontSolid, r.solid, `winding: front-facing raycast hits ${r.frontSolid}/${r.solid}: ${j(r)}`);
 });
 
 test('4a double-sided BLEND ribbon is visible from the back; alpha 0 texels are not', async (t) => {
@@ -91,11 +92,4 @@ test('7 per-face material: eye faces render with the eye material, skin faces wi
   }
   assert.equal(r.skin.hitMaterial, 'skin', `skin sample front face material: ${j(r.skin)}`);
   assert.ok(sameRgb(r.skin.actual, r.skin.reference), `skin pixel ${j(r.skin.actual)} != skin-material reference ${j(r.skin.reference)}`);
-});
-
-test('8 mirrored ribbon front face is visible from the front camera', async (t) => {
-  const r = await run(t, 'cutoutFront');
-  assert.ok(r.solid > 0, `no solid texels: ${j(r)}`);
-  assert.equal(r.frontSolid, r.solid, `winding: front-facing raycast hits ${r.frontSolid}/${r.solid}: ${j(r)}`);
-  assert.equal(r.visibleSolid, r.solid, `render shows ${r.visibleSolid}/${r.solid} solid texels: ${j(r)}`);
 });

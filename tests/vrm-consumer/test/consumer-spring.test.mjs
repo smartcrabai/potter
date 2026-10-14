@@ -55,20 +55,7 @@ function motion(t) {
 
 // Signed distance from a tail point to a collider surface, minus the joint hitRadius; >= 0 means outside.
 // Sphere: centre = collider.head. Capsule: segment head..tail including both end caps.
-function margin(tail, collider, hitRadius) {
-  const p = vec(tail);
-  const a = vec(collider.head);
-  const b = vec(collider.tail);
-  let d;
-  if (collider.type === 'capsule') {
-    const ab = b.clone().sub(a);
-    const t = Math.min(1, Math.max(0, p.clone().sub(a).dot(ab) / ab.lengthSq()));
-    d = p.distanceTo(a.clone().addScaledVector(ab, t));
-  } else {
-    d = p.distanceTo(a);
-  }
-  return d - (collider.radius + hitRadius);
-}
+const margin = (tail, collider, hitRadius) => shapeDistance(tail, collider) - (collider.radius + hitRadius);
 
 // Runs the motion on the loaded model; returns the worst collider margin over all tails and frames,
 // and the worst deviation of the bone-to-tail length from its rest value.

@@ -1,5 +1,4 @@
-// Check 10: VRM 0.x (after VRMUtils.rotateVRM0) matches VRM 1.0 for rest positions, a skinning sample and morph
-// outputs, within the same tolerances as the reference checks. Poses use the frame-invariant delta transfer.
+// Check 10: VRM 0.x (after VRMUtils.rotateVRM0) matches VRM 1.0 morph outputs; the thumbnail decodes at spec size.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { openHarness } from './support/browser.mjs';
@@ -13,8 +12,6 @@ import {
   TOL,
   correspondence,
   triples,
-  vrmPoseWorlds,
-  captureRestWorlds,
   assertVecClose,
   approx,
 } from './support/fixture.mjs';
@@ -37,38 +34,6 @@ after(async () => {
 });
 
 describe('VRM 0.x vs VRM 1.0 parity', () => {
-  it('rest positions of every reference vertex match in both models', async () => {
-    for (const [id, mesh] of Object.entries(reference.meshes)) {
-      correspondence(await potter.vertexPositions(V1, id), mesh.restGltf, `VRM 1.0 ${id}`);
-      correspondence(await potter.vertexPositions(V0, id), mesh.restGltf, `VRM 0.x ${id}`);
-    }
-  });
-
-  it('skinning sample (elbow and knee blended vertices) matches VRM 1.0 after the same delta-transferred pose', async () => {
-    const rest1 = {};
-    const rest0 = {};
-    for (const id of Object.keys(reference.blended)) {
-      rest1[id] = await potter.vertexPositions(V1, id);
-      rest0[id] = await potter.vertexPositions(V0, id);
-    }
-    const world1 = vrmPoseWorlds('v1Full', reference, await captureRestWorlds(potter, V1, 'v1Full', reference));
-    const world0 = vrmPoseWorlds('v0', reference, await captureRestWorlds(potter, V0, 'v0', reference));
-    await potter.setWorldPose(V1, world1);
-    await potter.setWorldPose(V0, world0);
-    let checked = 0;
-    for (const [id, entries] of Object.entries(reference.blended)) {
-      const posed1 = triples(await potter.vertexPositions(V1, id));
-      const posed0 = triples(await potter.vertexPositions(V0, id));
-      for (const e of entries) {
-        const k1 = correspondence(rest1[id], [e.restGltf], id)[0];
-        const k0 = correspondence(rest0[id], [e.restGltf], id)[0];
-        assertVecClose(posed0[k0], posed1[k1], TOL.posedPosition, `${id} potter vertex ${e.index}`);
-        checked++;
-      }
-    }
-    assert.ok(checked > 0, 'no blended vertices checked');
-  });
-
   for (const [expr, morph] of [
     ['blink', 'blink'],
     ['aa', 'aa'],

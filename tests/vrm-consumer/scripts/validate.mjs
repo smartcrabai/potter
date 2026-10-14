@@ -50,13 +50,15 @@ export function validateAllowlistEntries(entries) {
   });
 }
 
-// Splits warnings into those no entry covers, and counts hits per entry.
-export function classifyWarnings(messages, entries) {
+// Splits warnings of one fixture into those no entry covers, and counts hits per entry.
+// An entry with `file` set applies only to that fixture.
+export function classifyWarnings(messages, entries, file) {
   const hits = entries.map(() => 0);
   const unallowed = [];
   for (const message of messages.filter((m) => m.severity === SEVERITY_WARNING)) {
     let matched = false;
     entries.forEach((entry, i) => {
+      if (entry.file !== undefined && entry.file !== file) return;
       if (entry.code === message.code && new RegExp(entry.pointer).test(message.pointer ?? "")) {
         hits[i]++;
         matched = true;
@@ -146,7 +148,7 @@ async function main() {
       }
     }
 
-    const { unallowed, hits } = classifyWarnings(messages, allowlist);
+    const { unallowed, hits } = classifyWarnings(messages, allowlist, file);
     hits.forEach((n, i) => (allHits[i] += n));
     for (const m of messages.filter((m) => m.severity === SEVERITY_WARNING)) {
       const entry = warningCounts.get(m.code) ?? { total: 0, allowlisted: 0 };

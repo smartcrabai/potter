@@ -1,5 +1,5 @@
-// Shading and face checks that depend on pending Potter export fixes (smooth NORMAL, per-face material slots,
-// winding of negative-determinant copies). Expectations come from spec.mjs only.
+// Shading and face checks: smooth NORMAL, per-face material slots, winding of negative-determinant copies.
+// Expectations come from spec.mjs only.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
@@ -25,7 +25,7 @@ after(async () => {
 const vec = (a) => new THREE.Vector3().fromArray(a);
 const angleDeg = (a, b) => THREE.MathUtils.radToDeg(Math.acos(Math.min(1, Math.max(-1, a.dot(b)))));
 
-describe('pending fix: smooth NORMAL export (shade_smooth)', () => {
+describe('smooth NORMAL export (shade_smooth)', () => {
   it('head_mesh NORMAL attribute has one unit vector per glTF vertex', async () => {
     await potter.load(M, fixtureUrl(FILES.v1Full));
     const positions = triples(await potter.vertexPositions(M, MESHES.head));
@@ -60,7 +60,7 @@ describe('pending fix: smooth NORMAL export (shade_smooth)', () => {
   });
 });
 
-describe('pending fix: per-face material slots (Face.material_index)', () => {
+describe('per-face material slots (Face.material_index)', () => {
   it('faces whose centroid lies within the eye radius are in the eye primitive, all others in skin', async () => {
     await potter.load(M, fixtureUrl(FILES.v1Full));
     const primitives = await potter.primitiveTriangles(M, MESHES.head);
@@ -78,7 +78,7 @@ describe('pending fix: per-face material slots (Face.material_index)', () => {
   });
 });
 
-describe('pending fix: winding of the negative-determinant copy', () => {
+describe('winding of the negative-determinant copy', () => {
   it('ribbon_mirror triangles face the mirror of the ribbon normal (viewer rule: sign(det) times raw cross)', async () => {
     await potter.load(M, fixtureUrl(FILES.v1Full));
     const ribbonNormals = (await potter.primitiveTriangles(M, MESHES.ribbon)).flatMap((p) => triples(p.normals));
