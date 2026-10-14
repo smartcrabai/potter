@@ -56,7 +56,7 @@ impl TextureExport {
         }
     }
 
-    fn texture_info(
+    pub(crate) fn texture_info(
         &mut self,
         reference: &TextureRef,
         doc: &SceneDoc,
@@ -67,7 +67,7 @@ impl TextureExport {
         self.texture_info_channel(reference, None, doc, root_path, binary, views)
     }
 
-    fn texture_info_channel(
+    pub(crate) fn texture_info_channel(
         &mut self,
         reference: &TextureRef,
         source_channel: Option<usize>,
@@ -210,42 +210,6 @@ impl TextureExport {
             .as_u64()
             .and_then(|index| usize::try_from(index).ok())
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "glTF texture index is invalid"))
-    }
-
-    pub(crate) fn texture_info_for_vrm(
-        &mut self,
-        reference: &TextureRef,
-        doc: &SceneDoc,
-        root_path: &Path,
-        binary: &mut Vec<u8>,
-        views: &mut Vec<Value>,
-    ) -> Result<Value> {
-        self.texture_info(reference, doc, root_path, binary, views)
-    }
-
-    pub(crate) fn texture_info_remapped_for_vrm(
-        &mut self,
-        reference: &TextureRef,
-        source_channel: usize,
-        doc: &SceneDoc,
-        root_path: &Path,
-        binary: &mut Vec<u8>,
-        views: &mut Vec<Value>,
-    ) -> Result<Value> {
-        if !matches!(source_channel, 1 | 2) {
-            return Err(PotError::new(
-                ErrorCode::InvalidArgument,
-                "VRM mask remapping supports only source channels G and B",
-            ));
-        }
-        self.texture_info_channel(
-            reference,
-            Some(source_channel),
-            doc,
-            root_path,
-            binary,
-            views,
-        )
     }
 }
 
@@ -2259,9 +2223,13 @@ fn validate_shape_key_export(shape_keys: &ShapeKeyData) -> Result<()> {
 }
 
 fn validate_skin_binding_export(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
     data_id: &Id,
+    data: &DataBlock,
     binding: &SkinBinding,
     data_skin_bindings: &mut BTreeMap<Id, SkinBinding>,
+    rest_world_cache: &mut BTreeMap<Id, BTreeMap<Id, DMat4>>,
 ) -> Result<()> {
     if binding.joint_ids.is_empty() {
         return Err(unsupported_export(
@@ -2286,6 +2254,13 @@ fn validate_skin_binding_export(
         }
     } else {
         data_skin_bindings.insert(data_id.clone(), binding.clone());
+    }
+    if data
+        .shape_keys
+        .as_ref()
+        .is_some_and(|shape_keys| !shape_keys.keys.is_empty())
+    {
+        validate_skin_shape_key_rest(doc, snapshot, binding, rest_world_cache)?;
     }
     Ok(())
 }
@@ -2348,14 +2323,15 @@ pub(crate) fn validate_vrm_mesh_references(
         let Some(binding) = skin_binding(doc, node)? else {
             continue;
         };
-        validate_skin_binding_export(data_id, &binding, &mut data_skin_bindings)?;
-        if data
-            .shape_keys
-            .as_ref()
-            .is_some_and(|shape_keys| !shape_keys.keys.is_empty())
-        {
-            validate_skin_shape_key_rest(doc, snapshot, &binding, &mut rest_world_cache)?;
-        }
+        validate_skin_binding_export(
+            doc,
+            snapshot,
+            data_id,
+            data,
+            &binding,
+            &mut data_skin_bindings,
+            &mut rest_world_cache,
+        )?;
     }
     let mut exported_mesh_nodes = BTreeSet::new();
     for (node_id, node) in &doc.nodes {
@@ -2556,6 +2532,7 @@ fn export_with_root_inner(
     let mut node_mesh_indices = BTreeMap::<Id, usize>::new();
     let mut skin_bindings = BTreeMap::<Id, SkinBinding>::new();
     let mut data_skin_bindings = BTreeMap::<Id, SkinBinding>::new();
+    let mut rest_world_cache = BTreeMap::<Id, BTreeMap<Id, DMat4>>::new();
     for (node_id, node) in &doc.nodes {
         if !node.visible || !node.render_visible || !visible_node_ids.contains(node_id) {
             continue;
@@ -2563,17 +2540,25 @@ fn export_with_root_inner(
         let Some(data_id) = &node.data else {
             continue;
         };
-        if doc
+        let Some(data) = doc
             .data_blocks
             .get(data_id)
-            .is_none_or(|data| data.data_type != "mesh")
-        {
+            .filter(|data| data.data_type == "mesh")
+        else {
             continue;
-        }
+        };
         let Some(binding) = skin_binding(doc, node)? else {
             continue;
         };
-        validate_skin_binding_export(data_id, &binding, &mut data_skin_bindings)?;
+        validate_skin_binding_export(
+            doc,
+            snapshot,
+            data_id,
+            data,
+            &binding,
+            &mut data_skin_bindings,
+            &mut rest_world_cache,
+        )?;
         skin_bindings.insert(node_id.clone(), binding);
     }
     let avatar_armature_nodes = vrm.map(|(avatar, _)| super::vrm::referenced_armatures(avatar));
@@ -4139,18 +4124,13 @@ fn restore_skin_weights(
         .iter()
         .map(|vertex| vertex.id)
         .collect::<Vec<_>>();
-    let source_vertex_ids = match &mesh_value["extras"]["potter"]["vertex_ids"] {
-        Value::Array(values) => values
-            .iter()
-            .map(|value| {
-                value
-                    .as_u64()
-                    .and_then(|id| u32::try_from(id).ok())
-                    .ok_or_else(|| import_error("glTF skin source vertex ID is invalid"))
-            })
-            .collect::<Result<Vec<_>>>()?,
-        Value::Null => vertex_order.clone(),
-        _ => return Err(import_error("glTF skin source vertex IDs are invalid")),
+    let source_vertex_ids = match potter_vertex_ids(mesh_value)? {
+        // Copies of one Potter vertex rejoin, so the skin has one entry per welded vertex.
+        Some(ids) => {
+            let mut seen = BTreeSet::new();
+            ids.into_iter().filter(|id| seen.insert(*id)).collect()
+        }
+        None => vertex_order.clone(),
     };
     if vertex_order.len() != joint_weights.len() || source_vertex_ids.len() != vertex_order.len() {
         return Err(import_error(
@@ -4254,6 +4234,7 @@ fn restore_skin_weights(
 pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::ImportedGraph> {
     fn import_shape_keys(
         mesh_value: &Value,
+        welded_source_ids: Option<&[u32]>,
         mesh: &Mesh,
         morph_deltas: &[Vec<[f64; 3]>],
     ) -> Result<ShapeKeyData> {
@@ -4264,37 +4245,24 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             .map_err(|error| {
                 import_error(format!("glTF shape-key metadata is invalid: {error}"))
             })?;
-            let source_vertex_ids = mesh_value["extras"]["potter"]["vertex_ids"]
-                .as_array()
-                .ok_or_else(|| import_error("glTF shape-key vertex IDs are missing"))?
+            let source_vertex_ids = welded_source_ids
+                .ok_or_else(|| import_error("glTF shape-key vertex IDs are missing"))?;
+            // One entry per welded vertex, so each source vertex maps to exactly one mesh vertex.
+            let vertex_id_map = source_vertex_ids
                 .iter()
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .and_then(|id| u32::try_from(id).ok())
-                        .ok_or_else(|| import_error("glTF shape-key vertex ID is invalid"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if source_vertex_ids.len() != mesh.vertices.len() {
-                return Err(import_error(
-                    "glTF shape-key vertex ID count does not match mesh positions",
-                ));
-            }
-            let mut vertex_id_map = BTreeMap::<u32, Vec<u32>>::new();
-            for (source_id, vertex) in source_vertex_ids.into_iter().zip(&mesh.vertices) {
-                vertex_id_map.entry(source_id).or_default().push(vertex.id);
-            }
+                .zip(&mesh.vertices)
+                .map(|(source_id, vertex)| (*source_id, vertex.id))
+                .collect::<BTreeMap<_, _>>();
             let remap_positions = |positions: BTreeMap<u32, [f64; 3]>| {
-                let mut remapped = BTreeMap::new();
-                for (source_id, position) in positions {
-                    let vertex_ids = vertex_id_map.get(&source_id).ok_or_else(|| {
-                        import_error("glTF shape-key metadata references a missing vertex")
-                    })?;
-                    for vertex_id in vertex_ids {
-                        remapped.insert(*vertex_id, position);
-                    }
-                }
-                Ok::<_, PotError>(remapped)
+                positions
+                    .into_iter()
+                    .map(|(source_id, position)| {
+                        let vertex_id = vertex_id_map.get(&source_id).ok_or_else(|| {
+                            import_error("glTF shape-key metadata references a missing vertex")
+                        })?;
+                        Ok::<_, PotError>((*vertex_id, position))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()
             };
             shape_keys.basis = remap_positions(std::mem::take(&mut shape_keys.basis))?;
             for key in shape_keys.keys.values_mut() {
@@ -4591,7 +4559,7 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
         let mut has_missing_normals = false;
         let mut morph_normal_deltas = Vec::<Vec<[f64; 3]>>::new();
         let mut morph_normals_missing = false;
-        let mut accessor_bases = BTreeMap::<usize, usize>::new();
+        let mut vertex_bases = BTreeMap::<VertexPayload, usize>::new();
         for primitive in primitives {
             if primitive["attributes"]["TEXCOORD_1"].is_object() {
                 return Err(unsupported_export(
@@ -4607,11 +4575,10 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             )
             .map_err(|_| import_error("glTF POSITION accessor exceeds platform range"))?;
             let decoded = read_vec3(&root, &binaries, accessor_index)?;
-            // A POSITION accessor shared by several primitives is read once; later primitives reuse its vertices.
-            let first_use = !accessor_bases.contains_key(&accessor_index);
-            let base = *accessor_bases
-                .entry(accessor_index)
-                .or_insert(positions.len());
+            // Primitives share vertices only when their whole vertex payload matches.
+            let payload = vertex_payload(primitive);
+            let first_use = !vertex_bases.contains_key(&payload);
+            let base = *vertex_bases.entry(payload).or_insert(positions.len());
             if first_use {
                 positions.extend(
                     decoded
@@ -4774,13 +4741,41 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                 face_uvs.push(uv);
             }
         }
-        let mut mesh = Mesh::from_positions_and_faces(positions, polygons).map_err(|error| {
-            PotError::with_details(
-                ErrorCode::ImportFailed,
-                "glTF mesh topology is invalid",
-                json!({ "reason": error.to_string(), "data_id": data_id }),
-            )
-        })?;
+        // Copies of one Potter vertex, split per UV and normal, rejoin here; corners keep their own normals.
+        let source_ids = potter_vertex_ids(mesh_value)?;
+        let (welded_of, first) = weld_copies(positions.len(), source_ids.as_deref())?;
+        if welded_of
+            .iter()
+            .zip(&positions)
+            .any(|(welded, point)| *point != positions[first[*welded]])
+        {
+            return Err(import_error(
+                "glTF copies of one Potter vertex disagree on position",
+            ));
+        }
+        let source_ids_welded =
+            source_ids.map(|ids| first.iter().map(|index| ids[*index]).collect::<Vec<_>>());
+        let welded_positions = first
+            .iter()
+            .map(|index| positions[*index])
+            .collect::<Vec<_>>();
+        let welded_polygons = polygons
+            .iter()
+            .map(|polygon| {
+                polygon
+                    .iter()
+                    .map(|index| welded_of[*index])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut mesh =
+            Mesh::from_positions_and_faces(welded_positions, welded_polygons).map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    "glTF mesh topology is invalid",
+                    json!({ "reason": error.to_string(), "data_id": data_id }),
+                )
+            })?;
         for (face, material_index) in mesh.faces.iter_mut().zip(face_material_indices) {
             face.material_index = material_index;
         }
@@ -4797,27 +4792,51 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             );
         }
         let morph_normals_complete = !morph_deltas.is_empty() && !morph_normals_missing;
-        // Potter files derive morph NORMALs from their shape keys, so only third-party files are compared.
-        let potter_shape_keys = mesh_value["extras"]["potter"]["shape_key_data"].is_object();
+        // Morph deltas, like positions, come from each welded vertex's first copy.
+        let welded_morphs = morph_deltas
+            .iter()
+            .map(|deltas| first.iter().map(|index| deltas[*index]).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
         if !has_missing_normals && !normals.is_empty() {
-            let morph_targets = if morph_normals_complete && !potter_shape_keys {
-                morph_deltas
+            let corner_normals = polygons
+                .iter()
+                .flatten()
+                .map(|index| normals[*index])
+                .collect::<Vec<_>>();
+            let morph_targets = if morph_normals_complete {
+                welded_morphs
                     .iter()
                     .zip(&morph_normal_deltas)
-                    .map(|(positions, normal_values)| (positions.clone(), normal_values.clone()))
+                    .map(|(positions, normal_values)| {
+                        let corner_deltas = polygons
+                            .iter()
+                            .flatten()
+                            .map(|index| normal_values[*index])
+                            .collect::<Vec<_>>();
+                        (positions.clone(), corner_deltas)
+                    })
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
-            if import_shading(&mut mesh, &normals, &morph_targets)? {
+            if import_shading(&mut mesh, &corner_normals, &morph_targets)? {
                 morph_normal_loss = true;
             }
         }
         let shape_keys = if morph_deltas.is_empty() {
             None
         } else {
-            Some(import_shape_keys(mesh_value, &mesh, &morph_deltas)?)
+            Some(import_shape_keys(
+                mesh_value,
+                source_ids_welded.as_deref(),
+                &mesh,
+                &welded_morphs,
+            )?)
         };
+        let joint_data = first
+            .iter()
+            .map(|index| joint_data[*index].clone())
+            .collect::<Vec<_>>();
         let imported_joint_data = if joint_data.iter().any(Option::is_some) {
             if joint_data.iter().any(Option::is_none) {
                 return Err(import_error(
@@ -5154,10 +5173,77 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
     })
 }
 
-/// Morph position and NORMAL deltas for one target, both per imported vertex in Potter axes.
+/// Morph position deltas per welded vertex and morph NORMAL deltas per face corner, in Potter axes.
 type MorphNormalTarget = (Vec<[f64; 3]>, Vec<[f64; 3]>);
 
+/// Vertex-domain accessors of a glTF primitive. TEXCOORD is left out: UVs are stored per corner and
+/// read from each primitive, so sharing a vertex cannot lose them.
+type VertexPayload = (
+    BTreeMap<String, Option<u64>>,
+    Vec<BTreeMap<String, Option<u64>>>,
+);
+
+fn vertex_payload(primitive: &Value) -> VertexPayload {
+    fn accessors(value: &Value) -> BTreeMap<String, Option<u64>> {
+        value
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| !name.starts_with("TEXCOORD_"))
+            .map(|(name, accessor)| (name.clone(), accessor.as_u64()))
+            .collect()
+    }
+    let targets = primitive["targets"]
+        .as_array()
+        .map_or_else(Vec::new, |targets| targets.iter().map(accessors).collect());
+    (accessors(&primitive["attributes"]), targets)
+}
+
+/// Potter's `vertex_ids`: the source vertex of each glTF vertex. Third-party files have none.
+fn potter_vertex_ids(mesh_value: &Value) -> Result<Option<Vec<u32>>> {
+    match &mesh_value["extras"]["potter"]["vertex_ids"] {
+        Value::Null => Ok(None),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .ok_or_else(|| import_error("glTF source vertex ID is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        _ => Err(import_error("glTF source vertex IDs are invalid")),
+    }
+}
+
+/// Groups glTF vertices that are copies of one Potter vertex. Returns each glTF vertex's welded
+/// index and the first glTF copy of each welded vertex; without IDs every vertex stays separate.
+fn weld_copies(
+    vertex_count: usize,
+    source_ids: Option<&[u32]>,
+) -> Result<(Vec<usize>, Vec<usize>)> {
+    let Some(ids) = source_ids else {
+        return Ok(((0..vertex_count).collect(), (0..vertex_count).collect()));
+    };
+    if ids.len() != vertex_count {
+        return Err(import_error("glTF vertex IDs do not match mesh vertices"));
+    }
+    let mut welded_by_id = BTreeMap::<u32, usize>::new();
+    let mut welded_of = Vec::with_capacity(vertex_count);
+    let mut first = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        let welded = *welded_by_id.entry(*id).or_insert_with(|| {
+            first.push(index);
+            first.len() - 1
+        });
+        welded_of.push(welded);
+    }
+    Ok((welded_of, first))
+}
+
 /// Derives per-face smooth flags and custom normals from imported glTF NORMAL data.
+/// `normals` and each target's NORMAL deltas hold one value per face corner in `mesh.faces` order.
 /// Returns true when morph NORMAL deltas disagree with normals derived from the morphed geometry.
 fn import_shading(
     mesh: &mut Mesh,
@@ -5195,6 +5281,7 @@ fn import_shading(
         .map(|vertex| vertex.co)
         .collect::<Vec<_>>();
     let mut smooth = Vec::with_capacity(corners.len());
+    let mut corner = 0;
     for face_corners in &corners {
         let mut area = DVec3::ZERO;
         for (offset, vertex) in face_corners.iter().enumerate() {
@@ -5202,11 +5289,13 @@ fn import_shading(
             area += points[*vertex].cross(points[next]);
         }
         let flat = area.normalize_or_zero();
+        let end = corner + face_corners.len();
         smooth.push(
-            face_corners
+            normals[corner..end]
                 .iter()
-                .any(|vertex| !close(normals[*vertex], flat)),
+                .any(|normal| !close(*normal, flat)),
         );
+        corner = end;
     }
     if smooth.iter().any(|value| *value) {
         let values = mesh
@@ -5224,21 +5313,19 @@ fn import_shading(
     let mut custom_values = serde_json::Map::new();
     let mut corner = 0;
     for (face, face_corners) in mesh.faces.iter().zip(&corners) {
+        let end = corner + face_corners.len();
         let mismatch = match &computed {
-            Some(expected) => face_corners
-                .iter()
-                .enumerate()
-                .any(|(offset, vertex)| !close(expected[corner + offset], normals[*vertex])),
+            Some(expected) => (corner..end).any(|index| !close(expected[index], normals[index])),
             None => true,
         };
         if mismatch {
-            let values = face_corners
+            let values = normals[corner..end]
                 .iter()
-                .map(|vertex| normals[*vertex].normalize_or_zero().to_array())
+                .map(|normal| normal.normalize_or_zero().to_array())
                 .collect::<Vec<_>>();
             custom_values.insert(format!("f{}", face.id), json!(values));
         }
-        corner += face_corners.len();
+        corner = end;
     }
     if !custom_values.is_empty() {
         mesh.attributes.insert(
@@ -5267,15 +5354,11 @@ fn import_shading(
             disagree = true;
             continue;
         };
-        let mut corner = 0;
-        for face_corners in &corners {
-            for vertex in face_corners {
-                let implied = (normals[*vertex] + DVec3::from_array(normal_deltas[*vertex]))
-                    .normalize_or_zero();
-                if !close(implied, expected[corner]) {
-                    disagree = true;
-                }
-                corner += 1;
+        for (corner, expected) in expected.iter().enumerate() {
+            let implied =
+                (normals[corner] + DVec3::from_array(normal_deltas[corner])).normalize_or_zero();
+            if !close(implied, *expected) {
+                disagree = true;
             }
         }
     }
@@ -7549,15 +7632,15 @@ mod tests {
         scene(&Value::Array(operations))
     }
 
-    fn import_without_potter_shape_keys(doc: &SceneDoc) -> TestResult<ImportedGraph> {
+    fn import_without_potter_metadata(doc: &SceneDoc) -> TestResult<ImportedGraph> {
         let directory = tempfile::tempdir()?;
         let snapshot = Snapshot::evaluate(doc, &EvaluationContext::default())?;
         let (document, binary) =
             export_with_root(doc, &snapshot, directory.path(), Some("scene.bin"))?;
         let mut root: Value = serde_json::from_slice(&document)?;
         for mesh in root["meshes"].as_array_mut().ok_or("meshes are missing")? {
-            if let Some(potter) = mesh["extras"]["potter"].as_object_mut() {
-                potter.remove("shape_key_data");
+            if let Some(extras) = mesh["extras"].as_object_mut() {
+                extras.remove("potter");
             }
         }
         let path = directory.path().join("third_party.gltf");
@@ -7724,12 +7807,32 @@ mod tests {
 
     #[test]
     fn potter_smooth_seamed_shape_key_mesh_reports_no_morph_normal_loss() -> TestResult {
-        let doc = scene(&json!([
+        // Triangles keep the topology the morph normals were derived on, so only the UV seams can differ.
+        let base = scene(&json!([
             {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
-            {"op":"mesh.shade_smooth","target":{"id":"body"},"elements":{"domain":"face","ids":["f0","f1","f2","f3","f4","f5"]}},
-            {"op":"uv.unwrap","target":{"id":"body"},"method":"smart"},
-            {"op":"shape_key.create","target":{"id":"body"},"id":"lift","name":"Lift","positions":{"0":[-1.0,-1.0,1.5]}}
+            {"op":"mesh.triangulate","target":{"id":"body"},"elements":{"domain":"face","ids":["f0","f1","f2","f3","f4","f5"]}}
         ]))?;
+        let node_id = crate::model::Id::new("body")?;
+        let data_id = base.nodes[&node_id]
+            .data
+            .clone()
+            .ok_or("body mesh data is missing")?;
+        let face_ids = base.data_blocks[&data_id]
+            .mesh
+            .as_ref()
+            .ok_or("body mesh is missing")?
+            .faces
+            .iter()
+            .map(|face| format!("f{}", face.id))
+            .collect::<Vec<_>>();
+        let doc = apply_operations(
+            &base,
+            &json!([
+                {"op":"mesh.shade_smooth","target":{"id":"body"},"elements":{"domain":"face","ids":face_ids}},
+                {"op":"uv.unwrap","target":{"id":"body"},"method":"smart"},
+                {"op":"shape_key.create","target":{"id":"body"},"id":"lift","name":"Lift","positions":{"0":[-1.0,-1.0,1.5]}}
+            ]),
+        )?;
         let directory = tempfile::tempdir()?;
         let (imported, _) = round_trip_in(&doc, directory.path())?;
         assert!(
@@ -7740,7 +7843,22 @@ mod tests {
             "Potter-derived morph normals are not a loss: {:?}",
             imported.losses
         );
-        let third_party = import_without_potter_shape_keys(&doc)?;
+        let mesh = imported
+            .doc
+            .data_blocks
+            .values()
+            .find_map(|block| block.mesh.as_ref())
+            .ok_or("imported mesh is missing")?;
+        assert_eq!(
+            mesh.vertices.len(),
+            8,
+            "UV seams must rejoin the source vertices"
+        );
+        assert!(
+            !mesh.attributes.contains_key("custom_normal"),
+            "UV seams must not create custom normals"
+        );
+        let third_party = import_without_potter_metadata(&doc)?;
         assert!(
             third_party
                 .losses
@@ -7748,6 +7866,28 @@ mod tests {
                 .any(|loss| loss.feature_id == "mesh.morph_normals"),
             "third-party morph normals are still compared: {:?}",
             third_party.losses
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quad_smooth_seamed_shape_key_mesh_reports_triangulated_morph_normal_loss() -> TestResult {
+        // Quads are exported as triangles, and their morph normals are derived on the quads.
+        let doc = scene(&json!([
+            {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
+            {"op":"mesh.shade_smooth","target":{"id":"body"},"elements":{"domain":"face","ids":["f0","f1","f2","f3","f4","f5"]}},
+            {"op":"uv.unwrap","target":{"id":"body"},"method":"smart"},
+            {"op":"shape_key.create","target":{"id":"body"},"id":"lift","name":"Lift","positions":{"0":[-1.0,-1.0,1.5]}}
+        ]))?;
+        let directory = tempfile::tempdir()?;
+        let (imported, _) = round_trip_in(&doc, directory.path())?;
+        assert!(
+            imported
+                .losses
+                .iter()
+                .any(|loss| loss.feature_id == "mesh.morph_normals"),
+            "quad morph normals cannot be re-derived from triangles: {:?}",
+            imported.losses
         );
         Ok(())
     }
@@ -7793,6 +7933,119 @@ mod tests {
             error.code,
             crate::error::ErrorCode::UnsupportedFeature,
             "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collection_instance_member_with_topology_modifier_refuses_stale_shading() -> TestResult {
+        // The hidden source's subdivision adds faces, so its face-keyed smooth flags would land on other faces.
+        let doc = scene(&json!([
+            {"op":"collection.create","id":"source"},
+            {"op":"node.create","id":"member","kind":"box","collection":"source","params":{"size":1.0}},
+            {"op":"mesh.shade_smooth","target":{"id":"member"},"elements":{"domain":"face","ids":["f0","f1","f2","f3","f4","f5"]}},
+            {"op":"modifier.create","target":{"id":"member"},"id":"subdivide","type":"subdivision","params":{"levels":1}},
+            {"op":"collection.update","target":{"id":"source"},"set":{"exclude":true}},
+            {"op":"collection.instance_create","id":"instance","collection":"source","transform":{"translation":[4.0,0.0,0.0]}}
+        ]))?;
+        let error = Snapshot::evaluate(&doc, &EvaluationContext::default())
+            .err()
+            .ok_or("instancing stale shading must be refused")?;
+        assert_eq!(
+            error.code,
+            crate::error::ErrorCode::UnsupportedFeature,
+            "{error}"
+        );
+        assert_eq!(error.details["feature_id"], "mesh.shading_topology");
+        Ok(())
+    }
+
+    #[test]
+    fn primitives_sharing_positions_keep_their_own_morph_targets() -> TestResult {
+        fn vec3(values: &[[f32; 3]]) -> Vec<u8> {
+            values
+                .iter()
+                .flatten()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+        fn indices(values: &[u32]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+        // Both triangles use vertex 0; each primitive's morph target moves it along glTF Y in opposite directions.
+        let positions: [[f32; 3]; 5] = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ];
+        let lift: [[f32; 3]; 5] = [[0.0, 1.0, 0.0], [0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]];
+        let drop: [[f32; 3]; 5] = [[0.0, -1.0, 0.0], [0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]];
+        let mut binary = Vec::<u8>::new();
+        let mut views = Vec::<Value>::new();
+        let mut accessors = Vec::<Value>::new();
+        let mut push = |bytes: Vec<u8>, component: u32, kind: &str, count: usize| {
+            views.push(json!({"buffer": 0, "byteOffset": binary.len(), "byteLength": bytes.len()}));
+            binary.extend_from_slice(&bytes);
+            accessors.push(json!({"bufferView": views.len() - 1, "componentType": component, "count": count, "type": kind}));
+            accessors.len() - 1
+        };
+        let position = push(vec3(&positions), 5126, "VEC3", 5);
+        let lift_accessor = push(vec3(&lift), 5126, "VEC3", 5);
+        let drop_accessor = push(vec3(&drop), 5126, "VEC3", 5);
+        let front = push(indices(&[0, 1, 2]), 5125, "SCALAR", 3);
+        let back = push(indices(&[0, 3, 4]), 5125, "SCALAR", 3);
+        let root = json!({
+            "asset": {"version": "2.0"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0}],
+            "buffers": [{"uri": "scene.bin", "byteLength": binary.len()}],
+            "bufferViews": views,
+            "accessors": accessors,
+            "meshes": [{"primitives": [
+                {"attributes": {"POSITION": position}, "indices": front, "targets": [{"POSITION": lift_accessor}]},
+                {"attributes": {"POSITION": position}, "indices": back, "targets": [{"POSITION": drop_accessor}]}
+            ]}]
+        });
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("shared_positions.gltf");
+        std::fs::write(&path, serde_json::to_vec(&root)?)?;
+        std::fs::write(directory.path().join("scene.bin"), &binary)?;
+        let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+        let block = imported
+            .doc
+            .data_blocks
+            .values()
+            .find(|block| block.mesh.is_some())
+            .ok_or("imported mesh is missing")?;
+        let mesh = block.mesh.as_ref().ok_or("imported mesh is missing")?;
+        let key = block
+            .shape_keys
+            .as_ref()
+            .and_then(|keys| keys.keys.values().next())
+            .ok_or("imported shape key is missing")?;
+        // Each triangle's copy of vertex 0 must keep its own morph target: one lifted, one dropped.
+        let mut origin_keys = mesh
+            .faces
+            .iter()
+            .flat_map(|face| face.vertices.iter())
+            .filter(|id| {
+                mesh.vertices
+                    .iter()
+                    .any(|vertex| vertex.id == **id && vertex.co == glam::DVec3::ZERO)
+            })
+            .map(|id| key.positions[id])
+            .collect::<Vec<_>>();
+        origin_keys.sort_by(|left, right| left[2].total_cmp(&right[2]));
+        assert_eq!(
+            origin_keys,
+            vec![[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]],
+            "a shared POSITION must not discard the second primitive's morph target"
         );
         Ok(())
     }

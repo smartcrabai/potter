@@ -6,7 +6,7 @@
 //! edges and at flipped-winding neighbours (CORNER). Flat faces use their Newell normal.
 //! A `custom_normal` corner value replaces the computed normal.
 
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 
 use glam::DVec3;
 use serde_json::{Map, Value, json};
@@ -351,8 +351,8 @@ fn mesh_error(error: &MeshError) -> PotError {
 /// Attributes keyed by face or edge ID. Topology changes leave them stale; instances remap them.
 pub(crate) const SHADING_ATTRIBUTES: [&str; 3] = ["shade_smooth", "sharp", "custom_normal"];
 
-/// Whether a topology change leaves shading keys stale: when `evaluated` has different faces
-/// than `source`, the face- and edge-keyed `SHADING_ATTRIBUTES` would point at other elements.
+/// Whether a topology change leaves shading keys stale: unless `evaluated` keeps each face's vertex
+/// sequence and each edge's endpoints, the face- and edge-keyed `SHADING_ATTRIBUTES` name other elements.
 pub(crate) fn shading_keys_stale(source: &Mesh, evaluated: &Mesh) -> bool {
     let shaded = SHADING_ATTRIBUTES
         .iter()
@@ -360,10 +360,16 @@ pub(crate) fn shading_keys_stale(source: &Mesh, evaluated: &Mesh) -> bool {
     let faces = |mesh: &Mesh| {
         mesh.faces
             .iter()
-            .map(|face| (face.id, face.vertices.len()))
-            .collect::<Vec<_>>()
+            .map(|face| (face.id, face.vertices.clone()))
+            .collect::<BTreeMap<_, _>>()
     };
-    shaded && faces(source) != faces(evaluated)
+    let edges = |mesh: &Mesh| {
+        mesh.edges
+            .iter()
+            .map(|edge| (edge.id, edge_key(edge.vertices[0], edge.vertices[1])))
+            .collect::<BTreeMap<_, _>>()
+    };
+    shaded && (faces(source) != faces(evaluated) || edges(source) != edges(evaluated))
 }
 
 #[cfg(test)]
@@ -675,5 +681,31 @@ mod tests {
         assert!(corner_normals(&mesh, &collapsed).is_err());
         let morphed = morph_corner_normals(&mesh, &collapsed, &base).expect("morph normals");
         assert_eq!(morphed, base);
+    }
+
+    #[test]
+    fn weld_that_keeps_face_ids_and_corner_counts_marks_shading_stale() {
+        // Welding copies of vertices 3 and 4 onto 1 and 0 keeps face IDs and corner counts, but e3 now joins other vertices.
+        let mut source = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::ZERO,
+                DVec3::X,
+                DVec3::Y,
+                DVec3::X,
+                DVec3::ZERO,
+                DVec3::NEG_Y,
+            ],
+            vec![vec![0, 1, 2], vec![3, 4, 5]],
+        )
+        .expect("source mesh");
+        set_faces_attribute(&mut source, "shade_smooth", &[(0, true), (1, true)]);
+        set_edge_sharp(&mut source, 3, 4);
+        let welded = Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::NEG_Y],
+            vec![vec![0, 1, 2], vec![1, 0, 3]],
+        )
+        .expect("welded mesh");
+        assert!(shading_keys_stale(&source, &welded));
+        assert!(!shading_keys_stale(&source, &source.clone()));
     }
 }

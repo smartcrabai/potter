@@ -10,7 +10,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Aabb, CylinderParams, IcosphereParams, Mesh, normals::SHADING_ATTRIBUTES},
+    geom::{
+        Aabb, CylinderParams, IcosphereParams, Mesh,
+        normals::{SHADING_ATTRIBUTES, shading_keys_stale},
+    },
     hash,
     model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc},
 };
@@ -3518,6 +3521,7 @@ fn append_collection_geometry(
         let (nested_mesh, nested_paths) = if instance_collection_target(source_node)?.is_some() {
             evaluate_collection_instance(doc, object_id, matrices, meshes, active_instances)?
         } else if let Some(source_mesh) = meshes.get(object_id) {
+            validate_member_shading(doc, object_id, source_mesh)?;
             (source_mesh.clone(), vec![vec![object_id.clone()]])
         } else {
             (Mesh::new(), Vec::new())
@@ -3554,6 +3558,31 @@ fn append_collection_geometry(
     }
     collection_stack.remove(collection_id);
     Ok(())
+}
+
+/// Shading keys are face- and edge-keyed, so a member whose modifiers change its faces cannot
+/// be instanced with them: the instance would shade the wrong faces.
+fn validate_member_shading(doc: &SceneDoc, member_id: &Id, evaluated: &Mesh) -> Result<()> {
+    let source = doc
+        .nodes
+        .get(member_id)
+        .and_then(|node| node.data.as_ref())
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .and_then(|data| data.mesh.as_ref());
+    if source.is_none_or(|source| !shading_keys_stale(source, evaluated)) {
+        return Ok(());
+    }
+    let reason = "a collection member's modifier stack changes its faces while it has custom normals or smooth shading; apply the modifiers before authoring shading, or remove the modifiers";
+    Err(PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        reason,
+        json!({
+            "feature_id": "mesh.shading_topology",
+            "status": "not_supported",
+            "reason": reason,
+            "node_id": member_id,
+        }),
+    ))
 }
 
 /// Instances copy each source's attributes, remapping the face- and edge-keyed shading ones.
