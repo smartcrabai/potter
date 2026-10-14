@@ -102,6 +102,7 @@ fn scene_schema() -> Value {
         "resources":{"type":"object"},
         "libraries":registry_schema("library"),
         "compatibility":{"type":"object"},
+        "avatar":avatar_settings_schema(),
         "history":{"$ref":"#/$defs/history"}
     });
     root["additionalProperties"] = json!(false);
@@ -166,7 +167,271 @@ fn scene_schema() -> Value {
     });
     root["$defs"]["node"]["properties"]["constraints"]["items"] =
         json!({"$ref":"#/$defs/constraint"});
+    complete_scene_schema(&mut root);
     root
+}
+
+fn complete_scene_schema(root: &mut Value) {
+    root["properties"]["images"] = registry_schema("image");
+    root["properties"]["movie_clips"] = registry_schema("movie_clip");
+    root["properties"]["masks"] = registry_schema("mask");
+    let defs = &mut root["$defs"];
+
+    defs["image_tile"] = json!({"type":"object","required":["number","width","height","blob"],"properties":{"number":{"type":"integer","minimum":1,"maximum":u32::MAX},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"blob":{"type":"string"}},"additionalProperties":false});
+    defs["image"] = json!({"type":"object","required":["name","source","colorspace","width","height","tiles","blob","source_path","source_hash","alpha_mode"],"properties":{"name":{"type":"string"},"source":{"enum":["generated","file","packed"]},"colorspace":{"enum":["srgb","linear","non_color"]},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"tiles":{"type":"array","items":{"$ref":"#/$defs/image_tile"}},"blob":{"type":["string","null"]},"source_path":{"type":["string","null"]},"source_hash":{"type":["string","null"]},"alpha_mode":{"enum":["straight","premultiplied","none"]}},"additionalProperties":false});
+    defs["mask"] = json!({"type":"object","required":["splines"],"properties":{"splines":{"type":"array","items":{"$ref":"#/$defs/mask_spline"}}},"additionalProperties":false});
+    defs["mask_spline"] = json!({"type":"object","required":["points","feather"],"properties":{"points":{"type":"array","minItems":3,"items":{"$ref":"#/$defs/mask_control_point"}},"feather":{"type":"number","minimum":0}},"additionalProperties":false});
+    defs["mask_control_point"] = json!({"type":"object","required":["position","keyframes"],"properties":{"position":{"$ref":"#/$defs/vec2"},"keyframes":{"type":"array","items":{"type":"object","required":["frame","position"],"properties":{"frame":{"type":"number"},"position":{"$ref":"#/$defs/vec2"}},"additionalProperties":false}}},"additionalProperties":false});
+    defs["movie_clip"] = json!({"type":"object","required":["name","source","source_hash","frame_start","width","height","fps","tracking"],"properties":{"name":{"type":"string"},"source":{"type":["string","null"]},"source_hash":{"type":["string","null"]},"frame_start":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"fps":{"type":"number","exclusiveMinimum":0},"tracking":{"$ref":"#/$defs/movie_tracking"}},"additionalProperties":false});
+    defs["movie_tracking"] = json!({"type":"object","required":["tracks","plane_tracks","camera","reconstruction","objects"],"properties":{"tracks":{"type":"array","items":{"type":"object","required":["id","name","markers"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"markers":{"type":"array","items":{"type":"object","required":["frame","co","pattern_corners","search_area","disabled"],"properties":{"frame":{"type":"number"},"co":{"$ref":"#/$defs/vec2"},"pattern_corners":{"type":"array","items":{"$ref":"#/$defs/vec2"},"minItems":4,"maxItems":4},"search_area":{"type":"array","items":{"$ref":"#/$defs/vec2"},"minItems":4,"maxItems":4},"disabled":{"type":"boolean"}},"additionalProperties":false}}},"additionalProperties":false}},"plane_tracks":{"type":"array","items":{"type":"object","required":["id","name","track_ids","reference_frame","homographies"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"track_ids":{"type":"array","items":{"type":"string"}},"reference_frame":{"type":"number"},"homographies":{"type":"array","items":{"type":"object","required":["frame","matrix"],"properties":{"frame":{"type":"number"},"matrix":{"type":"array","items":{"$ref":"#/$defs/vec3"},"minItems":3,"maxItems":3}},"additionalProperties":false}}},"additionalProperties":false}},"camera":{"type":"object","required":["focal_mm","sensor_width_mm","principal","units","pixel_aspect","distortion_model","k1","k2","k3","division_k1","division_k2","nuke_k1","nuke_k2","nuke_p1","nuke_p2","brown_k1","brown_k2","brown_k3","brown_k4","brown_p1","brown_p2"],"properties":{"focal_mm":{"type":"number"},"sensor_width_mm":{"type":"number"},"principal":{"$ref":"#/$defs/vec2"},"units":{"enum":["PIXELS","MILLIMETERS"]},"pixel_aspect":{"type":"number"},"distortion_model":{"enum":["POLYNOMIAL","DIVISION","NUKE","BROWN"]},"k1":{"type":"number"},"k2":{"type":"number"},"k3":{"type":"number"},"division_k1":{"type":"number"},"division_k2":{"type":"number"},"nuke_k1":{"type":"number"},"nuke_k2":{"type":"number"},"nuke_p1":{"type":"number"},"nuke_p2":{"type":"number"},"brown_k1":{"type":"number"},"brown_k2":{"type":"number"},"brown_k3":{"type":"number"},"brown_k4":{"type":"number"},"brown_p1":{"type":"number"},"brown_p2":{"type":"number"}},"additionalProperties":false},"reconstruction":{"type":"object","required":["cameras","points","is_valid","average_error"],"properties":{"cameras":{"type":"array","items":{"type":"object","required":["frame","matrix","average_error","matrix_is_camera_to_world"],"properties":{"frame":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"matrix":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"minItems":3,"maxItems":3},"average_error":{"type":"number"},"matrix_is_camera_to_world":{"type":"boolean"}},"additionalProperties":false}},"points":{"type":"array","items":{"type":"object","required":["track","co"],"properties":{"track":{"type":"string"},"co":{"$ref":"#/$defs/vec3"}},"additionalProperties":false}},"is_valid":{"type":"boolean"},"average_error":{"type":"number"}},"additionalProperties":false},"objects":{"type":"array"}},"additionalProperties":false});
+    defs["movie_tracking"]["properties"]["objects"]["items"] = json!({"type":"object","required":["id","name","tracks","reconstruction","reconstruction_is_valid","reconstruction_average_error","scale"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"reconstruction":{"type":"array","items":{"type":"object","required":["frame","matrix","average_error","matrix_is_camera_to_world"],"properties":{"frame":{"type":"number"},"matrix":{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},"average_error":{"type":"number"},"matrix_is_camera_to_world":{"type":"boolean"}},"additionalProperties":false}},"reconstruction_is_valid":{"type":"boolean"},"reconstruction_average_error":{"type":"number"},"scale":{"type":"number"}},"additionalProperties":false});
+
+    defs["color_management"] = json!({"type":"object","required":["display_device","view_transform","look","exposure","gamma","curve"],"properties":{"display_device":{"type":"string"},"view_transform":{"enum":["standard","ag_x","filmic","raw","false_color"]},"look":{"type":"string"},"exposure":{"type":"number"},"gamma":{"type":"number"},"curve":{"type":"array","items":{"$ref":"#/$defs/vec2"}}},"additionalProperties":false});
+    defs["sequencer"] = json!({"type":"object","required":["channels","strips"],"properties":{"channels":{"type":"integer","minimum":0,"maximum":u32::MAX},"strips":{"type":"array","items":{"type":"object","required":["id","name","type","channel","frame_start","frame_offset_start","frame_offset_end","length","blend_type","opacity","mute","retiming_keys","modifiers","sound_volume","sound_pan","sound_pitch","source","color","text","transition","inputs","effect"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"type":{"enum":["image","image_sequence","movie","sound","scene","color","text","meta","transition","effect"]},"channel":{"type":"integer","minimum":0,"maximum":u32::MAX},"frame_start":{"type":"number"},"frame_offset_start":{"type":"number"},"frame_offset_end":{"type":"number"},"length":{"type":"number"},"blend_type":{"enum":["replace","alpha_over","add","subtract","multiply"]},"opacity":{"type":"number","minimum":0,"maximum":1},"mute":{"type":"boolean"},"retiming_keys":{"type":"array","items":{"type":"object","required":["frame","source_frame"],"properties":{"frame":{"type":"number"},"source_frame":{"type":"number"}},"additionalProperties":false}},"modifiers":{"type":"array","items":{"type":"object","required":["brightness","contrast","color_balance","curves"],"properties":{"brightness":{"type":"number"},"contrast":{"type":"number"},"color_balance":{"$ref":"#/$defs/vec3"},"curves":{"type":"array","items":{"$ref":"#/$defs/vec2"}}},"additionalProperties":false}},"sound_volume":{"type":"number","minimum":0},"sound_pan":{"type":"number","minimum":-1,"maximum":1},"sound_pitch":{"type":"number","exclusiveMinimum":0},"source":{"type":["string","null"]},"color":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"text":{"type":["string","null"]},"transition":{"enum":["cross","gamma_cross","wipe",null]},"inputs":{"type":"array","items":{"type":"string"}},"effect":{"enum":["add","subtract","multiply","alpha_over","transform","speed","glow","gaussian_blur",null]}},"additionalProperties":false}}},"additionalProperties":false});
+    defs["sequencer"]["properties"]["strips"]["items"]["properties"]["channel"]["minimum"] =
+        json!(1);
+    let scene = &mut defs["scene"];
+    scene["required"] = json!([
+        "name",
+        "root_collection",
+        "view_layers",
+        "frame_current",
+        "frame_start",
+        "frame_end",
+        "fps",
+        "fps_base",
+        "camera",
+        "world",
+        "active_clip",
+        "unit",
+        "render",
+        "use_compositing",
+        "compositor",
+        "color_management",
+        "markers",
+        "rigid_body_world",
+        "sequencer"
+    ]);
+    scene["properties"]["active_clip"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
+    scene["properties"]["use_compositing"] = json!({"type":"boolean"});
+    scene["properties"]["compositor"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
+    scene["properties"]["color_management"] = json!({"$ref":"#/$defs/color_management"});
+    scene["properties"]["sequencer"] = json!({"$ref":"#/$defs/sequencer"});
+    let render = &mut defs["render_settings"];
+    render["required"] = json!([
+        "resolution_x",
+        "resolution_y",
+        "resolution_percentage",
+        "samples",
+        "seed",
+        "max_bounces",
+        "film_transparent",
+        "engine",
+        "use_sequencer",
+        "audio_codec",
+        "passes",
+        "motion_blur",
+        "shutter",
+        "motion_blur_samples"
+    ]);
+    render["properties"]["motion_blur"] = json!({"type":"boolean"});
+    render["properties"]["shutter"] = json!({"type":"number"});
+    render["properties"]["motion_blur_samples"] =
+        json!({"type":"integer","minimum":0,"maximum":u32::MAX});
+
+    defs["node"]["properties"]["kind"]["enum"] =
+        json!(["empty", "mesh", "camera", "light", "armature"]);
+    let material = &mut defs["material"];
+    material["required"] = json!([
+        "name",
+        "base_color",
+        "alpha_mode",
+        "alpha_threshold",
+        "metallic",
+        "roughness",
+        "emission_color",
+        "emission_strength",
+        "transmission",
+        "ior",
+        "double_sided",
+        "node_tree",
+        "base_color_texture",
+        "roughness_texture",
+        "metallic_texture",
+        "normal_texture",
+        "displacement_method",
+        "displacement_scale",
+        "displacement_midlevel",
+        "volume_density",
+        "volume_color",
+        "volume_anisotropy"
+    ]);
+    material["properties"]["alpha_mode"] = json!({"enum":["opaque","blend","clip"]});
+    material["properties"]["alpha_threshold"] = json!({"type":"number","minimum":0,"maximum":1});
+    material["properties"]["displacement_method"] = json!({"enum":["bump","displacement"]});
+    material["properties"]["displacement_scale"] = json!({"type":"number"});
+    material["properties"]["displacement_midlevel"] =
+        json!({"type":"number","minimum":0,"maximum":1});
+    material["properties"]["volume_density"] = json!({"type":"number","minimum":0});
+    material["properties"]["volume_color"] =
+        json!({"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3});
+    material["properties"]["volume_anisotropy"] =
+        json!({"type":"number","minimum":-0.999,"maximum":0.999});
+    complete_data_block_schemas(defs);
+}
+
+fn complete_data_block_schemas(defs: &mut Value) {
+    defs["curve_data"] = json!({"type":"object","required":["resolution_u","splines","dimensions","bevel_depth","bevel_resolution","extrude","taper","fill_mode","twist_mode","use_path","path_duration","eval_time","eval_time_fcurves"],"properties":{"resolution_u":{"type":"integer","minimum":0,"maximum":u32::MAX},"splines":{"type":"array","items":{"type":"object","required":["type","points","order","cyclic","resolution","use_endpoint"],"properties":{"type":{"enum":["bezier","poly","nurbs"]},"points":{"type":"array","items":{"type":"object","required":["co","handle_left","handle_right","handle_type","weight","radius","tilt"],"properties":{"co":{"$ref":"#/$defs/vec3"},"handle_left":{"$ref":"#/$defs/vec3"},"handle_right":{"$ref":"#/$defs/vec3"},"handle_type":{"enum":["auto","vector","aligned","free"]},"weight":{"type":"number"},"radius":{"type":"number"},"tilt":{"type":"number"}},"additionalProperties":false}},"order":{"type":"integer","minimum":0,"maximum":u32::MAX},"cyclic":{"type":"boolean"},"resolution":{"type":"integer","minimum":0,"maximum":u32::MAX},"use_endpoint":{"type":"boolean"}},"additionalProperties":false}},"dimensions":{"enum":["two_d","three_d"]},"bevel_depth":{"type":"number"},"bevel_resolution":{"type":"integer","minimum":0,"maximum":u32::MAX},"extrude":{"type":"number"},"taper":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"fill_mode":{"enum":["none","front","back","both"]},"twist_mode":{"type":"string"},"use_path":{"type":"boolean"},"path_duration":{"type":"integer","minimum":0,"maximum":u32::MAX},"eval_time":{"type":"number"},"eval_time_fcurves":{"type":"array","items":{"$ref":"#/$defs/fcurve"}}},"additionalProperties":false});
+    defs["surface_data"] = json!({"type":"object","required":["points","order_u","order_v","resolution","cyclic_u","cyclic_v","use_endpoint_u","use_endpoint_v"],"properties":{"points":{"type":"array","items":{"type":"array","items":{"type":"object","required":["co","weight"],"properties":{"co":{"$ref":"#/$defs/vec3"},"weight":{"type":"number"}},"additionalProperties":false}}},"order_u":{"type":"integer","minimum":0,"maximum":u32::MAX},"order_v":{"type":"integer","minimum":0,"maximum":u32::MAX},"resolution":{"type":"array","items":{"type":"integer","minimum":0,"maximum":u32::MAX},"minItems":2,"maxItems":2},"cyclic_u":{"type":"boolean"},"cyclic_v":{"type":"boolean"},"use_endpoint_u":{"type":"boolean"},"use_endpoint_v":{"type":"boolean"}},"additionalProperties":false});
+    defs["text_data"] = json!({"type":"object","required":["body","font","font_name","size","align_x","align_y","extrude","bevel_depth","character_spacing","word_spacing","line_spacing","shear","offset_x","offset_y","small_caps_scale"],"properties":{"body":{"type":"string"},"font":{"type":"string"},"font_name":{"type":"string"},"size":{"type":"number"},"align_x":{"type":"string"},"align_y":{"type":"string"},"extrude":{"type":"number"},"bevel_depth":{"type":"number"},"character_spacing":{"type":"number"},"word_spacing":{"type":"number"},"line_spacing":{"type":"number"},"shear":{"type":"number"},"offset_x":{"type":"number"},"offset_y":{"type":"number"},"small_caps_scale":{"type":"number"}},"additionalProperties":false});
+    defs["hair_curves_data"] = json!({"type":"object","required":["curves"],"properties":{"curves":{"type":"array","items":{"type":"object","required":["points","radius"],"properties":{"points":{"type":"array","items":{"$ref":"#/$defs/vec3"}},"radius":{"type":"number"}},"additionalProperties":false}}},"additionalProperties":false});
+    defs["metaball_data"] = json!({"type":"object","required":["elements","resolution","render_resolution","threshold"],"properties":{"elements":{"type":"array","items":{"type":"object","required":["type","co","radius","stiffness","size","rotation","negative"],"properties":{"type":{"enum":["ball","capsule","plane","ellipsoid","cube"]},"co":{"$ref":"#/$defs/vec3"},"radius":{"type":"number"},"stiffness":{"type":"number"},"size":{"$ref":"#/$defs/vec3"},"rotation":{"$ref":"#/$defs/vec3"},"negative":{"type":"boolean"}},"additionalProperties":false}},"resolution":{"type":"number"},"render_resolution":{"type":"number"},"threshold":{"type":"number"}},"additionalProperties":false});
+    defs["lattice_data"] = json!({"type":"object","required":["points_u","points_v","points_w","interpolation","points","domain"],"properties":{"points_u":{"type":"integer","minimum":0},"points_v":{"type":"integer","minimum":0},"points_w":{"type":"integer","minimum":0},"interpolation":{"enum":["linear","cardinal","bspline"]},"points":{"type":"array","items":{"$ref":"#/$defs/vec3"}},"domain":{"type":"object","required":["min","max"],"properties":{"min":{"$ref":"#/$defs/vec3"},"max":{"$ref":"#/$defs/vec3"}},"additionalProperties":false}},"additionalProperties":false});
+    defs["point_cloud_data"] = json!({"type":"object","required":["points","attributes","next_id"],"properties":{"points":{"type":"array","items":{"type":"object","required":["id","position","radius"],"properties":{"id":{"type":"integer","minimum":0,"maximum":u32::MAX},"position":{"$ref":"#/$defs/vec3"},"radius":{"type":"number"}},"additionalProperties":false}},"attributes":{"type":"object","additionalProperties":{"type":"object","required":["domain","values"],"properties":{"domain":{"type":"string"},"values":{"type":"object"}},"additionalProperties":false}},"next_id":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false});
+    defs["volume_data"] = json!({"type":"object","required":["grids","source"],"properties":{"grids":{"type":"array","items":{"type":"object","required":["dims","voxel_size","origin","values","blob_f32","content_ref"],"properties":{"dims":{"type":"array","items":{"type":"integer","minimum":0,"maximum":u32::MAX},"minItems":3,"maxItems":3},"voxel_size":{"type":"number"},"origin":{"$ref":"#/$defs/vec3"},"values":{"oneOf":[{"type":"array","items":{"type":"number"}},{"type":"null"}]},"blob_f32":{"oneOf":[{"type":"array","items":{"type":"integer","minimum":0,"maximum":255}},{"type":"null"}]},"content_ref":{"type":["string","null"]}},"additionalProperties":false}},"source":{"oneOf":[{"type":"object","required":["kind","metadata"],"properties":{"kind":{"const":"generated"},"metadata":{"type":"object","required":["algorithm"],"properties":{"algorithm":{"type":"string"}},"additionalProperties":false}},"additionalProperties":false},{"type":"object","required":["kind","metadata"],"properties":{"kind":{"const":"file"},"metadata":{"type":"object","required":["format","content_ref","grid_names","bounds_min","bounds_max"],"properties":{"format":{"type":"string"},"content_ref":{"type":["string","null"]},"grid_names":{"type":"array","items":{"type":"string"}},"bounds_min":{"oneOf":[{"$ref":"#/$defs/vec3"},{"type":"null"}]},"bounds_max":{"oneOf":[{"$ref":"#/$defs/vec3"},{"type":"null"}]}},"additionalProperties":false}},"additionalProperties":false}]}},"additionalProperties":false});
+    for axis in ["points_u", "points_v", "points_w"] {
+        defs["lattice_data"]["properties"][axis]["minimum"] = json!(2);
+        defs["lattice_data"]["properties"][axis]["maximum"] = json!(256);
+    }
+    defs["point_cloud_data"]["properties"]["points"]["items"]["properties"]["radius"]["minimum"] =
+        json!(0);
+    defs["point_cloud_data"]["properties"]["attributes"]["additionalProperties"]["properties"]["domain"]
+        ["const"] = json!("points");
+    defs["volume_data"]["properties"]["grids"]["items"]["properties"]["dims"]["items"]["minimum"] =
+        json!(1);
+    for (field, definition) in [
+        ("curve", "curve_data"),
+        ("surface", "surface_data"),
+        ("text", "text_data"),
+        ("hair_curves", "hair_curves_data"),
+        ("metaball", "metaball_data"),
+        ("lattice", "lattice_data"),
+        ("pointcloud", "point_cloud_data"),
+        ("volume", "volume_data"),
+    ] {
+        defs["data_block"]["properties"][field] =
+            json!({"oneOf":[{"$ref":format!("#/$defs/{definition}")},{"type":"null"}]});
+    }
+}
+
+fn avatar_settings_schema() -> Value {
+    let id = id_schema();
+    let nullable_id = json!({"oneOf":[id.clone(),{"type":"null"}]});
+    let texture_ref = json!({"type":"object","required":["image"],"properties":{"image":id.clone(),"uv_map":{"type":["string","null"],"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"}},"additionalProperties":false});
+    let node_ref = json!({"type":"object","required":["node"],"properties":{"node":id.clone(),"bone":nullable_id.clone()},"additionalProperties":false});
+    let expression_override = json!({"enum":["none","block","blend"]});
+    let expressions = json!({
+        "type":"object",
+        "propertyNames":{"type":"string","minLength":1},
+        "additionalProperties":{
+            "type":"object",
+            "properties":{
+                "is_binary":{"type":"boolean","default":false},
+                "override_blink":expression_override,
+                "override_mouth":expression_override,
+                "override_look_at":expression_override,
+                "morph_target_binds":{"type":"array","items":{"type":"object","required":["node","shape_key","weight"],"properties":{"node":id.clone(),"shape_key":id.clone(),"weight":{"type":"number","minimum":0,"maximum":1}},"additionalProperties":false}},
+                "material_color_binds":{"type":"array","items":{"type":"object","required":["material","color_type","target_value"],"properties":{"material":id.clone(),"color_type":{"enum":["color","emissionColor","shadeColor","matcapColor","rimColor","outlineColor"]},"target_value":vec_schema(4)},"additionalProperties":false}},
+                "texture_transform_binds":{"type":"array","items":{"type":"object","required":["material","scale","offset"],"properties":{"material":id.clone(),"scale":vec_schema(2),"offset":vec_schema(2)},"additionalProperties":false}}
+            },
+            "additionalProperties":false
+        }
+    });
+    let first_person = json!({"type":"object","properties":{"mesh_annotations":{"type":"array","items":{"type":"object","required":["node","annotation_type"],"properties":{"node":id.clone(),"annotation_type":{"enum":["auto","both","third_person_only","first_person_only"]}},"additionalProperties":false}}},"additionalProperties":false});
+    let range = json!({"type":"object","required":["input_max_value","output_scale"],"properties":{"input_max_value":{"type":"number","minimum":0,"maximum":180},"output_scale":{"type":"number","minimum":0}},"additionalProperties":false});
+    let mut look_at = json!({"type":"object","required":["look_at_type","offset_from_head_bone","range_map_horizontal_inner","range_map_horizontal_outer","range_map_vertical_down","range_map_vertical_up"],"properties":{"look_at_type":{"enum":["bone","expression"]},"offset_from_head_bone":vec_schema(3),"range_map_horizontal_inner":range,"range_map_horizontal_outer":range,"range_map_vertical_down":range,"range_map_vertical_up":range},"additionalProperties":false});
+    look_at["allOf"] = json!([
+        {"if":{"required":["look_at_type"],"properties":{"look_at_type":{"const":"expression"}}},"then":{"properties":{
+            "range_map_horizontal_inner":{"properties":{"output_scale":{"maximum":1}}},
+            "range_map_horizontal_outer":{"properties":{"output_scale":{"maximum":1}}},
+            "range_map_vertical_down":{"properties":{"output_scale":{"maximum":1}}},
+            "range_map_vertical_up":{"properties":{"output_scale":{"maximum":1}}}
+        }}},
+        {"if":{"required":["look_at_type"],"properties":{"look_at_type":{"const":"bone"}}},"then":{"properties":{
+            "range_map_horizontal_inner":{"properties":{"output_scale":{"maximum":180}}},
+            "range_map_horizontal_outer":{"properties":{"output_scale":{"maximum":180}}},
+            "range_map_vertical_down":{"properties":{"output_scale":{"maximum":180}}},
+            "range_map_vertical_up":{"properties":{"output_scale":{"maximum":180}}}
+        }}}
+    ]);
+    let collider_shape = json!({"oneOf":[
+        {"type":"object","required":["type","offset","radius"],"properties":{"type":{"const":"sphere"},"offset":vec_schema(3),"radius":{"type":"number","minimum":0}},"additionalProperties":false},
+        {"type":"object","required":["type","offset","tail","radius"],"properties":{"type":{"const":"capsule"},"offset":vec_schema(3),"tail":vec_schema(3),"radius":{"type":"number","minimum":0}},"additionalProperties":false}
+    ]});
+    let spring = json!({"type":"object","properties":{
+        "colliders":{"type":"array","items":{"type":"object","required":["node","shape"],"properties":{"node":node_ref,"shape":collider_shape},"additionalProperties":false}},
+        "collider_groups":{"type":"array","items":{"type":"object","required":["name","colliders"],"properties":{"name":{"type":"string","minLength":1},"colliders":{"type":"array","items":{"type":"integer","minimum":0},"minItems":1,"uniqueItems":true}},"additionalProperties":false}},
+        "springs":{"type":"array","items":{"type":"object","required":["joints"],"properties":{"name":{"type":["string","null"]},"center":{"oneOf":[node_ref,{"type":"null"}]},"joints":{"type":"array","minItems":1,"items":{"type":"object","required":["node"],"properties":{"node":node_ref,"hit_radius":{"type":"number","minimum":0,"default":0},"stiffness":{"type":"number","minimum":0,"default":1},"gravity_power":{"type":"number","minimum":0,"default":0},"gravity_dir":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3,"default":[0,0,-1]},"drag_force":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"additionalProperties":false}},"collider_groups":{"type":"array","items":{"type":"integer","minimum":0},"uniqueItems":true}},"additionalProperties":false}}
+    },"additionalProperties":false});
+    let texture = json!({"oneOf":[texture_ref.clone(),{"type":"null"}]});
+    let mtoon = json!({"type":"object","properties":{
+        "transparent_with_z_write":{"type":"boolean","default":false},
+        "render_queue_offset_number":{"type":"integer","minimum":-9,"maximum":9,"default":0},
+        "shade_color_factor":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":3,"maxItems":3,"default":[1,1,1]},
+        "shade_multiply_texture":texture,
+        "shading_shift_factor":{"type":"number","default":0},
+        "shading_shift_texture":{"oneOf":[{"type":"object","required":["texture","scale"],"properties":{"texture":texture_ref,"scale":{"type":"number","default":1}},"additionalProperties":false},{"type":"null"}]},
+        "shading_toony_factor":{"type":"number","minimum":0,"maximum":1,"default":0.9},
+        "gi_equalization_factor":{"type":"number","minimum":0,"maximum":1,"default":0.9},
+        "matcap_factor":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":3,"maxItems":3,"default":[1,1,1]},
+        "matcap_texture":texture,
+        "parametric_rim_color_factor":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":3,"maxItems":3,"default":[0,0,0]},
+        "rim_multiply_texture":texture,
+        "rim_lighting_mix_factor":{"type":"number","minimum":0,"maximum":1,"default":1},
+        "parametric_rim_fresnel_power_factor":{"type":"number","minimum":0,"default":5},
+        "parametric_rim_lift_factor":{"type":"number","default":0},
+        "outline_width_mode":{"enum":["none","world_coordinates","screen_coordinates"],"default":"none"},
+        "outline_width_factor":{"type":"number","minimum":0,"default":0},
+        "outline_width_multiply_texture":texture,
+        "outline_color_factor":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":3,"maxItems":3,"default":[0,0,0]},
+        "outline_lighting_mix_factor":{"type":"number","minimum":0,"maximum":1,"default":1},
+        "uv_animation_mask_texture":texture,
+        "uv_animation_scroll_x_speed_factor":{"type":"number","default":0},
+        "uv_animation_scroll_y_speed_factor":{"type":"number","default":0},
+        "uv_animation_rotation_speed_factor":{"type":"number","default":0}
+    },"additionalProperties":false});
+    json!({
+        "type":"object","required":["armature","humanoid","meta"],
+        "properties":{
+            "armature":id,
+            "humanoid":{"type":"object","propertyNames":{"enum":["hips","spine","chest","upperChest","neck","head","leftEye","rightEye","jaw","leftUpperLeg","leftLowerLeg","leftFoot","leftToes","rightUpperLeg","rightLowerLeg","rightFoot","rightToes","leftShoulder","leftUpperArm","leftLowerArm","leftHand","rightShoulder","rightUpperArm","rightLowerArm","rightHand","leftThumbMetacarpal","leftThumbProximal","leftThumbDistal","leftIndexProximal","leftIndexIntermediate","leftIndexDistal","leftMiddleProximal","leftMiddleIntermediate","leftMiddleDistal","leftRingProximal","leftRingIntermediate","leftRingDistal","leftLittleProximal","leftLittleIntermediate","leftLittleDistal","rightThumbMetacarpal","rightThumbProximal","rightThumbDistal","rightIndexProximal","rightIndexIntermediate","rightIndexDistal","rightMiddleProximal","rightMiddleIntermediate","rightMiddleDistal","rightRingProximal","rightRingIntermediate","rightRingDistal","rightLittleProximal","rightLittleIntermediate","rightLittleDistal"]},"required":["hips","spine","head","leftUpperLeg","leftLowerLeg","leftFoot","rightUpperLeg","rightLowerLeg","rightFoot","leftUpperArm","leftLowerArm","leftHand","rightUpperArm","rightLowerArm","rightHand"],"additionalProperties":id},
+            "meta":{"type":"object","required":["name","authors","license_url"],"properties":{
+                "name":{"type":"string","minLength":1},"version":{"type":["string","null"]},"authors":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},
+                "copyright_information":{"type":["string","null"]},"contact_information":{"type":["string","null"]},"references":{"type":"array","items":{"type":"string"}},
+                "third_party_licenses":{"type":["string","null"]},"thumbnail":nullable_id,"license_url":{"type":"string","minLength":1},
+                "avatar_permission":{"enum":["only_author","only_separately_licensed_person","everyone"],"default":"only_author"},
+                "allow_excessively_violent_usage":{"type":"boolean","default":false},"allow_excessively_sexual_usage":{"type":"boolean","default":false},
+                "commercial_usage":{"enum":["personal_non_profit","personal_profit","corporation"],"default":"personal_non_profit"},
+                "allow_political_or_religious_usage":{"type":"boolean","default":false},"allow_antisocial_or_hate_usage":{"type":"boolean","default":false},
+                "credit_notation":{"enum":["required","unnecessary"],"default":"required"},"allow_redistribution":{"type":"boolean","default":false},
+                "modification":{"enum":["prohibited","allow_modification","allow_modification_redistribution"],"default":"prohibited"},
+                "other_license_url":{"type":["string","null"]},
+                "legacy":{"oneOf":[{"type":"object","properties":{
+                    "title":{"type":["string","null"]},"author":{"type":["string","null"]},"reference":{"type":["string","null"]},
+                    "allowed_user":{"oneOf":[{"enum":["only_author","explicitly_licensed_person","everyone"]},{"type":"null"}]},
+                    "violent_usage":{"oneOf":[{"enum":["disallow","allow"]},{"type":"null"}]},"sexual_usage":{"oneOf":[{"enum":["disallow","allow"]},{"type":"null"}]},"commercial_usage":{"oneOf":[{"enum":["disallow","allow"]},{"type":"null"}]},
+                    "other_permission_url":{"type":["string","null"]},"license_name":{"oneOf":[{"enum":["redistribution_prohibited","cc0","cc_by","cc_by_nc","cc_by_sa","cc_by_nc_sa","cc_by_nd","cc_by_nc_nd","other"]},{"type":"null"}]},
+                    "other_license_url":{"type":["string","null"]}
+                },"allOf":[{"if":{"required":["license_name"],"properties":{"license_name":{"const":"other"}}},"then":{"required":["other_license_url"],"properties":{"other_license_url":{"type":"string","minLength":1}}}}],"additionalProperties":false},{"type":"null"}]}
+            },"additionalProperties":false},
+            "expressions":expressions,
+            "first_person":{"oneOf":[first_person,{"type":"null"}]},
+            "look_at":{"oneOf":[look_at,{"type":"null"}]},
+            "spring_bone":{"oneOf":[spring,{"type":"null"}]},
+            "mtoon":{"type":"object","propertyNames":{"$ref":"#/$defs/id"},"additionalProperties":mtoon}
+        },
+        "additionalProperties":false
+    })
+}
+
+fn avatar_update_set_schema() -> Value {
+    let settings = avatar_settings_schema();
+    let mut properties = settings["properties"].clone();
+    for field in ["expressions", "mtoon"] {
+        let current = properties[field].clone();
+        properties[field] = json!({"oneOf":[current,{"type":"null"}]});
+    }
+    json!({"type":"object","minProperties":1,"properties":properties,"additionalProperties":false})
 }
 
 fn registry_schema(definition: &str) -> Value {
@@ -1375,6 +1640,14 @@ fn operation_contract(name: &str) -> OperationContract {
             "none",
             json!({}),
         ),
+        "avatar.clear" => (vec![], vec!["op"], "avatar settings", "none", json!({})),
+        "avatar.update" => (
+            vec!["set"],
+            vec!["op", "set"],
+            "avatar settings",
+            "none",
+            json!({"partial_components":true,"null_clears_optional_components":true}),
+        ),
         _ => (
             vec!["target", "set"],
             vec!["op", "target", "set"],
@@ -1394,6 +1667,9 @@ fn operation_contract(name: &str) -> OperationContract {
 }
 
 fn field_schema(operation: &str, field: &str) -> Value {
+    if operation == "avatar.update" && field == "set" {
+        return avatar_update_set_schema();
+    }
     if matches!(
         operation,
         "library.link"

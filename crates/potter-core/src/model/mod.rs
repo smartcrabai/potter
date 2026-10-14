@@ -1,3 +1,4 @@
+mod avatar;
 mod id;
 mod rig;
 mod scene;
@@ -8,6 +9,17 @@ pub use crate::geom::{
     metaball::{ElementType, MetaballData, MetaballElement},
     pointcloud::{PointCloudAttribute, PointCloudData, PointCloudPoint},
     volume::{VolumeData, VolumeFileSource, VolumeGeneratedSource, VolumeGrid, VolumeSource},
+};
+pub use avatar::{
+    AVATAR_FEATURE_DESCRIPTORS, AvatarCommercialUsage, AvatarCreditNotation, AvatarExpression,
+    AvatarExpressionOverride, AvatarFeatureDescriptor, AvatarFirstPerson, AvatarLegacyAllowedUser,
+    AvatarLegacyBinaryPermission, AvatarLegacyLicenseName, AvatarLegacyMeta, AvatarLookAt,
+    AvatarLookAtType, AvatarMaterialColorBind, AvatarMaterialColorType, AvatarMeshAnnotation,
+    AvatarMeshAnnotationType, AvatarMeta, AvatarModification, AvatarMorphTargetBind, AvatarMtoon,
+    AvatarMtoonShadingShiftTexture, AvatarNodeRef, AvatarOutlineWidthMode, AvatarPermission,
+    AvatarRangeMap, AvatarSettings, AvatarSpring, AvatarSpringBone, AvatarSpringCollider,
+    AvatarSpringColliderGroup, AvatarSpringColliderShape, AvatarSpringJoint,
+    AvatarTextureTransformBind, AvatarVersion, validate_avatar_settings,
 };
 pub use id::{Id, is_valid as is_valid_id};
 pub use rig::{

@@ -1,5 +1,6 @@
 mod animation;
 mod asset;
+mod avatar;
 mod camera;
 mod collection;
 mod color;
@@ -47,6 +48,8 @@ pub const OP_NAMES: &[&str] = &[
     "asset.clear",
     "asset.mark",
     "asset.update",
+    "avatar.clear",
+    "avatar.update",
     "bone.create",
     "bone.delete",
     "bone.update",
@@ -275,7 +278,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    model::{Id, SceneDoc},
+    model::{Id, SceneDoc, validate_avatar_settings},
 };
 
 #[derive(Debug, Clone)]
@@ -298,6 +301,7 @@ enum ChangeKind {
 #[derive(Debug, Default)]
 struct ChangeSet {
     registries: BTreeMap<String, BTreeMap<String, ChangeKind>>,
+    avatar: bool,
 }
 
 impl ChangeSet {
@@ -348,6 +352,7 @@ impl ChangeSet {
                 }
             }
         }
+        self.avatar = original.avatar != changed.avatar;
         Ok(())
     }
 
@@ -384,11 +389,12 @@ impl ChangeSet {
                 json!({"created": created, "updated": updated, "deleted": deleted}),
             );
         }
+        registries.insert("avatar".to_owned(), json!({"updated":self.avatar}));
         Value::Object(registries)
     }
 
     fn is_empty(&self) -> bool {
-        self.registries.values().all(BTreeMap::is_empty)
+        !self.avatar && self.registries.values().all(BTreeMap::is_empty)
     }
 }
 fn registry_entry(doc: &SceneDoc, registry: &str, id: &Id) -> Result<Option<Value>> {
@@ -604,10 +610,19 @@ fn apply_batch_internal(
                 &operation_pointer(index, "op"),
             ));
         }
-        library::ensure_operation_editable(&engine, object)?;
+        if !matches!(name, "avatar.clear" | "avatar.update") {
+            library::ensure_operation_editable(&engine, object)?;
+        }
         let result = match name {
             "asset.mark" | "asset.clear" | "asset.update" | "asset.catalog_create" => {
                 asset::apply(&mut engine, name, object)
+            }
+            "avatar.clear" | "avatar.update" => {
+                let result = avatar::apply(&mut *engine.doc, name, object, index);
+                if result.as_ref().is_ok_and(|changed| *changed) {
+                    engine.changes.avatar = true;
+                }
+                result
             }
             "scene.create" | "scene.update" => scene::apply(&mut engine, name, object),
             "extension.register" => extension::apply(&mut engine, name, object),
@@ -824,6 +839,27 @@ fn apply_batch_internal(
         pending_assets = next_pending_assets;
         let batch_changed = !changes.is_empty();
         operation_results.push(json!({"index":index,"op":name,"changed":changed_by_operation,"batch_changed":batch_changed}));
+    }
+    if let Some(avatar) = &working.avatar {
+        validate_avatar_settings(&working, avatar).map_err(|mut error| {
+            error.code = ErrorCode::InvalidOperation;
+            if let Some(operation_index) = operations.len().checked_sub(1)
+                && let Some(details) = error.details.as_object_mut()
+            {
+                details.insert("operation_index".to_owned(), json!(operation_index));
+                let document_pointer = details
+                    .get("pointer")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/avatar")
+                    .to_owned();
+                details.insert("document_pointer".to_owned(), json!(document_pointer));
+                details.insert(
+                    "pointer".to_owned(),
+                    json!(format!("/operations/{operation_index}")),
+                );
+            }
+            error
+        })?;
     }
     let mut referenced_assets = BTreeSet::new();
     for image in working.images.values() {

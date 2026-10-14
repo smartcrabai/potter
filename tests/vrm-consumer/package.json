@@ -1,0 +1,22 @@
+{
+  "name": "potter-vrm-consumer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/fetch-schemas.mjs && node scripts/build-fixture.mjs && node scripts/validate.mjs && node --test validate/validate.test.mjs test/*.test.mjs",
+    "postinstall": "patch-package"
+  },
+  "dependencies": {
+    "@pixiv/three-vrm": "3.5.5",
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "gltf-validator": "2.0.0-dev.3.10",
+    "patch-package": "8.0.1",
+    "playwright": "1.64.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

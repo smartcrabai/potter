@@ -38,6 +38,8 @@ pot schema --kind capabilities --json   # List of supported/unsupported features
 
 The authoritative sources for supported and unsupported features are `pot schema --kind capabilities --json` and `pot inspect <scene> --features --json`.
 
+Configure native VRM avatars with `avatar.update` / `avatar.clear`, then export VRM 1.0 or 0.x with `pot export --format vrm|vrm0`. Supported consumers and acceptance checks are in [VRM Support Targets and Acceptance](docs/vrm-acceptance.md); `tests/vrm-consumer` runs the automated part (`npm ci && npm test`).
+
 ## Agent workflows (`pot workflow`)
 
 `pot workflow` runs multi-agent workflows on top of potter, driven by [jcode](https://github.com/1jehuang/jcode) agents through `jcode-sdk`. It needs `jcode` on PATH with a provider login.

@@ -867,7 +867,7 @@ fn volume_to_mesh(
             .collect::<serde_json::Map<_, _>>();
         output.attributes.insert(
             "shade_smooth".to_owned(),
-            json!({"domain":"faces","type":"bool","values":values}),
+            json!({"domain":"face","type":"bool","values":values}),
         );
     }
     Ok(output)

@@ -4,7 +4,7 @@ use crate::ops;
 
 #[must_use]
 pub fn feature_catalog() -> Value {
-    let rows = vec![
+    let mut rows = vec![
         supported(
             "scene.graph",
             "Scene and View Layer",
@@ -1940,6 +1940,24 @@ pub fn feature_catalog() -> Value {
             "Scripts and native extension adapters are never executed.",
         ),
     ];
+    rows.extend(
+        crate::model::AVATAR_FEATURE_DESCRIPTORS
+            .iter()
+            .map(|descriptor| {
+                let mut row = supported(
+                    descriptor.feature_id,
+                    descriptor.feature_id,
+                    "Avatar",
+                    &["avatar.update", "avatar.clear"],
+                    [true, true, true, false, false, false, true],
+                );
+                row["reason"] = json!(format!(
+                    "VRM 1.0 and 0.x export: supported; {}",
+                    descriptor.limitation
+                ));
+                row
+            }),
+    );
     json!({"catalog_version":1,"features":rows})
 }
 
@@ -2056,6 +2074,8 @@ pub fn formats_catalog() -> Value {
                 "Only the adapter's implemented GLTF feature subset is supported; unsupported source features are rejected or reported as losses.",
             ],
         ),
+        vrm_format_row("vrm"),
+        vrm_format_row("vrm0"),
         format_row(
             "obj",
             [true, true],
@@ -2228,6 +2248,34 @@ pub fn formats_catalog() -> Value {
     json!({"catalog_version":1,"formats":formats})
 }
 
+fn vrm_format_row(format: &str) -> Value {
+    let mut row = format_row(
+        format,
+        [false, true],
+        &[
+            "GLB 2.0 container",
+            "avatar metadata and humanoid",
+            "expressions",
+            "first-person and look-at",
+            "spring bones",
+            "MToon materials",
+        ],
+        false,
+        &[],
+        &[
+            "Settings not representable by this VRM version are rejected during validation and export.",
+        ],
+    );
+    let mut features = row["features"].as_array().cloned().unwrap_or_default();
+    features.extend(
+        crate::model::AVATAR_FEATURE_DESCRIPTORS
+            .iter()
+            .map(|descriptor| json!(descriptor.feature_id)),
+    );
+    row["features"] = Value::Array(features);
+    row
+}
+
 fn format_row(
     name: &str,
     direction: [bool; 2],
@@ -2237,8 +2285,8 @@ fn format_row(
     loss_conditions: &[&str],
 ) -> Value {
     let (status, reason) = match name {
-        "blend" | "glb" | "gltf" | "usda" | "usdc" | "usd" | "usdz" | "alembic" | "fbx"
-        | "fbx-binary" | "bvh" | "obj" | "stl" | "ply" | "svg" | "pdf" => {
+        "blend" | "glb" | "gltf" | "vrm" | "vrm0" | "usda" | "usdc" | "usd" | "usdz"
+        | "alembic" | "fbx" | "fbx-binary" | "bvh" | "obj" | "stl" | "ply" | "svg" | "pdf" => {
             ("supported", Value::Null)
         }
         _ => ("not_supported", json!("Format adapter is not implemented.")),
@@ -2248,7 +2296,7 @@ fn format_row(
 
 #[must_use]
 pub fn capabilities_schema() -> Value {
-    json!({"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Potter capabilities catalog","type":"object","required":["catalog_version","features"],"properties":{"catalog_version":{"const":1},"features":{"type":"array","items":{"$ref":"#/$defs/feature"}}},"$defs":{"feature":{"type":"object","required":["feature_id","name","blender_type","pot_ops","capabilities","status","reason"],"properties":{"feature_id":{"type":"string"},"name":{"type":"string"},"blender_type":{"type":"string"},"pot_ops":{"type":"array","items":{"type":"string"}},"capabilities":{"type":"object","required":["create","edit","inspect","evaluate","render","import","export"],"properties":{"create":{"type":"boolean"},"edit":{"type":"boolean"},"inspect":{"type":"boolean"},"evaluate":{"type":"boolean"},"render":{"type":"boolean"},"import":{"type":"boolean"},"export":{"type":"boolean"}},"additionalProperties":false},"status":{"enum":["supported","not_supported"]},"reason":{"type":["string","null"]}},"additionalProperties":false}}})
+    json!({"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Potter capabilities catalog","type":"object","required":["catalog_version","features"],"properties":{"catalog_version":{"const":1},"features":{"type":"array","items":{"$ref":"#/$defs/feature"}}},"$defs":{"feature":{"type":"object","required":["feature_id","name","blender_type","pot_ops","capabilities","status","reason"],"properties":{"feature_id":{"type":"string"},"name":{"type":"string"},"blender_type":{"type":"string"},"pot_ops":{"type":"array","items":{"type":"string"}},"capabilities":{"type":"object","required":["create","edit","inspect","evaluate","render","import","export"],"properties":{"create":{"type":"boolean"},"edit":{"type":"boolean"},"inspect":{"type":"boolean"},"evaluate":{"type":"boolean"},"render":{"type":"boolean"},"import":{"type":"boolean"},"export":{"type":"boolean"}},"additionalProperties":false},"status":{"enum":["supported","not_supported"]},"reason":{"type":["string","null"]},"enabled":{"type":"boolean"}},"additionalProperties":false}}})
 }
 
 #[must_use]

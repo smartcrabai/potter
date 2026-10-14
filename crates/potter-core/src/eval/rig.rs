@@ -1099,7 +1099,11 @@ fn ik_target_matrices(
             )
         })?;
         let mut target_world = target_object_world;
-        if let Some(bone_id) = constraint.subtarget.as_ref() {
+        if let Some(bone_id) = constraint
+            .subtarget
+            .as_ref()
+            .filter(|_| constraint.owner_bone.is_some())
+        {
             target_world = ik_target_bone_matrix(
                 target_id,
                 bone_id,
@@ -1999,11 +2003,24 @@ fn solve_legacy_ik(
             ));
         }
 
-        pose_matrix_overrides.insert(bone_id.clone(), double_ik_mat4(desired_pose));
+        let mut desired_pose = double_ik_mat4(desired_pose);
+        let (scale, rotation, translation) = desired_pose.to_scale_rotation_translation();
+        let average_scale = (scale.x + scale.y + scale.z) / 3.0;
+        if average_scale > 0.0
+            && (scale - DVec3::splat(average_scale)).abs().max_element()
+                <= 1.0e-5 * average_scale.max(1.0)
+        {
+            // Remove float32 IK roundoff before the pose becomes a VRM skin-joint transform.
+            desired_pose = DMat4::from_scale_rotation_translation(
+                DVec3::splat(average_scale),
+                rotation.normalize(),
+                translation,
+            );
+        }
+        pose_matrix_overrides.insert(bone_id.clone(), desired_pose);
     }
     Ok(())
 }
-
 /// Blend shape keys using caller-evaluated animated or driven key values.
 pub(crate) fn apply_shape_keys_with_values(
     mesh: &mut Mesh,

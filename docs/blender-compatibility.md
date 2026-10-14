@@ -40,7 +40,7 @@ The following are potter requirements derived from Blender's official feature ca
 | Video Sequencer | image/movie/sound/scene/meta strips, transition, effect, retiming, mix | Strip hierarchy/channel/offset/duration, Modifier, proxy, audio volume/pan/pitch, codec |
 | Asset and library | Link/Append, Library Override, asset library/catalog, dependency resolution, pack/unpack | Linked ID, source library, override operation, ID remapping, resource URI/hash/license/author |
 | Scripting and extension | Text Data-Block, custom property, registered extensions, scripted driver | Source text, dependency version, RNA identifier. Execution requires a declared runtime/permission |
-| Input and output | .blend, GLB/glTF, USD/USDZ, Alembic, FBX, OBJ, PLY, STL, BVH, SVG, PDF | Format-specific conversion/axes/units/animation/assets/loss report. Implemented formats are specified in Section 12 |
+| Input and output | .blend, GLB/glTF, VRM 0.x/1.0 (export), USD/USDZ, Alembic, FBX, OBJ, PLY, STL, BVH, SVG, PDF | Format-specific conversion/axes/units/animation/assets/loss report. Implemented formats are specified in Section 12 |
 
 
 In potter's current physics evaluation, in addition to rigid bodies, deterministic cloth and soft body with vertex-group pin/goal and collisions, seeded face/vertex particles, boundary-constrained SPH liquid with metaball surfaces, and dynamic-paint vertex color/weight driven by brush proximity are evaluated and cached per frame, and output to `bake --kind simulation`. Particles are evaluated as point markers, object instances, or hair strand meshes. Fluid smoke/fire and simulation nodes are reported as `not_supported`.
@@ -122,7 +122,7 @@ Prepare "create," "edit," "evaluate," and "round trip" fixtures for each feature
 8. Reproduce sculpting, paint, and weight results by replaying the Brush world-space sample sequence and seed.
 9. Reproduce bakes with fixed physics initial state, seed, and solver version. Invalidate old caches when settings change.
 10. Verify editing and output of Grease Pencil, tracking, masks, compositor, and VSE, including audio synchronization.
-11. Compare supported features, axes, units, and loss reports for GLB/glTF, USD/USDZ, Alembic, FBX, OBJ, PLY, STL, BVH, SVG, and PDF.
+11. Compare supported features, axes, units, and loss reports for GLB/glTF, VRM 0.x/1.0, USD/USDZ, Alembic, FBX, OBJ, PLY, STL, BVH, SVG, and PDF.
 12. Distinguish corruption, versions that are too new, unknown extensions, missing assets, and unrepresentable formats with errors. Preserve existing canonical data and output when import/export fails.
 13. Preserve shared Data-Blocks, libraries, rigs, Actions, simulations, and assets through undo/redo and restore after restart. Do not garbage-collect dependencies of past snapshots.
 

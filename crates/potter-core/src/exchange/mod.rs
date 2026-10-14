@@ -381,3 +381,4 @@ pub mod svg;
 pub mod usd;
 pub mod usdc;
 mod vector;
+pub mod vrm;

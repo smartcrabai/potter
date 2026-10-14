@@ -1,0 +1,13 @@
+[
+  {
+    "code": "INVALID_EXTENSION_NAME_FORMAT",
+    "file": "v0.vrm",
+    "pointer": "^/extensionsUsed/\\d+$",
+    "reason": "v0.vrm only: extensionsUsed[2] is \"VRM\", the unprefixed extension name mandated by the VRM 0.x spec. The glTF validator's vendor-prefix name rule does not apply to it. Not a producer defect."
+  },
+  {
+    "code": "MESH_PRIMITIVE_GENERATED_TANGENT_SPACE",
+    "pointer": "^/meshes/\\d+/primitives/\\d+/material$",
+    "reason": "Not a producer defect: the glTF 2.0 spec makes TANGENT optional and says consumers generate tangents (MikkTSpace) when it is absent. The VRM 0.0 README says \"TANGENT information is not saved in the exported VRM model since v0.42. It can be obtained based on the calculation of Normal and UV during the import.\" The normal-mapped material's primitives therefore omit TANGENT by design; the validator reports the runtime-generated tangents as a warning."
+  }
+]

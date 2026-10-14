@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>potter vrm consumer harness</title>
+    <script>
+      addEventListener('error', (e) => (window.potterError = e.message));
+      addEventListener('unhandledrejection', (e) => (window.potterError = String(e.reason)));
+    </script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/node_modules/three/build/three.module.js",
+          "three/addons/": "/node_modules/three/examples/jsm/",
+          "@pixiv/three-vrm": "/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module" src="./main.mjs"></script>
+  </body>
+</html>

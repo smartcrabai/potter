@@ -79,7 +79,7 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
             .collect::<Result<Vec<_>>>()?
     };
     let features = if args.features {
-        crate::catalog::feature_catalog()["features"].clone()
+        inspect_features(doc)
     } else {
         json!([])
     };
@@ -89,6 +89,7 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
         Some(scene),
         json!({
             "summary": summary,
+            "avatar": doc.avatar,
             "items": items,
             "libraries": doc.libraries,
             "references": {},
@@ -102,6 +103,34 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
             },
         }),
     ))
+}
+fn inspect_features(doc: &SceneDoc) -> Value {
+    let mut features = crate::catalog::feature_catalog()["features"].clone();
+    if let Some(rows) = features.as_array_mut() {
+        for row in rows {
+            let Some(feature_id) = row["feature_id"].as_str() else {
+                continue;
+            };
+            if let Some(enabled) = avatar_feature_enabled(doc, feature_id) {
+                row["enabled"] = json!(enabled);
+            }
+        }
+    }
+    features
+}
+
+fn avatar_feature_enabled(doc: &SceneDoc, feature_id: &str) -> Option<bool> {
+    let avatar = doc.avatar.as_ref();
+    match feature_id {
+        "humanoid" => Some(avatar.is_some_and(|settings| !settings.humanoid.is_empty())),
+        "metadata" => Some(avatar.is_some()),
+        "expressions" => Some(avatar.is_some_and(|settings| !settings.expressions.is_empty())),
+        "first_person" => Some(avatar.is_some_and(|settings| settings.first_person.is_some())),
+        "look_at" => Some(avatar.is_some_and(|settings| settings.look_at.is_some())),
+        "spring_bone" => Some(avatar.is_some_and(|settings| settings.spring_bone.is_some())),
+        "mtoon" => Some(avatar.is_some_and(|settings| !settings.mtoon.is_empty())),
+        _ => None,
+    }
 }
 
 fn node_error_item(id: &Id, node: &Node, error: &PotError) -> Value {

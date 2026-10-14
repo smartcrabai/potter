@@ -1,0 +1,43 @@
+diff --git a/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js b/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js
+index 7384c13..b18d909 100644
+--- a/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js
++++ b/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js
+@@ -802,9 +802,10 @@ var _VRMExpressionLoaderPlugin = class _VRMExpressionLoaderPlugin2 {
+               const material = object.material;
+               if (material) {
+                 if (Array.isArray(material)) {
+-                  gltfMaterials.push(...material);
++                  // Potter patch: a material shared by several meshes must bind once per instance, not once per mesh.
++                  for (const m of material) if (!gltfMaterials.includes(m)) gltfMaterials.push(m);
+                 } else {
+-                  gltfMaterials.push(material);
++                  if (!gltfMaterials.includes(material)) gltfMaterials.push(material);
+                 }
+               }
+             });
+@@ -2643,10 +2644,11 @@ var VRMLookAtBoneApplier = class {
+     const leftEyeNormalized = this.humanoid.getNormalizedBoneNode("leftEye");
+     const rightEyeNormalized = this.humanoid.getNormalizedBoneNode("rightEye");
+     if (leftEye) {
++      // Potter patch: pitch>0 looks down and takes rangeMapVerticalDown (VRM 1.0 lookAt.md), as the expression applier does.
+       if (pitch < 0) {
+-        _eulerA2.x = -THREE14.MathUtils.DEG2RAD * this.rangeMapVerticalDown.map(-pitch);
++        _eulerA2.x = -THREE14.MathUtils.DEG2RAD * this.rangeMapVerticalUp.map(-pitch);
+       } else {
+-        _eulerA2.x = THREE14.MathUtils.DEG2RAD * this.rangeMapVerticalUp.map(pitch);
++        _eulerA2.x = THREE14.MathUtils.DEG2RAD * this.rangeMapVerticalDown.map(pitch);
+       }
+       if (yaw < 0) {
+         _eulerA2.y = -THREE14.MathUtils.DEG2RAD * this.rangeMapHorizontalInner.map(-yaw);
+@@ -2661,9 +2663,9 @@ var VRMLookAtBoneApplier = class {
+     }
+     if (rightEye) {
+       if (pitch < 0) {
+-        _eulerA2.x = -THREE14.MathUtils.DEG2RAD * this.rangeMapVerticalDown.map(-pitch);
++        _eulerA2.x = -THREE14.MathUtils.DEG2RAD * this.rangeMapVerticalUp.map(-pitch);
+       } else {
+-        _eulerA2.x = THREE14.MathUtils.DEG2RAD * this.rangeMapVerticalUp.map(pitch);
++        _eulerA2.x = THREE14.MathUtils.DEG2RAD * this.rangeMapVerticalDown.map(pitch);
+       }
+       if (yaw < 0) {
+         _eulerA2.y = -THREE14.MathUtils.DEG2RAD * this.rangeMapHorizontalOuter.map(-yaw);

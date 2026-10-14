@@ -57,6 +57,10 @@ pub fn scene_changes(before: &SceneDoc, after: &SceneDoc) -> Result<Value> {
             registry_changes(&before[registry], &after[registry]),
         );
     }
+    changes.insert(
+        "avatar".to_owned(),
+        json!({"updated": before["avatar"] != after["avatar"]}),
+    );
     Ok(Value::Object(changes))
 }
 
@@ -107,6 +111,8 @@ pub(super) fn evaluation_context(
 
 pub(super) fn exchange_format_name(format: ExchangeFormat) -> &'static str {
     match format {
+        ExchangeFormat::Vrm => "vrm",
+        ExchangeFormat::Vrm0 => "vrm0",
         ExchangeFormat::Blend => "blend",
         ExchangeFormat::Glb => "glb",
         ExchangeFormat::Gltf => "gltf",
@@ -136,6 +142,7 @@ pub(super) fn check_extension(
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     let extension_matches = match format {
+        "vrm" | "vrm0" => extension.eq_ignore_ascii_case("vrm"),
         "alembic" => extension.eq_ignore_ascii_case("abc"),
         "fbx-binary" => extension.eq_ignore_ascii_case("fbx"),
         "usdc" => extension.eq_ignore_ascii_case("usdc") || extension.eq_ignore_ascii_case("usd"),

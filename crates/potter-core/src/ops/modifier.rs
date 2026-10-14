@@ -1005,6 +1005,19 @@ fn apply_modifier(
                 .data_blocks
                 .get(&data_id)
                 .is_some_and(|data| data.descriptor.is_some());
+        let stale = engine
+            .doc
+            .data_blocks
+            .get(&data_id)
+            .and_then(|data| data.mesh.as_ref())
+            .is_some_and(|previous| crate::geom::normals::shading_keys_stale(previous, &evaluated));
+        if stale {
+            return Err(engine.error(
+                ErrorCode::UnsupportedFeature,
+                "modifier.apply would leave face-keyed shading (shade_smooth, sharp, custom_normal) on changed faces; apply the modifier before adding shading",
+                "/target",
+            ));
+        }
         if let Some(data) = engine.doc.data_blocks.get_mut(&data_id) {
             data.mesh = Some(evaluated);
             if mesh_changed {

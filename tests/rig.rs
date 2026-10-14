@@ -145,6 +145,19 @@ fn assert_vec3_close(actual: DVec3, expected: DVec3, tolerance: f64) {
     );
 }
 
+fn assert_matrix_close(actual: DMat4, expected: DMat4, tolerance: f64) {
+    for (actual, expected) in actual
+        .to_cols_array()
+        .into_iter()
+        .zip(expected.to_cols_array())
+    {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "matrix element differs: expected {expected}, got {actual}"
+        );
+    }
+}
+
 fn armature_chain_operations(target: [f64; 3]) -> Value {
     json!([
         {"op":"node.create","id":"arm","kind":"armature"},
@@ -586,6 +599,16 @@ fn rig_generate_basic_human_creates_scaled_deform_and_control_rigs() -> Integrat
         .bones
         .get(&root_id)
         .ok_or_else(|| io::Error::other("generated root bone is missing"))?;
+    let hips_id = Id::new("hips")?;
+    let hips = armature
+        .bones
+        .get(&hips_id)
+        .ok_or_else(|| io::Error::other("generated hips bone is missing"))?;
+    let spine_id = Id::new("spine")?;
+    let spine = armature
+        .bones
+        .get(&spine_id)
+        .ok_or_else(|| io::Error::other("generated spine bone is missing"))?;
     let head_id = Id::new("head")?;
     let head = armature
         .bones
@@ -601,14 +624,68 @@ fn rig_generate_basic_human_creates_scaled_deform_and_control_rigs() -> Integrat
         DVec3::new(0.0, 0.0, 0.3),
         1.0e-12,
     );
+    assert_eq!(hips.parent.as_ref(), Some(&root_id));
+    assert_vec3_close(
+        DVec3::from_array(hips.head),
+        DVec3::new(0.0, 0.0, 1.7),
+        1.0e-12,
+    );
+    assert_vec3_close(
+        DVec3::from_array(hips.tail),
+        DVec3::new(0.0, 0.0, 1.9),
+        1.0e-12,
+    );
+    assert_eq!(spine.parent.as_ref(), Some(&hips_id));
+    assert_vec3_close(
+        DVec3::from_array(spine.head),
+        DVec3::from_array(hips.tail),
+        1.0e-12,
+    );
     assert_eq!(head.name, "head");
     assert!(head.deform);
     assert!(!hand_control.deform);
+    for side in ["l", "r"] {
+        let thigh = armature
+            .bones
+            .get(&Id::new(format!("thigh_{side}"))?)
+            .ok_or_else(|| io::Error::other(format!("generated {side} thigh is missing")))?;
+        assert_eq!(thigh.parent.as_ref(), Some(&hips_id));
+        let foot_id = Id::new(format!("foot_{side}"))?;
+        let foot = armature
+            .bones
+            .get(&foot_id)
+            .ok_or_else(|| io::Error::other(format!("generated {side} foot is missing")))?;
+        let toe = armature
+            .bones
+            .get(&Id::new(format!("toe_{side}"))?)
+            .ok_or_else(|| io::Error::other(format!("generated {side} toe is missing")))?;
+        assert_vec3_close(
+            DVec3::from_array(foot.head),
+            DVec3::new(0.3 * if side == "l" { 1.0 } else { -1.0 }, 0.0, 0.2),
+            1.0e-12,
+        );
+        assert_vec3_close(
+            DVec3::from_array(foot.tail),
+            DVec3::new(0.3 * if side == "l" { 1.0 } else { -1.0 }, -0.5, 0.1),
+            1.0e-12,
+        );
+        assert_eq!(toe.parent.as_ref(), Some(&foot_id));
+        assert_vec3_close(
+            DVec3::from_array(toe.head),
+            DVec3::from_array(foot.tail),
+            1.0e-12,
+        );
+        assert_vec3_close(
+            DVec3::from_array(toe.tail),
+            DVec3::new(0.3 * if side == "l" { 1.0 } else { -1.0 }, -0.8, 0.1),
+            1.0e-12,
+        );
+    }
     let deform_collection_id = Id::new("rigify_deform")?;
     let controls_collection_id = Id::new("rigify_controls")?;
     assert_eq!(
         armature.bone_collections[&deform_collection_id].bones.len(),
-        23
+        24
     );
     assert_eq!(
         armature.bone_collections[&controls_collection_id]
@@ -624,8 +701,249 @@ fn rig_generate_basic_human_creates_scaled_deform_and_control_rigs() -> Integrat
     assert!(node.constraints.iter().all(|constraint| {
         constraint.constraint_type == potter_core::model::ConstraintType::Ik && constraint.enabled
     }));
+    for (constraint_id, target_role, end_bone) in [
+        ("ik_arm_l", "hand_ik_l", "hand_l"),
+        ("ik_arm_r", "hand_ik_r", "hand_r"),
+        ("ik_leg_l", "foot_ik_l", "shin_l"),
+        ("ik_leg_r", "foot_ik_r", "shin_r"),
+    ] {
+        let constraint = node
+            .constraints
+            .iter()
+            .find(|constraint| constraint.id.as_str() == constraint_id)
+            .ok_or_else(|| {
+                io::Error::other(format!("generated {constraint_id} constraint is missing"))
+            })?;
+        assert_eq!(
+            constraint.target.as_ref(),
+            Some(&Id::new(format!("rig_arm_{target_role}"))?)
+        );
+        assert_eq!(constraint.subtarget.as_ref(), Some(&Id::new(end_bone)?));
+        assert_eq!(constraint.owner_bone, None);
+    }
+    for side in ["l", "r"] {
+        let sign = if side == "l" { 1.0 } else { -1.0 };
+        let foot_control = armature
+            .bones
+            .get(&Id::new(format!("foot_ik_{side}"))?)
+            .ok_or_else(|| {
+                io::Error::other(format!("generated {side} foot IK control is missing"))
+            })?;
+        assert_vec3_close(
+            DVec3::from_array(foot_control.head),
+            DVec3::new(0.3 * sign, 0.0, 0.2),
+            1.0e-12,
+        );
+        assert_vec3_close(
+            DVec3::from_array(foot_control.tail),
+            DVec3::new(0.3 * sign, -0.5, 0.1),
+            1.0e-12,
+        );
+        let foot_target = document
+            .nodes
+            .get(&Id::new(format!("rig_arm_foot_ik_{side}"))?)
+            .ok_or_else(|| {
+                io::Error::other(format!("generated {side} foot IK target is missing"))
+            })?;
+        assert_vec3_close(
+            DVec3::from_array(foot_target.transform.translation),
+            DVec3::new(0.3 * sign, 0.0, 0.2),
+            1.0e-12,
+        );
+    }
+
+    let constrained = Snapshot::evaluate(&document, &EvaluationContext::default())?;
+    let mut rest_document = document.clone();
+    for constraint in &mut rest_document
+        .nodes
+        .get_mut(&arm_id)
+        .ok_or_else(|| io::Error::other("armature node is missing"))?
+        .constraints
+    {
+        constraint.enabled = false;
+    }
+    let rest = Snapshot::evaluate(&rest_document, &EvaluationContext::default())?;
+    for bone_id in &armature.bone_collections[&deform_collection_id].bones {
+        assert_matrix_close(
+            bone_matrix(&constrained, "arm", bone_id.as_str())?,
+            bone_matrix(&rest, "arm", bone_id.as_str())?,
+            3.0e-6,
+        );
+    }
+    for side in ["l", "r"] {
+        let sign = if side == "l" { 1.0 } else { -1.0 };
+        for (bone, head, tail) in [
+            (
+                format!("shoulder_{side}"),
+                DVec3::new(0.0, 0.0, 3.0),
+                DVec3::new(0.5 * sign, 0.0, 3.0),
+            ),
+            (
+                format!("upper_arm_{side}"),
+                DVec3::new(0.5 * sign, 0.0, 3.0),
+                DVec3::new(1.3 * sign, 0.05, 3.0),
+            ),
+            (
+                format!("forearm_{side}"),
+                DVec3::new(1.3 * sign, 0.05, 3.0),
+                DVec3::new(2.0 * sign, 0.0, 3.0),
+            ),
+            (
+                format!("hand_{side}"),
+                DVec3::new(2.0 * sign, 0.0, 3.0),
+                DVec3::new(2.5 * sign, 0.0, 3.0),
+            ),
+            (
+                format!("thigh_{side}"),
+                DVec3::new(0.3 * sign, 0.0, 1.8),
+                DVec3::new(0.3 * sign, -0.05, 1.0),
+            ),
+            (
+                format!("shin_{side}"),
+                DVec3::new(0.3 * sign, -0.05, 1.0),
+                DVec3::new(0.3 * sign, 0.0, 0.2),
+            ),
+            (
+                format!("foot_{side}"),
+                DVec3::new(0.3 * sign, 0.0, 0.2),
+                DVec3::new(0.3 * sign, -0.5, 0.1),
+            ),
+            (
+                format!("toe_{side}"),
+                DVec3::new(0.3 * sign, -0.5, 0.1),
+                DVec3::new(0.3 * sign, -0.8, 0.1),
+            ),
+        ] {
+            let actual_matrix = bone_matrix(&constrained, "arm", &bone)?;
+            let tolerance = if bone.starts_with("upper_arm_")
+                || bone.starts_with("forearm_")
+                || bone.starts_with("thigh_")
+                || bone.starts_with("shin_")
+                || bone.starts_with("foot_")
+                || bone.starts_with("toe_")
+            {
+                3.0e-6
+            } else {
+                1.0e-6
+            };
+            assert_vec3_close(actual_matrix.transform_point3(DVec3::ZERO), head, tolerance);
+            assert_vec3_close(
+                bone_endpoint(&constrained, "arm", &bone, head.distance(tail))?,
+                tail,
+                tolerance,
+            );
+        }
+    }
+
+    let mut moved_document = document.clone();
+    let moved_target_id = Id::new("rig_arm_foot_ik_l")?;
+    moved_document
+        .nodes
+        .get_mut(&moved_target_id)
+        .ok_or_else(|| io::Error::other("generated left foot IK target is missing"))?
+        .transform
+        .translation[2] += 0.1;
+    let moved = Snapshot::evaluate(&moved_document, &EvaluationContext::default())?;
+    assert_vec3_close(
+        bone_endpoint(&moved, "arm", "shin_l", DVec3::new(0.0, 0.8, 0.05).length())?,
+        DVec3::new(0.3, 0.000_003, 0.299_97),
+        1.0e-4,
+    );
+    assert!(
+        bone_matrix(&moved, "arm", "thigh_l")?
+            .to_cols_array()
+            .into_iter()
+            .zip(bone_matrix(&constrained, "arm", "thigh_l")?.to_cols_array())
+            .any(|(moved, rest)| (moved - rest).abs() > 1.0e-3),
+        "moving the foot IK target did not deform the generated leg"
+    );
+
+    let mut moved_arm_document = document.clone();
+    let moved_hand_target_id = Id::new("rig_arm_hand_ik_l")?;
+    let moved_hand_target = moved_arm_document
+        .nodes
+        .get_mut(&moved_hand_target_id)
+        .ok_or_else(|| io::Error::other("generated left hand IK target is missing"))?;
+    moved_hand_target.transform.translation[0] -= 0.2;
+    moved_hand_target.transform.translation[2] += 0.1;
+    let moved_arm = Snapshot::evaluate(&moved_arm_document, &EvaluationContext::default())?;
+    assert_vec3_close(
+        bone_endpoint(&moved_arm, "arm", "hand_l", 0.5)?,
+        DVec3::new(2.300_058, -0.000_012, 3.100_003),
+        1.0e-4,
+    );
+    assert!(
+        bone_matrix(&moved_arm, "arm", "upper_arm_l")?
+            .to_cols_array()
+            .into_iter()
+            .zip(bone_matrix(&constrained, "arm", "upper_arm_l")?.to_cols_array())
+            .any(|(moved, rest)| (moved - rest).abs() > 1.0e-3),
+        "moving the hand IK target did not deform the generated arm"
+    );
+    let left_elbow = bone_endpoint(
+        &moved_arm,
+        "arm",
+        "upper_arm_l",
+        DVec3::new(0.8, 0.05, 0.0).length(),
+    )?;
+    assert!(
+        left_elbow.y > 0.0,
+        "left elbow must bend backward (+Y): {left_elbow:?}"
+    );
+
+    let mut moved_right_document = document.clone();
+    let moved_right_target = moved_right_document
+        .nodes
+        .get_mut(&Id::new("rig_arm_hand_ik_r")?)
+        .ok_or_else(|| io::Error::other("generated right hand IK target is missing"))?;
+    moved_right_target.transform.translation[0] += 0.2;
+    moved_right_target.transform.translation[2] += 0.1;
+    let moved_right = Snapshot::evaluate(&moved_right_document, &EvaluationContext::default())?;
+    let right_elbow = bone_endpoint(
+        &moved_right,
+        "arm",
+        "upper_arm_r",
+        DVec3::new(-0.8, 0.05, 0.0).length(),
+    )?;
+    assert!(
+        right_elbow.y > 0.0,
+        "right elbow must bend backward (+Y): {right_elbow:?}"
+    );
+    assert_vec3_close(
+        bone_endpoint(&moved_right, "arm", "hand_r", 0.5)?,
+        DVec3::new(-2.3, 0.0, 3.1),
+        1.0e-4,
+    );
+
     let hand_target = Id::new("rig_arm_hand_ik_l")?;
     assert!(document.nodes.contains_key(&hand_target));
+    let preview = pot()
+        .arg("inspect")
+        .arg(&project)
+        .arg("--id")
+        .arg("arm")
+        .arg("--json")
+        .output()?;
+    assert!(
+        preview.status.success(),
+        "generated rig preview failed: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&preview.stdout)?;
+    let inspected_arm = envelope["result"]["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == "arm"))
+        .ok_or("inspect omitted the generated armature")?;
+    assert!(
+        inspected_arm["evaluated_bones"]["hips"]
+            .as_array()
+            .is_some()
+    );
+    assert!(
+        inspected_arm["evaluated_bones"]["head"]
+            .as_array()
+            .is_some()
+    );
     Ok(())
 }
 
@@ -935,6 +1253,37 @@ fn ik_chain_count_and_pole_target_are_evaluated() -> IntegrationResult {
         bone_endpoint(&evaluated, "arm", "tip", 1.0)?,
         DVec3::new(1.414_213_538_169_860_8, 1.414_213_538_169_860_8, 0.0),
         1.0e-6,
+    );
+    Ok(())
+}
+#[test]
+fn pose_ik_evaluates_target_and_pole_armature_subtargets() -> IntegrationResult {
+    let (_directory, project) = new_project(&json!([
+        {"op":"node.create","id":"arm","kind":"armature"},
+        {"op":"bone.create","target":{"id":"arm"},"id":"root","name":"Root",
+         "head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.025]},
+        {"op":"bone.create","target":{"id":"arm"},"id":"tip","name":"Tip",
+         "head":[0.0,1.0,0.025],"tail":[0.0,2.0,0.0],"parent":"root"},
+        {"op":"node.create","id":"goal_rig","kind":"armature"},
+        {"op":"bone.create","target":{"id":"goal_rig"},"id":"goal_bone","name":"Goal",
+         "head":[1.0,1.0,0.0],"tail":[1.0,2.0,0.0]},
+        {"op":"node.create","id":"pole_rig","kind":"armature"},
+        {"op":"bone.create","target":{"id":"pole_rig"},"id":"pole_bone","name":"Pole",
+         "head":[0.0,0.0,2.0],"tail":[0.0,0.0,3.0]},
+        {"op":"constraint.create","target":{"id":"arm"},"id":"reach","type":"ik",
+         "constraint_target":"goal_rig","subtarget":"goal_bone","owner_bone":"tip",
+         "params":{"chain_count":2,"pole_target":"pole_rig","pole_subtarget":"pole_bone"}}
+    ]))?;
+    let evaluated = snapshot(&project, None)?;
+    assert_vec3_close(
+        bone_endpoint(
+            &evaluated,
+            "arm",
+            "tip",
+            DVec3::new(0.0, 1.0, 0.025).length(),
+        )?,
+        DVec3::new(1.000_066, 1.000_038, 0.0),
+        1.0e-4,
     );
     Ok(())
 }

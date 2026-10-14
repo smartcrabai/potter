@@ -30,6 +30,7 @@ pub mod lattice;
 pub mod mesh_cache;
 pub mod metaball;
 pub mod modifiers;
+pub(crate) mod normals;
 pub mod pointcloud;
 pub mod remesh;
 pub mod sculpt;

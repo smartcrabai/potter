@@ -2,7 +2,7 @@
 
 use std::{error::Error, fs, path::Path, process::Command};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 fn pot() -> Command {
@@ -335,7 +335,8 @@ fn append_remaps_colliding_ids_and_dry_run_does_not_commit() -> Result<(), Box<d
     assert_ne!(mapped, "body");
     let document: Value = serde_json::from_slice(&fs::read(target.join("scene.json"))?)?;
     assert!(document["nodes"].get(mapped).is_some());
-    assert_eq!(vertex_count(&target)?, 16);
+    // The exporter splits the box's vertices per normal; the importer welds those copies back to 8.
+    assert_eq!(vertex_count(&target)?, 8 + 8);
     Ok(())
 }
 
@@ -445,5 +446,156 @@ fn export_view_is_restricted_to_svg_and_pdf() -> Result<(), Box<dyn Error>> {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(json(&output)?["error"]["code"], "INVALID_ARGUMENT");
     assert!(!output_path.exists());
+    Ok(())
+}
+
+#[test]
+fn glb_emissive_strength_is_omitted_when_inert_and_round_trips_through_extras()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let source = directory.path().join("source");
+    let imported = directory.path().join("imported");
+    let output_path = directory.path().join("emissive.glb");
+    pot()
+        .args(["init", source.to_str().unwrap(), "--json"])
+        .output()?;
+    let operations = directory.path().join("emissive.operations.json");
+    fs::write(
+        &operations,
+        json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op": "material.create", "id": "inert", "name": "Inert", "emission_strength": 2.5},
+                {"op": "material.create", "id": "unit", "name": "Unit", "emission_color": [0.5, 0.25, 0.125], "emission_strength": 1.0},
+                {"op": "material.create", "id": "glow", "name": "Glow", "emission_color": [0.5, 0.25, 0.125], "emission_strength": 2.5},
+                {"op": "node.create", "id": "inert_box", "kind": "box", "params": {"size": 0.5}, "material": "inert"},
+                {"op": "node.create", "id": "unit_box", "kind": "box", "params": {"size": 0.5}, "material": "unit"},
+                {"op": "node.create", "id": "glow_box", "kind": "box", "params": {"size": 0.5}, "material": "glow"}
+            ]
+        })
+        .to_string(),
+    )?;
+    let applied = pot()
+        .args(["apply", source.to_str().unwrap(), "--file"])
+        .arg(&operations)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    export(&source, "glb", &output_path)?;
+    let bytes = fs::read(&output_path)?;
+    let json_length = usize::try_from(u32::from_le_bytes(bytes[12..16].try_into()?))?;
+    let document: Value = serde_json::from_slice(&bytes[20..20 + json_length])?;
+    let named = |name: &str| -> Result<Value, Box<dyn Error>> {
+        document["materials"]
+            .as_array()
+            .and_then(|materials| materials.iter().find(|material| material["name"] == name))
+            .cloned()
+            .ok_or_else(|| format!("missing material {name}").into())
+    };
+    let inert = named("Inert")?;
+    assert!(inert["extensions"]["KHR_materials_emissive_strength"].is_null());
+    assert_eq!(inert["extras"]["potter"]["emission_strength"], 2.5);
+    assert!(named("Unit")?["extensions"]["KHR_materials_emissive_strength"].is_null());
+    assert_eq!(
+        named("Glow")?["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
+        2.5
+    );
+    assert!(document["extensionsUsed"].as_array().is_some_and(|used| {
+        used.iter()
+            .any(|name| name == "KHR_materials_emissive_strength")
+    }));
+
+    pot()
+        .args(["init", imported.to_str().unwrap(), "--json"])
+        .output()?;
+    import_replace(&imported, &output_path, "glb")?;
+    let scene: Value = serde_json::from_slice(&fs::read(imported.join("scene.json"))?)?;
+    assert_eq!(scene["materials"]["inert"]["emission_strength"], 2.5);
+    assert_eq!(scene["materials"]["unit"]["emission_strength"], 1.0);
+    assert_eq!(scene["materials"]["glow"]["emission_strength"], 2.5);
+    Ok(())
+}
+
+fn rigged_shape_key_scene(scene: &Path, posed: bool) -> Result<(), Box<dyn Error>> {
+    let init = pot()
+        .args(["init", scene.to_str().unwrap(), "--json"])
+        .output()?;
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stdout)
+    );
+    let weights: Vec<Value> = (0..8)
+        .map(|vertex_id| json!({"vertex_id": vertex_id, "weight": 1.0}))
+        .collect();
+    let mut operations = vec![
+        json!({"op":"node.create","id":"body","kind":"box","params":{"size":2.0}}),
+        json!({"op":"node.create","id":"rig","name":"Rig","kind":"armature"}),
+        json!({"op":"bone.create","target":{"id":"rig"},"id":"root","name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,0.0,1.0]}),
+        json!({"op":"vertex_group.create","target":{"id":"body"},"id":"root_group","name":"Root"}),
+        json!({"op":"vertex_group.assign","target":{"id":"body"},"group_id":"root_group","weights":weights}),
+        json!({"op":"modifier.create","target":{"id":"body"},"id":"armature","type":"armature","params":{"object":"rig","use_vertex_groups":true}}),
+        json!({"op":"shape_key.create","target":{"id":"body"},"id":"lift","name":"Lift","positions":{"0":[-1.0,-1.0,1.5]}}),
+    ];
+    if posed {
+        let half_turn = std::f64::consts::FRAC_1_SQRT_2;
+        operations.push(json!({"op":"pose.set","target":{"id":"rig"},"bone_id":"root","set":{"rotation":[0.0,0.0,half_turn,half_turn]}}));
+    }
+    let operations_path = scene.with_extension("operations.json");
+    fs::write(
+        &operations_path,
+        serde_json::to_vec(
+            &json!({"schema_version": 1, "base_revision": 0, "operations": operations}),
+        )?,
+    )?;
+    let applied = pot()
+        .args(["apply", scene.to_str().unwrap(), "--file"])
+        .arg(&operations_path)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    Ok(())
+}
+
+#[test]
+fn glb_refuses_posed_armature_under_shape_keys_and_exports_at_rest() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let rest = directory.path().join("rest");
+    rigged_shape_key_scene(&rest, false)?;
+    export(&rest, "glb", &directory.path().join("rest.glb"))?;
+
+    let posed = directory.path().join("posed");
+    rigged_shape_key_scene(&posed, true)?;
+    let output = pot()
+        .args([
+            "export",
+            posed.to_str().unwrap(),
+            "--format",
+            "glb",
+            "--out",
+        ])
+        .arg(directory.path().join("posed.glb"))
+        .arg("--json")
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "a posed armature under shape keys must not export as glb"
+    );
+    let failure = json(&output)?;
+    assert_eq!(failure["ok"], false);
+    assert_eq!(failure["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        failure["error"]["details"]["feature_id"],
+        "rig.skin_shape_key_pose"
+    );
     Ok(())
 }
