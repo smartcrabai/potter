@@ -13,7 +13,7 @@ use crate::{
     eval::{EvaluationContext, Snapshot},
     exchange::{self, ExportOptions, Loss},
     hash,
-    model::{Id, LightType, SceneDoc},
+    model::{AvatarVersion, Id, LightType, SceneDoc},
     response::SceneInfo,
     store::Project,
 };
@@ -30,6 +30,8 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         "blend"
             | "glb"
             | "gltf"
+            | "vrm"
+            | "vrm0"
             | "usda"
             | "usdc"
             | "usd"
@@ -65,7 +67,16 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                 "output file already exists",
             ));
         }
-        let report = exchange::blend::export_blend(&doc, &project, &args.out, &options)?;
+        let avatar_loss = avatar_settings_loss(&doc, format);
+        if !args.allow_lossy
+            && let Some(loss) = avatar_loss.as_ref()
+        {
+            return Err(lossy_error(format, std::slice::from_ref(loss)));
+        }
+        let mut report = exchange::blend::export_blend(&doc, &project, &args.out, &options)?;
+        if let Some(loss) = avatar_loss {
+            report.losses.push(loss);
+        }
         if !report.losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &report.losses));
         }
@@ -104,6 +115,14 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                     exchange::gltf::to_glb(&json_bytes, &binary)?,
                 )]
             }
+            "vrm" => vec![(
+                args.out.clone(),
+                exchange::vrm::export(&doc, &snapshot, project.path(), AvatarVersion::V1)?,
+            )],
+            "vrm0" => vec![(
+                args.out.clone(),
+                exchange::vrm::export(&doc, &snapshot, project.path(), AvatarVersion::V0)?,
+            )],
             "gltf" => {
                 let sidecar = sidecar_path(&args.out, "bin")?;
                 let uri = sidecar
@@ -311,11 +330,24 @@ fn blend_export_context_json(doc: &SceneDoc, context: &EvaluationContext) -> Res
 pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     let supports_scene = matches!(
         format,
-        "glb" | "gltf" | "usda" | "usdc" | "usd" | "usdz" | "fbx" | "fbx-binary" | "alembic"
+        "glb"
+            | "gltf"
+            | "vrm"
+            | "vrm0"
+            | "usda"
+            | "usdc"
+            | "usd"
+            | "usdz"
+            | "fbx"
+            | "fbx-binary"
+            | "alembic"
     );
     let supports_bvh = format == "bvh";
-    let supports_gltf_skin = matches!(format, "glb" | "gltf");
-    let supports_cameras = matches!(format, "glb" | "gltf" | "usda" | "usdc" | "usd" | "usdz");
+    let supports_gltf_skin = matches!(format, "glb" | "gltf" | "vrm" | "vrm0");
+    let supports_cameras = matches!(
+        format,
+        "glb" | "gltf" | "vrm" | "vrm0" | "usda" | "usdc" | "usd" | "usdz"
+    );
     let supports_lights = supports_cameras;
     let supports_strokes = matches!(format, "svg" | "pdf");
     let mut losses = Vec::new();
@@ -418,7 +450,8 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
         }
         if let Some(light) = &data.light {
             let unsupported = !supports_lights
-                || (matches!(format, "glb" | "gltf") && light.light_type == LightType::Area);
+                || (matches!(format, "glb" | "gltf" | "vrm" | "vrm0")
+                    && light.light_type == LightType::Area);
             if unsupported {
                 losses.push(Loss {
                     feature_id: format!("light.{:?}", light.light_type).to_ascii_lowercase(),
@@ -443,7 +476,22 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
             });
         }
     }
+    if let Some(loss) = avatar_settings_loss(doc, format) {
+        losses.push(loss);
+    }
     losses
+}
+
+pub(crate) fn avatar_settings_loss(doc: &SceneDoc, format: &str) -> Option<Loss> {
+    if doc.avatar.is_none() || matches!(format, "vrm" | "vrm0") {
+        return None;
+    }
+    Some(Loss {
+        feature_id: "avatar.settings".to_owned(),
+        data_id: None,
+        reason: format!("{format} cannot preserve configured VRM avatar settings"),
+        suggestion: Some("export as vrm or vrm0 to preserve avatar settings".to_owned()),
+    })
 }
 
 fn lossy_error(format: &str, losses: &[Loss]) -> PotError {
@@ -473,14 +521,14 @@ fn export_conversions(
         values
             .push(json!({ "feature_id": "transform.world", "conversion": "world_space_geometry" }));
     }
-    if matches!(format, "stl" | "glb" | "gltf")
+    if matches!(format, "stl" | "glb" | "gltf" | "vrm" | "vrm0")
         && meshes
             .iter()
             .any(|mesh| mesh.faces.iter().any(|face| face.len() > 3))
     {
         values.push(json!({ "feature_id": "mesh.polygon", "conversion": "triangulation" }));
     }
-    if matches!(format, "glb" | "gltf") {
+    if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
         values.push(
             json!({ "feature_id": "coordinate_system", "conversion": "potter_z_up_to_gltf_y_up" }),
         );
@@ -492,7 +540,10 @@ fn export_conversions(
     {
         values.push(json!({ "feature_id": "modifier.evaluation", "conversion": "evaluated_mesh" }));
     }
-    if matches!(format, "glb" | "gltf" | "stl" | "ply" | "usda" | "usdz") {
+    if matches!(
+        format,
+        "glb" | "gltf" | "vrm" | "vrm0" | "stl" | "ply" | "usda" | "usdz"
+    ) {
         values.push(
             json!({ "feature_id": "numeric_precision", "conversion": "float32_quantization" }),
         );

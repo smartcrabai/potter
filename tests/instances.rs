@@ -174,3 +174,35 @@ fn nested_collection_instances_keep_recursive_paths_and_transformed_bounds() {
     assert_eq!(bounds.min.to_array(), [4.0, -1.0, -1.0]);
     assert_eq!(bounds.max.to_array(), [6.0, 1.0, 1.0]);
 }
+
+#[test]
+fn instanced_custom_normals_rotate_with_the_instance_transform() {
+    let doc = apply(
+        &SceneDoc::new("4ae99b7f-471e-4c30-95a1-d8bfce8d2576".to_owned()),
+        &json!([
+            {"op":"collection.create","id":"source"},
+            {"op":"node.create","id":"box","kind":"box","collection":"source","params":{"size":1.0},"transform":{"rotation_deg":[0.0,0.0,90.0]}},
+            {"op":"mesh.set_custom_normals","target":{"id":"box"},"elements":{"domain":"face","ids":["f0"]},"normals":{"f0":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]]}},
+            {"op":"collection.instance_create","id":"instance","collection":"source"}
+        ]),
+    )
+    .unwrap();
+    let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
+    let mesh = &snapshot.meshes[&"instance".parse::<Id>().unwrap()];
+    let custom = mesh.attributes["custom_normal"]["values"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        custom.len(),
+        1,
+        "only the authored face carries a custom normal"
+    );
+    // A 90 degree turn about Z maps the authored +X normal to +Y.
+    for corner in custom.values().next().unwrap().as_array().unwrap() {
+        let [x, y, z] = [0, 1, 2].map(|axis| corner[axis].as_f64().unwrap());
+        assert!(
+            (x).abs() < 1.0e-12 && (y - 1.0).abs() < 1.0e-12 && z.abs() < 1.0e-12,
+            "{corner:?}"
+        );
+    }
+}

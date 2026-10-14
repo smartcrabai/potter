@@ -1,0 +1,17 @@
+diff --git a/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js b/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js
+index 7384c13..e412ba6 100644
+--- a/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js
++++ b/node_modules/@pixiv/three-vrm/lib/three-vrm.module.js
+@@ -802,9 +802,10 @@ var _VRMExpressionLoaderPlugin = class _VRMExpressionLoaderPlugin2 {
+               const material = object.material;
+               if (material) {
+                 if (Array.isArray(material)) {
+-                  gltfMaterials.push(...material);
++                  // Potter patch: a material shared by several meshes must bind once per instance, not once per mesh.
++                  for (const m of material) if (!gltfMaterials.includes(m)) gltfMaterials.push(m);
+                 } else {
+-                  gltfMaterials.push(material);
++                  if (!gltfMaterials.includes(material)) gltfMaterials.push(material);
+                 }
+               }
+             });

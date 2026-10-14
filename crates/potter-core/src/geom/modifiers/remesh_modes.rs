@@ -145,7 +145,7 @@ fn finish_remesh(
             .collect::<Map<_, _>>();
         mesh.attributes.insert(
             "shade_smooth".to_owned(),
-            json!({"domain":"faces","type":"bool","values":values}),
+            json!({"domain":"face","type":"bool","values":values}),
         );
     }
     validated(mesh)

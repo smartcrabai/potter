@@ -262,6 +262,9 @@ pub struct SchemaArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ExchangeFormat {
     Blend,
+    Vrm,
+    #[value(name = "vrm0")]
+    Vrm0,
     Glb,
     Gltf,
     Usda,

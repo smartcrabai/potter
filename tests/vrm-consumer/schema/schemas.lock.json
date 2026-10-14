@@ -1,0 +1,236 @@
+{
+  "sources": [
+    {
+      "repo": "vrm-c/vrm-specification",
+      "commit": "94e82dd346fa6cf0337c4421728640e5252dd38e",
+      "files": [
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_materials_mtoon-1.0/schema/mtoon.shadingShiftTexture.schema.json",
+          "path": "mtoon.shadingShiftTexture.schema.json",
+          "sha256": "248280f5bbb0d0677125237d6837d8157f88632a3a3c1aef1f7ee923e23c152c"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.blendshape.bind.schema.json",
+          "path": "vrm.blendshape.bind.schema.json",
+          "sha256": "94690cf6df8671a1834ab2a555a2dd24cb62213d0be5f182fc2e37ac1de75221"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.blendshape.group.schema.json",
+          "path": "vrm.blendshape.group.schema.json",
+          "sha256": "f7c0552659123ef4be7885f493f0cf9a18c7937dd4887866b687de9ca838942b"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.blendshape.materialbind.schema.json",
+          "path": "vrm.blendshape.materialbind.schema.json",
+          "sha256": "dc3327f2490a6763696668cc987d62e80e05ff6a11e64d956bc86d5d589d690e"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.blendshape.schema.json",
+          "path": "vrm.blendshape.schema.json",
+          "sha256": "48d86efa2a8f57b8e799ecb1d7a4ca1d4cf583c036a1307f15e19f6ade235e15"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.firstperson.degreemap.schema.json",
+          "path": "vrm.firstperson.degreemap.schema.json",
+          "sha256": "fb2e3b5cefcdfc9765a14eb09b4c79f5e69aa78bcc542279af0193944665061c"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.firstperson.meshannotation.schema.json",
+          "path": "vrm.firstperson.meshannotation.schema.json",
+          "sha256": "4bd400caf1296560ea4ec10347ea8bf2a86781349450555514e8f8b5b178c11a"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.firstperson.schema.json",
+          "path": "vrm.firstperson.schema.json",
+          "sha256": "64127cb50bae24f569dc1c6fc72eb588f11a3c39ed83f9f4c2dea2455b47b495"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.humanoid.bone.schema.json",
+          "path": "vrm.humanoid.bone.schema.json",
+          "sha256": "de77590a2bee2daa02bd40576e3aade4b114cfd1c8efc51e0566b8dc8d611f2b"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.humanoid.schema.json",
+          "path": "vrm.humanoid.schema.json",
+          "sha256": "0d5ac42a32b5350d9dc31cddd693ddfe9724efad205f054d097fd3a3d800b33b"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.material.schema.json",
+          "path": "vrm.material.schema.json",
+          "sha256": "b084587aa63a9486f2cc44f2aad3f57ec9a2f6f3ff4c003f61ef2a2d335dcf50"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.meta.schema.json",
+          "path": "vrm.meta.schema.json",
+          "sha256": "d3d5a45f86902b0d3df8ad71c7e1ee6874967579d787585eaa9e7302dc3bbc87"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.schema.json",
+          "path": "vrm.schema.json",
+          "sha256": "32ad3187458eb5f7d4a735adf11002f7d1b80c1565c2f429962fbcfb20afd54c"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.secondaryanimation.collidergroup.schema.json",
+          "path": "vrm.secondaryanimation.collidergroup.schema.json",
+          "sha256": "60bc92e5237eb6eb3b85d44941722814f6adb4e9e3c127ef28f19aec93210f45"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.secondaryanimation.schema.json",
+          "path": "vrm.secondaryanimation.schema.json",
+          "sha256": "a76718238953979f42cd232cb76f48c2ec4508a1c65ddb66833e273b2f9ef046"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/0.0/schema/vrm.secondaryanimation.spring.schema.json",
+          "path": "vrm.secondaryanimation.spring.schema.json",
+          "sha256": "21b98512fe905d8e363eac64d683a936a451fd71e0a066362482e14b816bc636"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_materials_mtoon-1.0/schema/VRMC_materials_mtoon.schema.json",
+          "path": "VRMC_materials_mtoon.schema.json",
+          "sha256": "39e69f102c7ae3bdaa35ff8f2bcbc022a5a4c052fe97009198566105c667e941"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_springBone_extended_collider-1.0/schema/VRMC_springBone_extended_collider.schema.json",
+          "path": "VRMC_springBone_extended_collider.schema.json",
+          "sha256": "d79f0f5bf163c4c8d6fcec3b28642ecbb1c8e5d6161d5890eb02f467078a3b51"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_springBone_extended_collider-1.0/schema/VRMC_springBone_extended_collider.shape.schema.json",
+          "path": "VRMC_springBone_extended_collider.shape.schema.json",
+          "sha256": "f37b23b3b77b54d56b97ac881ddb99b797957995f584453c544290025963551a"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_springBone-1.0/schema/VRMC_springBone.collider.schema.json",
+          "path": "VRMC_springBone.collider.schema.json",
+          "sha256": "d323adbea9133c20ad554514a75d1c48ddac33f8866745332cd3dfc1921d08c2"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_springBone-1.0/schema/VRMC_springBone.colliderGroup.schema.json",
+          "path": "VRMC_springBone.colliderGroup.schema.json",
+          "sha256": "73c6a51ceb4f21493cc6f7bdb62a08874bfee4d969c88301e0c8d87d680b22bc"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_springBone-1.0/schema/VRMC_springBone.joint.schema.json",
+          "path": "VRMC_springBone.joint.schema.json",
+          "sha256": "886dba93de146dd529c7e0fa8e0e8b585e5160d5455764f4bdfbcdf800a8d8d6"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_springBone-1.0/schema/VRMC_springBone.schema.json",
+          "path": "VRMC_springBone.schema.json",
+          "sha256": "084ec425e4e69da15dbc2127726c70d9a26291cfaabaeddd8f5a173f23dbeb02"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_springBone-1.0/schema/VRMC_springBone.shape.schema.json",
+          "path": "VRMC_springBone.shape.schema.json",
+          "sha256": "448c92d1961a314a4c9b48e194b145cb2a8cbb2c59d021ec02a0da84dd3929ee"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_springBone-1.0/schema/VRMC_springBone.spring.schema.json",
+          "path": "VRMC_springBone.spring.schema.json",
+          "sha256": "3a4a7a1311f7653c1955c478de3fcca4ae44efafa6ee3688208dcd345584647e"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.expressions.expression.materialColorBind.schema.json",
+          "path": "VRMC_vrm.expressions.expression.materialColorBind.schema.json",
+          "sha256": "3106d724bf5f680f40e76a4386a7d19d91069edaf942b7a50075e62b92658950"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.expressions.expression.morphTargetBind.schema.json",
+          "path": "VRMC_vrm.expressions.expression.morphTargetBind.schema.json",
+          "sha256": "32e94d057ee4a590426e92597ba9b0b7ebd527d3be924e5ffbe722d7a6eec4ba"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.expressions.expression.schema.json",
+          "path": "VRMC_vrm.expressions.expression.schema.json",
+          "sha256": "35671fab00107e0cd95bf7a2675fae4a44aeb5058ea9be3fd88464fb9311beeb"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.expressions.expression.textureTransformBind.schema.json",
+          "path": "VRMC_vrm.expressions.expression.textureTransformBind.schema.json",
+          "sha256": "692155ed69e8c8ebb6da57d380a11847260064e64dd3ec4bbe57767b42aaef53"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.expressions.schema.json",
+          "path": "VRMC_vrm.expressions.schema.json",
+          "sha256": "1aafa72830f3ac7cbbb26ca21f9f0e0da2025db453e2df223dbb2750cc848748"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.firstPerson.meshAnnotation.schema.json",
+          "path": "VRMC_vrm.firstPerson.meshAnnotation.schema.json",
+          "sha256": "833b4f9309c59925ee46fba4fc2106a37eee31b0ddee8df2de78045a6273cf00"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.firstPerson.schema.json",
+          "path": "VRMC_vrm.firstPerson.schema.json",
+          "sha256": "95c524ae48ac6d9163fd1dc7fee6dba1730e86f17f2c370c9239c1486b74c81d"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.humanoid.humanBones.humanBone.schema.json",
+          "path": "VRMC_vrm.humanoid.humanBones.humanBone.schema.json",
+          "sha256": "1d9c3ffe288e49d38e17048756c35af19b5cb4d3f9b9a9096c91ed51248e6e7a"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.humanoid.humanBones.schema.json",
+          "path": "VRMC_vrm.humanoid.humanBones.schema.json",
+          "sha256": "eb74f10a7bcae4a4fb44073ffc99b64cadb4c41c000ff137fac651106163f033"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.humanoid.schema.json",
+          "path": "VRMC_vrm.humanoid.schema.json",
+          "sha256": "40f033c9f47d04aae8fa9d5d2ffae6dd5fa2f1592c6885a526a5b4232992f4a0"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.lookAt.rangeMap.schema.json",
+          "path": "VRMC_vrm.lookAt.rangeMap.schema.json",
+          "sha256": "ca423bbb60628a55cd08438201e2dff9f5d0f0fcf939fc69e5e9ebac508fae46"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.lookAt.schema.json",
+          "path": "VRMC_vrm.lookAt.schema.json",
+          "sha256": "a2c5e057f5294e8cae61b51a95a049db46415c818b516f8e2bada98bd5e32c78"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.meta.schema.json",
+          "path": "VRMC_vrm.meta.schema.json",
+          "sha256": "8d1d11ce15deedf91da1c5179febf4cc59168a02701e631538962d61f0e146f2"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vrm-c/vrm-specification/94e82dd346fa6cf0337c4421728640e5252dd38e/specification/VRMC_vrm-1.0/schema/VRMC_vrm.schema.json",
+          "path": "VRMC_vrm.schema.json",
+          "sha256": "b852c4ecaf66cc2ba8af00659d1c408f5b1ae06174ba766319ef7e4d8db2f5e0"
+        }
+      ]
+    },
+    {
+      "repo": "KhronosGroup/glTF",
+      "commit": "521a91d491f02bb7db7d445b35f591d09d2a64ce",
+      "files": [
+        {
+          "url": "https://raw.githubusercontent.com/KhronosGroup/glTF/521a91d491f02bb7db7d445b35f591d09d2a64ce/specification/2.0/schema/extensions.schema.json",
+          "path": "extensions.schema.json",
+          "sha256": "54883a92c20931fa872e9bdeb0a97c0b326a5716323d34df5baabba9d5f420ac"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/KhronosGroup/glTF/521a91d491f02bb7db7d445b35f591d09d2a64ce/specification/2.0/schema/extras.schema.json",
+          "path": "extras.schema.json",
+          "sha256": "70db7ccfebe098b0c94e85419dee1202500c3d3c99094fcf542a6d0eafb99613"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/KhronosGroup/glTF/521a91d491f02bb7db7d445b35f591d09d2a64ce/specification/2.0/schema/glTFid.schema.json",
+          "path": "glTFid.schema.json",
+          "sha256": "3091582ad34958ec416ff21ccac1118a7281167a6330288e2e08fb176dc9b930"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/KhronosGroup/glTF/521a91d491f02bb7db7d445b35f591d09d2a64ce/specification/2.0/schema/glTFProperty.schema.json",
+          "path": "glTFProperty.schema.json",
+          "sha256": "730f003563c74817f3a2759b1ca471be4a053dc3038caa7a1c4fdce9858e2fde"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/KhronosGroup/glTF/521a91d491f02bb7db7d445b35f591d09d2a64ce/specification/2.0/schema/textureInfo.schema.json",
+          "path": "textureInfo.schema.json",
+          "sha256": "f849132abf8a5f374e6f8b99b71d4a1ec88dbb44864e6da1bb592d71c2ca4d7f"
+        }
+      ]
+    }
+  ]
+}

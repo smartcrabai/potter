@@ -667,46 +667,53 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
     for (id, name, parent, head, tail) in [
         ("root", "root", None, [0.0, 0.0, 0.0], [0.0, 0.0, 0.15]),
         (
-            "spine",
-            "spine",
+            "hips",
+            "hips",
             Some("root"),
-            [0.0, 0.0, 0.15],
-            [0.0, 0.0, 0.45],
+            [0.0, 0.0, 0.85],
+            [0.0, 0.0, 0.95],
+        ),
+        (
+            "spine",
+            "spine",
+            Some("hips"),
+            [0.0, 0.0, 0.95],
+            [0.0, 0.0, 1.15],
         ),
         (
             "spine_001",
             "spine.001",
             Some("spine"),
-            [0.0, 0.0, 0.45],
-            [0.0, 0.0, 0.75],
+            [0.0, 0.0, 1.15],
+            [0.0, 0.0, 1.35],
         ),
         (
             "spine_002",
             "spine.002",
             Some("spine_001"),
-            [0.0, 0.0, 0.75],
-            [0.0, 0.0, 1.05],
+            [0.0, 0.0, 1.35],
+            [0.0, 0.0, 1.5],
         ),
         (
             "spine_003",
             "spine.003",
             Some("spine_002"),
-            [0.0, 0.0, 1.05],
-            [0.0, 0.0, 1.25],
+            [0.0, 0.0, 1.5],
+            [0.0, 0.0, 1.6],
         ),
         (
             "neck",
             "neck",
             Some("spine_003"),
-            [0.0, 0.0, 1.25],
-            [0.0, 0.0, 1.45],
+            [0.0, 0.0, 1.6],
+            [0.0, 0.0, 1.7],
         ),
         (
             "head",
             "head",
             Some("neck"),
-            [0.0, 0.0, 1.45],
-            [0.0, 0.0, 1.8],
+            [0.0, 0.0, 1.7],
+            [0.0, 0.0, 1.9],
         ),
     ] {
         append_human_bone(&mut plan, id, name, parent, head, tail, scale, true)?;
@@ -718,42 +725,42 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
                 format!("shoulder_{side}"),
                 format!("shoulder.{suffix}"),
                 "spine_003".to_owned(),
-                [0.0, 0.0, 1.2],
-                [0.25 * sign, 0.0, 1.2],
+                [0.0, 0.0, 1.5],
+                [0.25 * sign, 0.0, 1.5],
             ),
             (
                 format!("upper_arm_{side}"),
                 format!("upper_arm.{suffix}"),
                 format!("shoulder_{side}"),
-                [0.25 * sign, 0.0, 1.2],
-                [0.65 * sign, 0.0, 1.2],
+                [0.25 * sign, 0.0, 1.5],
+                [0.65 * sign, -0.025, 1.5],
             ),
             (
                 format!("forearm_{side}"),
                 format!("forearm.{suffix}"),
                 format!("upper_arm_{side}"),
-                [0.65 * sign, 0.0, 1.2],
-                [1.0 * sign, 0.0, 1.2],
+                [0.65 * sign, -0.025, 1.5],
+                [1.0 * sign, 0.0, 1.5],
             ),
             (
                 format!("hand_{side}"),
                 format!("hand.{suffix}"),
                 format!("forearm_{side}"),
-                [1.0 * sign, 0.0, 1.2],
-                [1.25 * sign, 0.0, 1.2],
+                [1.0 * sign, 0.0, 1.5],
+                [1.25 * sign, 0.0, 1.5],
             ),
             (
                 format!("thigh_{side}"),
                 format!("thigh.{suffix}"),
-                "root".to_owned(),
+                "hips".to_owned(),
                 [0.15 * sign, 0.0, 0.9],
-                [0.15 * sign, 0.0, 0.5],
+                [0.15 * sign, -0.025, 0.5],
             ),
             (
                 format!("shin_{side}"),
                 format!("shin.{suffix}"),
                 format!("thigh_{side}"),
-                [0.15 * sign, 0.0, 0.5],
+                [0.15 * sign, -0.025, 0.5],
                 [0.15 * sign, 0.0, 0.1],
             ),
             (
@@ -761,14 +768,14 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
                 format!("foot.{suffix}"),
                 format!("shin_{side}"),
                 [0.15 * sign, 0.0, 0.1],
-                [0.15 * sign, 0.25, 0.05],
+                [0.15 * sign, -0.25, 0.05],
             ),
             (
                 format!("toe_{side}"),
                 format!("toe.{suffix}"),
                 format!("foot_{side}"),
-                [0.15 * sign, 0.25, 0.05],
-                [0.15 * sign, 0.4, 0.05],
+                [0.15 * sign, -0.25, 0.05],
+                [0.15 * sign, -0.4, 0.05],
             ),
         ] {
             append_human_bone(
@@ -786,23 +793,23 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
             (
                 format!("hand_ik_{side}"),
                 format!("hand_ik.{suffix}"),
-                [1.0 * sign, 0.0, 1.2],
-                [1.25 * sign, 0.0, 1.2],
-                [1.25 * sign, 0.0, 1.2],
+                [1.0 * sign, 0.0, 1.5],
+                [1.25 * sign, 0.0, 1.5],
+                [1.25 * sign, 0.0, 1.5],
             ),
             (
                 format!("elbow_pole_{side}"),
                 format!("elbow_pole.{suffix}"),
-                [0.65 * sign, -1.0, 1.2],
-                [0.65 * sign, -1.25, 1.2],
-                [0.65 * sign, -1.0, 1.2],
+                [0.65 * sign, -1.0, 1.5],
+                [0.65 * sign, -1.25, 1.5],
+                [0.65 * sign, -1.0, 1.5],
             ),
             (
                 format!("foot_ik_{side}"),
                 format!("foot_ik.{suffix}"),
                 [0.15 * sign, 0.0, 0.1],
-                [0.15 * sign, 0.25, 0.05],
-                [0.15 * sign, 0.25, 0.05],
+                [0.15 * sign, -0.25, 0.05],
+                [0.15 * sign, 0.0, 0.1],
             ),
             (
                 format!("knee_pole_{side}"),
@@ -815,6 +822,7 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
             append_human_bone(&mut plan, &role, &name, None, head, tail, scale, false)?;
             append_rig_controller(&mut plan, armature_id, &role, &name, translation, scale)?;
         }
+        // The right rest frame reverses local X, so its shared -Y pole needs a half-turn.
         append_human_ik_constraint(
             &mut plan,
             &format!("ik_arm_{side}"),
@@ -822,14 +830,23 @@ fn basic_human_rig_plan(armature_id: &Id, scale: f64) -> Result<BasicHumanRigPla
             &format!("hand_ik_{side}"),
             &format!("elbow_pole_{side}"),
             &format!("hand_{side}"),
+            3,
+            if side == "r" {
+                std::f64::consts::PI
+            } else {
+                0.0
+            },
         )?;
+        // The thigh rest frame needs a 90-degree offset to align its up axis with the -Y knee pole.
         append_human_ik_constraint(
             &mut plan,
             &format!("ik_leg_{side}"),
             &format!("IK Leg {suffix}"),
             &format!("foot_ik_{side}"),
             &format!("knee_pole_{side}"),
-            &format!("foot_{side}"),
+            &format!("shin_{side}"),
+            2,
+            -std::f64::consts::FRAC_PI_2,
         )?;
     }
     plan.collections.insert(
@@ -920,6 +937,8 @@ fn append_human_ik_constraint(
     target_role: &str,
     pole_role: &str,
     end_bone: &str,
+    chain_count: u64,
+    pole_angle: f64,
 ) -> Result<()> {
     let target = plan
         .controller_ids
@@ -933,9 +952,9 @@ fn append_human_ik_constraint(
         )
     })?;
     let mut params = Map::new();
-    params.insert("chain_count".to_owned(), Value::from(3));
+    params.insert("chain_count".to_owned(), Value::from(chain_count));
     params.insert("pole_target".to_owned(), Value::String(pole.to_string()));
-    params.insert("pole_angle".to_owned(), Value::from(0.0));
+    params.insert("pole_angle".to_owned(), Value::from(pole_angle));
     plan.constraints.push(Constraint {
         id: rig_plan_id(id)?,
         constraint_type: ConstraintType::Ik,

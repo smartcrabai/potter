@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::{
-    Id, Registry, Transform,
+    AvatarSettings, Id, Registry, Transform,
     rig::{
         ArmatureData, Constraint, ConstraintType, Driver, ParentType, PoseBone, ShapeKeyData,
         VertexGroup,
@@ -63,6 +63,8 @@ pub struct SceneDoc {
     pub actions: Registry<Action>,
     #[serde(default)]
     pub resources: Registry<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<AvatarSettings>,
     #[serde(default)]
     pub libraries: Registry<Library>,
     #[serde(default)]
@@ -137,6 +139,7 @@ impl SceneDoc {
             resources: Registry::new(),
             libraries: Registry::new(),
             compatibility: Map::new(),
+            avatar: None,
             history: HistoryState::default(),
         }
     }
@@ -424,6 +427,11 @@ impl SceneDoc {
                     ));
                 }
             }
+        }
+        if let Some(avatar) = &self.avatar {
+            crate::model::validate_avatar_settings(self, avatar).map_err(|error| {
+                PotError::with_details(ErrorCode::SceneInvalid, error.message, error.details)
+            })?;
         }
         Ok(())
     }

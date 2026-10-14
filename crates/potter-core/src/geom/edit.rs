@@ -3383,6 +3383,16 @@ fn apply_set_attribute(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdC
                 return Err(invalid("crease must be a finite number from zero to one"));
             }
         }
+        "shade_smooth" => {
+            if selected.domain != Domain::Face || !value.is_boolean() {
+                return Err(invalid(
+                    "shade_smooth requires face elements and a boolean value",
+                ));
+            }
+        }
+        "custom_normal" => {
+            return Err(invalid("set custom normals with mesh.set_custom_normals"));
+        }
         _ => {}
     }
     let values = selected
@@ -3390,14 +3400,23 @@ fn apply_set_attribute(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdC
         .iter()
         .map(|id| (format!("{}{id}", selected.domain.prefix()), value.clone()))
         .collect::<Map<_, _>>();
+    // Shading attributes use the singular domain names and explicit types their readers require.
+    let (domain_name, kind) = match name {
+        "sharp" => ("edge", Some("bool")),
+        "shade_smooth" => ("face", Some("bool")),
+        _ => (selected.domain.name(), None),
+    };
     let attribute = mesh
         .attributes
         .entry(name.to_owned())
-        .or_insert_with(|| json!({ "domain": selected.domain.name(), "values": {} }));
+        .or_insert_with(|| match kind {
+            Some(kind) => json!({ "domain": domain_name, "type": kind, "values": {} }),
+            None => json!({ "domain": domain_name, "values": {} }),
+        });
     let attribute_object = attribute
         .as_object_mut()
         .ok_or_else(|| invalid("existing mesh attribute is not a domain attribute object"))?;
-    if attribute_object.get("domain").and_then(Value::as_str) != Some(selected.domain.name()) {
+    if attribute_object.get("domain").and_then(Value::as_str) != Some(domain_name) {
         return Err(invalid(
             "mesh attribute already exists in a different domain",
         ));

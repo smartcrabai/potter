@@ -4,13 +4,13 @@ use std::{
     path::Path,
 };
 
-use glam::{DMat4, DQuat, DVec3};
+use glam::{DMat3, DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Aabb, CylinderParams, IcosphereParams, Mesh},
+    geom::{Aabb, CylinderParams, IcosphereParams, Mesh, normals::SHADING_ATTRIBUTES},
     hash,
     model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc},
 };
@@ -3556,9 +3556,15 @@ fn append_collection_geometry(
     Ok(())
 }
 
+/// Instances copy each source's attributes, remapping the face- and edge-keyed shading ones.
 fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> Result<()> {
     if output.vertices.is_empty() {
-        output.attributes.clone_from(&source.attributes);
+        output.attributes = source
+            .attributes
+            .iter()
+            .filter(|(name, _)| !SHADING_ATTRIBUTES.contains(&name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
     }
     let mut vertex_ids = BTreeMap::new();
     for vertex in &source.vertices {
@@ -3567,6 +3573,7 @@ fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> R
             .map_err(|error| PotError::new(ErrorCode::EvaluationFailed, error.to_string()))?;
         vertex_ids.insert(vertex.id, id);
     }
+    let mut edge_ids = BTreeMap::new();
     for edge in &source.edges {
         let first = vertex_ids.get(&edge.vertices[0]).copied().ok_or_else(|| {
             PotError::new(
@@ -3580,10 +3587,12 @@ fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> R
                 "instance edge references a missing vertex",
             )
         })?;
-        output
+        let id = output
             .insert_edge([first, second])
             .map_err(|error| PotError::new(ErrorCode::EvaluationFailed, error.to_string()))?;
+        edge_ids.insert(edge.id, id);
     }
+    let mut face_ids = BTreeMap::new();
     for face in &source.faces {
         let vertices = face
             .vertices
@@ -3597,11 +3606,99 @@ fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> R
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        output
+        let id = output
             .insert_face(vertices, face.material_index)
             .map_err(|error| PotError::new(ErrorCode::EvaluationFailed, error.to_string()))?;
+        face_ids.insert(face.id, id);
+    }
+    merge_shading(output, source, &face_ids, &edge_ids, matrix)
+}
+
+/// Copies one source's shading attributes into the combined instance mesh under remapped IDs.
+/// Custom normals rotate with the instance matrix, using the inverse transpose of its linear part.
+fn merge_shading(
+    output: &mut Mesh,
+    source: &Mesh,
+    face_ids: &BTreeMap<u32, u32>,
+    edge_ids: &BTreeMap<u32, u32>,
+    matrix: DMat4,
+) -> Result<()> {
+    let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
+    for name in SHADING_ATTRIBUTES {
+        let Some(source_attribute) = source.attributes.get(name) else {
+            continue;
+        };
+        let (Some(domain), Some(kind), Some(source_values)) = (
+            source_attribute.get("domain"),
+            source_attribute.get("type"),
+            source_attribute.get("values").and_then(Value::as_object),
+        ) else {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                format!("instance source attribute `{name}` must have domain, type, and values"),
+                json!({ "attribute": name }),
+            ));
+        };
+        let (prefix, ids) = if name == "sharp" {
+            ('e', edge_ids)
+        } else {
+            ('f', face_ids)
+        };
+        let target = output
+            .attributes
+            .entry(name.to_owned())
+            .or_insert_with(|| json!({ "domain": domain, "type": kind, "values": {} }));
+        let values = target
+            .get_mut("values")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    format!("instance attribute `{name}` values must be an object"),
+                )
+            })?;
+        for (key, value) in source_values {
+            let Some(id) = key
+                .strip_prefix(prefix)
+                .and_then(|id| id.parse::<u32>().ok())
+                .and_then(|id| ids.get(&id))
+            else {
+                continue;
+            };
+            let value = if name == "custom_normal" {
+                rotate_corner_normals(value, normal_matrix)
+            } else {
+                value.clone()
+            };
+            values.insert(format!("{prefix}{id}"), value);
+        }
     }
     Ok(())
+}
+
+/// Rotates `custom_normal` corner vectors into instance space. Malformed entries pass through
+/// unchanged so the normal computation rejects them.
+fn rotate_corner_normals(value: &Value, normal_matrix: DMat3) -> Value {
+    let Some(corners) = value.as_array() else {
+        return value.clone();
+    };
+    Value::Array(
+        corners
+            .iter()
+            .map(|corner| {
+                let vector = corner
+                    .as_array()
+                    .and_then(|components| match components.as_slice() {
+                        [x, y, z] => Some(DVec3::new(x.as_f64()?, y.as_f64()?, z.as_f64()?)),
+                        _ => None,
+                    });
+                match vector {
+                    Some(vector) => json!((normal_matrix * vector).normalize_or_zero().to_array()),
+                    None => corner.clone(),
+                }
+            })
+            .collect(),
+    )
 }
 
 fn evaluate_grease_pencil(

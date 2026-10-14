@@ -212,12 +212,14 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
             "base_revision": 0,
             "operations": [{"op": operation}]
         });
-        let error = potter_core::ops::apply_batch(&doc, &batch).unwrap_err();
-        assert_ne!(
-            error.message,
-            format!("unsupported operation `{operation}`"),
-            "OP_NAMES entry must have a dispatcher route: {operation}"
-        );
+        // A minimal op may be valid (`avatar.clear`); any result other than the unsupported-op error proves routing.
+        if let Err(error) = potter_core::ops::apply_batch(&doc, &batch) {
+            assert_ne!(
+                error.message,
+                format!("unsupported operation `{operation}`"),
+                "OP_NAMES entry must have a dispatcher route: {operation}"
+            );
+        }
     }
     Ok(())
 }
@@ -376,6 +378,7 @@ fn every_export_catalog_format_handles_the_spec_box_or_reports_loss() {
         let extension = match format {
             "alembic" => "abc",
             "fbx" | "fbx-binary" => "fbx",
+            "vrm0" => "vrm",
             other => other,
         };
         let output_path = directory
@@ -402,6 +405,16 @@ fn every_export_catalog_format_handles_the_spec_box_or_reports_loss() {
                 output_path.is_file(),
                 "{format} export did not create its output"
             );
+        } else if matches!(format, "vrm" | "vrm0") {
+            // VRM needs avatar settings the plain box does not have; the rejection must say so.
+            assert_eq!(
+                response["error"]["details"]["feature_id"], "vrm.avatar_settings",
+                "{format} must reject a scene without avatar settings with a typed error"
+            );
+            assert!(
+                !output_path.exists(),
+                "{format} wrote output despite rejection"
+            );
         } else {
             let details = &response["error"]["details"];
             let losses = details["result"]["losses"]
@@ -426,6 +439,7 @@ fn every_export_catalog_format_handles_the_spec_box_or_reports_loss() {
         let extension = match format {
             "alembic" => "abc",
             "fbx" | "fbx-binary" => "fbx",
+            "vrm0" => "vrm",
             other => other,
         };
         let input_path = directory

@@ -47,6 +47,8 @@ pot pick ./scene \
 
 pot validate ./scene --json
 pot export ./scene --format glb --out model.glb --json
+pot export ./scene --format vrm --out character.vrm --json
+pot validate ./scene --format vrm0 --strict --json
 pot export ./scene --format blend --out model.blend --json
 
 # Read all Blender Scenes and production data
@@ -118,6 +120,7 @@ context = [--scene-id <id>] [--view-layer <id>] [--frame <number>]
 - Preview size is an integer from 64 to 16384, defaulting to 768. Large images are processed in tiles. Render resolution, samples, passes, and codec use Scene render settings.
 - The default `schema` kind is operations. Include JSON Schema Draft 2020-12 and resolve all `$ref` values locally. Specify an op to retrieve its individual operation schema.
 - formats returns directions, supported features, required runtimes, and loss conditions. capabilities returns the custom engine's actual support.
+- `pot validate --format vrm|vrm0` runs the same representability checks as export without writing a file; failures report `VRM_EXPORT_PREFLIGHT_FAILED`.
 - Include Snapshot selection, driver execution policy, asset resolution, and solver / renderer versions in the evaluation context. Automatic script execution from input .blend files is disabled by default.
 
 ### Exit codes
@@ -294,6 +297,15 @@ Implement all families below in the first release. Each variant MUST cover every
 | tracking / video | `tracking.*`, `mask.*`, `sequencer.*`: track, solve, spline, strip, retiming, effect, sound |
 | asset / library | `resource.*`, `library.*`, `asset.*`: retrieval, reference updates, pack / unpack, link / append, override, metadata |
 | script / extension | `text.*`, `property.*`, `extension.*`: source, custom data, dependency registration, permitted native adapters |
+| avatar | `avatar.update`, `avatar.clear`: typed `SceneDoc.avatar` settings |
+
+### Avatar Settings
+
+- `SceneDoc.avatar` is optional and includes `armature`, `humanoid`, `meta`, `expressions`, `first_person`, `look_at`, `spring_bone`, and per-material `mtoon`.
+- `avatar.update` sparsely replaces top-level components; its first call MUST set `armature`, `humanoid`, and `meta`. Set optional components to `null` to clear them. `avatar.clear` removes avatar settings.
+- `humanoid` maps official VRM 1.0 role names to bone IDs, requires 15 bones, and checks ancestor order. `meta` includes name, authors, license_url, restrictive-default VRM 1.0 permissions, and optional `legacy` VRM 0.x overrides.
+- Expressions support morph, material-color, and texture-transform binds and overrides. Spring bones support sphere/capsule colliders, collider groups, per-joint settings, and an optional center; scene references use `{node, bone?}`.
+- Invalid settings are rejected atomically with a JSON pointer; the revision remains unchanged.
 
 ### Basic Operations
 
@@ -485,6 +497,8 @@ See the [Blender Compatibility requirements](blender-compatibility.md#3-meaning-
 | --- | --- | --- | --- |
 | blend | REQUIRED | REQUIRED | All Scenes, creation graph, hidden / unused data, editing information, sharing, library, script / UI information preservation |
 | glb / gltf | REQUIRED | REQUIRED | Mesh, material / texture, camera / light, skin, morph, animation, metadata, supported extensions |
+| vrm | — | REQUIRED | Humanoid avatar, skin, morph, MToon, spring bones, metadata |
+| vrm0 | — | REQUIRED | Humanoid avatar, skin, morph, MToon, spring bones, metadata |
 | usd / usda / usdc / usdz | REQUIRED | REQUIRED | Scene, instances, materials, geometry, animation, volume, assets |
 | abc | REQUIRED | REQUIRED | Alembic geometry / transform / attribute time-series cache |
 | fbx | REQUIRED | REQUIRED | Hierarchy, mesh, material, rig, animation. Report variants / losses |
@@ -494,6 +508,15 @@ See the [Blender Compatibility requirements](blender-compatibility.md#3-meaning-
 | pdf | — | REQUIRED | Grease Pencil projection, frame, page |
 | PNG / JPEG / TIFF / EXR / video / audio | Asset import | Render / bake | Color, bit depth, alpha, codec, frame / fps / audio sync |
 
+- VRM 1.0 uses `VRMC_vrm`, `VRMC_springBone`, and `VRMC_materials_mtoon` 1.0; VRM 0.x uses the `VRM` extension.
+- VRM 1.0 and 0.x are export-only. `pot validate --format vrm|vrm0 [--strict]` runs the same export preflight without writing a file and reports `VRM_EXPORT_PREFLIGHT_FAILED` when output is unrepresentable.
+- Reject settings a selected VRM version cannot represent; never silently drop them. VRM 0.x supports only sphere colliders (`vrm.v0.spring_capsule` for capsules), one set of joint settings per spring, and no expression overrides; combined MToon scroll and rotation and some MToon textures are also unrepresentable.
+- Never broaden licensing rights. A VRM 0.x Creative Commons `licenseName` is rejected when canonical `modification` is `prohibited`, when `allow_modification` (private only) meets a license that permits sharing adapted material (CC0, BY, BY-SA, BY-NC, BY-NC-SA), or when a license that permits commercial use by anyone (CC0, BY, BY-SA, BY-ND) meets a `commercial_usage` other than `corporation` (`vrm.v0.meta_license_modification`, `vrm.v0.meta_license_commercial`).
+- Reject unsupported shared material / mesh constructs: `material.shader_graph`, `material.metallic_roughness_texture`, `material.texture_uv_map`, `mesh.shape_key_absolute`, and `mesh.shading_topology` (shading attributes on a mesh whose modifier stack changes its faces; `modifier.apply` refuses the same case).
+- glTF / GLB / VRM meshes write `NORMAL` from Blender 5.2 corner normals: `shade_smooth` faces, `sharp` edges, and `custom_normal` corners (all-smooth meshes use vertex normals; otherwise fans split at sharp, boundary, non-manifold, and flipped edges). Morph targets carry `NORMAL` deltas; a corner whose morphed normal is undefined keeps its base normal.
+- Write one primitive per material slot used by `Face.material_index`; primitives share vertex and morph accessors. Collection-instance meshes still use slot 0. When VRM 1.0 bakes a negative scale into geometry, triangle winding is reversed so front faces stay front.
+- `KHR_materials_emissive_strength` is written only when it changes shading; Potter's emission strength is kept in `extras.potter.emission_strength`.
+
 - Specify each format's representation scope in the formats catalog. Do not claim preservation of creation features that do not exist in the target format.
 - .blend is a round-trip format for the entire creation project. GLB, etc. are interchange formats for assets / geometry / motion, etc. as defined by the formats catalog. Determine the preservation scope for the selected format in advance.
 - Record in conversions for that format contract when an interchange format does not include the creation graph, when generating evaluated geometry for primitives / Modifiers, or when triangulating / converting bases / quantizing to float32. The basic box-to-GLB workflow does not require allow-lossy.
@@ -502,6 +525,7 @@ See the [Blender Compatibility requirements](blender-compatibility.md#3-meaning-
 - .blend export reconstructs all creation data rather than converting the selected frame to mesh output. Preserve hidden / unused data and Action / NLA / physics settings for all frames.
 - Evaluated exports such as GLB use render visibility and required ancestors in context. Preserve skin / morph / animation / texture as exportable structures.
 - Convert potter Z-up world(x,y,z) to glTF(x,z,-y). Convert transforms, normals, bones, bind matrices, and animation in the same basis; retain m. [glTF 2.0 Specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html)
+- VRM maps Potter Z-up / -Y-front to +Z-front in 1.0 and -Z-front in 0.x. Normalize bone local rotations; VRM 0.x uses identity rotation and unit scale. Bake nonuniform mesh scale into geometry for VRM 1.0.
 - .blend restores Z-up, original Scene units, rotation mode, parent inverse, and shared data. Write materials, Modifiers, nodes, and rigs as creation data.
 - Store potter persistent IDs, tags, element IDs, and Scene hash / revision in .blend custom properties / attributes, etc. and format metadata. Use a namespace that does not conflict with original user properties.
 - With pack specified, pack assets the format can contain. Put data that cannot be packed, such as caches / libraries, in a relative sidecar bundle plus manifest, and return the list of generated files.

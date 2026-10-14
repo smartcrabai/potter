@@ -490,6 +490,38 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
         );
     }
 
+    match &doc.avatar {
+        Some(avatar) => match crate::model::validate_avatar_settings(doc, avatar) {
+            Ok(()) => checks.push(check("avatar_settings", "supported", Value::Null)),
+            Err(error) => {
+                let pointer = error
+                    .details
+                    .get("pointer")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let message = error.message;
+                let details = error.details;
+                checks.push(check(
+                    "avatar_settings",
+                    "not_supported",
+                    json!({"message":message,"details":details}),
+                ));
+                let report_details = checks
+                    .last()
+                    .map_or(Value::Null, |entry| entry["reason"]["details"].clone());
+                issue(
+                    &mut issues,
+                    "error",
+                    "AVATAR_SETTINGS_INVALID",
+                    &message,
+                    None,
+                    pointer,
+                    report_details,
+                );
+            }
+        },
+        None => checks.push(check("avatar_settings", "supported", Value::Null)),
+    }
     let context = crate::eval::EvaluationContext::default();
     match crate::eval::Snapshot::evaluate(doc, &context) {
         Ok(snapshot) => {
