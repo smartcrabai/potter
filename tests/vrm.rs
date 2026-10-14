@@ -1623,7 +1623,8 @@ fn assert_v0_semantics(glb: &Glb, options: FixtureOptions) -> TestResult<()> {
     close(&spring["gravityPower"], 1.1);
     close(&spring["dragForce"], 0.2);
     close(&spring["hitRadius"], 0.02);
-    close(&spring["gravityDir"]["x"], 1.0);
+    // VRM 0.x gravityDir is z-reflect(Rot_Y180(glTF dir)): VRM 1.0 [1,3,-2] becomes [-1,3,-2].
+    close(&spring["gravityDir"]["x"], -1.0);
     close(&spring["gravityDir"]["y"], 3.0);
     close(&spring["gravityDir"]["z"], -2.0);
 
@@ -2231,6 +2232,10 @@ fn vrm_material_alpha_modes_have_consumer_semantics_in_both_versions() -> TestRe
         "transparent_with_z_write": true,
         "render_queue_offset_number": 2,
     });
+    mtoon_settings["plain_blend_material"] = json!({
+        "shading_toony_factor": 0.7,
+        "shading_shift_factor": -0.15,
+    });
     apply_success(
         &project,
         1,
@@ -2276,6 +2281,14 @@ fn vrm_material_alpha_modes_have_consumer_semantics_in_both_versions() -> TestRe
             }),
             json!({"op": "node.create", "id": "mask_surface", "kind": "box", "params": {"size": 0.5}, "material": "mask_material"}),
             json!({"op": "node.create", "id": "blend_surface", "kind": "box", "params": {"size": 0.5}, "material": "blend_material"}),
+            json!({
+                "op": "material.create",
+                "id": "plain_blend_material",
+                "name": "Plain Blend Surface",
+                "alpha_mode": "blend",
+                "base_color": [0.7, 0.8, 0.9, 0.5],
+            }),
+            json!({"op": "node.create", "id": "plain_blend_surface", "kind": "box", "params": {"size": 0.5}, "material": "plain_blend_material"}),
             json!({"op": "avatar.update", "set": {"mtoon": mtoon_settings}}),
         ],
     )?;
@@ -2347,11 +2360,20 @@ fn vrm_material_alpha_modes_have_consumer_semantics_in_both_versions() -> TestRe
     close(&mask_properties["floatProperties"]["_DstBlend"], 0.0);
     assert_eq!(mask_properties["renderQueue"], 2450);
     assert_eq!(blend_properties["keywordMap"]["_ALPHABLEND_ON"], true);
-    close(&blend_properties["floatProperties"]["_BlendMode"], 2.0);
+    close(&blend_properties["floatProperties"]["_BlendMode"], 3.0);
     close(&blend_properties["floatProperties"]["_ZWrite"], 1.0);
     close(&blend_properties["floatProperties"]["_SrcBlend"], 5.0);
     close(&blend_properties["floatProperties"]["_DstBlend"], 10.0);
-    assert_eq!(blend_properties["renderQueue"], 3002);
+    assert_eq!(blend_properties["renderQueue"], 2503);
+    let plain_blend_properties =
+        &legacy_properties[gltf_material_index(v0_root, "plain_blend_material")];
+    assert_eq!(plain_blend_properties["keywordMap"]["_ALPHABLEND_ON"], true);
+    close(
+        &plain_blend_properties["floatProperties"]["_BlendMode"],
+        2.0,
+    );
+    close(&plain_blend_properties["floatProperties"]["_ZWrite"], 0.0);
+    assert_eq!(plain_blend_properties["renderQueue"], 3000);
 
     let (transmission_directory, transmission_project) = new_fixture(FixtureOptions::default())?;
     apply_success(

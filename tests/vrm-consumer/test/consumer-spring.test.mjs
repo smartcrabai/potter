@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import * as THREE from 'three';
 import { openHarness } from './support/browser.mjs';
 import { api, fixtureUrl, readGlbJson, FILES, TOL, toGltf, assertVecClose, approx } from './support/fixture.mjs';
-import { SPRING, COLLIDERS, HEAD_BONE_POTTER_COLUMNS } from '../fixture/spec.mjs';
+import { SPRING, COLLIDERS, HEAD_BONE_POTTER_COLUMNS, v0GravityDir } from '../fixture/spec.mjs';
 
 const M = 'spring';
 const FRAMES = 360;
@@ -276,6 +276,30 @@ describe('spring bones (VRM 0.x)', () => {
       approx(j.dragForce, u.dragForce, TOL.weight, `${j.bone} dragForce`);
       approx(j.gravityPower, u.gravityPower, TOL.weight, `${j.bone} gravityPower`);
       approx(j.hitRadius, u.hitRadius, TOL.position, `${j.bone} hitRadius`);
+    }
+  });
+
+  it('file gravityDir is the Unity-space VRM 0.x vector of spec.mjs SPRING.v0Uniform (glTF JSON)', async () => {
+    const json = await readGlbJson(FILES.v0);
+    const g = json.extensions.VRM.secondaryAnimation.boneGroups[0].gravityDir;
+    assertVecClose(
+      [g.x, g.y, g.z],
+      v0GravityDir(toGltf(SPRING.v0Uniform.gravityDir)),
+      TOL.weight,
+      'v0 gravityDir (file)',
+    );
+  });
+
+  it('three-vrm uses the v0 gravityDir as-is: rotateVRM0 turns the scene, not world gravity', async () => {
+    await potter.load('v0s', fixtureUrl(FILES.v0));
+    const joints = await potter.springJoints('v0s');
+    for (const j of joints) {
+      assertVecClose(
+        j.gravityDir,
+        v0GravityDir(toGltf(SPRING.v0Uniform.gravityDir)),
+        TOL.weight,
+        `${j.bone} world gravityDir`,
+      );
     }
   });
 

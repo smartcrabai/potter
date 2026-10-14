@@ -269,7 +269,7 @@ export const SPRING = {
     { bone: 'hair_tip', stiffness: 1.6, dragForce: 0.7, gravityPower: 0.3, gravityDir: [0, 0, -1], hitRadius: 0.02 },
   ],
   // VRM 0.x has one parameter set per spring chain; the v0 variant uses these for every joint.
-  v0Uniform: { stiffness: 1.0, dragForce: 0.5, gravityPower: 0.1, gravityDir: [0, 0, -1], hitRadius: 0.02 },
+  v0Uniform: { stiffness: 1.0, dragForce: 0.5, gravityPower: 0.1, gravityDir: [1, 0, 0], hitRadius: 0.02 }, // sideways: Potter +X is the character's left
 };
 
 // Colliders. Index order is the collider index used by collider groups.
@@ -366,6 +366,10 @@ export const POSE = [
 
 // Basis from Potter to glTF/VRM for positions and directions: gltf = [x, z, -y].
 export const toGltf = ([x, y, z]) => [x, z, -y];
+
+// VRM 0.x vectors are Unity-space and the model faces -Z: VRM 1.0 glTF direction g is stored as [-g.x, g.y, g.z].
+// three-vrm 3.5.5 reads v0 gravityDir as-is; VRMUtils.rotateVRM0 turns the scene but not world gravity.
+export const v0GravityDir = ([x, y, z]) => [-x, y, z];
 
 // Comparison tolerances. Units: positions in metres, angles in degrees,
 // colors/uv/weights/morph weights unitless. Consumers import these; never inline.
