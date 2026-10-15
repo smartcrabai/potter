@@ -36,6 +36,7 @@ pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
 pub mod text;
+pub(crate) mod uv_layers;
 pub mod vdb;
 pub mod volume;
 

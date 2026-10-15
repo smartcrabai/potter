@@ -13,7 +13,8 @@ use crate::model::Modifier;
 
 use super::{
     bool_param, build_mesh, closest_point_triangle, id_indices, invalid_parameter, loose_edges,
-    number_param, polygons, positions, string_param, uint_param, validated, vec3_param,
+    number_param, polygons, positions, string_param, uint_param, usize_as_f64, validated,
+    vec3_param,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -201,12 +202,12 @@ fn simple_deform_bend(coordinates: [f64; 3], cut: [f64; 3], axis: usize, factor:
 
 pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let steps = usize::try_from(uint_param(modifier, "steps", 16)?)
-        .map_err(|_| invalid_parameter(modifier, "steps", "an integer from 3 to 4096"))?;
-    if !(3..=4096).contains(&steps) {
+        .map_err(|_| invalid_parameter(modifier, "steps", "an integer from 1 to 4096"))?;
+    if !(1..=4096).contains(&steps) {
         return Err(invalid_parameter(
             modifier,
             "steps",
-            "an integer from 3 to 4096",
+            "an integer from 1 to 4096",
         ));
     }
     let angle = number_param(modifier, "angle", std::f64::consts::TAU)?;
@@ -229,6 +230,8 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     };
     let center = DVec3::ZERO;
     let height = number_param(modifier, "screw_offset", 0.0)?;
+    let stretch_u = bool_param(modifier, "use_stretch_u", false)?;
+    let stretch_v = bool_param(modifier, "use_stretch_v", false)?;
     let source_positions = positions(mesh);
     let vertex_indices = id_indices(mesh);
     let source_edges = mesh
@@ -257,7 +260,12 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "at least one profile edge",
         ));
     }
-    let closed = (angle.abs() - std::f64::consts::TAU).abs() <= 1.0e-10;
+    // Blender closes a full turn only from three steps up, and only when the screw offset is within
+    // FLT_EPSILON * 100 of zero; a closed screw then ignores the offset.
+    let closed = steps >= 3
+        && height.abs() <= f64::from(f32::EPSILON) * 100.0
+        && (angle.abs() - std::f64::consts::TAU).abs() <= 1.0e-10;
+    let height = if closed { 0.0 } else { height };
     let ring_count = if closed { steps } else { steps + 1 };
     let mut points = Vec::with_capacity(source_positions.len() * ring_count);
     for step in 0..ring_count {
@@ -273,23 +281,114 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     for step in 0..segments {
         let next_step = (step + 1) % ring_count;
         for [first, second] in &source_edges {
+            // Same cycle as the profile edge's own winding, started at its second vertex: for copies of
+            // an on-axis vertex the later corner lands on the next ring, as Blender's loops do.
             faces.push((
                 vec![
+                    step * source_positions.len() + second,
                     step * source_positions.len() + first,
                     next_step * source_positions.len() + first,
                     next_step * source_positions.len() + second,
-                    step * source_positions.len() + second,
                 ],
                 0,
             ));
         }
     }
     let vertex_count = source_positions.len();
-    let origin = Origin::copies(
-        (0..ring_count * vertex_count).map(|index| Some(index % vertex_count)),
-        vec![None; faces.len()],
+    // Blender takes each screw loop's data from the last source loop of its profile vertex. A profile
+    // edge that no face uses has no loops, so its screw corners carry no source data.
+    let mut last_loop: Vec<Option<usize>> = vec![None; vertex_count];
+    let mut loop_start = 0_usize;
+    let mut face_edges: HashSet<(usize, usize)> = HashSet::new();
+    for source_face in &mesh.faces {
+        for (corner, id) in source_face.vertices.iter().enumerate() {
+            if let Some(&index) = vertex_indices.get(id) {
+                last_loop[index] = Some(loop_start + corner);
+            }
+        }
+        loop_start += source_face.vertices.len();
+        let ring: Vec<usize> = source_face
+            .vertices
+            .iter()
+            .filter_map(|id| vertex_indices.get(id).copied())
+            .collect();
+        for pair in 0..ring.len() {
+            let (a, b) = (ring[pair], ring[(pair + 1) % ring.len()]);
+            face_edges.insert((a.min(b), a.max(b)));
+        }
+    }
+    let edge_count = source_edges.len();
+    let loose_edge: Vec<bool> = source_edges
+        .iter()
+        .map(|&[a, b]| !face_edges.contains(&(a.min(b), a.max(b))))
+        .collect();
+    let mut corners = Vec::with_capacity(faces.len() * 4);
+    for (face, (vertices, _)) in faces.iter().enumerate() {
+        let loose = loose_edge[face % edge_count];
+        for index in vertices {
+            corners.push(match last_loop[index % vertex_count] {
+                Some(corner) if !loose => vec![(corner, 1.0)],
+                _ => Vec::new(),
+            });
+        }
+    }
+    let origin = Origin {
+        corners: Some(corners),
+        ..Origin::copies(
+            (0..ring_count * vertex_count).map(|index| Some(index % vertex_count)),
+            vec![None; faces.len()],
+        )
+    };
+    // Each corner's U advances by the rings between its face's step and its vertex's ring: one share
+    // of the angle per ring, or 1/steps per ring under use_stretch_u. A closed seam keeps counting:
+    // its wrap ring is one full share further on. Corners of a loose profile edge (no face loop) start
+    // from zero U and take V from the profile vertex's height along the axis: that height unchanged
+    // without use_stretch_v, and rescaled over the profile's height range with it (zero when flat).
+    // Corners of face-loop edges keep their source V.
+    let turn = if stretch_u {
+        1.0 / usize_as_f64(steps)
+    } else {
+        angle / (std::f64::consts::TAU * usize_as_f64(steps))
+    };
+    let axial: Vec<f64> = source_positions
+        .iter()
+        .map(|point| point.dot(axis))
+        .collect();
+    let (low, high) = axial.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(low, high), &height| (low.min(height), high.max(height)),
     );
-    build_mesh(points, faces, Vec::new(), &origin, mesh)
+    let loose_v = |profile: usize| {
+        if !stretch_v {
+            axial[profile]
+        } else if high > low {
+            (axial[profile] - low) / (high - low)
+        } else {
+            0.0
+        }
+    };
+    let corner_uv: Vec<Vec<(usize, Option<f64>)>> = faces
+        .iter()
+        .enumerate()
+        .map(|(face, (vertices, _))| {
+            let step = face / edge_count;
+            let loose = loose_edge[face % edge_count];
+            vertices
+                .iter()
+                .map(|index| {
+                    let ring = index / vertex_count;
+                    let turns = step + (ring + ring_count - step) % ring_count;
+                    (turns, loose.then(|| loose_v(index % vertex_count)))
+                })
+                .collect()
+        })
+        .collect();
+    let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
+    super::map_uv_values(&mut result, |face, corner, [u, v]| {
+        let (turns, loose_value) = corner_uv[face][corner];
+        [u + turn * usize_as_f64(turns), loose_value.unwrap_or(v)]
+    });
+    Ok(result)
 }
 
 pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -1829,12 +1928,14 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .max()
         .unwrap_or(0);
     let mut faces = Vec::new();
+    let mut face_sources: Vec<Option<usize>> = Vec::new();
     let mut crease_edges = HashSet::new();
     for (face_index, indices) in face_indices.iter().enumerate() {
         let source_face = &mesh.faces[face_index];
         let material_index = i64::from(source_face.material_index)
             .saturating_add(material_offset)
             .clamp(0, i64::from(material_max)) as u32;
+        let emitted_before = faces.len();
         for corner in 0..indices.len() {
             let next = (corner + 1) % indices.len();
             let first = indices[corner];
@@ -1906,9 +2007,13 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 }
             }
         }
+        face_sources.extend(std::iter::repeat_n(
+            Some(face_index),
+            faces.len() - emitted_before,
+        ));
     }
     let (sources, coords): (Vec<usize>, Vec<DVec3>) = points.into_iter().unzip();
-    let origin = Origin::copies(sources.into_iter().map(Some), vec![None; faces.len()]);
+    let origin = Origin::copies(sources.into_iter().map(Some), face_sources);
     let mut result = build_mesh(coords, faces, Vec::new(), &origin, mesh)?;
     result.attributes.remove("wireframe_use_crease");
     result.attributes.remove("wireframe_crease_weight");
@@ -2220,11 +2325,36 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let origin = Origin {
         vertices: origins,
         faces: vec![None; faces.len()],
+        corners: None,
     };
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
     result.attributes.remove("blender_skin_vertices");
     result.attributes.remove("skin_radii");
     result.attributes.remove("skin_roots");
+    // Blender's Skin output has no UV layers, so UV data is dropped (reported as attribute loss).
+    let uv_names: Vec<String> = result
+        .attributes
+        .get("blender_uv_layers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|layer| layer.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    result.attributes.remove("blender_uv_layers");
+    result.attributes.remove("uv_map");
+    if let Some(entries) = result
+        .attributes
+        .get_mut("blender_attributes")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        entries.retain(|entry| {
+            !entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| uv_names.iter().any(|uv| uv == name))
+        });
+    }
     drop_partial_vertex_groups(mesh, &origin, &mut result);
     result.attributes.insert(
         "blender_polygon_smooth".to_owned(),
