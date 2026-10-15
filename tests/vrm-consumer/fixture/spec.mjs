@@ -223,6 +223,20 @@ export const MATERIALS = {
   cutout: { baseColor: [0.2, 0.8, 0.3, 1], alphaMode: 'MASK', alphaCutoff: 0.5, doubleSided: false, baseTexture: 'tex_cutout' },
 };
 
+// Node-graph materials (material.create with `graph`). Kept apart from MATERIALS because their
+// surface comes from the graph, not from the material fields. Not assigned to any mesh: the
+// glTF exporter writes every material, so this one is exported as a material only. Images are
+// existing IMAGES entries, so the image count is unchanged.
+export const GRAPH_MATERIALS = {
+  graph_avatar: {
+    baseTexture: 'tex_cutout', // RGB white; alpha disc, clipped at 0.5 by Math GREATER_THAN
+    alphaCutoff: 0.5,
+    normalMap: 'tex_skin_normal', // NormalMap (TANGENT) input
+    emissionColor: [1.0, 0.5, 0.2, 1],
+    emissionStrength: 1.5,
+  },
+};
+
 // Images (created with pot image ops, pixels generated deterministically in JS).
 // Channel semantics: tex_uv_mask carries the animation mask in B; tex_cutout in A.
 export const IMAGES = {

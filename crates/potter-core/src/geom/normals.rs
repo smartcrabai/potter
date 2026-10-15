@@ -431,8 +431,14 @@ fn flag(values: Option<&Map<String, Value>>, key: &str) -> Result<bool> {
     }
 }
 
-/// Per face: the `shade_smooth` flag, in `mesh.faces` order.
+/// Per face: the `shade_smooth` flag, in `mesh.faces` order. Meshes imported from `.blend`
+/// without a `shade_smooth` attribute carry `blender_polygon_smooth` in the same order.
 pub(crate) fn smooth_face_flags(mesh: &Mesh) -> Result<Vec<bool>> {
+    if !mesh.attributes.contains_key("shade_smooth")
+        && let Some(flags) = imported_flags(mesh, "blender_polygon_smooth", mesh.faces.len())
+    {
+        return Ok(flags);
+    }
     let values = attribute_values(mesh, "shade_smooth", "face", "bool")?;
     mesh.faces
         .iter()
@@ -440,13 +446,35 @@ pub(crate) fn smooth_face_flags(mesh: &Mesh) -> Result<Vec<bool>> {
         .collect()
 }
 
-/// Per edge: the `sharp` flag, in `mesh.edges` order.
+/// Per edge: the `sharp` flag, in `mesh.edges` order. Meshes imported from `.blend` without a
+/// `sharp` attribute carry `sharp` inside `blender_edge_flags` in the same order.
 pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
+    if !mesh.attributes.contains_key("sharp")
+        && let Some(edges) = mesh
+            .attributes
+            .get("blender_edge_flags")
+            .and_then(Value::as_array)
+            .filter(|edges| edges.len() == mesh.edges.len())
+    {
+        return Ok(edges
+            .iter()
+            .map(|edge| edge.get("sharp").and_then(Value::as_bool).unwrap_or(false))
+            .collect());
+    }
     let values = attribute_values(mesh, "sharp", "edge", "bool")?;
     mesh.edges
         .iter()
         .map(|edge| flag(values, &format!("e{}", edge.id)))
         .collect()
+}
+
+/// Per-element flags stored as a plain boolean list (Blender import), when its length matches.
+fn imported_flags(mesh: &Mesh, name: &str, count: usize) -> Option<Vec<bool>> {
+    let flags = mesh.attributes.get(name)?.as_array()?;
+    if flags.len() != count {
+        return None;
+    }
+    flags.iter().map(Value::as_bool).collect()
 }
 
 fn union(parent: &mut [usize], first: usize, second: usize) {

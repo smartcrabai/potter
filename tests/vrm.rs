@@ -569,6 +569,50 @@ fn assert_preflight_both_versions(
     Ok(())
 }
 
+fn assert_format_loss_both_versions(project: &Path, feature_id: &str) -> TestResult<()> {
+    for format in ["vrm", "vrm0"] {
+        let validation_output = pot()
+            .arg("validate")
+            .arg(project)
+            .args(["--format", format, "--json"])
+            .output()?;
+        assert!(validation_output.status.success());
+        let validation = cli_json(&validation_output)?;
+        assert_eq!(validation["result"]["valid"], false);
+        assert!(
+            validation["result"]["checks"]
+                .as_array()
+                .is_some_and(|checks| checks.iter().any(|check| {
+                    check["check"] == "format_loss" && check["status"] == "not_supported"
+                }))
+        );
+        assert!(
+            validation["result"]["issues"]
+                .as_array()
+                .is_some_and(|issues| issues.iter().any(|issue| {
+                    issue["code"] == "UNREPRESENTABLE_FEATURE"
+                        && issue["details"]["feature_id"] == feature_id
+                }))
+        );
+    }
+    Ok(())
+}
+
+fn assert_exports_both_versions(
+    directory: &TempDir,
+    project: &Path,
+    output_stem: &str,
+) -> TestResult<()> {
+    for format in ["vrm", "vrm0"] {
+        export(
+            project,
+            format,
+            &directory.path().join(format!("{output_stem}-{format}.vrm")),
+        )?;
+    }
+    Ok(())
+}
+
 fn parse_glb(path: &Path) -> TestResult<Glb> {
     let bytes = fs::read(path)?;
     assert!(bytes.len() >= 28, "GLB container is too short");
@@ -2279,6 +2323,7 @@ fn vrm_material_alpha_modes_have_consumer_semantics_in_both_versions() -> TestRe
                 "ior": 1.25,
                 "emission_color": [0.4, 0.5, 0.6],
                 "emission_strength": 3.5,
+                "transmission": 0.5,
             }),
             json!({
                 "op": "node.create",
@@ -2313,16 +2358,22 @@ fn vrm_material_alpha_modes_have_consumer_semantics_in_both_versions() -> TestRe
     assert_eq!(opaque["alphaMode"].as_str().unwrap_or("OPAQUE"), "OPAQUE");
     let ordinary = &v1_root["materials"][gltf_material_index(v1_root, "ordinary_physical")];
     assert!(opaque["extensions"]["KHR_materials_ior"].is_null());
-    assert_eq!(opaque["emissiveFactor"], json!([0.2, 0.3, 0.4]));
-    close(
-        &opaque["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
-        2.5,
-    );
+    close(&opaque["emissiveFactor"][0], 0.5);
+    close(&opaque["emissiveFactor"][1], 0.75);
+    close(&opaque["emissiveFactor"][2], 1.0);
+    // The peak channel is exactly 1, so no emissive strength extension is written.
+    assert!(opaque["extensions"]["KHR_materials_emissive_strength"].is_null());
     close(&ordinary["extensions"]["KHR_materials_ior"]["ior"], 1.25);
-    assert_eq!(ordinary["emissiveFactor"], json!([0.4, 0.5, 0.6]));
+    close(
+        &ordinary["extensions"]["KHR_materials_transmission"]["transmissionFactor"],
+        0.5,
+    );
+    close(&ordinary["emissiveFactor"][0], 2.0 / 3.0);
+    close(&ordinary["emissiveFactor"][1], 5.0 / 6.0);
+    close(&ordinary["emissiveFactor"][2], 1.0);
     close(
         &ordinary["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
-        3.5,
+        2.1,
     );
     assert!(
         v1_root["extensionsUsed"]
@@ -2554,7 +2605,7 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
         "material.texture_uv_map",
     )?;
 
-    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    let (_directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
         &project,
         1,
@@ -2563,6 +2614,49 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
                 "op": "material.create",
                 "id": "shader_graph_material",
                 "name": "Shader Graph Surface",
+                "graph": {
+                    "kind": "shader",
+                    "nodes": {
+                        "out": {"type": "OutputMaterial"},
+                        "principled": {"type": "ShaderNodeBsdfPrincipled"},
+                        "noise": {"type": "ShaderNodeTexNoise"}
+                    },
+                    "links": [
+                        {
+                            "from_node": "principled",
+                            "from_socket": "BSDF",
+                            "to_node": "out",
+                            "to_socket": "Surface"
+                        },
+                        {
+                            "from_node": "noise",
+                            "from_socket": "Color",
+                            "to_node": "principled",
+                            "to_socket": "Base Color"
+                        }
+                    ]
+                },
+            }),
+            json!({
+                "op": "node.create",
+                "id": "shader_graph_surface",
+                "kind": "box",
+                "params": {"size": 0.5},
+                "material": "shader_graph_material",
+            }),
+        ],
+    )?;
+    assert_format_loss_both_versions(&project, "material.shader_graph.unsupported_node")?;
+
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    apply_success(
+        &project,
+        1,
+        &[
+            json!({
+                "op": "material.create",
+                "id": "plain_graph_material",
+                "name": "Plain Principled Graph",
                 "graph": {
                     "kind": "shader",
                     "nodes": {
@@ -2582,19 +2676,14 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
             }),
             json!({
                 "op": "node.create",
-                "id": "shader_graph_surface",
+                "id": "plain_graph_surface",
                 "kind": "box",
                 "params": {"size": 0.5},
-                "material": "shader_graph_material",
+                "material": "plain_graph_material",
             }),
         ],
     )?;
-    assert_preflight_both_versions(
-        &directory,
-        &project,
-        "shader-graph-material",
-        "material.shader_graph",
-    )?;
+    assert_exports_both_versions(&directory, &project, "plain-principled-graph")?;
 
     let (directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
@@ -2615,14 +2704,26 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
                 "params": {"size": 0.5},
                 "material": "split_map_material",
             }),
+            json!({"op": "uv.unwrap", "target": {"id": "split_map_surface"}, "method": "smart"}),
         ],
     )?;
-    assert_preflight_both_versions(
-        &directory,
-        &project,
-        "separate-metallic-roughness-maps",
-        "material.metallic_roughness_texture",
+    assert_exports_both_versions(&directory, &project, "separate-metallic-roughness-maps")?;
+    let packed = parse_glb(
+        &directory
+            .path()
+            .join("separate-metallic-roughness-maps-vrm.vrm"),
     )?;
+    let material = gltf_material_index(&packed.json, "split_map_material");
+    let texture = usize_field(
+        &packed.json["materials"][material]["pbrMetallicRoughness"]["metallicRoughnessTexture"]["index"],
+    );
+    let image = usize_field(&packed.json["textures"][texture]["source"]);
+    assert_eq!(
+        packed.json["images"][image]["extras"]["potter"]["packed"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
 
     let (directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(

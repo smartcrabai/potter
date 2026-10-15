@@ -4,9 +4,9 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
 import { openHarness } from './support/browser.mjs';
-import { api, fixtureUrl, FILES, MESHES, TOL, toGltf, triples } from './support/fixture.mjs';
+import { api, fixtureUrl, FILES, MESHES, TOL, toGltf, triples, readGlbJson } from './support/fixture.mjs';
 import { readGlb, smoothNormalRecords } from './support/glb.mjs';
-import { EYES, HEAD_MESH, RIBBON } from '../fixture/spec.mjs';
+import { EYES, GRAPH_MATERIALS, HEAD_MESH, RIBBON } from '../fixture/spec.mjs';
 
 const M = 'shading';
 // Normal tolerance (per component, unit vectors). Lead decision; not part of spec.mjs TOL.
@@ -91,5 +91,16 @@ describe('winding of the negative-determinant copy', () => {
       const err = angleDeg(vec(t), expected);
       assert.ok(err <= TOL.angleDeg, `ribbon_mirror triangle ${i} faces ${err} deg away from the mirrored ribbon normal`);
     });
+  });
+});
+
+describe('graph material export', () => {
+  it('graph_avatar (shader graph) exports as MASK with a normalTexture in the v1 GLB', async () => {
+    const json = await readGlbJson(FILES.v1Full);
+    const name = Object.keys(GRAPH_MATERIALS)[0];
+    const material = json.materials.find((m) => m.name === name);
+    assert.ok(material, `glTF material ${name} is missing`);
+    assert.equal(material.alphaMode, 'MASK', `${name} alphaMode`);
+    assert.ok(material.normalTexture, `${name} has no normalTexture`);
   });
 });

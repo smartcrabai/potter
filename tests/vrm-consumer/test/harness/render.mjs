@@ -196,11 +196,14 @@ const nearestOffset = (T, u, v) => {
 };
 
 // REPEAT-wrapped 3x3 neighbourhood; returns the key if all agree, else null (used for mask edges only).
-function uniformAt(T, u, v, key) {
+// Key of the texels within `radius` of (u, v), or null when they differ. Mip-mapped minification
+// (LINEAR_MIPMAP_LINEAR, as Blender exports) blends a sharp mask step over the sampling footprint,
+// so the mask check uses a radius wide enough to cover that footprint.
+function uniformAt(T, u, v, key, radius = 1) {
   const x0 = Math.floor((((u % 1) + 1) % 1) * T.w);
   const y0 = Math.floor((((v % 1) + 1) % 1) * T.h);
   let out;
-  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+  for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
     const x = (x0 + dx + T.w) % T.w;
     const y = (y0 + dy + T.h) % T.h;
     const k = key(T.d, (y * T.w + x) * 4);
@@ -429,6 +432,7 @@ function checkNormalMap(spec) {
 // MToon samples the base texture at uv + offset * B(mask at uv), with rotation phase 0 (spec sets no rotation).
 // Prediction per pixel: changed iff nearest texel at (u0 + off0*m) differs from nearest texel at (u0 + off1*m).
 // ---------------------------------------------------------------------------
+const MASK_FOOTPRINT_TEXELS = 8;
 function checkUvAnimation(spec) {
   const cloth = spec.MATERIALS.cloth;
   show([spec.MESHES.body]);
@@ -455,7 +459,7 @@ function checkUvAnimation(spec) {
     const hit = pick(A0, body, i, j, 'front');
     if (!hit) continue;
     const [u0, v0] = [hit.uv.x, hit.uv.y];
-    const m = uniformAt(mask, u0, v0, keyMaskB);
+    const m = uniformAt(mask, u0, v0, keyMaskB, MASK_FOOTPRINT_TEXELS);
     if (m === null) { r.undetermined++; continue; }
     const observed = differs(A0, A1, i, j);
     if (m === 0) {

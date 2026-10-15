@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -11,7 +12,11 @@ use crate::{
     commands::util::{check_extension, exchange_format_name},
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot},
-    exchange::{self, ExportOptions, Loss},
+    exchange::{
+        self, ExportOptions, Loss,
+        gltf::{mesh_default_uv_layer, surface_textures},
+        material_surface::{feature_id, material_is_used, resolve_surface},
+    },
     hash,
     model::{AvatarVersion, Id, LightType, SceneDoc},
     response::SceneInfo,
@@ -494,8 +499,78 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
             });
         }
     }
+    if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
+        losses.extend(material_losses(doc));
+    }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);
+    }
+    losses
+}
+
+/// Material losses for glTF-family output: graph parts the resolver cannot represent, and texture
+/// samples on a UV layer other than the mesh's default, which glTF exports as `TEXCOORD_0`.
+fn material_losses(doc: &SceneDoc) -> Vec<Loss> {
+    let mut losses = Vec::new();
+    for id in doc.materials.keys() {
+        if !material_is_used(doc, id) {
+            continue;
+        }
+        // An unresolvable graph is reported by the export itself, so it adds no loss here.
+        let Ok((surface, resolver_losses)) = resolve_surface(doc, id) else {
+            continue;
+        };
+        let layer_loss_reported = resolver_losses.iter().any(|loss| {
+            loss.feature_id == feature_id::TEXTURE_UV_LAYER
+                && loss.data_id.as_deref() == Some(id.as_str())
+        });
+        losses.extend(resolver_losses);
+        if layer_loss_reported {
+            continue;
+        }
+        let layers = surface_textures(&surface)
+            .into_iter()
+            .filter_map(|texture| texture.uv_layer.clone())
+            .collect::<BTreeSet<String>>();
+        let mut mismatches = BTreeMap::<String, BTreeSet<String>>::new();
+        for (node_id, node) in &doc.nodes {
+            if !node.materials.contains(id) {
+                continue;
+            }
+            let Some(data_id) = &node.data else {
+                continue;
+            };
+            let Some(mesh) = doc
+                .data_blocks
+                .get(data_id)
+                .and_then(|data| data.mesh.as_ref())
+            else {
+                continue;
+            };
+            let default_layer = mesh_default_uv_layer(&mesh.attributes);
+            for layer in &layers {
+                if default_layer.as_deref() != Some(layer.as_str()) {
+                    mismatches
+                        .entry(layer.clone())
+                        .or_default()
+                        .insert(format!("{data_id} (node {node_id})"));
+                }
+            }
+        }
+        for (layer, meshes) in mismatches {
+            let meshes = meshes.into_iter().collect::<Vec<_>>().join(", ");
+            losses.push(Loss {
+                feature_id: feature_id::TEXTURE_UV_LAYER.to_owned(),
+                data_id: Some(id.to_string()),
+                reason: format!(
+                    "material `{id}` samples UV layer `{layer}`, which is not the default layer of {meshes}; glTF exports only the default layer as TEXCOORD_0"
+                ),
+                suggestion: Some(
+                    "assign the textured material to the mesh's default UV layer, or export with --allow-lossy to keep the default layer"
+                        .to_owned(),
+                ),
+            });
+        }
     }
     losses
 }

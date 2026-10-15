@@ -66,14 +66,14 @@ pub fn feature_catalog() -> Value {
             "Base color, metallic, roughness, emission, transmission, IOR, texture maps, and alpha modes",
             "Material",
             &["material.create", "material.update"],
-            [true, true, true, true, true, true, false],
+            [true, true, true, true, true, true, true],
         ),
         supported(
             "shader.evaluator_subset",
-            "Principled, procedural surface nodes, and PBR texture maps",
+            "Principled, Emission, and Background surfaces, PBR texture maps, and graph channel packing; glTF and VRM export the supported subset and report the rest as losses",
             "ShaderNodeTree",
             &["material.create"],
-            [true, false, true, true, false, false, false],
+            [true, false, true, true, false, false, true],
         ),
         unsupported(
             "shader.advanced",
@@ -2055,6 +2055,7 @@ pub fn formats_catalog() -> Value {
             &[],
             &[
                 "Only the adapter's implemented GLTF feature subset is supported; unsupported source features are rejected or reported as losses.",
+                "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture samples on a non-default UV layer are reported as losses (material.texture_uv_set).",
             ],
         ),
         format_row(
@@ -2072,6 +2073,7 @@ pub fn formats_catalog() -> Value {
             &[],
             &[
                 "Only the adapter's implemented GLTF feature subset is supported; unsupported source features are rejected or reported as losses.",
+                "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture samples on a non-default UV layer are reported as losses (material.texture_uv_set).",
             ],
         ),
         vrm_format_row("vrm"),
@@ -2264,6 +2266,7 @@ fn vrm_format_row(format: &str) -> Value {
         &[],
         &[
             "Settings not representable by this VRM version are rejected during validation and export.",
+            "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture samples on a non-default UV layer are reported as losses (material.texture_uv_set).",
         ],
     );
     let mut features = row["features"].as_array().cloned().unwrap_or_default();

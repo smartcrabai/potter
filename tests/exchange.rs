@@ -503,7 +503,7 @@ fn glb_emissive_strength_is_omitted_when_inert_and_round_trips_through_extras()
     assert!(named("Unit")?["extensions"]["KHR_materials_emissive_strength"].is_null());
     assert_eq!(
         named("Glow")?["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
-        2.5
+        1.25
     );
     assert!(document["extensionsUsed"].as_array().is_some_and(|used| {
         used.iter()

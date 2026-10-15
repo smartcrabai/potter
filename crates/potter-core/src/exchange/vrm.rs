@@ -17,12 +17,13 @@ use crate::{
         AvatarLegacyAllowedUser, AvatarLegacyBinaryPermission, AvatarLegacyLicenseName,
         AvatarLookAt, AvatarLookAtType, AvatarMaterialColorType, AvatarMeta, AvatarModification,
         AvatarNodeRef, AvatarPermission, AvatarSettings, AvatarSpring, AvatarSpringBone,
-        AvatarSpringColliderShape, AvatarVersion, Id, Material, SceneDoc, TextureRef,
+        AvatarSpringColliderShape, AvatarVersion, Id, SceneDoc, TextureRef,
         validate_avatar_settings,
     },
 };
 
-use super::gltf::{TextureExport, VrmWriterMappings, unsupported_export};
+use super::gltf::{TextureExport, VrmWriterMappings, reference_texture, unsupported_export};
+use super::material_surface::{ResolvedSurface, resolve_surface};
 
 pub fn export(
     doc: &SceneDoc,
@@ -92,10 +93,14 @@ pub fn validate_settings(doc: &SceneDoc, version: AvatarVersion) -> Result<()> {
                 }
             }
             for material_id in avatar.mtoon.keys() {
-                let material = doc.materials.get(material_id).ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "MToon material is missing")
-                })?;
-                mtoon::validate_v1(material)?;
+                if !doc.materials.contains_key(material_id) {
+                    return Err(PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "MToon material is missing",
+                    ));
+                }
+                let (surface, _) = resolve_surface(doc, material_id)?;
+                mtoon::validate_v1(&surface)?;
             }
         }
         AvatarVersion::V0 => validate_v0_settings(doc, avatar)?,
@@ -458,28 +463,31 @@ fn validate_v0_settings(doc: &SceneDoc, avatar: &AvatarSettings) -> Result<()> {
             ensure_unique_legacy_material_name(doc, &bind.material)?;
         }
         for bind in &expression.texture_transform_binds {
-            let material = doc.materials.get(&bind.material).ok_or_else(|| {
-                PotError::new(
+            if !doc.materials.contains_key(&bind.material) {
+                return Err(PotError::new(
                     ErrorCode::SceneInvalid,
                     "expression target material is missing",
-                )
-            })?;
+                ));
+            }
             if !avatar.mtoon.contains_key(&bind.material) {
                 return Err(unsupported_export(
                     "vrm.v0.expression_texture_transform",
                     "VRM 0.x texture-transform binds require MToon settings on the target material.",
                 ));
             }
-            ensure_legacy_texture_transform(doc, material)?;
+            ensure_legacy_texture_transform(doc, &bind.material)?;
             ensure_unique_legacy_material_name(doc, &bind.material)?;
         }
     }
     for (material_id, mtoon) in &avatar.mtoon {
-        let material = doc
-            .materials
-            .get(material_id)
-            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "MToon material is missing"))?;
-        mtoon::validate_v0(material, mtoon)?;
+        if !doc.materials.contains_key(material_id) {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "MToon material is missing",
+            ));
+        }
+        let (surface, _) = resolve_surface(doc, material_id)?;
+        mtoon::validate_v0(&surface, mtoon)?;
     }
     if let Some(spring) = &avatar.spring_bone {
         validate_v0_spring(doc, spring)?;
@@ -1379,8 +1387,14 @@ fn vrm1_extension(
     }
     for (material_id, mtoon) in &avatar.mtoon {
         let material_index = index_for(mappings.material_indices, material_id, "MToon material")?;
+        let surface = mappings.surfaces.get(material_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "MToon material surface is missing",
+            )
+        })?;
         let mtoon_extension = mtoon::v1(
-            material_id,
+            surface,
             mtoon,
             doc,
             root_path,
@@ -1825,6 +1839,7 @@ fn vrm0_extension(
         extension["materialProperties"] = Value::Array(vrm0_material_properties(
             doc,
             avatar,
+            mappings.surfaces,
             root_path,
             texture_export,
             binary,
@@ -1891,7 +1906,13 @@ fn vrm0_meta(
             uv_map: None,
             interpolation: ImageInterpolation::Linear,
         };
-        let index = texture_export.texture_index(&texture, doc, root_path, binary, views)?;
+        let index = texture_export.sampled_index(
+            &reference_texture(&texture),
+            doc,
+            root_path,
+            binary,
+            views,
+        )?;
         value["texture"] = json!(index);
     }
     Ok(value)
@@ -2033,17 +2054,19 @@ fn vrm0_expressions(
     Ok(json!({ "blendShapeGroups": groups }))
 }
 
-fn ensure_legacy_texture_transform(doc: &SceneDoc, material: &Material) -> Result<()> {
-    if material.roughness_texture.is_some()
-        || material.metallic_texture.is_some()
-        || material
-            .node_tree
-            .as_ref()
-            .is_some_and(|graph_id| !super::is_default_material_graph(doc, graph_id))
+/// VRM 0.x `_MainTex_ST` holds one transform, so a material whose base texture already has a KHR
+/// texture transform cannot also take an expression texture-transform bind.
+fn ensure_legacy_texture_transform(doc: &SceneDoc, material_id: &Id) -> Result<()> {
+    let (surface, _) = resolve_surface(doc, material_id)?;
+    if surface
+        .base_color
+        .texture
+        .as_ref()
+        .is_some_and(|texture| texture.transform.is_some())
     {
         return Err(unsupported_export(
             "vrm.v0.expression_texture_transform",
-            "VRM 0.x MToon `_MainTex_ST` cannot transform glTF metallic/roughness maps or non-default shader graphs; remove them or export VRM 1.0.",
+            "VRM 0.x MToon `_MainTex_ST` holds one transform; this material's base texture already has a texture transform, so an expression texture-transform bind cannot also target it. Remove one or export VRM 1.0.",
         ));
     }
     Ok(())
@@ -2176,6 +2199,7 @@ fn legacy_collider_groups(
 fn vrm0_material_properties(
     doc: &SceneDoc,
     avatar: &AvatarSettings,
+    surfaces: &BTreeMap<Id, ResolvedSurface>,
     root_path: &Path,
     texture_export: &mut TextureExport,
     binary: &mut Vec<u8>,
@@ -2185,8 +2209,15 @@ fn vrm0_material_properties(
         .iter()
         .map(|(material_id, material)| {
             if let Some(mtoon) = avatar.mtoon.get(material_id) {
+                let surface = surfaces.get(material_id).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "MToon material surface is missing",
+                    )
+                })?;
                 mtoon::v0(
-                    material,
+                    &material.name,
+                    surface,
                     mtoon,
                     doc,
                     root_path,
