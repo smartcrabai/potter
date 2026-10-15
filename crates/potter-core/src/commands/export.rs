@@ -101,11 +101,12 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         })
     } else {
         let snapshot = Snapshot::evaluate_with_cache(&doc, &context, Some(project.path()))?;
-        let losses = export_losses(&doc, format);
+        let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
+        let mut losses = export_losses(&doc, format);
+        losses.extend(exchange::shading::shading_losses(format, &meshes));
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
         }
-        let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
         let artifacts = match format {
             "glb" => {
                 let (json_bytes, binary) =
@@ -468,6 +469,22 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
             || (supports_strokes && data.data_type == "grease_pencil")
             || (supports_bvh && data.data_type == "armature")
             || (supports_gltf_skin && data.data_type == "armature");
+        if format == "alembic"
+            && data
+                .mesh
+                .as_ref()
+                .is_some_and(|mesh| mesh.attributes.contains_key("alembic_normals"))
+        {
+            losses.push(Loss {
+                feature_id: "mesh.attribute".to_owned(),
+                data_id: Some(id.to_string()),
+                reason: "Alembic export does not re-write normals imported from an .abc file".to_owned(),
+                suggestion: Some(
+                    "re-import the original .abc to restore its normals, or export with --allow-lossy"
+                        .to_owned(),
+                ),
+            });
+        }
         if !data_supported {
             losses.push(Loss {
                 feature_id: format!("data.{}", data.data_type),

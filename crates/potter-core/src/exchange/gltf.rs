@@ -13,8 +13,8 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{Snapshot, mesh_vertex_weights},
     geom::{
-        Face, Mesh,
-        normals::{corner_normals, morph_corner_normals, shading_keys_stale},
+        Face, Mesh, MeshError,
+        normals::{close, corner_normals, shading_keys_stale},
     },
     image::{ImageData, ImageInterpolation, load_image_data},
     model::{
@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-use super::import_error;
+use super::{import_error, shading};
 
 const POT_TO_GLTF: DMat4 = DMat4::from_cols_array(&[
     1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -863,20 +863,48 @@ fn export_vertex_layout(
     })
 }
 
+/// Triangles for glTF export, `len - 2` per face in `mesh.faces` order. A face without area has no
+/// ear to clip, so it fans into degenerate triangles, as Blender's glTF exporter writes it.
+fn export_triangles(mesh: &Mesh) -> std::result::Result<Vec<[u32; 3]>, MeshError> {
+    if let Ok(triangles) = mesh.triangulate() {
+        return Ok(triangles);
+    }
+    let mut subset = mesh.clone();
+    let mut degenerate = BTreeSet::<u32>::new();
+    let triangles = loop {
+        match subset.triangulate() {
+            Ok(triangles) => break triangles,
+            Err(MeshError::TriangulationFailed(id))
+                if subset.faces.iter().any(|face| face.id == id) =>
+            {
+                degenerate.insert(id);
+                subset.faces.retain(|face| face.id != id);
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let mut regular = triangles.into_iter();
+    let mut output = Vec::new();
+    for face in &mesh.faces {
+        if degenerate.contains(&face.id) {
+            for pair in face.vertices[1..].windows(2) {
+                output.push([face.vertices[0], pair[0], pair[1]]);
+            }
+        } else {
+            output.extend(regular.by_ref().take(face.vertices.len().saturating_sub(2)));
+        }
+    }
+    Ok(output)
+}
+
 /// Maps pot-space normals into the glTF output frame: inverse transpose of diag(scale) * basis.
-fn output_normals(normals: &[DVec3], geometry_scale: DVec3, basis: DMat4) -> Result<Vec<DVec3>> {
+/// A zero normal becomes the unit up vector first, as Blender's glTF exporter writes it.
+fn output_normals(normals: &[DVec3], geometry_scale: DVec3, basis: DMat4) -> Vec<DVec3> {
     normals
         .iter()
         .map(|normal| {
-            let unit = (basis.transform_vector3(*normal) / geometry_scale).normalize();
-            if unit.is_finite() {
-                Ok(unit)
-            } else {
-                Err(PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "mesh normal cannot be transformed for glTF export",
-                ))
-            }
+            let unit = normal.try_normalize().unwrap_or(DVec3::Z);
+            (basis.transform_vector3(unit) / geometry_scale).normalize_or_zero()
         })
         .collect()
 }
@@ -997,22 +1025,25 @@ fn mesh_export_layout(
         None => Vec::new(),
     };
     let base = shape_key_base_positions(mesh, data_block);
-    let base_corners = corner_normals(mesh, &base)?;
-    let mut layers = vec![output_normals(&base_corners, geometry_scale, basis)?];
+    let mut layers = vec![output_normals(
+        &corner_normals(mesh, &base)?,
+        geometry_scale,
+        basis,
+    )];
     for deltas in &key_deltas {
         let morphed = base
             .iter()
             .zip(deltas)
             .map(|(point, delta)| *point + *delta)
             .collect::<Vec<_>>();
-        // A morph that collapses a face has no normal there, so its NORMAL delta is zero.
+        // Morph layers follow the base rules, so a collapsed face gets the same normals as Blender.
         layers.push(output_normals(
-            &morph_corner_normals(mesh, &morphed, &base_corners)?,
+            &corner_normals(mesh, &morphed)?,
             geometry_scale,
             basis,
-        )?);
+        ));
     }
-    let fallback = output_normals(&[DVec3::Z], geometry_scale, basis)?[0];
+    let fallback = output_normals(&[DVec3::Z], geometry_scale, basis)[0];
     let layout = export_vertex_layout(mesh, &layers, fallback)?;
     Ok(MeshExportLayout { layout, key_deltas })
 }
@@ -2757,7 +2788,7 @@ fn export_with_root_inner(
             }
         }
         let mirrored = geometry_scale.x * geometry_scale.y * geometry_scale.z < 0.0;
-        let triangles = mesh.triangulate().map_err(|error| {
+        let triangles = export_triangles(mesh).map_err(|error| {
             PotError::with_details(
                 ErrorCode::ExportFailed,
                 "mesh triangulation failed",
@@ -4828,7 +4859,8 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             } else {
                 Vec::new()
             };
-            if import_shading(&mut mesh, &corner_normals, &morph_targets)? {
+            shading::import_shading(&mut mesh, &corner_normals)?;
+            if morph_normals_disagree(&mesh, &corner_normals, &morph_targets) {
                 morph_normal_loss = true;
             }
         }
@@ -5251,104 +5283,15 @@ fn weld_copies(
     Ok((welded_of, first))
 }
 
-/// Derives per-face smooth flags and custom normals from imported glTF NORMAL data.
+/// Whether morph NORMAL deltas disagree with normals derived from the morphed geometry.
+/// Runs after `shading::import_shading`, so `mesh` already carries the imported shading.
 /// `normals` and each target's NORMAL deltas hold one value per face corner in `mesh.faces` order.
-/// Returns true when morph NORMAL deltas disagree with normals derived from the morphed geometry.
-fn import_shading(
-    mesh: &mut Mesh,
+fn morph_normals_disagree(
+    mesh: &Mesh,
     normals: &[DVec3],
     morph_targets: &[MorphNormalTarget],
-) -> Result<bool> {
-    const TOLERANCE: f64 = 1.0e-4;
-    fn close(left: DVec3, right: DVec3) -> bool {
-        (left - right).abs().max_element() <= TOLERANCE
-    }
-    let index_of = mesh
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect::<BTreeMap<_, _>>();
-    let corners = mesh
-        .faces
-        .iter()
-        .map(|face| {
-            face.vertices
-                .iter()
-                .map(|id| {
-                    index_of
-                        .get(id)
-                        .copied()
-                        .ok_or_else(|| import_error("glTF face references a missing vertex"))
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let points = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co)
-        .collect::<Vec<_>>();
-    let mut smooth = Vec::with_capacity(corners.len());
-    let mut corner = 0;
-    for face_corners in &corners {
-        let mut area = DVec3::ZERO;
-        for (offset, vertex) in face_corners.iter().enumerate() {
-            let next = face_corners[(offset + 1) % face_corners.len()];
-            area += points[*vertex].cross(points[next]);
-        }
-        let flat = area.normalize_or_zero();
-        let end = corner + face_corners.len();
-        smooth.push(
-            normals[corner..end]
-                .iter()
-                .any(|normal| !close(*normal, flat)),
-        );
-        corner = end;
-    }
-    if smooth.iter().any(|value| *value) {
-        let values = mesh
-            .faces
-            .iter()
-            .zip(&smooth)
-            .map(|(face, value)| (format!("f{}", face.id), json!(value)))
-            .collect::<serde_json::Map<String, Value>>();
-        mesh.attributes.insert(
-            "shade_smooth".to_owned(),
-            json!({ "domain": "face", "type": "bool", "values": values }),
-        );
-    }
-    let computed = corner_normals(mesh, &points).ok();
-    let mut custom_values = serde_json::Map::new();
-    let mut corner = 0;
-    for (face, face_corners) in mesh.faces.iter().zip(&corners) {
-        let end = corner + face_corners.len();
-        let mismatch = match &computed {
-            Some(expected) => (corner..end).any(|index| !close(expected[index], normals[index])),
-            None => true,
-        };
-        if mismatch {
-            let values = normals[corner..end]
-                .iter()
-                .map(|normal| normal.normalize_or_zero().to_array())
-                .collect::<Vec<_>>();
-            custom_values.insert(format!("f{}", face.id), json!(values));
-        }
-        corner = end;
-    }
-    if !custom_values.is_empty() {
-        mesh.attributes.insert(
-            "custom_normal".to_owned(),
-            json!({ "domain": "corner", "type": "float3", "values": custom_values }),
-        );
-    }
+) -> bool {
     let mut disagree = false;
-    // The exporter's base layer includes the imported custom normals, so morph fallbacks come from it.
-    let base = if morph_targets.is_empty() {
-        None
-    } else {
-        corner_normals(mesh, &points).ok()
-    };
     for (position_deltas, normal_deltas) in morph_targets {
         let morphed = mesh
             .vertices
@@ -5356,22 +5299,21 @@ fn import_shading(
             .zip(position_deltas)
             .map(|(vertex, delta)| vertex.co + DVec3::from_array(*delta))
             .collect::<Vec<_>>();
-        let Some(expected) = base
-            .as_deref()
-            .and_then(|base| morph_corner_normals(mesh, &morphed, base).ok())
-        else {
+        let Ok(expected) = corner_normals(mesh, &morphed) else {
             disagree = true;
             continue;
         };
+        // glTF stores zero normals as the unit up vector, so the comparison uses that fallback.
         for (corner, expected) in expected.iter().enumerate() {
+            let expected = expected.try_normalize().unwrap_or(DVec3::Z);
             let implied =
                 (normals[corner] + DVec3::from_array(normal_deltas[corner])).normalize_or_zero();
-            if !close(implied, *expected) {
+            if !close(implied, expected) {
                 disagree = true;
             }
         }
     }
-    Ok(disagree)
+    disagree
 }
 
 fn append_triangles(
@@ -7516,25 +7458,24 @@ mod tests {
     }
 
     #[test]
-    fn baked_scale_normals_use_inverse_transpose() -> TestResult {
+    fn baked_scale_normals_use_inverse_transpose() {
         let normal = glam::DVec3::new(1.0, 1.0, 0.0).normalize();
         let stretched = super::output_normals(
             &[normal],
             glam::DVec3::new(2.0, 1.0, 1.0),
             glam::DMat4::IDENTITY,
-        )?[0];
+        )[0];
         let expected = glam::DVec3::new(0.5, 1.0, 0.0).normalize();
         assert!((stretched - expected).length() < 1.0e-12, "{stretched:?}");
         let mirrored = super::output_normals(
             &[glam::DVec3::Y],
             glam::DVec3::new(-1.0, 1.0, 1.0),
             glam::DMat4::IDENTITY,
-        )?[0];
+        )[0];
         assert!(
             (mirrored - glam::DVec3::Y).length() < 1.0e-12,
             "{mirrored:?}"
         );
-        Ok(())
     }
 
     #[test]

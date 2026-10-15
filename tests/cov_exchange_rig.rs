@@ -487,16 +487,10 @@ fn rigged_exchange_formats_preserve_skin_morphs_and_animation() -> TestResult {
                     .as_f64()
                     .ok_or("Blender final position missing")?,
             ]);
-            let blender_expected_start = if format == "alembic" {
-                DVec3::new(expected_start.x, -expected_start.z, expected_start.y)
-            } else {
-                expected_start
-            };
-            let blender_expected_end = if format == "alembic" {
-                DVec3::new(expected_end.x, -expected_end.z, expected_end.y)
-            } else {
-                expected_end
-            };
+            // Potter's Alembic files are read in Blender's Y-up basis, so Blender places them at
+            // Potter's world position.
+            let blender_expected_start = expected_start;
+            let blender_expected_end = expected_end;
             let blender_expected_motion = blender_expected_end - blender_expected_start;
             if matches!(format, "usda" | "alembic") {
                 assert_vec_close(

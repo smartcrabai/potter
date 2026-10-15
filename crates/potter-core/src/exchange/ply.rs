@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use glam::DVec3;
 
-use super::ExchangeMesh;
+use super::{ExchangeMesh, shading};
 use crate::error::{ErrorCode, PotError, Result};
 
 pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
@@ -14,18 +14,31 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
         .iter()
         .try_fold(0_usize, |sum, mesh| sum.checked_add(mesh.faces.len()))
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "PLY face count overflow"))?;
+    // Blender writes shading normals only when a face is shaded (export_normals is off by default).
+    let with_normals = meshes.iter().any(|mesh| !shading::is_flat(mesh));
+    let normal_properties = if with_normals {
+        "property float nx\nproperty float ny\nproperty float nz\n"
+    } else {
+        ""
+    };
     let header = format!(
-        "ply\nformat binary_little_endian 1.0\nelement vertex {vertex_count}\nproperty float x\nproperty float y\nproperty float z\nproperty float nx\nproperty float ny\nproperty float nz\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar alpha\nproperty float u\nproperty float v\nelement face {face_count}\nproperty list uint uint vertex_indices\nend_header\n"
+        "ply\nformat binary_little_endian 1.0\nelement vertex {vertex_count}\nproperty float x\nproperty float y\nproperty float z\n{normal_properties}property uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar alpha\nproperty float u\nproperty float v\nelement face {face_count}\nproperty list uint uint vertex_indices\nend_header\n"
     );
     let mut output = header.into_bytes();
     for mesh in meshes {
-        let normals = vertex_normals(mesh)?;
+        let normals = if with_normals {
+            vertex_normals(mesh)?
+        } else {
+            Vec::new()
+        };
         for (index, position) in mesh.positions.iter().enumerate() {
             for value in position {
                 push_f32(&mut output, *value)?;
             }
-            for value in normals[index] {
-                output.extend_from_slice(&value.to_le_bytes());
+            if with_normals {
+                for value in normals[index] {
+                    output.extend_from_slice(&value.to_le_bytes());
+                }
             }
             output.extend_from_slice(&[153, 153, 153, 255]);
             output.extend_from_slice(&0.0_f32.to_le_bytes());
@@ -34,7 +47,8 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     }
     let mut base = 0_usize;
     for mesh in meshes {
-        for face in &mesh.faces {
+        let (faces, _) = shading::baked_faces(mesh)?;
+        for face in &faces {
             let count = u32::try_from(face.len())
                 .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "PLY face is too large"))?;
             output.extend_from_slice(&count.to_le_bytes());
@@ -81,24 +95,28 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     }
     let mut cursor = header_end;
     let mut positions = Vec::with_capacity(parsed.vertex_count);
+    let mut per_vertex_normals = Vec::with_capacity(parsed.vertex_count);
     for _ in 0..parsed.vertex_count {
         let mut position = [0.0_f64; 3];
+        let mut normal = [0.0_f64; 3];
         for property in &parsed.vertex_properties {
             let raw = take(&bytes, &mut cursor, scalar_size(&property.scalar_type)?)?;
-            let axis = match property.name.as_str() {
-                "x" => Some(0),
-                "y" => Some(1),
-                "z" => Some(2),
-                _ => None,
+            let (target, axis) = match property.name.as_str() {
+                "x" => (&mut position, 0),
+                "y" => (&mut position, 1),
+                "z" => (&mut position, 2),
+                "nx" => (&mut normal, 0),
+                "ny" => (&mut normal, 1),
+                "nz" => (&mut normal, 2),
+                _ => continue,
             };
-            if let Some(axis) = axis {
-                position[axis] = read_scalar(raw, &property.scalar_type)?;
-            }
+            target[axis] = read_scalar(raw, &property.scalar_type)?;
         }
         if !position.iter().all(|value| value.is_finite()) {
             return Err(ply_error("PLY contains non-finite vertex coordinates"));
         }
         positions.push(position);
+        per_vertex_normals.push(normal);
     }
     let mut faces = Vec::with_capacity(parsed.face_count);
     for _ in 0..parsed.face_count {
@@ -147,11 +165,21 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     if positions.is_empty() || faces.is_empty() {
         return Err(ply_error("PLY contains no mesh geometry"));
     }
+    let normals = if parsed.has_normals {
+        Some(import_corner_normals(&per_vertex_normals, &faces)?)
+    } else {
+        None
+    };
     Ok(vec![ExchangeMesh {
         id: "ply_mesh".to_owned(),
         name: "PLY Mesh".to_owned(),
         positions,
         faces,
+        normals,
+        mirrored: false,
+        singular: false,
+        vertex_normals: Vec::new(),
+        smooth: Vec::new(),
     }])
 }
 
@@ -161,6 +189,7 @@ struct Header {
     face_count: usize,
     vertex_properties: Vec<ScalarProperty>,
     face_properties: Vec<FaceProperty>,
+    has_normals: bool,
 }
 
 struct ScalarProperty {
@@ -243,11 +272,8 @@ fn parse_header(header: &str) -> Result<Header> {
             _ => {}
         }
     }
-    let has_coordinates = ["x", "y", "z"].iter().all(|name| {
-        vertex_properties
-            .iter()
-            .any(|property| property.name == *name)
-    });
+    let has_coordinates = has_vertex_properties(&vertex_properties, ["x", "y", "z"]);
+    let has_normals = has_vertex_properties(&vertex_properties, ["nx", "ny", "nz"]);
     let has_indices = face_properties.iter().any(|property| matches!(property, FaceProperty::List(_, _, name) if name == "vertex_indices" || name == "vertex_index"));
     if !has_coordinates || !has_indices {
         return Err(ply_error(
@@ -260,50 +286,27 @@ fn parse_header(header: &str) -> Result<Header> {
         face_count,
         vertex_properties,
         face_properties,
+        has_normals,
     })
 }
 
+fn has_vertex_properties(properties: &[ScalarProperty], names: [&str; 3]) -> bool {
+    names
+        .iter()
+        .all(|name| properties.iter().any(|property| property.name == *name))
+}
+
+/// Blender's per-vertex normals (`mesh.vertex_normals`) in float32. A vertex whose faces cancel
+/// out, or that only touches degenerate faces, writes zero.
 fn vertex_normals(mesh: &ExchangeMesh) -> Result<Vec<[f32; 3]>> {
-    let mut normals = vec![DVec3::ZERO; mesh.positions.len()];
-    for face in &mesh.faces {
-        if face.len() < 3 {
-            continue;
-        }
-        let a = DVec3::from_array(
-            *mesh
-                .positions
-                .get(face[0])
-                .ok_or_else(|| ply_error("face index is invalid"))?,
-        );
-        let b = DVec3::from_array(
-            *mesh
-                .positions
-                .get(face[1])
-                .ok_or_else(|| ply_error("face index is invalid"))?,
-        );
-        let c = DVec3::from_array(
-            *mesh
-                .positions
-                .get(face[2])
-                .ok_or_else(|| ply_error("face index is invalid"))?,
-        );
-        let normal = (b - a).cross(c - a);
-        for index in face {
-            let target = normals
-                .get_mut(*index)
-                .ok_or_else(|| ply_error("face index is invalid"))?;
-            *target += normal;
-        }
-    }
-    normals
-        .into_iter()
-        .map(|normal| {
-            let value = normal.normalize_or_zero();
+    mesh.vertex_normals
+        .iter()
+        .map(|value| {
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "PLY normals use float32 by specification"
             )]
-            let output = [value.x as f32, value.y as f32, value.z as f32];
+            let output = [value[0] as f32, value[1] as f32, value[2] as f32];
             if output.iter().any(|component| !component.is_finite()) {
                 return Err(PotError::new(
                     ErrorCode::ExportFailed,
@@ -311,6 +314,29 @@ fn vertex_normals(mesh: &ExchangeMesh) -> Result<Vec<[f32; 3]>> {
                 ));
             }
             Ok(output)
+        })
+        .collect()
+}
+
+/// Expands per-vertex PLY normals to face corners. Zero normals stay zero, as Blender writes
+/// them; non-finite components are invalid.
+fn import_corner_normals(per_vertex: &[[f64; 3]], faces: &[Vec<usize>]) -> Result<Vec<[f64; 3]>> {
+    let unit = per_vertex
+        .iter()
+        .map(|normal| {
+            if !normal.iter().all(|value| value.is_finite()) {
+                return Err(ply_error("PLY vertex normal is not finite"));
+            }
+            Ok(DVec3::from_array(*normal).normalize_or_zero().to_array())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    faces
+        .iter()
+        .flatten()
+        .map(|index| {
+            unit.get(*index)
+                .copied()
+                .ok_or_else(|| ply_error("face index is invalid"))
         })
         .collect()
 }
@@ -440,5 +466,5 @@ pub(crate) fn imported_graph(
     scene_id: String,
 ) -> Result<crate::exchange::ImportedGraph> {
     let meshes = import(path)?;
-    crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "ply")
+    crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "ply", Vec::new())
 }

@@ -970,7 +970,8 @@ fn encode_value(
             16,
             false,
             0,
-            values
+            // Crate quaternions store the imaginary part first and the real part last.
+            [values[1], values[2], values[3], values[0]]
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect(),
@@ -2313,11 +2314,15 @@ fn decode_value(
                 let data = bytes
                     .get(payload..payload + size)
                     .ok_or_else(|| import_error("truncated USD vector value"))?;
-                let numbers = if width == 4 {
+                let mut numbers = if width == 4 {
                     decode_f32_components(data)?
                 } else {
                     decode_f64_components(data)?
                 };
+                if code == 16 {
+                    // Text quaternions are `(w, x, y, z)`; the crate stores `(x, y, z, w)`.
+                    numbers.rotate_right(1);
+                }
                 Ok(DecodedValue::Numbers {
                     type_code: code,
                     values: numbers,
@@ -2573,5 +2578,33 @@ impl<'a> Cursor<'a> {
                 .try_into()
                 .map_err(|_| import_error("invalid crate i64"))?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{ValueData, encode_value};
+
+    #[test]
+    fn identity_quaternion_stores_imaginary_parts_first() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Crate quaternions are stored `(x, y, z, w)`; the text form is `(w, x, y, z)`.
+        let mut file = Vec::new();
+        encode_value(
+            &ValueData::Quatd([1.0, 0.0, 0.0, 0.0]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut file,
+        )?;
+        let (stored, rest) = file.as_chunks::<8>();
+        assert_eq!(rest.len(), 0);
+        let stored = stored
+            .iter()
+            .map(|bytes| f64::from_le_bytes(*bytes))
+            .collect::<Vec<_>>();
+        assert_eq!(stored, [0.0, 0.0, 0.0, 1.0]);
+        Ok(())
     }
 }

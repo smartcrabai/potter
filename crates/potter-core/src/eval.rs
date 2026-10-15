@@ -3654,7 +3654,7 @@ fn merge_shading(
     edge_ids: &BTreeMap<u32, u32>,
     matrix: DMat4,
 ) -> Result<()> {
-    let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
+    let normal_matrix = crate::geom::normals::normal_matrix(matrix);
     for name in SHADING_ATTRIBUTES {
         let Some(source_attribute) = source.attributes.get(name) else {
             continue;

@@ -523,9 +523,10 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
         None => checks.push(check("avatar_settings", "supported", Value::Null)),
     }
     let context = crate::eval::EvaluationContext::default();
-    match crate::eval::Snapshot::evaluate(doc, &context) {
+    let evaluation = crate::eval::Snapshot::evaluate(doc, &context);
+    match &evaluation {
         Ok(snapshot) => {
-            for (id, evaluated) in snapshot.nodes {
+            for (id, evaluated) in &snapshot.nodes {
                 let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
                 if matrix.determinant().abs() <= f64::EPSILON {
                     issue(
@@ -550,7 +551,7 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
                     &error.message,
                     None,
                     None,
-                    error.details,
+                    error.details.clone(),
                 );
             }
         }
@@ -562,7 +563,7 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
                 &error.message,
                 None,
                 None,
-                error.details,
+                error.details.clone(),
             );
         }
         Err(error) => issue(
@@ -572,7 +573,7 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
             &error.message,
             None,
             None,
-            error.details,
+            error.details.clone(),
         ),
     }
 
@@ -588,7 +589,26 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
                 losses.extend(crate::commands::export::avatar_settings_loss(doc, "blend"));
                 losses
             } else {
-                crate::commands::export::export_losses(doc, format)
+                let mut losses = crate::commands::export::export_losses(doc, format);
+                // Shading losses need the same meshes export builds, so evaluation errors surface here too.
+                if let Ok(snapshot) = &evaluation {
+                    match crate::exchange::evaluated_meshes(doc, snapshot) {
+                        Ok(meshes) => {
+                            losses
+                                .extend(crate::exchange::shading::shading_losses(format, &meshes));
+                        }
+                        Err(error) => issue(
+                            &mut issues,
+                            "error",
+                            "EVALUATION_FAILED",
+                            &error.message,
+                            None,
+                            None,
+                            error.details,
+                        ),
+                    }
+                }
+                losses
             };
             let supported = entry["status"] == "supported";
             if !supported {

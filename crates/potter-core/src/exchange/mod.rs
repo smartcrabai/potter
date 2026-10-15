@@ -54,6 +54,21 @@ pub(crate) struct ExchangeMesh {
     pub name: String,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
+    /// World-space shading normals, one per face corner in `faces` order. `None` when the
+    /// source format carries no normals.
+    pub normals: Option<Vec<[f64; 3]>>,
+    /// Whether the node's world transform mirrors geometry. Writers that bake world space
+    /// reverse winding for these meshes; writers that keep the transform do not.
+    pub mirrored: bool,
+    /// Whether the node's world transform is singular. OBJ writes zero normals for these nodes,
+    /// as Blender does.
+    pub singular: bool,
+    /// World-space per-vertex normals, indexed like `positions`: Blender's PLY vertex normals.
+    /// Empty for imported meshes.
+    pub vertex_normals: Vec<[f64; 3]>,
+    /// Per face: whether a corner normal differs from the face's flat normal, in local space.
+    /// Empty for imported meshes, where every face counts as flat.
+    pub smooth: Vec<bool>,
 }
 
 pub(crate) fn evaluated_meshes(
@@ -89,6 +104,12 @@ pub(crate) fn evaluated_meshes(
             .enumerate()
             .map(|(index, vertex)| (vertex.id, index))
             .collect::<BTreeMap<_, _>>();
+        let local = source
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let shading = shading::world_normals(source, &local, matrix)?;
         let mut faces = Vec::with_capacity(source.faces.len());
         for face in &source.faces {
             let Some(indices) = face
@@ -109,6 +130,11 @@ pub(crate) fn evaluated_meshes(
             name: node.name.clone(),
             positions,
             faces,
+            normals: Some(shading.corners),
+            vertex_normals: shading.vertices,
+            smooth: shading.smooth,
+            singular: shading::is_singular(matrix),
+            mirrored: shading::is_mirrored(matrix),
         });
     }
     Ok(output)
@@ -180,13 +206,21 @@ pub(crate) fn graph_from_meshes(meshes: Vec<ExchangeMesh>, scene_id: String) -> 
             .iter()
             .map(|position| DVec3::from_array(*position))
             .collect();
-        let mesh = Mesh::from_positions_and_faces(positions, geometry.faces).map_err(|error| {
-            PotError::with_details(
-                ErrorCode::ImportFailed,
-                "imported geometry is invalid",
-                serde_json::json!({ "reason": error.to_string(), "data_id": data_id }),
-            )
-        })?;
+        let mut mesh =
+            Mesh::from_positions_and_faces(positions, geometry.faces).map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    "imported geometry is invalid",
+                    serde_json::json!({ "reason": error.to_string(), "data_id": data_id }),
+                )
+            })?;
+        if let Some(normals) = &geometry.normals {
+            let normals = normals
+                .iter()
+                .map(|normal| DVec3::from_array(*normal))
+                .collect::<Vec<_>>();
+            shading::import_shading(&mut mesh, &normals)?;
+        }
         doc.data_blocks.insert(
             data_id.clone(),
             DataBlock {
@@ -236,11 +270,12 @@ pub(crate) fn import_graph_from_meshes(
     path: &std::path::Path,
     scene_id: String,
     format: &str,
+    losses: Vec<Loss>,
 ) -> Result<ImportedGraph> {
     let source = serde_json::json!({ "format": format, "path": path.display().to_string() });
     Ok(ImportedGraph {
         doc: graph_from_meshes(meshes, scene_id)?,
-        losses: Vec::new(),
+        losses,
         id_mappings: serde_json::json!({}),
         compat_blobs: Vec::new(),
         assets: Vec::new(),
@@ -376,6 +411,7 @@ pub mod gltf;
 pub mod obj;
 pub mod pdf;
 pub mod ply;
+pub(crate) mod shading;
 pub mod stl;
 pub mod svg;
 pub mod usd;

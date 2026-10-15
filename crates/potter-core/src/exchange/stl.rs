@@ -1,9 +1,13 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
+use glam::DVec3;
 use serde_json::json;
 
-use super::ExchangeMesh;
+use super::{ExchangeMesh, Loss, shading};
 use crate::error::{ErrorCode, PotError, Result};
+
+/// Per-component slack for stored facet normals, which exporters often round to two decimals.
+const FACET_NORMAL_TOLERANCE: f64 = 1.0e-2;
 
 pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     let triangle_count = meshes
@@ -31,7 +35,8 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     output.extend_from_slice(&header);
     output.extend_from_slice(&triangle_count_u32.to_le_bytes());
     for mesh in meshes {
-        for face in &mesh.faces {
+        let (faces, _) = shading::baked_faces(mesh)?;
+        for face in &faces {
             if face.len() < 3 {
                 continue;
             }
@@ -59,7 +64,7 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
+pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
     let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
     if bytes.len() < 84 {
         return Err(stl_error("binary STL header is truncated"));
@@ -84,25 +89,20 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     let mut positions = Vec::new();
     let mut faces = Vec::with_capacity(count);
     let mut indices = BTreeMap::<[u32; 3], usize>::new();
+    let mut facet_normals_disagree = false;
     for triangle in bytes[84..].as_chunks::<50>().0 {
+        let stored = DVec3::from_array(read_vec3(&triangle[..12])?.map(f64::from));
         let mut face = Vec::with_capacity(3);
-        let mut key = [0_u32; 3];
-        for corner in 0..3 {
+        let mut corners = [DVec3::ZERO; 3];
+        for (corner, slot) in corners.iter_mut().enumerate() {
             let start = 12 + corner * 12;
-            let mut position = [0.0_f64; 3];
-            for axis in 0..3 {
-                let offset = start + axis * 4;
-                let value = f32::from_le_bytes(
-                    triangle[offset..offset + 4]
-                        .try_into()
-                        .map_err(|_| stl_error("binary STL vertex is truncated"))?,
-                );
-                if !value.is_finite() {
-                    return Err(stl_error("binary STL contains a non-finite vertex"));
-                }
-                key[axis] = value.to_bits();
-                position[axis] = f64::from(value);
+            let value = read_vec3(&triangle[start..start + 12])?;
+            if !value.iter().all(|component| component.is_finite()) {
+                return Err(stl_error("binary STL contains a non-finite vertex"));
             }
+            let position = value.map(f64::from);
+            *slot = DVec3::from_array(position);
+            let key = value.map(f32::to_bits);
             let index = if let Some(index) = indices.get(&key) {
                 *index
             } else {
@@ -113,17 +113,70 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
             };
             face.push(index);
         }
+        facet_normals_disagree |= facet_normal_disagrees(stored, corners);
         faces.push(face);
     }
     if faces.is_empty() {
         return Err(stl_error("binary STL contains no triangles"));
     }
-    Ok(vec![ExchangeMesh {
-        id: "stl_mesh".to_owned(),
-        name: "STL Mesh".to_owned(),
-        positions,
-        faces,
-    }])
+    // Blender ignores stored facet normals and recomputes them from winding. Potter does the same,
+    // but reports a contradicted normal instead of dropping it silently.
+    let losses = if facet_normals_disagree {
+        vec![Loss {
+            feature_id: "mesh.normals".to_owned(),
+            data_id: None,
+            reason:
+                "stored STL facet normals disagree with winding and are ignored, matching Blender"
+                    .to_owned(),
+            suggestion: None,
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok((
+        vec![ExchangeMesh {
+            id: "stl_mesh".to_owned(),
+            name: "STL Mesh".to_owned(),
+            positions,
+            faces,
+            normals: None,
+            mirrored: false,
+            singular: false,
+            vertex_normals: Vec::new(),
+            smooth: Vec::new(),
+        }],
+        losses,
+    ))
+}
+
+fn read_vec3(bytes: &[u8]) -> Result<[f32; 3]> {
+    let mut value = [0.0_f32; 3];
+    for (axis, target) in value.iter_mut().enumerate() {
+        let raw = bytes
+            .get(axis * 4..axis * 4 + 4)
+            .ok_or_else(|| stl_error("binary STL vertex is truncated"))?;
+        *target = f32::from_le_bytes(
+            raw.try_into()
+                .map_err(|_| stl_error("binary STL vertex is truncated"))?,
+        );
+    }
+    Ok(value)
+}
+
+/// Whether a stored facet normal contradicts the winding normal of its triangle. Zero stored
+/// normals are absent, and degenerate triangles have no winding direction to contradict.
+fn facet_normal_disagrees(stored: DVec3, corners: [DVec3; 3]) -> bool {
+    if stored == DVec3::ZERO {
+        return false;
+    }
+    let Some(stored) = stored.try_normalize() else {
+        return true;
+    };
+    let winding = (corners[1] - corners[0]).cross(corners[2] - corners[0]);
+    let Some(winding) = winding.try_normalize() else {
+        return false;
+    };
+    (stored - winding).abs().max_element() > FACET_NORMAL_TOLERANCE
 }
 
 #[expect(
@@ -158,6 +211,6 @@ pub(crate) fn imported_graph(
     path: &Path,
     scene_id: String,
 ) -> Result<crate::exchange::ImportedGraph> {
-    let meshes = import(path)?;
-    crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "stl")
+    let (meshes, losses) = import(path)?;
+    crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "stl", losses)
 }
