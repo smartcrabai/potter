@@ -509,7 +509,7 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     losses
 }
 
-/// Blender color layers on meshes that nodes use. glTF export does not write them yet (COLOR_0 is
+/// Blender color layers on meshes that nodes use. glTF export does not write them yet (`COLOR_0` is
 /// pending), so each layer is a reported loss rather than a silent drop.
 fn mesh_color_losses(doc: &SceneDoc) -> Vec<Loss> {
     let data_ids = doc
