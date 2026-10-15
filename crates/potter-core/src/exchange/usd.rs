@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use super::{ExchangeMesh, ImportedGraph, evaluated_meshes, import_error};
+use super::{ExchangeMesh, ImportedGraph, Loss, evaluated_meshes, import_error, shading};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{Snapshot, animation::animated_transform},
@@ -169,10 +169,10 @@ pub(crate) fn export_usdz_with_root(
 pub(crate) fn import_usda(path: &Path, scene_id: String) -> Result<ImportedGraph> {
     let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
     let text = std::str::from_utf8(&bytes).map_err(|_| import_error("USDA layer is not UTF-8"))?;
-    let doc = parse_usda(text, scene_id)?;
+    let (doc, losses) = parse_usda(text, scene_id)?;
     Ok(ImportedGraph {
         doc,
-        losses: Vec::new(),
+        losses,
         id_mappings: json!({}),
         compat_blobs: Vec::new(),
         assets: Vec::new(),
@@ -185,10 +185,10 @@ pub(crate) fn import_usdz(path: &Path, scene_id: String) -> Result<ImportedGraph
     let (name, layer) = read_usdz_root(&archive)?;
     let text =
         std::str::from_utf8(layer).map_err(|_| import_error("USDZ root layer is not UTF-8"))?;
-    let doc = parse_usda(text, scene_id)?;
+    let (doc, losses) = parse_usda(text, scene_id)?;
     Ok(ImportedGraph {
         doc,
-        losses: Vec::new(),
+        losses,
         id_mappings: json!({}),
         compat_blobs: Vec::new(),
         assets: Vec::new(),
@@ -509,6 +509,7 @@ fn write_node(
             snapshot,
             node,
             exchange,
+            evaluated_mesh,
             &positions,
             child_depth,
         )?;
@@ -550,6 +551,7 @@ fn write_mesh(
     snapshot: &Snapshot,
     node: &Node,
     exchange: &ExchangeMesh,
+    source: &crate::geom::Mesh,
     positions: &[[f64; 3]],
     depth: usize,
 ) -> Result<()> {
@@ -591,6 +593,10 @@ fn write_mesh(
         output,
         &format!("{}point3f[] points = [{}]", spaces(d), points.join(", ")),
     );
+    line(
+        output,
+        &format!("{}uniform token subdivisionScheme = \"none\"", spaces(d)),
+    );
     let counts = exchange
         .faces
         .iter()
@@ -627,19 +633,20 @@ fn write_mesh(
             flat_indices.join(", ")
         ),
     );
-    let normals = exchange
-        .faces
+    // Points stay object-local and the transform sits on the xform, so normals are object-local too.
+    let local_points = positions
         .iter()
-        .map(|face| face_normal(face, positions))
-        .collect::<Result<Vec<_>>>()?;
-    let normals = normals
+        .map(|point| glam::DVec3::from_array(*point))
+        .collect::<Vec<_>>();
+    let corner_normals = crate::geom::normals::corner_normals(source, &local_points)?;
+    let normals = corner_normals
         .iter()
-        .map(|normal| vec3(*normal))
+        .map(|normal| vec3(normal.to_array()))
         .collect::<Result<Vec<_>>>()?;
     line(
         output,
         &format!(
-            "{}normal3f[] normals = [{}] (interpolation = \"uniform\")",
+            "{}normal3f[] normals = [{}] (interpolation = \"faceVarying\")",
             spaces(d),
             normals.join(", ")
         ),
@@ -1697,7 +1704,7 @@ fn write_animation(output: &mut String, doc: &SceneDoc, node: &Node, depth: usiz
     Ok(())
 }
 
-fn parse_usda(text: &str, scene_id: String) -> Result<SceneDoc> {
+fn parse_usda(text: &str, scene_id: String) -> Result<(SceneDoc, Vec<Loss>)> {
     if !text.starts_with(USDA_HEADER) {
         return Err(import_error("input is not a USDA 1.0 layer"));
     }
@@ -1707,6 +1714,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<SceneDoc> {
         .iter()
         .find(|prim| (prim.kind == "Xform" || prim.kind == "SkelRoot") && prim.name == "Scene");
     let mut doc = SceneDoc::new(scene_id);
+    let mut losses = Vec::new();
     let mut used_nodes = BTreeSet::<Id>::new();
     let mut used_data = BTreeSet::<Id>::new();
     let mut used_materials = BTreeSet::<Id>::new();
@@ -1833,6 +1841,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<SceneDoc> {
                 &mut used_data,
                 &mut used_actions,
                 &materials_by_name,
+                &mut losses,
             )?;
         }
     } else {
@@ -1848,6 +1857,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<SceneDoc> {
                 &mut used_data,
                 &mut used_actions,
                 &materials_by_name,
+                &mut losses,
             )?;
         }
     }
@@ -1876,7 +1886,7 @@ fn parse_usda(text: &str, scene_id: String) -> Result<SceneDoc> {
             json!({"reason": error.message}),
         )
     })?;
-    Ok(doc)
+    Ok((doc, losses))
 }
 
 fn import_node_tree(
@@ -1887,6 +1897,7 @@ fn import_node_tree(
     used_data: &mut BTreeSet<Id>,
     used_actions: &mut BTreeSet<Id>,
     materials: &BTreeMap<String, Id>,
+    losses: &mut Vec<Loss>,
 ) -> Result<()> {
     if prim.kind == "Scope" && prim.name == "Materials" {
         return Ok(());
@@ -1905,6 +1916,7 @@ fn import_node_tree(
                 used_data,
                 used_actions,
                 materials,
+                losses,
             )?;
         }
         return Ok(());
@@ -1942,8 +1954,8 @@ fn import_node_tree(
     let mut data_id = None;
     let mut node_materials = Vec::new();
     if let Some(mesh_prim) = mesh_prim {
-        let (positions, faces) = import_mesh(mesh_prim)?;
-        let mesh = Mesh::from_positions_and_faces(
+        let (positions, faces, normals) = import_mesh(mesh_prim, losses)?;
+        let mut mesh = Mesh::from_positions_and_faces(
             positions.iter().copied().map(DVec3::from_array).collect(),
             faces,
         )
@@ -1954,6 +1966,9 @@ fn import_node_tree(
                 json!({"reason": error.to_string()}),
             )
         })?;
+        if let Some(normals) = normals {
+            shading::import_shading(&mut mesh, &normals)?;
+        }
         let mesh_id = import_id(None, &format!("{}_mesh", id.as_str()), used_data)?;
         let (shape_keys, vertex_groups, vertex_weights) = import_deformation(mesh_prim, &mesh)?;
         doc.data_blocks.insert(
@@ -2158,19 +2173,20 @@ fn import_node_tree(
             used_data,
             used_actions,
             materials,
+            losses,
         )?;
     }
     Ok(())
 }
 
-type ImportedMesh = (Vec<[f64; 3]>, Vec<Vec<usize>>);
+type ImportedMesh = (Vec<[f64; 3]>, Vec<Vec<usize>>, Option<Vec<DVec3>>);
 type UsdDeformation = (
     Option<ShapeKeyData>,
     Vec<VertexGroup>,
     BTreeMap<u32, BTreeMap<Id, f64>>,
 );
 
-fn import_mesh(prim: &Prim) -> Result<ImportedMesh> {
+fn import_mesh(prim: &Prim, losses: &mut Vec<Loss>) -> Result<ImportedMesh> {
     let point_values = property_numbers(prim, "points")
         .ok_or_else(|| import_error("USD mesh points are missing"))?;
     if point_values.len() % 3 != 0 {
@@ -2220,8 +2236,97 @@ fn import_mesh(prim: &Prim) -> Result<ImportedMesh> {
         faces.push(face);
         offset = end;
     }
-    Ok((points, faces))
+    let normals = import_normals(prim, &points, &faces, losses)?;
+    Ok((points, faces, normals))
 }
+
+/// Corner normals for `prim`, from `primvars:normals` or the legacy `normals` attribute.
+///
+/// The `interpolation` metadata decides which value belongs to each face corner. Normals that
+/// cannot be mapped are dropped with a loss instead of being imported onto the wrong corners.
+fn import_normals(
+    prim: &Prim,
+    points: &[[f64; 3]],
+    faces: &[Vec<usize>],
+    losses: &mut Vec<Loss>,
+) -> Result<Option<Vec<DVec3>>> {
+    let Some(raw) = prim
+        .properties
+        .get("primvars:normals")
+        .or_else(|| prim.properties.get("normals"))
+    else {
+        return Ok(None);
+    };
+    let (value_text, interpolation) = split_interpolation(raw);
+    let Some(interpolation) = interpolation else {
+        losses.push(normal_loss("USD normals have no interpolation metadata"));
+        return Ok(None);
+    };
+    let values = scan_numbers(value_text)?;
+    if values.len() % 3 != 0 {
+        return Err(import_error("USD mesh normal array has an invalid size"));
+    }
+    let corner_total = faces.iter().map(Vec::len).sum::<usize>();
+    let (expected, corner_values) = match interpolation.as_str() {
+        "faceVarying" => (corner_total, (0..corner_total).collect::<Vec<_>>()),
+        "vertex" | "varying" => (points.len(), faces.iter().flatten().copied().collect()),
+        "uniform" => (
+            faces.len(),
+            faces
+                .iter()
+                .enumerate()
+                .flat_map(|(face, corners)| std::iter::repeat_n(face, corners.len()))
+                .collect(),
+        ),
+        "constant" => (1, vec![0; corner_total]),
+        other => {
+            losses.push(normal_loss(&format!(
+                "USD normals use unsupported interpolation `{other}`"
+            )));
+            return Ok(None);
+        }
+    };
+    if values.len() != expected * 3 {
+        return Err(import_error(
+            "USD mesh normals do not match their interpolation",
+        ));
+    }
+    let units = values
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|value| DVec3::from_array(*value).normalize_or_zero())
+        .collect::<Vec<_>>();
+    if units.contains(&DVec3::ZERO) {
+        losses.push(normal_loss("USD normals contain a zero-length vector"));
+        return Ok(None);
+    }
+    Ok(Some(
+        corner_values
+            .into_iter()
+            .map(|index| units[index])
+            .collect(),
+    ))
+}
+
+/// Splits an attribute's raw text into its value text and its `interpolation` metadata.
+fn split_interpolation(raw: &str) -> (&str, Option<String>) {
+    let Some(position) = raw.find("interpolation") else {
+        return (raw, None);
+    };
+    let value = raw[..position].rfind('(').map_or(raw, |open| &raw[..open]);
+    (value, first_string(&raw[position..]))
+}
+
+fn normal_loss(reason: &str) -> Loss {
+    Loss {
+        feature_id: "mesh.normals".to_owned(),
+        data_id: None,
+        reason: reason.to_owned(),
+        suggestion: Some("use --allow-lossy to import the file with derived shading".to_owned()),
+    }
+}
+
 fn import_deformation(prim: &Prim, mesh: &Mesh) -> Result<UsdDeformation> {
     let Some(encoded) = property_string(prim, "potter:deformation") else {
         return Ok((None, Vec::new(), BTreeMap::new()));
@@ -2951,34 +3056,6 @@ fn integral_index(value: f64) -> Result<usize> {
         return Err(import_error("USD mesh index is invalid"));
     }
     Ok(value as usize)
-}
-
-fn face_normal(face: &[usize], positions: &[[f64; 3]]) -> Result<[f64; 3]> {
-    let a = positions
-        .get(
-            *face
-                .first()
-                .ok_or_else(|| import_error("USD face is empty"))?,
-        )
-        .ok_or_else(|| import_error("USD face references an absent point"))?;
-    let b = positions
-        .get(
-            *face
-                .get(1)
-                .ok_or_else(|| import_error("USD face has fewer than three vertices"))?,
-        )
-        .ok_or_else(|| import_error("USD face references an absent point"))?;
-    let c = positions
-        .get(
-            *face
-                .get(2)
-                .ok_or_else(|| import_error("USD face has fewer than three vertices"))?,
-        )
-        .ok_or_else(|| import_error("USD face references an absent point"))?;
-    let normal = (DVec3::from_array(*b) - DVec3::from_array(*a))
-        .cross(DVec3::from_array(*c) - DVec3::from_array(*a))
-        .normalize_or_zero();
-    Ok(normal.to_array())
 }
 
 fn generated_uvs(points: &[[f64; 3]]) -> Vec<[f64; 2]> {

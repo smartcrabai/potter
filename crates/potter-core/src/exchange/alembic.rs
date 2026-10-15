@@ -12,7 +12,7 @@ use super::{ImportedGraph, Loss, evaluated_meshes, import_error};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot},
-    geom::Mesh,
+    geom::{Mesh, normals::corner_normals},
     model::{Action, DataBlock, FCurve, Id, Interpolation, Keyframe, Node, SceneDoc, Transform},
 };
 
@@ -378,7 +378,7 @@ struct MeshSample {
     positions: Vec<[f64; 3]>,
     faces: Vec<Vec<usize>>,
     uvs: Option<Vec<Vec<[f64; 2]>>>,
-    normals: Option<Vec<[f64; 3]>>,
+    normals: Vec<[f64; 3]>,
 }
 
 fn sample_frames(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<f64>> {
@@ -441,8 +441,10 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
         faces.push(indices);
     }
     for attribute in mesh.attributes.keys() {
-        let supported_attribute = matches!(attribute.as_str(), "uv_map" | "alembic_normals")
-            || (allow_lossy && attribute == "vertex_groups");
+        let supported_attribute = matches!(
+            attribute.as_str(),
+            "uv_map" | "shade_smooth" | "sharp" | "custom_normal"
+        ) || (allow_lossy && attribute == "vertex_groups");
         if !supported_attribute {
             return Err(unsupported(
                 "mesh.attribute",
@@ -451,103 +453,21 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
         }
     }
     let uvs = mesh_uvs(mesh)?;
-    let normals = mesh_normals(mesh, &faces)?;
+    let points = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let normals = corner_normals(mesh, &points)?
+        .into_iter()
+        .map(|normal| normal.to_array())
+        .collect::<Vec<_>>();
     Ok(MeshSample {
         positions,
         faces,
         uvs,
         normals,
     })
-}
-
-fn mesh_normals(mesh: &Mesh, faces: &[Vec<usize>]) -> Result<Option<Vec<[f64; 3]>>> {
-    let Some(attribute) = mesh.attributes.get("alembic_normals") else {
-        return Ok(None);
-    };
-    let scope = attribute
-        .get("scope")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::SceneInvalid,
-                "Alembic normals have no geometry scope",
-            )
-        })?;
-    let source = attribute
-        .get("values")
-        .and_then(Value::as_array)
-        .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "Alembic normals have no values"))?;
-    let values = source
-        .iter()
-        .map(|value| {
-            let vector = value
-                .as_array()
-                .filter(|components| components.len() == 3)
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "Alembic normal must have three values",
-                    )
-                })?;
-            let result = [
-                vector[0].as_f64().ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "Alembic normal is not numeric")
-                })?,
-                vector[1].as_f64().ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "Alembic normal is not numeric")
-                })?,
-                vector[2].as_f64().ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "Alembic normal is not numeric")
-                })?,
-            ];
-            if result.iter().any(|component| !component.is_finite()) {
-                return Err(PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "Alembic normal is not finite",
-                ));
-            }
-            Ok(result)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut output = Vec::new();
-    let mut corner = 0;
-    for (face_index, face) in faces.iter().enumerate() {
-        for vertex in face {
-            let value_index = match scope {
-                "vertex" | "varying" => *vertex,
-                "facevarying" => corner,
-                "uniform" => face_index,
-                "constant" => 0,
-                _ => {
-                    return Err(unsupported(
-                        "alembic.geom_scope",
-                        format!("Alembic normal scope `{scope}` is unsupported"),
-                    ));
-                }
-            };
-            output.push(*values.get(value_index).ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "Alembic normal value count does not match its scope",
-                )
-            })?);
-            corner += 1;
-        }
-    }
-    let expected = match scope {
-        "vertex" | "varying" => mesh.vertices.len(),
-        "facevarying" => corner,
-        "uniform" => faces.len(),
-        "constant" => 1,
-        _ => 0,
-    };
-    if values.len() != expected {
-        return Err(PotError::new(
-            ErrorCode::SceneInvalid,
-            "Alembic normal value count does not match its scope",
-        ));
-    }
-    Ok(Some(output))
 }
 
 fn mesh_uvs(mesh: &Mesh) -> Result<Option<Vec<Vec<[f64; 2]>>>> {
@@ -776,14 +696,7 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
         counts.push(encode_i32s(&face_counts));
         indices.push(encode_i32s(&face_indices));
         bounds.push(encode_bounds(&sample.positions)?);
-        let generated_normals;
-        let normal_values = if let Some(normals) = &sample.normals {
-            normals.as_slice()
-        } else {
-            generated_normals = corner_normals(sample)?;
-            &generated_normals
-        };
-        normals.push(encode_vec3_f32(normal_values)?);
+        normals.push(encode_vec3_f32(&sample.normals)?);
         let face_uvs = if let Some(uvs) = &sample.uvs {
             if uvs.len() != sample.faces.len() {
                 return Err(PotError::new(
@@ -875,42 +788,6 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
         properties: vec![geometry],
         children: Vec::new(),
     })
-}
-
-fn corner_normals(sample: &MeshSample) -> Result<Vec<[f64; 3]>> {
-    let mut normals = Vec::new();
-    for face in &sample.faces {
-        let first = *face
-            .first()
-            .ok_or_else(|| import_error("Alembic mesh contains an empty face"))?;
-        let second = *face
-            .get(1)
-            .ok_or_else(|| import_error("Alembic mesh face has fewer than three vertices"))?;
-        let third = *face
-            .get(2)
-            .ok_or_else(|| import_error("Alembic mesh face has fewer than three vertices"))?;
-        let a = DVec3::from_array(
-            *sample
-                .positions
-                .get(first)
-                .ok_or_else(|| import_error("Alembic mesh index is out of range"))?,
-        );
-        let b = DVec3::from_array(
-            *sample
-                .positions
-                .get(second)
-                .ok_or_else(|| import_error("Alembic mesh index is out of range"))?,
-        );
-        let c = DVec3::from_array(
-            *sample
-                .positions
-                .get(third)
-                .ok_or_else(|| import_error("Alembic mesh index is out of range"))?,
-        );
-        let normal = (b - a).cross(c - a).normalize_or_zero().to_array();
-        normals.extend(std::iter::repeat_n(normal, face.len()));
-    }
-    Ok(normals)
 }
 
 fn generated_uvs(points: &[[f64; 3]]) -> Vec<[f64; 2]> {
@@ -2472,7 +2349,7 @@ fn import_polymesh(
             positions,
             faces,
             uvs: None,
-            normals: None,
+            normals: Vec::new(),
         });
     }
     let first = mesh_samples
@@ -2531,7 +2408,7 @@ fn import_polymesh(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let normal_samples = normals
+    let normal_samples = match normals
         .map(|parameter| {
             (0..sample_count)
                 .map(|sample_index| {
@@ -2546,7 +2423,21 @@ fn import_polymesh(
                 })
                 .collect::<Result<Vec<_>>>()
         })
-        .transpose()?;
+        .transpose()
+    {
+        Ok(samples) => samples,
+        Err(error) => {
+            losses.push(Loss {
+                feature_id: "mesh.normals".to_owned(),
+                data_id: Some(object.name.clone()),
+                reason: format!("Alembic normals were not imported: {}", error.message),
+                suggestion: Some(
+                    "export normals with one value per geometry scope element".to_owned(),
+                ),
+            });
+            None
+        }
+    };
     let uv_samples = uv
         .map(|parameter| {
             (0..sample_count)
@@ -2563,11 +2454,9 @@ fn import_polymesh(
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?;
-    if let Some(normal_values) = normal_samples.as_ref().and_then(|values| values.first()) {
-        mesh.attributes.insert(
-            "alembic_normals".to_owned(),
-            json!({"scope":normal_values.0,"values":normal_values.1}),
-        );
+    if let Some((scope, values)) = normal_samples.as_ref().and_then(|samples| samples.first()) {
+        let corner_values = normal_corners(&first.faces, scope, values)?;
+        super::shading::import_shading(&mut mesh, &corner_values)?;
     }
     if let Some(uv_values) = uv_samples.as_ref().and_then(|values| values.first()) {
         let mut corner_offset = 0;
@@ -2759,7 +2648,7 @@ pub(crate) fn read_mesh_cache(
             positions: points.clone(),
             faces: faces.clone(),
             uvs: None,
-            normals: None,
+            normals: Vec::new(),
         };
         let uv_faces = uv
             .map(|parameter| {
@@ -3078,6 +2967,38 @@ fn validate_cache_parameter_samples(property: &ParsedProperty, sample_count: usi
         ));
     }
     Ok(())
+}
+
+/// Per-corner normals from an Alembic normal parameter, in `faces` order.
+fn normal_corners(faces: &[Vec<usize>], scope: &str, values: &[Vec<f64>]) -> Result<Vec<DVec3>> {
+    let mut corner = 0;
+    let mut output = Vec::new();
+    for (face_index, face) in faces.iter().enumerate() {
+        for vertex in face {
+            let value_index = match scope {
+                "vertex" | "varying" => *vertex,
+                "facevarying" => corner,
+                "uniform" => face_index,
+                "constant" => 0,
+                _ => {
+                    return Err(unsupported(
+                        "alembic.geom_scope",
+                        format!("Alembic normal scope `{scope}` is unsupported"),
+                    ));
+                }
+            };
+            let normal = values
+                .get(value_index)
+                .and_then(|components| <[f64; 3]>::try_from(components.as_slice()).ok())
+                .filter(|components| components.iter().all(|component| component.is_finite()))
+                .ok_or_else(|| {
+                    import_error("Alembic normal is not a finite three-component vector")
+                })?;
+            output.push(DVec3::from_array(normal));
+            corner += 1;
+        }
+    }
+    Ok(output)
 }
 
 fn cache_uv_faces(

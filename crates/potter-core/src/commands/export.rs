@@ -101,11 +101,12 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         })
     } else {
         let snapshot = Snapshot::evaluate_with_cache(&doc, &context, Some(project.path()))?;
-        let losses = export_losses(&doc, format);
+        let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
+        let mut losses = export_losses(&doc, format);
+        losses.extend(exchange::shading::shading_losses(format, &meshes));
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
         }
-        let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
         let artifacts = match format {
             "glb" => {
                 let (json_bytes, binary) =

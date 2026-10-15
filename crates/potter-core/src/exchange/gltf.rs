@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-use super::import_error;
+use super::{import_error, shading};
 
 const POT_TO_GLTF: DMat4 = DMat4::from_cols_array(&[
     1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -4828,7 +4828,8 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             } else {
                 Vec::new()
             };
-            if import_shading(&mut mesh, &corner_normals, &morph_targets)? {
+            shading::import_shading(&mut mesh, &corner_normals)?;
+            if morph_normals_disagree(&mesh, &corner_normals, &morph_targets) {
                 morph_normal_loss = true;
             }
         }
@@ -5251,97 +5252,23 @@ fn weld_copies(
     Ok((welded_of, first))
 }
 
-/// Derives per-face smooth flags and custom normals from imported glTF NORMAL data.
+/// Whether morph NORMAL deltas disagree with normals derived from the morphed geometry.
+/// Runs after `shading::import_shading`, so `mesh` already carries the imported shading.
 /// `normals` and each target's NORMAL deltas hold one value per face corner in `mesh.faces` order.
-/// Returns true when morph NORMAL deltas disagree with normals derived from the morphed geometry.
-fn import_shading(
-    mesh: &mut Mesh,
+fn morph_normals_disagree(
+    mesh: &Mesh,
     normals: &[DVec3],
     morph_targets: &[MorphNormalTarget],
-) -> Result<bool> {
+) -> bool {
     const TOLERANCE: f64 = 1.0e-4;
     fn close(left: DVec3, right: DVec3) -> bool {
         (left - right).abs().max_element() <= TOLERANCE
     }
-    let index_of = mesh
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect::<BTreeMap<_, _>>();
-    let corners = mesh
-        .faces
-        .iter()
-        .map(|face| {
-            face.vertices
-                .iter()
-                .map(|id| {
-                    index_of
-                        .get(id)
-                        .copied()
-                        .ok_or_else(|| import_error("glTF face references a missing vertex"))
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
     let points = mesh
         .vertices
         .iter()
         .map(|vertex| vertex.co)
         .collect::<Vec<_>>();
-    let mut smooth = Vec::with_capacity(corners.len());
-    let mut corner = 0;
-    for face_corners in &corners {
-        let mut area = DVec3::ZERO;
-        for (offset, vertex) in face_corners.iter().enumerate() {
-            let next = face_corners[(offset + 1) % face_corners.len()];
-            area += points[*vertex].cross(points[next]);
-        }
-        let flat = area.normalize_or_zero();
-        let end = corner + face_corners.len();
-        smooth.push(
-            normals[corner..end]
-                .iter()
-                .any(|normal| !close(*normal, flat)),
-        );
-        corner = end;
-    }
-    if smooth.iter().any(|value| *value) {
-        let values = mesh
-            .faces
-            .iter()
-            .zip(&smooth)
-            .map(|(face, value)| (format!("f{}", face.id), json!(value)))
-            .collect::<serde_json::Map<String, Value>>();
-        mesh.attributes.insert(
-            "shade_smooth".to_owned(),
-            json!({ "domain": "face", "type": "bool", "values": values }),
-        );
-    }
-    let computed = corner_normals(mesh, &points).ok();
-    let mut custom_values = serde_json::Map::new();
-    let mut corner = 0;
-    for (face, face_corners) in mesh.faces.iter().zip(&corners) {
-        let end = corner + face_corners.len();
-        let mismatch = match &computed {
-            Some(expected) => (corner..end).any(|index| !close(expected[index], normals[index])),
-            None => true,
-        };
-        if mismatch {
-            let values = normals[corner..end]
-                .iter()
-                .map(|normal| normal.normalize_or_zero().to_array())
-                .collect::<Vec<_>>();
-            custom_values.insert(format!("f{}", face.id), json!(values));
-        }
-        corner = end;
-    }
-    if !custom_values.is_empty() {
-        mesh.attributes.insert(
-            "custom_normal".to_owned(),
-            json!({ "domain": "corner", "type": "float3", "values": custom_values }),
-        );
-    }
     let mut disagree = false;
     // The exporter's base layer includes the imported custom normals, so morph fallbacks come from it.
     let base = if morph_targets.is_empty() {
@@ -5371,7 +5298,7 @@ fn import_shading(
             }
         }
     }
-    Ok(disagree)
+    disagree
 }
 
 fn append_triangles(

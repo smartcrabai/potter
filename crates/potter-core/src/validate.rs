@@ -588,7 +588,14 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
                 losses.extend(crate::commands::export::avatar_settings_loss(doc, "blend"));
                 losses
             } else {
-                crate::commands::export::export_losses(doc, format)
+                let mut losses = crate::commands::export::export_losses(doc, format);
+                let context = crate::eval::EvaluationContext::default();
+                if let Ok(snapshot) = crate::eval::Snapshot::evaluate(doc, &context)
+                    && let Ok(meshes) = crate::exchange::evaluated_meshes(doc, &snapshot)
+                {
+                    losses.extend(crate::exchange::shading::shading_losses(format, &meshes));
+                }
+                losses
             };
             let supported = entry["status"] == "supported";
             if !supported {

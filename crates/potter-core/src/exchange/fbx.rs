@@ -10,11 +10,11 @@ use serde_json::{Value, json};
 
 use serde::de::DeserializeOwned;
 
-use super::{ImportedGraph, Loss, import_error};
+use super::{ImportedGraph, Loss, import_error, shading};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::Mesh,
+    geom::{Mesh, normals::corner_normals},
     model::{
         Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode,
         ImageColorspace, ImageSource, Interpolation, Keyframe, Material, Node, SceneDoc,
@@ -1161,7 +1161,12 @@ fn write_geometry(
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
 ) -> Result<()> {
-    if !mesh.attributes.is_empty() {
+    // Shading attributes are carried by the exported normal layer; any other attribute is refused.
+    if mesh
+        .attributes
+        .keys()
+        .any(|name| !crate::geom::normals::SHADING_ATTRIBUTES.contains(&name.as_str()))
+    {
         return Err(PotError::with_details(
             ErrorCode::UnrepresentableFeature,
             "FBX adapter does not represent mesh custom attributes",
@@ -1288,6 +1293,7 @@ fn write_geometry(
         }
     }
     output.push_str("\n\t\t}\n");
+    write_normal_layer(output, mesh)?;
     if !node.materials.is_empty() {
         write!(output, "\t\tLayerElementMaterial: 0 {{\n\t\t\tVersion: 101\n\t\t\tName: \"\"\n\t\t\tMappingInformationType: \"ByPolygon\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tMaterials: *{} {{\n\t\t\t\ta: ", mesh.faces.len()).map_err(write_error)?;
         for (index, face) in mesh.faces.iter().enumerate() {
@@ -1305,9 +1311,63 @@ fn write_geometry(
             }
             write!(output, "{}", face.material_index).map_err(write_error)?;
         }
-        output.push_str("\n\t\t\t}\n\t\t}\n\t\tLayer: 0 {\n\t\t\tVersion: 100\n\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementMaterial\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n\t\t}\n");
+        output.push_str("\n\t\t\t}\n\t\t}\n");
     }
-    output.push_str("\t}\n");
+    output.push_str("\t\tLayer: 0 {\n\t\t\tVersion: 100\n\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementNormal\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
+    if !node.materials.is_empty() {
+        output.push_str("\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementMaterial\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
+    }
+    output.push_str("\t\t}\n\t}\n");
+    Ok(())
+}
+
+/// Writes `LayerElementNormal` in Blender's default layout: mesh-local corner normals, stored
+/// as unique values and indexed per polygon vertex. `LayerElementSmoothing` is never written,
+/// matching Blender's default export.
+fn write_normal_layer(output: &mut String, mesh: &Mesh) -> Result<()> {
+    let points = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let mut unique = BTreeMap::<[u64; 3], usize>::new();
+    let mut values = Vec::<[f64; 3]>::new();
+    let mut indices = Vec::<usize>::new();
+    for corner in corner_normals(mesh, &points)? {
+        let unit = corner
+            .try_normalize()
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::ExportFailed, "FBX normal cannot be normalized")
+            })?
+            .to_array();
+        let key = unit.map(f64::to_bits);
+        let index = *unique.entry(key).or_insert_with(|| {
+            values.push(unit);
+            values.len() - 1
+        });
+        indices.push(index);
+    }
+    write!(
+        output,
+        "\t\tLayerElementNormal: 0 {{\n\t\t\tVersion: 101\n\t\t\tName: \"\"\n\t\t\tMappingInformationType: \"ByPolygonVertex\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tNormals: *{} {{\n\t\t\t\ta: ",
+        values.len().saturating_mul(3)
+    )
+    .map_err(write_error)?;
+    let components = values
+        .iter()
+        .flatten()
+        .map(|value| fmt_num(*value))
+        .collect::<Vec<_>>();
+    output.push_str(&components.join(","));
+    write!(
+        output,
+        "\n\t\t\t}}\n\t\t\tNormalsIndex: *{} {{\n\t\t\t\ta: ",
+        indices.len()
+    )
+    .map_err(write_error)?;
+    let encoded = indices.iter().map(usize::to_string).collect::<Vec<_>>();
+    output.push_str(&encoded.join(","));
+    output.push_str("\n\t\t\t}\n\t\t}\n");
     Ok(())
 }
 
@@ -1438,14 +1498,12 @@ fn import_bytes_with_base(
                         json!({ "feature_id": format!("format.fbx.geometry.{kind}") }),
                     ));
                 }
-                let geometry = parse_geometry(object)?;
+                let geometry = parse_geometry(object, id, &mut losses)?;
                 for attribute in [
-                    "LayerElementNormal",
                     "LayerElementUV",
                     "LayerElementTangent",
                     "LayerElementBinormal",
                     "LayerElementColor",
-                    "LayerElementSmoothing",
                 ] {
                     if object.child(attribute).is_some() {
                         losses.push(Loss {
@@ -1728,6 +1786,9 @@ fn import_bytes_with_base(
                     json!({"reason":error.to_string(),"geometry_id":geometry_number}),
                 )
             })?;
+            if let Some(normals) = &geometry.normals {
+                shading::import_shading(&mut mesh, normals)?;
+            }
             for (face_index, face) in mesh.faces.iter_mut().enumerate() {
                 let slot = geometry
                     .material_indices
@@ -1844,6 +1905,8 @@ struct ImportedGeometry {
     faces: Vec<Vec<usize>>,
     material_indices: Vec<u32>,
     deformation: Option<Value>,
+    /// Mesh-local corner normals in `faces` order, unit length; `None` when absent.
+    normals: Option<Vec<DVec3>>,
 }
 
 fn decode_deformation_field<T: DeserializeOwned>(
@@ -1993,7 +2056,11 @@ fn parse_model(node: &FbxNode, numeric_id: i64) -> Result<ImportedModel> {
     })
 }
 
-fn parse_geometry(node: &FbxNode) -> Result<ImportedGeometry> {
+fn parse_geometry(
+    node: &FbxNode,
+    geometry_id: i64,
+    losses: &mut Vec<Loss>,
+) -> Result<ImportedGeometry> {
     let vertex_values = numeric_array(
         node.child("Vertices")
             .ok_or_else(|| import_error("FBX geometry has no Vertices array"))?,
@@ -2086,12 +2153,139 @@ fn parse_geometry(node: &FbxNode) -> Result<ImportedGeometry> {
             })
         })
         .transpose()?;
+    let normals = parse_normal_layer(node, positions.len(), &faces, geometry_id, losses)?;
+    if normals.is_none() && node.child("LayerElementSmoothing").is_some() {
+        losses.push(Loss {
+            feature_id: "format.fbx.smoothing".to_owned(),
+            data_id: Some(geometry_id.to_string()),
+            reason: "FBX LayerElementSmoothing without LayerElementNormal data is not represented in the Potter mesh model".to_owned(),
+            suggestion: None,
+        });
+    }
     Ok(ImportedGeometry {
         positions,
         faces,
         material_indices,
         deformation,
+        normals,
     })
+}
+
+/// Reads `LayerElementNormal` as mesh-local corner normals in `faces` order.
+///
+/// Normals map per polygon vertex (`ByPolygonVertex`) or per control point (`ByVertice` or
+/// `ByVertex`), stored directly (`Direct`) or through `NormalsIndex` (`IndexToDirect`). Other
+/// mappings and zero-length normals are reported as losses and yield no normals.
+fn parse_normal_layer(
+    node: &FbxNode,
+    point_count: usize,
+    faces: &[Vec<usize>],
+    geometry_id: i64,
+    losses: &mut Vec<Loss>,
+) -> Result<Option<Vec<DVec3>>> {
+    let Some(layer) = node.child("LayerElementNormal") else {
+        return Ok(None);
+    };
+    let mapping = layer
+        .child("MappingInformationType")
+        .and_then(FbxNode::first_arg)
+        .unwrap_or("");
+    let reference = layer
+        .child("ReferenceInformationType")
+        .and_then(FbxNode::first_arg)
+        .unwrap_or("");
+    let by_corner = match mapping {
+        "ByPolygonVertex" => true,
+        "ByVertice" | "ByVertex" => false,
+        _ => {
+            losses.push(normal_loss(
+                geometry_id,
+                format!("FBX LayerElementNormal mapping `{mapping}` is not represented in the Potter mesh model"),
+            ));
+            return Ok(None);
+        }
+    };
+    let indexed = match reference {
+        "Direct" => false,
+        "IndexToDirect" => true,
+        _ => {
+            losses.push(normal_loss(
+                geometry_id,
+                format!("FBX LayerElementNormal reference `{reference}` is not represented in the Potter mesh model"),
+            ));
+            return Ok(None);
+        }
+    };
+    let values = numeric_array(
+        layer
+            .child("Normals")
+            .ok_or_else(|| import_error("FBX LayerElementNormal has no Normals array"))?,
+    )?;
+    if values.len() % 3 != 0 || values.iter().any(|value| !value.is_finite()) {
+        return Err(import_error(
+            "FBX Normals array must contain finite xyz triples",
+        ));
+    }
+    let vectors = values
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|value| DVec3::from_array([value[0], value[1], value[2]]))
+        .collect::<Vec<_>>();
+    let indices = if indexed {
+        Some(integer_array(layer.child("NormalsIndex").ok_or_else(
+            || import_error("FBX LayerElementNormal has no NormalsIndex array"),
+        )?)?)
+    } else {
+        None
+    };
+    let polygon_points = faces.iter().flatten().copied().collect::<Vec<_>>();
+    let element_count = indices.as_ref().map_or(vectors.len(), Vec::len);
+    let expected = if by_corner {
+        polygon_points.len()
+    } else {
+        point_count
+    };
+    if element_count != expected {
+        return Err(import_error(
+            "FBX LayerElementNormal count does not match its mapping",
+        ));
+    }
+    let mut normals = Vec::with_capacity(polygon_points.len());
+    for (corner, point) in polygon_points.iter().enumerate() {
+        let element = if by_corner { corner } else { *point };
+        let value_index = match &indices {
+            Some(indices) => {
+                let raw = indices
+                    .get(element)
+                    .ok_or_else(|| import_error("FBX LayerElementNormal index is missing"))?;
+                usize::try_from(*raw)
+                    .map_err(|_| import_error("FBX LayerElementNormal index is negative"))?
+            }
+            None => element,
+        };
+        let vector = vectors
+            .get(value_index)
+            .ok_or_else(|| import_error("FBX LayerElementNormal index is outside Normals"))?;
+        let Some(unit) = vector.try_normalize() else {
+            losses.push(normal_loss(
+                geometry_id,
+                "FBX LayerElementNormal contains a zero-length normal",
+            ));
+            return Ok(None);
+        };
+        normals.push(unit);
+    }
+    Ok(Some(normals))
+}
+
+fn normal_loss(geometry_id: i64, reason: impl Into<String>) -> Loss {
+    Loss {
+        feature_id: "mesh.normals".to_owned(),
+        data_id: Some(geometry_id.to_string()),
+        reason: reason.into(),
+        suggestion: None,
+    }
 }
 
 fn parse_material(node: &FbxNode, numeric_id: i64) -> Result<ImportedMaterial> {
