@@ -19,7 +19,7 @@ use crate::{
     model::{
         ArmatureData, Constraint, ConstraintType, DataBlock, Driver, DriverType, DriverVariable,
         DriverVariableType, Id, Modifier, Node, ParentType, PoseBone, SceneDoc, ShapeKeyData,
-        Transform,
+        Transform, VertexGroup,
     },
 };
 
@@ -2022,6 +2022,7 @@ fn solve_legacy_ik(
     Ok(())
 }
 /// Blend shape keys using caller-evaluated animated or driven key values.
+/// `mesh` must be the source mesh: weights are read from `data_block.vertex_weights` by source vertex ID.
 pub(crate) fn apply_shape_keys_with_values(
     mesh: &mut Mesh,
     shape_keys: &ShapeKeyData,
@@ -2375,6 +2376,29 @@ fn interpolate_absolute_shape_keys(
     Ok(values)
 }
 
+/// Per-vertex weights of each deform group, indexed like `groups` and keyed by vertex ID.
+fn vertex_group_weights(mesh: &Mesh, groups: &[VertexGroup]) -> Vec<HashMap<u32, f64>> {
+    let by_group = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object);
+    groups
+        .iter()
+        .map(|group| {
+            by_group
+                .and_then(|by_group| by_group.get(&group.name))
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(key, value)| {
+                    let vertex_id = key.strip_prefix('v')?.parse::<u32>().ok()?;
+                    Some((vertex_id, value.as_f64()?))
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Apply one Armature modifier's linear-blend-skinning transform in mesh-local space.
 ///
 /// Vertex group names bind to deform bone names. When `use_vertex_groups` is false, all deforming
@@ -2423,7 +2447,7 @@ pub(crate) fn apply_armature_skinning(
         let group = data_block
             .vertex_groups
             .iter()
-            .find(|group| group.name.as_str() == bone.name.as_str());
+            .position(|group| group.name.as_str() == bone.name.as_str());
         let transform =
             object_inverse * armature_world * matrices.skin * armature_inverse * object_world;
         if !finite_matrix(transform) {
@@ -2437,6 +2461,11 @@ pub(crate) fn apply_armature_skinning(
     if transforms.is_empty() {
         return Ok(());
     }
+    let weights_by_group = if use_groups {
+        vertex_group_weights(mesh, &data_block.vertex_groups)
+    } else {
+        Vec::new()
+    };
     for vertex in &mut mesh.vertices {
         let armature_position = object_to_armature.transform_point3(vertex.co);
         if !armature_position.is_finite() {
@@ -2450,12 +2479,8 @@ pub(crate) fn apply_armature_skinning(
         for (bone_id, bone, group, matrix) in &transforms {
             let mut weight = if use_groups {
                 group
-                    .and_then(|group| {
-                        data_block
-                            .vertex_weights
-                            .get(&vertex.id)
-                            .and_then(|weights| weights.get(&group.id))
-                    })
+                    .and_then(|group| weights_by_group.get(group))
+                    .and_then(|weights| weights.get(&vertex.id))
                     .copied()
                     .unwrap_or(0.0)
             } else {

@@ -714,6 +714,7 @@ mod tests {
             evaluation_frame: 1.0,
             asset_root: None,
             pending_assets: BTreeMap::new(),
+            warnings: Vec::new(),
         };
         let operation = json!({
             "op":"mesh.separate",
@@ -809,6 +810,7 @@ mod tests {
             evaluation_frame: 1.0,
             asset_root: None,
             pending_assets: BTreeMap::new(),
+            warnings: Vec::new(),
         };
         let occupied = Id::new("mesh_separated_1").unwrap();
         engine.doc.nodes.insert(occupied, Node::default());

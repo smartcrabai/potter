@@ -240,6 +240,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             "compatibility": doc.compatibility,
             "conversions": conversions,
             "losses": losses,
+            "warnings": snapshot.warnings,
         })
     };
     Ok((Some(project.info()?), result))

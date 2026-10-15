@@ -116,12 +116,11 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             None,
             &bind_nodes,
         )?;
-        let mut source_bind_mesh = bind_snapshot
+        let source_bind_mesh = bind_snapshot
             .meshes
             .get(&subject_id)
             .cloned()
             .ok_or_else(|| PotError::invalid_operation("evaluated source mesh is unavailable"))?;
-        crate::eval::attach_vertex_group_weights(&mut source_bind_mesh, source_data);
         let binding = if modifier.modifier_type == "laplacian_deform" {
             let group_name = modifier
                 .params
@@ -634,6 +633,12 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
     Ok(changed)
 }
 
+/// `modifier.attribute_dropped` reports output that was applied with attributes lost, so it is
+/// surfaced as a warning on every apply path instead of failing the operation.
+fn is_attribute_dropped(warning: &PotError) -> bool {
+    warning.details.get("feature_id").and_then(Value::as_str) == Some("modifier.attribute_dropped")
+}
+
 fn apply_modifier(
     engine: &mut Engine<'_>,
     operation: &Map<String, Value>,
@@ -807,21 +812,13 @@ fn apply_modifier(
                     _ => false,
                 }
             });
-            let uses_vertex_group = modifier_stack.iter().any(|modifier| {
-                modifier.enabled
-                    && (modifier.modifier_type == "mask"
-                        || (matches!(
-                            modifier.modifier_type.as_str(),
-                            "surface_deform" | "mesh_deform" | "laplacian_deform"
-                        ) && modifier
-                            .params
-                            .get("vertex_group")
-                            .is_some_and(Value::is_string)))
+            // Vertex-group readers consume the mesh attribute, so attach source weights whenever the
+            // block has groups; the evaluated output then carries the remapped weights.
+            let prepared_output = (!data_block.vertex_groups.is_empty()).then(|| {
+                let mut mesh = output.clone();
+                crate::eval::attach_vertex_group_weights(&mut mesh, data_block);
+                mesh
             });
-            let mut prepared_output = uses_vertex_group.then(|| output.clone());
-            if let Some(mesh) = &mut prepared_output {
-                crate::eval::attach_vertex_group_weights(mesh, data_block);
-            }
             if !allow_shape_keys && data_block.shape_keys.is_some() {
                 return Err(PotError::with_details(
                     ErrorCode::UnsupportedFeature,
@@ -831,13 +828,20 @@ fn apply_modifier(
             }
             if !uses_armature && !uses_lattice && !uses_volume_node && !uses_scene_operand {
                 let source = prepared_output.as_ref().unwrap_or(output);
-                evaluate_modifiers_with_groups_at_frame(
+                let evaluation = evaluate_modifiers_with_groups_at_frame(
                     source,
                     modifier_stack,
                     &engine.doc.node_groups,
                     engine.evaluation_frame,
-                )?
-                .mesh
+                )?;
+                engine.warnings.extend(
+                    evaluation
+                        .warnings
+                        .into_iter()
+                        .filter(is_attribute_dropped)
+                        .map(|warning| crate::eval::attach_node_owner(warning, &target)),
+                );
+                evaluation.mesh
             } else {
                 let frame = engine.evaluation_frame;
                 let scene_snapshot = if uses_scene_operand {
@@ -987,12 +991,31 @@ fn apply_modifier(
                         )),
                     },
                 )?;
-                if let Some(warning) = evaluation.warnings.into_iter().next() {
+                let (dropped, blocking): (Vec<PotError>, Vec<PotError>) = evaluation
+                    .warnings
+                    .into_iter()
+                    .partition(is_attribute_dropped);
+                if let Some(warning) = blocking.into_iter().next() {
                     return Err(warning);
                 }
+                engine.warnings.extend(
+                    dropped
+                        .into_iter()
+                        .map(|warning| crate::eval::attach_node_owner(warning, &target)),
+                );
                 evaluation.mesh
             }
         };
+        // The evaluated `vertex_groups` attribute is a view of DataBlock weights keyed by this mesh's
+        // IDs. Persist it as the weights and keep the transient attribute out of stored mesh data.
+        let mut evaluated = evaluated;
+        let persisted_weights = engine
+            .doc
+            .data_blocks
+            .get(&data_id)
+            .map(|data| crate::eval::mesh_vertex_weights(&evaluated, &data.vertex_groups))
+            .unwrap_or_default();
+        evaluated.attributes.remove("vertex_groups");
         let mesh_changed = engine
             .doc
             .data_blocks
@@ -1020,6 +1043,7 @@ fn apply_modifier(
         }
         if let Some(data) = engine.doc.data_blocks.get_mut(&data_id) {
             data.mesh = Some(evaluated);
+            data.vertex_weights = persisted_weights;
             if mesh_changed {
                 data.descriptor = None;
             }
@@ -1089,12 +1113,14 @@ fn apply_modifier_as_shape_key(
         doc: &mut temp_doc,
         changes: super::ChangeSet::default(),
         id_mappings: Map::new(),
+        warnings: Vec::new(),
         operation_index: engine.operation_index,
         evaluation_frame: engine.evaluation_frame,
         asset_root: engine.asset_root,
         pending_assets: BTreeMap::new(),
     };
     apply_modifier(&mut temp_engine, &temp_operation, true)?;
+    engine.warnings.extend(temp_engine.warnings);
     for target in selected {
         let original_data_id = engine
             .doc
@@ -1322,11 +1348,11 @@ fn apply_lattice_modifier(
         }
     };
     let weights = vertex_group.map(|group_id| {
+        let weights_by_vertex = crate::eval::mesh_vertex_weights(mesh, &source_data.vertex_groups);
         mesh.vertices
             .iter()
             .map(|vertex| {
-                source_data
-                    .vertex_weights
+                weights_by_vertex
                     .get(&vertex.id)
                     .and_then(|weights| weights.get(group_id))
                     .copied()
