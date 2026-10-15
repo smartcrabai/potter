@@ -4,15 +4,15 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-export const addonCacheDir = join(root, '.cache', 'vrm-addon');
+const addonCacheDir = join(root, '.cache', 'vrm-addon');
 const lockPath = join(root, 'blender', 'vrm-addon.lock.json');
 
 export class AddonIntegrityError extends Error {}
 
-export async function loadAddonLock() {
+async function loadAddonLock() {
   const lock = JSON.parse(await readFile(lockPath, 'utf8'));
   if (!/^[0-9a-f]{64}$/.test(lock.sha256)) throw new Error(`lock: bad sha256 for ${lock.url}`);
   if (!lock.url.startsWith('https://github.com/saturday06/VRM-Addon-for-Blender/releases/download/')) {
@@ -46,8 +46,4 @@ export async function ensureVrmAddon() {
   await writeFile(`${dest}.part`, bytes);
   await rename(`${dest}.part`, dest);
   return dest;
-}
-
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  console.log(await ensureVrmAddon());
 }

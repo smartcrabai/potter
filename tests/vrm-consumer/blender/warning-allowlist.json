@@ -1,11 +1,13 @@
 [
   {
     "spec": "1.0",
+    "level": "WARNING",
     "message": "^Duplicated VRM0 bone: \"HumanBoneName\\.[A-Z_]+\"$",
     "reason": "Not a producer defect: VRM Add-on behaviour. Before its VRM 1.0 loader runs, the add-on pre-fills all 55 VRM 0.x humanoid slots, then logs once for each mapped VRM 1.0 bone. Reproduced without any Potter data: the add-on's own basic humanoid (icyp.make_basic_armature) exported as VRM 1.0 and re-imported logs 53 such notices."
   },
   {
     "spec": "0.0",
+    "level": "WARNING",
     "message": "^class=LicenseConfirmationRequired$",
     "reason": "Not a producer defect: the add-on asks for confirmation for any otherPermissionUrl it does not whitelist (importer/license_validation.py). Potter writes that URL on purpose in the VRM 0.x legacy meta (fixture/spec.mjs META.legacy). The probe accepts the prompt through the add-on's switch; the url and json_key lines are asserted separately."
   }

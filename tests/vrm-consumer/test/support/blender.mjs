@@ -3,7 +3,7 @@
 // directory, and runs blender/probe.py on one .vrm file.
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,6 +56,7 @@ export async function setupBlender() {
   );
   const output = `${install.stdout ?? ''}${install.stderr ?? ''}`;
   if (install.status !== 0 || !/STATUS Installed "vrm"/.test(output)) {
+    await rm(userResources, { recursive: true, force: true });
     return { reason: `VRM Add-on install failed (exit ${install.status}): ${output.slice(-1000)}` };
   }
   return { blender, userResources };

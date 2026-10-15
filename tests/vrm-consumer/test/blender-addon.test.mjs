@@ -20,6 +20,8 @@ import {
   SPRING,
   SPRING_COLLIDER_GROUPS,
   TOL,
+  toGltf,
+  V0_PRESET,
   v0GravityDir,
 } from '../fixture/spec.mjs';
 
@@ -45,13 +47,21 @@ const VRM1_PRESETS = [
   'blink', 'blinkLeft', 'blinkRight', 'lookUp', 'lookDown', 'lookLeft', 'lookRight', 'neutral',
 ];
 const snake = (name) => name.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-// Add-on warnings are matched like validate/warning-allowlist.json: each entry has a reason, applies to one VRM
-// version, and must still be produced (a stale entry fails). Messages are the text after the add-on's log prefix.
-const WARNING_PREFIX = '[VRM Add-on:WARNING] ';
+// Spec names (only_author, personal_non_profit) in VRM 1.0 camelCase and VRM 0.x forms (OnlyAuthor, Redistribution_Prohibited).
+const camel = (s) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+const pascal = (s) => camel(s).replace(/^[a-z]/, (c) => c.toUpperCase());
+const v0Case = (s) => s.replace(/(^|_)[a-z]/g, (c) => c.toUpperCase());
+// The add-on stores a VRM 0.x vector in Blender axes by swapping the file's y and z (importer/vrm0_importer.py).
+const v0AddonAxes = ([x, y, z]) => [x, z, y];
+// Add-on log lines are "[VRM Add-on:LEVEL] message". Every level from WARNING up is checked against the allowlist
+// (blender/warning-allowlist.json): each entry has a level, a reason, applies to one VRM version, and must still be
+// produced (a stale entry fails).
+const LOG_LINE = /^\[VRM Add-on:(WARNING|ERROR|CRITICAL)\] (.*)$/;
 const WARNING_ALLOWLIST = JSON.parse(await readFile(new URL('../blender/warning-allowlist.json', import.meta.url), 'utf8')).map(
   (entry) => {
     assert.ok(entry.reason?.trim(), `warning allowlist entry needs a reason: ${entry.message}`);
     assert.ok(['1.0', '0.0'].includes(entry.spec), `warning allowlist entry has a bad spec: ${entry.message}`);
+    assert.ok(['WARNING', 'ERROR', 'CRITICAL'].includes(entry.level), `warning allowlist entry has a bad level: ${entry.message}`);
     return { ...entry, regex: new RegExp(entry.message) };
   },
 );
@@ -131,16 +141,18 @@ function runVariants() {
         assert.match(facts.blender, /^5\.2\./);
       });
 
-      it('add-on warnings all match blender/warning-allowlist.json; every applicable entry is still produced', () => {
+      it('add-on logs (WARNING, ERROR, CRITICAL) all match blender/warning-allowlist.json; every applicable entry is still produced', () => {
         const logged = stderr
           .split('\n')
-          .filter((line) => line.startsWith(WARNING_PREFIX))
-          .map((line) => line.slice(WARNING_PREFIX.length));
+          .map((line) => LOG_LINE.exec(line))
+          .filter(Boolean)
+          .map(([, level, message]) => ({ level, message }));
         const applicable = WARNING_ALLOWLIST.filter((entry) => entry.spec === spec);
-        const unknown = logged.filter((message) => !applicable.some((entry) => entry.regex.test(message)));
-        assert.deepEqual(unknown, [], 'unknown add-on warnings');
+        const matches = (entry, log) => entry.level === log.level && entry.regex.test(log.message);
+        const unknown = logged.filter((log) => !applicable.some((entry) => matches(entry, log)));
+        assert.deepEqual(unknown, [], 'unknown add-on log lines');
         for (const entry of applicable) {
-          assert.ok(logged.some((message) => entry.regex.test(message)), `allowlist entry is stale: ${entry.message}`);
+          assert.ok(logged.some((log) => matches(entry, log)), `allowlist entry is stale: ${entry.message}`);
         }
         if (spec === '0.0') {
           // The license prompt names the legacy otherPermissionUrl; the allowlist only matches the message line.
@@ -259,39 +271,35 @@ function runVariants() {
           assertFacts(facts.spring, expected, TOL.morph, 'spring');
         });
 
-        it('meta: name, version, authors and permissions match the file and the spec', () => {
-          const m = json.extensions.VRMC_vrm.meta;
-          assert.equal(m.name, META.name);
-          assert.equal(m.version, META.version);
-          assert.deepEqual(m.authors, META.authors);
-          assert.equal(m.modification, META.rights.modification);
-          assert.equal(m.allowRedistribution, META.rights.allowRedistribution);
+        it('meta: name, version, authors and permissions match the spec', () => {
           assertFacts(
             facts.meta,
             {
               vrm_name: META.name,
               version: META.version,
               authors: META.authors,
-              avatar_permission: m.avatarPermission,
-              commercial_usage: m.commercialUsage,
-              credit_notation: m.creditNotation,
-              allow_redistribution: m.allowRedistribution,
-              modification: m.modification,
-              allow_excessively_violent_usage: m.allowExcessivelyViolentUsage,
-              allow_excessively_sexual_usage: m.allowExcessivelySexualUsage,
-              allow_political_or_religious_usage: m.allowPoliticalOrReligiousUsage,
-              allow_antisocial_or_hate_usage: m.allowAntisocialOrHateUsage,
+              avatar_permission: camel(META.rights.avatarPermission),
+              commercial_usage: camel(META.rights.commercialUsage),
+              credit_notation: META.rights.creditNotation,
+              allow_redistribution: META.rights.allowRedistribution,
+              modification: META.rights.modification,
+              // META grants none of these; VRM 1.0 false is the value for each.
+              allow_excessively_violent_usage: false,
+              allow_excessively_sexual_usage: false,
+              allow_political_or_religious_usage: false,
+              allow_antisocial_or_hate_usage: false,
             },
             TOL.morph,
             'meta',
           );
         });
       } else {
-        it('blend shape groups: one per expression, binding the spec shape keys', () => {
+        it('blend shape groups: one per expression, with the VRM 0.x preset name and the spec shape keys', () => {
           const groups = Object.fromEntries(
             Object.entries(EXPRESSIONS).map(([name, s]) => [
               name,
               {
+                preset: V0_PRESET[name] ?? 'unknown',
                 is_binary: !!s.isBinary,
                 binds: s.morphs.map(([index, weight]) => ({ mesh: MESHES.head, index, weight })),
                 material_values: (s.materialColorBinds?.length ?? 0) + (s.textureTransformBinds?.length ?? 0),
@@ -301,7 +309,7 @@ function runVariants() {
           const actual = Object.fromEntries(
             Object.entries(facts.expressions.blend_shape_groups).map(([name, g]) => [
               name,
-              { is_binary: g.is_binary, binds: g.binds, material_values: g.material_values },
+              { preset: g.preset, is_binary: g.is_binary, binds: g.binds, material_values: g.material_values },
             ]),
           );
           assertFacts(actual, groups, TOL.morph, 'blend_shape_groups');
@@ -326,11 +334,9 @@ function runVariants() {
           );
         });
 
-        it('first person: head bone, offset in Blender axes, no mesh annotations', () => {
-          // The VRM 0.x file stores (x, y, -z_glTF); the add-on keeps Blender axes (x, -z, y), so the file vector maps to (x, z, y).
-          const { x, y, z } = json.extensions.VRM.firstPerson.firstPersonBoneOffset;
+        it('first person: head bone, spec look-at offset in Blender axes, no mesh annotations', () => {
           assert.equal(facts.first_person.bone, blenderBone(HUMANOID.v0.head));
-          assertVecClose(facts.first_person.bone_offset, [x, z, y], TOL.morph, 'first person bone offset');
+          assertVecClose(facts.first_person.bone_offset, v0AddonAxes(LOOKAT.v0.offsetFromHeadBone), TOL.morph, 'first person offset');
           assert.equal(facts.first_person.mesh_annotations, 0);
         });
 
@@ -343,7 +349,7 @@ function runVariants() {
                 stiffness: SPRING.v0Uniform.stiffness,
                 drag_force: SPRING.v0Uniform.dragForce,
                 gravity_power: SPRING.v0Uniform.gravityPower,
-                gravity_dir: v0GravityDir(SPRING.v0Uniform.gravityDir),
+                gravity_dir: v0AddonAxes(v0GravityDir(toGltf(SPRING.v0Uniform.gravityDir))),
                 hit_radius: SPRING.v0Uniform.hitRadius,
                 collider_groups: SPRING_COLLIDER_GROUPS.v0.length,
               },
@@ -356,19 +362,19 @@ function runVariants() {
           assert.equal(facts.spring.collider_groups[0].colliders.length, group.colliders.length);
         });
 
-        it('meta: title, version, author and license fields match the file and the spec', () => {
-          const m = json.extensions.VRM.meta;
+        it('meta: title, version, author and license fields match the spec', () => {
           assertFacts(
             facts.meta,
             {
               title: META.name,
               version: META.version,
               author: META.authors[0],
-              allowed_user_name: m.allowedUserName,
-              violent_ussage_name: m.violentUssageName,
-              sexual_ussage_name: m.sexualUssageName,
-              commercial_ussage_name: m.commercialUssageName,
-              license_name: m.licenseName,
+              allowed_user_name: pascal(META.rights.avatarPermission),
+              // META grants no violent, sexual or commercial usage.
+              violent_ussage_name: 'Disallow',
+              sexual_ussage_name: 'Disallow',
+              commercial_ussage_name: 'Disallow',
+              license_name: v0Case(META.legacy.licenseName),
               other_permission_url: META.legacy.otherPermissionUrl,
             },
             TOL.morph,

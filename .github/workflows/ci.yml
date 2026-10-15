@@ -5,14 +5,15 @@ on:
     branches: [ main ]
 
 
+# Blender 5.2.x: the .blend adapter (test job) and the VRM Add-on consumer (vrm-consumer job) both need it.
+env:
+  BLENDER_VERSION: 5.2.2
+
 jobs:
   test:
     runs-on: ubuntu-latest
     # About 16 minutes with warm caches; a hung Blender test should not hold the runner for 6 hours.
     timeout-minutes: 45
-    env:
-      # The .blend adapter accepts only Blender 5.2.x.
-      BLENDER_VERSION: 5.2.2
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -79,9 +80,6 @@ jobs:
     runs-on: ubuntu-latest
     # Fixture build, official schema/glTF validation, Chromium render checks, and VRM Add-on for Blender imports.
     timeout-minutes: 45
-    env:
-      # The VRM Add-on consumer test and the .blend adapter both require Blender 5.2.x.
-      BLENDER_VERSION: 5.2.2
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

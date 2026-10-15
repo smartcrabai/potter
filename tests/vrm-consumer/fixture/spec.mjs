@@ -260,6 +260,22 @@ export const EXPRESSIONS = {
   },
 };
 
+// VRM 0.x blend shape group preset names (BlendShapePresetName). Every expression not listed is "unknown".
+export const V0_PRESET = {
+  aa: 'a',
+  ih: 'i',
+  ou: 'u',
+  ee: 'e',
+  oh: 'o',
+  blink: 'blink',
+  happy: 'joy',
+  sad: 'sorrow',
+  lookUp: 'lookup',
+  lookDown: 'lookdown',
+  lookLeft: 'lookleft',
+  lookRight: 'lookright',
+};
+
 // ---------------------------------------------------------------------------
 // Spring bones (hair). Joints ordered root -> tip. VRM 1.0 pairs consecutive joints, so the
 // last joint (hair_tip) is the tail-only node: it is emitted with its parameters but is not
