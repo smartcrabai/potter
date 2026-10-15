@@ -1234,6 +1234,7 @@ mod tests {
             evaluation_frame: 1.0,
             asset_root: None,
             pending_assets: BTreeMap::default(),
+            warnings: Vec::new(),
         };
         assert!(apply(&mut engine, operation.as_object().unwrap()).unwrap());
         let target = Id::new("target").unwrap();
@@ -1304,6 +1305,7 @@ mod tests {
             evaluation_frame: 1.0,
             asset_root: None,
             pending_assets: BTreeMap::default(),
+            warnings: Vec::new(),
         };
         assert!(apply(&mut engine, operation.as_object().unwrap()).unwrap());
         let target_data = engine.doc.nodes[&Id::new("target").unwrap()]
@@ -1368,6 +1370,7 @@ mod tests {
             evaluation_frame: 1.0,
             asset_root: None,
             pending_assets: BTreeMap::default(),
+            warnings: Vec::new(),
         };
         assert!(apply(&mut engine, operation.as_object().unwrap()).is_err());
         assert!(engine.doc.nodes.contains_key(&Id::new("source").unwrap()));

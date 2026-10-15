@@ -45,6 +45,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
     check_base_revision(project.doc(), base_revision)?;
     let before = project.doc().clone();
     let outcome = ops::apply_batch_with_asset_root(&before, &batch, project.path())?;
+    let warnings = serde_json::to_value(&outcome.warnings).map_err(PotError::internal_json)?;
     let candidate_revision = if outcome.changed {
         base_revision
             .checked_add(1)
@@ -89,6 +90,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
             &outcome.operations,
             &outcome.id_mappings,
             &previews,
+            &warnings,
         );
         return Ok((Some(scene), result));
     }
@@ -102,6 +104,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
         &outcome.operations,
         &outcome.id_mappings,
         &previews,
+        &warnings,
     );
     Ok((Some(scene), result))
 }
@@ -235,6 +238,7 @@ fn apply_result(
     operations: &Value,
     id_mappings: &Value,
     previews: &[Value],
+    warnings: &Value,
 ) -> Value {
     json!({
         "committed": committed,
@@ -245,5 +249,6 @@ fn apply_result(
         "operations": operations,
         "id_mappings": id_mappings,
         "previews": previews,
+        "warnings": warnings,
     })
 }

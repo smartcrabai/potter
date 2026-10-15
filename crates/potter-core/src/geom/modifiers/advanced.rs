@@ -2255,15 +2255,20 @@ fn drop_partial_vertex_groups(source: &Mesh, origin: &Origin, result: &mut Mesh)
         let source_weights = source_groups
             .and_then(|groups| groups.get(name))
             .and_then(Value::as_object);
+        // Whether each source vertex, by storage index, has an entry for this group.
+        let has_group: Vec<bool> = source
+            .vertices
+            .iter()
+            .map(|vertex| {
+                source_weights
+                    .is_some_and(|weights| weights.contains_key(&format!("v{}", vertex.id)))
+            })
+            .collect();
         for (output, sources) in origin.vertices.iter().enumerate() {
             if sources.len() < 2 {
                 continue;
             }
-            let every_source_has_group = sources.iter().all(|(index, _)| {
-                let key = format!("v{}", source.vertices[*index].id);
-                source_weights.is_some_and(|weights| weights.contains_key(&key))
-            });
-            if !every_source_has_group {
+            if !sources.iter().all(|(index, _)| has_group[*index]) {
                 weights.remove(&format!("v{}", result.vertices[output].id));
             }
         }

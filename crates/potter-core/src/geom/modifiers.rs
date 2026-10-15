@@ -833,31 +833,61 @@ fn mirror_vertex_groups(
     else {
         return;
     };
-    let mut weights = BTreeMap::<(String, String), f64>::new();
-    for (vertex, copies) in output.vertices.iter().zip(members) {
+    let names: Vec<&str> = source_groups.keys().map(String::as_str).collect();
+    let position: HashMap<&str, usize> = names
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, name)| (name, index))
+        .collect();
+    let group_values: Vec<&Value> = source_groups.values().collect();
+    // `targets[usize::from(flipped)][group]`: the group a copy with that flip state takes weight from.
+    // A mirrored name is an existing group or the name itself, so the fallback is never taken.
+    let targets: [Vec<usize>; 2] = [false, true].map(|flipped| {
+        names
+            .iter()
+            .enumerate()
+            .map(|(group, name)| {
+                let target = mirrored_group_name(name, source_groups, flipped);
+                position.get(target.as_str()).copied().unwrap_or(group)
+            })
+            .collect()
+    });
+    let source_keys: Vec<String> = source
+        .vertices
+        .iter()
+        .map(|vertex| format!("v{}", vertex.id))
+        .collect();
+    // Summed weight per group and output vertex; `None` when no copy has an entry for the group.
+    let mut sums = vec![vec![None::<f64>; output.vertices.len()]; names.len()];
+    for (vertex, copies) in members.iter().enumerate().take(output.vertices.len()) {
         let share = 1.0 / usize_as_f64(copies.len());
-        let key = format!("v{}", vertex.id);
         for &copy in copies {
             let flipped = (copy / vertex_count).count_ones() % 2 == 1;
-            let source_key = format!("v{}", source.vertices[copy % vertex_count].id);
-            for (name, group) in source_groups {
-                let Some(weight) = group.get(&source_key).and_then(Value::as_f64) else {
+            let source_key = source_keys[copy % vertex_count].as_str();
+            for (group, values) in group_values.iter().enumerate() {
+                let Some(weight) = values.get(source_key).and_then(Value::as_f64) else {
                     continue;
                 };
-                let target = mirrored_group_name(name, source_groups, flipped);
-                *weights.entry((target, key.clone())).or_insert(0.0) += weight * share;
+                let slot = &mut sums[targets[usize::from(flipped)][group]][vertex];
+                *slot = Some(slot.unwrap_or(0.0) + weight * share);
             }
         }
     }
-    let mut groups: Map<String, Value> = source_groups
-        .keys()
-        .map(|name| (name.clone(), json!({})))
+    let groups: Map<String, Value> = names
+        .iter()
+        .zip(sums)
+        .map(|(name, sums)| {
+            let weights: Map<String, Value> = sums
+                .into_iter()
+                .enumerate()
+                .filter_map(|(vertex, sum)| {
+                    Some((format!("v{}", output.vertices[vertex].id), json!(sum?)))
+                })
+                .collect();
+            ((*name).to_owned(), Value::Object(weights))
+        })
         .collect();
-    for ((name, key), weight) in weights {
-        if let Some(group) = groups.get_mut(&name).and_then(Value::as_object_mut) {
-            group.insert(key, json!(weight));
-        }
-    }
     output
         .attributes
         .insert("vertex_groups".to_owned(), Value::Object(groups));
@@ -2916,6 +2946,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             }
             let index = points.len();
             points.push(point);
+            // shortcut: corner vertices take one source vertex; Blender blends the bevel stencil of several corners, upgrade with those coefficients
             point_vertices.push(vertex);
             face_corner.insert((face_index, vertex), index);
         }
@@ -3039,6 +3070,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             continue;
         }
         let center_index = points.len();
+        // shortcut: corner vertices take one source vertex; Blender blends the bevel stencil of several corners, upgrade with those coefficients
         points.push(corner_center);
         point_vertices.push(vertex);
         for (face_index, corner, material) in faces {
@@ -3097,6 +3129,7 @@ fn bevel_vertices(
         (-2.0_f64.ln() / profile.sqrt().ln()).clamp(0.0, 1.0e4)
     };
     let mut points = source_points.to_vec();
+    // shortcut: corner vertices take one source vertex; Blender blends the bevel stencil of several corners, upgrade with those coefficients
     let mut point_origins: Vec<Vec<(usize, f64)>> = (0..source_points.len())
         .map(|vertex| vec![(vertex, 1.0)])
         .collect();
@@ -3762,7 +3795,7 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 }
 
 /// Keeps the first polygon for each vertex set, with the tag it arrived with.
-fn unique_tagged_polygons<T>(polygons: Vec<(T, Polygon)>) -> Vec<(T, Polygon)> {
+pub(super) fn unique_tagged_polygons<T>(polygons: Vec<(T, Polygon)>) -> Vec<(T, Polygon)> {
     let mut seen = HashSet::new();
     polygons
         .into_iter()

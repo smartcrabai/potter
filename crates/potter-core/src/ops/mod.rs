@@ -287,6 +287,7 @@ pub struct ApplyOutcome {
     pub changes: Value,
     pub operations: Value,
     pub id_mappings: Value,
+    pub warnings: Vec<PotError>,
     pub asset_blobs: BTreeMap<String, Vec<u8>>,
     pub changed: bool,
 }
@@ -435,6 +436,7 @@ struct Engine<'a> {
     evaluation_frame: f64,
     asset_root: Option<&'a Path>,
     pending_assets: BTreeMap<String, Vec<u8>>,
+    warnings: Vec<PotError>,
 }
 
 impl Engine<'_> {
@@ -576,6 +578,7 @@ fn apply_batch_internal(
         })?;
     let mut working = doc.clone();
     let mut pending_assets = BTreeMap::new();
+    let mut warnings = Vec::new();
     let mut changes = ChangeSet::default();
     let mut id_mappings = Map::new();
     let mut operation_results = Vec::with_capacity(operations.len());
@@ -602,6 +605,7 @@ fn apply_batch_internal(
             evaluation_frame,
             asset_root,
             pending_assets: std::mem::take(&mut pending_assets),
+            warnings: std::mem::take(&mut warnings),
         };
         if !OP_NAMES.contains(&name) {
             return Err(engine.error(
@@ -832,11 +836,13 @@ fn apply_batch_internal(
             changes: next_changes,
             id_mappings: next_mappings,
             pending_assets: next_pending_assets,
+            warnings: next_warnings,
             ..
         } = engine;
         changes = next_changes;
         id_mappings = next_mappings;
         pending_assets = next_pending_assets;
+        warnings = next_warnings;
         let batch_changed = !changes.is_empty();
         operation_results.push(json!({"index":index,"op":name,"changed":changed_by_operation,"batch_changed":batch_changed}));
     }
@@ -890,6 +896,7 @@ fn apply_batch_internal(
         operations: Value::Array(operation_results),
         id_mappings: Value::Object(id_mappings),
         asset_blobs: pending_assets,
+        warnings,
         changed: scene_changed,
     })
 }

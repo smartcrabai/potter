@@ -1703,6 +1703,7 @@ mod tests {
             evaluation_frame: 1.0,
             asset_root: None,
             pending_assets: std::collections::BTreeMap::new(),
+            warnings: Vec::new(),
         };
         apply(&mut engine, name, &object)
     }

@@ -101,6 +101,7 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
                 "frame": snapshot.frame,
                 "evaluation_hash": snapshot.evaluation_hash,
             },
+            "warnings": snapshot.warnings,
         }),
     ))
 }

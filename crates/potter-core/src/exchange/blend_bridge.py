@@ -2584,7 +2584,7 @@ def mesh_create(name, raw, block_id):
                 uv.data[index].uv = item
     for source in attributes.get("blender_attributes", []):
         name = source.get("name")
-        if not name or name == "position":
+        if not name or name in ("position", ".corner_vert", ".corner_edge", ".edge_verts"):
             continue
         try:
             attribute = mesh.attributes.get(name)

@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, error::Error, fs, path::Path, process::Command}
 
 use glam::DVec3;
 use potter_core::{
+    eval::{EvaluationContext, Snapshot},
     geom::{
         GridParams, Mesh,
         modifiers::{evaluate_modifiers, evaluate_modifiers_with_groups_at_frame},
@@ -61,6 +62,53 @@ fn weight_at(entries: &[(DVec3, f64)], point: DVec3) -> Option<f64> {
         .iter()
         .find(|(co, _)| co.distance(point) < 1.0e-9)
         .map(|(_, weight)| *weight)
+}
+
+fn blender_attribute_values(mesh: &Mesh, name: &str, domain: &str) -> TestResult<Vec<f64>> {
+    let attribute = mesh.attributes["blender_attributes"]
+        .as_array()
+        .and_then(|attributes| {
+            attributes
+                .iter()
+                .find(|attribute| attribute["name"] == name)
+        })
+        .ok_or_else(|| format!("Blender attribute `{name}` missing"))?;
+    assert_eq!(attribute["domain"], domain);
+    attribute["values"]
+        .as_array()
+        .ok_or_else(|| format!("Blender attribute `{name}` values missing"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| format!("non-float `{name}` value").into())
+        })
+        .collect()
+}
+
+fn sorted_corner_values_by_face(mesh: &Mesh, name: &str) -> TestResult<Vec<Vec<f64>>> {
+    let values = blender_attribute_values(mesh, name, "CORNER")?;
+    let mut offset = 0;
+    let mut faces = Vec::with_capacity(mesh.faces.len());
+    for face in &mesh.faces {
+        let end = offset + face.vertices.len();
+        let mut face_values = values
+            .get(offset..end)
+            .ok_or("corner attribute is shorter than the mesh corner count")?
+            .to_vec();
+        face_values.sort_by(f64::total_cmp);
+        faces.push(face_values);
+        offset = end;
+    }
+    assert_eq!(offset, values.len(), "corner attribute has extra values");
+    faces.sort_by(|left, right| {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| left.total_cmp(right))
+            .find(|ordering| !ordering.is_eq())
+            .unwrap_or_else(|| left.len().cmp(&right.len()))
+    });
+    Ok(faces)
 }
 
 #[test]
@@ -193,7 +241,7 @@ fn decimate_keeps_each_surviving_vertex_group_weight_with_its_vertex() -> TestRe
     );
     for (co, weight) in &weights {
         assert!(
-            (weight - f64::midpoint(co.x, 1.0)).abs() < 0.05,
+            (weight - f64::midpoint(co.x, 1.0)).abs() < 1.0e-6,
             "weight {weight} at {co:?} does not follow its vertex"
         );
     }
@@ -256,6 +304,107 @@ fn remesh_reports_dropped_vertex_groups_as_a_typed_warning() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn provenance_remaps_blender_attributes_on_corners_and_faces() -> TestResult {
+    let mut quad = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    quad.attributes.insert(
+        "blender_attributes".to_owned(),
+        json!([
+            {"name":"Col","domain":"CORNER","data_type":"FLOAT","values":[0.0,1.0,2.0,3.0]},
+            {"name":"mat_tag","domain":"FACE","data_type":"INT","values":[7]}
+        ]),
+    );
+    let triangulated = evaluate_modifiers(&quad, &[modifier("triangulate", json!({}))?])?;
+    assert_eq!(
+        blender_attribute_values(&triangulated, "Col", "CORNER")?,
+        vec![3.0, 0.0, 1.0, 1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        blender_attribute_values(&triangulated, "mat_tag", "FACE")?,
+        vec![7.0, 7.0]
+    );
+
+    let mut triangle =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
+    triangle.attributes.insert(
+        "blender_attributes".to_owned(),
+        json!([{
+            "name":"Col","domain":"CORNER","data_type":"FLOAT","values":[10.0,11.0,12.0]
+        }]),
+    );
+    let mirrored = evaluate_modifiers(
+        &triangle,
+        &[modifier("mirror", json!({"use_axis":[true,false,false]}))?],
+    )?;
+    let values = blender_attribute_values(&mirrored, "Col", "CORNER")?;
+    assert_eq!(values, vec![10.0, 11.0, 12.0, 12.0, 11.0, 10.0]);
+    assert_eq!(
+        sorted_corner_values_by_face(&mirrored, "Col")?,
+        vec![vec![10.0, 11.0, 12.0], vec![10.0, 11.0, 12.0]]
+    );
+    Ok(())
+}
+
+#[test]
+fn weld_and_subdivision_remap_corner_colours_from_oracle() -> TestResult {
+    let mut weld_mesh = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(2.0, 1.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+        ],
+        vec![vec![0, 1, 2, 3], vec![7, 6, 4, 5]],
+    )?;
+    weld_mesh.attributes.insert(
+        "blender_attributes".to_owned(),
+        json!([{
+            "name":"Col","domain":"CORNER","data_type":"FLOAT",
+            "values":[1.0,1.1,1.2,1.3,2.0,2.1,2.2,2.3]
+        }]),
+    );
+    let welded = evaluate_modifiers(
+        &weld_mesh,
+        &[modifier("weld", json!({"merge_threshold":0.001}))?],
+    )?;
+    assert_eq!(
+        sorted_corner_values_by_face(&welded, "Col")?,
+        vec![vec![1.0, 1.1, 1.2, 1.3], vec![2.0, 2.1, 2.2, 2.3]]
+    );
+
+    let mut subdivision_mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    subdivision_mesh.attributes.insert(
+        "blender_attributes".to_owned(),
+        json!([{
+            "name":"Col","domain":"CORNER","data_type":"FLOAT","values":[0.0,1.0,2.0,3.0]
+        }]),
+    );
+    let subdivided = evaluate_modifiers(
+        &subdivision_mesh,
+        &[modifier("subdivision", json!({"levels":1}))?],
+    )?;
+    assert_eq!(
+        sorted_corner_values_by_face(&subdivided, "Col")?,
+        vec![
+            vec![0.0, 0.5, 1.5, 1.5],
+            vec![0.5, 1.0, 1.5, 1.5],
+            vec![1.5, 1.5, 2.0, 2.5],
+            vec![1.5, 1.5, 2.5, 3.0]
+        ]
+    );
+    Ok(())
+}
+
 // Armature skin export of a mirrored mesh: the mirror copies must carry the side-swapped group
 // weights, so the glTF writer does not reject them as unweighted and the importer returns them.
 
@@ -275,10 +424,10 @@ fn run_ok(command: &mut Command) -> TestResult<std::process::Output> {
     Ok(output)
 }
 
-fn apply(scene: &Path, operations: &Value) -> TestResult {
+fn apply_response(scene: &Path, operations: &Value) -> TestResult<Value> {
     let batch = scene.join("operations.json");
     fs::write(&batch, serde_json::to_vec(operations)?)?;
-    run_ok(
+    let output = run_ok(
         pot()
             .arg("apply")
             .arg(scene)
@@ -286,6 +435,131 @@ fn apply(scene: &Path, operations: &Value) -> TestResult {
             .arg(batch)
             .arg("--json"),
     )?;
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn apply(scene: &Path, operations: &Value) -> TestResult {
+    apply_response(scene, operations)?;
+    Ok(())
+}
+
+fn evaluate_snapshot(scene: &Path) -> TestResult<Snapshot> {
+    let document: SceneDoc = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    Ok(Snapshot::evaluate(
+        &document,
+        &EvaluationContext::default(),
+    )?)
+}
+
+fn assert_attribute_drop_warning(envelope: &Value) -> TestResult {
+    let warnings = envelope["warnings"]
+        .as_array()
+        .ok_or("response warnings missing")?;
+    assert!(
+        warnings.iter().any(|warning| {
+            warning["details"]["feature_id"] == "modifier.attribute_dropped"
+                && warning["details"]["attributes"]
+                    .as_array()
+                    .is_some_and(|attributes| {
+                        attributes
+                            .iter()
+                            .any(|attribute| attribute == "vertex_groups")
+                    })
+        }),
+        "attribute-drop warning missing: {warnings:?}"
+    );
+    Ok(())
+}
+
+fn grouped_box_operations() -> Vec<Value> {
+    let vertex_weights: Vec<Value> = (0..8)
+        .map(|vertex_id| json!({"vertex_id": vertex_id, "weight": 1.0}))
+        .collect();
+    vec![
+        json!({"op":"node.create","id":"body","kind":"box","params":{"size":2.0}}),
+        json!({"op":"vertex_group.create","target":{"id":"body"},"id":"group_g","name":"G"}),
+        json!({"op":"vertex_group.assign","target":{"id":"body"},"group_id":"group_g","weights":vertex_weights}),
+    ]
+}
+
+fn remesh_params() -> Value {
+    json!({
+        "mode":"BLOCKS","octree_depth":3,"scale":0.9,"sharpness":1.0,
+        "use_remove_disconnected":false,"threshold":1.0,"use_smooth_shade":true
+    })
+}
+
+#[test]
+fn mirror_then_armature_stack_is_posed_on_both_halves() -> TestResult {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    run_ok(pot().arg("init").arg(&scene).arg("--json"))?;
+    let vertex_weights: Vec<Value> = (0..8)
+        .map(|vertex_id| json!({"vertex_id": vertex_id, "weight": 1.0}))
+        .collect();
+    let operations = json!({
+        "schema_version":1,
+        "base_revision":0,
+        "operations":[
+            {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
+            {"op":"mesh.transform_elements","target":{"id":"body"},"elements":{"domain":"vertex","ids":["v0","v1","v2","v3","v4","v5","v6","v7"]},"translation":[2.0,0.0,0.0]},
+            {"op":"vertex_group.create","target":{"id":"body"},"id":"arm_left","name":"Arm.L"},
+            {"op":"vertex_group.create","target":{"id":"body"},"id":"arm_right","name":"Arm.R"},
+            {"op":"vertex_group.assign","target":{"id":"body"},"group_id":"arm_left","weights":vertex_weights},
+            {"op":"node.create","id":"rig","name":"Rig","kind":"armature"},
+            {"op":"bone.create","target":{"id":"rig"},"id":"bone_left","name":"Arm.L","head":[0.0,0.0,0.0],"tail":[0.0,0.0,1.0]},
+            {"op":"bone.create","target":{"id":"rig"},"id":"bone_right","name":"Arm.R","head":[0.0,0.0,0.0],"tail":[0.0,0.0,1.0]},
+            {"op":"modifier.create","target":{"id":"body"},"id":"mirror","type":"mirror","params":{"use_axis":[true,false,false]}},
+            {"op":"modifier.create","target":{"id":"body"},"id":"skin","type":"armature","params":{"object":"rig","use_vertex_groups":true}}
+        ]
+    });
+    apply(&scene, &operations)?;
+    let rest = evaluate_snapshot(&scene)?;
+    let rest_mesh = rest
+        .meshes
+        .get(&Id::new("body")?)
+        .ok_or("rest evaluated mesh missing")?;
+    apply_response(
+        &scene,
+        &json!({
+            "schema_version":1,
+            "base_revision":1,
+            "operations":[
+                {"op":"pose.set","target":{"id":"rig"},"bone_id":"bone_right","set":{"translation":[0.0,0.0,5.0]}}
+            ]
+        }),
+    )?;
+    let posed = evaluate_snapshot(&scene)?;
+    let posed_mesh = posed
+        .meshes
+        .get(&Id::new("body")?)
+        .ok_or("posed evaluated mesh missing")?;
+    let mut mirrored_count = 0;
+    let mut original_count = 0;
+    for rest_vertex in &rest_mesh.vertices {
+        let posed_vertex = posed_mesh
+            .vertices
+            .iter()
+            .find(|vertex| vertex.id == rest_vertex.id)
+            .ok_or("posed mesh vertex missing")?;
+        let displacement = posed_vertex.co.distance(rest_vertex.co);
+        if rest_vertex.co.x < 0.0 {
+            mirrored_count += 1;
+            assert!(
+                displacement > 1.0e-4,
+                "mirrored vertex {:?} did not follow Arm.R",
+                rest_vertex.co
+            );
+        } else if rest_vertex.co.x > 0.0 {
+            original_count += 1;
+            assert!(
+                displacement < 1.0e-9,
+                "original vertex {:?} unexpectedly moved",
+                rest_vertex.co
+            );
+        }
+    }
+    assert!(mirrored_count > 0 && original_count > 0);
     Ok(())
 }
 
@@ -391,5 +665,87 @@ fn mirrored_armature_skin_export_weights_both_halves() -> TestResult {
         }
     }
     assert_eq!((original, mirrored), (8, 8));
+    Ok(())
+}
+
+#[test]
+fn apply_drops_attribute_with_warning_on_both_branches() -> TestResult {
+    for with_armature in [false, true] {
+        let directory = tempdir()?;
+        let scene = directory.path().join("scene");
+        run_ok(pot().arg("init").arg(&scene).arg("--json"))?;
+        let mut operations = grouped_box_operations();
+        if with_armature {
+            operations.extend([
+                json!({"op":"node.create","id":"rig","kind":"armature"}),
+                json!({"op":"bone.create","target":{"id":"rig"},"id":"bone_g","name":"G","head":[0.0,0.0,0.0],"tail":[0.0,0.0,1.0]}),
+                json!({"op":"modifier.create","target":{"id":"body"},"id":"armature","type":"armature","params":{"object":"rig","use_vertex_groups":true}}),
+            ]);
+        }
+        operations.extend([
+            json!({"op":"modifier.create","target":{"id":"body"},"id":"remesh","type":"remesh","params":remesh_params()}),
+            json!({"op":"modifier.apply","target":{"id":"body"},"modifier_id":"remesh"}),
+        ]);
+        let response = apply_response(
+            &scene,
+            &json!({"schema_version":1,"base_revision":0,"operations":operations}),
+        )?;
+        assert_eq!(response["ok"], true);
+        assert_attribute_drop_warning(&response)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn inspect_reports_attribute_drop_warning() -> TestResult {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let glb = directory.path().join("remesh.glb");
+    run_ok(pot().arg("init").arg(&scene).arg("--json"))?;
+    let mut operations = grouped_box_operations();
+    operations.push(json!({
+        "op":"modifier.create","target":{"id":"body"},"id":"remesh",
+        "type":"remesh","params":remesh_params()
+    }));
+    apply(
+        &scene,
+        &json!({"schema_version":1,"base_revision":0,"operations":operations}),
+    )?;
+
+    let inspect = run_ok(
+        pot()
+            .arg("inspect")
+            .arg(&scene)
+            .args(["--id", "body", "--json"]),
+    )?;
+    let inspect: Value = serde_json::from_slice(&inspect.stdout)?;
+    assert!(
+        inspect["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| {
+                warning["details"]["feature_id"] == "modifier.attribute_dropped"
+            })),
+        "inspect attribute-drop warning missing: {}",
+        inspect["warnings"]
+    );
+
+    let export = run_ok(
+        pot()
+            .arg("export")
+            .arg(&scene)
+            .args(["--format", "glb", "--allow-lossy", "--out"])
+            .arg(&glb)
+            .args(["--overwrite", "--json"]),
+    )?;
+    let export: Value = serde_json::from_slice(&export.stdout)?;
+    assert!(
+        export["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| {
+                warning["details"]["feature_id"] == "modifier.attribute_dropped"
+            })),
+        "export attribute-drop warning missing: {}",
+        export["warnings"]
+    );
     Ok(())
 }

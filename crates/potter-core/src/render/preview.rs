@@ -111,6 +111,9 @@ pub fn render_previews(
             "message": error.message,
         }));
     }
+    geometry
+        .warnings
+        .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
     let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
     let mut pending = Vec::with_capacity(labels.len());
     for label in labels {

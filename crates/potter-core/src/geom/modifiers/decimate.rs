@@ -18,7 +18,7 @@ use crate::{
 use super::{
     Mesh, Polygon, blend_weights, bool_param, clean_polygon, cyclic_pairs, decimate_compact,
     edge_key, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
-    unique_polygons,
+    unique_polygons, unique_tagged_polygons,
 };
 #[derive(Clone, Copy, Default)]
 struct DecimateQuadric([f64; 10]);
@@ -1389,25 +1389,9 @@ fn collapse_untriangulate(mesh: &CollapseMesh) -> (Vec<Polygon>, Vec<Option<usiz
             face_origins.push(Some(face.origin));
         }
     }
-    unique_polygons_with_origins(polygons, face_origins)
-}
-
-fn unique_polygons_with_origins(
-    polygons: Vec<Polygon>,
-    face_origins: Vec<Option<usize>>,
-) -> (Vec<Polygon>, Vec<Option<usize>>) {
-    let mut seen = HashSet::with_capacity(polygons.len());
-    let mut unique_polygons = Vec::with_capacity(polygons.len());
-    let mut unique_origins = Vec::with_capacity(face_origins.len());
-    for (polygon, face_origin) in polygons.into_iter().zip(face_origins) {
-        let mut key = polygon.0.clone();
-        key.sort_unstable();
-        if seen.insert(key) {
-            unique_polygons.push(polygon);
-            unique_origins.push(face_origin);
-        }
-    }
-    (unique_polygons, unique_origins)
+    let tagged: Vec<(Option<usize>, Polygon)> = face_origins.into_iter().zip(polygons).collect();
+    let (origins, polygons): (Vec<_>, Vec<_>) = unique_tagged_polygons(tagged).into_iter().unzip();
+    (polygons, origins)
 }
 
 fn decimate_symmetry_axis(modifier: &Modifier) -> Result<usize> {

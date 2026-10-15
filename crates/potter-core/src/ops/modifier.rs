@@ -633,6 +633,12 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
     Ok(changed)
 }
 
+/// `modifier.attribute_dropped` reports output that was applied with attributes lost, so it is
+/// surfaced as a warning on every apply path instead of failing the operation.
+fn is_attribute_dropped(warning: &PotError) -> bool {
+    warning.details.get("feature_id").and_then(Value::as_str) == Some("modifier.attribute_dropped")
+}
+
 fn apply_modifier(
     engine: &mut Engine<'_>,
     operation: &Map<String, Value>,
@@ -822,13 +828,16 @@ fn apply_modifier(
             }
             if !uses_armature && !uses_lattice && !uses_volume_node && !uses_scene_operand {
                 let source = prepared_output.as_ref().unwrap_or(output);
-                evaluate_modifiers_with_groups_at_frame(
+                let evaluation = evaluate_modifiers_with_groups_at_frame(
                     source,
                     modifier_stack,
                     &engine.doc.node_groups,
                     engine.evaluation_frame,
-                )?
-                .mesh
+                )?;
+                engine
+                    .warnings
+                    .extend(evaluation.warnings.into_iter().filter(is_attribute_dropped));
+                evaluation.mesh
             } else {
                 let frame = engine.evaluation_frame;
                 let scene_snapshot = if uses_scene_operand {
@@ -978,9 +987,14 @@ fn apply_modifier(
                         )),
                     },
                 )?;
-                if let Some(warning) = evaluation.warnings.into_iter().next() {
+                let (dropped, blocking): (Vec<PotError>, Vec<PotError>) = evaluation
+                    .warnings
+                    .into_iter()
+                    .partition(is_attribute_dropped);
+                if let Some(warning) = blocking.into_iter().next() {
                     return Err(warning);
                 }
+                engine.warnings.extend(dropped);
                 evaluation.mesh
             }
         };
@@ -1091,12 +1105,14 @@ fn apply_modifier_as_shape_key(
         doc: &mut temp_doc,
         changes: super::ChangeSet::default(),
         id_mappings: Map::new(),
+        warnings: Vec::new(),
         operation_index: engine.operation_index,
         evaluation_frame: engine.evaluation_frame,
         asset_root: engine.asset_root,
         pending_assets: BTreeMap::new(),
     };
     apply_modifier(&mut temp_engine, &temp_operation, true)?;
+    engine.warnings.extend(temp_engine.warnings);
     for target in selected {
         let original_data_id = engine
             .doc
