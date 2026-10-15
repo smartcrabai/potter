@@ -7,7 +7,7 @@
 //! let the transform carry the placement, as Blender does. Import: each importer hands per-corner
 //! normals to `import_shading`, which derives `shade_smooth` and `custom_normal` the way glTF does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{DMat3, DMat4, DVec3};
 use serde_json::{Value, json};
@@ -79,12 +79,29 @@ pub(super) fn baked_faces(mesh: &ExchangeMesh) -> Result<BakedFaces> {
     Ok((faces, reversed))
 }
 
+/// Shading a Potter writer stores exactly. `smooth` is per face in `mesh.faces` order; `sharp`
+/// holds the endpoint vertex indices (into `mesh.vertices`) of each sharp edge.
+pub(super) struct ExactShading {
+    pub(super) smooth: Vec<bool>,
+    pub(super) sharp: Vec<[usize; 2]>,
+}
+
 /// Derives `shade_smooth` and `custom_normal` on `mesh` from per-corner normals.
 ///
 /// `normals` holds one value per face corner in `mesh.faces` order. A face is smooth when any
 /// corner differs from its flat normal. A corner whose normal differs from what the derived
 /// shading computes gets a `custom_normal` entry.
 pub(super) fn import_shading(mesh: &mut Mesh, normals: &[DVec3]) -> Result<()> {
+    import_shading_flags(mesh, normals, None)
+}
+
+/// [`import_shading`] with exact flags from a Potter writer: they replace the derived smooth flags
+/// and add the sharp edges the normals were computed with.
+pub(super) fn import_shading_flags(
+    mesh: &mut Mesh,
+    normals: &[DVec3],
+    flags: Option<&ExactShading>,
+) -> Result<()> {
     let index_of = mesh
         .vertices
         .iter()
@@ -116,23 +133,28 @@ pub(super) fn import_shading(mesh: &mut Mesh, normals: &[DVec3]) -> Result<()> {
         .iter()
         .map(|vertex| vertex.co)
         .collect::<Vec<_>>();
-    let mut smooth = Vec::with_capacity(corners.len());
-    let mut corner = 0;
-    for face_corners in &corners {
-        let flat = face_normal(
-            &face_corners
-                .iter()
-                .map(|vertex| points[*vertex])
-                .collect::<Vec<_>>(),
-        );
-        let end = corner + face_corners.len();
-        smooth.push(
-            normals[corner..end]
-                .iter()
-                .any(|normal| !close(*normal, flat)),
-        );
-        corner = end;
-    }
+    let smooth = if let Some(flags) = flags {
+        flags.smooth.clone()
+    } else {
+        let mut smooth = Vec::with_capacity(corners.len());
+        let mut corner = 0;
+        for face_corners in &corners {
+            let flat = face_normal(
+                &face_corners
+                    .iter()
+                    .map(|vertex| points[*vertex])
+                    .collect::<Vec<_>>(),
+            );
+            let end = corner + face_corners.len();
+            smooth.push(
+                normals[corner..end]
+                    .iter()
+                    .any(|normal| !close(*normal, flat)),
+            );
+            corner = end;
+        }
+        smooth
+    };
     if smooth.iter().any(|value| *value) {
         let values = mesh
             .faces
@@ -143,6 +165,41 @@ pub(super) fn import_shading(mesh: &mut Mesh, normals: &[DVec3]) -> Result<()> {
         mesh.attributes.insert(
             "shade_smooth".to_owned(),
             json!({ "domain": "face", "type": "bool", "values": values }),
+        );
+    }
+    if let Some(flags) = flags.filter(|flags| !flags.sharp.is_empty()) {
+        let edge_key = |first: u32, second: u32| (first.min(second), first.max(second));
+        let mut sharp_keys = BTreeSet::new();
+        for [first, second] in &flags.sharp {
+            let vertex_id = |index: usize| {
+                mesh.vertices
+                    .get(index)
+                    .map(|vertex| vertex.id)
+                    .ok_or_else(|| {
+                        import_error("glTF Potter sharp edge references a missing vertex")
+                    })
+            };
+            sharp_keys.insert(edge_key(vertex_id(*first)?, vertex_id(*second)?));
+        }
+        let edge_keys = mesh
+            .edges
+            .iter()
+            .map(|edge| edge_key(edge.vertices[0], edge.vertices[1]))
+            .collect::<BTreeSet<_>>();
+        if !sharp_keys.is_subset(&edge_keys) {
+            return Err(import_error("glTF Potter sharp edge is not a mesh edge"));
+        }
+        let values = mesh
+            .edges
+            .iter()
+            .map(|edge| {
+                let sharp = sharp_keys.contains(&edge_key(edge.vertices[0], edge.vertices[1]));
+                (format!("e{}", edge.id), json!(sharp))
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        mesh.attributes.insert(
+            "sharp".to_owned(),
+            json!({ "domain": "edge", "type": "bool", "values": values }),
         );
     }
     let computed = crate::geom::normals::corner_normals(mesh, &points).ok();

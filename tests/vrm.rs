@@ -3722,3 +3722,63 @@ fn mtoon_validation_pointers_name_the_material_and_field_through_apply() -> Test
     assert_eq!(revision(&project)?, base_revision);
     Ok(())
 }
+
+#[test]
+fn mirrored_vrm1_export_reimports_with_the_winding_its_normals_describe() -> TestResult {
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    let base_revision = revision(&project)?;
+    apply_success(
+        &project,
+        base_revision,
+        &[
+            json!({"op":"node.create","id":"mirror_plane","name":"mirror_plane","kind":"plane","params":{"size":2.0},"transform":{"translation":[3.0,0.0,0.0],"scale":[-1.0,1.0,1.0]}}),
+        ],
+    )?;
+    let vrm_path = directory.path().join("mirror.vrm");
+    export(&project, "vrm", &vrm_path)?;
+    // The GLB importer accepts the VRM container once its extension says `.glb`.
+    let glb_path = directory.path().join("mirror.glb");
+    fs::copy(&vrm_path, &glb_path)?;
+    let (_fresh_directory, fresh) = init_project()?;
+    let fresh_revision = revision(&fresh)?;
+    let output = pot()
+        .arg("import")
+        .arg(&fresh)
+        .arg("--file")
+        .arg(&glb_path)
+        .args(["--format", "glb", "--base-revision"])
+        .arg(fresh_revision.to_string())
+        .arg("--allow-lossy")
+        .arg("--json")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "pot import failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reexport_path = directory.path().join("reimported.glb");
+    let reexport = pot()
+        .arg("export")
+        .arg(&fresh)
+        .args(["--format", "glb", "--out"])
+        .arg(&reexport_path)
+        .arg("--json")
+        .output()?;
+    assert!(
+        reexport.status.success(),
+        "glb re-export failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&reexport.stdout),
+        String::from_utf8_lossy(&reexport.stderr)
+    );
+    let glb = parse_glb(&reexport_path)?;
+    let (front, vertex_normals) = plane_normals(&glb, "mirror_plane")?;
+    assert!(!front.is_empty(), "mirror_plane has no triangles");
+    for normal in front.into_iter().chain(vertex_normals) {
+        assert!(
+            (normal - DVec3::Y).length() < 1.0e-6,
+            "reimported mirror_plane normal {normal:?} must agree with its winding"
+        );
+    }
+    Ok(())
+}
