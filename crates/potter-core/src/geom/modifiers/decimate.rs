@@ -11,12 +11,14 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    geom::provenance::Origin,
     model::Modifier,
 };
 
 use super::{
-    Mesh, Polygon, bool_param, clean_polygon, cyclic_pairs, decimate_compact, edge_key, id_indices,
-    invalid_parameter, loose_edges, number_param, polygons, positions, unique_polygons,
+    Mesh, Polygon, blend_weights, bool_param, clean_polygon, cyclic_pairs, decimate_compact,
+    edge_key, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
+    unique_polygons,
 };
 #[derive(Clone, Copy, Default)]
 struct DecimateQuadric([f64; 10]);
@@ -132,6 +134,8 @@ struct CollapseMesh {
     edges: Vec<CollapseEdge>,
     vertex_edges: Vec<Vec<usize>>,
     edge_lookup: BTreeMap<(usize, usize), usize>,
+    /// Per vertex: the input vertices its position interpolates, with weights summing to one.
+    origins: Vec<Vec<(usize, f64)>>,
 }
 
 fn ensure_collapse_edge(
@@ -436,12 +440,14 @@ fn collapse_mesh_from_mesh(mesh: &Mesh) -> Result<CollapseMesh> {
         vertex_edges[edge.vertices[0]].push(edge_index);
         vertex_edges[edge.vertices[1]].push(edge_index);
     }
+    let origins = (0..points.len()).map(|index| vec![(index, 1.0)]).collect();
     Ok(CollapseMesh {
         points,
         faces,
         edges,
         vertex_edges,
         edge_lookup,
+        origins,
     })
 }
 
@@ -927,6 +933,19 @@ fn collapse_apply(
         values[keep] = (values[keep] * (1.0 - factor) + values[clear] * factor).clamp(0.0, 1.0);
     }
     mesh.points[keep] = position;
+    let keep_origin = std::mem::take(&mut mesh.origins[keep]);
+    let clear_origin = std::mem::take(&mut mesh.origins[clear]);
+    let share = f64::from(factor);
+    mesh.origins[keep] = blend_weights(
+        keep_origin
+            .into_iter()
+            .map(|(source, weight)| (source, weight * (1.0 - share)))
+            .chain(
+                clear_origin
+                    .into_iter()
+                    .map(|(source, weight)| (source, weight * share)),
+            ),
+    );
     normals[keep] = (normals[keep] * (1.0 - factor) + normals[clear] * factor).normalize_or_zero();
     quadrics[keep] = quadrics[keep].add(quadrics[clear]);
 
@@ -1290,12 +1309,15 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
         }
     }
 
-    let polygons = if use_triangulate {
-        model
-            .faces
-            .iter()
-            .map(|face| (face.vertices.to_vec(), face.material))
-            .collect()
+    let (polygons, face_origins) = if use_triangulate {
+        (
+            model
+                .faces
+                .iter()
+                .map(|face| (face.vertices.to_vec(), face.material))
+                .collect(),
+            model.faces.iter().map(|face| Some(face.origin)).collect(),
+        )
     } else {
         collapse_untriangulate(&model)
     };
@@ -1308,14 +1330,23 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
             (edge.active && edge.input_loose && counts[index] == 0).then_some(edge.vertices)
         })
         .collect();
-    let points = model.points.iter().map(|point| point.as_dvec3()).collect();
-    decimate_compact(points, polygons, loose, &mesh.attributes)
+    let points = model
+        .points
+        .iter()
+        .map(|point| point.as_dvec3())
+        .collect::<Vec<_>>();
+    let origin = Origin {
+        vertices: model.origins,
+        faces: face_origins,
+    };
+    decimate_compact(points, polygons, loose, origin, mesh)
 }
 
-fn collapse_untriangulate(mesh: &CollapseMesh) -> Vec<Polygon> {
+fn collapse_untriangulate(mesh: &CollapseMesh) -> (Vec<Polygon>, Vec<Option<usize>>) {
     let (links, counts) = collapse_edge_face_links(mesh);
     let mut merged_faces = vec![false; mesh.faces.len()];
     let mut polygons = Vec::new();
+    let mut face_origins = Vec::new();
     for (edge_index, edge) in mesh.edges.iter().enumerate() {
         let Some(origin) = edge.cut_origin else {
             continue;
@@ -1350,13 +1381,33 @@ fn collapse_untriangulate(mesh: &CollapseMesh) -> Vec<Polygon> {
         merged_faces[first_index] = true;
         merged_faces[second_index] = true;
         polygons.push((vertices, first.material));
+        face_origins.push(Some(origin));
     }
     for (index, face) in mesh.faces.iter().enumerate() {
         if !merged_faces[index] {
             polygons.push((face.vertices.to_vec(), face.material));
+            face_origins.push(Some(face.origin));
         }
     }
-    unique_polygons(polygons)
+    unique_polygons_with_origins(polygons, face_origins)
+}
+
+fn unique_polygons_with_origins(
+    polygons: Vec<Polygon>,
+    face_origins: Vec<Option<usize>>,
+) -> (Vec<Polygon>, Vec<Option<usize>>) {
+    let mut seen = HashSet::with_capacity(polygons.len());
+    let mut unique_polygons = Vec::with_capacity(polygons.len());
+    let mut unique_origins = Vec::with_capacity(face_origins.len());
+    for (polygon, face_origin) in polygons.into_iter().zip(face_origins) {
+        let mut key = polygon.0.clone();
+        key.sort_unstable();
+        if seen.insert(key) {
+            unique_polygons.push(polygon);
+            unique_origins.push(face_origin);
+        }
+    }
+    (unique_polygons, unique_origins)
 }
 
 fn decimate_symmetry_axis(modifier: &Modifier) -> Result<usize> {
@@ -2583,7 +2634,9 @@ pub(super) fn decimate_dissolve(
             }
         }
     }
-    decimate_compact(points, polygons, loose, &mesh.attributes)
+    let face_origins = decimate_face_origins(mesh, &polygons)?;
+    let origin = Origin::copies((0..points.len()).map(Some), face_origins);
+    decimate_compact(points, polygons, loose, origin, mesh)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2936,6 +2989,36 @@ fn decimate_unsubdivide_dissolve_vertex(
     }
 }
 
+fn decimate_face_origins(mesh: &Mesh, polygons: &[Polygon]) -> Result<Vec<Option<usize>>> {
+    let vertex_indices = id_indices(mesh);
+    let mut source_faces = HashMap::<Vec<usize>, Option<usize>>::with_capacity(mesh.faces.len());
+    for (face_index, face) in mesh.faces.iter().enumerate() {
+        let mut key = face
+            .vertices
+            .iter()
+            .map(|vertex| {
+                vertex_indices.get(vertex).copied().ok_or_else(|| {
+                    PotError::invalid_argument("decimate face references a missing vertex")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        key.sort_unstable();
+        if let Some(source_face) = source_faces.get_mut(&key) {
+            *source_face = None;
+        } else {
+            source_faces.insert(key, Some(face_index));
+        }
+    }
+    polygons
+        .iter()
+        .map(|(vertices, _)| {
+            let mut key = vertices.clone();
+            key.sort_unstable();
+            Ok(source_faces.get(&key).copied().flatten())
+        })
+        .collect()
+}
+
 pub(super) fn decimate_unsubdivide(mesh: &Mesh, iterations: usize) -> Result<Mesh> {
     if iterations == 0 || mesh.faces.len() <= 3 {
         return Ok(mesh.clone());
@@ -3002,5 +3085,7 @@ pub(super) fn decimate_unsubdivide(mesh: &Mesh, iterations: usize) -> Result<Mes
             );
         }
     }
-    decimate_compact(points, polygons, loose, &mesh.attributes)
+    let face_origins = decimate_face_origins(mesh, &polygons)?;
+    let origin = Origin::copies((0..points.len()).map(Some), face_origins);
+    decimate_compact(points, polygons, loose, origin, mesh)
 }

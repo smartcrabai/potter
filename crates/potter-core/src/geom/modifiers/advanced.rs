@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{Mesh, provenance::Origin},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -284,7 +284,12 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             ));
         }
     }
-    build_mesh(points, faces, Vec::new(), &mesh.attributes)
+    let vertex_count = source_positions.len();
+    let origin = Origin::copies(
+        (0..ring_count * vertex_count).map(|index| Some(index % vertex_count)),
+        vec![None; faces.len()],
+    );
+    build_mesh(points, faces, Vec::new(), &origin, mesh)
 }
 
 pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -1081,8 +1086,9 @@ pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh
     let vertex_count = (mesh.vertices.len() as f64 * threshold) as usize;
     let source_positions = positions(mesh);
     let source_indices = id_indices(mesh);
-    let mut points = Vec::new();
+    let mut sources = Vec::new();
     let mut result_faces = Vec::new();
+    let mut face_sources = Vec::new();
     let mut result_edges = Vec::new();
     let mut vertex_map = HashMap::new();
     if face_count > 0 {
@@ -1096,14 +1102,15 @@ pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh
                 let result_index = if let Some(index) = vertex_map.get(&source_index) {
                     *index
                 } else {
-                    let index = points.len();
-                    points.push(source_positions[source_index]);
+                    let index = sources.len();
+                    sources.push(source_index);
                     vertex_map.insert(source_index, index);
                     index
                 };
                 vertices.push(result_index);
             }
             result_faces.push((vertices, face.material_index));
+            face_sources.push(Some(face_index));
         }
         for edge in &mesh.edges {
             let first = *source_indices.get(&edge.vertices[0]).ok_or_else(|| {
@@ -1131,9 +1138,8 @@ pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     vertex_map.entry(source_index)
                 {
-                    let index = points.len();
-                    points.push(source_positions[source_index]);
-                    entry.insert(index);
+                    entry.insert(sources.len());
+                    sources.push(source_index);
                 }
             }
             result_edges.push([
@@ -1146,14 +1152,14 @@ pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh
         if use_random_order {
             randomize_build_order(&mut vertex_order, seed);
         }
-        points.extend(
-            vertex_order
-                .into_iter()
-                .take(vertex_count)
-                .map(|index| source_positions[index]),
-        );
+        sources.extend(vertex_order.into_iter().take(vertex_count));
     }
-    let result = build_mesh(points, result_faces, result_edges, &mesh.attributes)?;
+    let points: Vec<DVec3> = sources
+        .iter()
+        .map(|&index| source_positions[index])
+        .collect();
+    let origin = Origin::copies(sources.into_iter().map(Some), face_sources);
+    let result = build_mesh(points, result_faces, result_edges, &origin, mesh)?;
     if !result.vertices.is_empty() {
         validated(&result)?;
     }
@@ -1214,7 +1220,8 @@ pub(super) fn edge_split(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     } else {
         HashSet::new()
     };
-    let mut points = positions(mesh);
+    // Vertex i copies source vertex i; split corners append copies of their source vertex.
+    let mut points: Vec<usize> = (0..mesh.vertices.len()).collect();
     let mut out_faces = Vec::new();
     let mut any_split = false;
     for (face_index, (indices, material)) in face_polygons.into_iter().enumerate() {
@@ -1240,7 +1247,7 @@ pub(super) fn edge_split(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         for index in indices {
             if should_split {
                 output.push(points.len());
-                points.push(mesh.vertices[index].co);
+                points.push(index);
             } else {
                 output.push(index);
             }
@@ -1276,13 +1283,17 @@ pub(super) fn edge_split(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
     let mut remap = vec![usize::MAX; points.len()];
-    let mut compact_points = Vec::with_capacity(used.len());
-    for (index, point) in points.into_iter().enumerate() {
+    let mut sources = Vec::with_capacity(used.len());
+    for (index, source) in points.into_iter().enumerate() {
         if used.contains(&index) {
-            remap[index] = compact_points.len();
-            compact_points.push(point);
+            remap[index] = sources.len();
+            sources.push(source);
         }
     }
+    let compact_points: Vec<DVec3> = sources
+        .iter()
+        .map(|&index| source_positions[index])
+        .collect();
     let compact_faces = out_faces
         .into_iter()
         .map(|(face, material)| {
@@ -1296,11 +1307,16 @@ pub(super) fn edge_split(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .into_iter()
         .map(|[first, second]| [remap[first], remap[second]])
         .collect();
+    let origin = Origin::copies(
+        sources.into_iter().map(Some),
+        (0..mesh.faces.len()).map(Some).collect(),
+    );
     build_mesh(
         compact_points,
         compact_faces,
         compact_loose_edges,
-        &mesh.attributes,
+        &origin,
+        mesh,
     )
 }
 
@@ -1475,7 +1491,8 @@ pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let source_indices = id_indices(mesh);
     let mut keep = HashSet::new();
     let mut retained_faces = Vec::new();
-    for face in &mesh.faces {
+    let mut retained_sources = Vec::new();
+    for (face_index, face) in mesh.faces.iter().enumerate() {
         if face.vertices.iter().all(|id| selected.contains(id)) {
             let indices = face
                 .vertices
@@ -1489,6 +1506,7 @@ pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 })
                 .collect::<Result<Vec<_>>>()?;
             retained_faces.push((indices, face.material_index));
+            retained_sources.push(Some(face_index));
         }
     }
     let source_loose_edges = loose_edges(mesh)?;
@@ -1501,13 +1519,16 @@ pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
     let mut remap = vec![usize::MAX; source_positions.len()];
-    let mut points = Vec::with_capacity(keep.len());
-    for index in 0..source_positions.len() {
-        if keep.contains(&index) {
-            remap[index] = points.len();
-            points.push(source_positions[index]);
-        }
+    let sources: Vec<usize> = (0..source_positions.len())
+        .filter(|index| keep.contains(index))
+        .collect();
+    for (output, &source) in sources.iter().enumerate() {
+        remap[source] = output;
     }
+    let points: Vec<DVec3> = sources
+        .iter()
+        .map(|&index| source_positions[index])
+        .collect();
     let faces = retained_faces
         .into_iter()
         .map(|(face, material)| {
@@ -1524,7 +1545,8 @@ pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .then_some([remap[first], remap[second]])
         })
         .collect();
-    build_mesh(points, faces, edges, &mesh.attributes)
+    let origin = Origin::copies(sources.into_iter().map(Some), retained_sources);
+    build_mesh(points, faces, edges, &origin, mesh)
 }
 
 #[expect(
@@ -1619,7 +1641,7 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         mesh.vertices.len() * 2 + mesh.faces.iter().map(|f| f.vertices.len()).sum::<usize>(),
     );
     if !use_replace {
-        points.extend(source_positions.iter().copied());
+        points.extend(source_positions.iter().copied().enumerate());
     }
     let mut negative_vertices = vec![usize::MAX; mesh.vertices.len()];
     let mut positive_vertices = vec![usize::MAX; mesh.vertices.len()];
@@ -1636,9 +1658,15 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         let factor = relative_factors[index];
         let center = source_positions[index] + normals[index] * (offset_midpoint * factor);
         negative_vertices[index] = points.len();
-        points.push(center + normals[index] * ((offset_original - offset_midpoint) * factor));
+        points.push((
+            index,
+            center + normals[index] * ((offset_original - offset_midpoint) * factor),
+        ));
         positive_vertices[index] = points.len();
-        points.push(center + normals[index] * ((offset_new - offset_midpoint) * factor));
+        points.push((
+            index,
+            center + normals[index] * ((offset_new - offset_midpoint) * factor),
+        ));
     }
 
     let mut loop_vertices = Vec::with_capacity(mesh.faces.len());
@@ -1743,7 +1771,7 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 point += normals[current] * (offset_midpoint * factor);
             }
             face_loops.push(points.len());
-            points.push(point);
+            points.push((current, point));
             if use_boundary
                 && boundary_edges.get(&(current.min(next), current.max(next))) == Some(&1)
             {
@@ -1787,7 +1815,7 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                         point += normals[boundary_vertex] * (offset_midpoint * factor);
                     }
                     boundary_vertices[boundary_vertex] = points.len();
-                    points.push(point);
+                    points.push((boundary_vertex, point));
                 }
             }
         }
@@ -1879,10 +1907,11 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             }
         }
     }
-    let mut attributes = mesh.attributes.clone();
-    attributes.remove("wireframe_use_crease");
-    attributes.remove("wireframe_crease_weight");
-    let mut result = build_mesh(points, faces, Vec::new(), &attributes)?;
+    let (sources, coords): (Vec<usize>, Vec<DVec3>) = points.into_iter().unzip();
+    let origin = Origin::copies(sources.into_iter().map(Some), vec![None; faces.len()]);
+    let mut result = build_mesh(coords, faces, Vec::new(), &origin, mesh)?;
+    result.attributes.remove("wireframe_use_crease");
+    result.attributes.remove("wireframe_crease_weight");
     if use_crease {
         let vertex_indices = id_indices(&result);
         let mut values = vec![0.0; result.edges.len()];
@@ -1940,6 +1969,9 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         bool_param(modifier, "use_z_symmetry", false)?,
     ];
     let mut node_positions = source_positions.clone();
+    let mut node_origins: Vec<Vec<(usize, f64)>> = (0..mesh.vertices.len())
+        .map(|index| vec![(index, 1.0)])
+        .collect();
     let mut node_radii = Vec::with_capacity(mesh.vertices.len() + mesh.edges.len() * 4);
     let mut node_roots = Vec::with_capacity(mesh.vertices.len());
     for vertex_index in 0..mesh.vertices.len() {
@@ -2007,6 +2039,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             let fraction = ratio.powf(radius_ratio);
             let index = node_positions.len();
             node_positions.push(source_positions[first].lerp(source_positions[second], fraction));
+            node_origins.push(vec![(first, 1.0 - fraction), (second, fraction)]);
             node_radii.push([
                 first_radius[0] + (second_radius[0] - first_radius[0]) * fraction,
                 first_radius[1] + (second_radius[1] - first_radius[1]) * fraction,
@@ -2133,6 +2166,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ]);
     }
     let mut points = Vec::with_capacity(node_positions.len() * 4);
+    let mut origins = Vec::with_capacity(node_positions.len() * 4);
     let mut frame_vertex_ids = vec![None; frames.len()];
     for (index, frame) in frames.iter().enumerate() {
         let Some(frame) = frame else {
@@ -2142,6 +2176,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         for corner in 0..4 {
             vertex_ids[corner] = points.len();
             points.push(frame[corner]);
+            origins.push(node_origins[index].clone());
         }
         frame_vertex_ids[index] = Some(vertex_ids);
     }
@@ -2182,17 +2217,57 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             faces.push((cap, 0));
         }
     }
-    let mut attributes = mesh.attributes.clone();
-    attributes.remove("blender_skin_vertices");
-    attributes.remove("skin_radii");
-    attributes.remove("skin_roots");
-    attributes.insert(
+    let origin = Origin {
+        vertices: origins,
+        faces: vec![None; faces.len()],
+    };
+    let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
+    result.attributes.remove("blender_skin_vertices");
+    result.attributes.remove("skin_radii");
+    result.attributes.remove("skin_roots");
+    drop_partial_vertex_groups(mesh, &origin, &mut result);
+    result.attributes.insert(
         "blender_polygon_smooth".to_owned(),
-        serde_json::json!(vec![smooth_shade; faces.len()]),
+        serde_json::json!(vec![smooth_shade; result.faces.len()]),
     );
-    let result = build_mesh(points, faces, Vec::new(), &attributes)?;
     validated(&result)?;
     Ok(result)
+}
+
+/// Blender interpolates a vertex group onto a blended skin vertex only when every source vertex
+/// has it; a group present on one source alone is dropped rather than zero-filled.
+fn drop_partial_vertex_groups(source: &Mesh, origin: &Origin, result: &mut Mesh) {
+    let Some(groups) = result
+        .attributes
+        .get_mut("vertex_groups")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let source_groups = source
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object);
+    for (name, weights) in groups.iter_mut() {
+        let Some(weights) = weights.as_object_mut() else {
+            continue;
+        };
+        let source_weights = source_groups
+            .and_then(|groups| groups.get(name))
+            .and_then(Value::as_object);
+        for (output, sources) in origin.vertices.iter().enumerate() {
+            if sources.len() < 2 {
+                continue;
+            }
+            let every_source_has_group = sources.iter().all(|(index, _)| {
+                let key = format!("v{}", source.vertices[*index].id);
+                source_weights.is_some_and(|weights| weights.contains_key(&key))
+            });
+            if !every_source_has_group {
+                weights.remove(&format!("v{}", result.vertices[output].id));
+            }
+        }
+    }
 }
 
 fn skin_radius(

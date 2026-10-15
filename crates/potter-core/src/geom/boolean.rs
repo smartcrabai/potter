@@ -11,7 +11,10 @@ use robust::{Coord3D, orient3d};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{
+        Mesh,
+        provenance::{Origin, remap_attributes},
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +43,7 @@ impl Operation {
 struct Polygon {
     vertices: Vec<DVec3>,
     material_index: u32,
+    source_face: Option<usize>,
 }
 
 impl Polygon {
@@ -64,6 +68,12 @@ impl Polygon {
     fn invert(&mut self) {
         self.vertices.reverse();
     }
+}
+#[derive(Clone, Debug)]
+struct OutputPolygon {
+    vertices: Vec<usize>,
+    material_index: u32,
+    source_face: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,12 +174,14 @@ impl Plane {
                     front.push(Polygon {
                         vertices,
                         material_index: polygon.material_index,
+                        source_face: polygon.source_face,
                     });
                 }
                 if let Some(vertices) = clean_vertices(back_vertices, epsilon) {
                     back.push(Polygon {
                         vertices,
                         material_index: polygon.material_index,
+                        source_face: polygon.source_face,
                     });
                 }
             }
@@ -392,7 +404,9 @@ pub fn boolean_mesh(source: &Mesh, operand: &Mesh, operation: &str) -> Result<Me
     let operation = Operation::parse(operation)?;
     if source.faces.is_empty() {
         return if operation == Operation::Union {
-            Ok(operand.clone())
+            let mut result = operand.clone();
+            clear_element_keyed_attributes(&mut result);
+            Ok(result)
         } else {
             Ok(Mesh::new())
         };
@@ -424,8 +438,8 @@ pub fn boolean_mesh(source: &Mesh, operand: &Mesh, operation: &str) -> Result<Me
 }
 
 fn boolean_mesh_validated(source: &Mesh, operand: &Mesh, operation: Operation) -> Result<Mesh> {
-    let mut source_polygons = mesh_polygons(source)?;
-    let mut operand_polygons = mesh_polygons(operand)?;
+    let mut source_polygons = mesh_polygons(source, false)?;
+    let mut operand_polygons = mesh_polygons(operand, true)?;
     let epsilon = weld_tolerance(source, operand);
     let mut source_node = BspNode::new(std::mem::take(&mut source_polygons), epsilon);
     let mut operand_node = BspNode::new(std::mem::take(&mut operand_polygons), epsilon);
@@ -538,8 +552,32 @@ fn mesh_for_faces(mesh: &Mesh, faces: &[usize]) -> Result<Mesh> {
                 PotError::invalid_argument(format!("boolean component face failed: {error}"))
             })?;
     }
-    component.attributes.clone_from(&mesh.attributes);
     Ok(component)
+}
+/// Clear B-only keys when the empty-source shortcut has no A provenance to remap.
+fn clear_element_keyed_attributes(mesh: &mut Mesh) {
+    for key in [
+        "vertex_groups",
+        "crease_edge",
+        "blender_edge_flags",
+        "skin_radii",
+        "skin_roots",
+        "blender_skin_vertices",
+    ] {
+        mesh.attributes.remove(key);
+    }
+    if let Some(entries) = mesh
+        .attributes
+        .get_mut("blender_attributes")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        entries.retain(|entry| {
+            !matches!(
+                entry.get("domain").and_then(serde_json::Value::as_str),
+                Some("POINT" | "EDGE" | "FACE" | "CORNER")
+            )
+        });
+    }
 }
 
 fn validate_closed_mesh(mesh: &Mesh, role: &str) -> Result<()> {
@@ -626,7 +664,7 @@ fn signed_volume(mesh: &Mesh) -> Result<f64> {
     Ok(volume)
 }
 
-fn mesh_polygons(mesh: &Mesh) -> Result<Vec<Polygon>> {
+fn mesh_polygons(mesh: &Mesh, has_operand_b: bool) -> Result<Vec<Polygon>> {
     let positions: HashMap<u32, DVec3> = mesh
         .vertices
         .iter()
@@ -637,7 +675,7 @@ fn mesh_polygons(mesh: &Mesh) -> Result<Vec<Polygon>> {
     })?;
     let mut cursor = 0;
     let mut result = Vec::with_capacity(triangles.len());
-    for face in &mesh.faces {
+    for (face_index, face) in mesh.faces.iter().enumerate() {
         let triangle_count = face.vertices.len() - 2;
         for triangle in &triangles[cursor..cursor + triangle_count] {
             let vertices = triangle
@@ -660,6 +698,7 @@ fn mesh_polygons(mesh: &Mesh) -> Result<Vec<Polygon>> {
             result.push(Polygon {
                 vertices,
                 material_index: face.material_index,
+                source_face: (!has_operand_b).then_some(face_index),
             });
         }
         cursor += triangle_count;
@@ -673,63 +712,100 @@ fn mesh_polygons(mesh: &Mesh) -> Result<Vec<Polygon>> {
 }
 
 fn polygons_to_mesh(polygons: Vec<Polygon>, template: &Mesh, epsilon: f64) -> Result<Mesh> {
+    let source_vertex_index: HashMap<u32, usize> = template
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
     let mut points = Vec::new();
-    let mut faces = Vec::<(Vec<usize>, u32)>::new();
+    let mut point_origins = Vec::new();
+    let mut faces = Vec::<OutputPolygon>::new();
     for polygon in polygons {
         let Some(vertices) = clean_vertices(polygon.vertices, epsilon) else {
             continue;
         };
+        let source_face_vertices = polygon
+            .source_face
+            .and_then(|face_index| template.faces.get(face_index))
+            .map(|face| face.vertices.as_slice());
+        let mut source_vertex_origins = Vec::with_capacity(vertices.len());
         let indices = vertices
             .into_iter()
-            .map(|point| find_or_insert_point(point, &mut points, epsilon))
+            .map(|point| {
+                let source_vertex =
+                    source_face_vertices
+                        .into_iter()
+                        .flatten()
+                        .find_map(|vertex_id| {
+                            let index = source_vertex_index.get(vertex_id).copied()?;
+                            (template.vertices[index].co == point).then_some(index)
+                        });
+                source_vertex_origins.push(source_vertex);
+                find_or_insert_point(point, &mut points, &mut point_origins, epsilon)
+            })
             .collect::<Vec<_>>();
         if indices.len() >= 3 && polygon_area(&indices, &points) > epsilon * epsilon {
-            faces.push((indices, polygon.material_index));
+            for (index, source_vertex) in indices.iter().zip(source_vertex_origins) {
+                if point_origins[*index].is_none() {
+                    point_origins[*index] = source_vertex;
+                }
+            }
+            faces.push(OutputPolygon {
+                vertices: indices,
+                material_index: polygon.material_index,
+                source_face: polygon.source_face,
+            });
         }
     }
     merge_coplanar_faces(&mut faces, &points, epsilon);
     let active_points: HashSet<usize> = faces
         .iter()
-        .flat_map(|(face, _)| face.iter().copied())
+        .flat_map(|polygon| polygon.vertices.iter().copied())
         .collect();
     split_t_junctions(&points, &mut faces, &active_points, epsilon);
     let used_points: HashSet<usize> = faces
         .iter()
-        .flat_map(|(face, _)| face.iter().copied())
+        .flat_map(|polygon| polygon.vertices.iter().copied())
         .collect();
     let mut point_remap = vec![usize::MAX; points.len()];
     let mut compact_points = Vec::with_capacity(used_points.len());
+    let mut compact_vertex_origins = Vec::with_capacity(used_points.len());
     for (index, point) in points.into_iter().enumerate() {
         if used_points.contains(&index) {
             point_remap[index] = compact_points.len();
             compact_points.push(point);
+            compact_vertex_origins.push(point_origins[index]);
         }
     }
-    for (face, _) in &mut faces {
-        for index in face {
+    for polygon in &mut faces {
+        for index in &mut polygon.vertices {
             *index = point_remap[*index];
         }
     }
-    let points = compact_points;
     let mut mesh = Mesh::new();
-    for point in points {
+    for point in compact_points {
         mesh.insert_vertex(point).map_err(|error| {
             PotError::invalid_argument(format!("boolean output vertex failed: {error}"))
         })?;
     }
-    for (indices, material_index) in faces {
-        let vertices = indices
+    let mut output_face_origins = Vec::with_capacity(faces.len());
+    for polygon in faces {
+        let vertices = polygon
+            .vertices
             .into_iter()
             .filter_map(|index| mesh.vertices.get(index).map(|vertex| vertex.id))
             .collect::<Vec<_>>();
         if vertices.len() >= 3 {
-            mesh.insert_face(vertices, material_index)
+            mesh.insert_face(vertices, polygon.material_index)
                 .map_err(|error| {
                     PotError::invalid_argument(format!("boolean output face failed: {error}"))
                 })?;
+            output_face_origins.push(polygon.source_face);
         }
     }
-    mesh.attributes.clone_from(&template.attributes);
+    let origin = Origin::copies(compact_vertex_origins, output_face_origins);
+    remap_attributes(template, &mut mesh, &origin)?;
     mesh.validate().map_err(|error| {
         PotError::invalid_argument(format!("boolean output is invalid: {error}"))
     })?;
@@ -739,7 +815,12 @@ fn polygons_to_mesh(polygons: Vec<Polygon>, template: &Mesh, epsilon: f64) -> Re
     Ok(mesh)
 }
 
-fn find_or_insert_point(point: DVec3, points: &mut Vec<DVec3>, tolerance: f64) -> usize {
+fn find_or_insert_point(
+    point: DVec3,
+    points: &mut Vec<DVec3>,
+    point_origins: &mut Vec<Option<usize>>,
+    tolerance: f64,
+) -> usize {
     if let Some((index, _)) = points
         .iter()
         .enumerate()
@@ -748,14 +829,16 @@ fn find_or_insert_point(point: DVec3, points: &mut Vec<DVec3>, tolerance: f64) -
         index
     } else {
         points.push(point);
+        point_origins.push(None);
         points.len() - 1
     }
 }
 
-fn merge_coplanar_faces(faces: &mut Vec<(Vec<usize>, u32)>, points: &[DVec3], tolerance: f64) {
+fn merge_coplanar_faces(faces: &mut Vec<OutputPolygon>, points: &[DVec3], tolerance: f64) {
     loop {
         let mut shared_edges = BTreeMap::<(usize, usize), Vec<(usize, usize)>>::new();
-        for (face_index, (face, _)) in faces.iter().enumerate() {
+        for (face_index, polygon) in faces.iter().enumerate() {
+            let face = &polygon.vertices;
             for edge_index in 0..face.len() {
                 let first = face[edge_index];
                 let second = face[(edge_index + 1) % face.len()];
@@ -771,28 +854,40 @@ fn merge_coplanar_faces(faces: &mut Vec<(Vec<usize>, u32)>, points: &[DVec3], to
             }
             let (first_index, first_edge) = owners[0];
             let (second_index, second_edge) = owners[1];
-            let (first, first_material) = &faces[first_index];
-            let (second, second_material) = &faces[second_index];
-            if first_material != second_material
-                || first[first_edge] != second[(second_edge + 1) % second.len()]
-                || first[(first_edge + 1) % first.len()] != second[second_edge]
-                || !faces_are_coplanar(first, second, points, tolerance)
+            let first = &faces[first_index];
+            let second = &faces[second_index];
+            if first.material_index != second.material_index
+                || first.vertices[first_edge]
+                    != second.vertices[(second_edge + 1) % second.vertices.len()]
+                || first.vertices[(first_edge + 1) % first.vertices.len()]
+                    != second.vertices[second_edge]
+                || !faces_are_coplanar(&first.vertices, &second.vertices, points, tolerance)
             {
                 return None;
             }
-            let merged_face = merge_face_loops(first, first_edge, second, second_edge);
+            let merged_face =
+                merge_face_loops(&first.vertices, first_edge, &second.vertices, second_edge);
             let merged_face = clean_face_loop(merged_face, points, tolerance)?;
             (polygon_area(&merged_face, points) > tolerance * tolerance).then_some((
                 first_index,
-                *first_material,
                 second_index,
                 merged_face,
             ))
         });
-        let Some((first_index, material_index, second_index, merged_face)) = candidate else {
+        let Some((first_index, second_index, merged_face)) = candidate else {
             break;
         };
-        faces[first_index] = (merged_face, material_index);
+        let first = &faces[first_index];
+        let second = &faces[second_index];
+        let source_face = (first.source_face == second.source_face)
+            .then_some(first.source_face)
+            .flatten();
+        let material_index = first.material_index;
+        faces[first_index] = OutputPolygon {
+            vertices: merged_face,
+            material_index,
+            source_face,
+        };
         faces.remove(second_index);
     }
 }
@@ -873,12 +968,12 @@ fn clean_face_loop(mut face: Vec<usize>, points: &[DVec3], tolerance: f64) -> Op
 
 fn split_t_junctions(
     points: &[DVec3],
-    faces: &mut [(Vec<usize>, u32)],
+    faces: &mut [OutputPolygon],
     active_points: &HashSet<usize>,
     tolerance: f64,
 ) {
-    for (face, _) in faces {
-        let original = std::mem::take(face);
+    for polygon in faces {
+        let original = std::mem::take(&mut polygon.vertices);
         let mut split = Vec::new();
         for index in 0..original.len() {
             let first_index = original[index];
@@ -913,7 +1008,7 @@ fn split_t_junctions(
             interior.sort_by(|left, right| left.0.total_cmp(&right.0));
             split.extend(interior.into_iter().map(|(_, point_index)| point_index));
         }
-        *face = split;
+        polygon.vertices = split;
     }
 }
 

@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::animation::animated_transform,
+    eval::{animation::animated_transform, mesh_vertex_weights},
     geom::Mesh,
     model::{
         ArmatureData, Constraint, ConstraintType, DataBlock, Driver, DriverType, DriverVariable,
@@ -2022,6 +2022,7 @@ fn solve_legacy_ik(
     Ok(())
 }
 /// Blend shape keys using caller-evaluated animated or driven key values.
+/// `mesh` must be the source mesh: weights are read from `data_block.vertex_weights` by source vertex ID.
 pub(crate) fn apply_shape_keys_with_values(
     mesh: &mut Mesh,
     shape_keys: &ShapeKeyData,
@@ -2437,6 +2438,11 @@ pub(crate) fn apply_armature_skinning(
     if transforms.is_empty() {
         return Ok(());
     }
+    let weights_by_vertex = if use_groups {
+        mesh_vertex_weights(mesh, &data_block.vertex_groups)
+    } else {
+        BTreeMap::new()
+    };
     for vertex in &mut mesh.vertices {
         let armature_position = object_to_armature.transform_point3(vertex.co);
         if !armature_position.is_finite() {
@@ -2451,8 +2457,7 @@ pub(crate) fn apply_armature_skinning(
             let mut weight = if use_groups {
                 group
                     .and_then(|group| {
-                        data_block
-                            .vertex_weights
+                        weights_by_vertex
                             .get(&vertex.id)
                             .and_then(|weights| weights.get(&group.id))
                     })

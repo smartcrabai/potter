@@ -15,7 +15,7 @@ use crate::{
         normals::{SHADING_ATTRIBUTES, shading_keys_stale},
     },
     hash,
-    model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc},
+    model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
 };
 
 pub mod animation;
@@ -3253,12 +3253,12 @@ fn apply_lattice_modifier(
             ));
         }
         let group_id = &group.id;
+        let weights_by_vertex = mesh_vertex_weights(mesh, &source_data.vertex_groups);
         Some(
             mesh.vertices
                 .iter()
                 .map(|vertex| {
-                    source_data
-                        .vertex_weights
+                    weights_by_vertex
                         .get(&vertex.id)
                         .and_then(|groups| groups.get(group_id))
                         .copied()
@@ -3876,6 +3876,40 @@ pub(crate) fn attach_vertex_group_weights(mesh: &mut Mesh, data_block: &DataBloc
         serde_json::Value::Object(groups),
     );
 }
+
+/// Inverse of [`attach_vertex_group_weights`]: vertex ID -> group ID -> weight, read from the
+/// `vertex_groups` attribute of `mesh`. Group names resolve through `groups`; names absent from
+/// `groups` and keys that are not `v{id}` are ignored.
+pub(crate) fn mesh_vertex_weights(
+    mesh: &Mesh,
+    groups: &[VertexGroup],
+) -> BTreeMap<u32, BTreeMap<Id, f64>> {
+    let mut weights = BTreeMap::<u32, BTreeMap<Id, f64>>::new();
+    let Some(by_group) = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+    else {
+        return weights;
+    };
+    for group in groups {
+        let Some(values) = by_group.get(&group.name).and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, value) in values {
+            let vertex_id = key.strip_prefix('v').and_then(|id| id.parse::<u32>().ok());
+            let (Some(vertex_id), Some(weight)) = (vertex_id, value.as_f64()) else {
+                continue;
+            };
+            weights
+                .entry(vertex_id)
+                .or_default()
+                .insert(group.id.clone(), weight);
+        }
+    }
+    weights
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]

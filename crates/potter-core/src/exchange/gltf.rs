@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
@@ -10,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::Snapshot,
+    eval::{Snapshot, mesh_vertex_weights},
     geom::{
         Face, Mesh,
         normals::{corner_normals, morph_corner_normals, shading_keys_stale},
@@ -448,6 +449,24 @@ fn validate_skin_shape_key_rest(
     Ok(())
 }
 
+/// Vertex-group weights keyed by `mesh`'s vertex IDs. Shape-key exports pass the source mesh, whose
+/// IDs key `DataBlock.vertex_weights`; every other export passes the evaluated mesh, whose remapped
+/// `vertex_groups` attribute is the only valid source.
+fn export_vertex_weights<'a>(
+    mesh: &Mesh,
+    data_block: &'a DataBlock,
+) -> Cow<'a, BTreeMap<u32, BTreeMap<Id, f64>>> {
+    let shape_keyed = data_block
+        .shape_keys
+        .as_ref()
+        .is_some_and(|shape_keys| !shape_keys.keys.is_empty());
+    if shape_keyed {
+        Cow::Borrowed(&data_block.vertex_weights)
+    } else {
+        Cow::Owned(mesh_vertex_weights(mesh, &data_block.vertex_groups))
+    }
+}
+
 /// Deform-bone influences per exported vertex as (joint index, weight), sorted by joint index.
 /// The glTF writer and VRM preflight share this so `validate --format vrm|vrm0` reports the same
 /// failures: every skinned vertex needs weight, and VRM also caps influences at four.
@@ -502,6 +521,7 @@ fn skin_influences(
     // Keyed by source vertex: one source vertex can appear in several split output vertices.
     let mut unweighted = BTreeSet::<u32>::new();
     let mut over_limit = BTreeMap::<u32, usize>::new();
+    let weights_by_vertex = export_vertex_weights(mesh, data_block);
     for source_index in source_vertex_indices {
         let vertex = mesh.vertices.get(*source_index).ok_or_else(|| {
             PotError::new(
@@ -510,7 +530,7 @@ fn skin_influences(
             )
         })?;
         let mut influences = Vec::<(usize, f64)>::new();
-        if let Some(vertex_weights) = data_block.vertex_weights.get(&vertex.id) {
+        if let Some(vertex_weights) = weights_by_vertex.get(&vertex.id) {
             for (group_id, weight) in vertex_weights {
                 if !group_ids.contains(group_id) {
                     return Err(PotError::new(
@@ -1027,42 +1047,31 @@ fn used_material_ids<'a>(node: &'a Node, mesh: &Mesh, instanced: bool) -> Result
         .collect())
 }
 
-fn matches_source_vertex_groups(attribute: &Value, data_block: &DataBlock) -> bool {
+/// Whether a `vertex_groups` attribute is a structurally valid export of `data_block`'s groups:
+/// every group name exists on the block and every entry is `v{vertex id}` with a finite, nonnegative
+/// weight. Weights are not compared with the source, because modifiers may change them.
+fn valid_vertex_groups_attribute(attribute: &Value, data_block: &DataBlock) -> bool {
     if data_block.vertex_groups.is_empty() {
         return false;
     }
     let Some(groups) = attribute.as_object() else {
         return false;
     };
-    if groups.len() != data_block.vertex_groups.len() {
-        return false;
-    }
-    for group in &data_block.vertex_groups {
-        let Some(weights) = groups.get(&group.name).and_then(Value::as_object) else {
-            return false;
-        };
-        let expected_count = data_block
-            .vertex_weights
-            .values()
-            .filter(|weights| weights.contains_key(&group.id))
-            .count();
-        if weights.len() != expected_count {
-            return false;
-        }
-        for (vertex_id, source_weights) in &data_block.vertex_weights {
-            let Some(expected) = source_weights.get(&group.id) else {
-                continue;
-            };
-            let key = format!("v{vertex_id}");
-            let Some(actual) = weights.get(&key).and_then(Value::as_f64) else {
-                return false;
-            };
-            if actual.to_bits() != expected.to_bits() {
-                return false;
-            }
-        }
-    }
-    true
+    groups.iter().all(|(name, entries)| {
+        data_block
+            .vertex_groups
+            .iter()
+            .any(|group| group.name == *name)
+            && entries.as_object().is_some_and(|weights| {
+                weights.iter().all(|(key, weight)| {
+                    key.strip_prefix('v')
+                        .is_some_and(|id| id.parse::<u32>().is_ok())
+                        && weight
+                            .as_f64()
+                            .is_some_and(|weight| weight.is_finite() && weight >= 0.0)
+                })
+            })
+    })
 }
 
 fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) -> Result<()> {
@@ -1070,7 +1079,7 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
         let supported = match name.as_str() {
             "uv_map" | "seam" | "shade_smooth" | "sharp" | "custom_normal" => true,
             "vertex_groups" => {
-                data_block.is_some_and(|block| matches_source_vertex_groups(value, block))
+                data_block.is_some_and(|block| valid_vertex_groups_attribute(value, block))
             }
             _ => false,
         };
@@ -2931,7 +2940,7 @@ fn export_with_root_inner(
                 "shape_key_data": data_block.and_then(|block| block.shape_keys.as_ref()),
                 "vertex_ids": layout.source_vertex_indices.iter().map(|index| mesh.vertices[*index].id).collect::<Vec<_>>(),
                 "vertex_groups": data_block.map(|block| &block.vertex_groups),
-                "vertex_weights": data_block.map(|block| &block.vertex_weights)
+                "vertex_weights": data_block.map(|block| export_vertex_weights(mesh, block))
             } }
         });
         if !target_names.is_empty() {

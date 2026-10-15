@@ -116,12 +116,11 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             None,
             &bind_nodes,
         )?;
-        let mut source_bind_mesh = bind_snapshot
+        let source_bind_mesh = bind_snapshot
             .meshes
             .get(&subject_id)
             .cloned()
             .ok_or_else(|| PotError::invalid_operation("evaluated source mesh is unavailable"))?;
-        crate::eval::attach_vertex_group_weights(&mut source_bind_mesh, source_data);
         let binding = if modifier.modifier_type == "laplacian_deform" {
             let group_name = modifier
                 .params
@@ -807,21 +806,13 @@ fn apply_modifier(
                     _ => false,
                 }
             });
-            let uses_vertex_group = modifier_stack.iter().any(|modifier| {
-                modifier.enabled
-                    && (modifier.modifier_type == "mask"
-                        || (matches!(
-                            modifier.modifier_type.as_str(),
-                            "surface_deform" | "mesh_deform" | "laplacian_deform"
-                        ) && modifier
-                            .params
-                            .get("vertex_group")
-                            .is_some_and(Value::is_string)))
+            // Vertex-group readers consume the mesh attribute, so attach source weights whenever the
+            // block has groups; the evaluated output then carries the remapped weights.
+            let prepared_output = (!data_block.vertex_groups.is_empty()).then(|| {
+                let mut mesh = output.clone();
+                crate::eval::attach_vertex_group_weights(&mut mesh, data_block);
+                mesh
             });
-            let mut prepared_output = uses_vertex_group.then(|| output.clone());
-            if let Some(mesh) = &mut prepared_output {
-                crate::eval::attach_vertex_group_weights(mesh, data_block);
-            }
             if !allow_shape_keys && data_block.shape_keys.is_some() {
                 return Err(PotError::with_details(
                     ErrorCode::UnsupportedFeature,
@@ -993,6 +984,16 @@ fn apply_modifier(
                 evaluation.mesh
             }
         };
+        // The evaluated `vertex_groups` attribute is a view of DataBlock weights keyed by this mesh's
+        // IDs. Persist it as the weights and keep the transient attribute out of stored mesh data.
+        let mut evaluated = evaluated;
+        let persisted_weights = engine
+            .doc
+            .data_blocks
+            .get(&data_id)
+            .map(|data| crate::eval::mesh_vertex_weights(&evaluated, &data.vertex_groups))
+            .unwrap_or_default();
+        evaluated.attributes.remove("vertex_groups");
         let mesh_changed = engine
             .doc
             .data_blocks
@@ -1020,6 +1021,7 @@ fn apply_modifier(
         }
         if let Some(data) = engine.doc.data_blocks.get_mut(&data_id) {
             data.mesh = Some(evaluated);
+            data.vertex_weights = persisted_weights;
             if mesh_changed {
                 data.descriptor = None;
             }
@@ -1322,11 +1324,11 @@ fn apply_lattice_modifier(
         }
     };
     let weights = vertex_group.map(|group_id| {
+        let weights_by_vertex = crate::eval::mesh_vertex_weights(mesh, &source_data.vertex_groups);
         mesh.vertices
             .iter()
             .map(|vertex| {
-                source_data
-                    .vertex_weights
+                weights_by_vertex
                     .get(&vertex.id)
                     .and_then(|weights| weights.get(group_id))
                     .copied()

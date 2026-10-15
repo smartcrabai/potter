@@ -17,7 +17,10 @@ use crate::{
     params::{self, ParameterFamily},
 };
 
-use super::{Mesh, MeshError, edge_key};
+use super::{
+    Mesh, MeshError, edge_key,
+    provenance::{Origin, remap_attributes},
+};
 
 mod advanced;
 pub mod attributes;
@@ -29,7 +32,29 @@ pub mod simulation;
 type Polygon = (Vec<usize>, u32);
 type BevelEdgeFaces = BTreeMap<(usize, usize), Vec<(usize, usize, u32)>>;
 type BevelEdgeFacesWithMaterial = BTreeMap<(usize, usize), Vec<(usize, usize, usize, u32)>>;
-type MergedGeometry = (Vec<DVec3>, Vec<Polygon>, Vec<[usize; 2]>);
+/// Merged points, polygons, and edges, with the input element each output point and polygon came from.
+struct MergedGeometry {
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    edges: Vec<[usize; 2]>,
+    /// Per merged point, the input point indices merged into it.
+    point_members: Vec<Vec<usize>>,
+    /// Per merged polygon, the input polygon index it was built from.
+    polygon_sources: Vec<usize>,
+}
+
+impl MergedGeometry {
+    /// Geometry that is not merged: every input point and polygon is kept in place.
+    fn unmerged(points: Vec<DVec3>, polygons: Vec<Polygon>, edges: Vec<[usize; 2]>) -> Self {
+        Self {
+            point_members: (0..points.len()).map(|point| vec![point]).collect(),
+            polygon_sources: (0..polygons.len()).collect(),
+            points,
+            polygons,
+            edges,
+        }
+    }
+}
 const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
@@ -239,6 +264,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             }
             continue;
         }
+        let attributes_before = attribute_labels(&evaluated);
         evaluated = match modifier.modifier_type.as_str() {
             "mirror" => mirror(&evaluated, modifier)?,
             "array" => array(
@@ -288,6 +314,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "ocean" => ocean::ocean(&evaluated, modifier, frame)?,
             _ => return Err(unsupported_modifier(modifier)),
         };
+        let dropped: Vec<String> = attributes_before
+            .difference(&attribute_labels(&evaluated))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            warnings.push(attribute_dropped_warning(modifier, &dropped));
+        }
     }
     Ok(ModifierEvaluation {
         mesh: evaluated,
@@ -627,7 +660,8 @@ fn build_mesh(
     points: Vec<DVec3>,
     polygons: Vec<Polygon>,
     loose_edges: Vec<[usize; 2]>,
-    attributes: &serde_json::Map<String, Value>,
+    origin: &Origin,
+    source: &Mesh,
 ) -> Result<Mesh> {
     let mut result = Mesh::new();
     for point in points {
@@ -680,9 +714,55 @@ fn build_mesh(
                 .map_err(|error| mesh_error(&error))?;
         }
     }
-    result.attributes.clone_from(attributes);
+    remap_attributes(source, &mut result, origin)?;
     validated(&result)?;
     Ok(result)
+}
+
+/// Labels of the element-keyed data a modifier must carry through a rebuild: each top-level
+/// attribute, and each `blender_attributes` entry by name. Skin inputs are consumed by the Skin
+/// modifier itself, and wireframe settings are Potter-only modifier state, so neither is a label.
+fn attribute_labels(mesh: &Mesh) -> BTreeSet<String> {
+    let mut labels = BTreeSet::new();
+    for (key, value) in &mesh.attributes {
+        if matches!(
+            key.as_str(),
+            "skin_radii"
+                | "skin_roots"
+                | "blender_skin_vertices"
+                | "wireframe_use_crease"
+                | "wireframe_crease_weight"
+        ) {
+            continue;
+        }
+        labels.insert(key.clone());
+        if key == "blender_attributes" {
+            for attribute in value.as_array().into_iter().flatten() {
+                if let Some(name) = attribute.get("name").and_then(Value::as_str) {
+                    labels.insert(format!("blender_attributes:{name}"));
+                }
+            }
+        }
+    }
+    labels
+}
+
+fn attribute_dropped_warning(modifier: &Modifier, dropped: &[String]) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnrepresentableFeature,
+        format!(
+            "modifier `{}` cannot carry mesh attributes through this rebuild: {}",
+            modifier.id,
+            dropped.join(", ")
+        ),
+        json!({
+            "feature_id": "modifier.attribute_dropped",
+            "status": "dropped",
+            "modifier_id": modifier.id,
+            "modifier_type": modifier.modifier_type,
+            "attributes": dropped,
+        }),
+    )
 }
 
 fn cyclic_pairs<T>(items: &[T]) -> impl Iterator<Item = (&T, &T)> {
@@ -698,6 +778,89 @@ fn cyclic_pairs<T>(items: &[T]) -> impl Iterator<Item = (&T, &T)> {
 )]
 fn usize_as_f64(value: usize) -> f64 {
     value as f64
+}
+
+/// Origin weights from `(source, weight)` pairs: repeated sources add up and zero weights drop out.
+pub(super) fn blend_weights(pairs: impl IntoIterator<Item = (usize, f64)>) -> Vec<(usize, f64)> {
+    let mut weights = BTreeMap::new();
+    for (source, weight) in pairs {
+        *weights.entry(source).or_insert(0.0) += weight;
+    }
+    weights
+        .into_iter()
+        .filter(|(_, weight)| *weight > 0.0)
+        .collect()
+}
+
+/// Origin of a point at the equal-weight mean of `members`. `None` members carry no input data and
+/// are left out; a point whose members all lack input data is new.
+fn mean_origin(members: impl IntoIterator<Item = Option<usize>>) -> Vec<(usize, f64)> {
+    let members: Vec<usize> = members.into_iter().flatten().collect();
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let share = 1.0 / usize_as_f64(members.len());
+    blend_weights(members.into_iter().map(|member| (member, share)))
+}
+
+/// The group a mirrored copy takes weight from: the `.L`/`.R` side-swapped name when the mesh has
+/// that group, otherwise the name itself.
+fn mirrored_group_name(name: &str, groups: &Map<String, Value>, flipped: bool) -> String {
+    let swapped = name
+        .strip_suffix(".L")
+        .map(|stem| format!("{stem}.R"))
+        .or_else(|| name.strip_suffix(".R").map(|stem| format!("{stem}.L")));
+    match swapped {
+        Some(swapped) if flipped && groups.contains_key(&swapped) => swapped,
+        _ => name.to_owned(),
+    }
+}
+
+/// Rewrites `vertex_groups` of a mirrored `output`. `members[o]` lists the input points merged into
+/// output vertex `o`; input point `c * vertex_count + v` is copy `c` of source vertex `v`. A copy
+/// with an odd number of mirrored axes takes each group under its side-swapped name, and a merged
+/// point averages its members with absent weights counted as zero.
+fn mirror_vertex_groups(
+    source: &Mesh,
+    output: &mut Mesh,
+    members: &[Vec<usize>],
+    vertex_count: usize,
+) {
+    let Some(source_groups) = source
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let mut weights = BTreeMap::<(String, String), f64>::new();
+    for (vertex, copies) in output.vertices.iter().zip(members) {
+        let share = 1.0 / usize_as_f64(copies.len());
+        let key = format!("v{}", vertex.id);
+        for &copy in copies {
+            let flipped = (copy / vertex_count).count_ones() % 2 == 1;
+            let source_key = format!("v{}", source.vertices[copy % vertex_count].id);
+            for (name, group) in source_groups {
+                let Some(weight) = group.get(&source_key).and_then(Value::as_f64) else {
+                    continue;
+                };
+                let target = mirrored_group_name(name, source_groups, flipped);
+                *weights.entry((target, key.clone())).or_insert(0.0) += weight * share;
+            }
+        }
+    }
+    let mut groups: Map<String, Value> = source_groups
+        .keys()
+        .map(|name| (name.clone(), json!({})))
+        .collect();
+    for ((name, key), weight) in weights {
+        if let Some(group) = groups.get_mut(&name).and_then(Value::as_object_mut) {
+            group.insert(key, json!(weight));
+        }
+    }
+    output
+        .attributes
+        .insert("vertex_groups".to_owned(), Value::Object(groups));
 }
 
 fn clean_polygon(vertices: Vec<usize>) -> Option<Vec<usize>> {
@@ -793,17 +956,29 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .map(|[a, b]| [base + *a, base + *b]),
         );
     }
-    let (points, output_polygons, output_loose_edges) = if merge {
+    let merged = if merge {
         merge_geometry(&points, output_polygons, output_loose_edges, threshold)?
     } else {
-        (points, output_polygons, output_loose_edges)
+        MergedGeometry::unmerged(points, output_polygons, output_loose_edges)
     };
-    build_mesh(
-        points,
-        output_polygons,
-        output_loose_edges,
-        &mesh.attributes,
-    )
+    let vertex_count = source_points.len();
+    let origin = Origin {
+        vertices: merged
+            .point_members
+            .iter()
+            .map(|members| mean_origin(members.iter().map(|&point| Some(point % vertex_count))))
+            .collect(),
+        faces: merged
+            .polygon_sources
+            .iter()
+            .map(|&polygon| Some(polygon % source_polygons.len()))
+            .collect(),
+    };
+    let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
+    if bool_param(modifier, "use_mirror_vertex_groups", true)? {
+        mirror_vertex_groups(mesh, &mut result, &merged.point_members, vertex_count);
+    }
+    Ok(result)
 }
 
 fn array(
@@ -1042,7 +1217,7 @@ fn array(
             "a count that produces finite coordinates",
         ));
     }
-    let (points, output_polygons, output_loose_edges) = if use_merge {
+    let merged = if use_merge {
         let mut pairs = Vec::with_capacity(count_usize + usize::from(merge_final));
         for index in 1..copy_ranges.len() {
             pairs.push((copy_ranges[index - 1].clone(), copy_ranges[index].clone()));
@@ -1067,18 +1242,40 @@ fn array(
             &pairs,
         )?
     } else {
-        (points, output_polygons, output_loose_edges)
+        MergedGeometry::unmerged(points, output_polygons, output_loose_edges)
+    };
+    // Copies come first in point and polygon order, so an index below the copy count is a copy of
+    // the source; cap geometry comes from another mesh and has no input data.
+    let copy_vertex_count = count_usize * source_points.len();
+    let copy_face_count = count_usize * source_polygons.len();
+    let origin = Origin {
+        vertices: merged
+            .point_members
+            .iter()
+            .map(|members| {
+                mean_origin(
+                    members.iter().map(|&point| {
+                        (point < copy_vertex_count).then(|| point % source_points.len())
+                    }),
+                )
+            })
+            .collect(),
+        faces: merged
+            .polygon_sources
+            .iter()
+            .map(|&polygon| (polygon < copy_face_count).then(|| polygon % source_polygons.len()))
+            .collect(),
     };
     let source_loop_count = source_polygons.iter().map(|(face, _)| face.len()).sum();
-    let mut attributes = mesh.attributes.clone();
+    let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     array_uv_attributes(
-        &mut attributes,
+        &mut result.attributes,
         source_loop_count,
         count_usize,
         offset_u,
         offset_v,
     )?;
-    build_mesh(points, output_polygons, output_loose_edges, &attributes)
+    Ok(result)
 }
 
 fn array_cap_mesh<'a>(
@@ -1332,43 +1529,7 @@ fn merge_geometry_pairs(
             }
         }
     }
-    let mut root_to_index = HashMap::new();
-    let mut sums = Vec::<DVec3>::new();
-    let mut counts = Vec::<usize>::new();
-    let mut remap = vec![0; points.len()];
-    for index in 0..points.len() {
-        let root = find(&mut parent, index);
-        let mapped = *root_to_index.entry(root).or_insert_with(|| {
-            sums.push(DVec3::ZERO);
-            counts.push(0);
-            sums.len() - 1
-        });
-        remap[index] = mapped;
-        sums[mapped] += points[index];
-        counts[mapped] += 1;
-    }
-    let merged_points = sums
-        .into_iter()
-        .zip(counts)
-        .map(|(sum, count)| sum / usize_as_f64(count))
-        .collect();
-    let merged_polygons = unique_polygons(
-        polygons
-            .into_iter()
-            .filter_map(|(face, material)| {
-                clean_polygon(face.into_iter().map(|index| remap[index]).collect())
-                    .map(|clean| (clean, material))
-            })
-            .collect(),
-    );
-    let merged_edges = edges
-        .into_iter()
-        .filter_map(|[first, second]| {
-            let pair = [remap[first], remap[second]];
-            (pair[0] != pair[1]).then_some(pair)
-        })
-        .collect();
-    Ok((merged_points, merged_polygons, merged_edges))
+    Ok(collapse_clusters(points, parent, polygons, edges))
 }
 
 #[derive(Clone, Copy)]
@@ -1919,23 +2080,32 @@ fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
         output_loose_edges.push([first, midpoint]);
         output_loose_edges.push([midpoint, second]);
     }
-    let attributes = mesh
-        .attributes
-        .get("vertex_groups")
-        .and_then(Value::as_object)
-        .map(|_| {
-            let mut attributes = mesh.attributes.clone();
-            attributes.insert(
-                "vertex_groups".to_owned(),
-                subdivided_vertex_group_attributes(mesh, &source_polygons, &edge_faces),
-            );
-            attributes
-        });
+    let mut vertex_origins: Vec<Vec<(usize, f64)>> = (0..source_points.len())
+        .map(|vertex| vec![(vertex, 1.0)])
+        .collect();
+    vertex_origins.extend(
+        edge_faces
+            .keys()
+            .map(|edge| vec![(edge.0, 0.5), (edge.1, 0.5)]),
+    );
+    vertex_origins.extend(source_polygons.iter().map(|(face, _)| {
+        let share = 1.0 / usize_as_f64(face.len());
+        face.iter().map(|&vertex| (vertex, share)).collect()
+    }));
+    let origin = Origin {
+        vertices: vertex_origins,
+        faces: source_polygons
+            .iter()
+            .enumerate()
+            .flat_map(|(index, (face, _))| std::iter::repeat_n(Some(index), face.len()))
+            .collect(),
+    };
     let mut output = build_mesh(
         updated_points,
         output_polygons,
         output_loose_edges,
-        attributes.as_ref().unwrap_or(&mesh.attributes),
+        &origin,
+        mesh,
     )?;
     if options.use_creases && mesh.attributes.contains_key("crease_edge") {
         let mut next_creases = BTreeMap::new();
@@ -1977,51 +2147,6 @@ fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
     Ok(output)
 }
 
-fn subdivided_vertex_group_attributes(
-    mesh: &Mesh,
-    polygons: &[Polygon],
-    edges: &BTreeMap<(usize, usize), Vec<usize>>,
-) -> Value {
-    let source_groups = mesh
-        .attributes
-        .get("vertex_groups")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut output_groups = Map::new();
-    for (name, group) in source_groups {
-        let Some(group_weights) = group.as_object() else {
-            continue;
-        };
-        let weights = mesh
-            .vertices
-            .iter()
-            .map(|vertex| {
-                group_weights
-                    .get(&format!("v{}", vertex.id))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0)
-            })
-            .collect::<Vec<_>>();
-        let mut output_weights = weights.clone();
-        for edge in edges.keys() {
-            output_weights.push(f64::midpoint(weights[edge.0], weights[edge.1]));
-        }
-        for (face, _) in polygons {
-            let average =
-                face.iter().map(|index| weights[*index]).sum::<f64>() / usize_as_f64(face.len());
-            output_weights.push(average);
-        }
-        let values = output_weights
-            .into_iter()
-            .enumerate()
-            .map(|(index, weight)| (format!("v{index}"), json!(weight)))
-            .collect::<Map<_, _>>();
-        output_groups.insert(name, Value::Object(values));
-    }
-    Value::Object(output_groups)
-}
-
 fn triangulate(mesh: &Mesh) -> Result<Mesh> {
     validated(mesh)?;
     let triangles = mesh.triangulate().map_err(|error| mesh_error(&error))?;
@@ -2044,11 +2169,20 @@ fn triangulate(mesh: &Mesh) -> Result<Mesh> {
         }
         triangle_index += triangle_count;
     }
+    let origin = Origin::copies(
+        (0..mesh.vertices.len()).map(Some),
+        mesh.faces
+            .iter()
+            .enumerate()
+            .flat_map(|(index, face)| std::iter::repeat_n(Some(index), face.vertices.len() - 2))
+            .collect(),
+    );
     build_mesh(
         positions(mesh),
         output_polygons,
         loose_edges(mesh)?,
-        &mesh.attributes,
+        &origin,
+        mesh,
     )
 }
 
@@ -2159,6 +2293,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let original_offset = (offset + 1.0) * 0.5 * thickness;
     let shell_offset = (offset - 1.0) * 0.5 * thickness;
     let mut points = Vec::with_capacity(source_points.len() * 2);
+    let mut point_sources: Vec<usize> = (0..source_points.len()).collect();
     points.extend(
         source_points
             .iter()
@@ -2177,6 +2312,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                         source_points[vertex]
                             + normals[vertex] * (shell_offset * even_scale(vertex)),
                     );
+                    point_sources.push(vertex);
                 }
             }
         }
@@ -2184,6 +2320,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         for (index, point) in source_points.iter().enumerate() {
             duplicate_indices[index] = Some(source_points.len() + index);
             points.push(*point + normals[index] * (shell_offset * even_scale(index)));
+            point_sources.push(index);
         }
     }
     if points.iter().any(|point| !point.is_finite()) {
@@ -2194,12 +2331,14 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ));
     }
     let mut output_polygons = Vec::with_capacity(source_polygons.len() * 2 + edge_faces.len());
-    for (face, material) in &source_polygons {
+    let mut face_sources = Vec::with_capacity(source_polygons.len() * 2 + edge_faces.len());
+    for (face_index, (face, material)) in source_polygons.iter().enumerate() {
         let mut outer = face.clone();
         if flip {
             outer.reverse();
         }
         output_polygons.push((outer, *material));
+        face_sources.push(Some(face_index));
         if !rim_only {
             let mut shell: Vec<_> = face
                 .iter()
@@ -2210,6 +2349,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 shell.reverse();
             }
             output_polygons.push((shell, *material));
+            face_sources.push(Some(face_index));
         }
     }
     if use_rim {
@@ -2222,6 +2362,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 rim.reverse();
             }
             output_polygons.push((rim, material));
+            face_sources.push(None);
         }
     }
     let mut output_loose_edges = Vec::with_capacity(source_loose_edges.len().saturating_mul(2));
@@ -2231,12 +2372,8 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             Some([duplicate_indices[*first]?, duplicate_indices[*second]?])
         }));
     }
-    build_mesh(
-        points,
-        output_polygons,
-        output_loose_edges,
-        &mesh.attributes,
-    )
+    let origin = Origin::copies(point_sources.into_iter().map(Some), face_sources);
+    build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)
 }
 
 fn mesh_attribute_values<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a [Value]> {
@@ -2716,6 +2853,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     };
     let profile_coordinates = bevel_profile_coordinates(segments, exponent);
     let mut points = Vec::new();
+    let mut point_vertices = Vec::new();
     let mut face_corner = HashMap::new();
     let mut corner_width = HashMap::new();
     for (face_index, (face, _)) in source_polygons.iter().enumerate() {
@@ -2778,12 +2916,15 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             }
             let index = points.len();
             points.push(point);
+            point_vertices.push(vertex);
             face_corner.insert((face_index, vertex), index);
         }
     }
 
     let mut output_polygons = Vec::new();
+    let mut face_sources = Vec::new();
     for (face_index, (face, material)) in source_polygons.iter().enumerate() {
+        face_sources.push(Some(face_index));
         output_polygons.push((
             face.iter()
                 .map(|vertex| face_corner[&(face_index, *vertex)])
@@ -2812,6 +2953,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 {
                     let index = points.len();
                     points.push(bevel_profile_point(points[a], points[b], middle, x, y));
+                    point_vertices.push(vertex);
                     profile_points.insert((*edge, vertex, segment), index);
                 }
             }
@@ -2827,6 +2969,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             for segment in 0..segments {
                 let (start, end) = (side_a.1, side_a.2);
                 let material = side_a.3;
+                face_sources.push(None);
                 output_polygons.push((
                     vec![
                         point_at(start, 0, segment),
@@ -2890,12 +3033,14 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .map(|(face_index, _, _)| face_corner[&(*face_index, vertex)])
                 .collect();
             if boundary.len() >= 3 {
+                face_sources.push(None);
                 output_polygons.push((boundary, faces[0].2));
             }
             continue;
         }
         let center_index = points.len();
         points.push(corner_center);
+        point_vertices.push(vertex);
         for (face_index, corner, material) in faces {
             let face = &source_polygons[*face_index].0;
             let previous = face[(*corner + face.len() - 1) % face.len()];
@@ -2916,18 +3061,15 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                         .map(|segment| profile_points[&(incoming_edge, vertex, segment)]),
                 );
             }
+            face_sources.push(None);
             output_polygons.push((patch, *material));
         }
     }
     if output_polygons.is_empty() {
         return Ok(mesh.clone());
     }
-    build_mesh(
-        points,
-        output_polygons,
-        loose_edges(mesh)?,
-        &mesh.attributes,
-    )
+    let origin = Origin::copies(point_vertices.iter().copied().map(Some), face_sources);
+    build_mesh(points, output_polygons, loose_edges(mesh)?, &origin, mesh)
 }
 #[expect(
     clippy::too_many_lines,
@@ -2955,11 +3097,15 @@ fn bevel_vertices(
         (-2.0_f64.ln() / profile.sqrt().ln()).clamp(0.0, 1.0e4)
     };
     let mut points = source_points.to_vec();
+    let mut point_origins: Vec<Vec<(usize, f64)>> = (0..source_points.len())
+        .map(|vertex| vec![(vertex, 1.0)])
+        .collect();
     let mut edge_points = HashMap::new();
     let mut patch_graph = vec![HashMap::<usize, Vec<usize>>::new(); source_points.len()];
     let mut corner_sectors = vec![Vec::new(); source_points.len()];
     let mut output_polygons = Vec::with_capacity(source_polygons.len());
-    for (face, material) in source_polygons {
+    let mut face_sources = Vec::with_capacity(source_polygons.len());
+    for (face_index, (face, material)) in source_polygons.iter().enumerate() {
         let mut output_face = Vec::with_capacity(face.len() * (segments + 1));
         for (corner, vertex) in face.iter().copied().enumerate() {
             if !selected_vertices.contains(&vertex) {
@@ -2995,10 +3141,13 @@ fn bevel_vertices(
                         amount = amount.min(edge_length * 0.49);
                     }
                     let index = points.len();
-                    points.push(source_points[vertex].lerp(
-                        source_points[neighbor],
-                        amount / edge_length.max(f64::EPSILON),
-                    ));
+                    let fraction = amount / edge_length.max(f64::EPSILON);
+                    points.push(source_points[vertex].lerp(source_points[neighbor], fraction));
+                    let bounded = fraction.clamp(0.0, 1.0);
+                    point_origins.push(blend_weights([
+                        (vertex, 1.0 - bounded),
+                        (neighbor, bounded),
+                    ]));
                     index
                 })
             };
@@ -3030,6 +3179,17 @@ fn bevel_vertices(
                 };
                 let index = points.len();
                 points.push(arc_center + direction * radius);
+                let origin = blend_weights(
+                    point_origins[incoming]
+                        .iter()
+                        .map(|&(source, weight)| (source, weight * (1.0 - t)))
+                        .chain(
+                            point_origins[outgoing]
+                                .iter()
+                                .map(|&(source, weight)| (source, weight * t)),
+                        ),
+                );
+                point_origins.push(origin);
                 arc_points.push(index);
             }
             output_face.push(incoming);
@@ -3045,6 +3205,7 @@ fn bevel_vertices(
                 .push(incoming);
             corner_sectors[vertex].push((incoming, arc_points, outgoing, *material));
         }
+        face_sources.push(Some(face_index));
         output_polygons.push((output_face, *material));
     }
     let circle_fullness = [
@@ -3085,6 +3246,7 @@ fn bevel_vertices(
         }
         if segments == 1 {
             let material = corner_sectors[vertex].first().map_or(0, |sector| sector.3);
+            face_sources.push(None);
             output_polygons.push((boundary, material));
             continue;
         }
@@ -3109,8 +3271,10 @@ fn bevel_vertices(
         let center = source_points[vertex] - normal_sum * (amount * fullness * 0.301_073_345);
         let center_index = points.len();
         points.push(center);
+        point_origins.push(vec![(vertex, 1.0)]);
         for (incoming, arc_points, outgoing, material) in &corner_sectors[vertex] {
             if segments == 2 {
+                face_sources.push(None);
                 output_polygons.push((
                     vec![*incoming, arc_points[0], *outgoing, center_index],
                     *material,
@@ -3121,6 +3285,7 @@ fn bevel_vertices(
                 boundary.extend(arc_points.iter().copied());
                 boundary.push(*outgoing);
                 for pair in boundary.windows(2) {
+                    face_sources.push(None);
                     output_polygons.push((vec![pair[0], pair[1], center_index], *material));
                 }
             }
@@ -3139,10 +3304,12 @@ fn bevel_vertices(
     }
     let mut remap = vec![0; points.len()];
     let mut compact_points = Vec::with_capacity(points.len());
-    for (index, point) in points.into_iter().enumerate() {
+    let mut compact_origins = Vec::with_capacity(points.len());
+    for ((index, point), origin) in points.into_iter().enumerate().zip(point_origins) {
         if used[index] {
             remap[index] = compact_points.len();
             compact_points.push(point);
+            compact_origins.push(origin);
         }
     }
     for (face, _) in &mut output_polygons {
@@ -3154,11 +3321,16 @@ fn bevel_vertices(
         .into_iter()
         .map(|[first, second]| [remap[first], remap[second]])
         .collect();
+    let origin = Origin {
+        vertices: compact_origins,
+        faces: face_sources,
+    };
     build_mesh(
         compact_points,
         output_polygons,
         compact_loose,
-        &mesh.attributes,
+        &origin,
+        mesh,
     )
 }
 
@@ -3255,7 +3427,8 @@ fn decimate_compact(
     points: Vec<DVec3>,
     mut polygons: Vec<Polygon>,
     mut loose: Vec<[usize; 2]>,
-    attributes: &serde_json::Map<String, Value>,
+    origin: Origin,
+    source: &Mesh,
 ) -> Result<Mesh> {
     let mut used = vec![false; points.len()];
     for (face, _) in &polygons {
@@ -3269,10 +3442,12 @@ fn decimate_compact(
     }
     let mut remap = vec![0; points.len()];
     let mut compact_points = Vec::with_capacity(points.len());
-    for (index, point) in points.into_iter().enumerate() {
+    let mut compact_origin = Vec::with_capacity(points.len());
+    for ((index, point), sources) in points.into_iter().enumerate().zip(origin.vertices) {
         if used[index] {
             remap[index] = compact_points.len();
             compact_points.push(point);
+            compact_origin.push(sources);
         }
     }
     for (face, _) in &mut polygons {
@@ -3284,7 +3459,11 @@ fn decimate_compact(
         *first = remap[*first];
         *second = remap[*second];
     }
-    build_mesh(compact_points, polygons, loose, attributes)
+    let origin = Origin {
+        vertices: compact_origin,
+        faces: origin.faces,
+    };
+    build_mesh(compact_points, polygons, loose, &origin, source)
 }
 
 fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -3301,13 +3480,25 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     if mesh.vertices.len() < 2 {
         return Ok(mesh.clone());
     }
-    let (points, output_polygons, output_edges) = merge_geometry(
+    let merged = merge_geometry(
         &positions(mesh),
         polygons(mesh)?,
         loose_edges(mesh)?,
         threshold,
     )?;
-    build_mesh(points, output_polygons, output_edges, &mesh.attributes)
+    let origin = Origin {
+        vertices: merged
+            .point_members
+            .iter()
+            .map(|members| mean_origin(members.iter().map(|&vertex| Some(vertex))))
+            .collect(),
+        faces: merged
+            .polygon_sources
+            .iter()
+            .map(|&face| Some(face))
+            .collect(),
+    };
+    build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)
 }
 
 fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Result<Mesh> {
@@ -3570,16 +3761,81 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-fn unique_polygons(polygons: Vec<Polygon>) -> Vec<Polygon> {
+/// Keeps the first polygon for each vertex set, with the tag it arrived with.
+fn unique_tagged_polygons<T>(polygons: Vec<(T, Polygon)>) -> Vec<(T, Polygon)> {
     let mut seen = HashSet::new();
     polygons
         .into_iter()
-        .filter(|(face, _)| {
+        .filter(|(_, (face, _))| {
             let mut key = face.clone();
             key.sort_unstable();
             seen.insert(key)
         })
         .collect()
+}
+
+fn unique_polygons(polygons: Vec<Polygon>) -> Vec<Polygon> {
+    unique_tagged_polygons(polygons.into_iter().map(|polygon| ((), polygon)).collect())
+        .into_iter()
+        .map(|((), polygon)| polygon)
+        .collect()
+}
+
+/// Merges each union-find cluster of `parent` into one point at the cluster centroid, recording the
+/// input points of each cluster so that its provenance is their equal-weight mean.
+fn collapse_clusters(
+    points: &[DVec3],
+    mut parent: Vec<usize>,
+    polygons: Vec<Polygon>,
+    edges: Vec<[usize; 2]>,
+) -> MergedGeometry {
+    let mut root_to_index = HashMap::new();
+    let mut sums = Vec::<DVec3>::new();
+    let mut point_members = Vec::<Vec<usize>>::new();
+    let mut remap = vec![0; points.len()];
+    for index in 0..points.len() {
+        let root = find(&mut parent, index);
+        let mapped = *root_to_index.entry(root).or_insert_with(|| {
+            sums.push(DVec3::ZERO);
+            point_members.push(Vec::new());
+            sums.len() - 1
+        });
+        remap[index] = mapped;
+        sums[mapped] += points[index];
+        point_members[mapped].push(index);
+    }
+    let merged_points = sums
+        .into_iter()
+        .zip(&point_members)
+        .map(|(sum, members)| sum / usize_as_f64(members.len()))
+        .collect::<Vec<_>>();
+    let (merged_polygons, polygon_sources): (Vec<Polygon>, Vec<usize>) = unique_tagged_polygons(
+        polygons
+            .into_iter()
+            .enumerate()
+            .filter_map(|(source, (face, material))| {
+                clean_polygon(face.into_iter().map(|index| remap[index]).collect())
+                    .map(|clean| (source, (clean, material)))
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|(source, polygon)| (polygon, source))
+    .unzip();
+    let merged_edges = edges
+        .into_iter()
+        .filter_map(|[first, second]| {
+            let pair = [remap[first], remap[second]];
+            (pair[0] != pair[1]).then_some(pair)
+        })
+        .collect();
+    MergedGeometry {
+        points: merged_points,
+        polygons: merged_polygons,
+        edges: merged_edges,
+        point_members,
+        polygon_sources,
+    }
 }
 
 fn merge_geometry(
@@ -3615,43 +3871,7 @@ fn merge_geometry(
         }
         cells.entry(cell).or_default().push(index);
     }
-    let mut root_to_index = HashMap::new();
-    let mut sums = Vec::<DVec3>::new();
-    let mut counts = Vec::<usize>::new();
-    let mut remap = vec![0; points.len()];
-    for index in 0..points.len() {
-        let root = find(&mut parent, index);
-        let mapped = *root_to_index.entry(root).or_insert_with(|| {
-            sums.push(DVec3::ZERO);
-            counts.push(0);
-            sums.len() - 1
-        });
-        remap[index] = mapped;
-        sums[mapped] += points[index];
-        counts[mapped] += 1;
-    }
-    let merged_points = sums
-        .into_iter()
-        .zip(counts)
-        .map(|(sum, count)| sum / usize_as_f64(count))
-        .collect::<Vec<_>>();
-    let merged_polygons = unique_polygons(
-        polygons
-            .into_iter()
-            .filter_map(|(face, material)| {
-                clean_polygon(face.into_iter().map(|index| remap[index]).collect())
-                    .map(|clean| (clean, material))
-            })
-            .collect(),
-    );
-    let merged_edges = edges
-        .into_iter()
-        .filter_map(|[first, second]| {
-            let pair = [remap[first], remap[second]];
-            (pair[0] != pair[1]).then_some(pair)
-        })
-        .collect();
-    Ok((merged_points, merged_polygons, merged_edges))
+    Ok(collapse_clusters(points, parent, polygons, edges))
 }
 
 #[expect(
