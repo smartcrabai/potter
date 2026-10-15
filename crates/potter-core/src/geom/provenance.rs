@@ -84,7 +84,9 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
         || entries.iter().any(|entry| text(entry, "domain") == "EDGE");
     let needs_corners = source.attributes.contains_key("blender_uv_layers")
         || source.attributes.contains_key("uv_map")
-        || entries.iter().any(|entry| text(entry, "domain") == "CORNER");
+        || entries
+            .iter()
+            .any(|entry| text(entry, "domain") == "CORNER");
     let mut edge_origin = Vec::new();
     if needs_edges || needs_corners {
         let output_vertex_index: HashMap<u32, usize> = output
@@ -375,7 +377,10 @@ fn mean_value_weights(polygon: &[DVec3], point: DVec3) -> Option<Vec<f64>> {
     let offsets: Vec<DVec3> = polygon.iter().map(|corner| *corner - plane_point).collect();
     let distances: Vec<f64> = offsets.iter().map(|offset| offset.length()).collect();
     let scale = distances.iter().copied().fold(0.0, f64::max);
-    if let Some(index) = distances.iter().position(|distance| *distance <= COLLINEAR * scale) {
+    if let Some(index) = distances
+        .iter()
+        .position(|distance| *distance <= COLLINEAR * scale)
+    {
         let mut weights = vec![0.0; count];
         weights[index] = 1.0;
         return Some(weights);
@@ -439,6 +444,9 @@ where
         })
         .collect()
 }
+
+/// One face's `uv_map` entry: its corner UVs and optional corner pins, borrowed from the entry.
+type PerFaceUv<'a> = (&'a Vec<Value>, Option<&'a Vec<Value>>);
 
 struct Sources<'a> {
     source: &'a Mesh,
@@ -616,9 +624,11 @@ impl Sources<'_> {
         with_values(layer, Value::Array(remapped))
     }
 
-    /// `uv_map` entries (`{"face_id","layer","uv"}`) rebuilt per output face. A layer is written for
-    /// an output face whose source face has an entry, and each output corner blends the source
-    /// corners that corner came from, so the entry follows the face it was made for.
+    /// `uv_map` entries (`{"face_id","layer","uv"}`, plus `"pinned"` when the source has pins)
+    /// rebuilt per output face. A layer is written for an output face whose source face has an
+    /// entry, and each output corner blends the source corners that corner came from, so the entry
+    /// follows the face it was made for. A corner's pin is the pin of its heaviest source corner
+    /// (see [`heaviest_source`]); `pinned` is omitted when no source corner of the face has pins.
     fn uv_map(&self, entries: &[Value]) -> Vec<Value> {
         let source_faces: HashMap<u64, usize> = self
             .source
@@ -627,12 +637,13 @@ impl Sources<'_> {
             .enumerate()
             .map(|(index, face)| (u64::from(face.id), index))
             .collect();
-        let source_offsets = corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
+        let source_offsets =
+            corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
         let output_offsets =
             corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
         let mut layers: Vec<String> = Vec::new();
-        // (layer, source face index) -> that face's corner UVs as written in `uv_map`.
-        let mut per_face: HashMap<(String, usize), &Vec<Value>> = HashMap::new();
+        // (layer, source face index) -> that face's corner UVs and pins as written in `uv_map`.
+        let mut per_face: HashMap<(String, usize), PerFaceUv<'_>> = HashMap::new();
         for entry in entries {
             let Some(face) = entry
                 .get("face_id")
@@ -644,20 +655,34 @@ impl Sources<'_> {
             let Some(uv) = entry.get("uv").and_then(Value::as_array) else {
                 continue;
             };
-            let layer = entry.get("layer").and_then(Value::as_str).unwrap_or("UVMap");
+            let layer = uv_map_entry_layer(entry);
             if !layers.iter().any(|known| known == layer) {
                 layers.push(layer.to_owned());
             }
-            per_face.insert((layer.to_owned(), *face), uv);
+            let pinned = entry.get("pinned").and_then(Value::as_array);
+            per_face.insert((layer.to_owned(), *face), (uv, pinned));
         }
-        let source_corners: usize = self.source.faces.iter().map(|face| face.vertices.len()).sum();
+        let source_corners: usize = self
+            .source
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum();
         let mut output = Vec::new();
         for layer in &layers {
             let mut flat = vec![uv_default(); source_corners];
-            for ((name, face), uv) in &per_face {
+            // Pin per source corner; `None` where the source entry has no `pinned` array.
+            let mut flat_pinned: Vec<Option<bool>> = vec![None; source_corners];
+            for ((name, face), (uv, pinned)) in &per_face {
                 if name == layer {
                     for (corner, value) in uv.iter().enumerate() {
                         flat[source_offsets[*face] + corner] = value.clone();
+                    }
+                    if let Some(pins) = pinned {
+                        for (corner, pin) in pins.iter().enumerate() {
+                            flat_pinned[source_offsets[*face] + corner] =
+                                Some(pin.as_bool() == Some(true));
+                        }
                     }
                 }
             }
@@ -668,13 +693,30 @@ impl Sources<'_> {
                 if !per_face.contains_key(&(layer.clone(), source)) {
                     continue;
                 }
-                let uv: Vec<Value> = (0..face.vertices.len())
-                    .map(|corner| {
-                        let sources = &self.corner_origin[output_offsets[index] + corner];
+                let corners = &self.corner_origin[output_offsets[index]..][..face.vertices.len()];
+                let uv: Vec<Value> = corners
+                    .iter()
+                    .map(|sources| {
                         blend_indexed(&flat, sources, "FLOAT2").unwrap_or_else(uv_default)
                     })
                     .collect();
-                output.push(json!({"face_id": face.id, "layer": layer, "uv": uv}));
+                let mut entry = json!({"face_id": face.id, "layer": layer, "uv": uv});
+                let has_pins = corners
+                    .iter()
+                    .flatten()
+                    .any(|(source, _)| flat_pinned.get(*source).is_some_and(Option::is_some));
+                if has_pins {
+                    let pins: Vec<bool> = corners
+                        .iter()
+                        .map(|sources| {
+                            heaviest_source(sources)
+                                .and_then(|source| flat_pinned.get(source).copied().flatten())
+                                == Some(true)
+                        })
+                        .collect();
+                    entry["pinned"] = json!(pins);
+                }
+                output.push(entry);
             }
         }
         output
@@ -682,8 +724,24 @@ impl Sources<'_> {
 }
 
 /// Default UV for a corner with no source data.
-fn uv_default() -> Value {
+pub(crate) fn uv_default() -> Value {
     json!([0.0, 0.0])
+}
+
+/// Layer name of a `uv_map` entry; an entry without a `layer` belongs to `UVMap`.
+pub(crate) fn uv_map_entry_layer(entry: &Value) -> &str {
+    entry
+        .get("layer")
+        .and_then(Value::as_str)
+        .unwrap_or("UVMap")
+}
+
+/// Index of the heaviest `(index, weight)` source; ties go to the lowest index.
+fn heaviest_source(sources: &[(usize, f64)]) -> Option<usize> {
+    sources
+        .iter()
+        .max_by(|left, right| left.1.total_cmp(&right.1).then(right.0.cmp(&left.0)))
+        .map(|(index, _)| *index)
 }
 
 /// [`blend`] over `values` at the `(index, weight)` sources; indices past the end are skipped.
@@ -867,6 +925,7 @@ mod tests {
                 vec![(0, 0.25), (1, 0.25), (2, 0.25), (3, 0.25)],
             ],
             faces: vec![Some(0); 4],
+            corners: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let centre = output.vertices[8].id;
@@ -905,6 +964,7 @@ mod tests {
         let origin = Origin {
             vertices: vec![vec![(0, 0.5), (2, 0.5)], vec![(1, 0.5), (3, 0.5)]],
             faces: Vec::new(),
+            corners: None,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         assert_eq!(
@@ -929,5 +989,36 @@ mod tests {
             blend([(&off, 0.5), (&off, 0.5)].into_iter(), "BOOLEAN"),
             Some(json!(false))
         );
+    }
+
+    /// A rebuilt corner keeps the pin of its heaviest source corner (ties: lowest source index),
+    /// and `pinned` stays aligned with the output corners.
+    #[test]
+    fn uv_pins_follow_heaviest_source_corner() {
+        let mut source = triangle();
+        let face_id = source.faces[0].id;
+        source.attributes.insert(
+            "uv_map".to_owned(),
+            json!([{
+                "face_id": face_id,
+                "layer": "UVMap",
+                "uv": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                "pinned": [true, false, false]
+            }]),
+        );
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            faces: vec![Some(0)],
+            corners: Some(vec![
+                vec![(0, 0.25), (1, 0.75)],
+                vec![(0, 0.5), (1, 0.5)],
+                vec![(2, 1.0)],
+            ]),
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+        let entry = &output.attributes["uv_map"][0];
+        assert_eq!(entry["uv"].as_array().map(Vec::len), Some(3));
+        assert_eq!(entry["pinned"], json!([false, true, false]));
     }
 }

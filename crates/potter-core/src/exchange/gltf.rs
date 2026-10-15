@@ -685,35 +685,48 @@ fn append_skin_attributes(
     Ok(accessors_for_sets)
 }
 
-/// glTF vertices after splitting by source vertex, UV, and every shading layer's normal.
+/// glTF vertices after splitting by source vertex, every UV set, and every shading layer's normal.
 struct ExportVertexLayout {
     source_vertex_indices: Vec<usize>,
-    uvs: Option<Vec<[f64; 2]>>,
+    /// One entry per UV set (`TEXCOORD_n`), each with one coordinate per output vertex.
+    uvs: Vec<Vec<[f64; 2]>>,
     /// Layer zero is base shading; each later layer is one shape key's morphed shading.
     normals: Vec<Vec<DVec3>>,
     face_indices: BTreeMap<u32, BTreeMap<u32, u32>>,
 }
 
-fn export_vertex_layout(
-    mesh: &Mesh,
-    layers: &[Vec<DVec3>],
-    fallback_normal: DVec3,
-) -> Result<ExportVertexLayout> {
-    let uv_entries = mesh.attributes.get("uv_map").and_then(Value::as_array);
-    let vertex_indices = mesh
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect::<BTreeMap<_, _>>();
+fn invalid_uv() -> PotError {
+    PotError::new(ErrorCode::SceneInvalid, "UV coordinate is invalid")
+}
+
+/// Parses one `[u, v]` UV coordinate; both components must be finite.
+fn parse_uv(value: &Value) -> Result<[f64; 2]> {
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 2)
+        .ok_or_else(invalid_uv)?;
+    let uv = [
+        values[0].as_f64().ok_or_else(invalid_uv)?,
+        values[1].as_f64().ok_or_else(invalid_uv)?,
+    ];
+    if !uv[0].is_finite() || !uv[1].is_finite() {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "UV coordinate is non-finite",
+        ));
+    }
+    Ok(uv)
+}
+
+/// One UV set from `uv_map` entries: each entry gives one face's corner coordinates.
+fn uv_map_set(mesh: &Mesh, entries: &[Value]) -> Result<BTreeMap<u32, Vec<[f64; 2]>>> {
     let faces = mesh
         .faces
         .iter()
         .map(|face| (face.id, face))
         .collect::<BTreeMap<_, _>>();
-    let mut face_uvs = BTreeMap::<u32, Vec<[f64; 2]>>::new();
-    let mut preferred_uvs = vec![None; mesh.vertices.len()];
-    for entry in uv_entries.into_iter().flatten() {
+    let mut set = BTreeMap::<u32, Vec<[f64; 2]>>::new();
+    for entry in entries {
         let face_id = entry["face_id"]
             .as_u64()
             .and_then(|value| u32::try_from(value).ok())
@@ -730,48 +743,77 @@ fn export_vertex_layout(
                 "UV corner count does not match its face",
             ));
         }
-        let mut values = Vec::with_capacity(coordinates.len());
-        for (vertex_id, coordinate) in face.vertices.iter().zip(coordinates) {
-            let uv_values = coordinate
-                .as_array()
-                .filter(|values| values.len() == 2)
-                .ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "UV coordinate is invalid")
-                })?;
-            let uv = [
-                uv_values[0].as_f64().ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "UV coordinate is invalid")
-                })?,
-                uv_values[1].as_f64().ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "UV coordinate is invalid")
-                })?,
-            ];
-            if !uv[0].is_finite() || !uv[1].is_finite() {
-                return Err(PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "UV coordinate is non-finite",
-                ));
-            }
-            let vertex_index = vertex_indices.get(vertex_id).copied().ok_or_else(|| {
+        let values = coordinates
+            .iter()
+            .map(parse_uv)
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(previous) = set.get(&face_id)
+            && previous != &values
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "UV map repeats a face with conflicting coordinates",
+            ));
+        }
+        set.insert(face_id, values);
+    }
+    Ok(set)
+}
+
+/// Export UV sets as per-face corner values keyed by face ID. A `uv_map` attribute is one set and
+/// takes precedence; otherwise each `blender_uv_layers` layer is a set, in layer order.
+fn export_uv_sets(mesh: &Mesh) -> Result<Vec<BTreeMap<u32, Vec<[f64; 2]>>>> {
+    if let Some(entries) = mesh.attributes.get("uv_map").and_then(Value::as_array) {
+        return Ok(vec![uv_map_set(mesh, entries)?]);
+    }
+    let layers = mesh
+        .attributes
+        .get("blender_uv_layers")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    layers
+        .iter()
+        .map(|layer| {
+            let values = layer["values"].as_array().ok_or_else(|| {
                 PotError::new(
                     ErrorCode::SceneInvalid,
-                    "UV face references a missing vertex",
+                    "blender UV layer values are missing",
                 )
             })?;
-            preferred_uvs[vertex_index].get_or_insert(uv);
-            values.push(uv);
-        }
-        if let Some(previous) = face_uvs.get(&face_id) {
-            if previous != &values {
-                return Err(PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "UV map repeats a face with conflicting coordinates",
-                ));
+            let mut set = BTreeMap::new();
+            let mut corner = 0;
+            for face in &mesh.faces {
+                let end = corner + face.vertices.len();
+                let coordinates = values.get(corner..end).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "blender UV layer corner count does not match mesh corners",
+                    )
+                })?;
+                let uvs = coordinates
+                    .iter()
+                    .map(parse_uv)
+                    .collect::<Result<Vec<_>>>()?;
+                set.insert(face.id, uvs);
+                corner = end;
             }
-        } else {
-            face_uvs.insert(face_id, values);
-        }
-    }
+            Ok(set)
+        })
+        .collect()
+}
+
+fn export_vertex_layout(
+    mesh: &Mesh,
+    layers: &[Vec<DVec3>],
+    fallback_normal: DVec3,
+) -> Result<ExportVertexLayout> {
+    let uv_sets = export_uv_sets(mesh)?;
+    let vertex_indices = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<BTreeMap<_, _>>();
     let corner_count = mesh
         .faces
         .iter()
@@ -785,10 +827,9 @@ fn export_vertex_layout(
     }
     // Corners grouped by source vertex; corner indices follow mesh.faces order then face corner order.
     let mut corners_by_vertex =
-        vec![Vec::<(u32, u32, usize, [f64; 2])>::new(); mesh.vertices.len()];
+        vec![Vec::<(u32, u32, usize, Vec<[f64; 2]>)>::new(); mesh.vertices.len()];
     let mut corner = 0;
     for face in &mesh.faces {
-        let coordinates = face_uvs.get(&face.id);
         for (position, vertex_id) in face.vertices.iter().enumerate() {
             let source_index = vertex_indices.get(vertex_id).copied().ok_or_else(|| {
                 PotError::new(
@@ -796,36 +837,44 @@ fn export_vertex_layout(
                     "UV face references a missing vertex",
                 )
             })?;
-            let uv = coordinates
-                .and_then(|values| values.get(position))
-                .copied()
-                .unwrap_or([0.0, 0.0]);
-            corners_by_vertex[source_index].push((face.id, *vertex_id, corner, uv));
+            let uvs: Vec<[f64; 2]> = uv_sets
+                .iter()
+                .map(|set| {
+                    set.get(&face.id)
+                        .and_then(|values| values.get(position))
+                        .copied()
+                        .unwrap_or([0.0, 0.0])
+                })
+                .collect();
+            corners_by_vertex[source_index].push((face.id, *vertex_id, corner, uvs));
             corner += 1;
         }
     }
-    let has_uv = uv_entries.is_some();
     let mut source_vertex_indices = Vec::<usize>::new();
-    let mut uvs = Vec::<[f64; 2]>::new();
+    let mut uvs = vec![Vec::<[f64; 2]>::new(); uv_sets.len()];
     let mut normals = vec![Vec::<DVec3>::new(); layers.len()];
-    let mut outputs = BTreeMap::<(usize, [u64; 2], Vec<[u64; 3]>), u32>::new();
+    let mut outputs = BTreeMap::<(usize, Vec<[u64; 2]>, Vec<[u64; 3]>), u32>::new();
     let mut face_indices = BTreeMap::<u32, BTreeMap<u32, u32>>::new();
     for (source_index, corners) in corners_by_vertex.iter().enumerate() {
         if corners.is_empty() {
             // Loose vertices keep an output slot so positions and vertex IDs stay aligned.
             source_vertex_indices.push(source_index);
-            uvs.push(preferred_uvs[source_index].unwrap_or([0.0, 0.0]));
+            for output in &mut uvs {
+                output.push([0.0, 0.0]);
+            }
             for output in &mut normals {
                 output.push(fallback_normal);
             }
             continue;
         }
-        for (face_id, vertex_id, corner, uv) in corners {
-            let uv = if has_uv { *uv } else { [0.0, 0.0] };
+        for (face_id, vertex_id, corner, corner_uvs) in corners {
             // Normal bits are normalized so -0.0 and 0.0 share one vertex.
             let key = (
                 source_index,
-                uv.map(|value| (value + 0.0).to_bits()),
+                corner_uvs
+                    .iter()
+                    .map(|uv| uv.map(|value| (value + 0.0).to_bits()))
+                    .collect::<Vec<_>>(),
                 layers
                     .iter()
                     .map(|layer| {
@@ -842,7 +891,9 @@ fn export_vertex_layout(
                     PotError::new(ErrorCode::LimitExceeded, "glTF mesh has too many vertices")
                 })?;
                 source_vertex_indices.push(source_index);
-                uvs.push(uv);
+                for (output, uv) in uvs.iter_mut().zip(corner_uvs) {
+                    output.push(*uv);
+                }
                 for (output, layer) in normals.iter_mut().zip(layers) {
                     output.push(layer[*corner]);
                 }
@@ -857,7 +908,7 @@ fn export_vertex_layout(
     }
     Ok(ExportVertexLayout {
         source_vertex_indices,
-        uvs: has_uv.then_some(uvs),
+        uvs,
         normals,
         face_indices,
     })
@@ -1229,7 +1280,8 @@ fn valid_vertex_groups_attribute(attribute: &Value, data_block: &DataBlock) -> b
 fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) -> Result<()> {
     for (name, value) in &mesh.attributes {
         let supported = match name.as_str() {
-            "uv_map" | "seam" | "shade_smooth" | "sharp" | "custom_normal" => true,
+            "uv_map" | "blender_uv_layers" | "seam" | "shade_smooth" | "sharp"
+            | "custom_normal" => true,
             "vertex_groups" => {
                 data_block.is_some_and(|block| valid_vertex_groups_attribute(value, block))
             }
@@ -2549,7 +2601,12 @@ pub(crate) fn validate_vrm_mesh_references(
             )?;
         }
         for material_id in used_material_ids(node, mesh, data_block.is_none())? {
-            validate_mesh_material_uv(doc, material_id, Some(avatar), export.layout.uvs.is_some())?;
+            validate_mesh_material_uv(
+                doc,
+                material_id,
+                Some(avatar),
+                !export.layout.uvs.is_empty(),
+            )?;
         }
         exported_mesh_nodes.insert(node_id.clone());
     }
@@ -2796,13 +2853,13 @@ fn export_with_root_inner(
         );
         let MeshExportLayout { layout, key_deltas } =
             mesh_export_layout(mesh, data_block, geometry_scale, geometry_basis)?;
-        let uv_values = layout.uvs.as_ref();
+        let uv_sets = &layout.uvs;
         for material_id in used_material_ids(node, mesh, data_block.is_none())? {
             validate_mesh_material_uv(
                 doc,
                 material_id,
                 vrm.map(|(avatar, _)| avatar),
-                uv_values.is_some(),
+                !uv_sets.is_empty(),
             )?;
         }
         if let Some(shape_keys) = data_block
@@ -2852,7 +2909,7 @@ fn export_with_root_inner(
             "max": maximum
         }));
         let mut attributes = json!({ "POSITION": position_accessor });
-        if let Some(uv_values) = uv_values {
+        for (set_index, uv_values) in uv_sets.iter().enumerate() {
             let mut floats = Vec::with_capacity(uv_values.len().saturating_mul(2));
             for uv in uv_values {
                 floats.push(to_f32(uv[0])?);
@@ -2868,7 +2925,7 @@ fn export_with_root_inner(
                 None,
                 None,
             );
-            attributes["TEXCOORD_0"] = json!(accessor);
+            attributes[format!("TEXCOORD_{set_index}").as_str()] = json!(accessor);
         }
         let mut normal_floats = Vec::with_capacity(layout.normals[0].len().saturating_mul(3));
         for normal in &layout.normals[0] {

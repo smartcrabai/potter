@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::provenance::Origin,
+    geom::provenance::{Origin, uv_map_entry_layer},
     model::Modifier,
 };
 
@@ -109,9 +109,15 @@ pub(super) fn decimate_face_normal(points: &[DVec3], face: &[usize]) -> DVec3 {
     normal.normalize_or_zero()
 }
 
+/// One `[u, v]` per UV layer, in the collapse's layer order.
+type CornerUv = Vec<[f64; 2]>;
+
 #[derive(Clone)]
 struct CollapseFace {
     vertices: [usize; 3],
+    // Per corner, the UV values of each layer. Blender interpolates loop data during a collapse and
+    // compares it per layer, so the values (not source weights) are what a collapse rewrites.
+    uv: [CornerUv; 3],
     edges: [usize; 3],
     material: u32,
     origin: usize,
@@ -136,6 +142,8 @@ struct CollapseMesh {
     edge_lookup: BTreeMap<(usize, usize), usize>,
     /// Per vertex: the input vertices its position interpolates, with weights summing to one.
     origins: Vec<Vec<(usize, f64)>>,
+    /// UV layer names, in the order of each corner's `CornerUv`.
+    layer_names: Vec<String>,
 }
 
 fn ensure_collapse_edge(
@@ -247,6 +255,14 @@ fn collapse_mesh_from_mesh(mesh: &Mesh) -> Result<CollapseMesh> {
                 )
             })?,
         ];
+        // Edges are oriented (lower index first). Oracle-verified on the decimate variants: the stored
+        // face-cycle orientation gave UV errors on grid3 r0.3/r0.5 and more cube position diffs. Order of
+        // edges imported from .blend is not oracle-verified.
+        let vertices = if vertices[0] <= vertices[1] {
+            vertices
+        } else {
+            [vertices[1], vertices[0]]
+        };
         let index = edges.len();
         edges.push(CollapseEdge {
             vertices,
@@ -342,6 +358,16 @@ fn collapse_mesh_from_mesh(mesh: &Mesh) -> Result<CollapseMesh> {
         .map_err(|error| super::mesh_error(&error))?;
     let mut face_ranges = Vec::with_capacity(mesh.faces.len());
     let mut faces = Vec::with_capacity(triangles.len());
+    let (layer_names, layer_values) = collapse_uv_layers(mesh);
+    let corner_offsets: Vec<usize> = mesh
+        .faces
+        .iter()
+        .scan(0, |offset, face| {
+            let start = *offset;
+            *offset += face.vertices.len();
+            Some(start)
+        })
+        .collect();
     let mut triangle_offset = 0;
     for (origin, face) in mesh.faces.iter().enumerate() {
         let first_face = faces.len();
@@ -409,8 +435,24 @@ fn collapse_mesh_from_mesh(mesh: &Mesh) -> Result<CollapseMesh> {
                     edges[edge_index].cut_origin = Some(origin);
                 }
             }
+            let mut slot_uv: [CornerUv; 3] = Default::default();
+            for (slot, vertex) in vertices.iter().enumerate() {
+                let position = face
+                    .vertices
+                    .iter()
+                    .position(|id| vertex_indices.get(id).copied() == Some(*vertex))
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InvalidArgument,
+                            "decimate triangle references a vertex outside its face",
+                        )
+                    })?;
+                let corner = corner_offsets[origin] + position;
+                slot_uv[slot] = layer_values.iter().map(|values| values[corner]).collect();
+            }
             faces.push(CollapseFace {
                 vertices,
+                uv: slot_uv,
                 edges: edge_ids,
                 material: face.material_index,
                 origin,
@@ -448,7 +490,86 @@ fn collapse_mesh_from_mesh(mesh: &Mesh) -> Result<CollapseMesh> {
         vertex_edges,
         edge_lookup,
         origins,
+        layer_names,
     })
+}
+
+/// UV layers of `mesh` as `(names, values)`: `values[l][c]` is the input `[u, v]` of corner `c` (face
+/// order, then corner order) in layer `names[l]`. Layers come from `blender_uv_layers`, then from
+/// `uv_map` entries whose layer name is new. A corner with no `uv_map` entry takes `[0, 0]`.
+fn collapse_uv_layers(mesh: &Mesh) -> (Vec<String>, Vec<Vec<[f64; 2]>>) {
+    let corner_count: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    let uv_pair = |uv: &Value| Some([uv.get(0)?.as_f64()?, uv.get(1)?.as_f64()?]);
+    for layer in mesh
+        .attributes
+        .get("blender_uv_layers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(raw) = layer.get("values").and_then(Value::as_array) else {
+            continue;
+        };
+        let parsed = (raw.len() == corner_count)
+            .then(|| raw.iter().map(uv_pair).collect::<Option<Vec<_>>>())
+            .flatten();
+        if let Some(parsed) = parsed {
+            names.push(
+                layer
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+            values.push(parsed);
+        }
+    }
+    let offsets: HashMap<u32, (usize, usize)> = mesh
+        .faces
+        .iter()
+        .scan(0, |offset, face| {
+            let start = *offset;
+            *offset += face.vertices.len();
+            Some((face.id, (start, face.vertices.len())))
+        })
+        .collect();
+    for entry in mesh
+        .attributes
+        .get("uv_map")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let layer = uv_map_entry_layer(entry);
+        let Some(id) = entry
+            .get("face_id")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+        else {
+            continue;
+        };
+        let Some(&(start, len)) = offsets.get(&id) else {
+            continue;
+        };
+        let Some(uv) = entry.get("uv").and_then(Value::as_array) else {
+            continue;
+        };
+        let index = if let Some(index) = names.iter().position(|name| name == layer) {
+            index
+        } else {
+            names.push(layer.to_owned());
+            values.push(vec![[0.0, 0.0]; corner_count]);
+            names.len() - 1
+        };
+        for (corner, pair) in uv.iter().take(len).enumerate() {
+            if let Some(value) = uv_pair(pair) {
+                values[index][start + corner] = value;
+            }
+        }
+    }
+    (names, values)
 }
 
 fn collapse_edge_face_links(mesh: &CollapseMesh) -> (Vec<[usize; 2]>, Vec<u8>) {
@@ -911,6 +1032,104 @@ fn collapse_line_factor(position: Vec3, first: Vec3, second: Vec3) -> f32 {
     }
 }
 
+fn collapse_corner_slot(face: &CollapseFace, vertex: usize) -> Option<usize> {
+    face.vertices
+        .iter()
+        .position(|candidate| *candidate == vertex)
+}
+
+/// Squared UV distance under which two loops hold equal data (Blender's `layerEqual_propfloat2`).
+const UV_EQUAL_DIST_SQ: f64 = 1.0e-5;
+
+/// Blender's `bm_edge_collapse_loop_customdata`, per UV layer. Each collapsed triangle gives its two
+/// corners at the collapsed edge a `share`-weighted mix of their values. Around each endpoint the fan is
+/// walked up to the other collapsed triangle, and a loop takes the mix in layer `l` when its value there is
+/// equal to the endpoint loop's value in `l`. Layers are gated independently. With no UV layers this is a no-op.
+fn collapse_interpolate_loops(
+    mesh: &mut CollapseMesh,
+    edge_index: usize,
+    [keep, clear]: [usize; 2],
+    share: f64,
+    remove_faces: &BTreeSet<usize>,
+    links: &[[usize; 2]],
+    counts: &[u8],
+) {
+    let layers = mesh.layer_names.len();
+    if layers == 0 {
+        return;
+    }
+    for &killed in remove_faces {
+        let face = &mesh.faces[killed];
+        let (Some(clear_slot), Some(keep_slot)) = (
+            collapse_corner_slot(face, clear),
+            collapse_corner_slot(face, keep),
+        ) else {
+            continue;
+        };
+        let clear_uv = face.uv[clear_slot].clone();
+        let keep_uv = face.uv[keep_slot].clone();
+        let blended: CornerUv = (0..layers)
+            .map(|l| {
+                [
+                    clear_uv[l][0] * share + keep_uv[l][0] * (1.0 - share),
+                    clear_uv[l][1] * share + keep_uv[l][1] * (1.0 - share),
+                ]
+            })
+            .collect();
+        let exit = remove_faces.iter().copied().find(|other| *other != killed);
+        for (vertex, gate) in [(clear, clear_uv), (keep, keep_uv)] {
+            let mut current = killed;
+            let mut previous = edge_index;
+            while let Some((next, next_slot, next_edge)) =
+                collapse_fan_step(mesh, links, counts, current, vertex, previous)
+            {
+                if Some(next) == exit || next == killed {
+                    break;
+                }
+                for (l, endpoint) in gate.iter().enumerate() {
+                    let value = &mut mesh.faces[next].uv[next_slot][l];
+                    let dx = value[0] - endpoint[0];
+                    let dy = value[1] - endpoint[1];
+                    if dx * dx + dy * dy < UV_EQUAL_DIST_SQ {
+                        *value = blended[l];
+                    }
+                }
+                current = next;
+                previous = next_edge;
+            }
+        }
+    }
+}
+
+/// Blender's `BM_vert_step_fan_loop`: from the corner of `vertex` in `face`, cross the edge at `vertex`
+/// other than `previous` into the neighbouring face. Returns `(face, slot, edge)`, or `None` at a boundary.
+fn collapse_fan_step(
+    mesh: &CollapseMesh,
+    links: &[[usize; 2]],
+    counts: &[u8],
+    face: usize,
+    vertex: usize,
+    previous: usize,
+) -> Option<(usize, usize, usize)> {
+    let current = &mesh.faces[face];
+    let slot = collapse_corner_slot(current, vertex)?;
+    let edge = if current.edges[slot] == previous {
+        current.edges[(slot + 2) % 3]
+    } else {
+        current.edges[slot]
+    };
+    if counts[edge] != 2 {
+        return None;
+    }
+    let next = if links[edge][0] == face {
+        links[edge][1]
+    } else {
+        links[edge][0]
+    };
+    let next_slot = collapse_corner_slot(&mesh.faces[next], vertex)?;
+    Some((next, next_slot, edge))
+}
+
 fn collapse_apply(
     mesh: &mut CollapseMesh,
     edge_index: usize,
@@ -919,6 +1138,7 @@ fn collapse_apply(
     normals: &mut [Vec3],
     weights: &mut Option<Vec<f32>>,
 ) {
+    // The first edge vertex is kept at the new position; the second is cleared into it.
     let [keep, clear] = mesh.edges[edge_index].vertices;
     let keep_edges = mesh.vertex_edges[keep].clone();
     let clear_edges = mesh.vertex_edges[clear].clone();
@@ -929,13 +1149,22 @@ fn collapse_apply(
         .copied()
         .collect::<BTreeSet<_>>();
     let factor = collapse_line_factor(position, mesh.points[keep], mesh.points[clear]);
+    let share = f64::from(factor);
+    collapse_interpolate_loops(
+        mesh,
+        edge_index,
+        [keep, clear],
+        share,
+        &remove_faces,
+        &links,
+        &counts,
+    );
     if let Some(values) = weights {
         values[keep] = (values[keep] * (1.0 - factor) + values[clear] * factor).clamp(0.0, 1.0);
     }
     mesh.points[keep] = position;
     let keep_origin = std::mem::take(&mut mesh.origins[keep]);
     let clear_origin = std::mem::take(&mut mesh.origins[clear]);
-    let share = f64::from(factor);
     mesh.origins[keep] = blend_weights(
         keep_origin
             .into_iter()
@@ -1309,7 +1538,8 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
         }
     }
 
-    let (polygons, face_origins) = if use_triangulate {
+    let layer_names = std::mem::take(&mut model.layer_names);
+    let (polygons, face_origins, corner_uv) = if use_triangulate {
         (
             model
                 .faces
@@ -1317,6 +1547,11 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
                 .map(|face| (face.vertices.to_vec(), face.material))
                 .collect(),
             model.faces.iter().map(|face| Some(face.origin)).collect(),
+            model
+                .faces
+                .iter()
+                .flat_map(|face| face.uv.iter().cloned())
+                .collect(),
         )
     } else {
         collapse_untriangulate(&model)
@@ -1335,19 +1570,97 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
         .iter()
         .map(|point| point.as_dvec3())
         .collect::<Vec<_>>();
+    // Corners keep the baseline derived sources; UV layers are rewritten from `corner_uv` below.
     let origin = Origin {
         vertices: model.origins,
         faces: face_origins,
         corners: None,
     };
-    decimate_compact(points, polygons, loose, origin, mesh)
+    let mut out = decimate_compact(points, polygons, loose, origin, mesh)?;
+    collapse_write_uv(&mut out, &layer_names, &corner_uv)?;
+    Ok(out)
 }
 
-fn collapse_untriangulate(mesh: &CollapseMesh) -> (Vec<Polygon>, Vec<Option<usize>>) {
+/// Rewrites the UV layers of `mesh`, rebuilt by a collapse, from the per-corner values of `corner_uv`
+/// (output face order, then corner order). `names[l]` is the layer of `corner_uv[c][l]`. Layers in
+/// `blender_uv_layers` and `uv_map` entries of the same name are both written.
+fn collapse_write_uv(mesh: &mut Mesh, names: &[String], corner_uv: &[CornerUv]) -> Result<()> {
+    let corner_total: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+    if corner_total != corner_uv.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "decimate UV values do not match the rebuilt mesh",
+        ));
+    }
+    let starts: HashMap<u32, (usize, usize)> = mesh
+        .faces
+        .iter()
+        .scan(0, |offset, face| {
+            let start = *offset;
+            *offset += face.vertices.len();
+            Some((face.id, (start, face.vertices.len())))
+        })
+        .collect();
+    let layer_value = |l: usize, start: usize, len: usize| {
+        Value::Array(
+            (start..start + len)
+                .map(|corner| json!([corner_uv[corner][l][0], corner_uv[corner][l][1]]))
+                .collect(),
+        )
+    };
+    if let Some(layers) = mesh
+        .attributes
+        .get_mut("blender_uv_layers")
+        .and_then(Value::as_array_mut)
+    {
+        for layer in layers {
+            let Some(l) = layer
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|name| names.iter().position(|candidate| candidate == name))
+            else {
+                continue;
+            };
+            layer["values"] = layer_value(l, 0, corner_total);
+        }
+    }
+    if let Some(entries) = mesh
+        .attributes
+        .get_mut("uv_map")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            let Some(l) = names
+                .iter()
+                .position(|name| name == uv_map_entry_layer(entry))
+            else {
+                continue;
+            };
+            let Some(&(start, len)) = entry
+                .get("face_id")
+                .and_then(Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+                .and_then(|id| starts.get(&id))
+            else {
+                continue;
+            };
+            entry["uv"] = layer_value(l, start, len);
+        }
+    }
+    Ok(())
+}
+
+/// A rebuilt polygon with its source face and per-corner UV values, before duplicates are dropped.
+type TaggedCorners = ((Option<usize>, Vec<CornerUv>), Polygon);
+
+fn collapse_untriangulate(
+    mesh: &CollapseMesh,
+) -> (Vec<Polygon>, Vec<Option<usize>>, Vec<CornerUv>) {
     let (links, counts) = collapse_edge_face_links(mesh);
     let mut merged_faces = vec![false; mesh.faces.len()];
     let mut polygons = Vec::new();
     let mut face_origins = Vec::new();
+    let mut face_corners = Vec::new();
     for (edge_index, edge) in mesh.edges.iter().enumerate() {
         let Some(origin) = edge.cut_origin else {
             continue;
@@ -1381,18 +1694,51 @@ fn collapse_untriangulate(mesh: &CollapseMesh) -> (Vec<Polygon>, Vec<Option<usiz
         }
         merged_faces[first_index] = true;
         merged_faces[second_index] = true;
+        face_corners.push(decimate_merged_corners(first, second, &vertices));
         polygons.push((vertices, first.material));
         face_origins.push(Some(origin));
     }
     for (index, face) in mesh.faces.iter().enumerate() {
         if !merged_faces[index] {
             polygons.push((face.vertices.to_vec(), face.material));
+            face_corners.push(face.uv.to_vec());
             face_origins.push(Some(face.origin));
         }
     }
-    let tagged: Vec<(Option<usize>, Polygon)> = face_origins.into_iter().zip(polygons).collect();
-    let (origins, polygons): (Vec<_>, Vec<_>) = unique_tagged_polygons(tagged).into_iter().unzip();
-    (polygons, origins)
+    let tagged: Vec<TaggedCorners> = face_origins
+        .into_iter()
+        .zip(face_corners)
+        .zip(polygons)
+        .collect();
+    let mut kept_polygons = Vec::new();
+    let mut kept_origins = Vec::new();
+    let mut kept_corners = Vec::new();
+    for ((origin, corners), polygon) in unique_tagged_polygons(tagged) {
+        kept_polygons.push(polygon);
+        kept_origins.push(origin);
+        kept_corners.extend(corners);
+    }
+    (kept_polygons, kept_origins, kept_corners)
+}
+
+/// UV values of a merged triangle pair's corners, one per merged vertex. A shared-edge vertex takes
+/// the first triangle's values, as `decimate_merge_faces` takes its vertex.
+fn decimate_merged_corners(
+    first: &CollapseFace,
+    second: &CollapseFace,
+    merged: &[usize],
+) -> Vec<CornerUv> {
+    merged
+        .iter()
+        .map(|vertex| {
+            collapse_corner_slot(first, *vertex)
+                .map(|slot| first.uv[slot].clone())
+                .or_else(|| {
+                    collapse_corner_slot(second, *vertex).map(|slot| second.uv[slot].clone())
+                })
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 fn decimate_symmetry_axis(modifier: &Modifier) -> Result<usize> {

@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use glam::{DQuat, DVec3};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::model::Modifier;
 
@@ -202,12 +202,12 @@ fn simple_deform_bend(coordinates: [f64; 3], cut: [f64; 3], axis: usize, factor:
 
 pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let steps = usize::try_from(uint_param(modifier, "steps", 16)?)
-        .map_err(|_| invalid_parameter(modifier, "steps", "an integer from 3 to 4096"))?;
-    if !(3..=4096).contains(&steps) {
+        .map_err(|_| invalid_parameter(modifier, "steps", "an integer from 1 to 4096"))?;
+    if !(1..=4096).contains(&steps) {
         return Err(invalid_parameter(
             modifier,
             "steps",
-            "an integer from 3 to 4096",
+            "an integer from 1 to 4096",
         ));
     }
     let angle = number_param(modifier, "angle", std::f64::consts::TAU)?;
@@ -230,29 +230,9 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     };
     let center = DVec3::ZERO;
     let height = number_param(modifier, "screw_offset", 0.0)?;
-    if (bool_param(modifier, "use_stretch_u", false)? || bool_param(modifier, "use_stretch_v", false)?)
-        && !super::uv_corner_values(mesh).is_empty()
-    {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "screw stretch UVs are not supported on UV layers",
-            json!({"feature_id":"modifier.screw.stretch_uv","modifier_id":modifier.id}),
-        ));
-    }
+    let stretch_u = bool_param(modifier, "use_stretch_u", false)?;
+    let stretch_v = bool_param(modifier, "use_stretch_v", false)?;
     let source_positions = positions(mesh);
-    // Copies of an on-axis vertex coincide across rings, and Blender's loop ring for them depends on
-    // its edge orientation, which Potter does not reproduce. Reject that case on UV layers.
-    if !super::uv_corner_values(mesh).is_empty()
-        && source_positions
-            .iter()
-            .any(|point| (*point - center).cross(axis).length() <= 1.0e-9)
-    {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "screw on UV layers is not supported when the profile touches the axis",
-            json!({"feature_id":"modifier.screw.axis_uv","modifier_id":modifier.id}),
-        ));
-    }
     let vertex_indices = id_indices(mesh);
     let source_edges = mesh
         .edges
@@ -280,7 +260,12 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "at least one profile edge",
         ));
     }
-    let closed = (angle.abs() - std::f64::consts::TAU).abs() <= 1.0e-10;
+    // Blender closes a full turn only from three steps up, and only when the screw offset is within
+    // FLT_EPSILON * 100 of zero; a closed screw then ignores the offset.
+    let closed = steps >= 3
+        && height.abs() <= f64::from(f32::EPSILON) * 100.0
+        && (angle.abs() - std::f64::consts::TAU).abs() <= 1.0e-10;
+    let height = if closed { 0.0 } else { height };
     let ring_count = if closed { steps } else { steps + 1 };
     let mut points = Vec::with_capacity(source_positions.len() * ring_count);
     for step in 0..ring_count {
@@ -296,21 +281,25 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     for step in 0..segments {
         let next_step = (step + 1) % ring_count;
         for [first, second] in &source_edges {
+            // Same cycle as the profile edge's own winding, started at its second vertex: for copies of
+            // an on-axis vertex the later corner lands on the next ring, as Blender's loops do.
             faces.push((
                 vec![
+                    step * source_positions.len() + second,
                     step * source_positions.len() + first,
                     next_step * source_positions.len() + first,
                     next_step * source_positions.len() + second,
-                    step * source_positions.len() + second,
                 ],
                 0,
             ));
         }
     }
     let vertex_count = source_positions.len();
-    // Blender takes each screw loop's data from the last source loop of its profile vertex.
+    // Blender takes each screw loop's data from the last source loop of its profile vertex. A profile
+    // edge that no face uses has no loops, so its screw corners carry no source data.
     let mut last_loop: Vec<Option<usize>> = vec![None; vertex_count];
     let mut loop_start = 0_usize;
+    let mut face_edges: HashSet<(usize, usize)> = HashSet::new();
     for source_face in &mesh.faces {
         for (corner, id) in source_face.vertices.iter().enumerate() {
             if let Some(&index) = vertex_indices.get(id) {
@@ -318,16 +307,31 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             }
         }
         loop_start += source_face.vertices.len();
+        let ring: Vec<usize> = source_face
+            .vertices
+            .iter()
+            .filter_map(|id| vertex_indices.get(id).copied())
+            .collect();
+        for pair in 0..ring.len() {
+            let (a, b) = (ring[pair], ring[(pair + 1) % ring.len()]);
+            face_edges.insert((a.min(b), a.max(b)));
+        }
     }
-    let corners: Vec<Vec<(usize, f64)>> = faces
+    let edge_count = source_edges.len();
+    let loose_edge: Vec<bool> = source_edges
         .iter()
-        .flat_map(|(vertices, _)| vertices.iter())
-        .map(|index| {
-            last_loop[index % vertex_count]
-                .map(|corner| vec![(corner, 1.0)])
-                .unwrap_or_default()
-        })
+        .map(|&[a, b]| !face_edges.contains(&(a.min(b), a.max(b))))
         .collect();
+    let mut corners = Vec::with_capacity(faces.len() * 4);
+    for (face, (vertices, _)) in faces.iter().enumerate() {
+        let loose = loose_edge[face % edge_count];
+        for index in vertices {
+            corners.push(match last_loop[index % vertex_count] {
+                Some(corner) if !loose => vec![(corner, 1.0)],
+                _ => Vec::new(),
+            });
+        }
+    }
     let origin = Origin {
         corners: Some(corners),
         ..Origin::copies(
@@ -335,16 +339,54 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             vec![None; faces.len()],
         )
     };
+    // Each corner's U advances by the rings between its face's step and its vertex's ring: one share
+    // of the angle per ring, or 1/steps per ring under use_stretch_u. A closed seam keeps counting:
+    // its wrap ring is one full share further on. Corners of a loose profile edge (no face loop) start
+    // from zero U and take V from the profile vertex's height along the axis: that height unchanged
+    // without use_stretch_v, and rescaled over the profile's height range with it (zero when flat).
+    // Corners of face-loop edges keep their source V.
+    let turn = if stretch_u {
+        1.0 / usize_as_f64(steps)
+    } else {
+        angle / (std::f64::consts::TAU * usize_as_f64(steps))
+    };
+    let axial: Vec<f64> = source_positions
+        .iter()
+        .map(|point| point.dot(axis))
+        .collect();
+    let (low, high) = axial.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(low, high), &height| (low.min(height), high.max(height)),
+    );
+    let loose_v = |profile: usize| {
+        if !stretch_v {
+            axial[profile]
+        } else if high > low {
+            (axial[profile] - low) / (high - low)
+        } else {
+            0.0
+        }
+    };
+    let corner_uv: Vec<Vec<(usize, Option<f64>)>> = faces
+        .iter()
+        .enumerate()
+        .map(|(face, (vertices, _))| {
+            let step = face / edge_count;
+            let loose = loose_edge[face % edge_count];
+            vertices
+                .iter()
+                .map(|index| {
+                    let ring = index / vertex_count;
+                    let turns = step + (ring + ring_count - step) % ring_count;
+                    (turns, loose.then(|| loose_v(index % vertex_count)))
+                })
+                .collect()
+        })
+        .collect();
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
-    // Each step turns U by its share of the total angle: face `f` is step `f / edges`, and its
-    // corners 1 and 2 sit on the next ring (wrapping to ring 0 when closed).
-    let turn = angle / (std::f64::consts::TAU * usize_as_f64(steps));
-    let edge_count = source_edges.len();
-    // The seam of a closed screw keeps counting: its last ring turns U to one full share more.
     super::map_uv_values(&mut result, |face, corner, [u, v]| {
-        let step = face / edge_count;
-        let ring = step + usize::from(corner == 1 || corner == 2);
-        [u + turn * usize_as_f64(ring), v]
+        let (turns, loose_value) = corner_uv[face][corner];
+        [u + turn * usize_as_f64(turns), loose_value.unwrap_or(v)]
     });
     Ok(result)
 }
@@ -1965,7 +2007,10 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 }
             }
         }
-        face_sources.extend(std::iter::repeat_n(Some(face_index), faces.len() - emitted_before));
+        face_sources.extend(std::iter::repeat_n(
+            Some(face_index),
+            faces.len() - emitted_before,
+        ));
     }
     let (sources, coords): (Vec<usize>, Vec<DVec3>) = points.into_iter().unzip();
     let origin = Origin::copies(sources.into_iter().map(Some), face_sources);

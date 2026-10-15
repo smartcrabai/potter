@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Edge, Face, Mesh, Vertex},
+    geom::{Edge, Face, Mesh, Vertex, provenance::uv_map_entry_layer},
     model::{CameraData, Modifier},
 };
 
@@ -177,11 +177,7 @@ fn vertex_uv_coordinates(
     for face in &mesh.faces {
         let Some(entry) = entries.iter().find(|entry| {
             entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(face.id))
-                && entry
-                    .get("layer")
-                    .and_then(Value::as_str)
-                    .unwrap_or("UVMap")
-                    == layer
+                && uv_map_entry_layer(entry) == layer
         }) else {
             continue;
         };
@@ -2330,11 +2326,7 @@ fn transfer_uv(
             };
             let Some(source_uv) = source_entries.iter().find(|entry| {
                 entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(source_face.id))
-                    && entry
-                        .get("layer")
-                        .and_then(Value::as_str)
-                        .unwrap_or("UVMap")
-                        == source_layer
+                    && uv_map_entry_layer(entry) == source_layer
             }) else {
                 continue;
             };
@@ -2793,11 +2785,7 @@ fn uv_entries(mesh: &Mesh, modifier: &Modifier) -> Result<Vec<Value>> {
 fn insert_uv(entries: &mut Vec<Value>, face_id: u32, layer: &str, uv: Value) {
     if let Some(entry) = entries.iter_mut().find(|entry| {
         entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(face_id))
-            && entry
-                .get("layer")
-                .and_then(Value::as_str)
-                .unwrap_or("UVMap")
-                == layer
+            && uv_map_entry_layer(entry) == layer
     }) {
         if let Some(object) = entry.as_object_mut() {
             object.insert("uv".to_owned(), uv);
@@ -2813,11 +2801,7 @@ fn existing_uv(mesh: &Mesh, face_id: u32, layer: &str, corner: usize) -> Option<
             .iter()
             .find(|entry| {
                 entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(face_id))
-                    && entry
-                        .get("layer")
-                        .and_then(Value::as_str)
-                        .unwrap_or("UVMap")
-                        == layer
+                    && uv_map_entry_layer(entry) == layer
             })
             .and_then(|entry| entry.get("uv"))
             .and_then(Value::as_array)
