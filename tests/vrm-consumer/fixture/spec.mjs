@@ -127,6 +127,11 @@ export const HEAD_BONE_POTTER_COLUMNS = [
   [0, -1, 0],
 ];
 
+// Head-local look-at offset -> glTF world displacement at rest. Both VRM versions place the gaze origin here
+// (the offset is the same physical point), so tests use this instead of a version-specific head frame.
+export const headLocalToGltf = (v) =>
+  toGltf(HEAD_BONE_POTTER_COLUMNS.reduce((sum, axis, i) => sum.map((s, k) => s + v[i] * axis[k]), [0, 0, 0]));
+
 // Bone chains that skin each mesh. Weights are computed from distance to the
 // chain's bone heads with a smooth falloff, keeping at most 3 bones.
 export const SKIN_CHAINS = {
@@ -253,6 +258,22 @@ export const EXPRESSIONS = {
     materialColorBinds: [{ material: 'cloth', colorType: 'color', targetValue: [0.9, 0.3, 0.3, 1] }],
     textureTransformBinds: [{ material: 'cloth', scale: [2, 2], offset: [0.25, 0] }],
   },
+};
+
+// VRM 0.x blend shape group preset names (BlendShapePresetName). Every expression not listed is "unknown".
+export const V0_PRESET = {
+  aa: 'a',
+  ih: 'i',
+  ou: 'u',
+  ee: 'e',
+  oh: 'o',
+  blink: 'blink',
+  happy: 'joy',
+  sad: 'sorrow',
+  lookUp: 'lookup',
+  lookDown: 'lookdown',
+  lookLeft: 'lookleft',
+  lookRight: 'lookright',
 };
 
 // ---------------------------------------------------------------------------

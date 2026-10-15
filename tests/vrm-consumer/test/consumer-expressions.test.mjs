@@ -1,5 +1,5 @@
 // Checks 3 (morph vertices), 4 (shared cloth material binds), 5 (procedural overrides + isBinary),
-// 6 (bone look-at vs expression look-at). Expectations come from spec.mjs and the VRM 1.0 expressions spec.
+// 6 (bone look-at for VRM 1.0 and VRM 0.x, expression look-at). Expectations come from spec.mjs and the VRM 1.0 expressions spec.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
@@ -11,14 +11,13 @@ import {
   FILES,
   MESHES,
   TOL,
-  toGltf,
   correspondence,
   triples,
   assertVecClose,
   approx,
   saturate,
 } from './support/fixture.mjs';
-import { EXPRESSIONS, MORPHS, LOOKAT, MATERIALS } from '../fixture/spec.mjs';
+import { EXPRESSIONS, MORPHS, LOOKAT, MATERIALS, headLocalToGltf } from '../fixture/spec.mjs';
 
 const reference = await readReference();
 const head = MESHES.head;
@@ -38,13 +37,11 @@ after(async () => {
   await h?.close();
 });
 
-// Look-at target 2 m away from the look-at origin (head bone world position + head rotation * spec offset).
+// Look-at target 2 m away from the look-at origin (head bone world position + spec offset in the head's Potter frame).
 // Direction: yaw > 0 towards the character's left (+X), pitch > 0 looks down (-Y).
 async function lookTargetFor(name, yawDeg, pitchDeg, offset) {
   const headNode = await potter.nodeWorld(name, 'head');
-  const origin = new THREE.Vector3()
-    .fromArray(headNode.position)
-    .add(new THREE.Vector3().fromArray(toGltf(offset)).applyQuaternion(new THREE.Quaternion().fromArray(headNode.quaternion)));
+  const origin = new THREE.Vector3().fromArray(headNode.position).add(new THREE.Vector3().fromArray(headLocalToGltf(offset)));
   const yaw = THREE.MathUtils.degToRad(yawDeg);
   const pitch = THREE.MathUtils.degToRad(pitchDeg);
   const dir = new THREE.Vector3(Math.sin(yaw) * Math.cos(pitch), -Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
@@ -190,35 +187,40 @@ describe('check 6: bone look-at rotates eyes, expression look-at drives look wei
   };
   const rangeValue = (range, deg) => range.outputScale * saturate(Math.abs(deg) / range.inputMaxValue);
 
-  for (const [yawDeg, pitchDeg] of [
-    [15, 0],
-    [-15, 0],
-    [45, 0],
-    [0, 20],
-    [0, -20],
+  for (const [variant, file, suffix] of [
+    ['v1Full', FILES.v1Full, ''],
+    ['v0', FILES.v0, ' (VRM 0.x)'],
   ]) {
-    it(`bone look-at yaw=${yawDeg} pitch=${pitchDeg}: eyes rotate by the spec range maps`, async () => {
-      const spec = LOOKAT.v1Full;
-      await potter.load('b', fixtureUrl(FILES.v1Full));
-      const restLeft = (await potter.humanBoneWorld('b', 'leftEye')).quaternion;
-      const restRight = (await potter.humanBoneWorld('b', 'rightEye')).quaternion;
-      await potter.lookAt('b', await lookTargetFor('b', yawDeg, pitchDeg, spec.offsetFromHeadBone));
-      await potter.update('b', 0);
-      const angles = await potter.lookAtAngles('b');
-      approx(angles.yaw, yawDeg, TOL.angleDeg, 'look-at yaw');
-      approx(angles.pitch, pitchDeg, TOL.angleDeg, 'look-at pitch');
-      // Single-axis rotations, so the eye's rotation angle is the range-map output for that axis.
-      // Left eye uses the outer map for yaw > 0 and the inner map for yaw < 0; the right eye is mirrored.
-      const horiz = (leftEye) => {
-        const outer = leftEye ? yawDeg > 0 : yawDeg < 0;
-        return rangeValue(outer ? spec.rangeMapHorizontalOuter : spec.rangeMapHorizontalInner, yawDeg);
-      };
-      const vert = rangeValue(pitchDeg > 0 ? spec.rangeMapVerticalDown : spec.rangeMapVerticalUp, pitchDeg);
-      const eyeLeft = (await potter.humanBoneWorld('b', 'leftEye')).quaternion;
-      const eyeRight = (await potter.humanBoneWorld('b', 'rightEye')).quaternion;
-      approx(angleDeg(restLeft, eyeLeft), Math.hypot(horiz(true), vert), TOL.angleDeg, 'left eye rotation');
-      approx(angleDeg(restRight, eyeRight), Math.hypot(horiz(false), vert), TOL.angleDeg, 'right eye rotation');
-    });
+    for (const [yawDeg, pitchDeg] of [
+      [15, 0],
+      [-15, 0],
+      [45, 0],
+      [0, 20],
+      [0, -20],
+    ]) {
+      it(`bone look-at yaw=${yawDeg} pitch=${pitchDeg}${suffix}: eyes rotate by the spec range maps`, async () => {
+        const spec = LOOKAT[variant];
+        await potter.load('b', fixtureUrl(file));
+        const restLeft = (await potter.humanBoneWorld('b', 'leftEye')).quaternion;
+        const restRight = (await potter.humanBoneWorld('b', 'rightEye')).quaternion;
+        await potter.lookAt('b', await lookTargetFor('b', yawDeg, pitchDeg, spec.offsetFromHeadBone));
+        await potter.update('b', 0);
+        const angles = await potter.lookAtAngles('b');
+        approx(angles.yaw, yawDeg, TOL.angleDeg, 'look-at yaw');
+        approx(angles.pitch, pitchDeg, TOL.angleDeg, 'look-at pitch');
+        // Single-axis rotations, so the eye's rotation angle is the range-map output for that axis.
+        // Left eye uses the outer map for yaw > 0 and the inner map for yaw < 0; the right eye is mirrored.
+        const horiz = (leftEye) => {
+          const outer = leftEye ? yawDeg > 0 : yawDeg < 0;
+          return rangeValue(outer ? spec.rangeMapHorizontalOuter : spec.rangeMapHorizontalInner, yawDeg);
+        };
+        const vert = rangeValue(pitchDeg > 0 ? spec.rangeMapVerticalDown : spec.rangeMapVerticalUp, pitchDeg);
+        const eyeLeft = (await potter.humanBoneWorld('b', 'leftEye')).quaternion;
+        const eyeRight = (await potter.humanBoneWorld('b', 'rightEye')).quaternion;
+        approx(angleDeg(restLeft, eyeLeft), Math.hypot(horiz(true), vert), TOL.angleDeg, 'left eye rotation');
+        approx(angleDeg(restRight, eyeRight), Math.hypot(horiz(false), vert), TOL.angleDeg, 'right eye rotation');
+      });
+    }
   }
 
   for (const [yawDeg, pitchDeg] of [
