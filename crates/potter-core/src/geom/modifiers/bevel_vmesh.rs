@@ -12,7 +12,8 @@
 //! mesh (`cubic_subdiv`), followed by interpolation for odd segment counts (`interp_vmesh`).
 //!
 //! Covered: EDGES bevels whose beveled corners are all three-edge cube-like corners
-//! (`tri_corner_adj_vmesh`), and VERTICES bevels (`adj_vmesh`).
+//! (`tri_corner_adj_vmesh`, or `square_out_adj_vmesh` for the square profile with an even segment
+//! count), and VERTICES bevels (`adj_vmesh`).
 
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
@@ -21,6 +22,7 @@ use glam::DVec3;
 
 use super::{Mesh, Polygon, build_mesh};
 use crate::error::Result;
+use crate::geom::uv_layers;
 use crate::geom::{
     edge_key,
     provenance::{Origin, mean_value_corners},
@@ -942,6 +944,160 @@ fn closest_on_segment(point: DVec3, a: DVec3, b: DVec3) -> DVec3 {
     a + direction * t
 }
 
+/// Blender's `isect_line_line_epsilon_v3`: `(kind, r_i1, r_i2)` for the lines `v1`-`v2` and `v3`-`v4`.
+/// `kind` is 0 for parallel lines, 1 for coplanar lines meeting at `r_i1 == r_i2`, and 2 for skew
+/// lines, whose nearest points are `r_i1` on the first line and `r_i2` on the second.
+fn isect_line_line(v1: DVec3, v2: DVec3, v3: DVec3, v4: DVec3) -> (u8, DVec3, DVec3) {
+    let a = v2 - v1;
+    let b = v4 - v3;
+    let ab = a.cross(b);
+    let div = ab.dot(ab);
+    if div == 0.0 {
+        return (0, DVec3::ZERO, DVec3::ZERO);
+    }
+    let c = v3 - v1;
+    if c.dot(ab).abs() <= BEVEL_EPSILON {
+        let point = v1 + a * (c.cross(b).dot(ab) / div);
+        return (1, point, point);
+    }
+    // Skew: slide the second line along the common normal into the plane of the first line.
+    let offset = (v1 - v3).project_onto(ab);
+    let c = c + offset;
+    let r_i1 = v1 + a * (c.cross(b).dot(ab) / div);
+    (2, r_i1, r_i1 - offset)
+}
+
+/// Blender's `edges_angle_kind` test for the corner edges `vertex`-`first` and `vertex`-`second`:
+/// whether the angle between them, measured through the face with `normal`, is the smaller one.
+/// Straight edges are not smaller.
+fn angle_is_smaller(vertex: DVec3, first: DVec3, second: DVec3, normal: DVec3) -> bool {
+    let cross = (vertex - first)
+        .normalize_or_zero()
+        .cross((vertex - second).normalize_or_zero());
+    cross.length_squared() > BEVEL_EPSILON_SQ && cross.normalize().dot(normal) >= 0.0
+}
+
+/// Blender's `square_out_adj_vmesh`: the vertex mesh of a three-edge corner for the square profile
+/// with an even segment count. Each boundary vertex moves onto the centerlines of the beveled edges,
+/// where its offset lines meet them, and the centerlines run from the edges to the vertex. Corner
+/// edge `i` joins the vertex to `neighbors[i]`, and centerline `i` lies on that edge.
+fn square_out_vmesh(points: &[DVec3], polygons: &[Polygon], corner: &Corner, seg: usize) -> VMesh {
+    let count = corner.count();
+    let ns2 = seg / 2;
+    let ns2_inv = 1.0 / ns2 as f64;
+    let vertex = points[corner.vertex];
+    let neighbor = |edge: usize| points[corner.neighbors[edge % count]];
+    // Blender's closer_v3_v3v3v3: keep the candidate that is nearer the vertex.
+    let nearer = |current: DVec3, candidate: DVec3| {
+        if (current - vertex).length_squared() <= (candidate - vertex).length_squared() {
+            current
+        } else {
+            candidate
+        }
+    };
+    // centerline[i][j]: j = 0 on edge i, j = ns2 at the vertex.
+    let mut centerline = vec![vec![DVec3::ZERO; ns2 + 1]; count];
+    let mut set = vec![false; count];
+    for i in 0..count {
+        let previous = (i + count - 1) % count;
+        let bound = corner.bounds[i];
+        let first = neighbor(previous);
+        let second = neighbor(i);
+        let normal = face_normal(points, &polygons[corner.bound_face(i)].0);
+        if !angle_is_smaller(vertex, first, second, normal) {
+            continue;
+        }
+        let (kind, on_second, _) = isect_line_line(vertex, second, bound, bound + (first - vertex));
+        if kind != 0 {
+            centerline[i][0] = if set[i] {
+                nearer(centerline[i][0], on_second)
+            } else {
+                on_second
+            };
+            set[i] = true;
+        }
+        let (kind, on_first, _) = isect_line_line(vertex, first, bound, bound + (second - vertex));
+        if kind != 0 {
+            centerline[previous][0] = if set[previous] {
+                nearer(centerline[previous][0], on_first)
+            } else {
+                on_first
+            };
+            set[previous] = true;
+        }
+    }
+    for i in 0..count {
+        if !set[i] {
+            // Blender's fallback: the point of edge `i` nearest to the next boundary vertex.
+            centerline[i][0] =
+                closest_on_segment(corner.bounds[(i + 1) % count], vertex, neighbor(i));
+        }
+    }
+    for line in &mut centerline {
+        let start = line[0];
+        for (j, point) in line.iter_mut().enumerate().skip(1) {
+            *point = start + (vertex - start) * (j as f64 * ns2_inv);
+        }
+    }
+
+    let mut vm = VMesh::new(count, seg);
+    for i in 0..count {
+        let bound = corner.bounds[i];
+        let before = centerline[(i + count - 1) % count][0];
+        for j in 0..ns2 {
+            vm.put(i, j, 0, bound + (before - bound) * (j as f64 * ns2_inv));
+        }
+        let after = centerline[i][0];
+        for k in 1..=ns2 {
+            vm.put(i, 0, k, bound + (after - bound) * (k as f64 * ns2_inv));
+        }
+    }
+    vm.put(0, ns2, ns2, vertex);
+    vm.copy_equiv();
+    for i in 0..count {
+        let before = (i + count - 1) % count;
+        for j in 1..ns2 {
+            for k in 1..=ns2 {
+                let (kind, meet1, meet2) = isect_line_line(
+                    vm.get(i, 0, k),
+                    centerline[before][k],
+                    vm.get(i, j, 0),
+                    centerline[i][j],
+                );
+                let point = match kind {
+                    0 => {
+                        let start = vm.get(i, 0, k);
+                        start + (centerline[before][k] - start) * (j as f64 * ns2_inv)
+                    }
+                    1 => meet1,
+                    _ => (meet1 + meet2) * 0.5,
+                };
+                vm.put(i, j, k, point);
+            }
+        }
+    }
+    vm.copy_equiv();
+    vm
+}
+
+/// The vertex mesh of a three-edge corner for `spacing`: Blender's `square_out_adj_vmesh` for the
+/// square profile with an even segment count (`bevel_build_rings`), otherwise the cube-corner map.
+fn corner_vmesh(
+    points: &[DVec3],
+    polygons: &[Polygon],
+    corner: &Corner,
+    spacing: &ProfileSpacing,
+) -> VMesh {
+    if spacing.super_r == PRO_SQUARE_R && spacing.seg.is_multiple_of(2) {
+        return square_out_vmesh(points, polygons, corner, spacing.seg);
+    }
+    cube_corner_vmesh(
+        spacing,
+        [corner.bounds[0], corner.bounds[1], corner.bounds[2]],
+        points[corner.vertex],
+    )
+}
+
 /// A beveled corner: its vertex, its edges and faces in Blender's CCW order, and its boundary
 /// vertices. Edge `i` joins the corner to `neighbors[i]`; `faces[i]` lies between edge `i` and
 /// edge `i + 1`; boundary vertex `i` lies on face `faces[i - 1]`. The ring from boundary vertex `i`
@@ -1264,6 +1420,15 @@ fn gather_corners(
         }
         corners.push(corner);
     }
+    if super_r == PRO_SQUARE_IN_R {
+        // Blender's build_square_in_vmesh merges boundary vertices across corners: not ported.
+        rejections.extend(corners.iter().map(|corner| CornerRejection {
+            vertex: corner.vertex,
+            valence: corner.count(),
+            selected: corner.count(),
+            reason: "profile 0 (square inward) merges boundary vertices across corners, which is not supported",
+        }));
+    }
     if !rejections.is_empty() {
         return Err(rejections);
     }
@@ -1285,10 +1450,10 @@ pub(super) fn cube_corner_rejections(
         .unwrap_or_default()
 }
 
-/// Rebuilds an EDGES bevel with `seg > 2` whose beveled corners are all three-edge cube-like
-/// corners: each beveled edge becomes a strip of `seg` quads between its corners' rings, and each
-/// corner becomes a vertex mesh. `bound_of(face, vertex)` is the bevel's boundary point of a face
-/// corner. Otherwise returns the corners that are not covered (empty when the profile is not).
+/// Rebuilds an EDGES bevel whose beveled corners are all three-edge cube-like corners: each beveled
+/// edge becomes a strip of `seg` quads between its corners' rings, and each corner becomes a vertex
+/// mesh. `bound_of(face, vertex)` is the bevel's boundary point of a face corner. Otherwise returns
+/// the corners that are not covered, which is never empty.
 pub(super) fn bevel_edges(
     mesh: &Mesh,
     seg: usize,
@@ -1298,9 +1463,6 @@ pub(super) fn bevel_edges(
     selected_edges: &HashSet<(usize, usize)>,
     bound_of: &dyn Fn(usize, usize) -> DVec3,
 ) -> std::result::Result<Emission, Vec<CornerRejection>> {
-    if super_r == PRO_SQUARE_IN_R || (super_r == PRO_SQUARE_R && seg.is_multiple_of(2)) {
-        return Err(Vec::new());
-    }
     let mut edges: Vec<(usize, usize)> = selected_edges.iter().copied().collect();
     edges.sort_unstable();
     let corners = gather_corners(points, polygons, selected_edges, bound_of, super_r)?;
@@ -1314,11 +1476,7 @@ pub(super) fn bevel_edges(
     let mut emission = Emission::new(points);
     let mut ids: Vec<CornerIds> = Vec::with_capacity(corners.len());
     for corner in &corners {
-        let vm = cube_corner_vmesh(
-            &spacing,
-            [corner.bounds[0], corner.bounds[1], corner.bounds[2]],
-            points[corner.vertex],
-        );
+        let vm = corner_vmesh(points, polygons, corner, &spacing);
         ids.push(CornerIds::new(corner, vm, &mut emission));
     }
 
@@ -1331,7 +1489,12 @@ pub(super) fn bevel_edges(
                     let corner = &corners[index];
                     let Some(i) = (0..corner.count()).find(|i| corner.bound_face(*i) == face_index)
                     else {
-                        return Err(Vec::new());
+                        return Err(vec![CornerRejection {
+                            vertex: corner.vertex,
+                            valence: corner.count(),
+                            selected: corner.count(),
+                            reason: "the bevel boundary point is missing from a face around the corner",
+                        }]);
                     };
                     vertices.push(ids[index].bound_ids[i]);
                 }
@@ -2126,24 +2289,9 @@ const STD_UV_CONNECT_LIMIT: f64 = 1.0e-4;
 type SourceUvs = Vec<Vec<Option<Vec<[f64; 2]>>>>;
 
 fn source_uvs(mesh: &Mesh) -> SourceUvs {
-    super::uv_corner_values(mesh)
+    uv_layers::read_layers(mesh)
         .into_iter()
-        .map(|layer| {
-            layer
-                .into_iter()
-                .map(|face| {
-                    face.and_then(|values| {
-                        values
-                            .iter()
-                            .map(|value| {
-                                let pair = value.as_array()?;
-                                Some([pair.first()?.as_f64()?, pair.get(1)?.as_f64()?])
-                            })
-                            .collect::<Option<Vec<_>>>()
-                    })
-                })
-                .collect()
-        })
+        .map(|layer| layer.faces)
         .collect()
 }
 

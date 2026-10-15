@@ -19,7 +19,8 @@ use crate::{
 
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
-    provenance::{Origin, mean_value_corners, remap_attributes, uv_default, uv_map_entry_layer},
+    provenance::{Origin, mean_value_corners, remap_attributes},
+    uv_layers::{self, uv_default, uv_map_entry_layer},
 };
 
 mod advanced;
@@ -366,11 +367,11 @@ pub fn evaluate_modifiers_with_groups_at_frame(
 }
 
 /// The `modifier.bevel.uv_profile` rejection for a bevel on UV layers whose beveled corners the
-/// vertex-mesh construction does not cover; `rejections` lists them.
+/// vertex-mesh construction does not cover; `rejections` lists them (never empty).
 fn bevel_uv_profile_error(
     modifier: &Modifier,
     mesh: &Mesh,
-    segments: usize,
+    profile: f64,
     rejections: &[bevel_vmesh::CornerRejection],
 ) -> PotError {
     let rejected: Vec<Value> = rejections
@@ -384,10 +385,27 @@ fn bevel_uv_profile_error(
             })
         })
         .collect();
-    let message = if segments > 2 {
-        "bevel with more than two segments on UV layers needs every beveled corner to be a cube-like three-edge corner"
+    let (parameter, message) = if bevel_vmesh::profile_super_r(profile)
+        == bevel_vmesh::PRO_SQUARE_IN_R
+    {
+        (
+            "profile",
+            "bevel with UV layers does not support profile 0 (square inward) on EDGES; use a profile above 0"
+                .to_owned(),
+        )
     } else {
-        "bevel with two segments on UV layers needs every beveled corner to be a cube-like three-edge corner"
+        let detail = rejections.first().map_or_else(String::new, |worst| {
+            format!(
+                "; corner at vertex {} has valence {} / selected {} edges: {}",
+                mesh.vertices[worst.vertex].id, worst.valence, worst.selected, worst.reason
+            )
+        });
+        (
+            "segments",
+            format!(
+                "bevel with UV layers supports only three-edge cube-like corners with every edge selected{detail}"
+            ),
+        )
     };
     PotError::with_details(
         ErrorCode::UnsupportedFeature,
@@ -395,7 +413,7 @@ fn bevel_uv_profile_error(
         json!({
             "feature_id": "modifier.bevel.uv_profile",
             "modifier_id": modifier.id,
-            "parameter": "segments",
+            "parameter": parameter,
             "rejected_corners": rejected,
         }),
     )
@@ -1659,67 +1677,25 @@ fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
     Ok(source)
 }
 
-/// A cap's UV layers by name, as per-corner values over the cap's faces. `blender_uv_layers` supply
-/// their layers; `uv_map` entries supply layers the cap does not list there, default where a face
-/// has no entry.
+/// A cap's UV layers by name, as per-corner values over the cap's faces, default where a face has no
+/// value.
 fn cap_uv_layers(cap: &Mesh) -> Vec<(String, Vec<Value>)> {
-    let mut layers: Vec<(String, Vec<Value>)> = cap
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
+    uv_layers::read_layers(cap)
         .into_iter()
-        .flatten()
-        .filter_map(|layer| {
-            let name = layer.get("name").and_then(Value::as_str)?;
+        .map(|layer| {
             let values = layer
-                .get("values")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            Some((name.to_owned(), values))
+                .faces
+                .iter()
+                .zip(&cap.faces)
+                .flat_map(|(uv, face)| {
+                    (0..face.vertices.len()).map(move |corner| {
+                        uv.as_ref().map_or_else(uv_default, |uv| json!(uv[corner]))
+                    })
+                })
+                .collect();
+            (layer.name, values)
         })
-        .collect();
-    let listed = layers.len();
-    let corners: usize = cap.faces.iter().map(|face| face.vertices.len()).sum();
-    // Face ID -> (first corner, corner count), in the cap's corner order.
-    let mut spans = HashMap::with_capacity(cap.faces.len());
-    let mut start = 0;
-    for face in &cap.faces {
-        spans.insert(u64::from(face.id), (start, face.vertices.len()));
-        start += face.vertices.len();
-    }
-    for entry in cap
-        .attributes
-        .get("uv_map")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let name = uv_map_entry_layer(entry);
-        let Some(&(start, count)) = entry
-            .get("face_id")
-            .and_then(Value::as_u64)
-            .and_then(|id| spans.get(&id))
-        else {
-            continue;
-        };
-        let Some(uv) = entry.get("uv").and_then(Value::as_array) else {
-            continue;
-        };
-        if layers[..listed].iter().any(|(known, _)| known == name) {
-            continue;
-        }
-        let index = if let Some(index) = layers.iter().position(|(known, _)| known == name) {
-            index
-        } else {
-            layers.push((name.to_owned(), vec![uv_default(); corners]));
-            layers.len() - 1
-        };
-        for (corner, value) in uv.iter().take(count).enumerate() {
-            layers[index].1[start + corner] = value.clone();
-        }
-    }
-    layers
+        .collect()
 }
 
 /// The first element ID after `ids`, or zero when there are none.
@@ -1779,95 +1755,19 @@ fn array_corner_origin(
     corners
 }
 
-/// Rewrites the UV values of a rebuilt `mesh`: `blender_uv_layers`, UV-named FLOAT2 CORNER
-/// `blender_attributes`, and `uv_map`. `transform(face, corner, uv)` maps one corner's `[u, v]`
-/// where `face` is the output polygon index and `corner` the corner position within it.
+/// Rewrites the UV values of a rebuilt `mesh` in every store of each layer. `transform(face, corner,
+/// uv)` maps one corner's `[u, v]`, where `face` is the output polygon index and `corner` the corner
+/// position within it.
 fn map_uv_values(mesh: &mut Mesh, transform: impl Fn(usize, usize, [f64; 2]) -> [f64; 2]) {
-    let corner_positions: Vec<(usize, usize)> = mesh
-        .faces
-        .iter()
-        .enumerate()
-        .flat_map(|(face, polygon)| (0..polygon.vertices.len()).map(move |corner| (face, corner)))
-        .collect();
-    let face_index: HashMap<u64, usize> = mesh
-        .faces
-        .iter()
-        .enumerate()
-        .map(|(index, face)| (u64::from(face.id), index))
-        .collect();
-    let apply = |value: &mut Value, (face, corner): (usize, usize)| {
-        let uv = value
-            .as_array()
-            .and_then(|coordinates| match coordinates.as_slice() {
-                [u, v] => Some([u.as_f64()?, v.as_f64()?]),
-                _ => None,
-            });
-        if let Some(uv) = uv {
-            *value = json!(transform(face, corner, uv));
-        }
-    };
-    let uv_names: HashSet<String> = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|layer| layer.get("name").and_then(Value::as_str).map(str::to_owned))
-        .collect();
-    if let Some(layers) = mesh
-        .attributes
-        .get_mut("blender_uv_layers")
-        .and_then(Value::as_array_mut)
-    {
-        for values in layers
-            .iter_mut()
-            .filter_map(|layer| layer.get_mut("values").and_then(Value::as_array_mut))
-        {
-            for (value, position) in values.iter_mut().zip(&corner_positions) {
-                apply(value, *position);
+    let mut layers = uv_layers::read_layers(mesh);
+    for layer in &mut layers {
+        for (face, values) in layer.faces.iter_mut().enumerate() {
+            for (corner, uv) in values.iter_mut().flatten().enumerate() {
+                *uv = transform(face, corner, *uv);
             }
         }
     }
-    if let Some(attributes) = mesh
-        .attributes
-        .get_mut("blender_attributes")
-        .and_then(Value::as_array_mut)
-    {
-        for attribute in attributes.iter_mut().filter(|attribute| {
-            attribute
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| uv_names.contains(name))
-                && attribute.get("domain").and_then(Value::as_str) == Some("CORNER")
-                && attribute.get("data_type").and_then(Value::as_str) == Some("FLOAT2")
-        }) {
-            if let Some(values) = attribute.get_mut("values").and_then(Value::as_array_mut) {
-                for (value, position) in values.iter_mut().zip(&corner_positions) {
-                    apply(value, *position);
-                }
-            }
-        }
-    }
-    if let Some(entries) = mesh
-        .attributes
-        .get_mut("uv_map")
-        .and_then(Value::as_array_mut)
-    {
-        for entry in entries {
-            let Some(&face) = entry
-                .get("face_id")
-                .and_then(Value::as_u64)
-                .and_then(|id| face_index.get(&id))
-            else {
-                continue;
-            };
-            if let Some(uv) = entry.get_mut("uv").and_then(Value::as_array_mut) {
-                for (corner, value) in uv.iter_mut().enumerate() {
-                    apply(value, (face, corner));
-                }
-            }
-        }
-    }
+    uv_layers::write_layers(mesh, &layers);
 }
 
 /// One mirror pass over a UV coordinate. A flipped axis is reflected about 0.5, or about the centre
@@ -1882,8 +1782,9 @@ fn mirror_uv_pass(
 ) -> [f64; 2] {
     std::array::from_fn(|axis| {
         let value = if flip[axis] {
+            // Blender's UDIM reflection: a whole-number coordinate maps to itself.
             let reflected = if udim {
-                2.0 * uv[axis].floor() + 1.0 - uv[axis]
+                uv[axis].ceil() - uv[axis] % 1.0
             } else {
                 1.0 - uv[axis]
             };
@@ -2046,11 +1947,13 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .ok_or_else(|| {
                 PotError::new(ErrorCode::LimitExceeded, "subdivision face count overflows")
             })?;
+        let uv_layer_count = uv_layers::read_layers(mesh).len();
         check_subdivision_budget(
             first_level_faces,
             mesh.vertices.len(),
             mesh.edges.len(),
             levels,
+            uv_layer_count,
         )?;
     }
     let mut result = mesh.clone();
@@ -2089,69 +1992,12 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-/// Corner UV values of every UV layer as `[layer][face]`, from `blender_uv_layers` and `uv_map`.
-fn uv_corner_values(mesh: &Mesh) -> Vec<Vec<Option<Vec<Value>>>> {
-    let mut face_starts = Vec::with_capacity(mesh.faces.len());
-    let mut loop_start = 0_usize;
-    for face in &mesh.faces {
-        face_starts.push(loop_start);
-        loop_start += face.vertices.len();
-    }
-    let mut layers = Vec::new();
-    if let Some(blender_layers) = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-    {
-        for layer in blender_layers {
-            let values = layer.get("values").and_then(Value::as_array);
-            layers.push(
-                mesh.faces
-                    .iter()
-                    .zip(&face_starts)
-                    .map(|(face, start)| {
-                        values.and_then(|values| {
-                            values
-                                .get(*start..*start + face.vertices.len())
-                                .map(<[Value]>::to_vec)
-                        })
-                    })
-                    .collect(),
-            );
-        }
-    }
-    if let Some(entries) = mesh.attributes.get("uv_map").and_then(Value::as_array) {
-        let face_index: HashMap<u64, usize> = mesh
-            .faces
-            .iter()
-            .enumerate()
-            .map(|(index, face)| (u64::from(face.id), index))
-            .collect();
-        let mut by_layer: BTreeMap<String, Vec<Option<Vec<Value>>>> = BTreeMap::new();
-        for entry in entries {
-            let Some(face) = entry
-                .get("face_id")
-                .and_then(Value::as_u64)
-                .and_then(|id| face_index.get(&id))
-            else {
-                continue;
-            };
-            let layer = uv_map_entry_layer(entry);
-            let uv = entry.get("uv").and_then(Value::as_array).cloned();
-            by_layer
-                .entry(layer.to_owned())
-                .or_insert_with(|| vec![None; mesh.faces.len()])[*face] = uv;
-        }
-        layers.extend(by_layer.into_values());
-    }
-    layers
-}
-
 fn check_subdivision_budget(
     first_level_faces: usize,
     input_vertices: usize,
     input_edges: usize,
     levels: u64,
+    uv_layer_count: usize,
 ) -> Result<()> {
     let convert = |count: usize| {
         u128::try_from(count)
@@ -2215,12 +2061,23 @@ fn check_subdivision_budget(
             "subdivision corner estimate overflows",
         )
     })?;
-    // Include simultaneous input/output mesh storage and subdivision adjacency indexes.
+    // Include simultaneous input/output mesh storage and subdivision adjacency indexes. Each UV
+    // layer adds face-varying channels and UV attribute copies, measured at about 260 bytes per
+    // output corner.
+    let uv_corners = estimated_corners
+        .checked_mul(convert(uv_layer_count)?)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "subdivision UV estimate overflows",
+            )
+        })?;
     let estimated_bytes = [
         (estimated_vertices, 64_u128),
         (estimated_edges, 128_u128),
         (face_count, 128_u128),
         (estimated_corners, 32_u128),
+        (uv_corners, 260_u128),
     ]
     .into_iter()
     .try_fold(0_u128, |total, (count, bytes_per_element)| {
@@ -3366,7 +3223,11 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
 
-    if affect == "EDGES" && segments > 2 {
+    // Blender's square profile also uses its even-segment corner mesh (`square_out_adj_vmesh`) for
+    // two segments, which the generic path below does not build.
+    let square_two_segments =
+        segments == 2 && bevel_vmesh::profile_super_r(profile) == bevel_vmesh::PRO_SQUARE_R;
+    if affect == "EDGES" && (segments > 2 || square_two_segments) {
         let bound_of = |face: usize, vertex: usize| points[face_corner[&(face, vertex)]];
         match bevel_vmesh::bevel_edges(
             mesh,
@@ -3380,19 +3241,14 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             Ok(emission) => {
                 return bevel_vmesh::finish(mesh, &source_polygons, emission, loose_edges(mesh)?);
             }
-            Err(rejections) if !uv_corner_values(mesh).is_empty() => {
-                return Err(bevel_uv_profile_error(
-                    modifier,
-                    mesh,
-                    segments,
-                    &rejections,
-                ));
+            Err(rejections) if uv_layers::has_uv_layers(mesh) => {
+                return Err(bevel_uv_profile_error(modifier, mesh, profile, &rejections));
             }
             Err(_) => {}
         }
     }
     // Two segments on UV layers: the old path's UV rules are verified only for cube-like corners.
-    if affect == "EDGES" && segments == 2 && !uv_corner_values(mesh).is_empty() {
+    if affect == "EDGES" && segments == 2 && uv_layers::has_uv_layers(mesh) {
         let bound_of = |face: usize, vertex: usize| points[face_corner[&(face, vertex)]];
         let rejections = bevel_vmesh::cube_corner_rejections(
             &source_points,
@@ -3402,12 +3258,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             bevel_vmesh::profile_super_r(profile),
         );
         if !rejections.is_empty() {
-            return Err(bevel_uv_profile_error(
-                modifier,
-                mesh,
-                segments,
-                &rejections,
-            ));
+            return Err(bevel_uv_profile_error(modifier, mesh, profile, &rejections));
         }
     }
     let mut output_polygons = Vec::new();
@@ -4579,9 +4430,7 @@ mod tests {
         model::{CurveData, CurvePoint, CurveSpline, Id, Modifier},
     };
 
-    use super::{
-        cap_uv_layers, check_subdivision_budget, evaluate_modifiers, evaluated_curve_path_length,
-    };
+    use super::{check_subdivision_budget, evaluate_modifiers, evaluated_curve_path_length};
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
         Modifier {
@@ -4676,25 +4525,16 @@ mod tests {
         );
     }
 
+    /// Blender's UDIM mirror (values from a Blender 5.2.2 probe): whole-number coordinates map to
+    /// themselves, a tile's interior reflects about its centre, and negative values follow `fmod`.
     #[test]
-    fn array_cap_keeps_layer_less_uv_map_entries_as_uvmap() {
-        let mut cap = Mesh::from_positions_and_faces(
-            vec![DVec3::ZERO, DVec3::X, DVec3::Y],
-            vec![vec![0, 1, 2]],
-        )
-        .unwrap();
-        let face_id = cap.faces[0].id;
-        cap.attributes.insert(
-            "uv_map".to_owned(),
-            json!([{"face_id": face_id, "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]}]),
-        );
-        assert_eq!(
-            cap_uv_layers(&cap),
-            vec![(
-                "UVMap".to_owned(),
-                vec![json!([0.0, 0.0]), json!([1.0, 0.0]), json!([1.0, 1.0])]
-            )]
-        );
+    fn mirror_udim_reflection_matches_blender_on_tile_edges_and_negatives() {
+        let mirrored = |uv| super::mirror_uv_pass(uv, [true, true], [0.0, 0.0], [0.0, 0.0], true);
+        assert_eq!(mirrored([0.0, 0.0]), [0.0, 0.0]);
+        assert_eq!(mirrored([1.0, 1.0]), [1.0, 1.0]);
+        assert_eq!(mirrored([2.0, 0.5]), [2.0, 0.5]);
+        assert_eq!(mirrored([-0.25, 1.25]), [0.25, 1.75]);
+        assert_eq!(mirrored([1.25, 0.25]), [1.75, 0.75]);
     }
 
     #[test]
@@ -4766,11 +4606,49 @@ mod tests {
 
     #[test]
     fn subdivision_resource_budget_preserves_fixture_and_rejects_excess() {
-        assert!(check_subdivision_budget(24, 8, 12, 2).is_ok());
-        let triangle_error = check_subdivision_budget(3_072, 8, 12, 8).unwrap_err();
+        assert!(check_subdivision_budget(24, 8, 12, 2, 0).is_ok());
+        let triangle_error = check_subdivision_budget(3_072, 8, 12, 8, 0).unwrap_err();
         assert_eq!(triangle_error.code, ErrorCode::LimitExceeded);
-        let memory_error = check_subdivision_budget(10_000_000, 8, 10_000_000, 1).unwrap_err();
+        let memory_error = check_subdivision_budget(10_000_000, 8, 10_000_000, 1, 0).unwrap_err();
         assert_eq!(memory_error.code, ErrorCode::LimitExceeded);
+    }
+
+    #[test]
+    fn subdivision_budget_counts_uv_layers() {
+        // A 50x50 quad grid at level 5: 10_000 corners, about 2.82e9 bytes without UVs and 2.66e9 per
+        // UV layer. Two layers still fit the 8 GiB budget; four do not.
+        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 5, 0).is_ok());
+        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 5, 2).is_ok());
+        let error = check_subdivision_budget(10_000, 2_601, 5_100, 5, 4).unwrap_err();
+        assert_eq!(error.code, ErrorCode::LimitExceeded);
+    }
+
+    #[test]
+    fn subdivision_rejects_four_uv_layers_over_budget_before_allocating() {
+        let mut mesh = Mesh::grid(crate::geom::GridParams {
+            size_x: 2.0,
+            size_y: 2.0,
+            x_subdivisions: 51,
+            y_subdivisions: 51,
+        })
+        .unwrap();
+        let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+        let layers: Vec<serde_json::Value> = ["UV0", "UV1", "UV2", "UV3"]
+            .into_iter()
+            .map(|name| {
+                let values: Vec<serde_json::Value> = (0..corners)
+                    .map(|index| json!([(index % 7) as f64 / 7.0, (index % 5) as f64 / 5.0]))
+                    .collect();
+                json!({"name": name, "values": values})
+            })
+            .collect();
+        mesh.attributes.insert(
+            "blender_uv_layers".to_owned(),
+            serde_json::Value::Array(layers),
+        );
+        let error = evaluate_modifiers(&mesh, &[with_params("subdivision", json!({"levels": 5}))])
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::LimitExceeded);
     }
 
     #[test]

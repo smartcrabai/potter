@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::provenance::{Origin, uv_map_entry_layer},
+    geom::{provenance::Origin, uv_layers},
     model::Modifier,
 };
 
@@ -495,79 +495,24 @@ fn collapse_mesh_from_mesh(mesh: &Mesh) -> Result<CollapseMesh> {
 }
 
 /// UV layers of `mesh` as `(names, values)`: `values[l][c]` is the input `[u, v]` of corner `c` (face
-/// order, then corner order) in layer `names[l]`. Layers come from `blender_uv_layers`, then from
-/// `uv_map` entries whose layer name is new. A corner with no `uv_map` entry takes `[0, 0]`.
+/// order, then corner order) in layer `names[l]`, from [`uv_layers::read_layers`]. A corner without a
+/// value takes `[0, 0]`.
 fn collapse_uv_layers(mesh: &Mesh) -> (Vec<String>, Vec<Vec<[f64; 2]>>) {
-    let corner_count: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
     let mut names = Vec::new();
     let mut values = Vec::new();
-    let uv_pair = |uv: &Value| Some([uv.get(0)?.as_f64()?, uv.get(1)?.as_f64()?]);
-    for layer in mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(raw) = layer.get("values").and_then(Value::as_array) else {
-            continue;
-        };
-        let parsed = (raw.len() == corner_count)
-            .then(|| raw.iter().map(uv_pair).collect::<Option<Vec<_>>>())
-            .flatten();
-        if let Some(parsed) = parsed {
-            names.push(
-                layer
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            );
-            values.push(parsed);
-        }
-    }
-    let offsets: HashMap<u32, (usize, usize)> = mesh
-        .faces
-        .iter()
-        .scan(0, |offset, face| {
-            let start = *offset;
-            *offset += face.vertices.len();
-            Some((face.id, (start, face.vertices.len())))
-        })
-        .collect();
-    for entry in mesh
-        .attributes
-        .get("uv_map")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let layer = uv_map_entry_layer(entry);
-        let Some(id) = entry
-            .get("face_id")
-            .and_then(Value::as_u64)
-            .and_then(|id| u32::try_from(id).ok())
-        else {
-            continue;
-        };
-        let Some(&(start, len)) = offsets.get(&id) else {
-            continue;
-        };
-        let Some(uv) = entry.get("uv").and_then(Value::as_array) else {
-            continue;
-        };
-        let index = if let Some(index) = names.iter().position(|name| name == layer) {
-            index
-        } else {
-            names.push(layer.to_owned());
-            values.push(vec![[0.0, 0.0]; corner_count]);
-            names.len() - 1
-        };
-        for (corner, pair) in uv.iter().take(len).enumerate() {
-            if let Some(value) = uv_pair(pair) {
-                values[index][start + corner] = value;
-            }
-        }
+    for layer in uv_layers::read_layers(mesh) {
+        names.push(layer.name);
+        values.push(
+            layer
+                .faces
+                .iter()
+                .zip(&mesh.faces)
+                .flat_map(|(uv, face)| {
+                    (0..face.vertices.len())
+                        .map(move |corner| uv.as_ref().map_or([0.0, 0.0], |uv| uv[corner]))
+                })
+                .collect(),
+        );
     }
     (names, values)
 }
@@ -1582,8 +1527,7 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
 }
 
 /// Rewrites the UV layers of `mesh`, rebuilt by a collapse, from the per-corner values of `corner_uv`
-/// (output face order, then corner order). `names[l]` is the layer of `corner_uv[c][l]`. Layers in
-/// `blender_uv_layers` and `uv_map` entries of the same name are both written.
+/// (output face order, then corner order). `names[l]` is the layer of `corner_uv[c][l]`.
 fn collapse_write_uv(mesh: &mut Mesh, names: &[String], corner_uv: &[CornerUv]) -> Result<()> {
     let corner_total: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
     if corner_total != corner_uv.len() {
@@ -1592,61 +1536,29 @@ fn collapse_write_uv(mesh: &mut Mesh, names: &[String], corner_uv: &[CornerUv]) 
             "decimate UV values do not match the rebuilt mesh",
         ));
     }
-    let starts: HashMap<u32, (usize, usize)> = mesh
-        .faces
+    let layers: Vec<uv_layers::UvLayer> = names
         .iter()
-        .scan(0, |offset, face| {
-            let start = *offset;
-            *offset += face.vertices.len();
-            Some((face.id, (start, face.vertices.len())))
+        .enumerate()
+        .map(|(l, name)| {
+            let mut corner = 0;
+            let faces = mesh
+                .faces
+                .iter()
+                .map(|face| {
+                    let row = (corner..corner + face.vertices.len())
+                        .map(|c| corner_uv[c][l])
+                        .collect();
+                    corner += face.vertices.len();
+                    Some(row)
+                })
+                .collect();
+            uv_layers::UvLayer {
+                name: name.clone(),
+                faces,
+            }
         })
         .collect();
-    let layer_value = |l: usize, start: usize, len: usize| {
-        Value::Array(
-            (start..start + len)
-                .map(|corner| json!([corner_uv[corner][l][0], corner_uv[corner][l][1]]))
-                .collect(),
-        )
-    };
-    if let Some(layers) = mesh
-        .attributes
-        .get_mut("blender_uv_layers")
-        .and_then(Value::as_array_mut)
-    {
-        for layer in layers {
-            let Some(l) = layer
-                .get("name")
-                .and_then(Value::as_str)
-                .and_then(|name| names.iter().position(|candidate| candidate == name))
-            else {
-                continue;
-            };
-            layer["values"] = layer_value(l, 0, corner_total);
-        }
-    }
-    if let Some(entries) = mesh
-        .attributes
-        .get_mut("uv_map")
-        .and_then(Value::as_array_mut)
-    {
-        for entry in entries {
-            let Some(l) = names
-                .iter()
-                .position(|name| name == uv_map_entry_layer(entry))
-            else {
-                continue;
-            };
-            let Some(&(start, len)) = entry
-                .get("face_id")
-                .and_then(Value::as_u64)
-                .and_then(|id| u32::try_from(id).ok())
-                .and_then(|id| starts.get(&id))
-            else {
-                continue;
-            };
-            entry["uv"] = layer_value(l, start, len);
-        }
-    }
+    uv_layers::write_layers(mesh, &layers);
     Ok(())
 }
 

@@ -44,6 +44,24 @@ fn fixture(name: &str) -> TestResult<Value> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
+/// Names of every fixture in `tests/fixtures/pr3_uv/`, sorted.
+fn fixture_names() -> TestResult<Vec<String>> {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr3_uv");
+    let mut names = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or("fixture file name")?;
+            names.push(stem.to_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 fn point(value: &Value) -> TestResult<DVec3> {
     let coords = value
         .as_array()
@@ -94,30 +112,59 @@ fn input_mesh(input: &Value) -> TestResult<Mesh> {
     let mut mesh = Mesh::from_positions_and_faces(positions, polygons)?;
     mesh.attributes
         .insert("blender_uv_layers".to_owned(), input["uv_layers"].clone());
+    // Loose edges (no face loop) are Screw's profile edges; `edges` lists them as vertex index pairs.
+    for edge in input
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let [first, second] = edge.as_array().ok_or("edge must be an array")?.as_slice() else {
+            return Err("edge must have two vertex indices".into());
+        };
+        let mut ids = [0_u32; 2];
+        for (id, index) in ids.iter_mut().zip([first, second]) {
+            let index = usize::try_from(index.as_u64().ok_or("edge index must be a number")?)?;
+            *id = mesh
+                .vertices
+                .get(index)
+                .ok_or("edge index out of range")?
+                .id;
+        }
+        mesh.insert_edge(ids)?;
+    }
     Ok(mesh)
 }
 
-/// Moves a mesh's `UVMap` layer from `blender_uv_layers` into layer-less `uv_map` entries, one per
-/// face; the evaluator reads a layer-less entry as `UVMap`. Other layers stay in `blender_uv_layers`.
-fn layerless_uv_map(mesh: &mut Mesh) -> TestResult {
+/// Moves the layers `moved` selects from `blender_uv_layers` into `uv_map` entries, one per face. A
+/// `UVMap` entry is layer-less, as the evaluator reads it; any other layer names its `layer`.
+fn move_to_uv_map(mesh: &mut Mesh, moved: impl Fn(&str) -> bool) -> TestResult {
     let layers = mesh
         .attributes
         .remove("blender_uv_layers")
         .and_then(|layers| layers.as_array().cloned())
-        .ok_or("cap UV layers missing")?;
-    let (uv_map_layers, kept): (Vec<Value>, Vec<Value>) = layers
-        .into_iter()
-        .partition(|layer| layer["name"] == "UVMap");
-    let values = uv_map_layers
-        .first()
-        .and_then(|layer| layer["values"].as_array())
-        .ok_or("cap UVMap values missing")?;
-    let mut entries = Vec::with_capacity(mesh.faces.len());
-    let mut corner = 0;
-    for face in &mesh.faces {
-        let end = corner + face.vertices.len();
-        entries.push(json!({"face_id": face.id, "uv": &values[corner..end]}));
-        corner = end;
+        .ok_or("UV layers missing")?;
+    // A layer without corners has no per-face entry to carry it, so it stays in `blender_uv_layers`.
+    let (moved_layers, kept): (Vec<Value>, Vec<Value>) = layers.into_iter().partition(|layer| {
+        let has_corners = layer["values"]
+            .as_array()
+            .is_some_and(|values| !values.is_empty());
+        has_corners && moved(layer["name"].as_str().unwrap_or_default())
+    });
+    let mut entries = Vec::new();
+    for layer in &moved_layers {
+        let name = layer["name"].as_str().ok_or("layer name missing")?;
+        let values = layer["values"].as_array().ok_or("layer values missing")?;
+        let mut corner = 0;
+        for face in &mesh.faces {
+            let end = corner + face.vertices.len();
+            let mut entry = json!({"face_id": face.id, "uv": &values[corner..end]});
+            if name != "UVMap" {
+                entry["layer"] = json!(name);
+            }
+            entries.push(entry);
+            corner = end;
+        }
     }
     mesh.attributes
         .insert("blender_uv_layers".to_owned(), Value::Array(kept));
@@ -126,11 +173,12 @@ fn layerless_uv_map(mesh: &mut Mesh) -> TestResult {
     Ok(())
 }
 
-fn modifier(id: &str, modifier_type: &str, params: &Value) -> TestResult<Modifier> {
+fn modifier(id: impl Into<String>, modifier_type: &str, params: &Value) -> TestResult<Modifier> {
+    let id = id.into();
     Ok(Modifier {
-        id: Id::new(id)?,
+        id: Id::new(&id)?,
         modifier_type: modifier_type.to_owned(),
-        name: id.to_owned(),
+        name: id,
         enabled: true,
         params: params
             .as_object()
@@ -190,9 +238,58 @@ fn scene_doc(
     Ok(doc)
 }
 
-/// Scene document for a fixture's input: the subject stack plus any cap objects. With
-/// `caps_as_uv_map`, each cap's `UVMap` is a layer-less `uv_map` entry; its other layers stay named.
-fn fixture_scene(input: &Value, caps_as_uv_map: bool) -> TestResult<SceneDoc> {
+/// How a fixture's UV layers are stored in a Potter input.
+#[derive(Clone, Copy)]
+enum UvStorage {
+    /// `blender_uv_layers` only, as the fixtures are written.
+    Blender,
+    /// `UVMap` moved into layer-less `uv_map` entries; other layers stay in `blender_uv_layers`.
+    LayerlessUvMap,
+    /// Every layer moved into `uv_map` entries that name their layer.
+    AllUvMap,
+    /// `blender_uv_layers`, plus a UV-named `FLOAT2` `CORNER` `blender_attributes` copy of each layer.
+    AttributeCopies,
+}
+
+/// Stores `mesh`'s UV layers as `storage` says.
+fn store_uv_layers(mesh: &mut Mesh, storage: UvStorage) -> TestResult {
+    match storage {
+        UvStorage::Blender => {}
+        UvStorage::LayerlessUvMap => move_to_uv_map(mesh, |name| name == "UVMap")?,
+        UvStorage::AllUvMap => move_to_uv_map(mesh, |_| true)?,
+        UvStorage::AttributeCopies => {
+            let copies: Vec<Value> = mesh
+                .attributes
+                .get("blender_uv_layers")
+                .and_then(Value::as_array)
+                .ok_or("UV layers missing")?
+                .iter()
+                .map(|layer| {
+                    json!({
+                        "name": layer["name"],
+                        "domain": "CORNER",
+                        "data_type": "FLOAT2",
+                        "values": layer["values"],
+                    })
+                })
+                .collect();
+            let mut attributes = mesh
+                .attributes
+                .get("blender_attributes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            attributes.extend(copies);
+            mesh.attributes
+                .insert("blender_attributes".to_owned(), Value::Array(attributes));
+        }
+    }
+    Ok(())
+}
+
+/// Scene document for a fixture's input: the subject stack plus any cap objects, with every
+/// object's UV layers stored as `storage` says.
+fn fixture_scene(input: &Value, storage: UvStorage) -> TestResult<SceneDoc> {
     let modifiers = input["modifiers"]
         .as_array()
         .ok_or("modifiers missing")?
@@ -200,7 +297,7 @@ fn fixture_scene(input: &Value, caps_as_uv_map: bool) -> TestResult<SceneDoc> {
         .enumerate()
         .map(|(index, stack)| {
             modifier(
-                &format!("modifier_{index}"),
+                format!("modifier_{index}"),
                 stack["type"].as_str().ok_or("modifier type")?,
                 &stack["params"],
             )
@@ -212,9 +309,7 @@ fn fixture_scene(input: &Value, caps_as_uv_map: bool) -> TestResult<SceneDoc> {
         .flatten()
         .map(|(name, cap)| -> TestResult<_> {
             let mut mesh = input_mesh(cap)?;
-            if caps_as_uv_map {
-                layerless_uv_map(&mut mesh)?;
-            }
+            store_uv_layers(&mut mesh, storage)?;
             let loc = &cap["loc"];
             Ok((
                 name.clone(),
@@ -227,7 +322,9 @@ fn fixture_scene(input: &Value, caps_as_uv_map: bool) -> TestResult<SceneDoc> {
             ))
         })
         .collect::<TestResult<Vec<_>>>()?;
-    scene_doc(input_mesh(input)?, modifiers, objects)
+    let mut subject = input_mesh(input)?;
+    store_uv_layers(&mut subject, storage)?;
+    scene_doc(subject, modifiers, objects)
 }
 
 fn evaluate(doc: &SceneDoc) -> TestResult<Snapshot> {
@@ -245,13 +342,12 @@ struct Corner {
     uv: Vec<[f64; 2]>,
 }
 
-/// Corners of an evaluated mesh in face order, one entry per loop, with every UV layer.
-fn corners(mesh: &Mesh) -> TestResult<Vec<Corner>> {
-    let layers = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
+/// Corners of an evaluated mesh in face order, one entry per loop, with the values of `layers`.
+fn corners(mesh: &Mesh, layers: &[String]) -> TestResult<Vec<Corner>> {
+    let values = layers
+        .iter()
+        .map(|name| layer_uvs(mesh, name))
+        .collect::<TestResult<Vec<_>>>()?;
     let positions: BTreeMap<u32, DVec3> = mesh
         .vertices
         .iter()
@@ -267,13 +363,15 @@ fn corners(mesh: &Mesh) -> TestResult<Vec<Corner>> {
             .collect::<Result<Vec<_>, _>>()?;
         let centroid = points.iter().sum::<DVec3>() / f64::from(u32::try_from(points.len())?);
         for (corner, point) in points.iter().enumerate() {
-            let uvs = layers
+            let uvs = values
                 .iter()
                 .map(|layer| {
-                    let values = layer["values"].as_array().ok_or("layer values")?;
-                    uv(values.get(loop_index + corner).ok_or("loop UV missing")?)
+                    layer
+                        .get(loop_index + corner)
+                        .copied()
+                        .ok_or("loop UV missing")
                 })
-                .collect::<TestResult<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, _>>()?;
             output.push(Corner {
                 centroid,
                 point: *point,
@@ -295,19 +393,95 @@ fn uv_layer_names(mesh: &Mesh) -> Vec<String> {
         .collect()
 }
 
+/// The `uv_map` entries of `mesh`.
+fn uv_map_entries(mesh: &Mesh) -> &[Value] {
+    mesh.attributes
+        .get("uv_map")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+}
+
+/// Layer of a `uv_map` entry; an entry without a `layer` belongs to `UVMap`.
+fn uv_map_layer(entry: &Value) -> &str {
+    entry["layer"].as_str().unwrap_or("UVMap")
+}
+
+/// Names of the UV layers `mesh` stores: those `blender_uv_layers` lists, then `uv_map` layers it
+/// does not list.
+fn stored_uv_layer_names(mesh: &Mesh) -> Vec<String> {
+    let mut names = uv_layer_names(mesh);
+    for entry in uv_map_entries(mesh) {
+        let name = uv_map_layer(entry);
+        if !names.iter().any(|known| known == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+/// Values of UV layer `name` in loop order, read as the evaluator reads them: `blender_uv_layers`
+/// when it lists the layer, otherwise the layer's `uv_map` entry for each face.
+fn layer_uvs(mesh: &Mesh, name: &str) -> TestResult<Vec<[f64; 2]>> {
+    let listed = mesh
+        .attributes
+        .get("blender_uv_layers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|layer| layer["name"].as_str() == Some(name));
+    if let Some(layer) = listed {
+        return layer["values"]
+            .as_array()
+            .ok_or("layer values missing")?
+            .iter()
+            .map(uv)
+            .collect();
+    }
+    let entries = uv_map_entries(mesh);
+    let mut output = Vec::new();
+    for face in &mesh.faces {
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry["face_id"].as_u64() == Some(u64::from(face.id)) && uv_map_layer(entry) == name
+            })
+            .ok_or_else(|| format!("no `{name}` uv_map entry for face {}", face.id))?;
+        let row = entry["uv"].as_array().ok_or("uv_map entry without uv")?;
+        if row.len() != face.vertices.len() {
+            return Err(format!(
+                "`{name}` uv_map entry of face {} has the wrong corner count",
+                face.id
+            )
+            .into());
+        }
+        for value in row {
+            output.push(uv(value)?);
+        }
+    }
+    Ok(output)
+}
+
+/// Layer names a fixture lists, in fixture order.
+fn fixture_layers(fixture: &Value) -> TestResult<Vec<String>> {
+    let layers = fixture["layers"].as_array().ok_or("layers missing")?;
+    layers
+        .iter()
+        .map(|name| -> TestResult<String> { Ok(name.as_str().ok_or("layer name")?.to_owned()) })
+        .collect()
+}
+
 /// Pairs oracle corners with Potter corners at the same face centroid and corner position, and
 /// checks each layer's UV within `UV_TOLERANCE`. Repeated positions pair by closest UVs. With
 /// `partial`, oracle corners without a Potter counterpart are skipped; otherwise every oracle corner
 /// must match and the corner counts must be equal. Returns the number of matched oracle corners.
 fn matched_oracle_corners(mesh: &Mesh, fixture: &Value, partial: bool) -> TestResult<usize> {
-    let layers: Vec<String> = fixture["layers"]
-        .as_array()
-        .ok_or("layers missing")?
-        .iter()
-        .filter_map(|name| name.as_str().map(str::to_owned))
-        .collect();
-    assert_eq!(uv_layer_names(mesh), layers, "UV layer names");
-    let actual = corners(mesh)?;
+    let layers = fixture_layers(fixture)?;
+    let mut stored = stored_uv_layer_names(mesh);
+    stored.sort();
+    let mut wanted = layers.clone();
+    wanted.sort();
+    assert_eq!(stored, wanted, "UV layer names");
+    let actual = corners(mesh, &layers)?;
     let rows = fixture["corners"].as_array().ok_or("corners missing")?;
     if !partial {
         assert_eq!(actual.len(), rows.len(), "Potter corner count");
@@ -375,7 +549,7 @@ fn matched_oracle_corners(mesh: &Mesh, fixture: &Value, partial: bool) -> TestRe
 /// Evaluates a fixture's input and checks that every oracle corner matches Blender.
 fn check_fixture(name: &str) -> TestResult<usize> {
     let fixture = fixture(name)?;
-    let snapshot = evaluate(&fixture_scene(&fixture["input"], false)?)?;
+    let snapshot = evaluate(&fixture_scene(&fixture["input"], UvStorage::Blender)?)?;
     matched_oracle_corners(subject_mesh(&snapshot)?, &fixture, false)
 }
 
@@ -436,6 +610,21 @@ fn mirror_udim_matches_blender_oracle() -> TestResult {
     Ok(())
 }
 
+// Mirror on X and Y with flip U (uvcube, merge on), and a UDIM reflection of a quad whose corner UVs
+// lie outside 0..1.
+
+#[test]
+fn mirror_xy_flip_u_matches_blender_oracle() -> TestResult {
+    assert_eq!(check_fixture("mirror_xy_flip_u")?, 80);
+    Ok(())
+}
+
+#[test]
+fn mirror_udim_half_plane_matches_blender_oracle() -> TestResult {
+    assert_eq!(check_fixture("mirror_udim_half_plane")?, 8);
+    Ok(())
+}
+
 // Subdivision. Default uv_smooth (PRESERVE_BOUNDARIES) on a continuous UV grid at level 2,
 // SIMPLE at levels 1 and 2, and SMOOTH_ALL on island UVs (a cube whose faces each own a UV island).
 
@@ -472,6 +661,12 @@ fn bevel_edges_two_segments_matches_blender_oracle() -> TestResult {
 }
 
 #[test]
+fn bevel_edges_three_segments_matches_blender_oracle() -> TestResult {
+    assert_eq!(check_fixture("bevel_cube_seg3")?, 384);
+    Ok(())
+}
+
+#[test]
 fn bevel_vertices_two_segments_matches_blender_oracle() -> TestResult {
     assert_eq!(check_fixture("bevel_verts_seg2_uv")?, 168);
     Ok(())
@@ -499,13 +694,75 @@ fn screw_stretch_uv_matches_blender_oracle() -> TestResult {
     Ok(())
 }
 
+// Screw over loose edges: a three-point polyline (no faces, so no loops) spun a full turn with
+// screw_offset 0.5. The variant also stretches V.
+
+#[test]
+fn screw_loose_edges_full_turn_offset_matches_blender_oracle() -> TestResult {
+    assert_eq!(check_fixture("screw_loose_edge_offset")?, 24);
+    Ok(())
+}
+
+#[test]
+fn screw_loose_edges_full_turn_offset_stretch_v_matches_blender_oracle() -> TestResult {
+    assert_eq!(check_fixture("screw_loose_edge_offset_stretch_v")?, 24);
+    Ok(())
+}
+
+#[test]
+fn screw_keeps_uv_map_entries_equal_to_blender_uv_layers_path() -> TestResult {
+    // `screw_stretch_uv` with every layer in `uv_map`: each output face keeps an entry per layer,
+    // and the entries carry the values that the `blender_uv_layers` input produces.
+    let fixture = fixture("screw_stretch_uv")?;
+    let stored = evaluate(&fixture_scene(&fixture["input"], UvStorage::Blender)?)?;
+    let mapped = evaluate(&fixture_scene(&fixture["input"], UvStorage::AllUvMap)?)?;
+    let (stored, mapped) = (subject_mesh(&stored)?, subject_mesh(&mapped)?);
+    assert_eq!(stored.faces.len(), mapped.faces.len(), "face count");
+    let layers = fixture_layers(&fixture)?;
+    let mut corner = 0;
+    for face in &mapped.faces {
+        let end = corner + face.vertices.len();
+        for layer in &layers {
+            let entry = uv_map_entries(mapped)
+                .iter()
+                .find(|entry| {
+                    entry["face_id"].as_u64() == Some(u64::from(face.id))
+                        && uv_map_layer(entry) == layer.as_str()
+                })
+                .ok_or_else(|| format!("no `{layer}` uv_map entry for face {}", face.id))?;
+            let want = layer_uvs(stored, layer)?;
+            let row = entry["uv"].as_array().ok_or("uv_map entry without uv")?;
+            assert_eq!(
+                row.len(),
+                end - corner,
+                "`{layer}` corners of face {}",
+                face.id
+            );
+            for (value, expected) in row.iter().zip(&want[corner..end]) {
+                let got = uv(value)?;
+                for axis in 0..2 {
+                    assert!(
+                        (got[axis] - expected[axis]).abs() <= UV_TOLERANCE,
+                        "`{layer}` UV[{axis}] = {}, stored {}",
+                        got[axis],
+                        expected[axis]
+                    );
+                }
+            }
+        }
+        corner = end;
+    }
+    assert_eq!(matched_oracle_corners(mapped, &fixture, false)?, 144);
+    Ok(())
+}
+
 // Decimate (collapse, ratio 0.5). Blender moves 10 of 21 corners to other positions, so only the
 // 11 corners present at the same face centroid and corner position are compared.
 
 #[test]
 fn decimate_collapse_matches_blender_oracle_on_matched_corners() -> TestResult {
     let fixture = fixture("decimate_uv")?;
-    let snapshot = evaluate(&fixture_scene(&fixture["input"], false)?)?;
+    let snapshot = evaluate(&fixture_scene(&fixture["input"], UvStorage::Blender)?)?;
     assert_eq!(
         matched_oracle_corners(subject_mesh(&snapshot)?, &fixture, true)?,
         11
@@ -522,14 +779,122 @@ fn array_caps_carry_uvs_matching_blender_oracle() -> TestResult {
 }
 
 #[test]
-fn array_cap_layerless_uv_map_entries_survive_matching_blender_oracle() -> TestResult {
-    // Same case as `array_cap_both`, with each cap's UVMap given as layer-less `uv_map` entries.
-    let fixture = fixture("array_cap_both")?;
-    let snapshot = evaluate(&fixture_scene(&fixture["input"], true)?)?;
-    assert_eq!(
-        matched_oracle_corners(subject_mesh(&snapshot)?, &fixture, false)?,
-        112
+fn array_merge_with_uv_offset_matches_blender_oracle() -> TestResult {
+    assert_eq!(check_fixture("array_merge_uv_offset")?, 64);
+    Ok(())
+}
+
+/// Checks that two evaluated corner lists agree: same centroid and corner position, same UVs.
+fn same_corners(got: &[Corner], want: &[Corner]) -> TestResult {
+    if got.len() != want.len() {
+        return Err(format!("corner count {}, expected {}", got.len(), want.len()).into());
+    }
+    for (index, (got, want)) in got.iter().zip(want).enumerate() {
+        if (got.centroid - want.centroid).length() > UV_TOLERANCE
+            || (got.point - want.point).length() > UV_TOLERANCE
+        {
+            return Err(format!("corner {index} at {:?} moved", got.point).into());
+        }
+        for (layer, (got_uv, want_uv)) in got.uv.iter().zip(&want.uv).enumerate() {
+            for axis in 0..2 {
+                if (got_uv[axis] - want_uv[axis]).abs() > UV_TOLERANCE {
+                    return Err(format!(
+                        "corner {index} layer {layer} UV[{axis}] = {}, expected {}",
+                        got_uv[axis], want_uv[axis]
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compares one fixture's layer-less `uv_map` input with its `blender_uv_layers` input.
+fn layerless_input_matches_layers(name: &str) -> TestResult {
+    let fixture = fixture(name)?;
+    let layers = fixture_layers(&fixture)?;
+    let stored = evaluate(&fixture_scene(&fixture["input"], UvStorage::Blender)?)?;
+    let layerless = evaluate(&fixture_scene(
+        &fixture["input"],
+        UvStorage::LayerlessUvMap,
+    )?)?;
+    let (stored, layerless) = (subject_mesh(&stored)?, subject_mesh(&layerless)?);
+    same_corners(&corners(layerless, &layers)?, &corners(stored, &layers)?)?;
+    let matched = matched_oracle_corners(layerless, &fixture, true)?;
+    let expected = matched_oracle_corners(stored, &fixture, true)?;
+    if matched != expected {
+        return Err(format!("{matched} oracle corners matched, expected {expected}").into());
+    }
+    Ok(())
+}
+
+// Every fixture through layer-less `uv_map` input: the UVMap of the subject and of each cap moves
+// into `uv_map` entries, and the corners must equal those of the `blender_uv_layers` input.
+
+#[test]
+fn every_fixture_through_layerless_uv_map_input_matches_blender_layers() -> TestResult {
+    let mut failures = Vec::new();
+    for name in fixture_names()? {
+        if let Err(error) = layerless_input_matches_layers(&name) {
+            failures.push(format!("{name}: {error}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "layer-less uv_map input differs:\n{}",
+        failures.join("\n")
     );
+    Ok(())
+}
+
+// Rebuilding modifiers must keep the UV-named `FLOAT2` `CORNER` copy in `blender_attributes` equal to
+// `blender_uv_layers`: mirror, subdivision at level 2, decimate, and array with caps.
+
+#[test]
+fn blender_attribute_uv_copies_match_blender_uv_layers_after_rebuilds() -> TestResult {
+    for name in [
+        "mirror_flip_uv_offset_uv",
+        "subsurf_cc_l2_cont",
+        "decimate_uv",
+        "array_cap_both",
+    ] {
+        let fixture = fixture(name)?;
+        let snapshot = evaluate(&fixture_scene(
+            &fixture["input"],
+            UvStorage::AttributeCopies,
+        )?)?;
+        let mesh = subject_mesh(&snapshot)?;
+        let attributes = mesh
+            .attributes
+            .get("blender_attributes")
+            .and_then(Value::as_array)
+            .ok_or("blender_attributes missing")?;
+        for layer in fixture_layers(&fixture)? {
+            let copy = attributes
+                .iter()
+                .find(|attribute| {
+                    attribute["name"].as_str() == Some(layer.as_str())
+                        && attribute["domain"].as_str() == Some("CORNER")
+                        && attribute["data_type"].as_str() == Some("FLOAT2")
+                })
+                .ok_or_else(|| format!("{name}: no FLOAT2 CORNER copy of `{layer}`"))?;
+            let copied = copy["values"].as_array().ok_or("copy values missing")?;
+            let stored = layer_uvs(mesh, &layer)?;
+            assert_eq!(copied.len(), stored.len(), "{name}: `{layer}` copy length");
+            for (value, want) in copied.iter().zip(&stored) {
+                let got = uv(value)?;
+                for axis in 0..2 {
+                    assert!(
+                        (got[axis] - want[axis]).abs() <= UV_TOLERANCE,
+                        "{name}: `{layer}` copy UV[{axis}] = {}, layer {}",
+                        got[axis],
+                        want[axis]
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -584,7 +949,7 @@ fn glb_parts(bytes: &[u8]) -> TestResult<(Value, Vec<u8>)> {
     Ok((json, binary))
 }
 
-/// Float components of a glTF VEC2 or VEC3 accessor, in order.
+/// Float components of a `glTF` VEC2 or VEC3 accessor, in order.
 fn accessor_floats(json: &Value, binary: &[u8], index: u64) -> TestResult<Vec<f64>> {
     let accessor = &json["accessors"][usize::try_from(index)?];
     let view = &json["bufferViews"]
@@ -680,7 +1045,7 @@ fn assert_same_vertices(exported: &[ExportedVertex], expected: &[ExportedVertex]
 #[test]
 fn glb_export_texcoords_after_mirror_and_subdivision_match_blender_oracle() -> TestResult {
     let fixture = fixture("mirror_subsurf_uv_quarter")?;
-    let exported = exported_glb_vertices(&fixture_scene(&fixture["input"], false)?)?;
+    let exported = exported_glb_vertices(&fixture_scene(&fixture["input"], UvStorage::Blender)?)?;
     // Blender's layers are UVMap then UV2; they export as TEXCOORD_0 then TEXCOORD_1.
     assert!(
         exported.iter().all(|(_, uvs)| uvs.len() == 2),
