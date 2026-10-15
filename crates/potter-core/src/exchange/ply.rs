@@ -179,6 +179,9 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             faces,
             normals,
             mirrored: false,
+            singular: false,
+            vertex_normals: None,
+            smooth: None,
         }],
         losses,
     ))
@@ -297,35 +300,17 @@ fn has_vertex_properties(properties: &[ScalarProperty], names: [&str; 3]) -> boo
         .all(|name| properties.iter().any(|property| property.name == *name))
 }
 
-/// Blender's per-vertex normal: the normalized sum of every corner normal at that vertex.
-/// Vertices no corner uses, or whose corners cancel out, write zero.
+/// Blender's per-vertex normals (`mesh.vertex_normals`) in float32. A vertex whose faces cancel
+/// out, or that only touches degenerate faces, writes zero.
 fn vertex_normals(mesh: &ExchangeMesh) -> Result<Vec<[f32; 3]>> {
-    let corners = shading::corner_normals(mesh);
-    let mut sums = vec![DVec3::ZERO; mesh.positions.len()];
-    let mut corner = 0;
-    for face in &mesh.faces {
-        for index in face {
-            let normal = corners.get(corner).ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::ExportFailed,
-                    "PLY corner normal count is invalid",
-                )
-            })?;
-            corner += 1;
-            let target = sums.get_mut(*index).ok_or_else(|| {
-                PotError::new(ErrorCode::ExportFailed, "PLY face index is invalid")
-            })?;
-            *target += DVec3::from_array(*normal);
-        }
-    }
-    sums.into_iter()
-        .map(|sum| {
-            let value = sum.normalize_or_zero();
+    shading::vertex_normals(mesh)?
+        .iter()
+        .map(|value| {
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "PLY normals use float32 by specification"
             )]
-            let output = [value.x as f32, value.y as f32, value.z as f32];
+            let output = [value[0] as f32, value[1] as f32, value[2] as f32];
             if output.iter().any(|component| !component.is_finite()) {
                 return Err(PotError::new(
                     ErrorCode::ExportFailed,

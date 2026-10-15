@@ -31,6 +31,12 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
                 .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
         }
         let (faces, normals) = shading::baked_faces(mesh);
+        // Blender writes zero normals for singular transforms.
+        let normals = if mesh.singular {
+            vec![[0.0; 3]; normals.len()]
+        } else {
+            normals
+        };
         let normals = normals.into_iter().map(to_obj_axes).collect::<Vec<_>>();
         let (normal_lines, corner_ids) = normal_table(&normals);
         for line in &normal_lines {
@@ -121,6 +127,9 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
         faces: Vec::new(),
         normals: None,
         mirrored: false,
+        singular: false,
+        vertex_normals: None,
+        smooth: None,
     };
     // Normal named by each face corner of `current`, in face order.
     let mut corner_normals = Vec::<Option<DVec3>>::new();
@@ -141,9 +150,11 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             }
             "vn" => {
                 let values = parse_floats(words, 3, line_number)?;
-                let normal = DVec3::from_array(from_obj_axes([values[0], values[1], values[2]]))
-                    .try_normalize()
-                    .ok_or_else(|| parse_error(line_number))?;
+                // Zero normals are valid: Blender writes them for degenerate faces and singular nodes.
+                let normal = DVec3::from_array(from_obj_axes([values[0], values[1], values[2]]));
+                if !normal.is_finite() {
+                    return Err(parse_error(line_number));
+                }
                 normals.push(normal);
             }
             "o" | "g" => {
@@ -162,6 +173,9 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                         faces: Vec::new(),
                         normals: None,
                         mirrored: false,
+                        singular: false,
+                        vertex_normals: None,
+                        smooth: None,
                     };
                     corner_normals.clear();
                     smoothed = false;

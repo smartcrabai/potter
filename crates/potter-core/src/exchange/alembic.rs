@@ -4,16 +4,19 @@ use std::{
     path::Path,
 };
 
-use glam::{DMat4, DVec3};
+use glam::{DMat3, DMat4, DQuat, DVec3, DVec4};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{ImportedGraph, Loss, evaluated_meshes, import_error};
+use super::{ImportedGraph, Loss, import_error, render_visible_nodes};
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, Snapshot, animation::animated_transform},
     geom::{Mesh, normals::corner_normals},
-    model::{Action, DataBlock, FCurve, Id, Interpolation, Keyframe, Node, SceneDoc, Transform},
+    model::{
+        Action, DataBlock, FCurve, Id, Interpolation, Keyframe, Node, ParentType, SceneDoc,
+        Transform,
+    },
 };
 
 const MAX_FILE_BYTES: usize = 268_435_456;
@@ -49,11 +52,19 @@ pub(crate) fn export(
             "Alembic export does not represent the scene rigid-body world".to_owned(),
         ));
     }
-    let evaluated = evaluated_meshes(doc, snapshot)?;
-    let evaluated_ids = evaluated
+    let visible_nodes = render_visible_nodes(doc, snapshot)?;
+    let evaluated_ids = doc
+        .nodes
         .iter()
-        .map(|mesh| mesh.id.as_str())
-        .collect::<BTreeSet<_>>();
+        .filter(|(id, node)| {
+            node.visible
+                && node.render_visible
+                && node.data.is_some()
+                && visible_nodes.contains(*id)
+                && snapshot.meshes.contains_key(*id)
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<Id>>();
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
@@ -167,16 +178,17 @@ pub(crate) fn export(
             &owned
         };
         let mut matrices = BTreeMap::new();
-        for id in doc.nodes.keys() {
-            let node_state = value.nodes.get(id).ok_or_else(|| {
+        for (id, node) in &doc.nodes {
+            let state = value.nodes.get(id).ok_or_else(|| {
                 PotError::new(
                     ErrorCode::EvaluationFailed,
                     "Alembic node evaluation is missing",
                 )
             })?;
-            let world = DMat4::from_cols_array(&node_state.world_matrix);
-            let local =
-                if let Some(parent_id) = doc.nodes.get(id).and_then(|node| node.parent.as_ref()) {
+            let world = DMat4::from_cols_array(&state.world_matrix);
+            let local = match node.parent.as_ref() {
+                None => world,
+                Some(parent_id) => {
                     let parent_state = value.nodes.get(parent_id).ok_or_else(|| {
                         PotError::new(
                             ErrorCode::EvaluationFailed,
@@ -185,30 +197,23 @@ pub(crate) fn export(
                     })?;
                     let parent_world = DMat4::from_cols_array(&parent_state.world_matrix);
                     let determinant = parent_world.determinant();
-                    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
-                        return Err(PotError::new(
-                            ErrorCode::EvaluationFailed,
-                            "Alembic parent transform is singular",
-                        ));
+                    if determinant.is_finite() && determinant.abs() > f64::EPSILON {
+                        parent_world.inverse() * world
+                    } else {
+                        document_local_matrix(node, doc, *frame)?
                     }
-                    parent_world.inverse() * world
-                } else {
-                    world
-                };
+                }
+            };
             if !local.is_finite() {
                 return Err(PotError::new(
                     ErrorCode::EvaluationFailed,
                     "Alembic node transform is not finite",
                 ));
             }
-            matrices.insert(id.clone(), local.to_cols_array());
+            matrices.insert(id.clone(), file_matrix(local.to_cols_array()));
         }
         let mut meshes = BTreeMap::new();
-        for id in doc
-            .nodes
-            .keys()
-            .filter(|id| evaluated_ids.contains(id.as_str()))
-        {
+        for id in doc.nodes.keys().filter(|id| evaluated_ids.contains(*id)) {
             let source = value.meshes.get(id).ok_or_else(|| {
                 PotError::new(
                     ErrorCode::EvaluationFailed,
@@ -268,6 +273,47 @@ pub(crate) fn export(
         Chunk::Data(Vec::new()),
     ]);
     encode_archive(root)
+}
+
+/// Local transform of `node` at `frame` from the document, used only when the parent's world matrix
+/// has no inverse.
+///
+/// Potter places a node at `parent_world · parent_inverse · animated`, so the Alembic local is
+/// `parent_inverse · animated`. Constraints, transform drivers and bone parenting change the world
+/// matrix after that composition, so a node carrying them under a singular parent keeps the
+/// singular-parent error.
+fn document_local_matrix(node: &Node, doc: &SceneDoc, frame: f64) -> Result<DMat4> {
+    let constrained = node
+        .constraints
+        .iter()
+        .any(|constraint| constraint.enabled && constraint.influence != 0.0);
+    let driven = node
+        .drivers
+        .iter()
+        .any(|driver| is_transform_path(&driver.path));
+    if constrained || driven || node.parent_type == ParentType::Bone {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "Alembic parent transform is singular",
+        ));
+    }
+    let parent_inverse = node
+        .parent_inverse
+        .map_or(DMat4::IDENTITY, |matrix| DMat4::from_cols_array(&matrix));
+    Ok(parent_inverse * animated_transform(node, doc, frame)?.matrix())
+}
+
+fn is_transform_path(path: &str) -> bool {
+    path.starts_with("transform.")
+        || matches!(
+            path,
+            "location"
+                | "translation"
+                | "scale"
+                | "rotation"
+                | "rotation_euler"
+                | "rotation_quaternion"
+        )
 }
 
 /// Read a native Ogawa Alembic archive containing Xform and `PolyMesh` objects.
@@ -373,11 +419,13 @@ struct FrameSample {
     meshes: BTreeMap<Id, MeshSample>,
 }
 
+/// One mesh sample in Alembic space. Points and normals are Y-up file vectors, and faces, corner
+/// normals and corner UVs follow Alembic's reversed polygon winding.
 #[derive(Clone)]
 struct MeshSample {
     positions: Vec<[f64; 3]>,
     faces: Vec<Vec<usize>>,
-    uvs: Option<Vec<Vec<[f64; 2]>>>,
+    uvs: Vec<Vec<[f64; 2]>>,
     normals: Vec<[f64; 3]>,
 }
 
@@ -414,11 +462,6 @@ fn sample_frames(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<f64>> {
 }
 
 fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
-    let positions = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co.to_array())
-        .collect::<Vec<_>>();
     let vertex_indices = mesh
         .vertices
         .iter()
@@ -452,21 +495,50 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
             ));
         }
     }
-    let uvs = mesh_uvs(mesh)?;
     let points = mesh
         .vertices
         .iter()
         .map(|vertex| vertex.co)
         .collect::<Vec<_>>();
-    let normals = corner_normals(mesh, &points)?
-        .into_iter()
-        .map(|normal| normal.to_array())
-        .collect::<Vec<_>>();
+    let uvs = if let Some(uvs) = mesh_uvs(mesh)? {
+        uvs
+    } else {
+        let point_arrays = points.iter().map(DVec3::to_array).collect::<Vec<_>>();
+        let vertex_uv = generated_uvs(&point_arrays);
+        faces
+            .iter()
+            .map(|face| {
+                face.iter()
+                    .map(|index| {
+                        vertex_uv.get(*index).copied().ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "Alembic UV references a missing vertex",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let normals = reverse_corner_runs(&faces, corner_normals(mesh, &points)?)?;
     Ok(MeshSample {
-        positions,
-        faces,
-        uvs,
-        normals,
+        positions: points
+            .iter()
+            .map(|point| file_vector(point.to_array()))
+            .collect(),
+        faces: reversed_faces(&faces),
+        uvs: uvs
+            .into_iter()
+            .map(|mut corners| {
+                corners.reverse();
+                corners
+            })
+            .collect(),
+        normals: normals
+            .iter()
+            .map(|normal| file_vector(normal.to_array()))
+            .collect(),
     })
 }
 
@@ -697,47 +769,16 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
         indices.push(encode_i32s(&face_indices));
         bounds.push(encode_bounds(&sample.positions)?);
         normals.push(encode_vec3_f32(&sample.normals)?);
-        let face_uvs = if let Some(uvs) = &sample.uvs {
-            if uvs.len() != sample.faces.len() {
-                return Err(PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "Alembic UV face count does not match topology",
-                ));
-            }
-            for (coordinates, face) in uvs.iter().zip(&sample.faces) {
-                if coordinates.len() != face.len() {
-                    return Err(PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "Alembic UV corner count does not match topology",
-                    ));
-                }
-            }
-            uvs.iter().flatten().copied().collect()
-        } else {
-            let vertex_uv = generated_uvs(&sample.positions);
-            sample
-                .faces
-                .iter()
-                .flatten()
-                .map(|index| {
-                    vertex_uv.get(*index).copied().ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::SceneInvalid,
-                            "Alembic UV references a missing vertex",
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
+        let face_uvs = sample.uvs.iter().flatten().copied().collect::<Vec<_>>();
         uvs.push(encode_vec2_f32(&face_uvs)?);
-        let indices = (0..face_uvs.len())
+        let uv_index_values = (0..face_uvs.len())
             .map(|index| {
                 u32::try_from(index).map_err(|_| {
                     PotError::new(ErrorCode::LimitExceeded, "Alembic UV index exceeds uint32")
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        uv_indices.push(encode_u32s(&indices));
+        uv_indices.push(encode_u32s(&uv_index_values));
     }
     let p_meta = metadata_map(&[("geoScope", "vtx"), ("interpretation", "point")]);
     let n_meta = geomparam_metadata("facevarying", "normal", 3);
@@ -2211,7 +2252,7 @@ fn import_xform_object(
     let mut frames = Vec::with_capacity(sample_count);
     for sample_index in 0..sample_count {
         let values = decode_numeric_sample(bytes, vals, sample_index)?;
-        matrices.push(xform_matrix(&op_bytes, &values)?);
+        matrices.push(potter_matrix(xform_matrix(&op_bytes, &values)?));
         frames.push(sample_frame(
             vals,
             sample_index,
@@ -2348,7 +2389,7 @@ fn import_polymesh(
         mesh_samples.push(MeshSample {
             positions,
             faces,
-            uvs: None,
+            uvs: Vec::new(),
             normals: Vec::new(),
         });
     }
@@ -2359,10 +2400,9 @@ fn import_polymesh(
         first
             .positions
             .iter()
-            .copied()
-            .map(DVec3::from_array)
+            .map(|point| DVec3::from_array(potter_vector(*point)))
             .collect(),
-        first.faces.clone(),
+        reversed_faces(&first.faces),
     )
     .map_err(|error| {
         PotError::with_details(
@@ -2408,18 +2448,26 @@ fn import_polymesh(
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    // Each sample's corner normals and UVs are resolved from its file faces, then reversed to match
+    // the Potter-wound faces.
     let normal_samples = match normals
         .map(|parameter| {
             (0..sample_count)
                 .map(|sample_index| {
                     let values = geomparam_values_property(parameter)?;
-                    geomparam_values(
+                    let sample = &mesh_samples[sample_index];
+                    let (scope, values) = geomparam_values(
                         bytes,
                         parameter,
-                        &mesh_samples[sample_index],
+                        sample,
                         3,
                         sample_slot(values, sample_index),
-                    )
+                    )?;
+                    let corners = normal_corners(&sample.faces, &scope, &values)?;
+                    Ok(reverse_corner_runs(&sample.faces, corners)?
+                        .into_iter()
+                        .map(|normal| potter_vector(normal.to_array()))
+                        .collect::<Vec<_>>())
                 })
                 .collect::<Result<Vec<_>>>()
         })
@@ -2443,50 +2491,39 @@ fn import_polymesh(
             (0..sample_count)
                 .map(|sample_index| {
                     let values = geomparam_values_property(parameter)?;
-                    geomparam_values(
+                    let sample = &mesh_samples[sample_index];
+                    let (scope, tuples) = geomparam_values(
                         bytes,
                         parameter,
-                        &mesh_samples[sample_index],
+                        sample,
                         2,
                         sample_slot(values, sample_index),
-                    )
+                    )?;
+                    Ok(cache_uv_faces(&sample.faces, &scope, &tuples)?
+                        .into_iter()
+                        .map(|mut corners| {
+                            corners.reverse();
+                            corners
+                        })
+                        .collect::<Vec<_>>())
                 })
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?;
-    if let Some((scope, values)) = normal_samples.as_ref().and_then(|samples| samples.first()) {
-        let corner_values = normal_corners(&first.faces, scope, values)?;
-        super::shading::import_shading(&mut mesh, &corner_values)?;
+    if let Some(corners) = normal_samples.as_ref().and_then(|samples| samples.first()) {
+        let corners = corners
+            .iter()
+            .map(|normal| DVec3::from_array(*normal))
+            .collect::<Vec<_>>();
+        super::shading::import_shading(&mut mesh, &corners)?;
     }
-    if let Some(uv_values) = uv_samples.as_ref().and_then(|values| values.first()) {
-        let mut corner_offset = 0;
-        let mut faces_uv = Vec::with_capacity(mesh.faces.len());
-        for (face_index, (face, indices)) in mesh.faces.iter().zip(&first.faces).enumerate() {
-            let mut coordinates = Vec::with_capacity(indices.len());
-            for (corner, vertex) in indices.iter().enumerate() {
-                let value_index = match uv_values.0.as_str() {
-                    "vertex" | "varying" => *vertex,
-                    "facevarying" => corner_offset + corner,
-                    "uniform" => face_index,
-                    "constant" => 0,
-                    scope => {
-                        return Err(unsupported(
-                            "alembic.geom_scope",
-                            format!("Alembic UV scope `{scope}` is unsupported"),
-                        ));
-                    }
-                };
-                coordinates.push(
-                    uv_values
-                        .1
-                        .get(value_index)
-                        .cloned()
-                        .ok_or_else(|| import_error("Alembic UV value index is out of range"))?,
-                );
-            }
-            corner_offset += indices.len();
-            faces_uv.push(json!({"face_id":face.id,"uv":coordinates}));
-        }
+    if let Some(faces_uv) = uv_samples.as_ref().and_then(|samples| samples.first()) {
+        let faces_uv = mesh
+            .faces
+            .iter()
+            .zip(faces_uv)
+            .map(|(face, coordinates)| json!({"face_id":face.id,"uv":coordinates}))
+            .collect::<Vec<_>>();
         mesh.attributes
             .insert("uv_map".to_owned(), Value::Array(faces_uv));
     }
@@ -2495,8 +2532,11 @@ fn import_polymesh(
             "alembic_time_samples".to_owned(),
             json!({
                 "frames": frames,
-                "positions": mesh_samples.iter().map(|sample| &sample.positions).collect::<Vec<_>>(),
-                "faces": mesh_samples.iter().map(|sample| &sample.faces).collect::<Vec<_>>(),
+                "positions": mesh_samples
+                    .iter()
+                    .map(|sample| sample.positions.iter().map(|point| potter_vector(*point)).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                "faces": mesh_samples.iter().map(|sample| reversed_faces(&sample.faces)).collect::<Vec<_>>(),
                 "normals": normal_samples,
                 "uv": uv_samples,
             }),
@@ -2542,14 +2582,6 @@ pub(crate) fn read_mesh_cache(
     read_velocity: bool,
 ) -> Result<Vec<MeshCacheSample>> {
     let archive = parse_archive(bytes)?;
-    let blender_coordinates = archive
-        .metadata
-        .get("application")
-        .is_some_and(|application| application.starts_with("Blender"))
-        || archive
-            .metadata
-            .get("_ai_Application")
-            .is_some_and(|application| application == "Blender");
     let object = alembic_object_at_path(&archive.objects, object_path)?;
     let object = if is_polymesh(object) {
         object
@@ -2633,21 +2665,16 @@ pub(crate) fn read_mesh_cache(
         let index_sample = sample_slot(indices, sample_index);
         let points = decode_vec3_sample(bytes, positions, point_sample)?
             .into_iter()
-            .map(|[x, y, z]| {
-                if blender_coordinates {
-                    [x, -z, y]
-                } else {
-                    [x, y, z]
-                }
-            })
+            .map(potter_vector)
             .collect::<Vec<_>>();
         let face_counts = decode_i32_sample(bytes, counts, face_sample)?;
         let face_indices = decode_i32_sample(bytes, indices, index_sample)?;
-        let faces = decode_faces(&points, &face_counts, &face_indices)?;
+        // Per-corner values arrive in file winding, so they are indexed by file faces and reversed.
+        let file_faces = decode_faces(&points, &face_counts, &face_indices)?;
         let geometry_sample = MeshSample {
             positions: points.clone(),
-            faces: faces.clone(),
-            uvs: None,
+            faces: file_faces.clone(),
+            uvs: Vec::new(),
             normals: Vec::new(),
         };
         let uv_faces = uv
@@ -2661,7 +2688,15 @@ pub(crate) fn read_mesh_cache(
                     2,
                     sample_slot(values, sample_index),
                 )?;
-                cache_uv_faces(&faces, &scope, &tuples)
+                cache_uv_faces(&file_faces, &scope, &tuples).map(|faces| {
+                    faces
+                        .into_iter()
+                        .map(|mut corners| {
+                            corners.reverse();
+                            corners
+                        })
+                        .collect::<Vec<_>>()
+                })
             })
             .transpose()?;
         let colors = color
@@ -2675,13 +2710,15 @@ pub(crate) fn read_mesh_cache(
                         format!("Alembic color extent {extent} is unsupported"),
                     ));
                 }
-                geomparam_values(
+                let (scope, tuples) = geomparam_values(
                     bytes,
                     parameter,
                     &geometry_sample,
                     extent,
                     sample_slot(values, sample_index),
-                )
+                )?;
+                let tuples = potter_scoped_values(&file_faces, &scope, tuples)?;
+                Ok((scope, tuples))
             })
             .transpose()?;
         let velocities = velocity
@@ -2694,26 +2731,21 @@ pub(crate) fn read_mesh_cache(
                         format!("Alembic velocity extent {} is unsupported", values.extent),
                     ));
                 }
-                geomparam_values(
+                let (scope, tuples) = geomparam_values(
                     bytes,
                     parameter,
                     &geometry_sample,
                     3,
                     sample_slot(values, sample_index),
-                )
+                )?;
+                let tuples = tuples
+                    .into_iter()
+                    .map(|value| potter_vector([value[0], value[1], value[2]]).to_vec())
+                    .collect::<Vec<Vec<f64>>>();
+                let tuples = potter_scoped_values(&file_faces, &scope, tuples)?;
+                Ok((scope, tuples))
             })
             .transpose()?;
-        let velocities = velocities.map(|(scope, values)| {
-            let values = if blender_coordinates {
-                values
-                    .into_iter()
-                    .map(|value| vec![value[0], -value[2], value[1]])
-                    .collect()
-            } else {
-                values
-            };
-            (scope, values)
-        });
         let sample_time = sample_seconds(
             time_property,
             sample_slot(time_property, sample_index),
@@ -2722,7 +2754,7 @@ pub(crate) fn read_mesh_cache(
         result.push(MeshCacheSample {
             time_seconds: sample_time,
             positions: points,
-            faces,
+            faces: reversed_faces(&file_faces),
             uv_faces,
             colors,
             velocities,
@@ -2795,20 +2827,7 @@ pub(crate) fn read_xform_matrix(
             json!({"object_path":object_path}),
         ));
     }
-    let blender_coordinates = archive
-        .metadata
-        .get("application")
-        .is_some_and(|application| application.starts_with("Blender"))
-        || archive
-            .metadata
-            .get("_ai_Application")
-            .is_some_and(|application| application == "Blender");
-    let matrix = if blender_coordinates {
-        let basis = DMat4::from_rotation_x(std::f64::consts::FRAC_PI_2);
-        (basis * world * basis.inverse()).to_cols_array()
-    } else {
-        world.to_cols_array()
-    };
+    let matrix = potter_matrix(world.to_cols_array());
     if matrix.iter().any(|value| !value.is_finite()) {
         return Err(import_error("Alembic Xform matrix is not finite"));
     }
@@ -3482,15 +3501,132 @@ fn xform_matrix(ops: &[u8], values: &[f64]) -> Result<[f64; 16]> {
     Ok(matrix.to_cols_array())
 }
 
+/// Alembic archives hold Y-up data and Potter is Z-up. Points, normals and velocities map from file
+/// to Potter space with `B = rotX(+90°)`, which sends `(x, y, z)` to `(x, -z, y)`.
+fn potter_vector(value: [f64; 3]) -> [f64; 3] {
+    [value[0], -value[2], value[1]]
+}
+
+/// Inverse of [`potter_vector`]: Potter space to file space with `B^-1`, sending `(x, y, z)` to
+/// `(x, z, -y)`.
+fn file_vector(value: [f64; 3]) -> [f64; 3] {
+    [value[0], value[2], -value[1]]
+}
+
+/// `B` as a matrix: `B e_x = e_x`, `B e_y = e_z`, `B e_z = -e_y`.
+fn potter_basis() -> DMat4 {
+    DMat4::from_cols(DVec4::X, DVec4::Z, -DVec4::Y, DVec4::W)
+}
+
+/// `B^-1` as a matrix.
+fn file_basis() -> DMat4 {
+    DMat4::from_cols(DVec4::X, -DVec4::Z, DVec4::Y, DVec4::W)
+}
+
+/// Converts a file-space transform `X` to Potter space as `B · X · B^-1`.
+fn potter_matrix(matrix: [f64; 16]) -> [f64; 16] {
+    (potter_basis() * DMat4::from_cols_array(&matrix) * file_basis()).to_cols_array()
+}
+
+/// Converts a Potter-space transform `X` to file space as `B^-1 · X · B`.
+fn file_matrix(matrix: [f64; 16]) -> [f64; 16] {
+    (file_basis() * DMat4::from_cols_array(&matrix) * potter_basis()).to_cols_array()
+}
+
+/// Reverses the vertex order of every face. Alembic polygons wind opposite to Potter's.
+fn reversed_faces(faces: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    faces
+        .iter()
+        .map(|face| face.iter().rev().copied().collect())
+        .collect()
+}
+
+/// Reverses each face's run of per-corner values, moving between Alembic and Potter corner order.
+fn reverse_corner_runs<T>(faces: &[Vec<usize>], mut values: Vec<T>) -> Result<Vec<T>> {
+    let mut start = 0;
+    for face in faces {
+        let end = start + face.len();
+        values
+            .get_mut(start..end)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "per-corner values do not match mesh topology",
+                )
+            })?
+            .reverse();
+        start = end;
+    }
+    if start != values.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "per-corner values do not match mesh topology",
+        ));
+    }
+    Ok(values)
+}
+
+/// Moves per-corner geometry-parameter values to Potter corner order. Only `facevarying` values
+/// hold one entry per corner; other scopes are indexed by vertex, face, or constant.
+fn potter_scoped_values<T>(faces: &[Vec<usize>], scope: &str, values: Vec<T>) -> Result<Vec<T>> {
+    if scope == "facevarying" {
+        reverse_corner_runs(faces, values)
+    } else {
+        Ok(values)
+    }
+}
+
+/// Splits an affine matrix into scale, rotation and translation. Unlike
+/// `DMat4::to_scale_rotation_translation`, a zero scale is accepted: a zero-length axis takes any
+/// orthonormal completion, because the matrix does not depend on that axis's rotation. A negative
+/// determinant is carried by a negative X scale, as glam does.
+fn decompose_matrix(matrix: DMat4) -> (DVec3, DQuat, DVec3) {
+    let columns = [
+        matrix.x_axis.truncate(),
+        matrix.y_axis.truncate(),
+        matrix.z_axis.truncate(),
+    ];
+    let lengths = columns.map(DVec3::length);
+    let mut scale = lengths;
+    let mut axes = [DVec3::X, DVec3::Y, DVec3::Z];
+    let known = (0..3)
+        .filter(|index| lengths[*index] > 0.0)
+        .collect::<Vec<_>>();
+    for index in &known {
+        axes[*index] = columns[*index] / lengths[*index];
+    }
+    if matrix.determinant() < 0.0 {
+        scale[0] = -scale[0];
+        axes[0] = -axes[0];
+    }
+    match known.as_slice() {
+        [index] => {
+            let index = *index;
+            let next = (index + 1) % 3;
+            axes[next] = axes[index].any_orthonormal_vector();
+            axes[(index + 2) % 3] = axes[index].cross(axes[next]);
+        }
+        [first, second] => {
+            let zero = 3 - *first - *second;
+            axes[zero] = axes[(zero + 1) % 3].cross(axes[(zero + 2) % 3]);
+        }
+        _ => {}
+    }
+    (
+        DVec3::from_array(scale),
+        DQuat::from_mat3(&DMat3::from_cols(axes[0], axes[1], axes[2])),
+        matrix.w_axis.truncate(),
+    )
+}
+
 fn matrix_to_transform(matrix_values: [f64; 16]) -> Result<Transform> {
-    let matrix = DMat4::from_cols_array(&matrix_values);
-    let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
-    if !scale.is_finite() || !rotation.is_finite() || !translation.is_finite() {
+    if matrix_values.iter().any(|value| !value.is_finite()) {
         return Err(import_error("Alembic Xform matrix is not finite"));
     }
+    let (scale, rotation, translation) = decompose_matrix(DMat4::from_cols_array(&matrix_values));
     let transform = Transform::from_rotation_quat(
         translation.to_array(),
-        [rotation.x, rotation.y, rotation.z, rotation.w],
+        rotation.to_array(),
         scale.to_array(),
     )
     .map_err(|error| {
@@ -3977,6 +4113,72 @@ mod tests {
                 )
             })?;
         assert_eq!(error.code, ErrorCode::ImportFailed);
+        Ok(())
+    }
+
+    #[test]
+    fn exports_zero_scale_parent_and_restores_its_transform() -> Result<()> {
+        let mut doc = SceneDoc::new(SOURCE_SCENE_ID.to_owned());
+        let data_id = Id::new("flat_mesh")?;
+        let parent_id = Id::new("flat")?;
+        let child_id = Id::new("flat_child")?;
+        let mesh = Mesh::box_mesh(BoxParams::default())
+            .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.to_string()))?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            parent_id.clone(),
+            Node {
+                name: "Flat".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                transform: Transform {
+                    scale: [0.0, 1.0, 1.0],
+                    ..Transform::default()
+                },
+                ..Node::default()
+            },
+        );
+        doc.nodes.insert(
+            child_id.clone(),
+            Node {
+                name: "Flat child".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                parent: Some(parent_id.clone()),
+                transform: Transform {
+                    translation: [0.0, 3.0, 0.0],
+                    ..Transform::default()
+                },
+                ..Node::default()
+            },
+        );
+        let snapshot = Snapshot::evaluate(
+            &doc,
+            &EvaluationContext {
+                frame: Some(1.0),
+                ..EvaluationContext::default()
+            },
+        )?;
+        let archive = export(&doc, &snapshot, false, None)?;
+        let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
+        fs::write(file.path(), archive).map_err(|error| PotError::io(&error))?;
+        let imported = import(file.path(), IMPORT_SCENE_ID.to_owned(), None)?;
+        let parent = imported.doc.nodes.get(&parent_id).ok_or_else(|| {
+            PotError::new(ErrorCode::ImportFailed, "zero-scale parent is missing")
+        })?;
+        assert_eq!(parent.transform.scale, [0.0, 1.0, 1.0]);
+        let child = imported.doc.nodes.get(&child_id).ok_or_else(|| {
+            PotError::new(ErrorCode::ImportFailed, "child of zero scale is missing")
+        })?;
+        assert_eq!(child.parent.as_ref(), Some(&parent_id));
+        assert_eq!(child.transform.translation, [0.0, 3.0, 0.0]);
         Ok(())
     }
 }

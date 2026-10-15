@@ -60,6 +60,15 @@ pub(crate) struct ExchangeMesh {
     /// Whether the node's world transform mirrors geometry. Writers that bake world space
     /// reverse winding for these meshes; writers that keep the transform do not.
     pub mirrored: bool,
+    /// Whether the node's world transform is singular. OBJ writes zero normals for these nodes,
+    /// as Blender does.
+    pub singular: bool,
+    /// World-space per-vertex normals, indexed like `positions`: Blender's PLY vertex normals.
+    /// `None` when the source format carries no normals.
+    pub vertex_normals: Option<Vec<[f64; 3]>>,
+    /// Per face: whether a corner normal differs from the face's flat normal, in local space.
+    /// `None` when the source format carries no normals; then every face is flat.
+    pub smooth: Option<Vec<bool>>,
 }
 
 pub(crate) fn evaluated_meshes(
@@ -100,7 +109,7 @@ pub(crate) fn evaluated_meshes(
             .iter()
             .map(|vertex| vertex.co)
             .collect::<Vec<_>>();
-        let corner_normals = shading::world_corner_normals(source, &local, matrix)?;
+        let shading = shading::world_normals(source, &local, matrix)?;
         let mut faces = Vec::with_capacity(source.faces.len());
         for face in &source.faces {
             let Some(indices) = face
@@ -121,7 +130,10 @@ pub(crate) fn evaluated_meshes(
             name: node.name.clone(),
             positions,
             faces,
-            normals: Some(corner_normals.into_iter().flatten().collect()),
+            normals: Some(shading.corners),
+            vertex_normals: Some(shading.vertices),
+            smooth: Some(shading.smooth),
+            singular: shading::is_singular(matrix),
             mirrored: shading::is_mirrored(matrix),
         });
     }

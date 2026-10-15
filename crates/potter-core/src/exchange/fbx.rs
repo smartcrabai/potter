@@ -1334,15 +1334,11 @@ fn write_normal_layer(output: &mut String, mesh: &Mesh) -> Result<()> {
     let mut values = Vec::<[f64; 3]>::new();
     let mut indices = Vec::<usize>::new();
     for corner in corner_normals(mesh, &points)? {
-        let unit = corner
-            .try_normalize()
-            .ok_or_else(|| {
-                PotError::new(ErrorCode::ExportFailed, "FBX normal cannot be normalized")
-            })?
-            .to_array();
-        let key = unit.map(f64::to_bits);
+        // Zero normals are written as they are; Blender writes them for degenerate faces too.
+        let value = corner.to_array();
+        let key = value.map(|component| (component + 0.0).to_bits());
         let index = *unique.entry(key).or_insert_with(|| {
-            values.push(unit);
+            values.push(value);
             values.len() - 1
         });
         indices.push(index);

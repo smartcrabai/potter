@@ -1,7 +1,7 @@
 //! Shading normals shared by every exchange format.
 //!
-//! Export: `evaluated_meshes` maps each mesh's local corner normals to world space (inverse
-//! transpose of the world matrix, normalized) and records whether the node mirrors. World-space
+//! Export: `evaluated_meshes` maps each mesh's local normals to world space through the normal
+//! matrix (cofactor form of the world matrix, normalized) and records whether the node mirrors or is singular. World-space
 //! writers (OBJ, PLY, STL) take `baked_faces`, which reverses mirrored faces so winding agrees
 //! with the normals. Object-local writers (USD, FBX, Alembic) keep local winding and normals and
 //! let the transform carry the placement, as Blender does. Import: each importer hands per-corner
@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 use super::{ExchangeMesh, Loss, import_error};
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{
+        Mesh,
+        normals::{face_normal, normal_matrix},
+    },
 };
 
 /// Corner normals and flatness compare within this distance, matching glTF import.
@@ -26,39 +29,32 @@ pub(super) fn is_mirrored(matrix: DMat4) -> bool {
     DMat3::from_mat4(matrix).determinant() < 0.0
 }
 
-/// World-space corner normals for each face of `mesh`, in `mesh.faces` order.
-///
-/// Normals come from local geometry (Blender computes shading before transforming it) and then
-/// pass through the inverse transpose, which keeps them perpendicular under non-uniform scale.
-pub(super) fn world_corner_normals(
-    mesh: &Mesh,
-    local: &[DVec3],
-    matrix: DMat4,
-) -> Result<Vec<Vec<[f64; 3]>>> {
-    let local_normals = crate::geom::normals::corner_normals(mesh, local)?;
-    let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
-    let mut start = 0;
-    let mut faces = Vec::with_capacity(mesh.faces.len());
-    for face in &mesh.faces {
-        let end = start + face.vertices.len();
-        let row = local_normals[start..end]
-            .iter()
-            .map(|normal| {
-                (normal_matrix * *normal)
-                    .try_normalize()
-                    .map(|world| world.to_array())
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::ExportFailed,
-                            "mesh normal cannot be transformed to world space",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        faces.push(row);
-        start = end;
-    }
-    Ok(faces)
+/// Whether the transform is singular. Its normals have no inverse-transpose; OBJ writes zero
+/// normals for such nodes, as Blender does.
+pub(super) fn is_singular(matrix: DMat4) -> bool {
+    let determinant = DMat3::from_mat4(matrix).determinant();
+    determinant == 0.0 || !determinant.is_finite()
+}
+
+/// World-space shading of one mesh: corner normals in `mesh.faces` order, per-vertex normals
+/// indexed like `mesh.vertices`, and per-face smooth flags.
+pub(super) struct WorldNormals {
+    pub corners: Vec<[f64; 3]>,
+    pub vertices: Vec<[f64; 3]>,
+    pub smooth: Vec<bool>,
+}
+
+/// World-space shading computed from local geometry. Blender computes shading before transforming
+/// it, so normals come from local positions and then pass through the normal matrix.
+pub(super) fn world_normals(mesh: &Mesh, local: &[DVec3], matrix: DMat4) -> Result<WorldNormals> {
+    let shading = crate::geom::normals::export_normals(mesh, local)?;
+    let normal_matrix = normal_matrix(matrix);
+    let to_world = |normal: DVec3| (normal_matrix * normal).normalize_or_zero().to_array();
+    Ok(WorldNormals {
+        corners: shading.corners.into_iter().map(to_world).collect(),
+        vertices: shading.vertices.into_iter().map(to_world).collect(),
+        smooth: shading.smooth,
+    })
 }
 
 /// Faces and corner normals as a world-baked writer stores them. A mirrored node reverses each
@@ -206,35 +202,12 @@ pub(crate) fn shading_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<Loss>
     }]
 }
 
-/// Per-face smooth state: a face is smooth when any of its corners differs from its flat normal.
-/// One value per face in `mesh.faces` order; all false when `normals` is None.
+/// Per-face smooth state from export: a face is smooth when a corner normal differs from its flat
+/// normal in mesh-local space. All false when the mesh carries no normals.
 pub(super) fn smooth_faces(mesh: &ExchangeMesh) -> Vec<bool> {
-    let Some(normals) = &mesh.normals else {
-        return vec![false; mesh.faces.len()];
-    };
-    let mut corner = 0;
-    mesh.faces
-        .iter()
-        .map(|face| {
-            let end = corner + face.len();
-            let mut points = face
-                .iter()
-                .filter_map(|index| mesh.positions.get(*index))
-                .map(|point| DVec3::from_array(*point))
-                .collect::<Vec<_>>();
-            // Corner normals point along the world-space surface, so a mirrored face's winding must
-            // be reversed before its geometric normal is compared with them.
-            if mesh.mirrored {
-                points.reverse();
-            }
-            let flat = face_normal(&points);
-            let smooth = !normals[corner..end]
-                .iter()
-                .all(|normal| close(DVec3::from_array(*normal), flat));
-            corner = end;
-            smooth
-        })
-        .collect()
+    mesh.smooth
+        .clone()
+        .unwrap_or_else(|| vec![false; mesh.faces.len()])
 }
 
 /// Whether every corner of `mesh` carries its face's flat normal.
@@ -261,6 +234,14 @@ pub(super) fn corner_normals(mesh: &ExchangeMesh) -> Vec<[f64; 3]> {
     normals
 }
 
+/// Per-vertex world normals of an exported mesh, indexed like `mesh.positions`. Blender's PLY
+/// writer uses these vertex normals.
+pub(super) fn vertex_normals(mesh: &ExchangeMesh) -> Result<&[[f64; 3]]> {
+    mesh.vertex_normals
+        .as_deref()
+        .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "mesh vertex normals are missing"))
+}
+
 /// Whether all corners sharing a vertex agree, so one normal per vertex describes them all.
 fn vertex_normals_exact(mesh: &ExchangeMesh) -> bool {
     let Some(normals) = &mesh.normals else {
@@ -283,15 +264,6 @@ fn vertex_normals_exact(mesh: &ExchangeMesh) -> bool {
         }
     }
     true
-}
-
-/// Newell normal of a polygon, normalized; zero for degenerate polygons.
-fn face_normal(points: &[DVec3]) -> DVec3 {
-    let mut area = DVec3::ZERO;
-    for (index, current) in points.iter().enumerate() {
-        area += current.cross(points[(index + 1) % points.len()]);
-    }
-    area.normalize_or_zero()
 }
 
 fn close(left: DVec3, right: DVec3) -> bool {

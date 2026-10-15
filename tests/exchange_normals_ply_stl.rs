@@ -279,6 +279,18 @@ fn stl_single_triangle(stored: [f32; 3]) -> Vec<u8> {
     bytes
 }
 
+/// Diagonal scale of the fixture object that owns a world position: `NonUni` at y = 5 with scale
+/// (2, 1, 0.5), `Mirror` at x = 5 with scale (-1, 1, 1), `Mixed` at the origin.
+fn fixture_scale(position: [f64; 3]) -> [f64; 3] {
+    if position[1] >= 3.0 {
+        [2.0, 1.0, 0.5]
+    } else if position[0] >= 3.0 {
+        [-1.0, 1.0, 1.0]
+    } else {
+        [1.0, 1.0, 1.0]
+    }
+}
+
 #[test]
 fn ply_fixture_vertex_normals_are_blender_per_vertex_sums() -> TestResult {
     let directory = tempdir()?;
@@ -291,6 +303,8 @@ fn ply_fixture_vertex_normals_are_blender_per_vertex_sums() -> TestResult {
 
     let reference = reference_corners()?;
     for vertex in &ply.vertices {
+        // Blender sums the object-local corner normals and transforms the sum by N = M^-T. A world
+        // corner normal n_w is proportional to M^-T n_local, so n_local is proportional to M^T n_w.
         let mut sum = [0.0_f64; 3];
         let mut corners = 0;
         for corner in reference
@@ -298,7 +312,13 @@ fn ply_fixture_vertex_normals_are_blender_per_vertex_sums() -> TestResult {
             .filter(|corner| same_point(corner.corner, vertex.position))
         {
             corners += 1;
-            for (total, value) in sum.iter_mut().zip(corner.normal) {
+            let scale = fixture_scale(corner.corner);
+            let local = normalized([
+                corner.normal[0] * scale[0],
+                corner.normal[1] * scale[1],
+                corner.normal[2] * scale[2],
+            ]);
+            for (total, value) in sum.iter_mut().zip(local) {
                 *total += value;
             }
         }
@@ -307,7 +327,8 @@ fn ply_fixture_vertex_normals_are_blender_per_vertex_sums() -> TestResult {
             "PLY vertex {:?} matches no Blender corner",
             vertex.position
         );
-        let expected = normalized(sum);
+        let scale = fixture_scale(vertex.position);
+        let expected = normalized([sum[0] / scale[0], sum[1] / scale[1], sum[2] / scale[2]]);
         // Blender's corner normals are int16-quantized, so its per-vertex sums can differ from
         // exact sums by more than NORMAL_TOLERANCE. Compare with the Blender-side bound.
         let error = max_error(vertex.normal, expected);
