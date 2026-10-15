@@ -1438,9 +1438,11 @@ pub(crate) fn load_vdb_volume_data(
     Ok(volumes)
 }
 
-fn attach_node_owner(mut error: PotError, node_id: &Id) -> PotError {
-    if error.code == ErrorCode::UnsupportedFeature
-        && let Some(details) = error.details.as_object_mut()
+pub(crate) fn attach_node_owner(mut error: PotError, node_id: &Id) -> PotError {
+    if matches!(
+        error.code,
+        ErrorCode::UnsupportedFeature | ErrorCode::UnrepresentableFeature
+    ) && let Some(details) = error.details.as_object_mut()
     {
         details
             .entry("node_id".to_owned())

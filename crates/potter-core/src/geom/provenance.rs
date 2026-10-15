@@ -115,14 +115,9 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
                 .as_object()
                 .map(|groups| Value::Object(sources.vertex_groups(groups))),
             "crease_edge" => Some(sources.keyed_edge_attribute(value)),
-            "blender_edge_flags" => value.as_array().map(|flags| {
-                // Flags are objects, so the heaviest source edge wins rather than a blend.
-                Value::Array(sources.edge_values(
-                    flags,
-                    "",
-                    || json!({"sharp": false, "seam": false}),
-                ))
-            }),
+            "blender_edge_flags" => value
+                .as_array()
+                .map(|flags| Value::Array(sources.edge_flags(flags))),
             "blender_attributes" => value.as_array().map(|entries| {
                 Value::Array(
                     entries
@@ -173,9 +168,12 @@ fn with_values(entry: &Value, values: Value) -> Value {
     Value::Object(fields)
 }
 
-/// Source edges each output edge blends from: every distinct input edge that joins a source vertex
-/// of the output edge's first vertex to a source vertex of its second, with equal weights. Blender
-/// averages merged duplicate edges, so several candidates blend instead of falling back to default.
+/// Source edges each output edge blends from, with equal weights. Candidates are the distinct input
+/// edges joining a source vertex of the output edge's first endpoint to a source vertex of its
+/// second. When the endpoints share a source vertex (a subdivision inner edge, for example), a
+/// candidate counts only if its two vertices are every source of both endpoints; otherwise the
+/// output edge is a new span and gets no source. Blender averages merged duplicate edges, so
+/// several candidates blend instead of falling back to default.
 fn edge_sources(
     source: &Mesh,
     output: &Mesh,
@@ -214,13 +212,26 @@ fn edge_sources(
             else {
                 return Vec::new();
             };
+            let shared = first
+                .iter()
+                .any(|(a, _)| second.iter().any(|(b, _)| a == b));
+            let endpoint_sources: Vec<usize> = first
+                .iter()
+                .chain(second)
+                .map(|(index, _)| *index)
+                .collect();
             let mut found: Vec<usize> = Vec::new();
             for (first_source, _) in first {
                 for (second_source, _) in second {
-                    if let Some(index) =
+                    let Some(index) =
                         source_edge_index.get(&edge_key(*first_source, *second_source))
-                        && !found.contains(index)
-                    {
+                    else {
+                        continue;
+                    };
+                    let spans_all = endpoint_sources
+                        .iter()
+                        .all(|source| source == first_source || source == second_source);
+                    if (!shared || spans_all) && !found.contains(index) {
                         found.push(*index);
                     }
                 }
@@ -379,6 +390,27 @@ impl Sources<'_> {
             .collect()
     }
 
+    /// `blender_edge_flags` per output edge: `sharp` and `seam` are OR-ed over the positive-weight
+    /// source edges, so a merged edge keeps a mark from any input edge it came from. An edge with
+    /// no source has neither mark.
+    fn edge_flags(&self, flags: &[Value]) -> Vec<Value> {
+        self.edge_origin
+            .iter()
+            .map(|sources| {
+                let mut sharp = false;
+                let mut seam = false;
+                for (index, _) in sources.iter().filter(|(_, weight)| *weight > 0.0) {
+                    let Some(flag) = flags.get(*index) else {
+                        continue;
+                    };
+                    sharp |= flag.get("sharp").and_then(Value::as_bool) == Some(true);
+                    seam |= flag.get("seam").and_then(Value::as_bool) == Some(true);
+                }
+                json!({"sharp": sharp, "seam": seam})
+            })
+            .collect()
+    }
+
     /// Positional vertex values, blended by origin weights (see [`blend`]).
     fn vertex_values(
         &self,
@@ -456,11 +488,12 @@ fn blend_indexed(values: &[Value], sources: &[(usize, f64)], data_type: &str) ->
 
 /// Blender data types stored as integers; blended results round to the nearest integer.
 fn is_integer(data_type: &str) -> bool {
-    matches!(data_type, "INT" | "INT8" | "INT32")
+    matches!(data_type, "INT" | "INT8")
 }
 
 /// Blend values by weight: numbers and equal-length number arrays interpolate componentwise
-/// (rounded for integer types); anything else takes the value of the heaviest source.
+/// (rounded for integer types); booleans OR over the positive-weight sources; anything else takes
+/// the value of the heaviest source.
 /// `None` when there are no sources.
 fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> Option<Value> {
     let items: Vec<(&Value, f64)> = items.collect();
@@ -502,6 +535,11 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
                 .collect(),
         ));
     }
+    if items.iter().all(|(value, _)| value.is_boolean()) {
+        return Some(json!(items.iter().any(|(value, weight)| {
+            *weight > 0.0 && value.as_bool() == Some(true)
+        })));
+    }
     items
         .iter()
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
@@ -512,7 +550,7 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
 fn default_value(data_type: &str) -> Value {
     match data_type {
         "BOOLEAN" | "BOOL" => json!(false),
-        "INT" | "INT8" | "INT32" => json!(0),
+        "INT" | "INT8" => json!(0),
         "FLOAT" => json!(0.0),
         "INT32_2D" => json!([0, 0]),
         "FLOAT2" => json!([0.0, 0.0]),
@@ -562,5 +600,123 @@ mod tests {
         assert_eq!(groups[format!("v{}", out_ids[0])], json!(1.0));
         assert_eq!(groups[format!("v{}", out_ids[1])], json!(0.0));
         assert_eq!(groups[format!("v{}", out_ids[2])], json!(0.5));
+    }
+
+    /// Subdivision of one quad: edge midpoints take two corners, the face centre takes all four.
+    /// Boundary halves keep their source edge's flags; the inner spokes take the default.
+    #[test]
+    fn subdivision_inner_edges_take_no_source_edge_flags() {
+        let corners = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ];
+        let mut source =
+            Mesh::from_positions_and_faces(corners, vec![vec![0, 1, 2, 3]]).expect("quad");
+        let flags: Vec<Value> = source
+            .edges
+            .iter()
+            .map(|_| json!({"sharp": true, "seam": true}))
+            .collect();
+        source
+            .attributes
+            .insert("blender_edge_flags".to_owned(), Value::Array(flags));
+        let positions = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(0.5, 0.0, 0.0),
+            DVec3::new(1.0, 0.5, 0.0),
+            DVec3::new(0.5, 1.0, 0.0),
+            DVec3::new(0.0, 0.5, 0.0),
+            DVec3::new(0.5, 0.5, 0.0),
+        ];
+        let mut output = Mesh::from_positions_and_faces(
+            positions,
+            vec![
+                vec![0, 4, 8, 7],
+                vec![4, 1, 5, 8],
+                vec![8, 5, 2, 6],
+                vec![7, 8, 6, 3],
+            ],
+        )
+        .expect("subdivided quad");
+        let origin = Origin {
+            vertices: vec![
+                vec![(0, 1.0)],
+                vec![(1, 1.0)],
+                vec![(2, 1.0)],
+                vec![(3, 1.0)],
+                vec![(0, 0.5), (1, 0.5)],
+                vec![(1, 0.5), (2, 0.5)],
+                vec![(2, 0.5), (3, 0.5)],
+                vec![(3, 0.5), (0, 0.5)],
+                vec![(0, 0.25), (1, 0.25), (2, 0.25), (3, 0.25)],
+            ],
+            faces: vec![Some(0); 4],
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+        let centre = output.vertices[8].id;
+        assert_eq!(output.edges.len(), 12);
+        let flags = output.attributes["blender_edge_flags"]
+            .as_array()
+            .expect("edge flags");
+        for (edge, flag) in output.edges.iter().zip(flags) {
+            if edge.vertices.contains(&centre) {
+                assert_eq!(flag, &json!({"sharp": false, "seam": false}));
+            } else {
+                assert_eq!(flag, &json!({"sharp": true, "seam": true}));
+            }
+        }
+    }
+
+    /// Two coincident source edges, one sharp and one seam, merge into one output edge whose
+    /// flags OR over both sources.
+    #[test]
+    fn merged_edge_flags_or_over_coincident_source_edges() {
+        let mut source = Mesh::new();
+        let first = source.insert_vertex(DVec3::ZERO).expect("vertex");
+        let second = source.insert_vertex(DVec3::X).expect("vertex");
+        let third = source.insert_vertex(DVec3::ZERO).expect("vertex");
+        let fourth = source.insert_vertex(DVec3::X).expect("vertex");
+        source.insert_edge([first, second]).expect("edge");
+        source.insert_edge([third, fourth]).expect("edge");
+        source.attributes.insert(
+            "blender_edge_flags".to_owned(),
+            json!([{"sharp": true, "seam": false}, {"sharp": false, "seam": true}]),
+        );
+        let mut output = Mesh::new();
+        let near = output.insert_vertex(DVec3::ZERO).expect("vertex");
+        let far = output.insert_vertex(DVec3::X).expect("vertex");
+        output.insert_edge([near, far]).expect("edge");
+        let origin = Origin {
+            vertices: vec![vec![(0, 0.5), (2, 0.5)], vec![(1, 0.5), (3, 0.5)]],
+            faces: Vec::new(),
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+        assert_eq!(
+            output.attributes["blender_edge_flags"],
+            json!([{"sharp": true, "seam": true}])
+        );
+    }
+
+    #[test]
+    fn blend_ors_booleans_over_positive_weights() {
+        let on = json!(true);
+        let off = json!(false);
+        assert_eq!(
+            blend([(&on, 0.5), (&off, 0.5)].into_iter(), "BOOLEAN"),
+            Some(json!(true))
+        );
+        assert_eq!(
+            blend([(&off, 0.5), (&on, 0.0)].into_iter(), "BOOLEAN"),
+            Some(json!(false))
+        );
+        assert_eq!(
+            blend([(&off, 0.5), (&off, 0.5)].into_iter(), "BOOLEAN"),
+            Some(json!(false))
+        );
     }
 }

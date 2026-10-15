@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use glam::{DMat4, DQuat};
 use serde_json::{Value, json};
@@ -84,6 +84,20 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
         json!([])
     };
     let summary = summary(doc);
+    let mut warnings = snapshot.warnings;
+    if args.id.is_some() || args.tag.is_some() {
+        let item_ids = items
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect::<BTreeSet<_>>();
+        warnings.retain(|warning| {
+            warning
+                .details
+                .get("node_id")
+                .and_then(Value::as_str)
+                .is_some_and(|node_id| item_ids.contains(node_id))
+        });
+    }
     let scene = project.info()?;
     Ok((
         Some(scene),
@@ -101,7 +115,7 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
                 "frame": snapshot.frame,
                 "evaluation_hash": snapshot.evaluation_hash,
             },
-            "warnings": snapshot.warnings,
+            "warnings": warnings,
         }),
     ))
 }

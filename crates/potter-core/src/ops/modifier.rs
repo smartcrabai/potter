@@ -834,9 +834,13 @@ fn apply_modifier(
                     &engine.doc.node_groups,
                     engine.evaluation_frame,
                 )?;
-                engine
-                    .warnings
-                    .extend(evaluation.warnings.into_iter().filter(is_attribute_dropped));
+                engine.warnings.extend(
+                    evaluation
+                        .warnings
+                        .into_iter()
+                        .filter(is_attribute_dropped)
+                        .map(|warning| crate::eval::attach_node_owner(warning, &target)),
+                );
                 evaluation.mesh
             } else {
                 let frame = engine.evaluation_frame;
@@ -994,7 +998,11 @@ fn apply_modifier(
                 if let Some(warning) = blocking.into_iter().next() {
                     return Err(warning);
                 }
-                engine.warnings.extend(dropped);
+                engine.warnings.extend(
+                    dropped
+                        .into_iter()
+                        .map(|warning| crate::eval::attach_node_owner(warning, &target)),
+                );
                 evaluation.mesh
             }
         };

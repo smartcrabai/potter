@@ -73,12 +73,6 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         {
             return Err(lossy_error(format, std::slice::from_ref(loss)));
         }
-        // shortcut: blend export writes stored data and never required a full evaluation, so an
-        // evaluation error here is not an export error; warnings are omitted in that case.
-        let warnings =
-            Snapshot::evaluate_available_with_cache(&doc, &context, Some(project.path()))
-                .map(|(snapshot, _node_errors)| snapshot.warnings)
-                .unwrap_or_default();
         let mut report = exchange::blend::export_blend(&doc, &project, &args.out, &options)?;
         if let Some(loss) = avatar_loss {
             report.losses.push(loss);
@@ -104,7 +98,6 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             "compatibility": doc.compatibility,
             "conversions": report.conversions,
             "losses": report.losses,
-            "warnings": warnings,
         })
     } else {
         let snapshot = Snapshot::evaluate_with_cache(&doc, &context, Some(project.path()))?;
