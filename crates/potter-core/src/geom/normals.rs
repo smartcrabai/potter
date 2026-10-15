@@ -26,7 +26,7 @@ use crate::error::{ErrorCode, PotError, Result};
 /// faces, zero-length smooth fans, and malformed `shade_smooth`, `sharp`, or
 /// `custom_normal` attributes.
 pub(crate) fn corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
-    shading_normals(mesh, positions, None)
+    shading_normals(mesh, positions, None).map(|(normals, _)| normals)
 }
 
 /// Morph-layer normals. Corners without a defined normal (degenerate faces, fans whose
@@ -40,10 +40,14 @@ pub(crate) fn morph_corner_normals(
     positions: &[DVec3],
     base: &[DVec3],
 ) -> Result<Vec<DVec3>> {
-    shading_normals(mesh, positions, Some(base))
+    shading_normals(mesh, positions, Some(base)).map(|(normals, _)| normals)
 }
 
-fn shading_normals(mesh: &Mesh, positions: &[DVec3], base: Option<&[DVec3]>) -> Result<Vec<DVec3>> {
+fn shading_normals(
+    mesh: &Mesh,
+    positions: &[DVec3],
+    base: Option<&[DVec3]>,
+) -> Result<(Vec<DVec3>, Vec<bool>)> {
     mesh.validate().map_err(|error| mesh_error(&error))?;
     if positions.len() != mesh.vertices.len() {
         return Err(PotError::invalid_argument(
@@ -173,8 +177,10 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3], base: Option<&[DVec3]>) -> 
     }
 
     let mut result = Vec::with_capacity(corner_total);
+    let mut face_smooth = Vec::with_capacity(mesh.faces.len());
     for (face_index, face) in mesh.faces.iter().enumerate() {
         let authored = custom_corner_normals(custom, face)?;
+        face_smooth.push(authored.is_some() || smooth[face_index]);
         for corner in 0..face.vertices.len() {
             let index = offsets[face_index] + corner;
             let normal = match &authored {
@@ -195,7 +201,32 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3], base: Option<&[DVec3]>) -> 
             }
         }
     }
-    Ok(result)
+    Ok((result, face_smooth))
+}
+
+/// Corner normals per face for render shading. `None` marks a flat face, whose triangles keep
+/// their geometric normal; smooth and custom-normal faces return one normal per face corner.
+///
+/// # Errors
+///
+/// Returns the errors of [`corner_normals`].
+pub(crate) fn render_corner_normals(
+    mesh: &Mesh,
+    positions: &[DVec3],
+) -> Result<Vec<Option<Vec<DVec3>>>> {
+    let (normals, smooth) = shading_normals(mesh, positions, None)?;
+    let mut offset = 0;
+    Ok(mesh
+        .faces
+        .iter()
+        .zip(smooth)
+        .map(|(face, smooth)| {
+            let end = offset + face.vertices.len();
+            let corners = normals[offset..end].to_vec();
+            offset = end;
+            smooth.then_some(corners)
+        })
+        .collect())
 }
 
 /// Union the corners at the shared start and end vertices of two face uses of one edge.
@@ -707,5 +738,19 @@ mod tests {
         .expect("welded mesh");
         assert!(shading_keys_stale(&source, &welded));
         assert!(!shading_keys_stale(&source, &source.clone()));
+    }
+
+    #[test]
+    fn render_corner_normals_return_corners_only_for_smooth_faces() {
+        let mut mesh = fold();
+        let points = positions(&mesh);
+        assert_eq!(
+            render_corner_normals(&mesh, &points).expect("fold is valid"),
+            vec![None, None]
+        );
+        set_faces_attribute(&mut mesh, "shade_smooth", &[(0, true)]);
+        let faces = render_corner_normals(&mesh, &points).expect("fold is valid");
+        assert_eq!(faces[0].as_ref().map(Vec::len), Some(4));
+        assert!(faces[1].is_none());
     }
 }

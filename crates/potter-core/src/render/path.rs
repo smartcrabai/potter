@@ -14,7 +14,8 @@ use crate::{
 use super::{
     bvh::{Bvh, BvhHit},
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, camera_eye, rasterize_with_lines, ray_for_sample,
+        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
+        rasterize_with_lines, ray_for_sample,
     },
     scene::{Geometry, ObjectRecord},
 };
@@ -72,6 +73,8 @@ struct VolumeSegment {
 struct Surface {
     point: DVec3,
     normal: DVec3,
+    /// Unit normal on the viewer's side of the triangle; offsets ray origins to avoid self-hits.
+    geometric_normal: DVec3,
     params: BsdfParams,
     object_index: u32,
     element_index: u32,
@@ -839,7 +842,7 @@ fn trace_path(
             alpha = 1.0;
         }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
-            origin = offset_origin(surface.point, direction, surface.normal);
+            origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
         radiance += throughput
@@ -877,7 +880,7 @@ fn trace_path(
         }
         previous_diffuse = diffuse_event;
         direction = next_direction.normalize_or_zero();
-        origin = offset_origin(surface.point, direction, surface.normal);
+        origin = offset_origin(surface.point, direction, surface.geometric_normal);
     }
     if !radiance.is_finite() {
         return Err(PotError::new(
@@ -947,6 +950,7 @@ fn write_center_passes(
                 bvh,
                 &geometry.triangles,
                 surface.point,
+                surface.geometric_normal,
                 surface.normal,
                 1.0,
             ));
@@ -990,6 +994,7 @@ fn overlay_rasterized_lines(
         [0, 0, 0, 0],
         1,
         seed,
+        None,
     )?;
     for index in 0..output.ids.len() {
         let Some(object_index) = overlay.ids.get(index).copied().filter(|value| *value != 0) else {
@@ -1101,12 +1106,24 @@ fn make_surface(
         )
     })?;
     let point = origin + direction * hit.distance;
-    let mut normal = (triangle.positions[1] - triangle.positions[0])
+    let mut geometric_normal = (triangle.positions[1] - triangle.positions[0])
         .cross(triangle.positions[2] - triangle.positions[0])
         .normalize_or_zero();
-    if normal.dot(-direction) < 0.0 {
-        normal = -normal;
+    if geometric_normal.dot(-direction) < 0.0 {
+        geometric_normal = -geometric_normal;
     }
+    // Smooth triangles light with the blended corner normal on the geometric normal's side.
+    let normal = match triangle.normals {
+        None => geometric_normal,
+        Some(corners) => {
+            let shading = blend_corner_normals(corners, hit.barycentric, geometric_normal);
+            if shading.dot(geometric_normal) < 0.0 {
+                -shading
+            } else {
+                shading
+            }
+        }
+    };
     let uv = [
         triangle.uv[0][0] * hit.barycentric[0]
             + triangle.uv[1][0] * hit.barycentric[1]
@@ -1186,6 +1203,7 @@ fn make_surface(
     Ok(Surface {
         point,
         normal: params.normal,
+        geometric_normal,
         params,
         object_index: triangle.object_index,
         element_index: triangle.element_index,
@@ -1296,6 +1314,7 @@ fn direct_lighting(
     rng: &mut Pcg32,
 ) -> Result<DVec3> {
     let normal = surface.normal;
+    let geometric = surface.geometric_normal;
     let view = -incoming_direction;
     let mut contribution = DVec3::ZERO;
     for light in lights {
@@ -1314,7 +1333,7 @@ fn direct_lighting(
             volumes,
             images,
             surface.point,
-            normal,
+            geometric,
             sample.direction,
             sample.distance,
             rng,
@@ -1339,7 +1358,7 @@ fn direct_lighting(
             volumes,
             images,
             surface.point,
-            normal,
+            geometric,
             direction,
             f64::INFINITY,
             rng,
@@ -1364,7 +1383,7 @@ fn direct_lighting(
                 volumes,
                 images,
                 surface.point,
-                normal,
+                geometric,
                 direction,
                 f64::INFINITY,
                 rng,

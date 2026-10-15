@@ -18,12 +18,12 @@ use super::{
     raster::{
         Camera, DepthOfField, Mode, Projection, RasterOutput, StereoMode, rasterize_with_lines,
     },
-    scene::{Geometry, extract_geometry},
+    scene::{Geometry, extract_geometry, surface_shader},
 };
 
 const MIN_SIZE: u32 = 64;
 const MAX_SIZE: u32 = 16_384;
-pub(super) const ENGINE: &str = "potter-cpu-path-1";
+pub(super) const ENGINE: &str = "potter-cpu-path-2";
 const VALID_VIEWS: [&str; 7] = ["front", "back", "right", "left", "top", "bottom", "iso"];
 
 #[derive(Clone, Debug)]
@@ -111,6 +111,7 @@ pub fn render_previews(
             "message": error.message,
         }));
     }
+    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
     let mut pending = Vec::with_capacity(labels.len());
     for label in labels {
         let prepared = if let Some(camera_id) = request.camera_id {
@@ -147,6 +148,7 @@ pub fn render_previews(
                 background,
                 1,
                 0,
+                shader.as_deref(),
             )?
         };
         if matches!(mode, Mode::Beauty) {
@@ -239,6 +241,7 @@ pub(crate) fn render_camera_frame(
         engine == "path" && matches!(mode, Mode::Beauty),
         &images,
     )?;
+    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
     let camera = stored_camera(doc, &snapshot, camera_id)?;
     let scene = doc
         .scenes
@@ -270,8 +273,10 @@ pub(crate) fn render_camera_frame(
             background,
             samples,
             seed,
+            shader.as_deref(),
         )?
     };
+    drop(shader);
     if engine == "realtime" && matches!(mode, Mode::Beauty) {
         super::path::composite_realtime_volumes(
             doc,

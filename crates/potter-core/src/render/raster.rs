@@ -66,6 +66,36 @@ pub(crate) struct Triangle {
     pub(crate) material_index: usize,
     pub(crate) uv: [[f64; 2]; 3],
     pub(crate) uv_available: bool,
+    /// World-space corner shading normals; `None` for flat faces, which keep their geometric normal.
+    pub(crate) normals: Option<[DVec3; 3]>,
+}
+
+/// Lighting for triangles with corner normals, evaluated at each visible hit.
+pub(crate) trait SurfaceShader {
+    /// Linear RGB at `point` lit with the interpolated shading `normal`. `geometric` is the unit
+    /// triangle normal, used for shadow-ray origins.
+    fn shade(
+        &self,
+        triangle: &Triangle,
+        point: DVec3,
+        normal: DVec3,
+        geometric: DVec3,
+    ) -> Result<[f64; 3]>;
+}
+
+/// Barycentric blend of corner normals, normalised; `fallback` covers blends that cancel.
+pub(crate) fn blend_corner_normals(
+    corners: [DVec3; 3],
+    weights: [f64; 3],
+    fallback: DVec3,
+) -> DVec3 {
+    let normal = (corners[0] * weights[0] + corners[1] * weights[1] + corners[2] * weights[2])
+        .normalize_or_zero();
+    if normal == DVec3::ZERO {
+        fallback
+    } else {
+        normal
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,6 +168,7 @@ struct Ray {
 #[derive(Clone, Copy)]
 struct Hit {
     depth: f64,
+    distance: f64,
     barycentric: [f64; 3],
     direction: DVec3,
 }
@@ -207,6 +238,7 @@ pub(crate) fn rasterize_with_samples(
     background: [u8; 4],
     samples: u32,
     seed: u32,
+    shader: Option<&dyn SurfaceShader>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
         return Err(PotError::invalid_argument(
@@ -225,6 +257,7 @@ pub(crate) fn rasterize_with_samples(
             background,
             samples,
             seed,
+            shader,
         )?;
         let right_output = rasterize_with_samples(
             triangles,
@@ -235,6 +268,7 @@ pub(crate) fn rasterize_with_samples(
             background,
             samples,
             seed,
+            shader,
         )?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
         let (right_pixels, _) = right_output.rgba.as_chunks::<4>();
@@ -322,15 +356,23 @@ pub(crate) fn rasterize_with_samples(
                 ids[pixel_index] = triangle.source.object_index;
                 depths[pixel_index] = depth_to_f32(hit.depth);
                 elements[pixel_index] = triangle.source.element_index;
-                normals[pixel_index] = triangle.normal.to_array().map(|value| value as f32);
+                normals[pixel_index] = shading_normal(triangle, hit)
+                    .to_array()
+                    .map(|value| value as f32);
                 albedo[pixel_index] = linear_color_to_f32(triangle.source.color);
                 if let Some(bvh) = &ao_bvh {
-                    let mut normal = triangle.normal;
-                    if normal.dot(hit.direction) > 0.0 {
-                        normal = -normal;
+                    let geometric = if triangle.normal.dot(hit.direction) > 0.0 {
+                        -triangle.normal
+                    } else {
+                        triangle.normal
+                    };
+                    let mut shading = shading_normal(triangle, hit);
+                    if shading.dot(geometric) < 0.0 {
+                        shading = -shading;
                     }
                     let point = center_ray.origin + center_ray.direction * hit.depth;
-                    let visibility = ambient_visibility(bvh, triangles, point, normal, 1.0);
+                    let visibility =
+                        ambient_visibility(bvh, triangles, point, geometric, shading, 1.0);
                     ambient_occlusion[pixel_index] =
                         linear_color_to_f32([visibility, visibility, visibility, 1.0])[0];
                 }
@@ -364,12 +406,20 @@ pub(crate) fn rasterize_with_samples(
                                 background_linear
                             }
                         })
-                    } else if let Some((triangle_index, _)) = sample_hit {
-                        let triangle = &prepared[triangle_index].source;
-                        if triangle_opacity(triangle) >= 1.0 {
-                            [triangle.color[0], triangle.color[1], triangle.color[2], 1.0]
+                    } else if let Some((triangle_index, hit)) = sample_hit {
+                        let triangle = &prepared[triangle_index];
+                        if triangle_opacity(&triangle.source) >= 1.0 {
+                            let point = sample_ray.origin + sample_ray.direction * hit.distance;
+                            let [red, green, blue, _] = hit_color(triangle, hit, point, shader)?;
+                            [red, green, blue, 1.0]
                         } else {
-                            composite_sample(&prepared, sample_ray, &frame, background_linear)
+                            composite_sample(
+                                &prepared,
+                                sample_ray,
+                                &frame,
+                                background_linear,
+                                shader,
+                            )?
                         }
                     } else {
                         background_linear
@@ -394,7 +444,7 @@ pub(crate) fn rasterize_with_samples(
                 let triangle = &prepared[triangle_index];
                 let (color, linear_color) = match mode {
                     Mode::Normal => {
-                        let color = normal_to_rgba(triangle.normal);
+                        let color = normal_to_rgba(shading_normal(triangle, hit));
                         (color, display_color_to_float(color))
                     }
                     Mode::Depth => {
@@ -441,9 +491,10 @@ pub(crate) fn rasterize_with_lines(
     background: [u8; 4],
     samples: u32,
     seed: u32,
+    shader: Option<&dyn SurfaceShader>,
 ) -> Result<RasterOutput> {
     let mut output = rasterize_with_samples(
-        triangles, camera, width, height, mode, background, samples, seed,
+        triangles, camera, width, height, mode, background, samples, seed, shader,
     )?;
     if lines.is_empty() {
         return Ok(output);
@@ -777,11 +828,12 @@ pub(crate) fn ambient_visibility(
     bvh: &super::bvh::Bvh,
     triangles: &[Triangle],
     point: DVec3,
-    normal: DVec3,
+    geometric: DVec3,
+    shading: DVec3,
     distance: f64,
 ) -> f64 {
     const SAMPLE_COUNT: u32 = 12;
-    let normal = normal.normalize_or_zero();
+    let normal = shading.normalize_or_zero();
     if normal == DVec3::ZERO || !distance.is_finite() || distance <= 0.0 {
         return 1.0;
     }
@@ -791,7 +843,8 @@ pub(crate) fn ambient_visibility(
         normal.cross(DVec3::Y).normalize_or_zero()
     };
     let bitangent = normal.cross(tangent).normalize_or_zero();
-    let origin = point + normal * 1.0e-5;
+    let geometric = geometric.normalize_or_zero();
+    let origin = point + geometric * 1.0e-5;
     let mut visible = 0_u32;
     for index in 0..SAMPLE_COUNT {
         let fraction = (f64::from(index) + 0.5) / f64::from(SAMPLE_COUNT);
@@ -801,6 +854,13 @@ pub(crate) fn ambient_visibility(
             + tangent * (radius * angle.cos())
             + bitangent * (radius * angle.sin()))
         .normalize_or_zero();
+        // Smooth shading can aim below the geometric surface; mirror such rays back above it.
+        let below = direction.dot(geometric).min(0.0);
+        let direction = if below < 0.0 {
+            (direction - geometric * (2.0 * below)).normalize_or_zero()
+        } else {
+            direction
+        };
         if bvh
             .closest_hit_two_sided(triangles, origin, direction, 1.0e-5, distance)
             .is_none()
@@ -1019,12 +1079,41 @@ fn triangle_opacity(triangle: &Triangle) -> f64 {
     }
 }
 
+/// Shading normal at a hit: the blended corner normal for smooth triangles, else the geometric one.
+fn shading_normal(triangle: &PreparedTriangle, hit: Hit) -> DVec3 {
+    triangle.source.normals.map_or(triangle.normal, |corners| {
+        blend_corner_normals(corners, hit.barycentric, triangle.normal)
+    })
+}
+
+/// Linear RGBA at a visible hit. Smooth triangles are lit per pixel when a shader is present.
+fn hit_color(
+    triangle: &PreparedTriangle,
+    hit: Hit,
+    point: DVec3,
+    shader: Option<&dyn SurfaceShader>,
+) -> Result<[f64; 4]> {
+    match (triangle.source.normals, shader) {
+        (Some(_), Some(shader)) => {
+            let [red, green, blue] = shader.shade(
+                &triangle.source,
+                point,
+                shading_normal(triangle, hit),
+                triangle.normal,
+            )?;
+            Ok([red, green, blue, triangle.source.color[3]])
+        }
+        _ => Ok(triangle.source.color),
+    }
+}
+
 fn composite_sample(
     triangles: &[PreparedTriangle],
     ray: Ray,
     frame: &CameraFrame,
     background: [f64; 4],
-) -> [f64; 4] {
+    shader: Option<&dyn SurfaceShader>,
+) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<(usize, Hit)>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
     let mut hit_count = 0;
@@ -1054,10 +1143,11 @@ fn composite_sample(
     let mut transmittance = 1.0;
     let mut alpha = 0.0;
     let mut premultiplied = DVec3::ZERO;
-    for (triangle_index, _) in hits.iter().take(hit_count).flatten().copied() {
-        let triangle = &triangles[triangle_index].source;
-        let color = triangle.color;
-        let opacity = triangle_opacity(triangle);
+    for (triangle_index, hit) in hits.iter().take(hit_count).flatten().copied() {
+        let triangle = &triangles[triangle_index];
+        let point = ray.origin + ray.direction * hit.distance;
+        let color = hit_color(triangle, hit, point, shader)?;
+        let opacity = triangle_opacity(&triangle.source);
         let contribution = transmittance * opacity;
         premultiplied += DVec3::new(color[0], color[1], color[2]) * contribution;
         alpha += contribution;
@@ -1071,10 +1161,10 @@ fn composite_sample(
         * (transmittance * background_alpha);
     alpha += transmittance * background_alpha;
     if alpha <= f64::MIN_POSITIVE {
-        return background;
+        return Ok(background);
     }
     let color = premultiplied / alpha;
-    [color.x, color.y, color.z, alpha]
+    Ok([color.x, color.y, color.z, alpha])
 }
 
 fn prepare_triangles(triangles: &[Triangle]) -> Result<Vec<PreparedTriangle>> {
@@ -1204,6 +1294,7 @@ fn intersect_triangle(triangle: &PreparedTriangle, ray: Ray, frame: &CameraFrame
     }
     Some(Hit {
         depth,
+        distance,
         barycentric: [
             barycentric_0.clamp(0.0, 1.0),
             barycentric_1.clamp(0.0, 1.0),
@@ -1518,6 +1609,7 @@ mod line_tests {
             [242, 242, 242, 255],
             1,
             0,
+            None,
         );
         assert!(output.is_ok());
         let Ok(output) = output else {
@@ -1552,5 +1644,176 @@ mod kani_verification {
                 "a rejected pixel is outside a non-empty image",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod smooth_shading_tests {
+    #![expect(clippy::expect_used, reason = "small raster fixtures")]
+
+    use std::cell::RefCell;
+
+    use glam::DVec3;
+
+    use super::{
+        AlphaMode, Camera, Mode, Projection, RasterOutput, StereoMode, SurfaceShader, Triangle,
+        rasterize_with_samples,
+    };
+    use crate::error::Result;
+
+    const SIZE: u32 = 64;
+    /// Pixel (32, 32) has its centre at world (1/64, -1/64, 0) for this camera.
+    const CENTER: usize = 32 * SIZE as usize + 32;
+    const CORNERS: [DVec3; 3] = [
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(0.6, 0.0, 0.8),
+        DVec3::new(0.0, 0.6, 0.8),
+    ];
+
+    struct RecordingShader {
+        calls: RefCell<Vec<(DVec3, DVec3, DVec3)>>,
+    }
+
+    impl SurfaceShader for RecordingShader {
+        fn shade(
+            &self,
+            _triangle: &Triangle,
+            point: DVec3,
+            normal: DVec3,
+            geometric: DVec3,
+        ) -> Result<[f64; 3]> {
+            self.calls.borrow_mut().push((point, normal, geometric));
+            Ok([0.25, 0.5, 0.75])
+        }
+    }
+
+    fn camera() -> Camera {
+        Camera {
+            position: DVec3::new(0.0, 0.0, 5.0),
+            target: DVec3::ZERO,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Orthographic { height: 2.0 },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.065,
+        }
+    }
+
+    fn triangle(normals: Option<[DVec3; 3]>) -> Triangle {
+        Triangle {
+            positions: [
+                DVec3::new(-2.0, -2.0, 0.0),
+                DVec3::new(2.0, -2.0, 0.0),
+                DVec3::new(0.0, 2.0, 0.0),
+            ],
+            object_index: 1,
+            element_index: 1,
+            color: [0.8, 0.4, 0.2, 1.0],
+            alpha_mode: AlphaMode::Opaque,
+            alpha_threshold: 0.5,
+            double_sided: false,
+            material_index: 0,
+            uv: [[0.0; 2]; 3],
+            uv_available: false,
+            normals,
+        }
+    }
+
+    fn render(
+        triangles: &[Triangle],
+        mode: Mode,
+        shader: Option<&dyn SurfaceShader>,
+    ) -> RasterOutput {
+        rasterize_with_samples(
+            triangles,
+            &camera(),
+            SIZE,
+            SIZE,
+            mode,
+            [0, 0, 0, 255],
+            1,
+            0,
+            shader,
+        )
+        .expect("triangle rasterizes")
+    }
+
+    /// Barycentric weights of the centre pixel's world point, in triangle corner order.
+    fn center_weights() -> [f64; 3] {
+        let point = DVec3::new(1.0 / 64.0, -1.0 / 64.0, 0.0);
+        let positions = triangle(None).positions;
+        let (a, b, c) = (positions[0], positions[1], positions[2]);
+        let (v0, v1, v2) = (b - a, c - a, point - a);
+        let (d00, d01, d11) = (v0.dot(v0), v0.dot(v1), v1.dot(v1));
+        let (d20, d21) = (v2.dot(v0), v2.dot(v1));
+        let denominator = d00 * d11 - d01 * d01;
+        let v = (d11 * d20 - d01 * d21) / denominator;
+        let w = (d00 * d21 - d01 * d20) / denominator;
+        [1.0 - v - w, v, w]
+    }
+
+    #[test]
+    fn smooth_normal_pass_interpolates_corner_normals_per_pixel() {
+        let output = render(&[triangle(Some(CORNERS))], Mode::Normal, None);
+        let weights = center_weights();
+        let expected =
+            (CORNERS[0] * weights[0] + CORNERS[1] * weights[1] + CORNERS[2] * weights[2])
+                .normalize();
+        let actual = DVec3::from_array(output.normals[CENTER].map(f64::from));
+        assert!(
+            actual.abs_diff_eq(expected, 1e-5),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn flat_normal_pass_keeps_the_geometric_normal() {
+        let output = render(&[triangle(None)], Mode::Normal, None);
+        let actual = DVec3::from_array(output.normals[CENTER].map(f64::from));
+        assert!(actual.abs_diff_eq(DVec3::Z, 1e-6), "got {actual:?}");
+    }
+
+    #[test]
+    fn smooth_triangles_are_lit_per_pixel_with_shading_and_geometric_normals() {
+        let shader = RecordingShader {
+            calls: RefCell::new(Vec::new()),
+        };
+        let output = render(&[triangle(Some(CORNERS))], Mode::Solid, Some(&shader));
+        let color = output.linear_rgba[CENTER];
+        for (channel, expected) in color.iter().zip([0.25, 0.5, 0.75, 1.0]) {
+            assert!(
+                (f64::from(*channel) - expected).abs() < 1e-5,
+                "color {color:?}"
+            );
+        }
+        let calls = shader.calls.borrow();
+        let center_point = DVec3::new(1.0 / 64.0, -1.0 / 64.0, 0.0);
+        let (_, normal, geometric) = *calls
+            .iter()
+            .find(|(point, _, _)| point.abs_diff_eq(center_point, 1e-9))
+            .expect("shader ran at the centre pixel");
+        let weights = center_weights();
+        let expected =
+            (CORNERS[0] * weights[0] + CORNERS[1] * weights[1] + CORNERS[2] * weights[2])
+                .normalize();
+        assert!(normal.abs_diff_eq(expected, 1e-6), "normal {normal:?}");
+        assert!(
+            geometric.abs_diff_eq(DVec3::Z, 1e-9),
+            "geometric {geometric:?}"
+        );
+    }
+
+    #[test]
+    fn flat_triangles_bypass_the_shader() {
+        let shader = RecordingShader {
+            calls: RefCell::new(Vec::new()),
+        };
+        let output = render(&[triangle(None)], Mode::Solid, Some(&shader));
+        assert!(shader.calls.borrow().is_empty());
+        let color = output.linear_rgba[CENTER];
+        assert!((f64::from(color[0]) - 0.8).abs() < 1e-5, "color {color:?}");
     }
 }
