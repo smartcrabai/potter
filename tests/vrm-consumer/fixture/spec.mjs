@@ -127,6 +127,11 @@ export const HEAD_BONE_POTTER_COLUMNS = [
   [0, -1, 0],
 ];
 
+// Head-local look-at offset -> glTF world displacement at rest. Both VRM versions place the gaze origin here
+// (the offset is the same physical point), so tests use this instead of a version-specific head frame.
+export const headLocalToGltf = (v) =>
+  toGltf(HEAD_BONE_POTTER_COLUMNS.reduce((sum, axis, i) => sum.map((s, k) => s + v[i] * axis[k]), [0, 0, 0]));
+
 // Bone chains that skin each mesh. Weights are computed from distance to the
 // chain's bone heads with a smooth falloff, keeping at most 3 bones.
 export const SKIN_CHAINS = {

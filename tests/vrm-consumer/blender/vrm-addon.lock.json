@@ -1,0 +1,8 @@
+{
+  "addon": "VRM Add-on for Blender",
+  "version": "4.10.2",
+  "release": "https://github.com/saturday06/VRM-Addon-for-Blender/releases/tag/v4.10.2",
+  "url": "https://github.com/saturday06/VRM-Addon-for-Blender/releases/download/v4.10.2/VRM_Addon_for_Blender-Extension-4_10_2.zip",
+  "sha256": "228e622d158fbbf070b1b49547708f360a223873f00fa81a42170794492e6db9",
+  "license": "MIT OR GPL-3.0-or-later"
+}

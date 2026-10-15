@@ -1,4 +1,5 @@
-// Check 10: VRM 0.x (after VRMUtils.rotateVRM0) matches VRM 1.0 morph outputs; the thumbnail decodes at spec size.
+// Check 10: VRM 0.x (after VRMUtils.rotateVRM0) matches VRM 1.0 morph outputs; the thumbnail decodes at spec size;
+// the first-person bone offset (bone look-at origin) is the spec offset.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { openHarness } from './support/browser.mjs';
@@ -15,7 +16,7 @@ import {
   assertVecClose,
   approx,
 } from './support/fixture.mjs';
-import { EXPRESSIONS, IMAGES, META } from '../fixture/spec.mjs';
+import { EXPRESSIONS, IMAGES, LOOKAT, META } from '../fixture/spec.mjs';
 
 const reference = await readReference();
 const V1 = 'parity1';
@@ -72,5 +73,13 @@ describe('VRM 0.x vs VRM 1.0 parity', () => {
     const img = (await potter.imageInfo(V0))[thumb];
     assert.ok(img, `no decoded image at meta.texture ${thumb}`);
     assert.deepEqual([img.width, img.height], [IMAGES[META.thumbnail].width, IMAGES[META.thumbnail].height]);
+  });
+
+  it('VRM 0.x firstPerson points at the head with the spec look-at offset (Unity z reflection cancels the head frame turn)', async () => {
+    const json = await readGlbJson(FILES.v0);
+    const fp = json.extensions.VRM.firstPerson;
+    assert.equal(fp.firstPersonBone, json.nodes.findIndex((n) => n.name === 'head'), 'firstPersonBone is not the head node');
+    const { x, y, z } = fp.firstPersonBoneOffset;
+    assertVecClose([x, y, z], LOOKAT.v0.offsetFromHeadBone, TOL.position, 'firstPersonBoneOffset');
   });
 });

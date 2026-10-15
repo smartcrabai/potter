@@ -8,6 +8,7 @@ Potter is responsible for authoring and export fidelity. Tracking capture, retar
 | --- | --- | --- |
 | 1.0 (`--format vrm`) | `@pixiv/three-vrm` 3.5.5 + `three` 0.180.0 in Playwright 1.64 Chromium, with the consumer fix in `tests/vrm-consumer/patches/` | Automated (`tests/vrm-consumer`, CI job `vrm-consumer`). No VRM 1.0 desktop application is certified |
 | 0.x (`--format vrm0`) | Same SDK through its VRM 0.x path (`VRMUtils.rotateVRM0`) | Automated |
+| 1.0 and 0.x (`--format vrm`, `--format vrm0`) | VRM Add-on for Blender 4.10.2 (`bpy.ops.import_scene.vrm`) in Blender 5.2.2, an independent importer. Version pinned in `tests/vrm-consumer/blender/vrm-addon.lock.json` | Automated (`tests/vrm-consumer/test/blender-addon.test.mjs`, CI job `vrm-consumer`) |
 | 0.x (`--format vrm0`) | VSeeFace v1.13.38c5, Windows 8 or later, 64-bit | Manual procedure below. **Not yet run** |
 
 VSeeFace supports VRM 0.x only. Do not give it a VRM 1.0 file.
@@ -23,12 +24,13 @@ Known unpatched gap: `VRMUtils.rotateVRM0` rotates the scene but not VRM 0.x wor
 
 ## Automated acceptance
 
-`cd tests/vrm-consumer && npm ci && npm test` (set `POT` to choose the `pot` binary; `POTTER_SWIFTSHADER=1` forces software WebGL, which Linux always uses).
+`cd tests/vrm-consumer && npm ci && npm test` (set `POT` to choose the `pot` binary; `POTTER_SWIFTSHADER=1` forces software WebGL, which Linux always uses; `POTTER_BLENDER` points at a Blender 5.2.x executable for the add-on checks, which are skipped without one and fail under `POTTER_REQUIRE_BLENDER=1`).
 
 1. Builds a representative avatar only through the `pot` CLI: generated human rig, eye bones, continuous skinned limbs with 2–3 blended bone weights, smooth UV-sphere head with UV seams and two material slots, 11 shape keys, bone-parented hat sharing a material with the torso, a single-sided ribbon and its mirrored copy, MToon with textures, normal map, outline, UV-animation mask, alpha clip and double-sided blend.
 2. Exports VRM 1.0 (full), VRM 1.0 (expression look-at), and VRM 0.x, and loads only the `.vrm` files.
 3. Khronos glTF Validator: 0 errors. Warnings must match `validate/warning-allowlist.json` (code, pointer, reason); new or stale entries fail. Official VRM JSON schemas at a pinned, hash-locked commit.
-4. Chromium + three-vrm checks with exact expectations: upright grounded rest; posed skinning against Potter's evaluated mesh; morphs at weights 0, 0.25, 0.5, 1, 0; shared-material color/UV binds applied once; combined expressions with `isBinary` and `block` / `blend` overrides; bone and expression look-at; spring sphere and capsule collisions, reset, varying time step, finite state and bone length; smooth vs flat shading, outline, alpha holes, double-sided, mirrored faces, normal map, UV-animation mask, per-face materials; VRM 0.x parity with VRM 1.0.
+4. Chromium + three-vrm checks with exact expectations: upright grounded rest; posed skinning against Potter's evaluated mesh; morphs at weights 0, 0.25, 0.5, 1, 0; shared-material color/UV binds applied once; combined expressions with `isBinary` and `block` / `blend` overrides; bone look-at for VRM 1.0 and VRM 0.x, and expression look-at; spring sphere and capsule collisions, reset, varying time step, finite state and bone length; smooth vs flat shading, outline, alpha holes, double-sided, mirrored faces, normal map, UV-animation mask, per-face materials; VRM 0.x parity with VRM 1.0; the VRM 0.x first-person bone offset.
+5. VRM Add-on for Blender 4.10.2 in Blender 5.2.2 imports each `.vrm` with `bpy.ops.import_scene.vrm` (FINISHED) and reports what the add-on reads back: humanoid bones and their rest heads, meshes and material slots, MToon flags, shape keys, expressions or VRM 0.x blend shape groups, spring bones and colliders, look-at, first-person offset and meta. Its warnings must match `tests/vrm-consumer/blender/warning-allowlist.json` (message pattern, version, reason); unknown warnings and stale entries fail. The allowlist covers the add-on's duplicate-bone notice (VRM 1.0, reproduced on a file with no Potter data) and the license prompt for a VRM 0.x file's legacy `otherPermissionUrl`.
 
 ## Manual acceptance: VSeeFace (VRM 0.x)
 

@@ -77,8 +77,11 @@ jobs:
 
   vrm-consumer:
     runs-on: ubuntu-latest
-    # Fixture build, official schema/glTF validation, and Chromium render checks.
+    # Fixture build, official schema/glTF validation, Chromium render checks, and VRM Add-on for Blender imports.
     timeout-minutes: 45
+    env:
+      # The VRM Add-on consumer test and the .blend adapter both require Blender 5.2.x.
+      BLENDER_VERSION: 5.2.2
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -113,11 +116,37 @@ jobs:
         working-directory: tests/vrm-consumer
         run: npx playwright install --with-deps chromium
 
+      - name: Cache Blender
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/blender
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
+
+      - name: Install Blender
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libice6 libsm6 libx11-6 libxext6 libxfixes3 libxi6 libxkbcommon0 libxrender1
+          if [ ! -x "$HOME/blender/blender" ]; then
+            mkdir -p "$HOME/blender"
+            curl -fsSL "https://download.blender.org/release/Blender${BLENDER_VERSION%.*}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" \
+              | tar -xJ --strip-components=1 -C "$HOME/blender"
+          fi
+          "$HOME/blender/blender" --version
+          echo "POTTER_BLENDER=$HOME/blender/blender" >> "$GITHUB_ENV"
+
+      - name: Cache VRM Add-on for Blender
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: tests/vrm-consumer/.cache/vrm-addon
+          key: vrm-addon-${{ hashFiles('tests/vrm-consumer/blender/vrm-addon.lock.json') }}
+
       - name: Run VRM consumer tests
         shell: bash
         working-directory: tests/vrm-consumer
         env:
           POT: ${{ github.workspace }}/target/debug/pot
+          POTTER_REQUIRE_BLENDER: "1"
         run: npm test
 
 
