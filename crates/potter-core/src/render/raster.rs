@@ -72,15 +72,37 @@ pub(crate) struct Triangle {
 
 /// Lighting for triangles with corner normals, evaluated at each visible hit.
 pub(crate) trait SurfaceShader {
-    /// Linear RGB at `point` lit with the interpolated shading `normal`. `geometric` is the unit
-    /// triangle normal, used for shadow-ray origins.
+    /// Linear RGB at `point` lit with the interpolated shading `normal`. Shadow rays start at
+    /// `shadow_point` (see [`smooth_shadow_origin`]); `geometric` is the unit triangle normal.
     fn shade(
         &self,
         triangle: &Triangle,
         point: DVec3,
+        shadow_point: DVec3,
         normal: DVec3,
         geometric: DVec3,
     ) -> Result<[f64; 3]>;
+}
+
+/// Shadow-ray origin for a hit on a smooth triangle, after Hanika's shadow-terminator offset
+/// (Cycles' `shadow_ray_smooth_surface_offset`). It lifts the flat hit point onto the surface
+/// that the corner normals describe, so shadow rays near the terminator do not re-enter the
+/// curved surface. Flat triangles return `point` unchanged.
+pub(crate) fn smooth_shadow_origin(
+    triangle: &Triangle,
+    point: DVec3,
+    barycentric: [f64; 3],
+) -> DVec3 {
+    let Some(normals) = triangle.normals else {
+        return point;
+    };
+    let mut offset = DVec3::ZERO;
+    for (corner, normal) in normals.iter().enumerate() {
+        let tangent = point - triangle.positions[corner];
+        let below = tangent.dot(*normal).min(0.0);
+        offset += (tangent - *normal * below) * barycentric[corner];
+    }
+    point + offset
 }
 
 /// Barycentric blend of corner normals, normalised; `fallback` covers blends that cancel.
@@ -431,7 +453,13 @@ pub(crate) fn rasterize_with_samples(
                             average[channel] * previous_weight + sample_color[channel] / count;
                     }
                 }
-                if let Some(ao) = ambient_occlusion.get(pixel_index).copied() {
+                // Solid mirrors Blender Workbench, which shows no ambient occlusion by default.
+                let ao_in_color = !matches!(mode, Mode::Solid);
+                if let Some(ao) = ambient_occlusion
+                    .get(pixel_index)
+                    .copied()
+                    .filter(|_| ao_in_color)
+                {
                     let ao = f64::from(ao);
                     for channel in &mut average[..3] {
                         *channel *= ao;
@@ -1095,9 +1123,11 @@ fn hit_color(
 ) -> Result<[f64; 4]> {
     match (triangle.source.normals, shader) {
         (Some(_), Some(shader)) => {
+            let shadow_point = smooth_shadow_origin(&triangle.source, point, hit.barycentric);
             let [red, green, blue] = shader.shade(
                 &triangle.source,
                 point,
+                shadow_point,
                 shading_normal(triangle, hit),
                 triangle.normal,
             )?;
@@ -1679,6 +1709,7 @@ mod smooth_shading_tests {
             &self,
             _triangle: &Triangle,
             point: DVec3,
+            _shadow_point: DVec3,
             normal: DVec3,
             geometric: DVec3,
         ) -> Result<[f64; 3]> {
@@ -1815,5 +1846,38 @@ mod smooth_shading_tests {
         assert!(shader.calls.borrow().is_empty());
         let color = output.linear_rgba[CENTER];
         assert!((f64::from(color[0]) - 0.8).abs() < 1e-5, "color {color:?}");
+    }
+
+    #[test]
+    fn ambient_visibility_mirrors_smooth_rays_back_above_the_geometric_surface() {
+        let plane = triangle(None);
+        let bvh = crate::render::bvh::Bvh::build(&[plane]).expect("plane builds");
+        // The shading normal leans 30 degrees from the plane, so some rays dip below it.
+        let visibility = super::ambient_visibility(
+            &bvh,
+            &[plane],
+            DVec3::ZERO,
+            DVec3::Z,
+            DVec3::new(0.866, 0.0, 0.5),
+            1.0,
+        );
+        assert!((visibility - 1.0).abs() < 1e-12, "visibility {visibility}");
+    }
+
+    #[test]
+    fn smooth_shadow_origin_lifts_flat_hits_onto_the_curved_surface() {
+        let sphere = Triangle {
+            positions: [DVec3::X, DVec3::Y, DVec3::Z],
+            normals: Some([DVec3::X, DVec3::Y, DVec3::Z]),
+            ..triangle(None)
+        };
+        let centre = DVec3::splat(1.0 / 3.0);
+        let lifted = super::smooth_shadow_origin(&sphere, centre, [1.0 / 3.0; 3]);
+        assert!(lifted.length() > centre.length(), "lifted {lifted:?}");
+        let flat = triangle(None);
+        assert_eq!(
+            super::smooth_shadow_origin(&flat, centre, [1.0 / 3.0; 3]),
+            centre
+        );
     }
 }

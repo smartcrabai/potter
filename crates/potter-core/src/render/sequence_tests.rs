@@ -40,8 +40,19 @@ fn render(
     width: u32,
     height: u32,
 ) -> crate::error::Result<crate::sequencer::RgbaFrame> {
+    let mut warnings = Vec::new();
     render_vse_frame(
-        doc, scene, frame, width, height, root, "realtime", 1, 0, false,
+        doc,
+        scene,
+        frame,
+        width,
+        height,
+        root,
+        "realtime",
+        1,
+        0,
+        false,
+        &mut warnings,
     )
 }
 
@@ -162,7 +173,7 @@ fn scene_strips_match_their_source_camera_render() -> Result<(), Box<dyn Error>>
         frame: Some(1.0),
         ..EvaluationContext::default()
     };
-    let (_, raster) = render_camera_frame(
+    let (_, raster, _) = render_camera_frame(
         &doc,
         &context,
         directory.path(),

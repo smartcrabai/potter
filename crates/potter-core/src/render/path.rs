@@ -15,7 +15,7 @@ use super::{
     bvh::{Bvh, BvhHit},
     raster::{
         Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
-        rasterize_with_lines, ray_for_sample,
+        rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, ObjectRecord},
 };
@@ -75,6 +75,8 @@ struct Surface {
     normal: DVec3,
     /// Unit normal on the viewer's side of the triangle; offsets ray origins to avoid self-hits.
     geometric_normal: DVec3,
+    /// Origin of shadow rays: `point` on flat triangles, lifted onto the smooth surface otherwise.
+    shadow_point: DVec3,
     params: BsdfParams,
     object_index: u32,
     element_index: u32,
@@ -1106,6 +1108,7 @@ fn make_surface(
         )
     })?;
     let point = origin + direction * hit.distance;
+    let shadow_point = smooth_shadow_origin(triangle, point, hit.barycentric);
     let mut geometric_normal = (triangle.positions[1] - triangle.positions[0])
         .cross(triangle.positions[2] - triangle.positions[0])
         .normalize_or_zero();
@@ -1204,6 +1207,7 @@ fn make_surface(
         point,
         normal: params.normal,
         geometric_normal,
+        shadow_point,
         params,
         object_index: triangle.object_index,
         element_index: triangle.element_index,
@@ -1332,7 +1336,7 @@ fn direct_lighting(
             bvh,
             volumes,
             images,
-            surface.point,
+            surface.shadow_point,
             geometric,
             sample.direction,
             sample.distance,
@@ -1357,7 +1361,7 @@ fn direct_lighting(
             bvh,
             volumes,
             images,
-            surface.point,
+            surface.shadow_point,
             geometric,
             direction,
             f64::INFINITY,
@@ -1382,7 +1386,7 @@ fn direct_lighting(
                 bvh,
                 volumes,
                 images,
-                surface.point,
+                surface.shadow_point,
                 geometric,
                 direction,
                 f64::INFINITY,

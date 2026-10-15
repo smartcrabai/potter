@@ -215,16 +215,16 @@ pub(crate) fn render_corner_normals(
     positions: &[DVec3],
 ) -> Result<Vec<Option<Vec<DVec3>>>> {
     let (normals, smooth) = shading_normals(mesh, positions, None)?;
-    let mut offset = 0;
+    let mut start = 0;
     Ok(mesh
         .faces
         .iter()
         .zip(smooth)
         .map(|(face, smooth)| {
-            let end = offset + face.vertices.len();
-            let corners = normals[offset..end].to_vec();
-            offset = end;
-            smooth.then_some(corners)
+            let end = start + face.vertices.len();
+            let corners = smooth.then(|| normals[start..end].to_vec());
+            start = end;
+            corners
         })
         .collect())
 }
@@ -738,6 +738,22 @@ mod tests {
         .expect("welded mesh");
         assert!(shading_keys_stale(&source, &welded));
         assert!(!shading_keys_stale(&source, &source.clone()));
+    }
+
+    #[test]
+    fn render_corner_normals_keep_custom_normals_on_flat_faces() {
+        let mut mesh = fold();
+        mesh.attributes.insert(
+            "custom_normal".to_owned(),
+            json!({
+                "domain": "corner",
+                "type": "float3",
+                "values": {"f1": [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]}
+            }),
+        );
+        let faces = render_corner_normals(&mesh, &positions(&mesh)).expect("fold is valid");
+        assert!(faces[0].is_none());
+        assert_eq!(faces[1], Some(vec![DVec3::Y; 4]));
     }
 
     #[test]

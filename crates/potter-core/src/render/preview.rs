@@ -224,7 +224,7 @@ pub(crate) fn render_camera_frame(
     film_transparent: bool,
     samples: u32,
     seed: u32,
-) -> Result<(Snapshot, RasterOutput)> {
+) -> Result<(Snapshot, RasterOutput, Vec<Value>)> {
     if width == 0 || height == 0 || width > MAX_SIZE || height > MAX_SIZE {
         return Err(PotError::invalid_argument(
             "render dimensions must be between 1 and 16384 pixels",
@@ -298,7 +298,7 @@ pub(crate) fn render_camera_frame(
         height,
         context.frame.unwrap_or(scene.frame_current),
     )?;
-    Ok((snapshot, raster))
+    Ok((snapshot, raster, geometry.warnings))
 }
 
 fn parse_mode(value: &str) -> Result<Mode> {
