@@ -1338,6 +1338,7 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
     let origin = Origin {
         vertices: model.origins,
         faces: face_origins,
+        corners: None,
     };
     decimate_compact(points, polygons, loose, origin, mesh)
 }

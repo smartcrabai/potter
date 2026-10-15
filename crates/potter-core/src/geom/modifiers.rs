@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     Mesh, MeshError, edge_key,
-    provenance::{Origin, remap_attributes},
+    provenance::{Origin, mean_value_corners, remap_attributes},
 };
 
 mod advanced;
@@ -1003,11 +1003,37 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .iter()
             .map(|&polygon| Some(polygon % source_polygons.len()))
             .collect(),
+        corners: None,
     };
+    // Each copy has one mirror pass per mirrored axis in its copy mask, so its UVs take that many
+    // passes; merged polygons keep the lowest copy they came from, as in the origin above.
+    let passes: Vec<usize> = merged
+        .polygon_sources
+        .iter()
+        .map(|&polygon| (polygon / source_polygons.len()).count_ones() as usize)
+        .collect();
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     if bool_param(modifier, "use_mirror_vertex_groups", true)? {
         mirror_vertex_groups(mesh, &mut result, &merged.point_members, vertex_count);
     }
+    let flip = [
+        bool_param(modifier, "use_mirror_u", false)?,
+        bool_param(modifier, "use_mirror_v", false)?,
+    ];
+    let mirror_offset = [
+        number_param(modifier, "mirror_offset_u", 0.0)?,
+        number_param(modifier, "mirror_offset_v", 0.0)?,
+    ];
+    let offset = [
+        number_param(modifier, "offset_u", 0.0)?,
+        number_param(modifier, "offset_v", 0.0)?,
+    ];
+    let udim = bool_param(modifier, "use_mirror_udim", false)?;
+    map_uv_values(&mut result, |face, _, uv| {
+        (0..passes[face]).fold(uv, |uv, _| {
+            mirror_uv_pass(uv, flip, mirror_offset, offset, udim)
+        })
+    });
     Ok(result)
 }
 
@@ -1295,16 +1321,24 @@ fn array(
             .iter()
             .map(|&polygon| (polygon < copy_face_count).then(|| polygon % source_polygons.len()))
             .collect(),
+        corners: None,
     };
-    let source_loop_count = source_polygons.iter().map(|(face, _)| face.len()).sum();
+    let passes: Vec<usize> = merged
+        .polygon_sources
+        .iter()
+        .map(|&polygon| {
+            if polygon < copy_face_count {
+                polygon / source_polygons.len()
+            } else {
+                0
+            }
+        })
+        .collect();
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
-    array_uv_attributes(
-        &mut result.attributes,
-        source_loop_count,
-        count_usize,
-        offset_u,
-        offset_v,
-    )?;
+    map_uv_values(&mut result, |face, _, [u, v]| {
+        let copy = usize_as_f64(passes[face]);
+        [u + offset_u * copy, v + offset_v * copy]
+    });
     Ok(result)
 }
 
@@ -1430,81 +1464,119 @@ fn append_array_geometry(
     base..points.len()
 }
 
-fn array_uv_attributes(
-    attributes: &mut Map<String, Value>,
-    loop_count: usize,
-    copy_count: usize,
-    offset_u: f64,
-    offset_v: f64,
-) -> Result<()> {
-    let Some(layers) = attributes
+/// Rewrites the UV values of a rebuilt `mesh`: `blender_uv_layers`, UV-named FLOAT2 CORNER
+/// `blender_attributes`, and `uv_map`. `transform(face, corner, uv)` maps one corner's `[u, v]`
+/// where `face` is the output polygon index and `corner` the corner position within it.
+fn map_uv_values(mesh: &mut Mesh, transform: impl Fn(usize, usize, [f64; 2]) -> [f64; 2]) {
+    let corner_positions: Vec<(usize, usize)> = mesh
+        .faces
+        .iter()
+        .enumerate()
+        .flat_map(|(face, polygon)| (0..polygon.vertices.len()).map(move |corner| (face, corner)))
+        .collect();
+    let face_index: HashMap<u64, usize> = mesh
+        .faces
+        .iter()
+        .enumerate()
+        .map(|(index, face)| (u64::from(face.id), index))
+        .collect();
+    let apply = |value: &mut Value, (face, corner): (usize, usize)| {
+        let uv = value.as_array().and_then(|coordinates| match coordinates.as_slice() {
+            [u, v] => Some([u.as_f64()?, v.as_f64()?]),
+            _ => None,
+        });
+        if let Some(uv) = uv {
+            *value = json!(transform(face, corner, uv));
+        }
+    };
+    let uv_names: HashSet<String> = mesh
+        .attributes
+        .get("blender_uv_layers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|layer| layer.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    if let Some(layers) = mesh
+        .attributes
         .get_mut("blender_uv_layers")
         .and_then(Value::as_array_mut)
-    else {
-        return Ok(());
-    };
-    let capacity = loop_count
-        .checked_mul(copy_count)
-        .ok_or_else(|| mesh_error(&MeshError::IdExhausted))?;
-    let mut uv_names = HashSet::new();
-    for layer in layers {
-        let Some(name) = layer.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        uv_names.insert(name.to_owned());
-        let Some(source_values) = layer.get("values").and_then(Value::as_array) else {
-            continue;
-        };
-        let mut values = Vec::with_capacity(capacity);
-        for copy in 0..copy_count {
-            let u_offset = offset_u * usize_as_f64(copy);
-            let v_offset = offset_v * usize_as_f64(copy);
-            for value in source_values.iter().take(loop_count) {
-                values.push(offset_uv_value(value, u_offset, v_offset));
+    {
+        for values in layers
+            .iter_mut()
+            .filter_map(|layer| layer.get_mut("values").and_then(Value::as_array_mut))
+        {
+            for (value, position) in values.iter_mut().zip(&corner_positions) {
+                apply(value, *position);
             }
         }
-        layer["values"] = Value::Array(values);
     }
-    if let Some(attributes) = attributes
+    if let Some(attributes) = mesh
+        .attributes
         .get_mut("blender_attributes")
         .and_then(Value::as_array_mut)
     {
-        for attribute in attributes {
-            let name = attribute.get("name").and_then(Value::as_str);
-            if !name.is_some_and(|name| uv_names.contains(name))
-                || attribute.get("domain").and_then(Value::as_str) != Some("CORNER")
-                || attribute.get("data_type").and_then(Value::as_str) != Some("FLOAT2")
-            {
-                continue;
-            }
-            let Some(source_values) = attribute.get("values").and_then(Value::as_array) else {
-                continue;
-            };
-            let mut values = Vec::with_capacity(capacity);
-            for copy in 0..copy_count {
-                let u_offset = offset_u * usize_as_f64(copy);
-                let v_offset = offset_v * usize_as_f64(copy);
-                for value in source_values.iter().take(loop_count) {
-                    values.push(offset_uv_value(value, u_offset, v_offset));
+        for attribute in attributes.iter_mut().filter(|attribute| {
+            attribute
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| uv_names.contains(name))
+                && attribute.get("domain").and_then(Value::as_str) == Some("CORNER")
+                && attribute.get("data_type").and_then(Value::as_str) == Some("FLOAT2")
+        }) {
+            if let Some(values) = attribute.get_mut("values").and_then(Value::as_array_mut) {
+                for (value, position) in values.iter_mut().zip(&corner_positions) {
+                    apply(value, *position);
                 }
             }
-            attribute["values"] = Value::Array(values);
         }
     }
-    Ok(())
+    if let Some(entries) = mesh
+        .attributes
+        .get_mut("uv_map")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries {
+            let Some(&face) = entry
+                .get("face_id")
+                .and_then(Value::as_u64)
+                .and_then(|id| face_index.get(&id))
+            else {
+                continue;
+            };
+            if let Some(uv) = entry.get_mut("uv").and_then(Value::as_array_mut) {
+                for (corner, value) in uv.iter_mut().enumerate() {
+                    apply(value, (face, corner));
+                }
+            }
+        }
+    }
 }
 
-fn offset_uv_value(value: &Value, offset_u: f64, offset_v: f64) -> Value {
-    let Some(coordinates) = value
-        .as_array()
-        .filter(|coordinates| coordinates.len() == 2)
-    else {
-        return value.clone();
-    };
-    let (Some(u), Some(v)) = (coordinates[0].as_f64(), coordinates[1].as_f64()) else {
-        return value.clone();
-    };
-    json!([u + offset_u, v + offset_v])
+
+/// One mirror pass over a UV coordinate. A flipped axis is reflected about 0.5, or about the centre
+/// of its UDIM tile with `udim`; the mirror offset applies to flipped axes only. The UV offset applies
+/// to every copy.
+fn mirror_uv_pass(
+    uv: [f64; 2],
+    flip: [bool; 2],
+    mirror_offset: [f64; 2],
+    offset: [f64; 2],
+    udim: bool,
+) -> [f64; 2] {
+    std::array::from_fn(|axis| {
+        let value = if flip[axis] {
+            let reflected = if udim {
+                2.0 * uv[axis].floor() + 1.0 - uv[axis]
+            } else {
+                1.0 - uv[axis]
+            };
+            reflected + mirror_offset[axis]
+        } else {
+            uv[axis]
+        };
+        value + offset[axis]
+    })
 }
 
 fn merge_geometry_pairs(
@@ -1629,6 +1701,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         preserve_corners: boundary_smooth == "PRESERVE_CORNERS",
         use_creases: bool_param(modifier, "use_creases", true)?,
     };
+    check_supported_subdivision(mesh, modifier, uv_smooth, levels)?;
     let use_limit_surface = levels > 0 && bool_param(modifier, "use_limit_surface", true)?;
     if levels > 0 {
         let first_level_faces = mesh
@@ -1668,6 +1741,161 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
     Ok(result)
+}
+
+/// Rejects subdivision settings Potter does not reproduce. Only Catmull-Clark is modeled. UV layers
+/// follow Blender's linear result exactly when UV Smooth is None, or when no interior edge carries
+/// the same UVs on both faces (each UV island is separate). Catmull-Clark UV smoothing of shared UVs
+/// needs face-varying limit evaluation, and SMOOTH_ALL differs from linear even on islands.
+fn check_supported_subdivision(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    uv_smooth: &str,
+    levels: u64,
+) -> Result<()> {
+    match modifier.params.get("subdivision_type").map(Value::as_str) {
+        None | Some(Some("CATMULL_CLARK")) => {}
+        Some(Some("SIMPLE")) => {
+            return Err(unsupported_subdivision(
+                modifier,
+                "subdivision_type",
+                "SIMPLE subdivision is not modeled; only Catmull-Clark is supported",
+            ));
+        }
+        Some(_) => {
+            return Err(invalid_parameter(
+                modifier,
+                "subdivision_type",
+                "CATMULL_CLARK or SIMPLE",
+            ));
+        }
+    }
+    if levels == 0 || uv_smooth == "NONE" {
+        return Ok(());
+    }
+    let layers = uv_corner_values(mesh);
+    if layers.is_empty() {
+        return Ok(());
+    }
+    if uv_smooth == "SMOOTH_ALL" {
+        return Err(unsupported_subdivision(
+            modifier,
+            "uv_smooth",
+            "SMOOTH_ALL UV smoothing is not modeled; only NONE and the boundary-preserving modes are supported",
+        ));
+    }
+    if uv_shares_interior_edge(mesh, &layers)? {
+        return Err(unsupported_subdivision(
+            modifier,
+            "uv_smooth",
+            "UV Smooth on UV layers whose interior edges share UVs is not modeled; use UV Smooth None or unwrap each face as its own island",
+        ));
+    }
+    Ok(())
+}
+
+fn unsupported_subdivision(modifier: &Modifier, parameter: &str, detail: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("subdivision {detail}"),
+        json!({
+            "feature_id": format!("modifier.subdivision.{parameter}"),
+            "modifier_id": modifier.id,
+            "parameter": parameter,
+        }),
+    )
+}
+
+/// Corner UV values of every UV layer as `[layer][face]`, from `blender_uv_layers` and `uv_map`.
+fn uv_corner_values(mesh: &Mesh) -> Vec<Vec<Option<Vec<Value>>>> {
+    let mut face_starts = Vec::with_capacity(mesh.faces.len());
+    let mut loop_start = 0_usize;
+    for face in &mesh.faces {
+        face_starts.push(loop_start);
+        loop_start += face.vertices.len();
+    }
+    let mut layers = Vec::new();
+    if let Some(blender_layers) = mesh
+        .attributes
+        .get("blender_uv_layers")
+        .and_then(Value::as_array)
+    {
+        for layer in blender_layers {
+            let values = layer.get("values").and_then(Value::as_array);
+            layers.push(
+                mesh.faces
+                    .iter()
+                    .zip(&face_starts)
+                    .map(|(face, start)| {
+                        values.and_then(|values| {
+                            values
+                                .get(*start..*start + face.vertices.len())
+                                .map(<[Value]>::to_vec)
+                        })
+                    })
+                    .collect(),
+            );
+        }
+    }
+    if let Some(entries) = mesh.attributes.get("uv_map").and_then(Value::as_array) {
+        let face_index: HashMap<u64, usize> = mesh
+            .faces
+            .iter()
+            .enumerate()
+            .map(|(index, face)| (u64::from(face.id), index))
+            .collect();
+        let mut by_layer: BTreeMap<String, Vec<Option<Vec<Value>>>> = BTreeMap::new();
+        for entry in entries {
+            let Some(face) = entry
+                .get("face_id")
+                .and_then(Value::as_u64)
+                .and_then(|id| face_index.get(&id))
+            else {
+                continue;
+            };
+            let layer = entry.get("layer").and_then(Value::as_str).unwrap_or("UVMap");
+            let uv = entry.get("uv").and_then(Value::as_array).cloned();
+            by_layer
+                .entry(layer.to_owned())
+                .or_insert_with(|| vec![None; mesh.faces.len()])[*face] = uv;
+        }
+        layers.extend(by_layer.into_values());
+    }
+    layers
+}
+
+/// Whether some interior edge has the same UV at both of its ends on both faces, in any layer.
+fn uv_shares_interior_edge(mesh: &Mesh, layers: &[Vec<Option<Vec<Value>>>]) -> Result<bool> {
+    let polygons = polygons(mesh)?;
+    let mut edge_faces: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+    for (index, (face, _)) in polygons.iter().enumerate() {
+        for (first, second) in cyclic_pairs(face) {
+            edge_faces
+                .entry(edge_key(*first, *second))
+                .or_default()
+                .push(index);
+        }
+    }
+    for layer in layers {
+        let value_at = |face: usize, vertex: usize| -> Option<&Value> {
+            let corner = polygons[face].0.iter().position(|id| *id == vertex)?;
+            layer.get(face)?.as_ref()?.get(corner)
+        };
+        for ((first_vertex, second_vertex), faces) in &edge_faces {
+            let [first, second] = faces.as_slice() else {
+                continue;
+            };
+            let shared = |vertex: usize| {
+                value_at(*first, vertex)
+                    .zip(value_at(*second, vertex))
+                    .is_some_and(|(left, right)| left == right)
+            };
+            if shared(*first_vertex) && shared(*second_vertex) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn check_subdivision_budget(
@@ -2129,6 +2357,7 @@ fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
             .enumerate()
             .flat_map(|(index, (face, _))| std::iter::repeat_n(Some(index), face.len()))
             .collect(),
+        corners: None,
     };
     let mut output = build_mesh(
         updated_points,
@@ -2254,7 +2483,8 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let mut even_scales = vec![0.0; source_points.len()];
     let mut angle_totals = vec![0.0; source_points.len()];
     let mut edge_faces: BevelEdgeFaces = BTreeMap::new();
-    for (face, material) in &source_polygons {
+    let mut edge_owner: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for (face_index, (face, material)) in source_polygons.iter().enumerate() {
         let mut face_normal = DVec3::ZERO;
         for (first, second) in cyclic_pairs(face) {
             face_normal += source_points[*first].cross(source_points[*second]);
@@ -2262,6 +2492,9 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .entry(edge_key(*first, *second))
                 .or_default()
                 .push((*first, *second, *material));
+            edge_owner
+                .entry(edge_key(*first, *second))
+                .or_insert(face_index);
         }
         let face_area = face_normal.length();
         face_normal = face_normal.normalize_or_zero();
@@ -2383,7 +2616,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
     if use_rim {
-        for faces in edge_faces.values().filter(|faces| faces.len() == 1) {
+        for (edge, faces) in edge_faces.iter().filter(|(_, faces)| faces.len() == 1) {
             let (first, second, material) = faces[0];
             let duplicate_first = duplicate_indices[first].unwrap_or(first);
             let duplicate_second = duplicate_indices[second].unwrap_or(second);
@@ -2392,7 +2625,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 rim.reverse();
             }
             output_polygons.push((rim, material));
-            face_sources.push(None);
+            face_sources.push(Some(edge_owner[edge]));
         }
     }
     let mut output_loose_edges = Vec::with_capacity(source_loose_edges.len().saturating_mul(2));
@@ -2670,6 +2903,19 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .to_ascii_uppercase();
     if !matches!(affect.as_str(), "EDGES" | "VERTICES") {
         return Err(invalid_parameter(modifier, "affect", "EDGES or VERTICES"));
+    }
+    // Blender interpolates profile-loop UVs of multi-segment edge bevels from the profile geometry,
+    // which Potter does not model; single-segment and vertex bevels interpolate exactly.
+    if affect == "EDGES" && segments > 1 && !uv_corner_values(mesh).is_empty() {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "bevel with more than one segment on edges is not supported on UV layers",
+            json!({
+                "feature_id": "modifier.bevel.uv_profile",
+                "modifier_id": modifier.id,
+                "parameter": "segments",
+            }),
+        ));
     }
     let profile = number_param(modifier, "profile", 0.5)?;
     if !(0.0..=1.0).contains(&profile) {
@@ -3000,7 +3246,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             for segment in 0..segments {
                 let (start, end) = (side_a.1, side_a.2);
                 let material = side_a.3;
-                face_sources.push(None);
+                face_sources.push(Some(side_a.0));
                 output_polygons.push((
                     vec![
                         point_at(start, 0, segment),
@@ -3064,7 +3310,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .map(|(face_index, _, _)| face_corner[&(*face_index, vertex)])
                 .collect();
             if boundary.len() >= 3 {
-                face_sources.push(None);
+                face_sources.push(Some(faces[0].0));
                 output_polygons.push((boundary, faces[0].2));
             }
             continue;
@@ -3093,14 +3339,26 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                         .map(|segment| profile_points[&(incoming_edge, vertex, segment)]),
                 );
             }
-            face_sources.push(None);
+            face_sources.push(Some(*face_index));
             output_polygons.push((patch, *material));
         }
     }
     if output_polygons.is_empty() {
         return Ok(mesh.clone());
     }
-    let origin = Origin::copies(point_vertices.iter().copied().map(Some), face_sources);
+    // Blender interpolates each bevel loop from its source face at the loop's position.
+    let corners = mean_value_corners(
+        mesh,
+        &points,
+        output_polygons
+            .iter()
+            .zip(&face_sources)
+            .map(|((vertices, _), source)| (vertices.as_slice(), *source)),
+    );
+    let origin = Origin {
+        corners: Some(corners),
+        ..Origin::copies(point_vertices.iter().copied().map(Some), face_sources)
+    };
     build_mesh(points, output_polygons, loose_edges(mesh)?, &origin, mesh)
 }
 #[expect(
@@ -3236,7 +3494,7 @@ fn bevel_vertices(
                 .entry(outgoing)
                 .or_default()
                 .push(incoming);
-            corner_sectors[vertex].push((incoming, arc_points, outgoing, *material));
+            corner_sectors[vertex].push((incoming, arc_points, outgoing, *material, face_index));
         }
         face_sources.push(Some(face_index));
         output_polygons.push((output_face, *material));
@@ -3278,8 +3536,9 @@ fn bevel_vertices(
             continue;
         }
         if segments == 1 {
-            let material = corner_sectors[vertex].first().map_or(0, |sector| sector.3);
-            face_sources.push(None);
+            let sector = corner_sectors[vertex].first();
+            let material = sector.map_or(0, |sector| sector.3);
+            face_sources.push(sector.map(|sector| sector.4));
             output_polygons.push((boundary, material));
             continue;
         }
@@ -3305,9 +3564,9 @@ fn bevel_vertices(
         let center_index = points.len();
         points.push(center);
         point_origins.push(vec![(vertex, 1.0)]);
-        for (incoming, arc_points, outgoing, material) in &corner_sectors[vertex] {
+        for (incoming, arc_points, outgoing, material, source) in &corner_sectors[vertex] {
             if segments == 2 {
-                face_sources.push(None);
+                face_sources.push(Some(*source));
                 output_polygons.push((
                     vec![*incoming, arc_points[0], *outgoing, center_index],
                     *material,
@@ -3318,7 +3577,7 @@ fn bevel_vertices(
                 boundary.extend(arc_points.iter().copied());
                 boundary.push(*outgoing);
                 for pair in boundary.windows(2) {
-                    face_sources.push(None);
+                    face_sources.push(Some(*source));
                     output_polygons.push((vec![pair[0], pair[1], center_index], *material));
                 }
             }
@@ -3354,9 +3613,19 @@ fn bevel_vertices(
         .into_iter()
         .map(|[first, second]| [remap[first], remap[second]])
         .collect();
+    // Blender interpolates each bevel loop from its source face at the loop's position.
+    let corners = mean_value_corners(
+        mesh,
+        &compact_points,
+        output_polygons
+            .iter()
+            .zip(&face_sources)
+            .map(|((vertices, _), source)| (vertices.as_slice(), *source)),
+    );
     let origin = Origin {
         vertices: compact_origins,
         faces: face_sources,
+        corners: Some(corners),
     };
     build_mesh(
         compact_points,
@@ -3495,6 +3764,7 @@ fn decimate_compact(
     let origin = Origin {
         vertices: compact_origin,
         faces: origin.faces,
+        corners: None,
     };
     build_mesh(compact_points, polygons, loose, &origin, source)
 }
@@ -3530,6 +3800,7 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .iter()
             .map(|&face| Some(face))
             .collect(),
+        corners: None,
     };
     build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)
 }

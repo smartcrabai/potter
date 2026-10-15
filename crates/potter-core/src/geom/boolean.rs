@@ -13,7 +13,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
-        provenance::{Origin, remap_attributes},
+        provenance::{Origin, mean_value_corners, remap_attributes},
     },
 };
 
@@ -804,7 +804,32 @@ fn polygons_to_mesh(polygons: Vec<Polygon>, template: &Mesh, epsilon: f64) -> Re
             output_face_origins.push(polygon.source_face);
         }
     }
-    let origin = Origin::copies(compact_vertex_origins, output_face_origins);
+    // Blender interpolates each loop from its operand-A source face at the loop's position, so cut
+    // vertices take the face's UVs by mean value; untouched vertices map to their own corner.
+    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    let vertex_index: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let face_vertices: Vec<Vec<usize>> = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.iter().map(|id| vertex_index[id]).collect())
+        .collect();
+    let corners = mean_value_corners(
+        template,
+        &positions,
+        face_vertices
+            .iter()
+            .zip(&output_face_origins)
+            .map(|(vertices, source)| (vertices.as_slice(), *source)),
+    );
+    let origin = Origin {
+        corners: Some(corners),
+        ..Origin::copies(compact_vertex_origins, output_face_origins)
+    };
     remap_attributes(template, &mut mesh, &origin)?;
     mesh.validate().map_err(|error| {
         PotError::invalid_argument(format!("boolean output is invalid: {error}"))
