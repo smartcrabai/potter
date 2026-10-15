@@ -29,7 +29,11 @@ export const MESHES = {
   hat: 'hat', // bone-parented to head, material cloth
   ribbon: 'ribbon', // single-sided plane, bone-parented to head, material ribbon
   ribbonMirror: 'ribbon_mirror', // same plane with scale [-1,1,1], material cutout
+  graphPart: 'graph_part', // plane off to the side, material graph_avatar (shader graph export)
 };
+
+// Graph part: away from the avatar so every render check (which shows named meshes only) is unaffected.
+export const GRAPH_PART = { center: [0, 3, 1], size: 0.3 };
 
 // Head sphere placement (world, metres) and radius.
 export const HEAD_MESH = { center: [0, 0, 1.8], radius: 0.12, segments: 32, ringCount: 16 };
@@ -216,7 +220,7 @@ export const MATERIALS = {
     outlineWidth: 0.002,
     outlineWidthMode: 'worldCoordinates',
     outlineColor: [0, 0, 0],
-    uvAnimationMask: 'tex_uv_mask', // packed mask, value in channel B: B=0 for u<0.5, B=1 for u>=0.5
+    uvAnimationMask: 'tex_uv_mask', // packed mask, value in channel B: B=0 for u<0.5, B=1 for u>=0.5 (hard step: Closest sampling)
     uvAnimationScrollX: 0.1,
   },
   ribbon: { baseColor: [0.9, 0.9, 0.2, 0.6], alphaMode: 'BLEND', doubleSided: true, baseTexture: 'tex_ribbon' },

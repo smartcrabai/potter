@@ -433,6 +433,8 @@ fn flag(values: Option<&Map<String, Value>>, key: &str) -> Result<bool> {
 
 /// Per face: the `shade_smooth` flag, in `mesh.faces` order. Meshes imported from `.blend`
 /// without a `shade_smooth` attribute carry `blender_polygon_smooth` in the same order.
+// shortcut: PR9 converts .blend mesh data to native keys; delete the blender_polygon_smooth
+// fallback when it lands, so shading comes only from `shade_smooth`.
 pub(crate) fn smooth_face_flags(mesh: &Mesh) -> Result<Vec<bool>> {
     if !mesh.attributes.contains_key("shade_smooth")
         && let Some(flags) = imported_flags(mesh, "blender_polygon_smooth", mesh.faces.len())
@@ -448,6 +450,8 @@ pub(crate) fn smooth_face_flags(mesh: &Mesh) -> Result<Vec<bool>> {
 
 /// Per edge: the `sharp` flag, in `mesh.edges` order. Meshes imported from `.blend` without a
 /// `sharp` attribute carry `sharp` inside `blender_edge_flags` in the same order.
+// shortcut: PR9 converts .blend mesh data to native keys; delete the blender_edge_flags
+// fallback when it lands, so sharpness comes only from `sharp`.
 pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
     if !mesh.attributes.contains_key("sharp")
         && let Some(edges) = mesh

@@ -1502,8 +1502,8 @@ const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 13] = [
     ".hide_edge",
 ];
 
-/// Whether a `blender_attributes` entry is exported or intentionally not written. Color
-/// layers are written only through material vertex-color references (a material loss otherwise).
+/// Whether a `blender_attributes` entry carries data the writer ignores on purpose. Color layers
+/// are never written here; `export_losses` reports each one as `mesh.color_attribute`.
 fn blender_attribute_exportable(mesh: &Mesh, entry: &Value) -> bool {
     let name = entry["name"].as_str().unwrap_or_default();
     let color = matches!(

@@ -1151,6 +1151,20 @@ fn graph_materials_match_blender_probe_export() -> TestResult {
         "the probe scene exported without --allow-lossy although it contains losses"
     );
     let attributed = attribute_losses(&project, &reported_losses(&strict)?)?;
+    // Blender color layers are reported per mesh until COLOR_0 export exists: only P15 and P40 have one.
+    let mut colors: Vec<String> = reported_losses(&strict)?
+        .iter()
+        .filter(|loss| loss["feature_id"] == "mesh.color_attribute")
+        .filter_map(|loss| loss["data_id"].as_str().map(str::to_owned))
+        .collect();
+    colors.sort();
+    assert_eq!(colors.len(), 2, "color layers reported: {colors:?}");
+    assert!(
+        colors
+            .iter()
+            .all(|id| id.contains("p15_") || id.contains("p40_")),
+        "color layers reported on unexpected meshes: {colors:?}"
+    );
 
     let potter_glb = root.path().join("potter.glb");
     let lossy = export_glb(&project, &potter_glb, true)?;

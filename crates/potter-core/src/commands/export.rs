@@ -501,9 +501,58 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     }
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
         losses.extend(material_losses(doc));
+        losses.extend(mesh_color_losses(doc));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);
+    }
+    losses
+}
+
+/// Blender color layers on meshes that nodes use. glTF export does not write them yet (COLOR_0 is
+/// pending), so each layer is a reported loss rather than a silent drop.
+fn mesh_color_losses(doc: &SceneDoc) -> Vec<Loss> {
+    let data_ids = doc
+        .nodes
+        .values()
+        .filter_map(|node| node.data.as_ref())
+        .collect::<BTreeSet<_>>();
+    let mut losses = Vec::new();
+    for data_id in data_ids {
+        let Some(mesh) = doc
+            .data_blocks
+            .get(data_id)
+            .and_then(|data| data.mesh.as_ref())
+        else {
+            continue;
+        };
+        let Some(entries) = mesh
+            .attributes
+            .get("blender_attributes")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for entry in entries {
+            let is_color = matches!(
+                entry["data_type"].as_str(),
+                Some("FLOAT_COLOR" | "BYTE_COLOR")
+            );
+            let Some(name) = entry["name"].as_str().filter(|_| is_color) else {
+                continue;
+            };
+            losses.push(Loss {
+                feature_id: "mesh.color_attribute".to_owned(),
+                data_id: Some(data_id.to_string()),
+                reason: format!(
+                    "glTF export does not write the Blender color attribute `{name}` on mesh `{data_id}` (COLOR_0 export is not implemented)"
+                ),
+                suggestion: Some(
+                    "export with --allow-lossy to omit the color layer, or remove it before export"
+                        .to_owned(),
+                ),
+            });
+        }
     }
     losses
 }

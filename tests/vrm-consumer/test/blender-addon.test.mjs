@@ -193,9 +193,7 @@ function runVariants() {
       });
 
       it('materials: glTF materials plus the add-on outline material; MToon flag only on MToon materials', () => {
-        // Blender imports only materials a mesh uses; the fixture's graph material is unassigned.
-        const usedIndices = new Set(json.meshes.flatMap((mesh) => mesh.primitives.map((prim) => prim.material)));
-        const gltfNames = json.materials.filter((_, index) => usedIndices.has(index)).map((m) => m.name);
+        const gltfNames = json.materials.map((m) => m.name);
         assert.deepEqual(Object.keys(facts.materials).sort(), [...gltfNames, ...MTOON_OUTLINE].sort());
         const mtoon = new Set(mtoonNames(json, spec === '1.0' ? 'v1' : 'v0'));
         assert.ok(mtoon.size > 0, 'the file has no MToon material');

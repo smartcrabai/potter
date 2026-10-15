@@ -243,6 +243,8 @@ function buildBatchOne(dir) {
     { op: 'node.create', id: M.ribbonMirror, kind: 'plane', params: { size: S.RIBBON.size }, materials: ['cutout'], transform: { translation: S.RIBBON.mirrorCenter, rotation_deg: S.RIBBON.rotationDeg, scale: S.RIBBON.mirrorScale } },
     { op: 'uv.unwrap', target: { id: M.ribbonMirror }, method: 'smart' },
     attachToBone(M.ribbonMirror, S.RIBBON.parentBone),
+    { op: 'node.create', id: M.graphPart, kind: 'plane', params: { size: S.GRAPH_PART.size }, materials: ['graph_avatar'], transform: { translation: S.GRAPH_PART.center } },
+    { op: 'uv.unwrap', target: { id: M.graphPart }, method: 'smart' },
   ];
   apply(dir, ops);
 }
@@ -428,7 +430,7 @@ function avatarSet(variant) {
         outline_width_mode: 'world_coordinates',
         outline_width_factor: c.outlineWidth,
         outline_color_factor: c.outlineColor,
-        uv_animation_mask_texture: { image: c.uvAnimationMask, interpolation: 'linear' },
+        uv_animation_mask_texture: { image: c.uvAnimationMask, interpolation: 'closest' },
         uv_animation_scroll_x_speed_factor: c.uvAnimationScrollX,
       },
     },

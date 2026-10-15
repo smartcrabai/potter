@@ -687,12 +687,14 @@ for index, (name, builder) in enumerate(selected):
     obj = bpy.context.active_object
     obj.name = name
     obj.data.name = name + "_mesh"
-    # Second UV layer for P20 (first layer with swapped coordinates).
-    uv2 = obj.data.uv_layers.new(name="UVLight")
-    for loop in uv2.data:
-        loop.uv = (loop.uv[1], loop.uv[0])
-    # Vertex color layer for P15 and P40.
-    obj.data.color_attributes.new(name="Col", type='FLOAT_COLOR', domain='CORNER')
+    # Only P20 has a second UV layer; only P15 and P40 have a vertex color layer. Other meshes
+    # keep Blender's default data, so the default sphere has no extra layers.
+    if name == "P20_SecondUVLayer":
+        uv2 = obj.data.uv_layers.new(name="UVLight")
+        for loop in uv2.data:
+            loop.uv = (loop.uv[1], loop.uv[0])
+    if name in ("P15_VertexColorMultiply", "P40_VertexColorBaseColorOnly"):
+        obj.data.color_attributes.new(name="Col", type='FLOAT_COLOR', domain='CORNER')
     mat, nt, out, bsdf = new_mat(name)
     builder(mat, nt, out, bsdf)
     obj.data.materials.append(mat)
