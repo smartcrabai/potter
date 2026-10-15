@@ -109,8 +109,6 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Shading> {
             "vertex coordinate is not finite",
         )));
     }
-    let shade_smooth = attribute_values(mesh, "shade_smooth", "face", "bool")?;
-    let sharp = attribute_values(mesh, "sharp", "edge", "bool")?;
     let custom = attribute_values(mesh, "custom_normal", "corner", "float3")?;
 
     let index_by_id: HashMap<u32, usize> = mesh
@@ -120,16 +118,12 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Shading> {
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
     let mut sharp_edges = HashSet::new();
-    for edge in &mesh.edges {
-        if flag(sharp, &format!("e{}", edge.id))? {
+    for (edge, sharp) in mesh.edges.iter().zip(sharp_edge_flags(mesh)?) {
+        if sharp {
             sharp_edges.insert(edge_key(edge.vertices[0], edge.vertices[1]));
         }
     }
-    let smooth = mesh
-        .faces
-        .iter()
-        .map(|face| flag(shade_smooth, &format!("f{}", face.id)))
-        .collect::<Result<Vec<_>>>()?;
+    let smooth = smooth_face_flags(mesh)?;
 
     let mut offsets = Vec::with_capacity(mesh.faces.len());
     let mut corner_total = 0_usize;
@@ -435,6 +429,24 @@ fn flag(values: Option<&Map<String, Value>>, key: &str) -> Result<bool> {
             "boolean attribute value {key} must be true or false"
         ))),
     }
+}
+
+/// Per face: the `shade_smooth` flag, in `mesh.faces` order.
+pub(crate) fn smooth_face_flags(mesh: &Mesh) -> Result<Vec<bool>> {
+    let values = attribute_values(mesh, "shade_smooth", "face", "bool")?;
+    mesh.faces
+        .iter()
+        .map(|face| flag(values, &format!("f{}", face.id)))
+        .collect()
+}
+
+/// Per edge: the `sharp` flag, in `mesh.edges` order.
+pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
+    let values = attribute_values(mesh, "sharp", "edge", "bool")?;
+    mesh.edges
+        .iter()
+        .map(|edge| flag(values, &format!("e{}", edge.id)))
+        .collect()
 }
 
 fn union(parent: &mut [usize], first: usize, second: usize) {

@@ -14,7 +14,7 @@ use crate::{
     eval::{Snapshot, mesh_vertex_weights},
     geom::{
         Face, Mesh, MeshError,
-        normals::{close, corner_normals, shading_keys_stale},
+        normals::{close, corner_normals, shading_keys_stale, sharp_edge_flags, smooth_face_flags},
     },
     image::{ImageData, ImageInterpolation, load_image_data},
     model::{
@@ -895,6 +895,53 @@ fn export_triangles(mesh: &Mesh) -> std::result::Result<Vec<[u32; 3]>, MeshError
         }
     }
     Ok(output)
+}
+
+/// `extras.potter.polygons`: the source polygons in face order over global glTF vertex indices, the
+/// exact smooth flag of each face, and each sharp edge as one glTF vertex pair. A mirrored bake
+/// reverses each polygon as a whole, which makes the importer's face normals match the exported NORMAL.
+fn export_polygons(mesh: &Mesh, layout: &ExportVertexLayout, mirrored: bool) -> Result<Value> {
+    let key = |first: u32, second: u32| (first.min(second), first.max(second));
+    let sharp_keys = mesh
+        .edges
+        .iter()
+        .zip(sharp_edge_flags(mesh)?)
+        .filter(|(_, sharp)| *sharp)
+        .map(|(edge, _)| key(edge.vertices[0], edge.vertices[1]))
+        .collect::<BTreeSet<_>>();
+    let mut emitted = BTreeSet::new();
+    let mut sharp_pairs = Vec::new();
+    let mut faces = Vec::with_capacity(mesh.faces.len());
+    for (face, smooth) in mesh.faces.iter().zip(smooth_face_flags(mesh)?) {
+        let indices = layout.face_indices.get(&face.id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "face has no output vertices")
+        })?;
+        let mut corners = face
+            .vertices
+            .iter()
+            .map(|id| {
+                indices.get(id).copied().ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "polygon references missing output vertex",
+                    )
+                })
+            })
+            .collect::<Result<Vec<u32>>>()?;
+        let count = corners.len();
+        for corner in 0..count {
+            let next = (corner + 1) % count;
+            let pair = key(face.vertices[corner], face.vertices[next]);
+            if sharp_keys.contains(&pair) && emitted.insert(pair) {
+                sharp_pairs.push(json!([corners[corner], corners[next]]));
+            }
+        }
+        if mirrored {
+            corners.reverse();
+        }
+        faces.push(json!({ "corners": corners, "smooth": smooth }));
+    }
+    Ok(json!({ "version": 1, "faces": faces, "sharp_edges": sharp_pairs }))
 }
 
 /// Maps pot-space normals into the glTF output frame: inverse transpose of diag(scale) * basis.
@@ -2835,6 +2882,7 @@ fn export_with_root_inner(
                 "mesh triangulation has unexpected triangles",
             ));
         }
+        let polygons = export_polygons(mesh, &layout, mirrored)?;
         if slot_indices.is_empty() {
             slot_indices.insert(0, Vec::new());
         }
@@ -2971,7 +3019,8 @@ fn export_with_root_inner(
                 "shape_key_data": data_block.and_then(|block| block.shape_keys.as_ref()),
                 "vertex_ids": layout.source_vertex_indices.iter().map(|index| mesh.vertices[*index].id).collect::<Vec<_>>(),
                 "vertex_groups": data_block.map(|block| &block.vertex_groups),
-                "vertex_weights": data_block.map(|block| export_vertex_weights(mesh, block))
+                "vertex_weights": data_block.map(|block| export_vertex_weights(mesh, block)),
+                "polygons": polygons
             } }
         });
         if !target_names.is_empty() {
@@ -4577,6 +4626,7 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
     let mesh_values = root["meshes"].as_array().map_or(&[][..], Vec::as_slice);
     let mut used_data_ids = BTreeSet::new();
     let mut morph_normal_loss = false;
+    let mut polygon_loss = false;
     for (mesh_index, mesh_value) in mesh_values.iter().enumerate() {
         let suggested = mesh_value["extras"]["potter"]["data_id"]
             .as_str()
@@ -4799,6 +4849,33 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             .iter()
             .map(|index| positions[*index])
             .collect::<Vec<_>>();
+        // Potter's stored polygons replace the triangles, which carry only materials and UVs here.
+        let (polygons, face_material_indices, face_uvs, exact) =
+            match potter_polygons(mesh_value, positions.len())? {
+                PotterPolygons::Absent => (polygons, face_material_indices, face_uvs, None),
+                PotterPolygons::UnknownVersion => {
+                    polygon_loss = true;
+                    (polygons, face_material_indices, face_uvs, None)
+                }
+                PotterPolygons::Faces(faces) => {
+                    let (materials, uvs) = assign_polygon_triangles(
+                        &faces,
+                        &polygons,
+                        &face_material_indices,
+                        &face_uvs,
+                        positions.len(),
+                    )?;
+                    let exact = shading::ExactShading {
+                        smooth: faces.smooth,
+                        sharp: faces
+                            .sharp
+                            .iter()
+                            .map(|[first, second]| [welded_of[*first], welded_of[*second]])
+                            .collect(),
+                    };
+                    (faces.corners, materials, uvs, Some(exact))
+                }
+            };
         let welded_polygons = polygons
             .iter()
             .map(|polygon| {
@@ -4859,7 +4936,7 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             } else {
                 Vec::new()
             };
-            shading::import_shading(&mut mesh, &corner_normals)?;
+            shading::import_shading_flags(&mut mesh, &corner_normals, exact.as_ref())?;
             if morph_normals_disagree(&mesh, &corner_normals, &morph_targets) {
                 morph_normal_loss = true;
             }
@@ -5203,6 +5280,17 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             ),
         });
     }
+    if polygon_loss {
+        losses.push(crate::exchange::Loss {
+            feature_id: "mesh.polygon_topology".to_owned(),
+            data_id: None,
+            reason: "glTF Potter polygon topology has an unknown version and imports as triangles"
+                .to_owned(),
+            suggestion: Some(
+                "use --allow-lossy to import the file with triangulated faces".to_owned(),
+            ),
+        });
+    }
     doc.validate()?;
     Ok(crate::exchange::ImportedGraph {
         doc,
@@ -5314,6 +5402,155 @@ fn morph_normals_disagree(
         }
     }
     disagree
+}
+
+/// Polygons a Potter writer stores in `extras.potter.polygons`, over global glTF vertex indices.
+struct PotterFaces {
+    corners: Vec<Vec<usize>>,
+    smooth: Vec<bool>,
+    /// Endpoint vertex pairs of sharp edges.
+    sharp: Vec<[usize; 2]>,
+}
+
+enum PotterPolygons {
+    Absent,
+    /// A version this importer does not read; the mesh imports as triangles and reports a loss.
+    UnknownVersion,
+    Faces(PotterFaces),
+}
+
+/// Reads `extras.potter.polygons`. Malformed records are errors, as the other Potter extras are.
+fn potter_polygons(mesh_value: &Value, vertex_count: usize) -> Result<PotterPolygons> {
+    let value = &mesh_value["extras"]["potter"]["polygons"];
+    if value.is_null() {
+        return Ok(PotterPolygons::Absent);
+    }
+    let invalid = || import_error("glTF Potter polygon topology is invalid");
+    if !value.is_object() {
+        return Err(invalid());
+    }
+    if value["version"].as_u64() != Some(1) {
+        return Ok(PotterPolygons::UnknownVersion);
+    }
+    let vertex = |value: &Value| {
+        value
+            .as_u64()
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < vertex_count)
+            .ok_or_else(invalid)
+    };
+    let faces = value["faces"]
+        .as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .map(|face| -> Result<(Vec<usize>, bool)> {
+            let corners = face["corners"]
+                .as_array()
+                .ok_or_else(invalid)?
+                .iter()
+                .map(vertex)
+                .collect::<Result<Vec<_>>>()?;
+            let mut sorted = corners.clone();
+            sorted.sort_unstable();
+            if corners.len() < 3 || sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(invalid());
+            }
+            let smooth = face["smooth"].as_bool().ok_or_else(invalid)?;
+            Ok((corners, smooth))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let sharp = value["sharp_edges"]
+        .as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .map(|pair| -> Result<[usize; 2]> {
+            let pair = pair
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(invalid)?;
+            let (first, second) = (vertex(&pair[0])?, vertex(&pair[1])?);
+            if first == second {
+                return Err(invalid());
+            }
+            Ok([first, second])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (corners, smooth) = faces.into_iter().unzip();
+    Ok(PotterPolygons::Faces(PotterFaces {
+        corners,
+        smooth,
+        sharp,
+    }))
+}
+
+/// Per polygon, the UV of each corner.
+type CornerUvs = Vec<Vec<[f64; 2]>>;
+
+/// Pairs each Potter polygon with the triangles covering it. A polygon owns `corners - 2` triangles
+/// whose vertices all belong to it, drawn from one material slot. Returns each polygon's slot and
+/// per-corner UVs.
+fn assign_polygon_triangles(
+    faces: &PotterFaces,
+    triangles: &[Vec<usize>],
+    slots: &[u32],
+    uvs: &[Vec<[f64; 2]>],
+    vertex_count: usize,
+) -> Result<(Vec<u32>, CornerUvs)> {
+    let mut faces_at = vec![Vec::<usize>::new(); vertex_count];
+    for (face, corners) in faces.corners.iter().enumerate() {
+        for corner in corners {
+            faces_at[*corner].push(face);
+        }
+    }
+    let members = faces
+        .corners
+        .iter()
+        .map(|corners| corners.iter().copied().collect::<BTreeSet<_>>())
+        .collect::<Vec<_>>();
+    let mut owned = vec![Vec::<usize>::new(); faces.corners.len()];
+    let mut slot_of = vec![None::<u32>; faces.corners.len()];
+    for (index, triangle) in triangles.iter().enumerate() {
+        let owner = faces_at[triangle[0]].iter().copied().find(|&face| {
+            let corners = &members[face];
+            owned[face].len() < faces.corners[face].len() - 2
+                && slot_of[face].is_none_or(|slot| slot == slots[index])
+                && triangle.iter().all(|corner| corners.contains(corner))
+        });
+        let owner =
+            owner.ok_or_else(|| import_error("glTF triangle lies outside every Potter polygon"))?;
+        owned[owner].push(index);
+        slot_of[owner] = Some(slots[index]);
+    }
+    let mut materials = Vec::with_capacity(faces.corners.len());
+    let mut corner_uvs = Vec::with_capacity(faces.corners.len());
+    for (face, corners) in faces.corners.iter().enumerate() {
+        if owned[face].len() != corners.len() - 2 {
+            return Err(import_error(
+                "glTF Potter polygon does not match its triangles",
+            ));
+        }
+        let mut uv_of = BTreeMap::<usize, [f64; 2]>::new();
+        for &index in &owned[face] {
+            for (corner, uv) in triangles[index].iter().zip(&uvs[index]) {
+                uv_of.entry(*corner).or_insert(*uv);
+            }
+        }
+        corner_uvs.push(
+            corners
+                .iter()
+                .map(|corner| {
+                    uv_of
+                        .get(corner)
+                        .copied()
+                        .ok_or_else(|| import_error("glTF Potter polygon corner has no triangle"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        materials.push(
+            slot_of[face].ok_or_else(|| import_error("glTF Potter polygon has no triangle"))?,
+        );
+    }
+    Ok((materials, corner_uvs))
 }
 
 fn append_triangles(
@@ -6367,6 +6604,12 @@ mod tests {
     use proptest::{prelude::*, test_runner::TestCaseError};
     use serde_json::{Value, json};
 
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::geom::{
+        Mesh,
+        normals::{sharp_edge_flags, smooth_face_flags},
+    };
     use crate::{
         eval::{EvaluationContext, Snapshot},
         exchange::ImportedGraph,
@@ -6377,6 +6620,9 @@ mod tests {
     use super::{axis_from_gltf, axis_to_gltf, export_with_root, gltf_import_losses, import};
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    /// Edits one field of an exported `extras.potter.polygons` record.
+    type Edit = fn(&mut Value);
 
     fn scene(operations: &Value) -> TestResult<SceneDoc> {
         let initial = SceneDoc::new(uuid::Uuid::new_v4().to_string());
@@ -7499,7 +7745,7 @@ mod tests {
             .values()
             .filter(|value| value.as_bool() == Some(true))
             .count();
-        // The writer triangulates, so every imported face is a triangle of the smooth cube.
+        // Potter polygons keep the cube's quads, so every imported face is still a smooth quad.
         assert_eq!(smooth_faces, mesh.faces.len());
         let flat = scene(&json!([
             {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0}}
@@ -7518,11 +7764,9 @@ mod tests {
 
     #[test]
     fn morph_normal_deltas_are_exported_and_roundtrip_without_loss() -> TestResult {
-        // Quad faces are exported as triangles, and morph normals derived on quad topology differ
-        // from triangle topology; a triangle source keeps the topology identical across the roundtrip.
+        // Potter polygons keep the quads, so morph normals derived on them agree after the roundtrip.
         let source = scene(&json!([
             {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0}},
-            {"op":"mesh.triangulate","target":{"id":"cube"},"elements":{"domain":"face","ids":["f0","f1","f2","f3","f4","f5"]}},
             {"op":"shape_key.create","target":{"id":"cube"},"id":"lift","name":"Lift","positions":{"0":[0.0,0.0,1.0]}}
         ]))?;
         let (root, binary) = export_root_and_binary(&source)?;
@@ -7821,8 +8065,8 @@ mod tests {
     }
 
     #[test]
-    fn quad_smooth_seamed_shape_key_mesh_reports_triangulated_morph_normal_loss() -> TestResult {
-        // Quads are exported as triangles, and their morph normals are derived on the quads.
+    fn quad_smooth_seamed_shape_key_mesh_roundtrips_without_morph_normal_loss() -> TestResult {
+        // Potter polygons keep the quads that the morph normals were derived on.
         let doc = scene(&json!([
             {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
             {"op":"mesh.shade_smooth","target":{"id":"body"},"elements":{"domain":"face","ids":["f0","f1","f2","f3","f4","f5"]}},
@@ -7832,14 +8076,298 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let (imported, _) = round_trip_in(&doc, directory.path())?;
         assert!(
+            !imported
+                .losses
+                .iter()
+                .any(|loss| loss.feature_id == "mesh.morph_normals"),
+            "Potter-derived morph normals are not a loss: {:?}",
+            imported.losses
+        );
+        let mesh = imported_mesh(&imported)?;
+        assert_eq!(
+            mesh.vertices.len(),
+            8,
+            "UV seams must rejoin the source vertices"
+        );
+        assert!(
+            mesh.faces.iter().all(|face| face.vertices.len() == 4),
+            "quads must survive the roundtrip"
+        );
+        assert!(
+            !mesh.attributes.contains_key("custom_normal"),
+            "UV seams must not create custom normals"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quad_smooth_seamed_shape_key_mesh_third_party_reports_morph_normal_loss() -> TestResult {
+        // Without Potter polygons the quads arrive as triangles, so their morph normals disagree.
+        let doc = scene(&json!([
+            {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
+            {"op":"mesh.shade_smooth","target":{"id":"body"},"elements":{"domain":"face","ids":["f0","f1","f2","f3","f4","f5"]}},
+            {"op":"uv.unwrap","target":{"id":"body"},"method":"smart"},
+            {"op":"shape_key.create","target":{"id":"body"},"id":"lift","name":"Lift","positions":{"0":[-1.0,-1.0,1.5]}}
+        ]))?;
+        let imported = import_without_potter_metadata(&doc)?;
+        assert!(
             imported
                 .losses
                 .iter()
                 .any(|loss| loss.feature_id == "mesh.morph_normals"),
-            "quad morph normals cannot be re-derived from triangles: {:?}",
+            "third-party morph normals are still compared: {:?}",
             imported.losses
         );
         Ok(())
+    }
+
+    #[test]
+    fn potter_polygons_roundtrip_restores_face_order_corners_materials_and_uvs() -> TestResult {
+        // Pentagonal caps, quad sides, and one triangle over two material slots.
+        let doc = scene(&json!([
+            {"op":"material.create","id":"jacket"},
+            {"op":"material.create","id":"skin"},
+            {"op":"node.create","id":"body","kind":"cylinder","params":{"vertices":5,"radius":1.0,"depth":2.0}},
+            {"op":"node.update","target":{"id":"body"},"set":{"materials":["jacket","skin"]}},
+            {"op":"mesh.triangulate","target":{"id":"body"},"elements":{"domain":"face","ids":["f2"]}},
+            {"op":"mesh.set_attribute","target":{"id":"body"},"elements":{"domain":"face","ids":["f1","f4"]},"material_index":1},
+            {"op":"uv.unwrap","target":{"id":"body"},"method":"smart"}
+        ]))?;
+        let directory = tempfile::tempdir()?;
+        let (imported, _) = round_trip_in(&doc, directory.path())?;
+        let source = first_mesh(&doc)?;
+        let mesh = imported_mesh(&imported)?;
+        let sizes = |mesh: &Mesh| {
+            mesh.faces
+                .iter()
+                .map(|face| face.vertices.len())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sizes(mesh), sizes(source));
+        assert!(
+            [3, 4, 5].iter().all(|size| sizes(mesh).contains(size)),
+            "{:?}",
+            sizes(mesh)
+        );
+        let materials = |mesh: &Mesh| {
+            mesh.faces
+                .iter()
+                .map(|face| face.material_index)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(materials(mesh), materials(source));
+        assert_close("positions", &face_points(mesh), &face_points(source));
+        assert_close("uvs", &face_uvs(mesh)?, &face_uvs(source)?);
+        Ok(())
+    }
+
+    #[test]
+    fn potter_shading_flags_roundtrip_exactly() -> TestResult {
+        let base = scene(&json!([
+            {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0}},
+            {"op":"mesh.shade_smooth","target":{"id":"cube"},"elements":{"domain":"face","ids":["f0","f2","f5"]}}
+        ]))?;
+        let edge_ids = first_mesh(&base)?
+            .edges
+            .iter()
+            .take(3)
+            .map(|edge| format!("e{}", edge.id))
+            .collect::<Vec<_>>();
+        let doc = apply_operations(
+            &base,
+            &json!([{"op":"mesh.set_attribute","target":{"id":"cube"},"elements":{"domain":"edge","ids":edge_ids},"name":"sharp","value":true}]),
+        )?;
+        let directory = tempfile::tempdir()?;
+        let (imported, _) = round_trip_in(&doc, directory.path())?;
+        let source = first_mesh(&doc)?;
+        let mesh = imported_mesh(&imported)?;
+        assert!(!sharp_edge_points(source)?.is_empty());
+        assert_eq!(smooth_face_flags(mesh)?, smooth_face_flags(source)?);
+        assert_eq!(sharp_edge_points(mesh)?, sharp_edge_points(source)?);
+        assert!(
+            !mesh.attributes.contains_key("custom_normal"),
+            "exact flags must derive no custom normals"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_potter_polygons_are_rejected() -> TestResult {
+        let doc = scene(&json!([
+            {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0}},
+            {"op":"mesh.shade_smooth","target":{"id":"cube"},"elements":{"domain":"face","ids":["f0"]}}
+        ]))?;
+        let cases: [(&str, Edit); 6] = [
+            ("corner beyond the vertex list", |polygons| {
+                polygons["faces"][0]["corners"][0] = json!(99);
+            }),
+            ("repeated corner", |polygons| {
+                let first = polygons["faces"][0]["corners"][0].clone();
+                polygons["faces"][0]["corners"][1] = first;
+            }),
+            ("face with two corners", |polygons| {
+                polygons["faces"][0]["corners"] = json!([0, 1]);
+            }),
+            ("face without a smooth flag", |polygons| {
+                polygons["faces"][0]
+                    .as_object_mut()
+                    .map(|face| face.remove("smooth"));
+            }),
+            ("faces that are not a list", |polygons| {
+                polygons["faces"] = json!("quads");
+            }),
+            ("sharp edge that is not a mesh edge", |polygons| {
+                let corners = polygons["faces"][0]["corners"].clone();
+                polygons["sharp_edges"] = json!([[corners[0], corners[2]]]);
+            }),
+        ];
+        for (name, edit) in cases {
+            let error = import_with_edited_polygons(&doc, edit)?
+                .err()
+                .ok_or(format!("{name} must be rejected"))?;
+            assert_eq!(
+                error.code,
+                crate::error::ErrorCode::ImportFailed,
+                "{name}: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_potter_polygon_version_imports_triangles_with_loss() -> TestResult {
+        let doc = scene(&json!([
+            {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0}}
+        ]))?;
+        let imported =
+            import_with_edited_polygons(&doc, |polygons| polygons["version"] = json!(2))??;
+        assert!(
+            imported
+                .losses
+                .iter()
+                .any(|loss| loss.feature_id == "mesh.polygon_topology"),
+            "unknown polygon versions are reported: {:?}",
+            imported.losses
+        );
+        let mesh = imported_mesh(&imported)?;
+        assert_eq!(mesh.faces.len(), 12, "the cube imports as its triangles");
+        assert!(mesh.faces.iter().all(|face| face.vertices.len() == 3));
+        Ok(())
+    }
+
+    /// Exports `doc`, applies `edit` to the mesh's `extras.potter.polygons`, and imports the result.
+    fn import_with_edited_polygons(
+        doc: &SceneDoc,
+        edit: fn(&mut Value),
+    ) -> TestResult<crate::error::Result<ImportedGraph>> {
+        let directory = tempfile::tempdir()?;
+        let snapshot = Snapshot::evaluate(doc, &EvaluationContext::default())?;
+        let (document, binary) =
+            export_with_root(doc, &snapshot, directory.path(), Some("scene.bin"))?;
+        let mut root: Value = serde_json::from_slice(&document)?;
+        edit(&mut root["meshes"][0]["extras"]["potter"]["polygons"]);
+        let path = directory.path().join("edited.gltf");
+        std::fs::write(&path, serde_json::to_vec(&root)?)?;
+        std::fs::write(directory.path().join("scene.bin"), binary)?;
+        Ok(import(&path, uuid::Uuid::new_v4().to_string()))
+    }
+
+    fn first_mesh(doc: &SceneDoc) -> TestResult<&Mesh> {
+        Ok(doc
+            .data_blocks
+            .values()
+            .find_map(|block| block.mesh.as_ref())
+            .ok_or("mesh is missing")?)
+    }
+
+    fn imported_mesh(imported: &ImportedGraph) -> TestResult<&Mesh> {
+        Ok(imported
+            .doc
+            .data_blocks
+            .values()
+            .find_map(|block| block.mesh.as_ref())
+            .ok_or("imported mesh is missing")?)
+    }
+
+    /// Corner positions per face, in face order, as flat `x, y, z` runs.
+    fn face_points(mesh: &Mesh) -> Vec<Vec<f64>> {
+        let points = mesh
+            .vertices
+            .iter()
+            .map(|vertex| (vertex.id, vertex.co))
+            .collect::<BTreeMap<_, _>>();
+        mesh.faces
+            .iter()
+            .map(|face| {
+                face.vertices
+                    .iter()
+                    .flat_map(|id| points[id].to_array())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Corner UVs per face, in face order, as flat `u, v` runs.
+    fn face_uvs(mesh: &Mesh) -> TestResult<Vec<Vec<f64>>> {
+        let entries = mesh
+            .attributes
+            .get("uv_map")
+            .and_then(Value::as_array)
+            .ok_or("uv_map is missing")?;
+        let mut by_face = BTreeMap::new();
+        for entry in entries {
+            let face_id = entry["face_id"].as_u64().ok_or("uv face ID is missing")?;
+            let mut values = Vec::new();
+            for corner in entry["uv"].as_array().ok_or("uv corners are missing")? {
+                values.push(corner[0].as_f64().ok_or("uv value is missing")?);
+                values.push(corner[1].as_f64().ok_or("uv value is missing")?);
+            }
+            by_face.insert(face_id, values);
+        }
+        Ok(mesh
+            .faces
+            .iter()
+            .map(|face| {
+                by_face
+                    .get(&u64::from(face.id))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
+
+    /// Sharp edges as sorted endpoint positions, rounded so f32 storage compares equal.
+    fn sharp_edge_points(mesh: &Mesh) -> TestResult<BTreeSet<[[i64; 3]; 2]>> {
+        let positions = mesh
+            .vertices
+            .iter()
+            .map(|vertex| (vertex.id, vertex.co))
+            .collect::<BTreeMap<_, _>>();
+        let rounded = |id: u32| {
+            let point = positions[&id];
+            point.to_array().map(|value| (value * 1.0e6).round() as i64)
+        };
+        Ok(mesh
+            .edges
+            .iter()
+            .zip(sharp_edge_flags(mesh)?)
+            .filter(|(_, sharp)| *sharp)
+            .map(|(edge, _)| {
+                let mut pair = [rounded(edge.vertices[0]), rounded(edge.vertices[1])];
+                pair.sort_unstable();
+                pair
+            })
+            .collect())
+    }
+
+    fn assert_close(what: &str, left: &[Vec<f64>], right: &[Vec<f64>]) {
+        assert_eq!(left.len(), right.len(), "{what}: face count");
+        for (left, right) in left.iter().zip(right) {
+            assert_eq!(left.len(), right.len(), "{what}: corner count");
+            for (left, right) in left.iter().zip(right) {
+                assert!((left - right).abs() < 1.0e-5, "{what}: {left} != {right}");
+            }
+        }
     }
 
     #[test]
