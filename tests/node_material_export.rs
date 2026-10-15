@@ -202,6 +202,8 @@ const EXPECTATIONS: &[Expectation] = &[
         name: "P24_MixEmissionShader",
         kind: Kind::Loss,
         losses: &["material.shader_graph.unrepresentable_surface"],
+        // Divergence (D3): Potter weights the emission by the 0.5 mix factor; Blender adds it at full weight.
+        expected: &[("emissiveFactor", "[0.5,0.5,0.5]")],
         ignore: &["emissiveFactor", "emissiveStrength"],
         ..BASE
     },
@@ -1175,6 +1177,21 @@ fn graph_materials_match_blender_probe_export() -> TestResult {
         String::from_utf8_lossy(&lossy.stderr)
     );
 
+    let blender_glb_parsed = parse_glb(&fs::read(&blender_glb)?)?;
+    let potter_glb_parsed = parse_glb(&fs::read(&potter_glb)?)?;
+    let required = |glb: &Glb| -> BTreeSet<String> {
+        glb.json["extensionsRequired"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(
+        required(&potter_glb_parsed),
+        required(&blender_glb_parsed),
+        "extensionsRequired differs from Blender's export"
+    );
     let blender_records = records(&parse_glb(&fs::read(&blender_glb)?)?)?;
     let potter_records = records(&parse_glb(&fs::read(&potter_glb)?)?)?;
     let table: BTreeSet<&str> = EXPECTATIONS.iter().map(|row| row.name).collect();
@@ -1217,6 +1234,141 @@ fn graph_materials_match_blender_probe_export() -> TestResult {
 
 /// Smoke test: the default Principled sphere (P01, no edits) exports as glTF without
 /// `--allow-lossy`.
+/// Blender 5.2 mesh attributes that multi-material, sharp, seamed and hidden meshes carry export
+/// without `--allow-lossy`, with the same primitives as Blender's own export. The UV Warp plane is
+/// the V-flip oracle: its UVs come from a modifier (Blender-layer data, V up).
+#[test]
+fn blender_mesh_attributes_export_without_allow_lossy() -> TestResult {
+    let Some(blender) = probe_blender()? else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let blend = root.path().join("attributes.blend");
+    run_blender(
+        &blender,
+        &fixture("build_attributes.py"),
+        vec![("POTTER_ATTRIBUTES_BLEND", blend.as_os_str().to_owned())],
+    )?;
+    let blender_glb = root.path().join("blender.glb");
+    export_gltf(&blender, &blend, &blender_glb)?;
+
+    let project = new_project(root.path())?;
+    import_blend(&project, &blend, &blender, false)?;
+    let potter_glb = root.path().join("potter.glb");
+    let output = export_glb(&project, &potter_glb, false)?;
+    assert!(
+        output.status.success(),
+        "mesh attributes need --allow-lossy: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let blender_parts = primitive_summary(&parse_glb(&fs::read(&blender_glb)?)?)?;
+    let potter_parts = primitive_summary(&parse_glb(&fs::read(&potter_glb)?)?)?;
+    assert_eq!(
+        potter_parts
+            .iter()
+            .map(|(m, _, _)| m.as_str())
+            .collect::<BTreeSet<_>>(),
+        blender_parts
+            .iter()
+            .map(|(m, _, _)| m.as_str())
+            .collect::<BTreeSet<_>>(),
+        "material slots per primitive differ from Blender's export"
+    );
+    assert_eq!(
+        potter_parts.iter().map(|(_, n, _)| *n).sum::<usize>(),
+        blender_parts.iter().map(|(_, n, _)| *n).sum::<usize>(),
+        "triangle counts differ from Blender's export"
+    );
+    let warp_blender = texcoords_for(&parse_glb(&fs::read(&blender_glb)?)?, "AttrWarp")?;
+    let warp_potter = texcoords_for(&parse_glb(&fs::read(&potter_glb)?)?, "AttrWarp")?;
+    assert!(
+        !warp_blender.is_empty(),
+        "Blender exported no UVs for the warp plane"
+    );
+    assert_eq!(
+        warp_potter, warp_blender,
+        "UV Warp plane TEXCOORD_0 differs from Blender's export"
+    );
+    Ok(())
+}
+
+/// (material name, triangle count, primitive index) for every primitive of a GLB.
+fn primitive_summary(glb: &Glb) -> TestResult<Vec<(String, usize, usize)>> {
+    let mut rows = Vec::new();
+    for (mesh_index, mesh) in glb.json["meshes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (index, primitive) in mesh["primitives"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let material = primitive["material"]
+                .as_u64()
+                .and_then(|value| {
+                    glb.json["materials"][usize::try_from(value).ok()?]["name"].as_str()
+                })
+                .unwrap_or_default()
+                .to_owned();
+            let indices = primitive["indices"].as_u64().ok_or("indices missing")?;
+            let count = glb.json["accessors"][usize::try_from(indices)?]["count"]
+                .as_u64()
+                .ok_or("index count missing")?;
+            rows.push((
+                material,
+                usize::try_from(count)? / 3,
+                mesh_index * 100 + index,
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+/// `TEXCOORD_0` values, sorted, of every primitive that uses `material`, rounded to 1e-4.
+fn texcoords_for(glb: &Glb, material: &str) -> TestResult<Vec<[i64; 2]>> {
+    let mut values = Vec::new();
+    for mesh in glb.json["meshes"].as_array().into_iter().flatten() {
+        for primitive in mesh["primitives"].as_array().into_iter().flatten() {
+            let name = primitive["material"].as_u64().and_then(|value| {
+                glb.json["materials"][usize::try_from(value).ok()?]["name"].as_str()
+            });
+            if name != Some(material) {
+                continue;
+            }
+            let accessor = primitive["attributes"]["TEXCOORD_0"]
+                .as_u64()
+                .ok_or("TEXCOORD_0 missing")?;
+            let accessor = &glb.json["accessors"][usize::try_from(accessor)?];
+            let view = &glb.json["bufferViews"][usize::try_from(
+                accessor["bufferView"]
+                    .as_u64()
+                    .ok_or("bufferView missing")?,
+            )?];
+            let start = usize::try_from(view["byteOffset"].as_u64().unwrap_or(0))?
+                + usize::try_from(accessor["byteOffset"].as_u64().unwrap_or(0))?;
+            let count = usize::try_from(accessor["count"].as_u64().ok_or("count missing")?)?;
+            let binary = &glb.binary;
+            for vertex in 0..count {
+                let at = start + vertex * 8;
+                let u = f32::from_le_bytes(binary[at..at + 4].try_into()?);
+                let v = f32::from_le_bytes(binary[at + 4..at + 8].try_into()?);
+                values.push([
+                    (f64::from(u) * 1.0e4).round() as i64,
+                    (f64::from(v) * 1.0e4).round() as i64,
+                ]);
+            }
+        }
+    }
+    values.sort_unstable();
+    Ok(values)
+}
+
 #[test]
 fn default_principled_sphere_exports_without_allow_lossy() -> TestResult {
     let Some(blender) = probe_blender()? else {

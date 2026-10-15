@@ -14,7 +14,7 @@ use crate::{
     eval::{EvaluationContext, Snapshot},
     exchange::{
         self, ExportOptions, Loss,
-        gltf::{mesh_default_uv_layer, surface_textures},
+        gltf::{is_color_attribute, mesh_default_uv_layer, surface_textures},
         material_surface::{feature_id, material_is_used, resolve_surface},
     },
     hash,
@@ -534,10 +534,7 @@ fn mesh_color_losses(doc: &SceneDoc) -> Vec<Loss> {
             continue;
         };
         for entry in entries {
-            let is_color = matches!(
-                entry["data_type"].as_str(),
-                Some("FLOAT_COLOR" | "BYTE_COLOR")
-            );
+            let is_color = is_color_attribute(entry);
             let Some(name) = entry["name"].as_str().filter(|_| is_color) else {
                 continue;
             };

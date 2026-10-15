@@ -9,8 +9,11 @@ use crate::{
 };
 
 use super::super::{
-    gltf::{TextureExport, reference_texture, remapped_reference_texture, unsupported_export},
-    material_surface::{AlphaMode, ResolvedSurface, SampledTexture, TextureChannel},
+    gltf::{TextureExport, reads, unsupported_export},
+    material_surface::{
+        AlphaMode, ResolvedSurface, SampledTexture, TextureChannel, reference_sampled,
+        remapped_reference_sampled,
+    },
 };
 
 pub(crate) fn uv_textures(mtoon: &AvatarMtoon) -> impl Iterator<Item = &TextureRef> {
@@ -105,7 +108,8 @@ pub(super) fn v1(
     });
     if let Some(texture) = &mtoon.shade_multiply_texture {
         value["shadeMultiplyTexture"] = texture_export.sampled_info(
-            &reference_texture(texture),
+            &reference_sampled(texture),
+            reads::RGBA,
             doc,
             root_path,
             binary,
@@ -114,7 +118,8 @@ pub(super) fn v1(
     }
     if let Some(shift) = &mtoon.shading_shift_texture {
         let mut info = texture_export.sampled_info(
-            &reference_texture(&shift.texture),
+            &reference_sampled(&shift.texture),
+            reads::RGBA,
             doc,
             root_path,
             binary,
@@ -137,7 +142,8 @@ pub(super) fn v1(
     ] {
         if let Some(texture) = texture {
             value[key] = texture_export.sampled_info(
-                &reference_texture(texture),
+                &reference_sampled(texture),
+                reads::RGBA,
                 doc,
                 root_path,
                 binary,
@@ -287,8 +293,8 @@ pub(super) fn v0(
     ] {
         if let Some(reference) = reference {
             let texture = match remap {
-                Some(channel) => remapped_reference_texture(reference, channel),
-                None => reference_texture(reference),
+                Some(channel) => remapped_reference_sampled(reference, channel),
+                None => reference_sampled(reference),
             };
             add_texture(
                 &mut texture_properties,
@@ -395,9 +401,14 @@ fn main_texture_st(surface: &ResolvedSurface) -> Result<[f64; 4]> {
             "VRM 0.x MToon `_MainTex_ST` cannot represent a base texture rotation; clear the rotation or export VRM 1.0.",
         ));
     }
-    let [scale_x, scale_y] = transform.scale;
-    let [offset_x, offset_y] = transform.offset;
-    Ok([scale_x, scale_y, offset_x, 1.0 - offset_y - scale_y])
+    Ok(legacy_st(transform.scale, transform.offset))
+}
+
+/// VRM 0.x `_MainTex_ST` (scale x, scale y, offset x, offset y) from a glTF KHR transform. Unity-style
+/// shaders flip V relative to glTF, so the offset y is `1 - offset_y - scale_y`. Shared by the
+/// material property and the expression texture-transform bind.
+pub(crate) fn legacy_st(scale: [f64; 2], offset: [f64; 2]) -> [f64; 4] {
+    [scale[0], scale[1], offset[0], 1.0 - offset[1] - scale[1]]
 }
 
 fn add_texture(
@@ -470,5 +481,18 @@ fn outline_mode_v1(mode: AvatarOutlineWidthMode) -> &'static str {
         AvatarOutlineWidthMode::None => "none",
         AvatarOutlineWidthMode::WorldCoordinates => "worldCoordinates",
         AvatarOutlineWidthMode::ScreenCoordinates => "screenCoordinates",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::legacy_st;
+
+    #[test]
+    fn legacy_st_flips_v_and_keeps_scale_and_offset_x() {
+        // glTF offset (0.25, 0) with scale (2, 2): Unity's offset y is 1 - 0 - 2 = -1.
+        assert_eq!(legacy_st([2.0, 2.0], [0.25, 0.0]), [2.0, 2.0, 0.25, -1.0]);
+        // Identity transform (scale 1, offset 0) maps to the identity _MainTex_ST.
+        assert_eq!(legacy_st([1.0, 1.0], [0.0, 0.0]), [1.0, 1.0, 0.0, 0.0]);
     }
 }

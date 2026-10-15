@@ -228,8 +228,8 @@ export const MATERIALS = {
 };
 
 // Node-graph materials (material.create with `graph`). Kept apart from MATERIALS because their
-// surface comes from the graph, not from the material fields. Not assigned to any mesh: the
-// glTF exporter writes every material, so this one is exported as a material only. Images are
+// surface comes from the graph, not from the material fields. Assigned to the `graph_part` mesh
+// only (off to the side, outside every render check), so the add-on imports it too. Images are
 // existing IMAGES entries, so the image count is unchanged.
 export const GRAPH_MATERIALS = {
   graph_avatar: {

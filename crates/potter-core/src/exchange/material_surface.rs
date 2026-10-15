@@ -302,7 +302,7 @@ fn normalize_uv_layer(name: Option<&str>) -> Option<String> {
 }
 
 /// Channels R, G, B, A each read the same channel of `image`.
-fn identity_channels(image: &Id) -> [Option<ChannelSource>; 4] {
+pub(crate) fn identity_channels(image: &Id) -> [Option<ChannelSource>; 4] {
     [
         TextureChannel::Red,
         TextureChannel::Green,
@@ -315,6 +315,25 @@ fn identity_channels(image: &Id) -> [Option<ChannelSource>; 4] {
             channel,
         })
     })
+}
+
+/// A Potter texture reference as a glTF texture: the image's own R, G, B, A channels.
+pub(crate) fn reference_sampled(reference: &TextureRef) -> SampledTexture {
+    sampled_from_ref(reference, identity_channels(&reference.image))
+}
+
+/// One channel of a Potter texture reference, as grey RGB with opaque alpha (VRM `MToon` masks).
+pub(crate) fn remapped_reference_sampled(
+    reference: &TextureRef,
+    channel: TextureChannel,
+) -> SampledTexture {
+    let source = || {
+        Some(ChannelSource {
+            image: reference.image.clone(),
+            channel,
+        })
+    };
+    sampled_from_ref(reference, [source(), source(), source(), None])
 }
 
 /// Sampling state of a Potter texture reference (repeat wrap, no transform).
@@ -669,6 +688,9 @@ fn is_identity_transform(transform: &TextureTransform) -> bool {
         && crate::float::equal_f64_array(&transform.scale, &[1.0; 2])
 }
 
+/// Longest chain of Reroute nodes followed upstream; longer chains are reported as unlinked.
+const MAX_REROUTE_DEPTH: usize = 64;
+
 /// Reduces the graph of one material. Losses accumulate; structural problems are errors.
 struct GraphReducer<'a> {
     doc: &'a SceneDoc,
@@ -687,12 +709,28 @@ impl<'a> GraphReducer<'a> {
     }
 
     /// The link into `node_id.socket`, if any.
+    /// The link feeding `node_id.socket`, with Reroute nodes stepped over: Blender's exporter
+    /// follows a Reroute to its input (`search_node_tree.py`). An unlinked Reroute reads as unlinked.
     fn link_into(&self, node_id: &Id, socket: &str) -> Option<&'a GraphLink> {
         let group: &'a NodeGroup = self.group;
-        group
+        let mut link = group
             .links
             .iter()
-            .find(|link| link.to_node == *node_id && link.to_socket == socket)
+            .find(|link| link.to_node == *node_id && link.to_socket == socket)?;
+        for _ in 0..MAX_REROUTE_DEPTH {
+            let is_reroute = group
+                .nodes
+                .get(&link.from_node)
+                .is_some_and(|node| node.node_type == "NodeReroute");
+            if !is_reroute {
+                break;
+            }
+            link = group
+                .links
+                .iter()
+                .find(|feed| feed.to_node == link.from_node)?;
+        }
+        Some(link)
     }
 
     fn invalid(&self, node_id: &Id, message: String) -> PotError {
@@ -2058,19 +2096,15 @@ impl GraphReducer<'_> {
         }))
     }
 
-    /// `Specular IOR Level` (A): factor min(1, 2 * level), tint scaled by max(1, 2 * level)
-    /// (Blender specular.py). A textured level uses factor 2 (sampled A doubled) with no tint
-    /// scale: the per-pixel `2 * level` cannot be scaled exactly by a glTF factor.
+    /// `Specular IOR Level` (A): Blender's `2 * level` splits between `specularFactor`, capped at 1,
+    /// and the tint, which takes the excess (Blender specular.py). A textured level reads the raw
+    /// texture A, as Blender's exporter does, and its doubling moves into the tint.
     fn specular(&mut self, node_id: &Id, depth: usize) -> crate::error::Result<Option<Specular>> {
         let level = self.scalar_input(node_id, "Specular IOR Level", 0.5, depth)?;
         let tint = self.color_input(node_id, "Specular Tint", [1.0; 3], depth)?;
         let doubled = 2.0 * level.factor;
-        let (factor, tint_scale) = if level.tex.is_some() {
-            (doubled, 1.0)
-        } else {
-            (doubled.min(1.0), doubled.max(1.0))
-        };
-        let color_factor = tint.factor.map(|channel| channel * tint_scale);
+        let factor = doubled.min(1.0);
+        let color_factor = tint.factor.map(|channel| channel * doubled.max(1.0));
         if crate::float::equal_f64(factor, 1.0)
             && crate::float::equal_f64_array(&color_factor, &[1.0; 3])
             && level.tex.is_none()
@@ -2231,6 +2265,13 @@ impl GraphReducer<'_> {
                         None,
                     );
                 } else {
+                    if !crate::float::equal_f64(occlusion.factor, 1.0) {
+                        self.loss(
+                            feature_id::UNSUPPORTED_NODE,
+                            format!("occlusion on `{node_id}` is multiplied by {}; glTF occlusion strength is not a multiplier, so the factor is ignored", occlusion.factor),
+                            None,
+                        );
+                    }
                     found = Some(occlusion);
                 }
             }
@@ -2404,9 +2445,11 @@ impl GraphReducer<'_> {
                     .as_ref()
                     .map(|sample| slot_texture(sample, 0, TextureChannel::Red))
             };
+            // Blender's exporter writes strength only for its Mix-with-white pattern, which this
+            // reducer does not model; a multiplied occlusion factor is a loss (see `occlusion`).
             texture.map(|texture| TexturedOcclusion {
                 texture,
-                strength: occ.factor,
+                strength: 1.0,
             })
         });
         ResolvedSurface {
@@ -2984,5 +3027,62 @@ mod tests {
         assert!(close(surface.emissive.factor[1], 3.2));
         assert!(close(surface.emissive.factor[2], 1.6));
         assert_eq!(surface.base_color.factor, [0.5, 0.5, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn reroute_is_stepped_over_to_its_texture() {
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "tex",
+            "ShaderNodeTexImage",
+            &json!({"image": "img", "interpolation": "Linear", "extension": "REPEAT"}),
+            &json!({}),
+        );
+        add_node(&mut group, "dot", "NodeReroute", &json!({}), &json!({}));
+        link(&mut group, "tex", "Color", "dot", "Input");
+        link(&mut group, "dot", "Output", "bsdf", "Base Color");
+        let (surface, losses) = resolved(&document(Some(group)));
+        assert!(losses.is_empty(), "{losses:?}");
+        assert!(surface.base_color.texture.is_some());
+    }
+
+    #[test]
+    fn unlinked_reroute_reads_as_unlinked() {
+        let mut group = principled_graph(&json!({}));
+        add_node(&mut group, "dot", "NodeReroute", &json!({}), &json!({}));
+        link(&mut group, "dot", "Output", "bsdf", "Base Color");
+        let (surface, losses) = resolved(&document(Some(group)));
+        assert!(losses.is_empty(), "{losses:?}");
+        assert!(surface.base_color.texture.is_none());
+        assert_eq!(surface.base_color.factor[0], 0.8);
+    }
+
+    #[test]
+    fn textured_specular_level_reads_raw_texture_and_moves_doubling_to_tint() {
+        let mut group = principled_graph(&json!({"Specular IOR Level": 0.5}));
+        add_node(
+            &mut group,
+            "tex",
+            "ShaderNodeTexImage",
+            &json!({"image": "img", "interpolation": "Linear", "extension": "REPEAT"}),
+            &json!({}),
+        );
+        link(&mut group, "tex", "Alpha", "bsdf", "Specular IOR Level");
+        let (surface, losses) = resolved(&document(Some(group)));
+        assert!(losses.is_empty(), "{losses:?}");
+        let specular = surface.specular.unwrap();
+        assert!(close(specular.factor, 1.0));
+        assert!(close(specular.color_factor[0], 2.0));
+        assert!(specular.texture.is_some());
+    }
+
+    #[test]
+    fn specular_factor_never_exceeds_one() {
+        let group = principled_graph(&json!({"Specular IOR Level": 0.9}));
+        let (surface, _) = resolved(&document(Some(group)));
+        let specular = surface.specular.unwrap();
+        assert!(close(specular.factor, 1.0));
+        assert!(close(specular.color_factor[0], 1.8));
     }
 }

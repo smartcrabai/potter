@@ -72,10 +72,19 @@ test('5 normal map changes only pixels that hit skin faces', async (t) => {
   assert.ok((r.diffByMaterial.skin ?? 0) > 0, `normal map changed no skin pixels: ${j(r)}`);
 });
 
+const MASK_JUMP_MISMATCH_CEILING = 2166;
+const MASK_BAND_MISMATCH_CEILING = 714;
+
 test('6 UV animation: mask 0 pixels stay still; mask > 0 pixels move as predicted by speed', async (t) => {
   const r = await run(t, 'uvAnimation');
   assert.equal(r.offsetDelta, r.expectedOffsetDelta, `scroll offset delta ${r.offsetDelta} != speed*dt ${r.expectedOffsetDelta}`);
+  t.diagnostic(`mask classes: ${j(r.byClass)}`);
+  // Only pixels away from UV jumps and the mask step must match the nearest-texel prediction.
   assert.equal(r.mismatch, 0, `pixels disagree with predicted motion: ${j(r)}`);
+  // Jump and band pixels are measured, not explained: their mismatch counts are ceilings recorded on
+  // this fixture (Closest sampling, +-1 texel read). A higher count is a regression to investigate.
+  assert.ok(r.byClass.jump.mismatch <= MASK_JUMP_MISMATCH_CEILING, `UV-jump mismatches ${r.byClass.jump.mismatch} > ${MASK_JUMP_MISMATCH_CEILING}: ${j(r.byClass)}`);
+  assert.ok(r.byClass.band.mismatch <= MASK_BAND_MISMATCH_CEILING, `mask-step mismatches ${r.byClass.band.mismatch} > ${MASK_BAND_MISMATCH_CEILING}: ${j(r.byClass)}`);
   assert.ok(r.predictedChanged > 0, `no predicted moving pixels: ${j(r)}`);
   assert.ok(r.maskZeroDetermined > 0, `no determined mask-0 pixels: ${j(r)}`);
 });

@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::{
-    import_error,
+    import_error, is_default_material_graph,
     material_surface::{
         AlphaMode, ChannelSource, ResolvedSurface, SampledTexture, TextureChannel,
         TextureTransform, TextureWrap, TexturedNormal, material_is_used, resolve_fields_surface,
@@ -74,16 +74,20 @@ impl TextureExport {
     }
 
     /// Texture info for a sampled texture: `index`, `texCoord` (always the mesh's first UV layer),
-    /// and `KHR_texture_transform` when the texture has a transform.
+    /// and `KHR_texture_transform` when the texture has a transform. `reads` names the channels
+    /// the slot samples; the rest are free to hold the image's own values.
     pub(crate) fn sampled_info(
         &mut self,
         texture: &SampledTexture,
+        reads: [bool; 4],
         doc: &SceneDoc,
         root_path: &Path,
         binary: &mut Vec<u8>,
         views: &mut Vec<Value>,
     ) -> Result<Value> {
-        let index = self.sampled_index(texture, doc, root_path, binary, views)?;
+        let mut filled = texture.clone();
+        fill_unread(&mut filled.channels, reads);
+        let index = self.sampled_index(&filled, doc, root_path, binary, views)?;
         let mut info = json!({ "index": index, "texCoord": 0 });
         if let Some(transform) = &texture.transform {
             self.uses_texture_transform = true;
@@ -224,6 +228,64 @@ fn identity_image(channels: &[Option<ChannelSource>; 4]) -> Option<&Id> {
     (same_image && in_order).then_some(&red.image)
 }
 
+/// glTF channels (R, G, B, A) a texture slot samples. Unread channels may hold any value, so a
+/// texture whose read channels already sit in place can reuse its image without re-encoding.
+pub(crate) mod reads {
+    pub(crate) const RGBA: [bool; 4] = [true, true, true, true];
+    pub(crate) const RGB: [bool; 4] = [true, true, true, false];
+    pub(crate) const R: [bool; 4] = [true, false, false, false];
+    pub(crate) const G: [bool; 4] = [false, true, false, false];
+    pub(crate) const A: [bool; 4] = [false, false, false, true];
+    /// metallicRoughness: G roughness, B metallic.
+    pub(crate) const MR: [bool; 4] = [false, true, true, false];
+}
+
+/// Channels a base color slot samples: alpha only when the material is not opaque (glTF ignores
+/// `baseColorTexture` alpha under OPAQUE).
+fn base_reads(surface: &ResolvedSurface) -> [bool; 4] {
+    if matches!(surface.alpha_mode, AlphaMode::Opaque) {
+        reads::RGB
+    } else {
+        reads::RGBA
+    }
+}
+
+/// Fills unread channels that are constant 1.0 with the one image the texture reads, at their own
+/// channel. glTF never samples those channels, so the output is unchanged; a texture whose read
+/// channels already sit in place then reuses its image whole, as Blender's exporter does when it
+/// fills only the channels it needs (`encode_image.py`, `__on_happy_path`).
+fn fill_unread(channels: &mut [Option<ChannelSource>; 4], reads: [bool; 4]) {
+    let mut sources = channels.iter().flatten().map(|source| &source.image);
+    let Some(image) = sources.next().cloned() else {
+        return;
+    };
+    if sources.any(|other| *other != image) {
+        return;
+    }
+    let own = [
+        TextureChannel::Red,
+        TextureChannel::Green,
+        TextureChannel::Blue,
+        TextureChannel::Alpha,
+    ];
+    for (slot, read) in reads.iter().enumerate() {
+        if !read && channels[slot].is_none() {
+            channels[slot] = Some(ChannelSource {
+                image: image.clone(),
+                channel: own[slot],
+            });
+        }
+    }
+}
+
+/// Whether a `blender_attributes` entry is a Blender color layer (`FLOAT_COLOR` or `BYTE_COLOR`).
+pub(crate) fn is_color_attribute(entry: &Value) -> bool {
+    matches!(
+        entry["data_type"].as_str(),
+        Some("FLOAT_COLOR" | "BYTE_COLOR")
+    )
+}
+
 /// A derived glTF image: its pixels plus the Potter images it was packed from.
 struct PackedImage {
     name: String,
@@ -359,48 +421,6 @@ fn wrap_code(wrap: TextureWrap) -> u32 {
         TextureWrap::Repeat => 10497,
         TextureWrap::ClampToEdge => 33071,
         TextureWrap::MirroredRepeat => 33648,
-    }
-}
-
-/// A Potter texture reference as a glTF texture: the image's own R, G, B, A channels.
-pub(crate) fn reference_texture(reference: &TextureRef) -> SampledTexture {
-    let source = |channel| {
-        Some(ChannelSource {
-            image: reference.image.clone(),
-            channel,
-        })
-    };
-    SampledTexture {
-        channels: [
-            source(TextureChannel::Red),
-            source(TextureChannel::Green),
-            source(TextureChannel::Blue),
-            source(TextureChannel::Alpha),
-        ],
-        uv_layer: None,
-        interpolation: reference.interpolation,
-        wrap: [TextureWrap::Repeat; 2],
-        transform: None,
-    }
-}
-
-/// One channel of a Potter texture reference as grey RGB with opaque alpha (VRM `MToon` masks).
-pub(crate) fn remapped_reference_texture(
-    reference: &TextureRef,
-    channel: TextureChannel,
-) -> SampledTexture {
-    let source = || {
-        Some(ChannelSource {
-            image: reference.image.clone(),
-            channel,
-        })
-    };
-    SampledTexture {
-        channels: [source(), source(), source(), None],
-        uv_layer: None,
-        interpolation: reference.interpolation,
-        wrap: [TextureWrap::Repeat; 2],
-        transform: None,
     }
 }
 
@@ -949,9 +969,15 @@ fn uv_map_set(mesh: &Mesh, entries: &[Value]) -> Result<BTreeMap<u32, Vec<[f64; 
                 "UV corner count does not match its face",
             ));
         }
+        // shortcut: entries with a `layer` key come from Blender-layer code paths (UV modifiers) and
+        // keep Blender's V-up values, so they are flipped here. PR12 (one `uv_layers` store) should
+        // store one convention and delete this flip.
+        let blender_layer = entry.get("layer").is_some();
         let values = coordinates
             .iter()
-            .map(parse_uv)
+            .map(|value| {
+                parse_uv(value).map(|[u, v]| if blender_layer { [u, 1.0 - v] } else { [u, v] })
+            })
             .collect::<Result<Vec<_>>>()?;
         if let Some(previous) = set.get(&face_id)
             && previous != &values
@@ -1486,7 +1512,15 @@ fn valid_vertex_groups_attribute(attribute: &Value, data_block: &DataBlock) -> b
 
 /// Blender per-element attributes that carry no exported data: editor selection, cached
 /// topology, the vertex positions, and the shading flag already kept in `blender_polygon_smooth`.
-const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 13] = [
+/// Blender 5.2 attributes the writer skips. Each one's data is carried elsewhere (face slots in
+/// `Face.material_index`, edge flags in `blender_edge_flags`, shading in `blender_polygon_smooth`),
+/// is editor state, or is topology kept in the mesh; hidden geometry is written, as Blender's
+/// exporter writes it (`primitive_extract.py` reads no hide flags).
+const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 17] = [
+    "material_index",
+    "sharp_edge",
+    "uv_seam",
+    ".hide_poly",
     ".select_vert",
     ".select_edge",
     ".select_poly",
@@ -1506,10 +1540,7 @@ const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 13] = [
 /// are never written here; `export_losses` reports each one as `mesh.color_attribute`.
 fn blender_attribute_exportable(mesh: &Mesh, entry: &Value) -> bool {
     let name = entry["name"].as_str().unwrap_or_default();
-    let color = matches!(
-        entry["data_type"].as_str(),
-        Some("FLOAT_COLOR" | "BYTE_COLOR")
-    );
+    let color = is_color_attribute(entry);
     let uv_layer = mesh
         .attributes
         .get("blender_uv_layers")
@@ -2583,7 +2614,9 @@ pub(crate) fn export_vrm_with_frames(
 ///
 /// A material used by a mesh must resolve. An unused material whose graph does not resolve falls
 /// back to its explicit fields, so it never blocks export. Every referenced image must exist.
-fn resolve_material_surfaces(doc: &SceneDoc) -> Result<BTreeMap<Id, ResolvedSurface>> {
+/// Every material resolved to its glTF surface once: used materials must resolve, unused ones fall
+/// back to their fields so an invalid graph on an unused material never blocks export.
+pub(crate) fn resolve_material_surfaces(doc: &SceneDoc) -> Result<BTreeMap<Id, ResolvedSurface>> {
     let mut surfaces = BTreeMap::new();
     for id in doc.materials.keys() {
         let surface = if material_is_used(doc, id) {
@@ -2673,36 +2706,54 @@ fn material_value(
         "roughnessFactor": surface.roughness
     });
     if let Some(texture) = &surface.base_color.texture {
-        pbr["baseColorTexture"] =
-            texture_export.sampled_info(texture, doc, root_path, binary, views)?;
+        pbr["baseColorTexture"] = texture_export.sampled_info(
+            texture,
+            base_reads(surface),
+            doc,
+            root_path,
+            binary,
+            views,
+        )?;
     }
     if let Some(texture) = &surface.metallic_roughness_texture {
         pbr["metallicRoughnessTexture"] =
-            texture_export.sampled_info(texture, doc, root_path, binary, views)?;
+            texture_export.sampled_info(texture, reads::MR, doc, root_path, binary, views)?;
     }
     let mut value = json!({
         "name": material.name,
         "pbrMetallicRoughness": pbr,
         "emissiveFactor": emissive_factor,
         "doubleSided": surface.double_sided,
-        "extras": { "potter": {
-            "id": id,
-            "emission_strength": material.emission_strength,
-            "transmission": material.transmission,
-            "ior": material.ior
-        } }
+        "extras": { "potter": { "id": id } }
     });
+    // These fields are the material's own values. A graph material takes them from its graph, so
+    // writing them would contradict the glTF extensions on re-import.
+    if material
+        .node_tree
+        .as_ref()
+        .is_none_or(|graph| is_default_material_graph(doc, graph))
+    {
+        value["extras"]["potter"]["emission_strength"] = json!(material.emission_strength);
+        value["extras"]["potter"]["transmission"] = json!(material.transmission);
+        value["extras"]["potter"]["ior"] = json!(material.ior);
+    }
     if let Some(texture) = &surface.emissive.texture {
         value["emissiveTexture"] =
-            texture_export.sampled_info(texture, doc, root_path, binary, views)?;
+            texture_export.sampled_info(texture, reads::RGB, doc, root_path, binary, views)?;
     }
     if let Some(normal) = &surface.normal {
         value["normalTexture"] =
             textured_normal_info(normal, doc, root_path, texture_export, binary, views)?;
     }
     if let Some(occlusion) = &surface.occlusion {
-        let mut info =
-            texture_export.sampled_info(&occlusion.texture, doc, root_path, binary, views)?;
+        let mut info = texture_export.sampled_info(
+            &occlusion.texture,
+            reads::R,
+            doc,
+            root_path,
+            binary,
+            views,
+        )?;
         if !crate::float::equal_f64(occlusion.strength, 1.0) {
             info["strength"] = json!(occlusion.strength);
         }
@@ -2732,7 +2783,7 @@ fn material_value(
         if let Some(texture) = &transmission.texture {
             extension.insert(
                 "transmissionTexture".to_owned(),
-                texture_export.sampled_info(texture, doc, root_path, binary, views)?,
+                texture_export.sampled_info(texture, reads::R, doc, root_path, binary, views)?,
             );
         }
         add_extension(
@@ -2761,7 +2812,7 @@ fn material_value(
         if let Some(texture) = &clearcoat.texture {
             extension.insert(
                 "clearcoatTexture".to_owned(),
-                texture_export.sampled_info(texture, doc, root_path, binary, views)?,
+                texture_export.sampled_info(texture, reads::R, doc, root_path, binary, views)?,
             );
         }
         if !crate::float::equal_f64(clearcoat.roughness_factor, 0.0) {
@@ -2773,7 +2824,7 @@ fn material_value(
         if let Some(texture) = &clearcoat.roughness_texture {
             extension.insert(
                 "clearcoatRoughnessTexture".to_owned(),
-                texture_export.sampled_info(texture, doc, root_path, binary, views)?,
+                texture_export.sampled_info(texture, reads::G, doc, root_path, binary, views)?,
             );
         }
         if let Some(normal) = &clearcoat.normal {
@@ -2797,7 +2848,7 @@ fn material_value(
         if let Some(texture) = &sheen.color_texture {
             extension.insert(
                 "sheenColorTexture".to_owned(),
-                texture_export.sampled_info(texture, doc, root_path, binary, views)?,
+                texture_export.sampled_info(texture, reads::RGB, doc, root_path, binary, views)?,
             );
         }
         if !crate::float::equal_f64(sheen.roughness_factor, 0.0) {
@@ -2809,7 +2860,7 @@ fn material_value(
         if let Some(texture) = &sheen.roughness_texture {
             extension.insert(
                 "sheenRoughnessTexture".to_owned(),
-                texture_export.sampled_info(texture, doc, root_path, binary, views)?,
+                texture_export.sampled_info(texture, reads::A, doc, root_path, binary, views)?,
             );
         }
         add_extension(
@@ -2827,7 +2878,7 @@ fn material_value(
         if let Some(texture) = &specular.texture {
             extension.insert(
                 "specularTexture".to_owned(),
-                texture_export.sampled_info(texture, doc, root_path, binary, views)?,
+                texture_export.sampled_info(texture, reads::A, doc, root_path, binary, views)?,
             );
         }
         if !crate::float::equal_f64_array(&specular.color_factor, &[1.0; 3]) {
@@ -2839,7 +2890,7 @@ fn material_value(
         if let Some(texture) = &specular.color_texture {
             extension.insert(
                 "specularColorTexture".to_owned(),
-                texture_export.sampled_info(texture, doc, root_path, binary, views)?,
+                texture_export.sampled_info(texture, reads::RGB, doc, root_path, binary, views)?,
             );
         }
         add_extension(
@@ -2889,7 +2940,8 @@ fn textured_normal_info(
     binary: &mut Vec<u8>,
     views: &mut Vec<Value>,
 ) -> Result<Value> {
-    let mut info = texture_export.sampled_info(&normal.texture, doc, root_path, binary, views)?;
+    let mut info =
+        texture_export.sampled_info(&normal.texture, reads::RGB, doc, root_path, binary, views)?;
     if !crate::float::equal_f64(normal.scale, 1.0) {
         info["scale"] = json!(normal.scale);
     }
@@ -9359,5 +9411,100 @@ mod tests {
             "a shared POSITION must not discard the second primitive's morph target"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod material_texture_tests {
+    #![expect(clippy::unwrap_used, reason = "tests")]
+    use glam::DVec3;
+    use serde_json::json;
+
+    use crate::{geom::Mesh, model::Id};
+
+    use super::{
+        ChannelSource, TextureChannel, export_uv_sets, fill_unread, identity_image, reads,
+    };
+
+    fn quad() -> Mesh {
+        Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(1.0, 1.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )
+        .unwrap()
+    }
+
+    fn source(image: &str, channel: TextureChannel) -> ChannelSource {
+        ChannelSource {
+            image: Id::new(image).unwrap(),
+            channel,
+        }
+    }
+
+    #[test]
+    fn uv_entries_with_a_layer_key_are_flipped_to_gltf_v() {
+        let mut mesh = quad();
+        let face = mesh.faces[0].id;
+        mesh.attributes.insert(
+            "uv_map".to_owned(),
+            json!([{"face_id": face, "layer": "UVMap",
+                    "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 0.25], [0.0, 0.25]]}]),
+        );
+        let sets = export_uv_sets(&mesh).unwrap();
+        assert_eq!(sets.len(), 1);
+        let uvs = &sets[0][&face];
+        assert_eq!(uvs[2], [1.0, 0.75]);
+        assert_eq!(uvs[3], [0.0, 0.75]);
+    }
+
+    #[test]
+    fn native_uv_entries_without_a_layer_key_keep_their_values() {
+        let mut mesh = quad();
+        let face = mesh.faces[0].id;
+        mesh.attributes.insert(
+            "uv_map".to_owned(),
+            json!([{"face_id": face, "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 0.25], [0.0, 0.25]]}]),
+        );
+        let sets = export_uv_sets(&mesh).unwrap();
+        assert_eq!(sets[0][&face][2], [1.0, 0.25]);
+    }
+
+    #[test]
+    fn unread_channels_are_filled_from_the_read_image_and_reuse_it() {
+        // Opaque base color: RGB read, alpha unread.
+        let mut channels = [
+            Some(source("img", TextureChannel::Red)),
+            Some(source("img", TextureChannel::Green)),
+            Some(source("img", TextureChannel::Blue)),
+            None,
+        ];
+        fill_unread(&mut channels, reads::RGB);
+        assert_eq!(identity_image(&channels), Some(&Id::new("img").unwrap()));
+    }
+
+    #[test]
+    fn a_read_channel_that_is_constant_forces_packing() {
+        // Metallic from the image, roughness constant: G is read, so it cannot be left to the image.
+        let mut channels = [None, None, Some(source("img", TextureChannel::Blue)), None];
+        fill_unread(&mut channels, reads::MR);
+        assert!(identity_image(&channels).is_none());
+        assert!(channels[1].is_none());
+    }
+
+    #[test]
+    fn channels_from_two_images_are_not_filled() {
+        let mut channels = [
+            Some(source("a", TextureChannel::Red)),
+            Some(source("b", TextureChannel::Green)),
+            None,
+            None,
+        ];
+        fill_unread(&mut channels, reads::RGBA);
+        assert!(channels[3].is_none());
     }
 }

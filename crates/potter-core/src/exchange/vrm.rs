@@ -22,8 +22,9 @@ use crate::{
     },
 };
 
-use super::gltf::{TextureExport, VrmWriterMappings, reference_texture, unsupported_export};
-use super::material_surface::{ResolvedSurface, resolve_surface};
+use super::gltf::resolve_material_surfaces;
+use super::gltf::{TextureExport, VrmWriterMappings, unsupported_export};
+use super::material_surface::{ResolvedSurface, reference_sampled};
 
 pub fn export(
     doc: &SceneDoc,
@@ -45,6 +46,16 @@ pub(crate) fn required_avatar(doc: &SceneDoc) -> Result<&AvatarSettings> {
 }
 
 pub fn validate_settings(doc: &SceneDoc, version: AvatarVersion) -> Result<()> {
+    let surfaces = resolve_material_surfaces(doc)?;
+    validate_settings_with(doc, version, &surfaces)
+}
+
+/// `validate_settings` with the materials already resolved, so each material resolves once per export.
+fn validate_settings_with(
+    doc: &SceneDoc,
+    version: AvatarVersion,
+    surfaces: &BTreeMap<Id, ResolvedSurface>,
+) -> Result<()> {
     let avatar = required_avatar(doc)?;
     validate_avatar_settings(doc, avatar)?;
     validate_animation_channels(doc)?;
@@ -99,11 +110,13 @@ pub fn validate_settings(doc: &SceneDoc, version: AvatarVersion) -> Result<()> {
                         "MToon material is missing",
                     ));
                 }
-                let (surface, _) = resolve_surface(doc, material_id)?;
-                mtoon::validate_v1(&surface)?;
+                let surface = surfaces.get(material_id).ok_or_else(|| {
+                    PotError::new(ErrorCode::SceneInvalid, "MToon material is missing")
+                })?;
+                mtoon::validate_v1(surface)?;
             }
         }
-        AvatarVersion::V0 => validate_v0_settings(doc, avatar)?,
+        AvatarVersion::V0 => validate_v0_settings(doc, avatar, surfaces)?,
     }
     Ok(())
 }
@@ -120,7 +133,8 @@ fn validate_output_with_frames(
     snapshot: &crate::eval::Snapshot,
     version: AvatarVersion,
 ) -> Result<super::gltf::VrmFrameMaps> {
-    validate_settings(doc, version)?;
+    let surfaces = resolve_material_surfaces(doc)?;
+    validate_settings_with(doc, version, &surfaces)?;
     let avatar = required_avatar(doc)?;
     let frames = super::gltf::vrm_frame_maps(doc, snapshot, avatar, version)?;
     super::gltf::validate_vrm_mesh_references(doc, snapshot, avatar, &frames, version)?;
@@ -427,7 +441,11 @@ fn is_transform_channel(path: &str) -> bool {
     )
 }
 
-fn validate_v0_settings(doc: &SceneDoc, avatar: &AvatarSettings) -> Result<()> {
+fn validate_v0_settings(
+    doc: &SceneDoc,
+    avatar: &AvatarSettings,
+    surfaces: &BTreeMap<Id, ResolvedSurface>,
+) -> Result<()> {
     validate_v0_meta_settings(&avatar.meta)?;
     for role in ["chest", "neck"] {
         if !avatar.humanoid.contains_key(role) {
@@ -475,7 +493,7 @@ fn validate_v0_settings(doc: &SceneDoc, avatar: &AvatarSettings) -> Result<()> {
                     "VRM 0.x texture-transform binds require MToon settings on the target material.",
                 ));
             }
-            ensure_legacy_texture_transform(doc, &bind.material)?;
+            ensure_legacy_texture_transform(surfaces, &bind.material)?;
             ensure_unique_legacy_material_name(doc, &bind.material)?;
         }
     }
@@ -486,8 +504,10 @@ fn validate_v0_settings(doc: &SceneDoc, avatar: &AvatarSettings) -> Result<()> {
                 "MToon material is missing",
             ));
         }
-        let (surface, _) = resolve_surface(doc, material_id)?;
-        mtoon::validate_v0(&surface, mtoon)?;
+        let surface = surfaces
+            .get(material_id)
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "MToon material is missing"))?;
+        mtoon::validate_v0(surface, mtoon)?;
     }
     if let Some(spring) = &avatar.spring_bone {
         validate_v0_spring(doc, spring)?;
@@ -1907,7 +1927,7 @@ fn vrm0_meta(
             interpolation: ImageInterpolation::Linear,
         };
         let index = texture_export.sampled_index(
-            &reference_texture(&texture),
+            &reference_sampled(&texture),
             doc,
             root_path,
             binary,
@@ -2038,12 +2058,7 @@ fn vrm0_expressions(
             material_values.push(json!({
                 "materialName": material.name,
                 "propertyName": "_MainTex_ST",
-                "targetValue": [
-                    bind.scale[0],
-                    bind.scale[1],
-                    bind.offset[0],
-                    1.0 - bind.offset[1] - bind.scale[1]
-                ]
+                "targetValue": mtoon::legacy_st(bind.scale, bind.offset)
             }));
         }
         if !material_values.is_empty() {
@@ -2056,8 +2071,16 @@ fn vrm0_expressions(
 
 /// VRM 0.x `_MainTex_ST` holds one transform, so a material whose base texture already has a KHR
 /// texture transform cannot also take an expression texture-transform bind.
-fn ensure_legacy_texture_transform(doc: &SceneDoc, material_id: &Id) -> Result<()> {
-    let (surface, _) = resolve_surface(doc, material_id)?;
+fn ensure_legacy_texture_transform(
+    surfaces: &BTreeMap<Id, ResolvedSurface>,
+    material_id: &Id,
+) -> Result<()> {
+    let surface = surfaces.get(material_id).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "expression target material is missing",
+        )
+    })?;
     if surface
         .base_color
         .texture
