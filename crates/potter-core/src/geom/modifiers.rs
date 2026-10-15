@@ -1947,7 +1947,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .ok_or_else(|| {
                 PotError::new(ErrorCode::LimitExceeded, "subdivision face count overflows")
             })?;
-        let uv_layer_count = uv_layers::read_layers(mesh).len();
+        let uv_layer_count = uv_layers::layer_count(mesh);
         check_subdivision_budget(
             first_level_faces,
             mesh.vertices.len(),
@@ -4535,6 +4535,48 @@ mod tests {
         assert_eq!(mirrored([2.0, 0.5]), [2.0, 0.5]);
         assert_eq!(mirrored([-0.25, 1.25]), [0.25, 1.75]);
         assert_eq!(mirrored([1.25, 0.25]), [1.75, 0.75]);
+    }
+
+    /// A UV tool writes `uv_map` and leaves the imported `blender_uv_layers` stale. A later mirror
+    /// must carry the `uv_map` UVs into both stores, never the stale imported ones.
+    #[test]
+    fn uv_map_overrides_stale_blender_uv_layer_through_later_rebuild() {
+        let mut mesh = Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+            vec![vec![0, 1, 2, 3]],
+        )
+        .unwrap();
+        mesh.attributes.insert(
+            "blender_uv_layers".to_owned(),
+            json!([{"name": "UVMap", "values": [[0.1, 0.2], [0.3, 0.2], [0.3, 0.4], [0.1, 0.4]]}]),
+        );
+        let warp = with_params(
+            "uv_warp",
+            json!({"offset": [0.5, 0.0], "uv_layer": "UVMap"}),
+        );
+        let mirror = with_params(
+            "mirror",
+            json!({"use_axis": [true, false, false], "use_mirror_merge": false}),
+        );
+        let out = evaluate_modifiers(&mesh, &[warp, mirror]).unwrap();
+        let warped: [[f64; 2]; 4] = [[0.6, 0.2], [0.8, 0.2], [0.8, 0.4], [0.6, 0.4]];
+        let is_warped = |uv: &serde_json::Value| {
+            warped.iter().any(|want| {
+                (want[0] - uv[0].as_f64().unwrap()).abs() < 1e-9
+                    && (want[1] - uv[1].as_f64().unwrap()).abs() < 1e-9
+            })
+        };
+        let stored = out.attributes["blender_uv_layers"][0]["values"]
+            .as_array()
+            .unwrap();
+        assert_eq!(stored.len(), 8);
+        assert!(stored.iter().all(is_warped), "stale blender UV: {stored:?}");
+        let entries = out.attributes["uv_map"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let uv = entry["uv"].as_array().unwrap();
+            assert!(uv.iter().all(is_warped), "stale uv_map UV: {uv:?}");
+        }
     }
 
     #[test]

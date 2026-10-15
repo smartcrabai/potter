@@ -626,11 +626,13 @@ impl Sources<'_> {
     }
 
     /// `uv_map` entries (`{"face_id","layer","uv"}`, plus `"pinned"` when the source has pins)
-    /// rebuilt per output face. Each output corner blends the source corners it came from, counting
-    /// only those whose source face has an entry for the layer. An output face gets an entry when any
-    /// of its corners has such a source, so a modifier that leaves face sources empty (screw) keeps
-    /// its UVs. A corner's pin is the pin of its heaviest source corner (see [`heaviest_source`]);
-    /// `pinned` is omitted when no contributing source corner has pins.
+    /// rebuilt per output face. Each output corner blends the source corners it came from; a source
+    /// corner whose face has no entry for the layer reads as `[0, 0]` and keeps its weight (no
+    /// renormalisation: Blender layers are complete, so no oracle covers partial layers). An output
+    /// face gets an entry when any of its corners has a source with an entry, so a modifier that
+    /// leaves face sources empty (screw) keeps its UVs. A corner's pin is the pin of its heaviest
+    /// source corner (see [`heaviest_source`]); `pinned` is omitted when no contributing source
+    /// corner has pins.
     fn uv_map(&self, entries: &[Value]) -> Vec<Value> {
         let source_faces: HashMap<u64, usize> = self
             .source
@@ -703,16 +705,7 @@ impl Sources<'_> {
                 let uv: Vec<Value> = corners
                     .iter()
                     .map(|sources| {
-                        if sources.iter().all(|(source, _)| filled[*source]) {
-                            blend_indexed(&flat, sources, "FLOAT2").unwrap_or_else(uv_default)
-                        } else {
-                            let known: Vec<(usize, f64)> = sources
-                                .iter()
-                                .copied()
-                                .filter(|(source, _)| filled[*source])
-                                .collect();
-                            blend_indexed(&flat, &known, "FLOAT2").unwrap_or_else(uv_default)
-                        }
+                        blend_indexed(&flat, sources, "FLOAT2").unwrap_or_else(uv_default)
                     })
                     .collect();
                 let mut entry = json!({"face_id": face.id, "layer": layer, "uv": uv});
