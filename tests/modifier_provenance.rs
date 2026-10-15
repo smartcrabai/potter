@@ -749,3 +749,76 @@ fn inspect_reports_attribute_drop_warning() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn attribute_drop_warnings_name_their_node_and_filter_by_id() -> TestResult {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    run_ok(pot().arg("init").arg(&scene).arg("--json"))?;
+    let vertex_weights: Vec<Value> = (0..8)
+        .map(|vertex_id| json!({"vertex_id": vertex_id, "weight": 1.0}))
+        .collect();
+    let mut operations = Vec::new();
+    for node in ["body_a", "body_b"] {
+        operations.push(json!({"op":"node.create","id":node,"kind":"box","params":{"size":2.0}}));
+        operations.push(
+            json!({"op":"vertex_group.create","target":{"id":node},"id":"group_g","name":"G"}),
+        );
+        operations.push(json!({"op":"vertex_group.assign","target":{"id":node},"group_id":"group_g","weights":vertex_weights}));
+        operations.push(json!({
+            "op":"modifier.create","target":{"id":node},"id":"remesh",
+            "type":"remesh","params":remesh_params()
+        }));
+    }
+    apply(
+        &scene,
+        &json!({"schema_version":1,"base_revision":0,"operations":operations}),
+    )?;
+
+    let drops = |warnings: &Value| -> Vec<Value> {
+        warnings
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|warning| warning["details"]["feature_id"] == "modifier.attribute_dropped")
+            .cloned()
+            .collect()
+    };
+
+    let all = run_ok(pot().arg("inspect").arg(&scene).arg("--json"))?;
+    let all: Value = serde_json::from_slice(&all.stdout)?;
+    let all_drops = drops(&all["warnings"]);
+    let mut node_ids: Vec<&str> = all_drops
+        .iter()
+        .filter_map(|warning| warning["details"]["node_id"].as_str())
+        .collect();
+    node_ids.sort_unstable();
+    assert_eq!(
+        all_drops.len(),
+        2,
+        "one drop warning per object: {}",
+        all["warnings"]
+    );
+    assert_eq!(
+        node_ids,
+        ["body_a", "body_b"],
+        "warnings must name distinct nodes"
+    );
+
+    let first = run_ok(
+        pot()
+            .arg("inspect")
+            .arg(&scene)
+            .args(["--id", "body_a", "--json"]),
+    )?;
+    let first: Value = serde_json::from_slice(&first.stdout)?;
+    let first_drops = drops(&first["warnings"]);
+    assert_eq!(
+        first_drops.len(),
+        1,
+        "filtered inspect: {}",
+        first["warnings"]
+    );
+    assert_eq!(first_drops[0]["details"]["node_id"], "body_a");
+    Ok(())
+}
