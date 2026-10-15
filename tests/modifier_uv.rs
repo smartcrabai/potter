@@ -1063,9 +1063,11 @@ fn glb_export_texcoords_after_mirror_and_subdivision_match_blender_oracle() -> T
                 .map(|value| -> TestResult<f64> { Ok(value.as_f64().ok_or("corner value")?) })
                 .collect::<TestResult<Vec<f64>>>()?;
             let point = DVec3::new(values[3], values[4], values[5]);
+            // The fixture holds Blender loop UVs (V up). glTF stores V down: Blender's own glTF
+            // exporter writes 1 - v for the same loop data (verified against Blender 5.2).
             let uvs = values[6..]
                 .chunks(2)
-                .map(|pair| [pair[0], pair[1]])
+                .map(|pair| [pair[0], 1.0 - pair[1]])
                 .collect();
             Ok((DVec3::new(point.x, point.z, -point.y), uvs))
         })
