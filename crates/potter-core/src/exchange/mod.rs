@@ -64,11 +64,11 @@ pub(crate) struct ExchangeMesh {
     /// as Blender does.
     pub singular: bool,
     /// World-space per-vertex normals, indexed like `positions`: Blender's PLY vertex normals.
-    /// `None` when the source format carries no normals.
-    pub vertex_normals: Option<Vec<[f64; 3]>>,
+    /// Empty for imported meshes.
+    pub vertex_normals: Vec<[f64; 3]>,
     /// Per face: whether a corner normal differs from the face's flat normal, in local space.
-    /// `None` when the source format carries no normals; then every face is flat.
-    pub smooth: Option<Vec<bool>>,
+    /// Empty for imported meshes, where every face counts as flat.
+    pub smooth: Vec<bool>,
 }
 
 pub(crate) fn evaluated_meshes(
@@ -131,8 +131,8 @@ pub(crate) fn evaluated_meshes(
             positions,
             faces,
             normals: Some(shading.corners),
-            vertex_normals: Some(shading.vertices),
-            smooth: Some(shading.smooth),
+            vertex_normals: shading.vertices,
+            smooth: shading.smooth,
             singular: shading::is_singular(matrix),
             mirrored: shading::is_mirrored(matrix),
         });

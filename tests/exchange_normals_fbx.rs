@@ -11,12 +11,12 @@ mod exchange_normals;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
 };
 
 use exchange_normals::{
-    ObservedCorner, TestResult, assert_matches_reference, export, export_strict, obj_to_potter,
-    observed_corners, usd_world_corners, write_fixture_scene,
+    ObservedCorner, TestResult, assert_matches_reference, export, export_strict, init,
+    obj_to_potter, observed_corners, pot, usd_world_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -89,16 +89,6 @@ const SMOOTHING: &str = r#"    LayerElementSmoothing: 0 {
 
 const TRIANGLE_POSITIONS: [[f64; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
 const TRIANGLE_NORMALS: [[f64; 3]; 3] = [[0.0, 0.0, 1.0], [0.6, 0.0, 0.8], [0.0, 0.6, 0.8]];
-
-fn pot() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pot"))
-}
-
-fn init(scene: &Path) -> TestResult {
-    let output = pot().arg("init").arg(scene).arg("--json").output()?;
-    assert!(output.status.success(), "pot init failed");
-    Ok(())
-}
 
 fn import_file(scene: &Path, file: &Path, format: &str, allow_lossy: bool) -> TestResult<Output> {
     let mut command = pot();
@@ -401,9 +391,9 @@ fn unsupported_normal_mapping_is_a_mesh_normals_loss() -> TestResult {
 }
 
 #[test]
-fn zero_length_normal_is_a_mesh_normals_loss() -> TestResult {
-    let allowed = import_minimal(ZERO_LENGTH_NORMAL, true)?;
-    assert!(allowed.output.status.success());
-    assert_eq!(loss_ids(&allowed.output)?, ["mesh.normals"]);
+fn zero_length_normal_imports_as_zero_without_loss() -> TestResult {
+    let imported = import_minimal(ZERO_LENGTH_NORMAL, false)?;
+    assert!(imported.output.status.success());
+    assert_eq!(loss_ids(&imported.output)?, Vec::<String>::new());
     Ok(())
 }

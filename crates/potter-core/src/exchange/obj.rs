@@ -30,7 +30,7 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
             writeln!(object, "v {x:.9} {y:.9} {z:.9}")
                 .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
         }
-        let (faces, normals) = shading::baked_faces(mesh);
+        let (faces, normals) = shading::baked_faces(mesh)?;
         // Blender writes zero normals for singular transforms.
         let normals = if mesh.singular {
             vec![[0.0; 3]; normals.len()]
@@ -44,10 +44,10 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
             object.push('\n');
         }
         object.push_str("usemtl potter_default\n");
-        let smooth = shading::smooth_faces(mesh);
+        let smooth = &mesh.smooth;
         let mut smooth_state = None::<bool>;
         let mut corner = 0_usize;
-        for (face, is_smooth) in faces.iter().zip(smooth) {
+        for (face, is_smooth) in faces.iter().zip(smooth.iter().copied()) {
             let first_corner = corner;
             corner = first_corner.checked_add(face.len()).ok_or_else(|| {
                 PotError::new(ErrorCode::ExportFailed, "OBJ corner count overflow")
@@ -128,8 +128,8 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
         normals: None,
         mirrored: false,
         singular: false,
-        vertex_normals: None,
-        smooth: None,
+        vertex_normals: Vec::new(),
+        smooth: Vec::new(),
     };
     // Normal named by each face corner of `current`, in face order.
     let mut corner_normals = Vec::<Option<DVec3>>::new();
@@ -174,8 +174,8 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                         normals: None,
                         mirrored: false,
                         singular: false,
-                        vertex_normals: None,
-                        smooth: None,
+                        vertex_normals: Vec::new(),
+                        smooth: Vec::new(),
                     };
                     corner_normals.clear();
                     smoothed = false;

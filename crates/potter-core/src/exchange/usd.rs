@@ -2250,24 +2250,34 @@ fn import_normals(
     faces: &[Vec<usize>],
     losses: &mut Vec<Loss>,
 ) -> Result<Option<Vec<DVec3>>> {
-    let Some(raw) = prim
-        .properties
-        .get("primvars:normals")
-        .or_else(|| prim.properties.get("normals"))
-    else {
+    let (raw, interpolation) = if let Some(raw) = prim.properties.get("primvars:normals") {
+        let Some(interpolation) = split_interpolation(raw).1 else {
+            losses.push(normal_loss("USD normals have no interpolation metadata"));
+            return Ok(None);
+        };
+        (raw, interpolation)
+    } else if let Some(raw) = prim.properties.get("normals") {
+        // An unauthored interpolation on the plain `normals` attribute means `vertex`.
+        let interpolation = split_interpolation(raw)
+            .1
+            .unwrap_or_else(|| "vertex".to_owned());
+        (raw, interpolation)
+    } else {
         return Ok(None);
     };
-    let (value_text, interpolation) = split_interpolation(raw);
-    let Some(interpolation) = interpolation else {
-        losses.push(normal_loss("USD normals have no interpolation metadata"));
-        return Ok(None);
-    };
-    let values = scan_numbers(value_text)?;
+    let values = scan_numbers(split_interpolation(raw).0)?;
     if values.len() % 3 != 0 {
         return Err(import_error("USD mesh normal array has an invalid size"));
     }
+    let units = values
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|value| DVec3::from_array(*value).normalize_or_zero())
+        .collect::<Vec<_>>();
     let corner_total = faces.iter().map(Vec::len).sum::<usize>();
-    let (expected, corner_values) = match interpolation.as_str() {
+    // Each corner's element in the interpolation domain, and the domain's element count.
+    let (element_count, corner_elements) = match interpolation.as_str() {
         "faceVarying" => (corner_total, (0..corner_total).collect::<Vec<_>>()),
         "vertex" | "varying" => (points.len(), faces.iter().flatten().copied().collect()),
         "uniform" => (
@@ -2286,25 +2296,38 @@ fn import_normals(
             return Ok(None);
         }
     };
-    if values.len() != expected * 3 {
-        return Err(import_error(
-            "USD mesh normals do not match their interpolation",
-        ));
-    }
-    let units = values
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|value| DVec3::from_array(*value).normalize_or_zero())
-        .collect::<Vec<_>>();
-    if units.contains(&DVec3::ZERO) {
-        losses.push(normal_loss("USD normals contain a zero-length vector"));
-        return Ok(None);
-    }
-    Ok(Some(
-        corner_values
+    // `primvars:normals:indices` stores each unique normal once; without it, values are per element.
+    let element_values = if let Some(raw) = prim.properties.get("primvars:normals:indices") {
+        let indices = scan_numbers(raw)?
+            .into_iter()
+            .map(|index| {
+                usize::try_from(index as i64)
+                    .ok()
+                    .filter(|index| *index < units.len())
+                    .ok_or_else(|| import_error("USD normal index is outside its values"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if indices.len() != element_count {
+            return Err(import_error(
+                "USD mesh normals do not match their interpolation",
+            ));
+        }
+        indices
             .into_iter()
             .map(|index| units[index])
+            .collect::<Vec<_>>()
+    } else {
+        if units.len() != element_count {
+            return Err(import_error(
+                "USD mesh normals do not match their interpolation",
+            ));
+        }
+        units
+    };
+    Ok(Some(
+        corner_elements
+            .into_iter()
+            .map(|element| element_values[element])
             .collect(),
     ))
 }

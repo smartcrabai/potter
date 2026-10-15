@@ -2170,8 +2170,9 @@ fn parse_geometry(
 /// Reads `LayerElementNormal` as mesh-local corner normals in `faces` order.
 ///
 /// Normals map per polygon vertex (`ByPolygonVertex`) or per control point (`ByVertice` or
-/// `ByVertex`), stored directly (`Direct`) or through `NormalsIndex` (`IndexToDirect`). Other
-/// mappings and zero-length normals are reported as losses and yield no normals.
+/// `ByVertex`), stored directly (`Direct`) or through `NormalsIndex` (`IndexToDirect`). Zero
+/// normals stay zero, as Blender writes them. Other mappings are reported as losses and yield no
+/// normals.
 fn parse_normal_layer(
     node: &FbxNode,
     point_count: usize,
@@ -2263,14 +2264,7 @@ fn parse_normal_layer(
         let vector = vectors
             .get(value_index)
             .ok_or_else(|| import_error("FBX LayerElementNormal index is outside Normals"))?;
-        let Some(unit) = vector.try_normalize() else {
-            losses.push(normal_loss(
-                geometry_id,
-                "FBX LayerElementNormal contains a zero-length normal",
-            ));
-            return Ok(None);
-        };
-        normals.push(unit);
+        normals.push(vector.normalize_or_zero());
     }
     Ok(Some(normals))
 }

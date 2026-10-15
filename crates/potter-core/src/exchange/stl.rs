@@ -35,7 +35,7 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     output.extend_from_slice(&header);
     output.extend_from_slice(&triangle_count_u32.to_le_bytes());
     for mesh in meshes {
-        let (faces, _) = shading::baked_faces(mesh);
+        let (faces, _) = shading::baked_faces(mesh)?;
         for face in &faces {
             if face.len() < 3 {
                 continue;
@@ -142,8 +142,8 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             normals: None,
             mirrored: false,
             singular: false,
-            vertex_normals: None,
-            smooth: None,
+            vertex_normals: Vec::new(),
+            smooth: Vec::new(),
         }],
         losses,
     ))

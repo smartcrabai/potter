@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use glam::DVec3;
 
-use super::{ExchangeMesh, Loss, shading};
+use super::{ExchangeMesh, shading};
 use crate::error::{ErrorCode, PotError, Result};
 
 pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
@@ -47,7 +47,7 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     }
     let mut base = 0_usize;
     for mesh in meshes {
-        let (faces, _) = shading::baked_faces(mesh);
+        let (faces, _) = shading::baked_faces(mesh)?;
         for face in &faces {
             let count = u32::try_from(face.len())
                 .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "PLY face is too large"))?;
@@ -72,7 +72,7 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
+pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
     let marker = b"end_header";
     let marker_end = bytes
@@ -165,26 +165,22 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
     if positions.is_empty() || faces.is_empty() {
         return Err(ply_error("PLY contains no mesh geometry"));
     }
-    let mut losses = Vec::new();
     let normals = if parsed.has_normals {
-        import_corner_normals(&per_vertex_normals, &faces, &mut losses)
+        Some(import_corner_normals(&per_vertex_normals, &faces)?)
     } else {
         None
     };
-    Ok((
-        vec![ExchangeMesh {
-            id: "ply_mesh".to_owned(),
-            name: "PLY Mesh".to_owned(),
-            positions,
-            faces,
-            normals,
-            mirrored: false,
-            singular: false,
-            vertex_normals: None,
-            smooth: None,
-        }],
-        losses,
-    ))
+    Ok(vec![ExchangeMesh {
+        id: "ply_mesh".to_owned(),
+        name: "PLY Mesh".to_owned(),
+        positions,
+        faces,
+        normals,
+        mirrored: false,
+        singular: false,
+        vertex_normals: Vec::new(),
+        smooth: Vec::new(),
+    }])
 }
 
 struct Header {
@@ -303,7 +299,7 @@ fn has_vertex_properties(properties: &[ScalarProperty], names: [&str; 3]) -> boo
 /// Blender's per-vertex normals (`mesh.vertex_normals`) in float32. A vertex whose faces cancel
 /// out, or that only touches degenerate faces, writes zero.
 fn vertex_normals(mesh: &ExchangeMesh) -> Result<Vec<[f32; 3]>> {
-    shading::vertex_normals(mesh)?
+    mesh.vertex_normals
         .iter()
         .map(|value| {
             #[expect(
@@ -322,37 +318,27 @@ fn vertex_normals(mesh: &ExchangeMesh) -> Result<Vec<[f32; 3]>> {
         .collect()
 }
 
-/// Expands per-vertex PLY normals to face corners. Every vertex a face uses needs a non-zero,
-/// finite normal; otherwise no normals are imported and the loss is reported.
-fn import_corner_normals(
-    per_vertex: &[[f64; 3]],
-    faces: &[Vec<usize>],
-    losses: &mut Vec<Loss>,
-) -> Option<Vec<[f64; 3]>> {
+/// Expands per-vertex PLY normals to face corners. Zero normals stay zero, as Blender writes
+/// them; non-finite components are invalid.
+fn import_corner_normals(per_vertex: &[[f64; 3]], faces: &[Vec<usize>]) -> Result<Vec<[f64; 3]>> {
     let unit = per_vertex
         .iter()
-        .map(|normal| DVec3::from_array(*normal).try_normalize())
-        .collect::<Vec<_>>();
-    let corners = faces
+        .map(|normal| {
+            if !normal.iter().all(|value| value.is_finite()) {
+                return Err(ply_error("PLY vertex normal is not finite"));
+            }
+            Ok(DVec3::from_array(*normal).normalize_or_zero().to_array())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    faces
         .iter()
         .flatten()
-        .map(|index| unit.get(*index).copied().flatten())
-        .collect::<Option<Vec<_>>>();
-    if let Some(corners) = corners {
-        return Some(
-            corners
-                .into_iter()
-                .map(|corner| corner.to_array())
-                .collect(),
-        );
-    }
-    losses.push(Loss {
-        feature_id: "mesh.normals".to_owned(),
-        data_id: None,
-        reason: "PLY vertex normal is zero or non-finite; normals ignored".to_owned(),
-        suggestion: None,
-    });
-    None
+        .map(|index| {
+            unit.get(*index)
+                .copied()
+                .ok_or_else(|| ply_error("face index is invalid"))
+        })
+        .collect()
 }
 
 fn push_f32(output: &mut Vec<u8>, value: f64) -> Result<()> {
@@ -479,6 +465,6 @@ pub(crate) fn imported_graph(
     path: &Path,
     scene_id: String,
 ) -> Result<crate::exchange::ImportedGraph> {
-    let (meshes, losses) = import(path)?;
-    crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "ply", losses)
+    let meshes = import(path)?;
+    crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "ply", Vec::new())
 }

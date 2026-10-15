@@ -11,15 +11,11 @@ use std::{
 };
 
 use exchange_normals::{
-    NORMAL_TOLERANCE, TestResult, assert_matches_reference, export, export_strict,
+    NORMAL_TOLERANCE, TestResult, assert_matches_reference, export, export_strict, pot,
     usd_world_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
-
-fn pot() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pot"))
-}
 
 fn run_ok(command: &mut Command) -> TestResult<Output> {
     let output = command.output()?;
@@ -39,17 +35,6 @@ fn export_fixture_abc(scene: &std::path::Path, out: &std::path::Path) -> TestRes
         "alembic export of shading attributes must not require --allow-lossy: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    Ok(())
-}
-
-#[test]
-fn alembic_export_accepts_shading_attributes_without_allow_lossy() -> TestResult {
-    let dir = tempdir()?;
-    let scene = dir.path().join("scene");
-    write_fixture_scene(&scene)?;
-    let out = dir.path().join("fixture.abc");
-    export_fixture_abc(&scene, &out)?;
-    assert!(out.is_file(), "alembic file was not written");
     Ok(())
 }
 
@@ -258,32 +243,5 @@ fn alembic_animated_mesh_writes_each_frame_normals() -> TestResult {
         change > 1.0e-3,
         "the fixture's normals must change between frames for this test to mean anything"
     );
-    Ok(())
-}
-
-/// A zero-scale parent with a child must export, and the parent's scale must import back as zero.
-#[test]
-fn alembic_export_accepts_zero_scale_nodes() -> TestResult {
-    let dir = tempdir()?;
-    let scene = dir.path().join("scene");
-    run_ok(pot().arg("init").arg(&scene).arg("--json"))?;
-    apply_batch(
-        &scene,
-        &json!({"schema_version": 1, "base_revision": 0, "operations": [
-            {"op":"node.create","id":"flat","kind":"box","params":{"size":2.0},"transform":{"translation":[0.0,0.0,0.0],"scale":[0.0,1.0,1.0]}},
-            {"op":"node.create","id":"flat_child","kind":"box","params":{"size":2.0},"transform":{"translation":[0.0,3.0,0.0],"scale":[1.0,1.0,1.0]}},
-            {"op":"node.parent","target":{"id":"flat_child"},"parent":"flat","keep_world":false}
-        ]}),
-    )?;
-    let abc = dir.path().join("flat.abc");
-    export_fixture_abc(&scene, &abc)?;
-
-    let project = import_alembic(dir.path(), &abc)?;
-    let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    assert_eq!(
-        document["nodes"]["flat"]["transform"]["scale"],
-        json!([0.0, 1.0, 1.0])
-    );
-    assert_eq!(document["nodes"]["flat_child"]["parent"], json!("flat"));
     Ok(())
 }

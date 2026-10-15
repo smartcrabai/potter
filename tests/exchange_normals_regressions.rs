@@ -8,12 +8,18 @@
 //! is the unit Z normal, in both flat and smooth shading. Blender writes zero OBJ normals for a
 //! zero-scale object, which the zero-scale checks below assert.
 
-use std::{fs, path::Path, process::Command};
+#[path = "common/exchange_normals.rs"]
+#[expect(
+    dead_code,
+    reason = "each test binary uses a subset of the shared fixture helpers"
+)]
+mod exchange_normals;
 
+use std::{fs, path::Path};
+
+use exchange_normals::{TestResult, pot};
 use serde_json::{Value, json};
 use tempfile::tempdir;
-
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// Every format `pot export` accepts for shading, with its file extension.
 const FORMATS: [(&str, &str); 10] = [
@@ -28,10 +34,6 @@ const FORMATS: [(&str, &str); 10] = [
     ("gltf", "gltf"),
     ("glb", "glb"),
 ];
-
-fn pot() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pot"))
-}
 
 /// Two operations: a 2x2 plane at `translation` whose four vertices are flattened onto the X axis.
 fn collapsed_plane(id: &str, translation: [f64; 3]) -> Vec<Value> {

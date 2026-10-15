@@ -80,7 +80,8 @@ pub(crate) fn corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVe
 /// Corner and flat normals agree within this distance, matching the importers.
 const FLAT_TOLERANCE: f64 = 1.0e-4;
 
-fn close(left: DVec3, right: DVec3) -> bool {
+/// Whether two normals agree within the flatness tolerance shared by export and import.
+pub(crate) fn close(left: DVec3, right: DVec3) -> bool {
     (left - right).abs().max_element() <= FLAT_TOLERANCE
 }
 

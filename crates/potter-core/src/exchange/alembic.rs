@@ -487,7 +487,8 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
         let supported_attribute = matches!(
             attribute.as_str(),
             "uv_map" | "shade_smooth" | "sharp" | "custom_normal"
-        ) || (allow_lossy && attribute == "vertex_groups");
+        ) || (allow_lossy
+            && matches!(attribute.as_str(), "vertex_groups" | "alembic_normals"));
         if !supported_attribute {
             return Err(unsupported(
                 "mesh.attribute",

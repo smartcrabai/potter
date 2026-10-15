@@ -11,19 +11,15 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
 };
 
 use exchange_normals::{
     NORMAL_TOLERANCE, ObservedCorner, TestResult, assert_matches_reference, export, export_strict,
-    obj_to_potter, observed_corners, write_fixture_scene,
+    init, near, obj_to_potter, observed_corners, pot, write_fixture_scene,
 };
 use serde_json::Value;
 use tempfile::tempdir;
-
-fn pot() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pot"))
-}
 
 /// One `o` object of a parsed OBJ file, with face indices and corner normals as written.
 struct ObjObject {
@@ -129,20 +125,6 @@ fn close(left: [f64; 3], right: [f64; 3]) -> bool {
     (0..3).all(|axis| (left[axis] - right[axis]).abs() <= NORMAL_TOLERANCE)
 }
 
-fn same_point(left: [f64; 3], right: [f64; 3]) -> bool {
-    (0..3).all(|axis| (left[axis] - right[axis]).abs() <= 1.0e-4)
-}
-
-fn init(scene: &Path) -> TestResult {
-    let output = pot().arg("init").arg(scene).arg("--json").output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    Ok(())
-}
-
 fn output_json(output: &Output) -> TestResult<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
@@ -215,7 +197,42 @@ fn obj_export_matches_blender_reference_corners() -> TestResult {
     let observed = corners(&file);
     assert_eq!(observed.len(), 72);
     assert_matches_reference(&observed)?;
+
+    // A mirrored node's faces are reversed, so each face's winding normal agrees with its vn.
+    // Face 2 carries a deliberately tilted custom normal, so it is left out.
+    let mirror = file
+        .objects
+        .iter()
+        .find(|object| object.name == "mirror")
+        .ok_or("mirror object is missing")?;
+    for (index, face) in mirror
+        .faces
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 2)
+    {
+        let points = face
+            .iter()
+            .map(|vertex| file.positions[*vertex])
+            .collect::<Vec<_>>();
+        let winding = newell_normal(&points);
+        let normal = mirror.corner_normals[index * 4];
+        let dot = (0..3).map(|axis| winding[axis] * normal[axis]).sum::<f64>();
+        assert!(dot > 0.0, "mirror face {index} winds against its normals");
+    }
     Ok(())
+}
+
+/// Newell normal of a polygon, unnormalized: its direction follows the winding.
+fn newell_normal(points: &[[f64; 3]]) -> [f64; 3] {
+    let mut area = [0.0_f64; 3];
+    for (index, current) in points.iter().enumerate() {
+        let next = points[(index + 1) % points.len()];
+        area[0] += (current[1] - next[1]) * (current[2] + next[2]);
+        area[1] += (current[2] - next[2]) * (current[0] + next[0]);
+        area[2] += (current[0] - next[0]) * (current[1] + next[1]);
+    }
+    area
 }
 
 #[test]
@@ -234,15 +251,6 @@ fn obj_export_writes_shared_normals_and_smooth_groups() -> TestResult {
             "{} repeats a vn line",
             object.name
         );
-        for line in &object.vn_lines {
-            for word in line.split_whitespace().skip(1) {
-                assert_eq!(
-                    word.split_once('.').map(|(_, digits)| digits.len()),
-                    Some(6),
-                    "vn values use six decimals: {line}"
-                );
-            }
-        }
     }
 
     let mixed = file
@@ -313,8 +321,8 @@ fn obj_round_trip_through_import_keeps_corner_normals() -> TestResult {
         let found = reexported
             .iter()
             .filter(|corner| {
-                same_point(corner.corner, expected.corner)
-                    && same_point(corner.face_center, expected.face_center)
+                near(corner.corner, expected.corner)
+                    && near(corner.face_center, expected.face_center)
             })
             .collect::<Vec<_>>();
         assert_eq!(

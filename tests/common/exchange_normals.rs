@@ -173,8 +173,20 @@ struct ReferenceCorner {
     normal: [f64; 3],
 }
 
-fn pot() -> Command {
+/// The `pot` binary under test.
+pub fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
+}
+
+/// Creates an empty project at `scene` and asserts that `pot init` succeeds.
+pub fn init(scene: &Path) -> TestResult {
+    let output = pot().arg("init").arg(scene).arg("--json").output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    Ok(())
 }
 
 /// Creates the fixture scene at `scene` (a project directory).
@@ -339,6 +351,7 @@ pub fn assert_matches_reference(observed: &[ObservedCorner]) -> TestResult<f64> 
     Ok(worst)
 }
 
-fn near(left: [f64; 3], right: [f64; 3]) -> bool {
+/// Whether two world positions agree within the fixture tolerance.
+pub fn near(left: [f64; 3], right: [f64; 3]) -> bool {
     (0..3).all(|axis| (left[axis] - right[axis]).abs() <= 1.0e-4)
 }

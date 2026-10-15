@@ -2580,3 +2580,31 @@ impl<'a> Cursor<'a> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{ValueData, encode_value};
+
+    #[test]
+    fn identity_quaternion_stores_imaginary_parts_first() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Crate quaternions are stored `(x, y, z, w)`; the text form is `(w, x, y, z)`.
+        let mut file = Vec::new();
+        encode_value(
+            &ValueData::Quatd([1.0, 0.0, 0.0, 0.0]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut file,
+        )?;
+        let (stored, rest) = file.as_chunks::<8>();
+        assert_eq!(rest.len(), 0);
+        let stored = stored
+            .iter()
+            .map(|bytes| f64::from_le_bytes(*bytes))
+            .collect::<Vec<_>>();
+        assert_eq!(stored, [0.0, 0.0, 0.0, 1.0]);
+        Ok(())
+    }
+}

@@ -1,9 +1,9 @@
 //! Shading normals shared by every exchange format.
 //!
 //! Export: `evaluated_meshes` maps each mesh's local normals to world space through the normal
-//! matrix (cofactor form of the world matrix, normalized) and records whether the node mirrors or is singular. World-space
-//! writers (OBJ, PLY, STL) take `baked_faces`, which reverses mirrored faces so winding agrees
-//! with the normals. Object-local writers (USD, FBX, Alembic) keep local winding and normals and
+//! matrix (cofactor form of the world matrix, normalized) and records whether the node mirrors or
+//! is singular. World-space writers (OBJ, PLY, STL) take `baked_faces`, which reverses mirrored
+//! faces so winding agrees with the normals. Object-local writers (USD, FBX, Alembic) keep local winding and normals and
 //! let the transform carry the placement, as Blender does. Import: each importer hands per-corner
 //! normals to `import_shading`, which derives `shade_smooth` and `custom_normal` the way glTF does.
 
@@ -17,12 +17,9 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
-        normals::{face_normal, normal_matrix},
+        normals::{close, face_normal, normal_matrix},
     },
 };
-
-/// Corner normals and flatness compare within this distance, matching glTF import.
-const TOLERANCE: f64 = 1.0e-4;
 
 /// Whether the transform flips handedness, so exported faces must reverse their winding.
 pub(super) fn is_mirrored(matrix: DMat4) -> bool {
@@ -57,12 +54,18 @@ pub(super) fn world_normals(mesh: &Mesh, local: &[DVec3], matrix: DMat4) -> Resu
     })
 }
 
+/// Faces and corner normals of one mesh, as a world-baked writer stores them.
+pub(super) type BakedFaces = (Vec<Vec<usize>>, Vec<[f64; 3]>);
+
 /// Faces and corner normals as a world-baked writer stores them. A mirrored node reverses each
 /// face so its winding agrees with the normals, as Blender's OBJ, PLY, and STL exporters do.
-pub(super) fn baked_faces(mesh: &ExchangeMesh) -> (Vec<Vec<usize>>, Vec<[f64; 3]>) {
-    let normals = corner_normals(mesh);
+pub(super) fn baked_faces(mesh: &ExchangeMesh) -> Result<BakedFaces> {
+    let normals = mesh
+        .normals
+        .as_deref()
+        .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "mesh normals are missing"))?;
     if !mesh.mirrored {
-        return (mesh.faces.clone(), normals);
+        return Ok((mesh.faces.clone(), normals.to_vec()));
     }
     let mut faces = Vec::with_capacity(mesh.faces.len());
     let mut reversed = Vec::with_capacity(normals.len());
@@ -73,7 +76,7 @@ pub(super) fn baked_faces(mesh: &ExchangeMesh) -> (Vec<Vec<usize>>, Vec<[f64; 3]
         reversed.extend(normals[start..end].iter().rev().copied());
         start = end;
     }
-    (faces, reversed)
+    Ok((faces, reversed))
 }
 
 /// Derives `shade_smooth` and `custom_normal` on `mesh` from per-corner normals.
@@ -171,15 +174,16 @@ pub(super) fn import_shading(mesh: &mut Mesh, normals: &[DVec3]) -> Result<()> {
 
 /// Loss entries for a format whose normal layout cannot carry every corner normal.
 ///
-/// STL stores one normal per triangle, so any smooth or custom corner is lost. PLY stores one
-/// normal per vertex, so a vertex whose corners disagree is lost. Meshes with no shading
-/// (every corner equals its flat normal) write no normals in PLY and lose nothing.
+/// STL stores one normal per triangle, so any smooth or custom corner is lost. PLY writes one
+/// normal per vertex for every mesh in the file once any mesh is shaded, so a vertex whose corners
+/// disagree is lost in any mesh. A flat-only file writes no normals and loses nothing.
 pub(crate) fn shading_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<Loss> {
-    let lossy = meshes.iter().any(|mesh| match format {
-        "stl" => !is_flat(mesh),
-        "ply" => !is_flat(mesh) && !vertex_normals_exact(mesh),
+    let shaded = meshes.iter().any(|mesh| !is_flat(mesh));
+    let lossy = match format {
+        "stl" => shaded,
+        "ply" => shaded && meshes.iter().any(|mesh| !vertex_normals_exact(mesh)),
         _ => false,
-    });
+    };
     if !lossy {
         return Vec::new();
     }
@@ -202,56 +206,21 @@ pub(crate) fn shading_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<Loss>
     }]
 }
 
-/// Per-face smooth state from export: a face is smooth when a corner normal differs from its flat
-/// normal in mesh-local space. All false when the mesh carries no normals.
-pub(super) fn smooth_faces(mesh: &ExchangeMesh) -> Vec<bool> {
-    mesh.smooth
-        .clone()
-        .unwrap_or_else(|| vec![false; mesh.faces.len()])
-}
-
-/// Whether every corner of `mesh` carries its face's flat normal.
+/// Whether every face of `mesh` carries its flat normal at every corner.
 pub(super) fn is_flat(mesh: &ExchangeMesh) -> bool {
-    !smooth_faces(mesh).contains(&true)
-}
-
-/// World-space corner normals of `mesh`, in `faces` order. Meshes without normals are flat,
-/// so each corner takes its face's normal.
-pub(super) fn corner_normals(mesh: &ExchangeMesh) -> Vec<[f64; 3]> {
-    if let Some(normals) = &mesh.normals {
-        return normals.clone();
-    }
-    let mut normals = Vec::new();
-    for face in &mesh.faces {
-        let points = face
-            .iter()
-            .filter_map(|index| mesh.positions.get(*index))
-            .map(|point| DVec3::from_array(*point))
-            .collect::<Vec<_>>();
-        let flat = face_normal(&points).to_array();
-        normals.extend(std::iter::repeat_n(flat, face.len()));
-    }
-    normals
-}
-
-/// Per-vertex world normals of an exported mesh, indexed like `mesh.positions`. Blender's PLY
-/// writer uses these vertex normals.
-pub(super) fn vertex_normals(mesh: &ExchangeMesh) -> Result<&[[f64; 3]]> {
-    mesh.vertex_normals
-        .as_deref()
-        .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "mesh vertex normals are missing"))
+    !mesh.smooth.contains(&true)
 }
 
 /// Whether all corners sharing a vertex agree, so one normal per vertex describes them all.
 fn vertex_normals_exact(mesh: &ExchangeMesh) -> bool {
-    let Some(normals) = &mesh.normals else {
-        return true;
-    };
+    let normals = mesh.normals.as_deref().unwrap_or_default();
     let mut first: Vec<Option<DVec3>> = vec![None; mesh.positions.len()];
     let mut corner = 0;
     for face in &mesh.faces {
         for index in face {
-            let normal = DVec3::from_array(normals[corner]);
+            let Some(normal) = normals.get(corner).map(|normal| DVec3::from_array(*normal)) else {
+                return false;
+            };
             corner += 1;
             let Some(slot) = first.get_mut(*index) else {
                 return false;
@@ -264,8 +233,4 @@ fn vertex_normals_exact(mesh: &ExchangeMesh) -> bool {
         }
     }
     true
-}
-
-fn close(left: DVec3, right: DVec3) -> bool {
-    (left - right).abs().max_element() <= TOLERANCE
 }

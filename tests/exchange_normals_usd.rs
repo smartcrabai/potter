@@ -8,28 +8,14 @@
 )]
 mod exchange_normals;
 
-use std::{
-    fs,
-    path::Path,
-    process::{Command, Output},
-};
+use std::{fs, path::Path, process::Output};
 
 use exchange_normals::{
-    NORMAL_TOLERANCE, ObservedCorner, TestResult, assert_matches_reference, export,
+    NORMAL_TOLERANCE, ObservedCorner, TestResult, assert_matches_reference, export, init, pot,
     usd_world_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
-
-fn pot() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pot"))
-}
-
-fn init(project: &Path) -> TestResult {
-    let output = pot().arg("init").arg(project).arg("--json").output()?;
-    assert!(output.status.success(), "pot init failed");
-    Ok(())
-}
 
 fn run_import(project: &Path, file: &Path, format: &str, allow_lossy: bool) -> TestResult<Output> {
     let mut command = pot();
@@ -308,8 +294,53 @@ fn unknown_interpolation_is_reported_as_a_loss() -> TestResult {
 }
 
 #[test]
-fn zero_length_normals_are_reported_as_a_loss() -> TestResult {
-    assert_normals_reported_as_loss(
-        "normal3f[] normals = [(0, 0, 0)] (interpolation = \"constant\")",
-    )
+fn zero_normals_import_as_zero_without_loss() -> TestResult {
+    let directory = tempdir()?;
+    let source = directory.path().join("cube.usda");
+    fs::write(
+        &source,
+        cube_usda("normal3f[] normals = [(0, 0, 0)] (interpolation = \"constant\")"),
+    )?;
+    let project = directory.path().join("project");
+    init(&project)?;
+    let imported = import(&project, &source, "usda", false)?;
+    assert_eq!(imported["result"]["losses"], json!([]));
+    let exported = export(&project, "usda", &directory.path().join("out.usda"))?;
+    let text = fs::read_to_string(exported)?;
+    assert!(
+        text.contains("normal3f[] normals = [(0, 0, 0)"),
+        "zero normals must round-trip"
+    );
+    Ok(())
+}
+
+#[test]
+fn plain_normals_without_interpolation_are_per_point() -> TestResult {
+    // An unauthored interpolation on the plain `normals` attribute means `vertex`.
+    let corners = reimport_cube(
+        "normal3f[] normals = [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1), (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)]",
+    )?;
+    assert_eq!(corners.len(), 24);
+    for corner in &corners {
+        assert_normal(corner.normal, unit(corner.corner));
+    }
+    Ok(())
+}
+
+#[test]
+fn indexed_normals_map_through_primvars_indices() -> TestResult {
+    // Six unique face normals, stored once and addressed in reverse face order.
+    let values = CUBE_FLAT_NORMALS
+        .iter()
+        .map(|normal| format!("({}, {}, {})", normal[0], normal[1], normal[2]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let corners = reimport_cube(&format!(
+        "normal3f[] primvars:normals = [{values}] (interpolation = \"uniform\")\n    int[] primvars:normals:indices = [5, 4, 3, 2, 1, 0]"
+    ))?;
+    assert_eq!(corners.len(), 24);
+    for (index, corner) in corners.iter().enumerate() {
+        assert_normal(corner.normal, CUBE_FLAT_NORMALS[5 - index / 4]);
+    }
+    Ok(())
 }

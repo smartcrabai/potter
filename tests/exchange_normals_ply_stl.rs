@@ -9,22 +9,14 @@
 )]
 mod exchange_normals;
 
-use std::{
-    fs,
-    path::Path,
-    process::{Command, Output},
-};
+use std::{fs, path::Path, process::Output};
 
 use exchange_normals::{
-    BLENDER_NORMAL_TOLERANCE, NORMAL_TOLERANCE, TestResult, export, export_strict,
+    BLENDER_NORMAL_TOLERANCE, NORMAL_TOLERANCE, TestResult, export, export_strict, init, near, pot,
     reference_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
-
-fn pot() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pot"))
-}
 
 fn envelope(output: &Output) -> TestResult<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
@@ -43,18 +35,8 @@ fn has_feature(losses: &[Value], feature: &str) -> bool {
     losses.iter().any(|loss| loss["feature_id"] == feature)
 }
 
-fn init_project(scene: &Path) -> TestResult {
-    let output = pot().arg("init").arg(scene).arg("--json").output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    Ok(())
-}
-
 fn apply_operations(scene: &Path, operations: &Value) -> TestResult {
-    init_project(scene)?;
+    init(scene)?;
     let batch = scene.with_extension("batch.json");
     fs::write(
         &batch,
@@ -256,10 +238,6 @@ fn normalized(vector: [f64; 3]) -> [f64; 3] {
     vector.map(|value| value / length)
 }
 
-fn same_point(left: [f64; 3], right: [f64; 3]) -> bool {
-    (0..3).all(|axis| (left[axis] - right[axis]).abs() <= 1.0e-4)
-}
-
 fn max_error(left: [f64; 3], right: [f64; 3]) -> f64 {
     (0..3)
         .map(|axis| (left[axis] - right[axis]).abs())
@@ -309,7 +287,7 @@ fn ply_fixture_vertex_normals_are_blender_per_vertex_sums() -> TestResult {
         let mut corners = 0;
         for corner in reference
             .iter()
-            .filter(|corner| same_point(corner.corner, vertex.position))
+            .filter(|corner| near(corner.corner, vertex.position))
         {
             corners += 1;
             let scale = fixture_scale(corner.corner);
@@ -363,7 +341,7 @@ fn flat_only_ply_writes_no_normals_and_imports_flat() -> TestResult {
     );
 
     let imported = directory.path().join("imported-flat");
-    init_project(&imported)?;
+    init(&imported)?;
     let import = import_file(&imported, &flat_file, "ply", false)?;
     assert!(
         import.status.success(),
@@ -390,7 +368,7 @@ fn flat_only_ply_writes_no_normals_and_imports_flat() -> TestResult {
     );
     assert!(parse_ply(&fs::read(&smooth_file)?)?.has_normals);
     let smooth_import = directory.path().join("imported-smooth");
-    init_project(&smooth_import)?;
+    init(&smooth_import)?;
     let import = import_file(&smooth_import, &smooth_file, "ply", false)?;
     assert!(
         import.status.success(),
@@ -403,6 +381,38 @@ fn flat_only_ply_writes_no_normals_and_imports_flat() -> TestResult {
             .any(|name| name == "shade_smooth"),
         "a PLY with vertex normals must import as smooth"
     );
+    Ok(())
+}
+
+#[test]
+fn ply_flat_mesh_beside_a_shaded_mesh_reports_shading_loss() -> TestResult {
+    // One PLY file carries normals for every mesh once any mesh is shaded, so the flat box loses too.
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let mut operations = flat_box_operations()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    operations.extend(
+        smooth_box_operations()
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut op| {
+                if op["id"] == "cube" {
+                    op["id"] = json!("smooth");
+                }
+                if op["target"]["id"] == "cube" {
+                    op["target"]["id"] = json!("smooth");
+                }
+                op
+            }),
+    );
+    apply_operations(&scene, &json!(operations))?;
+    let refused = export_strict(&scene, "ply", &directory.path().join("mixed.ply"))?;
+    assert_eq!(refused.status.code(), Some(4));
+    assert!(has_feature(&losses(&envelope(&refused)?), "mesh.shading"));
     Ok(())
 }
 
@@ -470,13 +480,13 @@ fn stl_import_reports_facet_normal_that_contradicts_winding() -> TestResult {
     fs::write(&file, stl_single_triangle([0.0, 0.0, -1.0]))?;
 
     let refused_project = directory.path().join("refused");
-    init_project(&refused_project)?;
+    init(&refused_project)?;
     let refused = import_file(&refused_project, &file, "stl", false)?;
     assert_eq!(refused.status.code(), Some(4));
     assert!(has_feature(&losses(&envelope(&refused)?), "mesh.normals"));
 
     let project = directory.path().join("imported");
-    init_project(&project)?;
+    init(&project)?;
     let imported = import_file(&project, &file, "stl", true)?;
     assert!(
         imported.status.success(),
@@ -494,7 +504,7 @@ fn stl_import_accepts_agreeing_or_zero_facet_normals() -> TestResult {
         let file = directory.path().join("triangle.stl");
         fs::write(&file, stl_single_triangle(stored))?;
         let project = directory.path().join("imported");
-        init_project(&project)?;
+        init(&project)?;
         let imported = import_file(&project, &file, "stl", false)?;
         assert!(
             imported.status.success(),
@@ -519,7 +529,7 @@ fn ply_round_trip_keeps_per_vertex_normals() -> TestResult {
     let first = parse_ply(&fs::read(&first_file)?)?;
 
     let imported = directory.path().join("imported");
-    init_project(&imported)?;
+    init(&imported)?;
     let import = import_file(&imported, &first_file, "ply", false)?;
     assert!(
         import.status.success(),
@@ -542,7 +552,7 @@ fn ply_round_trip_keeps_per_vertex_normals() -> TestResult {
         let other = second
             .vertices
             .iter()
-            .find(|candidate| same_point(candidate.position, vertex.position))
+            .find(|candidate| near(candidate.position, vertex.position))
             .ok_or("re-exported PLY lost a vertex")?;
         let error = max_error(vertex.normal, other.normal);
         assert!(

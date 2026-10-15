@@ -30,15 +30,9 @@ mod process;
 
 use blender_checked::blender_executable;
 use exchange_normals::{
-    ObservedCorner, export, reference_corners, usd_world_corners, write_fixture_scene,
+    BLENDER_NORMAL_TOLERANCE, ObservedCorner, TestResult, export, near, pot, reference_corners,
+    usd_world_corners, write_fixture_scene,
 };
-
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-/// Tolerance for corner normals after a Blender import. Blender stores custom normals as int16,
-/// quantized to about 3e-5 per component (observed up to 9e-5), so this is looser than the
-/// `NORMAL_TOLERANCE` used for Potter-side decoding.
-const BLENDER_NORMAL_TOLERANCE: f64 = 2.0e-4;
 
 /// Imports the file given after `--` with the importer named by the first argument, then prints
 /// every mesh object's world-space corner normals. Normals follow `mesh.corner_normals` mapped by
@@ -200,10 +194,6 @@ fn assert_custom_normals(format: &str, meshes: &[BlenderMesh]) {
     }
 }
 
-fn same_point(left: [f64; 3], right: [f64; 3]) -> bool {
-    (0..3).all(|axis| (left[axis] - right[axis]).abs() <= 1.0e-4)
-}
-
 /// Expected corners for PLY: Blender's PLY import gives every corner the normal of its vertex.
 /// Blender writes a vertex normal as normalize(N * sum of the object-local corner normals at that
 /// vertex), with N the inverse transpose of the object matrix. Summing world corner normals instead
@@ -228,7 +218,7 @@ fn ply_vertex_normal_reference() -> TestResult<Vec<ObservedCorner>> {
             // World normal = normalize(M^-T n), so the local normal is proportional to M^T world.
             let local_sum = reference
                 .iter()
-                .filter(|other| same_point(other.corner, corner.corner))
+                .filter(|other| near(other.corner, corner.corner))
                 .fold(DVec3::ZERO, |sum, other| {
                     sum + (DVec3::from_array(other.normal) * scale).normalize()
                 });
@@ -258,8 +248,7 @@ fn assert_matches_expected(
         let found = observed
             .iter()
             .filter(|corner| {
-                same_point(corner.corner, want.corner)
-                    && same_point(corner.face_center, want.face_center)
+                near(corner.corner, want.corner) && near(corner.face_center, want.face_center)
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -401,10 +390,6 @@ print("POTTER_BLENDER_FRAMES=" + json.dumps(frames, sort_keys=True))
 #[derive(Deserialize)]
 struct BlenderFrameMesh {
     corners: Vec<BlenderCorner>,
-}
-
-fn pot() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_pot"))
 }
 
 fn run_pot(command: &mut Command) -> TestResult {

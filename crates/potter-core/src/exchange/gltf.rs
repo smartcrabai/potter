@@ -14,7 +14,7 @@ use crate::{
     eval::{Snapshot, mesh_vertex_weights},
     geom::{
         Face, Mesh, MeshError,
-        normals::{corner_normals, shading_keys_stale},
+        normals::{close, corner_normals, shading_keys_stale},
     },
     image::{ImageData, ImageInterpolation, load_image_data},
     model::{
@@ -5291,10 +5291,6 @@ fn morph_normals_disagree(
     normals: &[DVec3],
     morph_targets: &[MorphNormalTarget],
 ) -> bool {
-    const TOLERANCE: f64 = 1.0e-4;
-    fn close(left: DVec3, right: DVec3) -> bool {
-        (left - right).abs().max_element() <= TOLERANCE
-    }
     let mut disagree = false;
     for (position_deltas, normal_deltas) in morph_targets {
         let morphed = mesh
