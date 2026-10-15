@@ -512,6 +512,7 @@ mod tests {
                         material_index: 0,
                         uv: [[0.0; 2]; 3],
                         uv_available: false,
+                        normals: None,
                     }
                 })
                 .collect::<Vec<_>>();

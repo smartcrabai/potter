@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 
-use glam::{DMat4, DVec3};
+use glam::{DMat3, DMat4, DVec3};
 use serde::Serialize;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
+    geom::normals::render_corner_normals,
     image::ImageData,
     model::{Id, Material, SceneDoc},
     shader::{HitContext, evaluate_displacement},
@@ -13,7 +14,7 @@ use crate::{
 
 use super::{
     bvh::Bvh,
-    raster::{AlphaMode, Line, Mode, Triangle},
+    raster::{AlphaMode, Line, Mode, SurfaceShader, Triangle, blend_corner_normals},
 };
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -40,6 +41,14 @@ pub(super) struct Geometry {
     pub elements: Vec<ElementRecord>,
     pub bounds: Option<(DVec3, DVec3)>,
     pub warnings: Vec<serde_json::Value>,
+    pub shadows: Option<RealtimeShadows>,
+}
+
+/// Shadow acceleration for the realtime Beauty engine; built once per geometry and shared by
+/// the flat-triangle baking and the per-pixel shading of smooth triangles.
+pub(super) struct RealtimeShadows {
+    bvh: Bvh,
+    point_maps: BTreeMap<Id, PointShadowMap>,
 }
 
 const SHADOW_MAP_SIZE: u32 = 64;
@@ -224,8 +233,10 @@ pub(super) fn extract_geometry(
                     serde_json::json!({ "node_id": node_id }),
                 )
             })?;
+            let face_normals = world_face_normals(mesh, matrix, node_id, &mut warnings);
             let mut triangle_offset = 0_usize;
-            for face in &mesh.faces {
+            for (face_index, face) in mesh.faces.iter().enumerate() {
+                let face_corner_normals = face_normals[face_index].as_deref();
                 let element_index = u32::try_from(elements.len() + 1).map_err(|_| {
                     PotError::new(
                         ErrorCode::LimitExceeded,
@@ -281,6 +292,7 @@ pub(super) fn extract_geometry(
                 for triangle in face_triangles {
                     let mut positions = [DVec3::ZERO; 3];
                     let mut uv = [[0.0; 2]; 3];
+                    let corners = triangle_corners(face, triangle);
                     for (index, vertex_id) in triangle.iter().enumerate() {
                         let local = vertex_positions.get(vertex_id).copied().ok_or_else(|| {
                             PotError::new(
@@ -289,10 +301,7 @@ pub(super) fn extract_geometry(
                             )
                         })?;
                         positions[index] = matrix.transform_point3(local);
-                        uv[index] = face
-                            .vertices
-                            .iter()
-                            .position(|face_vertex| face_vertex == vertex_id)
+                        uv[index] = corners[index]
                             .and_then(|corner| {
                                 face_uv.as_ref().and_then(|values| values.get(corner))
                             })
@@ -304,16 +313,22 @@ pub(super) fn extract_geometry(
                     if raw_normal.length_squared() <= f64::EPSILON || !raw_normal.is_finite() {
                         continue;
                     }
+                    let corner_normals =
+                        face_corner_normals.and_then(|normals| corner_values(normals, corners));
                     let normal = raw_normal.normalize();
                     let center = (positions[0] + positions[1] + positions[2]) / 3.0;
-                    let color = if path_traced && matches!(mode, Mode::Beauty) {
+                    // Smooth triangles take lighting per pixel (raster) or per hit (path tracer).
+                    let color = if corner_normals.is_some()
+                        || (path_traced && matches!(mode, Mode::Beauty))
+                    {
                         base_color
                     } else {
                         shade(
                             doc,
                             snapshot,
-                            node,
                             center,
+                            center,
+                            normal,
                             normal,
                             base_color,
                             material.map_or(0.0, |value| value.metallic),
@@ -340,13 +355,14 @@ pub(super) fn extract_geometry(
                         material_index,
                         uv,
                         uv_available: face_uv.is_some(),
+                        normals: corner_normals,
                     };
                     if let Some(material) = material.filter(|material| {
                         material.displacement_method == "displacement"
                             && material.node_tree.is_some()
                     }) {
                         triangles.extend(subdivide_displaced_triangle(
-                            doc, material, matrix, triangle, images,
+                            doc, material, matrix, &triangle, images,
                         )?);
                     } else {
                         triangles.push(triangle);
@@ -603,6 +619,7 @@ pub(super) fn extract_geometry(
         elements,
         bounds,
         warnings,
+        shadows: None,
     };
     if !path_traced && matches!(mode, Mode::Beauty) && !geometry.triangles.is_empty() {
         geometry.triangles = subdivide_realtime_triangles(&geometry.triangles)?;
@@ -610,21 +627,14 @@ pub(super) fn extract_geometry(
         let bvh = Bvh::build(&geometry.triangles)?;
         for index in 0..geometry.triangles.len() {
             let triangle = geometry.triangles[index];
+            if triangle.normals.is_some() {
+                // Smooth triangles are shaded per pixel from their corner normals.
+                continue;
+            }
             let material = geometry
                 .materials
                 .get(triangle.material_index)
                 .unwrap_or(&geometry.materials[0]);
-            let object = geometry
-                .objects
-                .iter()
-                .find(|object| object.index == triangle.object_index)
-                .and_then(|object| doc.nodes.get(&object.node_id))
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::EvaluationFailed,
-                        "render triangle references a missing scene object",
-                    )
-                })?;
             let normal = (triangle.positions[1] - triangle.positions[0])
                 .cross(triangle.positions[2] - triangle.positions[0])
                 .normalize_or_zero();
@@ -633,8 +643,9 @@ pub(super) fn extract_geometry(
             let color = shade(
                 doc,
                 snapshot,
-                object,
                 center,
+                center,
+                normal,
                 normal,
                 material.base_color,
                 material.metallic,
@@ -647,6 +658,10 @@ pub(super) fn extract_geometry(
                 target.color = color;
             }
         }
+        geometry.shadows = Some(RealtimeShadows {
+            bvh,
+            point_maps: shadow_maps,
+        });
     }
     Ok(geometry)
 }
@@ -884,15 +899,21 @@ fn subdivide_realtime_triangles(triangles: &[Triangle]) -> Result<Vec<Triangle>>
             "realtime shadow subdivision exceeds available memory",
         )
     })?;
-    for triangle in triangles.iter().copied() {
+    for triangle in triangles {
+        // Smooth triangles are shaded per pixel from their corner normals, so splitting them
+        // would only multiply the raster and shadow work without changing the lighting.
+        if triangle.normals.is_some() {
+            refined.push(*triangle);
+            continue;
+        }
         for half in subdivide_triangle_once(triangle) {
-            refined.extend(subdivide_triangle_once(half));
+            refined.extend(subdivide_triangle_once(&half));
         }
     }
     Ok(refined)
 }
 
-fn subdivide_triangle_once(triangle: Triangle) -> [Triangle; 4] {
+fn subdivide_triangle_once(triangle: &Triangle) -> [Triangle; 4] {
     let positions = [
         triangle.positions[0],
         triangle.positions[1],
@@ -919,7 +940,7 @@ fn subdivide_triangle_once(triangle: Triangle) -> [Triangle; 4] {
         ],
     ];
     let subtriangles = [[0, 3, 5], [3, 1, 4], [5, 4, 2], [3, 4, 5]];
-    let mut result = [triangle; 4];
+    let mut result = [*triangle; 4];
     for (subtriangle, corners) in subtriangles.into_iter().enumerate() {
         for (corner, vertex) in corners.into_iter().enumerate() {
             result[subtriangle].positions[corner] = positions[vertex];
@@ -933,8 +954,43 @@ fn subdivide_displaced_triangle(
     doc: &SceneDoc,
     material: &Material,
     object_to_world: DMat4,
-    triangle: Triangle,
+    triangle: &Triangle,
     images: &BTreeMap<String, ImageData>,
+) -> Result<[Triangle; 4]> {
+    subdivide_displaced(triangle, object_to_world, |sample| {
+        let mut context = HitContext::new(&doc.node_groups)
+            .with_images(images)
+            .with_tangent_frame(sample.tangent, sample.bitangent);
+        context.uv = sample.uv;
+        context.position = sample.point;
+        context.object = sample.object;
+        context.generated = sample.object;
+        context.normal = sample.normal;
+        evaluate_displacement(material, &context)
+    })
+}
+
+/// One displacement sample of a triangle being subdivided.
+struct DisplacementSample {
+    point: DVec3,
+    object: DVec3,
+    uv: [f64; 2],
+    /// Blended corner normal the sample moves along, or the face normal on flat triangles.
+    normal: DVec3,
+    tangent: DVec3,
+    bitangent: DVec3,
+}
+
+/// Splits a triangle into four and moves its six sample points by `displacement`.
+///
+/// Samples move along the blended corner normal, so neighbouring smooth triangles agree on
+/// shared edges. Each sub-triangle then carries its own displaced face normal, flipped toward
+/// the blended sample normals, so the relief still shades instead of following the undisplaced
+/// normals.
+fn subdivide_displaced(
+    triangle: &Triangle,
+    object_to_world: DMat4,
+    mut displacement: impl FnMut(&DisplacementSample) -> Result<f64>,
 ) -> Result<[Triangle; 4]> {
     let normal = (triangle.positions[1] - triangle.positions[0])
         .cross(triangle.positions[2] - triangle.positions[0])
@@ -977,6 +1033,7 @@ fn subdivide_displaced_triangle(
     ];
     let mut positions = [DVec3::ZERO; 6];
     let mut uvs = [[0.0; 2]; 6];
+    let mut sample_normals = [normal; 6];
     let world_to_object = object_to_world.inverse();
     let inverse_is_finite = world_to_object
         .to_cols_array()
@@ -995,29 +1052,46 @@ fn subdivide_displaced_triangle(
                 + triangle.uv[1][1] * weights[1]
                 + triangle.uv[2][1] * weights[2],
         ];
-        let object_point = if inverse_is_finite {
+        let object = if inverse_is_finite {
             world_to_object.transform_point3(point)
         } else {
             point
         };
-        let mut context = HitContext::new(&doc.node_groups)
-            .with_images(images)
-            .with_tangent_frame(tangent, bitangent);
-        context.uv = uv;
-        context.position = point;
-        context.object = object_point;
-        context.generated = object_point;
-        context.normal = normal;
-        let displacement = evaluate_displacement(material, &context)?;
-        positions[index] = point + normal * displacement;
+        let sample_normal = triangle.normals.map_or(normal, |corners| {
+            blend_corner_normals(corners, weights, normal)
+        });
+        let sample = DisplacementSample {
+            point,
+            object,
+            uv,
+            normal: sample_normal,
+            tangent,
+            bitangent,
+        };
+        let displacement = displacement(&sample)?;
+        positions[index] = point + sample_normal * displacement;
+        sample_normals[index] = sample_normal;
         uvs[index] = uv;
     }
     let indices = [[0, 1, 2], [1, 3, 4], [2, 4, 5], [1, 4, 2]];
-    let mut result = [triangle; 4];
+    let mut result = [*triangle; 4];
     for (subtriangle, corners) in indices.iter().enumerate() {
         for (corner, vertex) in corners.iter().copied().enumerate() {
             result[subtriangle].positions[corner] = positions[vertex];
             result[subtriangle].uv[corner] = uvs[vertex];
+        }
+        if triangle.normals.is_some() {
+            let average = corners
+                .iter()
+                .fold(DVec3::ZERO, |sum, &vertex| sum + sample_normals[vertex]);
+            let [a, b, c] = corners.map(|vertex| positions[vertex]);
+            let mut face = (b - a)
+                .cross(c - a)
+                .normalize_or(average.normalize_or(normal));
+            if face.dot(average) < 0.0 {
+                face = -face;
+            }
+            result[subtriangle].normals = Some([face; 3]);
         }
     }
     Ok(result)
@@ -1042,6 +1116,123 @@ fn collect_collection_nodes(
     }
 }
 
+/// World-space corner normals per face; `None` marks a flat face. A mesh whose corner normals
+/// cannot be built keeps flat face normals and records a warning.
+fn world_face_normals(
+    mesh: &crate::geom::Mesh,
+    matrix: DMat4,
+    node_id: &Id,
+    warnings: &mut Vec<serde_json::Value>,
+) -> Vec<Option<Vec<DVec3>>> {
+    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    let local = match render_corner_normals(mesh, &positions) {
+        Ok(faces) => faces,
+        Err(error) => {
+            warnings.push(serde_json::json!({
+                "code": "shading.corner_normals_failed",
+                "message": format!(
+                    "smooth shading normals could not be computed ({error}); flat face normals were used"
+                ),
+                "node_id": node_id,
+            }));
+            return vec![None; mesh.faces.len()];
+        }
+    };
+    // Inverse-transpose keeps normals perpendicular to the surface under non-uniform scale.
+    let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
+    let mut degenerate = false;
+    let faces = local
+        .into_iter()
+        .map(|face| {
+            let world: Vec<DVec3> = face?
+                .into_iter()
+                .map(|normal| (normal_matrix * normal).normalize_or_zero())
+                .collect();
+            let valid = world
+                .iter()
+                .all(|normal| normal.is_finite() && *normal != DVec3::ZERO);
+            degenerate |= !valid;
+            valid.then_some(world)
+        })
+        .collect();
+    if degenerate {
+        warnings.push(serde_json::json!({
+            "code": "shading.corner_normals_failed",
+            "message": "smooth shading normals became zero-length under the object transform; affected faces were shaded flat",
+            "node_id": node_id,
+        }));
+    }
+    faces
+}
+
+/// Per-pixel lighting for smooth triangles in raster Solid and realtime Beauty output. Flat
+/// triangles keep the lighting baked into `Triangle::color`, which equals per-pixel lighting
+/// for a constant normal.
+pub(super) struct SceneShader<'a> {
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    images: &'a BTreeMap<String, ImageData>,
+    geometry: &'a Geometry,
+    mode: Mode,
+}
+
+/// The per-pixel shader for `mode`, or `None` when the raster outputs unlit or per-triangle colour.
+pub(super) fn surface_shader<'a>(
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    images: &'a BTreeMap<String, ImageData>,
+    geometry: &'a Geometry,
+    mode: Mode,
+) -> Option<Box<dyn SurfaceShader + 'a>> {
+    match mode {
+        Mode::Solid => {}
+        Mode::Beauty if geometry.shadows.is_some() => {}
+        _ => return None,
+    }
+    Some(Box::new(SceneShader {
+        doc,
+        snapshot,
+        images,
+        geometry,
+        mode,
+    }))
+}
+
+impl SurfaceShader for SceneShader<'_> {
+    fn shade(
+        &self,
+        triangle: &Triangle,
+        point: DVec3,
+        shadow_point: DVec3,
+        normal: DVec3,
+        geometric: DVec3,
+    ) -> Result<[f64; 3]> {
+        let material = self.geometry.materials.get(triangle.material_index);
+        let shadow = self.geometry.shadows.as_ref().map(|shadows| {
+            (
+                &shadows.bvh,
+                self.geometry.triangles.as_slice(),
+                &shadows.point_maps,
+            )
+        });
+        let color = shade(
+            self.doc,
+            self.snapshot,
+            point,
+            shadow_point,
+            normal,
+            geometric,
+            triangle.color,
+            material.map_or(0.0, |value| value.metallic),
+            material.map_or(0.8, |value| value.roughness),
+            self.mode,
+            shadow,
+            self.images,
+        )?;
+        Ok([color[0], color[1], color[2]])
+    }
+}
+
 fn read_face_uvs(mesh: &crate::geom::Mesh, face_id: u32) -> Option<Vec<[f64; 2]>> {
     mesh.attributes
         .get("uv_map")?
@@ -1055,6 +1246,24 @@ fn read_face_uvs(mesh: &crate::geom::Mesh, face_id: u32) -> Option<Vec<[f64; 2]>
         .iter()
         .map(|coordinate| Some([coordinate.get(0)?.as_f64()?, coordinate.get(1)?.as_f64()?]))
         .collect()
+}
+
+/// Face-corner index of each triangle vertex; the UV and shading-normal lookups share it.
+fn triangle_corners(face: &crate::geom::Face, triangle: &[u32; 3]) -> [Option<usize>; 3] {
+    triangle.map(|vertex_id| {
+        face.vertices
+            .iter()
+            .position(|face_vertex| *face_vertex == vertex_id)
+    })
+}
+
+/// Per-corner values for a triangle, or `None` when any corner is not on the face.
+fn corner_values<T: Copy>(values: &[T], corners: [Option<usize>; 3]) -> Option<[T; 3]> {
+    Some([
+        values.get(corners[0]?).copied()?,
+        values.get(corners[1]?).copied()?,
+        values.get(corners[2]?).copied()?,
+    ])
 }
 
 fn read_vertex_number(mesh: &crate::geom::Mesh, name: &str, vertex_id: u32) -> Option<f64> {
@@ -1098,9 +1307,10 @@ fn read_vertex_color(mesh: &crate::geom::Mesh, vertex_id: u32) -> Option<[f64; 4
 fn shade(
     doc: &SceneDoc,
     snapshot: &Snapshot,
-    _node: &crate::model::Node,
     point: DVec3,
+    shadow_point: DVec3,
     normal: DVec3,
+    geometric: DVec3,
     base: [f64; 4],
     metallic: f64,
     roughness: f64,
@@ -1187,7 +1397,9 @@ fn shade(
                 light,
                 matrix,
                 point,
+                shadow_point,
                 normal,
+                geometric,
                 albedo,
                 metallic,
                 roughness,
@@ -1237,7 +1449,9 @@ fn light_contribution(
     light: &crate::model::LightData,
     matrix: DMat4,
     point: DVec3,
+    shadow_point: DVec3,
     normal: DVec3,
+    geometric: DVec3,
     albedo: DVec3,
     metallic: f64,
     roughness: f64,
@@ -1262,8 +1476,8 @@ fn light_contribution(
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
-                point,
-                normal,
+                shadow_point,
+                geometric,
                 toward_light,
                 f64::INFINITY,
             )
@@ -1284,8 +1498,8 @@ fn light_contribution(
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
-                point,
-                normal,
+                shadow_point,
+                geometric,
                 toward_light,
                 distance_squared.sqrt(),
             )
@@ -1321,8 +1535,8 @@ fn light_contribution(
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
-                point,
-                normal,
+                shadow_point,
+                geometric,
                 toward_light,
                 distance_squared.sqrt(),
             )
@@ -1354,8 +1568,8 @@ fn light_contribution(
                 ) * visibility_for_light(
                     shadow,
                     point_shadow,
-                    point,
-                    normal,
+                    shadow_point,
+                    geometric,
                     toward_light,
                     distance_squared.sqrt(),
                 );
@@ -1492,4 +1706,150 @@ fn direct_brdf(
             / (4.0 * normal_view_cosine * normal_light_cosine).max(1.0e-9));
     let diffuse = (DVec3::ONE - fresnel) * albedo * ((1.0 - metallic) / std::f64::consts::PI);
     (diffuse + specular) * light_color * (intensity * normal_light_cosine)
+}
+
+#[cfg(test)]
+mod shading_normal_tests {
+    #![expect(clippy::expect_used, reason = "small mesh fixtures")]
+
+    use glam::{DMat4, DVec3};
+    use serde_json::json;
+
+    use super::{corner_values, subdivide_displaced, triangle_corners, world_face_normals};
+    use crate::{
+        geom::Mesh,
+        model::Id,
+        render::raster::{AlphaMode, Triangle},
+    };
+
+    fn node_id() -> Id {
+        Id::new("node").expect("valid id")
+    }
+
+    fn single_face_mesh(points: [DVec3; 3], smooth: bool) -> Mesh {
+        let mut mesh = Mesh::from_positions_and_faces(points.to_vec(), vec![vec![0, 1, 2]])
+            .expect("triangle is valid");
+        mesh.attributes.insert(
+            "shade_smooth".to_owned(),
+            json!({"domain": "face", "type": "bool", "values": {"f0": smooth}}),
+        );
+        mesh
+    }
+
+    #[test]
+    fn flat_faces_keep_geometric_normals_without_warnings() {
+        let mesh = single_face_mesh([DVec3::ZERO, DVec3::Y, DVec3::new(1.0, 0.0, -1.0)], false);
+        let mut warnings = Vec::new();
+        let faces = world_face_normals(&mesh, DMat4::IDENTITY, &node_id(), &mut warnings);
+        assert_eq!(faces, vec![None]);
+        assert_eq!(warnings, Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn smooth_corner_normals_use_the_inverse_transpose_of_the_object_matrix() {
+        let mesh = single_face_mesh([DVec3::ZERO, DVec3::Y, DVec3::new(1.0, 0.0, -1.0)], true);
+        let matrix = DMat4::from_scale(DVec3::new(1.0, 1.0, 3.0));
+        let mut warnings = Vec::new();
+        let faces = world_face_normals(&mesh, matrix, &node_id(), &mut warnings);
+        let corners = faces[0].as_ref().expect("smooth face has corner normals");
+        let expected = DVec3::new(-3.0, 0.0, -1.0).normalize();
+        assert_eq!(corners.len(), 3);
+        for corner in corners {
+            assert!(corner.abs_diff_eq(expected, 1e-9), "got {corner:?}");
+        }
+        assert_eq!(warnings, Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn degenerate_smooth_fans_fall_back_to_flat_with_a_warning() {
+        let mesh = single_face_mesh([DVec3::ZERO, DVec3::X, DVec3::new(2.0, 0.0, 0.0)], true);
+        let mut warnings = Vec::new();
+        let faces = world_face_normals(&mesh, DMat4::IDENTITY, &node_id(), &mut warnings);
+        assert_eq!(faces, vec![None]);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["code"], "shading.corner_normals_failed");
+        assert_eq!(warnings[0]["node_id"], "node");
+    }
+
+    #[test]
+    fn singular_object_transforms_warn_and_fall_back_to_flat() {
+        let mesh = single_face_mesh([DVec3::ZERO, DVec3::X, DVec3::Y], true);
+        let mut warnings = Vec::new();
+        let matrix = DMat4::from_scale(DVec3::new(1.0, 1.0, 0.0));
+        let faces = world_face_normals(&mesh, matrix, &node_id(), &mut warnings);
+        assert_eq!(faces, vec![None]);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["code"], "shading.corner_normals_failed");
+    }
+    fn source_triangle(positions: [DVec3; 3], normals: [DVec3; 3]) -> Triangle {
+        Triangle {
+            positions,
+            object_index: 1,
+            element_index: 1,
+            color: [1.0; 4],
+            alpha_mode: AlphaMode::Opaque,
+            alpha_threshold: 0.5,
+            double_sided: false,
+            material_index: 0,
+            uv: [[0.0; 2]; 3],
+            uv_available: false,
+            normals: Some(normals),
+        }
+    }
+
+    #[test]
+    fn triangle_vertices_map_to_their_own_face_corner_normals() {
+        let mesh = Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+            vec![vec![0, 1, 2, 3]],
+        )
+        .expect("quad is valid");
+        let face = &mesh.faces[0];
+        // The second triangle of the quad, (v0, v2, v3), uses corners 0, 2 and 3.
+        let ids = [face.vertices[0], face.vertices[2], face.vertices[3]];
+        let corners = triangle_corners(face, &ids);
+        assert_eq!(corners, [Some(0), Some(2), Some(3)]);
+        let normals = [DVec3::X, DVec3::Y, DVec3::Z, DVec3::NEG_X];
+        assert_eq!(
+            corner_values(&normals, corners),
+            Some([DVec3::X, DVec3::Z, DVec3::NEG_X])
+        );
+        assert_eq!(corner_values(&normals, [Some(0), None, Some(2)]), None);
+    }
+
+    #[test]
+    fn displaced_neighbours_share_edge_points_and_shade_with_their_own_face_normals() {
+        let tilt = DVec3::new(0.2, 0.1, 1.0).normalize();
+        // The second triangle is not coplanar with the first, so face normals differ.
+        let first = source_triangle([DVec3::ZERO, DVec3::X, DVec3::Y], [tilt; 3]);
+        let second = source_triangle([DVec3::X, DVec3::new(1.0, 1.0, 0.5), DVec3::Y], [tilt; 3]);
+        let first_out = subdivide_displaced(&first, DMat4::IDENTITY, |_| Ok(0.1)).expect("first");
+        let second_out =
+            subdivide_displaced(&second, DMat4::IDENTITY, |_| Ok(0.1)).expect("second");
+        let shared_edge = [
+            DVec3::X + tilt * 0.1,
+            DVec3::Y + tilt * 0.1,
+            (DVec3::X + DVec3::Y) * 0.5 + tilt * 0.1,
+        ];
+        for point in shared_edge {
+            for output in [&first_out, &second_out] {
+                assert!(
+                    output
+                        .iter()
+                        .flat_map(|triangle| triangle.positions)
+                        .any(|corner| corner.abs_diff_eq(point, 1e-12)),
+                    "shared displaced point {point:?} missing"
+                );
+            }
+        }
+        for sub in first_out.iter().chain(&second_out) {
+            let [a, b, c] = sub.positions;
+            let face = (b - a).cross(c - a).normalize();
+            let face = if face.dot(tilt) < 0.0 { -face } else { face };
+            let normals = sub
+                .normals
+                .expect("smooth sub-triangle keeps shading normals");
+            assert!(normals.iter().all(|normal| normal.abs_diff_eq(face, 1e-9)));
+        }
+    }
 }

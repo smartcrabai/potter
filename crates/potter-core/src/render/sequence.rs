@@ -158,6 +158,7 @@ pub fn render_sequence(
     let result = (|| -> Result<Value> {
         let mut rendered_frames = Vec::with_capacity(frames.len());
         let mut scene_hash = None;
+        let mut warnings = Vec::new();
         for (index, frame) in frames.iter().copied().enumerate() {
             let mut frame_context = context.clone();
             frame_context.frame = Some(frame);
@@ -179,6 +180,7 @@ pub fn render_sequence(
                     samples,
                     seed,
                     film_transparent,
+                    &mut warnings,
                 )?;
                 if format == "png" {
                     let image = CompositorImage::new(width, height, composed.pixels)?;
@@ -208,9 +210,10 @@ pub fn render_sequence(
                         seed,
                         scene.render.shutter,
                         scene.render.motion_blur_samples,
+                        &mut warnings,
                     )?
                 } else {
-                    render_camera_frame(
+                    let (snapshot, raster, frame_warnings) = render_camera_frame(
                         doc,
                         &frame_context,
                         cache_directory,
@@ -223,7 +226,9 @@ pub fn render_sequence(
                         film_transparent,
                         samples,
                         seed,
-                    )?
+                    )?;
+                    push_new_warnings(&mut warnings, frame_warnings);
+                    (snapshot, raster)
                 };
                 if format == "png" {
                     let bytes = encode_png(&raster.rgba, width, height)?;
@@ -368,6 +373,7 @@ pub fn render_sequence(
             "audio": absolute_audio.map(|path| path.display().to_string()),
             "frames": output_frames,
             "manifest": absolute_manifest.display().to_string(),
+            "warnings": warnings,
         }))
     })();
     let _ = fs::remove_dir_all(&staging);
@@ -390,6 +396,7 @@ fn render_motion_blurred_frame(
     seed: u32,
     shutter: f64,
     shutter_samples: u32,
+    warnings: &mut Vec<Value>,
 ) -> Result<(Snapshot, crate::render::raster::RasterOutput)> {
     if !shutter.is_finite()
         || shutter <= 0.0
@@ -417,7 +424,7 @@ fn render_motion_blurred_frame(
         let offset = (f64::from(sample_index) + 0.5) / f64::from(shutter_samples) - 0.5;
         let mut sample_context = context.clone();
         sample_context.frame = Some(center_frame + offset * shutter);
-        let (_, rendered) = render_camera_frame(
+        let (_, rendered, sample_warnings) = render_camera_frame(
             doc,
             &sample_context,
             cache_directory,
@@ -431,6 +438,7 @@ fn render_motion_blurred_frame(
             samples,
             seed,
         )?;
+        push_new_warnings(warnings, sample_warnings);
         let Some(output) = accumulated.as_mut() else {
             accumulated = Some(rendered);
             continue;
@@ -478,6 +486,15 @@ fn render_motion_blurred_frame(
     Ok((center_snapshot, raster))
 }
 
+/// Appends warnings not already recorded, so a warning repeated on every frame is reported once.
+fn push_new_warnings(warnings: &mut Vec<Value>, new: Vec<Value>) {
+    for warning in new {
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
+}
+
 fn validate_vse_exr_passes(passes: &[String]) -> Result<()> {
     for pass in passes {
         if pass != "combined" {
@@ -506,6 +523,7 @@ fn render_vse_frame(
     samples: u32,
     seed: u32,
     film_transparent: bool,
+    warnings: &mut Vec<Value>,
 ) -> Result<RgbaFrame> {
     let width_usize = usize::try_from(width).map_err(|_| {
         PotError::new(
@@ -571,6 +589,7 @@ fn render_vse_frame(
             film_transparent,
             false,
             &mut visiting,
+            warnings,
         )? {
             composite = blend_frames(&composite, &layer, strip.blend_type, strip.opacity)?;
         }
@@ -598,6 +617,7 @@ fn render_strip_frame(
     film_transparent: bool,
     allow_outside_range: bool,
     visiting: &mut BTreeSet<String>,
+    warnings: &mut Vec<Value>,
 ) -> Result<Option<RgbaFrame>> {
     if strip.mute || (!allow_outside_range && !strip.contains_frame(frame)) {
         return Ok(None);
@@ -622,6 +642,7 @@ fn render_strip_frame(
         seed,
         film_transparent,
         visiting,
+        warnings,
     );
     visiting.remove(&strip.id);
     let mut frame = result?;
@@ -650,6 +671,7 @@ fn render_strip_content(
     seed: u32,
     film_transparent: bool,
     visiting: &mut BTreeSet<String>,
+    warnings: &mut Vec<Value>,
 ) -> Result<Option<RgbaFrame>> {
     let result = match strip.kind {
         StripType::Image | StripType::ImageSequence => {
@@ -710,7 +732,7 @@ fn render_strip_content(
                 frame: Some(strip.source_frame(frame)),
                 ..EvaluationContext::default()
             };
-            let (_, raster) = render_camera_frame(
+            let (_, raster, strip_warnings) = render_camera_frame(
                 doc,
                 &nested_context,
                 root,
@@ -724,6 +746,7 @@ fn render_strip_content(
                 samples,
                 seed,
             )?;
+            push_new_warnings(warnings, strip_warnings);
             Some(RgbaFrame::new(width, height, raster.linear_rgba)?)
         }
         StripType::Color => {
@@ -767,6 +790,7 @@ fn render_strip_content(
             seed,
             film_transparent,
             visiting,
+            warnings,
         )?),
         StripType::Transition => {
             let transition_kind = strip.transition.ok_or_else(|| {
@@ -803,6 +827,7 @@ fn render_strip_content(
                 seed,
                 film_transparent,
                 visiting,
+                warnings,
             )?;
             let second = render_strip_input(
                 doc,
@@ -817,6 +842,7 @@ fn render_strip_content(
                 seed,
                 film_transparent,
                 visiting,
+                warnings,
             )?;
             let factor = ((frame - strip.frame_start) / strip.length).clamp(0.0, 1.0);
             Some(transition(&first, &second, factor, transition_kind)?)
@@ -854,6 +880,7 @@ fn render_strip_content(
                 seed,
                 film_transparent,
                 visiting,
+                warnings,
             )?;
             if matches!(
                 effect,
@@ -882,6 +909,7 @@ fn render_strip_content(
                     seed,
                     film_transparent,
                     visiting,
+                    warnings,
                 )?;
                 Some(apply_blend_effect(effect, &first, &second, 1.0)?)
             } else {
@@ -909,6 +937,7 @@ fn render_strip_input(
     seed: u32,
     film_transparent: bool,
     visiting: &mut BTreeSet<String>,
+    warnings: &mut Vec<Value>,
 ) -> Result<RgbaFrame> {
     let strip = scene
         .sequencer
@@ -936,6 +965,7 @@ fn render_strip_input(
         film_transparent,
         true,
         visiting,
+        warnings,
     )?
     .ok_or_else(|| {
         PotError::with_details(
@@ -963,6 +993,7 @@ fn compose_meta_frame(
     seed: u32,
     film_transparent: bool,
     visiting: &mut BTreeSet<String>,
+    warnings: &mut Vec<Value>,
 ) -> Result<RgbaFrame> {
     let width_usize = usize::try_from(width).map_err(|_| {
         PotError::new(
@@ -1012,6 +1043,7 @@ fn compose_meta_frame(
             film_transparent,
             true,
             visiting,
+            warnings,
         )? {
             composite = blend_frames(&composite, &layer, child.blend_type, child.opacity)?;
         }
