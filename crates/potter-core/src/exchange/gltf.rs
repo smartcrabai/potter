@@ -14,7 +14,7 @@ use crate::{
     eval::{Snapshot, mesh_vertex_weights},
     geom::{
         Face, Mesh, MeshError, edge_key,
-        normals::{close, corner_normals, shading_keys_stale, sharp_edge_flags, smooth_face_flags},
+        normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
     },
     image::{ImageData, ImageInterpolation, load_image_data},
     model::{
@@ -1593,7 +1593,6 @@ fn source_mesh_for_export<'a>(
         .as_ref()
         .filter(|shape_keys| !shape_keys.keys.is_empty())
     else {
-        validate_shading_topology(data_block, evaluated)?;
         return Ok(evaluated);
     };
     if node
@@ -1613,21 +1612,6 @@ fn source_mesh_for_export<'a>(
             "shape-key mesh Data-Block has no base mesh",
         )
     })
-}
-
-/// Shading attributes are keyed by face and edge IDs; a modifier stack that changes the faces
-/// leaves those keys stale, so export refuses rather than shading with the wrong normals.
-fn validate_shading_topology(data_block: &DataBlock, evaluated: &Mesh) -> Result<()> {
-    let Some(source) = data_block.mesh.as_ref() else {
-        return Ok(());
-    };
-    if shading_keys_stale(source, evaluated) {
-        return Err(unsupported_export(
-            "mesh.shading_topology",
-            "the modifier stack changes this mesh's faces while it has custom normals or smooth shading; apply the modifiers before authoring shading, or remove the modifiers",
-        ));
-    }
-    Ok(())
 }
 
 fn append_child(nodes: &mut [Value], parent_index: usize, child_index: usize) {
@@ -9256,7 +9240,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_custom_normals_after_topology_modifier_fail_export() -> TestResult {
+    fn custom_normals_survive_topology_modifier_export() -> TestResult {
         let doc = scene(&json!([
             {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0}},
             {"op":"mesh.set_custom_normals","target":{"id":"cube"},"elements":{"domain":"face","ids":["f0"]},"normals":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}},
@@ -9264,45 +9248,45 @@ mod tests {
         ]))?;
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         let directory = tempfile::tempdir()?;
-        let error = export_with_root(&doc, &snapshot, directory.path(), Some("scene.bin"))
-            .err()
-            .ok_or("export must reject stale custom normals")?;
-        assert_eq!(
-            error.code,
-            crate::error::ErrorCode::UnsupportedFeature,
-            "{error}"
-        );
+        export_with_root(&doc, &snapshot, directory.path(), Some("scene.bin"))?;
         Ok(())
     }
 
     #[test]
-    fn applying_topology_modifier_over_shading_is_refused() -> TestResult {
+    fn applying_topology_modifier_over_shading_keeps_shading() -> TestResult {
         let base = scene(&json!([
             {"op":"node.create","id":"cube","kind":"box","params":{"size":2.0}},
             {"op":"mesh.shade_smooth","target":{"id":"cube"},"elements":{"domain":"face","ids":["f0","f1","f2","f3","f4","f5"]}},
             {"op":"modifier.create","target":{"id":"cube"},"id":"subdivide","type":"subdivision","params":{"levels":1}}
         ]))?;
-        let error = apply_batch(
+        let applied = apply_batch(
             &base,
             &json!({
                 "schema_version": 1,
                 "base_revision": base.revision,
                 "operations": [{"op":"modifier.apply","target":{"id":"cube"},"modifier_id":"subdivide"}]
             }),
-        )
-        .err()
-        .ok_or("applying the modifier must be refused")?;
+        )?;
+        let mesh = applied
+            .doc
+            .data_blocks
+            .values()
+            .find_map(|data| data.mesh.as_ref())
+            .ok_or("applied mesh is missing")?;
+        assert_eq!(mesh.faces.len(), 24);
+        let smooth = mesh.attributes["shade_smooth"]["values"]
+            .as_object()
+            .ok_or("smooth flags are missing")?;
         assert_eq!(
-            error.code,
-            crate::error::ErrorCode::UnsupportedFeature,
-            "{error}"
+            smooth.values().filter(|flag| **flag == json!(true)).count(),
+            24
         );
         Ok(())
     }
 
     #[test]
-    fn collection_instance_member_with_topology_modifier_refuses_stale_shading() -> TestResult {
-        // The hidden source's subdivision adds faces, so its face-keyed smooth flags would land on other faces.
+    fn collection_instance_member_with_topology_modifier_keeps_shading() -> TestResult {
+        // The hidden source's subdivision adds faces; its smooth flags must follow those faces.
         let doc = scene(&json!([
             {"op":"collection.create","id":"source"},
             {"op":"node.create","id":"member","kind":"box","collection":"source","params":{"size":1.0}},
@@ -9311,15 +9295,19 @@ mod tests {
             {"op":"collection.update","target":{"id":"source"},"set":{"exclude":true}},
             {"op":"collection.instance_create","id":"instance","collection":"source","transform":{"translation":[4.0,0.0,0.0]}}
         ]))?;
-        let error = Snapshot::evaluate(&doc, &EvaluationContext::default())
-            .err()
-            .ok_or("instancing stale shading must be refused")?;
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let instance = snapshot
+            .meshes
+            .get(&crate::model::Id::new("instance")?)
+            .ok_or("instance mesh is missing")?;
+        assert_eq!(instance.faces.len(), 24);
+        let smooth = instance.attributes["shade_smooth"]["values"]
+            .as_object()
+            .ok_or("instance smooth flags are missing")?;
         assert_eq!(
-            error.code,
-            crate::error::ErrorCode::UnsupportedFeature,
-            "{error}"
+            smooth.values().filter(|flag| **flag == json!(true)).count(),
+            24
         );
-        assert_eq!(error.details["feature_id"], "mesh.shading_topology");
         Ok(())
     }
 

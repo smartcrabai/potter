@@ -320,7 +320,7 @@ fn provenance_remaps_blender_attributes_on_corners_and_faces() -> TestResult {
     let triangulated = evaluate_modifiers(&quad, &[modifier("triangulate", json!({}))?])?;
     assert_eq!(
         blender_attribute_values(&triangulated, "Col", "CORNER")?,
-        vec![3.0, 0.0, 1.0, 1.0, 2.0, 3.0]
+        vec![1.0, 3.0, 0.0, 1.0, 2.0, 3.0]
     );
     assert_eq!(
         blender_attribute_values(&triangulated, "mat_tag", "FACE")?,

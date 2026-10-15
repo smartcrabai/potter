@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 pub mod boolean;
+pub(crate) mod clnor;
+pub(crate) mod corner_space;
 pub mod curve;
 pub mod edit;
 pub mod lattice;
@@ -36,9 +38,13 @@ pub(crate) mod provenance;
 pub mod remesh;
 pub mod sculpt;
 pub mod text;
+pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
 pub mod vdb;
 pub mod volume;
+
+#[cfg(test)]
+mod shading_oracle;
 
 /// Stable vertex record. `id` is persistent; its position in [`Mesh::vertices`] is not.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

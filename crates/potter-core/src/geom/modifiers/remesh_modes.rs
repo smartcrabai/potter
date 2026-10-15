@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use serde_json::{Map, json};
+use serde_json::json;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -138,15 +138,7 @@ fn finish_remesh(
         remove_disconnected_components(mesh, threshold);
     }
     if smooth_shade {
-        let values = mesh
-            .faces
-            .iter()
-            .map(|face| (format!("f{}", face.id), json!(true)))
-            .collect::<Map<_, _>>();
-        mesh.attributes.insert(
-            "shade_smooth".to_owned(),
-            json!({"domain":"face","type":"bool","values":values}),
-        );
+        crate::geom::normals::shade_faces_smooth(mesh);
     }
     validated(mesh)
 }

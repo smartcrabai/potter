@@ -811,6 +811,9 @@ fn volume_to_mesh(
                     continue;
                 }
                 let signs = corrected_cell_signs(values, dimensions, coord);
+                // Quads around x and y edges face +x and +y, around z edges -z; each is reversed when its
+                // edge's first corner is outside (x, y) or inside (z), so every quad faces away from the inside.
+                let corner_outside = signs & 1 == 0;
                 if (signs & 1 != 0) != (signs & 2 != 0) {
                     add_quad(
                         &mut polygons,
@@ -818,6 +821,7 @@ fn volume_to_mesh(
                         cell_dimensions,
                         coord,
                         [(0, 0, 0, 1), (0, -1, 0, 5), (0, -1, -1, 7), (0, 0, -1, 3)],
+                        corner_outside,
                     );
                 }
                 if (signs & 1 != 0) != (signs & 16 != 0) {
@@ -832,6 +836,7 @@ fn volume_to_mesh(
                             (-1, 0, -1, 11),
                             (-1, 0, 0, 10),
                         ],
+                        corner_outside,
                     );
                 }
                 if (signs & 1 != 0) != (signs & 8 != 0) {
@@ -841,6 +846,7 @@ fn volume_to_mesh(
                         cell_dimensions,
                         coord,
                         [(0, 0, 0, 4), (0, -1, 0, 8), (-1, -1, 0, 6), (-1, 0, 0, 2)],
+                        !corner_outside,
                     );
                 }
             }
@@ -860,15 +866,7 @@ fn volume_to_mesh(
         )
     })?;
     if smooth_shade {
-        let values = output
-            .faces
-            .iter()
-            .map(|face| (format!("f{}", face.id), json!(true)))
-            .collect::<serde_json::Map<_, _>>();
-        output.attributes.insert(
-            "shade_smooth".to_owned(),
-            json!({"domain":"face","type":"bool","values":values}),
-        );
+        crate::geom::normals::shade_faces_smooth(&mut output);
     }
     Ok(output)
 }
@@ -879,6 +877,7 @@ fn add_quad(
     dimensions: [usize; 3],
     origin: [usize; 3],
     adjacent: [(i32, i32, i32, usize); 4],
+    reverse: bool,
 ) {
     let mut polygon = Vec::with_capacity(4);
     for (dx, dy, dz, group_edge) in adjacent {
@@ -910,6 +909,9 @@ fn add_quad(
             return;
         }
         polygon.push(cell.point_offset + usize::from(group) - 1);
+    }
+    if reverse {
+        polygon.reverse();
     }
     polygons.push(polygon);
 }

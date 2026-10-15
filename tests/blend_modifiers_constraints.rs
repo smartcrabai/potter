@@ -837,7 +837,8 @@ fn modifier_cases() -> Value {
         {"name":"CaseTriangulate","type":"TRIANGULATE","props":{"quad_method":"FIXED"},"expected":{"quad_method":"FIXED"}},
         {"name":"CaseBevel","type":"BEVEL","props":{"width":0.1,"segments":2},"expected":{"width":0.1,"segments":2}},
         {"name":"CaseBevelVertices","type":"BEVEL","props":{"width":0.1,"segments":2,"affect":"VERTICES"},"expected":{"width":0.1,"segments":2,"affect":"VERTICES"}},
-        {"name":"CaseBevelWidth","type":"BEVEL","props":{"width":0.1,"segments":2,"offset_type":"WIDTH","limit_method":"ANGLE","angle_limit":0.5,"profile":0.5,"use_clamp_overlap":false,"loop_slide":true,"harden_normals":true},"expected":{"width":0.1,"segments":2,"offset_type":"WIDTH","limit_method":"ANGLE","angle_limit":0.5,"profile":0.5,"use_clamp_overlap":false,"loop_slide":true,"harden_normals":true}},
+        {"name":"CaseBevelWidth","type":"BEVEL","props":{"width":0.1,"segments":2,"offset_type":"WIDTH","limit_method":"ANGLE","angle_limit":0.5,"profile":0.5,"use_clamp_overlap":false,"loop_slide":true},"expected":{"width":0.1,"segments":2,"offset_type":"WIDTH","limit_method":"ANGLE","angle_limit":0.5,"profile":0.5,"use_clamp_overlap":false,"loop_slide":true}},
+        {"name":"CaseBevelHarden","type":"BEVEL","props":{"width":0.1,"segments":1,"harden_normals":true,"mark_sharp":true},"expected":{"width":0.1,"segments":1,"harden_normals":true,"mark_sharp":true}},
         {"name":"CaseDecimate","type":"DECIMATE","props":{"ratio":0.65},"expected":{"ratio":0.65}},
         {"name":"CaseDecimateUnsubdiv","type":"DECIMATE","shape":"grid","props":{"decimate_type":"UNSUBDIV","iterations":1},"expected":{"decimate_type":"UNSUBDIV","iterations":1}},
         {"name":"CaseDecimateUnsubdivIterations","type":"DECIMATE","shape":"grid","props":{"decimate_type":"UNSUBDIV","iterations":2},"expected":{"decimate_type":"UNSUBDIV","iterations":2}},
@@ -1861,6 +1862,7 @@ modifier_test!(blender_bevel_round_trip, "CaseBevel");
 modifier_test!(blender_bevel_vertices_round_trip, "CaseBevelVertices");
 modifier_test!(blender_bevel_width_round_trip, "CaseBevelWidth");
 modifier_test!(blender_decimate_round_trip, "CaseDecimate");
+modifier_test!(blender_bevel_harden_round_trip, "CaseBevelHarden");
 modifier_test!(blender_decimate_unsubdiv_round_trip, "CaseDecimateUnsubdiv");
 modifier_test!(
     blender_decimate_unsubdiv_iterations_round_trip,

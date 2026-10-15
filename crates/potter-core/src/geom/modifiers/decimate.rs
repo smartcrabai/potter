@@ -1520,6 +1520,7 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
         vertices: model.origins,
         faces: face_origins,
         corners: None,
+        raw_normals: false,
     };
     let mut out = decimate_compact(points, polygons, loose, origin, mesh)?;
     collapse_write_uv(&mut out, &layer_names, &corner_uv)?;
