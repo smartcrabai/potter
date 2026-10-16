@@ -1,8 +1,8 @@
 # Usage: /Applications/Blender.app/Contents/MacOS/Blender --background --factory-startup \
 #        --python tests/fixtures/pr15_decimate/perf.py
 #
-# Times Blender 5.2.2's Decimate COLLAPSE (ratio 0.1) on the same 100k-triangle wavy triangulated grid
-# that tests/modifier_decimate_perf.rs builds. Prints the best of three evaluations in seconds.
+# Times Blender 5.2.2's Decimate COLLAPSE (ratio 0.1) on a 100k-triangle wavy triangulated grid.
+# Prints the best of three evaluations in seconds.
 import math
 import time
 
