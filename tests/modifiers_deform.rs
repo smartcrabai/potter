@@ -1779,6 +1779,260 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
 }
 
 #[test]
+fn blender_laplacian_deform_uses_hook_evaluated_quad_triangulation() -> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping Blender Laplacian Deform parity: no Blender executable was found");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let expected = blender_script_json(
+        &blender,
+        directory.path(),
+        r#"
+import bpy, json, sys
+# In face (0,1,4,3), vertex 1 is reflex at bind and convex after the Hook.
+coords = [(0.0,0.0,0.0), (0.3,0.5,0.15), (2.0,0.0,0.1),
+          (0.0,1.0,0.05), (1.0,1.0,0.5), (2.0,1.0,0.0),
+          (0.0,2.0,0.1), (1.0,2.0,-0.05), (2.0,2.0,0.2)]
+faces = [(0,1,4,3), (1,2,5,4), (3,4,7,6), (4,5,8,7)]
+mesh = bpy.data.meshes.new("SourceMesh")
+mesh.from_pydata(coords, [], faces)
+source = bpy.data.objects.new("Source", mesh)
+bpy.context.scene.collection.objects.link(source)
+anchor_indices = [0,1,2,3,5,6,7,8]
+anchor_group = source.vertex_groups.new(name="Anchor")
+anchor_group.add(anchor_indices, 1.0, 'REPLACE')
+hook_group = source.vertex_groups.new(name="HookVertex")
+hook_group.add([1], 1.0, 'REPLACE')
+target = bpy.data.objects.new("HookTarget", None)
+bpy.context.scene.collection.objects.link(target)
+hook = source.modifiers.new("Hook", "HOOK")
+hook.object = target
+hook.vertex_group = hook_group.name
+hook.matrix_inverse = target.matrix_world.inverted() @ source.matrix_world
+laplacian = source.modifiers.new("Laplacian", "LAPLACIANDEFORM")
+laplacian.vertex_group = anchor_group.name
+laplacian.iterations = 8
+def corner_tris(mesh):
+    mesh.calc_loop_triangles()
+    return sorted(sorted(int(index) for index in triangle.vertices)
+                  for triangle in mesh.loop_triangles)
+bpy.ops.object.select_all(action='DESELECT')
+source.select_set(True)
+bpy.context.view_layer.objects.active = source
+bpy.ops.object.laplaciandeform_bind(modifier=laplacian.name)
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+bind_evaluated = source.evaluated_get(depsgraph)
+bind_mesh = bind_evaluated.to_mesh()
+bind_corner_tris = corner_tris(bind_mesh)
+bind_evaluated.to_mesh_clear()
+target.location = (0.2, -0.5, 0.0)
+bpy.context.view_layer.update()
+laplacian.show_viewport = False
+depsgraph = bpy.context.evaluated_depsgraph_get()
+hook_evaluated = source.evaluated_get(depsgraph)
+hook_mesh = hook_evaluated.to_mesh()
+hook_positions = [list(vertex.co) for vertex in hook_mesh.vertices]
+hook_corner_tris = corner_tris(hook_mesh)
+hook_evaluated.to_mesh_clear()
+laplacian.show_viewport = True
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = source.evaluated_get(depsgraph)
+mesh = evaluated.to_mesh()
+positions = [list(vertex.co) for vertex in mesh.vertices]
+evaluated.to_mesh_clear()
+with open(sys.argv[-1], 'w', encoding='utf-8') as output:
+    json.dump({'baseline':coords, 'hook_positions':hook_positions,
+               'positions':positions, 'edges':[list(edge.vertices) for edge in source.data.edges],
+               'bind_corner_tris':bind_corner_tris,
+               'hook_corner_tris':hook_corner_tris}, output)
+"#,
+    )?;
+    assert_ne!(
+        expected["bind_corner_tris"],
+        expected["hook_corner_tris"],
+        "Blender Hook deformation did not change the evaluated corner triangulation"
+    );
+
+    let scene = directory.path().join("laplacian_topology_scene");
+    init(&scene)?;
+    let operations = vec![
+        json!({"op":"node.create","id":"subject","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}}),
+        json!({"op":"vertex_group.create","target":{"id":"subject"},"id":"anchor","name":"Anchor"}),
+        json!({"op":"vertex_group.assign","target":{"id":"subject"},"group_id":"anchor","weights":[
+            {"vertex_id":0,"weight":1.0},{"vertex_id":1,"weight":1.0},
+            {"vertex_id":2,"weight":1.0},{"vertex_id":3,"weight":1.0},
+            {"vertex_id":5,"weight":1.0},{"vertex_id":6,"weight":1.0},
+            {"vertex_id":7,"weight":1.0},{"vertex_id":8,"weight":1.0}
+        ]}),
+        json!({"op":"node.create","id":"hook_target","kind":"empty"}),
+        json!({"op":"vertex_group.create","target":{"id":"subject"},"id":"hook_vertex","name":"HookVertex"}),
+        json!({"op":"vertex_group.assign","target":{"id":"subject"},"group_id":"hook_vertex","weights":[{"vertex_id":1,"weight":1.0}]}),
+        json!({"op":"modifier.create","target":{"id":"subject"},"id":"hook","type":"hook","params":{"object":"hook_target","vertex_group":"HookVertex","strength":1.0}}),
+        json!({"op":"modifier.create","target":{"id":"subject"},"id":"laplace","type":"laplacian_deform","params":{"vertex_group":"Anchor","iterations":8}}),
+    ];
+    let created = apply(&scene, 0, &Value::Array(operations))?;
+    assert!(
+        created.status.success(),
+        "Laplacian topology fixture setup failed: {}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+    let mut doc = load_doc(&scene)?;
+    let revision = doc.revision;
+    let subject_id = Id::new("subject")?;
+    let data_id = doc.nodes[&subject_id]
+        .data
+        .as_ref()
+        .ok_or("subject data missing")?
+        .clone();
+    let mesh = doc
+        .data_blocks
+        .get_mut(&data_id)
+        .and_then(|data| data.mesh.as_mut())
+        .ok_or("subject mesh missing")?;
+    let baseline = points(&expected["baseline"])?;
+    assert_eq!(mesh.vertices.len(), baseline.len());
+    for (vertex, position) in mesh.vertices.iter_mut().zip(baseline.iter().copied()) {
+        vertex.co = position;
+    }
+    let mut blender_edge_order = Vec::with_capacity(mesh.edges.len());
+    for edge in expected["edges"]
+        .as_array()
+        .ok_or("Blender edge order missing")?
+    {
+        let vertices = edge
+            .as_array()
+            .filter(|vertices| vertices.len() == 2)
+            .ok_or("Blender edge has invalid vertex indices")?;
+        let first = usize::try_from(vertices[0].as_u64().ok_or("invalid edge endpoint")?)?;
+        let second = usize::try_from(vertices[1].as_u64().ok_or("invalid edge endpoint")?)?;
+        let first_id = mesh
+            .vertices
+            .get(first)
+            .ok_or("Blender edge endpoint is outside the mesh")?
+            .id;
+        let second_id = mesh
+            .vertices
+            .get(second)
+            .ok_or("Blender edge endpoint is outside the mesh")?
+            .id;
+        let edge_index = mesh
+            .edges
+            .iter()
+            .position(|edge| {
+                (edge.vertices[0] == first_id && edge.vertices[1] == second_id)
+                    || (edge.vertices[0] == second_id && edge.vertices[1] == first_id)
+            })
+            .ok_or("Blender edge does not exist in the Potter mesh")?;
+        blender_edge_order.push(mesh.edges.swap_remove(edge_index));
+    }
+    if !mesh.edges.is_empty() {
+        return Err("Blender and Potter edge counts differ".into());
+    }
+    mesh.edges = blender_edge_order;
+    fs::write(scene.join("scene.json"), serde_json::to_vec(&doc)?)?;
+    let bound = apply(
+        &scene,
+        revision,
+        &json!([
+            {"op":"modifier.bind","target":{"id":"subject"},"modifier_id":"laplace"},
+            {"op":"node.update","target":{"id":"hook_target"},"set":{"transform":{"translation":[0.2,-0.5,0.0]}}}
+        ]),
+    )?;
+    assert!(
+        bound.status.success(),
+        "Laplacian Deform bind failed: {}",
+        String::from_utf8_lossy(&bound.stdout)
+    );
+    let doc = load_doc(&scene)?;
+    let laplace_id = Id::new("laplace")?;
+    let mut hook_only_doc = doc.clone();
+    let hook_only_node = hook_only_doc
+        .nodes
+        .get_mut(&subject_id)
+        .ok_or("subject node missing")?;
+    let laplace = hook_only_node
+        .modifiers
+        .iter_mut()
+        .find(|modifier| modifier.id == laplace_id)
+        .ok_or("Laplacian Deform modifier missing")?;
+    laplace.enabled = false;
+    let hook_only = Snapshot::evaluate(&hook_only_doc, &EvaluationContext::default())?;
+    let hook_mesh = hook_only
+        .meshes
+        .get(&subject_id)
+        .ok_or("Hook-only mesh missing")?;
+    let hook_reference = points(&expected["hook_positions"])?;
+    let hook_native = hook_mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let maximum_hook_error = hook_native
+        .iter()
+        .zip(&hook_reference)
+        .map(|(actual, expected)| actual.distance(*expected))
+        .fold(0.0_f64, f64::max);
+    assert!(
+        maximum_hook_error <= 1.0e-5,
+        "Hook-only vertex positions max error was {maximum_hook_error}"
+    );
+    let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+    let native = snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("evaluated subject mesh missing")?
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let reference = points(&expected["positions"])?;
+    assert_eq!(native.len(), reference.len());
+    let movements = reference
+        .iter()
+        .zip(&baseline)
+        .map(|(position, original)| *position - *original)
+        .collect::<Vec<_>>();
+    let maximum_displacement = movements
+        .iter()
+        .map(|movement| movement.length())
+        .fold(0.0_f64, f64::max);
+    let mean_displacement = movements.iter().copied().sum::<DVec3>() / movements.len() as f64;
+    let nonrigid_residual = movements
+        .iter()
+        .map(|movement| (*movement - mean_displacement).length())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        maximum_displacement > 1.0e-2 && nonrigid_residual > 1.0e-2,
+        "Laplacian reference did not distinguish identity/rigid translation: max={maximum_displacement}, residual={nonrigid_residual}"
+    );
+    let errors = native
+        .iter()
+        .zip(&reference)
+        .map(|(actual, expected)| actual.distance(*expected))
+        .collect::<Vec<_>>();
+    let maximum_error = errors.iter().copied().fold(0.0, f64::max);
+    let mean_error = errors.iter().sum::<f64>() / errors.len() as f64;
+    let worst_index = errors
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index)
+        .ok_or("Laplacian error vector is empty")?;
+    eprintln!(
+        "Laplacian topology max/mean vertex errors: {maximum_error}/{mean_error}; worst={worst_index}, native={}, Blender={}",
+        native[worst_index], reference[worst_index]
+    );
+    assert!(
+        maximum_error <= 1.0e-5,
+        "Laplacian Deform max/mean vertex errors were {maximum_error}/{mean_error}"
+    );
+    Ok(())
+}
+
+#[test]
 fn blender_ocean_direction_and_choppiness_match_displacement_fields() -> Result<(), Box<dyn Error>>
 {
     let Some(blender) = blender_executable() else {
