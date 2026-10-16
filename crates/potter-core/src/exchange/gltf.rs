@@ -4549,22 +4549,15 @@ fn import_images(
     }
     Ok(image_ids)
 }
-/// The `KHR_texture_transform` of a texture info, or `None` when it is absent or the identity. Its
-/// `texCoord` override must be 0, the only UV set Potter imports.
+/// The `KHR_texture_transform` of a texture info, or `None` when it is absent or the identity. A `texCoord`
+/// override other than 0 (a UV set Potter does not import yet) is not applied; `gltf_import_losses` reports
+/// it as `material.texture_uv_set`.
 fn texture_transform(info: &Value) -> Result<Option<super::material_surface::TextureTransform>> {
     let Some(extension) = info["extensions"]["KHR_texture_transform"].as_object() else {
         return Ok(None);
     };
-    if extension
-        .get("texCoord")
-        .and_then(Value::as_u64)
-        .is_some_and(|set| set != 0)
-    {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "glTF texture transform uses an unsupported UV set",
-            json!({ "feature_id": "material.texture_uv_set", "status": "not_supported" }),
-        ));
+    if transform_reads_other_uv_set(info) {
+        return Ok(None);
     }
     let numbers = |key: &str, default: &[f64]| -> Result<Vec<f64>> {
         match extension.get(key) {
@@ -4596,13 +4589,24 @@ fn texture_transform(info: &Value) -> Result<Option<super::material_surface::Tex
         rotation,
         scale: [scale[0], scale[1]],
     };
-    let identity = crate::float::equal_f64_array(&transform.offset, &[0.0; 2])
-        && crate::float::equal_f64(transform.rotation, 0.0)
-        && crate::float::equal_f64_array(&transform.scale, &[1.0; 2]);
-    Ok((!identity).then_some(transform))
+    Ok((!transform.is_identity()).then_some(transform))
 }
 
-/// Every texture slot of a glTF material that a graph can hold, each with its transform.
+/// Whether a texture info reads a UV set other than 0, the only set Potter imports.
+fn reads_other_uv_set(info: &Value) -> bool {
+    info["texCoord"].as_u64().unwrap_or(0) != 0
+}
+
+/// Whether the `KHR_texture_transform` of a texture info overrides the UV set to one other than 0.
+fn transform_reads_other_uv_set(info: &Value) -> bool {
+    info["extensions"]["KHR_texture_transform"]["texCoord"]
+        .as_u64()
+        .unwrap_or(0)
+        != 0
+}
+
+/// Every texture slot of a glTF material that a graph can hold, each with its transform. An emissive or
+/// occlusion texture that reads another UV set is skipped and reported as `material.texture_uv_set`.
 fn material_textures(
     material: &Value,
     root: &Value,
@@ -4613,14 +4617,20 @@ fn material_textures(
         Ok(import_texture_ref(info, root, image_ids)?
             .map(|texture| material_graph::SlotTexture { texture, transform }))
     };
+    let optional_slot = |info: &Value| -> Result<Option<material_graph::SlotTexture>> {
+        if reads_other_uv_set(info) {
+            return Ok(None);
+        }
+        slot(info)
+    };
     let pbr = &material["pbrMetallicRoughness"];
     Ok(material_graph::GraphTextures {
         base_color: slot(&pbr["baseColorTexture"])?,
         metallic_roughness: slot(&pbr["metallicRoughnessTexture"])?,
         normal: slot(&material["normalTexture"])?,
         normal_scale: material["normalTexture"]["scale"].as_f64().unwrap_or(1.0),
-        emissive: slot(&material["emissiveTexture"])?,
-        occlusion: slot(&material["occlusionTexture"])?,
+        emissive: optional_slot(&material["emissiveTexture"])?,
+        occlusion: optional_slot(&material["occlusionTexture"])?,
     })
 }
 
@@ -7252,6 +7262,28 @@ fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
             data_id: None,
             reason: "glTF occlusion strength is not represented by Potter; occlusion is applied at full strength".to_owned(),
             suggestion: Some("use --allow-lossy to import occlusion at full strength".to_owned()),
+        });
+    }
+    if root["materials"].as_array().is_some_and(|materials| {
+        materials.iter().any(|material| {
+            let pbr = &material["pbrMetallicRoughness"];
+            [
+                &pbr["baseColorTexture"],
+                &pbr["metallicRoughnessTexture"],
+                &material["normalTexture"],
+            ]
+            .into_iter()
+            .any(transform_reads_other_uv_set)
+                || [&material["emissiveTexture"], &material["occlusionTexture"]]
+                    .into_iter()
+                    .any(|info| reads_other_uv_set(info) || transform_reads_other_uv_set(info))
+        })
+    }) {
+        losses.push(crate::exchange::Loss {
+            feature_id: "material.texture_uv_set".to_owned(),
+            data_id: None,
+            reason: "glTF texture reads a UV set other than TEXCOORD_0; Potter imports only that set, so the transform (or the emissive or occlusion texture) is not imported".to_owned(),
+            suggestion: Some("use --allow-lossy to import without it".to_owned()),
         });
     }
     if root["extensionsUsed"].as_array().is_some_and(|extensions| {

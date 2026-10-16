@@ -469,6 +469,13 @@ fn accept_components(
         candidate.look_at = Some(look_at);
         keep_if_valid(doc, &mut accepted, candidate, "vrm.look_at", losses);
     }
+    // MToon materials first: an expression that binds a material colour needs that material's settings.
+    for (material, mtoon) in avatar.mtoon {
+        let mut candidate = accepted.clone();
+        let feature = format!("vrm.mtoon.{material}");
+        candidate.mtoon.insert(material, mtoon);
+        keep_if_valid(doc, &mut accepted, candidate, &feature, losses);
+    }
     for (name, expression) in avatar.expressions {
         let mut candidate = accepted.clone();
         candidate.expressions.insert(name.clone(), expression);
@@ -488,12 +495,6 @@ fn accept_components(
         } else {
             accepted.spring_bone = Some(keep_spring_parts(doc, spring, losses));
         }
-    }
-    for (material, mtoon) in avatar.mtoon {
-        let mut candidate = accepted.clone();
-        let feature = format!("vrm.mtoon.{material}");
-        candidate.mtoon.insert(material, mtoon);
-        keep_if_valid(doc, &mut accepted, candidate, &feature, losses);
     }
     Some(accepted)
 }

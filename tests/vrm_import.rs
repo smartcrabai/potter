@@ -1260,3 +1260,24 @@ fn vrm1_base_color_texture_transform_round_trips_through_vrm_export() -> TestRes
     assert!((rotation - 0.25).abs() < 1e-12);
     Ok(())
 }
+
+#[test]
+fn vrm1_shade_color_expression_imports_after_its_mtoon_material() -> TestResult {
+    let (directory, source) = new_fixture()?;
+    let vrm = directory.path().join("shade.vrm");
+    export(&source, "vrm", &vrm)?;
+    edit_glb(&vrm, |document| {
+        document["extensions"]["VRMC_vrm"]["expressions"]["preset"]["happy"]["materialColorBinds"]
+            [0]["type"] = json!("shadeColor");
+        Ok(())
+    })?;
+    let (_fresh_directory, project) = init_project()?;
+    assert_eq!(import_losses(&project, &vrm, "vrm")?, loss_ids(&[]));
+    let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let bind = &scene["avatar"]["expressions"]["happy"]["material_color_binds"][0];
+    assert_eq!(
+        bind["color_type"], "shadeColor",
+        "the bind keeps its shade color"
+    );
+    Ok(())
+}

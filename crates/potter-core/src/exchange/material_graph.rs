@@ -183,10 +183,9 @@ fn build_graph(
         "Transmission Weight".to_owned(),
         json!(material.transmission),
     );
-    principled.inputs.insert(
-        "Emission Color".to_owned(),
-        json!(material.emission_color.map(|value| value)),
-    );
+    principled
+        .inputs
+        .insert("Emission Color".to_owned(), json!(material.emission_color));
     principled.inputs.insert(
         "Emission Strength".to_owned(),
         json!(material.emission_strength),
@@ -272,9 +271,15 @@ fn build_graph(
         normal_map
             .inputs
             .insert("Strength".to_owned(), json!(textures.normal_scale));
-        insert(&mut graph, "normal_map", normal_map)?;
-        connect(&mut graph, &color, "Color", "normal_map", "Color")?;
-        connect(&mut graph, "normal_map", "Normal", "principled", "Normal")?;
+        insert(&mut graph, "normal_strength", normal_map)?;
+        connect(&mut graph, &color, "Color", "normal_strength", "Color")?;
+        connect(
+            &mut graph,
+            "normal_strength",
+            "Normal",
+            "principled",
+            "Normal",
+        )?;
     }
 
     if let Some(slot) = &textures.emissive {
@@ -334,11 +339,7 @@ fn build_graph(
 fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result<String> {
     let tex = format!("{name}_tex");
     let mut source = ("coord".to_owned(), "UV".to_owned());
-    if let Some(transform) = slot
-        .transform
-        .as_ref()
-        .filter(|transform| !is_identity(transform))
-    {
+    if let Some(transform) = &slot.transform {
         let map = format!("{name}_map");
         let (location, rotation, scale) = mapping_values(transform);
         let mut mapping = GraphNode::new("ShaderNodeMapping");
@@ -370,12 +371,6 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
     insert(graph, &tex, image)?;
     connect(graph, &source.0, &source.1, &tex, "Vector")?;
     Ok(tex)
-}
-
-fn is_identity(transform: &TextureTransform) -> bool {
-    crate::float::equal_f64_array(&transform.offset, &[0.0; 2])
-        && crate::float::equal_f64(transform.rotation, 0.0)
-        && crate::float::equal_f64_array(&transform.scale, &[1.0; 2])
 }
 
 /// Links `color` (a Color output of `node`) into `to_socket`, multiplied by the RGB `factor`.
@@ -428,7 +423,11 @@ fn multiply_channel(
 }
 
 fn insert(graph: &mut NodeGroup, name: &str, node: GraphNode) -> Result<()> {
-    graph.nodes.insert(Id::new(name)?, node);
+    let id = Id::new(name)?;
+    if graph.nodes.contains_key(&id) {
+        return Err(graph_error(format!("graph node `{name}` is defined twice")));
+    }
+    graph.nodes.insert(id, node);
     Ok(())
 }
 
@@ -455,4 +454,17 @@ fn connect(
         to_socket: to_socket.to_owned(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_refuses_a_node_name_that_is_already_used() {
+        let mut graph = NodeGroup::new("test", GraphKind::Shader);
+        assert!(insert(&mut graph, "node", GraphNode::new("ShaderNodeMapping")).is_ok());
+        assert!(insert(&mut graph, "node", GraphNode::new("ShaderNodeNormalMap")).is_err());
+        assert_eq!(graph.nodes.len(), 1);
+    }
 }

@@ -313,3 +313,223 @@ fn emissive_and_occlusion_graphs_export_back_to_their_gltf_slots() -> TestResult
     );
     Ok(())
 }
+
+/// The glTF JSON chunk of a GLB file.
+fn glb_document(path: &Path) -> TestResult<Value> {
+    let bytes = fs::read(path)?;
+    let json_length = usize::try_from(u32::from_le_bytes(bytes[12..16].try_into()?))?;
+    Ok(serde_json::from_slice(&bytes[20..20 + json_length])?)
+}
+
+/// The `pot export --format glb` of the project into `out`.
+fn export_glb(project: &Path, out: &Path) -> TestResult<Value> {
+    let export = pot()
+        .arg("export")
+        .arg(project)
+        .args(["--format", "glb", "--out"])
+        .arg(out)
+        .arg("--json")
+        .output()?;
+    let envelope: Value = serde_json::from_slice(&export.stdout)?;
+    assert_eq!(envelope["ok"], true, "glb export failed: {envelope}");
+    glb_document(out)
+}
+
+/// The scene revision stored in `project`.
+fn revision(project: &Path) -> TestResult<u64> {
+    let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    scene["revision"]
+        .as_u64()
+        .ok_or_else(|| "scene has no revision".into())
+}
+
+/// Runs `pot import` of `gltf` into `project` and returns the JSON envelope; `allow_lossy` adds `--allow-lossy`.
+fn run_import(
+    project: &Path,
+    gltf: &Path,
+    base_revision: u64,
+    allow_lossy: bool,
+) -> TestResult<Value> {
+    let mut command = pot();
+    command
+        .arg("import")
+        .arg(project)
+        .arg("--file")
+        .arg(gltf)
+        .args(["--format", "gltf", "--mode", "append", "--base-revision"])
+        .arg(base_revision.to_string());
+    if allow_lossy {
+        command.arg("--allow-lossy");
+    }
+    let output = command.arg("--json").output()?;
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// Asserts that every number in `value` is within 1e-9 of the matching number in `expected`.
+fn assert_close(value: &Value, expected: &[f64]) {
+    let actual = value
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an array, got {value}"));
+    assert_eq!(actual.len(), expected.len(), "{value}");
+    for (actual, expected) in actual.iter().zip(expected) {
+        let actual = actual.as_f64().unwrap_or(f64::NAN);
+        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
+}
+
+#[test]
+fn transformed_normal_texture_keeps_its_scale_and_round_trips() -> TestResult {
+    let imported = import(&json!({
+        "name": "Bumpy",
+        "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+        "normalTexture": {
+            "index": 0,
+            "scale": 0.5,
+            "extensions": {
+                "KHR_texture_transform": { "offset": [0.1, 0.0], "scale": [2.0, 2.0] }
+            }
+        }
+    }))?;
+    let graph = only_graph(&imported.scene)?;
+    let (map_id, _) = node_of(graph, "ShaderNodeMapping")?;
+    let (tex_id, _) = node_of(graph, "ShaderNodeTexImage")?;
+    let (normal_id, normal_map) = node_of(graph, "ShaderNodeNormalMap")?;
+    assert_eq!(
+        normal_id, "normal_strength",
+        "the Normal Map node has its own name"
+    );
+    assert_eq!(normal_map["inputs"]["Strength"], json!(0.5));
+    assert!(has_link(graph, map_id, "Vector", tex_id, "Vector"));
+    assert!(has_link(graph, tex_id, "Color", normal_id, "Color"));
+    assert!(has_link(graph, normal_id, "Normal", "principled", "Normal"));
+
+    let out = imported.directory.path().join("out.glb");
+    let document = export_glb(&imported.project, &out)?;
+    let normal = &document["materials"][0]["normalTexture"];
+    assert_eq!(normal["scale"], json!(0.5), "normal scale survives");
+    let transform = &normal["extensions"]["KHR_texture_transform"];
+    assert_close(&transform["offset"], &[0.1, 0.0]);
+    assert_close(&transform["scale"], &[2.0, 2.0]);
+    Ok(())
+}
+
+#[test]
+fn appending_the_same_gltf_twice_keeps_each_copys_graph_and_image() -> TestResult {
+    let directory = TempDir::new()?;
+    let gltf = write_gltf(
+        directory.path(),
+        &transformed_material(&json!({ "offset": [0.25, 0.0] })),
+    )?;
+    let project = directory.path().join("scene");
+    let init = pot().arg("init").arg(&project).arg("--json").output()?;
+    assert!(init.status.success(), "pot init failed");
+    let first = run_import(&project, &gltf, 0, false)?;
+    assert_eq!(first["ok"], true, "first import failed: {first}");
+    let second = run_import(&project, &gltf, revision(&project)?, false)?;
+    assert_eq!(second["ok"], true, "second import failed: {second}");
+
+    let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let materials = scene["materials"]
+        .as_object()
+        .ok_or("no materials")?
+        .values()
+        .collect::<Vec<_>>();
+    assert_eq!(materials.len(), 2);
+    let graph_ids = materials
+        .iter()
+        .map(|material| material["node_tree"].as_str().map(str::to_owned))
+        .collect::<Option<std::collections::BTreeSet<_>>>()
+        .ok_or("a material has no shader graph")?;
+    assert_eq!(graph_ids.len(), 2, "each copy keeps its own graph");
+    let mut images = Vec::new();
+    for graph_id in &graph_ids {
+        let (_, node) = node_of(&scene["node_groups"][graph_id], "ShaderNodeTexImage")?;
+        images.push(
+            node["properties"]["image"]
+                .as_str()
+                .ok_or("no image")?
+                .to_owned(),
+        );
+    }
+    assert_ne!(images[0], images[1], "each copy samples its own image");
+    for image in &images {
+        assert!(
+            scene["images"][image].is_object(),
+            "{image} is in the scene"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn emissive_texture_on_another_uv_set_is_a_loss_not_a_failure() -> TestResult {
+    let directory = TempDir::new()?;
+    let gltf = write_gltf(
+        directory.path(),
+        &json!({
+            "name": "Lit",
+            "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+            "emissiveFactor": [1.0, 1.0, 1.0],
+            "emissiveTexture": { "index": 0, "texCoord": 1 }
+        }),
+    )?;
+    let project = directory.path().join("scene");
+    pot().arg("init").arg(&project).arg("--json").output()?;
+    let refused = run_import(&project, &gltf, 0, false)?;
+    assert_eq!(
+        refused["ok"], false,
+        "the loss is refused without --allow-lossy"
+    );
+    assert!(
+        refused.to_string().contains("material.texture_uv_set"),
+        "{refused}"
+    );
+    let accepted = run_import(&project, &gltf, 0, true)?;
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let material = scene["materials"]
+        .as_object()
+        .and_then(|materials| materials.values().next())
+        .ok_or("no material")?;
+    assert!(
+        material["node_tree"].is_null(),
+        "the skipped texture needs no graph"
+    );
+    Ok(())
+}
+
+#[test]
+fn transform_on_another_uv_set_is_dropped_with_a_loss() -> TestResult {
+    let directory = TempDir::new()?;
+    let gltf = write_gltf(
+        directory.path(),
+        &transformed_material(&json!({ "offset": [0.5, 0.0], "texCoord": 1 })),
+    )?;
+    let project = directory.path().join("scene");
+    pot().arg("init").arg(&project).arg("--json").output()?;
+    let refused = run_import(&project, &gltf, 0, false)?;
+    assert_eq!(
+        refused["ok"], false,
+        "the loss is refused without --allow-lossy"
+    );
+    assert!(
+        refused.to_string().contains("material.texture_uv_set"),
+        "{refused}"
+    );
+    let accepted = run_import(&project, &gltf, 0, true)?;
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let material = scene["materials"]
+        .as_object()
+        .and_then(|materials| materials.values().next())
+        .ok_or("no material")?;
+    assert!(
+        material["node_tree"].is_null(),
+        "the untransformed texture stays a field"
+    );
+    assert!(
+        !material["base_color_texture"].is_null(),
+        "the texture is kept"
+    );
+    Ok(())
+}

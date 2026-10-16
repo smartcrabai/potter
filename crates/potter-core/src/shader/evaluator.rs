@@ -600,7 +600,20 @@ impl Evaluator<'_, '_, '_, '_> {
             "ShaderNodeMath" => self.math(node_id, socket),
             "ShaderNodeVectorMath" => self.vector_math(node_id, socket),
             "ShaderNodeMapping" => self.mapping(node_id, socket),
-            "ShaderNodeSeparateColor" => self.separate_color(node_id, socket),
+            "ShaderNodeSeparateColor" => {
+                match node
+                    .properties
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    None | Some("RGB") => self.separate_color(node_id, socket),
+                    Some(mode) => Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        format!("Separate Color mode `{mode}` is not implemented"),
+                        json!({"feature_id":format!("shader.node.SeparateColor.{mode}"),"node_id":node_id}),
+                    )),
+                }
+            }
             "ShaderNodeTexCoord" => self.tex_coord(socket),
             "ShaderNodeNormalMap" => self.normal_map(node_id, socket),
             "ShaderNodeFresnel" => self.fresnel(node_id, socket),
@@ -1683,6 +1696,50 @@ mod tests {
         let params = evaluate_surface(&material, &context).unwrap();
         assert!((params.displacement_height - 0.5).abs() < f64::EPSILON);
         assert!((evaluate_displacement(&material, &context).unwrap() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn separate_color_refuses_a_non_rgb_mode() {
+        let mut graph = NodeGroup::new("Separate", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "displacement",
+            "ShaderNodeDisplacement",
+            json!({"Height":0.75,"Midlevel":0.5,"Scale":2.0}),
+        );
+        insert_node(
+            &mut graph,
+            "split",
+            "ShaderNodeSeparateColor",
+            json!({"Color":[0.1,0.2,0.3,1.0]}),
+        );
+        let split = Id::new("split".to_owned()).unwrap();
+        graph
+            .nodes
+            .get_mut(&split)
+            .unwrap()
+            .properties
+            .insert("mode".to_owned(), json!("HSV"));
+        link(&mut graph, "split", "Red", "displacement", "Height");
+        link(
+            &mut graph,
+            "displacement",
+            "Displacement",
+            "output",
+            "Displacement",
+        );
+        let graph_id = Id::new("separate_shader").unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let mut context = HitContext::new(&groups);
+        context.normal = DVec3::Z;
+        let error = evaluate_displacement(&material, &context).unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
     }
 
     proptest! {

@@ -531,6 +531,7 @@ fn append_graph(
     )?;
     let mut incoming_materials = std::mem::take(&mut imported.materials);
     for material in incoming_materials.values_mut() {
+        material.node_tree = remap_option(material.node_tree.take(), &node_group_map);
         for texture in [
             &mut material.base_color_texture,
             &mut material.roughness_texture,
@@ -559,6 +560,24 @@ fn append_graph(
         }
     }
     let merged_actions = merge_registry(incoming_actions, &base.actions, &action_map)?;
+    for group in imported.node_groups.values_mut() {
+        for node in group.nodes.values_mut() {
+            if node.node_type != "ShaderNodeTexImage" {
+                continue;
+            }
+            let Some(mapped) = node
+                .properties
+                .get("image")
+                .and_then(Value::as_str)
+                .and_then(|image| Id::new(image).ok())
+                .and_then(|image| image_map.get(&image).cloned())
+            else {
+                continue;
+            };
+            node.properties
+                .insert("image".to_owned(), json!(mapped.as_str()));
+        }
+    }
     let merged_node_groups = merge_registry(
         std::mem::take(&mut imported.node_groups),
         &base.node_groups,

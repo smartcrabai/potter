@@ -980,8 +980,5 @@ fn main_texture_transform(vectors: &Value) -> Option<TextureTransform> {
         rotation: 0.0,
         scale: [scale_x, scale_y],
     };
-    let identity = crate::float::equal_f64_array(&transform.offset, &[0.0; 2])
-        && crate::float::equal_f64(transform.rotation, 0.0)
-        && crate::float::equal_f64_array(&transform.scale, &[1.0; 2]);
-    (!identity).then_some(transform)
+    (!transform.is_identity()).then_some(transform)
 }
