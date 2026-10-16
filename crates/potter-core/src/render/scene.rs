@@ -286,8 +286,8 @@ pub(super) fn extract_geometry(
             let mut triangle_offset = 0_usize;
             for (face_index, face) in mesh.faces.iter().enumerate() {
                 let material_slot = usize::try_from(face.material_index).ok();
-                let binding = material_slot
-                    .and_then(|slot| snapshot.slot_binding(node_id, node, slot));
+                let binding =
+                    material_slot.and_then(|slot| snapshot.slot_binding(node_id, node, slot));
                 let render_layer = binding.map_or(uv_render, |binding| {
                     binding.uv.render_index.map(usize::from)
                 });
@@ -307,8 +307,8 @@ pub(super) fn extract_geometry(
                     uv_render: render_layer,
                     uv_available_mask,
                 });
-                let material_id = material_slot
-                    .and_then(|slot| snapshot.slot_material(node_id, node, slot));
+                let material_id =
+                    material_slot.and_then(|slot| snapshot.slot_material(node_id, node, slot));
                 let material_index = material_id.map_or(0, |id| {
                     if let Some(index) = material_indices.get(id).copied() {
                         index
@@ -1789,8 +1789,8 @@ mod shading_normal_tests {
     };
     use crate::{
         geom::{
-            uv_layers::{UvLayer, UvStore},
             Mesh,
+            uv_layers::{UvLayer, UvStore},
         },
         model::Id,
         render::raster::{AlphaMode, Triangle},

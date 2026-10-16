@@ -156,9 +156,9 @@ impl Snapshot {
         _node: &Node,
         slot: usize,
     ) -> Option<&'a SlotBinding> {
-        self.slot_bindings.get(node_id).and_then(|table| {
-            table.get(slot.min(table.len().checked_sub(1)?))
-        })
+        self.slot_bindings
+            .get(node_id)
+            .and_then(|table| table.get(slot.min(table.len().checked_sub(1)?)))
     }
 
     /// Material for a face slot; out-of-range indices clamp to the last available slot.
@@ -3737,8 +3737,7 @@ fn remap_slot_binding(
             .entry(pointer)
             .or_insert_with(|| {
                 let source_mask = Arc::clone(&binding.color_available_mask);
-                let mapped =
-                    remap_color_mask(&source_mask, color_map, color_count);
+                let mapped = remap_color_mask(&source_mask, color_map, color_count);
                 (source_mask, mapped)
             })
             .1,
@@ -3845,13 +3844,9 @@ fn evaluate_collection_instance(
         ));
     }
     let slot_coverage = fold_slot_coverage(&mesh, &uv_coverage, slot_base);
-    let mut color_masks =
-        HashMap::<*const [u64], (Arc<[u64]>, Arc<[u64]>)>::new();
+    let mut color_masks = HashMap::<*const [u64], (Arc<[u64]>, Arc<[u64]>)>::new();
     let mut bindings = Vec::with_capacity(slot_base);
-    for ((member, uv_map), color_map) in member_bindings
-        .into_iter()
-        .zip(&uv_maps)
-        .zip(&color_maps)
+    for ((member, uv_map), color_map) in member_bindings.into_iter().zip(&uv_maps).zip(&color_maps)
     {
         for (local_slot, binding) in member.slots.into_iter().enumerate() {
             let mut binding = remap_slot_binding(
@@ -3894,7 +3889,6 @@ fn is_isolated_failure(error: &PotError) -> bool {
     error.code == ErrorCode::UnsupportedFeature
         || error.details.get(INSTANCE_JOIN_FAILURE).is_some()
 }
-
 
 #[expect(
     clippy::too_many_arguments,
@@ -3967,8 +3961,7 @@ fn append_collection_geometry<'a>(
                     .collect();
                 let uv_coverage = uv_face_coverage(&uv_store.layers, source_mesh.faces.len());
                 let color_names = color_layer_names(source_mesh);
-                let slots =
-                    member_slot_bindings(source_node, source_mesh, &uv_store, &color_names);
+                let slots = member_slot_bindings(source_node, source_mesh, &uv_store, &color_names);
                 (
                     Cow::Borrowed(source_mesh),
                     vec![vec![object_id.clone()]],
@@ -3979,14 +3972,7 @@ fn append_collection_geometry<'a>(
                 )
             })
         };
-        let Some((
-            nested_mesh,
-            nested_paths,
-            slots,
-            uv_names,
-            uv_coverage,
-            color_names,
-        )) = member
+        let Some((nested_mesh, nested_paths, slots, uv_names, uv_coverage, color_names)) = member
         else {
             continue;
         };
@@ -4719,11 +4705,7 @@ mod tests {
         assert!(Snapshot::evaluate(&doc, &EvaluationContext::default()).is_err());
     }
 
-    fn member_mesh(
-        layers: &[(&str, [f64; 2], Option<usize>)],
-        render: &str,
-        color: &str,
-    ) -> Mesh {
+    fn member_mesh(layers: &[(&str, [f64; 2], Option<usize>)], render: &str, color: &str) -> Mesh {
         let mut mesh = Mesh::box_mesh(BoxParams {
             size: DVec3::splat(2.0),
         })
@@ -4737,8 +4719,7 @@ mod tests {
                         .iter()
                         .enumerate()
                         .map(|(index, face)| {
-                            (*missing_face != Some(index))
-                                .then(|| vec![*uv; face.vertices.len()])
+                            (*missing_face != Some(index)).then(|| vec![*uv; face.vertices.len()])
                         })
                         .collect(),
                 )
@@ -4849,18 +4830,12 @@ mod tests {
         );
         let prefix = member_mesh(&[("Other", [0.1, 0.2], None)], "Other", "Tint");
         let mut first = member_mesh(
-            &[
-                ("Base", [0.3, 0.4], Some(0)),
-                ("Detail", [0.5, 0.6], None),
-            ],
+            &[("Base", [0.3, 0.4], Some(0)), ("Detail", [0.5, 0.6], None)],
             "Detail",
             "Skin",
         );
         let second = member_mesh(
-            &[
-                ("Detail", [0.7, 0.8], None),
-                ("Base", [0.9, 0.25], None),
-            ],
+            &[("Detail", [0.7, 0.8], None), ("Base", [0.9, 0.25], None)],
             "Base",
             "Skin",
         );
@@ -4923,34 +4898,13 @@ mod tests {
             [0.0, 1.0],
             "an originally absent row stays uncovered after its default is materialized"
         );
-        assert_eq!(
-            uv.layers[1].faces[7].as_ref().unwrap()[0],
-            [0.3, 0.4]
-        );
-        assert_eq!(
-            uv.layers[2].faces[6].as_ref().unwrap()[0],
-            [0.5, 0.6]
-        );
-        assert_eq!(
-            uv.layers[1].faces[12].as_ref().unwrap()[0],
-            [0.9, 0.25]
-        );
-        assert_eq!(
-            uv.layers[2].faces[12].as_ref().unwrap()[0],
-            [0.7, 0.8]
-        );
-        assert_eq!(
-            &evaluation.uv_coverage[..6],
-            &[1, 1, 1, 1, 1, 1]
-        );
-        assert_eq!(
-            &evaluation.uv_coverage[6..12],
-            &[4, 6, 6, 6, 6, 6]
-        );
-        assert_eq!(
-            &evaluation.uv_coverage[12..],
-            &[6, 6, 6, 6, 6, 6]
-        );
+        assert_eq!(uv.layers[1].faces[7].as_ref().unwrap()[0], [0.3, 0.4]);
+        assert_eq!(uv.layers[2].faces[6].as_ref().unwrap()[0], [0.5, 0.6]);
+        assert_eq!(uv.layers[1].faces[12].as_ref().unwrap()[0], [0.9, 0.25]);
+        assert_eq!(uv.layers[2].faces[12].as_ref().unwrap()[0], [0.7, 0.8]);
+        assert_eq!(&evaluation.uv_coverage[..6], &[1, 1, 1, 1, 1, 1]);
+        assert_eq!(&evaluation.uv_coverage[6..12], &[4, 6, 6, 6, 6, 6]);
+        assert_eq!(&evaluation.uv_coverage[12..], &[6, 6, 6, 6, 6, 6]);
 
         assert_eq!(evaluation.bindings.len(), 4);
         assert_eq!(evaluation.bindings[0].uv.render_index, Some(0));
@@ -4963,7 +4917,10 @@ mod tests {
         assert_eq!(evaluation.bindings[3].uv.render_index, Some(1));
         assert_eq!(evaluation.bindings[3].uv.available_mask, 6);
         assert!(!evaluation.bindings[3].uv.texcoord0_covered);
-        assert_eq!(evaluation.bindings[1].material, evaluation.bindings[2].material);
+        assert_eq!(
+            evaluation.bindings[1].material,
+            evaluation.bindings[2].material
+        );
         assert_eq!(evaluation.bindings[1].color_render_layer, Some(1));
         assert_eq!(&*evaluation.bindings[1].color_available_mask, &[2]);
         assert!(std::sync::Arc::ptr_eq(
@@ -4982,8 +4939,7 @@ mod tests {
             .iter()
             .map(|vertex| vertex.co)
             .collect::<Vec<_>>();
-        let normals =
-            crate::geom::normals::corner_normals(&evaluation.mesh, &positions).unwrap();
+        let normals = crate::geom::normals::corner_normals(&evaluation.mesh, &positions).unwrap();
         assert_eq!(normals.len(), corner_count);
         let mut corner_base = 0;
         for face in &evaluation.mesh.faces {
@@ -5020,7 +4976,11 @@ mod tests {
             snapshot.slot_material(&ordinary_id, &ordinary, usize::MAX),
             Some(&last)
         );
-        assert!(snapshot.slot_material(&ordinary_id, &Node::default(), 0).is_none());
+        assert!(
+            snapshot
+                .slot_material(&ordinary_id, &Node::default(), 0)
+                .is_none()
+        );
 
         let instance_id = Id::new("instance").unwrap();
         let instance = Node::default();
@@ -5068,6 +5028,10 @@ mod tests {
                 .slot_binding(&empty_id, &instance, usize::MAX)
                 .is_none()
         );
-        assert!(snapshot.slot_material(&empty_id, &instance, usize::MAX).is_none());
+        assert!(
+            snapshot
+                .slot_material(&empty_id, &instance, usize::MAX)
+                .is_none()
+        );
     }
 }

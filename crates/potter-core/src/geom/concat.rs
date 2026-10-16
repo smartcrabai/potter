@@ -253,7 +253,6 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
     Ok(())
 }
 
-
 /// Reverses a mirrored member's faces, with every corner-keyed value of each face: the corner order
 /// of each face, `custom_normal` and named `corner` rows, `CORNER` `blender_attributes` segments, and
 /// UV rows. A corner keeps its vertex, UV, and normal together.
@@ -1009,7 +1008,11 @@ mod tests {
         assert!(!joined.attributes.contains_key("uv_map"));
         assert!(!joined.attributes.contains_key("blender_uv_layers"));
         let store = crate::geom::uv_layers::read(&joined);
-        let names: Vec<_> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let names: Vec<_> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(names, ["A", "Extra"]);
         assert_eq!(store.active.as_deref(), Some("A"));
         assert_eq!(store.render.as_deref(), Some("A"));

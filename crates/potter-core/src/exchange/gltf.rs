@@ -3103,10 +3103,10 @@ pub(crate) fn tex_coord_plan(
                         feature_id::UV_LAYER_MISSING,
                     ))
                 {
-                    let layer = reference.as_deref().filter(|name| !name.is_empty()).map_or_else(
-                        || "the render layer".to_owned(),
-                        |name| format!("`{name}`"),
-                    );
+                    let layer = reference
+                        .as_deref()
+                        .filter(|name| !name.is_empty())
+                        .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
                     plan.warnings.push(PotError::with_details(
                         ErrorCode::UnrepresentableFeature,
                         format!(
@@ -3222,7 +3222,10 @@ fn preserve_vrm_material_variants(
                 })?;
             for (index, material_id, _) in variants {
                 let base_index = material_indices.get(material_id).copied().ok_or_else(|| {
-                    PotError::new(ErrorCode::InternalError, "VRM base material index is missing")
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "VRM base material index is missing",
+                    )
                 })?;
                 let property = properties.get(base_index).cloned().ok_or_else(|| {
                     PotError::new(
@@ -3242,11 +3245,13 @@ fn preserve_vrm_material_variants(
         AvatarVersion::V1 => {
             for (material_id, mtoon) in &avatar.mtoon {
                 let base_index = material_indices.get(material_id).copied().ok_or_else(|| {
-                    PotError::new(ErrorCode::InternalError, "VRM base material index is missing")
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "VRM base material index is missing",
+                    )
                 })?;
-                let base_extension = root["materials"][base_index]["extensions"]
-                    ["VRMC_materials_mtoon"]
-                    .clone();
+                let base_extension =
+                    root["materials"][base_index]["extensions"]["VRMC_materials_mtoon"].clone();
                 if !base_extension.is_object() {
                     continue;
                 }
@@ -3521,7 +3526,10 @@ fn export_with_root_inner(
                 continue;
             }
             let material = doc.materials.get(material_id).ok_or_else(|| {
-                PotError::new(ErrorCode::SceneInvalid, "node material reference is missing")
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "node material reference is missing",
+                )
             })?;
             let surface = surfaces.get(material_id).ok_or_else(|| {
                 PotError::new(ErrorCode::SceneInvalid, "node material surface is missing")
@@ -3873,7 +3881,10 @@ fn export_with_root_inner(
             let mut primitive =
                 json!({ "attributes": attributes.clone(), "indices": index_accessor, "mode": 4 });
             let slot = usize::try_from(*slot).map_err(|_| {
-                PotError::new(ErrorCode::SceneInvalid, "mesh material slot exceeds platform range")
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "mesh material slot exceeds platform range",
+                )
             })?;
             if let Some(material_id) = snapshot.slot_material(node_id, node, slot) {
                 let coords = tex_coords
@@ -10788,11 +10799,8 @@ mod tests {
         assert!(attributes["TEXCOORD_2"].is_null());
         let buffers = vec![binary];
         let read_set = |set: &str| -> TestResult<Vec<[f64; 2]>> {
-            let accessor = usize::try_from(
-                attributes[set]
-                    .as_u64()
-                    .ok_or("UV accessor is missing")?,
-            )?;
+            let accessor =
+                usize::try_from(attributes[set].as_u64().ok_or("UV accessor is missing")?)?;
             Ok(super::read_vec2(&document, &buffers, accessor)?)
         };
         assert!(read_set("TEXCOORD_0")?.iter().all(|uv| *uv == [0.0, 1.0]));
