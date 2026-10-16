@@ -3666,20 +3666,22 @@ fn collect_modifier_collection_objects(
     Ok(())
 }
 
-/// Blender keeps object transforms in f32, so the world matrix is quantized to f32 before the
-/// product (`world_to_object * object_world` in `non_float_boolean_mesh`).
+/// The f64 fallback of the Boolean operand transform: the world matrix quantized to f32 before the
+/// product (`world_to_object * object_world` in `non_float_boolean_mesh`). The exact f32 path is
+/// `geom::blender_matrix::operand_to_subject`.
 fn world_matrix_f32(matrix: DMat4) -> glam::Mat4 {
     glam::Mat4::from_cols_array(&matrix.to_cols_array().map(|value| value as f32))
 }
 
 /// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
-/// its vertex groups) and its f32 transform into the subject's space. Also returns its material
-/// slots.
+/// its vertex groups) and its transform into the subject's space: Blender's f32 product from
+/// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its material slots.
 fn boolean_operand<'d>(
     modifier: &Modifier,
     doc: &'d SceneDoc,
     object_id: &Id,
     subject_inverse: glam::Mat4,
+    subject_id: &Id,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
 ) -> Result<(crate::geom::boolean::BooleanOperand, &'d [Option<Id>])> {
@@ -3731,10 +3733,23 @@ fn boolean_operand<'d>(
             json!({"modifier_id":modifier.id,"object":object_id}),
         )
     })?;
-    let to_subject = subject_inverse * world_matrix_f32(object_world);
+    // Blender's f32 product `world_to_object(subject) * object_to_world(operand)`; the f64
+    // fallback applies when either object has no exact replica.
+    let to_subject = match crate::geom::blender_matrix::operand_to_subject(
+        doc,
+        subject_id,
+        object_id,
+        world_matrices,
+    ) {
+        Some(exact) => exact,
+        None => {
+            let to_subject = subject_inverse * world_matrix_f32(object_world);
+            DMat4::from_cols_array(&to_subject.to_cols_array().map(f64::from))
+        }
+    };
     let operand = crate::geom::boolean::BooleanOperand {
         mesh,
-        to_subject: DMat4::from_cols_array(&to_subject.to_cols_array().map(f64::from)),
+        to_subject,
         material_remap: Vec::new(),
     };
     Ok((operand, object.materials.as_slice()))
@@ -3768,8 +3783,7 @@ fn apply_boolean_operands_modifier(
             "modifier subject world matrix is missing",
         )
     })?;
-    // Blender keeps object transforms in f32; the operand transform is the f32 subject inverse
-    // times the f32 operand world matrix.
+    // The f64 fallback inverse; operands with an exact f32 replica skip it (`geom::blender_matrix`).
     let subject_inverse = world_matrix_f32(subject_world).inverse();
     if !subject_inverse.is_finite() {
         return Err(PotError::invalid_argument(
@@ -3787,6 +3801,7 @@ fn apply_boolean_operands_modifier(
             doc,
             object_id,
             subject_inverse,
+            subject_id,
             world_matrices,
             evaluated_meshes,
         )?;

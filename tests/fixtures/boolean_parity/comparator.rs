@@ -3,9 +3,10 @@
 //! `tests/blend_boolean_parity.rs` and `tests/blend_boolean_regressions.rs` include this file with
 //! `#[path]`. A Blender expectation is canonical: each face ring is in world space, rotated to start
 //! at its minimum vertex, and the face list is sorted. Potter's result is reduced to the same form.
-//! Coordinates and per-corner values are quantized to 1e-6, so a difference at that resolution is a
-//! mismatch. The signed volume is compared with relative tolerance 1e-6, or with absolute tolerance
-//! 1e-9 when the expected volume is zero.
+//! Coordinates, UVs, and custom normals are quantized to 1e-5 (see `COORDINATE_SCALE`), and
+//! vertex-group weights to 1e-6. Topology (counts, face sizes, ring order, material, `fid`, and
+//! custom-normal presence) is compared exactly. The signed volume is compared with relative
+//! tolerance 1e-6, or with absolute tolerance 1e-9 when the expected volume is zero.
 //!
 //! Per face: the ring, the material index, `fid`, UV corners, and custom-normal corners. Per vertex:
 //! the vertex-group weights. Per mesh: vertex and edge counts, the face-size histogram, and volume.
@@ -30,7 +31,11 @@ use serde_json::Value;
 
 pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-const COORDINATE_SCALE: f64 = 1.0e6;
+/// Blender stores f32, so coordinates and UVs are compared at 1e-5 (about 84 f32 ulps at unit
+/// scale). Topology is exact and does not use this scale.
+const COORDINATE_SCALE: f64 = 1.0e5;
+/// Vertex-group weights are compared at 1e-6.
+const WEIGHT_SCALE: f64 = 1.0e6;
 const VOLUME_RELATIVE_TOLERANCE: f64 = 1.0e-6;
 const VOLUME_ABSOLUTE_TOLERANCE: f64 = 1.0e-9;
 
@@ -61,6 +66,10 @@ pub struct Canonical {
 
 fn quantize(value: f64) -> i64 {
     (value * COORDINATE_SCALE).round() as i64
+}
+
+fn quantize_weight(weight: f64) -> i64 {
+    (weight * WEIGHT_SCALE).round() as i64
 }
 
 fn quantize_point(point: DVec3) -> [i64; 3] {
@@ -209,7 +218,10 @@ fn uv_map_faces(mesh: &Mesh) -> TestResult<Vec<Option<Vec<[f64; 2]>>>> {
         .into_iter()
         .flatten()
     {
-        let layer = entry.get("layer").and_then(Value::as_str).unwrap_or("UVMap");
+        let layer = entry
+            .get("layer")
+            .and_then(Value::as_str)
+            .unwrap_or("UVMap");
         let Some(&index) = entry
             .get("face_id")
             .and_then(Value::as_u64)
@@ -292,7 +304,7 @@ fn potter_canonical(mesh: &Mesh, world: DMat4) -> TestResult<Canonical> {
                     let weight = weights
                         .get(format!("v{}", vertex.id).as_str())
                         .and_then(Value::as_f64)
-                        .map(quantize);
+                        .map(quantize_weight);
                     (quantize_point(world.transform_point3(vertex.co)), weight)
                 })
                 .collect();
@@ -360,7 +372,7 @@ fn expected_vertex_groups(value: &Value) -> TestResult<BTreeMap<String, Vec<Grou
         {
             let co = quantize_point(point_from_json(&entry["co"])?);
             let weight = match entry.get("weight") {
-                Some(weight) if !weight.is_null() => Some(quantize(number(weight)?)),
+                Some(weight) if !weight.is_null() => Some(quantize_weight(number(weight)?)),
                 _ => None,
             };
             list.push((co, weight));
