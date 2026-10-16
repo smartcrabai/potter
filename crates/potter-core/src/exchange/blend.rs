@@ -7756,8 +7756,8 @@ mod tests {
             return Ok(());
         };
         let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
-        let image_path = directory.path().join("normal.png");
-        let image_bytes = {
+        let encode_image = |name: &str, pixel: [u8; 4]| -> Result<(PathBuf, Vec<u8>)> {
+            let path = directory.path().join(name);
             let mut bytes = Vec::new();
             {
                 let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
@@ -7767,13 +7767,16 @@ mod tests {
                     .write_header()
                     .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
                 writer
-                    .write_image_data(&[128, 192, 230, 255])
+                    .write_image_data(&pixel)
                     .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
             }
-            bytes
+            fs::write(&path, &bytes).map_err(|error| PotError::io(&error))?;
+            Ok((path, bytes))
         };
-        fs::write(&image_path, &image_bytes).map_err(|error| PotError::io(&error))?;
-        let image_id = Id::new("normal_image")?;
+        let (normal_path, normal_bytes) = encode_image("normal.png", [128, 192, 230, 255])?;
+        let (emissive_path, emissive_bytes) = encode_image("emissive.png", [64, 128, 255, 255])?;
+        let normal_image_id = Id::new("normal_image")?;
+        let emissive_image_id = Id::new("emissive_image")?;
         let material_id = Id::new("normal_mat")?;
         let initial = SceneDoc::new(uuid::Uuid::new_v4().to_string());
         let applied = crate::ops::apply_batch(
@@ -7791,7 +7794,7 @@ mod tests {
         )?;
         let mut doc = applied.doc;
         doc.images.insert(
-            image_id.clone(),
+            normal_image_id.clone(),
             Image {
                 name: "Normal Texture".to_owned(),
                 source: ImageSource::File,
@@ -7800,13 +7803,28 @@ mod tests {
                 height: 1,
                 tiles: Vec::new(),
                 blob: None,
-                source_path: Some(image_path.to_string_lossy().into_owned()),
-                source_hash: Some(crate::hash::sha256(&image_bytes)),
+                source_path: Some(normal_path.to_string_lossy().into_owned()),
+                source_hash: Some(crate::hash::sha256(&normal_bytes)),
                 alpha_mode: ImageAlphaMode::Straight,
             },
         );
-        let texture = |uv_layer: &str| crate::model::TextureRef {
-            image: image_id.clone(),
+        doc.images.insert(
+            emissive_image_id.clone(),
+            Image {
+                name: "Emissive Texture".to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::Srgb,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(emissive_path.to_string_lossy().into_owned()),
+                source_hash: Some(crate::hash::sha256(&emissive_bytes)),
+                alpha_mode: ImageAlphaMode::Straight,
+            },
+        );
+        let texture = |image: &Id, uv_layer: &str| crate::model::TextureRef {
+            image: image.clone(),
             uv_layer: Some(uv_layer.to_owned()),
             interpolation: crate::image::ImageInterpolation::Linear,
         };
@@ -7817,12 +7835,12 @@ mod tests {
                 base_color: None,
                 metallic_roughness: None,
                 normal: Some(crate::exchange::material_graph::SlotTexture {
-                    texture: texture("Detail"),
+                    texture: texture(&normal_image_id, "Detail"),
                     transform: None,
                 }),
                 normal_scale: 0.65,
                 emissive: Some(crate::exchange::material_graph::SlotTexture {
-                    texture: texture("UVMap"),
+                    texture: texture(&emissive_image_id, "UVMap"),
                     transform: Some(crate::exchange::material_surface::TextureTransform {
                         offset: [0.25, 0.5],
                         rotation: 0.0,
@@ -7833,16 +7851,28 @@ mod tests {
             },
         )?;
 
-        let image_data = BTreeMap::from([(
-            image_id.as_str().to_owned(),
-            crate::image::ImageData {
-                width: 1,
-                height: 1,
-                pixels: vec![[128.0 / 255.0, 192.0 / 255.0, 230.0 / 255.0, 1.0]],
-                tiles: BTreeMap::new(),
-                interpolation: crate::image::ImageInterpolation::Linear,
-            },
-        )]);
+        let image_data = BTreeMap::from([
+            (
+                normal_image_id.as_str().to_owned(),
+                crate::image::ImageData {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![[128.0 / 255.0, 192.0 / 255.0, 230.0 / 255.0, 1.0]],
+                    tiles: BTreeMap::new(),
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                },
+            ),
+            (
+                emissive_image_id.as_str().to_owned(),
+                crate::image::ImageData {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![[64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]],
+                    tiles: BTreeMap::new(),
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                },
+            ),
+        ]);
         let layer_names = ["UVMap".to_owned(), "Detail".to_owned()];
         let layer_corners = [
             [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
@@ -7897,16 +7927,45 @@ mod tests {
             .node_groups
             .get(graph_id)
             .ok_or_else(|| invalid_intermediate("round-trip shader graph is missing"))?;
-        let normal_map = graph
+        let (normal_map_id, normal_map) = graph
             .nodes
-            .values()
-            .find(|node| node.node_type == "ShaderNodeNormalMap")
+            .iter()
+            .find(|(_, node)| node.node_type == "ShaderNodeNormalMap")
             .ok_or_else(|| invalid_intermediate("round-trip Normal Map node is missing"))?;
         assert_eq!(
             normal_map.properties.get("potter_gltf_imported_normal_map"),
             Some(&json!(true))
         );
         assert_eq!(normal_map.properties.get("uv_map"), Some(&json!("Detail")));
+        let (normal_texture_id, _) = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.node_type == "ShaderNodeTexImage"
+                    && node.properties.get("image").and_then(Value::as_str)
+                        == Some(normal_image_id.as_str())
+            })
+            .ok_or_else(|| invalid_intermediate("normal Image Texture was misrouted"))?;
+        assert!(graph.links.iter().any(|link| {
+            &link.from_node == normal_texture_id
+                && link.from_socket == "Color"
+                && &link.to_node == normal_map_id
+                && link.to_socket == "Color"
+        }));
+        let (detail_uv_id, _) = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.node_type == "ShaderNodeUVMap"
+                    && node.properties.get("uv_map").and_then(Value::as_str) == Some("Detail")
+            })
+            .ok_or_else(|| invalid_intermediate("normal texture UV Map node is missing"))?;
+        assert!(graph.links.iter().any(|link| {
+            &link.from_node == detail_uv_id
+                && link.from_socket == "UV"
+                && &link.to_node == normal_texture_id
+                && link.to_socket == "Vector"
+        }));
         assert!(
             graph
                 .nodes
@@ -7918,6 +7977,20 @@ mod tests {
             .iter()
             .find(|(_, node)| node.node_type == "ShaderNodeMapping")
             .ok_or_else(|| invalid_intermediate("emissive texture mapping is missing"))?;
+        let (render_uv_id, _) = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.node_type == "ShaderNodeUVMap"
+                    && node.properties.get("uv_map").and_then(Value::as_str) == Some("UVMap")
+            })
+            .ok_or_else(|| invalid_intermediate("emissive render UV Map node is missing"))?;
+        assert!(graph.links.iter().any(|link| {
+            &link.from_node == render_uv_id
+                && link.from_socket == "UV"
+                && &link.to_node == mapping_id
+                && link.to_socket == "Vector"
+        }));
         assert_eq!(
             mapping.inputs.get("Location"),
             Some(&json!([0.25, -2.5, 0.0]))
@@ -7938,6 +8011,11 @@ mod tests {
             .get(emissive_texture_id)
             .ok_or_else(|| invalid_intermediate("emissive Image Texture node is missing"))?;
         assert_eq!(emissive_texture.node_type, "ShaderNodeTexImage");
+        assert_eq!(
+            emissive_texture.properties.get("image"),
+            Some(&json!(emissive_image_id.as_str()))
+        );
+        assert_ne!(emissive_texture_id, normal_texture_id);
         let (principled_id, _) = graph
             .nodes
             .iter()

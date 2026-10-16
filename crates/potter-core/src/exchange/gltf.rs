@@ -8037,8 +8037,9 @@ fn read_accessor_values(
 
     if let Some(sparse) = sparse {
         let sparse_count = usize::try_from(
-            sparse["count"]
-                .as_u64()
+            sparse
+                .get("count")
+                .and_then(Value::as_u64)
                 .ok_or_else(|| import_error("glTF sparse accessor count is missing"))?,
         )
         .map_err(|_| import_error("glTF sparse accessor count exceeds platform range"))?;
@@ -8047,9 +8048,15 @@ fn read_accessor_values(
                 "glTF sparse accessor count is outside accessor count",
             ));
         }
-        let indices = &sparse["indices"];
-        let index_type = indices["componentType"]
-            .as_u64()
+        let indices_value = sparse
+            .get("indices")
+            .ok_or_else(|| import_error("glTF sparse accessor indices are missing"))?;
+        let indices = indices_value
+            .as_object()
+            .ok_or_else(|| import_error("glTF sparse accessor indices are invalid"))?;
+        let index_type = indices
+            .get("componentType")
+            .and_then(Value::as_u64)
             .ok_or_else(|| import_error("glTF sparse index component type is missing"))?;
         let index_size = match index_type {
             5121 => 1,
@@ -8062,25 +8069,32 @@ fn read_accessor_values(
             }
         };
         let index_view = usize::try_from(
-            indices["bufferView"]
-                .as_u64()
+            indices
+                .get("bufferView")
+                .and_then(Value::as_u64)
                 .ok_or_else(|| import_error("glTF sparse indices bufferView is missing"))?,
         )
         .map_err(|_| import_error("glTF sparse indices bufferView exceeds platform range"))?;
         let (_, index_data) = buffer_view_data(root, buffers, index_view)?;
-        let index_offset = gltf_byte_offset(indices)?;
+        let index_offset = gltf_byte_offset(indices_value)?;
         if !index_offset.is_multiple_of(index_size) {
             return Err(import_error("glTF sparse indices offset is misaligned"));
         }
-        let values_info = &sparse["values"];
+        let values_info_value = sparse
+            .get("values")
+            .ok_or_else(|| import_error("glTF sparse accessor values are missing"))?;
+        let values_info = values_info_value
+            .as_object()
+            .ok_or_else(|| import_error("glTF sparse accessor values are invalid"))?;
         let value_view = usize::try_from(
-            values_info["bufferView"]
-                .as_u64()
+            values_info
+                .get("bufferView")
+                .and_then(Value::as_u64)
                 .ok_or_else(|| import_error("glTF sparse values bufferView is missing"))?,
         )
         .map_err(|_| import_error("glTF sparse values bufferView exceeds platform range"))?;
         let (_, value_data) = buffer_view_data(root, buffers, value_view)?;
-        let value_offset = gltf_byte_offset(values_info)?;
+        let value_offset = gltf_byte_offset(values_info_value)?;
         if !value_offset.is_multiple_of(component_size) {
             return Err(import_error("glTF sparse values offset is misaligned"));
         }
@@ -8924,6 +8938,34 @@ mod tests {
             "accessors": [{ "componentType": 5126, "count": 3, "type": "VEC2" }]
         });
         assert_eq!(super::read_vec2(&document, &[], 0)?, vec![[0.0, 0.0]; 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_sparse_accessor_fields_return_import_errors() -> TestResult {
+        let sparse_cases = [
+            json!({}),
+            json!({"count": 1}),
+            json!({"count": 1, "indices": {}}),
+            json!({"count": 1, "indices": {"componentType": 5121}}),
+            json!({"count": 1, "indices": {"componentType": 5121, "bufferView": 0}}),
+            json!({"count": 1, "indices": {"componentType": 5121, "bufferView": 0}, "values": {}}),
+        ];
+        for sparse in sparse_cases {
+            let document = json!({
+                "accessors": [{
+                    "componentType": 5126,
+                    "count": 1,
+                    "type": "VEC2",
+                    "sparse": sparse
+                }],
+                "bufferViews": [{"buffer": 0, "byteLength": 1}]
+            });
+            let error = super::read_vec2(&document, &[vec![0_u8]], 0)
+                .err()
+                .ok_or("malformed sparse accessor was accepted")?;
+            assert_eq!(error.code, crate::error::ErrorCode::ImportFailed);
+        }
         Ok(())
     }
 

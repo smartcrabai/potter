@@ -3209,11 +3209,22 @@ def _encode_gltf_normal_map_handedness(nodes, links, normal_name):
 def _model_group_tree(group):
     tree_type = {"geometry": "GeometryNodeTree", "shader": "ShaderNodeTree",
                  "compositor": "CompositorNodeTree"}.get(group.get("kind"), "")
-    node_names = {identifier: node.get("name", identifier)
-                  for identifier, node in group.get("nodes", {}).items()}
+    node_names = {}
+    used_node_names = set()
+    for identifier, node in group.get("nodes", {}).items():
+        name = node.get("name") or identifier
+        if name in used_node_names:
+            name = identifier
+            suffix = 1
+            while name in used_node_names:
+                name = "%s_%d" % (identifier, suffix)
+                suffix += 1
+        used_node_names.add(name)
+        node_names[identifier] = name
     nodes = []
     imported_normal_nodes = []
     for identifier, node in group.get("nodes", {}).items():
+        display_name = node.get("name") or identifier
         properties = dict(node.get("properties", {}))
         custom_properties = properties.pop("_blender_custom_properties", {})
         imported_normal_map = properties.pop("potter_gltf_imported_normal_map", False) is True
@@ -3223,6 +3234,8 @@ def _model_group_tree(group):
             imported_normal_nodes.append(node_names[identifier])
         nodes.append({
             "name": node_names[identifier],
+            "label": ("%s (%s)" % (display_name, identifier)
+                      if node_names[identifier] != display_name else node.get("label", "")),
             "potter_id": identifier,
             "type": blender_node_type(node.get("type", "Node"), tree_type),
             "location": node.get("location", [0.0, 0.0]),

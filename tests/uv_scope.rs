@@ -105,6 +105,8 @@ fn add_modifier(doc: &mut SceneDoc, node: &str, modifier_type: &str, params: Val
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params,
         binding_data: None,
         runtime: ModifierRuntime::default(),

@@ -13,7 +13,7 @@ use std::{
 };
 
 use glam::DVec3;
-use potter_core::geom::Mesh;
+use potter_core::geom::{Edge, Mesh};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -151,8 +151,9 @@ fn layer_op(op: &str, name: &str) -> Value {
     json!({"op":op, "target":{"id":"body"}, "name":name})
 }
 
-/// The evaluated `uv_layers` store, per-face-corner positions, and evaluation warnings.
+/// The evaluated receiver mesh, UV store, per-face-corner positions, and warnings.
 struct Evaluated {
+    mesh: Mesh,
     store: Value,
     corner_positions: Vec<[f64; 3]>,
     warnings: Vec<Value>,
@@ -171,6 +172,7 @@ fn evaluate_body_at(scene: &Path, frame: f64) -> TestResult<Evaluated> {
             ..potter_core::eval::EvaluationContext::default()
         },
         Some(project.path()),
+        Some(project.cache_directory()),
     )?;
     let mesh = snapshot
         .meshes
@@ -190,6 +192,7 @@ fn evaluate_body_at(scene: &Path, frame: f64) -> TestResult<Evaluated> {
         })
         .collect::<TestResult<Vec<_>>>()?;
     Ok(Evaluated {
+        mesh: mesh.clone(),
         store: mesh
             .attributes
             .get("uv_layers")
@@ -443,6 +446,7 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
             ..potter_core::eval::EvaluationContext::default()
         },
         Some(project.path()),
+        Some(project.cache_directory()),
     )?;
     let mut receiver = snapshot
         .meshes
@@ -462,8 +466,39 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
         .map(|face| face.vertices.len())
         .sum::<usize>();
     for face in &mut receiver.faces {
+        face.id = face.id.checked_add(100).ok_or("face ID overflow")?;
+        face.material_index = 1;
         face.vertices.rotate_left(1);
     }
+    receiver.next_id.face = receiver
+        .faces
+        .iter()
+        .map(|face| face.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("face ID counter overflow")?;
+    let mut loose_edge_vertices = None;
+    'candidate: for (index, first) in receiver.vertices.iter().enumerate() {
+        for second in receiver.vertices.iter().skip(index + 1) {
+            let endpoints = [first.id.min(second.id), first.id.max(second.id)];
+            if !receiver.edges.iter().any(|edge| {
+                edge.vertices == endpoints || edge.vertices == [endpoints[1], endpoints[0]]
+            }) {
+                loose_edge_vertices = Some(endpoints);
+                break 'candidate;
+            }
+        }
+    }
+    let loose_edge_vertices = loose_edge_vertices.ok_or("receiver mesh has no loose-edge pair")?;
+    let loose_edge_id = receiver.next_id.edge;
+    receiver.edges.push(Edge {
+        id: loose_edge_id,
+        vertices: loose_edge_vertices,
+    });
+    receiver.next_id.edge = loose_edge_id
+        .checked_add(1)
+        .ok_or("edge ID counter overflow")?;
     let receiver_faces: Vec<Vec<u32>> = receiver
         .faces
         .iter()
@@ -489,6 +524,7 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
         .iter()
         .map(|face| face.vertices.len())
         .collect();
+    let receiver_face_ids: Vec<u32> = receiver.faces.iter().map(|face| face.id).collect();
     let uv_store = receiver
         .attributes
         .get_mut("uv_layers")
@@ -503,7 +539,8 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
             .and_then(Value::as_array_mut)
             .ok_or("cache source UV layer has no face rows")?;
         assert_eq!(rows.len(), corner_counts.len());
-        for (row, corner_count) in rows.iter_mut().zip(&corner_counts) {
+        for (face_index, (row, corner_count)) in rows.iter_mut().zip(&corner_counts).enumerate() {
+            row["face_id"] = json!(receiver_face_ids[face_index]);
             let uv = row
                 .get_mut("uv")
                 .and_then(Value::as_array_mut)
@@ -541,9 +578,62 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
 
     let receiver_scene = directory.path().join("receiver.pot");
     scene_with_cache(&receiver_scene, vec![cache_modifier(&["VERT"])])?;
+    apply(
+        &receiver_scene,
+        &json!([
+            {"op":"material.create","id":"slot_zero","name":"Slot zero"},
+            {"op":"material.create","id":"slot_one","name":"Slot one"},
+            {"op":"node.update","target":{"id":"body"},"set":{"materials":["slot_zero","slot_one"]}}
+        ]),
+    )?;
     replace_body_mesh(&receiver_scene, &receiver)?;
+    apply(
+        &receiver_scene,
+        &json!([{
+            "op":"mesh.attribute_create","target":{"id":"body"},
+            "name":"cache_receiver_probe","domain":"point","type":"float","default":42.0
+        }]),
+    )?;
     let evaluated = evaluate_body(&receiver_scene)?;
     assert_eq!(evaluated.corner_positions, expected_corner_positions);
+    assert_eq!(evaluated.mesh.faces, receiver.faces);
+    assert_eq!(evaluated.mesh.edges, receiver.edges);
+    assert_eq!(
+        evaluated
+            .mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.id)
+            .collect::<Vec<_>>(),
+        receiver
+            .vertices
+            .iter()
+            .map(|vertex| vertex.id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(evaluated.mesh.next_id, receiver.next_id);
+    assert!(
+        evaluated
+            .mesh
+            .faces
+            .iter()
+            .all(|face| face.material_index == 1)
+    );
+    let probe = evaluated
+        .mesh
+        .attributes
+        .get("cache_receiver_probe")
+        .ok_or("vertex-only cache dropped a receiver custom attribute")?;
+    assert_eq!(probe["domain"], json!("point"));
+    let probe_values = probe["values"]
+        .as_object()
+        .ok_or("receiver custom attribute has no values")?;
+    assert_eq!(probe_values.len(), receiver.vertices.len());
+    assert!(
+        probe_values
+            .values()
+            .all(|value| value.as_f64() == Some(42.0))
+    );
     let output_layers = layers(&evaluated.store)?;
     assert_eq!(layer_names(&output_layers), layer_names(&input_layers));
     for (name, input_uvs) in &input_layers {

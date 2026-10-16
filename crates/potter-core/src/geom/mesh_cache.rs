@@ -172,6 +172,31 @@ pub(crate) fn evaluate(
         *mesh = evaluated;
         return Ok(warnings);
     }
+    // With unchanged topology and POLY disabled, Blender updates selected streams on the receiver.
+    if !read.polygons {
+        if read.vertices {
+            let positions = sample
+                .sample
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| evaluated_position(&sample, index, modifier))
+                .collect::<Result<Vec<_>>>()?;
+            for (vertex, position) in mesh.vertices.iter_mut().zip(positions) {
+                vertex.co = position;
+            }
+        }
+        apply_cache_attributes(
+            mesh,
+            sample.sample,
+            read,
+            velocity_scale,
+            modifier,
+            &mut warnings,
+        )?;
+        validate_cache_output(mesh, modifier)?;
+        return Ok(warnings);
+    }
     let positions = if read.vertices {
         (0..sample.sample.positions.len())
             .map(|index| evaluated_position(&sample, index, modifier))
@@ -179,41 +204,14 @@ pub(crate) fn evaluate(
     } else {
         mesh.vertices.iter().map(|vertex| vertex.co).collect()
     };
-    // Blender's static reader preserves receiver polygons unless POLY is requested.
-    let faces = if read.polygons {
-        sample.sample.faces.clone()
-    } else {
-        let vertex_indices = mesh
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(index, vertex)| (vertex.id, index))
-            .collect::<HashMap<_, _>>();
-        mesh.faces
-            .iter()
-            .map(|face| {
-                face.vertices
-                    .iter()
-                    .map(|id| {
-                        vertex_indices.get(id).copied().ok_or_else(|| {
-                            PotError::with_details(
-                                ErrorCode::EvaluationFailed,
-                                "Mesh cache input face references a missing vertex",
-                                json!({"modifier_id":modifier.id,"face_id":face.id,"vertex_id":id}),
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-    let mut evaluated = Mesh::from_positions_and_faces(positions, faces).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "Alembic cache topology is invalid for the selected vertex sample",
-            json!({"modifier_id":modifier.id,"reason":error.to_string()}),
-        )
-    })?;
+    let mut evaluated = Mesh::from_positions_and_faces(positions, sample.sample.faces.clone())
+        .map_err(|error| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic cache topology is invalid for the selected vertex sample",
+                json!({"modifier_id":modifier.id,"reason":error.to_string()}),
+            )
+        })?;
     carry_uv_store(mesh, &mut evaluated);
     apply_cache_attributes(
         &mut evaluated,
