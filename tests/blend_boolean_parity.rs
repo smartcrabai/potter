@@ -22,7 +22,7 @@
 //!
 //! FLOAT cases are in the corpus as Blender's defective outputs (research §3.3, §3.4, §3.7
 //! INDEX row). They are `PR17b` targets for the `FLOAT` port, so this driver does not assert them.
-//!
+//! The open-operand EXACT cases from §3.5 assert both `hole_tolerant` settings and all operations.
 //! Comparator, applied to both Potter and Blender results:
 //! - vertex and edge counts must match exactly;
 //! - each face is `(ring, material_index)`. The ring is quantized to 1e-6, rotated to start
@@ -318,6 +318,7 @@ fn exact_boolean_matches_blender_parity_corpus() -> TestResult<()> {
     }
     paths.sort();
     assert!(!paths.is_empty(), "boolean parity corpus has no cases");
+    let mut open_asserted = 0;
     let mut asserted = 0;
     for path in paths {
         let expected_json: Value = serde_json::from_slice(&fs::read(&path)?)?;
@@ -328,7 +329,14 @@ fn exact_boolean_matches_blender_parity_corpus() -> TestResult<()> {
         }
         assert_case(&document, &expected_json)?;
         asserted += 1;
+        if expected_json["research_section"] == "3.5" {
+            open_asserted += 1;
+        }
     }
     assert!(asserted > 0, "no EXACT cases were asserted");
+    assert_eq!(
+        open_asserted, 18,
+        "expected all 18 open-operand EXACT cases to be asserted"
+    );
     Ok(())
 }

@@ -226,14 +226,11 @@ fn nested_cube_intersect_is_exact_1() -> TestResult {
 }
 
 #[test]
-fn open_operand_needs_the_raycast_path() -> TestResult {
+fn open_operand_uses_patch_raycast_fallback() -> TestResult {
     let (b_size, b_offset) = offset_b();
-    // B's top is at z = 2; removing it leaves an open operand.
-    match run(BoolOp::Difference, 2.0, b_size, b_offset, Some(2.0)) {
-        Err(error) if error.contains("PR17a-3") => Ok(()),
-        Err(error) => Err(format!("unexpected error: {error}")),
-        Ok(_) => Err("open operand was classified as PWN".to_owned()),
-    }
+    // Removing B's top at z=2 leaves an open face outside A.
+    let (arena, out) = run(BoolOp::Difference, 2.0, b_size, b_offset, Some(2.0))?;
+    expect_volume(&signed_volume(&arena, &out), 7.25)
 }
 
 #[test]

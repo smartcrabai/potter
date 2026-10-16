@@ -1,12 +1,12 @@
-//! Classification of intersected triangles (Blender `boolean_trimesh`, PWN path).
+//! Classification of intersected triangles (Blender `boolean_trimesh`).
 //!
-//! Port of the PWN branch of `boolean_trimesh` (`blenlib/intern/mesh_boolean.cc`): patches of
-//! triangles joined by manifold edges, cells between patches, exact angular sorts around edges,
-//! winding propagation from an ambient cell, and extraction of the cut triangles. Input that is
-//! not PWN needs the raycast fallback (PR17a-3) and is refused here.
+//! PWN meshes use patches, cells, exact angular sorts around edges, winding propagation from an
+//! ambient cell, and extraction of the cut triangles. Non-PWN meshes use the float-ray fallback.
 
 mod ambient;
 mod patches;
+#[path = "raycast.rs"]
+mod raycast;
 mod sort;
 #[cfg(test)]
 mod tests;
@@ -35,12 +35,11 @@ fn invariant(what: &str) -> PotError {
     )
 }
 
-/// Blender `boolean_trimesh` for the PWN case: intersects `tris`, classifies the result, and
-/// returns the triangles that bound the output volume.
+/// Blender `boolean_trimesh`: intersects `tris`, then classifies the result by the PWN cell
+/// graph or, for non-PWN meshes, Blender's float-ray fallback.
 ///
 /// `shape_fn` maps a triangle's `orig` to its operand index in `0..nshapes`. `hole_tolerant`
-/// selects the non-PWN raycast path only, so it is accepted for the call shape and ignored here.
-/// Non-PWN intersection output is refused with an error until the raycast path lands.
+/// selects per-triangle raycasting instead of per-patch classification for non-PWN meshes.
 pub(crate) fn boolean_tris(
     arena: &mut Arena,
     tris: &[Tri],
@@ -50,15 +49,19 @@ pub(crate) fn boolean_tris(
     use_self: bool,
     hole_tolerant: bool,
 ) -> Result<Vec<Tri>> {
-    let _ = hole_tolerant;
     let tm_si = trimesh_nary_intersect(arena, tris, nshapes, shape_fn, use_self);
     if tm_si.is_empty() {
         return Ok(tm_si);
     }
     let topo = Topology::new(&tm_si);
     if !is_pwn(&tm_si, &topo) {
-        return Err(PotError::invalid_argument(
-            "open or self-overlapping boolean result needs the non-PWN raycast path (PR17a-3)",
+        return Ok(raycast::raycast_boolean(
+            arena,
+            &tm_si,
+            nshapes,
+            shape_fn,
+            op,
+            hole_tolerant,
         ));
     }
     let mut pinfo = find_patches(&tm_si, &topo);

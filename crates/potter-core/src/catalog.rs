@@ -528,7 +528,7 @@ pub fn feature_catalog() -> Value {
             "Boolean output followed by a topology-dependent modifier",
             "BOOLEAN",
             &[],
-            "Blender's Boolean output topology is reproduced by the EXACT solver on closed operands. FLOAT output and EXACT output of open or self-overlapping operands are not, so topology-dependent downstream modifiers can diverge.",
+            "Blender's Boolean output topology is reproduced by the EXACT solver on supported inputs, including open and self-overlapping results. FLOAT output still differs, so topology-dependent downstream modifiers can diverge under FLOAT.",
         ),
         unsupported(
             "modifier.boolean.solver_manifold",
@@ -543,13 +543,6 @@ pub fn feature_catalog() -> Value {
             "BOOLEAN",
             &["modifier.create", "modifier.apply"],
             "FLOAT runs the pre-PR17 BSP shortcut, not Blender's float path. Touching, coplanar, and self-overlapping operands, and INTERSECT with a collection, differ from Blender in topology and volume until PR17b.",
-        ),
-        unsupported(
-            "modifier.boolean.exact_open_operands",
-            "Boolean EXACT solver with open or self-overlapping intersection results",
-            "BOOLEAN",
-            &["modifier.create", "modifier.apply"],
-            "Blender classifies these results with a float ray-parity fallback that is not ported yet (PR17a-3). Potter refuses them with an error instead of guessing.",
         ),
         unsupported(
             "modifier.boolean.exact_point_attribute_local_index",

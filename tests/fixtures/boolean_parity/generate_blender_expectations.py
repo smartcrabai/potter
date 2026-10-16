@@ -12,10 +12,10 @@ Outputs under the directory given after `--`:
     scene.blend            every case in one scene; the Potter import source (git-ignored)
 
 Cases reproduce research/§3 of the PR17 design: §3.1 offset, §3.2 nested, §3.3 coplanar,
-§3.4 face-touching and holes, §3.6 self-overlapping operand, §3.7 collection operand,
-attributes, vertex groups, and material INDEX/TRANSFER. EXACT cases are the parity oracle.
-FLOAT cases of §3.3, §3.4, and the §3.7 INDEX material row are recorded as Blender's
-defective outputs for PR17b; the Rust driver skips them.
+§3.4 face-touching and holes, §3.5 open operands, §3.6 self-overlapping operand, §3.7
+collection operand, attributes, vertex groups, and material INDEX/TRANSFER. EXACT cases are
+the parity oracle. FLOAT cases of §3.3, §3.4, and the §3.7 INDEX material row are recorded
+as Blender's defective outputs for PR17b; the Rust driver skips them.
 
 Each case is a Boolean modifier on a host object named after the case. Every object keeps
 the identity transform, so object-local and world coordinates coincide. All cases share one
@@ -55,6 +55,19 @@ def box(x0, x1, y0, y1, z0, z1):
         (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
     ]
     return verts, list(BOX_FACES)
+
+
+def remove_face(mesh, face_index):
+    verts, faces = mesh
+    return verts, [face for index, face in enumerate(faces) if index != face_index]
+
+
+def input_mesh_geometry(spec):
+    verts, faces = spec["mesh"]
+    return {
+        "vertices": [list(vertex) for vertex in verts],
+        "faces": [list(face) for face in faces],
+    }
 
 
 def join(*meshes):
@@ -99,8 +112,8 @@ def cross(a, b):
 
 
 def case(family, section, solver, operation, host, operands, *, collection=False,
-         use_self=False, material_mode="INDEX", suffix=""):
-    return {
+         use_self=False, material_mode="INDEX", suffix="", hole_tolerant=None):
+    result = {
         "id": f"{family}_{operation.lower()}_{solver.lower()}{suffix}",
         "research_section": section,
         "solver": solver,
@@ -111,6 +124,9 @@ def case(family, section, solver, operation, host, operands, *, collection=False
         "operands": operands,
         "collection": collection,
     }
+    if hole_tolerant is not None:
+        result["hole_tolerant"] = hole_tolerant
+    return result
 
 
 def specs():
@@ -141,6 +157,21 @@ def specs():
         case("hole_top", "3.4", solver, "DIFFERENCE", host, [top_hole])
         for solver in ("EXACT", "FLOAT")
     ]
+
+    # 3.5 open operands, EXACT: both hole-tolerant paths and all three operations.
+    open_operands = (
+        ("open_top_offset", part(remove_face(box(0.5, 2.5, -0.5, 1.5, 0, 2), 1))),
+        ("open_inside", part(remove_face(box(-0.5, 0.5, -0.5, 0.5, -0.5, 0.5), 1))),
+        ("open_bottom_offset", part(remove_face(box(0, 2, -0.5, 0.5, 0, 2), 0))),
+    )
+    for family, operand in open_operands:
+        for hole_tolerant in (False, True):
+            suffix = "_hole_tolerant_on" if hole_tolerant else "_hole_tolerant_off"
+            cases += [
+                case(family, "3.5", "EXACT", op, host, [operand],
+                     suffix=suffix, hole_tolerant=hole_tolerant)
+                for op in OPERATIONS
+            ]
 
     # 3.6 self-overlapping operand (two overlapping boxes in one object), EXACT.
     big_host = part(box(-2, 2, -2, 2, -2, 2))
@@ -241,7 +272,7 @@ def build_case(spec):
     modifier.operation = spec["operation"]
     modifier.solver = spec["solver"]
     modifier.use_self = spec["use_self"]
-    modifier.use_hole_tolerant = False
+    modifier.use_hole_tolerant = spec.get("hole_tolerant", False)
     modifier.material_mode = spec["material_mode"]
     if spec["collection"]:
         modifier.operand_type = "COLLECTION"
@@ -301,7 +332,7 @@ def describe_mesh(evaluated, mesh, spec):
     for entries in groups.values():
         entries.sort(key=lambda entry: entry["co"])
 
-    return {
+    result = {
         "case": spec["id"],
         "research_section": spec["research_section"],
         "solver": spec["solver"],
@@ -319,6 +350,13 @@ def describe_mesh(evaluated, mesh, spec):
         "vertex_groups": groups,
         "blender_version": bpy.app.version_string,
     }
+    if "hole_tolerant" in spec:
+        result["hole_tolerant"] = spec["hole_tolerant"]
+        result["input_geometry"] = {
+            "host": input_mesh_geometry(spec["host"]),
+            "operands": [input_mesh_geometry(operand) for operand in spec["operands"]],
+        }
+    return result
 
 
 def main():
