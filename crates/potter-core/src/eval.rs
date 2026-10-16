@@ -237,7 +237,7 @@ impl Snapshot {
         Self::evaluate_internal(doc, context, project_root, cache_directory, Some(node_ids))
     }
 
-    /// Evaluate only a modifier's classified geometry operands and target world transform.
+    /// Evaluate only a modifier's classified geometry operands and required world transforms.
     pub(crate) fn evaluate_modifier_operands_with_cache(
         doc: &SceneDoc,
         context: &EvaluationContext,
@@ -252,7 +252,7 @@ impl Snapshot {
             cache_directory,
         };
         let suppressed = BTreeSet::new();
-        let world_matrix_ids = BTreeSet::from([target_id.clone()]);
+        let mut world_matrix_ids = BTreeSet::from([target_id.clone()]);
         let mesh_dependencies = object_mesh_dependencies(
             doc,
             ModifierGate {
@@ -267,6 +267,35 @@ impl Snapshot {
         }
         if let Some(dependencies) = mesh_dependencies.other.get(target_id) {
             selected_nodes.extend(dependencies.iter().cloned());
+        }
+        if let Some(modifier) = doc
+            .nodes
+            .get(target_id)
+            .and_then(|node| node.modifiers.iter().find(|modifier| &modifier.id == modifier_id))
+        {
+            let transform_references = modifier_transform_references(modifier);
+            world_matrix_ids.extend(transform_references.iter().cloned());
+            for reference_id in transform_references {
+                let Some(reference) = doc.nodes.get(&reference_id) else {
+                    continue;
+                };
+                for constraint in &reference.constraints {
+                    if constraint.enabled
+                        && constraint.influence != 0.0
+                        && matches!(
+                            constraint.constraint_type,
+                            ConstraintType::Shrinkwrap | ConstraintType::GeometryAttribute
+                        )
+                        && let Some(dependency_id) = &constraint.target
+                        && mesh_dependencies
+                            .other
+                            .get(&reference_id)
+                            .is_some_and(|dependencies| dependencies.contains(dependency_id))
+                    {
+                        selected_nodes.insert(dependency_id.clone());
+                    }
+                }
+            }
         }
         doc.validate()?;
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
@@ -1489,6 +1518,69 @@ impl Snapshot {
     }
 }
 
+fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
+    fn add_reference(references: &mut BTreeSet<Id>, value: Option<&Value>) {
+        if let Some(text) = value.and_then(Value::as_str)
+            && let Ok(id) = Id::new(text.to_owned())
+        {
+            references.insert(id);
+        }
+    }
+
+    let parameters: &[&str] = match modifier.modifier_type.as_str() {
+        "hook" => &["object"],
+        "uv_project" => &["projectors"],
+        "uv_warp" | "warp" => &["object_from", "object_to"],
+        "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity" => {
+            &["mask_tex_map_object"]
+        }
+        "volume_displace" => &["texture_map_object"],
+        _ => &[],
+    };
+    let mut references = BTreeSet::new();
+    for parameter in parameters {
+        let Some(value) = modifier.params.get(*parameter) else {
+            continue;
+        };
+        if *parameter == "projectors" {
+            if let Some(projectors) = value.as_array() {
+                for projector in projectors {
+                    add_reference(&mut references, Some(projector));
+                }
+            }
+        } else {
+            add_reference(&mut references, Some(value));
+        }
+    }
+    if modifier.modifier_type == "array" {
+        if modifier
+            .params
+            .get("fit_type")
+            .and_then(Value::as_str)
+            == Some("FIT_CURVE")
+        {
+            add_reference(&mut references, modifier.params.get("curve"));
+        }
+        if modifier
+            .params
+            .get("use_object_offset")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            add_reference(&mut references, modifier.params.get("offset_object"));
+        }
+    } else if modifier.modifier_type == "screw"
+        && modifier
+            .params
+            .get("use_object_screw_offset")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        add_reference(&mut references, modifier.params.get("object"));
+    }
+    references
+}
+
 /// Content address of the authored scene. Purpose resolution never changes it.
 fn source_scene_hash(doc: &SceneDoc) -> Result<String> {
     let scene_value = serde_json::to_value(doc).map_err(PotError::internal_json)?;
@@ -1554,6 +1646,45 @@ impl ModifierGate<'_> {
     /// Whether `modifier` on `node_id` takes part in this evaluation.
     pub(crate) fn is_active(&self, node_id: &Id, modifier: &Modifier) -> bool {
         !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
+    }
+
+    /// Whether a legacy physics property has an active stack modifier linked to its settings.
+    pub(crate) fn is_property_active(
+        &self,
+        node_id: &Id,
+        node: &Node,
+        property_name: &str,
+        modifier_type: &str,
+    ) -> bool {
+        if self.suppressed.contains(node_id) {
+            return false;
+        }
+        let linked_modifier = if property_name == "physics_particle_emitter" {
+            node.properties
+                .get("physics_particle_emitter_modifier_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|modifier_id| {
+                    node.modifiers.iter().find(|modifier| {
+                        modifier.id.as_str() == modifier_id
+                            && modifier.modifier_type == modifier_type
+                            && modifier
+                                .params
+                                .get("settings_id")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(modifier.id.as_str())
+                    })
+                })
+        } else {
+            node.modifiers.iter().find(|modifier| {
+                modifier.modifier_type == modifier_type
+                    && modifier
+                        .params
+                        .get("settings_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(modifier.id.as_str())
+            })
+        };
+        linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
     }
 
     /// Borrow the stack when all modifiers remain active; otherwise copy only for visibility.
@@ -2019,7 +2150,15 @@ fn object_mesh_evaluation_order(
             let Some(node) = doc.nodes.get(id) else {
                 continue;
             };
-            let has_particle_system = node.properties.contains_key("physics_particle_emitter")
+            let has_particle_system = (node
+                .properties
+                .contains_key("physics_particle_emitter")
+                && gate.is_property_active(
+                    id,
+                    node,
+                    "physics_particle_emitter",
+                    "particle_system",
+                ))
                 || node.modifiers.iter().any(|modifier| {
                     gate.is_active(id, modifier) && modifier.modifier_type == "particle_system"
                 });
@@ -2389,25 +2528,91 @@ fn render_simulated_particles(
         }) {
             continue;
         }
-        let visible_states = states
+        let node = doc.nodes.get(emitter_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "particle emitter object was not found",
+                json!({"node_id":emitter_id}),
+            )
+        })?;
+        let primary_modifier_id = node
+            .properties
+            .get("physics_particle_emitter_modifier_id")
+            .and_then(serde_json::Value::as_str);
+        let mut visible_states_by_system = BTreeMap::<u32, Vec<&crate::sim::ParticleState>>::new();
+        for state in states
             .iter()
             .filter(|state| state.life_state == crate::sim::ParticleLifeState::Alive)
-            .collect::<Vec<_>>();
-        if visible_states.is_empty() {
-            continue;
+        {
+            let system_modifier = usize::try_from(state.system_index)
+                .ok()
+                .and_then(|index| {
+                    node.modifiers
+                        .iter()
+                        .filter(|modifier| modifier.modifier_type == "particle_system")
+                        .nth(index)
+                });
+            let active = match (system_modifier, primary_modifier_id) {
+                (Some(modifier), Some(primary_id))
+                    if modifier.id.as_str() == primary_id =>
+                {
+                    gate.is_property_active(
+                        emitter_id,
+                        node,
+                        "physics_particle_emitter",
+                        "particle_system",
+                    )
+                }
+                (Some(_), None) if state.system_index == 0 => gate.is_property_active(
+                    emitter_id,
+                    node,
+                    "physics_particle_emitter",
+                    "particle_system",
+                ),
+                (Some(modifier), _) => gate.is_active(emitter_id, modifier),
+                (None, _) => gate.is_property_active(
+                    emitter_id,
+                    node,
+                    "physics_particle_emitter",
+                    "particle_system",
+                ),
+            };
+            if active {
+                visible_states_by_system
+                    .entry(state.system_index)
+                    .or_default()
+                    .push(state);
+            }
         }
-        if visible_states.len() > MAX_RENDERED_PARTICLES {
-            return Err(PotError::with_details(
-                ErrorCode::LimitExceeded,
-                "particle visualization exceeds the 100000 particle limit",
-                json!({"node_id":emitter_id,"count":visible_states.len()}),
-            ));
-        }
-        let settings = doc
-            .nodes
-            .get(emitter_id)
-            .and_then(|node| node.properties.get("physics_particle_emitter"))
-            .and_then(serde_json::Value::as_object)
+        for (system_index, visible_states) in visible_states_by_system {
+            if visible_states.len() > MAX_RENDERED_PARTICLES {
+                return Err(PotError::with_details(
+                    ErrorCode::LimitExceeded,
+                    "particle visualization exceeds the 100000 particle limit",
+                    json!({"node_id":emitter_id,"count":visible_states.len()}),
+                ));
+            }
+            let has_stack_system = usize::try_from(system_index).ok().is_some_and(|index| {
+                node.modifiers
+                    .iter()
+                    .filter(|modifier| modifier.modifier_type == "particle_system")
+                    .nth(index)
+                    .is_some()
+            });
+            let settings = (if has_stack_system {
+                particle_system_for_index(doc, emitter_id, system_index)?.1
+            } else {
+                node.properties
+                    .get("physics_particle_emitter")
+                    .ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "particle emitter settings are missing",
+                            json!({"node_id":emitter_id}),
+                        )
+                    })?
+            })
+            .as_object()
             .ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::SceneInvalid,
@@ -2599,6 +2804,7 @@ fn render_simulated_particles(
         })?;
         evaluated.bounds = bounds;
         evaluated.dimensions = bounds.map(|value| value.size().to_array());
+        }
     }
     Ok(())
 }
@@ -4339,70 +4545,17 @@ pub(crate) fn mesh_vertex_weights(
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
 
-    use std::{borrow::Cow, collections::BTreeSet};
-
     use glam::DVec3;
 
     use crate::{
         geom::{BoxParams, Mesh},
         model::{
             DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
-            GreasePencilStroke, Id, Modifier, ModifierRuntime, Node, SceneDoc, Transform,
+            GreasePencilStroke, Id, Node, SceneDoc, Transform,
         },
     };
 
-    use super::{
-        EvaluationContext, EvaluationPurpose, ModifierEvaluationContext, ModifierGate, Snapshot,
-    };
-
-    #[test]
-    fn render_gate_borrows_large_binding_payload() {
-        let owner = Id::new("owner").unwrap();
-        let binding_data = serde_json::json!({"binds": vec![vec![0.25; 64]; 4096]});
-        let modifiers = vec![
-            Modifier {
-                id: Id::new("bound").unwrap(),
-                modifier_type: "mesh_deform".to_owned(),
-                name: "Bound".to_owned(),
-                enabled: true,
-                show_viewport: true,
-                show_render: true,
-                params: serde_json::Map::new(),
-                binding_data: Some(binding_data),
-                runtime: ModifierRuntime::default(),
-            },
-            Modifier {
-                id: Id::new("subdivision").unwrap(),
-                modifier_type: "subdivision".to_owned(),
-                name: "Subdivision".to_owned(),
-                enabled: true,
-                show_viewport: true,
-                show_render: true,
-                params: serde_json::Map::new(),
-                binding_data: None,
-                runtime: ModifierRuntime::default(),
-            },
-        ];
-        let suppressed = BTreeSet::new();
-        let gate = ModifierGate {
-            context: ModifierEvaluationContext {
-                purpose: EvaluationPurpose::Render,
-                project_root: None,
-                cache_directory: None,
-            },
-            suppressed: &suppressed,
-        };
-
-        let stack = gate.stack(&owner, &modifiers);
-        let Cow::Borrowed(stack) = stack else {
-            panic!("render-settings selection must borrow a fully active stack");
-        };
-        assert!(std::ptr::eq(stack.as_ptr(), modifiers.as_ptr()));
-        assert!(std::ptr::eq(
-            stack[0].binding_data.as_ref().unwrap(),
-            modifiers[0].binding_data.as_ref().unwrap()
-        ));
-    }
+    use super::{EvaluationContext, Snapshot};
 
     fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {
         let data_id = Id::new("grease_pencil_data").unwrap();

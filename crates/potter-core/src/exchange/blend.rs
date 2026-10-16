@@ -572,11 +572,12 @@ fn attach_native_target_vertices(
                 continue;
             };
             let modifier_name = modifier
-                .get("name")
+                .get("blender_name")
+                .or_else(|| modifier.get("name"))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(|| {
-                    invalid_intermediate("native Surface Deform modifier has no name")
+                    invalid_intermediate("native Surface Deform modifier has no Blender name")
                 })?;
             let vertices = target_mesh
                 .get("vertices")
@@ -1737,6 +1738,7 @@ fn build_imported_graph(
             action.slots = slots;
         }
     }
+    let mut modifier_ids_by_object = BTreeMap::<String, Vec<String>>::new();
     for item in objects {
         let name = string_field(item, "name")?;
         let id = object_ids
@@ -1819,6 +1821,10 @@ fn build_imported_graph(
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("modifier");
+                let blender_name = modifier
+                    .get("blender_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(modifier_name);
                 let modifier_type = modifier
                     .get("type")
                     .and_then(Value::as_str)
@@ -1969,7 +1975,7 @@ fn build_imported_graph(
                 }
                 modifier_ids.insert(modifier_id.clone());
                 mappings.insert(
-                    format!("Modifier:{}:{modifier_name}", id.as_str()),
+                    format!("Modifier:{}:{modifier_id}", id.as_str()),
                     modifier_id.clone(),
                 );
                 Ok(Modifier {
@@ -1991,12 +1997,19 @@ fn build_imported_graph(
                         .unwrap_or(true),
                     params,
                     binding_data: native_bindings
-                        .get(&(name.to_owned(), modifier_name.to_owned()))
+                        .get(&(name.to_owned(), blender_name.to_owned()))
                         .cloned(),
                     runtime: crate::model::ModifierRuntime::default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        modifier_ids_by_object.insert(
+            name.to_owned(),
+            modifiers
+                .iter()
+                .map(|modifier| modifier.id.as_str().to_owned())
+                .collect(),
+        );
         let material_slots = item
             .get("materials")
             .and_then(Value::as_array)
@@ -2352,9 +2365,34 @@ fn build_imported_graph(
         "active_scene": active_name,
         "id_mappings": id_mappings.clone(),
     });
+    let mut compatibility_intermediate = (*raw).clone();
+    if let Some(source_objects) = compatibility_intermediate
+        .get_mut("objects")
+        .and_then(Value::as_array_mut)
+    {
+        for source_object in source_objects {
+            let Some(source_name) = source_object.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(modifier_ids) = modifier_ids_by_object.get(source_name) else {
+                continue;
+            };
+            if let Some(source_modifiers) = source_object
+                .get_mut("modifiers")
+                .and_then(Value::as_array_mut)
+            {
+                for (source_modifier, modifier_id) in source_modifiers.iter_mut().zip(modifier_ids)
+                {
+                    if let Some(source_modifier) = source_modifier.as_object_mut() {
+                        source_modifier.insert("potter_id".to_owned(), json!(modifier_id));
+                    }
+                }
+            }
+        }
+    }
     doc.compatibility.insert(
         "blender_adapter".to_owned(),
-        json!({"intermediate": raw, "id_mappings": id_mappings.clone()}),
+        json!({"intermediate": compatibility_intermediate, "id_mappings": id_mappings.clone()}),
     );
     doc.validate()?;
     attach_native_target_vertex_orders(&mut doc);

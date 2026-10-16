@@ -1075,8 +1075,11 @@ fn evaluate_modifier_output(
                         .iter()
                         .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
                 }
-                "curve" | "hook" | "data_transfer" | "vertex_weight_proximity" | "normal_edit" => {
-                    ["object", "target"]
+                "curve" | "hook" | "data_transfer" | "normal_edit" => ["object", "target"]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
+                "vertex_weight_proximity" => {
+                    ["object", "target", "mask_tex_map_object"]
                         .iter()
                         .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
                 }
@@ -1167,18 +1170,29 @@ fn evaluate_modifier_output(
             let evaluated_operand_meshes = operand_snapshot
                 .as_ref()
                 .map_or(&empty_meshes, |snapshot| &snapshot.meshes);
-            let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
-            let mut world_matrices = if let Some(snapshot) = &operand_snapshot {
-                let scene = engine.doc.scenes.get(&engine.doc.active_scene);
-                crate::eval::rig::evaluate_world_matrices_with_evaluated_meshes(
-                    engine.doc,
-                    frame,
-                    &driver_values,
-                    engine.asset_root,
-                    scene.map_or(24, |scene| scene.fps),
-                    scene.map_or(1.0, |scene| scene.fps_base),
-                    &snapshot.meshes,
-                )?
+            let driver_values = if operand_snapshot.is_none() {
+                crate::eval::rig::evaluate_drivers(engine.doc, frame)?
+            } else {
+                BTreeMap::new()
+            };
+            let world_matrices = if let Some(snapshot) = &operand_snapshot {
+                let mut matrices = snapshot
+                    .nodes
+                    .iter()
+                    .map(|(node_id, node)| {
+                        (
+                            node_id.clone(),
+                            glam::DMat4::from_cols_array(&node.world_matrix),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                matrices.extend(
+                    snapshot
+                        .transform_world_matrices
+                        .iter()
+                        .map(|(id, matrix)| (id.clone(), *matrix)),
+                );
+                matrices
             } else {
                 let scene = engine.doc.scenes.get(&engine.doc.active_scene);
                 crate::eval::rig::evaluate_world_matrices_with_resources(
@@ -1190,20 +1204,6 @@ fn evaluate_modifier_output(
                     scene.map_or(1.0, |scene| scene.fps_base),
                 )?
             };
-            if let Some(snapshot) = &operand_snapshot {
-                for (node_id, node) in &snapshot.nodes {
-                    world_matrices.insert(
-                        node_id.clone(),
-                        glam::DMat4::from_cols_array(&node.world_matrix),
-                    );
-                }
-                world_matrices.extend(
-                    snapshot
-                        .transform_world_matrices
-                        .iter()
-                        .map(|(id, matrix)| (id.clone(), *matrix)),
-                );
-            }
             let curve_path_lengths = crate::eval::evaluated_array_curve_path_length(
                 engine.doc,
                 target_modifier,
