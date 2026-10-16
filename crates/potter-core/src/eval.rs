@@ -1311,7 +1311,8 @@ impl Snapshot {
                             &current,
                             modifier,
                             doc,
-                            modifier_context.project_root,
+                            gate,
+                            &mut texture_rng,
                             &matrices,
                             id,
                         )?);
@@ -2963,47 +2964,30 @@ fn apply_volume_displace_modifier(
     volume: &crate::geom::volume::VolumeData,
     modifier: &Modifier,
     doc: &SceneDoc,
-    project_root: Option<&Path>,
+    gate: ModifierGate<'_>,
+    rng: &mut crate::blender_rng::BlenderRng,
     world_matrices: &BTreeMap<Id, DMat4>,
     volume_id: &Id,
 ) -> Result<crate::geom::volume::VolumeData> {
     let params = &modifier.params;
-    let texture = params.get("texture").and_then(serde_json::Value::as_str);
-    let (texture_type, image) = if let Some(texture) = texture {
-        if texture == "noise" {
-            ("NOISE", None)
-        } else {
-            let image_id = Id::new(texture.to_owned()).map_err(|error| {
+    let texture = match params.get("texture").and_then(serde_json::Value::as_str) {
+        Some(texture_text) => {
+            let texture_id = Id::new(texture_text.to_owned()).map_err(|error| {
                 PotError::with_details(
-                    ErrorCode::UnsupportedFeature,
-                    "Volume Displace texture is not a supported image or noise source",
-                    json!({"feature_id":"modifier.volume_displace.texture_type","texture":texture,"cause":error.message}),
+                    ErrorCode::InvalidArgument,
+                    error.message,
+                    json!({"modifier_id":modifier.id,"parameter":"texture"}),
                 )
             })?;
-            let image = doc.images.get(&image_id).ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::UnsupportedFeature,
-                    "Volume Displace texture is not a supported image or noise source",
-                    json!({"feature_id":"modifier.volume_displace.texture_type","texture":texture}),
-                )
-            })?;
-            let root = project_root.ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "Volume Displace image texture requires a project root",
-                    json!({"feature_id":"modifier.volume_displace.image_texture","image":image_id}),
-                )
-            })?;
-            let image = crate::image::load_image_data(
-                image,
-                root,
-                crate::image::ImageInterpolation::Linear,
-            )?;
-            ("IMAGE", Some(image))
+            Some(crate::geom::resolve_texture(
+                doc,
+                &texture_id,
+                gate.context.project_root,
+            )?)
         }
-    } else {
-        ("NONE", None)
+        None => None,
     };
+    let texture_source = texture.as_ref().map(|resolved| resolved.source());
     let volume_world = world_matrices.get(volume_id).copied().ok_or_else(|| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -3034,8 +3018,8 @@ fn apply_volume_displace_modifier(
     crate::geom::modifiers::simulation::displace_volume(
         volume,
         params,
-        texture_type,
-        image.as_ref(),
+        texture_source,
+        rng,
         volume_world,
         texture_map_object_world,
     )
@@ -3985,6 +3969,7 @@ pub(crate) fn apply_volume_to_mesh_modifier(
                 )
             })?,
     };
+
     let source_world = matrices.get(source_node_id).copied().ok_or_else(|| {
         PotError::new(
             ErrorCode::InternalError,
