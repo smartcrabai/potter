@@ -5610,21 +5610,9 @@ fn has_verbatim_native_movie_clip(doc: &SceneDoc, clip: &MovieClip) -> bool {
             .all(|(key, value)| source_tracking.get(key) == Some(value))
 }
 
-/// Whether a Blender attribute list (a mesh's `blender_attributes` or an intermediate mesh's raw
-/// `attributes`) carries a `custom_normal` entry.
-fn has_raw_custom_normal(entries: Option<&Value>) -> bool {
-    entries.and_then(Value::as_array).is_some_and(|entries| {
-        entries
-            .iter()
-            .any(|entry| entry.get("name").and_then(Value::as_str) == Some("custom_normal"))
-    })
-}
-
-/// Lists features the Blender adapter cannot write back. Native `custom_normal` and
-/// `shade_smooth` are accepted only on a mesh whose `blender_attributes` carry Blender's raw
-/// `custom_normal` entry: import creates the native pair alongside that entry, and the writer
-/// emits native values in place of the raw entry and the stored polygon flags.
-/// Any other mesh attribute, including a `custom_normal` without the raw entry, is a loss.
+/// Lists features the Blender adapter cannot write back. Native `custom_normal` and `shade_smooth`
+/// are written from Potter's current values by the bridge (a malformed value fails the export), so
+/// they are never a loss. Any other mesh attribute is a loss.
 pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
     for (clip_id, clip) in &doc.movie_clips {
@@ -5736,11 +5724,11 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ));
         }
         if let Some(mesh) = &data.mesh {
-            let raw_custom_normal =
-                has_raw_custom_normal(mesh.attributes.get("blender_attributes"));
-            for attribute in mesh.attributes.keys().filter(|name| {
-                !(raw_custom_normal && matches!(name.as_str(), "custom_normal" | "shade_smooth"))
-            }) {
+            for attribute in mesh
+                .attributes
+                .keys()
+                .filter(|name| !matches!(name.as_str(), "custom_normal" | "shade_smooth"))
+            {
                 if !matches!(
                     attribute.as_str(),
                     "blender_uv_layers"
@@ -6950,7 +6938,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_normal_attributes_export_only_beside_raw_entry() -> Result<()> {
+    fn custom_normal_and_shade_smooth_export_without_loss() -> Result<()> {
         let shading = vec![
             (
                 "custom_normal",
@@ -6961,14 +6949,13 @@ mod tests {
                 json!({"domain": "face", "type": "bool", "values": {}}),
             ),
         ];
-        let mut with_raw = shading.clone();
+        assert!(
+            mesh_attribute_losses(box_with_attributes(shading.clone())?)?.is_empty(),
+            "native custom normals and smooth flags are written by the bridge"
+        );
+        let mut with_raw = shading;
         with_raw.push(("blender_attributes", json!([raw_custom_normal_entry(24)])));
         assert!(mesh_attribute_losses(box_with_attributes(with_raw)?)?.is_empty());
-        assert_eq!(
-            mesh_attribute_losses(box_with_attributes(shading)?)?.len(),
-            1,
-            "native custom normals without the raw entry are a loss"
-        );
         let unknown = vec![
             (
                 "scratch",
