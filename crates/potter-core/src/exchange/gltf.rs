@@ -7940,7 +7940,7 @@ mod tests {
         eval::{EvaluationContext, Snapshot},
         exchange::ImportedGraph,
         model::SceneDoc,
-        ops::{apply_batch, apply_batch_with_asset_root},
+        ops::{apply_batch, apply_batch_with_project_context},
     };
 
     use super::{
@@ -7966,7 +7966,7 @@ mod tests {
 
     fn scene_with_asset_root(root: &std::path::Path, operations: &Value) -> TestResult<SceneDoc> {
         let initial = SceneDoc::new(uuid::Uuid::new_v4().to_string());
-        let applied = apply_batch_with_asset_root(
+        let applied = apply_batch_with_project_context(
             &initial,
             &json!({
                 "schema_version": 1,
@@ -7974,6 +7974,7 @@ mod tests {
                 "operations": operations
             }),
             root,
+            None,
         )?;
         for (digest, bytes) in applied.asset_blobs {
             let hex = digest

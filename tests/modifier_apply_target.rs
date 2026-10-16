@@ -25,6 +25,7 @@ type TestResult<T> = Result<T, Box<dyn Error>>;
 
 const SCENE_ID: &str = "00000000-0000-4000-8000-000000000000";
 const SUBJECT: &str = "subject";
+const OPERAND: &str = "operand";
 
 fn ensure_eq<T: PartialEq + Debug>(actual: &T, expected: &T, what: &str) -> TestResult<()> {
     if actual == expected {
@@ -84,26 +85,81 @@ fn modifier(
     value
 }
 
-fn node_modifiers(doc: &SceneDoc) -> TestResult<Vec<Modifier>> {
+fn node_modifiers_for(doc: &SceneDoc, node_id: &str) -> TestResult<Vec<Modifier>> {
     let node = doc
         .nodes
-        .get(&Id::new(SUBJECT)?)
-        .ok_or("subject node is missing")?;
+        .get(&Id::new(node_id)?)
+        .ok_or("node is missing")?;
     Ok(node.modifiers.clone())
 }
 
-fn data_block(doc: &SceneDoc) -> TestResult<&DataBlock> {
+fn node_modifiers(doc: &SceneDoc) -> TestResult<Vec<Modifier>> {
+    node_modifiers_for(doc, SUBJECT)
+}
+
+fn data_block_for<'a>(doc: &'a SceneDoc, node_id: &str) -> TestResult<&'a DataBlock> {
     let node = doc
         .nodes
-        .get(&Id::new(SUBJECT)?)
-        .ok_or("subject node is missing")?;
-    let data_id = node
-        .data
-        .as_ref()
-        .ok_or("subject node has no geometry data")?;
+        .get(&Id::new(node_id)?)
+        .ok_or("node is missing")?;
+    let data_id = node.data.as_ref().ok_or("node has no geometry data")?;
     doc.data_blocks
         .get(data_id)
-        .ok_or_else(|| "subject data block is missing".into())
+        .ok_or_else(|| "node data block is missing".into())
+}
+
+fn data_block(doc: &SceneDoc) -> TestResult<&DataBlock> {
+    data_block_for(doc, SUBJECT)
+}
+
+fn unsupported_bevel_source(transform: Value) -> [Value; 2] {
+    [
+        json!({
+            "op": "node.create",
+            "id": OPERAND,
+            "kind": "box",
+            "params": {"size": 2.0},
+            "transform": transform,
+        }),
+        json!({
+            "op": "modifier.create",
+            "target": {"id": OPERAND},
+            "id": "unsupported_bevel",
+            "type": "bevel",
+            "show_viewport": true,
+            "show_render": true,
+            "params": {"width": 0.1, "segments": 2, "profile": 0.0, "limit_method": "NONE"},
+        }),
+    ]
+}
+
+fn add_unsupported_bevel_uv(doc: &mut SceneDoc) -> TestResult<()> {
+    let operand_id = Id::new(OPERAND)?;
+    let data_id = doc
+        .nodes
+        .get(&operand_id)
+        .and_then(|node| node.data.as_ref())
+        .ok_or("operand has no geometry data")?
+        .clone();
+    if let Some(node) = doc.nodes.get_mut(&operand_id) {
+        node.primitive = None;
+    }
+    let data = doc
+        .data_blocks
+        .get_mut(&data_id)
+        .ok_or("operand data block is missing")?;
+    let mesh = data.mesh.as_mut().ok_or("operand mesh is missing")?;
+    let values = mesh
+        .faces
+        .iter()
+        .flat_map(|face| face.vertices.iter().map(|_| json!([0.0, 0.0])))
+        .collect::<Vec<_>>();
+    mesh.attributes.insert(
+        "blender_uv_layers".to_owned(),
+        json!([{"name": "UVMap", "values": values}]),
+    );
+    data.descriptor = None;
+    Ok(())
 }
 
 fn vertex_group_names(doc: &SceneDoc) -> TestResult<Vec<String>> {
@@ -326,6 +382,262 @@ fn hidden_target_is_applied_and_its_viewport_flag_is_ignored() -> TestResult<()>
 }
 
 #[test]
+fn array_offset_object_apply_uses_transform_without_evaluating_source_geometry() -> TestResult<()> {
+    let mut extra = unsupported_bevel_source(json!({"translation": [3.0, 0.0, 0.0]}))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let array = modifier(
+        "array",
+        "array",
+        json!({
+            "count": 3,
+            "fit_type": "FIXED_COUNT",
+            "use_relative_offset": false,
+            "use_constant_offset": false,
+            "use_object_offset": true,
+            "offset_object": OPERAND,
+        }),
+        false,
+        false,
+    );
+    let solidify = modifier(
+        "solidify",
+        "solidify",
+        json!({"thickness": 0.1, "use_pin_to_last": true}),
+        true,
+        true,
+    );
+    extra.extend([array, solidify]);
+    let mut doc = build(&extra)?;
+    add_unsupported_bevel_uv(&mut doc)?;
+    let before = node_modifiers(&doc)?;
+    let operand_before = node_modifiers_for(&doc, OPERAND)?;
+
+    let applied = run(&doc, &apply_op("array"))?;
+
+    let mesh = data_block(&applied)?.mesh.as_ref().ok_or("subject mesh is missing")?;
+    ensure_eq(&mesh.vertices.len(), &24, "array vertices")?;
+    let max_x = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    ensure_eq(&max_x, &7.0, "array offset-object max X")?;
+    ensure_eq(
+        &node_modifiers(&applied)?,
+        &without(&before, "array"),
+        "remaining subject modifiers",
+    )?;
+    ensure_eq(
+        &node_modifiers_for(&applied, OPERAND)?,
+        &operand_before,
+        "source modifiers",
+    )
+}
+
+#[test]
+fn screw_object_apply_avoids_unrelated_source_geometry() -> TestResult<()> {
+    let mut extra = unsupported_bevel_source(json!({"translation": [0.0, 0.0, 0.5]}))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let screw = modifier(
+        "screw",
+        "screw",
+        json!({
+            "steps": 2,
+            "axis": "Z",
+            "angle": std::f64::consts::FRAC_PI_2,
+            "object": OPERAND,
+            "use_object_screw_offset": true,
+        }),
+        false,
+        false,
+    );
+    let solidify = modifier(
+        "solidify",
+        "solidify",
+        json!({"thickness": 0.1, "use_pin_to_last": true}),
+        true,
+        true,
+    );
+    extra.extend([screw, solidify]);
+    let mut doc = build(&extra)?;
+    add_unsupported_bevel_uv(&mut doc)?;
+    let before = node_modifiers(&doc)?;
+    let operand_before = node_modifiers_for(&doc, OPERAND)?;
+
+    let applied = run(&doc, &apply_op("screw"))?;
+
+    let mesh = data_block(&applied)?.mesh.as_ref().ok_or("subject mesh is missing")?;
+    ensure_eq(&mesh.vertices.len(), &24, "screw vertices")?;
+    ensure_eq(
+        &node_modifiers(&applied)?,
+        &without(&before, "screw"),
+        "remaining subject modifiers",
+    )?;
+    ensure_eq(
+        &node_modifiers_for(&applied, OPERAND)?,
+        &operand_before,
+        "source modifiers",
+    )
+}
+
+#[test]
+fn array_fit_curve_apply_uses_curve_data_and_world_transform() -> TestResult<()> {
+    let mut extra = unsupported_bevel_source(json!({"translation": [9.0, 0.0, 0.0]}))
+        .into_iter()
+        .collect::<Vec<_>>();
+    extra.push(json!({
+        "op": "curve.create",
+        "id": "path",
+        "dimensions": "three_d",
+        "transform": {"scale": [2.0, 1.0, 1.0]},
+        "splines": [{
+            "type": "poly",
+            "points": [{"co": [0.0, 0.0, 0.0]}, {"co": [2.0, 0.0, 0.0]}],
+            "order": 2,
+            "cyclic": false,
+            "resolution": 1,
+            "use_endpoint": true,
+        }],
+    }));
+    let array = modifier(
+        "array",
+        "array",
+        json!({
+            "count": 1,
+            "fit_type": "FIT_CURVE",
+            "curve": "path",
+            "use_relative_offset": true,
+            "relative_offset_displace": [1.0, 0.0, 0.0],
+            "use_constant_offset": false,
+        }),
+        false,
+        false,
+    );
+    let solidify = modifier(
+        "solidify",
+        "solidify",
+        json!({"thickness": 0.1, "use_pin_to_last": true}),
+        true,
+        true,
+    );
+    extra.extend([array, solidify]);
+    let mut doc = build(&extra)?;
+    add_unsupported_bevel_uv(&mut doc)?;
+    let before = node_modifiers(&doc)?;
+
+    let applied = run(&doc, &apply_op("array"))?;
+
+    let mesh = data_block(&applied)?.mesh.as_ref().ok_or("subject mesh is missing")?;
+    ensure_eq(&mesh.vertices.len(), &24, "fit-curve array vertices")?;
+    ensure_eq(
+        &node_modifiers(&applied)?,
+        &without(&before, "array"),
+        "remaining subject modifiers",
+    )
+}
+
+#[test]
+fn array_geometry_operand_uses_source_viewport_stack_visibility() -> TestResult<()> {
+    let apply_with_visibility = |source_visible| -> TestResult<SceneDoc> {
+        let source = json!({
+            "op": "node.create",
+            "id": OPERAND,
+            "kind": "box",
+            "params": {"size": 2.0},
+        });
+        let source_displace = json!({
+            "op": "modifier.create",
+            "target": {"id": OPERAND},
+            "id": "source_displace",
+            "type": "displace",
+            "show_viewport": source_visible,
+            "show_render": true,
+            "params": {"direction": "Z", "strength": 1.0, "mid_level": 0.0},
+        });
+        let array = modifier(
+            "array",
+            "array",
+            json!({
+                "count": 1,
+                "fit_type": "FIXED_COUNT",
+                "use_relative_offset": false,
+                "use_constant_offset": false,
+                "start_cap": OPERAND,
+            }),
+            false,
+            false,
+        );
+        let solidify = modifier(
+            "solidify",
+            "solidify",
+            json!({"thickness": 0.1, "use_pin_to_last": true}),
+            true,
+            true,
+        );
+        let doc = build(&[source, source_displace, array, solidify])?;
+        let before = node_modifiers(&doc)?;
+        let operand_before = node_modifiers_for(&doc, OPERAND)?;
+        let applied = run(&doc, &apply_op("array"))?;
+        ensure_eq(
+            &node_modifiers(&applied)?,
+            &without(&before, "array"),
+            "remaining subject modifiers",
+        )?;
+        ensure_eq(
+            &node_modifiers_for(&applied, OPERAND)?,
+            &operand_before,
+            "source modifier flags",
+        )?;
+        Ok(applied)
+    };
+    let hidden_source = apply_with_visibility(false)?;
+    let visible_source = apply_with_visibility(true)?;
+    let max_z = |doc: &SceneDoc| -> TestResult<f64> {
+        let mesh = data_block(doc)?.mesh.as_ref().ok_or("subject mesh is missing")?;
+        Ok(mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co.z)
+            .fold(f64::NEG_INFINITY, f64::max))
+    };
+
+    ensure_eq(&max_z(&hidden_source)?, &1.0, "hidden source stack max Z")?;
+    ensure_eq(&max_z(&visible_source)?, &2.0, "visible source stack max Z")
+}
+
+#[test]
+fn array_geometry_operand_propagates_unsupported_source_stack_errors() -> TestResult<()> {
+    let mut extra = unsupported_bevel_source(json!({"translation": [3.0, 0.0, 0.0]}))
+        .into_iter()
+        .collect::<Vec<_>>();
+    extra.push(modifier(
+        "array",
+        "array",
+        json!({
+            "count": 1,
+            "fit_type": "FIXED_COUNT",
+            "use_relative_offset": false,
+            "use_constant_offset": false,
+            "start_cap": OPERAND,
+        }),
+        false,
+        false,
+    ));
+    let mut doc = build(&extra)?;
+    add_unsupported_bevel_uv(&mut doc)?;
+
+    let error = run(&doc, &apply_op("array"))
+        .err()
+        .ok_or("unsupported geometry operand must block apply")?;
+    ensure_eq(
+        &error.code,
+        &ErrorCode::UnsupportedFeature,
+        "operand error code",
+    )
+}
+#[test]
 fn vertex_groups_persist_and_match_the_target_alone() -> TestResult<()> {
     let groups = vec![
         json!({"op": "vertex_group.create", "target": {"id": SUBJECT}, "id": "anchor", "name": "Anchor"}),
@@ -440,6 +752,15 @@ fn apply_as_shape_key_removes_only_the_target() -> TestResult<()> {
         &data_block(&alone)?.shape_keys,
         "baked shape key",
     )?;
+    let keys = data_block(&applied)?
+        .shape_keys
+        .as_ref()
+        .ok_or("baked shape keys are missing")?;
+    let baked = keys
+        .keys
+        .get(&Id::new("baked")?)
+        .ok_or("baked shape key is missing")?;
+    ensure_eq(&baked.positions.len(), &8, "baked shape-key vertices")?;
     ensure_eq(
         &ids_and_flags(&applied)?,
         &vec![("array".to_owned(), false, true)],
@@ -449,5 +770,68 @@ fn apply_as_shape_key_removes_only_the_target() -> TestResult<()> {
         &node_modifiers(&applied)?,
         &without(&before, "displace"),
         "remaining modifiers",
+    )
+}
+
+#[test]
+fn apply_as_shape_key_single_user_preserves_linked_data() -> TestResult<()> {
+    let wave = modifier(
+        "wave",
+        "wave",
+        json!({"height": 0.8, "speed": 0.0}),
+        true,
+        true,
+    );
+    let doc = build(&[wave])?;
+    let linked = run(
+        &doc,
+        &json!({"op": "node.duplicate", "target": {"id": SUBJECT}, "id": "linked", "mode": "linked"}),
+    )?;
+    let data_id = |doc: &SceneDoc, node_id: &str| -> TestResult<Id> {
+        Ok(doc
+            .nodes
+            .get(&Id::new(node_id)?)
+            .and_then(|node| node.data.clone())
+            .ok_or("linked node data is missing")?)
+    };
+    ensure_eq(
+        &data_id(&linked, SUBJECT)?,
+        &data_id(&linked, "linked")?,
+        "linked nodes share data before apply",
+    )?;
+
+    let applied = run(
+        &linked,
+        &json!({
+            "op": "modifier.apply_as_shape_key",
+            "target": {"id": SUBJECT},
+            "modifier_id": "wave",
+            "id": "baked",
+            "scope": "single_user",
+        }),
+    )?;
+
+    if data_id(&applied, SUBJECT)? == data_id(&applied, "linked")? {
+        return Err("single-user shape-key apply retained shared mesh data".into());
+    }
+    ensure_eq(
+        &data_block_for(&applied, SUBJECT)?.shape_keys.is_some(),
+        &true,
+        "subject shape keys",
+    )?;
+    ensure_eq(
+        &data_block_for(&applied, "linked")?.shape_keys.is_none(),
+        &true,
+        "linked shape keys remain unchanged",
+    )?;
+    ensure_eq(
+        &node_modifiers_for(&applied, SUBJECT)?.len(),
+        &0,
+        "applied subject modifier",
+    )?;
+    ensure_eq(
+        &node_modifiers_for(&applied, "linked")?.len(),
+        &1,
+        "unselected linked modifier",
     )
 }

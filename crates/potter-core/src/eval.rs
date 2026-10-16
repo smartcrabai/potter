@@ -234,6 +234,53 @@ impl Snapshot {
         Self::evaluate_internal(doc, context, project_root, cache_directory, Some(node_ids))
     }
 
+    /// Evaluate only a modifier's classified geometry operands and their dependencies.
+    pub(crate) fn evaluate_modifier_operands_with_cache(
+        doc: &SceneDoc,
+        context: &EvaluationContext,
+        project_root: Option<&Path>,
+        cache_directory: Option<&Path>,
+        target_id: &Id,
+        modifier_id: &Id,
+    ) -> Result<Option<Self>> {
+        let modifier_context = ModifierEvaluationContext {
+            purpose: context.purpose,
+            project_root,
+            cache_directory,
+        };
+        let suppressed = BTreeSet::new();
+        let mesh_dependencies = object_mesh_dependencies(
+            doc,
+            ModifierGate {
+                context: modifier_context,
+                suppressed: &suppressed,
+            },
+            Some((target_id, modifier_id)),
+        )?;
+        let mut selected_nodes = BTreeSet::new();
+        if let Some(dependencies) = mesh_dependencies.modifiers.get(target_id) {
+            selected_nodes.extend(dependencies.iter().cloned());
+        }
+        if let Some(dependencies) = mesh_dependencies.other.get(target_id) {
+            selected_nodes.extend(dependencies.iter().cloned());
+        }
+        if selected_nodes.is_empty() {
+            return Ok(None);
+        }
+        doc.validate()?;
+        crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
+        let scene_hash = source_scene_hash(doc)?;
+        Ok(Some(Self::evaluate_gated(
+            doc,
+            &scene_hash,
+            context,
+            modifier_context,
+            Some(&selected_nodes),
+            &suppressed,
+            &mesh_dependencies,
+        )?))
+    }
+
     /// Evaluate every supported node, recording modifier-feature failures per owner.
     pub fn evaluate_available_with_cache(
         doc: &SceneDoc,
@@ -256,6 +303,7 @@ impl Snapshot {
                 context: modifier_context,
                 suppressed: &suppressed,
             },
+            None,
         )?;
         let mut node_errors = BTreeMap::new();
         loop {
@@ -408,6 +456,7 @@ impl Snapshot {
                 context: modifier_context,
                 suppressed: &suppressed,
             },
+            None,
         )?;
         Self::evaluate_gated(
             source,
@@ -504,41 +553,11 @@ impl Snapshot {
                         .and_then(serde_json::Value::as_str)
                         == Some("FIT_CURVE")
             }) {
-                let Some(curve_reference) = modifier
-                    .params
-                    .get("curve")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-                let Ok(curve_id) = Id::new(curve_reference) else {
-                    continue;
-                };
-                if curve_path_lengths.contains_key(&curve_id) {
-                    continue;
+                if let Some((curve_id, length)) =
+                    evaluated_array_curve_path_length(doc, modifier, &matrices)?
+                {
+                    curve_path_lengths.entry(curve_id).or_insert(length);
                 }
-                let Some(curve_node) = doc.nodes.get(&curve_id) else {
-                    continue;
-                };
-                let Some(curve_data_id) = curve_node.data.as_ref() else {
-                    continue;
-                };
-                let Some(curve_data) = doc
-                    .data_blocks
-                    .get(curve_data_id)
-                    .filter(|data_block| data_block.data_type == "curve")
-                    .and_then(|data_block| data_block.curve.as_ref())
-                else {
-                    continue;
-                };
-                let Some(curve_world_matrix) = matrices.get(&curve_id).copied() else {
-                    continue;
-                };
-                let length = crate::geom::modifiers::evaluated_curve_path_length(
-                    curve_data,
-                    curve_world_matrix,
-                )?;
-                curve_path_lengths.insert(curve_id, length);
             }
         }
         let simulation = crate::sim::evaluate(doc, &scene_id, frame, &matrices, scene_hash, gate)?;
@@ -1477,6 +1496,52 @@ fn source_scene_hash(doc: &SceneDoc) -> Result<String> {
     let scene_value = serde_json::to_value(doc).map_err(PotError::internal_json)?;
     Ok(hash::sha256(&hash::canonicalize(&scene_value)?))
 }
+/// Curve-path length comes from the Curve Data-Block and world transform, not its modifier stack.
+pub(crate) fn evaluated_array_curve_path_length(
+    doc: &SceneDoc,
+    modifier: &Modifier,
+    world_matrices: &BTreeMap<Id, DMat4>,
+) -> Result<Option<(Id, f64)>> {
+    if modifier.modifier_type != "array"
+        || modifier
+            .params
+            .get("fit_type")
+            .and_then(serde_json::Value::as_str)
+            != Some("FIT_CURVE")
+    {
+        return Ok(None);
+    }
+    let Some(curve_reference) = modifier
+        .params
+        .get("curve")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Ok(curve_id) = Id::new(curve_reference.to_owned()) else {
+        return Ok(None);
+    };
+    let Some(curve_node) = doc.nodes.get(&curve_id) else {
+        return Ok(None);
+    };
+    let Some(curve_data_id) = curve_node.data.as_ref() else {
+        return Ok(None);
+    };
+    let Some(curve_data) = doc
+        .data_blocks
+        .get(curve_data_id)
+        .filter(|data_block| data_block.data_type == "curve")
+        .and_then(|data_block| data_block.curve.as_ref())
+    else {
+        return Ok(None);
+    };
+    let Some(curve_world_matrix) = world_matrices.get(&curve_id).copied() else {
+        return Ok(None);
+    };
+    let length = crate::geom::modifiers::evaluated_curve_path_length(curve_data, curve_world_matrix)?;
+    Ok(Some((curve_id, length)))
+}
+
 
 /// Modifier state for one evaluation. `purpose` selects the viewport or render stack, and
 /// `suppressed` nodes lost their modifiers to an unsupported-feature error. Every consumer asks
@@ -1492,7 +1557,6 @@ impl ModifierGate<'_> {
     pub(crate) fn is_active(&self, node_id: &Id, modifier: &Modifier) -> bool {
         !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
     }
-
     /// `node_id`'s modifier list with this evaluation's enabled flags and render settings applied.
     /// Borrowed when the stored state already matches; otherwise only this node's list is copied.
     pub(crate) fn stack<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> Cow<'m, [Modifier]> {
@@ -1780,6 +1844,7 @@ struct ObjectMeshDependencies {
 fn object_mesh_dependencies(
     doc: &SceneDoc,
     gate: ModifierGate<'_>,
+    only_modifier: Option<(&Id, &Id)>,
 ) -> Result<ObjectMeshDependencies> {
     let node_dependencies = || {
         doc.nodes
@@ -1796,7 +1861,15 @@ fn object_mesh_dependencies(
         for modifier in node
             .modifiers
             .iter()
-            .filter(|modifier| gate.is_active(owner_id, modifier))
+            .filter(|modifier| {
+                if let Some((target_id, modifier_id)) = only_modifier
+                    && target_id == owner_id
+                {
+                    modifier.enabled && &modifier.id == modifier_id
+                } else {
+                    gate.is_active(owner_id, modifier)
+                }
+            })
         {
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
                 "boolean" | "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => {
@@ -1814,7 +1887,7 @@ fn object_mesh_dependencies(
                     }
                 }
                 "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
-                "array" => &["start_cap", "end_cap", "curve"],
+                "array" => &["start_cap", "end_cap"],
                 _ => &[],
             };
             for parameter in parameters {

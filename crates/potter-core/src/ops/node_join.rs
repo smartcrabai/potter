@@ -1233,6 +1233,7 @@ mod tests {
             operation_index: 0,
             evaluation_frame: 1.0,
             asset_root: None,
+            cache_directory: None,
             pending_assets: BTreeMap::default(),
             warnings: Vec::new(),
         };
@@ -1304,6 +1305,7 @@ mod tests {
             operation_index: 0,
             evaluation_frame: 1.0,
             asset_root: None,
+            cache_directory: None,
             pending_assets: BTreeMap::default(),
             warnings: Vec::new(),
         };
@@ -1369,6 +1371,7 @@ mod tests {
             operation_index: 0,
             evaluation_frame: 1.0,
             asset_root: None,
+            cache_directory: None,
             pending_assets: BTreeMap::default(),
             warnings: Vec::new(),
         };
