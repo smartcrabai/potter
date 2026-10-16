@@ -5,7 +5,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::EvaluationPurpose,
     geom::modifiers::evaluate_modifiers_with_groups_at_frame,
-    model::{DataBlock, Id, Modifier, SceneDoc, ShapeKey, ShapeKeyData},
+    model::{Id, Modifier, ShapeKey, ShapeKeyData},
     params::{self, ParameterFamily},
 };
 

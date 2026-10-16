@@ -223,7 +223,10 @@ fn unpack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     &operation_pointer(engine.operation_index, "path"),
                 )
             })?;
-        return unpack_sequence(engine, id, record, raw_path);
+        let next = unpack_sequence(engine, &id, record, raw_path)?;
+        engine.doc.resources.insert(id.clone(), next);
+        engine.mark("resources", &id, ChangeKind::Updated);
+        return Ok(true);
     }
     let record = record.clone();
     let byte_values = record
@@ -305,11 +308,11 @@ fn unpack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
 }
 
 fn unpack_sequence(
-    engine: &mut Engine<'_>,
-    id: crate::model::Id,
-    record: Value,
+    engine: &Engine<'_>,
+    id: &crate::model::Id,
+    record: &Value,
     raw_path: String,
-) -> Result<bool> {
+) -> Result<Value> {
     if record.get("packed").and_then(Value::as_bool) != Some(true) {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -476,27 +479,41 @@ fn unpack_sequence(
             engine.asset_root,
         )?;
         let uri = frame_path.to_string_lossy();
-        output_frames.insert(
-            frame_key,
-            crate::cache_sequence::cache_sequence_resource_record(&uri, &kind, &digest, None),
-        );
+        let mut output_frame =
+            crate::cache_sequence::cache_sequence_resource_record(&uri, &kind, &digest, None);
+        let output_fields = output_frame.as_object_mut().ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "cache frame record is not an object")
+        })?;
+        if let Some(source_fields) = frame_record.as_object() {
+            for (key, value) in source_fields {
+                if !matches!(
+                    key.as_str(),
+                    "uri" | "kind" | "hash" | "packed" | "bytes" | "export_path"
+                ) {
+                    output_fields.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        output_fields.insert("status".to_owned(), json!("available"));
+        output_frames.insert(frame_key, output_frame);
         output_files.push((frame_path, bytes));
     }
 
     publish_sequence_outputs(&output_files)?;
-    engine.doc.resources.insert(
-        id.clone(),
-        json!({
-            "uri":raw_path,
-            "kind":kind,
-            "packed":false,
-            "sequence_start":start,
-            "sequence_end":end,
-            "sequence_frames":output_frames,
-        }),
-    );
-    engine.mark("resources", &id, ChangeKind::Updated);
-    Ok(true)
+    let mut next = record
+        .as_object()
+        .into_iter()
+        .flat_map(|fields| fields.iter())
+        .filter(|(key, _)| !matches!(key.as_str(), "bytes" | "sequence_frames" | "export_path"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Map<_, _>>();
+    next.insert("uri".to_owned(), Value::String(raw_path));
+    next.insert("kind".to_owned(), Value::String(kind));
+    next.insert("packed".to_owned(), Value::Bool(false));
+    next.insert("sequence_start".to_owned(), json!(start));
+    next.insert("sequence_end".to_owned(), json!(end));
+    next.insert("sequence_frames".to_owned(), Value::Object(output_frames));
+    Ok(Value::Object(next))
 }
 
 fn publish_sequence_outputs(outputs: &[(PathBuf, Vec<u8>)]) -> Result<()> {

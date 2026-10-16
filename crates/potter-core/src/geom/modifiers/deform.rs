@@ -80,14 +80,12 @@ fn native_surface_target_warning(
 }
 
 fn native_surface_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) -> Result<Mesh> {
-    let mut target: Mesh = serde_json::from_value(
-        modifier
-            .runtime
-            .target_mesh
-            .clone()
-            .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh object operand"))?,
-    )
-    .map_err(|_| invalid_parameter(modifier, "object", "a mesh object operand"))?;
+    let mut target = modifier
+        .runtime
+        .target_mesh
+        .as_ref()
+        .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh object operand"))?
+        .clone();
     let bind_object = bind_data
         .as_object()
         .ok_or_else(|| invalid_parameter(modifier, "binding_data", "native Surface Deform data"))?;
@@ -414,14 +412,11 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     )
     .map_err(|_| invalid_parameter(modifier, "binding_data", "a valid bind-time cage mesh"))?;
     let bind_matrix = native_matrix(bind_data, modifier)?;
-    let cage_owner: Mesh = serde_json::from_value(
-        modifier
-            .runtime
-            .target_mesh
-            .clone()
-            .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh cage object operand"))?,
-    )
-    .map_err(|_| invalid_parameter(modifier, "object", "a mesh cage object operand"))?;
+    let cage_owner = modifier
+        .runtime
+        .target_mesh
+        .as_ref()
+        .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh cage object operand"))?;
     let target_to_subject = modifier
         .runtime
         .target_to_subject
@@ -434,7 +429,7 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "an invertible cage transform",
         ));
     }
-    let mut cage = cage_owner.clone();
+    let mut cage = (*cage_owner).clone();
     for vertex in &mut cage.vertices {
         vertex.co = subject_to_target.transform_point3(vertex.co);
     }
@@ -545,13 +540,11 @@ fn native_mesh_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) -> Re
     let data = bind_data
         .as_object()
         .ok_or_else(|| invalid_parameter(modifier, "binding_data", "native Mesh Deform data"))?;
-    let cage: Mesh =
-        serde_json::from_value(
-            modifier.runtime.target_mesh.clone().ok_or_else(|| {
-                invalid_parameter(modifier, "object", "a mesh cage object operand")
-            })?,
-        )
-        .map_err(|_| invalid_parameter(modifier, "object", "a mesh cage object operand"))?;
+    let cage = modifier
+        .runtime
+        .target_mesh
+        .as_ref()
+        .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh cage object operand"))?;
     let source_count = native_count(data, &["verts_num", "source_vertex_count"], modifier)?;
     let cage_count = native_count(data, &["cage_verts_num", "cage_vertex_count"], modifier)?;
     if source_count != mesh.vertices.len() || cage_count != cage.vertices.len() {
@@ -3127,7 +3120,7 @@ mod tests {
             "bind_verts": bindings
         });
         let mut modifier = native_modifier("surface_deform", binding)?;
-        modifier.runtime.target_mesh = Some(serde_json::to_value(target)?);
+        modifier.runtime.target_mesh = Some(target);
         let evaluated = surface_deform(&source, &modifier)?;
         for vertex in evaluated.vertices {
             assert!((vertex.co.z - 3.0).abs() < 1.0e-12);
@@ -3150,7 +3143,7 @@ mod tests {
                 "bind_verts": []
             });
             let mut modifier = native_modifier("surface_deform", binding)?;
-            modifier.runtime.target_mesh = Some(serde_json::to_value(&target)?);
+            modifier.runtime.target_mesh = Some(target.clone());
             let evaluated = crate::geom::modifiers::evaluate_modifiers_with_groups(
                 &source,
                 &[modifier],
@@ -3187,7 +3180,7 @@ mod tests {
             "bind_matrix": translated_rows()
         });
         let mut modifier = native_modifier("mesh_deform", binding)?;
-        modifier.runtime.target_mesh = Some(serde_json::to_value(cage)?);
+        modifier.runtime.target_mesh = Some(cage);
         modifier.runtime.target_to_subject =
             Some(DMat4::from_translation(DVec3::new(2.0, 0.0, 0.0)).to_cols_array());
         let evaluated = mesh_deform(&source, &modifier)?;
@@ -3217,7 +3210,7 @@ mod tests {
             "dynamic_vertices": [1]
         });
         let mut modifier = native_modifier("mesh_deform", binding)?;
-        modifier.runtime.target_mesh = Some(serde_json::to_value(cage)?);
+        modifier.runtime.target_mesh = Some(cage);
         let evaluated = mesh_deform(&source, &modifier)?;
         assert!(evaluated.vertices[0].co.distance(DVec3::X) < 1.0e-12);
         Ok(())

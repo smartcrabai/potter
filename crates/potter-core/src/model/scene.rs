@@ -1487,10 +1487,10 @@ impl Modifier {
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModifierRuntime {
-    pub target_mesh: Option<Value>,
+    pub target_mesh: Option<Mesh>,
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
-    pub operand_mesh: Option<Value>,
+    pub operand_mesh: Option<Mesh>,
     /// `inv(subject_world) * reference_world` (column-major) for Hook, Cast, Simple Deform origin,
     /// Curve, and Wave's start object. A bone reference is `armature_world * pose_mat`.
     pub object_matrix: Option<[f64; 16]>,

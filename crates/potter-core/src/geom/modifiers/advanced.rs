@@ -451,9 +451,7 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .target_mesh
         .as_ref()
         .ok_or_else(|| invalid_parameter(modifier, "target", "a mesh object operand"))?;
-    let target: Mesh = serde_json::from_value(target.clone())
-        .map_err(|_| invalid_parameter(modifier, "target", "a mesh object operand"))?;
-    validated(&target)?;
+    validated(target)?;
     if target.vertices.is_empty() {
         return Err(invalid_parameter(modifier, "target", "a non-empty mesh"));
     }
@@ -1686,8 +1684,6 @@ pub(super) fn curve(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         // Blender disables the modifier without a curve object.
         return Ok(mesh.clone());
     };
-    let target: Mesh = serde_json::from_value(target.clone())
-        .map_err(|_| invalid_parameter(modifier, "object", "a curve or mesh object operand"))?;
     let (axis, negative) = curve_deform_axis(modifier)?;
     let object = reference_matrix(modifier).ok_or_else(|| {
         PotError::new(
@@ -2373,7 +2369,7 @@ mod tests {
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        modifier.runtime.target_mesh = Some(serde_json::to_value(target).unwrap());
+        modifier.runtime.target_mesh = Some(target);
         modifier
     }
 }

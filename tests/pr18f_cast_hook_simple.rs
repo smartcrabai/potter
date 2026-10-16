@@ -701,7 +701,7 @@ fn curve_modifier(params: Value, object_matrix: Option<[f64; 16]>, path: &[[f64;
             .insert_vertex(to_subject.transform_point3(DVec3::from_array(*point)))
             .unwrap();
     }
-    modifier.runtime.target_mesh = Some(serde_json::to_value(target).unwrap());
+    modifier.runtime.target_mesh = Some(target);
     modifier
 }
 

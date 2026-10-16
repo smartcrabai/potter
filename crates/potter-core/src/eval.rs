@@ -13,7 +13,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Aabb, CylinderParams, IcosphereParams, Mesh,
-        concat::{Part, concatenate, rotate_corner_normals, uv_covered_faces},
+        concat::{Part, concatenate, uv_covered_faces},
         normals::SHADING_ATTRIBUTES,
     },
     hash,
@@ -290,6 +290,7 @@ impl Snapshot {
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
         let mut suppressed = BTreeSet::new();
+        let mut suppressed_instances = BTreeSet::new();
         let mesh_dependencies = object_mesh_dependencies(
             doc,
             ModifierGate {
@@ -308,6 +309,7 @@ impl Snapshot {
                 modifier_context,
                 None,
                 &suppressed,
+                &suppressed_instances,
                 &mesh_dependencies,
                 None,
             );
@@ -337,8 +339,7 @@ impl Snapshot {
                     return Ok((snapshot, node_errors));
                 }
                 Err(error) if is_isolated_failure(&error) => {
-                    let source_doc = evaluation_doc.as_ref().unwrap_or(doc);
-                    let Some(node_id) = unsupported_feature_owner(source_doc, &error) else {
+                    let Some(node_id) = unsupported_feature_owner(doc, &error) else {
                         return Err(error);
                     };
                     if node_errors.contains_key(&node_id) {
@@ -350,30 +351,18 @@ impl Snapshot {
                             "unsupported feature owner disappeared during evaluation",
                         )
                     })?;
+                    let instance = instance_collection_target(owner)?.is_some();
+                    if instance && error.details.get(INSTANCE_JOIN_FAILURE).is_some() {
+                        suppressed_instances.insert(node_id.clone());
+                    }
                     if owner
                         .modifiers
                         .iter()
                         .all(|modifier| !modifier.is_active(context.purpose))
+                        && !instance
+                        && owner.modifiers.iter().all(|modifier| !modifier.enabled)
                     {
-                        let node = evaluation_doc.nodes.get_mut(&node_id).ok_or_else(|| {
-                            PotError::new(
-                                ErrorCode::InternalError,
-                                "unsupported feature owner disappeared during evaluation",
-                            )
-                        })?;
-                        // An instance has no modifier to disable: its failed join makes it an empty
-                        // node, leaving its members untouched, and its modifiers are disabled too.
-                        let instance = instance_collection_target(node)?.is_some();
-                        if !instance && node.modifiers.iter().all(|modifier| !modifier.enabled) {
-                            return Err(error);
-                        }
-                        for modifier in &mut node.modifiers {
-                            modifier.enabled = false;
-                        }
-                        if instance {
-                            "empty".clone_into(&mut node.kind);
-                            node.properties.remove(INSTANCE_COLLECTION_PROPERTY);
-                        }
+                        return Err(error);
                     }
                     suppressed.insert(node_id.clone());
                     let mut details = error.details.clone();
@@ -397,6 +386,11 @@ impl Snapshot {
                                 || node_errors.contains_key(dependent_id)
                             {
                                 continue;
+                            }
+                            if let Some(dependent) = doc.nodes.get(dependent_id)
+                                && instance_collection_target(dependent)?.is_some()
+                            {
+                                suppressed_instances.insert(dependent_id.clone());
                             }
                             suppressed.insert(dependent_id.clone());
                             let mut details = error.details.clone();
@@ -452,6 +446,7 @@ impl Snapshot {
             scene_hash.clone()
         };
         let suppressed = BTreeSet::new();
+        let suppressed_instances = BTreeSet::new();
         let mesh_dependencies = object_mesh_dependencies(
             source,
             ModifierGate {
@@ -468,13 +463,14 @@ impl Snapshot {
             modifier_context,
             selected_nodes,
             &suppressed,
+            &suppressed_instances,
             &mesh_dependencies,
             modifier_prefix,
         )
     }
 
-    /// Evaluates `doc` with the `suppressed` nodes' modifiers inactive. `scene_hash` addresses
-    /// the authored source, not the document itself.
+    /// Evaluates `doc` with suppressed modifiers inactive and failed instance joins omitted.
+    /// `scene_hash` addresses the authored source, not the document itself.
     fn evaluate_gated(
         doc: &SceneDoc,
         scene_hash: &str,
@@ -483,6 +479,7 @@ impl Snapshot {
         modifier_context: ModifierEvaluationContext<'_>,
         selected_nodes: Option<&BTreeSet<Id>>,
         suppressed: &BTreeSet<Id>,
+        suppressed_instances: &BTreeSet<Id>,
         mesh_dependencies: &ObjectMeshDependencies,
         modifier_prefix: Option<ModifierPrefix<'_>>,
     ) -> Result<Self> {
@@ -900,10 +897,12 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 doc,
+                                id,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
+                                modifier_warnings,
                             ),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
@@ -1182,10 +1181,12 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 doc,
+                                id,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
+                                modifier_warnings,
                             ),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
@@ -1511,7 +1512,10 @@ impl Snapshot {
             &evaluated_node_ids,
         )?;
         for (id, node) in &doc.nodes {
-            if !nodes.contains_key(id) || instance_collection_target(node)?.is_none() {
+            if !nodes.contains_key(id)
+                || suppressed_instances.contains(id)
+                || instance_collection_target(node)?.is_none()
+            {
                 continue;
             }
             let matrix = matrices.get(id).copied().ok_or_else(|| {
@@ -1520,9 +1524,14 @@ impl Snapshot {
                     "evaluated collection instance world matrix is missing",
                 )
             })?;
-            let (mesh, paths, bindings) =
-                evaluate_collection_instance(doc, id, &matrices, &meshes, &mut BTreeSet::new())?;
-            let bounds = mesh_bounds(&mesh, matrix)?;
+            let (mesh, paths, bindings) = evaluate_collection_instance(
+                doc,
+                id,
+                &matrices,
+                &meshes,
+                suppressed_instances,
+                &mut BTreeSet::new(),
+            )?;
             if !mesh.vertices.is_empty() {
                 instance_bindings.insert(id.clone(), bindings);
                 meshes.insert(id.clone(), mesh);
@@ -2456,9 +2465,7 @@ pub(crate) fn apply_scene_deform_modifier(
     let mut resolved = modifier.clone();
     resolved.params.remove(parameter);
     resolved.runtime.target_to_subject = Some(operand.local_to_subject.to_cols_array());
-    resolved.runtime.target_mesh = Some(serde_json::to_value(target_mesh).map_err(|error| {
-        PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
-    })?);
+    resolved.runtime.target_mesh = Some(target_mesh);
     let evaluation = crate::geom::modifiers::evaluate_modifiers_with_groups(
         mesh,
         &[resolved],
@@ -2511,10 +2518,12 @@ fn apply_mesh_sequence_cache_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     doc: &SceneDoc,
+    node_id: &Id,
     project_root: Option<&Path>,
     frame: f64,
     fps: u32,
     fps_base: f64,
+    warnings: &mut Vec<PotError>,
 ) -> Result<()> {
     let resource_text = modifier
         .params
@@ -2574,13 +2583,7 @@ fn apply_mesh_sequence_cache_modifier(
     } else {
         read_cache_resource(doc, project_root, &resource_id)?
     };
-    let cache_warnings =
-        crate::geom::mesh_cache::evaluate(mesh, modifier, frame, fps, fps_base, &actual_hash, &bytes)?;
-    warnings.extend(
-        cache_warnings
-            .into_iter()
-            .map(|warning| attach_node_owner(warning, node_id)),
-    );
+    crate::geom::mesh_cache::evaluate(mesh, modifier, frame, fps, fps_base, &actual_hash, &bytes)?;
     Ok(())
 }
 
@@ -3404,9 +3407,6 @@ fn apply_generic_scene_mesh_operand_modifier(
             modifier.modifier_type
         ))
     })?;
-    let operand = serde_json::to_value(operand).map_err(|error| {
-        PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
-    })?;
     if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
         resolved.runtime.target_mesh = Some(operand);
     } else {
@@ -3628,9 +3628,6 @@ pub(crate) fn apply_scene_operand_modifier(
     resolved.params.remove("target");
     let operand =
         combined.ok_or_else(|| PotError::invalid_argument("modifier operand is empty"))?;
-    let operand = serde_json::to_value(operand).map_err(|error| {
-        PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
-    })?;
     if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
         resolved.runtime.target_mesh = Some(operand);
     } else {
@@ -4443,6 +4440,7 @@ fn evaluate_collection_instance(
     instance_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &BTreeMap<Id, Mesh>,
+    suppressed_instances: &BTreeSet<Id>,
     active_instances: &mut BTreeSet<Id>,
 ) -> Result<CollectionEvaluation> {
     let instance_node = doc.nodes.get(instance_id).ok_or_else(|| {
@@ -4472,6 +4470,7 @@ fn evaluate_collection_instance(
         &target,
         matrices,
         meshes,
+        suppressed_instances,
         active_instances,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
@@ -4521,6 +4520,7 @@ fn append_collection_geometry<'a>(
     collection_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &'a BTreeMap<Id, Mesh>,
+    suppressed_instances: &BTreeSet<Id>,
     active_instances: &mut BTreeSet<Id>,
     visited_collections: &mut BTreeSet<Id>,
     collection_stack: &mut BTreeSet<Id>,
@@ -4553,12 +4553,17 @@ fn append_collection_geometry<'a>(
                 json!({ "collection": collection_id, "node_id": object_id }),
             )
         })?;
-        if !source_node.visible || !source_node.render_visible {
-            continue;
-        }
-        let member = if instance_collection_target(source_node)?.is_some() {
-            let (mesh, paths, bindings) =
-                evaluate_collection_instance(doc, object_id, matrices, meshes, active_instances)?;
+        let member = if suppressed_instances.contains(object_id) {
+            None
+        } else if instance_collection_target(source_node)?.is_some() {
+            let (mesh, paths, bindings) = evaluate_collection_instance(
+                doc,
+                object_id,
+                matrices,
+                meshes,
+                suppressed_instances,
+                active_instances,
+            )?;
             let slots: Vec<Option<Id>> = bindings
                 .into_iter()
                 .map(|binding| binding.material)
@@ -4603,6 +4608,7 @@ fn append_collection_geometry<'a>(
             child_id,
             matrices,
             meshes,
+            suppressed_instances,
             active_instances,
             visited_collections,
             collection_stack,

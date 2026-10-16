@@ -431,6 +431,7 @@ fn prepare_blend_export_resources(
     let sidecar = parent.join(format!("{stem}_assets"));
     let mut sidecar_created = false;
     let mut files = Vec::new();
+    let mut sequence_updates = Vec::new();
     let library_base = library_layout_base(&document);
     for id in resource_ids {
         let resource = document
@@ -455,7 +456,7 @@ fn prepare_blend_export_resources(
                 let (bytes, digest) = match crate::cache_sequence::read_cache_resource_record(
                     &frame_record,
                     &frame_resource_id,
-                    Some(project),
+                    Some(project.path()),
                 ) {
                     Ok(value) => value,
                     Err(error)
@@ -650,6 +651,15 @@ fn prepare_blend_export_resources(
         if !files.contains(&destination) {
             files.push(destination);
         }
+    }
+    for (id, pattern_path, output_frames) in sequence_updates {
+        let resource = document
+            .get_mut("resources")
+            .and_then(Value::as_object_mut)
+            .and_then(|resources| resources.get_mut(&id))
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "resource disappeared"))?;
+        resource["export_path"] = json!(pattern_path.to_string_lossy());
+        resource["sequence_frames"] = Value::Object(output_frames);
     }
     add_blender_image_pixels(&mut document, project)?;
     Ok((document, files))

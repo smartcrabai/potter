@@ -1826,8 +1826,8 @@ fn sample_image(
         rgb = rgb.map(|value| value.max(0.0));
     }
     if settings.saturation != 1.0 {
-        let (hue, saturation, value) = rgb_to_hsv(rgb);
-        rgb = hsv_to_rgb(hue, saturation * settings.saturation, value);
+        let hsv = rgb_to_hsv(rgb[0], rgb[1], rgb[2]);
+        rgb = hsv_to_rgb(hsv[0], hsv[1] * settings.saturation, hsv[2]);
         if settings.saturation > 1.0 && settings.use_clamp {
             rgb = rgb.map(|value| value.max(0.0));
         }
@@ -1952,13 +1952,13 @@ fn evaluate_color_ramp(ramp: &ColorRamp, input: f32) -> [f32; 4] {
     let right_rgb = [right.color[0], right.color[1], right.color[2]];
     let left_rgb = [left.color[0], left.color[1], left.color[2]];
     let right_color = match ramp.color_mode {
-        RampColorMode::Hsv => rgb_to_hsv(right_rgb),
-        RampColorMode::Hsl => rgb_to_hsl(right_rgb),
+        RampColorMode::Hsv => rgb_to_hsv(right_rgb[0], right_rgb[1], right_rgb[2]),
+        RampColorMode::Hsl => rgb_to_hsl(right_rgb[0], right_rgb[1], right_rgb[2]),
         RampColorMode::Rgb => unreachable!(),
     };
     let left_color = match ramp.color_mode {
-        RampColorMode::Hsv => rgb_to_hsv(left_rgb),
-        RampColorMode::Hsl => rgb_to_hsl(left_rgb),
+        RampColorMode::Hsv => rgb_to_hsv(left_rgb[0], left_rgb[1], left_rgb[2]),
+        RampColorMode::Hsl => rgb_to_hsl(left_rgb[0], left_rgb[1], left_rgb[2]),
         RampColorMode::Rgb => unreachable!(),
     };
     let hue = interpolate_hue(
@@ -2085,9 +2085,9 @@ fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> [f32; 3] {
 }
 const fn hex_digit(byte: u8) -> u32 {
     match byte {
-        b'0'..=b'9' => u32::from(byte - b'0'),
-        b'a'..=b'f' => u32::from(byte - b'a') + 10,
-        b'A'..=b'F' => u32::from(byte - b'A') + 10,
+        b'0'..=b'9' => (byte - b'0') as u32,
+        b'a'..=b'f' => (byte - b'a') as u32 + 10,
+        b'A'..=b'F' => (byte - b'A') as u32 + 10,
         _ => 0,
     }
 }
@@ -2586,6 +2586,13 @@ fn cell_noise_u(x:f32,y:f32,z:f32)->f32 {
     inner as f32 / 4_294_967_296.0
 }
 
+fn cell_noise_v3(x: f32, y: f32, z: f32) -> [f32; 3] {
+    let x = ((x + 0.000_001) * 1.000_01).floor() as i32;
+    let y = ((y + 0.000_001) * 1.000_01).floor() as i32;
+    let z = ((z + 0.000_001) * 1.000_01).floor() as i32;
+    hash_point(x, y, z)
+}
+
 fn noise_basis_unsigned(basis: u8, x: f32, y: f32, z: f32) -> f32 {
     match basis {
         0 => org_blender_noise(x, y, z),
@@ -2925,6 +2932,7 @@ mod tests {
     use super::{
         BlenderRng, DEFAULT_IMAGE_SETTINGS, ImageData, ImageInterpolation, LegacyTexture,
         ResolvedTexture, TextureSource, parse_record, record_value, sample,
+        cell_noise_v3,
     };
 
     fn image_record(settings: Value) -> Value {
@@ -2951,6 +2959,12 @@ mod tests {
         for (actual, expected) in actual.into_iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn blender_522_cell_noise_v3_matches_hash_point_color() {
+        // Blender 5.2.2 BLI_noise_cell_v3(0, 0, 0), using its HASHPNT tables.
+        assert_eq!(cell_noise_v3(0.0, 0.0, 0.0), [0.982_098, 0.161_631, 0.193_576]);
     }
 
     #[test]

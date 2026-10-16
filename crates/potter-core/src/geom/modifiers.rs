@@ -573,13 +573,11 @@ fn boolean_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let operand = modifier
         .runtime
         .operand_mesh
-        .clone()
+        .as_ref()
         .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh object operand"))?;
-    let operand: Mesh = serde_json::from_value(operand)
-        .map_err(|_| invalid_parameter(modifier, "object", "a mesh object operand"))?;
     let operation =
         string_param_with_expected(modifier, "operation", "UNION, DIFFERENCE, or INTERSECT")?;
-    super::boolean::boolean_mesh(mesh, &operand, operation)
+    super::boolean::boolean_mesh(mesh, operand, operation)
 }
 
 fn mesh_error(error: &MeshError) -> PotError {

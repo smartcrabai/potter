@@ -162,6 +162,7 @@ fn linked_blend_bytes(
                 library.resolved_path.as_str()
             }
         });
+    let path_text = uri.strip_prefix("file://").unwrap_or(uri);
     let path = Path::new(path_text);
     let path = if path.is_absolute() {
         path.to_path_buf()

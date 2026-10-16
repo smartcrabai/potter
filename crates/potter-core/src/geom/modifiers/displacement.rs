@@ -144,8 +144,8 @@ fn required_texture<'a>(
 ///
 /// `LOCAL` uses the current positions. `GLOBAL` and `OBJECT` apply the runtime texture matrix
 /// (subject-local to texture space). `OBJECT` without a map object is `LOCAL`. `UV` takes each
-/// vertex's UV from the first face that uses it, remapped from `[0, 1]` to `[-1, 1]`, and falls back
-/// to `LOCAL` on a mesh without UV layers.
+/// vertex's UV from the first face that uses it, converts stored V-down to Blender's V-up, then
+/// remaps from `[0, 1]` to `[-1, 1]`; a mesh without UV layers falls back to `LOCAL`.
 fn texture_coordinates(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -178,19 +178,19 @@ fn texture_coordinates(
 
 /// Blender's UV texture coordinates, or `None` when the mesh has no UV layer.
 fn uv_texture_coordinates(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<DVec3>>> {
-    let layers = uv_layers::read_layers(mesh);
-    if layers.is_empty() {
+    let store = uv_layers::read(mesh);
+    if store.layers.is_empty() {
         return Ok(None);
     }
     let requested = string_param(modifier, "uv_layer")?;
-    let active = uv_layers::selected_layer_name(mesh, "");
-    let name = [requested, active]
-        .into_iter()
-        .find(|name| layers.iter().any(|layer| layer.name == *name))
-        .unwrap_or(layers[0].name.as_str());
-    let Some(layer) = layers.iter().find(|layer| layer.name == name) else {
-        return Ok(None);
-    };
+    let requested = (!requested.is_empty())
+        .then(|| store.index_of(requested))
+        .flatten();
+    let active = store
+        .active
+        .as_deref()
+        .and_then(|name| store.resolve(Some(name)).0);
+    let layer = &store.layers[requested.or(active).unwrap_or(0)];
     let indices = id_indices(mesh);
     let mut coords = vec![DVec3::ZERO; mesh.vertices.len()];
     let mut assigned = vec![false; mesh.vertices.len()];
@@ -209,7 +209,7 @@ fn uv_texture_coordinates(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec
                 .and_then(|values| values.get(corner))
                 .copied()
                 .unwrap_or([0.0, 0.0]);
-            coords[index] = DVec3::new(uv[0] * 2.0 - 1.0, uv[1] * 2.0 - 1.0, 0.0);
+            coords[index] = DVec3::new(uv[0] * 2.0 - 1.0, (1.0 - uv[1]) * 2.0 - 1.0, 0.0);
             assigned[index] = true;
         }
     }
@@ -812,4 +812,72 @@ fn normalized_matrix_to_quat(m: impl Fn(usize, usize) -> f64) -> [f64; 4] {
         q = q.map(|value| value / length);
     }
     q
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "small mesh fixture")]
+
+    use glam::DVec3;
+    use serde_json::json;
+
+    use super::uv_texture_coordinates;
+    use crate::{
+        geom::{
+            BoxParams, Mesh,
+            uv_layers::{self, UvLayer, UvStore},
+        },
+        model::{Id, Modifier, ModifierRuntime},
+    };
+
+    fn modifier(uv_layer: &str) -> Modifier {
+        let mut params = serde_json::Map::new();
+        params.insert("uv_layer".to_owned(), json!(uv_layer));
+        Modifier {
+            id: Id::new("displace").unwrap(),
+            modifier_type: "displace".to_owned(),
+            name: "Displace".to_owned(),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params,
+            binding_data: None,
+            runtime: ModifierRuntime::default(),
+        }
+    }
+
+    #[test]
+    fn uv_texture_coordinates_use_the_active_layer_and_flip_stored_v() {
+        let mut mesh = Mesh::box_mesh(BoxParams {
+            size: DVec3::splat(2.0),
+        })
+        .unwrap();
+        let mut detail = UvLayer::new(
+            "Detail",
+            vec![Some(vec![[0.3, 0.4]; 4]); mesh.faces.len()],
+        );
+        detail.pinned = vec![Some(vec![true; 4]); mesh.faces.len()];
+        uv_layers::write(
+            &mut mesh,
+            &UvStore {
+                layers: vec![
+                    UvLayer::new("Map", vec![Some(vec![[0.1, 0.2]; 4]); mesh.faces.len()]),
+                    detail,
+                ],
+                active: Some("Map".to_owned()),
+                render: Some("Detail".to_owned()),
+            },
+        );
+
+        for (selector, expected) in [
+            ("", DVec3::new(-0.8, 0.6, 0.0)),
+            ("Detail", DVec3::new(-0.4, 0.2, 0.0)),
+            ("Missing", DVec3::new(-0.8, 0.6, 0.0)),
+        ] {
+            let coords = uv_texture_coordinates(&mesh, &modifier(selector))
+                .unwrap()
+                .unwrap();
+            assert!((coords[0] - expected).length() < 1e-12);
+        }
+    }
 }

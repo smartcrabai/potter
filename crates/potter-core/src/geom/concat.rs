@@ -6,12 +6,9 @@
 //! attributes concatenate in storage order. Members that lack an attribute contribute its default.
 //!
 //! UV layers join by position. Joined layer `k` is every member's `k`-th [`read_layers`] layer, in
-//! member order, in Blender's V-up convention. Potter's `uv_map` entries without a `layer` key hold
-//! glTF V (the exporter writes them unflipped) and flip to Blender's; entries with a `layer` key and
-//! `blender_uv_layers` already hold Blender's V. The joined layer keeps the name of the first member
-//! with that layer at that position, and a Potter default reads as `UVMap`, so references to the
-//! default layer still resolve. A corner with no value joins as `[0, 0]`; [`uv_covered_faces`] reports
-//! which faces really have one. The joined mesh stores UVs only in `blender_uv_layers`.
+//! member order and in Potter's stored convention. The joined layer keeps the name of the first
+//! member with that layer at that position. Missing corners stay absent in the canonical store;
+//! [`uv_covered_faces`] reports which faces have values. Per-corner pins follow their UV values.
 //!
 //! A member whose transform mirrors (negative determinant) reverses each face's corner order together
 //! with every corner-keyed value of that face. Its normals rotate with its normal matrix. A face's
@@ -30,8 +27,8 @@ use serde_json::{Map, Value, json};
 use crate::error::{ErrorCode, PotError, Result};
 
 use super::normals::{normal_matrix, sharp_edge_flags, smooth_face_flags};
-use super::provenance::{Origin, default_value, remap_attributes_skipping};
-use super::uv_layers::{UvLayer, read_layers, uv_map_entry_layer, write_layers};
+use super::provenance::{Origin, default_value, remap_attributes};
+use super::uv_layers::{UvLayer, read_layers, write_layers};
 use super::{Edge, IdCounters, Mesh, MeshError, Vertex};
 
 /// One collection member: its evaluated mesh (borrowed for plain members, owned for nested joins),
@@ -47,7 +44,8 @@ pub(crate) struct Part<'a> {
 }
 
 /// A member placed under the joined IDs: its element tables, its attributes remapped, and its UV
-/// layers read in Blender's convention. The `uv_map` and `blender_uv_layers` stores are not kept.
+/// layers read in Potter's storage convention. Its canonical UV store is removed and rebuilt after
+/// the members join.
 struct Placed {
     mesh: Mesh,
     uv_layers: Vec<UvLayer>,
@@ -101,14 +99,7 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
     output.attributes = merge_attributes(&pieces, &output)?;
     let layers = join_uv_layers(&mut pieces);
     if !layers.is_empty() {
-        let stores: Vec<Value> = layers
-            .iter()
-            .map(|layer| json!({"name": layer.name, "values": []}))
-            .collect();
-        output
-            .attributes
-            .insert("blender_uv_layers".to_owned(), Value::Array(stores));
-        // Fills the layer stores and the UV-named `blender_attributes` mirrors with the joined values.
+        // Rebuild the canonical UV store from the joined layers.
         write_layers(&mut output, &layers);
     }
     output.validate().map_err(|error| join_error(&error))?;
@@ -116,8 +107,8 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
 }
 
 /// Per joined face, whether the face's member has a value on every corner of its first UV layer,
-/// which is the joined `TEXCOORD_0`. The joined mesh cannot say this: a corner without a value joins
-/// as `[0, 0]`, which reads as a real UV.
+/// which is the joined `TEXCOORD_0`. The joined mesh cannot say this: a missing corner exports as
+/// `[0, 0]`, which reads as a real UV.
 pub(crate) fn uv_covered_faces(parts: &[Part<'_>]) -> Vec<bool> {
     parts
         .iter()
@@ -201,10 +192,9 @@ fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Placed> {
         (0..source.vertices.len()).map(Some),
         (0..source.faces.len()).map(Some).collect(),
     );
-    // `uv_map` is rebuilt in Blender's convention by `take_uv_layers`, so the remap never runs on it.
-    remap_attributes_skipping(source, &mut mesh, &origin, &["uv_map"])?;
+    remap_attributes(source, &mut mesh, &origin)?;
     canonical_shading(source, &mut mesh)?;
-    let mut uv_layers = take_uv_layers(source, &mut mesh);
+    let mut uv_layers = take_uv_layers(&mut mesh);
     if part.matrix.determinant() < 0.0 {
         mirror_corners(&mut mesh, &mut uv_layers);
     }
@@ -276,76 +266,17 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
     Ok(())
 }
 
-/// Reads `mesh`'s UV layers in Blender's V-up convention, then removes the `uv_map` and
-/// `blender_uv_layers` stores, which the joined mesh rebuilds from the layers.
-fn take_uv_layers(source: &Mesh, mesh: &mut Mesh) -> Vec<UvLayer> {
-    if source.attributes.contains_key("uv_map") {
-        let entries = blender_uv_map(source, mesh);
-        mesh.attributes
-            .insert("uv_map".to_owned(), Value::Array(entries));
-    }
+/// Reads `mesh`'s canonical UV layers, then removes the store which the joined mesh rebuilds.
+fn take_uv_layers(mesh: &mut Mesh) -> Vec<UvLayer> {
     let layers = read_layers(mesh);
-    mesh.attributes.remove("uv_map");
-    mesh.attributes.remove("blender_uv_layers");
+    mesh.attributes.remove("uv_layers");
     layers
 }
 
-/// The member's `uv_map` entries on the placed faces, in Blender's V-up convention. Placement keeps
-/// face order, so each source face maps to the placed face at the same index. The source entries are
-/// the only copy converted here: the remap skips `uv_map`, so no discarded remapped copy is made.
-/// Entries without a `layer` key are glTF V (Potter's default) and flip; the rest already hold
-/// Blender's V.
-fn blender_uv_map(source: &Mesh, placed: &Mesh) -> Vec<Value> {
-    let placed_faces: HashMap<u32, u32> = source
-        .faces
-        .iter()
-        .zip(&placed.faces)
-        .map(|(from, to)| (from.id, to.id))
-        .collect();
-    let entries = source
-        .attributes
-        .get("uv_map")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let face = entry
-                .get("face_id")
-                .and_then(Value::as_u64)
-                .and_then(|id| u32::try_from(id).ok())
-                .and_then(|id| placed_faces.get(&id))?;
-            // Entries without a `layer` key are Potter's glTF-space default; the rest are Blender's.
-            let flip = entry.get("layer").is_none();
-            let uv: Vec<Value> = entry
-                .get("uv")
-                .and_then(Value::as_array)?
-                .iter()
-                .map(|corner| if flip { flip_v(corner) } else { corner.clone() })
-                .collect();
-            Some(json!({
-                "face_id": *face,
-                "layer": uv_map_entry_layer(entry),
-                "uv": uv,
-            }))
-        })
-        .collect()
-}
-
-/// `[u, 1 - v]` for a `[u, v]` corner. A malformed corner passes through for [`read_layers`] to skip.
-fn flip_v(corner: &Value) -> Value {
-    match corner.as_array().map(Vec::as_slice) {
-        Some([u, v]) => match (u.as_f64(), v.as_f64()) {
-            (Some(u), Some(v)) => json!([u, 1.0 - v]),
-            _ => corner.clone(),
-        },
-        _ => corner.clone(),
-    }
-}
 
 /// Reverses a mirrored member's faces, with every corner-keyed value of each face: the corner order
-/// of each face, `custom_normal` and named `corner` rows, `CORNER` `blender_attributes` segments, and
-/// UV rows. A corner keeps its vertex, UV, and normal together.
+/// of each face, `custom_normal` and named `corner` rows, `CORNER` `blender_attributes` segments, UV
+/// rows, and UV pins. A corner keeps its vertex, UV, pin, and normal together.
 fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
     let sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
     for (key, attribute) in &mut mesh.attributes {
@@ -379,6 +310,9 @@ fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
     }
     for layer in layers.iter_mut() {
         for row in layer.faces.iter_mut().flatten() {
+            row.reverse();
+        }
+        for row in layer.pinned.iter_mut().flatten() {
             row.reverse();
         }
     }
@@ -441,13 +375,24 @@ fn join_uv_layers(pieces: &mut [Piece]) -> Vec<UvLayer> {
                 .map(|layer| layer.name.clone())
                 .unwrap_or_default();
             let mut faces = Vec::new();
+            let mut pinned = Vec::new();
             for piece in pieces.iter_mut() {
                 match piece.uv_layers.get_mut(index) {
-                    Some(layer) => faces.append(&mut layer.faces),
-                    None => faces.extend(std::iter::repeat_n(None, piece.faces)),
+                    Some(layer) => {
+                        faces.append(&mut layer.faces);
+                        pinned.append(&mut layer.pinned);
+                    }
+                    None => {
+                        faces.extend(std::iter::repeat_n(None, piece.faces));
+                        pinned.extend(std::iter::repeat_n(None, piece.faces));
+                    }
                 }
             }
-            UvLayer { name, faces }
+            UvLayer {
+                name,
+                faces,
+                pinned,
+            }
         })
         .collect()
 }
@@ -567,8 +512,8 @@ fn merge_positional(
 
 /// `blender_attributes` entries, keyed by domain and name. Each member's values concatenate in
 /// member order, and a member without the entry contributes the default of the joined data type.
-/// UV mirrors are left out: the joined UV layers are rebuilt from `blender_uv_layers`, and a mirror
-/// named after a member's layer would otherwise name a layer the joined store does not carry.
+/// UV-named mirrors are omitted: the joined UV layers are rebuilt from the canonical store, and a
+/// mirror named after a member's layer would otherwise name a layer the joined store does not carry.
 fn merge_blender_attributes(name: &str, members: &[Member<'_>]) -> Result<Value> {
     let uv_names: Vec<&str> = members
         .iter()
@@ -973,13 +918,24 @@ mod tests {
 
     use super::{Part, concatenate, uv_covered_faces};
     use crate::geom::normals::smooth_face_flags;
+    use crate::geom::uv_layers::{self, UvLayer, UvStore};
     use crate::geom::{BoxParams, Mesh};
-
     fn cube() -> Mesh {
         Mesh::box_mesh(BoxParams {
             size: DVec3::splat(2.0),
         })
         .unwrap()
+    }
+
+    fn write_uv_layers(mesh: &mut Mesh, layers: Vec<UvLayer>) {
+        uv_layers::write(
+            mesh,
+            &UvStore {
+                layers,
+                active: None,
+                render: None,
+            },
+        );
     }
 
     /// A member borrowed from `mesh` with `slot_count` material slots.
@@ -1059,26 +1015,25 @@ mod tests {
     }
 
     #[test]
-    fn uv_layers_join_by_position_and_convert_potter_v() {
-        // First member: one Blender layer, named "Map", in V-up space.
+    fn uv_layers_join_by_position_and_preserve_pins() {
         let mut first = cube();
-        first.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            json!([{"name": "Map", "values": vec![json!([0.1, 0.2]); 24]}]),
+        write_uv_layers(
+            &mut first,
+            vec![UvLayer::new(
+                "Map",
+                vec![Some(vec![[0.1, 0.2]; 4]); first.faces.len()],
+            )],
         );
-        // Second member: Potter's default `uv_map` (no `layer` key, glTF V) on every face.
         let mut second = cube();
-        let entries: Vec<Value> = second
-            .faces
-            .iter()
-            .map(|face| {
-                json!({"face_id": face.id, "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]})
-            })
-            .collect();
-        second
-            .attributes
-            .insert("uv_map".to_owned(), Value::Array(entries));
-        // Third member: no UVs at all.
+        let mut second_layer = UvLayer::new(
+            "UVMap",
+            vec![
+                Some(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+                second.faces.len()
+            ],
+        );
+        second_layer.pinned = vec![Some(vec![true, false, true, false]); second.faces.len()];
+        write_uv_layers(&mut second, vec![second_layer]);
         let third = cube();
 
         let parts = vec![
@@ -1090,31 +1045,48 @@ mod tests {
         assert_eq!(covered, [vec![true; 12], vec![false; 6]].concat());
 
         let joined = concatenate(parts).unwrap();
-        assert!(!joined.attributes.contains_key("uv_map"));
-        let layers = joined.attributes["blender_uv_layers"].as_array().unwrap();
-        assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0]["name"], json!("Map"));
-        let values = layers[0]["values"].as_array().unwrap();
-        assert_eq!(values.len(), 72);
-        assert_eq!(values[0], json!([0.1, 0.2]));
-        // Potter's glTF-space corners become Blender's: [0, 0] -> [0, 1], [1, 0] -> [1, 1], ...
-        assert_eq!(values[24], json!([0.0, 1.0]));
-        assert_eq!(values[25], json!([1.0, 1.0]));
-        assert_eq!(values[26], json!([1.0, 0.0]));
-        assert_eq!(values[27], json!([0.0, 0.0]));
-        // The member without UVs joins as zeros, which `uv_covered_faces` reports as uncovered.
-        assert!(values[48..].iter().all(|value| *value == json!([0.0, 0.0])));
+        let store = uv_layers::read(&joined);
+        assert_eq!(store.layers.len(), 1);
+        let layer = &store.layers[0];
+        assert_eq!(layer.name, "Map");
+        assert_eq!(layer.faces[0].as_ref().unwrap()[0], [0.1, 0.2]);
+        assert_eq!(
+            layer.faces[6].as_deref().unwrap(),
+            &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        );
+        assert_eq!(
+            layer.pinned[6].as_deref().unwrap(),
+            &[true, false, true, false]
+        );
+        assert!(layer.faces[12..].iter().all(Option::is_none));
+        assert!(layer.pinned[12..].iter().all(Option::is_none));
     }
 
     #[test]
     fn mirrored_members_reverse_each_face_with_its_corner_values() {
         let mut source = cube();
-        let mut uvs = Vec::new();
         let mut normals = Map::new();
-        for (index, face) in source.faces.iter().enumerate() {
-            for corner in 0..face.vertices.len() {
-                uvs.push(json!([index as f64, corner as f64]));
-            }
+        let mut layer = UvLayer::new(
+            "UVMap",
+            source
+                .faces
+                .iter()
+                .enumerate()
+                .map(|(index, face)| {
+                    Some(
+                        (0..face.vertices.len())
+                            .map(|corner| [index as f64, corner as f64])
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+        layer.pinned = source
+            .faces
+            .iter()
+            .map(|face| Some((0..face.vertices.len()).map(|corner| corner % 2 == 0).collect()))
+            .collect();
+        for face in &source.faces {
             let face_normals: Vec<Value> = (0..face.vertices.len())
                 .map(|corner| {
                     if corner == 0 {
@@ -1126,10 +1098,7 @@ mod tests {
                 .collect();
             normals.insert(format!("f{}", face.id), Value::Array(face_normals));
         }
-        source.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            json!([{"name": "UVMap", "values": uvs}]),
-        );
+        write_uv_layers(&mut source, vec![layer]);
         source.attributes.insert(
             "custom_normal".to_owned(),
             json!({"domain": "corner", "type": "FLOAT_VECTOR", "values": normals}),
@@ -1138,24 +1107,23 @@ mod tests {
         let joined = concatenate(vec![member(&source, mirror, 0, 1)]).unwrap();
         joined.validate().unwrap();
 
-        let uv = joined.attributes["blender_uv_layers"][0]["values"]
-            .as_array()
-            .unwrap();
+        let uv = uv_layers::read(&joined);
+        let uv = &uv.layers[0];
         let custom = joined.attributes["custom_normal"]["values"]
             .as_object()
             .unwrap();
         for (index, face) in joined.faces.iter().enumerate() {
             let source_face = &source.faces[index];
             let rows = &custom[&format!("f{}", face.id)];
+            let uv_face = uv.faces[index].as_ref().unwrap();
+            let pinned = uv.pinned[index].as_ref().unwrap();
             for (corner, vertex) in face.vertices.iter().enumerate() {
                 let original = source_face.vertices.len() - 1 - corner;
                 let expected = mirror
                     .transform_point3(source.vertex(source_face.vertices[original]).unwrap().co);
                 assert!((joined.vertex(*vertex).unwrap().co - expected).length() < 1e-9);
-                assert_eq!(
-                    uv[index * 4 + corner],
-                    json!([index as f64, original as f64])
-                );
+                assert_eq!(uv_face[corner], [index as f64, original as f64]);
+                assert_eq!(pinned[corner], original % 2 == 0);
                 let normal = if original == 0 {
                     json!([-1.0, 0.0, 0.0])
                 } else {
@@ -1421,9 +1389,12 @@ mod tests {
     #[test]
     fn uv_mirrors_of_member_layers_are_not_carried() {
         let mut first = cube();
-        first.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            json!([{"name": "Body", "values": vec![json!([0.5, 0.5]); 24]}]),
+        write_uv_layers(
+            &mut first,
+            vec![UvLayer::new(
+                "Body",
+                vec![Some(vec![[0.5, 0.5]; 4]); first.faces.len()],
+            )],
         );
         first.attributes.insert(
             "blender_attributes".to_owned(),
@@ -1440,9 +1411,6 @@ mod tests {
             .map(|entry| entry["name"].clone())
             .collect();
         assert_eq!(names, vec![json!("LoopColor")]);
-        assert_eq!(
-            joined.attributes["blender_uv_layers"][0]["name"],
-            json!("Body")
-        );
+        assert_eq!(uv_layers::read(&joined).layers[0].name, "Body");
     }
 }
