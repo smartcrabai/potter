@@ -700,6 +700,203 @@ fn boolean_apply_uses_simulated_geometry_operand_world_transform() -> TestResult
         "applied Boolean uses the simulated operand world transform",
     )
 }
+
+#[test]
+fn warp_apply_uses_simulated_transform_reference_world_matrix() -> TestResult<()> {
+    let scene = |target_visible| -> TestResult<SceneDoc> {
+        let from = json!({
+            "op": "node.create",
+            "id": "warp_from",
+            "kind": "empty",
+            "transform": {"translation": [-1.0, 0.0, 0.0]},
+        });
+        let operand = json!({
+            "op": "node.create",
+            "id": OPERAND,
+            "kind": "box",
+            "params": {"size": 1.0},
+            "transform": {"translation": [1.0, 0.0, 5.0]},
+        });
+        let physics_world = json!({
+            "op": "physics.world.update",
+            "target": {"id": "scene_main"},
+            "set": {
+                "enabled": true,
+                "gravity": [0.0, 0.0, -9.81],
+                "substeps": 4,
+                "solver_iterations": 8,
+                "frame_start": 1,
+                "frame_end": 120,
+                "seed": 23,
+            },
+        });
+        let active_operand = json!({
+            "op": "physics.rigid_body.create",
+            "target": {"id": OPERAND},
+            "type": "active",
+            "mass": 1.0,
+            "shape": "box",
+            "friction": 0.5,
+            "restitution": 0.0,
+            "linear_damping": 0.0,
+            "angular_damping": 0.0,
+        });
+        let warp = modifier(
+            "warp",
+            "warp",
+            json!({
+                "object_from": "warp_from",
+                "object_to": OPERAND,
+                "strength": 1.0,
+                "falloff_type": "NONE",
+            }),
+            target_visible,
+            true,
+        );
+        build(&[from, operand, physics_world, active_operand, warp])
+    };
+    let visible_target = scene(true)?;
+    let hidden_target = scene(false)?;
+    let subject_id = Id::new(SUBJECT)?;
+    let expected_snapshot = potter_core::eval::Snapshot::evaluate(
+        &visible_target,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(24.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let expected_mesh = expected_snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("evaluated target mesh is missing")?;
+    let initial_snapshot = potter_core::eval::Snapshot::evaluate(
+        &visible_target,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let initial_mesh = initial_snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("initial target mesh is missing")?;
+    if expected_mesh == initial_mesh {
+        return Err("rigid-body transform reference did not move the Warp output".into());
+    }
+
+    let batch = json!({
+        "schema_version": 1,
+        "base_revision": hidden_target.revision,
+        "evaluation": {"frame": 24.0},
+        "operations": [apply_op("warp")],
+    });
+    let applied = ops::apply_batch(&hidden_target, &batch)?.doc;
+    let actual_mesh = data_block(&applied)?
+        .mesh
+        .as_ref()
+        .ok_or("applied target mesh is missing")?;
+    ensure_eq(
+        actual_mesh,
+        expected_mesh,
+        "applied Warp uses the simulated transform reference world matrix",
+    )
+}
+
+#[test]
+fn hook_apply_uses_simulated_transform_reference_world_matrix() -> TestResult<()> {
+    let scene = |target_visible| -> TestResult<SceneDoc> {
+        let operand = json!({
+            "op": "node.create",
+            "id": OPERAND,
+            "kind": "box",
+            "params": {"size": 1.0},
+            "transform": {"translation": [0.0, 0.0, 5.0]},
+        });
+        let physics_world = json!({
+            "op": "physics.world.update",
+            "target": {"id": "scene_main"},
+            "set": {
+                "enabled": true,
+                "gravity": [0.0, 0.0, -9.81],
+                "substeps": 4,
+                "solver_iterations": 8,
+                "frame_start": 1,
+                "frame_end": 120,
+                "seed": 23,
+            },
+        });
+        let active_operand = json!({
+            "op": "physics.rigid_body.create",
+            "target": {"id": OPERAND},
+            "type": "active",
+            "mass": 1.0,
+            "shape": "box",
+            "friction": 0.5,
+            "restitution": 0.0,
+            "linear_damping": 0.0,
+            "angular_damping": 0.0,
+        });
+        let hook = modifier(
+            "hook",
+            "hook",
+            json!({
+                "object": OPERAND,
+                "center": [0.0, 0.0, 0.0],
+                "strength": 1.0,
+                "falloff_radius": 0.0,
+            }),
+            target_visible,
+            true,
+        );
+        build(&[operand, physics_world, active_operand, hook])
+    };
+    let visible_target = scene(true)?;
+    let hidden_target = scene(false)?;
+    let subject_id = Id::new(SUBJECT)?;
+    let expected_snapshot = potter_core::eval::Snapshot::evaluate(
+        &visible_target,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(24.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let expected_mesh = expected_snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("evaluated target mesh is missing")?;
+    let initial_snapshot = potter_core::eval::Snapshot::evaluate(
+        &visible_target,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let initial_mesh = initial_snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("initial target mesh is missing")?;
+    if expected_mesh == initial_mesh {
+        return Err("rigid-body transform reference did not move the Hook output".into());
+    }
+
+    let batch = json!({
+        "schema_version": 1,
+        "base_revision": hidden_target.revision,
+        "evaluation": {"frame": 24.0},
+        "operations": [apply_op("hook")],
+    });
+    let applied = ops::apply_batch(&hidden_target, &batch)?.doc;
+    let actual_mesh = data_block(&applied)?
+        .mesh
+        .as_ref()
+        .ok_or("applied target mesh is missing")?;
+    ensure_eq(
+        actual_mesh,
+        expected_mesh,
+        "applied Hook uses the simulated transform reference world matrix",
+    )
+}
+
 #[test]
 fn array_geometry_operand_propagates_unsupported_source_stack_errors() -> TestResult<()> {
     let mut extra = unsupported_bevel_source(&json!({"translation": [3.0, 0.0, 0.0]}))

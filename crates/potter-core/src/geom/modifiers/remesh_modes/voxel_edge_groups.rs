@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Portions derived from OpenVDB (https://github.com/AcademySoftwareFoundation/openvdb):
-//   openvdb/openvdb/tools/VolumeToMesh.h, SPDX-FileCopyrightText: Copyright Contributors to the OpenVDB Project, Apache-2.0.
+//   openvdb/openvdb/tools/VolumeToMesh.h (v13.0.0), SPDX-FileCopyrightText: Copyright Contributors to the OpenVDB Project, Apache-2.0.
 
-// OpenVDB v12.0.1 VolumeToMesh.h sEdgeGroupTable, Apache-2.0.
+// OpenVDB 13.0.0 VolumeToMesh.h sEdgeGroupTable and sAmbiguousFace (identical to v12.0.1), Apache-2.0.
 pub(super) const AMBIGUOUS_FACE: [u8; 256] = [
     0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 5, 1, 0, 4, 0, 0, 0, 4, 0, 0, 0,
     0, 1, 0, 0, 2, 0, 0, 0, 0, 1, 5, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0,
@@ -271,4 +271,26 @@ pub(super) const EDGE_GROUPS: [[u8; 13]; 256] = [
     [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
     [1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+];
+
+// OpenVDB 13.0.0 VolumeToMesh.h sAdaptable: cells whose sign configuration may be merged.
+pub(super) const SADAPTABLE: [bool; 256] = [
+    true, true, true, true, true, false, true, true, true, true, false, true, true, true, true,
+    true, true, true, false, true, false, false, false, true, false, true, false, true, false,
+    true, false, true, true, false, true, true, false, false, true, true, false, false, false,
+    true, false, false, true, true, true, true, true, true, false, false, true, true, false, true,
+    false, true, false, false, false, true, true, false, false, false, true, false, true, true,
+    false, false, false, false, true, true, true, true, false, false, false, false, false, false,
+    false, false, false, false, false, false, false, false, false, false, true, false, true, true,
+    true, false, true, true, false, false, false, false, true, false, true, true, true, true, true,
+    true, true, false, true, true, false, false, false, false, false, false, false, true, true,
+    false, false, false, false, false, false, false, true, true, false, true, true, true, true,
+    true, true, true, false, true, false, false, false, false, true, true, false, true, true, true,
+    false, true, false, false, false, false, false, false, false, false, false, false, false,
+    false, false, false, false, false, true, true, true, true, false, false, false, false, true,
+    true, false, true, false, false, false, true, true, false, false, false, true, false, true,
+    false, true, true, false, false, true, true, true, true, true, true, false, false, true, false,
+    false, false, true, true, false, false, true, true, false, true, true, false, true, false,
+    true, false, true, false, true, false, false, false, true, false, true, true, true, true, true,
+    true, true, false, true, true, true, true, false, true, true, true, true, true,
 ];

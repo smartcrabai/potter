@@ -137,6 +137,212 @@ fn modifier_hidden_for_viewport_is_render_only() -> TestResult {
 }
 
 #[test]
+fn hidden_physics_sources_respect_purpose_and_legacy_properties() -> TestResult {
+    let particle_settings = json!({
+        "emit_from": "VERT",
+        "count": 4,
+        "frame_start": 1.0,
+        "frame_end": 1.0,
+        "lifetime": 12.0,
+        "physics_type": "NEWTON",
+        "normal_factor": 0.0,
+        "render_type": "HALO",
+        "seed": 11,
+    });
+    let mut doc = apply(
+        &SceneDoc::new(SCENE_ID.to_owned()),
+        &[
+            json!({"op":"node.create","id":"emitter_hidden","kind":"plane","params":{}}),
+            json!({"op":"node.create","id":"emitter_legacy","kind":"plane","params":{},"transform":{"translation":[3.0,0.0,0.0]}}),
+            json!({"op":"node.create","id":"collider_hidden","kind":"plane","params":{},"transform":{"translation":[10.0,0.0,0.0]}}),
+            json!({"op":"node.create","id":"collision_emitter_hidden","kind":"plane","params":{},"transform":{"translation":[10.0,0.0,0.1]}}),
+            json!({"op":"node.create","id":"collider_legacy","kind":"plane","params":{},"transform":{"translation":[20.0,0.0,0.0]}}),
+            json!({"op":"node.create","id":"collision_emitter_legacy","kind":"plane","params":{},"transform":{"translation":[20.0,0.0,0.1]}}),
+            json!({"op":"node.create","id":"brush_hidden","kind":"plane","params":{},"transform":{"translation":[30.0,0.0,0.0]}}),
+            json!({"op":"node.create","id":"canvas_hidden","kind":"plane","params":{},"transform":{"translation":[30.0,0.0,0.0]}}),
+            json!({"op":"node.create","id":"brush_legacy","kind":"plane","params":{},"transform":{"translation":[40.0,0.0,0.0]}}),
+            json!({"op":"node.create","id":"canvas_legacy","kind":"plane","params":{},"transform":{"translation":[40.0,0.0,0.0]}}),
+            json!({"op":"physics.particle_emitter.create","target":{"id":"emitter_hidden"},"settings":particle_settings.clone()}),
+            json!({"op":"physics.particle_emitter.create","target":{"id":"emitter_legacy"},"settings":particle_settings.clone()}),
+            json!({"op":"physics.particle_emitter.create","target":{"id":"collision_emitter_hidden"},"settings":particle_settings.clone()}),
+            json!({"op":"physics.particle_emitter.create","target":{"id":"collision_emitter_legacy"},"settings":particle_settings}),
+            json!({"op":"physics.collision.create","target":{"id":"collider_hidden"}}),
+            json!({"op":"physics.collision.create","target":{"id":"collider_legacy"}}),
+            json!({"op":"physics.dynamic_paint.create","target":{"id":"brush_hidden"},"settings":{"role":"brush","radius":2.0,"strength":1.0}}),
+            json!({"op":"physics.dynamic_paint.create","target":{"id":"brush_legacy"},"settings":{"role":"brush","radius":2.0,"strength":1.0}}),
+            json!({"op":"physics.dynamic_paint.create","target":{"id":"canvas_hidden"},"settings":{"role":"canvas","brushes":["brush_hidden"],"radius":2.0,"strength":1.0}}),
+            json!({"op":"physics.dynamic_paint.create","target":{"id":"canvas_legacy"},"settings":{"role":"canvas","brushes":["brush_legacy"],"radius":2.0,"strength":1.0}}),
+        ],
+    )?;
+    for (node_id, modifier_type) in [
+        ("emitter_hidden", "particle_system"),
+        ("collider_hidden", "collision"),
+        ("brush_hidden", "dynamic_paint"),
+    ] {
+        let node = doc
+            .nodes
+            .get_mut(&Id::new(node_id)?)
+            .ok_or("linked physics node is missing")?;
+        node.modifiers
+            .iter_mut()
+            .find(|modifier| modifier.modifier_type == modifier_type)
+            .ok_or("linked physics modifier is missing")?
+            .show_viewport = false;
+    }
+    for (node_id, modifier_type) in [
+        ("emitter_legacy", "particle_system"),
+        ("collider_legacy", "collision"),
+        ("brush_legacy", "dynamic_paint"),
+    ] {
+        let node = doc
+            .nodes
+            .get_mut(&Id::new(node_id)?)
+            .ok_or("legacy physics node is missing")?;
+        node.modifiers
+            .retain(|modifier| modifier.modifier_type != modifier_type);
+        if node_id == "emitter_legacy" {
+            node.properties
+                .remove("physics_particle_emitter_modifier_id");
+        }
+    }
+
+    let context = |purpose| EvaluationContext {
+        purpose,
+        frame: Some(5.0),
+        ..EvaluationContext::default()
+    };
+    let mut unsupported_render_type_doc = doc.clone();
+    unsupported_render_type_doc
+        .nodes
+        .get_mut(&Id::new("emitter_hidden")?)
+        .and_then(|node| node.properties.get_mut("physics_particle_emitter"))
+        .and_then(Value::as_object_mut)
+        .ok_or("linked particle settings are missing")?
+        .insert("render_type".to_owned(), json!("UNSUPPORTED"));
+    let hidden_unsupported_preview = Snapshot::evaluate(
+        &unsupported_render_type_doc,
+        &context(EvaluationPurpose::Preview),
+    )?;
+    ensure_eq(
+        &hidden_unsupported_preview
+            .simulated_particles
+            .contains_key(&Id::new("emitter_hidden")?),
+        &false,
+        "viewport-hidden unsupported particle render type is not simulated",
+    )?;
+    let active_render_error = Snapshot::evaluate(
+        &unsupported_render_type_doc,
+        &context(EvaluationPurpose::Render),
+    )
+    .err()
+    .ok_or("active unsupported particle render type unexpectedly evaluated")?;
+    ensure_eq(
+        &active_render_error.code,
+        &ErrorCode::UnsupportedFeature,
+        "active unsupported particle render type error",
+    )?;
+    ensure_eq(
+        &active_render_error.details["feature_id"],
+        &json!("physics.particle_emitter.render_type"),
+        "active unsupported particle render type feature",
+    )?;
+
+    let preview = Snapshot::evaluate(&doc, &context(EvaluationPurpose::Preview))?;
+    let render = Snapshot::evaluate(&doc, &context(EvaluationPurpose::Render))?;
+    ensure_eq(
+        &preview
+            .simulated_particles
+            .contains_key(&Id::new("emitter_hidden")?),
+        &false,
+        "viewport-hidden linked particle emitter is not simulated",
+    )?;
+    ensure_eq(
+        &render
+            .simulated_particles
+            .contains_key(&Id::new("emitter_hidden")?),
+        &true,
+        "render-visible linked particle emitter is simulated",
+    )?;
+    ensure_eq(
+        &preview
+            .simulated_particles
+            .contains_key(&Id::new("emitter_legacy")?),
+        &true,
+        "legacy property-only particle emitter remains simulated",
+    )?;
+
+    let collision_z = |snapshot: &Snapshot, emitter: &str| -> TestResult<Vec<f64>> {
+        Ok(snapshot
+            .simulated_particles
+            .get(&Id::new(emitter)?)
+            .ok_or("collision emitter particle states are missing")?
+            .iter()
+            .map(|state| state.position[2])
+            .collect())
+    };
+    let hidden_preview_z = collision_z(&preview, "collision_emitter_hidden")?;
+    let hidden_render_z = collision_z(&render, "collision_emitter_hidden")?;
+    let legacy_z = collision_z(&preview, "collision_emitter_legacy")?;
+    ensure_eq(
+        &hidden_preview_z.iter().all(|height| *height < 0.0),
+        &true,
+        "viewport-hidden linked collision does not deflect particles",
+    )?;
+    ensure_eq(
+        &hidden_render_z.iter().all(|height| *height >= -1.0e-8),
+        &true,
+        "render-visible linked collision deflects particles",
+    )?;
+    ensure_eq(
+        &legacy_z.iter().all(|height| *height >= -1.0e-8),
+        &true,
+        "legacy property-only collision remains active",
+    )?;
+
+    let color_alphas = |snapshot: &Snapshot, canvas: &str| -> TestResult<Vec<f64>> {
+        let mesh = snapshot
+            .meshes
+            .get(&Id::new(canvas)?)
+            .ok_or("dynamic-paint canvas mesh is missing")?;
+        let values = mesh
+            .attributes
+            .get("color")
+            .and_then(|attribute| attribute.get("values"))
+            .and_then(Value::as_object)
+            .ok_or("dynamic-paint colors are missing")?;
+        let mut alphas = Vec::with_capacity(values.len());
+        for color in values.values() {
+            alphas.push(
+                color
+                    .get(3)
+                    .and_then(Value::as_f64)
+                    .ok_or("dynamic-paint alpha is missing")?,
+            );
+        }
+        Ok(alphas)
+    };
+    let hidden_preview_alpha = color_alphas(&preview, "canvas_hidden")?;
+    let hidden_render_alpha = color_alphas(&render, "canvas_hidden")?;
+    let legacy_alpha = color_alphas(&preview, "canvas_legacy")?;
+    ensure_eq(
+        &hidden_preview_alpha.iter().all(|alpha| *alpha == 0.0),
+        &true,
+        "viewport-hidden linked brush does not paint",
+    )?;
+    ensure_eq(
+        &hidden_render_alpha.iter().any(|alpha| *alpha > 0.0),
+        &true,
+        "render-visible linked brush paints",
+    )?;
+    ensure_eq(
+        &legacy_alpha.iter().any(|alpha| *alpha > 0.0),
+        &true,
+        "legacy property-only brush remains active",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn failing_node_and_dependents_are_reported_for_both_purposes() -> TestResult {
     // `host` gets Boolean followed by Decimate, which is refused as an unsupported topology
     // combination. `follower` uses `host` as its Boolean operand, so it depends on the failure.

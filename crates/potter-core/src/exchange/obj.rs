@@ -189,6 +189,10 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
     let mut group_on = false;
     let mut smoothed = false;
     let mut remap = BTreeMap::<usize, usize>::new();
+    // Names of every object declared by `o` or `g`. Objects without geometry are dropped from a
+    // file that has geometry; a file with no geometry imports each declared object empty, so
+    // Potter's own empty-object exports re-read.
+    let mut declared = Vec::<String>::new();
     for (line_number, line) in text.lines().enumerate() {
         let mut words = line.split_whitespace();
         let Some(kind) = words.next() else {
@@ -215,6 +219,7 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             }
             "o" | "g" => {
                 let name = words.collect::<Vec<_>>().join(" ");
+                declared.push(name.clone());
                 if !current.faces.is_empty() || !current.positions.is_empty() {
                     finish_object(
                         &mut current,
@@ -311,11 +316,32 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
         meshes.push(current);
     }
     if meshes.is_empty() {
-        return Err(PotError::with_details(
-            ErrorCode::ImportFailed,
-            "OBJ contains no faces",
-            json!({ "path": path.display().to_string() }),
-        ));
+        if declared.is_empty() {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "OBJ contains no faces",
+                json!({ "path": path.display().to_string() }),
+            ));
+        }
+        meshes = declared
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ExchangeMesh {
+                id: format!("object_{index}"),
+                name: if name.is_empty() {
+                    format!("Object {index}")
+                } else {
+                    name
+                },
+                positions: Vec::new(),
+                faces: Vec::new(),
+                normals: None,
+                mirrored: false,
+                singular: false,
+                vertex_normals: Vec::new(),
+                smooth: Vec::new(),
+            })
+            .collect();
     }
     Ok((meshes, losses))
 }

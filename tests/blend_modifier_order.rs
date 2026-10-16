@@ -192,7 +192,7 @@ obj.modifiers.new("Array", "ARRAY")
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "source.blend"))
 "#;
 
-/// Reads the object's modifier stack from a saved `.blend` as [name, type, pinned] rows.
+/// Reads the object's modifier stack and Potter identity metadata from a saved `.blend`.
 const READBACK: &str = r#"
 import bpy
 import json
@@ -201,8 +201,11 @@ import sys
 argv = sys.argv[sys.argv.index("--") + 1:]
 bpy.ops.wm.open_mainfile(filepath=argv[0])
 obj = bpy.data.objects[argv[1]]
+metadata = json.loads(obj.get("potter.modifier_ids_json", "{}"))
 with open(argv[2], "w", encoding="utf-8") as output:
-    json.dump([[m.name, m.type, bool(m.use_pin_to_last)] for m in obj.modifiers], output)
+    json.dump([[m.name, m.type, bool(m.use_pin_to_last), bool(m.show_viewport),
+                bool(m.show_render), getattr(m, "levels", None), metadata.get(m.name)]
+               for m in obj.modifiers], output)
 "#;
 
 /// Replaces a wrong-type target modifier, removes an extra modifier, and preserves a pinned target.
@@ -216,7 +219,7 @@ root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 source = open(os.path.join(root, "blend_bridge_source.py"), encoding="utf-8").read()
 start = source.index("def _create_modifier(")
 end = source.index("def _ensure_dynamic_paint_role(")
-namespace = {"bpy": bpy, "blender_modifier_type": lambda value: value}
+namespace = {"bpy": bpy, "json": json, "blender_modifier_type": lambda value: value}
 exec(source[start:end], namespace)
 
 mesh = bpy.data.meshes.new("ExistingStackMesh")
@@ -304,6 +307,70 @@ fn stack_doc(steps: &[Step]) -> TestResult<SceneDoc> {
     Ok(doc)
 }
 
+fn duplicate_subdivision_doc() -> TestResult<SceneDoc> {
+    let mut doc = apply(
+        &SceneDoc::new(SCENE_ID.to_owned()),
+        &json!({"op": "node.create", "id": OBJECT, "kind": "box", "params": {"size": 2.0}}),
+    )?;
+    doc = apply(
+        &doc,
+        &json!({
+            "op": "modifier.create",
+            "target": {"id": OBJECT},
+            "id": "subdivision_first",
+            "type": "subdivision",
+            "show_viewport": false,
+            "show_render": true,
+            "params": {"levels": 1, "use_pin_to_last": false},
+        }),
+    )?;
+    apply(
+        &doc,
+        &json!({
+            "op": "modifier.create",
+            "target": {"id": OBJECT},
+            "id": "subdivision_second",
+            "type": "subdivision",
+            "show_viewport": true,
+            "show_render": false,
+            "params": {"levels": 3, "use_pin_to_last": true},
+        }),
+    )
+}
+
+fn potter_modifier_rows(
+    doc: &SceneDoc,
+    object_id: &str,
+) -> TestResult<Vec<(String, String, bool, bool, bool, bool, Value)>> {
+    let node = doc
+        .nodes
+        .get(&Id::new(object_id.to_owned())?)
+        .ok_or("stack node is missing")?;
+    Ok(node
+        .modifiers
+        .iter()
+        .map(|modifier| {
+            (
+                modifier.id.as_str().to_owned(),
+                modifier.name.clone(),
+                modifier.enabled,
+                modifier.show_viewport,
+                modifier.show_render,
+                modifier
+                    .params
+                    .get("use_pin_to_last")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                modifier
+                    .params
+                    .get("levels")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            )
+        })
+        .collect())
+}
+
 /// Potter's stack for `OBJECT`, bottom to top, as (name, `use_pin_to_last`).
 fn potter_stack(doc: &SceneDoc) -> TestResult<Vec<(String, bool)>> {
     potter_stack_for(doc, OBJECT)
@@ -328,7 +395,7 @@ fn potter_stack_for(doc: &SceneDoc, object_id: &str) -> TestResult<Vec<(String, 
         .collect())
 }
 
-fn blender_stack(blender: &Path, root: &Path, blend: &Path) -> TestResult<Vec<(String, bool)>> {
+fn blender_readback(blender: &Path, root: &Path, blend: &Path) -> TestResult<Value> {
     let script = root.join("readback.py");
     fs::write(&script, READBACK)?;
     let output_path = root.join("readback.json");
@@ -347,8 +414,12 @@ fn blender_stack(blender: &Path, root: &Path, blend: &Path) -> TestResult<Vec<(S
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let rows: Value = serde_json::from_slice(&fs::read(output_path)?)?;
-    rows.as_array()
+    Ok(serde_json::from_slice(&fs::read(output_path)?)?)
+}
+
+fn blender_stack(blender: &Path, root: &Path, blend: &Path) -> TestResult<Vec<(String, bool)>> {
+    blender_readback(blender, root, blend)?
+        .as_array()
         .ok_or("Blender stack must be an array")?
         .iter()
         .map(|row| {
@@ -403,6 +474,90 @@ fn blender_stack_order_and_pins_match_potter_for_each_stack() -> TestResult<()> 
             case.name
         );
     }
+    Ok(())
+}
+
+#[test]
+fn repeated_default_modifier_names_round_trip_by_id() -> TestResult<()> {
+    let Some(blender) = blender_5_2()? else {
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let project = Project::init(root.join("project"))?;
+    let context = EvaluationContext::default();
+    let doc = duplicate_subdivision_doc()?;
+    let expected = vec![
+        (
+            "subdivision_first".to_owned(),
+            "subdivision".to_owned(),
+            true,
+            false,
+            true,
+            false,
+            json!(1),
+        ),
+        (
+            "subdivision_second".to_owned(),
+            "subdivision".to_owned(),
+            true,
+            true,
+            false,
+            true,
+            json!(3),
+        ),
+    ];
+    assert_eq!(potter_modifier_rows(&doc, OBJECT)?, expected);
+
+    let blend = root.join("duplicate_subdivisions.blend");
+    export_blend(
+        &doc,
+        &project,
+        &blend,
+        &ExportOptions {
+            allow_lossy: false,
+            pack: false,
+            blender: Some(blender.as_path()),
+            context: &context,
+        },
+    )?;
+    let rows = blender_readback(&blender, root, &blend)?;
+    let rows = rows.as_array().ok_or("Blender stack must be an array")?;
+    assert_eq!(rows.len(), 2);
+    assert_ne!(
+        rows[0].get(0).and_then(Value::as_str),
+        rows[1].get(0).and_then(Value::as_str),
+        "Blender modifier RNA names must remain unique"
+    );
+    for (index, (id, name, _, show_viewport, show_render, pinned, levels)) in
+        expected.iter().enumerate()
+    {
+        let row = &rows[index];
+        assert_eq!(row.get(2).and_then(Value::as_bool), Some(*pinned));
+        assert_eq!(row.get(3).and_then(Value::as_bool), Some(*show_viewport));
+        assert_eq!(row.get(4).and_then(Value::as_bool), Some(*show_render));
+        assert_eq!(row.get(5), Some(levels));
+        assert_eq!(
+            row.get(6)
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            row.get(6)
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str),
+            Some(name.as_str())
+        );
+    }
+
+    let imported = import_blend(&blend, Some(blender.as_path()))?;
+    let imported_id = imported
+        .id_mappings
+        .get("Object:stack")
+        .and_then(Value::as_str)
+        .ok_or("Blender stack object ID mapping is missing")?;
+    assert_eq!(potter_modifier_rows(&imported.doc, imported_id)?, expected);
     Ok(())
 }
 

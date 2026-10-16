@@ -337,7 +337,7 @@ impl Snapshot {
         Self::evaluate_internal(doc, context, project_root, cache_directory, Some(node_ids))
     }
 
-    /// Evaluate only a modifier's classified geometry operands and target world transform.
+    /// Evaluate only a modifier's classified geometry operands and required world transforms.
     pub(crate) fn evaluate_modifier_operands_with_cache(
         doc: &SceneDoc,
         context: &EvaluationContext,
@@ -352,7 +352,7 @@ impl Snapshot {
             cache_directory,
         };
         let suppressed = BTreeSet::new();
-        let world_matrix_ids = BTreeSet::from([target_id.clone()]);
+        let mut world_matrix_ids = BTreeSet::from([target_id.clone()]);
         let mesh_dependencies = object_mesh_dependencies(
             doc,
             ModifierGate {
@@ -367,6 +367,35 @@ impl Snapshot {
         }
         if let Some(dependencies) = mesh_dependencies.other.get(target_id) {
             selected_nodes.extend(dependencies.iter().cloned());
+        }
+        if let Some(modifier) = doc.nodes.get(target_id).and_then(|node| {
+            node.modifiers
+                .iter()
+                .find(|modifier| &modifier.id == modifier_id)
+        }) {
+            let transform_references = modifier_transform_references(modifier);
+            world_matrix_ids.extend(transform_references.iter().cloned());
+            for reference_id in transform_references {
+                let Some(reference) = doc.nodes.get(&reference_id) else {
+                    continue;
+                };
+                for constraint in &reference.constraints {
+                    if constraint.enabled
+                        && constraint.influence != 0.0
+                        && matches!(
+                            constraint.constraint_type,
+                            ConstraintType::Shrinkwrap | ConstraintType::GeometryAttribute
+                        )
+                        && let Some(dependency_id) = &constraint.target
+                        && mesh_dependencies
+                            .other
+                            .get(&reference_id)
+                            .is_some_and(|dependencies| dependencies.contains(dependency_id))
+                    {
+                        selected_nodes.insert(dependency_id.clone());
+                    }
+                }
+            }
         }
         doc.validate()?;
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
@@ -1591,6 +1620,64 @@ impl Snapshot {
     }
 }
 
+fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
+    fn add_reference(references: &mut BTreeSet<Id>, value: Option<&Value>) {
+        if let Some(text) = value.and_then(Value::as_str)
+            && let Ok(id) = Id::new(text.to_owned())
+        {
+            references.insert(id);
+        }
+    }
+
+    let parameters: &[&str] = match modifier.modifier_type.as_str() {
+        "hook" => &["object"],
+        "uv_project" => &["projectors"],
+        "uv_warp" | "warp" => &["object_from", "object_to"],
+        "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity" => {
+            &["mask_tex_map_object"]
+        }
+        "volume_displace" => &["texture_map_object"],
+        _ => &[],
+    };
+    let mut references = BTreeSet::new();
+    for parameter in parameters {
+        let Some(value) = modifier.params.get(*parameter) else {
+            continue;
+        };
+        if *parameter == "projectors" {
+            if let Some(projectors) = value.as_array() {
+                for projector in projectors {
+                    add_reference(&mut references, Some(projector));
+                }
+            }
+        } else {
+            add_reference(&mut references, Some(value));
+        }
+    }
+    if modifier.modifier_type == "array" {
+        if modifier.params.get("fit_type").and_then(Value::as_str) == Some("FIT_CURVE") {
+            add_reference(&mut references, modifier.params.get("curve"));
+        }
+        if modifier
+            .params
+            .get("use_object_offset")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            add_reference(&mut references, modifier.params.get("offset_object"));
+        }
+    } else if modifier.modifier_type == "screw"
+        && modifier
+            .params
+            .get("use_object_screw_offset")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        add_reference(&mut references, modifier.params.get("object"));
+    }
+    references
+}
+
 /// Content address of the authored scene. Purpose resolution never changes it.
 fn source_scene_hash(doc: &SceneDoc) -> Result<String> {
     let scene_value = serde_json::to_value(doc).map_err(PotError::internal_json)?;
@@ -1696,6 +1783,7 @@ impl ModifierGate<'_> {
         };
         linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
     }
+
 }
 
 /// Read and verify a cache resource from the scene's asset registry.
@@ -2142,7 +2230,13 @@ fn object_mesh_evaluation_order(
             let Some(node) = doc.nodes.get(id) else {
                 continue;
             };
-            let has_particle_system = node.properties.contains_key("physics_particle_emitter")
+            let has_particle_system = (node.properties.contains_key("physics_particle_emitter")
+                && gate.is_property_active(
+                    id,
+                    node,
+                    "physics_particle_emitter",
+                    "particle_system",
+                ))
                 || node.modifiers.iter().any(|modifier| {
                     gate.is_active(id, modifier) && modifier.modifier_type == "particle_system"
                 });
@@ -2512,25 +2606,89 @@ fn render_simulated_particles(
         }) {
             continue;
         }
-        let visible_states = states
+        let node = doc.nodes.get(emitter_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "particle emitter object was not found",
+                json!({"node_id":emitter_id}),
+            )
+        })?;
+        let primary_modifier_id = node
+            .properties
+            .get("physics_particle_emitter_modifier_id")
+            .and_then(serde_json::Value::as_str);
+        let mut visible_states_by_system = BTreeMap::<u32, Vec<&crate::sim::ParticleState>>::new();
+        for state in states
             .iter()
             .filter(|state| state.life_state == crate::sim::ParticleLifeState::Alive)
-            .collect::<Vec<_>>();
-        if visible_states.is_empty() {
-            continue;
+        {
+            let system_modifier = usize::try_from(state.system_index).ok().and_then(|index| {
+                node.modifiers
+                    .iter()
+                    .filter(|modifier| modifier.modifier_type == "particle_system")
+                    .nth(index)
+            });
+            let active = match (system_modifier, primary_modifier_id) {
+                (Some(modifier), Some(primary_id)) if modifier.id.as_str() == primary_id => gate
+                    .is_property_active(
+                        emitter_id,
+                        node,
+                        "physics_particle_emitter",
+                        "particle_system",
+                    ),
+                (Some(_), None) if state.system_index == 0 => gate.is_property_active(
+                    emitter_id,
+                    node,
+                    "physics_particle_emitter",
+                    "particle_system",
+                ),
+                (Some(modifier), _) => gate.is_active(emitter_id, modifier),
+                (None, _) => gate.is_property_active(
+                    emitter_id,
+                    node,
+                    "physics_particle_emitter",
+                    "particle_system",
+                ),
+            };
+            if active {
+                visible_states_by_system
+                    .entry(state.system_index)
+                    .or_default()
+                    .push(state);
+            }
         }
-        if visible_states.len() > MAX_RENDERED_PARTICLES {
+        let particle_count = visible_states_by_system
+            .values()
+            .fold(0_usize, |count, states| count.saturating_add(states.len()));
+        if particle_count > MAX_RENDERED_PARTICLES {
             return Err(PotError::with_details(
                 ErrorCode::LimitExceeded,
                 "particle visualization exceeds the 100000 particle limit",
-                json!({"node_id":emitter_id,"count":visible_states.len()}),
+                json!({"node_id":emitter_id,"count":particle_count}),
             ));
         }
-        let settings = doc
-            .nodes
-            .get(emitter_id)
-            .and_then(|node| node.properties.get("physics_particle_emitter"))
-            .and_then(serde_json::Value::as_object)
+        for (system_index, visible_states) in visible_states_by_system {
+            let has_stack_system = usize::try_from(system_index).ok().is_some_and(|index| {
+                node.modifiers
+                    .iter()
+                    .filter(|modifier| modifier.modifier_type == "particle_system")
+                    .nth(index)
+                    .is_some()
+            });
+            let settings = (if has_stack_system {
+                particle_system_for_index(doc, emitter_id, system_index)?.1
+            } else {
+                node.properties
+                    .get("physics_particle_emitter")
+                    .ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "particle emitter settings are missing",
+                            json!({"node_id":emitter_id}),
+                        )
+                    })?
+            })
+            .as_object()
             .ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::SceneInvalid,
@@ -2538,190 +2696,197 @@ fn render_simulated_particles(
                     json!({"node_id":emitter_id}),
                 )
             })?;
-        let render_type = settings
-            .get("render_type")
-            .and_then(serde_json::Value::as_str);
-        let mode = match render_type {
-            Some("HALO") => "points",
-            Some("PATH") => "hair_curves",
-            Some("OBJECT") => "object",
-            Some("COLLECTION") => "collection",
-            Some(_) => {
-                return Err(PotError::with_details(
-                    ErrorCode::UnsupportedFeature,
-                    "particle render_type is not supported",
-                    json!({"feature_id":"physics.particle_emitter.render_type","node_id":emitter_id,"render_type":render_type}),
-                ));
-            }
-            None => settings
-                .get("render_as")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("points"),
-        };
-        let emitter_world = matrices.get(emitter_id).copied().ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "particle emitter transform is missing",
-                json!({"node_id":emitter_id}),
-            )
-        })?;
-        let emitter_inverse = emitter_world.inverse();
-        if !emitter_inverse.is_finite() {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "particle emitter transform cannot be inverted",
-                json!({"node_id":emitter_id}),
-            ));
-        }
-        let (template, object_world) = match mode {
-            "points" => (
-                Mesh::icosphere(IcosphereParams {
-                    subdivisions: 1,
-                    radius: 1.0,
-                })
-                .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?,
-                None,
-            ),
-            "hair_curves" => (
-                Mesh::cylinder(CylinderParams {
-                    vertices: 6,
-                    radius: 1.0,
-                    depth: 2.0,
-                    ..CylinderParams::default()
-                })
-                .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?,
-                None,
-            ),
-            "object" => {
-                let object_id = settings
-                    .get("instance_object")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::InvalidOperation,
-                            "object particle rendering requires instance_object",
-                            json!({"node_id":emitter_id}),
-                        )
-                    })?;
-                let object_id = Id::new(object_id.to_owned())
-                    .map_err(|error| PotError::new(ErrorCode::InvalidOperation, error.message))?;
-                if object_id == *emitter_id {
+            let render_type = settings
+                .get("render_type")
+                .and_then(serde_json::Value::as_str);
+            let mode = match render_type {
+                Some("HALO") => "points",
+                Some("PATH") => "hair_curves",
+                Some("OBJECT") => "object",
+                Some("COLLECTION") => "collection",
+                Some(_) => {
                     return Err(PotError::with_details(
-                        ErrorCode::InvalidOperation,
-                        "particle instances cannot reference their own emitter",
-                        json!({"node_id":emitter_id}),
+                        ErrorCode::UnsupportedFeature,
+                        "particle render_type is not supported",
+                        json!({"feature_id":"physics.particle_emitter.render_type","node_id":emitter_id,"render_type":render_type}),
                     ));
                 }
-                let template = meshes.get(&object_id).cloned().ok_or_else(|| {
-                    PotError::with_details(
-                        ErrorCode::TargetNotFound,
-                        "particle instance mesh was not evaluated",
-                        json!({"node_id":emitter_id,"instance_object":object_id}),
-                    )
-                })?;
-                let mut matrix = matrices.get(&object_id).copied().ok_or_else(|| {
-                    PotError::with_details(
-                        ErrorCode::EvaluationFailed,
-                        "particle instance transform is missing",
-                        json!({"instance_object":object_id}),
-                    )
-                })?;
-                matrix.w_axis = DVec3::ZERO.extend(1.0);
-                (template, Some(matrix))
-            }
-            "collection" => {
-                let collection_text = settings
-                    .get("instance_collection")
+                None => settings
+                    .get("render_as")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::InvalidOperation,
-                            "collection particle rendering requires instance_collection",
-                            json!({"node_id":emitter_id}),
-                        )
-                    })?;
-                let collection_id = Id::new(collection_text.to_owned())
-                    .map_err(|error| PotError::new(ErrorCode::InvalidOperation, error.message))?;
-                let mut object_ids = BTreeSet::new();
-                collect_modifier_collection_objects(
-                    doc,
-                    &collection_id,
-                    &mut BTreeSet::new(),
-                    &mut object_ids,
-                )?;
-                let mut template = Mesh::new();
-                for object_id in object_ids {
-                    if &object_id == emitter_id {
-                        continue;
-                    }
-                    let Some(source) = meshes.get(&object_id) else {
-                        continue;
-                    };
-                    let object_world = matrices.get(&object_id).copied().ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::EvaluationFailed,
-                            "particle collection object transform is missing",
-                            json!({"object":object_id}),
-                        )
-                    })?;
-                    append_transformed_mesh(&mut template, source, emitter_inverse * object_world)?;
-                }
-                (template, None)
-            }
-            _ => {
+                    .unwrap_or("points"),
+            };
+            let emitter_world = matrices.get(emitter_id).copied().ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "particle emitter transform is missing",
+                    json!({"node_id":emitter_id}),
+                )
+            })?;
+            let emitter_inverse = emitter_world.inverse();
+            if !emitter_inverse.is_finite() {
                 return Err(PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "particle render_as setting is invalid",
-                    json!({"node_id":emitter_id,"render_as":mode}),
+                    ErrorCode::EvaluationFailed,
+                    "particle emitter transform cannot be inverted",
+                    json!({"node_id":emitter_id}),
                 ));
             }
-        };
-        let output = meshes.get_mut(emitter_id).ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "particle emitter mesh was not evaluated",
-                json!({"node_id":emitter_id}),
-            )
-        })?;
-        let size = settings
-            .get("hair_length")
-            .and_then(serde_json::Value::as_f64)
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(0.1);
-        for particle in visible_states {
-            let position = DVec3::from_array(particle.position);
-            let world_transform = if let Some(object_world) = object_world {
-                DMat4::from_translation(position)
-                    * DMat4::from_scale(DVec3::splat(particle.size))
-                    * object_world
-            } else if mode == "hair_curves" {
-                let velocity = DVec3::from_array(particle.velocity);
-                let direction = if velocity.length_squared() > 1.0e-24 {
-                    velocity.normalize()
-                } else {
-                    DVec3::Z
-                };
-                DMat4::from_scale_rotation_translation(
-                    DVec3::new(
-                        0.004 * particle.size,
-                        0.004 * particle.size,
-                        size * 0.5 * particle.size,
-                    ),
-                    DQuat::from_rotation_arc(DVec3::Z, direction),
-                    position + direction * (size * 0.5 * particle.size),
-                )
-            } else {
-                DMat4::from_translation(position)
-                    * DMat4::from_scale(DVec3::splat(0.02 * particle.size))
+            let (template, object_world) = match mode {
+                "points" => (
+                    Mesh::icosphere(IcosphereParams {
+                        subdivisions: 1,
+                        radius: 1.0,
+                    })
+                    .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?,
+                    None,
+                ),
+                "hair_curves" => (
+                    Mesh::cylinder(CylinderParams {
+                        vertices: 6,
+                        radius: 1.0,
+                        depth: 2.0,
+                        ..CylinderParams::default()
+                    })
+                    .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?,
+                    None,
+                ),
+                "object" => {
+                    let object_id = settings
+                        .get("instance_object")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            PotError::with_details(
+                                ErrorCode::InvalidOperation,
+                                "object particle rendering requires instance_object",
+                                json!({"node_id":emitter_id}),
+                            )
+                        })?;
+                    let object_id = Id::new(object_id.to_owned()).map_err(|error| {
+                        PotError::new(ErrorCode::InvalidOperation, error.message)
+                    })?;
+                    if object_id == *emitter_id {
+                        return Err(PotError::with_details(
+                            ErrorCode::InvalidOperation,
+                            "particle instances cannot reference their own emitter",
+                            json!({"node_id":emitter_id}),
+                        ));
+                    }
+                    let template = meshes.get(&object_id).cloned().ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::TargetNotFound,
+                            "particle instance mesh was not evaluated",
+                            json!({"node_id":emitter_id,"instance_object":object_id}),
+                        )
+                    })?;
+                    let mut matrix = matrices.get(&object_id).copied().ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::EvaluationFailed,
+                            "particle instance transform is missing",
+                            json!({"instance_object":object_id}),
+                        )
+                    })?;
+                    matrix.w_axis = DVec3::ZERO.extend(1.0);
+                    (template, Some(matrix))
+                }
+                "collection" => {
+                    let collection_text = settings
+                        .get("instance_collection")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            PotError::with_details(
+                                ErrorCode::InvalidOperation,
+                                "collection particle rendering requires instance_collection",
+                                json!({"node_id":emitter_id}),
+                            )
+                        })?;
+                    let collection_id = Id::new(collection_text.to_owned()).map_err(|error| {
+                        PotError::new(ErrorCode::InvalidOperation, error.message)
+                    })?;
+                    let mut object_ids = BTreeSet::new();
+                    collect_modifier_collection_objects(
+                        doc,
+                        &collection_id,
+                        &mut BTreeSet::new(),
+                        &mut object_ids,
+                    )?;
+                    let mut template = Mesh::new();
+                    for object_id in object_ids {
+                        if &object_id == emitter_id {
+                            continue;
+                        }
+                        let Some(source) = meshes.get(&object_id) else {
+                            continue;
+                        };
+                        let object_world = matrices.get(&object_id).copied().ok_or_else(|| {
+                            PotError::with_details(
+                                ErrorCode::EvaluationFailed,
+                                "particle collection object transform is missing",
+                                json!({"object":object_id}),
+                            )
+                        })?;
+                        append_transformed_mesh(
+                            &mut template,
+                            source,
+                            emitter_inverse * object_world,
+                        )?;
+                    }
+                    (template, None)
+                }
+                _ => {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "particle render_as setting is invalid",
+                        json!({"node_id":emitter_id,"render_as":mode}),
+                    ));
+                }
             };
-            append_transformed_mesh(output, &template, emitter_inverse * world_transform)?;
+            let output = meshes.get_mut(emitter_id).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "particle emitter mesh was not evaluated",
+                    json!({"node_id":emitter_id}),
+                )
+            })?;
+            let size = settings
+                .get("hair_length")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(0.1);
+            for particle in visible_states {
+                let position = DVec3::from_array(particle.position);
+                let world_transform = if let Some(object_world) = object_world {
+                    DMat4::from_translation(position)
+                        * DMat4::from_scale(DVec3::splat(particle.size))
+                        * object_world
+                } else if mode == "hair_curves" {
+                    let velocity = DVec3::from_array(particle.velocity);
+                    let direction = if velocity.length_squared() > 1.0e-24 {
+                        velocity.normalize()
+                    } else {
+                        DVec3::Z
+                    };
+                    DMat4::from_scale_rotation_translation(
+                        DVec3::new(
+                            0.004 * particle.size,
+                            0.004 * particle.size,
+                            size * 0.5 * particle.size,
+                        ),
+                        DQuat::from_rotation_arc(DVec3::Z, direction),
+                        position + direction * (size * 0.5 * particle.size),
+                    )
+                } else {
+                    DMat4::from_translation(position)
+                        * DMat4::from_scale(DVec3::splat(0.02 * particle.size))
+                };
+                append_transformed_mesh(output, &template, emitter_inverse * world_transform)?;
+            }
+            let bounds = mesh_bounds(output, emitter_world)?;
+            let evaluated = nodes.get_mut(emitter_id).ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "particle emitter node is missing")
+            })?;
+            evaluated.bounds = bounds;
+            evaluated.dimensions = bounds.map(|value| value.size().to_array());
         }
-        let bounds = mesh_bounds(output, emitter_world)?;
-        let evaluated = nodes.get_mut(emitter_id).ok_or_else(|| {
-            PotError::new(ErrorCode::InternalError, "particle emitter node is missing")
-        })?;
-        evaluated.bounds = bounds;
-        evaluated.dimensions = bounds.map(|value| value.size().to_array());
     }
     Ok(())
 }
@@ -4471,21 +4636,63 @@ mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
 
     use std::collections::BTreeSet;
-
     use glam::DVec3;
 
     use crate::{
         geom::{BoxParams, Mesh},
         model::{
             DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
-            GreasePencilStroke, Id, Modifier, ModifierRuntime, Node, SceneDoc, Transform,
+            GreasePencilStroke, Id, Node, SceneDoc, Transform,
         },
     };
 
-    use super::{
-        EvaluationContext, EvaluationPurpose, ModifierEvaluationContext, ModifierGate, Snapshot,
-    };
+    use super::{EvaluationContext, Snapshot};
 
+    #[test]
+    fn particle_render_limit_counts_all_systems_for_each_emitter() {
+        let emitter_id = Id::new("emitter").unwrap();
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.nodes.insert(
+            emitter_id.clone(),
+            Node {
+                name: "Emitter".to_owned(),
+                kind: "mesh".to_owned(),
+                ..Node::default()
+            },
+        );
+        let mut states = Vec::with_capacity(120_002);
+        for system_index in 0..2 {
+            for _ in 0..60_001 {
+                states.push(crate::sim::ParticleState {
+                    system_index,
+                    ..crate::sim::ParticleState::default()
+                });
+            }
+        }
+        let particles = std::collections::BTreeMap::from([(emitter_id.clone(), states)]);
+        let suppressed = std::collections::BTreeSet::new();
+        let gate = super::ModifierGate {
+            context: super::ModifierEvaluationContext {
+                purpose: super::EvaluationPurpose::Preview,
+                project_root: None,
+                cache_directory: None,
+            },
+            suppressed: &suppressed,
+        };
+        let evaluated_nodes = std::collections::BTreeSet::from([emitter_id.clone()]);
+        let error = super::render_simulated_particles(
+            &doc,
+            gate,
+            &particles,
+            &std::collections::BTreeMap::new(),
+            &mut std::collections::BTreeMap::new(),
+            &mut std::collections::BTreeMap::new(),
+            &evaluated_nodes,
+        )
+        .expect_err("combined visible systems must exceed the per-emitter limit");
+        assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
+        assert_eq!(error.details["count"], serde_json::json!(120_002));
+    }
     fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {
         let data_id = Id::new("grease_pencil_data").unwrap();
         let node_id = Id::new("grease_pencil_node").unwrap();

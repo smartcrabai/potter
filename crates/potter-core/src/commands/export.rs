@@ -162,7 +162,12 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                     })?;
                 let (json_bytes, binary) =
                     exchange::gltf::export_with_root(&doc, &snapshot, project.path(), Some(uri))?;
-                vec![(sidecar, binary), (args.out.clone(), json_bytes)]
+                let mut files = Vec::with_capacity(2);
+                if !binary.is_empty() {
+                    files.push((sidecar, binary));
+                }
+                files.push((args.out.clone(), json_bytes));
+                files
             }
             "usda" => vec![(
                 args.out.clone(),

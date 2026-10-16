@@ -33,13 +33,7 @@ const NORMAL_TOLERANCE: f64 = 1.0e-5;
 const QUANTIZED_NORMAL_TOLERANCE: f64 = 2.0e-4;
 
 /// Fixtures whose stack Potter refuses with a typed feature, as `(fixture, feature_id)`.
-const REFUSED: &[(&str, &str)] = &[
-    ("mirror_cube_bisect_flip", "modifier.mirror.bisect"),
-    (
-        "remesh_smooth_mode_grid",
-        "modifier.remesh.open_nonmanifold",
-    ),
-];
+const REFUSED: &[(&str, &str)] = &[("mirror_cube_bisect_flip", "modifier.mirror.bisect")];
 
 /// Fixtures whose flags match Blender exactly and whose corner normals are within tolerance.
 const EXACT: &[&str] = &[
@@ -61,6 +55,7 @@ const EXACT: &[&str] = &[
     "mirror_cube_nocustom",
     "mirror_cube_nomerge",
     "mirror_grid",
+    "remesh_smooth_mode_grid",
     "remesh_voxel_cube",
     "remesh_voxel_cube_smooth",
     "screw_line",
