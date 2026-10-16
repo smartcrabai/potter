@@ -249,7 +249,9 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     if cursor != bytes.len() {
         return Err(ply_error("PLY has trailing or malformed binary data"));
     }
-    if positions.is_empty() || faces.is_empty() {
+    // Zero vertices and zero faces is an empty mesh, which Potter writes for empty objects.
+    // Vertices without faces are a point cloud, which is not a mesh.
+    if faces.is_empty() && !positions.is_empty() {
         return Err(ply_error("PLY contains no mesh geometry"));
     }
     let normals = if parsed.has_normals {

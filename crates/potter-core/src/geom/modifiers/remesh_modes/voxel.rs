@@ -4,12 +4,12 @@
 //   source/blender/blenkernel/intern/mesh_remesh_voxel.cc, SPDX-FileCopyrightText: 2019 Blender Authors, GPL-2.0-or-later.
 //
 // Portions derived from OpenVDB (https://github.com/AcademySoftwareFoundation/openvdb):
-//   openvdb/openvdb/tools/MeshToVolume.h, openvdb/openvdb/tools/VolumeToMesh.h, SPDX-FileCopyrightText: Copyright Contributors to the OpenVDB Project, Apache-2.0.
+//   openvdb/openvdb/tools/MeshToVolume.h, openvdb/openvdb/tools/VolumeToMesh.h (v13.0.0), SPDX-FileCopyrightText: Copyright Contributors to the OpenVDB Project, Apache-2.0.
 
-//! Blender-compatible voxel remeshing using a float32 level set and uniform volume meshing.
-//!
-//! The conversion follows `OpenVDB`'s `meshToLevelSet` narrow-band distance construction and
-//! `volumeToMesh`'s per-cell edge-intersection averaging for adaptivity zero.
+//! Blender-compatible voxel remeshing: a float32 narrow-band level set (`meshToLevelSet` with
+//! `OpenVDB`'s topological sign rule) meshed by uniform `volumeToMesh` at adaptivity zero and by the
+//! adaptive port in [`adaptive`] above zero. Empty surfaces pass the input mesh through, as
+//! Blender's nullptr result does.
 
 use glam::DVec3;
 use serde_json::json;
@@ -18,12 +18,16 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::Mesh,
 };
+#[path = "voxel_adaptive.rs"]
+mod adaptive;
 
 // Blender explicitly overrides OpenVDB's default level-set half width of 3.0 with 1.0.
 const LEVEL_SET_HALF_WIDTH: f32 = 1.0;
 const RENORMALIZE_OFFSET: f32 = 0.8;
 const VOXEL_BUDGET: usize = 16_000_000;
 const BVH_LEAF_SIZE: usize = 8;
+/// `OpenVDB`'s `adaptive` flag is `mPrimAdaptivity > 1e-7`; at or below it the uniform mesher runs.
+const ADAPTIVE_THRESHOLD: f64 = 1.0e-7;
 
 #[derive(Clone, Copy)]
 struct Triangle {
@@ -168,14 +172,20 @@ impl TriangleBvh {
     }
 }
 
-/// Evaluate Blender's VOXEL remesh at zero adaptivity.
-pub(super) fn remesh(mesh: &Mesh, voxel_size: f32, smooth_shade: bool) -> Result<Mesh> {
+/// Evaluate Blender's VOXEL remesh.
+///
+/// Adaptivity above `OpenVDB`'s 1e-7 threshold runs the adaptive `volumeToMesh` port; otherwise the
+/// uniform cell mesher runs. When the surface is empty, Blender's `BKE_mesh_remesh_voxel` returns
+/// nullptr and the modifier stack keeps its input, so the input mesh is returned unchanged.
+pub(super) fn remesh(
+    mesh: &Mesh,
+    voxel_size: f32,
+    adaptivity: f32,
+    smooth_shade: bool,
+) -> Result<Mesh> {
     let triangles = mesh_triangles(mesh, voxel_size)?;
     if triangles.is_empty() {
-        return Err(PotError::new(
-            ErrorCode::InvalidArgument,
-            "voxel remesh requires a mesh with at least one triangle",
-        ));
+        return Ok(mesh.clone());
     }
     let bvh = TriangleBvh::new(triangles.clone());
     let (min_coord, dimensions) = grid_dimensions(&triangles, voxel_size)?;
@@ -192,9 +202,7 @@ pub(super) fn remesh(mesh: &Mesh, voxel_size: f32, smooth_shade: bool) -> Result
     let mut distance = vec![0.0_f32; count];
     let mut squared_distance = vec![0.0_f32; count];
     let mut closest_primitive = vec![usize::MAX; count];
-    let mut known_sign = vec![false; count];
     let band = voxel_size * LEVEL_SET_HALF_WIDTH;
-    let narrow_sign_radius = f64::from(LEVEL_SET_HALF_WIDTH + 1.0);
 
     for x in 0..dimensions[0] {
         for y in 0..dimensions[1] {
@@ -214,25 +222,19 @@ pub(super) fn remesh(mesh: &Mesh, voxel_size: f32, smooth_shade: bool) -> Result
                 let squared = squared as f32;
                 squared_distance[offset] = squared;
                 closest_primitive[offset] = primitive;
-                let index_distance = squared.sqrt();
-                let world_distance = index_distance * voxel_size;
-                let inside = if f64::from(index_distance) <= narrow_sign_radius {
-                    known_sign[offset] = true;
-                    point_inside_mesh(point, &bvh.triangles)
-                } else {
-                    false
-                };
-                distance[offset] = if inside {
-                    -world_distance
-                } else {
-                    world_distance
-                };
+                distance[offset] = squared.sqrt() * voxel_size;
             }
         }
     }
 
     let mut active = initial_voxelization_mask(&bvh.triangles, min_coord, dimensions);
-    let mut inside = fill_interior_signs(&mut distance, &known_sign, &active, dimensions, band);
+    let mut inside = fill_interior_signs_topological(
+        &mut distance,
+        &squared_distance,
+        &active,
+        dimensions,
+        band,
+    );
     let mut signed_squared = squared_distance
         .iter()
         .zip(&inside)
@@ -262,7 +264,46 @@ pub(super) fn remesh(mesh: &Mesh, voxel_size: f32, smooth_shade: bool) -> Result
         }
     }
     renormalize_level_set(&mut distance, &active, dimensions, voxel_size, band);
-    volume_to_mesh(&distance, dimensions, min_coord, voxel_size, smooth_shade)
+
+    let output = if f64::from(adaptivity) > ADAPTIVE_THRESHOLD {
+        match adaptive::volume_to_mesh(
+            &distance, dimensions, min_coord, voxel_size, band, adaptivity,
+        ) {
+            Some(surface) => Some(surface_to_mesh(surface, smooth_shade)?),
+            None => None,
+        }
+    } else {
+        volume_to_mesh(&distance, dimensions, min_coord, voxel_size, smooth_shade)?
+    };
+    Ok(output.unwrap_or_else(|| mesh.clone()))
+}
+
+/// Blender's `remesh_voxel_volume_to_mesh` corner order: quads `[q0, q3, q2, q1]`, triangles
+/// `[t2, t1, t0]`, quads first.
+fn surface_to_mesh(surface: adaptive::Surface, smooth_shade: bool) -> Result<Mesh> {
+    let polygons = surface
+        .quads
+        .iter()
+        .map(|quad| vec![quad[0], quad[3], quad[2], quad[1]])
+        .chain(
+            surface
+                .triangles
+                .iter()
+                .map(|triangle| vec![triangle[2], triangle[1], triangle[0]]),
+        )
+        .collect::<Vec<_>>();
+    let mut output =
+        Mesh::from_positions_and_faces(surface.positions, polygons).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                format!("voxel remesh produced invalid geometry: {error}"),
+                json!({"mesh_error": error.to_string()}),
+            )
+        })?;
+    if smooth_shade {
+        crate::geom::normals::shade_faces_smooth(&mut output);
+    }
+    Ok(output)
 }
 
 fn mesh_triangles(mesh: &Mesh, voxel_size: f32) -> Result<Vec<Triangle>> {
@@ -402,22 +443,6 @@ fn grid_dimensions(triangles: &[Triangle], voxel_size: f32) -> Result<([i32; 3],
     Ok((lower, dimensions))
 }
 
-fn point_inside_mesh(point: DVec3, triangles: &[Triangle]) -> bool {
-    let mut winding = 0.0;
-    for triangle in triangles {
-        let a = triangle.points[0] - point;
-        let b = triangle.points[1] - point;
-        let c = triangle.points[2] - point;
-        let la = a.length();
-        let lb = b.length();
-        let lc = c.length();
-        let numerator = a.dot(b.cross(c));
-        let denominator = la * lb * lc + a.dot(b) * lc + b.dot(c) * la + c.dot(a) * lb;
-        winding += 2.0 * numerator.atan2(denominator);
-    }
-    winding.abs() > std::f64::consts::TAU
-}
-
 fn initial_voxelization_mask(
     triangles: &[Triangle],
     min_coord: [i32; 3],
@@ -497,17 +522,21 @@ fn initial_voxelization_mask(
     active
 }
 
-fn fill_interior_signs(
+/// Assigns topological signs for VOXEL remeshing. The exterior is flood-filled from the grid
+/// boundary through voxels that do not intersect the surface (squared distance above 0.75).
+/// Intersecting voxels keep the interior sign here and `repair_intersecting_voxels` decides them
+/// from their exterior neighbors, without relying on triangle winding.
+fn fill_interior_signs_topological(
     distance: &mut [f32],
-    known_sign: &[bool],
+    squared_distance: &[f32],
     active: &[bool],
     dimensions: [usize; 3],
     band: f32,
 ) -> Vec<bool> {
     let count = distance.len();
     let mut exterior = vec![false; count];
-    let mut inside = vec![false; count];
     let mut queue = std::collections::VecDeque::new();
+    let free = |offset: usize| squared_distance[offset] > 0.75_f32;
     for x in 0..dimensions[0] {
         for y in 0..dimensions[1] {
             for z in 0..dimensions[2] {
@@ -521,7 +550,7 @@ fn fill_interior_signs(
                     continue;
                 }
                 let offset = grid_index([x, y, z], dimensions);
-                if !known_sign[offset] && !exterior[offset] {
+                if free(offset) && !exterior[offset] {
                     exterior[offset] = true;
                     queue.push_back([x, y, z]);
                 }
@@ -531,18 +560,17 @@ fn fill_interior_signs(
     while let Some([x, y, z]) = queue.pop_front() {
         for neighbor in neighbors([x, y, z], dimensions) {
             let offset = grid_index(neighbor, dimensions);
-            if !known_sign[offset] && !exterior[offset] {
+            if free(offset) && !exterior[offset] {
                 exterior[offset] = true;
                 queue.push_back(neighbor);
             }
         }
     }
+    let inside = exterior
+        .iter()
+        .map(|exterior| !exterior)
+        .collect::<Vec<_>>();
     for offset in 0..count {
-        inside[offset] = if known_sign[offset] {
-            distance[offset] < 0.0
-        } else {
-            !exterior[offset]
-        };
         if active[offset] {
             distance[offset] = if inside[offset] {
                 -distance[offset].abs()
@@ -752,7 +780,7 @@ fn volume_to_mesh(
     min_coord: [i32; 3],
     voxel_size: f32,
     smooth_shade: bool,
-) -> Result<Mesh> {
+) -> Result<Option<Mesh>> {
     let cell_dimensions = [dimensions[0] - 1, dimensions[1] - 1, dimensions[2] - 1];
     let cell_count = cell_dimensions[0]
         .checked_mul(cell_dimensions[1])
@@ -767,96 +795,94 @@ fn volume_to_mesh(
     let mut cells = vec![Cell::default(); cell_count];
     let mut positions = Vec::<DVec3>::new();
 
-    for x in 0..cell_dimensions[0] {
-        for y in 0..cell_dimensions[1] {
-            for z in 0..cell_dimensions[2] {
-                let coord = [x, y, z];
-                let cell_values = cell_corner_values(values, dimensions, coord);
-                let signs = corrected_cell_signs(values, dimensions, coord);
-                if signs == 0 || signs == u8::MAX {
-                    continue;
-                }
-                let (groups, count) = edge_groups(signs);
-                let point_offset = positions.len();
-                for group in 1..=count {
-                    let point = compute_cell_point(&cell_values, &groups, group);
-                    let index_position = DVec3::new(
-                        f64::from(min_coord[0] + x as i32) + point.x,
-                        f64::from(min_coord[1] + y as i32) + point.y,
-                        f64::from(min_coord[2] + z as i32) + point.z,
-                    );
-                    let world = index_position * f64::from(voxel_size);
-                    positions.push(DVec3::new(
-                        f64::from(world.x as f32),
-                        f64::from(world.y as f32),
-                        f64::from(world.z as f32),
-                    ));
-                }
-                cells[cell_index(coord, cell_dimensions)] = Cell {
-                    groups,
-                    point_offset,
-                    point_count: usize::from(count),
-                };
-            }
+    for (index, cell) in cells.iter_mut().enumerate() {
+        let coord = cell_coord(index, cell_dimensions);
+        let signs = corrected_cell_signs(values, dimensions, coord);
+        if signs == 0 || signs == u8::MAX {
+            continue;
+        }
+        let (groups, count) = edge_groups(signs);
+        *cell = Cell {
+            groups,
+            point_offset: 0,
+            point_count: usize::from(count),
+        };
+    }
+
+    let mut cell_order = (0..cell_count)
+        .filter(|&index| cells[index].point_count != 0)
+        .collect::<Vec<_>>();
+    cell_order.sort_by_key(|&index| {
+        let local = cell_coord(index, cell_dimensions);
+        let absolute = std::array::from_fn(|axis| i64::from(min_coord[axis]) + local[axis] as i64);
+        openvdb_cell_order(absolute)
+    });
+    for &index in &cell_order {
+        let coord = cell_coord(index, cell_dimensions);
+        let cell_values = cell_corner_values(values, dimensions, coord);
+        let cell = &mut cells[index];
+        cell.point_offset = positions.len();
+        for group in 1..=cell.point_count as u8 {
+            let point = compute_cell_point(&cell_values, &cell.groups, group);
+            let index_position = DVec3::new(
+                f64::from(min_coord[0] + coord[0] as i32) + point.x,
+                f64::from(min_coord[1] + coord[1] as i32) + point.y,
+                f64::from(min_coord[2] + coord[2] as i32) + point.z,
+            );
+            let world = index_position * f64::from(voxel_size);
+            positions.push(DVec3::new(
+                f64::from(world.x as f32),
+                f64::from(world.y as f32),
+                f64::from(world.z as f32),
+            ));
         }
     }
 
     let mut polygons = Vec::<Vec<usize>>::new();
-    for x in 0..cell_dimensions[0] {
-        for y in 0..cell_dimensions[1] {
-            for z in 0..cell_dimensions[2] {
-                let coord = [x, y, z];
-                let cell = cells[cell_index(coord, cell_dimensions)];
-                if cell.point_count == 0 {
-                    continue;
-                }
-                let signs = corrected_cell_signs(values, dimensions, coord);
-                // Quads around x and y edges face +x and +y, around z edges -z; each is reversed when its
-                // edge's first corner is outside (x, y) or inside (z), so every quad faces away from the inside.
-                let corner_outside = signs & 1 == 0;
-                if (signs & 1 != 0) != (signs & 2 != 0) {
-                    add_quad(
-                        &mut polygons,
-                        &cells,
-                        cell_dimensions,
-                        coord,
-                        [(0, 0, 0, 1), (0, -1, 0, 5), (0, -1, -1, 7), (0, 0, -1, 3)],
-                        corner_outside,
-                    );
-                }
-                if (signs & 1 != 0) != (signs & 16 != 0) {
-                    add_quad(
-                        &mut polygons,
-                        &cells,
-                        cell_dimensions,
-                        coord,
-                        [
-                            (0, 0, 0, 9),
-                            (0, 0, -1, 12),
-                            (-1, 0, -1, 11),
-                            (-1, 0, 0, 10),
-                        ],
-                        corner_outside,
-                    );
-                }
-                if (signs & 1 != 0) != (signs & 8 != 0) {
-                    add_quad(
-                        &mut polygons,
-                        &cells,
-                        cell_dimensions,
-                        coord,
-                        [(0, 0, 0, 4), (0, -1, 0, 8), (-1, -1, 0, 6), (-1, 0, 0, 2)],
-                        !corner_outside,
-                    );
-                }
-            }
+    for &index in &cell_order {
+        let coord = cell_coord(index, cell_dimensions);
+        let signs = corrected_cell_signs(values, dimensions, coord);
+        // Quads around x and y edges face +x and +y, around z edges -z; each is reversed when its
+        // edge's first corner is outside (x, y) or inside (z), so every quad faces away from the inside.
+        let corner_outside = signs & 1 == 0;
+        if (signs & 1 != 0) != (signs & 2 != 0) {
+            add_quad(
+                &mut polygons,
+                &cells,
+                cell_dimensions,
+                coord,
+                [(0, 0, 0, 1), (0, -1, 0, 5), (0, -1, -1, 7), (0, 0, -1, 3)],
+                corner_outside,
+            );
+        }
+        if (signs & 1 != 0) != (signs & 16 != 0) {
+            add_quad(
+                &mut polygons,
+                &cells,
+                cell_dimensions,
+                coord,
+                [
+                    (0, 0, 0, 9),
+                    (0, 0, -1, 12),
+                    (-1, 0, -1, 11),
+                    (-1, 0, 0, 10),
+                ],
+                corner_outside,
+            );
+        }
+        if (signs & 1 != 0) != (signs & 8 != 0) {
+            add_quad(
+                &mut polygons,
+                &cells,
+                cell_dimensions,
+                coord,
+                [(0, 0, 0, 4), (0, -1, 0, 8), (-1, -1, 0, 6), (-1, 0, 0, 2)],
+                !corner_outside,
+            );
         }
     }
     if polygons.is_empty() {
-        return Err(PotError::new(
-            ErrorCode::InvalidArgument,
-            "voxel remesh did not produce a surface",
-        ));
+        return Ok(None);
     }
     let mut output = Mesh::from_positions_and_faces(positions, polygons).map_err(|error| {
         PotError::with_details(
@@ -868,7 +894,7 @@ fn volume_to_mesh(
     if smooth_shade {
         crate::geom::normals::shade_faces_smooth(&mut output);
     }
-    Ok(output)
+    Ok(Some(output))
 }
 
 fn add_quad(
@@ -1050,6 +1076,36 @@ fn grid_index(coord: [usize; 3], dimensions: [usize; 3]) -> usize {
 
 fn cell_index(coord: [usize; 3], dimensions: [usize; 3]) -> usize {
     grid_index(coord, dimensions)
+}
+
+fn cell_coord(index: usize, dimensions: [usize; 3]) -> [usize; 3] {
+    [
+        index / (dimensions[1] * dimensions[2]),
+        (index / dimensions[2]) % dimensions[1],
+        index % dimensions[2],
+    ]
+}
+
+/// `OpenVDB` leaf-tree traversal order followed by the leaf buffer's x/y/z offset order.
+fn openvdb_cell_order(coord: [i64; 3]) -> ([i64; 9], usize) {
+    let leaf = coord.map(|value| value & !7);
+    let order = [
+        leaf[0] >> 12,
+        leaf[1] >> 12,
+        leaf[2] >> 12,
+        (leaf[0] >> 7) & 31,
+        (leaf[1] >> 7) & 31,
+        (leaf[2] >> 7) & 31,
+        (leaf[0] >> 3) & 15,
+        (leaf[1] >> 3) & 15,
+        (leaf[2] >> 3) & 15,
+    ];
+    let local = [
+        (coord[0] - leaf[0]) as usize,
+        (coord[1] - leaf[1]) as usize,
+        (coord[2] - leaf[2]) as usize,
+    ];
+    (order, (local[0] << 6) | (local[1] << 3) | local[2])
 }
 
 fn neighbors(coord: [usize; 3], dimensions: [usize; 3]) -> impl Iterator<Item = [usize; 3]> {
