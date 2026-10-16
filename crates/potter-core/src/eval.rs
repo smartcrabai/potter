@@ -4539,8 +4539,8 @@ mod tests {
     use super::{EvaluationContext, Snapshot};
 
     #[test]
-    fn particle_render_limit_counts_all_systems_for_each_emitter(
-    ) -> std::result::Result<(), &'static str> {
+    fn particle_render_limit_counts_all_systems_for_each_emitter()
+    -> std::result::Result<(), &'static str> {
         let emitter_id = Id::new("emitter").unwrap();
         let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         doc.nodes.insert(
