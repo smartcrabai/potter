@@ -10,6 +10,9 @@ import json
 import os
 import sys
 
+if bpy.app.version[:3] != (5, 2, 2):
+    raise RuntimeError("Skin fixtures require Blender 5.2.2")
+
 OUT = sys.argv[sys.argv.index("--") + 1]
 os.makedirs(OUT, exist_ok=True)
 

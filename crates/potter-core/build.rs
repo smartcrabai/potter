@@ -1,7 +1,11 @@
-use std::{env, path::PathBuf};
+use std::{env, io, path::PathBuf};
 
-fn main() {
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
+fn main() -> Result<(), io::Error> {
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "CARGO_MANIFEST_DIR is not set")
+        })?,
+    );
     let skin_native = manifest_dir.join("src/geom/modifiers/skin_native");
     let bullet = skin_native.join("bullet/LinearMath");
 
@@ -29,4 +33,5 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={}", bullet.join(source).display());
     }
+    Ok(())
 }
