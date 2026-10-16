@@ -194,8 +194,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     }
     let mut instance_paths = Vec::new();
     let mut warnings = Vec::new();
-    let last_subdivision_index = modifiers.iter().rposition(|modifier| {
-        modifier.enabled && modifier.modifier_type == "subdivision"
+    let last_subdivision_index = modifiers.iter().enumerate().rposition(|(index, modifier)| {
+        is_active(index, modifier) && modifier.modifier_type == "subdivision"
     });
     for (modifier_index, modifier) in modifiers
         .iter()
@@ -531,7 +531,7 @@ pub(crate) fn validate_boolean_topology_suffix(
         .map(|(_, modifier)| modifier)
     else {
         return Ok(());
-    }
+    };
     Err(PotError::with_details(
         ErrorCode::UnsupportedFeature,
         "Boolean output topology is not Blender-compatible for a downstream topology-dependent modifier",
