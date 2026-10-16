@@ -985,7 +985,7 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
 }
 
 /// Value written for an element with no source, by Blender data type.
-fn default_value(data_type: &str) -> Value {
+pub(crate) fn default_value(data_type: &str) -> Value {
     match data_type {
         "BOOLEAN" | "BOOL" => json!(false),
         "INT" | "INT8" => json!(0),
