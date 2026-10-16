@@ -333,8 +333,8 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
 /// - A valid `blender_uv_layers[].active` flag selects the active layer independently; when none
 ///   survives, the render layer is active.
 /// - At most [`MAX_LAYERS`] layers are kept. Priority: the render layer, then the layers
-///   `referenced` names, then the rest in order. Kept layers keep their original order. Each dropped
-///   layer is reported with a `uv.legacy_layer_dropped` warning.
+///   `referenced` names, then the valid legacy active layer, then the rest in order. Kept layers
+///   keep their original order. Each dropped layer is reported with a `uv.legacy_layer_dropped` warning.
 /// - `blender_attributes` entries that are FLOAT2 `CORNER` attributes named like a version-1 layer
 ///   are removed, because the store now holds those values.
 ///
@@ -615,7 +615,7 @@ pub(crate) fn upgrade_mesh_v1(
             .as_deref()
             .and_then(|name| layers.iter().position(|layer| layer.name == name))
             .unwrap_or(0);
-        let kept = kept_layers(&layers, render_index, referenced);
+        let kept = kept_layers(&layers, render_index, legacy_active, referenced);
         for (index, layer) in layers.iter().enumerate() {
             if !kept.contains(&index) {
                 warnings.push(json!({
@@ -693,13 +693,24 @@ fn skipped_row(
 }
 
 /// The layers the layer limit keeps, as indices in their original order. Priority: the render
-/// layer, then the layers `referenced` names, then the rest in order.
-fn kept_layers(layers: &[UvLayer], render: usize, referenced: &BTreeSet<String>) -> Vec<usize> {
+/// layer, then the layers `referenced` names, then the valid legacy active layer, then the rest.
+fn kept_layers(
+    layers: &[UvLayer],
+    render: usize,
+    legacy_active: Option<usize>,
+    referenced: &BTreeSet<String>,
+) -> Vec<usize> {
     let is_referenced = |index: &usize| referenced.contains(&layers[*index].name);
+    let is_active = |index: &usize| Some(*index) == legacy_active;
     let others = (0..layers.len()).filter(|index| *index != render);
     let mut order: Vec<usize> = std::iter::once(render)
         .chain(others.clone().filter(is_referenced))
-        .chain(others.filter(|index| !is_referenced(index)))
+        .chain(
+            others
+                .clone()
+                .filter(|index| is_active(index) && !is_referenced(index)),
+        )
+        .chain(others.filter(|index| !is_referenced(index) && !is_active(index)))
         .take(MAX_LAYERS)
         .collect();
     order.sort_unstable();
@@ -942,6 +953,44 @@ mod tests {
             .collect();
         assert_eq!(names, ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L8"]);
         assert_eq!(store.render.as_deref(), Some("L0"));
+    }
+
+    /// Eight Blender layers, with `L7` active, and a distinct `uv_map` render layer. The active
+    /// layer outranks ordinary source order under the layer limit; stored layers remain ordered.
+    #[test]
+    fn active_layer_outranks_original_order_under_the_limit() {
+        let mesh = two_triangles();
+        let face = mesh.faces[0].id;
+        let mut value = serde_json::to_value(&mesh).expect("mesh json");
+        let blender: Vec<Value> = (0..8)
+            .map(|index| {
+                json!({"name": format!("L{index}"), "active": index == 7, "values": [
+                    [0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0], [0.5, 0.5], [0.25, 0.75]
+                ]})
+            })
+            .collect();
+        value["attributes"] = json!({
+            "blender_uv_layers": blender,
+            "uv_map": [{"face_id": face, "layer": "Render", "uv": [
+                [0.1, 0.1], [0.2, 0.2], [0.3, 0.3]
+            ]}]
+        });
+
+        let warnings = upgrade_mesh_v1(&mut value, "mesh", &BTreeSet::new());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0]["code"], "uv.legacy_layer_dropped");
+        assert_eq!(warnings[0]["layer"], "L6");
+
+        let upgraded: Mesh = serde_json::from_value(value).expect("upgraded mesh parses");
+        let store = read(&upgraded);
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
+        assert_eq!(names, ["L0", "L1", "L2", "L3", "L4", "L5", "L7", "Render"]);
+        assert_eq!(store.active.as_deref(), Some("L7"));
+        assert_eq!(store.render.as_deref(), Some("Render"));
     }
 
     /// Pins of the wrong length are dropped while the row's UVs are kept, and a later row for the

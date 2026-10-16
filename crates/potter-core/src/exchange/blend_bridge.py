@@ -2858,15 +2858,71 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
     return socket_map
 
 
+def _encode_gltf_normal_map_handedness(nodes, links, normal_name):
+    # glTF/Potter tangent V points down; Blender's Normal Map node uses V-up, so G becomes 1-G.
+    color_links = [link for link in links
+                   if link.get("to_node") == normal_name
+                   and link.get("to_socket") == "Color"]
+    if len(color_links) != 1:
+        raise ValueError("imported glTF Normal Map must have one Color input")
+    source = color_links[0]
+    links.remove(source)
+    used_names = {node["name"] for node in nodes}
+
+    def unique_name(base):
+        name = base
+        index = 1
+        while name in used_names:
+            name = "%s_%d" % (base, index)
+            index += 1
+        used_names.add(name)
+        return name
+
+    multiply_name = unique_name("Potter GLTF Normal Green Multiply")
+    add_name = unique_name("Potter GLTF Normal Green Add")
+    normal_node = next(node for node in nodes if node["name"] == normal_name)
+    location = normal_node.get("location", [0.0, 0.0])
+    try:
+        x, y = float(location[0]), float(location[1])
+    except (IndexError, TypeError, ValueError):
+        x, y = 0.0, 0.0
+    nodes.extend([
+        {"name": multiply_name, "potter_id": None, "type": "ShaderNodeVectorMath",
+         "location": [x - 180.0, y], "properties": {"operation": "MULTIPLY"},
+         "custom_properties": {},
+         "inputs": [{"identifier": "Vector_001", "name": "Vector_001",
+                     "default": [1.0, -1.0, 1.0]}]},
+        {"name": add_name, "potter_id": None, "type": "ShaderNodeVectorMath",
+         "location": [x - 90.0, y], "properties": {"operation": "ADD"},
+         "custom_properties": {},
+         "inputs": [{"identifier": "Vector_001", "name": "Vector_001",
+                     "default": [0.0, 1.0, 0.0]}]},
+    ])
+    links.extend([
+        {"from_node": source["from_node"], "from_socket": source["from_socket"],
+         "to_node": multiply_name, "to_socket": "Vector"},
+        {"from_node": multiply_name, "from_socket": "Vector",
+         "to_node": add_name, "to_socket": "Vector"},
+        {"from_node": add_name, "from_socket": "Vector",
+         "to_node": normal_name, "to_socket": "Color"},
+    ])
+
+
 def _model_group_tree(group):
     tree_type = {"geometry": "GeometryNodeTree", "shader": "ShaderNodeTree",
                  "compositor": "CompositorNodeTree"}.get(group.get("kind"), "")
     node_names = {identifier: node.get("name", identifier)
                   for identifier, node in group.get("nodes", {}).items()}
     nodes = []
+    imported_normal_nodes = []
     for identifier, node in group.get("nodes", {}).items():
         properties = dict(node.get("properties", {}))
         custom_properties = properties.pop("_blender_custom_properties", {})
+        imported_normal_map = properties.pop("potter_gltf_imported_normal_map", False) is True
+        if imported_normal_map:
+            if node.get("type") != "ShaderNodeNormalMap":
+                raise ValueError("glTF normal-map metadata is on a non-Normal Map node")
+            imported_normal_nodes.append(node_names[identifier])
         nodes.append({
             "name": node_names[identifier],
             "potter_id": identifier,
@@ -2890,6 +2946,8 @@ def _model_group_tree(group):
             "to_node": to_node,
             "to_socket": link.get("to_socket", ""),
         })
+    for normal_name in imported_normal_nodes:
+        _encode_gltf_normal_map_handedness(nodes, links, normal_name)
     return {
         "name": group.get("name"),
         "type": tree_type,

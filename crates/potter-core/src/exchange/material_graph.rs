@@ -482,6 +482,148 @@ fn connect(
     Ok(())
 }
 
+/// Restores the internal glTF tangent-frame marker from the exact green-flip graph emitted by the
+/// Blender bridge. The graph uses standard Blender nodes; this keeps Potter's V-down representation
+/// canonical after a `.blend` round trip.
+pub(crate) fn restore_gltf_normal_map_handedness(group: &mut NodeGroup) {
+    if group.kind != GraphKind::Shader {
+        return;
+    }
+    let mut restored = Vec::new();
+    for (normal_id, normal) in &group.nodes {
+        if normal.node_type != "ShaderNodeNormalMap" {
+            continue;
+        }
+        let Some(color_link) = only_link(&group.links, |link| {
+            link.to_node == *normal_id && link.to_socket == "Color"
+        }) else {
+            continue;
+        };
+        let add_id = color_link.from_node.clone();
+        let Some(add) = group.nodes.get(&add_id) else {
+            continue;
+        };
+        // Only collapse the bridge's named helpers; user-authored vector math remains untouched.
+        if !add.name.starts_with("Potter GLTF Normal Green Add")
+            || !is_vector_math(add, "ADD", [0.0, 1.0, 0.0])
+            || group
+                .links
+                .iter()
+                .filter(|link| link.to_node == add_id)
+                .count()
+                != 1
+            || group
+                .links
+                .iter()
+                .filter(|link| link.from_node == add_id)
+                .count()
+                != 1
+        {
+            continue;
+        }
+        let Some(multiply_link) = only_link(&group.links, |link| {
+            link.to_node == add_id && link.to_socket == "Vector"
+        }) else {
+            continue;
+        };
+        let multiply_id = multiply_link.from_node.clone();
+        let Some(multiply) = group.nodes.get(&multiply_id) else {
+            continue;
+        };
+        if !multiply
+            .name
+            .starts_with("Potter GLTF Normal Green Multiply")
+            || !is_vector_math(multiply, "MULTIPLY", [1.0, -1.0, 1.0])
+            || group
+                .links
+                .iter()
+                .filter(|link| link.to_node == multiply_id)
+                .count()
+                != 1
+            || group
+                .links
+                .iter()
+                .filter(|link| link.from_node == multiply_id)
+                .count()
+                != 1
+        {
+            continue;
+        }
+        let Some(source_link) = only_link(&group.links, |link| {
+            link.to_node == multiply_id && link.to_socket == "Vector"
+        }) else {
+            continue;
+        };
+        let source_id = source_link.from_node.clone();
+        if source_link.from_socket != "Color"
+            || group
+                .nodes
+                .get(&source_id)
+                .is_none_or(|source| source.node_type != "ShaderNodeTexImage")
+        {
+            continue;
+        }
+        restored.push((
+            normal_id.clone(),
+            add_id,
+            multiply_id,
+            GraphLink {
+                from_node: source_id,
+                from_socket: source_link.from_socket.clone(),
+                to_node: normal_id.clone(),
+                to_socket: "Color".to_owned(),
+            },
+        ));
+    }
+    if restored.is_empty() {
+        return;
+    }
+    let mut removed = std::collections::BTreeSet::new();
+    let mut links = Vec::with_capacity(restored.len());
+    for (normal_id, add_id, multiply_id, link) in restored {
+        removed.insert(add_id);
+        removed.insert(multiply_id);
+        if let Some(normal) = group.nodes.get_mut(&normal_id) {
+            normal
+                .properties
+                .insert("potter_gltf_imported_normal_map".to_owned(), json!(true));
+        }
+        links.push(link);
+    }
+    group
+        .links
+        .retain(|link| !removed.contains(&link.from_node) && !removed.contains(&link.to_node));
+    for node_id in &removed {
+        group.nodes.remove(node_id);
+    }
+    group.links.extend(links);
+}
+
+fn only_link<'a>(
+    links: &'a [GraphLink],
+    predicate: impl Fn(&GraphLink) -> bool,
+) -> Option<&'a GraphLink> {
+    let mut matching = links.iter().filter(|link| predicate(link));
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+fn is_vector_math(node: &GraphNode, operation: &str, second: [f64; 3]) -> bool {
+    node.node_type == "ShaderNodeVectorMath"
+        && node.properties.get("operation").and_then(Value::as_str) == Some(operation)
+        && node
+            .inputs
+            .get("Vector_001")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values.len() == second.len()
+                    && values
+                        .iter()
+                        .zip(second)
+                        .all(|(value, expected)| value.as_f64() == Some(expected))
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

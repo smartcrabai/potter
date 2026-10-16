@@ -431,6 +431,140 @@ fn cache_writes_named_layers_past_the_first_and_reports_the_one_without_room() -
 }
 
 #[test]
+fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> TestResult {
+    let directory = tempdir()?;
+    let source_scene = directory.path().join("source.pot");
+    scene_with_cache(&source_scene, vec![cache_modifier(&["VERT", "POLY", "UV"])])?;
+    let project = potter_core::store::Project::open(&source_scene)?;
+    let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
+        project.doc(),
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+        Some(project.path()),
+    )?;
+    let mut receiver = snapshot
+        .meshes
+        .get(&potter_core::model::Id::new("body")?)
+        .ok_or("cache source mesh is missing")?
+        .clone();
+    let source_faces: Vec<Vec<u32>> = receiver
+        .faces
+        .iter()
+        .map(|face| face.vertices.clone())
+        .collect();
+    let source_vertex_count = receiver.vertices.len();
+    let source_face_count = receiver.faces.len();
+    let source_corner_count = receiver
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .sum::<usize>();
+    for face in &mut receiver.faces {
+        face.vertices.rotate_left(1);
+    }
+    let receiver_faces: Vec<Vec<u32>> = receiver
+        .faces
+        .iter()
+        .map(|face| face.vertices.clone())
+        .collect();
+    assert_eq!(receiver.vertices.len(), source_vertex_count);
+    assert_eq!(receiver.faces.len(), source_face_count);
+    assert_eq!(
+        receiver
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>(),
+        source_corner_count
+    );
+    assert_ne!(
+        receiver_faces, source_faces,
+        "test receiver must differ from the cache's face-corner connectivity"
+    );
+
+    let corner_counts: Vec<usize> = receiver
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .collect();
+    let uv_store = receiver
+        .attributes
+        .get_mut("uv_layers")
+        .ok_or("cache source mesh has no UV store")?;
+    let uv_layers = uv_store
+        .get_mut("layers")
+        .and_then(Value::as_array_mut)
+        .ok_or("cache source UV store has no layers")?;
+    for uv_layer in uv_layers {
+        let rows = uv_layer
+            .get_mut("faces")
+            .and_then(Value::as_array_mut)
+            .ok_or("cache source UV layer has no face rows")?;
+        assert_eq!(rows.len(), corner_counts.len());
+        for (row, corner_count) in rows.iter_mut().zip(&corner_counts) {
+            let uv = row
+                .get_mut("uv")
+                .and_then(Value::as_array_mut)
+                .ok_or("cache source UV row has no corners")?;
+            assert_eq!(uv.len(), *corner_count);
+            uv.rotate_left(1);
+            if let Some(pinned) = row.get_mut("pinned") {
+                let pinned = pinned
+                    .as_array_mut()
+                    .ok_or("cache source UV pins are not an array")?;
+                assert_eq!(pinned.len(), *corner_count);
+                pinned.rotate_left(1);
+            }
+        }
+    }
+    let input_layers = layers(
+        receiver
+            .attributes
+            .get("uv_layers")
+            .ok_or("receiver UV store is missing")?,
+    )?;
+    let expected_corner_positions = receiver
+        .faces
+        .iter()
+        .flat_map(|face| &face.vertices)
+        .map(|id| -> TestResult<[f64; 3]> {
+            receiver
+                .vertices
+                .iter()
+                .find(|vertex| vertex.id == *id)
+                .map(|vertex| vertex.co.to_array())
+                .ok_or_else(|| "receiver face references a missing vertex".into())
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+
+    let receiver_scene = directory.path().join("receiver.pot");
+    scene_with_cache(&receiver_scene, vec![cache_modifier(&["VERT"])])?;
+    replace_body_mesh(&receiver_scene, &receiver)?;
+    let evaluated = evaluate_body(&receiver_scene)?;
+    assert_eq!(evaluated.corner_positions, expected_corner_positions);
+    let output_layers = layers(&evaluated.store)?;
+    assert_eq!(layer_names(&output_layers), layer_names(&input_layers));
+    for (name, input_uvs) in &input_layers {
+        assert_corners(layer(&output_layers, name)?, input_uvs, name);
+        let expected = expected_corner_positions
+            .iter()
+            .copied()
+            .zip(input_uvs.iter().copied())
+            .collect::<Vec<_>>();
+        assert_corner_associations(
+            &evaluated.corner_positions,
+            layer(&output_layers, name)?,
+            &expected,
+            name,
+        );
+    }
+    assert!(evaluated.warnings.is_empty(), "{:?}", evaluated.warnings);
+    Ok(())
+}
+
+#[test]
 fn topology_change_reloads_uvs_for_same_count_corner_reorder() -> TestResult {
     let directory = tempdir()?;
     let scene = directory.path().join("reordered.pot");

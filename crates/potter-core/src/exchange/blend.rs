@@ -2784,6 +2784,9 @@ fn import_node_groups(
                 to_socket: string_field(raw_link, "to_socket")?.to_owned(),
             });
         }
+        if kind == GraphKind::Shader {
+            super::material_graph::restore_gltf_normal_map_handedness(&mut group);
+        }
         doc.node_groups.insert(group_id, group);
     }
     Ok(group_ids)
@@ -7690,6 +7693,232 @@ mod tests {
                     .any(|node| node.node_type == "OutputMaterial")
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_preserves_gltf_normal_handedness_and_emissive_transform() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let image_path = directory.path().join("normal.png");
+        let image_bytes = {
+            let mut bytes = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                let mut writer = encoder
+                    .write_header()
+                    .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
+                writer
+                    .write_image_data(&[128, 192, 230, 255])
+                    .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
+            }
+            bytes
+        };
+        fs::write(&image_path, &image_bytes).map_err(|error| PotError::io(&error))?;
+        let image_id = Id::new("normal_image")?;
+        let material_id = Id::new("normal_mat")?;
+        let initial = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let applied = crate::ops::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {"op": "material.create", "id": "normal_mat", "name": "Normal and Emission",
+                     "emission_color": [0.5, 0.5, 0.5], "emission_strength": 0.75},
+                    {"op": "node.create", "id": "body", "kind": "box",
+                     "params": {"size": 1.0}, "material": "normal_mat"}
+                ]
+            }),
+        )?;
+        let mut doc = applied.doc;
+        doc.images.insert(
+            image_id.clone(),
+            Image {
+                name: "Normal Texture".to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::NonColor,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(image_path.to_string_lossy().into_owned()),
+                source_hash: Some(crate::hash::sha256(&image_bytes)),
+                alpha_mode: ImageAlphaMode::Straight,
+            },
+        );
+        let texture = |uv_layer: &str| crate::model::TextureRef {
+            image: image_id.clone(),
+            uv_layer: Some(uv_layer.to_owned()),
+            interpolation: crate::image::ImageInterpolation::Linear,
+        };
+        crate::exchange::material_graph::move_textures_to_graph(
+            &mut doc,
+            &material_id,
+            &crate::exchange::material_graph::GraphTextures {
+                base_color: None,
+                metallic_roughness: None,
+                normal: Some(crate::exchange::material_graph::SlotTexture {
+                    texture: texture("Detail"),
+                    transform: None,
+                }),
+                normal_scale: 0.65,
+                emissive: Some(crate::exchange::material_graph::SlotTexture {
+                    texture: texture("UVMap"),
+                    transform: Some(crate::exchange::material_surface::TextureTransform {
+                        offset: [0.25, 0.5],
+                        rotation: 0.0,
+                        scale: [2.0, 3.0],
+                    }),
+                }),
+                occlusion: None,
+            },
+        )?;
+
+        let image_data = BTreeMap::from([(
+            image_id.as_str().to_owned(),
+            crate::image::ImageData {
+                width: 1,
+                height: 1,
+                pixels: vec![[128.0 / 255.0, 192.0 / 255.0, 230.0 / 255.0, 1.0]],
+                tiles: BTreeMap::new(),
+                interpolation: crate::image::ImageInterpolation::Linear,
+            },
+        )]);
+        let layer_names = ["UVMap".to_owned(), "Detail".to_owned()];
+        let layer_corners = [
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            [[0.0, 0.0], [0.2, 0.9], [0.8, 0.2]],
+        ];
+        let hit_layers = crate::shader::HitUvLayers {
+            names: &layer_names,
+            corners: &layer_corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [0.3, 0.3, 0.4],
+            render: Some(0),
+            available_mask: None,
+        };
+        let source_material = doc
+            .materials
+            .get(&material_id)
+            .ok_or_else(|| invalid_intermediate("source material is missing"))?;
+        let source_normal = crate::shader::evaluate_surface(
+            source_material,
+            &crate::shader::HitContext::new(&doc.node_groups)
+                .with_images(&image_data)
+                .with_uv_layers(hit_layers),
+        )?
+        .normal;
+
+        let project = Project::init(directory.path().join("project"))?;
+        let output = directory.path().join("normal-handedness.blend");
+        let context = crate::eval::EvaluationContext::default();
+        export_blend(
+            &doc,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let imported = import_blend(&output, Some(&blender))?;
+        let imported_material = imported
+            .doc
+            .materials
+            .get(&material_id)
+            .ok_or_else(|| invalid_intermediate("round-trip material is missing"))?;
+        let graph_id = imported_material
+            .node_tree
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("round-trip shader graph is missing"))?;
+        let graph = imported
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or_else(|| invalid_intermediate("round-trip shader graph is missing"))?;
+        let normal_map = graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeNormalMap")
+            .ok_or_else(|| invalid_intermediate("round-trip Normal Map node is missing"))?;
+        assert_eq!(
+            normal_map.properties.get("potter_gltf_imported_normal_map"),
+            Some(&json!(true))
+        );
+        assert_eq!(normal_map.properties.get("uv_map"), Some(&json!("Detail")));
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.node_type == "ShaderNodeMapping")
+        );
+        let (mapping_id, mapping) = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| node.node_type == "ShaderNodeMapping")
+            .ok_or_else(|| invalid_intermediate("emissive texture mapping is missing"))?;
+        assert_eq!(
+            mapping.inputs.get("Location"),
+            Some(&json!([0.25, -2.5, 0.0]))
+        );
+        assert_eq!(mapping.inputs.get("Scale"), Some(&json!([2.0, 3.0, 1.0])));
+        let emissive_texture_id = graph
+            .links
+            .iter()
+            .find(|link| {
+                &link.from_node == mapping_id
+                    && link.from_socket == "Vector"
+                    && link.to_socket == "Vector"
+            })
+            .map(|link| &link.to_node)
+            .ok_or_else(|| invalid_intermediate("emissive Mapping link is missing"))?;
+        let emissive_texture = graph
+            .nodes
+            .get(emissive_texture_id)
+            .ok_or_else(|| invalid_intermediate("emissive Image Texture node is missing"))?;
+        assert_eq!(emissive_texture.node_type, "ShaderNodeTexImage");
+        let (principled_id, _) = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| node.node_type == "ShaderNodeBsdfPrincipled")
+            .ok_or_else(|| invalid_intermediate("Principled BSDF node is missing"))?;
+        assert!(graph.links.iter().any(|link| {
+            &link.from_node == mapping_id
+                && link.from_socket == "Vector"
+                && &link.to_node == emissive_texture_id
+                && link.to_socket == "Vector"
+        }));
+        assert!(graph.links.iter().any(|link| {
+            &link.from_node == emissive_texture_id
+                && link.from_socket == "Color"
+                && &link.to_node == principled_id
+                && link.to_socket == "Emission Color"
+        }));
+        assert!(
+            !graph
+                .nodes
+                .values()
+                .any(|node| node.node_type == "ShaderNodeVectorMath"),
+            "Blender-only green conversion nodes should collapse to the canonical glTF marker"
+        );
+        let roundtrip_normal = crate::shader::evaluate_surface(
+            imported_material,
+            &crate::shader::HitContext::new(&imported.doc.node_groups)
+                .with_images(&image_data)
+                .with_uv_layers(hit_layers),
+        )?
+        .normal;
+        assert!(
+            source_normal.distance(roundtrip_normal) <= 1.0e-12,
+            "normal direction changed across .blend round-trip: {source_normal:?} != {roundtrip_normal:?}"
+        );
         Ok(())
     }
 

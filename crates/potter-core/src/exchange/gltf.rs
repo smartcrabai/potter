@@ -8026,10 +8026,6 @@ fn read_accessor_values(
                     read_accessor_component(raw, component_type, normalized)?;
             }
         }
-    } else if sparse.is_none() {
-        return Err(import_error(
-            "glTF accessor needs a bufferView or sparse values",
-        ));
     }
 
     if let Some(sparse) = sparse {
@@ -8912,6 +8908,15 @@ mod tests {
         result: std::result::Result<T, E>,
     ) -> std::result::Result<T, TestCaseError> {
         result.map_err(|error| TestCaseError::fail(error.to_string()))
+    }
+
+    #[test]
+    fn read_vec2_defaults_missing_buffer_view_to_zero() -> TestResult {
+        let document = json!({
+            "accessors": [{ "componentType": 5126, "count": 3, "type": "VEC2" }]
+        });
+        assert_eq!(super::read_vec2(&document, &[], 0)?, vec![[0.0, 0.0]; 3]);
+        Ok(())
     }
 
     proptest! {
@@ -11591,6 +11596,62 @@ mod tests {
         let normalized_uvs = values(2);
         assert!(normalized_uvs.contains(&[0.0, 1.0]));
         assert!(normalized_uvs.contains(&[32_768.0 / 65_535.0, 16_384.0 / 65_535.0]));
+        Ok(())
+    }
+
+    #[test]
+    fn higher_texcoord_without_storage_imports_zero_uv_rows() -> TestResult {
+        let doc = scene(&json!([
+            {"op":"node.create","id":"plane","kind":"plane","params":{"size":2.0}},
+            {"op":"uv.unwrap","target":{"id":"plane"},"method":"smart"}
+        ]))?;
+        let imported = import_edited(&doc, |root, _| {
+            let position_accessor = usize::try_from(
+                root["meshes"][0]["primitives"][0]["attributes"]["POSITION"]
+                    .as_u64()
+                    .ok_or("POSITION accessor is missing")?,
+            )?;
+            let count = root["accessors"][position_accessor]["count"]
+                .as_u64()
+                .ok_or("POSITION count is missing")?;
+            let accessor = {
+                let accessors = root["accessors"]
+                    .as_array_mut()
+                    .ok_or("accessors are missing")?;
+                let index = accessors.len();
+                accessors.push(json!({
+                    "componentType": 5126,
+                    "count": count,
+                    "type": "VEC2"
+                }));
+                index
+            };
+            root["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_1"] = json!(accessor);
+            Ok(())
+        })??;
+
+        let mesh = first_mesh(&imported.doc)?;
+        let layers = uv_layers::read_layers(mesh);
+        let layer = layers
+            .iter()
+            .find(|layer| layer.name == "UVMap.001")
+            .ok_or("zero-filled TEXCOORD_1 did not create UVMap.001")?;
+        assert_eq!(layer.faces.len(), mesh.faces.len());
+        let mut corner_count = 0;
+        for (row, face) in layer.faces.iter().zip(&mesh.faces) {
+            let row = row.as_ref().ok_or("TEXCOORD_1 face row is missing")?;
+            assert_eq!(row.len(), face.vertices.len());
+            assert!(row.iter().all(|uv| *uv == [0.0, 0.0]));
+            corner_count += row.len();
+        }
+        assert_eq!(
+            corner_count,
+            mesh.faces
+                .iter()
+                .map(|face| face.vertices.len())
+                .sum::<usize>()
+        );
+        assert!(corner_count > 0, "fixture must exercise real UV corners");
         Ok(())
     }
 
