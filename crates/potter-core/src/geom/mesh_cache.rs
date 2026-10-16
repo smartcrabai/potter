@@ -263,9 +263,11 @@ fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
 }
 
 /// Writes each cached UV layer into the layer its name gives, creating the layer when the mesh
-/// lacks it. A layer's values are replaced; its pins and the other layers are kept. A cached layer
-/// with no room left under the mesh limit is reported and not written. The active and render names
-/// keep their layers while those exist; otherwise they name the first layer the cache wrote.
+/// lacks it. Alembic UV face-corner rows are reversed into Potter mesh-loop order whether or not
+/// cache polygons replace the input faces. A layer's values are replaced; its pins and the other
+/// layers are kept. A cached layer with no room left under the mesh limit is reported and not
+/// written. The active and render names keep their layers while those exist; otherwise they name
+/// the first layer the cache wrote.
 fn write_cache_uvs(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -295,7 +297,7 @@ fn write_cache_uvs(
         layer.faces = cached_layer
             .corners
             .iter()
-            .map(|corners| Some(corners.clone()))
+            .map(|corners| Some(corners.iter().rev().copied().collect()))
             .collect();
         if first_written.is_none() {
             first_written = Some(cached_layer.name.clone());

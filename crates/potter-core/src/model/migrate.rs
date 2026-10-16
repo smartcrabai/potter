@@ -359,7 +359,7 @@ mod tests {
         let current = SceneDoc::new(uuid::Uuid::new_v4().to_string());
         let parsed = parse_scene(&serde_json::to_vec(&serde_json::to_value(current)?)?)?;
         assert!(!parsed.legacy);
-        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.warnings, Vec::<Value>::new());
         Ok(())
     }
 

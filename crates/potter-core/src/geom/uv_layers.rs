@@ -77,38 +77,6 @@ impl UvStore {
     }
 }
 
-/// Resolves Blender's empty UV-layer selector to the mesh's active layer.
-pub(crate) fn selected_layer_name<'a>(mesh: &'a Mesh, requested: &'a str) -> &'a str {
-    if !requested.is_empty() {
-        return requested;
-    }
-    let layers = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array);
-    layers
-        .and_then(|layers| {
-            layers.iter().find_map(|layer| {
-                (layer.get("active").and_then(Value::as_bool) == Some(true))
-                    .then(|| layer.get("name").and_then(Value::as_str))
-                    .flatten()
-            })
-        })
-        .or_else(|| {
-            layers
-                .and_then(|layers| layers.first())
-                .and_then(|layer| layer.get("name").and_then(Value::as_str))
-        })
-        .or_else(|| {
-            mesh.attributes
-                .get("uv_map")
-                .and_then(Value::as_array)
-                .and_then(|entries| entries.first())
-                .map(uv_map_entry_layer)
-        })
-        .unwrap_or("UVMap")
-}
-
 /// Whether `mesh` stores any UV layer.
 pub(crate) fn has_uv_layers(mesh: &Mesh) -> bool {
     layer_count(mesh) > 0
@@ -528,12 +496,11 @@ pub(crate) fn upgrade_mesh_v1(
         }
         render.get_or_insert_with(|| name.to_owned());
         names.insert(name.to_owned());
-        let position = match layers.iter().position(|layer| layer.name == name) {
-            Some(position) => position,
-            None => {
-                layers.push(UvLayer::new(name, vec![None; faces.len()]));
-                layers.len() - 1
-            }
+        let position = if let Some(position) = layers.iter().position(|layer| layer.name == name) {
+            position
+        } else {
+            layers.push(UvLayer::new(name, vec![None; faces.len()]));
+            layers.len() - 1
         };
         let Some(face_id) = face_id else {
             warnings.push(skipped_row(
@@ -682,10 +649,15 @@ pub(crate) fn upgrade_mesh_v1(
 }
 
 /// A `uv.legacy_layer_skipped` warning for a version-1 Blender layer (or layer entry).
-fn skipped_layer(mesh_id: &str, layer: Option<&str>, reason: &str, message: String) -> Value {
+fn skipped_layer(
+    mesh_id: &str,
+    layer: Option<&str>,
+    reason: &str,
+    message: impl Into<String>,
+) -> Value {
     json!({
         "code": "uv.legacy_layer_skipped",
-        "message": message,
+        "message": message.into(),
         "mesh": mesh_id,
         "layer": layer,
         "reason": reason,
@@ -698,11 +670,11 @@ fn skipped_row(
     layer: Option<&str>,
     face_id: Option<u64>,
     reason: &str,
-    message: String,
+    message: impl Into<String>,
 ) -> Value {
     json!({
         "code": "uv.legacy_row_skipped",
-        "message": message,
+        "message": message.into(),
         "mesh": mesh_id,
         "layer": layer,
         "face_id": face_id,
@@ -990,27 +962,5 @@ mod tests {
             Some(vec![[0.4, 0.4], [0.5, 0.5], [0.6, 0.6]])
         );
         assert_eq!(store.layers[0].pinned[0], Some(vec![true, false, true]));
-    }
-}
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::selected_layer_name;
-    use crate::geom::Mesh;
-
-    #[test]
-    fn empty_selector_uses_active_uv_layer() {
-        let mut mesh = Mesh::default();
-        mesh.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            json!([
-                {"name":"First", "active":false, "values":[]},
-                {"name":"Active", "active":true, "values":[]}
-            ]),
-        );
-
-        assert_eq!(selected_layer_name(&mesh, ""), "Active");
-        assert_eq!(selected_layer_name(&mesh, "Explicit"), "Explicit");
     }
 }

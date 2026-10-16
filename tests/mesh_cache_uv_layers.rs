@@ -1,12 +1,8 @@
-//! Mesh Sequence Cache reads every UV parameter of a cached Alembic PolyMesh into the layer its
-//! `sourceName` names, as Blender does.
+//! Mesh Sequence Cache reads every UV geom parameter into the layer its `sourceName` names.
 //!
-//! The fixture `fixtures/mesh_cache_uv/two_layers.abc` is Blender 5.2.2's Alembic export of a plane
-//! with two UV layers: `Base` (render) and `Light` (active). Blender writes the active layer as the
-//! canonical `uv` parameter and `Base` as a named `.arbGeomParams` parameter. `generate.py` in that
-//! directory writes the file. Blender's loop `i` holds `Base` = `(0.1 i, 0.05 i)` and `Light` =
-//! `(0.5 + 0.1 i, 0.05 i)`, in V up. Potter stores V down and runs each face in reverse file order,
-//! so corner `k` of the stored face is file corner `3 - k`.
+//! `fixtures/mesh_cache_uv/two_layers.abc` is a Blender 5.2.2 export with asymmetric UVs that
+//! identify every loop. The expected UVs are matched to Blender's cache-evaluated corner positions,
+//! not to a presumed file or face order. Blender stores V up; Potter stores V down.
 
 use std::{
     error::Error,
@@ -20,10 +16,20 @@ use tempfile::tempdir;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// Blender's `Base` values in Potter's stored order (V down).
-const BASE: [[f64; 2]; 4] = [[0.3, 0.85], [0.2, 0.9], [0.1, 0.95], [0.0, 1.0]];
-/// Blender's `Light` values in Potter's stored order (V down).
-const LIGHT: [[f64; 2]; 4] = [[0.8, 0.85], [0.7, 0.9], [0.6, 0.95], [0.5, 1.0]];
+/// Blender 5.2.2 cache corners paired with evaluated positions, converted to Potter's V-down UVs.
+type ExpectedCorner = ([f64; 3], [f64; 2]);
+const BASE_CORNERS: [ExpectedCorner; 4] = [
+    ([-1.0, -1.0, 0.0], [0.137, 0.777]),
+    ([1.0, -1.0, 0.0], [0.619, 0.643]),
+    ([1.0, 1.0, 0.0], [0.283, 0.119]),
+    ([-1.0, 1.0, 0.0], [0.947, 0.431]),
+];
+const LIGHT_CORNERS: [ExpectedCorner; 4] = [
+    ([-1.0, -1.0, 0.0], [0.731, 0.837]),
+    ([1.0, -1.0, 0.0], [0.194, 0.093]),
+    ([1.0, 1.0, 0.0], [0.853, 0.579]),
+    ([-1.0, 1.0, 0.0], [0.367, 0.311]),
+];
 /// Float32 storage tolerance for the Alembic values.
 const TOLERANCE: f64 = 1.0e-6;
 
@@ -51,7 +57,7 @@ fn init(scene: &Path) -> TestResult {
     Ok(())
 }
 
-fn apply(scene: &Path, operations: Value) -> TestResult {
+fn apply(scene: &Path, operations: &Value) -> TestResult {
     let document_path = scene.join("scene.json");
     let document: Value = serde_json::from_slice(&fs::read(&document_path)?)?;
     let batch = scene.with_extension("uv-layer-ops.json");
@@ -83,7 +89,7 @@ fn scene_with_cache(scene: &Path, operations: Vec<Value>) -> TestResult {
         json!({"op":"resource.pack","id":"cache","uri":fixture(),"kind":"alembic"}),
     ];
     batch.extend(operations);
-    apply(scene, Value::Array(batch))?;
+    apply(scene, &Value::Array(batch))?;
 
     let archive = fs::read(fixture())?;
     let archive_hash = potter_core::hash::sha256(&archive);
@@ -121,9 +127,10 @@ fn layer_op(op: &str, name: &str) -> Value {
     json!({"op":op, "target":{"id":"body"}, "name":name})
 }
 
-/// The `uv_layers` store of the evaluated `body` mesh, and the warnings its evaluation reported.
+/// The evaluated `uv_layers` store, per-face-corner positions, and evaluation warnings.
 struct Evaluated {
     store: Value,
+    corner_positions: Vec<[f64; 3]>,
     warnings: Vec<Value>,
 }
 
@@ -139,15 +146,28 @@ fn evaluate_body(scene: &Path) -> TestResult<Evaluated> {
     )?;
     let mesh = snapshot
         .meshes
-        .values()
-        .next()
-        .ok_or("evaluated mesh is missing")?;
+        .get(&potter_core::model::Id::new("body")?)
+        .ok_or("evaluated body mesh is missing")?;
+    let corner_positions = mesh
+        .faces
+        .iter()
+        .flat_map(|face| &face.vertices)
+        .map(|id| -> TestResult<_> {
+            let vertex = mesh
+                .vertices
+                .iter()
+                .find(|vertex| vertex.id == *id)
+                .ok_or("evaluated face vertex is missing")?;
+            Ok(vertex.co.to_array())
+        })
+        .collect::<TestResult<Vec<_>>>()?;
     Ok(Evaluated {
         store: mesh
             .attributes
             .get("uv_layers")
             .cloned()
             .unwrap_or(Value::Null),
+        corner_positions,
         warnings: snapshot
             .warnings
             .iter()
@@ -224,19 +244,68 @@ fn assert_corners(actual: &[[f64; 2]], expected: &[[f64; 2]], label: &str) {
         }
     }
 }
+fn assert_corner_associations(
+    positions: &[[f64; 3]],
+    uvs: &[[f64; 2]],
+    expected: &[ExpectedCorner],
+    label: &str,
+) {
+    assert_eq!(positions.len(), uvs.len(), "{label}: corner count");
+    assert_eq!(
+        positions.len(),
+        expected.len(),
+        "{label}: oracle corner count"
+    );
+    let mut unmatched = expected.to_vec();
+    for (position, uv) in positions.iter().zip(uvs) {
+        let Some(index) = unmatched
+            .iter()
+            .position(|(expected_position, expected_uv)| {
+                expected_position
+                    .iter()
+                    .zip(position)
+                    .all(|(expected, actual)| (expected - actual).abs() <= TOLERANCE)
+                    && expected_uv
+                        .iter()
+                        .zip(uv)
+                        .all(|(expected, actual)| (expected - actual).abs() <= TOLERANCE)
+            })
+        else {
+            panic!(
+                "{label}: no Blender cache UV {uv:?} at corner position {position:?}; actual corner sequence: {:?}",
+                positions.iter().zip(uvs).collect::<Vec<_>>()
+            );
+        };
+        unmatched.swap_remove(index);
+    }
+    assert!(
+        unmatched.is_empty(),
+        "{label}: unmatched Blender cache corners"
+    );
+}
 
 #[test]
 fn cache_restores_every_uv_parameter_into_the_layer_it_names() -> TestResult {
     let temporary = tempdir()?;
     let scene = temporary.path().join("scene.pot");
     scene_with_cache(&scene, Vec::new())?;
-    apply(&scene, json!([cache_modifier(&["VERT", "POLY", "UV"])]))?;
+    apply(&scene, &json!([cache_modifier(&["VERT", "POLY", "UV"])]))?;
 
     let evaluated = evaluate_body(&scene)?;
     let layers = layers(&evaluated.store)?;
     assert_eq!(layer_names(&layers), ["Light", "Base"]);
-    assert_corners(layer(&layers, "Light")?, &LIGHT, "Light");
-    assert_corners(layer(&layers, "Base")?, &BASE, "Base");
+    assert_corner_associations(
+        &evaluated.corner_positions,
+        layer(&layers, "Light")?,
+        &LIGHT_CORNERS,
+        "Light",
+    );
+    assert_corner_associations(
+        &evaluated.corner_positions,
+        layer(&layers, "Base")?,
+        &BASE_CORNERS,
+        "Base",
+    );
     // The first cached layer, in file order, is the active and render layer, as in Blender.
     assert_eq!(evaluated.store["active"], json!("Light"));
     assert_eq!(evaluated.store["render"], json!("Light"));
@@ -258,15 +327,25 @@ fn cache_keeps_mesh_layers_it_does_not_name_and_keeps_selectors() -> TestResult 
         ],
     )?;
     let before = evaluate_body(&scene)?;
-    apply(&scene, json!([cache_modifier(&["VERT", "POLY", "UV"])]))?;
+    apply(&scene, &json!([cache_modifier(&["VERT", "POLY", "UV"])]))?;
     let after = evaluate_body(&scene)?;
 
     let before_layers = layers(&before.store)?;
     let after_layers = layers(&after.store)?;
     assert_eq!(layer_names(&before_layers), ["Base", "Extra"]);
     assert_eq!(layer_names(&after_layers), ["Base", "Extra", "Light"]);
-    assert_corners(layer(&after_layers, "Base")?, &BASE, "Base");
-    assert_corners(layer(&after_layers, "Light")?, &LIGHT, "Light");
+    assert_corner_associations(
+        &after.corner_positions,
+        layer(&after_layers, "Base")?,
+        &BASE_CORNERS,
+        "Base",
+    );
+    assert_corner_associations(
+        &after.corner_positions,
+        layer(&after_layers, "Light")?,
+        &LIGHT_CORNERS,
+        "Light",
+    );
     assert_corners(
         layer(&after_layers, "Extra")?,
         layer(&before_layers, "Extra")?,
@@ -290,7 +369,7 @@ fn cache_writes_named_layers_past_the_first_and_reports_the_one_without_room() -
     scene_with_cache(&scene, operations)?;
     let before = evaluate_body(&scene)?;
     // Without topology reads the mesh keeps its own layers, so the limit applies to the store.
-    apply(&scene, json!([cache_modifier(&["UV"])]))?;
+    apply(&scene, &json!([cache_modifier(&["UV"])]))?;
     let after = evaluate_body(&scene)?;
 
     let before_layers = layers(&before.store)?;
@@ -298,7 +377,12 @@ fn cache_writes_named_layers_past_the_first_and_reports_the_one_without_room() -
     assert_eq!(layer_names(&after_layers), names);
     // `Light` is the canonical cached layer and has no room: it is reported, not written.
     // `Base` is the second layer of the mesh and is overwritten by name, not the first layer.
-    assert_corners(layer(&after_layers, "Base")?, &BASE, "Base");
+    assert_corner_associations(
+        &after.corner_positions,
+        layer(&after_layers, "Base")?,
+        &BASE_CORNERS,
+        "Base",
+    );
     for name in names.iter().filter(|name| **name != "Base") {
         assert_corners(
             layer(&after_layers, name)?,

@@ -200,16 +200,13 @@ fn stored_pins(mesh: &Value, layer: &Value) -> TestResult<Vec<bool>> {
             .iter()
             .find(|entry| entry["face_id"].as_u64() == Some(id))
             .ok_or("stored layer has no entry for a face")?;
-        match entry.get("pinned").and_then(Value::as_array) {
-            Some(flags) => {
-                for flag in flags {
-                    pins.push(flag.as_bool().ok_or("stored pin is not a bool")?);
-                }
+        if let Some(flags) = entry.get("pinned").and_then(Value::as_array) {
+            for flag in flags {
+                pins.push(flag.as_bool().ok_or("stored pin is not a bool")?);
             }
-            None => {
-                let corners = entry["uv"].as_array().map_or(0, Vec::len);
-                pins.extend(std::iter::repeat_n(false, corners));
-            }
+        } else {
+            let corners = entry["uv"].as_array().map_or(0, Vec::len);
+            pins.extend(std::iter::repeat_n(false, corners));
         }
     }
     Ok(pins)

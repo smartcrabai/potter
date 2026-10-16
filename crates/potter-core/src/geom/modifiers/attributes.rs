@@ -1457,9 +1457,9 @@ fn uv_warp(
     let axis_v = string(modifier, "axis_v")?;
     let axis_u = selected_axis(axis_u, modifier, "axis_u")?;
     let axis_v = selected_axis(axis_v, modifier, "axis_v")?;
-    let offset = vector2(modifier, "offset", DVec2::ZERO)?;
-    let scale = vector2(modifier, "scale", DVec2::ONE)?;
-    let rotation = number(modifier, "rotation", 0.0)?;
+    let offset = vector2(modifier, "offset")?;
+    let scale = vector2(modifier, "scale")?;
+    let rotation = number(modifier, "rotation")?;
     let mut store = uv_layers::read(mesh);
     let layer = writer_layer_index(&mut store, mesh.faces.len(), modifier, "uv_layer")?;
     let group = optional_string(modifier, "vertex_group")?;
@@ -2759,7 +2759,7 @@ fn mix_json(
 /// Index of the layer that `parameter` names. An empty name is the active layer, as Blender's
 /// empty UV Map field is. `None` only for an empty name on a mesh without layers.
 fn uv_layer_index(store: &UvStore, modifier: &Modifier, parameter: &str) -> Result<Option<usize>> {
-    let name = string(modifier, parameter, "")?;
+    let name = string(modifier, parameter)?;
     if name.is_empty() {
         return Ok(active_index(store));
     }

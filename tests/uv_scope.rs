@@ -26,7 +26,9 @@ fn empty_scene() -> SceneDoc {
 }
 
 fn batch(doc: &SceneDoc, operations: Value) -> Value {
-    json!({"schema_version": 1, "base_revision": doc.revision, "operations": operations})
+    let mut batch = json!({"schema_version": 1, "base_revision": doc.revision});
+    batch["operations"] = operations;
+    batch
 }
 
 fn apply(doc: &SceneDoc, operations: Value) -> Result<SceneDoc, PotError> {
@@ -94,13 +96,16 @@ fn set_store(doc: &mut SceneDoc, node: &str, store: Value) {
 }
 
 fn add_modifier(doc: &mut SceneDoc, node: &str, modifier_type: &str, params: Value) {
+    let Value::Object(params) = params else {
+        unreachable!("modifier test parameters must be an object")
+    };
     let node = doc.nodes.get_mut(&Id::new(node).unwrap()).unwrap();
     node.modifiers.push(Modifier {
         id: Id::new(format!("{modifier_type}_modifier")).unwrap(),
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
-        params: params.as_object().unwrap().clone(),
+        params,
         binding_data: None,
         runtime: ModifierRuntime::default(),
     });
@@ -310,7 +315,7 @@ fn delete_is_refused_only_by_referrers_the_mesh_reaches() {
         json!([{"op":"uv.layer_delete","target":{"id":"a"},"name":"Light"}]),
     )
     .unwrap();
-    assert!(layer_names(&deleted, "a").is_empty());
+    assert_eq!(layer_names(&deleted, "a"), Vec::<String>::new());
     assert_eq!(layer_names(&deleted, "b"), ["Light"]);
     assert_eq!(texture_layer(&deleted, "surface").as_deref(), Some("Light"));
 }
@@ -446,8 +451,8 @@ fn uv_schemas_do_not_publish_modifier_select_enums_as_layers() {
     }
 }
 
-/// A 16 by 16 canvas and a box whose `UVMap` (render) covers the lower-left half of the texture
-/// and whose `Paint` layer (active) covers the upper-right half. Both are built by UV operations.
+/// A 16 by 16 canvas and a size-2 box. Its top-face `UVMap` spans [-.5,.5]² after scaling;
+/// `Paint` copies those UVs and translates that face to [0,1]².
 fn paint_setup() -> Vec<Value> {
     vec![
         json!({"op":"image.create","id":"canvas","width":16,"height":16,"fill_color":[0.0,0.0,0.0,1.0]}),
@@ -477,6 +482,15 @@ fn paint_operation(uv_layer: Option<&str>) -> Value {
     operation
 }
 
+fn paint_image_pixels(outcome: &ApplyOutcome) -> Vec<[f64; 4]> {
+    let image = &outcome.doc.images[&Id::new("canvas").unwrap()];
+    let digest = image.blob.as_ref().unwrap();
+    let bytes = &outcome.asset_blobs[digest];
+    potter_core::image::decode_pixels(bytes, image.colorspace)
+        .unwrap()
+        .2
+}
+
 #[test]
 fn paint_without_a_selector_samples_the_active_layer() {
     let root = tempdir().unwrap();
@@ -492,17 +506,35 @@ fn paint_without_a_selector_samples_the_active_layer() {
     let named_active = run(Some(paint_operation(Some("Paint")))).unwrap();
     let named_render = run(Some(paint_operation(Some("UVMap")))).unwrap();
 
-    assert!(
-        omitted.asset_blobs.len() > baseline.asset_blobs.len(),
-        "the stroke painted texels"
+    // Replaced staged blobs are pruned, so detect the paint by decoding the referenced image pixels.
+    let baseline_pixels = paint_image_pixels(&baseline);
+    let omitted_pixels = paint_image_pixels(&omitted);
+    let changed_pixels = baseline_pixels
+        .iter()
+        .zip(&omitted_pixels)
+        .enumerate()
+        .filter_map(|(index, (before, after))| {
+            before
+                .iter()
+                .zip(after)
+                .any(|(before, after)| (*before - *after).abs() > 0.0)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changed_pixels,
+        vec![103, 104, 118, 119, 120, 121, 134, 135, 136, 137, 151, 152],
+        "the world-space stroke reaches the expected 12 active-layer texels"
     );
     assert_eq!(
-        omitted.asset_blobs, named_active.asset_blobs,
+        omitted_pixels,
+        paint_image_pixels(&named_active),
         "an omitted selector paints the active layer"
     );
     assert_ne!(
-        omitted.asset_blobs, named_render.asset_blobs,
-        "the render layer covers other texels than the active layer"
+        omitted_pixels,
+        paint_image_pixels(&named_render),
+        "the active and render layers paint different texels"
     );
 
     let missing = run(Some(paint_operation(Some("Nope")))).unwrap_err();

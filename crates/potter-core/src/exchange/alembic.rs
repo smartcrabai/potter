@@ -2680,7 +2680,7 @@ pub(crate) fn read_mesh_cache(
             .collect::<Vec<_>>();
         let face_counts = decode_i32_sample(bytes, counts, face_sample)?;
         let face_indices = decode_i32_sample(bytes, indices, index_sample)?;
-        // Per-corner values arrive in file winding, so they are indexed by file faces and reversed.
+        // Keep cache UVs in file-corner order; the cache modifier reverses them only with polygons.
         let file_faces = decode_faces(&points, &face_counts, &face_indices)?;
         let geometry_sample = MeshSample {
             positions: points.clone(),
@@ -2705,10 +2705,7 @@ pub(crate) fn read_mesh_cache(
                         )?;
                         let corners = cache_uv_faces(&file_faces, &scope, &tuples)?
                             .into_iter()
-                            .map(|mut corners| {
-                                corners.reverse();
-                                uv_to_storage(corners)
-                            })
+                            .map(uv_to_storage)
                             .collect();
                         Ok(ExchangeUvLayer {
                             name: name.clone(),

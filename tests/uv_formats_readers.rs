@@ -17,9 +17,9 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// Float32 storage (glTF, PLY, GLB) and the 6-digit OBJ text both stay well inside this bound.
 const TOLERANCE: f64 = 1.0e-6;
 
-/// Triangle corners of `UVMap` (TEXCOORD_0), in glTF convention (v down).
+/// Triangle corners of `UVMap` (`TEXCOORD_0`), in glTF convention (v down).
 const SET0: [[f32; 2]; 3] = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]];
-/// Triangle corners of `UVMap.001` (TEXCOORD_1), in glTF convention (v down).
+/// Triangle corners of `UVMap.001` (`TEXCOORD_1`), in glTF convention (v down).
 const SET1: [[f32; 2]; 3] = [[0.7, 0.8], [0.9, 0.1], [0.2, 0.3]];
 const POSITIONS: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
 
@@ -239,7 +239,7 @@ fn push_floats<const N: usize>(bytes: &mut Vec<u8>, rows: &[[f32; N]]) {
     }
 }
 
-/// The triangle buffer: indices (3 x u16) at 0, positions at 8, TEXCOORD_0 at 44, TEXCOORD_1 at 68.
+/// The triangle buffer: indices (3 x u16) at 0, positions at 8, `TEXCOORD_0` at 44, `TEXCOORD_1` at 68.
 fn triangle_buffer() -> Vec<u8> {
     let mut bytes = Vec::new();
     for index in [0_u16, 1, 2] {
@@ -295,7 +295,7 @@ fn glb_bytes(document: &Value, binary: &[u8]) -> TestResult<Vec<u8>> {
         json_chunk.push(b' ');
     }
     let mut bin_chunk = binary.to_vec();
-    while bin_chunk.len() % 4 != 0 {
+    while !bin_chunk.len().is_multiple_of(4) {
         bin_chunk.push(0);
     }
     let total = 12 + 8 + json_chunk.len() + 8 + bin_chunk.len();

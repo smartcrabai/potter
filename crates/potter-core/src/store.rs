@@ -27,6 +27,8 @@ pub struct HistoryRecord {
     pub target: Option<String>,
     pub snapshot: SceneDoc,
 }
+/// History records returned together with any upgrade diagnostics from their snapshots.
+pub type HistoryRecordsAndWarnings = (Vec<(String, HistoryRecord)>, Vec<Value>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryDirection {
@@ -486,7 +488,7 @@ impl Project {
 
     /// Reads every record from the head back to the first commit, with the diagnostics of their
     /// upgrades.
-    pub fn history_records(&self) -> Result<(Vec<(String, HistoryRecord)>, Vec<Value>)> {
+    pub fn history_records(&self) -> Result<HistoryRecordsAndWarnings> {
         let mut records = Vec::new();
         let mut warnings = Vec::new();
         let mut next = self.doc.history.head.clone();

@@ -12,9 +12,12 @@ ob.name = "Plane"
 me = ob.data
 me.uv_layers[0].name = "Base"
 me.uv_layers.new(name="Light")
-for li, layer in enumerate(me.uv_layers):
-    for i, d in enumerate(layer.data):
-        d.uv = (0.1 * i + 0.5 * li, 0.05 * i)
+# Each corner is unique and nonsymmetric to make the cache's position/value association visible.
+BASE = [(0.137, 0.223), (0.619, 0.357), (0.283, 0.881), (0.947, 0.569)]
+LIGHT = [(0.731, 0.163), (0.194, 0.907), (0.853, 0.421), (0.367, 0.689)]
+for layer, values in zip(me.uv_layers, (BASE, LIGHT)):
+    for datum, uv in zip(layer.data, values):
+        datum.uv = uv
 me.uv_layers.active_index = 1
 me.uv_layers.active_render_index = 0
 bpy.ops.wm.alembic_export(filepath=out + "/two_layers.abc", uvs=True, selected=False)

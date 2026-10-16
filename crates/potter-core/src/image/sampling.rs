@@ -128,11 +128,11 @@ pub fn sample_with_extension(
     }
 }
 
-fn image_for_uv<'a>(
-    data: &'a ImageData,
+fn image_for_uv(
+    data: &ImageData,
     uv: [f64; 2],
     tile: u32,
-) -> Option<(ImageTileDataRef<'a>, [f64; 2])> {
+) -> Option<(ImageTileDataRef<'_>, [f64; 2])> {
     if tile == 0 {
         Some((
             ImageTileDataRef {
@@ -263,11 +263,18 @@ fn sample_closest_with_extension(
     v: f64,
     extension: ImageExtension,
 ) -> [f64; 4] {
-    let mut x = floor_to_i64(u * width as f64).expect("normalized image coordinate fits in i64");
-    let mut y = floor_to_i64(v * height as f64).expect("normalized image coordinate fits in i64");
+    let Some(mut x) = floor_to_i64(u * width as f64) else {
+        return TRANSPARENT_BLACK;
+    };
+    let Some(mut y) = floor_to_i64(v * height as f64) else {
+        return TRANSPARENT_BLACK;
+    };
     if extension == ImageExtension::Clip {
-        x = x.min(i64::try_from(width).expect("u32 image width fits in i64") - 1);
-        y = y.min(i64::try_from(height).expect("u32 image height fits in i64") - 1);
+        let (Ok(width), Ok(height)) = (i64::try_from(width), i64::try_from(height)) else {
+            return TRANSPARENT_BLACK;
+        };
+        x = x.min(width - 1);
+        y = y.min(height - 1);
     }
     pixel_with_extension(pixels, width, height, x, y, extension)
 }
@@ -286,10 +293,14 @@ fn sample_linear_with_extension(
 ) -> [f64; 4] {
     let x = u * width as f64 - 0.5;
     let y = v * height as f64 - 0.5;
-    let x0 = floor_to_i64(x).expect("normalized image coordinate fits in i64");
-    let y0 = floor_to_i64(y).expect("normalized image coordinate fits in i64");
-    let x1 = x0 + 1;
-    let y1 = y0 + 1;
+    let Some(x0) = floor_to_i64(x) else {
+        return TRANSPARENT_BLACK;
+    };
+    let Some(y0) = floor_to_i64(y) else {
+        return TRANSPARENT_BLACK;
+    };
+    let x1 = x0.saturating_add(1);
+    let y1 = y0.saturating_add(1);
     let tx = x - x0 as f64;
     let ty = y - y0 as f64;
 

@@ -1855,15 +1855,10 @@ fn parse_usda(text: &str, scene_id: String) -> Result<(SceneDoc, Vec<Loss>)> {
         .get(&doc.active_scene)
         .map(|scene| scene.root_collection.clone())
         .ok_or_else(|| import_error("USD scene root collection is missing"))?;
-    let mut roots = doc
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.parent.is_none())
-        .map(|(id, _)| id.clone())
-        .collect::<Vec<_>>();
-    roots.sort();
+    let mut objects = doc.nodes.keys().cloned().collect::<Vec<_>>();
+    objects.sort();
     if let Some(collection) = doc.collections.get_mut(&collection) {
-        collection.objects = roots;
+        collection.objects = objects;
     }
     if doc.nodes.is_empty() {
         return Err(import_error("USD layer contains no supported scene prims"));
@@ -2500,35 +2495,33 @@ fn read_uv_primvar(
         return Err("has values that are not uv pairs".to_owned());
     }
     let values = numbers.as_chunks::<2>().0.to_vec();
-    let element_values = match prim.properties.get(&format!("{primvar}:indices")) {
-        Some(raw_indices) => {
-            let indices =
-                scan_numbers(raw_indices).map_err(|_| "has malformed indices".to_owned())?;
-            if indices.len() != element_count {
-                return Err(format!(
-                    "has {} indices for {element_count} {interpolation} elements",
-                    indices.len()
-                ));
-            }
-            indices
-                .iter()
-                .map(|index| {
-                    (index.fract() == 0.0 && *index >= 0.0)
-                        .then(|| values.get(*index as usize).copied())
-                        .flatten()
-                        .ok_or_else(|| "has an index outside its values".to_owned())
-                })
-                .collect::<std::result::Result<Vec<_>, String>>()?
+    let element_values = if let Some(raw_indices) =
+        prim.properties.get(&format!("{primvar}:indices"))
+    {
+        let indices = scan_numbers(raw_indices).map_err(|_| "has malformed indices".to_owned())?;
+        if indices.len() != element_count {
+            return Err(format!(
+                "has {} indices for {element_count} {interpolation} elements",
+                indices.len()
+            ));
         }
-        None => {
-            if values.len() != element_count {
-                return Err(format!(
-                    "has {} values for {element_count} {interpolation} elements and no indices",
-                    values.len()
-                ));
-            }
-            values
+        indices
+            .iter()
+            .map(|index| {
+                (index.fract() == 0.0 && *index >= 0.0)
+                    .then(|| values.get(*index as usize).copied())
+                    .flatten()
+                    .ok_or_else(|| "has an index outside its values".to_owned())
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?
+    } else {
+        if values.len() != element_count {
+            return Err(format!(
+                "has {} values for {element_count} {interpolation} elements and no indices",
+                values.len()
+            ));
         }
+        values
     };
     let mut corners = Vec::with_capacity(faces.len());
     let mut corner = 0_usize;

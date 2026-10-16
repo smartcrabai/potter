@@ -970,8 +970,20 @@ fn array_cap_missing_a_layer_takes_blender_zero_stored_as_v_down_one() -> TestRe
 
 #[test]
 fn subdivision_level_one_keeps_the_pinned_corner_pattern_of_blender() -> TestResult {
-    // Blender 5.2.2 probe: pin_uv on loop 0 of a quad, then Subdivision level 1, pins on loops
-    // 0, 1, 2, 3, 4, 7, 8, 12, and 13 (nine of sixteen corners).
+    // Blender 5.2.2 probe: the nine pins attach to these output (position, V-up UV) corners.
+    // Compare by associated corner data rather than loop index, since tessellation order is not
+    // the semantic identity of a corner.
+    let expected = [
+        (DVec3::new(0.164_063, 0.164_063, 0.0), [0.1, 0.2]),
+        (DVec3::new(0.5, 0.041_667, 0.0), [0.15, 0.25]),
+        (DVec3::new(0.5, 0.041_667, 0.0), [0.15, 0.25]),
+        (DVec3::new(0.5, 0.5, 0.0), [0.25, 0.35]),
+        (DVec3::new(0.5, 0.5, 0.0), [0.25, 0.35]),
+        (DVec3::new(0.5, 0.5, 0.0), [0.25, 0.35]),
+        (DVec3::new(0.5, 0.5, 0.0), [0.25, 0.35]),
+        (DVec3::new(0.041_667, 0.5, 0.0), [0.25, 0.35]),
+        (DVec3::new(0.041_667, 0.5, 0.0), [0.25, 0.35]),
+    ];
     let mut subject = input_mesh(&json!({
         "vertices": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
         "faces": [[0, 1, 2, 3]],
@@ -985,10 +997,28 @@ fn subdivision_level_one_keeps_the_pinned_corner_pattern_of_blender() -> TestRes
     )?;
     let doc = scene_doc(subject, vec![subdivide], Vec::new())?;
     let snapshot = evaluate(&doc)?;
-    let pins = loop_pins(subject_mesh(&snapshot)?, "UVMap")?;
-    let pinned_loops = [0_usize, 1, 2, 3, 4, 7, 8, 12, 13];
-    let expected: Vec<bool> = (0..16).map(|index| pinned_loops.contains(&index)).collect();
-    assert_eq!(pins, expected);
+    let mesh = subject_mesh(&snapshot)?;
+    let pins = loop_pins(mesh, "UVMap")?;
+    let corners = corners(mesh, &["UVMap".to_owned()])?;
+    let actual: Vec<(DVec3, [f64; 2])> = corners
+        .iter()
+        .zip(pins)
+        .filter_map(|(corner, pinned)| pinned.then_some((corner.point, corner.uv[0])))
+        .collect();
+    assert_eq!(actual.len(), expected.len());
+    let mut expected = expected.to_vec();
+    for (point, uv) in actual {
+        let Some(index) = expected.iter().position(|(expected_point, expected_uv)| {
+            point.distance(*expected_point) <= POSITION_TOLERANCE
+                && (uv[0] - expected_uv[0]).abs() <= UV_TOLERANCE
+                && (uv[1] - expected_uv[1]).abs() <= UV_TOLERANCE
+        }) else {
+            panic!("pinned corner at {point:?} with UV {uv:?} was not in Blender's pin set");
+        };
+        // Preserve duplicate loop records at the same position and UV.
+        expected.swap_remove(index);
+    }
+    assert_eq!(expected.len(), 0);
     Ok(())
 }
 

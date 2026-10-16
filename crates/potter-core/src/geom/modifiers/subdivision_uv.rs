@@ -105,6 +105,8 @@ impl Channel {
 
 struct Layer {
     name: String,
+    /// Per-face corner pins, refined independently of the face-varying UV values.
+    pins: Vec<Option<Vec<bool>>>,
     /// Level-0 value UVs, read by `corner_limit` after the channel has been refined.
     base_uvs: Vec<DVec2>,
     /// Per level-0 value, the two values at the ends of its crease (if any).
@@ -731,6 +733,35 @@ fn refine_channel(channel: Channel, topology: &Topology) -> Channel {
     }
 }
 
+/// Refines loop pins like Blender's boolean corner interpolation: any pinned source with a
+/// positive contribution pins the child corner.
+fn refine_pins(pins: Vec<Option<Vec<bool>>>, starts: &[usize]) -> Vec<Option<Vec<bool>>> {
+    let mut child = Vec::with_capacity(starts.last().copied().unwrap_or_default());
+    for (face, row) in pins.into_iter().enumerate() {
+        let (start, end) = (starts[face], starts[face + 1]);
+        let Some(row) = row else {
+            child.extend(std::iter::repeat_n(None, end - start));
+            continue;
+        };
+        let face_pin = row.iter().any(|pinned| *pinned);
+        for corner in 0..end - start {
+            let next = (corner + 1) % (end - start);
+            let previous = if corner == 0 {
+                end - start - 1
+            } else {
+                corner - 1
+            };
+            child.push(Some(vec![
+                row[corner],
+                row[corner] || row[next],
+                face_pin,
+                row[previous] || row[corner],
+            ]));
+        }
+    }
+    child
+}
+
 impl Layer {
     /// Limit values of the final level. A single-face crease value follows the boundary chain of its
     /// level-0 value, iterated `quality` times.
@@ -909,6 +940,7 @@ impl UvSubdivision {
             .into_iter()
             .map(|layer| {
                 let base = channel_from(&position, &corner_uvs(&position, &layer));
+                let pins = layer.pinned;
                 let topology = classify(&base, &position, options);
                 let base_ends = topology
                     .rules
@@ -920,6 +952,7 @@ impl UvSubdivision {
                     .collect();
                 Layer {
                     name: layer.name,
+                    pins,
                     base_uvs: base.uvs.clone(),
                     base_ends,
                     current: base,
@@ -944,6 +977,7 @@ impl UvSubdivision {
         );
         for layer in &mut self.layers {
             let topology = classify(&layer.current, &position, self.options);
+            layer.pins = refine_pins(std::mem::take(&mut layer.pins), &layer.current.starts);
             layer.current = refine_channel(std::mem::take(&mut layer.current), &topology);
         }
         Ok(())
@@ -969,11 +1003,9 @@ impl UvSubdivision {
             }
             None => None,
         };
-        // The provenance rebuild already carried each corner's pin onto the layers of `result`.
-        let carried = uv_layers::read_layers(result);
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            if layer.current.face_count() != polys.len() {
+            if layer.current.face_count() != polys.len() || layer.pins.len() != polys.len() {
                 return Err(PotError::new(
                     ErrorCode::InternalError,
                     "subdivision UV channel does not match the output faces",
@@ -1001,9 +1033,8 @@ impl UvSubdivision {
                     )
                 })
                 .collect();
-            let pinned = carried_pins(&carried, &layer.name, &faces);
             let mut written = UvLayer::new(layer.name.clone(), faces);
-            written.pinned = pinned;
+            written.pinned.clone_from(&layer.pins);
             layers.push(written);
         }
         uv_layers::write_layers(result, &layers);
