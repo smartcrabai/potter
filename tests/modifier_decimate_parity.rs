@@ -365,7 +365,7 @@ fn compare(case: &Value) -> TestResult<Report> {
     let input = &case["input"];
     let blender = &case["blender"];
     let mesh = input_mesh(input)?;
-    let output = evaluate_modifiers(&mesh, &[modifier(&case["spec"]["modifier"])?])?;
+    let output = evaluate_modifiers(&mesh, &[modifier(&case["spec"]["modifier"])?], "TestObject")?;
 
     let blender_vertices: Vec<DVec3> = blender["vertices"]
         .as_array()

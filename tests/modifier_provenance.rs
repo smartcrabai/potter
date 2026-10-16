@@ -127,7 +127,7 @@ fn mirror_swaps_side_group_names_and_averages_merged_plane_vertices() -> TestRes
         }),
     );
 
-    let output = evaluate_modifiers(&mesh, &[modifier("mirror", json!({}))?])?;
+    let output = evaluate_modifiers(&mesh, &[modifier("mirror", json!({}))?], "TestObject")?;
     let left = weights_by_position(&output, "Arm.L")?;
     let right = weights_by_position(&output, "Arm.R")?;
 
@@ -166,7 +166,7 @@ fn mirror_copies_edge_creases_from_their_source_edges() -> TestResult {
         json!({"domain":"edge","type":"float","values":{format!("e{crease_edge}"): 0.5}}),
     );
 
-    let output = evaluate_modifiers(&mesh, &[modifier("mirror", json!({}))?])?;
+    let output = evaluate_modifiers(&mesh, &[modifier("mirror", json!({}))?], "TestObject")?;
     let creased: Vec<(DVec3, DVec3)> = output
         .edges
         .iter()
@@ -224,13 +224,10 @@ fn decimate_keeps_each_surviving_vertex_group_weight_with_its_vertex() -> TestRe
     mesh.attributes
         .insert("vertex_groups".to_owned(), json!({"Ramp": ramp}));
 
-    let output = evaluate_modifiers(
-        &mesh,
-        &[modifier(
-            "decimate",
-            json!({"decimate_type":"COLLAPSE","ratio":0.5}),
-        )?],
-    )?;
+    let output = evaluate_modifiers(&mesh, &[modifier(
+        "decimate",
+        json!({"decimate_type":"COLLAPSE","ratio":0.5}),
+    )?], "TestObject")?;
     assert!(
         output.vertices.len() < source_count,
         "decimate removed vertices"
@@ -259,7 +256,7 @@ fn subdivision_interpolates_vertex_group_weights_to_new_vertices() -> TestResult
     mesh.attributes
         .insert("vertex_groups".to_owned(), json!({"Corner": {"v0": 1.0}}));
 
-    let output = evaluate_modifiers(&mesh, &[modifier("subdivision", json!({"levels":1}))?])?;
+    let output = evaluate_modifiers(&mesh, &[modifier("subdivision", json!({"levels":1}))?], "TestObject")?;
     let mut weights: Vec<f64> = weights_by_position(&output, "Corner")?
         .into_iter()
         .map(|(_, weight)| weight)
@@ -287,7 +284,7 @@ fn remesh_reports_dropped_vertex_groups_as_a_typed_warning() -> TestResult {
         }),
     )?;
     let evaluation =
-        evaluate_modifiers_with_groups_at_frame(&mesh, &[remesh], &Registry::new(), 1.0)?;
+        evaluate_modifiers_with_groups_at_frame(&mesh, &[remesh], &Registry::new(), 1.0, "TestObject")?;
     assert!(
         evaluation.mesh.attributes.get("vertex_groups").is_none(),
         "remesh output must not carry stale vertex groups"
@@ -319,7 +316,7 @@ fn provenance_remaps_blender_attributes_on_corners_and_faces() -> TestResult {
             {"name":"mat_tag","domain":"FACE","data_type":"INT","values":[7]}
         ]),
     );
-    let triangulated = evaluate_modifiers(&quad, &[modifier("triangulate", json!({}))?])?;
+    let triangulated = evaluate_modifiers(&quad, &[modifier("triangulate", json!({}))?], "TestObject")?;
     assert_eq!(
         blender_attribute_values(&triangulated, "Col", "CORNER")?,
         vec![1.0, 3.0, 0.0, 1.0, 2.0, 3.0]
@@ -337,10 +334,7 @@ fn provenance_remaps_blender_attributes_on_corners_and_faces() -> TestResult {
             "name":"Col","domain":"CORNER","data_type":"FLOAT","values":[10.0,11.0,12.0]
         }]),
     );
-    let mirrored = evaluate_modifiers(
-        &triangle,
-        &[modifier("mirror", json!({"use_axis":[true,false,false]}))?],
-    )?;
+    let mirrored = evaluate_modifiers(&triangle, &[modifier("mirror", json!({"use_axis":[true,false,false]}))?], "TestObject")?;
     let values = blender_attribute_values(&mirrored, "Col", "CORNER")?;
     assert_eq!(values, vec![10.0, 11.0, 12.0, 12.0, 11.0, 10.0]);
     assert_eq!(
@@ -372,10 +366,7 @@ fn weld_and_subdivision_remap_corner_colours_from_oracle() -> TestResult {
             "values":[1.0,1.1,1.2,1.3,2.0,2.1,2.2,2.3]
         }]),
     );
-    let welded = evaluate_modifiers(
-        &weld_mesh,
-        &[modifier("weld", json!({"merge_threshold":0.001}))?],
-    )?;
+    let welded = evaluate_modifiers(&weld_mesh, &[modifier("weld", json!({"merge_threshold":0.001}))?], "TestObject")?;
     assert_eq!(
         sorted_corner_values_by_face(&welded, "Col")?,
         vec![vec![1.0, 1.1, 1.2, 1.3], vec![2.0, 2.1, 2.2, 2.3]]
@@ -391,10 +382,7 @@ fn weld_and_subdivision_remap_corner_colours_from_oracle() -> TestResult {
             "name":"Col","domain":"CORNER","data_type":"FLOAT","values":[0.0,1.0,2.0,3.0]
         }]),
     );
-    let subdivided = evaluate_modifiers(
-        &subdivision_mesh,
-        &[modifier("subdivision", json!({"levels":1}))?],
-    )?;
+    let subdivided = evaluate_modifiers(&subdivision_mesh, &[modifier("subdivision", json!({"levels":1}))?], "TestObject")?;
     assert_eq!(
         sorted_corner_values_by_face(&subdivided, "Col")?,
         vec![

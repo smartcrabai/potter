@@ -1048,6 +1048,12 @@ fn evaluate_modifier_output(
     target_modifier: &Modifier,
     allow_shape_keys: bool,
 ) -> Result<crate::geom::Mesh> {
+    let subject_name = engine
+        .doc
+        .nodes
+        .get(target)
+        .map(|node| node.name.as_str())
+        .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "modifier subject is missing"))?;
     let modifier_id = &target_modifier.id;
     let modifier_stack = std::slice::from_ref(target_modifier);
     let evaluated = {
@@ -1148,6 +1154,7 @@ fn evaluate_modifier_output(
                 modifier_stack,
                 &engine.doc.node_groups,
                 engine.evaluation_frame,
+                subject_name,
             )?;
             engine.warnings.extend(
                 evaluation
@@ -1230,6 +1237,7 @@ fn evaluate_modifier_output(
                 modifier_stack,
                 &engine.doc.node_groups,
                 frame,
+                subject_name,
                 object_world,
                 &world_matrices,
                 &base_object_meshes,

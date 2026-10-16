@@ -3170,6 +3170,7 @@ mod tests {
                 &source,
                 &[modifier],
                 &std::collections::BTreeMap::new(),
+                "Source",
             )?;
             assert_eq!(evaluated.mesh, source);
             let warning = evaluated

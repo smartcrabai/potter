@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, error::Error, fs, path::Path, proce
 use glam::{DMat4, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
-    geom::{Mesh, modifiers::attributes::{SceneOperand, SceneOperandMatricesF32, evaluate_with_context_and_subject_name as evaluate_with_context}},
+    geom::{Mesh, modifiers::attributes::{AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32, evaluate_with_context}},
     model::{Id, Modifier, ModifierRuntime, SceneDoc},
 };
 use serde_json::{Value, json};
@@ -620,14 +620,7 @@ fn assert_case(
     subject_name: &str,
     expected: &Value,
 ) -> Result<Mesh, Box<dyn Error>> {
-    let result = evaluate_with_context(
-        mesh,
-        modifier,
-        operands,
-        None,
-        subject_world,
-        subject_name,
-    )?;
+    let result = evaluate_with_context(mesh, modifier, operands, None, subject_world, subject_name, &AttributeLayerSelection::default())?;
     assert_weights(label, &weights(&result, "A")?, &expected["weights"], 2.0e-5)?;
     assert_members(label, &members(&result, "A")?, &expected["members"])?;
     Ok(result)
@@ -655,14 +648,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             params["map_curve"] = json!([[0.0,0.0],[0.27,0.72],[0.61,0.38],[1.0,1.0]]);
         }
         let modifier = modifier("vertex_weight_edit", params)?;
-        let result = evaluate_with_context(
-            &mesh,
-            &modifier,
-            &BTreeMap::new(),
-            None,
-            DMat4::IDENTITY,
-            "Weight Edit Oracle",
-        )?;
+        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle", &AttributeLayerSelection::default())?;
         assert_weights(
             &format!("weight edit {falloff}"),
             &weights(&result, "A")?,
@@ -684,7 +670,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "default_weight":0.23,"normalize":false
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &curve_invert, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle")?;
+    let result = evaluate_with_context(&mesh, &curve_invert, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle", &AttributeLayerSelection::default())?;
     assert_weights("weight edit inverted curve", &weights(&result, "A")?, &expected["edit_invert_curve"]["weights"], 2.0e-5)?;
 
     for (label, mask_name, inverted, constant, oracle_key) in [
@@ -699,7 +685,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "invert_mask_vertex_group":inverted,"mask_constant":constant,"default_weight":0.23
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle")?;
+        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle", &AttributeLayerSelection::default())?;
         assert_weights(label, &weights(&result, "A")?, &expected[oracle_key]["weights"], 2.0e-5)?;
     }
 
@@ -714,14 +700,14 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "mask_constant":constant,"default_weight":0.23
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle")?;
+        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle", &AttributeLayerSelection::default())?;
         assert_weights(label, &weights(&result, "A")?, &expected[oracle_key]["weights"], 2.0e-5)?;
     }
     let missing_edit_group = modifier(
         "vertex_weight_edit",
         json!({"vertex_group":"Missing","falloff_type":"SHARP"}),
     )?;
-    let result = evaluate_with_context(&mesh, &missing_edit_group, &BTreeMap::new(), None, DMat4::IDENTITY, "Missing Edit Group")?;
+    let result = evaluate_with_context(&mesh, &missing_edit_group, &BTreeMap::new(), None, DMat4::IDENTITY, "Missing Edit Group", &AttributeLayerSelection::default())?;
     assert_weights("missing edit group pass-through", &weights(&result, "A")?, &expected["edit_missing_group"]["weights"], 2.0e-5)?;
     assert_members("missing edit group pass-through", &members(&result, "A")?, &expected["edit_missing_group"]["members"])?;
 
@@ -732,7 +718,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "use_add":true,"add_threshold":0.4,"use_remove":true,"remove_threshold":0.2
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &add_remove, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Controls")?;
+    let result = evaluate_with_context(&mesh, &add_remove, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Controls", &AttributeLayerSelection::default())?;
     assert_weights("weight edit add and remove", &weights(&result, "A")?, &expected["edit_add_remove"]["weights"], 2.0e-5)?;
     assert_members("weight edit add and remove", &members(&result, "A")?, &expected["edit_add_remove"]["members"])?;
     let inclusive_thresholds = modifier(
@@ -742,7 +728,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "use_add":true,"add_threshold":0.23,"use_remove":true,"remove_threshold":0.15
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &inclusive_thresholds, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Inclusive Thresholds")?;
+    let result = evaluate_with_context(&mesh, &inclusive_thresholds, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Inclusive Thresholds", &AttributeLayerSelection::default())?;
     assert_weights("weight edit inclusive thresholds", &weights(&result, "A")?, &expected["edit_inclusive_thresholds"]["weights"], 2.0e-5)?;
     assert_members("weight edit inclusive thresholds", &members(&result, "A")?, &expected["edit_inclusive_thresholds"]["members"])?;
 
@@ -750,7 +736,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "vertex_weight_edit",
         json!({"vertex_group":"A","falloff_type":"LINEAR","default_weight":0.23,"normalize":true}),
     )?;
-    let result = evaluate_with_context(&mesh, &normalize, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Controls")?;
+    let result = evaluate_with_context(&mesh, &normalize, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Controls", &AttributeLayerSelection::default())?;
     assert_weights("weight edit normalize", &weights(&result, "A")?, &expected["edit_normalize"]["weights"], 2.0e-5)?;
 
     for mix_mode in ["SET", "ADD", "SUB", "MUL", "DIV", "DIF", "AVG", "MIN", "MAX"] {
@@ -761,7 +747,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "default_weight_a":0.23,"default_weight_b":0.31,"invert_vertex_group_a":true
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix")?;
+        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
         assert_weights(&format!("weight mix {mix_mode}"), &weights(&result, "A")?, &expected["mix_modes"][mix_mode]["weights"], 2.0e-5)?;
         assert_members(&format!("weight mix {mix_mode}"), &members(&result, "A")?, &expected["mix_modes"][mix_mode]["members"])?;
     }
@@ -773,7 +759,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "default_weight_a":0.23,"default_weight_b":0.31,"invert_vertex_group_b":true
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix")?;
+        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
         assert_weights(&format!("weight mix set {mix_set}"), &weights(&result, "A")?, &expected["mix_sets"][mix_set]["weights"], 2.0e-5)?;
         assert_members(&format!("weight mix set {mix_set}"), &members(&result, "A")?, &expected["mix_sets"][mix_set]["members"])?;
     }
@@ -781,13 +767,13 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "vertex_weight_mix",
         json!({"vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"DIV","default_weight_b":0.0}),
     )?;
-    let result = evaluate_with_context(&mesh, &divide_zero, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix")?;
+    let result = evaluate_with_context(&mesh, &divide_zero, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
     assert_weights("weight mix division by zero", &weights(&result, "A")?, &expected["mix_divide_zero"]["weights"], 2.0e-5)?;
     let mix_zero = modifier(
         "vertex_weight_mix",
         json!({"vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"SET","default_weight_b":0.0}),
     )?;
-    let result = evaluate_with_context(&mesh, &mix_zero, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix")?;
+    let result = evaluate_with_context(&mesh, &mix_zero, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
     assert_weights("weight mix selected zero", &weights(&result, "A")?, &expected["mix_set_zero"]["weights"], 2.0e-5)?;
     assert_members("weight mix selected zero", &members(&result, "A")?, &expected["mix_set_zero"]["members"])?;
     for (label, inverted, oracle_key) in [
@@ -801,7 +787,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "mask_vertex_group":"Mask","mask_constant":0.75,"invert_mask_vertex_group":inverted
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix")?;
+        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
         assert_weights(label, &weights(&result, "A")?, &expected[oracle_key]["weights"], 2.0e-5)?;
     }
     for (group_a, group_b, oracle_key) in [
@@ -812,7 +798,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "vertex_weight_mix",
             json!({"vertex_group_a":group_a,"vertex_group_b":group_b,"mix_set":"ALL","mix_mode":"ADD"}),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Missing Mix Group")?;
+        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Missing Mix Group", &AttributeLayerSelection::default())?;
         assert_weights("missing mix group pass-through", &weights(&result, "A")?, &expected[oracle_key]["weights"], 2.0e-5)?;
         assert_members("missing mix group pass-through", &members(&result, "A")?, &expected[oracle_key]["members"])?;
     }
@@ -823,7 +809,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "default_weight_a":0.23,"default_weight_b":0.31,"normalize":true
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &mix_normalize, &BTreeMap::new(), None, DMat4::IDENTITY, "Mix Normalize")?;
+    let result = evaluate_with_context(&mesh, &mix_normalize, &BTreeMap::new(), None, DMat4::IDENTITY, "Mix Normalize", &AttributeLayerSelection::default())?;
     assert_weights("weight mix normalize", &weights(&result, "A")?, &expected["mix_normalize"]["weights"], 2.0e-5)?;
     assert_members("weight mix normalize", &members(&result, "A")?, &expected["mix_normalize"]["members"])?;
     let mix_empty_b = modifier(
@@ -833,7 +819,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "default_weight_b":0.25
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &mix_empty_b, &BTreeMap::new(), None, DMat4::IDENTITY, "Mix Empty B")?;
+    let result = evaluate_with_context(&mesh, &mix_empty_b, &BTreeMap::new(), None, DMat4::IDENTITY, "Mix Empty B", &AttributeLayerSelection::default())?;
     assert_weights("weight mix empty B", &weights(&result, "A")?, &expected["mix_empty_group_b"]["weights"], 2.0e-5)?;
 
     let matrices = &expected["proximity_matrices"];
@@ -969,14 +955,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "vertex_weight_proximity",
         json!({"vertex_group":"Missing","target":"target","proximity_mode":"OBJECT","min_dist":0.0,"max_dist":5.0}),
     )?;
-    let result = evaluate_with_context(
-        &mesh,
-        &missing_proximity_group,
-        &object_operands,
-        None,
-        subject_transform,
-        "Proximity Missing Group",
-    )?;
+    let result = evaluate_with_context(&mesh, &missing_proximity_group, &object_operands, None, subject_transform, "Proximity Missing Group", &AttributeLayerSelection::default())?;
     assert_weights(
         "missing proximity group pass-through",
         &weights(&result, "A")?,
@@ -992,14 +971,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "vertex_weight_proximity",
         json!({"vertex_group":"A","target":null,"proximity_mode":"OBJECT"}),
     )?;
-    let result = evaluate_with_context(
-        &mesh,
-        &null_target_proximity,
-        &BTreeMap::new(),
-        None,
-        DMat4::IDENTITY,
-        "Proximity Null Target",
-    )?;
+    let result = evaluate_with_context(&mesh, &null_target_proximity, &BTreeMap::new(), None, DMat4::IDENTITY, "Proximity Null Target", &AttributeLayerSelection::default())?;
     assert_weights(
         "null proximity target pass-through",
         &weights(&result, "A")?,

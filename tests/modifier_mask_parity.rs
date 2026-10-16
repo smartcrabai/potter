@@ -288,7 +288,7 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
     ];
     for (name, params, with_group) in cases {
         let mesh = weighted_grid(with_group)?;
-        let actual = evaluate_modifiers(&mesh, &[mask_modifier(params)?])?;
+        let actual = evaluate_modifiers(&mesh, &[mask_modifier(params)?], "TestObject")?;
         assert_geometry_parity(name, &actual, &expected[name])?;
     }
     let empty_group_mesh = {
@@ -298,7 +298,7 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
     };
     for (name, invert) in [("empty_group",false),("empty_group_inverted",true),("no_weights",false),("no_weights_inverted",true)] {
         let mesh = if name.starts_with("empty_group") { empty_group_mesh.clone() } else { weighted_grid(false)? };
-        let actual = evaluate_modifiers(&mesh, &[mask_modifier(json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":invert}))?])?;
+        let actual = evaluate_modifiers(&mesh, &[mask_modifier(json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":invert}))?], "TestObject")?;
         assert_geometry_parity(name, &actual, &expected[name])?;
     }
     let empty_unrelated_mesh = {
@@ -310,13 +310,10 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
         ("empty_unrelated_missing_group", false),
         ("empty_unrelated_missing_group_inverted", true),
     ] {
-        let actual = evaluate_modifiers(
-            &empty_unrelated_mesh,
-            &[mask_modifier(json!({
-                "mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5,
-                "invert_vertex_group":invert
-            }))?],
-        )?;
+        let actual = evaluate_modifiers(&empty_unrelated_mesh, &[mask_modifier(json!({
+            "mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5,
+            "invert_vertex_group":invert
+        }))?], "TestObject")?;
         assert_geometry_parity(name, &actual, &expected[name])?;
     }
     for (name, selected, invert) in [

@@ -48,11 +48,7 @@ fn graph_with_nodes(nodes: Vec<Value>, links: Vec<Value>) -> SceneDoc {
 }
 
 fn evaluate(doc: &SceneDoc) -> GraphEvaluation {
-    graph::evaluate(
-        doc.node_groups.get(&Id::new("geo").unwrap()).unwrap(),
-        None,
-        &Map::new(),
-    )
+    graph::evaluate(doc.node_groups.get(&Id::new("geo").unwrap()).unwrap(), None, &Map::new(), "Geometry")
     .unwrap()
 }
 
@@ -124,12 +120,8 @@ fn graph_interface_defaults_accept_input_overrides() {
         ],
     );
     let group = doc.node_groups.get(&Id::new("geo").unwrap()).unwrap();
-    let default = graph::evaluate(group, None, &Map::new()).unwrap();
-    let overridden = graph::evaluate(
-        group,
-        None,
-        &Map::from_iter([("scale".to_owned(), json!([2.0, 2.0, 2.0]))]),
-    )
+    let default = graph::evaluate(group, None, &Map::new(), "Geometry").unwrap();
+    let overridden = graph::evaluate(group, None, &Map::from_iter([("scale".to_owned(), json!([2.0, 2.0, 2.0]))]), "Geometry")
     .unwrap();
     assert_close(default.mesh.bounds().unwrap().size().x, 1.0);
     assert_close(overridden.mesh.bounds().unwrap().size().x, 2.0);
@@ -189,11 +181,7 @@ fn graph_rejects_socket_type_mismatch_and_evaluation_rejects_cycles() {
             json!({"from_node":"a","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
         ],
     );
-    let error = graph::evaluate(
-        doc.node_groups.get(&Id::new("geo").unwrap()).unwrap(),
-        None,
-        &Map::new(),
-    )
+    let error = graph::evaluate(doc.node_groups.get(&Id::new("geo").unwrap()).unwrap(), None, &Map::new(), "Geometry")
     .unwrap_err();
     assert_eq!(error.code, ErrorCode::EvaluationFailed);
 }
@@ -606,8 +594,8 @@ fn simulation_zone_evaluates_and_caches_each_frame_state() {
         ],
     );
     let group = doc.node_groups.get(&Id::new("geo").unwrap()).unwrap();
-    let frame_three = graph::evaluate_at_frame(group, None, &Map::new(), 3.0).unwrap();
-    let frame_two = graph::evaluate_at_frame(group, None, &Map::new(), 2.0).unwrap();
+    let frame_three = graph::evaluate_at_frame(group, None, &Map::new(), 3.0, "Geometry").unwrap();
+    let frame_two = graph::evaluate_at_frame(group, None, &Map::new(), 2.0, "Geometry").unwrap();
     assert_close(frame_three.mesh.bounds().unwrap().min.z, 2.5);
     assert_close(frame_two.mesh.bounds().unwrap().min.z, 1.5);
     let group_id = Id::new("geo").unwrap();
@@ -620,12 +608,7 @@ fn simulation_zone_evaluates_and_caches_each_frame_state() {
         .unwrap()
         .inputs
         .insert("Translation".to_owned(), json!([0.0, 0.0, 2.0]));
-    let changed = graph::evaluate_at_frame(
-        doc.node_groups.get(&group_id).unwrap(),
-        None,
-        &Map::new(),
-        3.0,
-    )
+    let changed = graph::evaluate_at_frame(doc.node_groups.get(&group_id).unwrap(), None, &Map::new(), 3.0, "Geometry")
     .unwrap();
     assert_close(changed.mesh.bounds().unwrap().min.z, 5.5);
 }

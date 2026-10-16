@@ -6,7 +6,7 @@ use potter_core::{
         Mesh,
         modifiers::attributes::{
             AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32,
-            evaluate_with_transfer_context,
+            evaluate_with_context,
         },
     },
     model::{CameraData, Modifier, ModifierRuntime},
@@ -418,9 +418,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
             "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
             "max_distance":10.0,"ray_radius":0.01
         }))?;
-        let actual = evaluate_with_transfer_context(
-            &destination, &modifier, &source_operands, None, DMat4::IDENTITY,
-            "destination", &AttributeLayerSelection::default())?;
+        let actual = evaluate_with_context(&destination, &modifier, &source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
         let error = max_error(&json!(group_weights(&actual, "A")), &expected[mapping])?;
         assert!(error < 2.0e-4, "{mapping} max error {error}");
     }
@@ -432,9 +430,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
         "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"NEAREST",
         "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":10.0,
     }))?;
-    let no_transform_actual=evaluate_with_transfer_context(
-        &no_transform_destination,&no_transform_modifier,&source_operands,None,
-        DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+    let no_transform_actual=evaluate_with_context(&no_transform_destination, &no_transform_modifier, &source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let no_transform_error=max_error(
         &json!(group_weights(&no_transform_actual,"A")),
         &expected["NO_OBJECT_TRANSFORM"],
@@ -450,7 +446,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
         "object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
         "vert_mapping":"NEAREST","mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":0.1
     }))?;
-    let cutoff_actual=evaluate_with_transfer_context(&cutoff,&cutoff_modifier,&source_operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+    let cutoff_actual=evaluate_with_context(&cutoff, &cutoff_modifier, &source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let cutoff_error=max_error(&json!(group_weights(&cutoff_actual,"A")),&expected["DISTANCE_CUTOFF"])?;
     assert!(cutoff_error<1.0e-6,"max-distance cutoff error {cutoff_error}");
     let topology = Mesh::from_positions_and_faces(
@@ -464,9 +460,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
         "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY",
         "mix_mode":"REPLACE","mix_factor":1.0
     }))?;
-    let actual = evaluate_with_transfer_context(
-        &topology, &modifier, &source_operands, None, DMat4::IDENTITY,
-        "destination", &AttributeLayerSelection::default())?;
+    let actual = evaluate_with_context(&topology, &modifier, &source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let error = max_error(&json!(group_weights(&actual, "A")), &expected["TOPOLOGY"])?;
     assert!(error < 1.0e-6, "TOPOLOGY max error {error}");
     Ok(())
@@ -529,7 +523,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
         let mut destination=quad()?;
         set_group(&mut destination,"D0",&[0.2,0.4,0.6,0.8]); set_group(&mut destination,"D1",&[0.7,0.5,0.3,0.1]); set_group(&mut destination,"Mask",&[0.25,0.75,0.5,1.0]);
         let modifier=modifier("data_transfer",json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":mode,"mix_factor":0.4,"vertex_group":"Mask"}))?;
-        let actual=evaluate_with_transfer_context(&destination,&modifier,&operands,None,DMat4::IDENTITY,"destination",&layer_selection(&["D0","D1","Mask"],Some(1)))?;
+        let actual=evaluate_with_context(&destination, &modifier, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1","Mask"],Some(1)))?;
         for name in ["D0","D1"] {
             let error=max_error(&json!(group_weights(&actual,name)),&expected[mode][name])?;
             assert!(error<2.0e-6,"{mode}/{name} max error {error}");
@@ -540,14 +534,14 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     set_group(&mut inverted_destination,"D1",&[0.7,0.5,0.3,0.1]);
     set_group(&mut inverted_destination,"Mask",&[0.25,0.75,0.5,1.0]);
     let inverted_modifier=modifier("data_transfer",json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":0.4,"vertex_group":"Mask","invert_vertex_group":true}))?;
-    let inverted_actual=evaluate_with_transfer_context(&inverted_destination,&inverted_modifier,&operands,None,DMat4::IDENTITY,"destination",&layer_selection(&["D0","D1","Mask"],Some(1)))?;
+    let inverted_actual=evaluate_with_context(&inverted_destination, &inverted_modifier, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1","Mask"],Some(1)))?;
     for name in ["D0","D1"] {
         let error=max_error(&json!(group_weights(&inverted_actual,name)),&expected["INVERT_MASK"][name])?;
         assert!(error<2.0e-6,"inverted mask/{name} max error {error}");
     }
     let mut destination=quad()?; set_group(&mut destination,"D0",&[0.2;4]); set_group(&mut destination,"D1",&[0.3;4]);
     let modifier=modifier("data_transfer",json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ACTIVE","layers_vgroup_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0}))?;
-    let actual=evaluate_with_transfer_context(&destination,&modifier,&operands,None,DMat4::IDENTITY,"destination",&layer_selection(&["D0","D1"],Some(1)))?;
+    let actual=evaluate_with_context(&destination, &modifier, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1"],Some(1)))?;
     for name in ["D0","D1"] {
         let error=max_error(&json!(group_weights(&actual,name)),&expected["ACTIVE"][name])?;
         assert!(error<1.0e-6,"ACTIVE/{name} max error {error}");
@@ -557,16 +551,14 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
         "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"A",
         "layers_vgroup_select_dst":"D1","mix_mode":"REPLACE","mix_factor":1.0
     }))?;
-    let named_actual=evaluate_with_transfer_context(
-        &destination,&named_modifier,&operands,None,DMat4::IDENTITY,"destination",
-        &layer_selection(&["D0","D1"],Some(1)))?;
+    let named_actual=evaluate_with_context(&destination, &named_modifier, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1"],Some(1)))?;
     assert_eq!(group_weights(&named_actual,"D1"),group_weights(&actual,"D1"));
     let missing_source=modifier("data_transfer",json!({
         "object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
         "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"MissingGroup",
         "layers_vgroup_select_dst":"D1"
     }))?;
-    assert!(evaluate_with_transfer_context(
+    assert!(evaluate_with_context(
         &destination,&missing_source,&operands,None,DMat4::IDENTITY,"destination",
         &layer_selection(&["D0","D1"],Some(1))).is_err());
     let missing_destination=modifier("data_transfer",json!({
@@ -574,7 +566,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
         "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"A",
         "layers_vgroup_select_dst":"MissingGroup"
     }))?;
-    assert!(evaluate_with_transfer_context(
+    assert!(evaluate_with_context(
         &destination,&missing_destination,&operands,None,DMat4::IDENTITY,"destination",
         &layer_selection(&["D0","D1"],Some(1))).is_err());
     Ok(())
@@ -612,9 +604,7 @@ fn vertex_group_bone_selectors_filter_source_layers() -> Result<(), Box<dyn Erro
             "vert_mapping":"TOPOLOGY","layers_vgroup_select_src":selection,
             "layers_vgroup_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0,
         }))?;
-        let actual=evaluate_with_transfer_context(
-            &destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",
-            &layer_selection(&["D0","D1","D2"],None))?;
+        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &layer_selection(&["D0","D1","D2"],None))?;
         for (index,(name,prior)) in original.iter().enumerate() {
             let expected=if *name==target { &source_weights[source_index].1 } else { prior };
             assert_eq!(group_weights(&actual,name),*expected,"{selection} should filter source group layers");
@@ -631,9 +621,7 @@ fn absent_transfer_source_is_an_input_mesh_noop() -> Result<(), Box<dyn Error>> 
         vec![vec![0,1,2]],
     )?;
     let transfer=modifier("data_transfer",json!({"object":null}))?;
-    let actual=evaluate_with_transfer_context(
-        &destination,&transfer,&BTreeMap::new(),None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default())?;
+    let actual=evaluate_with_context(&destination, &transfer, &BTreeMap::new(), None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     assert_eq!(actual.attributes,destination.attributes);
     assert_eq!(
         actual.vertices.iter().map(|vertex|vertex.co).collect::<Vec<_>>(),
@@ -815,7 +803,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "loop_mapping":"TOPOLOGY","layers_uv_select_src":"ALL","layers_uv_select_dst":"INDEX",
         "mix_mode":"ADD","mix_factor":0.25
     }))?;
-    let actual=evaluate_with_transfer_context(&destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+    let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let uv_values=|mesh:&Mesh,name:&str| -> Value { uv_layer_values(mesh,name) };
     for name in ["Destination0","Destination1"] {
         let error=max_error(&uv_values(&actual,name),&expected[name])?;
@@ -828,16 +816,14 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "loop_mapping":"TOPOLOGY","layers_uv_select_src":"ACTIVE","layers_uv_select_dst":"ACTIVE",
         "mix_mode":"REPLACE","mix_factor":1.0
     }))?;
-    let active_actual=evaluate_with_transfer_context(&active_destination,&active_transfer,&operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+    let active_actual=evaluate_with_context(&active_destination, &active_transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     for name in ["Destination0","Destination1"] {
         let error=max_error(&uv_values(&active_actual,name),&expected["ACTIVE"][name])?;
         assert!(error<1.0e-6,"ACTIVE UV layer {name} max error {error}");
     }
     let mut no_active_destination=active_destination.clone();
     no_active_destination.attributes["uv_layers"]["active"]=Value::Null;
-    let no_active_destination_actual=evaluate_with_transfer_context(
-        &no_active_destination,&active_transfer,&operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default())?;
+    let no_active_destination_actual=evaluate_with_context(&no_active_destination, &active_transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     assert_eq!(uv_values(&no_active_destination_actual,"Destination1"),
         uv_values(&no_active_destination,"Destination1"),
         "ACTIVE UV destination selection must no-op without an active layer");
@@ -846,9 +832,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     let no_active_source_operands=BTreeMap::from([(
         "object".to_owned(),vec![operand(no_active_source,DMat4::IDENTITY,&[],None)],
     )]);
-    let no_active_source_actual=evaluate_with_transfer_context(
-        &active_destination,&active_transfer,&no_active_source_operands,None,
-        DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+    let no_active_source_actual=evaluate_with_context(&active_destination, &active_transfer, &no_active_source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     assert_eq!(uv_values(&no_active_source_actual,"Destination1"),
         uv_values(&active_destination,"Destination1"),
         "ACTIVE UV source selection must no-op without an active layer");
@@ -857,9 +841,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "loop_mapping":"TOPOLOGY","layers_uv_select_src":"Source1",
         "layers_uv_select_dst":"Destination1","mix_mode":"REPLACE","mix_factor":1.0
     }))?;
-    let named_actual=evaluate_with_transfer_context(
-        &active_destination,&named_transfer,&operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default())?;
+    let named_actual=evaluate_with_context(&active_destination, &named_transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     for name in ["Destination0","Destination1"] {
         assert_eq!(uv_values(&named_actual,name),expected["ACTIVE"][name]);
     }
@@ -868,7 +850,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "loop_mapping":"TOPOLOGY","layers_uv_select_src":"MissingUV",
         "layers_uv_select_dst":"NAME"
     }))?;
-    assert!(evaluate_with_transfer_context(
+    assert!(evaluate_with_context(
         &active_destination,&missing_uv_source,&operands,None,DMat4::IDENTITY,"destination",
         &AttributeLayerSelection::default()).is_err());
     let missing_uv_destination=modifier("data_transfer",json!({
@@ -876,7 +858,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "loop_mapping":"TOPOLOGY","layers_uv_select_src":"Source1",
         "layers_uv_select_dst":"MissingUV"
     }))?;
-    assert!(evaluate_with_transfer_context(
+    assert!(evaluate_with_context(
         &active_destination,&missing_uv_destination,&operands,None,DMat4::IDENTITY,"destination",
         &AttributeLayerSelection::default()).is_err());
     let color_values=|mesh:&Mesh,name:&str| -> Value {
@@ -899,7 +881,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     set_color_layer(&mut point_destination,"Dest1","point","FLOAT_COLOR",vec![[-0.4,-0.15,0.8,1.0],[-0.3,-0.15,0.8,1.0],[-0.2,-0.15,0.8,1.0],[-0.1,-0.15,0.8,1.0]])?;
     let point_transfer=modifier("data_transfer",json!({"object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],"vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL","layers_vcol_vert_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}))?;
     let mut point_selection=layer_selection(&[],None);
-    let point_actual=evaluate_with_transfer_context(&point_destination,&point_transfer,&operands,None,DMat4::IDENTITY,"destination",&point_selection)?;
+    let point_actual=evaluate_with_context(&point_destination, &point_transfer, &operands, None, DMat4::IDENTITY, "destination", &point_selection)?;
     for name in ["Dest0","Dest1"] {
         let error=max_error(&color_values(&point_actual,name),&expected["POINT_COLOR"][name])?;
         assert!(error<1.0e-6,"point color layer {name} max error {error}");
@@ -909,7 +891,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     set_color_layer(&mut corner_destination,"Dest1","corner","FLOAT_COLOR",vec![[-0.4,-0.15,0.8,1.0],[-0.3,-0.15,0.8,1.0],[-0.2,-0.15,0.8,1.0],[-0.1,-0.15,0.8,1.0]])?;
     let corner_transfer=modifier("data_transfer",json!({"object":"source","use_loop_data":true,"data_types_loops":["COLOR_CORNER"],"loop_mapping":"TOPOLOGY","layers_vcol_loop_select_src":"ALL","layers_vcol_loop_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}))?;
     let mut corner_selection=layer_selection(&[],None);
-    let corner_actual=evaluate_with_transfer_context(&corner_destination,&corner_transfer,&operands,None,DMat4::IDENTITY,"destination",&corner_selection)?;
+    let corner_actual=evaluate_with_context(&corner_destination, &corner_transfer, &operands, None, DMat4::IDENTITY, "destination", &corner_selection)?;
     for name in ["Dest0","Dest1"] {
         let error=max_error(&color_values(&corner_actual,name),&expected["CORNER_COLOR"][name])?;
         assert!(error<1.0e-6,"corner color layer {name} max error {error}");
@@ -981,9 +963,7 @@ fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box
         "object":"source","use_loop_data":true,"data_types_loops":["CUSTOM_NORMAL"],
         "loop_mapping":"TOPOLOGY","mix_mode":"MIX","mix_factor":0.35
     }))?;
-    let actual=evaluate_with_transfer_context(
-        &destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default())?;
+    let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let actual_normals=potter_core::geom::normals::corner_normals(
         &actual,&actual.vertices.iter().map(|vertex|vertex.co).collect::<Vec<_>>())?;
     let actual_values=actual_normals.iter().map(|normal|normal.to_array()).collect::<Vec<_>>();
@@ -1066,9 +1046,7 @@ fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> 
             "vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL",
             "layers_vcol_vert_select_dst":"NAME","mix_mode":mode,"mix_factor":0.4
         }))?;
-        let actual=evaluate_with_transfer_context(
-            &destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",
-            &AttributeLayerSelection::default())?;
+        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
         for name in ["FloatColor","ByteColor"] {
             let error=max_error(&color_values(&actual,name),&expected["outputs"][mode][name])?;
             assert!(error<1.0e-6,"{name} {mode} max error {error}");
@@ -1140,9 +1118,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
         "vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ACTIVE",
         "layers_vcol_vert_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0
     }))?;
-    let actual=evaluate_with_transfer_context(
-        &destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default())?;
+    let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let error=max_error(
         &domain_attribute_values(&actual,"ActiveColor"),
         &expected["output"],
@@ -1152,9 +1128,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
         "ACTIVE selection must leave the first, inactive color layer untouched");
     let mut no_active_destination=destination.clone();
     no_active_destination.attributes.get_mut("color_layers").ok_or("destination ColorStore missing")?["active"]=Value::Null;
-    let no_active_actual=evaluate_with_transfer_context(
-        &no_active_destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default())?;
+    let no_active_actual=evaluate_with_context(&no_active_destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     assert_eq!(
         domain_attribute_values(&no_active_actual,"ActiveColor"),
         json!(colors(&expected["destination"])),
@@ -1166,9 +1140,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
         "object".to_owned(),
         vec![operand(no_active_source,DMat4::IDENTITY,&[],None)],
     )]);
-    let no_active_source_actual=evaluate_with_transfer_context(
-        &destination,&transfer,&no_active_source_operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default())?;
+    let no_active_source_actual=evaluate_with_context(&destination, &transfer, &no_active_source_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     assert_eq!(
         domain_attribute_values(&no_active_source_actual,"ActiveColor"),
         json!(colors(&expected["destination"])),
@@ -1263,8 +1235,7 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
             "loop_mapping":"NEAREST_POLY","layers_uv_select_src":"ALL","layers_uv_select_dst":"NAME",
             "mix_mode":"REPLACE","mix_factor":1.0,"islands_precision":precision
         }))?;
-        let actual=evaluate_with_transfer_context(
-            &destination,&modifier,&operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+        let actual=evaluate_with_context(&destination, &modifier, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
         let values=uv_layer_values(&actual,"UVMap");
         let error=max_error(&values,&expected[key])?;
         assert!(error<2.0e-4,"islands_precision={precision} max error {error}");
@@ -1332,7 +1303,7 @@ fn loop_mapping_families_match_blender_with_corner_association() -> Result<(), B
             "loop_mapping":mapping,"layers_uv_select_src":"ALL","layers_uv_select_dst":"NAME",
             "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":5.0
         }))?;
-        let actual=evaluate_with_transfer_context(&destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
         let values=uv_layer_values(&actual,"UVMap");
         let error=max_error(&values,&expected[mapping])?;
         assert!(error<2.0e-4,"{mapping} loop max error {error}; values={values}");
@@ -1518,7 +1489,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "edge_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0,
             "use_max_distance":true,"max_distance":5.0,"ray_radius":0.15
         }))?;
-        let actual=evaluate_with_transfer_context(&destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
         let values=actual.attributes["blender_attributes"][0]["values"].clone();
         let error=max_error(&values,&expected["edge"][mapping])?;
         assert!(error<3.0e-4,"edge {mapping} max error {error}");
@@ -1531,9 +1502,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "edge_mapping":"EDGEINTERP_VNORPROJ","mix_mode":"REPLACE","mix_factor":1.0,
         "use_max_distance":true,"max_distance":5.0,"ray_radius":0.0
     }))?;
-    let radius_zero_actual=evaluate_with_transfer_context(
-        &radius_zero_destination,&radius_zero_transfer,&operands,None,DMat4::IDENTITY,
-        "destination",&AttributeLayerSelection::default())?;
+    let radius_zero_actual=evaluate_with_context(&radius_zero_destination, &radius_zero_transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let radius_zero_values=radius_zero_actual.attributes["blender_attributes"][0]["values"].clone();
     let radius_zero_error=max_error(&radius_zero_values,&expected["edge"]["EDGEINTERP_VNORPROJ_R0"])?;
     assert!(radius_zero_error<3.0e-4,
@@ -1546,7 +1515,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
         "edge_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0
     }))?;
-    let actual=evaluate_with_transfer_context(&topology_destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+    let actual=evaluate_with_context(&topology_destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let values=actual.attributes["blender_attributes"][0]["values"].clone();
     let error=max_error(&values,&expected["edge"]["TOPOLOGY"])?;
     assert!(error<1.0e-6,"edge TOPOLOGY max error {error}");
@@ -1566,7 +1535,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "poly_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0,
             "use_max_distance":true,"max_distance":5.0,"ray_radius":0.01
         }))?;
-        let actual=evaluate_with_transfer_context(&destination,&transfer,&face_operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+        let actual=evaluate_with_context(&destination, &transfer, &face_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
         let values=actual.attributes["blender_attributes"][0]["values"].clone();
         assert_eq!(values, expected["face"][mapping], "face {mapping} flags");
     }
@@ -1607,9 +1576,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
             "max_distance":5.0,"ray_radius":0.5
         }))?;
-        let oblique_actual=evaluate_with_transfer_context(
-            &oblique_destination,&oblique_transfer,&oblique_operands,None,DMat4::IDENTITY,
-            "destination",&AttributeLayerSelection::default())?;
+        let oblique_actual=evaluate_with_context(&oblique_destination, &oblique_transfer, &oblique_operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
         let values=oblique_actual.attributes["blender_attributes"][0]["values"].clone();
         assert_eq!(values,expected["face"][label],"oblique {label} flags");
     }
@@ -1724,9 +1691,7 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
         params.insert("mix_mode".to_owned(),json!("REPLACE"));
         params.insert("mix_factor".to_owned(),json!(1.0));
         let transfer=modifier("data_transfer",Value::Object(params))?;
-        let actual=evaluate_with_transfer_context(
-            &destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",
-            &AttributeLayerSelection::default())?;
+        let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
         let actual_values=match data_type {
             "SHARP_EDGE" => edge_flag_values(&actual,"sharp"),
             "SEAM" => edge_flag_values(&actual,"seam"),
@@ -1807,9 +1772,7 @@ fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<d
             "edge_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0,
         }),
     )?;
-    let actual=evaluate_with_transfer_context(
-        &destination,&transfer,&operands,None,DMat4::IDENTITY,"destination",
-        &AttributeLayerSelection::default())?;
+    let actual=evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "destination", &AttributeLayerSelection::default())?;
     let actual_normals=potter_core::geom::normals::corner_normals(&actual,&positions)?;
     let actual_values=json!(actual_normals.iter().map(|normal| [normal.x,normal.y,normal.z]).collect::<Vec<_>>());
     let error=max_error(&actual_values,&expected["corner_normals"])?;

@@ -95,6 +95,7 @@ struct Evaluator<'a> {
     group: &'a NodeGroup,
     input: Option<&'a Mesh>,
     overrides: &'a Map<String, Value>,
+    subject_name: &'a str,
     frame: f64,
     simulation_signature: Option<String>,
     simulation_states: HashMap<Id, GeometryValue>,
@@ -108,6 +109,7 @@ struct Evaluator<'a> {
 ///
 /// Inputs are keyed by interface socket ID or name. Generated instances are realized
 /// into `mesh` for bounds and rendering while `instance_paths` records each instance.
+/// `subject_name` is forwarded to modifier nodes that use name-seeded weight falloffs.
 ///
 /// # Errors
 ///
@@ -118,8 +120,9 @@ pub fn evaluate(
     group: &NodeGroup,
     input: Option<&Mesh>,
     overrides: &Map<String, Value>,
+    subject_name: &str,
 ) -> Result<GraphEvaluation> {
-    evaluate_at_frame(group, input, overrides, 1.0)
+    evaluate_at_frame(group, input, overrides, 1.0, subject_name)
 }
 
 /// Evaluate a geometry node group at a scene frame.
@@ -134,6 +137,7 @@ pub fn evaluate_at_frame(
     input: Option<&Mesh>,
     overrides: &Map<String, Value>,
     frame: f64,
+    subject_name: &str,
 ) -> Result<GraphEvaluation> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
@@ -223,6 +227,7 @@ pub fn evaluate_at_frame(
         input,
         overrides,
         frame,
+        subject_name,
         simulation_signature,
         simulation_states: HashMap::new(),
         repeat_states: HashMap::new(),
@@ -1283,7 +1288,7 @@ impl Evaluator<'_> {
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        let mesh = evaluate_modifiers(&geometry.mesh, &[modifier])?;
+        let mesh = evaluate_modifiers(&geometry.mesh, &[modifier], self.subject_name)?;
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: geometry.instance_paths,

@@ -981,6 +981,7 @@ impl Snapshot {
                         &node.modifiers,
                         &doc.node_groups,
                         frame,
+                        node.name.as_str(),
                         matrix,
                         &matrices,
                         &object_meshes,
@@ -1277,6 +1278,7 @@ impl Snapshot {
                         &node.modifiers,
                         &doc.node_groups,
                         frame,
+                        node.name.as_str(),
                         matrix,
                         &matrices,
                         &object_meshes,
@@ -3160,6 +3162,19 @@ pub(crate) fn apply_scene_attribute_modifier(
     Ok(())
 }
 
+fn scene_subject_name<'a>(doc: &'a SceneDoc, subject_id: &Id) -> Result<&'a str> {
+    doc.nodes
+        .get(subject_id)
+        .map(|node| node.name.as_str())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "modifier subject object is missing",
+                json!({"subject_id":subject_id}),
+            )
+        })
+}
+
 
 pub(crate) fn apply_scene_deform_modifier(
     mesh: &mut Mesh,
@@ -3208,6 +3223,7 @@ pub(crate) fn apply_scene_deform_modifier(
         mesh,
         &[resolved],
         &doc.node_groups,
+        scene_subject_name(doc, subject_id)?,
     )?;
     *mesh = evaluation.mesh;
     warnings.extend(
@@ -4306,7 +4322,11 @@ fn apply_scene_shrinkwrap_modifier(
         resolved.runtime.auxiliary_target_to_subject = None;
         resolved.runtime.shrinkwrap_auxiliary_target_mesh = None;
     }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(())
 }
 fn apply_generic_scene_mesh_operand_modifier(
@@ -4367,7 +4387,11 @@ fn apply_generic_scene_mesh_operand_modifier(
             .and_then(|operand| operand.local_to_subject)
             .map(|matrix| matrix.to_cols_array());
     }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(())
 }
 
@@ -4563,9 +4587,14 @@ pub(crate) fn apply_scene_operand_modifier(
     } else {
         resolved.runtime.operand_mesh = Some(operand);
     }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(())
 }
+
 fn apply_scene_hook_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -4610,7 +4639,11 @@ fn apply_scene_single_reference_modifier(
         let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
         resolved.runtime.object_matrix = Some((inverse * reference).to_cols_array());
     }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
     Ok(())
 }
 

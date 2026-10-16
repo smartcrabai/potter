@@ -74,50 +74,24 @@ pub struct SceneOperand {
 ///
 /// Returns an invalid-parameter or evaluation error when a requested group, UV layer,
 /// or attribute is missing or malformed.
-pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    evaluate_with_context(mesh, modifier, &BTreeMap::new(), None, DMat4::IDENTITY)
-}
-
-/// Evaluate an attribute modifier with a resolved scene texture.
-pub fn evaluate_with_context(
+pub(super) fn evaluate(
     mesh: &Mesh,
     modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
-    texture: Option<&crate::geom::ResolvedTexture>,
-    subject_world: DMat4,
-) -> Result<Mesh> {
-    evaluate_with_context_and_subject_name(
-        mesh,
-        modifier,
-        operands,
-        texture,
-        subject_world,
-        "",
-    )
-}
-
-/// Evaluate with the subject name used by Blender's seeded weight mappings.
-pub fn evaluate_with_context_and_subject_name(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
-    texture: Option<&crate::geom::ResolvedTexture>,
-    subject_world: DMat4,
     subject_name: &str,
 ) -> Result<Mesh> {
-    evaluate_with_transfer_context(
+    evaluate_with_context(
         mesh,
         modifier,
-        operands,
-        texture,
-        subject_world,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
         subject_name,
         &AttributeLayerSelection::default(),
     )
 }
 
-/// Evaluate with ordered destination layer selectors and a seed-zero modifier RNG.
-pub fn evaluate_with_transfer_context(
+/// Evaluate an attribute modifier with an explicit subject identity.
+pub fn evaluate_with_context(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,

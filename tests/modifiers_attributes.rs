@@ -6,7 +6,7 @@ use potter_core::{
     geom::{
         Mesh,
         modifiers::{
-            attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
+            attributes::{AttributeLayerSelection, SceneOperand, evaluate_mesh_cache, evaluate_with_context},
             evaluate_modifiers,
         },
     },
@@ -116,21 +116,18 @@ fn scene_operand_with_identity_space(mesh: Mesh, camera: Option<CameraData>) -> 
 fn vertex_weight_mix_applies_blender_operation_to_selected_vertices() -> Result<(), Box<dyn Error>>
 {
     let mesh = weighted_line()?;
-    let result = evaluate_modifiers(
-        &mesh,
-        &[modifier(
-            "vertex_weight_mix",
-            json!({
-                "vertex_group_a":"A",
-                "vertex_group_b":"B",
-                "mix_mode":"ADD",
-                "mix_set":"ALL",
-                "default_weight_a":0.0,
-                "default_weight_b":0.0,
-                "normalize":false
-            }),
-        )?],
-    )?;
+    let result = evaluate_modifiers(&mesh, &[modifier(
+        "vertex_weight_mix",
+        json!({
+            "vertex_group_a":"A",
+            "vertex_group_b":"B",
+            "mix_mode":"ADD",
+            "mix_set":"ALL",
+            "default_weight_a":0.0,
+            "default_weight_b":0.0,
+            "normalize":false
+        }),
+    )?], "TestObject")?;
     assert_eq!(weights(&result, "A")?, [0.75, 1.0]);
     Ok(())
 }
@@ -142,22 +139,19 @@ fn vertex_weight_edit_supports_curve_mapping_and_threshold_removal() -> Result<(
         .as_object()
         .ok_or("vertex group table missing")?;
     assert!(groups.contains_key("A"));
-    let result = evaluate_modifiers(
-        &mesh,
-        &[modifier(
-            "vertex_weight_edit",
-            json!({
-                "vertex_group":"A",
-                "falloff_type":"CURVE",
-                "map_curve":[[0.0,0.0],[1.0,1.0]],
-                "use_add":false,
-                "use_remove":true,
-                "remove_threshold":0.5,
-                "default_weight":0.0,
-                "normalize":false
-            }),
-        )?],
-    )?;
+    let result = evaluate_modifiers(&mesh, &[modifier(
+        "vertex_weight_edit",
+        json!({
+            "vertex_group":"A",
+            "falloff_type":"CURVE",
+            "map_curve":[[0.0,0.0],[1.0,1.0]],
+            "use_add":false,
+            "use_remove":true,
+            "remove_threshold":0.5,
+            "default_weight":0.0,
+            "normalize":false
+        }),
+    )?], "TestObject")?;
     assert_eq!(weights(&result, "A")?, [0.0, 0.75]);
     Ok(())
 }
@@ -166,13 +160,10 @@ fn vertex_weight_edit_supports_curve_mapping_and_threshold_removal() -> Result<(
 fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
     let mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
-    let result = evaluate_modifiers(
-        &mesh,
-        &[modifier(
-            "weighted_normal",
-            json!({"mode":"FACE_AREA","weight":50}),
-        )?],
-    )?;
+    let result = evaluate_modifiers(&mesh, &[modifier(
+        "weighted_normal",
+        json!({"mode":"FACE_AREA","weight":50}),
+    )?], "TestObject")?;
     if let Some(custom) = result.attributes.get("custom_normal") {
         assert_eq!(custom["type"], "normal_code");
     }
@@ -198,21 +189,18 @@ fn uv_warp_preserves_unknown_attributes_and_updates_named_uv_layer() -> Result<(
         }),
     );
     mesh.attributes.insert("marker".to_owned(), json!(true));
-    let result = evaluate_modifiers(
-        &mesh,
-        &[modifier(
-            "uv_warp",
-            json!({
-                "center":[0.0,0.0],
-                "axis_u":"X",
-                "axis_v":"Y",
-                "offset":[0.25,-0.5],
-                "scale":[1.0,1.0],
-                "rotation":0.0,
-                "uv_layer":"UVMap"
-            }),
-        )?],
-    )?;
+    let result = evaluate_modifiers(&mesh, &[modifier(
+        "uv_warp",
+        json!({
+            "center":[0.0,0.0],
+            "axis_u":"X",
+            "axis_v":"Y",
+            "offset":[0.25,-0.5],
+            "scale":[1.0,1.0],
+            "rotation":0.0,
+            "uv_layer":"UVMap"
+        }),
+    )?], "TestObject")?;
     assert_eq!(result.attributes["marker"], json!(true));
     assert_eq!(
         result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
@@ -236,13 +224,10 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
             "render": "UVMap"
         }),
     );
-    let result = evaluate_modifiers(
-        &mesh,
-        &[modifier(
-            "uv_warp",
-            json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
-        )?],
-    )?;
+    let result = evaluate_modifiers(&mesh, &[modifier(
+        "uv_warp",
+        json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
+    )?], "TestObject")?;
     let layers = &result.attributes["uv_layers"]["layers"];
     assert_eq!(
         layers[0]["faces"][0]["uv"],
@@ -259,13 +244,10 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
 fn uv_warp_without_uv_layers_leaves_mesh_unchanged() -> Result<(), Box<dyn Error>> {
     let mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
-    let result = evaluate_modifiers(
-        &mesh,
-        &[modifier(
-            "uv_warp",
-            json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
-        )?],
-    )?;
+    let result = evaluate_modifiers(&mesh, &[modifier(
+        "uv_warp",
+        json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
+    )?], "TestObject")?;
     assert_eq!(result, mesh);
     Ok(())
 }
@@ -283,7 +265,7 @@ fn uv_warp_named_layer_missing_uses_active() -> Result<(), Box<dyn Error>> {
         }),
     );
     let expected_uv = mesh.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"].clone();
-    let result = evaluate_modifiers(&mesh, &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?])?;
+    let result = evaluate_modifiers(&mesh, &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?], "TestObject")?;
     assert_eq!(
         result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
         expected_uv
@@ -295,13 +277,10 @@ fn uv_warp_named_layer_missing_uses_active() -> Result<(), Box<dyn Error>> {
 fn attribute_modifiers_do_not_mutate_the_source_mesh() -> Result<(), Box<dyn Error>> {
     let source = weighted_line()?;
     let original = source.clone();
-    let result = evaluate_modifiers(
-        &source,
-        &[modifier(
-            "vertex_weight_mix",
-            json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"SUB","normalize":false}),
-        )?],
-    )?;
+    let result = evaluate_modifiers(&source, &[modifier(
+        "vertex_weight_mix",
+        json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"SUB","normalize":false}),
+    )?], "TestObject")?;
     assert_ne!(result, source);
     assert_eq!(source, original);
     Ok(())
@@ -331,7 +310,7 @@ fn proximity_modifier_uses_target_object_distance_and_assigns_vertex_weights()
             "normalize":false
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &proximity, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(&mesh, &proximity, &operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     assert_eq!(weights(&result, "A")?, [0.5, 0.5]);
     Ok(())
 }
@@ -361,7 +340,7 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
             "mix_limit":std::f64::consts::PI
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
     let normal = normals.first().ok_or("custom normal missing")?;
@@ -405,7 +384,7 @@ fn uv_project_uses_camera_projection_and_writes_corner_uvs() -> Result<(), Box<d
             "uv_layer":"UVMap"
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &projection, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(&mesh, &projection, &operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     let uv = result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"][0]
         .as_array()
         .ok_or("projected UV missing")?;
@@ -439,7 +418,7 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
             "mix_factor":1.0
         }),
     )?;
-    let result = evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     let transferred = weights(&result, "A")?;
     assert!((transferred[0] - 0.9).abs() < 1.0e-12);
     assert!((transferred[1] - 0.1).abs() < 1.0e-12);
@@ -1663,13 +1642,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let expected: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
 
     let line = weighted_line()?;
-    let edited = evaluate_modifiers(
-        &line,
-        &[modifier(
-            "vertex_weight_edit",
-            json!({"vertex_group":"A","falloff_type":"SHARP","normalize":false}),
-        )?],
-    )?;
+    let edited = evaluate_modifiers(&line, &[modifier(
+        "vertex_weight_edit",
+        json!({"vertex_group":"A","falloff_type":"SHARP","normalize":false}),
+    )?], "TestObject")?;
     assert_material_change(
         "vertex_weight_edit",
         &expected["baseline_vertex_weight_edit"],
@@ -1683,13 +1659,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-5,
     )?;
 
-    let mixed = evaluate_modifiers(
-        &line,
-        &[modifier(
-            "vertex_weight_mix",
-            json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"ADD","mix_set":"ALL","normalize":false}),
-        )?],
-    )?;
+    let mixed = evaluate_modifiers(&line, &[modifier(
+        "vertex_weight_mix",
+        json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"ADD","mix_set":"ALL","normalize":false}),
+    )?], "TestObject")?;
     assert_material_change(
         "vertex_weight_mix",
         &expected["baseline_vertex_weight_mix"],
@@ -1712,13 +1685,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "STEP",
         "SHARP",
     ] {
-        let falloff_result = evaluate_modifiers(
-            &falloff_mesh,
-            &[modifier(
-                "vertex_weight_edit",
-                json!({"vertex_group":"A","falloff_type":falloff,"normalize":false}),
-            )?],
-        )?;
+        let falloff_result = evaluate_modifiers(&falloff_mesh, &[modifier(
+            "vertex_weight_edit",
+            json!({"vertex_group":"A","falloff_type":falloff,"normalize":false}),
+        )?], "TestObject")?;
         let actual = json!(vertex_weights(&falloff_result, "A")?);
         if falloff != "LINEAR" {
             assert_material_change(
@@ -1740,16 +1710,13 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     for mix_mode in [
         "SET", "ADD", "SUB", "MUL", "DIV", "DIF", "AVG", "MIN", "MAX",
     ] {
-        let mix_result = evaluate_modifiers(
-            &mix_modes_mesh,
-            &[modifier(
-                "vertex_weight_mix",
-                json!({
-                    "vertex_group_a":"A","vertex_group_b":"B",
-                    "mix_mode":mix_mode,"mix_set":"ALL","normalize":false
-                }),
-            )?],
-        )?;
+        let mix_result = evaluate_modifiers(&mix_modes_mesh, &[modifier(
+            "vertex_weight_mix",
+            json!({
+                "vertex_group_a":"A","vertex_group_b":"B",
+                "mix_mode":mix_mode,"mix_set":"ALL","normalize":false
+            }),
+        )?], "TestObject")?;
         let actual = json!(vertex_weights(&mix_result, "A")?);
         assert_material_change(
             &format!("vertex_weight_mix {mix_mode}"),
@@ -1804,13 +1771,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "vertex_weight_proximity",
         json!({"target":"target","vertex_group":"A","proximity_mode":"OBJECT","proximity_geometry":["VERTEX"],"min_dist":0.0,"max_dist":3.0,"normalize":false}),
     )?;
-    let proximity_result = evaluate_with_context(
-        &line,
-        &proximity,
-        &proximity_operands,
-        None,
-        proximity_subject_world,
-    )?;
+    let proximity_result = evaluate_with_context(&line, &proximity, &proximity_operands, None, proximity_subject_world, "TestObject", &AttributeLayerSelection::default())?;
     assert_material_change(
         "vertex_weight_proximity OBJECT",
         &expected["baseline_vertex_weight_proximity"],
@@ -1845,13 +1806,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "vertex_weight_proximity",
         json!({"target":"target","vertex_group":"A","proximity_mode":"GEOMETRY","proximity_geometry":["VERTEX"],"min_dist":0.0,"max_dist":1.0,"normalize":false}),
     )?;
-    let geometry_result = evaluate_with_context(
-        &line,
-        &geometry_modifier,
-        &geometry_operands,
-        None,
-        DMat4::IDENTITY,
-    )?;
+    let geometry_result = evaluate_with_context(&line, &geometry_modifier, &geometry_operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     assert_material_change(
         "vertex_weight_proximity GEOMETRY/VERTEX",
         &expected["baseline_vertex_weight_proximity_geometry"],
@@ -1905,21 +1860,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "STEP",
             "SHARP",
         ] {
-            let result_mesh = evaluate_with_context(
-                &proximity_geometry_subject,
-                &modifier(
-                    "vertex_weight_proximity",
-                    json!({
-                        "target":"target","vertex_group":"A",
-                        "proximity_mode":"GEOMETRY","proximity_geometry":[geometry],
-                        "min_dist":0.0,"max_dist":1.5,"falloff_type":falloff,
-                        "normalize":false
-                    }),
-                )?,
-                &proximity_surface_operands,
-                None,
-                DMat4::IDENTITY,
-            )?;
+            let result_mesh = evaluate_with_context(&proximity_geometry_subject, &modifier(
+                "vertex_weight_proximity",
+                json!({
+                    "target":"target","vertex_group":"A",
+                    "proximity_mode":"GEOMETRY","proximity_geometry":[geometry],
+                    "min_dist":0.0,"max_dist":1.5,"falloff_type":falloff,
+                    "normalize":false
+                }),
+            )?, &proximity_surface_operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
             let key = format!("{geometry}_{falloff}");
             let label = format!("vertex_weight_proximity GEOMETRY/{geometry} {falloff}");
             assert_material_change(
@@ -1938,13 +1887,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     }
 
     let weighted_mesh = weighted_normal_mesh(false)?;
-    let weighted = evaluate_modifiers(
-        &weighted_mesh,
-        &[modifier(
-            "weighted_normal",
-            json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false}),
-        )?],
-    )?;
+    let weighted = evaluate_modifiers(&weighted_mesh, &[modifier(
+        "weighted_normal",
+        json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false}),
+    )?], "TestObject")?;
     let weighted_corners = blender_quantize_loop_normals(
         &blender,
         &root,
@@ -1965,13 +1911,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     )?;
 
     let sharp_mesh = weighted_normal_mesh(true)?;
-    let weighted_sharp = evaluate_modifiers(
-        &sharp_mesh,
-        &[modifier(
-            "weighted_normal",
-            json!({"mode":"FACE_AREA","weight":50,"keep_sharp":true}),
-        )?],
-    )?;
+    let weighted_sharp = evaluate_modifiers(&sharp_mesh, &[modifier(
+        "weighted_normal",
+        json!({"mode":"FACE_AREA","weight":50,"keep_sharp":true}),
+    )?], "TestObject")?;
     assert_normal_stimulus(
         "weighted_normal keep_sharp",
         &expected["baseline_weighted_normal_sharp"],
@@ -1995,13 +1938,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "__mod_weightednormals_faceweight".to_owned(),
         json!({"domain":"face","type":"int","values":{"f0":0,"f1":1,"f2":2}}),
     );
-    let weighted_face = evaluate_modifiers(
-        &weighted_face_mesh,
-        &[modifier(
-            "weighted_normal",
-            json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false,"use_face_influence":true}),
-        )?],
-    )?;
+    let weighted_face = evaluate_modifiers(&weighted_face_mesh, &[modifier(
+        "weighted_normal",
+        json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false,"use_face_influence":true}),
+    )?], "TestObject")?;
     assert_normal_stimulus(
         "weighted_normal use_face_influence",
         &expected["baseline_weighted_normal_face_influence"],
@@ -2035,7 +1975,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         json!({"mode":"RADIAL","target":"target","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"use_direction_parallel":false}),
     )?;
     let normals =
-        evaluate_with_context(&quad, &normal_edit, &normal_operands, None, DMat4::IDENTITY)?;
+        evaluate_with_context(&quad, &normal_edit, &normal_operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     assert_normal_stimulus(
         "normal_edit RADIAL/COPY",
         &expected["baseline_normal_edit"],
@@ -2064,13 +2004,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "normal_edit",
         json!({"mode":"DIRECTIONAL","target":"target","offset":[0.5,0.1,0.0],"mix_mode":"ADD","mix_factor":0.65,"mix_limit":std::f64::consts::PI,"use_direction_parallel":true}),
     )?;
-    let directional_result = evaluate_with_context(
-        &quad,
-        &directional,
-        &directional_operands,
-        None,
-        DMat4::IDENTITY,
-    )?;
+    let directional_result = evaluate_with_context(&quad, &directional, &directional_operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     assert_normal_stimulus(
         "normal_edit DIRECTIONAL/ADD",
         &expected["baseline_normal_edit_directional"],
@@ -2106,16 +2040,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             ),
         ],
     )]);
-    let projected = evaluate_with_context(
-        &project_mesh,
-        &modifier(
-            "uv_project",
-            json!({"projectors":["camera_z","camera_x"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
-        )?,
-        &projectors,
-        None,
-        DMat4::IDENTITY,
-    )?;
+    let projected = evaluate_with_context(&project_mesh, &modifier(
+        "uv_project",
+        json!({"projectors":["camera_z","camera_x"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
+    )?, &projectors, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     let projected_uvs = json!([
         flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
         flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
@@ -2139,32 +2067,26 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-5,
     )?;
 
-    let orthographic = evaluate_with_context(
-        &project_mesh,
-        &modifier(
-            "uv_project",
-            json!({
-                "projectors":["orthographic"],
-                "uv_layer":"UVMap",
-                "aspect_x":1.4,"aspect_y":1.2,
-                "scale_x":0.8,"scale_y":1.3
+    let orthographic = evaluate_with_context(&project_mesh, &modifier(
+        "uv_project",
+        json!({
+            "projectors":["orthographic"],
+            "uv_layer":"UVMap",
+            "aspect_x":1.4,"aspect_y":1.2,
+            "scale_x":0.8,"scale_y":1.3
+        }),
+    )?, &BTreeMap::from([(
+        "projectors".to_owned(),
+        vec![scene_operand(
+            Mesh::default(),
+            DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
+            Some(CameraData {
+                projection: potter_core::model::CameraProjection::Orthographic,
+                ortho_scale: 3.5,
+                ..CameraData::default()
             }),
-        )?,
-        &BTreeMap::from([(
-            "projectors".to_owned(),
-            vec![scene_operand(
-                Mesh::default(),
-                DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
-                Some(CameraData {
-                    projection: potter_core::model::CameraProjection::Orthographic,
-                    ortho_scale: 3.5,
-                    ..CameraData::default()
-                }),
-            )],
-        )]),
-        None,
-        DMat4::IDENTITY,
-    )?;
+        )],
+    )]), None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     let orthographic_uvs = json!([
         flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
         flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
@@ -2182,32 +2104,26 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-5,
     )?;
 
-    let orthographic_clamped = evaluate_with_context(
-        &project_mesh,
-        &modifier(
-            "uv_project",
-            json!({
-                "projectors":["orthographic"],
-                "uv_layer":"UVMap",
-                "aspect_x":1.4,"aspect_y":0.7,
-                "scale_x":0.8,"scale_y":1.3
+    let orthographic_clamped = evaluate_with_context(&project_mesh, &modifier(
+        "uv_project",
+        json!({
+            "projectors":["orthographic"],
+            "uv_layer":"UVMap",
+            "aspect_x":1.4,"aspect_y":0.7,
+            "scale_x":0.8,"scale_y":1.3
+        }),
+    )?, &BTreeMap::from([(
+        "projectors".to_owned(),
+        vec![scene_operand(
+            Mesh::default(),
+            DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
+            Some(CameraData {
+                projection: potter_core::model::CameraProjection::Orthographic,
+                ortho_scale: 3.5,
+                ..CameraData::default()
             }),
-        )?,
-        &BTreeMap::from([(
-            "projectors".to_owned(),
-            vec![scene_operand(
-                Mesh::default(),
-                DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
-                Some(CameraData {
-                    projection: potter_core::model::CameraProjection::Orthographic,
-                    ortho_scale: 3.5,
-                    ..CameraData::default()
-                }),
-            )],
-        )]),
-        None,
-        DMat4::IDENTITY,
-    )?;
+        )],
+    )]), None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     let orthographic_clamped_uvs = json!([
         flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
         flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
@@ -2225,13 +2141,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-5,
     )?;
 
-    let warped = evaluate_modifiers(
-        &quad,
-        &[modifier(
-            "uv_warp",
-            json!({"center":[0.5,0.5],"axis_u":"X","axis_v":"Y","offset":[0.25,-0.5],"scale":[1.25,0.75],"rotation":0.35,"uv_layer":"UVMap"}),
-        )?],
-    )?;
+    let warped = evaluate_modifiers(&quad, &[modifier(
+        "uv_warp",
+        json!({"center":[0.5,0.5],"axis_u":"X","axis_v":"Y","offset":[0.25,-0.5],"scale":[1.25,0.75],"rotation":0.35,"uv_layer":"UVMap"}),
+    )?], "TestObject")?;
     assert_material_change(
         "uv_warp scale/rotation",
         &expected["baseline_uv_warp"],
@@ -2261,16 +2174,10 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "object".to_owned(),
         vec![scene_operand_with_identity_space(source, None)],
     );
-    let transferred = evaluate_with_context(
-        &destination,
-        &modifier(
-            "data_transfer",
-            json!({"object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0}),
-        )?,
-        &source_operands,
-        None,
-        DMat4::IDENTITY,
-    )?;
+    let transferred = evaluate_with_context(&destination, &modifier(
+        "data_transfer",
+        json!({"object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0}),
+    )?, &source_operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     assert_material_change(
         "data_transfer VGROUP_WEIGHTS/TOPOLOGY",
         &expected["baseline_data_transfer"],
@@ -2310,20 +2217,14 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "object".to_owned(),
             vec![scene_operand_with_identity_space(interpolation_source.clone(), None)],
         );
-        let transferred = evaluate_with_context(
-            &point_destination,
-            &modifier(
-                "data_transfer",
-                json!({
-                    "object":"source","use_object_transform":true,
-                    "use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
-                    "vert_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0
-                }),
-            )?,
-            &point_operands,
-            None,
-            DMat4::IDENTITY,
-        )?;
+        let transferred = evaluate_with_context(&point_destination, &modifier(
+            "data_transfer",
+            json!({
+                "object":"source","use_object_transform":true,
+                "use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
+                "vert_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0
+            }),
+        )?, &point_operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
         assert_material_change(
             &format!("data_transfer VGROUP_WEIGHTS/{mapping}"),
             &expected[&format!("baseline_{key}")],
@@ -2395,13 +2296,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         }),
     )?;
     let domain_destination = transfer_domain_destination_mesh()?;
-    let domains = evaluate_with_context(
-        &domain_destination,
-        &domain_transfer,
-        &domain_operands,
-        None,
-        DMat4::IDENTITY,
-    )?;
+    let domains = evaluate_with_context(&domain_destination, &domain_transfer, &domain_operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
     let domain_values = transfer_domain_values(&domains)?;
     assert_material_change(
         "data_transfer nonmatching edge/loop/polygon topology",

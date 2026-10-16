@@ -73,6 +73,15 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
     })
 }
 
+#[test]
+fn modifier_evaluation_requires_the_subject_name() -> Result<(), Box<dyn Error>> {
+    let mesh = Mesh::box_mesh(BoxParams::default())?;
+    let error = evaluate_modifiers(&mesh, &[], "").unwrap_err();
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidArgument);
+    assert_eq!(error.message, "modifier evaluation requires a subject name");
+    Ok(())
+}
+
 fn remesh_fixture() -> Result<Mesh, Box<dyn Error>> {
     let mut primary = Mesh::uv_sphere(UvSphereParams {
         segments: 16,
@@ -397,7 +406,7 @@ fn remesh_octree_modes_return_valid_closed_meshes_and_support_smooth_shading()
             "use_remove_disconnected":false,"threshold":1.0,
             "use_smooth_shade":smooth_shade
         });
-        let output = evaluate_modifiers(&source, &[modifier("remesh", params)?])?;
+        let output = evaluate_modifiers(&source, &[modifier("remesh", params)?], "RemeshBox")?;
         assert!(output.validate().is_ok(), "{mode} output is invalid");
         assert!(!output.faces.is_empty(), "{mode} output is empty");
         for face in &output.faces {
@@ -555,7 +564,7 @@ fn blender_remesh_supported_modes_match_exact_geometry_and_voxel_adaptivity_is_g
         "use_smooth_shade":false,"use_remove_disconnected":false,"threshold":0.15
     });
     let voxel_adaptive_mesh =
-        evaluate_modifiers(&source, &[modifier("remesh", voxel_adaptivity_params)?])?;
+        evaluate_modifiers(&source, &[modifier("remesh", voxel_adaptivity_params)?], "Input")?;
     assert!(
         !voxel_adaptive_mesh.faces.is_empty(),
         "nonzero VOXEL adaptivity must produce a remeshed surface"
@@ -644,7 +653,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                 "use_remove_disconnected":true,"threshold":0.15
             })
         };
-        let native = evaluate_modifiers(&source, &[modifier("remesh", params)?])?;
+        let native = evaluate_modifiers(&source, &[modifier("remesh", params)?], "Input")?;
         let reference = &references[mode];
         let blender_positions = points(&reference["positions"])?;
         let blender_polygons = reference["polygons"]
@@ -1051,7 +1060,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                 "threshold":case.threshold,
                 "use_smooth_shade":false
             });
-            let native = evaluate_modifiers(&input, &[modifier("remesh", params)?])?;
+            let native = evaluate_modifiers(&input, &[modifier("remesh", params)?], case.name)?;
             let expected = &reference["modes"][mode];
             let expected_positions = points(&expected["positions"])?;
             let expected_polygons = parse_polygons(&expected["polygons"])?;
@@ -1132,10 +1141,10 @@ fn ocean_fft_is_seeded_and_choppiness_changes_the_surface() -> Result<(), Box<dy
             }),
         )
     };
-    let first = evaluate_modifiers(&source, &[create(0.0)?])?;
-    let again = evaluate_modifiers(&source, &[create(0.0)?])?;
+    let first = evaluate_modifiers(&source, &[create(0.0)?], "OceanGrid")?;
+    let again = evaluate_modifiers(&source, &[create(0.0)?], "OceanGrid")?;
     assert_eq!(first, again);
-    let chopped = evaluate_modifiers(&source, &[create(2.0)?])?;
+    let chopped = evaluate_modifiers(&source, &[create(2.0)?], "OceanGrid")?;
     assert!(
         first
             .vertices
@@ -1155,18 +1164,15 @@ fn ocean_fft_is_seeded_and_choppiness_changes_the_surface() -> Result<(), Box<dy
             .sqrt()
     };
     assert!(rms_height(&first) > 1.0e-10);
-    let generated = evaluate_modifiers(
-        &source,
-        &[modifier(
-            "ocean",
-            json!({
-                "geometry_mode":"GENERATE","resolution":4,"viewport_resolution":4,
-                "spatial_size":8,"random_seed":17,"time":1.5,"wave_scale":1.0,
-                "wave_direction":-0.3,"wave_alignment":0.65,"repeat_x":2,"repeat_y":1,
-                "use_normals":true,"use_foam":true,"foam_layer_name":"foam","choppiness":0.0
-            }),
-        )?],
-    )?;
+    let generated = evaluate_modifiers(&source, &[modifier(
+        "ocean",
+        json!({
+            "geometry_mode":"GENERATE","resolution":4,"viewport_resolution":4,
+            "spatial_size":8,"random_seed":17,"time":1.5,"wave_scale":1.0,
+            "wave_direction":-0.3,"wave_alignment":0.65,"repeat_x":2,"repeat_y":1,
+            "use_normals":true,"use_foam":true,"foam_layer_name":"foam","choppiness":0.0
+        }),
+    )?], "OceanGrid")?;
     assert_eq!(generated.vertices.len(), 33 * 17);
     assert_eq!(generated.faces.len(), 32 * 16);
     assert!((generated.vertices[0].co.x + 8.0).abs() < 1.0e-9);
@@ -2076,7 +2082,8 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
             binding_data: None,
             runtime: potter_core::model::ModifierRuntime::default(),
         };
-        let output = evaluate_modifiers(&source, &[modifier])?;
+        let subject_name = format!("Ocean{choppiness:.1}");
+        let output = evaluate_modifiers(&source, &[modifier], &subject_name)?;
         Ok(output.vertices.iter().map(|vertex| vertex.co).collect())
     };
     let native_still = native_positions(0.0)?;
@@ -2388,18 +2395,15 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
     let references = blender_script_json(&blender, directory.path(), &script)?;
     for (voxel_size, smooth_shade) in [(0.1_f64, false), (0.05, true)] {
         let key = voxel_size.to_string();
-        let native = evaluate_modifiers(
-            &source,
-            &[modifier(
-                "remesh",
-                json!({
-                    "mode":"VOXEL",
-                    "voxel_size":voxel_size,
-                    "adaptivity":0.0,
-                    "use_smooth_shade":smooth_shade
-                }),
-            )?],
-        )?;
+        let native = evaluate_modifiers(&source, &[modifier(
+            "remesh",
+            json!({
+                "mode":"VOXEL",
+                "voxel_size":voxel_size,
+                "adaptivity":0.0,
+                "use_smooth_shade":smooth_shade
+            }),
+        )?], "VoxelInput")?;
         assert_voxel_remesh_geometry(
             &native,
             &references[&key],
