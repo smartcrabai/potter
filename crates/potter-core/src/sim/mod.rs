@@ -726,7 +726,7 @@ pub(crate) fn evaluate(
             .iter()
             .any(|(property, modifier_type)| {
                 node.properties.contains_key(*property)
-                    && gate.is_property_active(id, node, *property, *modifier_type)
+                    && gate.is_property_active(id, node, property, modifier_type)
             })
         })
     });
@@ -929,8 +929,7 @@ fn evaluate_physics(
                 .properties
                 .get("physics_particle_emitter_modifier_id")
                 .and_then(Value::as_str)
-                .map(|modifier_id| particle_system_index(node, modifier_id))
-                .unwrap_or(0);
+                .map_or(0, |modifier_id| particle_system_index(node, modifier_id));
             result.particles.insert(
                 id.clone(),
                 particles
