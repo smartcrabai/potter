@@ -1078,11 +1078,9 @@ fn evaluate_modifier_output(
                 "curve" | "hook" | "data_transfer" | "normal_edit" => ["object", "target"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                "vertex_weight_proximity" => {
-                    ["object", "target", "mask_tex_map_object"]
-                        .iter()
-                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
-                }
+                "vertex_weight_proximity" => ["object", "target", "mask_tex_map_object"]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
                 "uv_project" => modifier
                     .params
                     .get("projectors")

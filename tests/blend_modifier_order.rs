@@ -307,7 +307,6 @@ fn stack_doc(steps: &[Step]) -> TestResult<SceneDoc> {
     Ok(doc)
 }
 
-
 fn duplicate_subdivision_doc() -> TestResult<SceneDoc> {
     let mut doc = apply(
         &SceneDoc::new(SCENE_ID.to_owned()),
@@ -339,7 +338,6 @@ fn duplicate_subdivision_doc() -> TestResult<SceneDoc> {
     )
 }
 
-
 fn potter_modifier_rows(
     doc: &SceneDoc,
     object_id: &str,
@@ -363,7 +361,11 @@ fn potter_modifier_rows(
                     .get("use_pin_to_last")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-                modifier.params.get("levels").cloned().unwrap_or(Value::Null),
+                modifier
+                    .params
+                    .get("levels")
+                    .cloned()
+                    .unwrap_or(Value::Null),
             )
         })
         .collect())
@@ -475,7 +477,6 @@ fn blender_stack_order_and_pins_match_potter_for_each_stack() -> TestResult<()> 
     Ok(())
 }
 
-
 #[test]
 fn repeated_default_modifier_names_round_trip_by_id() -> TestResult<()> {
     let Some(blender) = blender_5_2()? else {
@@ -537,11 +538,15 @@ fn repeated_default_modifier_names_round_trip_by_id() -> TestResult<()> {
         assert_eq!(row.get(4).and_then(Value::as_bool), Some(*show_render));
         assert_eq!(row.get(5), Some(levels));
         assert_eq!(
-            row.get(6).and_then(|value| value.get("id")).and_then(Value::as_str),
+            row.get(6)
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str),
             Some(id.as_str())
         );
         assert_eq!(
-            row.get(6).and_then(|value| value.get("name")).and_then(Value::as_str),
+            row.get(6)
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str),
             Some(name.as_str())
         );
     }
