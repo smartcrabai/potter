@@ -849,3 +849,206 @@ fn glb_export_writes_store_uvs_unflipped() -> TestResult {
     assert_same_vertices(&exported, &expected);
     Ok(())
 }
+
+/// Pins of layer `name` per corner in loop order, read from the store. A face without a `pinned` row
+/// has no pins.
+fn loop_pins(mesh: &Mesh, name: &str) -> TestResult<Vec<bool>> {
+    let store = mesh
+        .attributes
+        .get("uv_layers")
+        .ok_or("uv_layers missing")?;
+    let layer = store["layers"]
+        .as_array()
+        .ok_or("uv_layers layers missing")?
+        .iter()
+        .find(|layer| layer["name"] == name)
+        .ok_or_else(|| format!("no `{name}` layer"))?;
+    let entries = layer["faces"].as_array().ok_or("layer faces missing")?;
+    let mut pins = Vec::new();
+    for face in &mesh.faces {
+        let entry = entries
+            .iter()
+            .find(|entry| entry["face_id"].as_u64() == Some(u64::from(face.id)))
+            .ok_or_else(|| format!("no `{name}` entry for face {}", face.id))?;
+        match entry["pinned"].as_array() {
+            Some(flags) => {
+                for flag in flags {
+                    pins.push(flag.as_bool().ok_or("pin must be a boolean")?);
+                }
+            }
+            None => pins.extend(std::iter::repeat_n(false, face.vertices.len())),
+        }
+    }
+    Ok(pins)
+}
+
+/// The stored (V-down) corner values of layer `name` on storage face `index`.
+fn stored_face_uv(mesh: &Mesh, name: &str, index: usize) -> TestResult<Vec<[f64; 2]>> {
+    let store = mesh
+        .attributes
+        .get("uv_layers")
+        .ok_or("uv_layers missing")?;
+    let face_id = u64::from(mesh.faces.get(index).ok_or("face index out of range")?.id);
+    let layer = store["layers"]
+        .as_array()
+        .ok_or("uv_layers layers missing")?
+        .iter()
+        .find(|layer| layer["name"] == name)
+        .ok_or_else(|| format!("no `{name}` layer"))?;
+    let entry = layer["faces"]
+        .as_array()
+        .ok_or("layer faces missing")?
+        .iter()
+        .find(|entry| entry["face_id"].as_u64() == Some(face_id))
+        .ok_or("face entry missing")?;
+    entry["uv"]
+        .as_array()
+        .ok_or("uv row missing")?
+        .iter()
+        .map(uv)
+        .collect()
+}
+
+/// Sets the `pinned` rows of layer `name`, one row per face in storage order.
+fn set_pins(mesh: &mut Mesh, name: &str, rows: &[Vec<bool>]) -> TestResult {
+    let store = mesh
+        .attributes
+        .get_mut("uv_layers")
+        .ok_or("uv_layers missing")?;
+    let layer = store["layers"]
+        .as_array_mut()
+        .ok_or("uv_layers layers missing")?
+        .iter_mut()
+        .find(|layer| layer["name"] == name)
+        .ok_or_else(|| format!("no `{name}` layer"))?;
+    let entries = layer["faces"].as_array_mut().ok_or("layer faces missing")?;
+    for (entry, row) in entries.iter_mut().zip(rows) {
+        entry["pinned"] = json!(row);
+    }
+    Ok(())
+}
+
+#[test]
+fn array_cap_missing_a_layer_takes_blender_zero_stored_as_v_down_one() -> TestResult {
+    // Blender 5.2.2 probe: a start cap with only UVMap gives its UV2 corners (0.0, 0.0) in V-up.
+    let subject = input_mesh(&json!({
+        "vertices": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        "faces": [[0, 1, 2, 3]],
+        "uv_layers": [
+            {"name": "UVMap", "values": [[0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5]]},
+            {"name": "UV2", "values": [[0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5]]}
+        ]
+    }))?;
+    let cap = input_mesh(&json!({
+        "vertices": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        "faces": [[0, 1, 2, 3]],
+        "uv_layers": [{"name": "UVMap", "values": [[0.5, 0.5], [0.6, 0.5], [0.6, 0.6], [0.5, 0.6]]}]
+    }))?;
+    let array = modifier(
+        "array",
+        "array",
+        &json!({
+            "count": 1,
+            "use_relative_offset": false,
+            "use_constant_offset": false,
+            "use_object_offset": false,
+            "start_cap": "start_cap"
+        }),
+    )?;
+    let doc = scene_doc(
+        subject,
+        vec![array],
+        vec![("start_cap".to_owned(), cap, [5.0, 0.0, 0.0])],
+    )?;
+    let snapshot = evaluate(&doc)?;
+    let mesh = subject_mesh(&snapshot)?;
+    // Storage order is the input face, then the start cap.
+    assert_eq!(mesh.faces.len(), 2);
+    assert_eq!(stored_face_uv(mesh, "UV2", 1)?, vec![[0.0, 1.0]; 4]);
+    Ok(())
+}
+
+#[test]
+fn subdivision_level_one_keeps_the_pinned_corner_pattern_of_blender() -> TestResult {
+    // Blender 5.2.2 probe: pin_uv on loop 0 of a quad, then Subdivision level 1, pins on loops
+    // 0, 1, 2, 3, 4, 7, 8, 12, and 13 (nine of sixteen corners).
+    let mut subject = input_mesh(&json!({
+        "vertices": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        "faces": [[0, 1, 2, 3]],
+        "uv_layers": [{"name": "UVMap", "values": [[0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5]]}]
+    }))?;
+    set_pins(&mut subject, "UVMap", &[vec![true, false, false, false]])?;
+    let subdivide = modifier(
+        "subdivision",
+        "subdivision",
+        &json!({"levels": 1, "render_levels": 1, "subdivision_type": "CATMULL_CLARK"}),
+    )?;
+    let doc = scene_doc(subject, vec![subdivide], Vec::new())?;
+    let snapshot = evaluate(&doc)?;
+    let pins = loop_pins(subject_mesh(&snapshot)?, "UVMap")?;
+    let pinned_loops = [0_usize, 1, 2, 3, 4, 7, 8, 12, 13];
+    let expected: Vec<bool> = (0..16).map(|index| pinned_loops.contains(&index)).collect();
+    assert_eq!(pins, expected);
+    Ok(())
+}
+
+/// UV of loop `index` in the decimate probe: `(0.043 * index mod 1, 0.071 * index mod 1)`.
+fn cube_loop_uv(index: u32) -> [f64; 2] {
+    [
+        (0.043 * f64::from(index)).fract(),
+        (0.071 * f64::from(index)).fract(),
+    ]
+}
+
+#[test]
+fn decimate_ratio_one_keeps_every_pinned_corner_of_blender() -> TestResult {
+    // Blender 5.2.2 probe: a size-2 cube with pin_uv on loops 0, 5, 10, 15, 20 and Decimate COLLAPSE
+    // at ratio 1.0 keeps the same five pinned corners on the same UVs, with 24 loops.
+    const PINNED: [u32; 5] = [0, 5, 10, 15, 20];
+    let uv_values: Vec<Value> = (0..24).map(|index| json!(cube_loop_uv(index))).collect();
+    let mut subject = input_mesh(&json!({
+        "vertices": [
+            [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [-1.0, 1.0, 1.0], [1.0, 1.0, 1.0]
+        ],
+        "faces": [[0, 1, 3, 2], [2, 3, 7, 6], [6, 7, 5, 4], [4, 5, 1, 0], [2, 6, 4, 0], [7, 3, 1, 5]],
+        "uv_layers": [{"name": "UVMap", "values": uv_values}]
+    }))?;
+    let rows: Vec<Vec<bool>> = (0..6_u32)
+        .map(|face| {
+            (0..4_u32)
+                .map(|corner| PINNED.contains(&(4 * face + corner)))
+                .collect()
+        })
+        .collect();
+    set_pins(&mut subject, "UVMap", &rows)?;
+    let decimate = modifier(
+        "decimate",
+        "decimate",
+        &json!({"decimate_type": "COLLAPSE", "ratio": 1.0}),
+    )?;
+    let doc = scene_doc(subject, vec![decimate], Vec::new())?;
+    let snapshot = evaluate(&doc)?;
+    let mesh = subject_mesh(&snapshot)?;
+    let uvs = layer_uvs(mesh, "UVMap")?;
+    let pins = loop_pins(mesh, "UVMap")?;
+    assert_eq!(uvs.len(), 24);
+    let pinned: Vec<[f64; 2]> = uvs
+        .iter()
+        .zip(&pins)
+        .filter(|(_, pinned)| **pinned)
+        .map(|(uv, _)| *uv)
+        .collect();
+    assert_eq!(pinned.len(), PINNED.len());
+    for index in PINNED {
+        let [u, v] = cube_loop_uv(index);
+        assert!(
+            pinned
+                .iter()
+                .any(|[pinned_u, pinned_v]| (pinned_u - u).abs() < 1e-9
+                    && (pinned_v - v).abs() < 1e-9),
+            "pin on loop {index} was lost"
+        );
+    }
+    Ok(())
+}

@@ -43,6 +43,8 @@ for layer_index, name in enumerate(["Base", "Light", "Detail"]):
         layer = mesh.uv_layers.new(name=name)
     for loop_index, item in enumerate(layer.data):
         item.uv = (layer_index * 0.25 + loop_index * 0.01, 0.1 * (layer_index + 1) + loop_index * 0.01)
+        if layer_index == 1:
+            item.pin_uv = loop_index % 2 == 0
 mesh.uv_layers.active_index = 2
 mesh.uv_layers.active_render_index = 1
 bpy.ops.wm.save_as_mainfile(filepath=out)
@@ -62,7 +64,7 @@ if len(meshes) != 1:
 mesh = meshes[0]
 result = {
     "layers": [
-        {"name": layer.name, "values": [[float(item.uv[0]), float(item.uv[1])] for item in layer.data]}
+        {"name": layer.name, "values": [[float(item.uv[0]), float(item.uv[1])] for item in layer.data], "pins": [bool(item.pin_uv) for item in layer.data]}
         for layer in mesh.uv_layers
     ],
     "active": mesh.uv_layers.active_index,
@@ -185,6 +187,46 @@ fn stored_corners(mesh: &Value, layer: &Value) -> TestResult<Vec<[f64; 2]>> {
     Ok(corners)
 }
 
+/// Stored pin flags of one layer, flattened in the mesh's face order. A face without a `pinned`
+/// list has no pinned corner.
+fn stored_pins(mesh: &Value, layer: &Value) -> TestResult<Vec<bool>> {
+    let entries = layer["faces"]
+        .as_array()
+        .ok_or("stored layer has no face entries")?;
+    let mut pins = Vec::new();
+    for face in mesh["faces"].as_array().ok_or("mesh has no faces")? {
+        let id = face["id"].as_u64().ok_or("face ID is missing")?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry["face_id"].as_u64() == Some(id))
+            .ok_or("stored layer has no entry for a face")?;
+        match entry.get("pinned").and_then(Value::as_array) {
+            Some(flags) => {
+                for flag in flags {
+                    pins.push(flag.as_bool().ok_or("stored pin is not a bool")?);
+                }
+            }
+            None => {
+                let corners = entry["uv"].as_array().map_or(0, Vec::len);
+                pins.extend(std::iter::repeat_n(false, corners));
+            }
+        }
+    }
+    Ok(pins)
+}
+
+/// Blender per-loop pin flags of one dumped layer, in loop order.
+fn blender_pins(layer: &Value) -> TestResult<Vec<bool>> {
+    let mut pins = Vec::new();
+    for pin in layer["pins"]
+        .as_array()
+        .ok_or("dumped layer pins are missing")?
+    {
+        pins.push(pin.as_bool().ok_or("dumped pin is not a bool")?);
+    }
+    Ok(pins)
+}
+
 fn assert_close(actual: f64, expected: f64, label: &str) {
     assert!(
         (actual - expected).abs() <= TOLERANCE,
@@ -209,6 +251,11 @@ fn three_uv_layers_round_trip_through_pot_and_blender() -> TestResult {
     assert_eq!(layer_names(&source), LAYER_NAMES);
     assert_eq!(source["active"], json!(ACTIVE_INDEX));
     assert_eq!(source["render"], json!(RENDER_INDEX));
+    // The fixture pins every even loop of `Light` (layer 1) on the 24-loop cube.
+    assert_eq!(
+        blender_pins(&source["layers"][1])?,
+        (0..24).map(|index| index % 2 == 0).collect::<Vec<bool>>()
+    );
 
     let project = root.path().join("project");
     run_pot(|command| {
@@ -260,6 +307,11 @@ fn three_uv_layers_round_trip_through_pot_and_blender() -> TestResult {
                 &format!("{name} loop {loop_index} storage v"),
             );
         }
+        assert_eq!(
+            stored_pins(mesh, stored_layer)?,
+            blender_pins(source_layer)?,
+            "{name}: stored pins"
+        );
     }
 
     let exported_blend = root.path().join("round-trip.blend");
@@ -305,6 +357,11 @@ fn three_uv_layers_round_trip_through_pot_and_blender() -> TestResult {
                 &format!("{name} loop {loop_index} v"),
             );
         }
+        assert_eq!(
+            blender_pins(reopened_layer)?,
+            blender_pins(source_layer)?,
+            "{name}: pins after export"
+        );
     }
     Ok(())
 }

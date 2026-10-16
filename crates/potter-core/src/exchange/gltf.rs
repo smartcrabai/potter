@@ -1444,13 +1444,9 @@ const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 17] = [
 
 /// Whether a `blender_attributes` entry carries data the writer ignores on purpose. Color layers
 /// are never written here; `export_losses` reports each one as `mesh.color_attribute`.
-fn blender_attribute_exportable(mesh: &Mesh, entry: &Value) -> bool {
+fn blender_attribute_exportable(entry: &Value) -> bool {
     let name = entry["name"].as_str().unwrap_or_default();
-    let color = is_color_attribute(entry);
-    let uv_layer = uv_layers::read_layers(mesh)
-        .iter()
-        .any(|layer| layer.name == name);
-    BLENDER_BOOKKEEPING_ATTRIBUTES.contains(&name) || color || uv_layer
+    BLENDER_BOOKKEEPING_ATTRIBUTES.contains(&name) || is_color_attribute(entry)
 }
 
 fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) -> Result<()> {
@@ -1466,11 +1462,9 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             "blender_metadata" => value["custom_properties"]
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty),
-            "blender_attributes" => value.as_array().is_some_and(|entries| {
-                entries
-                    .iter()
-                    .all(|entry| blender_attribute_exportable(mesh, entry))
-            }),
+            "blender_attributes" => value
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(blender_attribute_exportable)),
             "vertex_groups" => {
                 data_block.is_some_and(|block| valid_vertex_groups_attribute(value, block))
             }

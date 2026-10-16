@@ -480,6 +480,13 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
     }
     let uv_layer = match operation.get("uv_layer") {
         None => None,
+        Some(Value::String(name)) if name.is_empty() => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "uv_layer must not be empty; omit it to use the active layer",
+                "/uv_layer",
+            ));
+        }
         Some(Value::String(name)) => Some(name.as_str()),
         Some(_) => {
             return Err(engine.error(
@@ -613,19 +620,25 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
     Ok(true)
 }
 
-/// Corner UVs of the layer `requested` names, or of the render layer when `requested` is `None`.
-/// Keyed by face ID; faces without an entry are absent.
+/// Corner UVs of the layer `requested` names, or of the active layer when `requested` is `None`.
+/// Keyed by face ID; faces without an entry are absent. A named layer that does not exist is an
+/// error: unlike the render path, painting never falls back to another layer.
 fn read_corner_uvs(
     engine: &Engine<'_>,
     mesh: &Mesh,
     requested: Option<&str>,
 ) -> Result<BTreeMap<u32, Vec<DVec2>>> {
     let store = uv_layers::read(mesh);
-    let layer = match store.resolve(requested) {
-        (Some(index), None) => store.layers.get(index),
-        _ => None,
-    }
-    .ok_or_else(|| super::uv::layer_missing(requested))?;
+    let index = match requested {
+        None => store
+            .active
+            .as_deref()
+            .and_then(|active| store.index_of(active)),
+        Some(name) => store.index_of(name),
+    };
+    let layer = index
+        .and_then(|index| store.layers.get(index))
+        .ok_or_else(|| super::uv::layer_missing(requested))?;
     check_unique_face_rows(engine, mesh, &layer.name)?;
     let mut faces = BTreeMap::new();
     for (face, values) in mesh.faces.iter().zip(&layer.faces) {

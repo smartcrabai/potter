@@ -15,6 +15,8 @@ use crate::{
     store::Project,
 };
 
+use super::util::with_load_warnings;
+
 #[expect(
     clippy::too_many_lines,
     reason = "one command constructs a single complete asset verification report"
@@ -148,9 +150,10 @@ pub fn run(args: AssetsArgs) -> Result<(Option<SceneInfo>, Value)> {
             .as_str()
             .is_none_or(|uri| seen_uris.insert(uri.to_owned()))
     });
+    let warnings = with_load_warnings(&[], &project)?;
     Ok((
         Some(scene),
-        json!({"assets":assets,"checked":args.check,"summary":{"count":assets.len(),"missing":assets.iter().filter(|asset| asset["missing"] == true).count(),"changed":assets.iter().filter(|asset| asset["changed"] == true).count()}}),
+        json!({"assets":assets,"checked":args.check,"summary":{"count":assets.len(),"missing":assets.iter().filter(|asset| asset["missing"] == true).count(),"changed":assets.iter().filter(|asset| asset["changed"] == true).count()},"warnings":warnings}),
     ))
 }
 

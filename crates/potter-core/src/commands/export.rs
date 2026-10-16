@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ExportArgs,
-    commands::util::{check_extension, exchange_format_name},
+    commands::util::{check_extension, exchange_format_name, with_load_warnings},
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot},
     exchange::{
@@ -246,6 +246,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             .filter(|path| *path != &args.out)
             .collect::<Vec<_>>();
         let conversions = export_conversions(&doc, &meshes, format);
+        let warnings = with_load_warnings(&snapshot.warnings, &project)?;
         json!({
             "format": format,
             "path": args.out,
@@ -258,7 +259,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             "compatibility": doc.compatibility,
             "conversions": conversions,
             "losses": losses,
-            "warnings": snapshot.warnings,
+            "warnings": warnings,
         })
     };
     Ok((Some(project.info()?), result))

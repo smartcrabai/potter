@@ -662,7 +662,8 @@ impl Snapshot {
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
-                            ),
+                            )
+                            .map(|warnings| modifier_warnings.extend(warnings)),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
                                 modifier,
@@ -932,7 +933,8 @@ impl Snapshot {
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
-                            ),
+                            )
+                            .map(|warnings| modifier_warnings.extend(warnings)),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
                                 modifier,
@@ -2018,7 +2020,7 @@ fn apply_mesh_sequence_cache_modifier(
     frame: f64,
     fps: u32,
     fps_base: f64,
-) -> Result<()> {
+) -> Result<Vec<PotError>> {
     let resource_text = modifier
         .params
         .get("resource")

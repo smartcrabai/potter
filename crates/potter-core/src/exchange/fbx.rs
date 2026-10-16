@@ -1295,6 +1295,20 @@ fn write_geometry(
         quote(&format!("Geometry::{}", node.name))
     )
     .map_err(write_error)?;
+    // FBX has no active or render flag on its UV layers, so Potter records both by layer name.
+    let uv = uv_layers::read(mesh);
+    let mut properties = Vec::new();
+    for (property, name) in [
+        ("potter:uv_active", &uv.active),
+        ("potter:uv_render", &uv.render),
+    ] {
+        if let Some(name) = name {
+            properties.push(format!(
+                "\t\t\tP: \"{property}\", \"KString\", \"\", \"\", \"{}\"",
+                quote(name)
+            ));
+        }
+    }
     if let Some(data) = data_block.filter(|data| {
         data.shape_keys
             .as_ref()
@@ -1318,10 +1332,16 @@ fn write_geometry(
                 json!({"reason": error.to_string()}),
             )
         })?;
+        properties.push(format!(
+            "\t\t\tP: \"potter:deformation\", \"KString\", \"\", \"\", \"{}\"",
+            quote(&metadata)
+        ));
+    }
+    if !properties.is_empty() {
         writeln!(
             output,
-            "\t\tProperties70:  {{\n\t\t\tP: \"potter:deformation\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}",
-            quote(&metadata)
+            "\t\tProperties70:  {{\n{}\n\t\t}}",
+            properties.join("\n")
         )
         .map_err(write_error)?;
     }
@@ -1429,7 +1449,7 @@ fn write_geometry(
         output.push_str("\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementMaterial\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
     }
     // Blender keeps the first UV layer in layer 0 and gives each further layer its own layer.
-    let uv_count = uv_layers::read(mesh).layers.len();
+    let uv_count = uv_layers::layer_count(mesh);
     if uv_count > 0 {
         output.push_str("\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementUV\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
     }
@@ -1959,7 +1979,12 @@ fn import_bytes_with_base(
             if let Some(normals) = &geometry.normals {
                 shading::import_shading(&mut mesh, normals)?;
             }
-            import_uv_layers(&mut mesh, &geometry.uv_layers, Some(0), Some(0));
+            import_uv_layers(
+                &mut mesh,
+                &geometry.uv_layers,
+                geometry.uv_active,
+                geometry.uv_render,
+            );
             for (face_index, face) in mesh.faces.iter_mut().enumerate() {
                 let slot = geometry
                     .material_indices
@@ -2080,6 +2105,10 @@ struct ImportedGeometry {
     normals: Option<Vec<DVec3>>,
     /// UV layers in file order; empty when the geometry has none.
     uv_layers: Vec<ExchangeUvLayer>,
+    /// Index of the active UV layer; `None` when the geometry has no UV layer.
+    uv_active: Option<usize>,
+    /// Index of the render UV layer; `None` when the geometry has no UV layer.
+    uv_render: Option<usize>,
 }
 
 fn decode_deformation_field<T: DeserializeOwned>(
@@ -2336,6 +2365,17 @@ fn parse_geometry(
         });
     }
     let layers = parse_uv_layers(node, positions.len(), &faces, geometry_id, losses)?;
+    // A geometry without a recorded selection, or one naming no layer, selects the first layer.
+    let select = |property: &str| {
+        if layers.is_empty() {
+            return None;
+        }
+        let named = read_string_property(node.child("Properties70"), property)
+            .and_then(|name| layers.iter().position(|layer| layer.name == name));
+        Some(named.unwrap_or(0))
+    };
+    let uv_active = select("potter:uv_active");
+    let uv_render = select("potter:uv_render");
     Ok(ImportedGeometry {
         positions,
         faces,
@@ -2343,6 +2383,8 @@ fn parse_geometry(
         deformation,
         normals,
         uv_layers: layers,
+        uv_active,
+        uv_render,
     })
 }
 

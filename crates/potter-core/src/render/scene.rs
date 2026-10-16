@@ -15,7 +15,7 @@ use crate::{
     },
     image::ImageData,
     model::{Id, Material, SceneDoc},
-    shader::{HitContext, evaluate_displacement, fill_uv_maps},
+    shader::{HitContext, HitUvLayers, evaluate_displacement},
 };
 
 use super::{
@@ -32,6 +32,9 @@ pub(super) struct ObjectRecord {
     /// UV layer names in layer order, matching `Triangle::layer_uvs`. Not part of the output.
     #[serde(skip)]
     pub uv_layers: Vec<String>,
+    /// Index of the render layer in `uv_layers`; `None` without layers. Not part of the output.
+    #[serde(skip)]
+    pub uv_render: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -233,6 +236,7 @@ pub(super) fn extract_geometry(
             .map(|layer| layer.name.clone())
             .collect();
         let render_layer = uv_store.render_index().unwrap_or(0);
+        let uv_render = (!uv_names.is_empty()).then_some(render_layer);
         objects.push(ObjectRecord {
             index: object_index,
             node_id: node_id.clone(),
@@ -244,6 +248,7 @@ pub(super) fn extract_geometry(
                 .cloned()
                 .unwrap_or_default(),
             uv_layers: uv_names.clone(),
+            uv_render,
         });
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
@@ -397,13 +402,20 @@ pub(super) fn extract_geometry(
                         material.displacement_method == "displacement"
                             && material.node_tree.is_some()
                     }) {
+                        let layers = HitUvLayers {
+                            names: &uv_names,
+                            corners: &triangle.layer_uvs,
+                            positions: triangle.positions,
+                            barycentric: [1.0, 0.0, 0.0],
+                            render: uv_render,
+                        };
                         triangles.extend(subdivide_displaced_triangle(
                             doc,
                             material,
                             matrix,
                             &triangle,
                             images,
-                            &uv_names,
+                            layers,
                             &shader_warnings,
                         )?);
                     } else {
@@ -1004,23 +1016,16 @@ fn subdivide_displaced_triangle(
     object_to_world: DMat4,
     triangle: &Triangle,
     images: &BTreeMap<String, ImageData>,
-    uv_names: &[String],
+    layers: HitUvLayers<'_>,
     warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<[Triangle; 4]> {
     subdivide_displaced(triangle, object_to_world, |sample| {
-        let mut table: [(&str, [f64; 2]); uv_layers::MAX_LAYERS] =
-            [("", [0.0; 2]); uv_layers::MAX_LAYERS];
-        let maps = fill_uv_maps(
-            &mut table,
-            uv_names
-                .iter()
-                .map(String::as_str)
-                .zip(sample.layer_uvs.iter().copied()),
-        )?;
         let mut context = HitContext::new(&doc.node_groups)
             .with_images(images)
-            .with_tangent_frame(sample.tangent, sample.bitangent)
-            .with_uv_maps(maps)
+            .with_uv_layers(HitUvLayers {
+                barycentric: sample.barycentric,
+                ..layers
+            })
             .with_warnings(warnings);
         context.uv = sample.uv;
         context.position = sample.point;
@@ -1036,12 +1041,10 @@ struct DisplacementSample {
     point: DVec3,
     object: DVec3,
     uv: [f64; 2],
-    /// Each UV layer's value at this sample, in layer order.
-    layer_uvs: Vec<[f64; 2]>,
+    /// Barycentric weights of the sample over the triangle's corners.
+    barycentric: [f64; 3],
     /// Blended corner normal the sample moves along, or the face normal on flat triangles.
     normal: DVec3,
-    tangent: DVec3,
-    bitangent: DVec3,
 }
 
 /// Splits a triangle into four and moves its six sample points by `displacement`.
@@ -1058,34 +1061,6 @@ fn subdivide_displaced(
     let normal = (triangle.positions[1] - triangle.positions[0])
         .cross(triangle.positions[2] - triangle.positions[0])
         .normalize_or_zero();
-    let uv1 = [
-        triangle.uv[1][0] - triangle.uv[0][0],
-        triangle.uv[1][1] - triangle.uv[0][1],
-    ];
-    let uv2 = [
-        triangle.uv[2][0] - triangle.uv[0][0],
-        triangle.uv[2][1] - triangle.uv[0][1],
-    ];
-    let determinant = uv1[0] * uv2[1] - uv1[1] * uv2[0];
-    let (tangent, bitangent) = if determinant.abs() > f64::EPSILON {
-        (
-            ((triangle.positions[1] - triangle.positions[0]) * uv2[1]
-                - (triangle.positions[2] - triangle.positions[0]) * uv1[1])
-                / determinant,
-            ((triangle.positions[2] - triangle.positions[0]) * uv1[0]
-                - (triangle.positions[1] - triangle.positions[0]) * uv2[0])
-                / determinant,
-        )
-    } else {
-        let tangent = if normal.z.abs() < 0.999 {
-            normal.cross(DVec3::Z)
-        } else {
-            normal.cross(DVec3::Y)
-        };
-        (tangent, normal.cross(tangent))
-    };
-    let tangent = tangent.normalize_or_zero();
-    let bitangent = bitangent.normalize_or_zero();
     let barycentric = [
         [1.0, 0.0, 0.0],
         [0.5, 0.5, 0.0],
@@ -1121,21 +1096,15 @@ fn subdivide_displaced(
             point,
             object,
             uv,
-            layer_uvs: triangle
-                .layer_uvs
-                .iter()
-                .map(|corners| blend_uv(corners, weights))
-                .collect(),
+            barycentric: weights,
             normal: sample_normal,
-            tangent,
-            bitangent,
         };
         let displacement = displacement(&sample)?;
         positions[index] = point + sample_normal * displacement;
         sample_normals[index] = sample_normal;
         uvs[index] = uv;
-        for (table, layer_uv) in layer_samples.iter_mut().zip(&sample.layer_uvs) {
-            table[index] = *layer_uv;
+        for (table, corners) in layer_samples.iter_mut().zip(&triangle.layer_uvs) {
+            table[index] = blend_uv(corners, weights);
         }
     }
     let indices: [[usize; 3]; 4] = [[0, 1, 2], [1, 3, 4], [2, 4, 5], [1, 4, 2]];

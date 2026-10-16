@@ -1719,6 +1719,7 @@ fn apply_delete(mesh: &mut Mesh, selected: &Selection) -> IdChanges {
             });
         }
     }
+    uv_layers::prune_missing_faces(mesh);
     changes
 }
 

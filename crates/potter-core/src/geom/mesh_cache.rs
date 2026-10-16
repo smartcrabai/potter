@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    exchange::alembic::{self, MeshCacheSample},
+    exchange::{
+        ExchangeUvLayer,
+        alembic::{self, MeshCacheSample},
+    },
     model::Modifier,
     params::{self, ParameterFamily},
 };
@@ -22,6 +25,8 @@ static CACHE_SAMPLES: LazyLock<Mutex<HashMap<String, Arc<Vec<MeshCacheSample>>>>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Replace a mesh with the requested Alembic cache sample.
+///
+/// Returns the warnings for cache data the mesh could not take, such as UV layers past the limit.
 ///
 /// # Errors
 ///
@@ -38,7 +43,7 @@ pub(crate) fn evaluate(
     fps_base: f64,
     resource_hash: &str,
     archive_bytes: &[u8],
-) -> Result<()> {
+) -> Result<Vec<PotError>> {
     let resource = string_param(modifier, "resource")?;
     let object_path = string_param(modifier, "object_path")?;
     let frame_offset = number_param(modifier, "frame_offset")?;
@@ -141,15 +146,23 @@ pub(crate) fn evaluate(
             }),
         ));
     }
+    let mut warnings = Vec::new();
     if !read.polygons {
         if read.vertices {
             for (index, vertex) in mesh.vertices.iter_mut().enumerate() {
                 vertex.co = evaluated_position(&sample, index, modifier)?;
             }
         }
-        apply_cache_attributes(mesh, sample.sample, read, velocity_scale, modifier)?;
+        apply_cache_attributes(
+            mesh,
+            sample.sample,
+            read,
+            velocity_scale,
+            modifier,
+            &mut warnings,
+        )?;
         validate_cache_output(mesh, modifier)?;
-        return Ok(());
+        return Ok(warnings);
     }
     let positions = if read.vertices {
         (0..sample.sample.positions.len())
@@ -166,16 +179,18 @@ pub(crate) fn evaluate(
                 json!({"modifier_id":modifier.id,"reason":error.to_string()}),
             )
         })?;
+    carry_uv_store(mesh, &mut evaluated);
     apply_cache_attributes(
         &mut evaluated,
         sample.sample,
         read,
         velocity_scale,
         modifier,
+        &mut warnings,
     )?;
     validate_cache_output(&evaluated, modifier)?;
     *mesh = evaluated;
-    Ok(())
+    Ok(warnings)
 }
 
 fn apply_cache_attributes(
@@ -184,30 +199,15 @@ fn apply_cache_attributes(
     read: ReadAttributes,
     velocity_scale: f64,
     modifier: &Modifier,
+    warnings: &mut Vec<PotError>,
 ) -> Result<()> {
     if read.uv
-        && let Some(uv_faces) = &sample.uv_faces
+        && let Some(uv_layers) = &sample.uv_layers
     {
-        if uv_faces.len() != mesh.faces.len() {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "Alembic UV face count does not match the selected mesh topology",
-                json!({"modifier_id":modifier.id,"cache_faces":uv_faces.len(),"mesh_faces":mesh.faces.len()}),
-            ));
+        for layer in uv_layers {
+            check_cache_uv_layer(mesh, modifier, layer)?;
         }
-        if let Some((face, uv)) = mesh
-            .faces
-            .iter()
-            .zip(uv_faces)
-            .find(|(face, uv)| face.vertices.len() != uv.len())
-        {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "Alembic UV corner count does not match the selected face topology",
-                json!({"modifier_id":modifier.id,"face_id":face.id,"cache_corners":uv.len(),"mesh_corners":face.vertices.len()}),
-            ));
-        }
-        write_cache_uvs(mesh, modifier, uv_faces)?;
+        write_cache_uvs(mesh, modifier, uv_layers, warnings)?;
     }
     if read.color
         && let Some((scope, colors)) = &sample.colors
@@ -242,42 +242,134 @@ fn apply_cache_attributes(
     Ok(())
 }
 
-/// Writes the cache's corner UVs into the layer that the modifier names with `uv_layer`, or into
-/// the render layer when it names none. A named layer the mesh lacks is created. The layer's values
-/// and pins are replaced; its other layers are kept.
-fn write_cache_uvs(mesh: &mut Mesh, modifier: &Modifier, uv_faces: &[Vec<[f64; 2]>]) -> Result<()> {
+/// Carries the input mesh's UV layers onto the replacement mesh that a topology read builds. Rows
+/// are per face and corner, so they keep their values only while the corner layout is unchanged.
+/// Otherwise the layers keep their names, order, and selectors, with no values.
+fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
+    let mut store = uv_layers::read(input);
+    let same_layout = input.faces.len() == replacement.faces.len()
+        && input
+            .faces
+            .iter()
+            .zip(&replacement.faces)
+            .all(|(old, new)| old.vertices.len() == new.vertices.len());
+    if !same_layout {
+        for layer in &mut store.layers {
+            layer.faces = vec![None; replacement.faces.len()];
+            layer.pinned = vec![None; replacement.faces.len()];
+        }
+    }
+    uv_layers::write(replacement, &store);
+}
+
+/// Writes each cached UV layer into the layer its name gives, creating the layer when the mesh
+/// lacks it. A layer's values are replaced; its pins and the other layers are kept. A cached layer
+/// with no room left under the mesh limit is reported and not written. The active and render names
+/// keep their layers while those exist; otherwise they name the first layer the cache wrote.
+fn write_cache_uvs(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    cached: &[ExchangeUvLayer],
+    warnings: &mut Vec<PotError>,
+) -> Result<()> {
     let mut store = uv_layers::read(mesh);
-    let name = match modifier.params.get("uv_layer").and_then(Value::as_str) {
-        Some(name) => name.to_owned(),
-        None => store.render.clone().unwrap_or_else(|| "UVMap".to_owned()),
-    };
-    let index = if let Some(index) = store.index_of(&name) {
-        index
-    } else {
-        if store.layers.len() >= uv_layers::MAX_LAYERS {
-            return Err(PotError::with_details(
-                ErrorCode::LimitExceeded,
-                "Alembic UV cache needs a UV layer beyond the mesh limit",
-                json!({"feature_id":"uv.layer_limit","modifier_id":modifier.id}),
-            ));
+    let mut first_written = None;
+    for cached_layer in cached {
+        let index = match store.index_of(&cached_layer.name) {
+            Some(index) => index,
+            None if store.layers.len() < uv_layers::MAX_LAYERS => {
+                store.layers.push(UvLayer::new(
+                    cached_layer.name.clone(),
+                    vec![None; mesh.faces.len()],
+                ));
+                store.layers.len() - 1
+            }
+            None => {
+                warnings.push(layer_limit_warning(modifier, &cached_layer.name));
+                continue;
+            }
+        };
+        let layer = store.layers.get_mut(index).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "UV layer index is out of range")
+        })?;
+        layer.faces = cached_layer
+            .corners
+            .iter()
+            .map(|corners| Some(corners.clone()))
+            .collect();
+        if first_written.is_none() {
+            first_written = Some(cached_layer.name.clone());
         }
-        store
-            .layers
-            .push(UvLayer::new(name.clone(), vec![None; mesh.faces.len()]));
-        if store.layers.len() == 1 {
-            store.active = Some(name.clone());
-            store.render = Some(name);
-        }
-        store.layers.len() - 1
-    };
-    let layer = store
-        .layers
-        .get_mut(index)
-        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "UV layer index is out of range"))?;
-    layer.faces = uv_faces.iter().map(|uv| Some(uv.clone())).collect();
-    layer.pinned = vec![None; mesh.faces.len()];
+    }
+    let active_exists = store
+        .active
+        .as_deref()
+        .is_some_and(|name| store.index_of(name).is_some());
+    if !active_exists {
+        store.active.clone_from(&first_written);
+    }
+    let render_exists = store
+        .render
+        .as_deref()
+        .is_some_and(|name| store.index_of(name).is_some());
+    if !render_exists {
+        store.render.clone_from(&first_written);
+    }
     uv_layers::write(mesh, &store);
     Ok(())
+}
+
+fn check_cache_uv_layer(mesh: &Mesh, modifier: &Modifier, layer: &ExchangeUvLayer) -> Result<()> {
+    if layer.corners.len() != mesh.faces.len() {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic UV face count does not match the selected mesh topology",
+            json!({
+                "modifier_id":modifier.id,
+                "layer":layer.name,
+                "cache_faces":layer.corners.len(),
+                "mesh_faces":mesh.faces.len(),
+            }),
+        ));
+    }
+    if let Some((face, uv)) = mesh
+        .faces
+        .iter()
+        .zip(&layer.corners)
+        .find(|(face, uv)| face.vertices.len() != uv.len())
+    {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic UV corner count does not match the selected face topology",
+            json!({
+                "modifier_id":modifier.id,
+                "layer":layer.name,
+                "face_id":face.id,
+                "cache_corners":uv.len(),
+                "mesh_corners":face.vertices.len(),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+/// The warning for a cached UV layer the mesh has no room for. The layer is not written.
+fn layer_limit_warning(modifier: &Modifier, layer: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::LimitExceeded,
+        format!(
+            "Mesh Sequence Cache UV layer `{layer}` was not written: the mesh already has {} UV layers",
+            uv_layers::MAX_LAYERS
+        ),
+        json!({
+            "feature_id":"uv.layer_limit",
+            "status":"dropped",
+            "modifier_id":modifier.id,
+            "modifier_type":modifier.modifier_type,
+            "layer":layer,
+            "limit":uv_layers::MAX_LAYERS,
+        }),
+    )
 }
 
 fn validate_cache_output(mesh: &Mesh, modifier: &Modifier) -> Result<()> {

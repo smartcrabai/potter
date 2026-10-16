@@ -7,7 +7,8 @@
 //!   when the slot has a `KHR_texture_transform`, with Blender's Location, Rotation and Scale;
 //! - the base color, metallic-roughness and emissive colors into the Principled BSDF, multiplied by
 //!   their factors as Blender does;
-//! - the normal map through a Normal Map node whose Strength is the `normalTexture.scale`;
+//! - the normal map through a Normal Map node whose Strength is the `normalTexture.scale` and whose
+//!   UV Map is the normal texture's layer (the render layer when it names none);
 //! - occlusion through a Separate Color (Red) into the `glTF Material Output` group, which PR10's
 //!   resolver reads back as glTF occlusion.
 
@@ -268,6 +269,18 @@ fn build_graph(
         normal_map
             .properties
             .insert("space".to_owned(), json!("TANGENT"));
+        // The node reads the normal texture's layer, as Blender's importer sets it; the render
+        // layer (no name, or an empty one) is the node default.
+        if let Some(layer) = slot
+            .texture
+            .uv_layer
+            .as_deref()
+            .filter(|layer| !layer.is_empty())
+        {
+            normal_map
+                .properties
+                .insert("uv_map".to_owned(), json!(layer));
+        }
         normal_map
             .inputs
             .insert("Strength".to_owned(), json!(textures.normal_scale));
@@ -476,5 +489,40 @@ mod tests {
         assert!(insert(&mut graph, "node", GraphNode::new("ShaderNodeMapping")).is_ok());
         assert!(insert(&mut graph, "node", GraphNode::new("ShaderNodeNormalMap")).is_err());
         assert_eq!(graph.nodes.len(), 1);
+    }
+
+    fn normal_map_uv_map(uv_layer: Option<&str>) -> Result<Option<Value>> {
+        let textures = GraphTextures {
+            base_color: None,
+            metallic_roughness: None,
+            normal: Some(SlotTexture {
+                texture: TextureRef {
+                    image: Id::new("normal_image")?,
+                    uv_layer: uv_layer.map(str::to_owned),
+                    interpolation: ImageInterpolation::Linear,
+                },
+                transform: None,
+            }),
+            normal_scale: 1.0,
+            emissive: None,
+            occlusion: None,
+        };
+        let graph = build_graph(&Material::default(), &textures, false)?;
+        Ok(graph
+            .nodes
+            .get(&Id::new("normal_strength")?)
+            .and_then(|node| node.properties.get("uv_map"))
+            .cloned())
+    }
+
+    #[test]
+    fn normal_map_node_reads_the_normal_texture_layer() -> Result<()> {
+        assert_eq!(
+            normal_map_uv_map(Some("UVMap.001"))?,
+            Some(json!("UVMap.001"))
+        );
+        assert_eq!(normal_map_uv_map(None)?, None);
+        assert_eq!(normal_map_uv_map(Some(""))?, None);
+        Ok(())
     }
 }

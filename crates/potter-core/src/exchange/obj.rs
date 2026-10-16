@@ -209,9 +209,15 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                 normals.push(normal);
             }
             "vt" => {
-                // Blender's OBJ writes raw V, which points up; Potter stores V down.
-                let values = parse_floats(words, 2, line_number)?;
-                uvs.push([values[0], 1.0 - values[1]]);
+                // Blender's OBJ writes raw V, which points up; Potter stores V down. The OBJ format
+                // makes `v` optional with a default of 0, so `vt u` is a complete coordinate.
+                let u = parse_floats(words.by_ref(), 1, line_number)?[0];
+                let v = if words.clone().next().is_some() {
+                    parse_floats(words, 1, line_number)?[0]
+                } else {
+                    0.0
+                };
+                uvs.push([u, 1.0 - v]);
             }
             "o" | "g" => {
                 let name = words.collect::<Vec<_>>().join(" ");

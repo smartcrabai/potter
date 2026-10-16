@@ -865,6 +865,28 @@ fn corner_uvs(position: &Position, layer: &UvLayer) -> Vec<DVec2> {
     uvs
 }
 
+/// The pins of layer `name` that the rebuild carried onto `faces`. A face keeps its pins when they
+/// cover its corners; otherwise it has none.
+pub(super) fn carried_pins(
+    carried: &[UvLayer],
+    name: &str,
+    faces: &[Option<Vec<[f64; 2]>>],
+) -> Vec<Option<Vec<bool>>> {
+    let known = carried.iter().find(|layer| layer.name == name);
+    faces
+        .iter()
+        .enumerate()
+        .map(|(face, uv)| {
+            let corners = uv.as_ref()?.len();
+            known?
+                .pinned
+                .get(face)?
+                .clone()
+                .filter(|pins| pins.len() == corners)
+        })
+        .collect()
+}
+
 impl UvSubdivision {
     /// Face-varying channels of every UV layer of `mesh` (the level-0 state).
     pub(super) fn new(mesh: &Mesh, options: UvOptions) -> Result<Self> {
@@ -947,6 +969,8 @@ impl UvSubdivision {
             }
             None => None,
         };
+        // The provenance rebuild already carried each corner's pin onto the layers of `result`.
+        let carried = uv_layers::read_layers(result);
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             if layer.current.face_count() != polys.len() {
@@ -965,7 +989,7 @@ impl UvSubdivision {
                 }
                 None => &layer.current.uvs,
             };
-            let faces = (0..layer.current.face_count())
+            let faces: Vec<Option<Vec<[f64; 2]>>> = (0..layer.current.face_count())
                 .map(|face| {
                     Some(
                         layer
@@ -977,7 +1001,10 @@ impl UvSubdivision {
                     )
                 })
                 .collect();
-            layers.push(UvLayer::new(layer.name.clone(), faces));
+            let pinned = carried_pins(&carried, &layer.name, &faces);
+            let mut written = UvLayer::new(layer.name.clone(), faces);
+            written.pinned = pinned;
+            layers.push(written);
         }
         uv_layers::write_layers(result, &layers);
         Ok(())
