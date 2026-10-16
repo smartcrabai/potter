@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
-    model::{Id, LibraryKind, SceneDoc},
+    model::{Id, LibraryKind, SceneDoc, migrate::inline_resource_kind},
 };
 
 pub(crate) const REGISTRIES: &[&str] = &[
@@ -124,34 +124,32 @@ fn linked_blend_bytes(
         .resource
         .as_ref()
         .and_then(|resource_id| doc.resources.get(resource_id));
-    if resource
-        .is_some_and(|resource| resource.get("packed").and_then(Value::as_bool) == Some(true))
-    {
-        let values = resource
-            .and_then(|resource| resource.get("bytes"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "packed Blender library resource has no byte payload",
-                )
-            })?;
-        return values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                value
-                    .as_u64()
-                    .and_then(|byte| u8::try_from(byte).ok())
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::SceneInvalid,
-                            "packed Blender library byte is outside 0..255",
-                            json!({"resource_id":library.resource,"index":index}),
-                        )
-                    })
-            })
-            .collect();
+    let resource = if let Some(resource) = resource {
+        if inline_resource_kind(resource)?.is_some() {
+            None
+        } else {
+            Some(resource)
+        }
+    } else {
+        None
+    };
+    if let (Some(resource_id), Some(resource)) = (&library.resource, resource) {
+        if resource.get("sequence_frames").is_some()
+            || resource.get("sequence_start").is_some()
+            || resource.get("sequence_end").is_some()
+        {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "a Blender library cannot be backed by a cache sequence resource",
+                json!({"library_uri":library.uri,"resource_id":resource_id}),
+            ));
+        }
+        if resource.get("packed").and_then(Value::as_bool) == Some(true)
+            || resource.get("hash").and_then(Value::as_str).is_some()
+        {
+            return crate::eval::read_cache_resource(doc, project_root, resource_id)
+                .map(|(bytes, _)| bytes);
+        }
     }
     let uri = resource
         .and_then(|resource| resource.get("uri"))
@@ -164,11 +162,6 @@ fn linked_blend_bytes(
                 library.resolved_path.as_str()
             }
         });
-    let path_text = uri
-        .strip_prefix("file://")
-        .unwrap_or(uri)
-        .strip_prefix("//")
-        .unwrap_or_else(|| uri.strip_prefix("file://").unwrap_or(uri));
     let path = Path::new(path_text);
     let path = if path.is_absolute() {
         path.to_path_buf()

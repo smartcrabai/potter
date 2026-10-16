@@ -6,6 +6,7 @@
 //   source/blender/blenlib/intern/math_matrix_c.cc, SPDX-FileCopyrightText: 2001-2002 NaN Holding BV. All rights reserved., GPL-2.0-or-later.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use glam::{DMat4, DVec3};
 use serde_json::{Map, Value, json};
@@ -17,6 +18,7 @@ use crate::{
     model::{Id, Modifier, Registry},
     params::{self, ParameterFamily},
 };
+use crate::blender_rng::BlenderRng;
 
 use super::attribute_keys;
 use super::clnor::{self, CornerNormalCode, NormalCodeOptions, settle_custom_normals};
@@ -34,9 +36,13 @@ mod bevel_shading;
 mod bevel_vmesh;
 mod decimate;
 pub(crate) mod deform;
+pub(crate) mod displacement;
+pub(crate) use displacement::{displace_textured, load_modifier_texture, warp_textured, wave_textured};
 mod ocean;
 mod remesh_modes;
 pub mod simulation;
+mod skin;
+mod smoothing;
 mod subdivision_uv;
 type Polygon = (Vec<usize>, u32);
 type BevelEdgeFaces = BTreeMap<(usize, usize), Vec<(usize, usize, u32)>>;
@@ -101,7 +107,7 @@ pub fn evaluate_modifiers_with_groups_and_custom(
     evaluated: Mesh,
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
-    custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
+    custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>, Option<&[DVec3]>, &mut BlenderRng) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_groups_and_custom_at_frame(
         evaluated,
@@ -123,8 +129,9 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
-    custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
+    custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>, Option<&[DVec3]>, &mut BlenderRng) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
+    let mut texture_rng = BlenderRng::seed_random(0);
     evaluate_modifiers_with_scene_context(
         evaluated,
         modifiers,
@@ -136,6 +143,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         ModifierEvaluationContext::default(),
+        &mut texture_rng,
         custom_modifier,
     )
 }
@@ -151,21 +159,55 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     evaluated_object_meshes: &BTreeMap<Id, Mesh>,
     curve_path_lengths: &BTreeMap<Id, f64>,
     context: ModifierEvaluationContext<'_>,
-    mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
+    texture_rng: &mut BlenderRng,
+    mut custom_modifier: impl FnMut(
+        &mut Mesh,
+        &Modifier,
+        &mut Vec<PotError>,
+        Option<&[DVec3]>,
+        &mut BlenderRng,
+    ) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "modifier evaluation frame must be finite",
         ));
     }
+    let stack_input = modifiers
+        .iter()
+        .any(|modifier| modifier.enabled && modifier.modifier_type == "corrective_smooth")
+        .then(|| evaluated.clone());
     let mut instance_paths = Vec::new();
     let mut warnings = Vec::new();
+    // Blender's `vert_coords_prev`: positions before a deform that a following multi-input armature reads.
+    let mut run_input: Option<Rc<Vec<DVec3>>> = None;
     for (modifier_index, modifier) in modifiers
         .iter()
         .enumerate()
         .filter(|(_, modifier)| modifier.enabled)
     {
         validate_boolean_topology_suffix(modifiers, modifier_index)?;
+        let uses_multi_armature = |modifier: &Modifier| {
+            modifier.modifier_type == "armature"
+                && modifier
+                    .params
+                    .get("use_multi_modifier")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        };
+        let keep = uses_multi_armature(modifier) && run_input.is_some();
+        let incoming = if keep { run_input.clone() } else { None };
+        if !keep {
+            let next_reads_previous = modifiers[modifier_index + 1..]
+                .iter()
+                .find(|next| next.enabled)
+                .is_some_and(uses_multi_armature);
+            run_input = (matches!(
+                modifier.modifier_type.as_str(),
+                "armature" | "lattice" | "mesh_deform"
+            ) && next_reads_previous)
+                .then(|| Rc::new(evaluated.vertices.iter().map(|vertex| vertex.co).collect()));
+        }
         let scene_operand_modifier = (matches!(
             modifier.modifier_type.as_str(),
             "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform"
@@ -189,10 +231,16 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 && ["object_from", "object_to"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)))
-            || (modifier.modifier_type == "warp"
-                && ["object_from", "object_to"]
+            || (modifier.modifier_type == "displace"
+                && modifier.params.get("texture").is_some_and(|value| !value.is_null()))
+            || (modifier.modifier_type == "wave"
+                && ["texture", "start_position_object"]
                     .iter()
-                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)))
+                    .any(|key| modifier.params.get(*key).is_some_and(|value| !value.is_null())))
+            || (modifier.modifier_type == "warp"
+                && ["object_from", "object_to", "texture"]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(|value| !value.is_null())))
             || (matches!(
                 modifier.modifier_type.as_str(),
                 "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity"
@@ -219,7 +267,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 && modifier.params.get("object").is_some_and(Value::is_string))
             || scene_operand_modifier
         {
-            custom_modifier(&mut evaluated, modifier, &mut warnings)?;
+            custom_modifier(
+                &mut evaluated,
+                modifier,
+                &mut warnings,
+                incoming.as_deref().map(Vec::as_slice),
+                texture_rng,
+            )?;
             continue;
         }
         if modifier.modifier_type == "nodes" {
@@ -294,17 +348,17 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "bevel" => bevel(&evaluated, modifier)?,
             "decimate" => without_custom_normals(decimate(&evaluated, modifier)?),
             "weld" => weld(&evaluated, modifier)?,
-            "displace" => displace(&evaluated, modifier, owner_world_matrix)?,
+            "displace" => displace_textured(&evaluated, modifier, owner_world_matrix, None, texture_rng)?,
             "smooth" => smooth(&evaluated, modifier)?,
             "simple_deform" => advanced::simple_deform(&evaluated, modifier)?,
             "screw" => advanced::screw(&evaluated, modifier)?,
             "shrinkwrap" => advanced::shrinkwrap(&evaluated, modifier)?,
             "curve" => advanced::curve(&evaluated, modifier)?,
             "hook" => advanced::hook(&evaluated, modifier)?,
-            "skin" => advanced::skin(&evaluated, modifier)?,
+            "skin" => skin::skin(&evaluated, modifier)?,
             "cast" => advanced::cast(&evaluated, modifier)?,
-            "wave" => advanced::wave(&evaluated, modifier, frame)?,
-            "warp" => advanced::warp(&evaluated, modifier)?,
+            "wave" => wave_textured(&evaluated, modifier, frame, None, texture_rng)?,
+            "warp" => warp_textured(&evaluated, modifier, None, texture_rng)?,
             "vertex_weight_edit"
             | "vertex_weight_mix"
             | "vertex_weight_proximity"
@@ -312,10 +366,14 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             | "normal_edit"
             | "uv_project"
             | "uv_warp"
-            | "data_transfer" => attributes::evaluate(&evaluated, modifier)?,
-            "laplacian_smooth" => advanced::laplacian_smooth(&evaluated, modifier)?,
+            | "data_transfer" => attributes::evaluate(&evaluated, modifier, texture_rng)?,
+            "laplacian_smooth" => smoothing::laplacian_smooth(&evaluated, modifier)?,
             "laplacian_deform" => deform::laplacian_deform(&evaluated, modifier)?,
-            "corrective_smooth" => advanced::corrective_smooth(&evaluated, modifier)?,
+            "corrective_smooth" => smoothing::corrective_smooth(
+                &evaluated,
+                stack_input.as_ref().unwrap_or(&evaluated),
+                modifier,
+            )?,
             "build" => advanced::build(&evaluated, modifier, frame)?,
             "edge_split" => advanced::edge_split(&evaluated, modifier)?,
             "mask" => advanced::mask(&evaluated, modifier)?,
@@ -371,7 +429,7 @@ pub fn evaluate_modifiers_with_groups_at_frame(
         modifiers,
         node_groups,
         frame,
-        |_, modifier, _warnings| Err(unsupported_modifier(modifier)),
+        |_, modifier, _warnings, _, _texture_rng| Err(unsupported_modifier(modifier)),
     )
 }
 
@@ -4815,128 +4873,6 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Result<Mesh> {
-    validated(mesh)?;
-    let strength = number_param(modifier, "strength")?;
-    let mid_level = number_param(modifier, "mid_level")?;
-    let direction = string_param_with_expected(
-        modifier,
-        "direction",
-        "NORMAL, X, Y, Z, RGB_TO_XYZ, or CUSTOM_NORMAL",
-    )?;
-    if !matches!(
-        direction,
-        "NORMAL" | "NOR" | "X" | "Y" | "Z" | "RGB_TO_XYZ" | "CUSTOM_NORMAL" | "CLNOR"
-    ) {
-        return Err(invalid_parameter(
-            modifier,
-            "direction",
-            "NORMAL, X, Y, Z, RGB_TO_XYZ, or CUSTOM_NORMAL",
-        ));
-    }
-    let space = string_param_with_expected(modifier, "space", "LOCAL or GLOBAL")?;
-    if !matches!(space, "LOCAL" | "GLOBAL") {
-        return Err(invalid_parameter(modifier, "space", "LOCAL or GLOBAL"));
-    }
-    let has_texture = modifier
-        .params
-        .get("texture")
-        .is_some_and(|value| !value.is_null());
-    if strength == 0.0 || mesh.faces.is_empty() || (direction == "RGB_TO_XYZ" && !has_texture) {
-        return Ok(mesh.clone());
-    }
-    if has_texture {
-        return Err(PotError::new(
-            ErrorCode::UnsupportedFeature,
-            "displace modifier textures are not supported by the geometry evaluator",
-        ));
-    }
-
-    let group_name = string_param_with_expected(modifier, "vertex_group", "a vertex-group name")?;
-    let group_name = (!group_name.is_empty()).then_some(group_name);
-    let group_weights = if let Some(group_name) = group_name {
-        let group = mesh
-            .attributes
-            .get("vertex_groups")
-            .and_then(Value::as_object)
-            .and_then(|groups| groups.get(group_name))
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                invalid_parameter(
-                    modifier,
-                    "vertex_group",
-                    "a vertex group present in the mesh attributes",
-                )
-            })?;
-        Some(
-            mesh.vertices
-                .iter()
-                .map(|vertex| {
-                    let weight = group
-                        .get(&format!("v{}", vertex.id))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    if weight.is_finite() && (0.0..=1.0).contains(&weight) {
-                        Ok(weight)
-                    } else {
-                        Err(invalid_parameter(
-                            modifier,
-                            "vertex_group",
-                            "finite weights in [0, 1]",
-                        ))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )
-    } else {
-        None
-    };
-    let invert_group = bool_param(modifier, "invert_vertex_group")?;
-    let points = positions(mesh);
-    let indices = id_indices(mesh);
-    let mut normals = vec![DVec3::ZERO; points.len()];
-    for face in &mesh.faces {
-        let mut normal = DVec3::ZERO;
-        for (first, second) in cyclic_pairs(&face.vertices) {
-            normal += points[indices[first]].cross(points[indices[second]]);
-        }
-        for id in &face.vertices {
-            normals[indices[id]] += normal;
-        }
-    }
-    let delta = ((1.0 - mid_level) * strength).clamp(-10_000.0, 10_000.0);
-    let mut result = mesh.clone();
-    for (index, vertex) in result.vertices.iter_mut().enumerate() {
-        let weight = group_weights.as_ref().map_or(1.0, |weights| {
-            if invert_group {
-                1.0 - weights[index]
-            } else {
-                weights[index]
-            }
-        });
-        let displacement = delta * weight;
-        let axis = match direction {
-            "X" => Some(DVec3::X),
-            "Y" => Some(DVec3::Y),
-            "Z" => Some(DVec3::Z),
-            _ => None,
-        };
-        let direction_vector = axis.map_or_else(
-            || normals[index].normalize_or_zero(),
-            |local| {
-                if space == "GLOBAL" {
-                    owner_world_matrix.transpose().transform_vector3(local)
-                } else {
-                    local
-                }
-            },
-        );
-        vertex.co = points[index] + direction_vector * displacement;
-    }
-    validated(&result)?;
-    Ok(result)
-}
-
 fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     validated(mesh)?;
     let factor = number_param(modifier, "factor")?;
@@ -4948,13 +4884,6 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ));
     }
     let iterations = uint_param(modifier, "iterations")?;
-    if iterations > 100 {
-        return Err(invalid_parameter(
-            modifier,
-            "iterations",
-            "an integer from 0 through 100",
-        ));
-    }
     let axes = [
         bool_param(modifier, "use_x")?,
         bool_param(modifier, "use_y")?,
@@ -4963,45 +4892,7 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     if factor == 0.0 || iterations == 0 || !axes.into_iter().any(|enabled| enabled) {
         return Ok(mesh.clone());
     }
-    let group_name = string_param_with_expected(modifier, "vertex_group", "a vertex-group name")?;
-    let group_name = (!group_name.is_empty()).then_some(group_name);
-    let group_weights = if let Some(group_name) = group_name {
-        let group = mesh
-            .attributes
-            .get("vertex_groups")
-            .and_then(Value::as_object)
-            .and_then(|groups| groups.get(group_name))
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                invalid_parameter(
-                    modifier,
-                    "vertex_group",
-                    "a vertex group present in the mesh attributes",
-                )
-            })?;
-        Some(
-            mesh.vertices
-                .iter()
-                .map(|vertex| {
-                    let weight = group
-                        .get(&format!("v{}", vertex.id))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    if weight.is_finite() && (0.0..=1.0).contains(&weight) {
-                        Ok(weight)
-                    } else {
-                        Err(invalid_parameter(
-                            modifier,
-                            "vertex_group",
-                            "finite weights in [0, 1]",
-                        ))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )
-    } else {
-        None
-    };
+    let group = displacement::vertex_group(mesh, modifier)?;
     let invert_group = bool_param(modifier, "invert_vertex_group")?;
     let index_by_id = id_indices(mesh);
     let mut neighbors = vec![BTreeSet::new(); mesh.vertices.len()];
@@ -5023,18 +4914,13 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             }
         }
         for index in 0..points.len() {
-            if counts[index] == 0 {
-                continue;
-            }
-            let average = sums[index] / usize_as_f64(counts[index]);
-            let group_factor = group_weights.as_ref().map_or(1.0, |weights| {
-                if invert_group {
-                    1.0 - weights[index]
-                } else {
-                    weights[index]
-                }
-            });
-            let weight = factor * group_factor;
+            // Blender leaves an isolated vertex's average at zero, so it moves toward the origin.
+            let average = if counts[index] == 0 {
+                DVec3::ZERO
+            } else {
+                sums[index] / usize_as_f64(counts[index])
+            };
+            let weight = factor * group.weight(index, invert_group);
             for axis in 0..3 {
                 if axes[axis] {
                     points[index][axis] =

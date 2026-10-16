@@ -644,6 +644,13 @@ impl Snapshot {
         let mut instance_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
         let mut modifier_warnings = Vec::new();
+        let mut texture_rng = crate::blender_rng::BlenderRng::seed_random(
+            if modifier_context.purpose == EvaluationPurpose::Render {
+                scene.render.seed
+            } else {
+                0
+            },
+        );
         for id in &mesh_evaluation_order {
             let node = doc.nodes.get(id).ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "mesh evaluation node is missing")
@@ -740,6 +747,12 @@ impl Snapshot {
                         );
                     }
                     attach_vertex_group_weights(&mut rigged_source, data_block);
+                    let references = SceneReferences {
+                        world_matrices: &matrices,
+                        bone_matrices: &bone_matrices,
+                        evaluated_meshes: &meshes,
+                        project_root: modifier_context.project_root,
+                    };
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         rigged_source,
                         &gate.stack(id, &node.modifiers),
@@ -751,7 +764,8 @@ impl Snapshot {
                         &meshes,
                         &curve_path_lengths,
                         gate.context,
-                        |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
+                        &mut texture_rng,
+                        |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
                                 mesh,
                                 data_block,
@@ -765,6 +779,7 @@ impl Snapshot {
                                 scene.fps,
                                 scene.fps_base,
                                 &meshes,
+                                multi_input,
                             ),
                             "lattice" => apply_lattice_modifier(
                                 mesh, modifier, id, data_block, doc, &matrices,
@@ -777,11 +792,13 @@ impl Snapshot {
                                 &matrices,
                                 &volume_data,
                             ),
-                            "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                                apply_scene_operand_modifier(
-                                    mesh, modifier, id, doc, &matrices, &meshes,
-                                )
-                            }
+                            "boolean" | "shrinkwrap" | "curve" | "hook" | "cast"
+                            | "simple_deform" => apply_scene_operand_modifier(
+                                mesh, modifier, id, doc, &references,
+                            ),
+                            "displace" | "wave" | "warp" => apply_scene_displacement_modifier(
+                                mesh, modifier, id, doc, &references, frame, texture_rng,
+                            ),
                             "vertex_weight_edit"
                             | "vertex_weight_mix"
                             | "vertex_weight_proximity"
@@ -793,17 +810,15 @@ impl Snapshot {
                                 modifier,
                                 id,
                                 doc,
-                                &matrices,
-                                &meshes,
-                                modifier_context.project_root,
+                                &references,
+                                texture_rng,
                             ),
                             "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
                                 mesh,
                                 modifier,
                                 id,
                                 doc,
-                                &matrices,
-                                &meshes,
+                                &references,
                                 modifier_warnings,
                             ),
                             "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
@@ -1014,6 +1029,12 @@ impl Snapshot {
                         }
                     };
                     attach_vertex_group_weights(&mut source_mesh, data_block);
+                    let references = SceneReferences {
+                        world_matrices: &matrices,
+                        bone_matrices: &bone_matrices,
+                        evaluated_meshes: &meshes,
+                        project_root: modifier_context.project_root,
+                    };
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         source_mesh,
                         &gate.stack(id, &node.modifiers),
@@ -1025,7 +1046,8 @@ impl Snapshot {
                         &meshes,
                         &curve_path_lengths,
                         gate.context,
-                        |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
+                        &mut texture_rng,
+                        |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
                                 mesh,
                                 data_block,
@@ -1039,6 +1061,7 @@ impl Snapshot {
                                 scene.fps,
                                 scene.fps_base,
                                 &meshes,
+                                multi_input,
                             ),
                             "lattice" => apply_lattice_modifier(
                                 mesh, modifier, id, data_block, doc, &matrices,
@@ -1051,11 +1074,13 @@ impl Snapshot {
                                 &matrices,
                                 &volume_data,
                             ),
-                            "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                                apply_scene_operand_modifier(
-                                    mesh, modifier, id, doc, &matrices, &meshes,
-                                )
-                            }
+                            "boolean" | "shrinkwrap" | "curve" | "hook" | "cast"
+                            | "simple_deform" => apply_scene_operand_modifier(
+                                mesh, modifier, id, doc, &references,
+                            ),
+                            "displace" | "wave" | "warp" => apply_scene_displacement_modifier(
+                                mesh, modifier, id, doc, &references, frame, texture_rng,
+                            ),
                             "vertex_weight_edit"
                             | "vertex_weight_mix"
                             | "vertex_weight_proximity"
@@ -1067,17 +1092,15 @@ impl Snapshot {
                                 modifier,
                                 id,
                                 doc,
-                                &matrices,
-                                &meshes,
-                                modifier_context.project_root,
+                                &references,
+                                texture_rng,
                             ),
                             "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
                                 mesh,
                                 modifier,
                                 id,
                                 doc,
-                                &matrices,
-                                &meshes,
+                                &references,
                                 modifier_warnings,
                             ),
                             "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
@@ -1971,6 +1994,164 @@ fn object_mesh_evaluation_order(
     Ok(order)
 }
 
+/// Evaluated scene state that modifiers reading other objects, bones, or images resolve against.
+pub(crate) struct SceneReferences<'a> {
+    /// World matrix of every evaluated node.
+    pub(crate) world_matrices: &'a BTreeMap<Id, DMat4>,
+    /// Pose-bone matrices in world space (`armature world * pose`), keyed by armature, then bone.
+    pub(crate) bone_matrices: &'a BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
+    /// Meshes evaluated before the referencing modifier.
+    pub(crate) evaluated_meshes: &'a BTreeMap<Id, Mesh>,
+    /// Directory that image textures resolve against.
+    pub(crate) project_root: Option<&'a Path>,
+}
+
+fn invalid_reference(modifier: &Modifier, parameter: &str, expected: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::InvalidArgument,
+        format!(
+            "modifier `{}` `{parameter}` must be {expected}",
+            modifier.modifier_type
+        ),
+        json!({"modifier_id":modifier.id,"pointer":format!("/params/{parameter}")}),
+    )
+}
+
+/// An object-reference parameter; an absent, null, or empty value is no reference.
+fn reference_object_id(modifier: &Modifier, parameter: &str, doc: &SceneDoc) -> Result<Option<Id>> {
+    let text = match modifier.params.get(parameter) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(text)) if text.is_empty() => return Ok(None),
+        Some(Value::String(text)) => text.as_str(),
+        Some(_) => return Err(invalid_reference(modifier, parameter, "an object ID or null")),
+    };
+    let object_id = Id::new(text).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            error.message,
+            json!({"modifier_id":modifier.id,"pointer":format!("/params/{parameter}")}),
+        )
+    })?;
+    if !doc.nodes.contains_key(&object_id) {
+        return Err(PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier reference object `{object_id}` was not found"),
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        ));
+    }
+    Ok(Some(object_id))
+}
+
+/// A bone-name parameter; an absent or empty value names no bone.
+fn reference_bone_id(modifier: &Modifier, parameter: &str) -> Result<Option<Id>> {
+    let text = match modifier.params.get(parameter) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(text)) if text.is_empty() => return Ok(None),
+        Some(Value::String(text)) => text.as_str(),
+        Some(_) => return Err(invalid_reference(modifier, parameter, "a bone name")),
+    };
+    Id::new(text).map(Some).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            error.message,
+            json!({"modifier_id":modifier.id,"pointer":format!("/params/{parameter}")}),
+        )
+    })
+}
+
+fn modifier_str_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
+    modifier
+        .params
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_reference(modifier, name, "a string"))
+}
+
+fn modifier_number_param(modifier: &Modifier, name: &str) -> Result<f64> {
+    modifier
+        .params
+        .get(name)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| invalid_reference(modifier, name, "a finite number"))
+}
+
+fn modifier_bool_param(modifier: &Modifier, name: &str) -> Result<bool> {
+    modifier
+        .params
+        .get(name)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| invalid_reference(modifier, name, "a boolean"))
+}
+
+fn subject_world_matrix(
+    modifier: &Modifier,
+    subject_id: &Id,
+    references: &SceneReferences<'_>,
+) -> Result<DMat4> {
+    references
+        .world_matrices
+        .get(subject_id)
+        .copied()
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::DependencyMissing,
+                "modifier subject transform is unavailable",
+                json!({"modifier_id":modifier.id,"node_id":subject_id}),
+            )
+        })
+}
+
+/// Inverse subject transform, which maps scene space into the subject's local frame.
+fn subject_inverse_matrix(
+    modifier: &Modifier,
+    subject_id: &Id,
+    references: &SceneReferences<'_>,
+) -> Result<DMat4> {
+    let inverse = subject_world_matrix(modifier, subject_id, references)?.inverse();
+    if !inverse.is_finite() {
+        return Err(PotError::invalid_argument(format!(
+            "modifier `{}` subject transform must be invertible",
+            modifier.modifier_type
+        )));
+    }
+    Ok(inverse)
+}
+
+/// World matrix of a referenced object, or of its pose bone (`armature world * pose`) when named.
+fn reference_world_matrix(
+    modifier: &Modifier,
+    object_id: &Id,
+    bone: Option<&Id>,
+    references: &SceneReferences<'_>,
+) -> Result<DMat4> {
+    let Some(bone_id) = bone else {
+        return references
+            .world_matrices
+            .get(object_id)
+            .copied()
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "referenced object transform is unavailable",
+                    json!({"modifier_id":modifier.id,"object":object_id}),
+                )
+            });
+    };
+    references
+        .bone_matrices
+        .get(object_id)
+        .and_then(|bones| bones.get(bone_id))
+        .map(DMat4::from_cols_array)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::DependencyMissing,
+                "referenced bone pose transform is unavailable",
+                json!({"modifier_id":modifier.id,"object":object_id,"bone":bone_id}),
+            )
+        })
+}
+
 /// Resolve the object-reference parameters for a scene-bound modifier through one shared path.
 ///
 /// Each operand retains its object-local mesh and carries the matrix from that object into
@@ -2106,79 +2287,92 @@ pub(crate) fn resolve_modifier_object_operands(
     Ok(resolved)
 }
 
+/// Subject-local to Warp/UV Warp source and destination matrices
+/// (`inv(subject_world) * reference_world`). A known bone uses `armature_world * pose_mat`;
+/// an empty or unknown bone name falls back to the object world matrix. `None` unless both objects are set.
+fn warp_reference_matrices(
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    references: &SceneReferences<'_>,
+) -> Result<Option<(DMat4, DMat4)>> {
+    let (Some(from), Some(to)) = (
+        reference_object_id(modifier, "object_from", doc)?,
+        reference_object_id(modifier, "object_to", doc)?,
+    ) else {
+        return Ok(None);
+    };
+    let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
+    let from_matrix = reference_world_matrix_with_bone_fallback(
+        modifier,
+        &from,
+        "bone_from",
+        doc,
+        references,
+    )?;
+    let to_matrix = reference_world_matrix_with_bone_fallback(
+        modifier,
+        &to,
+        "bone_to",
+        doc,
+        references,
+    )?;
+    Ok(Some((inverse * from_matrix, inverse * to_matrix)))
+}
+
+
 pub(crate) fn apply_scene_attribute_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     subject_id: &Id,
     doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, DMat4>,
-    evaluated_meshes: &BTreeMap<Id, Mesh>,
-    project_root: Option<&Path>,
+    references: &SceneReferences<'_>,
+    texture_rng: &mut crate::blender_rng::BlenderRng,
 ) -> Result<()> {
     let operands = resolve_modifier_object_operands(
         modifier,
         subject_id,
         doc,
-        world_matrices,
-        evaluated_meshes,
+        references.world_matrices,
+        references.evaluated_meshes,
     )?;
-    let texture = load_weight_modifier_texture(modifier, doc, project_root)?;
-    let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "modifier subject world matrix is missing",
-        )
-    })?;
-    *mesh = crate::geom::modifiers::attributes::evaluate_with_context(
-        mesh,
+    let texture = crate::geom::modifiers::load_modifier_texture(
         modifier,
+        "mask_texture",
+        doc,
+        references.project_root,
+    )?;
+    let subject_world = subject_world_matrix(modifier, subject_id, references)?;
+    let mut resolved = modifier.clone();
+    if modifier.modifier_type == "uv_warp" {
+        resolved.runtime.warp_from_matrix = None;
+        resolved.runtime.warp_to_matrix = None;
+        if let Some((from, to)) = warp_reference_matrices(modifier, subject_id, doc, references)? {
+            resolved.runtime.warp_from_matrix = Some(from.to_cols_array());
+            resolved.runtime.warp_to_matrix = Some(to.to_cols_array());
+        }
+    }
+    if texture.is_some() {
+        resolved.runtime.texture_matrix = texture_coordinate_matrix_with_parameters(
+            modifier,
+            subject_world,
+            doc,
+            references,
+            "mask_tex_mapping",
+            "mask_tex_map_object",
+            "mask_tex_map_bone",
+        )?
+        .map(|matrix| matrix.to_cols_array());
+    }
+    *mesh = crate::geom::modifiers::attributes::evaluate_with_texture_context(
+        mesh,
+        &resolved,
         &operands,
-        texture.as_ref(),
+        texture.as_ref().map(|texture| texture.source()),
         subject_world,
+        texture_rng,
     )?;
     Ok(())
-}
-
-fn load_weight_modifier_texture(
-    modifier: &Modifier,
-    doc: &SceneDoc,
-    project_root: Option<&Path>,
-) -> Result<Option<crate::image::ImageData>> {
-    let Some(value) = modifier.params.get("mask_texture") else {
-        return Ok(None);
-    };
-    let Some(image_text) = value.as_str().filter(|value| !value.is_empty()) else {
-        if value.is_null() {
-            return Ok(None);
-        }
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "weight modifier texture is not an image texture",
-            json!({"feature_id":format!("modifier.{}.texture_type",modifier.modifier_type),"modifier_id":modifier.id}),
-        ));
-    };
-    let image_id = Id::new(image_text.to_owned()).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "weight modifier texture is not an image texture",
-            json!({"feature_id":format!("modifier.{}.texture_type",modifier.modifier_type),"modifier_id":modifier.id,"cause":error.message}),
-        )
-    })?;
-    let image = doc.images.get(&image_id).ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "procedural Blender texture masks are not modeled",
-            json!({"feature_id":format!("modifier.{}.texture_type",modifier.modifier_type),"modifier_id":modifier.id,"texture":image_text}),
-        )
-    })?;
-    let root = project_root.ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::DependencyMissing,
-            "image texture mask requires a project root",
-            json!({"feature_id":format!("modifier.{}.image_texture",modifier.modifier_type),"image":image_id}),
-        )
-    })?;
-    crate::image::load_image_data(image, root, crate::image::ImageInterpolation::Linear).map(Some)
 }
 
 pub(crate) fn apply_scene_deform_modifier(
@@ -2186,16 +2380,15 @@ pub(crate) fn apply_scene_deform_modifier(
     modifier: &Modifier,
     subject_id: &Id,
     doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, DMat4>,
-    evaluated_meshes: &BTreeMap<Id, Mesh>,
+    references: &SceneReferences<'_>,
     warnings: &mut Vec<PotError>,
 ) -> Result<()> {
     let operands = resolve_modifier_object_operands(
         modifier,
         subject_id,
         doc,
-        world_matrices,
-        evaluated_meshes,
+        references.world_matrices,
+        references.evaluated_meshes,
     )?;
     let parameter = if modifier.modifier_type == "surface_deform" {
         "target"
@@ -2900,6 +3093,13 @@ fn apply_generic_scene_mesh_operand_modifier(
     } else {
         resolved.runtime.operand_mesh = Some(operand);
     }
+    if modifier.modifier_type == "curve" {
+        // Blender deforms a Curve in its own local space, so it also needs the object transform.
+        resolved.runtime.object_matrix = operands
+            .get(object_parameter)
+            .and_then(|items| items.first())
+            .map(|operand| operand.local_to_subject.to_cols_array());
+    }
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
 }
@@ -2909,15 +3109,36 @@ pub(crate) fn apply_scene_operand_modifier(
     modifier: &Modifier,
     subject_id: &Id,
     doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, DMat4>,
-    evaluated_meshes: &BTreeMap<Id, Mesh>,
+    references: &SceneReferences<'_>,
 ) -> Result<()> {
-    if modifier.modifier_type == "warp" {
-        return apply_scene_warp_modifier(mesh, modifier, subject_id, doc, world_matrices);
+    match modifier.modifier_type.as_str() {
+        "hook" => return apply_scene_hook_modifier(mesh, modifier, subject_id, doc, references),
+        "cast" => {
+            return apply_scene_single_reference_modifier(
+                mesh,
+                modifier,
+                subject_id,
+                doc,
+                references,
+                "object",
+                None,
+            );
+        }
+        "simple_deform" => {
+            return apply_scene_single_reference_modifier(
+                mesh,
+                modifier,
+                subject_id,
+                doc,
+                references,
+                "origin",
+                None,
+            );
+        }
+        _ => {}
     }
-    if modifier.modifier_type == "hook" {
-        return apply_scene_hook_modifier(mesh, modifier, subject_id, doc, world_matrices);
-    }
+    let world_matrices = references.world_matrices;
+    let evaluated_meshes = references.evaluated_meshes;
     if matches!(
         modifier.modifier_type.as_str(),
         "boolean" | "shrinkwrap" | "curve"
@@ -3099,127 +3320,234 @@ pub(crate) fn apply_scene_operand_modifier(
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
 }
-fn apply_scene_warp_modifier(
-    mesh: &mut Mesh,
-    modifier: &Modifier,
-    subject_id: &Id,
-    doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, DMat4>,
-) -> Result<()> {
-    let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "warp subject world matrix is missing",
-        )
-    })?;
-    let subject_inverse = subject_world.inverse();
-    if !subject_inverse.is_finite() {
-        return Err(PotError::invalid_argument(
-            "warp subject transform must be invertible",
-        ));
-    }
-    let mut resolved = modifier.clone();
-    for (source_parameter, is_from) in [("object_from", true), ("object_to", false)] {
-        let object_id = modifier
-            .params
-            .get(source_parameter)
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::InvalidArgument,
-                    format!("warp modifier requires `{source_parameter}`"),
-                    json!({
-                        "modifier_id":modifier.id,
-                        "pointer":format!("/params/{source_parameter}")
-                    }),
-                )
-            })?;
-        let object_id = Id::new(object_id).map_err(|_| {
-            PotError::with_details(
-                ErrorCode::InvalidArgument,
-                format!("warp `{source_parameter}` must be a valid object ID"),
-                json!({
-                    "modifier_id":modifier.id,
-                    "pointer":format!("/params/{source_parameter}")
-                }),
-            )
-        })?;
-        if !doc.nodes.contains_key(&object_id) {
-            return Err(PotError::with_details(
-                ErrorCode::TargetNotFound,
-                format!("warp object `{object_id}` was not found"),
-                json!({"modifier_id":modifier.id,"object":object_id}),
-            ));
-        }
-        let world = world_matrices.get(&object_id).copied().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "warp object world matrix is missing",
-            )
-        })?;
-        let point = subject_inverse.transform_point3(world.transform_point3(DVec3::ZERO));
-        resolved.params.remove(source_parameter);
-        if is_from {
-            resolved.runtime.warp_from = Some(point.to_array());
-        } else {
-            resolved.runtime.warp_to = Some(point.to_array());
-        }
-    }
-    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
-    Ok(())
-}
-
 fn apply_scene_hook_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     subject_id: &Id,
     doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, DMat4>,
+    references: &SceneReferences<'_>,
 ) -> Result<()> {
-    let object_id = modifier
-        .params
-        .get("object")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::InvalidArgument,
-                "hook modifier requires an object",
-                json!({"modifier_id":modifier.id,"pointer":"/params/object"}),
-            )
-        })?;
-    let object_id = Id::new(object_id).map_err(|_| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "hook object must be a valid object ID",
-            json!({"modifier_id":modifier.id,"pointer":"/params/object"}),
-        )
-    })?;
-    if !doc.nodes.contains_key(&object_id) {
-        return Err(PotError::with_details(
-            ErrorCode::TargetNotFound,
-            format!("hook object `{object_id}` was not found"),
-            json!({"modifier_id":modifier.id,"object":object_id}),
-        ));
+    // Blender disables a Hook without an object, leaving the mesh unchanged.
+    if reference_object_id(modifier, "object", doc)?.is_none() {
+        return Ok(());
     }
-    let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "hook subject world matrix is missing",
-        )
-    })?;
-    let subject_inverse = subject_world.inverse();
-    let object_world = world_matrices.get(&object_id).copied().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "hook object world matrix is missing",
-        )
-    })?;
-    let position = subject_inverse.transform_point3(object_world.transform_point3(DVec3::ZERO));
+    apply_scene_single_reference_modifier(
+        mesh,
+        modifier,
+        subject_id,
+        doc,
+        references,
+        "object",
+        Some("subtarget"),
+    )
+}
+
+/// Hook, Cast, and Simple Deform read `object_matrix = inv(subject) * reference`, the product
+/// Blender multiplies into the referenced transform. An unset reference evaluates without one.
+fn apply_scene_single_reference_modifier(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    references: &SceneReferences<'_>,
+    parameter: &str,
+    bone_parameter: Option<&str>,
+) -> Result<()> {
     let mut resolved = modifier.clone();
-    resolved.params.remove("object");
-    resolved.runtime.hook_target_position = Some(position.to_array());
+    resolved.params.remove(parameter);
+    if let Some(object_id) = reference_object_id(modifier, parameter, doc)? {
+        let bone = match bone_parameter {
+            Some(name) => reference_bone_id(modifier, name)?,
+            None => None,
+        };
+        let reference = reference_world_matrix(modifier, &object_id, bone.as_ref(), references)?;
+        let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
+        resolved.runtime.object_matrix = Some((inverse * reference).to_cols_array());
+    }
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
+}
+
+/// Displace, Wave, and Warp resolve the references Blender reads from the scene (Warp's from/to
+/// objects, Wave's start object, and texture mapping), then evaluate with the loaded texture.
+pub(crate) fn apply_scene_displacement_modifier(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    references: &SceneReferences<'_>,
+    frame: f64,
+    texture_rng: &mut crate::blender_rng::BlenderRng,
+) -> Result<()> {
+    let mut resolved = modifier.clone();
+    if modifier.modifier_type == "warp" {
+        // Blender returns the mesh unchanged until both warp objects are set.
+        let Some((from, to)) = warp_reference_matrices(modifier, subject_id, doc, references)?
+        else {
+            return Ok(());
+        };
+        resolved.params.remove("object_from");
+        resolved.params.remove("object_to");
+        resolved.runtime.warp_from_matrix = Some(from.to_cols_array());
+        resolved.runtime.warp_to_matrix = Some(to.to_cols_array());
+    }
+    if modifier.modifier_type == "wave"
+        && let Some(object_id) = reference_object_id(modifier, "start_position_object", doc)?
+    {
+        let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
+        let object_matrix = reference_world_matrix(modifier, &object_id, None, references)?;
+        resolved.params.remove("start_position_object");
+        resolved.runtime.object_matrix = Some((inverse * object_matrix).to_cols_array());
+    }
+    let subject_world = subject_world_matrix(modifier, subject_id, references)?;
+    let texture = crate::geom::modifiers::load_modifier_texture(
+        modifier,
+        "texture",
+        doc,
+        references.project_root,
+    )?;
+    if texture.is_some() {
+        resolved.runtime.texture_matrix =
+            texture_coordinate_matrix(modifier, subject_world, doc, references)?
+                .map(|matrix| matrix.to_cols_array());
+    }
+    let texture = texture.as_ref();
+    let evaluated = match modifier.modifier_type.as_str() {
+        "displace" => crate::geom::modifiers::displace_textured(
+            mesh,
+            &resolved,
+            subject_world,
+            texture,
+            texture_rng,
+        )?,
+        "wave" => {
+            crate::geom::modifiers::wave_textured(mesh, &resolved, frame, texture, texture_rng)?
+        }
+        "warp" => crate::geom::modifiers::warp_textured(mesh, &resolved, texture, texture_rng)?,
+        _ => {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "unexpected displacement modifier callback",
+            ));
+        }
+    };
+    *mesh = evaluated;
+    Ok(())
+}
+
+/// Blender's MOD_get_texture_coords as a subject-local to texture-space matrix. Displacement and
+/// weight masks share the coordinate rules but store their mapping fields under different names.
+fn texture_coordinate_matrix(
+    modifier: &Modifier,
+    subject_world: DMat4,
+    doc: &SceneDoc,
+    references: &SceneReferences<'_>,
+) -> Result<Option<DMat4>> {
+    texture_coordinate_matrix_with_parameters(
+        modifier,
+        subject_world,
+        doc,
+        references,
+        "texture_coords",
+        "texture_coords_object",
+        "texture_coords_bone",
+    )
+}
+
+pub(crate) fn texture_coordinate_matrix_with_parameters(
+    modifier: &Modifier,
+    subject_world: DMat4,
+    doc: &SceneDoc,
+    references: &SceneReferences<'_>,
+    mapping_parameter: &str,
+    object_parameter: &str,
+    bone_parameter: &str,
+) -> Result<Option<DMat4>> {
+    match modifier_str_param(modifier, mapping_parameter)? {
+        "LOCAL" => Ok(Some(DMat4::IDENTITY)),
+        "GLOBAL" => Ok(Some(subject_world)),
+        "OBJECT" => {
+            let Some(object_id) = reference_object_id(modifier, object_parameter, doc)? else {
+                return Ok(Some(DMat4::IDENTITY));
+            };
+            let mapping =
+                reference_world_matrix_with_bone_fallback(
+                    modifier,
+                    &object_id,
+                    bone_parameter,
+                    doc,
+                    references,
+                )?
+                .inverse();
+            if !mapping.is_finite() {
+                return Err(PotError::invalid_argument(
+                    "texture coordinate mapping transform must be invertible",
+                ));
+            }
+            Ok(Some(mapping * subject_world))
+        }
+        "UV" => Ok(None),
+        _ => Err(invalid_reference(
+            modifier,
+            mapping_parameter,
+            "LOCAL, GLOBAL, OBJECT, or UV",
+        )),
+    }
+}
+
+/// Blender's mapping-object fallback for a missing bone. A named bone that exists in the armature
+/// must have an evaluated pose matrix; a name not found on the object uses the object world matrix.
+pub(crate) fn reference_world_matrix_with_bone_fallback(
+    modifier: &Modifier,
+    object_id: &Id,
+    bone_parameter: &str,
+    doc: &SceneDoc,
+    references: &SceneReferences<'_>,
+) -> Result<DMat4> {
+    let bone_name = modifier
+        .params
+        .get(bone_parameter)
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty());
+    let bone_id = bone_name.and_then(|name| {
+        doc.nodes
+            .get(object_id)
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|data| data.armature.as_ref())
+            .and_then(|armature| {
+                armature
+                    .bones
+                    .iter()
+                    .find(|(bone_id, bone)| bone_id.as_str() == name || bone.name == name)
+                    .map(|(bone_id, _)| bone_id)
+            })
+    });
+    if let Some(bone_id) = bone_id {
+        return references
+            .bone_matrices
+            .get(object_id)
+            .and_then(|bones| bones.get(bone_id))
+            .map(DMat4::from_cols_array)
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "referenced armature bone pose transform is unavailable",
+                    json!({"modifier_id":modifier.id,"object":object_id,"bone":bone_name}),
+                )
+            });
+    }
+    references
+        .world_matrices
+        .get(object_id)
+        .copied()
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::DependencyMissing,
+                "referenced object transform is unavailable",
+                json!({"modifier_id":modifier.id,"object":object_id}),
+            )
+        })
 }
 fn collect_modifier_collection_objects(
     doc: &SceneDoc,
@@ -3437,7 +3765,9 @@ fn volume_bounds(volume: &crate::geom::volume::VolumeData, matrix: DMat4) -> Res
     Ok(bounds)
 }
 
-fn apply_lattice_modifier(
+/// Blender's Lattice: each vertex moves by `strength * weight` times the lattice displacement
+/// sampled at its position in the lattice grid (MOD_lattice.cc, BKE_lattice_deform_coords).
+pub(crate) fn apply_lattice_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     source_node_id: &Id,
@@ -3445,24 +3775,10 @@ fn apply_lattice_modifier(
     doc: &SceneDoc,
     matrices: &BTreeMap<Id, DMat4>,
 ) -> Result<()> {
-    let lattice_text = modifier
-        .params
-        .get("object")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::InvalidArgument,
-                "lattice modifier requires an object node ID",
-                json!({"modifier_id":modifier.id,"parameter":"object"}),
-            )
-        })?;
-    let lattice_id = Id::new(lattice_text.to_owned()).map_err(|_| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "lattice modifier target is not a valid node ID",
-            json!({"modifier_id":modifier.id,"parameter":"object"}),
-        )
-    })?;
+    // Blender disables the modifier when no lattice object is set.
+    let Some(lattice_id) = reference_object_id(modifier, "object", doc)? else {
+        return Ok(());
+    };
     let lattice_node = doc.nodes.get(&lattice_id).ok_or_else(|| {
         PotError::with_details(
             ErrorCode::TargetNotFound,
@@ -3502,13 +3818,18 @@ fn apply_lattice_modifier(
         )
     })?;
     let source_world = matrices.get(source_node_id).copied().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "source mesh world matrix is missing",
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            "lattice modifier subject transform is unavailable",
+            json!({"modifier_id":modifier.id,"node_id":source_node_id}),
         )
     })?;
     let lattice_world = matrices.get(&lattice_id).copied().ok_or_else(|| {
-        PotError::new(ErrorCode::InternalError, "lattice world matrix is missing")
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            "lattice modifier lattice transform is unavailable",
+            json!({"modifier_id":modifier.id,"node_id":lattice_id}),
+        )
     })?;
     let source_inverse = source_world.inverse();
     if !source_inverse.is_finite() {
@@ -3516,61 +3837,66 @@ fn apply_lattice_modifier(
             "lattice modifier source transform must be invertible",
         ));
     }
+    // The kernel maps lattice-space offsets through inv(subject) * lattice, as Blender's latmat does.
     let lattice_to_mesh = source_inverse * lattice_world;
-
-    let weights = if let Some(group_name) = modifier
-        .params
-        .get("vertex_group")
-        .and_then(serde_json::Value::as_str)
+    let strength = modifier_number_param(modifier, "strength")?;
+    let weights = lattice_vertex_group_weights(mesh, modifier, source_data)?
+        .unwrap_or_else(|| vec![1.0; mesh.vertices.len()]);
+    let fully_deformed =
+        crate::geom::lattice::deform_mesh_with_transform(mesh, lattice, None, lattice_to_mesh)?;
+    // The full-weight result scaled by strength * weight is Blender's per-vertex blend.
+    let mut result = mesh.clone();
+    for ((vertex, deformed), weight) in result
+        .vertices
+        .iter_mut()
+        .zip(&fully_deformed.vertices)
+        .zip(weights)
     {
-        let mut matches = source_data
-            .vertex_groups
-            .iter()
-            .filter(|group| group.id.as_str() == group_name || group.name == group_name);
-        let group = matches.next().ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::TargetNotFound,
-                format!("vertex group `{group_name}` was not found"),
-                json!({"modifier_id":modifier.id,"vertex_group":group_name}),
-            )
-        })?;
-        if matches.next().is_some() {
-            return Err(PotError::with_details(
-                ErrorCode::InvalidArgument,
-                format!("vertex group name `{group_name}` is ambiguous"),
-                json!({"modifier_id":modifier.id,"vertex_group":group_name}),
-            ));
-        }
-        let group_id = &group.id;
-        let weights_by_vertex = mesh_vertex_weights(mesh, &source_data.vertex_groups);
-        Some(
-            mesh.vertices
-                .iter()
-                .map(|vertex| {
-                    weights_by_vertex
-                        .get(&vertex.id)
-                        .and_then(|groups| groups.get(group_id))
-                        .copied()
-                        .unwrap_or(0.0)
-                })
-                .collect::<Vec<_>>(),
-        )
-    } else if modifier.params.contains_key("vertex_group") {
-        return Err(PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "lattice modifier vertex_group must be a group ID or name",
-            json!({"modifier_id":modifier.id,"parameter":"vertex_group"}),
-        ));
-    } else {
-        None
-    };
-    *mesh = crate::geom::lattice::deform_mesh_with_transform(
-        mesh,
-        lattice,
-        weights.as_deref(),
-        lattice_to_mesh,
-    )?;
+        vertex.co += (deformed.co - vertex.co) * (strength * weight);
+    }
+    *mesh = result;
     Ok(())
+}
+
+/// Blender's modifier vertex group: a missing group, or a group absent from the mesh, leaves
+/// every vertex at full weight; `invert_vertex_group` maps each weight `w` to `1 - w`.
+fn lattice_vertex_group_weights(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    source_data: &DataBlock,
+) -> Result<Option<Vec<f64>>> {
+    let name = match modifier.params.get("vertex_group") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(name)) => name.as_str(),
+        Some(_) => {
+            return Err(invalid_reference(modifier, "vertex_group", "a group name"));
+        }
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let Some(group) = source_data
+        .vertex_groups
+        .iter()
+        .find(|group| group.id.as_str() == name || group.name == name)
+    else {
+        return Ok(None);
+    };
+    let invert = modifier_bool_param(modifier, "invert_vertex_group")?;
+    let weights_by_vertex = mesh_vertex_weights(mesh, &source_data.vertex_groups);
+    Ok(Some(
+        mesh.vertices
+            .iter()
+            .map(|vertex| {
+                let weight = weights_by_vertex
+                    .get(&vertex.id)
+                    .and_then(|groups| groups.get(&group.id))
+                    .copied()
+                    .unwrap_or(0.0);
+                if invert { 1.0 - weight } else { weight }
+            })
+            .collect(),
+    ))
 }
 
 pub(crate) fn apply_volume_to_mesh_modifier(

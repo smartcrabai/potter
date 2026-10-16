@@ -13,8 +13,11 @@ pub enum LatticeInterpolation {
     /// Trilinear interpolation between the eight surrounding points.
     #[default]
     Linear,
-    /// Catmull-Rom cubic interpolation.
+    /// Blender's Cardinal spline (`KEY_CARDINAL`, tension 0.71).
     Cardinal,
+    /// Blender's Catmull-Rom spline (`KEY_CATMULL_ROM`, tension 0.5).
+    #[serde(rename = "catmull_rom")]
+    CatmullRom,
     #[serde(rename = "bspline")]
     BSpline,
 }
@@ -103,8 +106,8 @@ fn axis_position(min: f64, max: f64, index: usize, count: usize) -> f64 {
 /// Deform a mesh through the lattice, optionally blending each result by a vertex weight.
 ///
 /// Weights must be finite values in `[0, 1]`; zero leaves a vertex unchanged and one
-/// applies the full lattice displacement. Vertices beyond the cage domain use the
-/// nearest cage boundary coordinate.
+/// applies the full lattice displacement. Vertices beyond the cage are extrapolated with the same
+/// basis as Blender, not snapped to the nearest cage point.
 ///
 /// # Errors
 ///
@@ -279,49 +282,50 @@ fn is_identity(lattice: &LatticeData, point_count: usize) -> bool {
 struct AxisSamples {
     indices: [usize; 4],
     weights: [f64; 4],
-    count: usize,
 }
 
+/// Four clamped grid samples around the cell and their basis weights (BKE_lattice_deform_data_eval_co).
 fn axis_samples(coordinate: f64, count: usize, interpolation: LatticeInterpolation) -> AxisSamples {
-    let lower = coordinate.floor() as usize;
-    let fraction = coordinate - lower as f64;
+    let lower = coordinate.floor();
+    let fraction = coordinate - lower;
+    let base = lower as isize;
+    AxisSamples {
+        indices: [
+            clamp_index(base - 1, count),
+            clamp_index(base, count),
+            clamp_index(base + 1, count),
+            clamp_index(base + 2, count),
+        ],
+        weights: basis_weights(fraction, interpolation),
+    }
+}
+
+/// Blender's `key_curve_position_weights`. Cardinal is KEY_CARDINAL (tension 0.71), Catmull-Rom
+/// is KEY_CATMULL_ROM (tension 0.5), and BSpline is KEY_BSPLINE; the fraction is never snapped.
+fn basis_weights(t: f64, interpolation: LatticeInterpolation) -> [f64; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
     match interpolation {
-        LatticeInterpolation::Linear => AxisSamples {
-            indices: [lower, (lower + 1).min(count - 1), 0, 0],
-            weights: [1.0 - fraction, fraction, 0.0, 0.0],
-            count: 2,
-        },
-        LatticeInterpolation::Cardinal | LatticeInterpolation::BSpline => {
-            let t = fraction;
-            let t2 = t * t;
-            let t3 = t2 * t;
-            let weights = if interpolation == LatticeInterpolation::Cardinal {
-                [
-                    -0.5 * t + t2 - 0.5 * t3,
-                    1.0 - 2.5 * t2 + 1.5 * t3,
-                    0.5 * t + 2.0 * t2 - 1.5 * t3,
-                    -0.5 * t2 + 0.5 * t3,
-                ]
+        LatticeInterpolation::Linear => [0.0, 1.0 - t, t, 0.0],
+        LatticeInterpolation::Cardinal | LatticeInterpolation::CatmullRom => {
+            let fc = if interpolation == LatticeInterpolation::Cardinal {
+                0.71
             } else {
-                [
-                    (1.0 - t).powi(3) / 6.0,
-                    (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0,
-                    (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0,
-                    t3 / 6.0,
-                ]
+                0.5
             };
-            let base = lower as isize;
-            AxisSamples {
-                indices: [
-                    clamp_index(base - 1, count),
-                    clamp_index(base, count),
-                    clamp_index(base + 1, count),
-                    clamp_index(base + 2, count),
-                ],
-                weights,
-                count: 4,
-            }
+            [
+                -fc * t3 + 2.0 * fc * t2 - fc * t,
+                (2.0 - fc) * t3 + (fc - 3.0) * t2 + 1.0,
+                (fc - 2.0) * t3 + (3.0 - 2.0 * fc) * t2 + fc * t,
+                fc * t3 - fc * t2,
+            ]
         }
+        LatticeInterpolation::BSpline => [
+            (1.0 - t).powi(3) / 6.0,
+            (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0,
+            (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0,
+            t3 / 6.0,
+        ],
     }
 }
 
@@ -329,13 +333,16 @@ fn clamp_index(index: isize, count: usize) -> usize {
     index.clamp(0, count as isize - 1) as usize
 }
 
+/// Cell coordinate of a lattice-local value, held to `[-2, count]` as Blender's
+/// `lattice_deform_axis_clamp` does; beyond the grid the basis is evaluated, not snapped.
 fn cage_coordinate(value: f64, min: f64, max: f64, count: usize) -> f64 {
-    if value <= min {
-        0.0
-    } else if value >= max {
-        (count - 1) as f64
+    let coordinate = (value - min) / ((max - min) / (count - 1) as f64);
+    if !(coordinate > -2.0) {
+        -2.0
+    } else if coordinate >= count as f64 {
+        count as f64
     } else {
-        ((value - min) / (max - min)) * (count - 1) as f64
+        coordinate
     }
 }
 
@@ -348,9 +355,9 @@ fn sample_displacement(position: DVec3, lattice: &LatticeData) -> DVec3 {
     let v_samples = axis_samples(y, lattice.points_v, lattice.interpolation);
     let w_samples = axis_samples(z, lattice.points_w, lattice.interpolation);
     let mut displacement = DVec3::ZERO;
-    for wi in 0..w_samples.count {
-        for vi in 0..v_samples.count {
-            for ui in 0..u_samples.count {
+    for wi in 0..4 {
+        for vi in 0..4 {
+            for ui in 0..4 {
                 let index = (w_samples.indices[wi] * lattice.points_v + v_samples.indices[vi])
                     * lattice.points_u
                     + u_samples.indices[ui];
@@ -419,7 +426,7 @@ mod tests {
                 (-1.0e4_f64..1.0e4, -1.0e4_f64..1.0e4, -1.0e4_f64..1.0e4),
                 0..32,
             ),
-            interpolation in 0_u8..3,
+            interpolation in 0_u8..4,
         ) {
             let positions: Vec<_> = points
                 .into_iter()
@@ -431,7 +438,8 @@ mod tests {
                 interpolation: match interpolation {
                     0 => LatticeInterpolation::Linear,
                     1 => LatticeInterpolation::Cardinal,
-                    _ => LatticeInterpolation::BSpline,
+                    2 => LatticeInterpolation::BSpline,
+                    _ => LatticeInterpolation::CatmullRom,
                 },
                 ..LatticeData::default()
             };

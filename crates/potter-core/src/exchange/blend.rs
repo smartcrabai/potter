@@ -1688,6 +1688,41 @@ fn build_imported_graph(
             doc.images.insert(id, image);
         }
     }
+    for resource in doc.resources.values_mut() {
+        if crate::model::migrate::inline_resource_kind(resource)? != Some("legacy_texture")
+            || resource.get("texture_type").and_then(Value::as_str) != Some("IMAGE")
+        {
+            continue;
+        }
+        let Some(image) = resource.get_mut("image") else {
+            continue;
+        };
+        if image.is_null() {
+            continue;
+        }
+        let image_name = match image {
+            Value::String(name) => name.as_str(),
+            Value::Object(reference)
+                if reference.get("id_type").and_then(Value::as_str) == Some("Image") =>
+            {
+                reference
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_intermediate("legacy Image Texture has an invalid image reference"))?
+            }
+            _ => {
+                return Err(invalid_intermediate(
+                    "legacy Image Texture has an invalid image reference",
+                ));
+            }
+        };
+        let image_id = image_ids.get(image_name).ok_or_else(|| {
+            invalid_intermediate(&format!(
+                "legacy Image Texture references unknown Image `{image_name}`"
+            ))
+        })?;
+        *image = json!(image_id.as_str());
+    }
     let mut graph_sources = array(raw, "node_groups")?.to_vec();
     let mut graph_names = graph_sources
         .iter()
@@ -2033,6 +2068,39 @@ fn build_imported_graph(
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_default();
+                if let Some(texture) = params.get_mut("texture")
+                    && let Some(reference) = texture.as_object()
+                    && let (Some(id_type), Some(name)) = (
+                        reference.get("id_type").and_then(Value::as_str),
+                        reference.get("name").and_then(Value::as_str),
+                    )
+                {
+                    let id = match id_type {
+                        "Image" => image_ids.get(name).map(Id::as_str),
+                        "Texture" => match resource_ids.get(name) {
+                            Some(reference) => {
+                                let resource_id = Id::new(reference.clone())?;
+                                match doc.resources.get(&resource_id) {
+                                    Some(resource)
+                                        if crate::model::migrate::inline_resource_kind(resource)?
+                                            == Some("legacy_texture") =>
+                                    {
+                                        Some(reference.as_str())
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            None => None,
+                        },
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        invalid_intermediate(&format!(
+                            "modifier texture references unknown {id_type} `{name}`"
+                        ))
+                    })?;
+                    *texture = json!(id);
+                }
                 if modifier_type == "MESH_SEQUENCE_CACHE" {
                     params = parse_mesh_sequence_cache_params(&params, &resource_ids)?;
                 } else if modifier_type == "MESH_CACHE" {
@@ -2555,9 +2623,22 @@ fn build_imported_graph(
         "active_scene": active_name,
         "id_mappings": id_mappings.clone(),
     });
+    let mut legacy_texture_names = Map::new();
+    for resource in optional_array(raw, "resources")? {
+        if crate::model::migrate::inline_resource_kind(resource)? != Some("legacy_texture") {
+            continue;
+        }
+        let Some(name) = resource.get("owner").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(id) = resource_ids.get(name) {
+            legacy_texture_names.insert(id.clone(), json!(name));
+        }
+    }
     doc.compatibility.insert(
         "blender_adapter".to_owned(),
-        json!({"intermediate": raw, "id_mappings": id_mappings.clone()}),
+        json!({"intermediate": raw, "id_mappings": id_mappings.clone(),
+            "legacy_texture_names": legacy_texture_names}),
     );
     doc.validate()?;
     attach_native_target_vertex_orders(&mut doc);
@@ -3886,6 +3967,7 @@ fn import_blend_library_overrides(
     Ok(())
 }
 
+
 fn import_blender_resources(
     raw: &Value,
     blend_file: &Path,
@@ -3895,6 +3977,25 @@ fn import_blender_resources(
     let mut assets = Vec::new();
     let mut used_ids = BTreeSet::new();
     for source in optional_array(raw, "resources")? {
+        let inline_kind = crate::model::migrate::inline_resource_kind(source)?;
+        if let Some(kind) = inline_kind {
+            let owner = source
+                .get("owner")
+                .and_then(Value::as_str)
+                .unwrap_or(kind);
+            let seed = format!(
+                "resource_{}",
+                &crate::hash::sha256(format!("{kind}:{owner}").as_bytes())[7..19]
+            );
+            let id = Id::new(unique_id(&seed, "resource", &mut used_ids))?;
+            let mut record = source.clone();
+            if let Some(record) = record.as_object_mut() {
+                record.remove("owner");
+            }
+            doc.resources.insert(id.clone(), record);
+            path_ids.insert(owner.to_owned(), id.as_str().to_owned());
+            continue;
+        }
         let source_path = source
             .get("path")
             .and_then(Value::as_str)
@@ -3903,9 +4004,6 @@ fn import_blender_resources(
             .get("packed_data")
             .and_then(Value::as_str)
             .filter(|data| !data.is_empty());
-        if source_path.is_none() && packed_data.is_none() {
-            continue;
-        }
         let resolved_path = source_path.map(|path| resolve_blend_resource_path(path, blend_file));
         let packed_bytes = packed_data.map(decode_resource_base64).transpose()?;
         let bytes = if let Some(bytes) = packed_bytes {
@@ -6380,6 +6478,24 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                     format!("blender.modifier.{}", modifier.modifier_type),
                     Some(modifier.id.as_str()),
                     "modifier kind is not supported by the adapter",
+                ));
+            }
+            if let Some(texture_id) = modifier.params.get("texture").and_then(Value::as_str)
+                && doc.resources.iter().any(|(resource_id, resource)| {
+                    resource_id.as_str() == texture_id
+                        && crate::model::migrate::inline_resource_kind(resource)
+                            .is_ok_and(|kind| kind == Some("legacy_texture"))
+                        && resource.get("texture_type").and_then(Value::as_str)
+                            == Some("NATIVE_VALUE_NOISE")
+                })
+            {
+                losses.push(loss(
+                    "blender.texture.native_value_noise",
+                    Some(modifier.id.as_str()),
+                    &format!(
+                        "modifier `{}` references native Value Noise resource `{texture_id}`, which has no Blender legacy Texture type; export omits its texture link",
+                        modifier.name
+                    ),
                 ));
             }
         }

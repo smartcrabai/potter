@@ -1321,25 +1321,27 @@ fn assert_skin_branch_round_trip(
         .args(["--id", owner_id, "--json"]);
     let output = run_guarded(command)?;
     assert!(
-        !output.status.success(),
-        "Skin branch inspection must reject unsupported evaluated geometry"
+        output.status.success(),
+        "Skin branch inspection must evaluate successfully: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    let response: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(response["error"]["code"], "UNSUPPORTED_FEATURE");
-    assert_eq!(
-        response["error"]["details"]["feature_id"],
-        "modifier.skin.branch_hull"
-    );
-
-    let feature_catalog = potter_core::catalog::feature_catalog();
-    let branch_feature = feature_catalog["features"]
+    let inspection: Value = serde_json::from_slice(&output.stdout)?;
+    let owner = inspection["result"]["items"]
         .as_array()
-        .unwrap()
-        .iter()
-        .find(|feature| feature["feature_id"] == "modifier.skin.branch_hull")
-        .unwrap();
-    assert_eq!(branch_feature["status"], "not_supported");
-    assert_eq!(branch_feature["capabilities"]["evaluate"], false);
+        .and_then(|items| items.iter().find(|item| item["id"] == owner_id))
+        .ok_or("Skin branch inspection omitted the owner")?;
+    let evaluated = &owner["evaluated_geometry"];
+    assert_matching_topology(evaluated, before_geometry, case["name"].as_str().unwrap());
+    let position_error = modifier_position_error(
+        evaluated["positions"].as_array().unwrap(),
+        before_geometry["positions"].as_array().unwrap(),
+    )
+    .ok_or_else(|| format!("{}: inspected vertex count differs from Blender", case["name"]))?;
+    assert!(
+        position_error <= 1.0e-5,
+        "{}: inspected branch geometry differs from Blender by {position_error}",
+        case["name"]
+    );
 
     let exported = root.join("modifier_roundtrip.blend");
     let export_result = pot_json(&[
@@ -1397,7 +1399,7 @@ fn assert_skin_branch_round_trip(
         case["name"]
     );
     println!(
-        "{}: Potter inspection reports UnsupportedFeature; .blend modifier settings and Blender-evaluated geometry round-trip",
+        "{}: Potter branch geometry matches Blender; .blend modifier settings and evaluated geometry round-trip",
         case["name"]
     );
     Ok(())

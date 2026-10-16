@@ -6,7 +6,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
     image::{ImageInterpolation, encode_pixels},
-    model::{Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile},
+    model::{Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, migrate::inline_resource_kind},
 };
 
 use super::{
@@ -561,14 +561,18 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 .map(|_| group_id.to_string())
         })
         .collect::<Vec<_>>();
-    let resource_references = engine
-        .doc
-        .resources
-        .iter()
-        .filter_map(|(resource_id, resource)| {
-            contains_image_reference(resource, id.as_str()).then_some(resource_id.to_string())
-        })
-        .collect::<Vec<_>>();
+    let mut resource_references = Vec::new();
+    for (resource_id, resource) in &engine.doc.resources {
+        if inline_resource_kind(resource)? != Some("legacy_texture")
+            || resource.get("texture_type").and_then(Value::as_str) != Some("IMAGE")
+            || resource.get("settings").and_then(Value::as_object).is_none()
+        {
+            continue;
+        }
+        if resource.get("image").and_then(Value::as_str) == Some(id.as_str()) {
+            resource_references.push(resource_id.to_string());
+        }
+    }
     if !material_references.is_empty()
         || !graph_references.is_empty()
         || !resource_references.is_empty()

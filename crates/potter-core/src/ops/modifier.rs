@@ -63,10 +63,10 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             })?;
         if !matches!(
             modifier.modifier_type.as_str(),
-            "surface_deform" | "mesh_deform" | "laplacian_deform"
+            "surface_deform" | "mesh_deform" | "laplacian_deform" | "corrective_smooth"
         ) {
             return Err(PotError::invalid_operation(
-                "modifier.bind supports surface_deform, mesh_deform, and laplacian_deform",
+                "modifier.bind supports surface_deform, mesh_deform, laplacian_deform, and corrective_smooth",
             ));
         }
         if modifier.binding_data.is_some() {
@@ -105,7 +105,12 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             .iter()
             .position(|candidate| candidate.id == modifier_id)
             .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "modifier disappeared"))?;
-        bind_node.modifiers.truncate(bind_index + 1);
+        let keep = if modifier.modifier_type == "corrective_smooth" {
+            bind_index
+        } else {
+            bind_index + 1
+        };
+        bind_node.modifiers.truncate(keep);
         let bind_nodes = BTreeSet::from([subject_id.clone()]);
         let bind_snapshot = crate::eval::Snapshot::evaluate_nodes_with_cache(
             &bind_doc,
@@ -124,7 +129,14 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             .get(&subject_id)
             .cloned()
             .ok_or_else(|| PotError::invalid_operation("evaluated source mesh is unavailable"))?;
-        let binding = if modifier.modifier_type == "laplacian_deform" {
+        let binding = if modifier.modifier_type == "corrective_smooth" {
+            let coords = source_bind_mesh
+                .vertices
+                .iter()
+                .map(|vertex| json!([vertex.co.x, vertex.co.y, vertex.co.z]))
+                .collect::<Vec<_>>();
+            json!({"format":"blender_corrective_bind_v1","coords":coords})
+        } else if modifier.modifier_type == "laplacian_deform" {
             let group_name = modifier
                 .params
                 .get("vertex_group")
@@ -189,7 +201,7 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                     json!({"modifier_id":modifier_id,"target":target_id}),
                 ));
             }
-            let mut target_mesh =
+            let target_mesh =
                 bind_snapshot
                     .meshes
                     .get(&target_id)
@@ -223,19 +235,18 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                     "modifier binding requires invertible source and target transforms",
                 ));
             }
-            for vertex in &mut target_mesh.vertices {
-                vertex.co = to_subject.transform_point3(vertex.co);
-            }
             if modifier.modifier_type == "surface_deform" {
                 crate::geom::modifiers::deform::bind_surface(
                     &source_bind_mesh,
                     &target_mesh,
+                    to_subject,
                     &modifier,
                 )?
             } else {
                 crate::geom::modifiers::deform::bind_mesh(
                     &source_bind_mesh,
                     &target_mesh,
+                    to_subject,
                     &modifier,
                 )?
             }
@@ -1008,9 +1019,25 @@ fn apply_modifier(
                     "uv_warp" => ["object_from", "object_to"]
                         .iter()
                         .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                    "warp" => ["object_from", "object_to"]
+                    "cast" | "simple_deform" | "displace" | "wave" => {
+                        [
+                            "object",
+                            "origin",
+                            "start_position_object",
+                            "texture_coords_object",
+                            "texture_coords_bone",
+                        ]
                         .iter()
-                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
+                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
+                    }
+                    "warp" => [
+                        "object_from",
+                        "object_to",
+                        "texture_coords_object",
+                        "texture_coords_bone",
+                    ]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
                     "vertex_weight_edit" | "vertex_weight_mix" => modifier
                         .params
                         .get("mask_tex_map_object")
@@ -1110,6 +1137,16 @@ fn apply_modifier(
                         "modifier subject transform is unavailable",
                     )
                 })?;
+                let empty_bone_matrices = BTreeMap::new();
+                let references = crate::eval::SceneReferences {
+                    world_matrices: &world_matrices,
+                    bone_matrices: scene_snapshot
+                        .as_ref()
+                        .map_or(&empty_bone_matrices, |snapshot| &snapshot.bone_matrices),
+                    evaluated_meshes: evaluated_operand_meshes,
+                    project_root: engine.asset_root,
+                };
+                let mut texture_rng = crate::blender_rng::BlenderRng::seed_random(0);
                 let evaluation = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                     source.clone(),
                     modifier_stack,
@@ -1121,7 +1158,8 @@ fn apply_modifier(
                     evaluated_operand_meshes,
                     &BTreeMap::new(),
                     crate::eval::ModifierEvaluationContext::default(),
-                    |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
+                    &mut texture_rng,
+                    |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier.modifier_type.as_str() {
                         "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
                             mesh,
                             data_block,
@@ -1143,12 +1181,13 @@ fn apply_modifier(
                                 .get(&engine.doc.active_scene)
                                 .map_or(1.0, |scene| scene.fps_base),
                             evaluated_operand_meshes,
+                            multi_input,
                         ),
-                        "lattice" => apply_lattice_modifier(
+                        "lattice" => crate::eval::apply_lattice_modifier(
                             mesh,
-                            data_block,
-                            &target,
                             modifier,
+                            &target,
+                            data_block,
                             engine.doc,
                             &world_matrices,
                         ),
@@ -1166,21 +1205,28 @@ fn apply_modifier(
                                 modifier,
                                 &target,
                                 engine.doc,
-                                &world_matrices,
-                                evaluated_operand_meshes,
+                                &references,
                                 modifier_warnings,
                             )
                         }
-                        "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                        "boolean" | "shrinkwrap" | "curve" | "hook" | "cast" | "simple_deform" => {
                             crate::eval::apply_scene_operand_modifier(
                                 mesh,
                                 modifier,
                                 &target,
                                 engine.doc,
-                                &world_matrices,
-                                evaluated_operand_meshes,
+                                &references,
                             )
                         }
+                        "displace" | "wave" | "warp" => crate::eval::apply_scene_displacement_modifier(
+                            mesh,
+                            modifier,
+                            &target,
+                            engine.doc,
+                            &references,
+                            frame,
+                            texture_rng,
+                        ),
                         "vertex_weight_edit"
                         | "vertex_weight_mix"
                         | "vertex_weight_proximity"
@@ -1192,9 +1238,8 @@ fn apply_modifier(
                             modifier,
                             &target,
                             engine.doc,
-                            &world_matrices,
-                            evaluated_operand_meshes,
-                            engine.asset_root,
+                            &references,
+                            texture_rng,
                         ),
                         _ => Err(PotError::new(
                             ErrorCode::InternalError,
@@ -1447,126 +1492,6 @@ fn same_topology(left: &crate::geom::Mesh, right: &crate::geom::Mesh) -> bool {
             .map(|face| (face.id, &face.vertices))
             .eq(right.faces.iter().map(|face| (face.id, &face.vertices)))
 }
-fn apply_lattice_modifier(
-    mesh: &mut crate::geom::Mesh,
-    source_data: &DataBlock,
-    target_id: &Id,
-    modifier: &Modifier,
-    doc: &SceneDoc,
-    world_matrices: &BTreeMap<Id, glam::DMat4>,
-) -> Result<()> {
-    let lattice_text = modifier
-        .params
-        .get("object")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::InvalidOperation,
-                "lattice modifier requires an object ID",
-                json!({"modifier_id":modifier.id,"parameter":"object"}),
-            )
-        })?;
-    let lattice_id = Id::new(lattice_text).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::InvalidOperation,
-            error.message,
-            json!({"modifier_id":modifier.id,"object":lattice_text}),
-        )
-    })?;
-    let lattice_node = doc.nodes.get(&lattice_id).ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::TargetNotFound,
-            "lattice modifier target Object was not found",
-            json!({"modifier_id":modifier.id,"object":lattice_id}),
-        )
-    })?;
-    let lattice_data_id = lattice_node.data.as_ref().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::InvalidOperation,
-            "lattice modifier target has no Data-Block",
-            json!({"modifier_id":modifier.id,"object":lattice_id}),
-        )
-    })?;
-    let lattice_block = doc.data_blocks.get(lattice_data_id).ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::TargetNotFound,
-            "lattice modifier Data-Block was not found",
-            json!({"modifier_id":modifier.id,"data_id":lattice_data_id}),
-        )
-    })?;
-    let lattice_data = lattice_block.lattice.as_ref().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::InvalidOperation,
-            "lattice modifier target is not a lattice Data-Block",
-            json!({"modifier_id":modifier.id,"data_id":lattice_data_id}),
-        )
-    })?;
-    let target_world = world_matrices.get(target_id).copied().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "lattice modifier source transform is unavailable",
-            json!({"node_id":target_id}),
-        )
-    })?;
-    let lattice_world = world_matrices.get(&lattice_id).copied().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "lattice modifier target transform is unavailable",
-            json!({"node_id":lattice_id}),
-        )
-    })?;
-    let vertex_group = match modifier.params.get("vertex_group") {
-        None => None,
-        Some(Value::String(name)) => {
-            let mut matching = source_data.vertex_groups.iter().filter(|group| {
-                group.id.as_str() == name.as_str() || group.name.as_str() == name.as_str()
-            });
-            let group = matching.next().ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::TargetNotFound,
-                    "lattice modifier vertex group was not found",
-                    json!({"modifier_id":modifier.id,"vertex_group":name}),
-                )
-            })?;
-            if matching.next().is_some() {
-                return Err(PotError::with_details(
-                    ErrorCode::AmbiguousTarget,
-                    "lattice modifier vertex group name is ambiguous",
-                    json!({"modifier_id":modifier.id,"vertex_group":name}),
-                ));
-            }
-            Some(&group.id)
-        }
-        Some(_) => {
-            return Err(PotError::with_details(
-                ErrorCode::InvalidOperation,
-                "lattice modifier vertex_group must be a string",
-                json!({"modifier_id":modifier.id}),
-            ));
-        }
-    };
-    let weights = vertex_group.map(|group_id| {
-        let weights_by_vertex = crate::eval::mesh_vertex_weights(mesh, &source_data.vertex_groups);
-        mesh.vertices
-            .iter()
-            .map(|vertex| {
-                weights_by_vertex
-                    .get(&vertex.id)
-                    .and_then(|weights| weights.get(group_id))
-                    .copied()
-                    .unwrap_or(0.0)
-            })
-            .collect::<Vec<_>>()
-    });
-    *mesh = crate::geom::lattice::deform_mesh_with_transform(
-        mesh,
-        lattice_data,
-        weights.as_deref(),
-        target_world.inverse() * lattice_world,
-    )?;
-    Ok(())
-}
-
 fn targets(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result<Vec<Id>> {
     let target = operation.get("target").ok_or_else(|| {
         engine.error(ErrorCode::InvalidOperation, "target is required", "/target")

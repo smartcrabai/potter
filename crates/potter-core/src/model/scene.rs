@@ -172,6 +172,21 @@ impl SceneDoc {
                 "active_scene does not reference a scene",
             ));
         }
+        for (resource_id, resource) in &self.resources {
+            let resource_kind = crate::model::migrate::inline_resource_kind(resource)?;
+            if resource.get("storage").is_some()
+                && resource.get("storage").and_then(Value::as_str) != Some("inline")
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "typed resources must use storage `inline`",
+                    json!({ "resource": resource_id }),
+                ));
+            }
+            if resource_kind == Some(crate::geom::legacy_texture::LEGACY_TEXTURE_KIND) {
+                crate::geom::legacy_texture::validate_record_in_scene(self, resource_id, resource)?;
+            }
+        }
         for clip in self.movie_clips.values() {
             clip.validate()?;
         }
@@ -1476,9 +1491,20 @@ pub struct ModifierRuntime {
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
     pub operand_mesh: Option<Value>,
-    pub warp_from: Option<[f64; 3]>,
-    pub warp_to: Option<[f64; 3]>,
-    pub hook_target_position: Option<[f64; 3]>,
+    /// `inv(subject_world) * reference_world` (column-major) for Hook, Cast, Simple Deform origin,
+    /// Curve, and Wave's start object. A bone reference is `armature_world * pose_mat`.
+    pub object_matrix: Option<[f64; 16]>,
+    /// `inv(subject_world) * source_world` for Warp or UV Warp source object or pose bone; a
+    /// named bone uses `armature_world * pose_mat`, while empty/unknown names use object world.
+    pub warp_from_matrix: Option<[f64; 16]>,
+    /// `inv(subject_world) * destination_world` for Warp or UV Warp destination object or pose bone;
+    /// a named bone uses `armature_world * pose_mat`, while empty/unknown names use object world.
+    pub warp_to_matrix: Option<[f64; 16]>,
+    /// Subject-local to texture space: LOCAL is identity, GLOBAL is `subject_world`, OBJECT is
+    /// `inv(texture_world) * subject_world` with a map object (otherwise LOCAL), and UV has no
+    /// matrix. A named bone's `texture_world` is `armature_world * pose_mat`; unknown names use
+    /// the map object's world matrix.
+    pub texture_matrix: Option<[f64; 16]>,
     pub use_render_settings: bool,
 }
 
@@ -2216,3 +2242,4 @@ fn kani_revision_bound_is_exact() {
         "revision range must include exactly the interoperable integer range",
     );
 }
+

@@ -17,6 +17,24 @@ DEFERRED_ID_ASSIGNMENTS = []
 CACHE_FILES_BY_IDENTITY = {}
 ALPHA_MODE_PROPERTY = "potter.alpha_mode"
 ALPHA_MODES = ("opaque", "clip", "blend")
+
+LEGACY_TEXTURE_SETTINGS = {
+    "CLOUDS": ("noise_scale", "noise_depth", "noise_basis", "noise_type", "cloud_type"),
+    "MARBLE": ("noise_scale", "turbulence", "noise_depth", "noise_type", "marble_type",
+               "noise_basis", "noise_basis_2"),
+    "WOOD": ("noise_scale", "turbulence", "noise_basis", "noise_type", "wood_type",
+             "noise_basis_2"),
+    "MAGIC": ("turbulence", "noise_depth"),
+    "BLEND": ("progression", "use_flip_axis"),
+    "STUCCI": ("turbulence", "noise_basis", "noise_scale", "noise_type", "stucci_type"),
+    "NOISE": ("noise_scale", "noise_basis", "noise_type"),
+    "DISTORTED_NOISE": ("distortion", "noise_scale", "noise_basis", "noise_distortion"),
+    "VORONOI": ("weight_1", "weight_2", "weight_3", "weight_4", "minkovsky_exponent",
+                "distance_metric", "color_mode", "noise_intensity", "noise_scale"),
+    "MUSGRAVE": ("musgrave_type", "dimension_max", "lacunarity", "offset", "gain",
+                 "noise_intensity", "noise_scale", "noise_basis"),
+    "IMAGE": (),
+}
 POTTER_TO_BLENDER_ANIMATION_PATH = {
     "transform.translation": "location",
     "transform.rotation_euler": "rotation_euler",
@@ -367,6 +385,112 @@ def _physics_modifier_settings(obj, modifier):
     if point_cache is not None:
         result["point_cache"] = point_cache
     return result
+def _rna_property_is_default(block, key):
+    property_definition = block.bl_rna.properties.get(key)
+    if property_definition is None:
+        return False
+    try:
+        default = (property_definition.default_array
+                   if property_definition.is_array else property_definition.default)
+    except Exception:
+        return False
+    return plain(getattr(block, key)) == plain(default)
+
+
+def _color_ramp_settings(ramp):
+    return {
+        "color_mode": ramp.color_mode,
+        "hue_interpolation": ramp.hue_interpolation,
+        "interpolation": ramp.interpolation,
+        "elements": [
+            {"position": float(element.position), "color": plain(element.color)}
+            for element in ramp.elements
+        ],
+    }
+
+
+def _restore_color_ramp(ramp, values, owner):
+    if not isinstance(values, dict) or not isinstance(values.get("elements"), list):
+        raise ValueError("%s has invalid ColorRamp settings" % owner)
+    elements = values["elements"]
+    if len(elements) < 2:
+        raise ValueError("%s ColorRamp must contain at least two elements" % owner)
+    ramp_values = {key: value for key, value in values.items() if key != "elements"}
+    set_rna(ramp, ramp_values, strict=True, owner=owner)
+    while len(ramp.elements) > 2:
+        ramp.elements.remove(ramp.elements[-1])
+    first, last = ramp.elements[0], ramp.elements[1]
+    first.color = elements[0]["color"]
+    first.position = float(elements[0]["position"])
+    last.color = elements[-1]["color"]
+    last.position = float(elements[-1]["position"])
+    for source in elements[1:-1]:
+        element = ramp.elements.new(float(source["position"]))
+        element.color = source["color"]
+
+
+def _color_ramp_is_default(ramp):
+    return _color_ramp_settings(ramp) == {
+        "color_mode": "RGB",
+        "hue_interpolation": "NEAR",
+        "interpolation": "LINEAR",
+        "elements": [
+            {"position": 0.0, "color": [0.0, 0.0, 0.0, 1.0]},
+            {"position": 1.0, "color": [1.0, 1.0, 1.0, 1.0]},
+        ],
+    }
+
+
+def _image_texture_uses_image_fastpath(texture):
+    image = texture.image
+    if image is None or sum(
+            item.type == "IMAGE" and item.image == image
+            for item in getattr(bpy.data, "textures", ())) != 1:
+    settings = _legacy_texture_settings(texture)
+    image_user_settings = settings.pop("image_user", {})
+    color_ramp = settings.pop("color_ramp", None)
+    return (all(_rna_property_is_default(texture, key) for key in settings)
+            and all(_rna_property_is_default(texture.image_user, key)
+                    for key in image_user_settings)
+            and (color_ramp is None or _color_ramp_is_default(texture.color_ramp)))
+
+
+def _rna_scalar_settings(block, omit=()):
+    return {
+        key: plain(value)
+        for prop, key, value in _walk_rna_properties(
+            block, omit=omit, skip_collections=True)
+        if prop.type in ("BOOLEAN", "INT", "FLOAT", "STRING", "ENUM")
+    }
+
+
+def _legacy_texture_settings(texture):
+    settings_keys = LEGACY_TEXTURE_SETTINGS.get(texture.type)
+    if settings_keys is None:
+        raise ValueError("unsupported legacy Texture type %s" % texture.type)
+    if texture.type == "IMAGE":
+        settings = _rna_scalar_settings(
+            texture, omit=("name", "name_full", "type", "image", "image_user",
+                           "color_ramp", "use_nodes", "node_tree"))
+        settings["color_ramp"] = _color_ramp_settings(texture.color_ramp)
+        settings["image_user"] = _rna_scalar_settings(texture.image_user)
+        return settings
+    return {key: plain(getattr(texture, key))
+            for key in settings_keys if hasattr(texture, key)}
+
+
+def _legacy_texture_record(texture):
+    settings = _legacy_texture_settings(texture)
+    if texture.type == "IMAGE" and _image_texture_uses_image_fastpath(texture):
+        return None
+    record = {"storage": "inline", "kind": "legacy_texture",
+              "owner": texture.name_full, "texture_type": texture.type,
+              "settings": settings}
+    if texture.type == "IMAGE":
+        record["image"] = plain(texture.image)
+    return record
+
+
 def modifier_params(modifier):
     omitted = (
         "type", "name", "execution_time", "persistent_uid", "show_viewport", "show_render",
@@ -388,6 +512,12 @@ def modifier_params(modifier):
             {"object": plain(projector.object) if projector.object else None}
             for projector in modifier.projectors
         ]
+    texture = getattr(modifier, "texture", None)
+    if texture is not None:
+        if texture.type == "IMAGE" and _image_texture_uses_image_fastpath(texture):
+            params["texture"] = {"id_type": "Image", "name": texture.image.name_full}
+        else:
+            params["texture"] = {"id_type": "Texture", "name": texture.name_full}
     return params
 def _curve_mapping_points(mapping):
     if mapping is None or not mapping.curves:
@@ -516,6 +646,7 @@ def images_dump():
     return result
 
 
+
 def _resource_record(kind, owner, path, packed_file=None):
     resolved = bpy.path.abspath(path) if path else None
     packed_data = None
@@ -634,6 +765,10 @@ def resources_dump():
         record = _resource_record("image", image.name_full, filepath,
                                  getattr(image, "packed_file", None))
         if record["path"] or record["packed"]:
+            result.append(record)
+    for texture in getattr(bpy.data, "textures", ()):
+        record = _legacy_texture_record(texture)
+        if record is not None:
             result.append(record)
     for curve in bpy.data.curves:
         if getattr(getattr(curve, "bl_rna", None), "identifier", "") != "TextCurve":
@@ -1908,7 +2043,8 @@ def _startup_metadata_datablock(collection_name, block):
 def other_datablocks_dump():
     known = {"actions", "armatures", "cache_files", "cameras", "collections", "curves", "fonts",
              "grease_pencils_v3", "images", "libraries", "lights", "materials", "meshes",
-             "movieclips", "node_groups", "objects", "scenes", "texts", "volumes", "worlds"}
+             "movieclips", "node_groups", "objects", "scenes", "texts", "textures", "volumes",
+             "worlds"}
     result = []
     for collection_name in dir(bpy.data):
         if collection_name.startswith("_") or collection_name in known:
@@ -2186,15 +2322,16 @@ def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
                 raise
             continue
 
-def _restore_modifier_id_references(modifier, params, id_lookup):
+def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup):
     for key, value in params.items():
         if not hasattr(modifier, key):
             continue
         pointer_type = _blender_id_pointer_type(modifier, key, getattr(modifier, key))
-        if pointer_type not in ("Object", "Collection") or value is None:
+        if pointer_type not in ("Object", "Collection", "Texture") or value is None:
             continue
         name = value.get("name") if isinstance(value, dict) else value
-        candidate = id_lookup.get(name) if isinstance(name, str) else None
+        lookup = texture_lookup if pointer_type == "Texture" else id_lookup
+        candidate = lookup.get(name) if isinstance(name, str) else None
         if (candidate is None
                 or candidate.bl_rna.identifier != pointer_type
                 or (isinstance(value, dict)
@@ -2203,6 +2340,61 @@ def _restore_modifier_id_references(modifier, params, id_lookup):
                 "modifier %s references unavailable %s ID %s"
                 % (modifier.name, pointer_type, name))
         setattr(modifier, key, candidate)
+
+
+def _legacy_textures_from_doc(doc, image_map):
+    textures = {}
+    adapter = doc.get("compatibility", {}).get("blender_adapter", {})
+    texture_names = adapter.get("legacy_texture_names", {})
+    for texture_id, record in doc.get("resources", {}).items():
+        if (record.get("storage") != "inline"
+                or record.get("kind") != "legacy_texture"):
+            continue
+        texture_type = record.get("texture_type")
+        if texture_type == "NATIVE_VALUE_NOISE":
+            continue
+        if texture_type not in LEGACY_TEXTURE_SETTINGS:
+            raise ValueError("unsupported inline legacy Texture type %s" % texture_type)
+        texture = bpy.data.textures.new(
+            texture_names.get(texture_id, texture_id), type=texture_type)
+        set_id(texture, texture_id)
+        settings = dict(record.get("settings", {}))
+        color_ramp_settings = settings.pop("color_ramp", None)
+        image_user_settings = settings.pop("image_user", {})
+        if texture_type == "IMAGE":
+            image_id = record.get("image")
+            if image_id is not None:
+                image = image_map.get(image_id)
+                if image is None:
+                    raise ValueError("legacy Image Texture references unavailable Image %s"
+                                     % image_id)
+                texture.image = image
+            set_rna(texture.image_user, image_user_settings, strict=True,
+                    owner="legacy Image Texture %s image_user" % texture_id)
+        elif image_user_settings:
+            raise ValueError("non-IMAGE legacy Texture has image_user settings")
+        if color_ramp_settings is not None:
+            if texture_type != "IMAGE" or not hasattr(texture, "color_ramp"):
+                raise ValueError("legacy Texture %s cannot restore its ColorRamp"
+                                 % texture_id)
+            _restore_color_ramp(
+                texture.color_ramp, color_ramp_settings,
+                "legacy Image Texture %s ColorRamp" % texture_id)
+        set_rna(texture, settings, strict=True,
+                owner="legacy Texture %s" % texture_id)
+        textures[texture_id] = texture
+    for node in doc.get("nodes", {}).values():
+        for modifier in node.get("modifiers", []):
+            image_id = modifier.get("params", {}).get("texture")
+            if image_id not in doc.get("images", {}) or image_id in textures:
+                continue
+            image = image_map.get(image_id)
+            if image is None:
+                raise ValueError("modifier references unavailable Image %s" % image_id)
+            texture = bpy.data.textures.new(image.name_full, type="IMAGE")
+            texture.image = image
+            textures[image_id] = texture
+    return textures
 
 
 def _create_modifier(obj, name, modifier_type):
@@ -2524,7 +2716,7 @@ def _bake_point_cache(obj, cache):
             scene.collection.objects.unlink(obj)
 
 
-def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
+def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, node_id, obj):
     params = item.get("params", {})
     kind = item.get("type")
     physics_property = {
@@ -2551,8 +2743,15 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
     rna_params = dict(params)
     for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve"):
         rna_params.pop(parameter, None)
+    texture_id = params.get("texture")
+    texture_record = doc.get("resources", {}).get(texture_id, {})
+    if (texture_record.get("storage") == "inline"
+            and texture_record.get("kind") == "legacy_texture"
+            and texture_record.get("texture_type") == "NATIVE_VALUE_NOISE"):
+        rna_params.pop("texture", None)
+        modifier.texture = None
     set_rna(modifier, rna_params, id_lookup)
-    _restore_modifier_id_references(modifier, rna_params, id_lookup)
+    _restore_modifier_id_references(modifier, rna_params, id_lookup, texture_lookup)
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
         _set_curve_mapping(modifier, params["map_curve"])
     if kind == "mesh_cache" and params.get("resource"):
@@ -4395,7 +4594,6 @@ def _resource_record_for_reference(doc, reference):
             return resource
     return None
 
-
 def _resource_path(doc, reference):
     resource = _resource_record_for_reference(doc, reference)
     path = (resource.get("export_path") if resource else None)
@@ -5297,7 +5495,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             bpy.data.collections.remove(collection)
     for collection_name in (
         "actions", "armatures", "cameras", "curves", "grease_pencils_v3",
-        "images", "lights", "materials", "meshes", "node_groups", "volumes", "worlds",
+        "images", "lights", "materials", "meshes", "node_groups", "textures", "volumes",
     ):
         collection = getattr(bpy.data, collection_name, None)
         if collection is None:
@@ -5446,6 +5644,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         image["potter.image_json"] = json.dumps(image_metadata, sort_keys=True)
         image_map[image_id] = image
         image.use_fake_user = True
+        image_map[image_id] = image
     data_raw = doc.get("data_blocks", {})
     linked_data_blocks = linked_maps["data_blocks"]
     mesh_map = {identifier: block for identifier, block in linked_data_blocks.items()
@@ -5836,6 +6035,9 @@ def export_doc(doc, target, pack, scene_hash, context):
     id_lookup.update({image.name_full: image for image in image_map.values()})
     id_lookup.update(image_map)
     id_lookup.update({image.name_full: image for image in linked_maps["resources"].values()})
+    id_lookup.update(image_map)
+    id_lookup.update({image.name_full: image for image in image_map.values()})
+    texture_map = _legacy_textures_from_doc(doc, image_map)
     socket_maps = _populate_geometry_groups(group_map, group_sources, id_lookup)
     for material_id, item in doc.get("materials", {}).items():
         material = material_map.get(material_id)
@@ -5919,7 +6121,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 rna_item = dict(modifier_item, params={
                     key: value for key, value in params.items() if key != "use_pin_to_last"})
                 set_modifier_params(
-                    modifier, rna_item, id_lookup, doc, target, node_id, obj)
+                    modifier, rna_item, id_lookup, texture_map, doc, target, node_id, obj)
                 if modifier_item.get("type") == "mesh_sequence_cache":
                     cache_file = _cache_file_for_resource(
                         doc, params["resource"], target, params)

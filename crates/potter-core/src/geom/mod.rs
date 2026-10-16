@@ -31,6 +31,8 @@ pub(crate) mod color_layers;
 pub mod curve;
 pub mod edit;
 pub mod lattice;
+pub(crate) mod legacy_texture;
+pub use legacy_texture::{ResolvedTexture, resolve_texture};
 pub mod mesh_cache;
 pub mod metaball;
 pub mod modifiers;

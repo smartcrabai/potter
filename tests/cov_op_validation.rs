@@ -865,7 +865,7 @@ fn modifier_apply_reports_shape_key_and_unsupported_failures() {
             Some("modifier.apply.shape_key_guard"),
         ),
         invalid_case(
-            "skin modifier branch hull is unsupported",
+            "skin adjacent branch hulls require topology repair",
             json!([
                 {"op":"node.create","id":"skeleton","kind":"box","params":{"size":1.0}},
                 {"op":"modifier.create","target":{"id":"skeleton"},"id":"skin","type":"skin","params":{}}
@@ -873,7 +873,7 @@ fn modifier_apply_reports_shape_key_and_unsupported_failures() {
             json!({"op":"modifier.apply","target":{"id":"skeleton"},"modifier_id":"skin"}),
             "UNSUPPORTED_FEATURE",
             None,
-            Some("modifier.skin.branch_hull"),
+            Some("modifier.skin.branch_hull_topology_repair"),
         ),
     ];
     run_invalid_cases(&cases);

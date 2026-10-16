@@ -17,6 +17,9 @@ use crate::{
     model::{CameraData, Modifier},
 };
 
+use crate::blender_rng::BlenderRng;
+use crate::geom::legacy_texture::{self, ResolvedTexture, TextureSource};
+
 use super::{
     bool_param as boolean, closest_point_triangle, invalid_parameter as invalid,
     number_param as number, schema_value, string_param as string,
@@ -40,24 +43,55 @@ pub struct SceneOperand {
 ///
 /// Returns an invalid-parameter or evaluation error when a requested group, UV layer,
 /// or attribute is missing or malformed.
-pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    evaluate_with_context(mesh, modifier, &BTreeMap::new(), None, DMat4::IDENTITY)
+pub(super) fn evaluate(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    rng: &mut BlenderRng,
+) -> Result<Mesh> {
+    evaluate_with_texture_context(
+        mesh,
+        modifier,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        rng,
+    )
 }
 
-/// Evaluate an attribute modifier with its resolved scene operands and optional image mask.
+/// Evaluate an attribute modifier with its resolved scene operands and optional resolved texture.
 ///
 /// # Errors
 ///
-/// Returns an invalid-parameter, missing-target, or evaluation error for malformed operands.
+/// Returns an invalid-parameter, missing-target, or evaluation error for malformed operands or
+/// a mask texture that was not resolved by the evaluation context.
 pub fn evaluate_with_context(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
-    mask_image: Option<&crate::image::ImageData>,
+    mask_texture: Option<&ResolvedTexture>,
     subject_world: DMat4,
 ) -> Result<Mesh> {
+    let mut rng = BlenderRng::seed_random(0);
+    evaluate_with_texture_context(
+        mesh,
+        modifier,
+        operands,
+        mask_texture.map(ResolvedTexture::source),
+        subject_world,
+        &mut rng,
+    )
+}
+
+pub(crate) fn evaluate_with_texture_context(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    operands: &BTreeMap<String, Vec<SceneOperand>>,
+    mask_texture: Option<TextureSource<'_>>,
+    subject_world: DMat4,
+    rng: &mut BlenderRng,
+) -> Result<Mesh> {
     let texture_weights =
-        texture_mask_weights(mesh, modifier, operands, mask_image, subject_world)?;
+        texture_mask_weights(mesh, modifier, operands, mask_texture, subject_world, rng)?;
     match modifier.modifier_type.as_str() {
         "vertex_weight_edit" => vertex_weight_edit(mesh, modifier, texture_weights.as_ref()),
         "vertex_weight_mix" => vertex_weight_mix(mesh, modifier, texture_weights.as_ref()),
@@ -86,20 +120,21 @@ fn texture_mask_weights(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
-    image: Option<&crate::image::ImageData>,
+    texture: Option<TextureSource<'_>>,
     subject_world: DMat4,
+    rng: &mut BlenderRng,
 ) -> Result<Option<BTreeMap<u32, f64>>> {
-    let Some(texture) = modifier.params.get("mask_texture") else {
+    let Some(texture_param) = modifier.params.get("mask_texture") else {
         return Ok(None);
     };
-    if texture.is_null() || texture.as_str().is_some_and(str::is_empty) {
+    if texture_param.is_null() || texture_param.as_str().is_some_and(str::is_empty) {
         return Ok(None);
     }
-    let image = image.ok_or_else(|| {
+    let texture = texture.ok_or_else(|| {
         PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "weight modifier texture is not a resolved image texture",
-            json!({"feature_id":format!("modifier.{}.texture_type",modifier.modifier_type),"modifier_id":modifier.id}),
+            ErrorCode::DependencyMissing,
+            "modifier mask texture was not resolved by the evaluation context",
+            json!({"feature_id":format!("modifier.{}.mask_texture",modifier.modifier_type),"modifier_id":modifier.id,"texture":texture_param}),
         )
     })?;
     // `mask_tex_*` exist only in the vertex-weight schemas. The other attribute types cannot
@@ -118,34 +153,6 @@ fn texture_mask_weights(
     } else {
         ("LOCAL", "INT")
     };
-    let uv_coordinates = if mapping == "UV" {
-        Some(vertex_uv_coordinates(mesh, modifier)?)
-    } else {
-        None
-    };
-    let object_inverse = if mapping == "OBJECT" {
-        let object = operands
-            .get("mask_tex_map_object")
-            .and_then(|objects| objects.first())
-            .ok_or_else(|| {
-                invalid(
-                    modifier,
-                    "mask_tex_map_object",
-                    "an object ID when mask_tex_mapping is OBJECT",
-                )
-            })?;
-        let inverse = object.local_to_subject.inverse();
-        if !inverse.is_finite() {
-            return Err(invalid(
-                modifier,
-                "mask_tex_map_object",
-                "an invertible object transform",
-            ));
-        }
-        Some(inverse)
-    } else {
-        None
-    };
     if !matches!(mapping, "LOCAL" | "GLOBAL" | "OBJECT" | "UV") {
         return Err(invalid(
             modifier,
@@ -163,25 +170,73 @@ fn texture_mask_weights(
             "a Blender image channel",
         ));
     }
+    let uv_coordinates = if mapping == "UV" {
+        Some(vertex_uv_coordinates(mesh, modifier)?)
+    } else {
+        None
+    };
+    let texture_matrix = modifier
+        .runtime
+        .texture_matrix
+        .map(|matrix| DMat4::from_cols_array(&matrix));
+    let object_matrix = if mapping == "OBJECT" {
+        if let Some(matrix) = texture_matrix {
+            Some(matrix)
+        } else {
+            let object = operands
+                .get("mask_tex_map_object")
+                .and_then(|objects| objects.first())
+                .ok_or_else(|| {
+                    invalid(
+                        modifier,
+                        "mask_tex_map_object",
+                        "an object ID when mask_tex_mapping is OBJECT",
+                    )
+                })?;
+            let inverse = object.local_to_subject.inverse();
+            if !inverse.is_finite() {
+                return Err(invalid(
+                    modifier,
+                    "mask_tex_map_object",
+                    "an invertible object transform",
+                ));
+            }
+            Some(inverse)
+        }
+    } else {
+        None
+    };
+    let global_matrix = texture_matrix.unwrap_or(subject_world);
     let mut weights = BTreeMap::new();
     for vertex in &mesh.vertices {
-        let local = match mapping {
-            "GLOBAL" => subject_world.transform_point3(vertex.co),
-            "OBJECT" => object_inverse
+        let coordinates = match mapping {
+            "LOCAL" => vertex.co,
+            "GLOBAL" => global_matrix.transform_point3(vertex.co),
+            "OBJECT" => object_matrix
+                .ok_or_else(|| {
+                    invalid(
+                        modifier,
+                        "mask_tex_mapping",
+                        "a resolved object-space matrix",
+                    )
+                })?
+                .transform_point3(vertex.co),
+            "UV" => uv_coordinates
                 .as_ref()
-                .map_or(vertex.co, |inverse| inverse.transform_point3(vertex.co)),
-            _ => vertex.co,
+                .and_then(|coordinates| coordinates.get(&vertex.id).copied())
+                .map_or(vertex.co, |uv| {
+                    DVec3::new(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, 0.0)
+                }),
+            _ => unreachable!("mask texture mapping was validated"),
         };
-        let uv = uv_coordinates
-            .as_ref()
-            .and_then(|coordinates| coordinates.get(&vertex.id).copied());
-        let mapping_coordinates =
-            uv.map_or(DVec2::new(local.x, local.y), |uv| uv * 2.0 - DVec2::ONE);
-        let mut texture_uv = (mapping_coordinates + DVec2::ONE) * 0.5;
-        texture_uv.x = repeat_texture_coordinate(texture_uv.x);
-        texture_uv.y = repeat_texture_coordinate(texture_uv.y);
-        let sample = crate::image::sample(image, texture_uv.to_array(), 0);
-        weights.insert(vertex.id, texture_channel(sample, channel));
+        let sample = legacy_texture::sample(texture, coordinates, rng)?;
+        weights.insert(
+            vertex.id,
+            texture_channel(
+                [sample.rgb[0], sample.rgb[1], sample.rgb[2], sample.alpha],
+                channel,
+            ),
+        );
     }
     Ok(Some(weights))
 }
@@ -241,13 +296,6 @@ fn texture_channel(color: [f64; 4], channel: &str) -> f64 {
     }
 }
 
-fn repeat_texture_coordinate(value: f64) -> f64 {
-    if value.is_finite() {
-        value.rem_euclid(1.0)
-    } else {
-        value
-    }
-}
 
 /// Evaluate a PC2 or MDD Mesh Cache resource at one scene frame.
 ///
@@ -1474,11 +1522,33 @@ fn uv_warp(
     let invert_group = boolean(modifier, "invert_vertex_group")?;
     let from = operands.get("object_from").and_then(|items| items.first());
     let to = operands.get("object_to").and_then(|items| items.first());
-    check_uv_warp_bone_binding(modifier, operands, "bone_from", "object_from")?;
-    check_uv_warp_bone_binding(modifier, operands, "bone_to", "object_to")?;
-    let object_transform = match (from, to) {
+    let has_from_bone =
+        optional_string(modifier, "bone_from")?.is_some_and(|bone| !bone.is_empty());
+    let has_to_bone =
+        optional_string(modifier, "bone_to")?.is_some_and(|bone| !bone.is_empty());
+    let from_matrix = modifier
+        .runtime
+        .warp_from_matrix
+        .map(|matrix| DMat4::from_cols_array(&matrix));
+    let to_matrix = modifier
+        .runtime
+        .warp_to_matrix
+        .map(|matrix| DMat4::from_cols_array(&matrix));
+    if (has_from_bone && from_matrix.is_none()) || (has_to_bone && to_matrix.is_none()) {
+        let parameter = if has_from_bone && from_matrix.is_none() {
+            "bone_from"
+        } else {
+            "bone_to"
+        };
+        return Err(PotError::with_details(
+            ErrorCode::DependencyMissing,
+            "UV Warp bone reference matrix is unavailable",
+            json!({"feature_id":"modifier.uv_warp.bone_transform","modifier_id":modifier.id,"parameter":parameter}),
+        ));
+    }
+    let object_transform = match (from_matrix, to_matrix) {
         (Some(from), Some(to)) => {
-            let inverse = to.local_to_subject.inverse();
+            let inverse = to.inverse();
             if !inverse.is_finite() {
                 return Err(invalid(
                     modifier,
@@ -1486,9 +1556,22 @@ fn uv_warp(
                     "an invertible object transform",
                 ));
             }
-            Some(inverse * from.local_to_subject)
+            Some(inverse * from)
         }
-        _ => None,
+        _ => match (from, to) {
+            (Some(from), Some(to)) => {
+                let inverse = to.local_to_subject.inverse();
+                if !inverse.is_finite() {
+                    return Err(invalid(
+                        modifier,
+                        "object_to",
+                        "an invertible object transform",
+                    ));
+                }
+                Some(inverse * from.local_to_subject)
+            }
+            _ => None,
+        },
     };
     for (face_index, face) in mesh.faces.iter().enumerate() {
         let mut uv = Vec::with_capacity(face.vertices.len());
@@ -1523,41 +1606,6 @@ fn uv_warp(
     let mut result = mesh.clone();
     uv_layers::write(&mut result, &store);
     Ok(result)
-}
-fn check_uv_warp_bone_binding(
-    modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
-    bone_parameter: &str,
-    object_parameter: &str,
-) -> Result<()> {
-    let Some(bone) = optional_string(modifier, bone_parameter)? else {
-        return Ok(());
-    };
-    if bone.is_empty() {
-        return Ok(());
-    }
-    let operand = operands
-        .get(object_parameter)
-        .and_then(|items| items.first())
-        .ok_or_else(|| {
-            invalid(
-                modifier,
-                object_parameter,
-                "an armature object for the requested bone",
-            )
-        })?;
-    if !operand.armature {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            format!("UV Warp `{bone_parameter}` requires an armature object"),
-            json!({"feature_id":"modifier.uv_warp.bone","modifier_id":modifier.id,"parameter":bone_parameter,"bone":bone}),
-        ));
-    }
-    Err(PotError::with_details(
-        ErrorCode::UnsupportedFeature,
-        "UV Warp bone-relative transforms are not available in the evaluated armature context",
-        json!({"feature_id":"modifier.uv_warp.bone_transform","modifier_id":modifier.id,"parameter":bone_parameter,"bone":bone}),
-    ))
 }
 
 fn data_transfer(

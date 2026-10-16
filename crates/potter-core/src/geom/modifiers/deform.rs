@@ -8,6 +8,7 @@
 //! Bound surface, cage, and Laplacian deformation modifiers.
 
 use std::collections::{BTreeMap, HashMap};
+use std::f64::consts::{FRAC_PI_2, PI};
 
 use glam::{DMat4, DVec2, DVec3};
 use serde_json::{Value, json};
@@ -23,155 +24,28 @@ use super::{
     validated,
 };
 
-/// Evaluates Surface Deform from bind-time triangle coordinates and barycentric weights.
+/// Evaluates a bound Surface Deform from the bind-time polygon bindings; unbound leaves the mesh unchanged.
 pub(super) fn surface_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let Some(bind_data) = modifier.binding_data.as_ref() else {
         return Ok(mesh.clone());
     };
-    if is_native_bind(bind_data, "surface_deform") {
-        return native_surface_deform(mesh, modifier, bind_data);
-    }
-    let Some(bind_data) = bind_data.as_array() else {
-        return Ok(mesh.clone());
-    };
-    let target: Mesh = serde_json::from_value(
-        modifier
-            .runtime
-            .target_mesh
-            .clone()
-            .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh object operand"))?,
-    )
-    .map_err(|_| invalid_parameter(modifier, "object", "a mesh object operand"))?;
-    if bind_data.len() != mesh.vertices.len() {
+    if !is_surface_bind(bind_data) {
         return Err(invalid_parameter(
             modifier,
-            "bind_data",
-            "one polygon-binding set per source vertex",
+            "binding_data",
+            "a Surface Deform bind",
         ));
     }
-    let strength = number_param(modifier, "strength")?;
-    if !(-100.0..=100.0).contains(&strength) {
-        return Err(invalid_parameter(
-            modifier,
-            "strength",
-            "a number in [-100, 100]",
-        ));
-    }
-    let falloff = number_param(modifier, "falloff")?;
-    if !(2.0..=16.0).contains(&falloff) {
-        return Err(invalid_parameter(
-            modifier,
-            "falloff",
-            "a number in [2, 16]",
-        ));
-    }
-    let _sparse = bool_param(modifier, "use_sparse_bind")?;
-    let group = group_weights(mesh, modifier)?;
-    let invert = bool_param(modifier, "invert_vertex_group")?;
-    let mut result = mesh.clone();
-    for (index, (vertex, record)) in result.vertices.iter_mut().zip(bind_data).enumerate() {
-        let polygons = record
-            .get("polygons")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                invalid_parameter(modifier, "bind_data", "stored target polygon weights")
-            })?;
-        if polygons.is_empty() {
-            continue;
-        }
-        let mut bind_distances = Vec::with_capacity(polygons.len());
-        for polygon in polygons {
-            let distance = polygon
-                .get("distance")
-                .and_then(Value::as_f64)
-                .filter(|distance| distance.is_finite() && *distance >= 0.0)
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "bind_data", "finite polygon distances")
-                })?;
-            bind_distances.push(distance);
-        }
-        let exact_face_count = bind_distances
-            .iter()
-            .filter(|distance| **distance <= f64::EPSILON)
-            .count();
-        let raw_weights = bind_distances
-            .iter()
-            .map(|distance| {
-                if exact_face_count > 0 {
-                    if *distance <= f64::EPSILON { 1.0 } else { 0.0 }
-                } else {
-                    distance.max(1.0e-12).powf(-falloff)
-                }
-            })
-            .collect::<Vec<_>>();
-        let total_weight = raw_weights.iter().sum::<f64>();
-        if !total_weight.is_finite() || total_weight <= f64::EPSILON {
-            return Err(invalid_parameter(
-                modifier,
-                "bind_data",
-                "normalizable polygon weights",
-            ));
-        }
-        let mut deformed = DVec3::ZERO;
-        for (polygon_index, polygon_record) in polygons.iter().enumerate() {
-            let indices = polygon_record
-                .get("vertices")
-                .and_then(Value::as_array)
-                .filter(|indices| indices.len() >= 3)
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "bind_data", "target polygon vertex indices")
-                })?;
-            let weights = polygon_record
-                .get("weights")
-                .and_then(Value::as_array)
-                .filter(|weights| weights.len() == indices.len())
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "bind_data", "mean-value weights per polygon loop")
-                })?;
-            let mut points = Vec::with_capacity(indices.len());
-            let mut interpolated = DVec3::ZERO;
-            for (vertex_index, weight) in indices.iter().zip(weights) {
-                let vertex_index = vertex_index
-                    .as_u64()
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| {
-                        invalid_parameter(modifier, "bind_data", "valid target vertex indices")
-                    })?;
-                let position = target
-                    .vertices
-                    .get(vertex_index)
-                    .map(|target_vertex| target_vertex.co)
-                    .ok_or_else(|| {
-                        invalid_parameter(modifier, "bind_data", "indices in the target mesh")
-                    })?;
-                let weight = finite_number(weight, modifier, "bind_data")?;
-                points.push(position);
-                interpolated += position * weight;
-            }
-            let normal = polygon_normal(&points).ok_or_else(|| {
-                invalid_parameter(modifier, "bind_data", "non-degenerate target polygons")
-            })?;
-            let normal_distance = polygon_record
-                .get("normal_distance")
-                .and_then(Value::as_f64)
-                .filter(|distance| distance.is_finite())
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "bind_data", "finite polygon normal offsets")
-                })?;
-            let influence = raw_weights[polygon_index] / total_weight;
-            deformed += (interpolated + normal * normal_distance) * influence;
-        }
-        let group_weight = group.as_ref().map_or(1.0, |weights| {
-            if invert {
-                1.0 - weights[index]
-            } else {
-                weights[index]
-            }
-        });
-        vertex.co += (deformed - vertex.co) * (strength * group_weight);
-    }
-    validated(&result)?;
-    Ok(result)
+    native_surface_deform(mesh, modifier, bind_data)
+}
+
+fn is_surface_bind(bind_data: &Value) -> bool {
+    bind_data.as_object().is_some_and(|object| {
+        matches!(
+            object.get("format").and_then(Value::as_str),
+            Some("blender_native_bind_v1" | "blender_surface_bind_v1")
+        ) && object.get("type").and_then(Value::as_str) == Some("surface_deform")
+    })
 }
 
 fn is_native_bind(bind_data: &Value, modifier_type: &str) -> bool {
@@ -510,7 +384,9 @@ fn native_polygon_normal(target: &Mesh, indices: &[Value], modifier: &Modifier) 
     })
 }
 
-/// Evaluates a bound Mesh Deform cage using stored voxel-grid harmonic coordinates.
+/// Evaluates a bound Mesh Deform cage. Each cage vertex contributes its displacement measured in
+/// the bind frame, applied as an offset through the inverse linear part of the current cage
+/// transform, as Blender's `meshdeformModifier_do` does.
 pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let Some(bind_data) = modifier.binding_data.as_ref() else {
         return Ok(mesh.clone());
@@ -527,38 +403,98 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .ok_or_else(|| invalid_parameter(modifier, "binding_data", "cage-coordinate rows"))?;
     let bound_cage: Mesh =
         serde_json::from_value(bind_data.get("cage_mesh").cloned().ok_or_else(|| {
-            invalid_parameter(modifier, "binding_data", "the bind-time cage mesh")
+            invalid_parameter(modifier, "binding_data", "the bind-time owner-space cage mesh")
         })?)
         .map_err(|_| invalid_parameter(modifier, "binding_data", "a valid bind-time cage mesh"))?;
-    let cage: Mesh =
-        serde_json::from_value(
-            modifier.runtime.target_mesh.clone().ok_or_else(|| {
-                invalid_parameter(modifier, "object", "a mesh cage object operand")
-            })?,
-        )
-        .map_err(|_| invalid_parameter(modifier, "object", "a mesh cage object operand"))?;
-    let precision = uint_param(modifier, "precision")?;
-    if !(2..=10).contains(&precision) {
+    let bound_cage_local: Mesh = serde_json::from_value(
+        bind_data
+            .get("cage_local_mesh")
+            .cloned()
+            .ok_or_else(|| invalid_parameter(modifier, "binding_data", "the bind-time cage mesh"))?,
+    )
+    .map_err(|_| invalid_parameter(modifier, "binding_data", "a valid bind-time cage mesh"))?;
+    let bind_matrix = native_matrix(bind_data, modifier)?;
+    let cage_owner: Mesh = serde_json::from_value(
+        modifier
+            .runtime
+            .target_mesh
+            .clone()
+            .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh cage object operand"))?,
+    )
+    .map_err(|_| invalid_parameter(modifier, "object", "a mesh cage object operand"))?;
+    let target_to_subject = modifier
+        .runtime
+        .target_to_subject
+        .map_or(DMat4::IDENTITY, |matrix| DMat4::from_cols_array(&matrix));
+    let subject_to_target = target_to_subject.inverse();
+    if !subject_to_target.is_finite() {
         return Err(invalid_parameter(
             modifier,
-            "precision",
-            "an integer from 2 to 10",
+            "object",
+            "an invertible cage transform",
         ));
     }
-    let precision = u32::try_from(precision)
-        .map_err(|_| invalid_parameter(modifier, "precision", "an integer from 2 to 10"))?;
-    let dynamic = bool_param(modifier, "use_dynamic_bind")?;
-    let group = group_weights(mesh, modifier)?;
-    let invert = bool_param(modifier, "invert_vertex_group")?;
-    if bind_weights.len() != mesh.vertices.len() || !same_mesh_topology(&bound_cage, &cage) {
+    let mut cage = cage_owner.clone();
+    for vertex in &mut cage.vertices {
+        vertex.co = subject_to_target.transform_point3(vertex.co);
+    }
+    if !same_mesh_topology(&bound_cage_local, &cage) {
         return Err(invalid_parameter(
             modifier,
             "bind_data",
             "binding rows and cage topology matching the bound meshes",
         ));
     }
+    let inverse_deform_matrix = (bind_matrix * subject_to_target).inverse();
+    if !inverse_deform_matrix.is_finite() {
+        return Err(invalid_parameter(
+            modifier,
+            "object",
+            "an invertible cage transform",
+        ));
+    }
+    let precision = match bind_data.get("precision") {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            invalid_parameter(modifier, "binding_data", "a valid bound grid precision")
+        })?,
+        None => uint_param(modifier, "precision")?,
+    };
+    if !(2..=10).contains(&precision) {
+        return Err(invalid_parameter(
+            modifier,
+            "binding_data",
+            "a bound grid precision from 2 to 10",
+        ));
+    }
+    let precision = u32::try_from(precision)
+        .map_err(|_| invalid_parameter(modifier, "binding_data", "a bound grid precision"))?;
+    let dynamic = match bind_data.get("dynamic_bind").and_then(Value::as_bool) {
+        Some(dynamic) => dynamic,
+        None => bool_param(modifier, "use_dynamic_bind")?,
+    };
+    let group = group_weights(mesh, modifier)?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
+    if bind_weights.len() != mesh.vertices.len() {
+        return Err(invalid_parameter(
+            modifier,
+            "bind_data",
+            "one bind-weight row per source vertex",
+        ));
+    }
+    // Blender measures the cage in cage-local space, maps it into the bind frame, and subtracts
+    // the bind-time position; moving the cage or owner object alone therefore has no effect.
+    let cage_displacements = cage
+        .vertices
+        .iter()
+        .zip(&bound_cage.vertices)
+        .map(|(current, bound)| bind_matrix.transform_point3(current.co) - bound.co)
+        .collect::<Vec<_>>();
     let dynamic_weights = if dynamic {
-        Some(harmonic_mesh_bind(mesh, &bound_cage, precision)?)
+        let mut source_cage_space = mesh.clone();
+        for vertex in &mut source_cage_space.vertices {
+            vertex.co = subject_to_target.transform_point3(vertex.co);
+        }
+        Some(harmonic_mesh_bind(&source_cage_space, &cage, precision)?)
     } else {
         None
     };
@@ -578,21 +514,6 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                     "weights matching the cage vertex count",
                 )
             })?;
-        let mut deformation = DVec3::ZERO;
-        for (cage_index, (weight, current_vertex)) in weights.iter().zip(&cage.vertices).enumerate()
-        {
-            let weight = weight
-                .as_f64()
-                .filter(|value| value.is_finite())
-                .ok_or_else(|| {
-                    invalid_parameter(modifier, "bind_data", "finite cage coordinates")
-                })?;
-            deformation += if dynamic {
-                (current_vertex.co - bound_cage.vertices[cage_index].co) * weight
-            } else {
-                current_vertex.co * weight
-            };
-        }
         let group_weight = group.as_ref().map_or(1.0, |weights| {
             if invert {
                 1.0 - weights[vertex_index]
@@ -600,15 +521,26 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 weights[vertex_index]
             }
         });
-        if dynamic {
-            vertex.co += deformation * group_weight;
-        } else {
-            vertex.co += (deformation - vertex.co) * group_weight;
+        if group_weight <= 0.0 {
+            continue;
         }
+        let mut total_weight = 0.0;
+        let mut deformation = DVec3::ZERO;
+        for (weight, displacement) in weights.iter().zip(&cage_displacements) {
+            let weight = finite_number(weight, modifier, "bind_data")?;
+            total_weight += weight;
+            deformation += *displacement * weight;
+        }
+        if total_weight <= 0.0 {
+            continue;
+        }
+        vertex.co += inverse_deform_matrix.transform_vector3(deformation / total_weight)
+            * group_weight;
     }
     validated(&result)?;
     Ok(result)
 }
+
 fn native_mesh_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) -> Result<Mesh> {
     let data = bind_data
         .as_object()
@@ -1108,11 +1040,7 @@ pub(super) fn laplacian_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh>
                 if point.is_finite() {
                     Ok(point)
                 } else {
-                    Err(invalid_parameter(
-                        modifier,
-                        "bind_data",
-                        "finite bind positions",
-                    ))
+                    Err(invalid_parameter(modifier, "bind_data", "finite bind positions"))
                 }
             })
             .collect::<Result<Vec<_>>>()?
@@ -1139,10 +1067,16 @@ pub(super) fn laplacian_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh>
     if !anchors.iter().any(|anchor| *anchor) {
         return Ok(mesh.clone());
     }
-    let triangles = mesh_triangles(mesh, &rest)?;
+    let current_positions = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let triangles = mesh_triangles(mesh, &current_positions)?;
     let laplacian = cotangent_laplacian(&rest, &triangles)?;
     let original_normals = vertex_normals(&rest, &triangles);
     let neighbors = mesh_neighbors(mesh);
+    let unit_vertices = laplacian_unit_vertices(&rest, &original_normals, &neighbors);
     let differential = apply_laplacian(&laplacian, &rest);
     let mut evaluated = solve_laplacian_system(
         &laplacian,
@@ -1158,8 +1092,8 @@ pub(super) fn laplacian_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh>
             &evaluated,
             &differential,
             &original_normals,
+            &unit_vertices,
             &triangles,
-            &neighbors,
             &mut rotated,
         );
         evaluated = solve_laplacian_system(
@@ -1294,29 +1228,44 @@ fn vertex_normals(points: &[DVec3], triangles: &[[usize; 3]]) -> Vec<DVec3> {
         .map(|normal| normal.try_normalize().unwrap_or(DVec3::ZERO))
         .collect()
 }
+/// Blender chooses each local frame's reference neighbor once from the bind mesh.
+fn laplacian_unit_vertices(
+    rest: &[DVec3],
+    normals: &[DVec3],
+    neighbors: &[Vec<usize>],
+) -> Vec<Option<usize>> {
+    neighbors
+        .iter()
+        .enumerate()
+        .map(|(index, adjacent)| {
+            let mut best = None;
+            for &neighbor in adjacent {
+                let direction = (rest[neighbor] - rest[index]).normalize_or_zero();
+                let weight = direction.dot(normals[index]).abs();
+                if best.is_none_or(|(_, best_weight)| weight < best_weight) {
+                    best = Some((neighbor, weight));
+                }
+            }
+            best.map(|(neighbor, _)| neighbor)
+        })
+        .collect()
+}
+
 
 fn rotate_differentials(
     rest: &[DVec3],
     current: &[DVec3],
     differential: &[DVec3],
     original_normals: &[DVec3],
+    unit_vertices: &[Option<usize>],
     triangles: &[[usize; 3]],
-    neighbors: &[Vec<usize>],
     output: &mut [DVec3],
 ) {
     let current_normals = vertex_normals(current, triangles);
     for index in 0..rest.len() {
         let original_normal = original_normals[index];
         let current_normal = current_normals[index];
-        let best_neighbor = neighbors[index].iter().copied().min_by(|left, right| {
-            let left_direction = (rest[*left] - rest[index]).normalize_or_zero();
-            let right_direction = (rest[*right] - rest[index]).normalize_or_zero();
-            left_direction
-                .dot(original_normal)
-                .abs()
-                .total_cmp(&right_direction.dot(original_normal).abs())
-        });
-        let Some(best_neighbor) = best_neighbor else {
+        let Some(best_neighbor) = unit_vertices.get(index).copied().flatten() else {
             output[index] = differential[index];
             continue;
         };
@@ -1451,7 +1400,7 @@ fn solve_laplacian_system(
         for axis in 0..3 {
             if residual_norm[axis] > target_norm[axis]
                 && denominator[axis].is_finite()
-                && denominator[axis] > f64::EPSILON
+                && denominator[axis] > 0.0
             {
                 scale[axis] = residual_norm[axis] / denominator[axis];
             }
@@ -1463,7 +1412,7 @@ fn solve_laplacian_system(
         let next_norm = componentwise_dot(&residual, &residual);
         let mut beta = [0.0; 3];
         for axis in 0..3 {
-            if next_norm[axis] > target_norm[axis] && residual_norm[axis] > f64::EPSILON {
+            if next_norm[axis] > target_norm[axis] && residual_norm[axis] > 0.0 {
                 beta[axis] = next_norm[axis] / residual_norm[axis];
             }
         }
@@ -1480,146 +1429,830 @@ fn solve_laplacian_system(
     Ok(solution)
 }
 
-/// Builds per-source mean-value bindings to the polygons adjacent to the nearest target vertex.
-pub(crate) fn bind_surface(mesh: &Mesh, target: &Mesh, modifier: &Modifier) -> Result<Value> {
-    let target_indices = index_positions(target);
-    let mut face_vertices = Vec::with_capacity(target.faces.len());
-    let mut vertex_faces = vec![Vec::new(); target.vertices.len()];
-    let mut triangles = Vec::new();
-    for (face_index, face) in target.faces.iter().enumerate() {
-        let indices = face
-            .vertices
-            .iter()
-            .map(|id| target_indices.get(id).copied())
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                PotError::invalid_argument("surface deform target face has invalid vertex IDs")
-            })?;
-        for vertex_index in &indices {
-            vertex_faces[*vertex_index].push(face_index);
-        }
-        for index in 1..indices.len().saturating_sub(1) {
-            triangles.push((face_index, [indices[0], indices[index], indices[index + 1]]));
-        }
-        face_vertices.push(indices);
-    }
-    if triangles.is_empty() {
-        return Err(PotError::invalid_operation(
-            "surface deform binding requires target polygons",
-        ));
-    }
-    let sparse = bool_param(modifier, "use_sparse_bind")?;
-    let group = group_weights(mesh, modifier)?;
-    let invert = bool_param(modifier, "invert_vertex_group")?;
-    let mut records = Vec::with_capacity(mesh.vertices.len());
-    for (source_index, vertex) in mesh.vertices.iter().enumerate() {
-        let bind_weight = group.as_ref().map_or(0.0, |weights| {
-            if invert {
-                1.0 - weights[source_index]
-            } else {
-                weights[source_index]
-            }
-        });
-        if sparse && bind_weight <= 0.0 {
-            records.push(json!({"polygons":[]}));
-            continue;
-        }
-        let mut closest_face = None;
-        let mut closest_distance = f64::INFINITY;
-        for (face_index, triangle) in &triangles {
-            let points = triangle.map(|index| target.vertices[index].co);
-            let (closest, _) = closest_triangle_point(vertex.co, points);
-            let distance = closest.distance_squared(vertex.co);
-            if distance < closest_distance {
-                closest_face = Some(*face_index);
-                closest_distance = distance;
-            }
-        }
-        let nearest_face = closest_face.ok_or_else(|| {
-            PotError::invalid_operation("surface deform target has no bindable polygon")
-        })?;
-        let nearest_face_vertices = &face_vertices[nearest_face];
-        let nearest_edge = (0..nearest_face_vertices.len())
-            .min_by(|left, right| {
-                let segment_distance_squared = |edge_index: usize| {
-                    let first = target.vertices[nearest_face_vertices[edge_index]].co;
-                    let second = target.vertices
-                        [nearest_face_vertices[(edge_index + 1) % nearest_face_vertices.len()]]
-                    .co;
-                    let edge = second - first;
-                    let factor =
-                        ((vertex.co - first).dot(edge) / edge.length_squared()).clamp(0.0, 1.0);
-                    vertex.co.distance_squared(first + edge * factor)
-                };
-                segment_distance_squared(*left).total_cmp(&segment_distance_squared(*right))
-            })
-            .ok_or_else(|| PotError::invalid_operation("surface deform target polygon is empty"))?;
-        let first = nearest_face_vertices[nearest_edge];
-        let second = nearest_face_vertices[(nearest_edge + 1) % nearest_face_vertices.len()];
-        let nearest_vertex = if target.vertices[first].co.distance_squared(vertex.co)
-            < target.vertices[second].co.distance_squared(vertex.co)
-        {
-            first
-        } else {
-            second
-        };
-        let mut polygon_bindings = Vec::new();
-        for face_index in &vertex_faces[nearest_vertex] {
-            let indices = &face_vertices[*face_index];
-            let points = indices
-                .iter()
-                .map(|index| target.vertices[*index].co)
-                .collect::<Vec<_>>();
-            let centroid = points.iter().copied().sum::<DVec3>() / points.len() as f64;
-            let normal = polygon_normal(&points).ok_or_else(|| {
-                PotError::invalid_operation("surface deform target contains a degenerate polygon")
-            })?;
-            let tangent = points
-                .iter()
-                .skip(1)
-                .map(|point| *point - points[0])
-                .find_map(DVec3::try_normalize)
-                .ok_or_else(|| {
-                    PotError::invalid_operation(
-                        "surface deform target contains a degenerate polygon",
-                    )
-                })?;
-            let bitangent = normal.cross(tangent).normalize_or_zero();
-            let projected = vertex.co - normal * (vertex.co - centroid).dot(normal);
-            let project = |point: DVec3| {
-                let relative = point - centroid;
-                DVec2::new(relative.dot(tangent), relative.dot(bitangent))
-            };
-            let polygon_2d = points.iter().copied().map(project).collect::<Vec<_>>();
-            let weights = mean_value_weights(project(projected), &polygon_2d).ok_or_else(|| {
-                PotError::invalid_operation(
-                    "surface deform target contains a non-convex or degenerate polygon",
-                )
-            })?;
-            let bind_surface_point = points
-                .iter()
-                .zip(&weights)
-                .map(|(point, weight)| *point * weight)
-                .sum::<DVec3>();
-            let offset = vertex.co - bind_surface_point;
-            let normal_distance = offset.dot(normal);
-            polygon_bindings.push(json!({
-                "vertices": indices,
-                "weights": weights,
-                "distance": vertex.co.distance(centroid),
-                "normal_distance": normal_distance
-            }));
-        }
-        records.push(json!({"polygons":polygon_bindings}));
-    }
-    Ok(Value::Array(records))
+/// Tolerance of Blender's Surface Deform bind (`FLT_EPSILON`).
+const SURFACE_BIND_EPSILON: f64 = f32::EPSILON as f64;
+
+/// Blender's `SDefBindPoly`: one target polygon around the nearest target vertex of a bound point.
+struct SurfaceBindPolygon {
+    face: usize,
+    corners: Vec<usize>,
+    corner_edges: Vec<usize>,
+    coords: Vec<DVec3>,
+    coords_v2: Vec<DVec2>,
+    point_v2: DVec2,
+    centroid: DVec3,
+    normal: DVec3,
+    edge_vertex_indices: [usize; 2],
+    edge_indices: [usize; 2],
+    edgemid_angle: f64,
+    corner_edgemid_angles: [f64; 2],
+    point_edgemid_angles: [f64; 2],
+    scales: [f64; 2],
+    scale_mid: f64,
+    weight_angular: f64,
+    weight_dist_proj: f64,
+    weight_dist: f64,
+    weight: f64,
+    dominant_edge: usize,
+    dominant_angle_weight: f64,
+    inside: bool,
 }
 
-/// Builds harmonic cage coordinates by solving a discrete Laplace equation on a voxel grid.
-pub(crate) fn bind_mesh(mesh: &Mesh, cage: &Mesh, modifier: &Modifier) -> Result<Value> {
+impl SurfaceBindPolygon {
+    /// Blender's `computeAngularWeight` input for the point's angle at one flanking edge.
+    fn edge_angular_weight(&self, edge: usize) -> f64 {
+        let side = usize::from(self.edge_indices[0] != edge);
+        angular_weight(self.point_edgemid_angles[side], self.edgemid_angle)
+    }
+}
+
+/// Blender's `MOD_SDEF_INFINITE_WEIGHT_*` flags.
+#[derive(Clone, Copy, Default)]
+struct InfiniteWeights {
+    angular: bool,
+    dist_proj: bool,
+    dist: bool,
+}
+
+impl InfiniteWeights {
+    fn any(self) -> bool {
+        self.angular || self.dist_proj || self.dist
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.angular |= other.angular;
+        self.dist_proj |= other.dist_proj;
+        self.dist |= other.dist;
+    }
+}
+
+/// One stored Surface Deform bind term (Blender's `SDefBind`).
+struct SurfaceBind {
+    influence: f64,
+    mode: u8,
+    vertex_indices: Vec<usize>,
+    vertex_weights: Vec<f64>,
+    normal_distance: f64,
+}
+
+impl SurfaceBind {
+    fn to_json(&self) -> Value {
+        json!({
+            "influence": self.influence,
+            "mode": self.mode,
+            "verts_num": self.vertex_indices.len(),
+            "vert_inds": self.vertex_indices,
+            "vert_weights": self.vertex_weights,
+            "normal_dist": self.normal_distance,
+        })
+    }
+}
+
+/// Target mesh prepared for Surface Deform binding (Blender's `SDefBindCalcData`).
+struct SurfaceBindTarget {
+    /// Bind-time target positions in the owner's space (`mat * target_local`).
+    points: Vec<DVec3>,
+    /// Target positions in target-local space, used for the nearest-triangle query.
+    local_points: Vec<DVec3>,
+    owner_to_local: DMat4,
+    faces: Vec<Vec<usize>>,
+    face_edges: Vec<Vec<usize>>,
+    edge_vertices: Vec<[usize; 2]>,
+    edge_faces: Vec<Vec<usize>>,
+    vertex_edges: Vec<Vec<usize>>,
+}
+
+impl SurfaceBindTarget {
+    fn new(target: &Mesh, target_to_owner: DMat4) -> Result<Self> {
+        if target.faces.is_empty() {
+            return Err(PotError::invalid_operation("Target has no faces"));
+        }
+        let owner_to_local = target_to_owner.inverse();
+        if !target_to_owner.is_finite() || !owner_to_local.is_finite() {
+            return Err(PotError::invalid_argument(
+                "surface deform binding requires an invertible target transform",
+            ));
+        }
+        let target_indices = index_positions(target);
+        let faces = target
+            .faces
+            .iter()
+            .map(|face| {
+                face.vertices
+                    .iter()
+                    .map(|id| target_indices.get(id).copied())
+                    .collect::<Option<Vec<_>>>()
+                    .filter(|corners| corners.len() >= 3)
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                PotError::invalid_operation("surface deform target face has invalid vertex IDs")
+            })?;
+        let mut edge_ids = HashMap::<(usize, usize), usize>::new();
+        let mut edge_vertices = Vec::<[usize; 2]>::new();
+        let mut edge_faces = Vec::<Vec<usize>>::new();
+        let mut face_edges = Vec::with_capacity(faces.len());
+        for (face_index, corners) in faces.iter().enumerate() {
+            let mut corner_edges = Vec::with_capacity(corners.len());
+            for corner in 0..corners.len() {
+                let first = corners[corner];
+                let second = corners[(corner + 1) % corners.len()];
+                let key = (first.min(second), first.max(second));
+                let edge = match edge_ids.get(&key) {
+                    Some(edge) => *edge,
+                    None => {
+                        let edge = edge_vertices.len();
+                        edge_ids.insert(key, edge);
+                        edge_vertices.push([first, second]);
+                        edge_faces.push(Vec::new());
+                        edge
+                    }
+                };
+                edge_faces[edge].push(face_index);
+                if edge_faces[edge].len() > 2 {
+                    return Err(PotError::invalid_operation(
+                        "Target has edges with more than two polygons",
+                    ));
+                }
+                corner_edges.push(edge);
+            }
+            face_edges.push(corner_edges);
+        }
+        let mut vertex_edges = vec![Vec::new(); target.vertices.len()];
+        for (edge, [first, second]) in edge_vertices.iter().copied().enumerate() {
+            vertex_edges[first].push(edge);
+            vertex_edges[second].push(edge);
+        }
+        let points: Vec<DVec3> = target
+            .vertices
+            .iter()
+            .map(|vertex| target_to_owner.transform_point3(vertex.co))
+            .collect();
+        let local_points: Vec<DVec3> = target.vertices.iter().map(|vertex| vertex.co).collect();
+        Ok(Self {
+            points,
+            local_points,
+            owner_to_local,
+            faces,
+            face_edges,
+            edge_vertices,
+            edge_faces,
+            vertex_edges,
+        })
+    }
+
+    /// Blender's `nearestVert`: nearest triangle in target-local space, then nearest edge and vertex.
+    fn nearest_vertex(&self, point: DVec3) -> Result<usize> {
+        let local_point = self.owner_to_local.transform_point3(point);
+        let mut nearest_face = None;
+        let mut nearest_distance = f64::INFINITY;
+        for (face_index, corners) in self.faces.iter().enumerate() {
+            for corner in 1..corners.len() - 1 {
+                let triangle = [corners[0], corners[corner], corners[corner + 1]]
+                    .map(|index| self.local_points[index]);
+                let (closest, _) = closest_triangle_point(local_point, triangle);
+                let distance = closest.distance_squared(local_point);
+                if distance < nearest_distance {
+                    nearest_distance = distance;
+                    nearest_face = Some(face_index);
+                }
+            }
+        }
+        let face = nearest_face
+            .ok_or_else(|| PotError::invalid_operation("surface deform target has no faces"))?;
+        let mut nearest_edge = None;
+        let mut nearest_edge_distance = f64::INFINITY;
+        for &edge in &self.face_edges[face] {
+            let [first, second] = self.edge_vertices[edge];
+            let distance =
+                distance_squared_to_segment(point, self.points[first], self.points[second]);
+            if distance < nearest_edge_distance {
+                nearest_edge_distance = distance;
+                nearest_edge = Some(edge);
+            }
+        }
+        let [first, second] = self.edge_vertices[nearest_edge.ok_or_else(|| {
+            PotError::invalid_operation("surface deform target polygon is empty")
+        })?];
+        Ok(
+            if point.distance_squared(self.points[first])
+                < point.distance_squared(self.points[second])
+            {
+                first
+            } else {
+                second
+            },
+        )
+    }
+
+    /// Blender's `computeBindWeights` followed by the per-polygon bind term selection of `bindVert`.
+    fn bind_vertex(&self, point: DVec3, falloff: f64) -> Result<Vec<SurfaceBind>> {
+        let nearest = self.nearest_vertex(point)?;
+        let mut polygons = Vec::<SurfaceBindPolygon>::new();
+        let mut infinite = InfiniteWeights::default();
+        for &edge in &self.vertex_edges[nearest] {
+            for &face in &self.edge_faces[edge] {
+                if polygons.iter().any(|polygon| polygon.face == face) {
+                    continue;
+                }
+                let (polygon, flags) = self.polygon(face, nearest, point)?;
+                infinite.merge(flags);
+                polygons.push(polygon);
+            }
+        }
+        if polygons.is_empty() {
+            return Err(PotError::invalid_operation(
+                "surface deform target vertex has no polygons",
+            ));
+        }
+        let average_distance =
+            polygons.iter().map(|polygon| polygon.weight_dist).sum::<f64>() / polygons.len() as f64;
+        if !infinite.any() {
+            for &edge in &self.vertex_edges[nearest] {
+                let members = (0..polygons.len())
+                    .filter(|&index| self.edge_faces[edge].contains(&polygons[index].face))
+                    .collect::<Vec<_>>();
+                match members.as_slice() {
+                    [first] => {
+                        let angle = polygons[*first].edge_angular_weight(edge);
+                        polygons[*first].weight_angular *= angle * angle;
+                    }
+                    [first, second] => {
+                        let product = polygons[*first].edge_angular_weight(edge)
+                            * polygons[*second].edge_angular_weight(edge);
+                        polygons[*first].weight_angular *= product;
+                        polygons[*second].weight_angular *= product;
+                    }
+                    _ => {}
+                }
+            }
+            for polygon in &mut polygons {
+                let corner_angle_weights = [0, 1].map(|index| {
+                    polygon.point_edgemid_angles[index] / polygon.corner_edgemid_angles[index]
+                });
+                if corner_angle_weights.iter().any(|weight| weight.is_nan()) {
+                    return Err(invalid_polygons());
+                }
+                let dominant = usize::from(corner_angle_weights[0] >= corner_angle_weights[1]);
+                let dominant_weight = corner_angle_weights[dominant];
+                if !(0.0..=1.0).contains(&dominant_weight) {
+                    return Err(invalid_polygons());
+                }
+                polygon.dominant_edge = dominant;
+                polygon.dominant_angle_weight = (dominant_weight * FRAC_PI_2).sin();
+                let other = 1 - dominant;
+                let edge_angle_a = polygon.point_edgemid_angles[dominant];
+                let edge_angle_b = polygon.point_edgemid_angles[other];
+                let mut scale_weight = edge_angle_a
+                    / edge_angle_a.max(polygon.edgemid_angle);
+                scale_weight /=
+                    scale_weight + edge_angle_b / edge_angle_b.max(polygon.edgemid_angle);
+                let squared = scale_weight * scale_weight;
+                let inverse_squared = (1.0 - scale_weight) * (1.0 - scale_weight);
+                let scale_weight = squared / (squared + inverse_squared);
+                let edge_scale = scale_weight * polygon.scales[other]
+                    + (1.0 - scale_weight) * polygon.scales[dominant];
+                let dominant_weight = polygon.dominant_angle_weight;
+                polygon.scales[0] = dominant_weight * polygon.scale_mid
+                    + (1.0 - dominant_weight) * edge_scale;
+                polygon.weight_dist_proj =
+                    (polygon.weight_dist_proj / polygon.scales[0]).powf(falloff);
+                polygon.weight_dist = (polygon.weight_dist / average_distance).powf(falloff);
+                if polygon.weight_dist < SURFACE_BIND_EPSILON {
+                    infinite.dist_proj = true;
+                    infinite.dist = true;
+                } else if polygon.weight_dist_proj < SURFACE_BIND_EPSILON {
+                    infinite.dist_proj = true;
+                } else if polygon.weight_angular < SURFACE_BIND_EPSILON {
+                    infinite.angular = true;
+                }
+            }
+        } else if !infinite.dist {
+            for polygon in &mut polygons {
+                polygon.weight_dist = (polygon.weight_dist / average_distance).powf(falloff);
+                if polygon.weight_dist < SURFACE_BIND_EPSILON {
+                    infinite.dist = true;
+                }
+            }
+        }
+        let mut total = 0.0;
+        for polygon in &mut polygons {
+            let mut weight = if infinite.dist {
+                if polygon.weight_dist < SURFACE_BIND_EPSILON {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else if infinite.dist_proj {
+                if polygon.weight_dist_proj < SURFACE_BIND_EPSILON {
+                    1.0 / polygon.weight_dist
+                } else {
+                    0.0
+                }
+            } else if infinite.angular {
+                if polygon.weight_angular < SURFACE_BIND_EPSILON {
+                    1.0 / polygon.weight_dist_proj / polygon.weight_dist
+                } else {
+                    0.0
+                }
+            } else {
+                1.0 / polygon.weight_angular / polygon.weight_dist_proj / polygon.weight_dist
+            };
+            weight *= polygon.edgemid_angle / PI;
+            polygon.weight = weight;
+            total += weight;
+        }
+        for polygon in &mut polygons {
+            polygon.weight /= total;
+        }
+        let mut binds = Vec::new();
+        for polygon in &polygons {
+            if !(polygon.weight >= SURFACE_BIND_EPSILON) {
+                continue;
+            }
+            if polygon.inside {
+                binds.push(self.ngon_bind(polygon, point)?);
+                continue;
+            }
+            if 1.0 - polygon.dominant_angle_weight >= SURFACE_BIND_EPSILON {
+                binds.push(self.centroid_bind(polygon, point)?);
+            }
+            if polygon.dominant_angle_weight >= SURFACE_BIND_EPSILON {
+                binds.push(self.corner_triangle_bind(polygon, point)?);
+            }
+        }
+        Ok(binds)
+    }
+
+    /// Blender's `bpoly` construction for one face adjacent to the nearest vertex.
+    fn polygon(
+        &self,
+        face: usize,
+        nearest: usize,
+        point: DVec3,
+    ) -> Result<(SurfaceBindPolygon, InfiniteWeights)> {
+        let corners = self.faces[face].clone();
+        let corner_edges = self.face_edges[face].clone();
+        let count = corners.len();
+        let coords = corners
+            .iter()
+            .map(|&vertex| self.points[vertex])
+            .collect::<Vec<_>>();
+        let corner_index = corners
+            .iter()
+            .position(|&vertex| vertex == nearest)
+            .ok_or_else(|| {
+                PotError::invalid_operation(
+                    "surface deform target polygon does not contain its nearest vertex",
+                )
+            })?;
+        let edge_vertex_indices = [(corner_index + count - 1) % count, (corner_index + 1) % count];
+        let edge_indices = [
+            corner_edges[edge_vertex_indices[0]],
+            corner_edges[corner_index],
+        ];
+        let centroid = coords.iter().copied().sum::<DVec3>() / count as f64;
+        let normal = polygon_normal(&coords).ok_or_else(invalid_polygons)?;
+        let axis = normal.cross(DVec3::Z).try_normalize().unwrap_or(DVec3::ZERO);
+        let angle = angle_normalized_3d(normal, DVec3::Z);
+        let coords_v2 = coords
+            .iter()
+            .map(|coord| rotate_to_xy(*coord, axis, angle))
+            .collect::<Vec<_>>();
+        let point_v2 = rotate_to_xy(point, axis, angle);
+        let centroid_v2 = coords_v2.iter().copied().sum::<DVec2>() / count as f64;
+        validate_bind_polygon(&coords_v2)?;
+        let inside = point_inside_polygon(point_v2, &coords_v2);
+        let weight_dist = centroid.distance(point);
+        let weight_dist_proj = centroid_v2.distance(point_v2);
+        let vert0 = coords_v2[edge_vertex_indices[0]];
+        let vert1 = coords_v2[edge_vertex_indices[1]];
+        let corner = coords_v2[corner_index];
+        let cent_edgemid_vectors =
+            [vert0, vert1].map(|vertex| ((vertex + corner) * 0.5 - centroid_v2).normalize_or_zero());
+        let scales = [
+            distance_to_line_2d(centroid_v2, vert0, corner),
+            distance_to_line_2d(centroid_v2, vert1, corner),
+        ];
+        let edgemid_angle = angle_normalized_2d(cent_edgemid_vectors[0], cent_edgemid_vectors[1]);
+        let corner_direction = (corner - centroid_v2).normalize_or_zero();
+        let corner_angles =
+            cent_edgemid_vectors.map(|vector| angle_signed_2d(corner_direction, vector));
+        let corner_edgemid_angles = corner_angles.map(f64::abs);
+        if scales.iter().any(|scale| *scale < SURFACE_BIND_EPSILON)
+            || edgemid_angle < SURFACE_BIND_EPSILON
+            || corner_edgemid_angles
+                .iter()
+                .any(|angle| *angle < SURFACE_BIND_EPSILON)
+        {
+            return Err(invalid_polygons());
+        }
+        let mut infinite = InfiniteWeights::default();
+        let mut scale_mid = 0.0;
+        let mut point_edgemid_angles = [0.0; 2];
+        if weight_dist < SURFACE_BIND_EPSILON {
+            infinite.dist_proj = true;
+            infinite.dist = true;
+        } else if weight_dist_proj < SURFACE_BIND_EPSILON {
+            infinite.dist_proj = true;
+        } else {
+            let point_direction = (point_v2 - centroid_v2).normalize_or_zero();
+            let mut point_angles = [0, 1].map(|index| {
+                angle_signed_2d(point_direction, cent_edgemid_vectors[index])
+                    * sign(corner_angles[index])
+            });
+            if point_angles[0] <= 0.0 && point_angles[1] <= 0.0 {
+                if point_angles[0] < point_angles[1] {
+                    point_angles[0] = edgemid_angle - point_angles[1];
+                } else {
+                    point_angles[1] = edgemid_angle - point_angles[0];
+                }
+            }
+            point_edgemid_angles = point_angles.map(|angle| angle.max(0.0));
+            scale_mid = triangle_area_2d(vert0, corner, vert1) / vert0.distance(vert1)
+                * std::f64::consts::SQRT_2;
+            if inside {
+                let min_distance = scales[0].min(scales[1]);
+                let factor = (weight_dist_proj / min_distance).min(1.0);
+                scale_mid = factor * scale_mid + (1.0 - factor) * (scales[0] + scales[1]) / 2.0;
+            }
+            if scale_mid < SURFACE_BIND_EPSILON
+                || point_edgemid_angles[0] + point_edgemid_angles[1] < SURFACE_BIND_EPSILON
+            {
+                return Err(invalid_polygons());
+            }
+        }
+        Ok((
+            SurfaceBindPolygon {
+                face,
+                corners,
+                corner_edges,
+                coords,
+                coords_v2,
+                point_v2,
+                centroid,
+                normal,
+                edge_vertex_indices,
+                edge_indices,
+                edgemid_angle,
+                corner_edgemid_angles,
+                point_edgemid_angles,
+                scales,
+                scale_mid,
+                weight_angular: 1.0,
+                weight_dist_proj,
+                weight_dist,
+                weight: 0.0,
+                dominant_edge: 0,
+                dominant_angle_weight: 0.0,
+                inside,
+            },
+            infinite,
+        ))
+    }
+
+    /// Blender's `MOD_SDEF_MODE_NGONS` term for a point inside its polygon.
+    fn ngon_bind(&self, polygon: &SurfaceBindPolygon, point: DVec3) -> Result<SurfaceBind> {
+        let weights = mean_value_weights(polygon.point_v2, &polygon.coords_v2)
+            .ok_or_else(invalid_polygons)?;
+        let projected = polygon
+            .coords
+            .iter()
+            .zip(&weights)
+            .map(|(coord, weight)| *coord * *weight)
+            .sum::<DVec3>();
+        Ok(SurfaceBind {
+            influence: polygon.weight,
+            mode: 1,
+            vertex_indices: polygon.corners.clone(),
+            vertex_weights: weights,
+            normal_distance: signed_normal_distance(point, projected, polygon.normal),
+        })
+    }
+
+    /// Blender's `MOD_SDEF_MODE_CENTROID` term: the dominant edge plus the polygon centroid.
+    fn centroid_bind(&self, polygon: &SurfaceBindPolygon, point: DVec3) -> Result<SurfaceBind> {
+        let sorted = sort_polygon_from_edge(
+            &polygon.corners,
+            &polygon.corner_edges,
+            polygon.edge_indices[polygon.dominant_edge],
+        )?;
+        let triangle = [
+            self.points[sorted[0]],
+            self.points[sorted[1]],
+            polygon.centroid,
+        ];
+        let (projected, weights) = project_onto_triangle(point, polygon.normal, triangle)?;
+        Ok(SurfaceBind {
+            influence: polygon.weight * (1.0 - polygon.dominant_angle_weight),
+            mode: 2,
+            vertex_indices: sorted,
+            vertex_weights: weights.to_vec(),
+            normal_distance: signed_normal_distance(point, projected, polygon.normal),
+        })
+    }
+
+    /// Blender's `MOD_SDEF_MODE_CORNER_TRIS` term around the nearest polygon corner.
+    fn corner_triangle_bind(
+        &self,
+        polygon: &SurfaceBindPolygon,
+        point: DVec3,
+    ) -> Result<SurfaceBind> {
+        let sorted = sort_polygon_from_index(&polygon.corners, polygon.edge_vertex_indices[0]);
+        let triangle = [
+            self.points[sorted[0]],
+            self.points[sorted[1]],
+            self.points[sorted[2]],
+        ];
+        let (projected, weights) = project_onto_triangle(point, polygon.normal, triangle)?;
+        Ok(SurfaceBind {
+            influence: polygon.weight * polygon.dominant_angle_weight,
+            mode: 0,
+            vertex_indices: sorted,
+            vertex_weights: weights.to_vec(),
+            normal_distance: signed_normal_distance(point, projected, polygon.normal),
+        })
+    }
+}
+
+/// Binds each source vertex to target polygons as Blender's Surface Deform bind does.
+///
+/// `target` holds target-local coordinates and `target_to_owner` maps them to the owner's
+/// space at bind time; Blender stores that matrix and never updates it at evaluation.
+pub(crate) fn bind_surface(
+    mesh: &Mesh,
+    target: &Mesh,
+    target_to_owner: DMat4,
+    modifier: &Modifier,
+) -> Result<Value> {
+    let falloff = number_param(modifier, "falloff")?;
+    if !(2.0..=16.0).contains(&falloff) {
+        return Err(invalid_parameter(modifier, "falloff", "a number in [2, 16]"));
+    }
+    let sparse = bool_param(modifier, "use_sparse_bind")?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
+    let group = group_weights(mesh, modifier)?;
+    let topology = SurfaceBindTarget::new(target, target_to_owner)?;
+    let mut bound = Vec::new();
+    for (index, vertex) in mesh.vertices.iter().enumerate() {
+        // Blender binds with a missing group as weight 0 (then inverted); deformation uses 1.
+        let group_weight = group
+            .as_ref()
+            .and_then(|weights| weights.get(index).copied())
+            .unwrap_or(0.0);
+        let bind_weight = if invert {
+            1.0 - group_weight
+        } else {
+            group_weight
+        };
+        if sparse && bind_weight <= 0.0 {
+            continue;
+        }
+        let binds = topology.bind_vertex(vertex.co, falloff)?;
+        if sparse && binds.is_empty() {
+            continue;
+        }
+        bound.push(json!({
+            "vertex_idx": index,
+            "binds": binds.iter().map(SurfaceBind::to_json).collect::<Vec<_>>(),
+        }));
+    }
+    if bound.is_empty() {
+        return Err(PotError::invalid_operation("No vertices were bound"));
+    }
+    let mat: Vec<Vec<f64>> = target_to_owner
+        .to_cols_array()
+        .chunks(4)
+        .map(<[f64]>::to_vec)
+        .collect();
+    Ok(json!({
+        "format": "blender_surface_bind_v1",
+        "type": "surface_deform",
+        "mesh_verts_num": mesh.vertices.len(),
+        "target_verts_num": target.vertices.len(),
+        "target_polys_num": target.faces.len(),
+        "bind_verts_num": bound.len(),
+        "mat": mat,
+        "bind_verts": bound,
+    }))
+}
+
+fn invalid_polygons() -> PotError {
+    PotError::invalid_operation("Target contains invalid polygons")
+}
+
+/// Blender's `isPolyValid`: convex, non-overlapping, and no adjacent parallel edges.
+fn validate_bind_polygon(coords: &[DVec2]) -> Result<()> {
+    let count = coords.len();
+    let mut positive = false;
+    let mut negative = false;
+    for index in 0..count {
+        let previous = coords[(index + count - 1) % count];
+        let current = coords[index];
+        let next = coords[(index + 1) % count];
+        let cross = (current - previous).perp_dot(next - current);
+        positive |= cross > 0.0;
+        negative |= cross < 0.0;
+    }
+    if positive && negative {
+        return Err(PotError::invalid_operation(
+            "Target contains concave polygons",
+        ));
+    }
+    let mut previous_previous = coords[count - 2];
+    let mut previous = coords[count - 1];
+    let mut previous_vector = (previous - previous_previous).normalize_or_zero();
+    for &current_point in coords {
+        let offset = current_point - previous;
+        let current_length = offset.length();
+        let current_vector = offset.normalize_or_zero();
+        if current_length < SURFACE_BIND_EPSILON
+            || previous_previous.distance_squared(current_point)
+                < SURFACE_BIND_EPSILON * SURFACE_BIND_EPSILON
+        {
+            return Err(PotError::invalid_operation(
+                "Target contains overlapping vertices",
+            ));
+        }
+        if 1.0 - previous_vector.dot(current_vector) < SURFACE_BIND_EPSILON {
+            return Err(PotError::invalid_operation(
+                "Target contains concave polygons",
+            ));
+        }
+        previous_previous = previous;
+        previous = current_point;
+        previous_vector = current_vector;
+    }
+    Ok(())
+}
+
+fn point_inside_polygon(point: DVec2, polygon: &[DVec2]) -> bool {
+    let mut inside = false;
+    for index in 0..polygon.len() {
+        let first = polygon[index];
+        let second = polygon[(index + 1) % polygon.len()];
+        if (first.y > point.y) != (second.y > point.y) {
+            let crossing = first.x + (point.y - first.y) * (second.x - first.x) / (second.y - first.y);
+            if point.x < crossing {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn triangle_area_2d(first: DVec2, second: DVec2, third: DVec2) -> f64 {
+    0.5 * (second - first).perp_dot(third - first).abs()
+}
+
+fn distance_to_line_2d(point: DVec2, first: DVec2, second: DVec2) -> f64 {
+    let direction = second - first;
+    let length_squared = direction.length_squared();
+    if length_squared <= 0.0 {
+        return point.distance(first);
+    }
+    let factor = (point - first).dot(direction) / length_squared;
+    point.distance(first + direction * factor)
+}
+
+fn distance_squared_to_segment(point: DVec3, first: DVec3, second: DVec3) -> f64 {
+    let edge = second - first;
+    let length_squared = edge.length_squared();
+    let factor = if length_squared > 0.0 {
+        ((point - first).dot(edge) / length_squared).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (first + edge * factor).distance_squared(point)
+}
+
+fn sign(value: f64) -> f64 {
+    if value < 0.0 { -1.0 } else { 1.0 }
+}
+
+/// Blender's `angle_normalized_v2v2`, robust for near-parallel and anti-parallel inputs.
+fn angle_normalized_2d(first: DVec2, second: DVec2) -> f64 {
+    if first.dot(second) >= 0.0 {
+        2.0 * half_chord_angle((first - second).length())
+    } else {
+        PI - 2.0 * half_chord_angle((first + second).length())
+    }
+}
+
+/// Blender's `angle_normalized_v3v3`, robust for near-parallel and anti-parallel inputs.
+fn angle_normalized_3d(first: DVec3, second: DVec3) -> f64 {
+    if first.dot(second) >= 0.0 {
+        2.0 * half_chord_angle((first - second).length())
+    } else {
+        PI - 2.0 * half_chord_angle((first + second).length())
+    }
+}
+
+fn half_chord_angle(chord: f64) -> f64 {
+    (chord / 2.0).clamp(-1.0, 1.0).asin()
+}
+
+fn angle_signed_2d(first: DVec2, second: DVec2) -> f64 {
+    let perpendicular = first.y * second.x - first.x * second.y;
+    perpendicular.atan2(first.dot(second))
+}
+
+/// Blender's `rotate_normalized_v3_v3v3fl` followed by taking the XY components.
+fn rotate_to_xy(point: DVec3, axis: DVec3, angle: f64) -> DVec2 {
+    let (sin, cos) = angle.sin_cos();
+    let rotated = point * cos + axis.cross(point) * sin + axis * (axis.dot(point) * (1.0 - cos));
+    DVec2::new(rotated.x, rotated.y)
+}
+
+fn angular_weight(point_angle: f64, edgemid_angle: f64) -> f64 {
+    ((point_angle / edgemid_angle).min(1.0) * FRAC_PI_2).sin()
+}
+
+/// Blender's `computeNormalDisplacement`: signed distance along the polygon normal.
+fn signed_normal_distance(point: DVec3, projected: DVec3, normal: DVec3) -> f64 {
+    let offset = point - projected;
+    let distance = offset.length();
+    if offset.dot(normal) < 0.0 {
+        -distance
+    } else {
+        distance
+    }
+}
+
+/// Blender's `isect_line_plane_v3` along the polygon normal, then barycentric weights.
+fn project_onto_triangle(
+    point: DVec3,
+    direction: DVec3,
+    triangle: [DVec3; 3],
+) -> Result<(DVec3, [f64; 3])> {
+    let [first, second, third] = triangle;
+    let normal = (first - second)
+        .cross(second - third)
+        .try_normalize()
+        .ok_or_else(invalid_polygons)?;
+    let centre = (first + second + third) / 3.0;
+    let slope = normal.dot(direction);
+    if slope.abs() <= f64::from(f32::EPSILON) {
+        return Err(invalid_polygons());
+    }
+    let lambda = -normal.dot(point - centre) / slope;
+    let projected = point + direction * lambda;
+    Ok((projected, triangle_barycentric(triangle, projected)))
+}
+
+/// Blender's `barycentric_weights` (area ratios on the triangle plane).
+fn triangle_barycentric(triangle: [DVec3; 3], point: DVec3) -> [f64; 3] {
+    let [first, second, third] = triangle;
+    let normal = (first - second).cross(second - third);
+    let area_first = (third - second).cross(point - second).dot(normal);
+    let area_second = (first - third).cross(point - third).dot(normal);
+    let area_third = (second - first).cross(point - first).dot(normal);
+    let total = area_first + area_second + area_third;
+    if total == 0.0 || !total.is_finite() {
+        return [1.0 / 3.0; 3];
+    }
+    [area_first / total, area_second / total, area_third / total]
+}
+
+/// Blender's `sortPolyVertsEdge`: loop vertices starting at the edge's first corner.
+fn sort_polygon_from_edge(corners: &[usize], corner_edges: &[usize], edge: usize) -> Result<Vec<usize>> {
+    let start = corner_edges
+        .iter()
+        .position(|&candidate| candidate == edge)
+        .ok_or_else(invalid_polygons)?;
+    Ok(corners[start..]
+        .iter()
+        .chain(&corners[..start])
+        .copied()
+        .collect())
+}
+
+/// Blender's `sortPolyVertsTri`: loop vertices starting at `start`.
+fn sort_polygon_from_index(corners: &[usize], start: usize) -> Vec<usize> {
+    corners[start..]
+        .iter()
+        .chain(&corners[..start])
+        .copied()
+        .collect()
+}
+
+/// Binds source vertices to Blender-style cage-local harmonic coordinates. `cage_to_owner` is
+/// the bind-time map from cage-local coordinates into subject-local coordinates.
+pub(crate) fn bind_mesh(
+    mesh: &Mesh,
+    cage: &Mesh,
+    cage_to_owner: DMat4,
+    modifier: &Modifier,
+) -> Result<Value> {
     if cage.vertices.len() < 4 {
         return Err(PotError::invalid_operation(
             "mesh deform binding requires at least four cage vertices",
+        ));
+    }
+    let owner_to_cage = cage_to_owner.inverse();
+    if !cage_to_owner.is_finite() || !owner_to_cage.is_finite() {
+        return Err(PotError::invalid_argument(
+            "mesh deform binding requires an invertible cage transform",
         ));
     }
     let precision = uint_param(modifier, "precision")?;
@@ -1632,8 +2265,29 @@ pub(crate) fn bind_mesh(mesh: &Mesh, cage: &Mesh, modifier: &Modifier) -> Result
     }
     let precision = u32::try_from(precision)
         .map_err(|_| invalid_parameter(modifier, "precision", "an integer from 2 to 10"))?;
-    let weights = harmonic_mesh_bind(mesh, cage, precision)?;
-    Ok(json!({"weights":weights,"cage_mesh":cage}))
+    let dynamic = bool_param(modifier, "use_dynamic_bind")?;
+    let mut source_cage_space = mesh.clone();
+    for vertex in &mut source_cage_space.vertices {
+        vertex.co = owner_to_cage.transform_point3(vertex.co);
+    }
+    let weights = harmonic_mesh_bind(&source_cage_space, cage, precision)?;
+    let mut cage_owner = cage.clone();
+    for vertex in &mut cage_owner.vertices {
+        vertex.co = cage_to_owner.transform_point3(vertex.co);
+    }
+    let mat: Vec<Vec<f64>> = cage_to_owner
+        .to_cols_array()
+        .chunks(4)
+        .map(<[f64]>::to_vec)
+        .collect();
+    Ok(json!({
+        "weights": weights,
+        "cage_mesh": cage_owner,
+        "cage_local_mesh": cage,
+        "dynamic_bind": dynamic,
+        "mat": mat,
+        "precision": precision
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -1818,7 +2472,7 @@ fn harmonic_mesh_bind(source: &Mesh, cage: &Mesh, precision: u32) -> Result<Valu
             rows.push(vec![0.0; cage.vertices.len()]);
             inside_source_indices.push(index);
         } else {
-            rows.push(affine_weights(vertex.co, cage, precision)?);
+            rows.push(vec![0.0; cage.vertices.len()]);
         }
     }
     let mut field = vec![0.0; node_count];
@@ -2298,19 +2952,15 @@ fn group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
     if group_name.is_empty() {
         return Ok(None);
     }
-    let weights = mesh
+    let Some(weights) = mesh
         .attributes
         .get("vertex_groups")
         .and_then(Value::as_object)
         .and_then(|groups| groups.get(group_name))
         .and_then(Value::as_object)
-        .ok_or_else(|| {
-            invalid_parameter(
-                modifier,
-                "vertex_group",
-                "a group present in mesh attributes",
-            )
-        })?;
+    else {
+        return Ok(None);
+    };
     mesh.vertices
         .iter()
         .map(|vertex| {

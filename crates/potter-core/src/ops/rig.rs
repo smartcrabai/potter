@@ -124,7 +124,7 @@ fn bone_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
         0.25,
     )?;
     let envelope_weight = operation.get("envelope_weight").map_or(Ok(1.0), |value| {
-        ranged_number(engine, value, 0.0, 1.0, "envelope_weight")
+        ranged_number(engine, value, 0.0, 1000.0, "envelope_weight")
     })?;
     let head_radius =
         nonnegative_optional(engine, operation.get("head_radius"), "head_radius", 0.1)?;
@@ -256,7 +256,7 @@ fn bone_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
         next.envelope_distance,
     )?;
     if let Some(value) = set.get("envelope_weight") {
-        next.envelope_weight = ranged_number(engine, value, 0.0, 1.0, "set/envelope_weight")?;
+        next.envelope_weight = ranged_number(engine, value, 0.0, 1000.0, "set/envelope_weight")?;
     }
     next.head_radius = nonnegative_optional(
         engine,

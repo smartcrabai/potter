@@ -47,20 +47,25 @@ const MTOON_TEXTURES: [&str; 5] = [
     "uv_animation_mask_texture",
 ];
 
-/// Parses a scene document, upgrading schema version 1 first.
+/// Parses and upgrades a scene document, then migrates its loaded-only legacy resource sentinels.
 pub fn parse_scene(bytes: &[u8]) -> Result<SceneDoc> {
     let mut value = parse_value(bytes)?;
     upgrade_scene(&mut value)?;
-    serde_json::from_value(value).map_err(|error| json_error(&error))
+    let mut scene = serde_json::from_value(value).map_err(|error| json_error(&error))?;
+    crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut scene)?;
+    Ok(scene)
 }
 
-/// Parses a history record, upgrading its snapshot's schema version first.
+/// Parses and upgrades a history snapshot, then migrates loaded-only legacy resource sentinels.
 pub(crate) fn parse_history_record(bytes: &[u8]) -> Result<HistoryRecord> {
     let mut value = parse_value(bytes)?;
     if let Some(snapshot) = value.get_mut("snapshot") {
         upgrade_scene(snapshot)?;
     }
-    serde_json::from_value(value).map_err(|error| json_error(&error))
+    let mut record: HistoryRecord =
+        serde_json::from_value(value).map_err(|error| json_error(&error))?;
+    crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut record.snapshot)?;
+    Ok(record)
 }
 
 fn parse_value(bytes: &[u8]) -> Result<Value> {
@@ -960,6 +965,97 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn inline_resource_kind_classifies_inline_records_without_treating_binary_as_inline() {
+        assert_eq!(
+            inline_resource_kind(&json!({"storage":"inline","kind":"legacy_texture"}))
+                .expect("inline kind"),
+            Some("legacy_texture")
+        );
+        assert_eq!(
+            inline_resource_kind(&json!({"kind":"alembic","uri":"cache.abc"}))
+                .expect("binary record"),
+            None
+        );
+        assert_eq!(
+            inline_resource_kind(&json!({"storage":"linked","kind":"alembic"}))
+                .expect("linked record"),
+            None
+        );
+        assert_eq!(
+            inline_resource_kind(&json!({"storage":"inline"}))
+                .unwrap_err()
+                .code,
+            ErrorCode::SceneInvalid
+        );
+    }
+
+    fn legacy_volume_noise_scene() -> SceneDoc {
+        let mut scene = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let node: crate::model::Node = serde_json::from_value(json!({
+            "name": "Volume",
+            "kind": "empty",
+            "modifiers": [
+                {"id":"volume_a","type":"volume_displace","name":"Volume A","enabled":true,"params":{"texture":"noise"}},
+                {"id":"volume_b","type":"volume_displace","name":"Volume B","enabled":true,"params":{"texture":"noise"}}
+            ]
+        }))
+        .expect("volume node");
+        scene
+            .nodes
+            .insert(crate::model::Id::new("volume").expect("node ID"), node);
+        scene
+    }
+
+    fn assert_native_value_noise(scene: &SceneDoc) {
+        let node = &scene.nodes[&crate::model::Id::new("volume").expect("node ID")];
+        let texture = node.modifiers[0].params["texture"]
+            .as_str()
+            .expect("migrated texture ID");
+        assert_eq!(
+            node.modifiers[1].params["texture"],
+            json!(texture),
+            "all legacy volume modifiers share one migrated resource"
+        );
+        assert_eq!(
+            scene.resources[&crate::model::Id::new(texture).expect("resource ID")],
+            json!({
+                "storage":"inline",
+                "kind":"legacy_texture",
+                "texture_type":"NATIVE_VALUE_NOISE",
+                "settings":{}
+            })
+        );
+    }
+
+    #[test]
+    fn parse_scene_migrates_the_legacy_volume_noise_sentinel() {
+        let bytes = serde_json::to_vec(&legacy_volume_noise_scene()).expect("scene JSON");
+        let scene = parse_scene(&bytes).expect("scene migration");
+        assert_native_value_noise(&scene);
+        assert_eq!(scene.resources.len(), 1);
+    }
+
+    #[test]
+    fn parse_history_record_migrates_after_reading_its_raw_snapshot() {
+        let record = HistoryRecord {
+            record_version: 1,
+            parent: None,
+            kind: "commit".to_owned(),
+            revision: 0,
+            scene_hash: "sha256:raw-scene".to_owned(),
+            operations: json!([]),
+            changes: json!({}),
+            target: None,
+            snapshot: legacy_volume_noise_scene(),
+        };
+        let bytes = serde_json::to_vec(&record).expect("history JSON");
+        let record = parse_history_record(&bytes).expect("history migration");
+        assert_native_value_noise(&record.snapshot);
+        assert_eq!(record.snapshot.resources.len(), 1);
+    }
+
 
     #[test]
     fn version_one_texture_refs_become_layer_references() {

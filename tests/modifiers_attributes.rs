@@ -4,14 +4,16 @@ use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh,
+        Mesh, ResolvedTexture, resolve_texture,
         modifiers::{
             attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
             evaluate_modifiers,
         },
     },
-    image::{ImageData, ImageInterpolation},
-    model::{CameraData, Modifier, SceneDoc},
+    image::{ImageData, ImageInterpolation, encode_pixels},
+    model::{
+        CameraData, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Modifier, SceneDoc,
+    },
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -68,6 +70,67 @@ fn scene_operand(mesh: Mesh, local_to_subject: DMat4, camera: Option<CameraData>
         camera,
         armature: false,
     }
+}
+
+fn resolved_mask_texture(
+    image_data: &ImageData,
+    texture_id: &str,
+    inline_image_record: bool,
+) -> Result<ResolvedTexture, Box<dyn Error>> {
+    let directory = tempdir()?;
+    let bytes = encode_pixels(image_data.width, image_data.height, &image_data.pixels)?;
+    let blob = potter_core::hash::sha256(&bytes);
+    let hash = blob.strip_prefix("sha256:").ok_or("image blob hash prefix missing")?;
+    let blob_path = directory
+        .path()
+        .join("assets")
+        .join("sha256")
+        .join(hash)
+        .join("blob");
+    fs::create_dir_all(blob_path.parent().ok_or("image blob has no parent directory")?)?;
+    fs::write(&blob_path, &bytes)?;
+
+    let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+    let texture_id = Id::new(texture_id.to_owned())?;
+    let image_id = if inline_image_record {
+        Id::new("mask_image_pixels")?
+    } else {
+        texture_id.clone()
+    };
+    doc.images.insert(
+        image_id.clone(),
+        Image {
+            name: "Mask".to_owned(),
+            source: ImageSource::Packed,
+            colorspace: ImageColorspace::Linear,
+            width: image_data.width,
+            height: image_data.height,
+            tiles: Vec::new(),
+            blob: Some(blob),
+            source_path: None,
+            source_hash: None,
+            alpha_mode: ImageAlphaMode::Straight,
+        },
+    );
+    if inline_image_record {
+        doc.resources.insert(
+            texture_id.clone(),
+            json!({
+                "storage":"inline",
+                "kind":"legacy_texture",
+                "texture_type":"IMAGE",
+                "image":image_id.as_str(),
+                "settings":{"use_interpolation":false}
+            }),
+        );
+    }
+    doc.validate()?;
+    let lookup_id = if inline_image_record {
+        &texture_id
+    } else {
+        &image_id
+    };
+    Ok(resolve_texture(&doc, lookup_id, Some(directory.path()))?)
 }
 
 #[test]
@@ -456,6 +519,7 @@ fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Err
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
     };
+    let resolved_texture = resolved_mask_texture(&image, "mask_image", false)?;
     let edit = modifier(
         "vertex_weight_edit",
         json!({
@@ -471,7 +535,7 @@ fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Err
         &source,
         &edit,
         &BTreeMap::new(),
-        Some(&image),
+        Some(&resolved_texture),
         DMat4::IDENTITY,
     )?;
     assert_eq!(weights(&result, "A")?, [0.25, 0.75]);
@@ -2454,6 +2518,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
     };
+    let resolved_texture = resolved_mask_texture(&image, "image_mask", true)?;
     let subject_world = DMat4::from_scale_rotation_translation(
         DVec3::new(0.8, 0.7, 1.0),
         DQuat::from_rotation_z(0.2),
@@ -2499,7 +2564,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &mask_mesh,
             &mask_modifier,
             &operands,
-            Some(&image),
+            Some(&resolved_texture),
             subject_world,
         )?;
         let key = format!("texture_mask_{}", mapping.to_lowercase());

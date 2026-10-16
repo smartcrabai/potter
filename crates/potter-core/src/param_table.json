@@ -3653,6 +3653,27 @@
           "type": "string",
           "default": ""
         },
+        "vertex_indices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "default": []
+        },
+        "falloff_curve": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "minItems": 2,
+          "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
         "use_falloff_uniform": {
           "type": "boolean",
           "default": false
@@ -4395,6 +4416,19 @@
         "falloff_radius": {
           "type": "number",
           "default": 1.0
+        },
+        "falloff_curve": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "minItems": 2,
+          "default": [[0.0, 0.0], [1.0, 1.0]]
         },
         "use_volume_preserve": {
           "type": "boolean",
