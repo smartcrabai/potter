@@ -2362,6 +2362,8 @@ mod tests {
             modifier_type: modifier_type.to_owned(),
             name: "Native Test".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params: Map::new(),
             binding_data: Some(binding_data),
             runtime: ModifierRuntime::default(),

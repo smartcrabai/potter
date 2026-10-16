@@ -4,7 +4,7 @@ use crate::{
     cli::ValidateArgs,
     commands::util::exchange_format_name,
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     model::AvatarVersion,
     response::SceneInfo,
     store::Project,
@@ -32,7 +32,10 @@ pub fn run(args: ValidateArgs) -> Result<(Option<SceneInfo>, Value)> {
         if let Some(error) = settings_error {
             append_vrm_preflight_error(&mut report, format, &error)?;
         } else {
-            let context = EvaluationContext::default();
+            let context = EvaluationContext {
+                purpose: EvaluationPurpose::Render,
+                ..EvaluationContext::default()
+            };
             match Snapshot::evaluate_with_cache(project.doc(), &context, Some(project.path())) {
                 Ok(snapshot) => {
                     if let Err(error) =

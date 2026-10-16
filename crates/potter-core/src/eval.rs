@@ -36,6 +36,16 @@ mod ik_solver;
 pub mod rig;
 const EVALUATION_ENGINE: &str = "potter-eval-4";
 
+/// Which stack an evaluation serves, following Blender's depsgraph modes: viewport previews use
+/// `show_viewport`, saved renders and exports use `show_render`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationPurpose {
+    #[default]
+    Preview,
+    Render,
+}
+
 /// Scene context used to produce one immutable evaluated snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +56,9 @@ pub struct EvaluationContext {
     pub view_layer: Option<Id>,
     #[serde(default)]
     pub frame: Option<f64>,
+    /// Modifier stack to evaluate; the viewport preview stack when omitted.
+    #[serde(default)]
+    pub purpose: EvaluationPurpose,
 }
 
 /// Evaluated node state for the selected scene and frame.
@@ -85,6 +98,8 @@ pub struct Snapshot {
     pub scene_id: Id,
     pub view_layer: Option<Id>,
     pub frame: f64,
+    #[serde(default)]
+    pub purpose: EvaluationPurpose,
     pub revision: u64,
     pub scene_hash: String,
     pub evaluation_hash: String,
@@ -236,6 +251,7 @@ impl Snapshot {
                         "scene_hash": scene_hash,
                         "scene_id": snapshot.scene_id,
                         "view_layer": snapshot.view_layer,
+                        "purpose": snapshot.purpose,
                         "frame": snapshot.frame,
                         "simulation_cache_key": snapshot.simulation_cache_key,
                     });
@@ -267,7 +283,12 @@ impl Snapshot {
                         // An instance has no modifier to disable: its failed join makes it an empty
                         // node, leaving its members untouched, and its modifiers are disabled too.
                         let instance = instance_collection_target(node)?.is_some();
-                        if !instance && node.modifiers.iter().all(|modifier| !modifier.enabled) {
+                        if !instance
+                            && node
+                                .modifiers
+                                .iter()
+                                .all(|modifier| !modifier.is_active(context.purpose))
+                        {
                             return Err(error);
                         }
                         for modifier in &mut node.modifiers {
@@ -288,7 +309,8 @@ impl Snapshot {
                         node_id.clone(),
                         PotError::with_details(error.code, error.message.clone(), details),
                     );
-                    let dependencies = object_mesh_dependencies(doc)?;
+                    let dependencies =
+                        object_mesh_dependencies(&purpose_document(doc, context.purpose))?;
                     let mut affected = vec![node_id];
                     while let Some(source_id) = affected.pop() {
                         for (dependent_id, targets) in &dependencies {
@@ -330,13 +352,15 @@ impl Snapshot {
     }
 
     fn evaluate_internal(
-        doc: &SceneDoc,
+        source: &SceneDoc,
         context: &EvaluationContext,
         cache_directory: Option<&Path>,
         selected_nodes: Option<&BTreeSet<Id>>,
     ) -> Result<Self> {
-        doc.validate()?;
-        crate::library::validate_linked_assets(doc, cache_directory)?;
+        source.validate()?;
+        crate::library::validate_linked_assets(source, cache_directory)?;
+        let purpose_doc = purpose_document(source, context.purpose);
+        let doc = &*purpose_doc;
         let scene_id = context
             .scene_id
             .clone()
@@ -371,7 +395,7 @@ impl Snapshot {
         let mesh_evaluation_order = object_mesh_evaluation_order(doc, selected_nodes)?;
         let evaluated_node_ids: BTreeSet<Id> = mesh_evaluation_order.iter().cloned().collect();
 
-        let scene_value = serde_json::to_value(doc).map_err(PotError::internal_json)?;
+        let scene_value = serde_json::to_value(source).map_err(PotError::internal_json)?;
         let scene_hash = hash::sha256(&hash::canonicalize(&scene_value)?);
         let driver_values = rig::evaluate_drivers(doc, frame)?;
         let mut matrices = rig::evaluate_world_matrices_with_resources(
@@ -539,6 +563,7 @@ impl Snapshot {
             "scene_hash": scene_hash,
             "scene_id": scene_id,
             "view_layer": view_layer,
+            "purpose": context.purpose,
             "frame": frame,
             "simulation_cache_key": simulation_cache_key,
         });
@@ -1343,6 +1368,7 @@ impl Snapshot {
             scene_id,
             view_layer,
             frame,
+            purpose: context.purpose,
             revision: doc.revision,
             scene_hash,
             evaluation_hash,
@@ -1362,6 +1388,26 @@ impl Snapshot {
             warnings: modifier_warnings,
         })
     }
+}
+
+/// Document whose `enabled` flags select `purpose`'s stack. Borrows the source unless a modifier
+/// is hidden for this purpose, so scenes without hidden modifiers are not copied.
+fn purpose_document(doc: &SceneDoc, purpose: EvaluationPurpose) -> Cow<'_, SceneDoc> {
+    let hidden = doc.nodes.values().any(|node| {
+        node.modifiers
+            .iter()
+            .any(|modifier| modifier.enabled && !modifier.is_active(purpose))
+    });
+    if !hidden {
+        return Cow::Borrowed(doc);
+    }
+    let mut effective = doc.clone();
+    for node in effective.nodes.values_mut() {
+        for modifier in &mut node.modifiers {
+            modifier.enabled = modifier.is_active(purpose);
+        }
+    }
+    Cow::Owned(effective)
 }
 
 /// Read and verify a cache resource from the scene's asset registry.

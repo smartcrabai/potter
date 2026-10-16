@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::{
     compositor::{self, Image as CompositorImage},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     hash,
     image::{ImageData, ImageInterpolation, sample, storage},
     media::{AudioBuffer, decode_wav, encode_flac, encode_wav},
@@ -222,7 +222,6 @@ pub fn render_sequence(
                         height,
                         "beauty",
                         engine,
-                        true,
                         film_transparent,
                         samples,
                         seed,
@@ -433,7 +432,6 @@ fn render_motion_blurred_frame(
             height,
             "beauty",
             engine,
-            true,
             film_transparent,
             samples,
             seed,
@@ -730,6 +728,7 @@ fn render_strip_content(
             let nested_context = EvaluationContext {
                 scene_id: Some(scene_id),
                 frame: Some(strip.source_frame(frame)),
+                purpose: EvaluationPurpose::Render,
                 ..EvaluationContext::default()
             };
             let (_, raster, strip_warnings) = render_camera_frame(
@@ -741,7 +740,6 @@ fn render_strip_content(
                 height,
                 "beauty",
                 engine,
-                true,
                 film_transparent,
                 samples,
                 seed,

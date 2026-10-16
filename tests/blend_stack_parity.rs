@@ -341,7 +341,7 @@ fn gear_bevel_array_subdivision_weighted_normal_stack_stops_at_unsupported_blend
             .get_mut(&gear_id)
             .ok_or("gear node is missing")?;
         for (modifier_index, modifier) in gear.modifiers.iter_mut().enumerate() {
-            modifier.enabled = modifier_index < index;
+            modifier.show_viewport = modifier_index < index;
         }
         let snapshot = match Snapshot::evaluate(
             &prefix_document,

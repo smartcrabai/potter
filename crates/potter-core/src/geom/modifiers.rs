@@ -5197,6 +5197,8 @@ mod tests {
             modifier_type: modifier_type.to_owned(),
             name: "Modifier".to_owned(),
             enabled,
+            show_viewport: true,
+            show_render: true,
             params: serde_json::Map::new(),
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),

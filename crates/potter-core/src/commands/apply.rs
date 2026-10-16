@@ -6,7 +6,7 @@ use crate::{
     cli::ApplyArgs,
     commands::util::check_base_revision,
     error::{ErrorCode, PotError, Result},
-    eval::EvaluationContext,
+    eval::{EvaluationContext, EvaluationPurpose},
     model::Id,
     ops,
     render::{PreviewRequest, render_previews},
@@ -155,6 +155,7 @@ fn render_candidate_preview(
         scene_id,
         view_layer,
         frame,
+        purpose: EvaluationPurpose::Preview,
     };
     render_previews(
         candidate,
@@ -167,7 +168,6 @@ fn render_candidate_preview(
             out: None,
             overwrite: false,
             context: &context,
-            render_visibility: false,
             staged_assets: Some(staged_assets),
         },
     )

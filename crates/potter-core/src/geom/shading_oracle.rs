@@ -284,6 +284,8 @@ fn modifiers(stack: &Value, objects: &Map<String, Value>) -> TestResult<Vec<Modi
                 modifier_type,
                 name: id,
                 enabled: true,
+                show_viewport: true,
+                show_render: true,
                 params,
                 binding_data: None,
                 runtime: ModifierRuntime::default(),

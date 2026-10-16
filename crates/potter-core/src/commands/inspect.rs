@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::{
     cli::InspectArgs,
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot, animation::animated_transform},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot, animation::animated_transform},
     model::{Collection, DataBlock, Id, Material, Node, Scene, SceneDoc, World},
     response::SceneInfo,
     store::Project,
@@ -175,6 +175,7 @@ fn evaluation_context(
         scene_id,
         view_layer,
         frame,
+        purpose: EvaluationPurpose::Preview,
     })
 }
 

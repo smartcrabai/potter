@@ -11,7 +11,7 @@ use crate::{
     cli::ExportArgs,
     commands::util::{check_extension, exchange_format_name},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     exchange::{
         self, ExportOptions, Loss,
         gltf::{is_color_attribute, mesh_default_uv_layer, surface_textures},
@@ -279,6 +279,7 @@ fn evaluation_context(context: &crate::cli::Context) -> Result<EvaluationContext
         scene_id: context.scene_id.as_deref().map(Id::new).transpose()?,
         view_layer: context.view_layer.as_deref().map(Id::new).transpose()?,
         frame: context.frame,
+        purpose: EvaluationPurpose::Render,
     })
 }
 
@@ -672,11 +673,11 @@ fn export_conversions(
             json!({ "feature_id": "coordinate_system", "conversion": "potter_z_up_to_gltf_y_up" }),
         );
     }
-    if doc
-        .nodes
-        .values()
-        .any(|node| node.modifiers.iter().any(|modifier| modifier.enabled))
-    {
+    if doc.nodes.values().any(|node| {
+        node.modifiers
+            .iter()
+            .any(|modifier| modifier.is_active(EvaluationPurpose::Render))
+    }) {
         values.push(json!({ "feature_id": "modifier.evaluation", "conversion": "evaluated_mesh" }));
     }
     if matches!(

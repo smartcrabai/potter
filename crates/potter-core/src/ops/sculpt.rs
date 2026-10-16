@@ -425,6 +425,8 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
             modifier_type: "multires".to_owned(),
             name: "Multires".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params: Map::from_iter([
                 ("levels".to_owned(), json!(levels)),
                 ("render_levels".to_owned(), json!(render_levels)),

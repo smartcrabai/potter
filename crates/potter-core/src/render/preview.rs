@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     hash,
     model::{CameraProjection, Id, SceneDoc},
 };
@@ -35,7 +35,6 @@ pub struct PreviewRequest<'a> {
     pub out: Option<&'a Path>,
     pub overwrite: bool,
     pub context: &'a EvaluationContext,
-    pub render_visibility: bool,
     pub staged_assets: Option<&'a BTreeMap<String, Vec<u8>>>,
 }
 
@@ -95,14 +94,8 @@ pub fn render_previews(
     } else {
         BTreeMap::new()
     };
-    let mut geometry = extract_geometry(
-        doc,
-        &snapshot,
-        mode,
-        request.render_visibility,
-        matches!(mode, Mode::Beauty),
-        &images,
-    )?;
+    let mut geometry =
+        extract_geometry(doc, &snapshot, mode, matches!(mode, Mode::Beauty), &images)?;
     for (node_id, error) in &node_errors {
         geometry.warnings.push(json!({
             "code": "UNSUPPORTED_FEATURE",
@@ -171,7 +164,6 @@ pub fn render_previews(
             &prepared,
             &label,
             mode,
-            request.render_visibility,
             request.size,
             background,
             &raster,
@@ -223,7 +215,6 @@ pub(crate) fn render_camera_frame(
     height: u32,
     mode_name: &str,
     engine: &str,
-    render_visibility: bool,
     film_transparent: bool,
     samples: u32,
     seed: u32,
@@ -240,7 +231,6 @@ pub(crate) fn render_camera_frame(
         doc,
         &snapshot,
         mode,
-        render_visibility,
         engine == "path" && matches!(mode, Mode::Beauty),
         &images,
     )?;
@@ -562,7 +552,6 @@ fn manifest_value(
     prepared: &PreparedCamera,
     view: &str,
     mode: Mode,
-    render_visibility: bool,
     size: u32,
     background: [u8; 4],
     raster: &RasterOutput,
@@ -625,7 +614,7 @@ fn manifest_value(
         "seed": 0,
         "mode": mode_name,
         "background": background,
-        "visibility": if render_visibility { "render" } else { "viewport" },
+        "visibility": if snapshot.purpose == EvaluationPurpose::Render { "render" } else { "viewport" },
         "transparent": false,
         "ambient": if ambient { json!({ "color": [0.08, 0.08, 0.08], "source": "default_no_lights_or_world" }) } else { Value::Null },
         "engine": "cpu",

@@ -963,6 +963,8 @@ fn ensure_physics_stack_modifier(
         modifier_type: modifier_type.to_owned(),
         name: format!("{system} Physics"),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params,
         binding_data: None,
         runtime: crate::model::ModifierRuntime::default(),
