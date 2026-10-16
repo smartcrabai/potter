@@ -29,7 +29,11 @@ export const MESHES = {
   hat: 'hat', // bone-parented to head, material cloth
   ribbon: 'ribbon', // single-sided plane, bone-parented to head, material ribbon
   ribbonMirror: 'ribbon_mirror', // same plane with scale [-1,1,1], material cutout
+  graphPart: 'graph_part', // plane off to the side, material graph_avatar (shader graph export)
 };
+
+// Graph part: away from the avatar so every render check (which shows named meshes only) is unaffected.
+export const GRAPH_PART = { center: [0, 3, 1], size: 0.3 };
 
 // Head sphere placement (world, metres) and radius.
 export const HEAD_MESH = { center: [0, 0, 1.8], radius: 0.12, segments: 32, ringCount: 16 };
@@ -216,11 +220,25 @@ export const MATERIALS = {
     outlineWidth: 0.002,
     outlineWidthMode: 'worldCoordinates',
     outlineColor: [0, 0, 0],
-    uvAnimationMask: 'tex_uv_mask', // packed mask, value in channel B: B=0 for u<0.5, B=1 for u>=0.5
+    uvAnimationMask: 'tex_uv_mask', // packed mask, value in channel B: B=0 for u<0.5, B=1 for u>=0.5 (hard step: Closest sampling)
     uvAnimationScrollX: 0.1,
   },
   ribbon: { baseColor: [0.9, 0.9, 0.2, 0.6], alphaMode: 'BLEND', doubleSided: true, baseTexture: 'tex_ribbon' },
   cutout: { baseColor: [0.2, 0.8, 0.3, 1], alphaMode: 'MASK', alphaCutoff: 0.5, doubleSided: false, baseTexture: 'tex_cutout' },
+};
+
+// Node-graph materials (material.create with `graph`). Kept apart from MATERIALS because their
+// surface comes from the graph, not from the material fields. Assigned to the `graph_part` mesh
+// only (off to the side, outside every render check), so the add-on imports it too. Images are
+// existing IMAGES entries, so the image count is unchanged.
+export const GRAPH_MATERIALS = {
+  graph_avatar: {
+    baseTexture: 'tex_cutout', // RGB white; alpha disc, clipped at 0.5 by Math GREATER_THAN
+    alphaCutoff: 0.5,
+    normalMap: 'tex_skin_normal', // NormalMap (TANGENT) input
+    emissionColor: [1.0, 0.5, 0.2, 1],
+    emissionStrength: 1.5,
+  },
 };
 
 // Images (created with pot image ops, pixels generated deterministically in JS).

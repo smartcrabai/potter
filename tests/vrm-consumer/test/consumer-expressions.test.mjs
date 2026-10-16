@@ -92,24 +92,31 @@ describe('check 4: shared cloth material binds', () => {
   const uvBind = bind.textureTransformBinds[0];
   const base = MATERIALS.cloth.baseColor;
 
-  it('color = base + w*(target - base); UV transform applied once; base at 0', async () => {
-    await potter.load('c', fixtureUrl(FILES.v1Full));
-    for (const w of [0, 0.25, 0.5, 1, 0]) {
-      await potter.setExpression('c', 'cloth_shift', w);
-      await potter.update('c', 0);
-      const m = await potter.materialState('c', 'cloth');
-      const expectedColor = [0, 1, 2].map((a) => base[a] + w * (colorBind.targetValue[a] - base[a]));
-      assertVecClose(m.color, expectedColor, TOL.color, `cloth color at w=${w}`);
-      approx(m.opacity, base[3], TOL.color, `cloth opacity at w=${w}`);
-      // All UV-accessed textures of the material share one transform.
-      assert.deepEqual(Object.keys(m.textures).sort(), ['map', 'uvAnimationMaskTexture'], 'cloth textures');
-      for (const t of Object.values(m.textures)) {
-        assertVecClose(t.offset, uvBind.offset.map((o) => w * o), TOL.uv, `uv offset at w=${w}`);
-        // Default scale is [1,1]; applied scale is default + w * (target - default).
-        assertVecClose(t.repeat, [0, 1].map((a) => 1 + w * (uvBind.scale[a] - 1)), TOL.uv, `uv scale at w=${w}`);
+  // VRM 1.0 binds the transform through KHR_texture_transform; VRM 0.x through _MainTex_ST (with the
+  // V flip UniVRM applies). Both must reach three-vrm as the same texture offset and repeat.
+  for (const [label, file, key] of [
+    ['VRM 1.0', FILES.v1Full, 'c'],
+    ['VRM 0.x', FILES.v0, 'c0'],
+  ]) {
+    it(`${label}: color = base + w*(target - base); UV transform applied once; base at 0`, async () => {
+      await potter.load(key, fixtureUrl(file));
+      for (const w of [0, 0.25, 0.5, 1, 0]) {
+        await potter.setExpression(key, 'cloth_shift', w);
+        await potter.update(key, 0);
+        const m = await potter.materialState(key, 'cloth');
+        const expectedColor = [0, 1, 2].map((a) => base[a] + w * (colorBind.targetValue[a] - base[a]));
+        assertVecClose(m.color, expectedColor, TOL.color, `cloth color at w=${w}`);
+        approx(m.opacity, base[3], TOL.color, `cloth opacity at w=${w}`);
+        // All UV-accessed textures of the material share one transform.
+        assert.deepEqual(Object.keys(m.textures).sort(), ['map', 'uvAnimationMaskTexture'], 'cloth textures');
+        for (const t of Object.values(m.textures)) {
+          assertVecClose(t.offset, uvBind.offset.map((o) => w * o), TOL.uv, `uv offset at w=${w}`);
+          // Default scale is [1,1]; applied scale is default + w * (target - default).
+          assertVecClose(t.repeat, [0, 1].map((a) => 1 + w * (uvBind.scale[a] - 1)), TOL.uv, `uv scale at w=${w}`);
+        }
       }
-    }
-  });
+    });
+  }
 });
 
 describe('check 5: procedural overrides and isBinary against the VRM 1.0 expressions spec', () => {

@@ -170,6 +170,33 @@ function materialOps() {
   });
 }
 
+function graphMaterialOps() {
+  return Object.entries(S.GRAPH_MATERIALS).map(([id, g]) => ({
+    op: 'material.create',
+    id,
+    name: id,
+    graph: {
+      kind: 'shader',
+      nodes: {
+        out: { type: 'OutputMaterial' },
+        bsdf: { type: 'ShaderNodeBsdfPrincipled', inputs: { 'Emission Color': g.emissionColor, 'Emission Strength': g.emissionStrength } },
+        base: { type: 'ShaderNodeTexImage', properties: { image: g.baseTexture } },
+        clip: { type: 'ShaderNodeMath', properties: { operation: 'GREATER_THAN' }, inputs: { Value_001: g.alphaCutoff } },
+        normal_img: { type: 'ShaderNodeTexImage', properties: { image: g.normalMap } },
+        normal: { type: 'ShaderNodeNormalMap', properties: { space: 'TANGENT' } },
+      },
+      links: [
+        { from_node: 'base', from_socket: 'Color', to_node: 'bsdf', to_socket: 'Base Color' },
+        { from_node: 'base', from_socket: 'Alpha', to_node: 'clip', to_socket: 'Value' },
+        { from_node: 'clip', from_socket: 'Value', to_node: 'bsdf', to_socket: 'Alpha' },
+        { from_node: 'normal_img', from_socket: 'Color', to_node: 'normal', to_socket: 'Color' },
+        { from_node: 'normal', from_socket: 'Normal', to_node: 'bsdf', to_socket: 'Normal' },
+        { from_node: 'bsdf', from_socket: 'BSDF', to_node: 'out', to_socket: 'Surface' },
+      ],
+    },
+  }));
+}
+
 function tubeOps(id, t, material) {
   return [
     { op: 'node.create', id, kind: 'cylinder', params: { radius: t.radius, depth: t.depth, vertices: t.vertices, end_fill_type: 'NOTHING' }, materials: [material] },
@@ -194,6 +221,7 @@ function buildBatchOne(dir) {
     })),
     ...imageOps(),
     ...materialOps(),
+    ...graphMaterialOps(),
     { op: 'node.create', id: M.head, kind: 'uv_sphere', params: { radius: S.HEAD_MESH.radius, segments: S.HEAD_MESH.segments, ring_count: S.HEAD_MESH.ringCount }, materials: ['skin', 'eye'] },
     { op: 'mesh.transform_elements', target: { id: M.head, elements: ALL_VERTICES }, translation: S.HEAD_MESH.center },
     { op: 'uv.unwrap', target: { id: M.head }, method: 'smart' },
@@ -215,6 +243,8 @@ function buildBatchOne(dir) {
     { op: 'node.create', id: M.ribbonMirror, kind: 'plane', params: { size: S.RIBBON.size }, materials: ['cutout'], transform: { translation: S.RIBBON.mirrorCenter, rotation_deg: S.RIBBON.rotationDeg, scale: S.RIBBON.mirrorScale } },
     { op: 'uv.unwrap', target: { id: M.ribbonMirror }, method: 'smart' },
     attachToBone(M.ribbonMirror, S.RIBBON.parentBone),
+    { op: 'node.create', id: M.graphPart, kind: 'plane', params: { size: S.GRAPH_PART.size }, materials: ['graph_avatar'], transform: { translation: S.GRAPH_PART.center } },
+    { op: 'uv.unwrap', target: { id: M.graphPart }, method: 'smart' },
   ];
   apply(dir, ops);
 }
@@ -400,7 +430,7 @@ function avatarSet(variant) {
         outline_width_mode: 'world_coordinates',
         outline_width_factor: c.outlineWidth,
         outline_color_factor: c.outlineColor,
-        uv_animation_mask_texture: { image: c.uvAnimationMask, interpolation: 'linear' },
+        uv_animation_mask_texture: { image: c.uvAnimationMask, interpolation: 'closest' },
         uv_animation_scroll_x_speed_factor: c.uvAnimationScrollX,
       },
     },

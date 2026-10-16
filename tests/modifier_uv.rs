@@ -1063,9 +1063,11 @@ fn glb_export_texcoords_after_mirror_and_subdivision_match_blender_oracle() -> T
                 .map(|value| -> TestResult<f64> { Ok(value.as_f64().ok_or("corner value")?) })
                 .collect::<TestResult<Vec<f64>>>()?;
             let point = DVec3::new(values[3], values[4], values[5]);
+            // The fixture holds Blender loop UVs (V up). glTF stores V down: Blender's own glTF
+            // exporter writes 1 - v for the same loop data (verified against Blender 5.2).
             let uvs = values[6..]
                 .chunks(2)
-                .map(|pair| [pair[0], pair[1]])
+                .map(|pair| [pair[0], 1.0 - pair[1]])
                 .collect();
             Ok((DVec3::new(point.x, point.z, -point.y), uvs))
         })
@@ -1093,9 +1095,11 @@ fn glb_export_prefers_uv_map_over_blender_uv_layers() -> TestResult {
         json!([{"name": "UVMap", "values": [[0.9, 0.9], [0.9, 0.9], [0.9, 0.9], [0.9, 0.9]]}]),
     );
     let points = [DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y];
+    // The entry carries a `layer` key, so it is Blender-layer data (V up) that the exporter flips to
+    // glTF's V down (`uv_map` shortcut in exchange/gltf.rs, until PR12).
     let expected: Vec<ExportedVertex> = points
         .iter()
-        .zip(preferred)
+        .zip(preferred.map(|[u, v]| [u, 1.0 - v]))
         .map(|(point, uv)| (DVec3::new(point.x, point.z, -point.y), vec![uv]))
         .collect();
     let exported = exported_glb_vertices(&scene_doc(subject, Vec::new(), Vec::new())?)?;

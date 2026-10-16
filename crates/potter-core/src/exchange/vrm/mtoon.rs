@@ -3,12 +3,18 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::{
-    error::{ErrorCode, PotError, Result},
+    error::Result,
     float::equal_f64,
-    model::{AvatarMtoon, AvatarOutlineWidthMode, Id, Material, SceneDoc, TextureRef},
+    model::{AvatarMtoon, AvatarOutlineWidthMode, SceneDoc, TextureRef},
 };
 
-use super::super::gltf::{TextureExport, unsupported_export};
+use super::super::{
+    gltf::{TextureExport, reads, unsupported_export},
+    material_surface::{
+        AlphaMode, ResolvedSurface, SampledTexture, TextureChannel, reference_sampled,
+        remapped_reference_sampled,
+    },
+};
 
 pub(crate) fn uv_textures(mtoon: &AvatarMtoon) -> impl Iterator<Item = &TextureRef> {
     [
@@ -25,12 +31,52 @@ pub(crate) fn uv_textures(mtoon: &AvatarMtoon) -> impl Iterator<Item = &TextureR
     .flatten()
 }
 
-pub(super) fn validate_v1(material: &Material) -> Result<()> {
-    validate_transmission(material)
+/// Rejects resolved surface features that VRM `MToon` cannot express. Both VRM versions share it.
+fn validate_mtoon_surface(surface: &ResolvedSurface) -> Result<()> {
+    if surface.transmission.is_some() {
+        return Err(unsupported_export(
+            "vrm.mtoon_transmission",
+            "VRM MToon does not support physical transmission; clear the material transmission factor or remove its MToon settings.",
+        ));
+    }
+    let unsupported = [
+        (
+            surface.unlit,
+            "vrm.mtoon_unlit",
+            "unlit (Background) shading",
+        ),
+        (
+            surface.clearcoat.is_some(),
+            "vrm.mtoon_clearcoat",
+            "clearcoat",
+        ),
+        (surface.sheen.is_some(), "vrm.mtoon_sheen", "sheen"),
+        (surface.specular.is_some(), "vrm.mtoon_specular", "specular"),
+        (
+            surface.anisotropy.is_some(),
+            "vrm.mtoon_anisotropy",
+            "anisotropy",
+        ),
+    ];
+    for (present, feature_id, name) in unsupported {
+        if present {
+            return Err(unsupported_export(
+                feature_id,
+                &format!(
+                    "VRM MToon does not support {name}; remove it from the material or remove its MToon settings."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_v1(surface: &ResolvedSurface) -> Result<()> {
+    validate_mtoon_surface(surface)
 }
 
 pub(super) fn v1(
-    material_id: &Id,
+    surface: &ResolvedSurface,
     mtoon: &AvatarMtoon,
     doc: &SceneDoc,
     root_path: &Path,
@@ -38,11 +84,7 @@ pub(super) fn v1(
     binary: &mut Vec<u8>,
     views: &mut Vec<Value>,
 ) -> Result<Value> {
-    let material = doc
-        .materials
-        .get(material_id)
-        .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "MToon material is missing"))?;
-    validate_v1(material)?;
+    validate_v1(surface)?;
     let mut value = json!({
         "specVersion": "1.0",
         "transparentWithZWrite": mtoon.transparent_with_z_write,
@@ -65,12 +107,24 @@ pub(super) fn v1(
         "uvAnimationRotationSpeedFactor": mtoon.uv_animation_rotation_speed_factor,
     });
     if let Some(texture) = &mtoon.shade_multiply_texture {
-        value["shadeMultiplyTexture"] =
-            texture_export.texture_info(texture, doc, root_path, binary, views)?;
+        value["shadeMultiplyTexture"] = texture_export.sampled_info(
+            &reference_sampled(texture),
+            reads::RGBA,
+            doc,
+            root_path,
+            binary,
+            views,
+        )?;
     }
     if let Some(shift) = &mtoon.shading_shift_texture {
-        let mut info =
-            texture_export.texture_info(&shift.texture, doc, root_path, binary, views)?;
+        let mut info = texture_export.sampled_info(
+            &reference_sampled(&shift.texture),
+            reads::RGBA,
+            doc,
+            root_path,
+            binary,
+            views,
+        )?;
         info["scale"] = json!(shift.scale);
         value["shadingShiftTexture"] = info;
     }
@@ -87,14 +141,22 @@ pub(super) fn v1(
         ),
     ] {
         if let Some(texture) = texture {
-            value[key] = texture_export.texture_info(texture, doc, root_path, binary, views)?;
+            value[key] = texture_export.sampled_info(
+                &reference_sampled(texture),
+                reads::RGBA,
+                doc,
+                root_path,
+                binary,
+                views,
+            )?;
         }
     }
     Ok(value)
 }
 
 pub(super) fn v0(
-    material: &Material,
+    name: &str,
+    surface: &ResolvedSurface,
     mtoon: &AvatarMtoon,
     doc: &SceneDoc,
     root_path: &Path,
@@ -102,13 +164,23 @@ pub(super) fn v0(
     binary: &mut Vec<u8>,
     views: &mut Vec<Value>,
 ) -> Result<Value> {
-    validate_v0(material, mtoon)?;
-    let (blend_mode, queue, alpha_tag, keyword) = alpha_properties(material, mtoon)?;
+    validate_v0(surface, mtoon)?;
+    let main_tex_st = main_texture_st(surface)?;
+    let (blend_mode, queue, alpha_tag, keyword) = alpha_properties(&surface.alpha_mode, mtoon);
     let (legacy_shade_shift, legacy_shade_toony) = legacy_shading_values(mtoon)?;
+    let blend = matches!(surface.alpha_mode, AlphaMode::Blend);
+    let cutoff = match &surface.alpha_mode {
+        AlphaMode::Mask { cutoff } => *cutoff,
+        AlphaMode::Opaque | AlphaMode::Blend => 0.5,
+    };
+    let base = surface.base_color.factor;
+    let emissive = surface.emissive.factor;
+    // VRM 0.x has no emission strength, so emitted colors clamp to [0, 1] before the legacy curve.
+    let emission = |component: f64| legacy_color_component(component.clamp(0.0, 1.0));
     let float_properties = json!({
         "_MToonVersion": 39.0,
-        "_Cutoff": material.alpha_threshold,
-        "_BumpScale": 1.0,
+        "_Cutoff": cutoff,
+        "_BumpScale": surface.normal.as_ref().map_or(1.0, |normal| normal.scale),
         "_ReceiveShadowRate": 1.0,
         "_ShadingGradeRate": 1.0,
         "_ShadeShift": legacy_shade_shift,
@@ -131,19 +203,19 @@ pub(super) fn v0(
             AvatarOutlineWidthMode::WorldCoordinates => 1.0,
             AvatarOutlineWidthMode::ScreenCoordinates => 2.0,
         },
-        "_CullMode": if material.double_sided { 0.0 } else { 2.0 },
+        "_CullMode": if surface.double_sided { 0.0 } else { 2.0 },
         "_OutlineCullMode": 1.0,
-        "_ZWrite": if material.alpha_mode != "blend" || mtoon.transparent_with_z_write { 1.0 } else { 0.0 },
+        "_ZWrite": if !blend || mtoon.transparent_with_z_write { 1.0 } else { 0.0 },
         "_AlphaToMask": 0.0,
-        "_SrcBlend": if material.alpha_mode == "blend" { 5.0 } else { 1.0 },
-        "_DstBlend": if material.alpha_mode == "blend" { 10.0 } else { 0.0 },
+        "_SrcBlend": if blend { 5.0 } else { 1.0 },
+        "_DstBlend": if blend { 10.0 } else { 0.0 },
     });
     let vector_properties = json!({
         "_Color": [
-            legacy_color_component(material.base_color[0]),
-            legacy_color_component(material.base_color[1]),
-            legacy_color_component(material.base_color[2]),
-            material.base_color[3]
+            legacy_color_component(base[0]),
+            legacy_color_component(base[1]),
+            legacy_color_component(base[2]),
+            base[3]
         ],
         "_ShadeColor": [
             legacy_color_component(mtoon.shade_color_factor[0]),
@@ -151,12 +223,7 @@ pub(super) fn v0(
             legacy_color_component(mtoon.shade_color_factor[2]),
             1.0
         ],
-        "_EmissionColor": [
-            legacy_color_component(material.emission_color[0] * material.emission_strength),
-            legacy_color_component(material.emission_color[1] * material.emission_strength),
-            legacy_color_component(material.emission_color[2] * material.emission_strength),
-            1.0
-        ],
+        "_EmissionColor": [emission(emissive[0]), emission(emissive[1]), emission(emissive[2]), 1.0],
         "_RimColor": [
             legacy_color_component(mtoon.parametric_rim_color_factor[0]),
             legacy_color_component(mtoon.parametric_rim_color_factor[1]),
@@ -169,16 +236,15 @@ pub(super) fn v0(
             legacy_color_component(mtoon.outline_color_factor[2]),
             1.0
         ],
-        "_MainTex_ST": [1.0, 1.0, 0.0, 0.0]
+        "_MainTex_ST": main_tex_st
     });
     let render_queue = queue + mtoon.render_queue_offset_number;
     let mut texture_properties = serde_json::Map::new();
-    if let Some(texture) = &material.base_color_texture {
+    if let Some(texture) = &surface.base_color.texture {
         add_texture(
             &mut texture_properties,
             "_MainTex",
             texture,
-            None,
             doc,
             root_path,
             texture_export,
@@ -186,12 +252,11 @@ pub(super) fn v0(
             views,
         )?;
     }
-    if let Some(texture) = &material.normal_texture {
+    if let Some(normal) = &surface.normal {
         add_texture(
             &mut texture_properties,
             "_BumpMap",
-            texture,
-            None,
+            &normal.texture,
             doc,
             root_path,
             texture_export,
@@ -199,12 +264,11 @@ pub(super) fn v0(
             views,
         )?;
     }
-    if let Some(texture) = &mtoon.shade_multiply_texture {
+    if let Some(texture) = &surface.emissive.texture {
         add_texture(
             &mut texture_properties,
-            "_ShadeTexture",
+            "_EmissionMap",
             texture,
-            None,
             doc,
             root_path,
             texture_export,
@@ -212,63 +276,43 @@ pub(super) fn v0(
             views,
         )?;
     }
-    if let Some(texture) = &mtoon.matcap_texture {
-        add_texture(
-            &mut texture_properties,
-            "_SphereAdd",
-            texture,
-            None,
-            doc,
-            root_path,
-            texture_export,
-            binary,
-            views,
-        )?;
-    }
-    if let Some(texture) = &mtoon.rim_multiply_texture {
-        add_texture(
-            &mut texture_properties,
-            "_RimTexture",
-            texture,
-            None,
-            doc,
-            root_path,
-            texture_export,
-            binary,
-            views,
-        )?;
-    }
-    if let Some(texture) = &mtoon.outline_width_multiply_texture {
-        add_texture(
-            &mut texture_properties,
+    for (key, reference, remap) in [
+        ("_ShadeTexture", mtoon.shade_multiply_texture.as_ref(), None),
+        ("_SphereAdd", mtoon.matcap_texture.as_ref(), None),
+        ("_RimTexture", mtoon.rim_multiply_texture.as_ref(), None),
+        (
             "_OutlineWidthTexture",
-            texture,
-            Some(1),
-            doc,
-            root_path,
-            texture_export,
-            binary,
-            views,
-        )?;
-    }
-    if let Some(texture) = &mtoon.uv_animation_mask_texture {
-        add_texture(
-            &mut texture_properties,
+            mtoon.outline_width_multiply_texture.as_ref(),
+            Some(TextureChannel::Green),
+        ),
+        (
             "_UvAnimMaskTexture",
-            texture,
-            Some(2),
-            doc,
-            root_path,
-            texture_export,
-            binary,
-            views,
-        )?;
+            mtoon.uv_animation_mask_texture.as_ref(),
+            Some(TextureChannel::Blue),
+        ),
+    ] {
+        if let Some(reference) = reference {
+            let texture = match remap {
+                Some(channel) => remapped_reference_sampled(reference, channel),
+                None => reference_sampled(reference),
+            };
+            add_texture(
+                &mut texture_properties,
+                key,
+                &texture,
+                doc,
+                root_path,
+                texture_export,
+                binary,
+                views,
+            )?;
+        }
     }
     let mut keywords = serde_json::Map::new();
     if !keyword.is_empty() {
         keywords.insert(keyword.to_owned(), json!(true));
     }
-    if material.normal_texture.is_some() {
+    if surface.normal.is_some() {
         keywords.insert("_NORMALMAP".to_owned(), json!(true));
     }
     match mtoon.outline_width_mode {
@@ -289,7 +333,7 @@ pub(super) fn v0(
         keywords.insert(color_keyword.to_owned(), json!(true));
     }
     Ok(json!({
-        "name": material.name,
+        "name": name,
         "shader": "VRM/MToon",
         "renderQueue": render_queue,
         "floatProperties": float_properties,
@@ -300,9 +344,9 @@ pub(super) fn v0(
     }))
 }
 
-pub(super) fn validate_v0(material: &Material, mtoon: &AvatarMtoon) -> Result<()> {
-    alpha_properties(material, mtoon)?;
-    validate_transmission(material)?;
+pub(super) fn validate_v0(surface: &ResolvedSurface, mtoon: &AvatarMtoon) -> Result<()> {
+    validate_mtoon_surface(surface)?;
+    main_texture_st(surface)?;
     if mtoon.shading_shift_texture.is_some() {
         return Err(unsupported_export(
             "vrm.v0.mtoon_shading_shift_texture",
@@ -320,7 +364,7 @@ pub(super) fn validate_v0(material: &Material, mtoon: &AvatarMtoon) -> Result<()
             "VRM 0.x MToon has no matcap color factor; use [1,1,1] or export VRM 1.0.",
         ));
     }
-    if material.alpha_mode != "blend" && mtoon.render_queue_offset_number != 0 {
+    if !matches!(surface.alpha_mode, AlphaMode::Blend) && mtoon.render_queue_offset_number != 0 {
         return Err(unsupported_export(
             "vrm.v0.material_render_queue",
             "VRM 0.x renderQueue offsets apply only to blend materials; clear render_queue_offset_number or use VRM 1.0.",
@@ -339,63 +383,62 @@ pub(super) fn validate_v0(material: &Material, mtoon: &AvatarMtoon) -> Result<()
     Ok(())
 }
 
-fn validate_transmission(material: &Material) -> Result<()> {
-    if !equal_f64(material.transmission, 0.0) {
+/// `_MainTex_ST` (tiling, offset) from the base texture's KHR transform. Unity-style VRM 0.x
+/// shaders flip V relative to glTF, so the offset follows the expression texture-transform bind.
+/// VRM 0.x has no rotation, so a rotated base texture is an error.
+fn main_texture_st(surface: &ResolvedSurface) -> Result<[f64; 4]> {
+    let Some(transform) = surface
+        .base_color
+        .texture
+        .as_ref()
+        .and_then(|texture| texture.transform.as_ref())
+    else {
+        return Ok([1.0, 1.0, 0.0, 0.0]);
+    };
+    if !equal_f64(transform.rotation, 0.0) {
         return Err(unsupported_export(
-            "vrm.mtoon_transmission",
-            "VRM MToon does not support physical transmission; clear the material transmission factor or remove its MToon settings.",
+            "vrm.v0.mtoon_texture_transform",
+            "VRM 0.x MToon `_MainTex_ST` cannot represent a base texture rotation; clear the rotation or export VRM 1.0.",
         ));
     }
-    Ok(())
+    Ok(legacy_st(transform.scale, transform.offset))
+}
+
+/// VRM 0.x `_MainTex_ST` (scale x, scale y, offset x, offset y) from a glTF KHR transform. Unity-style
+/// shaders flip V relative to glTF, so the offset y is `1 - offset_y - scale_y`. Shared by the
+/// material property and the expression texture-transform bind.
+pub(crate) fn legacy_st(scale: [f64; 2], offset: [f64; 2]) -> [f64; 4] {
+    [scale[0], scale[1], offset[0], 1.0 - offset[1] - scale[1]]
 }
 
 fn add_texture(
     output: &mut serde_json::Map<String, Value>,
     name: &str,
-    texture: &TextureRef,
-    remap_channel: Option<usize>,
+    texture: &SampledTexture,
     doc: &SceneDoc,
     root_path: &Path,
     texture_export: &mut TextureExport,
     binary: &mut Vec<u8>,
     views: &mut Vec<Value>,
 ) -> Result<()> {
-    let index = if let Some(channel) = remap_channel {
-        texture_export
-            .texture_info_channel(texture, Some(channel), doc, root_path, binary, views)?
-            .get("index")
-            .and_then(Value::as_u64)
-            .and_then(|index| usize::try_from(index).ok())
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InternalError,
-                    "remapped glTF texture index is invalid",
-                )
-            })?
-    } else {
-        texture_export.texture_index(texture, doc, root_path, binary, views)?
-    };
+    let index = texture_export.sampled_index(texture, doc, root_path, binary, views)?;
     output.insert(name.to_owned(), json!(index));
     Ok(())
 }
 
+/// Blend mode, render queue, `RenderType` tag, and keyword for a resolved alpha mode.
 fn alpha_properties(
-    material: &Material,
+    alpha: &AlphaMode,
     mtoon: &AvatarMtoon,
-) -> Result<(f64, i32, &'static str, &'static str)> {
-    let (blend_mode, queue, alpha_tag, keyword) = match material.alpha_mode.as_str() {
-        "opaque" => (0.0, 2000, "Opaque", ""),
-        "clip" => (1.0, 2450, "TransparentCutout", "_ALPHATEST_ON"),
-        "blend" if mtoon.transparent_with_z_write => (3.0, 2501, "Transparent", "_ALPHABLEND_ON"),
-        "blend" => (2.0, 3000, "Transparent", "_ALPHABLEND_ON"),
-        _ => {
-            return Err(unsupported_export(
-                "vrm.v0.material_alpha_mode",
-                "VRM 0.x MToon does not recognize this material alpha_mode.",
-            ));
+) -> (f64, i32, &'static str, &'static str) {
+    match alpha {
+        AlphaMode::Opaque => (0.0, 2000, "Opaque", ""),
+        AlphaMode::Mask { .. } => (1.0, 2450, "TransparentCutout", "_ALPHATEST_ON"),
+        AlphaMode::Blend if mtoon.transparent_with_z_write => {
+            (3.0, 2501, "Transparent", "_ALPHABLEND_ON")
         }
-    };
-    Ok((blend_mode, queue, alpha_tag, keyword))
+        AlphaMode::Blend => (2.0, 3000, "Transparent", "_ALPHABLEND_ON"),
+    }
 }
 
 fn legacy_shading_values(mtoon: &AvatarMtoon) -> Result<(f64, f64)> {
@@ -438,5 +481,18 @@ fn outline_mode_v1(mode: AvatarOutlineWidthMode) -> &'static str {
         AvatarOutlineWidthMode::None => "none",
         AvatarOutlineWidthMode::WorldCoordinates => "worldCoordinates",
         AvatarOutlineWidthMode::ScreenCoordinates => "screenCoordinates",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::legacy_st;
+
+    #[test]
+    fn legacy_st_flips_v_and_keeps_scale_and_offset_x() {
+        // glTF offset (0.25, 0) with scale (2, 2): Unity's offset y is 1 - 0 - 2 = -1.
+        assert_eq!(legacy_st([2.0, 2.0], [0.25, 0.0]), [2.0, 2.0, 0.25, -1.0]);
+        // Identity transform (scale 1, offset 0) maps to the identity _MainTex_ST.
+        assert_eq!(legacy_st([1.0, 1.0], [0.0, 0.0]), [1.0, 1.0, 0.0, 0.0]);
     }
 }

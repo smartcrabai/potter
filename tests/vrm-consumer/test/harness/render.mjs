@@ -429,6 +429,23 @@ function checkNormalMap(spec) {
 // MToon samples the base texture at uv + offset * B(mask at uv), with rotation phase 0 (spec sets no rotation).
 // Prediction per pixel: changed iff nearest texel at (u0 + off0*m) differs from nearest texel at (u0 + off1*m).
 // ---------------------------------------------------------------------------
+// Pixels are classed before the mask is read. `jump`: a 4-neighbour's UV differs by more than UV_JUMP
+// (UV island edges and the u wrap). `band`: within MASK_STEP_BAND_TEXELS of the mask's u = 0.5 step.
+// Every other pixel is `rest`. Only `rest` must match exactly; `jump` and `band` are measured and
+// reported, so a regression in either shows up as a count above its recorded ceiling.
+const MASK_STEP_BAND_TEXELS = 4;
+const UV_JUMP = 0.1;
+function inMaskStepBand(u, width) {
+  const x = (((u % 1) + 1) % 1) * width;
+  return Math.abs(x - width / 2) <= MASK_STEP_BAND_TEXELS;
+}
+function pixelUvJump(R, meshes, i, j, u0, v0) {
+  for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const n = pick(R, meshes, i + di, j + dj, 'front');
+    if (n && (Math.abs(n.uv.x - u0) > UV_JUMP || Math.abs(n.uv.y - v0) > UV_JUMP)) return true;
+  }
+  return false;
+}
 function checkUvAnimation(spec) {
   const cloth = spec.MATERIALS.cloth;
   show([spec.MESHES.body]);
@@ -447,20 +464,25 @@ function checkUvAnimation(spec) {
   const A1 = render('body');
   const mask = decode(surface.uvAnimationMaskTexture);
   const map = decode(surface.map);
+  const classes = ['rest', 'jump', 'band'];
   const r = { speed: cloth.uvAnimationScrollX, dt: DT, offsetDelta: off1 - off0, expectedOffsetDelta: cloth.uvAnimationScrollX * DT,
-    determined: 0, predictedChanged: 0, predictedUnchanged: 0, observedChanged: 0, mismatch: 0, undetermined: 0, maskZeroDetermined: 0 };
+    determined: 0, predictedChanged: 0, predictedUnchanged: 0, observedChanged: 0, mismatch: 0, undetermined: 0, maskZeroDetermined: 0,
+    byClass: Object.fromEntries(classes.map((c) => [c, { determined: 0, mismatch: 0 }])) };
   const colour = (u, v) => keyRGBA(map.d, nearestOffset(map, u, v));
   const [i0, j0, i1, j1] = boundsPx(A0, body);
   for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
     const hit = pick(A0, body, i, j, 'front');
     if (!hit) continue;
     const [u0, v0] = [hit.uv.x, hit.uv.y];
+    const cls = pixelUvJump(A0, body, i, j, u0, v0) ? 'jump' : inMaskStepBand(u0, mask.w) ? 'band' : 'rest';
     const m = uniformAt(mask, u0, v0, keyMaskB);
     if (m === null) { r.undetermined++; continue; }
     const observed = differs(A0, A1, i, j);
+    const bucket = r.byClass[cls];
+    bucket.determined++;
     if (m === 0) {
       r.maskZeroDetermined++;
-      if (observed) r.mismatch++;
+      if (observed) { r.mismatch += cls === 'rest' ? 1 : 0; bucket.mismatch++; }
       continue;
     }
     const c0 = colour(u0 + off0 * m, v0);
@@ -469,7 +491,7 @@ function checkUvAnimation(spec) {
     r.determined++;
     if (predicted) r.predictedChanged++; else r.predictedUnchanged++;
     if (observed) r.observedChanged++;
-    if (predicted !== observed) r.mismatch++;
+    if (predicted !== observed) { r.mismatch += cls === 'rest' ? 1 : 0; bucket.mismatch++; }
   }
   return r;
 }
