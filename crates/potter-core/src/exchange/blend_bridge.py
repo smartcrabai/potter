@@ -2155,31 +2155,230 @@ def _create_modifier(obj, name, modifier_type):
             scene.collection.objects.unlink(obj)
 
 
-def _restore_modifier_stack(obj, modifier_items):
-    """Make Blender's stack match Potter's order and pin-to-last flags.
+# Blender's modifier-stack insertion and move constraints. Keep these in sync with Blender's
+# ModifierTypeType::OnlyDeform and ModifierTypeFlag::RequiresOriginalData rules.
+_ONLY_DEFORM_MODIFIER_TYPES = frozenset((
+    "ARMATURE", "CAST", "CLOTH", "COLLISION", "CORRECTIVE_SMOOTH", "CURVE", "DISPLACE", "HOOK",
+    "LAPLACIANDEFORM", "LAPLACIANSMOOTH", "LATTICE", "MESH_CACHE", "MESH_DEFORM",
+    "PARTICLE_SYSTEM", "SHRINKWRAP", "SIMPLE_DEFORM", "SMOOTH", "SOFT_BODY", "SURFACE_DEFORM",
+    "WARP", "WAVE",
+))
+_ORIGINAL_DATA_MODIFIER_TYPES = frozenset(("MULTIRES", "SOFT_BODY"))
 
-    Setting use_pin_to_last moves the modifier at once, so pins are cleared, the stack is
-    sorted into Potter order, pins are set, and the stack is sorted again: the pin setter
-    moves modifiers, while ``modifiers.move`` places them exactly.
+
+def _modifier_stack_state(obj):
+    return [(modifier.name, modifier.type, bool(modifier.use_pin_to_last))
+            for modifier in obj.modifiers]
+
+
+def _stack_mismatch_message(obj_name, expected, actual):
+    for index, (want, have) in enumerate(zip(expected, actual)):
+        if want[0] != have[0]:
+            return ("cannot reproduce modifier order on %s: expected %s at position %d, "
+                    "Blender has %s there" % (obj_name, want[0], index, have[0]))
+        if want[1] != have[1]:
+            return ("cannot reproduce modifier type on %s: %s must be %s"
+                    % (obj_name, want[0], want[1]))
+        if want[2] != have[2]:
+            return ("cannot reproduce modifier pin on %s: %s must be %s"
+                    % (obj_name, want[0], "pinned to last" if want[2] else "unpinned"))
+    if len(expected) > len(actual):
+        name = expected[len(actual)][0]
+        return ("cannot reproduce modifier order on %s: expected %s at position %d, "
+                "Blender has no modifier there" % (obj_name, name, len(actual)))
+    if len(actual) > len(expected):
+        name = actual[len(expected)][0]
+        return ("cannot reproduce modifier order on %s: unexpected modifier %s at position %d"
+                % (obj_name, name, len(expected)))
+    return "cannot reproduce modifier order on %s" % obj_name
+
+
+def _insertion_index(stack, modifier_type):
+    if modifier_type == "HOOK" or modifier_type in _ORIGINAL_DATA_MODIFIER_TYPES:
+        index = 0
+        while index < len(stack) and stack[index][1] in _ONLY_DEFORM_MODIFIER_TYPES:
+            if index + 1 < len(stack) and stack[index + 1][2]:
+                break
+            index += 1
+        return index
+    index = len(stack)
+    while index > 0 and stack[index - 1][2]:
+        index -= 1
+    return index
+
+
+def _may_move_before(modifier, previous):
+    unpins_past_pinned = modifier[2] and not previous[2]
+    past_original_data = (
+        previous[1] in _ORIGINAL_DATA_MODIFIER_TYPES
+        and modifier[1] not in _ONLY_DEFORM_MODIFIER_TYPES
+    )
+    return not (unpins_past_pinned or past_original_data)
+
+
+def _may_move_after(modifier, following):
+    unpins_before_pinned = following[2] and not modifier[2]
+    past_non_deform = (
+        modifier[1] in _ORIGINAL_DATA_MODIFIER_TYPES
+        and following[1] not in _ONLY_DEFORM_MODIFIER_TYPES
+    )
+    return not (unpins_before_pinned or past_non_deform)
+
+
+def _move_stack_modifier(stack, source, destination, allow_partial=False):
+    modifier = stack[source]
+    current = source
+    if source < destination:
+        while current < destination and _may_move_after(modifier, stack[current + 1]):
+            current += 1
+    else:
+        while current > destination and _may_move_before(modifier, stack[current - 1]):
+            current -= 1
+    if current != destination and not allow_partial:
+        return
+    if current != source:
+        stack.insert(current, stack.pop(source))
+
+
+def _set_stack_pin(stack, index, pinned):
+    name, modifier_type, _ = stack[index]
+    stack[index] = (name, modifier_type, pinned)
+    destination = index
+    if pinned:
+        while destination + 1 < len(stack) and not stack[destination + 1][2]:
+            destination += 1
+    else:
+        while destination > 0 and stack[destination - 1][2]:
+            destination -= 1
+    _move_stack_modifier(stack, index, destination, allow_partial=True)
+
+
+
+def _apply_stack_operation(state, operation):
+    stack = list(state)
+    kind = operation[0]
+    if kind == "create":
+        _, name, modifier_type = operation
+        stack.insert(_insertion_index(stack, modifier_type), (name, modifier_type, False))
+    elif kind == "pin":
+        _, name, pinned = operation
+        index = next(index for index, modifier in enumerate(stack) if modifier[0] == name)
+        _set_stack_pin(stack, index, pinned)
+    else:
+        _, source, destination = operation
+        _move_stack_modifier(stack, source, destination)
+    return tuple(stack)
+
+
+def _search_operations(state, target):
+    present = {modifier[0] for modifier in state}
+    operations = [("create", name, modifier_type)
+                  for name, modifier_type, _ in target if name not in present]
+    operations.extend(("pin", name, not pinned) for name, _, pinned in state)
+    count = len(state)
+    operations.extend(("move", source, destination)
+                      for source in range(count) for destination in range(count)
+                      if source != destination)
+    return operations
+
+
+def _matched_prefix(state, expected):
+    length = 0
+    for have, want in zip(state, expected):
+        if have != want:
+            break
+        length += 1
+    return length
+
+
+def _plan_modifier_stack(obj, target):
+    """Search Blender's finite modifier-operation state space for Potter's exact stack.
+
+    The deterministic depth-first search memoizes each ordered (name, type, pin) state and
+    simulates Blender's modifier insertion, pin-setter and move constraints. Once a sequence is
+    found, it is replayed against Blender and the final names, types and pins are verified by
+    ``_restore_modifier_stack``. Exhausting the finite state space proves the order unreachable.
     """
-    names = [modifier_item["name"] for modifier_item in modifier_items]
-    for name in names:
-        modifier = obj.modifiers[name]
-        if getattr(modifier, "use_pin_to_last", False):
-            modifier.use_pin_to_last = False
+    expected = tuple(target)
+    start = tuple(_modifier_stack_state(obj))
+    if start == expected:
+        return []
+    parents = {start: None}
+    best = _matched_prefix(start, expected)
+    pending = [start]
+    found = None
+    while pending:
+        state = pending.pop()
+        operations = _search_operations(state, target)
+        for operation in reversed(operations):
+            next_state = _apply_stack_operation(state, operation)
+            if next_state == state or next_state in parents:
+                continue
+            parents[next_state] = (state, operation)
+            best = max(best, _matched_prefix(next_state, expected))
+            if next_state == expected:
+                found = next_state
+                break
+            pending.append(next_state)
+        if found is not None:
+            break
+    if found is None:
+        raise ValueError(
+            "cannot reproduce modifier order on %s: the order is not reachable with Blender operations; "
+            "first target position %d (%s, pinned to last=%s) is never reached"
+            % (obj.name, best, expected[best][0], expected[best][2]))
+    result = []
+    while parents[found] is not None:
+        previous, operation = parents[found]
+        result.append(operation)
+        found = previous
+    result.reverse()
+    return result
 
-    def sort_to_potter_order():
-        for target_index, name in enumerate(names):
-            current_index = next(index for index, modifier in enumerate(obj.modifiers)
-                                 if modifier.name == name)
-            if current_index != target_index:
-                obj.modifiers.move(current_index, target_index)
 
-    sort_to_potter_order()
-    for modifier_item in modifier_items:
-        if modifier_item.get("params", {}).get("use_pin_to_last"):
-            obj.modifiers[modifier_item["name"]].use_pin_to_last = True
-    sort_to_potter_order()
+def _execute_stack_op(obj, operation):
+    kind = operation[0]
+    if kind == "move":
+        # Blender may refuse or silently skip a constrained move; final state verification is
+        # authoritative and never relies on the move call reporting success.
+        try:
+            obj.modifiers.move(operation[1], operation[2])
+        except RuntimeError:
+            pass
+        return
+    name = operation[1]
+    try:
+        if kind == "create":
+            _create_modifier(obj, name, operation[2])
+        else:
+            obj.modifiers[name].use_pin_to_last = operation[2]
+    except Exception as error:
+        raise RuntimeError("cannot reconstruct modifier %s" % name) from error
+
+
+def _restore_modifier_stack(obj, modifier_items):
+    """Make Blender's stack equal Potter's order and pin flags, or raise a precise ValueError.
+
+    Modifiers whose names are absent from Potter's target and same-name modifiers with the wrong
+    Blender type are removed; Blender cannot change a modifier's type in place. ``modifiers.move``
+    is not guaranteed to place exactly, so the replayed stack is verified by name, type and pin.
+    """
+    target = [
+        (item["name"], blender_modifier_type(item["type"]),
+         bool(item.get("params", {}).get("use_pin_to_last", False)))
+        for item in modifier_items
+    ]
+    target_types = {name: modifier_type for name, modifier_type, _ in target}
+    for modifier in list(obj.modifiers):
+        if target_types.get(modifier.name) != modifier.type:
+            obj.modifiers.remove(modifier)
+    for operation in _plan_modifier_stack(obj, target):
+        _execute_stack_op(obj, operation)
+    actual = tuple(_modifier_stack_state(obj))
+    if actual != tuple(target):
+        raise ValueError(_stack_mismatch_message(obj.name, target, actual))
+
+
 
 
 def _ensure_dynamic_paint_role(modifier, obj, role):
@@ -5281,17 +5480,12 @@ def export_doc(doc, target, pack, scene_hash, context):
         source_object = compatibility_block(doc, "objects", "Object", node_id)
         source_modifiers = {modifier.get("name"): modifier
                             for modifier in source_object.get("modifiers", [])}
-        for modifier_item in item.get("modifiers", []):
+        modifier_items = item.get("modifiers", [])
+        _restore_modifier_stack(obj, modifier_items)
+        for modifier_item in modifier_items:
             try:
                 params = modifier_item.get("params", {})
-                modifier_type = blender_modifier_type(modifier_item["type"])
-                modifier = obj.modifiers.get(modifier_item["name"])
-                if modifier is not None and modifier.type != modifier_type:
-                    obj.modifiers.remove(modifier)
-                    modifier = None
-                if modifier is None:
-                    modifier = _create_modifier(
-                        obj, modifier_item["name"], modifier_type)
+                modifier = obj.modifiers[modifier_item["name"]]
                 enabled = modifier_item.get("enabled", True)
                 modifier.show_viewport = bool(enabled and modifier_item.get("show_viewport", True))
                 modifier.show_render = bool(enabled and modifier_item.get("show_render", True))
@@ -5333,13 +5527,6 @@ def export_doc(doc, target, pack, scene_hash, context):
                 raise RuntimeError(
                     "cannot reconstruct modifier %s (%s)" % (modifier_item.get("name"), modifier_item.get("type"))
                 ) from error
-        desired_modifier_names = {
-            modifier.get("name") for modifier in item.get("modifiers", [])
-        }
-        for modifier in list(obj.modifiers):
-            if modifier.name not in desired_modifier_names:
-                obj.modifiers.remove(modifier)
-        _restore_modifier_stack(obj, item.get("modifiers", []))
     for node_id, item in doc.get("nodes", {}).items():
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]

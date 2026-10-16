@@ -298,6 +298,7 @@ pub fn render_sequence(
             "implementation": super::preview::ENGINE,
             "profile": doc.profile,
             "format": format,
+            "visibility": super::preview::visibility_name(context.purpose),
             "camera": camera_id,
             "resolution": { "width": width, "height": height },
             "resolution_percentage": scene.render.resolution_percentage,

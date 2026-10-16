@@ -541,6 +541,14 @@ fn linear_to_byte(value: f64) -> u8 {
     (srgb * 255.0).round() as u8
 }
 
+/// Manifest `visibility` naming the modifier stack a render or preview evaluated.
+pub(crate) fn visibility_name(purpose: EvaluationPurpose) -> &'static str {
+    match purpose {
+        EvaluationPurpose::Preview => "viewport",
+        EvaluationPurpose::Render => "render",
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "manifest construction includes every value in the render-key contract"
@@ -614,7 +622,7 @@ fn manifest_value(
         "seed": 0,
         "mode": mode_name,
         "background": background,
-        "visibility": if snapshot.purpose == EvaluationPurpose::Render { "render" } else { "viewport" },
+        "visibility": visibility_name(snapshot.purpose),
         "transparent": false,
         "ambient": if ambient { json!({ "color": [0.08, 0.08, 0.08], "source": "default_no_lights_or_world" }) } else { Value::Null },
         "engine": "cpu",

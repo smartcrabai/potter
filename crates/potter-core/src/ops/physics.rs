@@ -958,17 +958,21 @@ fn ensure_physics_stack_modifier(
     let mut params = Map::new();
     let settings_id = modifier_id.to_string();
     params.insert("settings_id".to_owned(), Value::String(settings_id.clone()));
-    node.modifiers.push(Modifier {
-        id: modifier_id,
-        modifier_type: modifier_type.to_owned(),
-        name: format!("{system} Physics"),
-        enabled: true,
-        show_viewport: true,
-        show_render: true,
-        params,
-        binding_data: None,
-        runtime: crate::model::ModifierRuntime::default(),
-    });
+    let index = super::modifier::insertion_index(&node.modifiers, modifier_type);
+    node.modifiers.insert(
+        index,
+        Modifier {
+            id: modifier_id,
+            modifier_type: modifier_type.to_owned(),
+            name: format!("{system} Physics"),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params,
+            binding_data: None,
+            runtime: crate::model::ModifierRuntime::default(),
+        },
+    );
     if system == "particle_emitter" {
         node.properties.insert(
             "physics_particle_emitter_modifier_id".to_owned(),

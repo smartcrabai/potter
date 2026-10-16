@@ -700,6 +700,44 @@
     }
   },
   "checks": {
+    "I_array_then_cloth_operator_matches_rna": true,
+    "I_array_then_cloth_stack": true,
+    "I_array_then_hook_operator_matches_rna": true,
+    "I_array_then_hook_stack": true,
+    "I_array_then_multires_operator_matches_rna": true,
+    "I_array_then_multires_stack": true,
+    "I_array_then_soft_body_operator_matches_rna": true,
+    "I_array_then_soft_body_stack": true,
+    "I_pinned_array_then_cloth_operator_matches_rna": true,
+    "I_pinned_array_then_cloth_stack": true,
+    "I_pinned_array_then_collision_operator_matches_rna": true,
+    "I_pinned_array_then_collision_stack": true,
+    "I_pinned_array_then_dynamic_paint_operator_matches_rna": true,
+    "I_pinned_array_then_dynamic_paint_stack": true,
+    "I_pinned_array_then_fluid_operator_matches_rna": true,
+    "I_pinned_array_then_fluid_stack": true,
+    "I_pinned_array_then_hook_operator_matches_rna": true,
+    "I_pinned_array_then_hook_stack": true,
+    "I_pinned_array_then_multires_operator_matches_rna": true,
+    "I_pinned_array_then_multires_stack": true,
+    "I_pinned_array_then_particle_system_operator_matches_rna": true,
+    "I_pinned_array_then_particle_system_stack": true,
+    "I_pinned_array_then_soft_body_operator_matches_rna": true,
+    "I_pinned_array_then_soft_body_stack": true,
+    "I_taper_array_then_hook_operator_matches_rna": true,
+    "I_taper_array_then_hook_stack": true,
+    "I_taper_pinned_smooth_then_hook_operator_matches_rna": true,
+    "I_taper_pinned_smooth_then_hook_stack": true,
+    "I_taper_pinned_smooth_then_multires_operator_matches_rna": true,
+    "I_taper_pinned_smooth_then_multires_stack": true,
+    "I_taper_pinned_smooth_then_soft_body_operator_matches_rna": true,
+    "I_taper_pinned_smooth_then_soft_body_stack": true,
+    "I_taper_smooth_then_hook_operator_matches_rna": true,
+    "I_taper_smooth_then_hook_stack": true,
+    "I_taper_smooth_then_multires_operator_matches_rna": true,
+    "I_taper_smooth_then_multires_stack": true,
+    "I_taper_smooth_then_soft_body_operator_matches_rna": true,
+    "I_taper_smooth_then_soft_body_stack": true,
     "S_create_before_pinned_stack": true,
     "S_create_pinned_stack": true,
     "S_delete_middle_stack": true,
@@ -716,6 +754,817 @@
     "taper_array_order_changes_geometry": true
   },
   "generator": "tests/fixtures/pr18l_stack/generate.py",
+  "insertion_cases": {
+    "I_array_then_cloth": {
+      "description": "array then cloth: cloth is not original-data, so it appends",
+      "expected_pinned": [
+        false,
+        false
+      ],
+      "expected_stack": [
+        "array",
+        "cloth"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false
+      ],
+      "stack": [
+        "array",
+        "cloth"
+      ],
+      "stack_types": [
+        "ARRAY",
+        "CLOTH"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "cloth",
+          "name": "cloth"
+        }
+      ]
+    },
+    "I_array_then_hook": {
+      "description": "array then hook: hook goes before the non-deform array",
+      "expected_pinned": [
+        false,
+        false
+      ],
+      "expected_stack": [
+        "hook",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false
+      ],
+      "stack": [
+        "hook",
+        "array"
+      ],
+      "stack_types": [
+        "HOOK",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_array_then_multires": {
+      "description": "array then multires: original-data type goes before the non-deform array",
+      "expected_pinned": [
+        false,
+        false
+      ],
+      "expected_stack": [
+        "multires",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false
+      ],
+      "stack": [
+        "multires",
+        "array"
+      ],
+      "stack_types": [
+        "MULTIRES",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "multires",
+          "name": "multires"
+        }
+      ]
+    },
+    "I_array_then_soft_body": {
+      "description": "array then soft body: original-data type goes before the non-deform array",
+      "expected_pinned": [
+        false,
+        false
+      ],
+      "expected_stack": [
+        "soft",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false
+      ],
+      "stack": [
+        "soft",
+        "array"
+      ],
+      "stack_types": [
+        "SOFT_BODY",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "soft_body",
+          "name": "soft"
+        }
+      ]
+    },
+    "I_pinned_array_then_cloth": {
+      "description": "pinned array then cloth: cloth appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "cloth",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "cloth",
+        "array"
+      ],
+      "stack_types": [
+        "CLOTH",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "cloth",
+          "name": "cloth"
+        }
+      ]
+    },
+    "I_pinned_array_then_collision": {
+      "description": "pinned array then collision: appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "collision",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "collision",
+        "array"
+      ],
+      "stack_types": [
+        "COLLISION",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "collision",
+          "name": "collision"
+        }
+      ]
+    },
+    "I_pinned_array_then_dynamic_paint": {
+      "description": "pinned array then dynamic paint: appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "paint",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "paint",
+        "array"
+      ],
+      "stack_types": [
+        "DYNAMIC_PAINT",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "dynamic_paint",
+          "name": "paint"
+        }
+      ]
+    },
+    "I_pinned_array_then_fluid": {
+      "description": "pinned array then fluid: appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "fluid",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "fluid",
+        "array"
+      ],
+      "stack_types": [
+        "FLUID",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "fluid",
+          "name": "fluid"
+        }
+      ]
+    },
+    "I_pinned_array_then_hook": {
+      "description": "pinned array then hook: a valid pinned stack still accepts hook at the front",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "hook",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "hook",
+        "array"
+      ],
+      "stack_types": [
+        "HOOK",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_pinned_array_then_multires": {
+      "description": "pinned array then multires: original-data type goes before the pinned array",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "multires",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "multires",
+        "array"
+      ],
+      "stack_types": [
+        "MULTIRES",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "multires",
+          "name": "multires"
+        }
+      ]
+    },
+    "I_pinned_array_then_particle_system": {
+      "description": "pinned array then particle system: appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "particles",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "particles",
+        "array"
+      ],
+      "stack_types": [
+        "PARTICLE_SYSTEM",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "particle_system",
+          "name": "particles"
+        }
+      ]
+    },
+    "I_pinned_array_then_soft_body": {
+      "description": "pinned array then soft body: original-data type goes before the pinned array",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "soft",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "soft",
+        "array"
+      ],
+      "stack_types": [
+        "SOFT_BODY",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "soft_body",
+          "name": "soft"
+        }
+      ]
+    },
+    "I_taper_array_then_hook": {
+      "description": "taper then array then hook: hook goes after the deform taper, before the array",
+      "expected_pinned": [
+        false,
+        false,
+        false
+      ],
+      "expected_stack": [
+        "taper",
+        "hook",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        false
+      ],
+      "stack": [
+        "taper",
+        "hook",
+        "array"
+      ],
+      "stack_types": [
+        "SIMPLE_DEFORM",
+        "HOOK",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_taper_pinned_smooth_then_hook": {
+      "description": "taper then pinned smooth then hook: hook goes in front of the pinned block",
+      "expected_pinned": [
+        false,
+        false,
+        true
+      ],
+      "expected_stack": [
+        "hook",
+        "taper",
+        "third"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        true
+      ],
+      "stack": [
+        "hook",
+        "taper",
+        "third"
+      ],
+      "stack_types": [
+        "HOOK",
+        "SIMPLE_DEFORM",
+        "SMOOTH"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "pin",
+          "name": "third",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_taper_pinned_smooth_then_multires": {
+      "description": "taper then pinned smooth then multires: multires goes in front of the stack",
+      "expected_pinned": [
+        false,
+        false,
+        true
+      ],
+      "expected_stack": [
+        "multires",
+        "taper",
+        "third"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        true
+      ],
+      "stack": [
+        "multires",
+        "taper",
+        "third"
+      ],
+      "stack_types": [
+        "MULTIRES",
+        "SIMPLE_DEFORM",
+        "SMOOTH"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "pin",
+          "name": "third",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "multires",
+          "name": "multires"
+        }
+      ]
+    },
+    "I_taper_pinned_smooth_then_soft_body": {
+      "description": "taper then pinned smooth then soft body: soft body goes in front of the stack",
+      "expected_pinned": [
+        false,
+        false,
+        true
+      ],
+      "expected_stack": [
+        "soft",
+        "taper",
+        "third"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        true
+      ],
+      "stack": [
+        "soft",
+        "taper",
+        "third"
+      ],
+      "stack_types": [
+        "SOFT_BODY",
+        "SIMPLE_DEFORM",
+        "SMOOTH"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "pin",
+          "name": "third",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "soft_body",
+          "name": "soft"
+        }
+      ]
+    },
+    "I_taper_smooth_then_hook": {
+      "description": "taper then smooth then hook: all deform, hook appends",
+      "expected_pinned": [
+        false,
+        false,
+        false
+      ],
+      "expected_stack": [
+        "taper",
+        "third",
+        "hook"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        false
+      ],
+      "stack": [
+        "taper",
+        "third",
+        "hook"
+      ],
+      "stack_types": [
+        "SIMPLE_DEFORM",
+        "SMOOTH",
+        "HOOK"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_taper_smooth_then_multires": {
+      "description": "taper then smooth then multires: all deform, multires appends",
+      "expected_pinned": [
+        false,
+        false,
+        false
+      ],
+      "expected_stack": [
+        "taper",
+        "third",
+        "multires"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        false
+      ],
+      "stack": [
+        "taper",
+        "third",
+        "multires"
+      ],
+      "stack_types": [
+        "SIMPLE_DEFORM",
+        "SMOOTH",
+        "MULTIRES"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "create",
+          "kind": "multires",
+          "name": "multires"
+        }
+      ]
+    },
+    "I_taper_smooth_then_soft_body": {
+      "description": "taper then smooth then soft body: all deform, soft body appends",
+      "expected_pinned": [
+        false,
+        false,
+        false
+      ],
+      "expected_stack": [
+        "taper",
+        "third",
+        "soft"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        false
+      ],
+      "stack": [
+        "taper",
+        "third",
+        "soft"
+      ],
+      "stack_types": [
+        "SIMPLE_DEFORM",
+        "SMOOTH",
+        "SOFT_BODY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "create",
+          "kind": "soft_body",
+          "name": "soft"
+        }
+      ]
+    }
+  },
   "kinds": {
     "array": {
       "blender_type": "ARRAY",
@@ -730,12 +1579,78 @@
       },
       "potter_type": "array"
     },
+    "cloth": {
+      "blender_type": "CLOTH",
+      "params": {},
+      "potter_settings": {
+        "tension_stiffness": 12.0
+      },
+      "potter_type": "cloth"
+    },
+    "collision": {
+      "blender_type": "COLLISION",
+      "params": {},
+      "potter_settings": {
+        "thickness": 0.01
+      },
+      "potter_type": "collision"
+    },
+    "dynamic_paint": {
+      "blender_type": "DYNAMIC_PAINT",
+      "params": {},
+      "potter_settings": {
+        "role": "canvas"
+      },
+      "potter_type": "dynamic_paint"
+    },
+    "fluid": {
+      "blender_type": "FLUID",
+      "params": {},
+      "potter_settings": {
+        "resolution": 4,
+        "type": "liquid"
+      },
+      "potter_type": "fluid"
+    },
+    "hook": {
+      "blender_type": "HOOK",
+      "params": {
+        "object": "hook_target"
+      },
+      "potter_type": "hook"
+    },
+    "multires": {
+      "blender_type": "MULTIRES",
+      "params": {},
+      "potter_settings": {
+        "levels": 1,
+        "render_levels": 1
+      },
+      "potter_type": "multires"
+    },
+    "particle_system": {
+      "blender_type": "PARTICLE_SYSTEM",
+      "params": {},
+      "potter_settings": {
+        "lifetime": 12.0,
+        "rate": 1.0
+      },
+      "potter_type": "particle_system"
+    },
     "smooth": {
       "blender_type": "SMOOTH",
       "params": {
         "factor": 0.5
       },
       "potter_type": "smooth"
+    },
+    "soft_body": {
+      "blender_type": "SOFT_BODY",
+      "params": {},
+      "potter_settings": {
+        "goal_strength": 0.7
+      },
+      "potter_type": "soft_body"
     },
     "taper": {
       "blender_type": "SIMPLE_DEFORM",
@@ -757,7 +1672,11 @@
     "Blender's stack list is evaluation order: index 0 is evaluated first.",
     "modifier_apply does not refuse a viewport-disabled (or render-disabled) modifier in background mode; it applies it. The refusal message 'Modifier is disabled' was not printed.",
     "Move refusal is observed through the modifier_move_to_index operator result (CANCELLED); the stack is unchanged.",
-    "Only modifiers.new() was probed for insertion order; the RequiresOriginalData/Hook insertion rule of BKE_modifiers_add_at_end_if_possible is not exercised by any case and is not encoded.",
+    "insertion_cases are stack-order only (no geometry). Each case is built through modifiers.new and through object.modifier_add; operator_matches_rna records that both paths produce the same stack.",
+    "Observed Blender placement: [U]+SOFT_BODY -> [SB,U]; [S,D]+MULTIRES -> [S,D,M]; [S,D(pinned)]+MULTIRES -> [M,S,D]; [S,U]+HOOK -> [S,H,U]; [S,D]+HOOK -> [S,D,H]; [U(pinned)]+HOOK -> [H,U(pinned)].",
+    "Observed append placement before the trailing pinned block: CLOTH, COLLISION, DYNAMIC_PAINT, FLUID and PARTICLE_SYSTEM ([U]+CLOTH -> [U,C]; [U(pinned)]+CLOTH -> [C,U(pinned)]). CLOTH therefore does not take the original-data placement.",
+    "object.multires_subdivide adds a level to an existing Multires and returned CANCELLED on objects without one (empty, ARRAY, pinned ARRAY, deform-only stacks), so Multires creation is probed with object.modifier_add(type='MULTIRES').",
+    "potter_settings in KINDS are Potter-only operation settings (physics settings, multires levels). Blender stack order does not depend on them, and they are not applied to Blender modifiers.",
     "Pin semantics use the use_pin_to_last RNA setter (rna_Modifier_use_pin_to_last_set), not the move operator."
   ],
   "oracle": "tests/fixtures/pr18l_stack/blender_oracle.py",

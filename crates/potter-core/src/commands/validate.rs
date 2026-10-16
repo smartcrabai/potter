@@ -2,9 +2,9 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ValidateArgs,
-    commands::util::exchange_format_name,
+    commands::{export::export_purpose, util::exchange_format_name},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    eval::{EvaluationContext, Snapshot},
     model::AvatarVersion,
     response::SceneInfo,
     store::Project,
@@ -33,7 +33,7 @@ pub fn run(args: ValidateArgs) -> Result<(Option<SceneInfo>, Value)> {
             append_vrm_preflight_error(&mut report, format, &error)?;
         } else {
             let context = EvaluationContext {
-                purpose: EvaluationPurpose::Render,
+                purpose: export_purpose(format),
                 ..EvaluationContext::default()
             };
             match Snapshot::evaluate_with_cache(project.doc(), &context, Some(project.path())) {

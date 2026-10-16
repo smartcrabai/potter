@@ -33,7 +33,8 @@ pub mod rig;
 const EVALUATION_ENGINE: &str = "potter-eval-4";
 
 /// Which stack an evaluation serves, following Blender's depsgraph modes: viewport previews use
-/// `show_viewport`, saved renders and exports use `show_render`.
+/// `show_viewport`, and saved renders use `show_render`. Each export format chooses its purpose
+/// explicitly, following that format's Blender default; the purpose is not implied by "export".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvaluationPurpose {
@@ -172,21 +173,33 @@ impl Snapshot {
         context: &EvaluationContext,
         cache_directory: Option<&Path>,
     ) -> Result<(Self, BTreeMap<Id, PotError>)> {
-        let mut evaluation_doc = None;
+        doc.validate()?;
+        crate::library::validate_linked_assets(doc, cache_directory)?;
+        let scene_hash = source_scene_hash(doc)?;
+        let mut suppressed = BTreeSet::new();
+        let mesh_dependencies = object_mesh_dependencies(
+            doc,
+            ModifierGate {
+                purpose: context.purpose,
+                suppressed: &suppressed,
+            },
+        )?;
         let mut node_errors = BTreeMap::new();
         loop {
-            let evaluation = if let Some(evaluation_doc) = &evaluation_doc {
-                Self::evaluate_with_cache(evaluation_doc, context, cache_directory)
-            } else {
-                Self::evaluate_with_cache(doc, context, cache_directory)
-            };
+            let evaluation = Self::evaluate_gated(
+                doc,
+                &scene_hash,
+                context,
+                cache_directory,
+                None,
+                &suppressed,
+                &mesh_dependencies,
+            );
             match evaluation {
                 Ok(snapshot) if node_errors.is_empty() => {
                     return Ok((snapshot, node_errors));
                 }
                 Ok(mut snapshot) => {
-                    let scene_value = serde_json::to_value(doc).map_err(PotError::internal_json)?;
-                    let scene_hash = hash::sha256(&hash::canonicalize(&scene_value)?);
                     snapshot.scene_hash.clone_from(&scene_hash);
                     let evaluation_key = json!({
                         "engine": EVALUATION_ENGINE,
@@ -207,32 +220,26 @@ impl Snapshot {
                     return Ok((snapshot, node_errors));
                 }
                 Err(error) if error.code == ErrorCode::UnsupportedFeature => {
-                    let source_doc = evaluation_doc.as_ref().unwrap_or(doc);
-                    let Some(node_id) = unsupported_feature_owner(source_doc, &error) else {
+                    let Some(node_id) = unsupported_feature_owner(doc, &error) else {
                         return Err(error);
                     };
                     if node_errors.contains_key(&node_id) {
                         return Err(error);
                     }
-                    let evaluation_doc = evaluation_doc.get_or_insert_with(|| doc.clone());
+                    let owner = doc.nodes.get(&node_id).ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "unsupported feature owner disappeared during evaluation",
+                        )
+                    })?;
+                    if owner
+                        .modifiers
+                        .iter()
+                        .all(|modifier| !modifier.is_active(context.purpose))
                     {
-                        let node = evaluation_doc.nodes.get_mut(&node_id).ok_or_else(|| {
-                            PotError::new(
-                                ErrorCode::InternalError,
-                                "unsupported feature owner disappeared during evaluation",
-                            )
-                        })?;
-                        if node
-                            .modifiers
-                            .iter()
-                            .all(|modifier| !modifier.is_active(context.purpose))
-                        {
-                            return Err(error);
-                        }
-                        for modifier in &mut node.modifiers {
-                            modifier.enabled = false;
-                        }
+                        return Err(error);
                     }
+                    suppressed.insert(node_id.clone());
                     let mut details = error.details.clone();
                     if let Some(details) = details.as_object_mut() {
                         details
@@ -243,23 +250,21 @@ impl Snapshot {
                         node_id.clone(),
                         PotError::with_details(error.code, error.message.clone(), details),
                     );
-                    let dependencies =
-                        object_mesh_dependencies(&purpose_document(doc, context.purpose))?;
+                    let dependencies = &mesh_dependencies;
                     let mut affected = vec![node_id];
                     while let Some(source_id) = affected.pop() {
-                        for (dependent_id, targets) in &dependencies {
+                        for (dependent_id, targets) in dependencies
+                            .modifiers
+                            .iter()
+                            .chain(&dependencies.other)
+                        {
                             if dependent_id == &source_id
                                 || !targets.contains(&source_id)
                                 || node_errors.contains_key(dependent_id)
                             {
                                 continue;
                             }
-                            let Some(dependent) = evaluation_doc.nodes.get_mut(dependent_id) else {
-                                continue;
-                            };
-                            for modifier in &mut dependent.modifiers {
-                                modifier.enabled = false;
-                            }
+                            suppressed.insert(dependent_id.clone());
                             let mut details = error.details.clone();
                             if let Some(details) = details.as_object_mut() {
                                 details.insert("node_id".to_owned(), json!(dependent_id));
@@ -293,8 +298,40 @@ impl Snapshot {
     ) -> Result<Self> {
         source.validate()?;
         crate::library::validate_linked_assets(source, cache_directory)?;
-        let purpose_doc = purpose_document(source, context.purpose);
-        let doc = &*purpose_doc;
+        let scene_hash = source_scene_hash(source)?;
+        let mesh_dependencies = object_mesh_dependencies(
+            source,
+            ModifierGate {
+                purpose: context.purpose,
+                suppressed: &suppressed,
+            },
+        )?;
+        Self::evaluate_gated(
+            source,
+            &scene_hash,
+            context,
+            cache_directory,
+            selected_nodes,
+            &suppressed,
+            &mesh_dependencies,
+        )
+    }
+
+    /// Evaluates `doc` with the `suppressed` nodes' modifiers inactive. `scene_hash` addresses
+    /// the authored source, not the document itself.
+    fn evaluate_gated(
+        doc: &SceneDoc,
+        scene_hash: &str,
+        context: &EvaluationContext,
+        cache_directory: Option<&Path>,
+        selected_nodes: Option<&BTreeSet<Id>>,
+        suppressed: &BTreeSet<Id>,
+        mesh_dependencies: &BTreeMap<Id, BTreeSet<Id>>,
+    ) -> Result<Self> {
+        let gate = ModifierGate {
+            purpose: context.purpose,
+            suppressed,
+        };
         let scene_id = context
             .scene_id
             .clone()
@@ -326,11 +363,10 @@ impl Snapshot {
                 "frame must be finite",
             ));
         }
-        let mesh_evaluation_order = object_mesh_evaluation_order(doc, selected_nodes)?;
+        let mesh_evaluation_order =
+            object_mesh_evaluation_order(doc, selected_nodes, gate, mesh_dependencies)?;
         let evaluated_node_ids: BTreeSet<Id> = mesh_evaluation_order.iter().cloned().collect();
 
-        let scene_value = serde_json::to_value(source).map_err(PotError::internal_json)?;
-        let scene_hash = hash::sha256(&hash::canonicalize(&scene_value)?);
         let driver_values = rig::evaluate_drivers(doc, frame)?;
         let mut matrices = rig::evaluate_world_matrices_with_resources(
             doc,
@@ -357,7 +393,7 @@ impl Snapshot {
                 continue;
             };
             for modifier in owner.modifiers.iter().filter(|modifier| {
-                modifier.enabled
+                gate.is_active(owner_id, modifier)
                     && modifier.modifier_type == "array"
                     && modifier
                         .params
@@ -402,7 +438,8 @@ impl Snapshot {
                 curve_path_lengths.insert(curve_id, length);
             }
         }
-        let simulation = crate::sim::evaluate(doc, &scene_id, frame, &matrices, cache_directory)?;
+        let simulation =
+            crate::sim::evaluate(doc, &scene_id, frame, &matrices, cache_directory, scene_hash, gate)?;
         let mut simulated_velocities = BTreeMap::new();
         let mut deformed_vertices = BTreeMap::new();
         let mut fluid_surfaces = BTreeMap::new();
@@ -616,7 +653,7 @@ impl Snapshot {
                     attach_vertex_group_weights(&mut rigged_source, data_block);
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         rigged_source,
-                        &node.modifiers,
+                        &gate.stack(id, &node.modifiers),
                         &doc.node_groups,
                         frame,
                         matrix,
@@ -702,7 +739,8 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 id,
-                                doc,
+                                scene_hash,
+                                gate,
                                 &scene_id,
                                 frame,
                                 &matrices,
@@ -714,6 +752,7 @@ impl Snapshot {
                                 modifier,
                                 id,
                                 doc,
+                                gate,
                                 frame,
                                 f64::from(scene.fps) / scene.fps_base,
                                 &matrices,
@@ -724,6 +763,7 @@ impl Snapshot {
                                 modifier,
                                 id,
                                 doc,
+                                gate,
                                 frame,
                                 &matrices,
                                 &simulated_particles,
@@ -886,7 +926,7 @@ impl Snapshot {
                     attach_vertex_group_weights(&mut source_mesh, data_block);
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         source_mesh,
-                        &node.modifiers,
+                        &gate.stack(id, &node.modifiers),
                         &doc.node_groups,
                         frame,
                         matrix,
@@ -972,7 +1012,8 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 id,
-                                doc,
+                                scene_hash,
+                                gate,
                                 &scene_id,
                                 frame,
                                 &matrices,
@@ -984,6 +1025,7 @@ impl Snapshot {
                                 modifier,
                                 id,
                                 doc,
+                                gate,
                                 frame,
                                 f64::from(scene.fps) / scene.fps_base,
                                 &matrices,
@@ -994,6 +1036,7 @@ impl Snapshot {
                                 modifier,
                                 id,
                                 doc,
+                                gate,
                                 frame,
                                 &matrices,
                                 &simulated_particles,
@@ -1027,7 +1070,7 @@ impl Snapshot {
                     })?;
                     let mut generated = None;
                     for modifier in node.modifiers.iter().filter(|modifier| {
-                        modifier.enabled && modifier.modifier_type == "mesh_to_volume"
+                        gate.is_active(id, modifier) && modifier.modifier_type == "mesh_to_volume"
                     }) {
                         let object_text = modifier
                             .params
@@ -1147,7 +1190,7 @@ impl Snapshot {
                     let base_volume = volume_data.get(data_id).unwrap_or(volume);
                     let mut displaced = None;
                     for modifier in node.modifiers.iter().filter(|modifier| {
-                        modifier.enabled && modifier.modifier_type == "volume_displace"
+                        gate.is_active(id, modifier) && modifier.modifier_type == "volume_displace"
                     }) {
                         let current = displaced.take().unwrap_or_else(|| base_volume.clone());
                         displaced = Some(apply_volume_displace_modifier(
@@ -1262,6 +1305,7 @@ impl Snapshot {
         }
         render_simulated_particles(
             doc,
+            gate,
             &simulated_particles,
             &matrices,
             &mut meshes,
@@ -1302,7 +1346,7 @@ impl Snapshot {
             frame,
             purpose: context.purpose,
             revision: doc.revision,
-            scene_hash,
+            scene_hash: scene_hash.to_owned(),
             evaluation_hash,
             nodes,
             instance_paths,
@@ -1321,24 +1365,58 @@ impl Snapshot {
     }
 }
 
-/// Document whose `enabled` flags select `purpose`'s stack. Borrows the source unless a modifier
-/// is hidden for this purpose, so scenes without hidden modifiers are not copied.
-fn purpose_document(doc: &SceneDoc, purpose: EvaluationPurpose) -> Cow<'_, SceneDoc> {
-    let hidden = doc.nodes.values().any(|node| {
-        node.modifiers
-            .iter()
-            .any(|modifier| modifier.enabled && !modifier.is_active(purpose))
-    });
-    if !hidden {
-        return Cow::Borrowed(doc);
+/// Content address of the authored scene. Purpose resolution never changes it.
+fn source_scene_hash(doc: &SceneDoc) -> Result<String> {
+    let scene_value = serde_json::to_value(doc).map_err(PotError::internal_json)?;
+    hash::sha256(&hash::canonicalize(&scene_value)?)
+}
+
+/// Modifier state for one evaluation. `purpose` selects the viewport or render stack, and
+/// `suppressed` nodes lost their modifiers to an unsupported-feature error. Every consumer asks
+/// this type whether a modifier is active, so Preview and Render cannot diverge.
+#[derive(Clone, Copy)]
+pub(crate) struct ModifierGate<'a> {
+    pub(crate) purpose: EvaluationPurpose,
+    pub(crate) suppressed: &'a BTreeSet<Id>,
+}
+
+impl ModifierGate<'_> {
+    /// Whether `modifier` on `node_id` takes part in this evaluation.
+    pub(crate) fn is_active(&self, node_id: &Id, modifier: &Modifier) -> bool {
+        !self.suppressed.contains(node_id) && modifier.is_active(self.purpose)
     }
-    let mut effective = doc.clone();
-    for node in effective.nodes.values_mut() {
-        for modifier in &mut node.modifiers {
-            modifier.enabled = modifier.is_active(purpose);
+
+    /// `node_id`'s modifier list with this evaluation's `enabled` flags and render levels applied.
+    /// Borrowed when the stored state already matches; otherwise only this node's list is copied.
+    pub(crate) fn stack<'m>(
+        &self,
+        node_id: &Id,
+        modifiers: &'m [Modifier],
+    ) -> Cow<'m, [Modifier]> {
+        let matches = |modifier: &Modifier| {
+            modifier.enabled == self.is_active(node_id, modifier)
+                && modifier.runtime.use_render_levels == uses_render_levels(modifier, self.purpose)
+        };
+        if modifiers.iter().all(matches) {
+            return Cow::Borrowed(modifiers);
         }
+        Cow::Owned(
+            modifiers
+                .iter()
+                .map(|modifier| {
+                    let mut applied = modifier.clone();
+                    applied.enabled = self.is_active(node_id, modifier);
+                    applied.runtime.use_render_levels = uses_render_levels(modifier, self.purpose);
+                    applied
+                })
+                .collect(),
+        )
     }
-    Cow::Owned(effective)
+}
+
+fn uses_render_levels(modifier: &Modifier, purpose: EvaluationPurpose) -> bool {
+    purpose == EvaluationPurpose::Render
+        && matches!(modifier.modifier_type.as_str(), "subdivision" | "multires")
 }
 
 /// Read and verify a cache resource from the scene's asset registry.
@@ -1586,15 +1664,32 @@ fn add_mesh_operand_dependency(
     }
 }
 
-fn object_mesh_dependencies(doc: &SceneDoc) -> Result<BTreeMap<Id, BTreeSet<Id>>> {
-    let mut dependencies = doc
-        .nodes
-        .keys()
-        .cloned()
-        .map(|id| (id, BTreeSet::new()))
-        .collect::<BTreeMap<_, _>>();
+struct ObjectMeshDependencies {
+    modifiers: BTreeMap<Id, BTreeSet<Id>>,
+    other: BTreeMap<Id, BTreeSet<Id>>,
+}
+
+fn object_mesh_dependencies(
+    doc: &SceneDoc,
+    gate: ModifierGate<'_>,
+) -> Result<ObjectMeshDependencies> {
+    let node_dependencies = || {
+        doc.nodes
+            .keys()
+            .cloned()
+            .map(|id| (id, BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let mut dependencies = ObjectMeshDependencies {
+        modifiers: node_dependencies(),
+        other: node_dependencies(),
+    };
     for (owner_id, node) in &doc.nodes {
-        for modifier in node.modifiers.iter().filter(|modifier| modifier.enabled) {
+        for modifier in node
+            .modifiers
+            .iter()
+            .filter(|modifier| gate.is_active(owner_id, modifier))
+        {
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
                 "boolean" | "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => {
                     &["object"]
@@ -1616,7 +1711,7 @@ fn object_mesh_dependencies(doc: &SceneDoc) -> Result<BTreeMap<Id, BTreeSet<Id>>
             };
             for parameter in parameters {
                 add_mesh_operand_dependency(
-                    &mut dependencies,
+                    &mut dependencies.modifiers,
                     owner_id,
                     modifier.params.get(*parameter),
                 );
@@ -1637,8 +1732,9 @@ fn object_mesh_dependencies(doc: &SceneDoc) -> Result<BTreeMap<Id, BTreeSet<Id>>
                     &mut object_ids,
                 )?;
                 for target_id in object_ids {
-                    if dependencies.contains_key(&target_id)
-                        && let Some(owner_dependencies) = dependencies.get_mut(owner_id)
+                    if dependencies.modifiers.contains_key(&target_id)
+                        && let Some(owner_dependencies) =
+                            dependencies.modifiers.get_mut(owner_id)
                     {
                         owner_dependencies.insert(target_id);
                     }
@@ -1654,8 +1750,8 @@ fn object_mesh_dependencies(doc: &SceneDoc) -> Result<BTreeMap<Id, BTreeSet<Id>>
                 &mut object_ids,
             )?;
             for target_id in object_ids {
-                if dependencies.contains_key(&target_id)
-                    && let Some(owner_dependencies) = dependencies.get_mut(owner_id)
+                if dependencies.other.contains_key(&target_id)
+                    && let Some(owner_dependencies) = dependencies.other.get_mut(owner_id)
                 {
                     owner_dependencies.insert(target_id);
                 }
@@ -1670,8 +1766,8 @@ fn object_mesh_dependencies(doc: &SceneDoc) -> Result<BTreeMap<Id, BTreeSet<Id>>
                 )
         }) {
             if let Some(target_id) = &constraint.target
-                && dependencies.contains_key(target_id)
-                && let Some(owner_dependencies) = dependencies.get_mut(owner_id)
+                && dependencies.other.contains_key(target_id)
+                && let Some(owner_dependencies) = dependencies.other.get_mut(owner_id)
             {
                 owner_dependencies.insert(target_id.clone());
             }
@@ -1683,10 +1779,13 @@ fn object_mesh_dependencies(doc: &SceneDoc) -> Result<BTreeMap<Id, BTreeSet<Id>>
 fn object_mesh_evaluation_order(
     doc: &SceneDoc,
     selected_nodes: Option<&BTreeSet<Id>>,
+    gate: ModifierGate<'_>,
+    dependencies: &ObjectMeshDependencies,
 ) -> Result<Vec<Id>> {
     fn visit(
         id: &Id,
-        dependencies: &BTreeMap<Id, BTreeSet<Id>>,
+        dependencies: &ObjectMeshDependencies,
+        suppressed: &BTreeSet<Id>,
         complete: &mut BTreeSet<Id>,
         active: &mut Vec<Id>,
         output: &mut Vec<Id>,
@@ -1704,9 +1803,16 @@ fn object_mesh_evaluation_order(
             ));
         }
         active.push(id.clone());
-        if let Some(targets) = dependencies.get(id) {
+        if !suppressed.contains(id)
+            && let Some(targets) = dependencies.modifiers.get(id)
+        {
             for target in targets {
-                visit(target, dependencies, complete, active, output)?;
+                visit(target, dependencies, suppressed, complete, active, output)?;
+            }
+        }
+        if let Some(targets) = dependencies.other.get(id) {
+            for target in targets {
+                visit(target, dependencies, suppressed, complete, active, output)?;
             }
         }
         let popped = active.pop();
@@ -1717,26 +1823,33 @@ fn object_mesh_evaluation_order(
     }
     fn include_dependencies(
         id: &Id,
-        dependencies: &BTreeMap<Id, BTreeSet<Id>>,
+        dependencies: &ObjectMeshDependencies,
+        suppressed: &BTreeSet<Id>,
         required: &mut BTreeSet<Id>,
     ) {
         if !required.insert(id.clone()) {
             return;
         }
-        if let Some(targets) = dependencies.get(id) {
+        if !suppressed.contains(id)
+            && let Some(targets) = dependencies.modifiers.get(id)
+        {
             for target in targets {
-                include_dependencies(target, dependencies, required);
+                include_dependencies(target, dependencies, suppressed, required);
+            }
+        }
+        if let Some(targets) = dependencies.other.get(id) {
+            for target in targets {
+                include_dependencies(target, dependencies, suppressed, required);
             }
         }
     }
 
-    let dependencies = object_mesh_dependencies(doc)?;
     let roots = selected_nodes
         .cloned()
         .unwrap_or_else(|| doc.nodes.keys().cloned().collect());
     let mut required = BTreeSet::new();
     for id in roots {
-        include_dependencies(&id, &dependencies, &mut required);
+        include_dependencies(&id, dependencies, &gate.suppressed, &mut required);
     }
     let mut order = Vec::with_capacity(required.len());
     let mut complete = BTreeSet::new();
@@ -1748,10 +1861,17 @@ fn object_mesh_evaluation_order(
             };
             let has_particle_system = node.properties.contains_key("physics_particle_emitter")
                 || node.modifiers.iter().any(|modifier| {
-                    modifier.enabled && modifier.modifier_type == "particle_system"
+                    gate.is_active(id, modifier) && modifier.modifier_type == "particle_system"
                 });
             if has_particle_system == particle_system_first {
-                visit(id, &dependencies, &mut complete, &mut active, &mut order)?;
+                visit(
+                    id,
+                    dependencies,
+                    &gate.suppressed,
+                    &mut complete,
+                    &mut active,
+                    &mut order,
+                )?;
             }
         }
     }
@@ -2091,6 +2211,7 @@ const MAX_RENDERED_PARTICLES: usize = 100_000;
 
 fn render_simulated_particles(
     doc: &SceneDoc,
+    gate: ModifierGate<'_>,
     particles: &BTreeMap<Id, Vec<crate::sim::ParticleState>>,
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &mut BTreeMap<Id, Mesh>,
@@ -2104,7 +2225,9 @@ fn render_simulated_particles(
         if doc.nodes.get(emitter_id).is_some_and(|node| {
             node.modifiers
                 .iter()
-                .any(|modifier| modifier.enabled && modifier.modifier_type == "explode")
+                .any(|modifier| {
+                    gate.is_active(emitter_id, modifier) && modifier.modifier_type == "explode"
+                })
         }) {
             continue;
         }
@@ -2333,6 +2456,8 @@ fn apply_stack_physics_modifier(
     modifier: &Modifier,
     node_id: &Id,
     doc: &SceneDoc,
+    scene_hash: &str,
+    gate: ModifierGate<'_>,
     scene_id: &Id,
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
@@ -2344,10 +2469,12 @@ fn apply_stack_physics_modifier(
         scene_id,
         node_id,
         modifier,
-        mesh,
+        std::mem::replace(mesh, Mesh::new()),
         frame,
         matrices,
         cache_directory,
+        scene_hash,
+        gate,
     )?;
     if let Some(mut states) = result.particles {
         let system_index = doc
@@ -2381,6 +2508,7 @@ fn apply_particle_instance_modifier(
     modifier: &Modifier,
     node_id: &Id,
     doc: &SceneDoc,
+    gate: ModifierGate<'_>,
     frame: f64,
     fps: f64,
     matrices: &BTreeMap<Id, DMat4>,
@@ -2400,7 +2528,7 @@ fn apply_particle_instance_modifier(
     })?;
     let index = particle_system_index(modifier)?;
     let (system_modifier, _) = particle_system_for_index(doc, &object_id, index)?;
-    let particle_states = if system_modifier.enabled {
+    let particle_states = if gate.is_active(&object_id, system_modifier) {
         select_particle_states(particles.get(&object_id), index)
     } else {
         Vec::new()
@@ -2436,13 +2564,14 @@ fn apply_explode_modifier(
     modifier: &Modifier,
     node_id: &Id,
     doc: &SceneDoc,
+    gate: ModifierGate<'_>,
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
     particles: &BTreeMap<Id, Vec<crate::sim::ParticleState>>,
 ) -> Result<()> {
     let index = particle_system_index(modifier)?;
     let (system_modifier, _) = particle_system_for_index(doc, node_id, index)?;
-    let particle_states = if system_modifier.enabled {
+    let particle_states = if gate.is_active(node_id, system_modifier) {
         select_particle_states(particles.get(node_id), index)
     } else {
         Vec::new()

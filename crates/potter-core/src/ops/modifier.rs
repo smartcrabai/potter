@@ -748,7 +748,7 @@ fn is_pinned(modifier: &Modifier) -> bool {
 
 /// Blender's `BKE_modifiers_add_at_end_if_possible`: a new modifier goes before the trailing pinned
 /// block. Hook and original-data types go before the first modifier that is not deform-only.
-fn insertion_index(stack: &[Modifier], modifier_type: &str) -> usize {
+pub(crate) fn insertion_index(stack: &[Modifier], modifier_type: &str) -> usize {
     if modifier_type == "hook" || requires_original_data(modifier_type) {
         let mut index = 0;
         while index < stack.len() && only_deform(&stack[index].modifier_type) {
@@ -924,26 +924,13 @@ fn apply_modifier(
         if edited_data.contains(&data_id) {
             continue;
         }
-        let modifiers = engine
+        let stack = engine
             .doc
             .nodes
             .get(&target)
-            .map(|node| {
-                node.modifiers
-                    .iter()
-                    .map(|modifier| {
-                        // Blender's apply evaluates the applied modifier regardless of
-                        // show_viewport, and earlier modifiers with their viewport flags.
-                        if modifier.id == modifier_id {
-                            modifier.clone()
-                        } else {
-                            modifier.for_purpose(EvaluationPurpose::Preview)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
+            .map(|node| node.modifiers.as_slice())
             .unwrap_or_default();
-        let index = modifiers
+        let index = stack
             .iter()
             .position(|modifier| modifier.id == modifier_id)
             .ok_or_else(|| {
@@ -952,7 +939,26 @@ fn apply_modifier(
                     format!("modifier `{modifier_id}` was not found on node `{target}`"),
                 )
             })?;
-        crate::geom::modifiers::validate_boolean_topology_suffix(&modifiers, index)?;
+        // Only a boolean target can trip the guard. Downstream modifiers are judged by their Preview
+        // activeness, as before; the target keeps its own flags.
+        if stack[index].modifier_type == "boolean" {
+            let validator_stack: Vec<Modifier> = stack
+                .iter()
+                .enumerate()
+                .map(|(position, modifier)| {
+                    if position == index {
+                        modifier.clone()
+                    } else {
+                        modifier.for_purpose(EvaluationPurpose::Preview)
+                    }
+                })
+                .collect();
+            crate::geom::modifiers::validate_boolean_topology_suffix(&validator_stack, index)?;
+        }
+        // Blender's modifier_apply evaluates only the applied modifier on the base data, whatever
+        // its show_viewport. Earlier and later modifiers stay in the stack and are not evaluated.
+        let target_modifier = stack[index].clone();
+        let modifier_stack = std::slice::from_ref(&target_modifier);
         let evaluated = {
             let data_block = engine.doc.data_blocks.get(&data_id).ok_or_else(|| {
                 PotError::new(
@@ -966,7 +972,6 @@ fn apply_modifier(
                     format!("data block `{data_id}` has no mesh"),
                 )
             })?;
-            let modifier_stack = &modifiers[..=index];
             let uses_armature = modifier_stack
                 .iter()
                 .any(|modifier| modifier.enabled && modifier.modifier_type == "armature");
@@ -1239,7 +1244,7 @@ fn apply_modifier(
             }
         }
         if let Some(node) = engine.doc.nodes.get_mut(&target) {
-            node.modifiers.drain(..=index);
+            node.modifiers.retain(|modifier| modifier.id != modifier_id);
         }
         if mesh_changed {
             super::clear_primitive_metadata(engine, &data_id);
@@ -1415,12 +1420,9 @@ fn apply_modifier_as_shape_key(
         );
         if !keep_modifier
             && let Some(node) = engine.doc.nodes.get_mut(&target)
-            && let Some(index) = node
-                .modifiers
-                .iter()
-                .position(|modifier| modifier.id == modifier_id)
+            && node.modifiers.iter().any(|modifier| modifier.id == modifier_id)
         {
-            node.modifiers.drain(..=index);
+            node.modifiers.retain(|modifier| modifier.id != modifier_id);
             engine.mark("nodes", &target, ChangeKind::Updated);
         }
         engine.mark("data_blocks", &original_data_id, ChangeKind::Updated);

@@ -48,6 +48,53 @@ KINDS = {
             "relative_offset_displace": [1.5, 0.0, 0.0],
         },
     },
+    "hook": {
+        "blender_type": "HOOK",
+        "potter_type": "hook",
+        "params": {"object": "hook_target"},
+    },
+    "soft_body": {
+        "blender_type": "SOFT_BODY",
+        "potter_type": "soft_body",
+        "params": {},
+        "potter_settings": {"goal_strength": 0.7},
+    },
+    "cloth": {
+        "blender_type": "CLOTH",
+        "potter_type": "cloth",
+        "params": {},
+        "potter_settings": {"tension_stiffness": 12.0},
+    },
+    "collision": {
+        "blender_type": "COLLISION",
+        "potter_type": "collision",
+        "params": {},
+        "potter_settings": {"thickness": 0.01},
+    },
+    "dynamic_paint": {
+        "blender_type": "DYNAMIC_PAINT",
+        "potter_type": "dynamic_paint",
+        "params": {},
+        "potter_settings": {"role": "canvas"},
+    },
+    "fluid": {
+        "blender_type": "FLUID",
+        "potter_type": "fluid",
+        "params": {},
+        "potter_settings": {"type": "liquid", "resolution": 4},
+    },
+    "particle_system": {
+        "blender_type": "PARTICLE_SYSTEM",
+        "potter_type": "particle_system",
+        "params": {},
+        "potter_settings": {"rate": 1.0, "lifetime": 12.0},
+    },
+    "multires": {
+        "blender_type": "MULTIRES",
+        "potter_type": "multires",
+        "params": {},
+        "potter_settings": {"levels": 1, "render_levels": 1},
+    },
 }
 
 
@@ -188,6 +235,204 @@ CASES = [
 ]
 
 
+# Stack-order oracle. Only the modifier order and use_pin_to_last flags are observed; no geometry is
+# measured. Each case is built through modifiers.new (rna) and through object.modifier_add (operator),
+# and both paths must yield the same stack.
+INSERTION_CASES = [
+    {
+        "name": "I_array_then_soft_body",
+        "description": "array then soft body: original-data type goes before the non-deform array",
+        "steps": [create("array", "array"), create("soft", "soft_body")],
+        "expected_stack": ["soft", "array"],
+        "expected_pinned": [False, False],
+    },
+    {
+        "name": "I_array_then_multires",
+        "description": "array then multires: original-data type goes before the non-deform array",
+        "steps": [create("array", "array"), create("multires", "multires")],
+        "expected_stack": ["multires", "array"],
+        "expected_pinned": [False, False],
+    },
+    {
+        "name": "I_pinned_array_then_cloth",
+        "description": "pinned array then cloth: cloth appends before the trailing pinned block",
+        "steps": [create("array", "array"), pin("array", True), create("cloth", "cloth")],
+        "expected_stack": ["cloth", "array"],
+        "expected_pinned": [False, True],
+    },
+    {
+        "name": "I_array_then_cloth",
+        "description": "array then cloth: cloth is not original-data, so it appends",
+        "steps": [create("array", "array"), create("cloth", "cloth")],
+        "expected_stack": ["array", "cloth"],
+        "expected_pinned": [False, False],
+    },
+    {
+        "name": "I_pinned_array_then_collision",
+        "description": "pinned array then collision: appends before the trailing pinned block",
+        "steps": [create("array", "array"), pin("array", True), create("collision", "collision")],
+        "expected_stack": ["collision", "array"],
+        "expected_pinned": [False, True],
+    },
+    {
+        "name": "I_pinned_array_then_dynamic_paint",
+        "description": "pinned array then dynamic paint: appends before the trailing pinned block",
+        "steps": [create("array", "array"), pin("array", True), create("paint", "dynamic_paint")],
+        "expected_stack": ["paint", "array"],
+        "expected_pinned": [False, True],
+    },
+    {
+        "name": "I_pinned_array_then_fluid",
+        "description": "pinned array then fluid: appends before the trailing pinned block",
+        "steps": [create("array", "array"), pin("array", True), create("fluid", "fluid")],
+        "expected_stack": ["fluid", "array"],
+        "expected_pinned": [False, True],
+    },
+    {
+        "name": "I_pinned_array_then_particle_system",
+        "description": "pinned array then particle system: appends before the trailing pinned block",
+        "steps": [
+            create("array", "array"),
+            pin("array", True),
+            create("particles", "particle_system"),
+        ],
+        "expected_stack": ["particles", "array"],
+        "expected_pinned": [False, True],
+    },
+    {
+        "name": "I_pinned_array_then_soft_body",
+        "description": "pinned array then soft body: original-data type goes before the pinned array",
+        "steps": [create("array", "array"), pin("array", True), create("soft", "soft_body")],
+        "expected_stack": ["soft", "array"],
+        "expected_pinned": [False, True],
+    },
+    {
+        "name": "I_pinned_array_then_multires",
+        "description": "pinned array then multires: original-data type goes before the pinned array",
+        "steps": [create("array", "array"), pin("array", True), create("multires", "multires")],
+        "expected_stack": ["multires", "array"],
+        "expected_pinned": [False, True],
+    },
+    {
+        "name": "I_array_then_hook",
+        "description": "array then hook: hook goes before the non-deform array",
+        "steps": [create("array", "array"), create("hook", "hook")],
+        "expected_stack": ["hook", "array"],
+        "expected_pinned": [False, False],
+    },
+    {
+        "name": "I_pinned_array_then_hook",
+        "description": "pinned array then hook: a valid pinned stack still accepts hook at the front",
+        "steps": [create("array", "array"), pin("array", True), create("hook", "hook")],
+        "expected_stack": ["hook", "array"],
+        "expected_pinned": [False, True],
+    },
+    {
+        "name": "I_taper_array_then_hook",
+        "description": "taper then array then hook: hook goes after the deform taper, before the array",
+        "steps": [create("taper", "taper"), create("array", "array"), create("hook", "hook")],
+        "expected_stack": ["taper", "hook", "array"],
+        "expected_pinned": [False, False, False],
+    },
+    {
+        "name": "I_taper_smooth_then_hook",
+        "description": "taper then smooth then hook: all deform, hook appends",
+        "steps": [create("taper", "taper"), create("third", "smooth"), create("hook", "hook")],
+        "expected_stack": ["taper", "third", "hook"],
+        "expected_pinned": [False, False, False],
+    },
+    {
+        "name": "I_taper_pinned_smooth_then_hook",
+        "description": "taper then pinned smooth then hook: hook goes in front of the pinned block",
+        "steps": [
+            create("taper", "taper"),
+            create("third", "smooth"),
+            pin("third", True),
+            create("hook", "hook"),
+        ],
+        "expected_stack": ["hook", "taper", "third"],
+        "expected_pinned": [False, False, True],
+    },
+    {
+        "name": "I_taper_smooth_then_multires",
+        "description": "taper then smooth then multires: all deform, multires appends",
+        "steps": [create("taper", "taper"), create("third", "smooth"), create("multires", "multires")],
+        "expected_stack": ["taper", "third", "multires"],
+        "expected_pinned": [False, False, False],
+    },
+    {
+        "name": "I_taper_pinned_smooth_then_multires",
+        "description": "taper then pinned smooth then multires: multires goes in front of the stack",
+        "steps": [
+            create("taper", "taper"),
+            create("third", "smooth"),
+            pin("third", True),
+            create("multires", "multires"),
+        ],
+        "expected_stack": ["multires", "taper", "third"],
+        "expected_pinned": [False, False, True],
+    },
+    {
+        "name": "I_taper_smooth_then_soft_body",
+        "description": "taper then smooth then soft body: all deform, soft body appends",
+        "steps": [create("taper", "taper"), create("third", "smooth"), create("soft", "soft_body")],
+        "expected_stack": ["taper", "third", "soft"],
+        "expected_pinned": [False, False, False],
+    },
+    {
+        "name": "I_taper_pinned_smooth_then_soft_body",
+        "description": "taper then pinned smooth then soft body: soft body goes in front of the stack",
+        "steps": [
+            create("taper", "taper"),
+            create("third", "smooth"),
+            pin("third", True),
+            create("soft", "soft_body"),
+        ],
+        "expected_stack": ["soft", "taper", "third"],
+        "expected_pinned": [False, False, True],
+    },
+]
+
+
+def run_insertion(case, via):
+    ob = reset_scene()
+    add_hook_target()
+    for step in case["steps"]:
+        apply_step(ob, dict(step, via=via) if step["action"] == "create" else step)
+    return {
+        "stack": [modifier.name for modifier in ob.modifiers],
+        "stack_types": [modifier.type for modifier in ob.modifiers],
+        "pinned": [bool(modifier.use_pin_to_last) for modifier in ob.modifiers],
+    }
+
+
+def run_insertion_cases():
+    results = {}
+    for case in INSERTION_CASES:
+        by_rna = run_insertion(case, "rna")
+        by_operator = run_insertion(case, "operator")
+        results[case["name"]] = {
+            "description": case["description"],
+            "steps": case["steps"],
+            "expected_stack": case["expected_stack"],
+            "expected_pinned": case["expected_pinned"],
+            **by_rna,
+            "operator_matches_rna": by_operator == by_rna,
+        }
+    return results
+
+
+def insertion_checks(results):
+    checks = {}
+    for name, result in results.items():
+        checks[f"{name}_stack"] = (
+            result["stack"] == result["expected_stack"]
+            and result["pinned"] == result["expected_pinned"]
+        )
+        checks[f"{name}_operator_matches_rna"] = result["operator_matches_rna"]
+    return checks
+
+
 def reset_scene():
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.mesh.primitive_cube_add(size=2, location=(0.0, 0.0, 0.0))
@@ -198,19 +443,44 @@ def reset_scene():
     return ob
 
 
+def add_hook_target():
+    target = bpy.data.objects.new("hook_target", None)
+    bpy.context.scene.collection.objects.link(target)
+
+
 def apply_visibility(modifier, step):
     for key in ("show_viewport", "show_render"):
         if key in step:
             setattr(modifier, key, step[key])
 
 
+def add_modifier(ob, name, blender_type, via):
+    if via == "rna":
+        return ob.modifiers.new(name, blender_type)
+    if via != "operator":
+        raise ValueError(f"unknown creation path: {via}")
+    bpy.context.view_layer.objects.active = ob
+    before = {modifier.as_pointer() for modifier in ob.modifiers}
+    with bpy.context.temp_override(object=ob, active_object=ob):
+        result = bpy.ops.object.modifier_add(type=blender_type)
+    if result != {"FINISHED"}:
+        raise RuntimeError(f"modifier_add {blender_type} returned {result}")
+    added = [modifier for modifier in ob.modifiers if modifier.as_pointer() not in before]
+    if len(added) != 1:
+        raise RuntimeError(f"modifier_add {blender_type} added {len(added)} modifiers")
+    added[0].name = name
+    return added[0]
+
+
 def apply_step(ob, step):
     action = step["action"]
     if action == "create":
         kind = KINDS[step["kind"]]
-        modifier = ob.modifiers.new(step["name"], kind["blender_type"])
+        modifier = add_modifier(
+            ob, step["name"], kind["blender_type"], step.get("via", "rna")
+        )
         for key, value in kind["params"].items():
-            setattr(modifier, key, value)
+            setattr(modifier, key, bpy.data.objects[value] if key == "object" else value)
         apply_visibility(modifier, step)
         return None
     if action == "pin":
@@ -394,6 +664,8 @@ def main():
         "V_pinned_with_hidden_viewport_stack": by_name["V_pinned_with_hidden"]["viewport_stack"]
         == ["array", "taper"],
     }
+    insertion_results = run_insertion_cases()
+    checks.update(insertion_checks(insertion_results))
     failed = sorted(name for name, passed in checks.items() if not passed)
     if failed:
         raise RuntimeError(f"semantic checks failed: {failed}")
@@ -428,6 +700,7 @@ def main():
             ),
         },
         "cases": {case["name"]: case for case in cases},
+        "insertion_cases": insertion_results,
         "checks": checks,
         "apply_viewport_disabled": apply_results,
         "artifacts": artifacts,
@@ -441,7 +714,11 @@ def main():
             "Blender's stack list is evaluation order: index 0 is evaluated first.",
             "modifier_apply does not refuse a viewport-disabled (or render-disabled) modifier in background mode; it applies it. The refusal message 'Modifier is disabled' was not printed.",
             "Move refusal is observed through the modifier_move_to_index operator result (CANCELLED); the stack is unchanged.",
-            "Only modifiers.new() was probed for insertion order; the RequiresOriginalData/Hook insertion rule of BKE_modifiers_add_at_end_if_possible is not exercised by any case and is not encoded.",
+            "insertion_cases are stack-order only (no geometry). Each case is built through modifiers.new and through object.modifier_add; operator_matches_rna records that both paths produce the same stack.",
+            "Observed Blender placement: [U]+SOFT_BODY -> [SB,U]; [S,D]+MULTIRES -> [S,D,M]; [S,D(pinned)]+MULTIRES -> [M,S,D]; [S,U]+HOOK -> [S,H,U]; [S,D]+HOOK -> [S,D,H]; [U(pinned)]+HOOK -> [H,U(pinned)].",
+            "Observed append placement before the trailing pinned block: CLOTH, COLLISION, DYNAMIC_PAINT, FLUID and PARTICLE_SYSTEM ([U]+CLOTH -> [U,C]; [U(pinned)]+CLOTH -> [C,U(pinned)]). CLOTH therefore does not take the original-data placement.",
+            "object.multires_subdivide adds a level to an existing Multires and returned CANCELLED on objects without one (empty, ARRAY, pinned ARRAY, deform-only stacks), so Multires creation is probed with object.modifier_add(type='MULTIRES').",
+            "potter_settings in KINDS are Potter-only operation settings (physics settings, multires levels). Blender stack order does not depend on them, and they are not applied to Blender modifiers.",
             "Pin semantics use the use_pin_to_last RNA setter (rna_Modifier_use_pin_to_last_set), not the move operator.",
         ],
     }

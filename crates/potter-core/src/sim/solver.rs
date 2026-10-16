@@ -141,6 +141,7 @@ pub(super) fn evaluate(
     frame: f64,
     base_world_matrices: &BTreeMap<Id, DMat4>,
     cache_directory: Option<&Path>,
+    key: &str,
 ) -> Result<Option<SimulationResult>> {
     let scene = doc.scenes.get(scene_id).ok_or_else(|| {
         PotError::new(
@@ -214,9 +215,8 @@ pub(super) fn evaluate(
         forces.push(build_force(id, field, matrix)?);
     }
 
-    let key = cache::cache_key(doc, scene_id, frame, base_world_matrices)?;
     if let Some(directory) = cache_directory
-        && let Some(result) = cache::load(directory, &key)?
+        && let Some(result) = cache::load(directory, key)?
         && result_matches_bodies(&result, &body_ids)
     {
         return Ok(Some(result));
@@ -230,7 +230,7 @@ pub(super) fn evaluate(
         scene.fps_base,
         frame,
     )?;
-    let result = make_result(bodies, key)?;
+    let result = make_result(bodies, key.to_owned())?;
     if let Some(directory) = cache_directory {
         cache::store(directory, &result)?;
     }

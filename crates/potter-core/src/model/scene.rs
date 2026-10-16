@@ -1423,10 +1423,12 @@ pub struct Modifier {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Blender `show_viewport`: active in viewport previews (`EvaluationPurpose::Preview`).
-    #[serde(default = "default_true")]
+    /// Serialized only when false; a missing key reads as true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub show_viewport: bool,
-    /// Blender `show_render`: active in saved renders and exports (`EvaluationPurpose::Render`).
-    #[serde(default = "default_true")]
+    /// Blender `show_render`: active in saved renders and the exports whose Blender writer evaluates the render stack (`EvaluationPurpose::Render`).
+    /// Serialized only when false; a missing key reads as true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub show_render: bool,
     #[serde(default)]
     pub params: Map<String, Value>,
@@ -1605,6 +1607,14 @@ impl Default for Node {
 
 fn default_true() -> bool {
     true
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
