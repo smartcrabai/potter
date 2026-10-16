@@ -420,18 +420,19 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
     let mut branch_faces = Vec::new();
-    let mut detached_frames = Vec::new();
+    let mut branch_frame_states = vec![(false, [false; 4]); frames.len()];
     for ring_frames in &branch_rings {
         let rings: Vec<[usize; 4]> = ring_frames
             .iter()
             .map(|frame| frame_vertex_ids[*frame])
             .collect();
-        let hull = branch_hull_faces(&points, &rings, &mut branch_faces)?;
-        for (&frame, (detached, inside)) in ring_frames.iter().zip(hull.frame_states) {
-            if detached {
-                detached_frames.push((frame, inside));
-            }
-        }
+        branch_hull_faces(
+            &points,
+            &rings,
+            ring_frames,
+            &mut branch_faces,
+            &mut branch_frame_states,
+        )?;
     }
     let detached_frames: Vec<(usize, [bool; 4])> = branch_frame_states
         .into_iter()
@@ -604,14 +605,20 @@ fn merge_branch_frame_corners(
 fn frame_side_length(frame: [DVec3; 4]) -> f64 {
     (frame[0].distance(frame[1]) + frame[1].distance(frame[2])) * 0.5
 }
-struct BranchHullBuild {
-    frame_states: Vec<(bool, [bool; 4])>,
-}
+
 fn branch_hull_faces(
     points: &[DVec3],
     rings: &[[usize; 4]],
+    ring_frames: &[usize],
     faces: &mut Vec<Vec<usize>>,
-) -> Result<BranchHullBuild> {
+    frame_states: &mut [(bool, [bool; 4])],
+) -> Result<()> {
+    if rings.len() != ring_frames.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "Skin branch ring frames do not match their vertex indices",
+        ));
+    }
     let mut input: Vec<usize> = rings.iter().flatten().copied().collect();
     input.sort_unstable();
     input.dedup();
@@ -631,26 +638,33 @@ fn branch_hull_faces(
     }
 
     let mut removed_faces = vec![false; faces.len()];
-    let mut frame_states = Vec::with_capacity(rings.len());
-    for ring in rings {
-        let mut inside = [false; 4];
+    for (ring, frame_index) in rings.iter().zip(ring_frames) {
+        let Some((detached, inside)) = frame_states.get_mut(*frame_index) else {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "Skin branch frame index is out of range",
+            ));
+        };
+        if *detached {
+            continue;
+        }
+
         let first_inside = (0..4)
             .filter(|corner| !hull_vertices.contains(&ring[*corner]))
             .min_by_key(|corner| ring[*corner]);
-        let mut detached = false;
         if let Some(corner) = first_inside {
             inside[corner] = true;
-            detached = true;
+            *detached = true;
         }
-        if !detached
+        if !*detached
             && (0..4).any(|corner| {
                 !hull_edges.contains(&ordered_edge(ring[corner], ring[(corner + 1) % 4]))
             })
         {
-            detached = true;
+            *detached = true;
         }
 
-        if !detached {
+        if !*detached {
             let diagonal = if hull_edges.contains(&ordered_edge(ring[0], ring[2])) {
                 Some(ordered_edge(ring[0], ring[2]))
             } else if hull_edges.contains(&ordered_edge(ring[1], ring[3])) {
@@ -675,7 +689,7 @@ fn branch_hull_faces(
                 removed_faces[pair[0]] = true;
                 removed_faces[pair[1]] = true;
             } else {
-                detached = true;
+                *detached = true;
             }
         }
     }
@@ -686,7 +700,7 @@ fn branch_hull_faces(
         face_index += 1;
         keep
     });
-    Ok(BranchHullBuild { frame_states })
+    Ok(())
 }
 
 fn face_has_edge(face: &[usize], edge: (usize, usize)) -> bool {
