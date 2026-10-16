@@ -860,7 +860,7 @@ impl Snapshot {
                     attach_vertex_group_weights(&mut rigged_source, data_block);
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         rigged_source,
-                        &gate.stack(id, &node.modifiers),
+                        &node.modifiers,
                         &doc.node_groups,
                         frame,
                         matrix,
@@ -869,6 +869,7 @@ impl Snapshot {
                         &meshes,
                         &curve_path_lengths,
                         gate.context,
+                        |_, modifier| gate.is_active(id, modifier),
                         adaptive_render.as_ref(),
                         |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
@@ -1135,7 +1136,7 @@ impl Snapshot {
                     attach_vertex_group_weights(&mut source_mesh, data_block);
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         source_mesh,
-                        &gate.stack(id, &node.modifiers),
+                        &node.modifiers,
                         &doc.node_groups,
                         frame,
                         matrix,
@@ -1144,6 +1145,7 @@ impl Snapshot {
                         &meshes,
                         &curve_path_lengths,
                         gate.context,
+                        |_, modifier| gate.is_active(id, modifier),
                         adaptive_render.as_ref(),
                         |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
@@ -1656,22 +1658,43 @@ impl ModifierGate<'_> {
         !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
     }
 
-    /// Borrow the stack when all modifiers remain active; otherwise copy only for visibility.
-    pub(crate) fn stack<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> Cow<'m, [Modifier]> {
-        let matches = |modifier: &Modifier| modifier.enabled == self.is_active(node_id, modifier);
-        if modifiers.iter().all(matches) {
-            return Cow::Borrowed(modifiers);
+    /// Whether a legacy physics property has an active stack modifier linked to its settings.
+    pub(crate) fn is_property_active(
+        &self,
+        node_id: &Id,
+        node: &Node,
+        property_name: &str,
+        modifier_type: &str,
+    ) -> bool {
+        if self.suppressed.contains(node_id) {
+            return false;
         }
-        Cow::Owned(
-            modifiers
-                .iter()
-                .map(|modifier| {
-                    let mut applied = modifier.clone();
-                    applied.enabled = self.is_active(node_id, modifier);
-                    applied
+        let linked_modifier = if property_name == "physics_particle_emitter" {
+            node.properties
+                .get("physics_particle_emitter_modifier_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|modifier_id| {
+                    node.modifiers.iter().find(|modifier| {
+                        modifier.id.as_str() == modifier_id
+                            && modifier.modifier_type == modifier_type
+                            && modifier
+                                .params
+                                .get("settings_id")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(modifier.id.as_str())
+                    })
                 })
-                .collect(),
-        )
+        } else {
+            node.modifiers.iter().find(|modifier| {
+                modifier.modifier_type == modifier_type
+                    && modifier
+                        .params
+                        .get("settings_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(modifier.id.as_str())
+            })
+        };
+        linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
     }
 }
 
