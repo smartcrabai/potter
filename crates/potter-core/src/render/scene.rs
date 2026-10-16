@@ -397,6 +397,7 @@ pub(super) fn extract_geometry(
                 for triangle in face_triangles {
                     let mut positions = [DVec3::ZERO; 3];
                     let corners = triangle_corners(face, triangle);
+                    let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
                     for (index, vertex_id) in triangle.iter().enumerate() {
                         let local = vertex_positions.get(vertex_id).copied().ok_or_else(|| {
                             PotError::new(
@@ -541,6 +542,8 @@ pub(super) fn extract_geometry(
                         "vertex".to_owned()
                     },
                     element_id: format!("{}{}", if pointcloud { "p" } else { "v" }, vertex.id),
+                    uv_render: None,
+                    uv_available_mask: None,
                 });
                 let radius = read_vertex_number(mesh, "point_radius", vertex.id)
                     .unwrap_or(0.02)
@@ -614,6 +617,8 @@ pub(super) fn extract_geometry(
                         node_id: node_id.clone(),
                         domain: "point".to_owned(),
                         element_id: format!("p{stroke_number}_{point_number}"),
+                        uv_render: None,
+                        uv_available_mask: None,
                     });
                     let extent = DVec3::splat(radius);
                     bounds = Some(match bounds {
@@ -644,6 +649,8 @@ pub(super) fn extract_geometry(
                     node_id: node_id.clone(),
                     domain: "stroke".to_owned(),
                     element_id: format!("s{stroke_index}"),
+                    uv_render: None,
+                    uv_available_mask: None,
                 });
                 let mut segment_count = stroke.points_world.len().saturating_sub(1);
                 if stroke.cyclic && stroke.points_world.len() > 2 {
@@ -708,6 +715,8 @@ pub(super) fn extract_geometry(
                     node_id: node_id.clone(),
                     domain: "hair_curve".to_owned(),
                     element_id: format!("h{curve_index}"),
+                    uv_render: None,
+                    uv_available_mask: None,
                 });
                 let radius = curve.radius * radius_scale;
                 for point in &curve.points {
