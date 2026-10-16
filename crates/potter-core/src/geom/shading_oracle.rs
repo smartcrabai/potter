@@ -45,6 +45,7 @@ const EXACT: &[&str] = &[
     "build_cube",
     "chain_mirror_subsurf",
     "chain_mirror_subsurf_custom_l1_triangulate",
+    "decimate_cube_nocustom",
     "decimate_grid",
     "edge_split_cube",
     "edge_split_sharp_only",
@@ -157,6 +158,36 @@ fn input_mesh(input: &Value) -> TestResult<Mesh> {
             return Err("loose edge needs two vertices".into());
         };
         mesh.insert_edge([u32::try_from(first)?, u32::try_from(second)?])?;
+    }
+    if let Some(order) = input.get("blender_edge_order") {
+        let order = order
+            .as_array()
+            .ok_or("blender_edge_order must be an array")?;
+        let mut by_vertices: HashMap<_, _> = mesh
+            .edges
+            .drain(..)
+            .map(|edge| {
+                let [a, b] = edge.vertices;
+                ((a.min(b), a.max(b)), edge)
+            })
+            .collect();
+        mesh.edges = order
+            .iter()
+            .map(|pair| {
+                let [a, b] = indices(pair)?[..] else {
+                    return Err("Blender edge order needs two vertices".into());
+                };
+                let (a, b) = (u32::try_from(a)?, u32::try_from(b)?);
+                let mut edge = by_vertices
+                    .remove(&(a.min(b), a.max(b)))
+                    .ok_or("Blender edge order references a missing or duplicate edge")?;
+                edge.vertices = [a, b];
+                Ok(edge)
+            })
+            .collect::<TestResult<_>>()?;
+        if !by_vertices.is_empty() {
+            return Err("Blender edge order omits mesh edges".into());
+        }
     }
     let sharp: Vec<(u32, u32)> = input["sharp_edges"]
         .as_array()

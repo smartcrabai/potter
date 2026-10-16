@@ -426,6 +426,8 @@ def run_variant(v):
         objects=objects_doc,
         output=output,
     )
+    if any(t == "decimate" for t, _ in v["stack"]):
+        doc["input"]["blender_edge_order"] = [sorted(edge.vertices) for edge in ob.data.edges]
     return doc, debug
 
 

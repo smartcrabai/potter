@@ -4,9 +4,9 @@
 //   source/blender/bmesh/tools/bmesh_decimate_collapse.cc, source/blender/bmesh/tools/bmesh_decimate_dissolve.cc, source/blender/bmesh/tools/bmesh_decimate_unsubdivide.cc, source/blender/bmesh/intern/bmesh_polygon.cc, source/blender/bmesh/operators/bmo_dissolve.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
 //   source/blender/modifiers/intern/MOD_decimate.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
-use glam::{DVec3, Vec3};
+use glam::DVec3;
 use serde_json::{Value, json};
 
 use crate::{
@@ -16,90 +16,18 @@ use crate::{
 };
 
 use super::{
-    Mesh, Polygon, blend_weights, bool_param, clean_polygon, cyclic_pairs, decimate_compact,
-    edge_key, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
-    schema_value, unique_polygons, unique_tagged_polygons,
+    Mesh, Polygon, bool_param, cyclic_pairs, decimate_compact, edge_key, id_indices,
+    invalid_parameter, number_param, positions, schema_value,
 };
-#[derive(Clone, Copy, Default)]
-struct DecimateQuadric([f64; 10]);
+mod collapse;
+mod heap;
+mod interp;
+mod kdtree;
+mod normals;
+mod polyfill;
+mod quad;
 
-impl DecimateQuadric {
-    fn add_plane(&mut self, normal: DVec3, distance: f64, weight: f64) {
-        let [a, b, c] = normal.to_array();
-        let d = distance;
-        let plane = [
-            a * a,
-            a * b,
-            a * c,
-            a * d,
-            b * b,
-            b * c,
-            b * d,
-            c * c,
-            c * d,
-            d * d,
-        ];
-        for (value, coefficient) in self.0.iter_mut().zip(plane) {
-            *value += coefficient * weight;
-        }
-    }
-
-    fn add(self, other: Self) -> Self {
-        let mut result = self;
-        for (value, other_value) in result.0.iter_mut().zip(other.0) {
-            *value += other_value;
-        }
-        result
-    }
-
-    fn evaluate(self, point: DVec3) -> f64 {
-        let [x, y, z] = point.to_array();
-        let q = self.0;
-        ((q[0] * (x * x))
-            + (q[1] * 2.0 * (x * y))
-            + (q[2] * 2.0 * (x * z))
-            + (q[3] * 2.0 * x)
-            + (q[4] * (y * y))
-            + (q[5] * 2.0 * (y * z))
-            + (q[6] * 2.0 * y)
-            + (q[7] * (z * z))
-            + (q[8] * 2.0 * z))
-            + q[9]
-    }
-
-    fn optimize(self) -> Option<DVec3> {
-        let q = self.0;
-        let determinant = q[0] * (q[4] * q[7] - q[5] * q[5]) - q[1] * (q[1] * q[7] - q[2] * q[5])
-            + q[2] * (q[1] * q[5] - q[2] * q[4]);
-        if determinant.abs() <= 1.0e-8 {
-            return None;
-        }
-        let inverse_determinant = 1.0 / determinant;
-        let inverse = [
-            [
-                (q[4] * q[7] - q[5] * q[5]) * inverse_determinant,
-                (q[2] * q[5] - q[1] * q[7]) * inverse_determinant,
-                (q[1] * q[5] - q[4] * q[2]) * inverse_determinant,
-            ],
-            [
-                (q[2] * q[5] - q[1] * q[7]) * inverse_determinant,
-                (q[0] * q[7] - q[2] * q[2]) * inverse_determinant,
-                (q[1] * q[2] - q[0] * q[5]) * inverse_determinant,
-            ],
-            [
-                (q[1] * q[5] - q[2] * q[4]) * inverse_determinant,
-                (q[1] * q[2] - q[0] * q[5]) * inverse_determinant,
-                (q[0] * q[4] - q[1] * q[1]) * inverse_determinant,
-            ],
-        ];
-        let result = DVec3::new(
-            -(inverse[0][0] * q[3] + inverse[0][1] * q[6] + inverse[0][2] * q[8]),
-            -(inverse[1][0] * q[3] + inverse[1][1] * q[6] + inverse[1][2] * q[8]),
-            -(inverse[2][0] * q[3] + inverse[2][1] * q[6] + inverse[2][2] * q[8]),
-        );
-        result.is_finite().then_some(result)
-    }
-}
+pub(super) use collapse::decimate_collapse;
 
 pub(super) fn decimate_face_normal(points: &[DVec3], face: &[usize]) -> DVec3 {
     let mut normal = DVec3::ZERO;
@@ -111,388 +39,6 @@ pub(super) fn decimate_face_normal(points: &[DVec3], face: &[usize]) -> DVec3 {
 
 /// One `[u, v]` per UV layer, in the collapse's layer order.
 type CornerUv = Vec<[f64; 2]>;
-
-#[derive(Clone)]
-struct CollapseFace {
-    vertices: [usize; 3],
-    // Per corner, the UV values of each layer. Blender interpolates loop data during a collapse and
-    // compares it per layer, so the values (not source weights) are what a collapse rewrites.
-    uv: [CornerUv; 3],
-    edges: [usize; 3],
-    material: u32,
-    origin: usize,
-    bmesh_order: usize,
-    // BMesh retains the source polygon normal on the original face after triangulation.
-    quadric_normal: Option<Vec3>,
-}
-
-#[derive(Clone, Copy)]
-struct CollapseEdge {
-    vertices: [usize; 2],
-    active: bool,
-    cut_origin: Option<usize>,
-    input_loose: bool,
-}
-
-struct CollapseMesh {
-    points: Vec<Vec3>,
-    faces: Vec<CollapseFace>,
-    edges: Vec<CollapseEdge>,
-    vertex_edges: Vec<Vec<usize>>,
-    edge_lookup: BTreeMap<(usize, usize), usize>,
-    /// Per vertex: the input vertices its position interpolates, with weights summing to one.
-    origins: Vec<Vec<(usize, f64)>>,
-    /// UV layer names, in the order of each corner's `CornerUv`.
-    layer_names: Vec<String>,
-}
-
-fn ensure_collapse_edge(
-    edges: &mut Vec<CollapseEdge>,
-    lookup: &mut BTreeMap<(usize, usize), usize>,
-    vertices: [usize; 2],
-    cut_origin: Option<usize>,
-) -> usize {
-    let key = edge_key(vertices[0], vertices[1]);
-    if let Some(index) = lookup.get(&key).copied() {
-        if cut_origin.is_some() && edges[index].cut_origin.is_none() {
-            edges[index].cut_origin = cut_origin;
-        }
-        return index;
-    }
-    let index = edges.len();
-    edges.push(CollapseEdge {
-        vertices,
-        active: true,
-        cut_origin,
-        input_loose: false,
-    });
-    lookup.insert(key, index);
-    index
-}
-
-fn collapse_quad_split_02(points: &[Vec3], vertices: [usize; 4]) -> bool {
-    let [v1, v2, v3, v4] = [
-        points[vertices[1]],
-        points[vertices[2]],
-        points[vertices[3]],
-        points[vertices[0]],
-    ];
-    let cross = |first: Vec3, second: Vec3, third: Vec3| (second - first).cross(third - first);
-    let normal_a = cross(v2, v3, v4);
-    let normal_b = cross(v2, v4, v1);
-    let mut normal = normal_a + normal_b;
-    if normal.length_squared() <= f32::MIN_POSITIVE {
-        return true;
-    }
-    normal = normal.normalize_or_zero();
-    let normal_xy_length_squared = normal.x * normal.x + normal.y * normal.y;
-    let (basis_x, basis_y) = if normal_xy_length_squared > f32::EPSILON {
-        let inverse_length = normal_xy_length_squared.sqrt().recip();
-        let basis_x = Vec3::new(normal.y * inverse_length, -normal.x * inverse_length, 0.0);
-        let basis_y = Vec3::new(
-            -normal.z * basis_x.y,
-            normal.z * basis_x.x,
-            normal.x * basis_x.y - normal.y * basis_x.x,
-        );
-        (basis_x, basis_y)
-    } else {
-        (
-            Vec3::new(if normal.z < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0),
-            Vec3::Y,
-        )
-    };
-    let project = |point: Vec3| glam::Vec2::new(basis_x.dot(point), basis_y.dot(point));
-    let [v1, v2, v3, v4] = [v1, v2, v3, v4].map(project);
-    let cross2 = |first: glam::Vec2, second: glam::Vec2, third: glam::Vec2| {
-        (second - first).perp_dot(third - first)
-    };
-    let area_234 = cross2(v2, v3, v4);
-    let area_241 = cross2(v2, v4, v1);
-    let area_123 = cross2(v1, v2, v3);
-    let area_134 = cross2(v1, v3, v4);
-    let epsilon = 1.0e-12_f32;
-    if ((area_123 >= 0.0) != (area_134 >= 0.0))
-        || area_123.abs() <= epsilon
-        || area_134.abs() <= epsilon
-    {
-        return true;
-    }
-    if (area_234 >= 0.0) != (area_241 >= 0.0)
-        || area_234.abs() <= epsilon
-        || area_241.abs() <= epsilon
-    {
-        return false;
-    }
-    let length = |first: glam::Vec2, second: glam::Vec2| (second - first).length();
-    let fac_24 = area_234.abs() / (length(v2, v3) + length(v3, v4) + length(v2, v4))
-        + area_241.abs() / (length(v4, v1) + length(v1, v2) + length(v2, v4));
-    let fac_13 = area_123.abs() / (length(v1, v2) + length(v2, v3) + length(v1, v3))
-        + area_134.abs() / (length(v3, v4) + length(v4, v1) + length(v1, v3));
-    fac_24 - fac_13 > 0.0
-}
-
-fn collapse_mesh_from_mesh(mesh: &Mesh) -> Result<CollapseMesh> {
-    let vertex_indices = id_indices(mesh);
-    let points = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co.as_vec3())
-        .collect::<Vec<_>>();
-    let mut edges = Vec::with_capacity(mesh.edges.len() + mesh.faces.len());
-    let mut edge_lookup = BTreeMap::new();
-    for edge in &mesh.edges {
-        let vertices = [
-            *vertex_indices.get(&edge.vertices[0]).ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidArgument,
-                    "decimate edge references a missing vertex",
-                )
-            })?,
-            *vertex_indices.get(&edge.vertices[1]).ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidArgument,
-                    "decimate edge references a missing vertex",
-                )
-            })?,
-        ];
-        // Edges are oriented (lower index first). Oracle-verified on the decimate variants: the stored
-        // face-cycle orientation gave UV errors on grid3 r0.3/r0.5 and more cube position diffs. Order of
-        // edges imported from .blend is not oracle-verified.
-        let vertices = if vertices[0] <= vertices[1] {
-            vertices
-        } else {
-            [vertices[1], vertices[0]]
-        };
-        let index = edges.len();
-        edges.push(CollapseEdge {
-            vertices,
-            active: true,
-            cut_origin: None,
-            input_loose: true,
-        });
-        edge_lookup.insert(edge_key(vertices[0], vertices[1]), index);
-    }
-
-    let mut source_edges = BTreeSet::new();
-    // The original face's normal remains cached on the retained triangle in Blender's BMesh.
-    let mut original_face_normals = Vec::with_capacity(mesh.faces.len());
-    for face in &mesh.faces {
-        let original_normal = match face.vertices.len() {
-            4 => {
-                let vertices = [
-                    *vertex_indices.get(&face.vertices[0]).ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InvalidArgument,
-                            "decimate face references a missing vertex",
-                        )
-                    })?,
-                    *vertex_indices.get(&face.vertices[1]).ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InvalidArgument,
-                            "decimate face references a missing vertex",
-                        )
-                    })?,
-                    *vertex_indices.get(&face.vertices[2]).ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InvalidArgument,
-                            "decimate face references a missing vertex",
-                        )
-                    })?,
-                    *vertex_indices.get(&face.vertices[3]).ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InvalidArgument,
-                            "decimate face references a missing vertex",
-                        )
-                    })?,
-                ];
-                Some(
-                    (points[vertices[0]] - points[vertices[2]])
-                        .cross(points[vertices[1]] - points[vertices[3]])
-                        .normalize_or_zero(),
-                )
-            }
-            5.. => {
-                let mut normal = Vec3::ZERO;
-                for (first, second) in cyclic_pairs(&face.vertices) {
-                    let first = vertex_indices.get(first).copied().ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InvalidArgument,
-                            "decimate face references a missing vertex",
-                        )
-                    })?;
-                    let second = vertex_indices.get(second).copied().ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InvalidArgument,
-                            "decimate face references a missing vertex",
-                        )
-                    })?;
-                    normal += points[first].cross(points[second]);
-                }
-                Some(normal.normalize_or_zero())
-            }
-            _ => None,
-        };
-        original_face_normals.push(original_normal);
-        for (first, second) in cyclic_pairs(&face.vertices) {
-            let first = vertex_indices.get(first).copied().ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidArgument,
-                    "decimate face references a missing vertex",
-                )
-            })?;
-            let second = vertex_indices.get(second).copied().ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidArgument,
-                    "decimate face references a missing vertex",
-                )
-            })?;
-            source_edges.insert(edge_key(first, second));
-        }
-    }
-    for edge in &mut edges {
-        edge.input_loose = !source_edges.contains(&edge_key(edge.vertices[0], edge.vertices[1]));
-    }
-
-    let triangles = mesh
-        .triangulate()
-        .map_err(|error| super::mesh_error(&error))?;
-    let mut face_ranges = Vec::with_capacity(mesh.faces.len());
-    let mut faces = Vec::with_capacity(triangles.len());
-    let (layer_names, layer_values) = collapse_uv_layers(mesh);
-    let corner_offsets: Vec<usize> = mesh
-        .faces
-        .iter()
-        .scan(0, |offset, face| {
-            let start = *offset;
-            *offset += face.vertices.len();
-            Some(start)
-        })
-        .collect();
-    let mut triangle_offset = 0;
-    for (origin, face) in mesh.faces.iter().enumerate() {
-        let first_face = faces.len();
-        let triangle_count = face.vertices.len().saturating_sub(2);
-        for local_index in 0..triangle_count {
-            let vertices = if face.vertices.len() == 4 {
-                let quad = [
-                    face.vertices[0],
-                    face.vertices[1],
-                    face.vertices[2],
-                    face.vertices[3],
-                ]
-                .map(|id| vertex_indices.get(&id).copied().unwrap_or(usize::MAX));
-                if collapse_quad_split_02(&points, quad) {
-                    if local_index == 0 {
-                        [quad[0], quad[1], quad[2]]
-                    } else {
-                        [quad[0], quad[2], quad[3]]
-                    }
-                } else if local_index == 0 {
-                    [quad[1], quad[2], quad[3]]
-                } else {
-                    [quad[1], quad[3], quad[0]]
-                }
-            } else {
-                let Some(triangle) = triangles.get(triangle_offset + local_index) else {
-                    return Err(PotError::new(
-                        ErrorCode::InvalidArgument,
-                        "decimate triangulation omitted a face triangle",
-                    ));
-                };
-                triangle.map(|id| vertex_indices.get(&id).copied().unwrap_or(usize::MAX))
-            };
-            if vertices.contains(&usize::MAX) {
-                return Err(PotError::new(
-                    ErrorCode::InvalidArgument,
-                    "decimate triangulation references a missing vertex",
-                ));
-            }
-            let edge_ids = [
-                ensure_collapse_edge(
-                    &mut edges,
-                    &mut edge_lookup,
-                    [vertices[0], vertices[1]],
-                    None,
-                ),
-                ensure_collapse_edge(
-                    &mut edges,
-                    &mut edge_lookup,
-                    [vertices[1], vertices[2]],
-                    None,
-                ),
-                ensure_collapse_edge(
-                    &mut edges,
-                    &mut edge_lookup,
-                    [vertices[2], vertices[0]],
-                    None,
-                ),
-            ];
-            for edge_index in edge_ids {
-                if !source_edges.contains(&edge_key(
-                    edges[edge_index].vertices[0],
-                    edges[edge_index].vertices[1],
-                )) {
-                    edges[edge_index].cut_origin = Some(origin);
-                }
-            }
-            let mut slot_uv: [CornerUv; 3] = Default::default();
-            for (slot, vertex) in vertices.iter().enumerate() {
-                let position = face
-                    .vertices
-                    .iter()
-                    .position(|id| vertex_indices.get(id).copied() == Some(*vertex))
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InvalidArgument,
-                            "decimate triangle references a vertex outside its face",
-                        )
-                    })?;
-                let corner = corner_offsets[origin] + position;
-                slot_uv[slot] = layer_values.iter().map(|values| values[corner]).collect();
-            }
-            faces.push(CollapseFace {
-                vertices,
-                uv: slot_uv,
-                edges: edge_ids,
-                material: face.material_index,
-                origin,
-                bmesh_order: 0,
-                quadric_normal: (local_index + 1 == triangle_count)
-                    .then_some(original_face_normals[origin])
-                    .flatten(),
-            });
-        }
-        face_ranges.push((first_face, triangle_count));
-        triangle_offset += triangle_count;
-    }
-    let mut bmesh_order = 0;
-    for (first, count) in &face_ranges {
-        faces[first + count - 1].bmesh_order = bmesh_order;
-        bmesh_order += 1;
-    }
-    for (first, count) in &face_ranges {
-        let end = first + count - 1;
-        for face in faces.iter_mut().take(end).skip(*first) {
-            face.bmesh_order = bmesh_order;
-            bmesh_order += 1;
-        }
-    }
-    let mut vertex_edges = vec![Vec::new(); points.len()];
-    for (edge_index, edge) in edges.iter().enumerate() {
-        vertex_edges[edge.vertices[0]].push(edge_index);
-        vertex_edges[edge.vertices[1]].push(edge_index);
-    }
-    let origins = (0..points.len()).map(|index| vec![(index, 1.0)]).collect();
-    Ok(CollapseMesh {
-        points,
-        faces,
-        edges,
-        vertex_edges,
-        edge_lookup,
-        origins,
-        layer_names,
-    })
-}
 
 /// UV layers of `mesh` as `(names, values)`: `values[l][c]` is the input `[u, v]` of corner `c` (face
 /// order, then corner order) in layer `names[l]`, from [`uv_layers::read_layers`]. A corner without a
@@ -515,1016 +61,6 @@ fn collapse_uv_layers(mesh: &Mesh) -> (Vec<String>, Vec<Vec<[f64; 2]>>) {
         );
     }
     (names, values)
-}
-
-fn collapse_edge_face_links(mesh: &CollapseMesh) -> (Vec<[usize; 2]>, Vec<u8>) {
-    let mut links = vec![[usize::MAX; 2]; mesh.edges.len()];
-    let mut counts = vec![0_u8; mesh.edges.len()];
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        for edge in face.edges {
-            let slot = usize::from(counts[edge].min(2));
-            if slot < 2 {
-                links[edge][slot] = face_index;
-            }
-            counts[edge] = counts[edge].saturating_add(1);
-        }
-    }
-    (links, counts)
-}
-
-fn collapse_triangle_normal(points: &[Vec3], vertices: [usize; 3]) -> Vec3 {
-    (points[vertices[0]] - points[vertices[1]])
-        .cross(points[vertices[1]] - points[vertices[2]])
-        .normalize_or_zero()
-}
-fn collapse_midpoint_db(points: &[Vec3], first: usize, second: usize) -> DVec3 {
-    (points[first].as_dvec3() + points[second].as_dvec3()) * 0.5
-}
-
-fn collapse_quadrics(mesh: &CollapseMesh) -> Vec<DecimateQuadric> {
-    let mut quadrics = vec![DecimateQuadric::default(); mesh.points.len()];
-    let mut face_order = (0..mesh.faces.len()).collect::<Vec<_>>();
-    face_order.sort_unstable_by_key(|index| mesh.faces[*index].bmesh_order);
-    for face_index in face_order {
-        let face = &mesh.faces[face_index];
-        let normal = face
-            .quadric_normal
-            .unwrap_or_else(|| collapse_triangle_normal(&mesh.points, face.vertices));
-        if normal.length_squared() <= f32::MIN_POSITIVE {
-            continue;
-        }
-        let center = (mesh.points[face.vertices[0]]
-            + mesh.points[face.vertices[1]]
-            + mesh.points[face.vertices[2]])
-            / 3.0;
-        let normal_db = normal.as_dvec3();
-        let distance = -normal_db.dot(center.as_dvec3());
-        let mut quadric = DecimateQuadric::default();
-        quadric.add_plane(normal_db, distance, 1.0);
-        for vertex in face.vertices {
-            quadrics[vertex] = quadrics[vertex].add(quadric);
-        }
-    }
-    let (links, counts) = collapse_edge_face_links(mesh);
-    for (edge_index, edge) in mesh.edges.iter().enumerate() {
-        if !edge.active || counts[edge_index] != 1 {
-            continue;
-        }
-        let face = &mesh.faces[links[edge_index][0]];
-        let edge_vector = mesh.points[edge.vertices[1]] - mesh.points[edge.vertices[0]];
-        let normal = face
-            .quadric_normal
-            .unwrap_or_else(|| collapse_triangle_normal(&mesh.points, face.vertices));
-        let boundary = edge_vector.cross(normal).as_dvec3();
-        let length = boundary.length();
-        if length <= f64::from(f32::EPSILON) {
-            continue;
-        }
-        let boundary_normal = boundary / length;
-        let center =
-            ((mesh.points[edge.vertices[0]] + mesh.points[edge.vertices[1]]) * 0.5).as_dvec3();
-        let distance = -boundary_normal.dot(center);
-        let mut quadric = DecimateQuadric::default();
-        quadric.add_plane(boundary_normal, distance, 100.0);
-        for vertex in edge.vertices {
-            quadrics[vertex] = quadrics[vertex].add(quadric);
-        }
-    }
-    quadrics
-}
-
-fn collapse_safe_acos_approx(value: f32) -> f32 {
-    let absolute = value.abs();
-    let clamped = if absolute < 1.0 {
-        1.0 - (1.0 - absolute)
-    } else {
-        1.0
-    };
-    let angle = (1.0 - clamped).sqrt()
-        * (1.570_796_4
-            + clamped * (-0.213_301 + clamped * (0.077_980_48 + clamped * -0.021_640_95)));
-    if value < 0.0 {
-        std::f32::consts::PI - angle
-    } else {
-        angle
-    }
-}
-
-fn collapse_vertex_normals(mesh: &Mesh) -> Vec<Vec3> {
-    let vertex_indices = id_indices(mesh);
-    let points = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co.as_vec3())
-        .collect::<Vec<_>>();
-    let mut normals = vec![Vec3::ZERO; points.len()];
-    for face in &mesh.faces {
-        let Some(vertices) = face
-            .vertices
-            .iter()
-            .map(|id| vertex_indices.get(id).copied())
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
-        };
-        let Some(last) = vertices.last().copied() else {
-            continue;
-        };
-        let face_normal = if vertices.len() == 4 {
-            (points[vertices[0]] - points[vertices[2]])
-                .cross(points[vertices[1]] - points[vertices[3]])
-                .normalize_or_zero()
-        } else {
-            let mut normal = points[last].cross(points[vertices[0]]);
-            for corner in 0..vertices.len() - 1 {
-                normal += points[vertices[corner]].cross(points[vertices[corner + 1]]);
-            }
-            normal.normalize_or_zero()
-        };
-        for corner in 0..vertices.len() {
-            let vertex = vertices[corner];
-            let previous = points[vertices[(corner + vertices.len() - 1) % vertices.len()]];
-            let next = points[vertices[(corner + 1) % vertices.len()]];
-            let to_previous = (points[vertex] - previous).normalize_or_zero();
-            let to_next = (next - points[vertex]).normalize_or_zero();
-            let angle = collapse_safe_acos_approx(-to_previous.dot(to_next));
-            normals[vertex] += face_normal * angle;
-        }
-    }
-    for normal in &mut normals {
-        *normal = normal.normalize_or_zero();
-    }
-    normals
-}
-
-fn collapse_edge_is_eligible(
-    mesh: &CollapseMesh,
-    edge_index: usize,
-    links: &[[usize; 2]],
-    counts: &[u8],
-    weights: Option<&[f32]>,
-) -> bool {
-    let edge = mesh.edges[edge_index];
-    if !edge.active
-        || (counts[edge_index] != 1 && counts[edge_index] != 2)
-        || weights.is_some_and(|values| {
-            values[edge.vertices[0]] == 0.0 || values[edge.vertices[1]] == 0.0
-        })
-    {
-        return false;
-    }
-    links[edge_index]
-        .iter()
-        .take(usize::from(counts[edge_index]))
-        .all(|face| mesh.faces[*face].vertices.len() == 3)
-}
-
-fn collapse_edge_cost(
-    mesh: &CollapseMesh,
-    edge_index: usize,
-    links: &[[usize; 2]],
-    counts: &[u8],
-    quadrics: &[DecimateQuadric],
-    normals: &[Vec3],
-    weights: Option<&[f32]>,
-    weight_factor: f32,
-) -> Option<f32> {
-    if !collapse_edge_is_eligible(mesh, edge_index, links, counts, weights) {
-        return None;
-    }
-    let edge = mesh.edges[edge_index];
-    let first = edge.vertices[0];
-    let second = edge.vertices[1];
-    let quadric = quadrics[first].add(quadrics[second]);
-    let optimized = quadric
-        .optimize()
-        .unwrap_or_else(|| collapse_midpoint_db(&mesh.points, first, second));
-    let mut cost =
-        (quadrics[first].evaluate(optimized) + quadrics[second].evaluate(optimized)) as f32;
-    cost = cost.abs();
-    let edge_vector = mesh.points[second] - mesh.points[first];
-    if cost < 1.0e-12_f32 {
-        let denominator = if weights.is_some() {
-            (-edge_vector.length()).min(-f32::EPSILON)
-        } else {
-            (-edge_vector.length_squared()).min(-f32::EPSILON)
-        };
-        cost = normals[first].dot(normals[second]).abs() / denominator - cost;
-        if let Some(weights) = weights {
-            let edge_weight = weights[first] + weights[second];
-            if edge_weight != 0.0 {
-                cost *= 1.0 + edge_weight * weight_factor;
-            }
-        }
-    } else if let Some(weights) = weights {
-        let edge_weight = 2.0 - (weights[first] + weights[second]);
-        if edge_weight != 0.0 {
-            cost += edge_vector.length() * (edge_weight * weight_factor);
-        }
-    }
-    Some(cost)
-}
-
-fn collapse_is_topologically_degenerate(
-    mesh: &CollapseMesh,
-    edge_index: usize,
-    links: &[[usize; 2]],
-    counts: &[u8],
-) -> bool {
-    let edge = mesh.edges[edge_index];
-    let face_count = counts[edge_index];
-    if (face_count != 1 && face_count != 2)
-        || links[edge_index]
-            .iter()
-            .take(usize::from(face_count))
-            .any(|face| mesh.faces[*face].vertices.len() != 3)
-    {
-        return true;
-    }
-    let [first, second] = edge.vertices;
-    let mut opposite_vertices = [usize::MAX; 2];
-    for (slot, face_index) in links[edge_index]
-        .iter()
-        .take(usize::from(face_count))
-        .enumerate()
-    {
-        let Some(opposite) = mesh.faces[*face_index]
-            .vertices
-            .iter()
-            .copied()
-            .find(|vertex| *vertex != first && *vertex != second)
-        else {
-            return true;
-        };
-        if opposite_vertices[..slot].contains(&opposite) {
-            return true;
-        }
-        opposite_vertices[slot] = opposite;
-    }
-    let mut first_neighbors = vec![false; mesh.points.len()];
-    let mut second_neighbors = vec![false; mesh.points.len()];
-    for (index, candidate) in mesh.edges.iter().enumerate() {
-        if !candidate.active {
-            continue;
-        }
-        if (candidate.vertices.contains(&first) || candidate.vertices.contains(&second))
-            && (counts[index] == 0 || counts[index] > 2)
-        {
-            return true;
-        }
-        if candidate.vertices.contains(&first) {
-            let neighbor = if candidate.vertices[0] == first {
-                candidate.vertices[1]
-            } else {
-                candidate.vertices[0]
-            };
-            if neighbor != second {
-                first_neighbors[neighbor] = true;
-            }
-        }
-        if candidate.vertices.contains(&second) {
-            let neighbor = if candidate.vertices[0] == second {
-                candidate.vertices[1]
-            } else {
-                candidate.vertices[0]
-            };
-            if neighbor != first {
-                second_neighbors[neighbor] = true;
-            }
-        }
-    }
-    let mut common = 0;
-    for (neighbor, (first, second)) in first_neighbors.iter().zip(second_neighbors).enumerate() {
-        if *first && second {
-            if !opposite_vertices[..usize::from(face_count)].contains(&neighbor) {
-                return true;
-            }
-            common += 1;
-        }
-    }
-    common != usize::from(face_count)
-}
-
-fn collapse_would_flip(mesh: &CollapseMesh, edge_index: usize, position: Vec3) -> bool {
-    for vertex in mesh.edges[edge_index].vertices {
-        for face in &mesh.faces {
-            if face.edges.contains(&edge_index) {
-                continue;
-            }
-            let Some(corner) = face.vertices.iter().position(|current| *current == vertex) else {
-                continue;
-            };
-            let previous = mesh.points[face.vertices[(corner + 2) % 3]];
-            let next = mesh.points[face.vertices[(corner + 1) % 3]];
-            let other = previous - next;
-            let before = other.cross(previous - mesh.points[vertex]);
-            let after = other.cross(previous - position);
-            if before.dot(after) <= (before.length_squared() + after.length_squared()) * 0.01_f32 {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn collapse_reflect(point: Vec3, axis: usize) -> Vec3 {
-    let mut reflected = point;
-    reflected[axis] = -reflected[axis];
-    reflected
-}
-
-#[derive(Clone, Copy)]
-struct CollapseKdNode {
-    edge_index: usize,
-    axis: usize,
-    center: Vec3,
-    left: Option<usize>,
-    right: Option<usize>,
-}
-
-fn collapse_edge_midpoint(mesh: &CollapseMesh, edge_index: usize) -> Vec3 {
-    let edge = mesh.edges[edge_index];
-    (mesh.points[edge.vertices[0]] + mesh.points[edge.vertices[1]]) * 0.5
-}
-
-fn collapse_kd_build(
-    mesh: &CollapseMesh,
-    indices: &mut [usize],
-    depth: usize,
-    nodes: &mut Vec<CollapseKdNode>,
-) -> Option<usize> {
-    if indices.is_empty() {
-        return None;
-    }
-    let axis = depth % 3;
-    indices.sort_unstable_by(|first, second| {
-        collapse_edge_midpoint(mesh, *first)[axis]
-            .total_cmp(&collapse_edge_midpoint(mesh, *second)[axis])
-            .then_with(|| first.cmp(second))
-    });
-    let middle = indices.len() / 2;
-    let edge_index = indices[middle];
-    let left = collapse_kd_build(mesh, &mut indices[..middle], depth + 1, nodes);
-    let right = collapse_kd_build(mesh, &mut indices[middle + 1..], depth + 1, nodes);
-    let node_index = nodes.len();
-    nodes.push(CollapseKdNode {
-        edge_index,
-        axis,
-        center: collapse_edge_midpoint(mesh, edge_index),
-        left,
-        right,
-    });
-    Some(node_index)
-}
-
-fn collapse_edge_mirror_matches(
-    mesh: &CollapseMesh,
-    first_index: usize,
-    second_index: usize,
-    axis: usize,
-) -> bool {
-    let first = mesh.edges[first_index];
-    let second = mesh.edges[second_index];
-    let reflected_first = collapse_reflect(mesh.points[first.vertices[0]], axis);
-    let reflected_second = collapse_reflect(mesh.points[first.vertices[1]], axis);
-    let reflected_midpoint = (reflected_first + reflected_second) * 0.5;
-    if collapse_edge_midpoint(mesh, second_index).distance_squared(reflected_midpoint) > 4.0e-10_f32
-    {
-        return false;
-    }
-    let reflected_direction = reflected_second - reflected_first;
-    let direction = mesh.points[second.vertices[1]] - mesh.points[second.vertices[0]];
-    if direction.dot(reflected_direction) > 0.0 {
-        mesh.points[second.vertices[0]].distance_squared(reflected_first) <= 4.0e-10_f32
-            && mesh.points[second.vertices[1]].distance_squared(reflected_second) <= 4.0e-10_f32
-    } else {
-        mesh.points[second.vertices[1]].distance_squared(reflected_first) <= 4.0e-10_f32
-            && mesh.points[second.vertices[0]].distance_squared(reflected_second) <= 4.0e-10_f32
-    }
-}
-
-fn collapse_kd_find(
-    mesh: &CollapseMesh,
-    nodes: &[CollapseKdNode],
-    node_index: Option<usize>,
-    query: Vec3,
-    first_edge: usize,
-    axis: usize,
-    result: &mut Option<usize>,
-) {
-    let Some(node_index) = node_index else {
-        return;
-    };
-    let node = nodes[node_index];
-    if node.center.distance_squared(query) <= 4.0e-10_f32
-        && collapse_edge_mirror_matches(mesh, first_edge, node.edge_index, axis)
-    {
-        *result = Some(node.edge_index);
-        return;
-    }
-    let distance = query[node.axis] - node.center[node.axis];
-    let (near, far) = if distance <= 0.0 {
-        (node.left, node.right)
-    } else {
-        (node.right, node.left)
-    };
-    collapse_kd_find(mesh, nodes, near, query, first_edge, axis, result);
-    if result.is_none() && distance * distance <= 4.0e-10_f32 {
-        collapse_kd_find(mesh, nodes, far, query, first_edge, axis, result);
-    }
-}
-
-fn collapse_symmetry_map(mesh: &CollapseMesh, axis: usize) -> Vec<Option<usize>> {
-    let mut mapping = vec![None; mesh.edges.len()];
-    let mut indices = mesh
-        .edges
-        .iter()
-        .enumerate()
-        .filter_map(|(index, edge)| edge.active.then_some(index))
-        .collect::<Vec<_>>();
-    let mut nodes = Vec::with_capacity(indices.len());
-    let root = collapse_kd_build(mesh, &mut indices, 0, &mut nodes);
-    for (edge_index, edge) in mesh.edges.iter().enumerate() {
-        if !edge.active || mapping[edge_index].is_some() {
-            continue;
-        }
-        let reflected_midpoint = collapse_reflect(collapse_edge_midpoint(mesh, edge_index), axis);
-        let mut mirror = None;
-        collapse_kd_find(
-            mesh,
-            &nodes,
-            root,
-            reflected_midpoint,
-            edge_index,
-            axis,
-            &mut mirror,
-        );
-        if let Some(mirror_index) = mirror {
-            mapping[edge_index] = Some(mirror_index);
-            mapping[mirror_index] = Some(edge_index);
-        }
-    }
-    mapping
-}
-
-fn collapse_line_factor(position: Vec3, first: Vec3, second: Vec3) -> f32 {
-    let direction = second - first;
-    let length_squared = direction.length_squared();
-    if length_squared <= f32::EPSILON {
-        0.5
-    } else {
-        (position - first).dot(direction) / length_squared
-    }
-}
-
-fn collapse_corner_slot(face: &CollapseFace, vertex: usize) -> Option<usize> {
-    face.vertices
-        .iter()
-        .position(|candidate| *candidate == vertex)
-}
-
-/// Squared UV distance under which two loops hold equal data (Blender's `layerEqual_propfloat2`).
-const UV_EQUAL_DIST_SQ: f64 = 1.0e-5;
-
-/// Blender's `bm_edge_collapse_loop_customdata`, per UV layer. Each collapsed triangle gives its two
-/// corners at the collapsed edge a `share`-weighted mix of their values. Around each endpoint the fan is
-/// walked up to the other collapsed triangle, and a loop takes the mix in layer `l` when its value there is
-/// equal to the endpoint loop's value in `l`. Layers are gated independently. With no UV layers this is a no-op.
-fn collapse_interpolate_loops(
-    mesh: &mut CollapseMesh,
-    edge_index: usize,
-    [keep, clear]: [usize; 2],
-    share: f64,
-    remove_faces: &BTreeSet<usize>,
-    links: &[[usize; 2]],
-    counts: &[u8],
-) {
-    let layers = mesh.layer_names.len();
-    if layers == 0 {
-        return;
-    }
-    for &killed in remove_faces {
-        let face = &mesh.faces[killed];
-        let (Some(clear_slot), Some(keep_slot)) = (
-            collapse_corner_slot(face, clear),
-            collapse_corner_slot(face, keep),
-        ) else {
-            continue;
-        };
-        let clear_uv = face.uv[clear_slot].clone();
-        let keep_uv = face.uv[keep_slot].clone();
-        let blended: CornerUv = (0..layers)
-            .map(|l| {
-                [
-                    clear_uv[l][0] * share + keep_uv[l][0] * (1.0 - share),
-                    clear_uv[l][1] * share + keep_uv[l][1] * (1.0 - share),
-                ]
-            })
-            .collect();
-        let exit = remove_faces.iter().copied().find(|other| *other != killed);
-        for (vertex, gate) in [(clear, clear_uv), (keep, keep_uv)] {
-            let mut current = killed;
-            let mut previous = edge_index;
-            while let Some((next, next_slot, next_edge)) =
-                collapse_fan_step(mesh, links, counts, current, vertex, previous)
-            {
-                if Some(next) == exit || next == killed {
-                    break;
-                }
-                for (l, endpoint) in gate.iter().enumerate() {
-                    let value = &mut mesh.faces[next].uv[next_slot][l];
-                    let dx = value[0] - endpoint[0];
-                    let dy = value[1] - endpoint[1];
-                    if dx * dx + dy * dy < UV_EQUAL_DIST_SQ {
-                        *value = blended[l];
-                    }
-                }
-                current = next;
-                previous = next_edge;
-            }
-        }
-    }
-}
-
-/// Blender's `BM_vert_step_fan_loop`: from the corner of `vertex` in `face`, cross the edge at `vertex`
-/// other than `previous` into the neighbouring face. Returns `(face, slot, edge)`, or `None` at a boundary.
-fn collapse_fan_step(
-    mesh: &CollapseMesh,
-    links: &[[usize; 2]],
-    counts: &[u8],
-    face: usize,
-    vertex: usize,
-    previous: usize,
-) -> Option<(usize, usize, usize)> {
-    let current = &mesh.faces[face];
-    let slot = collapse_corner_slot(current, vertex)?;
-    let edge = if current.edges[slot] == previous {
-        current.edges[(slot + 2) % 3]
-    } else {
-        current.edges[slot]
-    };
-    if counts[edge] != 2 {
-        return None;
-    }
-    let next = if links[edge][0] == face {
-        links[edge][1]
-    } else {
-        links[edge][0]
-    };
-    let next_slot = collapse_corner_slot(&mesh.faces[next], vertex)?;
-    Some((next, next_slot, edge))
-}
-
-fn collapse_apply(
-    mesh: &mut CollapseMesh,
-    edge_index: usize,
-    position: Vec3,
-    quadrics: &mut [DecimateQuadric],
-    normals: &mut [Vec3],
-    weights: &mut Option<Vec<f32>>,
-) {
-    // The first edge vertex is kept at the new position; the second is cleared into it.
-    let [keep, clear] = mesh.edges[edge_index].vertices;
-    let keep_edges = mesh.vertex_edges[keep].clone();
-    let clear_edges = mesh.vertex_edges[clear].clone();
-    let (links, counts) = collapse_edge_face_links(mesh);
-    let remove_faces = links[edge_index]
-        .iter()
-        .take(usize::from(counts[edge_index]))
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let factor = collapse_line_factor(position, mesh.points[keep], mesh.points[clear]);
-    let share = f64::from(factor);
-    collapse_interpolate_loops(
-        mesh,
-        edge_index,
-        [keep, clear],
-        share,
-        &remove_faces,
-        &links,
-        &counts,
-    );
-    if let Some(values) = weights {
-        values[keep] = (values[keep] * (1.0 - factor) + values[clear] * factor).clamp(0.0, 1.0);
-    }
-    mesh.points[keep] = position;
-    let keep_origin = std::mem::take(&mut mesh.origins[keep]);
-    let clear_origin = std::mem::take(&mut mesh.origins[clear]);
-    mesh.origins[keep] = blend_weights(
-        keep_origin
-            .into_iter()
-            .map(|(source, weight)| (source, weight * (1.0 - share)))
-            .chain(
-                clear_origin
-                    .into_iter()
-                    .map(|(source, weight)| (source, weight * share)),
-            ),
-    );
-    normals[keep] = (normals[keep] * (1.0 - factor) + normals[clear] * factor).normalize_or_zero();
-    quadrics[keep] = quadrics[keep].add(quadrics[clear]);
-
-    mesh.faces = mesh
-        .faces
-        .drain(..)
-        .enumerate()
-        .filter_map(|(index, mut face)| {
-            if remove_faces.contains(&index) {
-                return None;
-            }
-            for vertex in &mut face.vertices {
-                if *vertex == clear {
-                    *vertex = keep;
-                }
-            }
-            Some(face)
-        })
-        .collect();
-
-    let mut retained = BTreeMap::new();
-    for index in &keep_edges {
-        let edge = mesh.edges[*index];
-        if edge.active && !edge.vertices.contains(&clear) {
-            retained.insert(edge_key(edge.vertices[0], edge.vertices[1]), *index);
-        }
-    }
-    let mut moved_edges = Vec::new();
-    let mut removed_edges = Vec::new();
-    for index in clear_edges {
-        if !mesh.edges[index].active {
-            continue;
-        }
-        let edge = mesh.edges[index];
-        let other = if edge.vertices[0] == clear {
-            edge.vertices[1]
-        } else {
-            edge.vertices[0]
-        };
-        if other == keep || index == edge_index {
-            mesh.edges[index].active = false;
-            removed_edges.push(index);
-            continue;
-        }
-        let vertices = [
-            if edge.vertices[0] == clear {
-                keep
-            } else {
-                edge.vertices[0]
-            },
-            if edge.vertices[1] == clear {
-                keep
-            } else {
-                edge.vertices[1]
-            },
-        ];
-        let key = edge_key(vertices[0], vertices[1]);
-        match retained.entry(key) {
-            std::collections::btree_map::Entry::Occupied(_) => {
-                mesh.edges[index].active = false;
-                removed_edges.push(index);
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                mesh.edges[index].vertices = vertices;
-                entry.insert(index);
-                moved_edges.push(index);
-            }
-        }
-    }
-    mesh.edges[edge_index].active = false;
-    for index in removed_edges {
-        let edge = mesh.edges[index];
-        for vertex in edge.vertices {
-            if vertex != keep && vertex != clear {
-                mesh.vertex_edges[vertex].retain(|candidate| *candidate != index);
-            }
-        }
-    }
-    let mut keep_disk = keep_edges
-        .into_iter()
-        .filter(|index| mesh.edges[*index].active)
-        .collect::<Vec<_>>();
-    keep_disk.extend(moved_edges);
-    mesh.vertex_edges[keep] = keep_disk;
-    mesh.vertex_edges[clear].clear();
-
-    mesh.edge_lookup.clear();
-    for (index, edge) in mesh.edges.iter().enumerate() {
-        if edge.active {
-            mesh.edge_lookup
-                .insert(edge_key(edge.vertices[0], edge.vertices[1]), index);
-        }
-    }
-    for face in &mut mesh.faces {
-        face.edges = [
-            mesh.edge_lookup[&edge_key(face.vertices[0], face.vertices[1])],
-            mesh.edge_lookup[&edge_key(face.vertices[1], face.vertices[2])],
-            mesh.edge_lookup[&edge_key(face.vertices[2], face.vertices[0])],
-        ];
-    }
-}
-fn collapse_heap_insert_or_update(heap: &mut DecimateHeap, edge_index: usize, cost: f32) {
-    if heap.positions[edge_index].is_some() {
-        heap.update(edge_index, cost);
-        return;
-    }
-    heap.nodes[edge_index].value = cost;
-    let position = heap.tree.len();
-    heap.positions[edge_index] = Some(position);
-    heap.tree.push(edge_index);
-    heap.up(position);
-}
-
-fn collapse_heap_update_after_collapse(
-    mesh: &CollapseMesh,
-    keep: usize,
-    quadrics: &[DecimateQuadric],
-    normals: &[Vec3],
-    weights: Option<&[f32]>,
-    weight_factor: f32,
-    heap: &mut DecimateHeap,
-) {
-    for (edge_index, edge) in mesh.edges.iter().enumerate() {
-        if !edge.active {
-            heap.remove(edge_index);
-        }
-    }
-    let (links, counts) = collapse_edge_face_links(mesh);
-    let mut touched = mesh.vertex_edges[keep].clone();
-    for edge_index in &mesh.vertex_edges[keep] {
-        for face_index in links[*edge_index]
-            .iter()
-            .take(usize::from(counts[*edge_index]))
-        {
-            let face = &mesh.faces[*face_index];
-            if let Some(corner) = face.vertices.iter().position(|vertex| *vertex == keep)
-                && face.edges[(corner + 2) % 3] == *edge_index
-            {
-                touched.push(face.edges[(corner + 1) % 3]);
-            }
-        }
-    }
-    for edge_index in touched {
-        if let Some(cost) = collapse_edge_cost(
-            mesh,
-            edge_index,
-            &links,
-            &counts,
-            quadrics,
-            normals,
-            weights,
-            weight_factor,
-        ) {
-            collapse_heap_insert_or_update(heap, edge_index, cost);
-        } else {
-            heap.remove(edge_index);
-        }
-    }
-}
-
-fn collapse_quad_is_convex(points: &[Vec3], vertices: &[usize]) -> bool {
-    if vertices.len() != 4 {
-        return false;
-    }
-    let corners = [
-        points[vertices[0]],
-        points[vertices[1]],
-        points[vertices[2]],
-        points[vertices[3]],
-    ];
-    let mut normal = Vec3::ZERO;
-    for index in 0..4 {
-        normal += corners[index].cross(corners[(index + 1) % 4]);
-    }
-    if normal.length_squared() <= f32::MIN_POSITIVE {
-        return false;
-    }
-    let normal = normal.normalize_or_zero();
-    (0..4).all(|index| {
-        let first = corners[(index + 1) % 4] - corners[index];
-        let second = corners[(index + 2) % 4] - corners[(index + 1) % 4];
-        first.cross(second).dot(normal) > f32::EPSILON
-    })
-}
-
-pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) -> Result<Mesh> {
-    if mesh.faces.len() <= 3 {
-        return Ok(mesh.clone());
-    }
-    let weights = decimate_group_weights(mesh, modifier)?;
-    let weight_factor = number_param(modifier, "vertex_group_factor")?;
-    if !(0.0..=1.0).contains(&weight_factor) {
-        return Err(invalid_parameter(
-            modifier,
-            "vertex_group_factor",
-            "a number from 0 through 1",
-        ));
-    }
-    let use_triangulate = bool_param(modifier, "use_collapse_triangulate")?;
-    let symmetry_axis = if bool_param(modifier, "use_symmetry")? {
-        Some(decimate_symmetry_axis(modifier)?)
-    } else {
-        None
-    };
-    let invert_weights = bool_param(modifier, "invert_vertex_group")?;
-    if ratio < 1.0 && invert_weights && weights.is_some() && weight_factor > 0.0 {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "DECIMATE COLLAPSE with an inverted vertex group is not supported",
-            json!({"feature_id":"modifier.decimate.collapse_vertex_group_invert"}),
-        ));
-    }
-    let mut weights: Option<Vec<f32>> =
-        weights.map(|values| values.into_iter().map(|value| value as f32).collect());
-    let weight_factor = weight_factor as f32;
-    if weight_factor == 0.0 {
-        weights = None;
-    }
-    let mut model = collapse_mesh_from_mesh(mesh)?;
-    let target_faces = (model.faces.len() as f32 * ratio as f32) as usize;
-    let mut quadrics = collapse_quadrics(&model);
-    let mut normals = collapse_vertex_normals(mesh);
-    let mut heap = DecimateHeap::new(vec![f32::MAX; model.edges.len()]);
-    heap.tree.clear();
-    heap.positions.fill(None);
-    let (links, counts) = collapse_edge_face_links(&model);
-    for edge_index in 0..model.edges.len() {
-        if let Some(cost) = collapse_edge_cost(
-            &model,
-            edge_index,
-            &links,
-            &counts,
-            &quadrics,
-            &normals,
-            weights.as_deref(),
-            weight_factor,
-        ) {
-            collapse_heap_insert_or_update(&mut heap, edge_index, cost);
-        }
-    }
-    while model.faces.len() > target_faces {
-        let Some(edge_index) = heap.top() else {
-            break;
-        };
-        if heap.value(edge_index) == Some(f32::MAX) {
-            break;
-        }
-        heap.remove(edge_index);
-        let (links, counts) = collapse_edge_face_links(&model);
-        let mirror_index = if let Some(axis) = symmetry_axis {
-            let symmetry = collapse_symmetry_map(&model, axis);
-            let Some(mirror_index) = symmetry[edge_index] else {
-                collapse_heap_insert_or_update(&mut heap, edge_index, f32::MAX);
-                continue;
-            };
-            if mirror_index != edge_index {
-                if heap.positions[mirror_index].is_none() {
-                    collapse_heap_insert_or_update(&mut heap, edge_index, f32::MAX);
-                    continue;
-                }
-                if model.edges[edge_index]
-                    .vertices
-                    .iter()
-                    .any(|vertex| model.edges[mirror_index].vertices.contains(vertex))
-                {
-                    continue;
-                }
-                if collapse_is_topologically_degenerate(&model, edge_index, &links, &counts)
-                    || collapse_is_topologically_degenerate(&model, mirror_index, &links, &counts)
-                {
-                    heap.remove(mirror_index);
-                    collapse_heap_insert_or_update(&mut heap, edge_index, f32::MAX);
-                    collapse_heap_insert_or_update(&mut heap, mirror_index, f32::MAX);
-                    continue;
-                }
-            } else if collapse_is_topologically_degenerate(&model, edge_index, &links, &counts) {
-                collapse_heap_insert_or_update(&mut heap, edge_index, f32::MAX);
-                continue;
-            }
-            Some(mirror_index)
-        } else {
-            if collapse_is_topologically_degenerate(&model, edge_index, &links, &counts) {
-                collapse_heap_insert_or_update(&mut heap, edge_index, f32::MAX);
-                continue;
-            }
-            None
-        };
-        let edge = model.edges[edge_index];
-        let quadric = quadrics[edge.vertices[0]].add(quadrics[edge.vertices[1]]);
-        let optimized = quadric.optimize().unwrap_or_else(|| {
-            collapse_midpoint_db(&model.points, edge.vertices[0], edge.vertices[1])
-        });
-        if !optimized.is_finite() {
-            collapse_heap_insert_or_update(&mut heap, edge_index, f32::MAX);
-            if let Some(mirror_index) = mirror_index
-                && mirror_index != edge_index
-            {
-                heap.remove(mirror_index);
-                collapse_heap_insert_or_update(&mut heap, mirror_index, f32::MAX);
-            }
-            continue;
-        }
-        let mut position = optimized.as_vec3();
-        if mirror_index == Some(edge_index)
-            && let Some(axis) = symmetry_axis
-        {
-            position[axis] = 0.0;
-        }
-        if collapse_would_flip(&model, edge_index, position) {
-            collapse_heap_insert_or_update(&mut heap, edge_index, f32::MAX);
-            if let Some(mirror_index) = mirror_index
-                && mirror_index != edge_index
-            {
-                heap.remove(mirror_index);
-                collapse_heap_insert_or_update(&mut heap, mirror_index, f32::MAX);
-            }
-            continue;
-        }
-        let keep = edge.vertices[0];
-        collapse_apply(
-            &mut model,
-            edge_index,
-            position,
-            &mut quadrics,
-            &mut normals,
-            &mut weights,
-        );
-        collapse_heap_update_after_collapse(
-            &model,
-            keep,
-            &quadrics,
-            &normals,
-            weights.as_deref(),
-            weight_factor,
-            &mut heap,
-        );
-        if let Some(mirror_index) = mirror_index
-            && mirror_index != edge_index
-            && heap.positions[mirror_index].is_some()
-        {
-            heap.remove(mirror_index);
-            let mirror_position = collapse_reflect(position, symmetry_axis.unwrap_or(0));
-            let mirror_keep = model.edges[mirror_index].vertices[0];
-            collapse_apply(
-                &mut model,
-                mirror_index,
-                mirror_position,
-                &mut quadrics,
-                &mut normals,
-                &mut weights,
-            );
-            collapse_heap_update_after_collapse(
-                &model,
-                mirror_keep,
-                &quadrics,
-                &normals,
-                weights.as_deref(),
-                weight_factor,
-                &mut heap,
-            );
-        }
-    }
-
-    let layer_names = std::mem::take(&mut model.layer_names);
-    let (polygons, face_origins, corner_uv) = if use_triangulate {
-        (
-            model
-                .faces
-                .iter()
-                .map(|face| (face.vertices.to_vec(), face.material))
-                .collect(),
-            model.faces.iter().map(|face| Some(face.origin)).collect(),
-            model
-                .faces
-                .iter()
-                .flat_map(|face| face.uv.iter().cloned())
-                .collect(),
-        )
-    } else {
-        collapse_untriangulate(&model)
-    };
-    let (_, counts) = collapse_edge_face_links(&model);
-    let loose = model
-        .edges
-        .iter()
-        .enumerate()
-        .filter_map(|(index, edge)| {
-            (edge.active && edge.input_loose && counts[index] == 0).then_some(edge.vertices)
-        })
-        .collect();
-    let points = model
-        .points
-        .iter()
-        .map(|point| point.as_dvec3())
-        .collect::<Vec<_>>();
-    // Corners keep the baseline derived sources; UV layers are rewritten from `corner_uv` below.
-    let origin = Origin {
-        vertices: model.origins,
-        faces: face_origins,
-        corners: None,
-        raw_normals: false,
-    };
-    let mut out = decimate_compact(points, polygons, loose, origin, mesh)?;
-    collapse_write_uv(&mut out, &layer_names, &corner_uv)?;
-    Ok(out)
 }
 
 /// Rewrites the UV layers of `mesh`, rebuilt by a collapse, from the per-corner values of `corner_uv`
@@ -1561,97 +97,6 @@ fn collapse_write_uv(mesh: &mut Mesh, names: &[String], corner_uv: &[CornerUv]) 
         .collect();
     uv_layers::write_layers(mesh, &layers);
     Ok(())
-}
-
-/// A rebuilt polygon with its source face and per-corner UV values, before duplicates are dropped.
-type TaggedCorners = ((Option<usize>, Vec<CornerUv>), Polygon);
-
-fn collapse_untriangulate(
-    mesh: &CollapseMesh,
-) -> (Vec<Polygon>, Vec<Option<usize>>, Vec<CornerUv>) {
-    let (links, counts) = collapse_edge_face_links(mesh);
-    let mut merged_faces = vec![false; mesh.faces.len()];
-    let mut polygons = Vec::new();
-    let mut face_origins = Vec::new();
-    let mut face_corners = Vec::new();
-    for (edge_index, edge) in mesh.edges.iter().enumerate() {
-        let Some(origin) = edge.cut_origin else {
-            continue;
-        };
-        if !edge.active || counts[edge_index] != 2 {
-            continue;
-        }
-        let first_index = links[edge_index][0];
-        let second_index = links[edge_index][1];
-        if merged_faces[first_index] || merged_faces[second_index] {
-            continue;
-        }
-        let first = &mesh.faces[first_index];
-        let second = &mesh.faces[second_index];
-        if first.origin != origin
-            || second.origin != origin
-            || first.vertices.len() != 3
-            || second.vertices.len() != 3
-        {
-            continue;
-        }
-        let Some(vertices) = super::decimate_merge_faces(
-            &first.vertices,
-            &second.vertices,
-            edge_key(edge.vertices[0], edge.vertices[1]),
-        ) else {
-            continue;
-        };
-        if !collapse_quad_is_convex(&mesh.points, &vertices) {
-            continue;
-        }
-        merged_faces[first_index] = true;
-        merged_faces[second_index] = true;
-        face_corners.push(decimate_merged_corners(first, second, &vertices));
-        polygons.push((vertices, first.material));
-        face_origins.push(Some(origin));
-    }
-    for (index, face) in mesh.faces.iter().enumerate() {
-        if !merged_faces[index] {
-            polygons.push((face.vertices.to_vec(), face.material));
-            face_corners.push(face.uv.to_vec());
-            face_origins.push(Some(face.origin));
-        }
-    }
-    let tagged: Vec<TaggedCorners> = face_origins
-        .into_iter()
-        .zip(face_corners)
-        .zip(polygons)
-        .collect();
-    let mut kept_polygons = Vec::new();
-    let mut kept_origins = Vec::new();
-    let mut kept_corners = Vec::new();
-    for ((origin, corners), polygon) in unique_tagged_polygons(tagged) {
-        kept_polygons.push(polygon);
-        kept_origins.push(origin);
-        kept_corners.extend(corners);
-    }
-    (kept_polygons, kept_origins, kept_corners)
-}
-
-/// UV values of a merged triangle pair's corners, one per merged vertex. A shared-edge vertex takes
-/// the first triangle's values, as `decimate_merge_faces` takes its vertex.
-fn decimate_merged_corners(
-    first: &CollapseFace,
-    second: &CollapseFace,
-    merged: &[usize],
-) -> Vec<CornerUv> {
-    merged
-        .iter()
-        .map(|vertex| {
-            collapse_corner_slot(first, *vertex)
-                .map(|slot| first.uv[slot].clone())
-                .or_else(|| {
-                    collapse_corner_slot(second, *vertex).map(|slot| second.uv[slot].clone())
-                })
-                .unwrap_or_default()
-        })
-        .collect()
 }
 
 fn decimate_symmetry_axis(modifier: &Modifier) -> Result<usize> {
@@ -1715,42 +160,2486 @@ fn decimate_group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec
         .map(Some)
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DecimateHeapNode {
-    value: f32,
+// Blender's `BM_mesh_decimate_dissolve` and `BM_mesh_decimate_unsubdivide` run on a BMesh. `BMesh`
+// below keeps the disk and radial cycles of `collapse.rs`, with arena indices in creation order
+// (Blender's element list order), and the operations these two decimators use: `BM_faces_join`,
+// `BM_face_split`, `BM_vert_collapse_edge`, `BM_vert_dissolve` and their kernels.
+
+/// Blender's `NONE` link: an absent element index.
+const NONE: usize = usize::MAX;
+/// Blender's `COST_INVALID`.
+const COST_INVALID: f32 = f32::MAX;
+/// Blender's `VERT_DISSOLVE_MAX`: the most edges or faces around a dissolvable vertex.
+const VERT_DISSOLVE_MAX: usize = 4;
+/// Blender's `VERT_INDEX_DO_COLLAPSE`, `VERT_INDEX_INIT` and `VERT_INDEX_IGNORE`.
+const TAG_DO_COLLAPSE: i8 = -1;
+const TAG_INIT: i8 = 0;
+const TAG_IGNORE: i8 = 1;
+/// `DEG2RADF(90.0f)`: the unit of the vertex and edge angle products, and their fallback angle.
+const UNIT_TO_ANGLE: f32 = 90.0 * (std::f64::consts::PI / 180.0) as f32;
+const ANGLE_TO_UNIT: f32 = 1.0 / UNIT_TO_ANGLE;
+
+#[derive(Clone, Copy)]
+struct DiskLink {
+    next: usize,
+    prev: usize,
 }
 
-#[derive(Debug)]
+const NO_DISK: DiskLink = DiskLink {
+    next: NONE,
+    prev: NONE,
+};
+
+struct BVert {
+    co: [f32; 3],
+    /// First edge of the disk cycle, or `NONE`.
+    edge: usize,
+    alive: bool,
+    /// `_FLAG_JF` of `BM_faces_join`.
+    jf: bool,
+}
+
+#[derive(Clone, Copy)]
+struct BEdge {
+    v: [usize; 2],
+    disk: [DiskLink; 2],
+    /// First loop of the radial cycle, or `NONE`.
+    l: usize,
+    alive: bool,
+    /// `BM_ELEM_SMOOTH` is set when the edge is not sharp.
+    smooth: bool,
+    seam: bool,
+    /// `BM_ELEM_TAG`: set on the edges that were already wire before dissolving.
+    tag: bool,
+    jf: bool,
+}
+
+#[derive(Clone)]
+struct BLoop {
+    v: usize,
+    e: usize,
+    f: usize,
+    next: usize,
+    prev: usize,
+    radial_next: usize,
+    radial_prev: usize,
+    /// One `[u, v]` per UV layer.
+    uv: Vec<[f32; 2]>,
+    /// Input corner index (flattened over the input faces) the loop's data came from, or `NONE`.
+    src: usize,
+}
+
+#[derive(Clone)]
+struct BFace {
+    /// First loop of the face ring, `BM_FACE_FIRST_LOOP`.
+    first: usize,
+    len: usize,
+    no: [f32; 3],
+    mat: u32,
+    /// Input polygon index, or `None` for a face made by a join or split.
+    origin: Option<usize>,
+    alive: bool,
+    jf: bool,
+}
+
+/// The `delimit` modes of the DISSOLVE decimator.
+#[derive(Clone, Copy, Default)]
+struct Delimit {
+    seam: bool,
+    sharp: bool,
+    material: bool,
+    normal: bool,
+    uv: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DissolveMethod {
+    InteriorFan,
+    InteriorChain,
+    BoundaryFan,
+    WireChain,
+}
+
+/// Blender's `BMesh` as the decimators use it. Elements live in arenas indexed by creation order; a
+/// killed element is marked dead and never reused. Killed loops are the exception: their slots go
+/// on `free_loops` and are reused. No output depends on loop indices, since faces are walked from
+/// their `first` loop; without reuse a join's new face would keep every ring it ever replaced.
+struct BMesh {
+    verts: Vec<BVert>,
+    edges: Vec<BEdge>,
+    loops: Vec<BLoop>,
+    faces: Vec<BFace>,
+    /// Loop slots of killed faces, available to `loop_alloc`.
+    free_loops: Vec<usize>,
+    /// Scratch membership of `sort_winding`: an edge (vertex) is in the set when its mark equals
+    /// `mark_stamp`, so starting a new set costs nothing.
+    edge_mark: Vec<usize>,
+    vert_mark: Vec<usize>,
+    mark_stamp: usize,
+    /// Scratch rings of `face_create_ngon`, kept for their capacity.
+    ring_verts: Vec<usize>,
+    ring_edges: Vec<usize>,
+    uv_layers: usize,
+}
+
+impl BMesh {
+    fn disk_index(&self, e: usize, v: usize) -> usize {
+        usize::from(self.edges[e].v[1] == v)
+    }
+
+    fn disk_next(&self, e: usize, v: usize) -> usize {
+        self.edges[e].disk[self.disk_index(e, v)].next
+    }
+
+    /// `BM_EDGES_OF_VERT`: the disk cycle of `v`, starting at `v->e`.
+    fn disk_edges(&self, v: usize) -> Vec<usize> {
+        let first = self.verts[v].edge;
+        let mut out = Vec::new();
+        if first == NONE {
+            return out;
+        }
+        let mut e = first;
+        loop {
+            out.push(e);
+            e = self.disk_next(e, v);
+            if e == first {
+                return out;
+            }
+        }
+    }
+
+    /// `BM_FACES_OF_EDGE`'s loops: the radial cycle of `e`, starting at `e->l`.
+    fn radial_loops(&self, e: usize) -> Vec<usize> {
+        let first = self.edges[e].l;
+        let mut out = Vec::new();
+        if first == NONE {
+            return out;
+        }
+        let mut l = first;
+        loop {
+            out.push(l);
+            l = self.loops[l].radial_next;
+            if l == first {
+                return out;
+            }
+        }
+    }
+
+    /// The loops of face `f` from its first loop, without collecting them.
+    fn face_loop_iter(&self, f: usize) -> impl Iterator<Item = usize> + '_ {
+        let first = self.faces[f].first;
+        let mut next = Some(first);
+        std::iter::from_fn(move || {
+            let l = next?;
+            let after = self.loops[l].next;
+            next = (after != first).then_some(after);
+            Some(l)
+        })
+    }
+
+    fn face_loops(&self, f: usize) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.faces[f].len);
+        out.extend(self.face_loop_iter(f));
+        out
+    }
+
+    fn other_vert(&self, e: usize, v: usize) -> usize {
+        let [a, b] = self.edges[e].v;
+        if a == v { b } else { a }
+    }
+
+    fn vert_in_edge(&self, e: usize, v: usize) -> bool {
+        self.edges[e].v.contains(&v)
+    }
+
+    fn is_wire(&self, e: usize) -> bool {
+        self.edges[e].l == NONE
+    }
+
+    fn is_boundary(&self, e: usize) -> bool {
+        let l = self.edges[e].l;
+        l != NONE && self.loops[l].radial_next == l
+    }
+
+    fn is_manifold(&self, e: usize) -> bool {
+        let l = self.edges[e].l;
+        l != NONE
+            && self.loops[l].radial_next != l
+            && self.loops[self.loops[l].radial_next].radial_next == l
+    }
+
+    /// `BM_edge_is_contiguous`.
+    fn is_contiguous(&self, e: usize) -> bool {
+        let l = self.edges[e].l;
+        if l == NONE {
+            return false;
+        }
+        let other = self.loops[l].radial_next;
+        other != l && self.loops[other].radial_next == l && self.loops[other].v != self.loops[l].v
+    }
+
+    /// `BM_edge_is_contiguous_loop_cd` for one UV layer.
+    #[expect(clippy::float_cmp, reason = "Blender compares UV values exactly")]
+    fn is_contiguous_uv(&self, e: usize, layer: usize) -> bool {
+        let l = self.edges[e].l;
+        if l == NONE || self.loops[l].radial_next == l {
+            return true;
+        }
+        let base_next = self.loops[l].next;
+        let mut it = self.loops[l].radial_next;
+        loop {
+            let (a, b) = if self.loops[it].v == self.loops[l].v {
+                (it, self.loops[it].next)
+            } else {
+                (self.loops[it].next, it)
+            };
+            if self.loops[l].uv[layer] != self.loops[a].uv[layer]
+                || self.loops[base_next].uv[layer] != self.loops[b].uv[layer]
+            {
+                return false;
+            }
+            it = self.loops[it].radial_next;
+            if it == l {
+                return true;
+            }
+        }
+    }
+
+    /// `BM_edge_face_count_is_over`.
+    fn edge_face_count_over(&self, e: usize, max: usize) -> bool {
+        self.radial_loops(e).len() > max
+    }
+
+    /// `bmesh_disk_count_at_most`.
+    fn disk_count_at_most(&self, v: usize, max: usize) -> usize {
+        self.disk_edges(v).len().min(max)
+    }
+
+    /// `bmesh_disk_edge_append`: appends `e` at the tail of `v`'s disk cycle.
+    fn disk_edge_append(&mut self, e: usize, v: usize) {
+        let idx = self.disk_index(e, v);
+        let head = self.verts[v].edge;
+        if head == NONE {
+            self.verts[v].edge = e;
+            self.edges[e].disk[idx] = DiskLink { next: e, prev: e };
+            return;
+        }
+        let head_idx = self.disk_index(head, v);
+        let tail = self.edges[head].disk[head_idx].prev;
+        self.edges[e].disk[idx] = DiskLink {
+            next: head,
+            prev: tail,
+        };
+        self.edges[head].disk[head_idx].prev = e;
+        let tail_idx = self.disk_index(tail, v);
+        self.edges[tail].disk[tail_idx].next = e;
+    }
+
+    /// `bmesh_disk_edge_remove`.
+    fn disk_edge_remove(&mut self, e: usize, v: usize) {
+        let idx = self.disk_index(e, v);
+        let DiskLink { next, prev } = self.edges[e].disk[idx];
+        if prev != NONE {
+            let i = self.disk_index(prev, v);
+            self.edges[prev].disk[i].next = next;
+        }
+        if next != NONE {
+            let i = self.disk_index(next, v);
+            self.edges[next].disk[i].prev = prev;
+        }
+        if self.verts[v].edge == e {
+            self.verts[v].edge = if e == next { NONE } else { next };
+        }
+        self.edges[e].disk[idx] = NO_DISK;
+    }
+
+    /// `bmesh_radial_loop_append`: the appended loop becomes the head of the radial cycle.
+    fn radial_append(&mut self, e: usize, l: usize) {
+        let head = self.edges[e].l;
+        if head == NONE {
+            self.edges[e].l = l;
+            self.loops[l].radial_next = l;
+            self.loops[l].radial_prev = l;
+        } else {
+            let after = self.loops[head].radial_next;
+            self.loops[l].radial_prev = head;
+            self.loops[l].radial_next = after;
+            self.loops[after].radial_prev = l;
+            self.loops[head].radial_next = l;
+            self.edges[e].l = l;
+        }
+        self.loops[l].e = e;
+    }
+
+    /// `bmesh_radial_loop_remove`.
+    fn radial_remove(&mut self, e: usize, l: usize) {
+        if self.loops[l].radial_next != l {
+            if l == self.edges[e].l {
+                self.edges[e].l = self.loops[l].radial_next;
+            }
+            let (next, prev) = (self.loops[l].radial_next, self.loops[l].radial_prev);
+            self.loops[next].radial_prev = prev;
+            self.loops[prev].radial_next = next;
+        } else if l == self.edges[e].l {
+            self.edges[e].l = NONE;
+        }
+        self.loops[l].radial_next = NONE;
+        self.loops[l].radial_prev = NONE;
+        self.loops[l].e = NONE;
+    }
+
+    /// `bmesh_disk_vert_replace`: moves edge `e` from `src` to `dst` in the disk cycles.
+    fn disk_vert_replace(&mut self, e: usize, dst: usize, src: usize) {
+        self.disk_edge_remove(e, src);
+        let idx = self.disk_index(e, src);
+        self.edges[e].v[idx] = dst;
+        self.edges[e].disk[idx] = NO_DISK;
+        self.disk_edge_append(e, dst);
+    }
+
+    /// `BM_edge_create`; with `no_double` an existing edge between the vertices is returned.
+    fn edge_create(&mut self, v1: usize, v2: usize, no_double: bool) -> usize {
+        if no_double && let Some(e) = self.edge_exists(v1, v2) {
+            return e;
+        }
+        let e = self.edges.len();
+        self.edges.push(BEdge {
+            v: [v1, v2],
+            disk: [NO_DISK; 2],
+            l: NONE,
+            alive: true,
+            smooth: false,
+            seam: false,
+            tag: false,
+            jf: false,
+        });
+        self.disk_edge_append(e, v1);
+        self.disk_edge_append(e, v2);
+        e
+    }
+
+    /// `BM_edge_exists`.
+    fn edge_exists(&self, v1: usize, v2: usize) -> Option<usize> {
+        let first = self.verts[v1].edge;
+        if first == NONE {
+            return None;
+        }
+        let mut e = first;
+        loop {
+            if self.vert_in_edge(e, v2) {
+                return Some(e);
+            }
+            e = self.disk_next(e, v1);
+            if e == first {
+                return None;
+            }
+        }
+    }
+
+    /// Takes a slot for a new loop of vertex `v`, edge `e` and face `f`: a killed loop's slot when
+    /// one is free (keeping its UV storage), else a new arena slot. Only `v`, `e` and `f` are set;
+    /// the caller sets the UV and provenance.
+    fn loop_alloc(&mut self, v: usize, e: usize, f: usize) -> usize {
+        let Some(l) = self.free_loops.pop() else {
+            self.loops.push(BLoop {
+                v,
+                e,
+                f,
+                next: NONE,
+                prev: NONE,
+                radial_next: NONE,
+                radial_prev: NONE,
+                uv: Vec::new(),
+                src: NONE,
+            });
+            return self.loops.len() - 1;
+        };
+        let lp = &mut self.loops[l];
+        lp.v = v;
+        lp.e = e;
+        lp.f = f;
+        lp.next = NONE;
+        lp.prev = NONE;
+        lp.radial_next = NONE;
+        lp.radial_prev = NONE;
+        lp.uv.clear();
+        lp.src = NONE;
+        l
+    }
+
+    /// `bm_loop_create` with `example` as the loop whose data is copied.
+    fn loop_create(&mut self, v: usize, e: usize, f: usize, example: usize) -> usize {
+        let l = self.loop_alloc(v, e, f);
+        self.loops[l].src = self.loops[example].src;
+        self.copy_loop_uv(l, example);
+        l
+    }
+
+    /// Copies the UV data of loop `from` into loop `to`, reusing the storage of `to`.
+    fn copy_loop_uv(&mut self, to: usize, from: usize) {
+        let mut uv = std::mem::take(&mut self.loops[to].uv);
+        uv.clear();
+        uv.extend_from_slice(&self.loops[from].uv);
+        self.loops[to].uv = uv;
+    }
+
+    /// `BM_face_create`: one loop per corner, each radially appended to its edge. The face takes the
+    /// material and provenance of `example`; its normal starts zeroed, as Blender's new faces do.
+    fn face_create(&mut self, verts: &[usize], edges: &[usize], example: usize) -> usize {
+        let f = self.faces.len();
+        let n = verts.len();
+        let mut first = NONE;
+        let mut prev = NONE;
+        for k in 0..n {
+            let l = self.loop_alloc(verts[k], edges[k], f);
+            self.loops[l].uv.resize(self.uv_layers, [0.0; 2]);
+            self.radial_append(edges[k], l);
+            if prev == NONE {
+                first = l;
+            } else {
+                self.loops[prev].next = l;
+                self.loops[l].prev = prev;
+            }
+            prev = l;
+        }
+        self.loops[prev].next = first;
+        self.loops[first].prev = prev;
+        let source = &self.faces[example];
+        let face = BFace {
+            first,
+            len: n,
+            no: [0.0; 3],
+            mat: source.mat,
+            origin: source.origin,
+            alive: true,
+            jf: false,
+        };
+        self.faces.push(face);
+        f
+    }
+
+    /// `BM_face_kill`: removes the face's loops from their radial cycles and frees their slots.
+    fn face_kill(&mut self, f: usize) {
+        assert!(self.faces[f].alive, "BMesh face killed twice");
+        let first = self.faces[f].first;
+        let mut l = first;
+        loop {
+            let next = self.loops[l].next;
+            let e = self.loops[l].e;
+            self.radial_remove(e, l);
+            self.free_loops.push(l);
+            l = next;
+            if l == first {
+                break;
+            }
+        }
+        self.faces[f].alive = false;
+    }
+
+    /// `BM_edge_kill`: kills the faces around `e`, then `e`.
+    fn edge_kill(&mut self, e: usize) {
+        while self.edges[e].l != NONE {
+            let f = self.loops[self.edges[e].l].f;
+            self.face_kill(f);
+        }
+        let [v1, v2] = self.edges[e].v;
+        self.disk_edge_remove(e, v1);
+        self.disk_edge_remove(e, v2);
+        self.edges[e].alive = false;
+    }
+
+    /// `BM_vert_kill`: kills the edges around `v`, then `v`.
+    fn vert_kill(&mut self, v: usize) {
+        while self.verts[v].edge != NONE {
+            let e = self.verts[v].edge;
+            self.edge_kill(e);
+        }
+        self.verts[v].alive = false;
+    }
+
+    /// `BM_ITER_ELEM(BM_FACES_OF_VERT)`: the face of each loop around `v`, in `BM_LOOPS_OF_VERT` order.
+    fn faces_of_vert(&self, v: usize) -> Vec<usize> {
+        self.loops_of_vert(v)
+            .into_iter()
+            .map(|l| self.loops[l].f)
+            .collect()
+    }
+
+    /// `BM_LOOPS_OF_VERT` order, as `bmiter__loop_of_vert_begin` and `_step`.
+    fn loops_of_vert(&self, v: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut count = self.disk_facevert_count(v);
+        if count == 0 {
+            return out;
+        }
+        let mut l_first = self.disk_faceloop_find_first(self.verts[v].edge, v);
+        let mut e_next = self.loops[l_first].e;
+        let mut l_next = l_first;
+        while count > 0 {
+            let l_curr = l_next;
+            count -= 1;
+            l_next = self.radial_faceloop_find_next(l_next, v);
+            if l_next == l_first {
+                e_next = self.disk_faceedge_find_next(e_next, v);
+                l_first = self.radial_faceloop_find_first(self.edges[e_next].l, v);
+                l_next = l_first;
+            }
+            out.push(l_curr);
+        }
+        out
+    }
+
+    fn radial_facevert_count(&self, l: usize, v: usize) -> usize {
+        let mut count = 0;
+        let mut it = l;
+        loop {
+            count += usize::from(self.loops[it].v == v);
+            it = self.loops[it].radial_next;
+            if it == l {
+                return count;
+            }
+        }
+    }
+
+    /// `bmesh_disk_facevert_count`.
+    fn disk_facevert_count(&self, v: usize) -> usize {
+        let first = self.verts[v].edge;
+        if first == NONE {
+            return 0;
+        }
+        let mut count = 0;
+        let mut e = first;
+        loop {
+            if self.edges[e].l != NONE {
+                count += self.radial_facevert_count(self.edges[e].l, v);
+            }
+            e = self.disk_next(e, v);
+            if e == first {
+                return count;
+            }
+        }
+    }
+
+    fn disk_faceloop_find_first(&self, e: usize, v: usize) -> usize {
+        let mut it = e;
+        loop {
+            let l = self.edges[it].l;
+            if l != NONE {
+                return if self.loops[l].v == v {
+                    l
+                } else {
+                    self.loops[l].next
+                };
+            }
+            it = self.disk_next(it, v);
+            if it == e {
+                return NONE;
+            }
+        }
+    }
+
+    fn radial_faceloop_find_first(&self, l: usize, v: usize) -> usize {
+        let mut it = l;
+        loop {
+            if self.loops[it].v == v {
+                return it;
+            }
+            it = self.loops[it].radial_next;
+            if it == l {
+                return NONE;
+            }
+        }
+    }
+
+    fn radial_faceloop_find_next(&self, l: usize, v: usize) -> usize {
+        let mut it = self.loops[l].radial_next;
+        loop {
+            if self.loops[it].v == v {
+                return it;
+            }
+            it = self.loops[it].radial_next;
+            if it == l {
+                return l;
+            }
+        }
+    }
+
+    fn disk_faceedge_find_next(&self, e: usize, v: usize) -> usize {
+        let mut found = self.disk_next(e, v);
+        loop {
+            if self.edges[found].l != NONE && self.radial_facevert_count(self.edges[found].l, v) > 0
+            {
+                return found;
+            }
+            found = self.disk_next(found, v);
+            if found == e {
+                return e;
+            }
+        }
+    }
+
+    /// `BM_edge_other_loop`.
+    fn edge_other_loop(&self, e: usize, l: usize) -> usize {
+        let start = if self.loops[l].e == e {
+            l
+        } else {
+            self.loops[l].prev
+        };
+        let other = self.loops[start].radial_next;
+        if self.loops[other].v == self.loops[l].v {
+            other
+        } else {
+            self.loops[other].next
+        }
+    }
+
+    /// `BM_vert_step_fan_loop`.
+    fn step_fan_loop(&self, l: usize, e_step: &mut usize) -> Option<usize> {
+        let e_prev = *e_step;
+        let e_next = if self.loops[l].e == e_prev {
+            self.loops[self.loops[l].prev].e
+        } else if self.loops[self.loops[l].prev].e == e_prev {
+            self.loops[l].e
+        } else {
+            return None;
+        };
+        if self.is_manifold(e_next) {
+            *e_step = e_next;
+            Some(self.edge_other_loop(e_next, l))
+        } else {
+            None
+        }
+    }
+
+    /// `BM_vert_is_manifold`.
+    fn vert_is_manifold(&self, v: usize) -> bool {
+        let first = self.verts[v].edge;
+        if first == NONE {
+            return false;
+        }
+        let mut loop_num = 0;
+        let mut boundary_num = 0;
+        let mut l_first = self.edges[first].l;
+        let mut e_iter = first;
+        loop {
+            let l = self.edges[e_iter].l;
+            if l == NONE || l != self.loops[self.loops[l].radial_next].radial_next {
+                return false;
+            }
+            if self.loops[l].v == v {
+                loop_num += 1;
+            }
+            if self.is_boundary(e_iter) {
+                l_first = l;
+                boundary_num += 1;
+                if boundary_num == 3 {
+                    return false;
+                }
+            } else if self.loops[self.loops[l].radial_next].v == v {
+                loop_num += 1;
+            }
+            e_iter = self.disk_next(e_iter, v);
+            if e_iter == first {
+                break;
+            }
+        }
+        let mut e_prev = self.loops[l_first].e;
+        let start = if self.loops[l_first].v == v {
+            l_first
+        } else {
+            self.loops[l_first].next
+        };
+        let mut l_iter = start;
+        let mut loop_num_region = 0;
+        loop {
+            loop_num_region += 1;
+            match self.step_fan_loop(l_iter, &mut e_prev) {
+                Some(next) if next != start => l_iter = next,
+                _ => break,
+            }
+        }
+        loop_num == loop_num_region
+    }
+
+    /// `BM_vert_edge_pair`.
+    fn vert_edge_pair(&self, v: usize) -> Option<(usize, usize)> {
+        let a = self.verts[v].edge;
+        if a == NONE {
+            return None;
+        }
+        let b = self.disk_next(a, v);
+        (b != a && self.disk_next(b, v) == a).then_some((a, b))
+    }
+
+    fn vert_is_edge_pair(&self, v: usize) -> bool {
+        self.vert_edge_pair(v).is_some()
+    }
+
+    /// `BM_face_vert_share_loop`.
+    fn face_vert_share_loop(&self, f: usize, v: usize) -> Option<usize> {
+        self.face_loops(f)
+            .into_iter()
+            .find(|&l| self.loops[l].v == v)
+    }
+
+    /// `BM_vert_calc_edge_angle`.
+    fn vert_calc_edge_angle(&self, v: usize) -> f32 {
+        let e1 = self.verts[v].edge;
+        if e1 != NONE {
+            let e2 = self.disk_next(e1, v);
+            if e1 != e2 && e1 == self.disk_next(e2, v) {
+                let v1 = self.other_vert(e1, v);
+                let v2 = self.other_vert(e2, v);
+                return std::f32::consts::PI
+                    - angle_v3v3v3(self.verts[v1].co, self.verts[v].co, self.verts[v2].co);
+            }
+        }
+        UNIT_TO_ANGLE
+    }
+
+    /// `BM_edge_calc_face_angle`.
+    fn edge_calc_face_angle(&self, e: usize) -> f32 {
+        if self.is_manifold(e) {
+            let l1 = self.edges[e].l;
+            let l2 = self.loops[l1].radial_next;
+            angle_normalized(
+                self.faces[self.loops[l1].f].no,
+                self.faces[self.loops[l2].f].no,
+            )
+        } else {
+            UNIT_TO_ANGLE
+        }
+    }
+
+    /// `BM_face_find_double`: an existing face with the same loops, in either winding.
+    fn face_find_double(&self, f: usize) -> Option<usize> {
+        let l_first = self.faces[f].first;
+        let len = self.faces[f].len;
+        let mut l_iter = self.loops[l_first].radial_next;
+        while l_iter != l_first {
+            let other = self.loops[l_iter].f;
+            if self.faces[other].len == len {
+                let same_vertex = self.loops[l_iter].v == self.loops[l_first].v;
+                let mut a = l_first;
+                let mut b = l_iter;
+                let mut same = true;
+                loop {
+                    if self.loops[a].e != self.loops[b].e {
+                        same = false;
+                        break;
+                    }
+                    a = if same_vertex {
+                        self.loops[a].next
+                    } else {
+                        self.loops[a].prev
+                    };
+                    b = self.loops[b].next;
+                    if b == l_iter {
+                        break;
+                    }
+                }
+                if same {
+                    return Some(other);
+                }
+            }
+            l_iter = self.loops[l_iter].radial_next;
+        }
+        None
+    }
+}
+
+impl BMesh {
+    /// `bm_loop_systag_count_radial`: the joined faces around `l`'s edge, `l`'s own face included.
+    fn radial_jf_count(&self, l: usize) -> usize {
+        let mut count = 0;
+        let mut it = l;
+        loop {
+            count += usize::from(self.faces[self.loops[it].f].jf);
+            it = self.loops[it].radial_next;
+            if it == l {
+                return count;
+            }
+        }
+    }
+
+    /// `bm_vert_is_manifold_flagged`: every face around `v` is joined and no edge at `v` is a boundary.
+    fn verts_all_jf(&self, v: usize) -> bool {
+        let first = self.verts[v].edge;
+        if first == NONE {
+            return false;
+        }
+        let mut e = first;
+        loop {
+            let l = self.edges[e].l;
+            if l == NONE || self.is_boundary(e) {
+                return false;
+            }
+            let mut it = l;
+            loop {
+                if !self.faces[self.loops[it].f].jf {
+                    return false;
+                }
+                it = self.loops[it].radial_next;
+                if it == l {
+                    break;
+                }
+            }
+            e = self.disk_next(e, v);
+            if e == first {
+                return true;
+            }
+        }
+    }
+
+    fn clear_jf_faces(&mut self, faces: &[usize]) {
+        for &f in faces {
+            self.faces[f].jf = false;
+        }
+    }
+
+    /// `bm_edges_sort_winding`: the ring of `edges` from `v1` to `v2`, as vertices and edges in order,
+    /// written to `verts` and `sorted`. Membership of the edges and of their vertices lives in the
+    /// stamped marks, so each call costs time linear in `edges` and allocates nothing.
+    fn sort_winding(
+        &mut self,
+        v1: usize,
+        v2: usize,
+        edges: &[usize],
+        verts: &mut Vec<usize>,
+        sorted: &mut Vec<usize>,
+    ) -> bool {
+        self.mark_stamp += 1;
+        let stamp = self.mark_stamp;
+        self.edge_mark.resize(self.edges.len(), 0);
+        self.vert_mark.resize(self.verts.len(), 0);
+        for &e in edges {
+            self.edge_mark[e] = stamp;
+            for v in self.edges[e].v {
+                self.vert_mark[v] = stamp;
+            }
+        }
+        verts.clear();
+        sorted.clear();
+        let first = self.verts[v1].edge;
+        if first == NONE {
+            return false;
+        }
+        let mut v_iter = v1;
+        let mut e_iter = first;
+        loop {
+            if self.edge_mark[e_iter] == stamp && self.other_vert(e_iter, v_iter) == v2 {
+                break;
+            }
+            e_iter = self.disk_next(e_iter, v_iter);
+            if e_iter == first {
+                return false;
+            }
+        }
+        let mut e_first = first;
+        loop {
+            if self.edge_mark[e_iter] == stamp {
+                if self.vert_mark[v_iter] != stamp {
+                    return false;
+                }
+                self.edge_mark[e_iter] = 0;
+                sorted.push(e_iter);
+                self.vert_mark[v_iter] = 0;
+                verts.push(v_iter);
+                v_iter = self.other_vert(e_iter, v_iter);
+                if sorted.len() == edges.len() {
+                    return v_iter == verts[0];
+                }
+                e_first = e_iter;
+            }
+            e_iter = self.disk_next(e_iter, v_iter);
+            if e_iter == e_first {
+                return false;
+            }
+        }
+    }
+
+    /// `BM_face_create_ngon`. The ring is sorted into the mesh's scratch vectors, which keep their
+    /// capacity between joins.
+    fn face_create_ngon(
+        &mut self,
+        v1: usize,
+        v2: usize,
+        edges: &[usize],
+        example: usize,
+    ) -> Option<usize> {
+        let mut verts = std::mem::take(&mut self.ring_verts);
+        let mut sorted = std::mem::take(&mut self.ring_edges);
+        let made = self
+            .sort_winding(v1, v2, edges, &mut verts, &mut sorted)
+            .then(|| self.face_create(&verts, &sorted, example));
+        self.ring_verts = verts;
+        self.ring_edges = sorted;
+        made
+    }
+
+    /// `BM_faces_join`. Returns the joined face and, with `want_double`, the existing face that the
+    /// joined face doubles (the joined face is kept). Without it, a double is replaced by that face.
+    fn faces_join(
+        &mut self,
+        faces: &[usize],
+        do_del: bool,
+        want_double: bool,
+    ) -> (Option<usize>, Option<usize>) {
+        if let [only] = faces {
+            return (Some(*only), None);
+        }
+        for &f in faces {
+            self.faces[f].jf = true;
+        }
+        let mut edges = Vec::new();
+        let mut deledges = Vec::new();
+        let mut delverts = Vec::new();
+        let mut ends: Option<(usize, usize)> = None;
+        for &f in faces {
+            // Walks the ring by index: the body edits the mesh.
+            let first = self.faces[f].first;
+            let mut l = first;
+            loop {
+                let rlen = self.radial_jf_count(l);
+                if rlen > 2 {
+                    // The input faces do not form a contiguous manifold region.
+                    self.clear_jf_faces(faces);
+                    return (None, None);
+                }
+                let e = self.loops[l].e;
+                if rlen == 1 {
+                    edges.push(e);
+                    if ends.is_none() {
+                        let v1 = self.loops[l].v;
+                        ends = Some((v1, self.other_vert(e, v1)));
+                    }
+                } else if rlen == 2 {
+                    let [a, b] = self.edges[e].v;
+                    let d1 = self.verts_all_jf(a);
+                    let d2 = self.verts_all_jf(b);
+                    if !d1 && !d2 && !self.edges[e].jf {
+                        // An edge that is also the side of another face is kept.
+                        if !self.edge_face_count_over(e, 2) {
+                            if do_del {
+                                deledges.push(e);
+                            }
+                            self.edges[e].jf = true;
+                        }
+                    } else {
+                        for (v, d) in [(a, d1), (b, d2)] {
+                            if d && !self.verts[v].jf {
+                                if do_del {
+                                    delverts.push(v);
+                                }
+                                self.verts[v].jf = true;
+                            }
+                        }
+                    }
+                }
+                l = self.loops[l].next;
+                if l == first {
+                    break;
+                }
+            }
+        }
+        let made = match ends {
+            Some((v1, v2)) if !edges.is_empty() => self.face_create_ngon(v1, v2, &edges, faces[0]),
+            _ => None,
+        };
+        let Some(mut f_new) = made else {
+            self.clear_jf_faces(faces);
+            return (None, None);
+        };
+        let mut double = None;
+        let mut reused = false;
+        if let Some(existing) = self.face_find_double(f_new) {
+            if want_double {
+                double = Some(existing);
+            } else {
+                self.face_kill(f_new);
+                f_new = existing;
+                reused = true;
+            }
+        }
+        if !reused {
+            // Each new loop takes the data of the joined face's loop on the same boundary edge.
+            let first = self.faces[f_new].first;
+            let mut l_iter = first;
+            loop {
+                let mut l2 = self.loops[l_iter].radial_next;
+                while l2 != l_iter && !self.faces[self.loops[l2].f].jf {
+                    l2 = self.loops[l2].radial_next;
+                }
+                if l2 != l_iter {
+                    if self.loops[l2].v != self.loops[l_iter].v {
+                        l2 = self.loops[l2].next;
+                    }
+                    self.copy_loop_uv(l_iter, l2);
+                    self.loops[l_iter].src = self.loops[l2].src;
+                }
+                l_iter = self.loops[l_iter].next;
+                if l_iter == first {
+                    break;
+                }
+            }
+        }
+        self.clear_jf_faces(faces);
+        if do_del {
+            for e in deledges {
+                self.edge_kill(e);
+            }
+            for v in delverts {
+                self.vert_kill(v);
+            }
+        } else {
+            for &f in faces {
+                self.face_kill(f);
+            }
+        }
+        (Some(f_new), double)
+    }
+
+    /// `BM_faces_join_pair`.
+    fn faces_join_pair(
+        &mut self,
+        l_a: usize,
+        l_b: usize,
+        do_del: bool,
+        want_double: bool,
+    ) -> (Option<usize>, Option<usize>) {
+        if self.loops[l_a].v == self.loops[l_b].v {
+            let f = self.loops[l_b].f;
+            self.loop_reverse(f);
+        }
+        let faces = [self.loops[l_a].f, self.loops[l_b].f];
+        self.faces_join(&faces, do_del, want_double)
+    }
+
+    /// `bmesh_kernel_loop_reverse`: reverses the winding of face `f`.
+    fn loop_reverse(&mut self, f: usize) {
+        let l_first = self.faces[f].first;
+        let prev_first = self.loops[l_first].prev;
+        let mut e_prev = self.loops[prev_first].e;
+        let mut l_prev_radial_next = self.loops[prev_first].radial_next;
+        let mut l_prev_radial_prev = self.loops[prev_first].radial_prev;
+        let mut is_prev_boundary = l_prev_radial_next == self.loops[l_prev_radial_next].radial_next;
+        let mut l_iter = l_first;
+        loop {
+            let e_iter = self.loops[l_iter].e;
+            let l_iter_radial_next = self.loops[l_iter].radial_next;
+            let l_iter_radial_prev = self.loops[l_iter].radial_prev;
+            let is_iter_boundary = l_iter_radial_next == self.loops[l_iter_radial_next].radial_next;
+            if is_prev_boundary {
+                self.loops[l_iter].radial_next = l_iter;
+                self.loops[l_iter].radial_prev = l_iter;
+            } else {
+                self.loops[l_iter].radial_next = l_prev_radial_next;
+                self.loops[l_iter].radial_prev = l_prev_radial_prev;
+                self.loops[l_prev_radial_next].radial_prev = l_iter;
+                self.loops[l_prev_radial_prev].radial_next = l_iter;
+            }
+            if self.edges[e_iter].l == l_iter {
+                self.edges[e_iter].l = self.loops[l_iter].next;
+            }
+            self.loops[l_iter].e = e_prev;
+            let (next, prev) = (self.loops[l_iter].next, self.loops[l_iter].prev);
+            self.loops[l_iter].next = prev;
+            self.loops[l_iter].prev = next;
+            e_prev = e_iter;
+            l_prev_radial_next = l_iter_radial_next;
+            l_prev_radial_prev = l_iter_radial_prev;
+            is_prev_boundary = is_iter_boundary;
+            l_iter = self.loops[l_iter].prev;
+            if l_iter == l_first {
+                break;
+            }
+        }
+    }
+
+    /// `BM_face_split` with a null example edge: divides `f` along the loops `l_a` and `l_b`. Returns
+    /// the new face and its loop at `l_a`'s vertex.
+    fn split_face(
+        &mut self,
+        f: usize,
+        l_a: usize,
+        l_b: usize,
+        no_double: bool,
+    ) -> Option<(usize, usize)> {
+        if self.loops[l_a].next == l_b || self.loops[l_a].prev == l_b {
+            return None;
+        }
+        Some(self.split_face_make_edge(f, l_a, l_b, no_double))
+    }
+
+    /// `bmesh_kernel_split_face_make_edge`: `f` keeps the loops from `l_v1` up to `l_v2`, and the new
+    /// face takes the loops from `l_v2` up to `l_v1`, joined by a new edge.
+    fn split_face_make_edge(
+        &mut self,
+        f: usize,
+        l_v1: usize,
+        l_v2: usize,
+        no_double: bool,
+    ) -> (usize, usize) {
+        let (v1, v2) = (self.loops[l_v1].v, self.loops[l_v2].v);
+        let e = self.edge_create(v1, v2, no_double);
+        let source = self.faces[f].clone();
+        let f2 = self.faces.len();
+        self.faces.push(BFace {
+            first: NONE,
+            len: 0,
+            no: [0.0; 3],
+            mat: source.mat,
+            origin: source.origin,
+            alive: true,
+            jf: false,
+        });
+        let l_f1 = self.loop_create(v2, e, f, l_v2);
+        let l_f2 = self.loop_create(v1, e, f2, l_v1);
+        let (prev_v1, prev_v2) = (self.loops[l_v1].prev, self.loops[l_v2].prev);
+        self.loops[l_f1].prev = prev_v2;
+        self.loops[l_f2].prev = prev_v1;
+        self.loops[prev_v2].next = l_f1;
+        self.loops[prev_v1].next = l_f2;
+        self.loops[l_f1].next = l_v1;
+        self.loops[l_f2].next = l_v2;
+        self.loops[l_v1].prev = l_f1;
+        self.loops[l_v2].prev = l_f2;
+
+        let first_f = self.faces[f].first;
+        let mut first_in_f1 = false;
+        let mut it = l_f1;
+        loop {
+            if it == first_f {
+                first_in_f1 = true;
+            }
+            it = self.loops[it].next;
+            if it == l_f1 {
+                break;
+            }
+        }
+        if first_in_f1 {
+            self.faces[f2].first = if self.loops[first_f].prev == l_f1 {
+                self.loops[l_f2].prev
+            } else if self.loops[first_f].next == l_f1 {
+                self.loops[l_f2].next
+            } else {
+                l_f2
+            };
+        } else {
+            self.faces[f2].first = first_f;
+            self.faces[f].first = if self.loops[first_f].prev == l_f2 {
+                self.loops[l_f1].prev
+            } else if self.loops[first_f].next == l_f2 {
+                self.loops[l_f1].next
+            } else {
+                l_f1
+            };
+        }
+        let f2_first = self.faces[f2].first;
+        let mut f2_len = 0;
+        let mut it = f2_first;
+        loop {
+            self.loops[it].f = f2;
+            f2_len += 1;
+            it = self.loops[it].next;
+            if it == f2_first {
+                break;
+            }
+        }
+        self.faces[f2].len = f2_len;
+        self.radial_append(e, l_f1);
+        self.radial_append(e, l_f2);
+        let f_first = self.faces[f].first;
+        let mut f_len = 0;
+        let mut it = f_first;
+        loop {
+            f_len += 1;
+            it = self.loops[it].next;
+            if it == f_first {
+                break;
+            }
+        }
+        self.faces[f].len = f_len;
+        (f2, l_f2)
+    }
+
+    /// `bmesh_kernel_join_edge_kill_vert` as `BM_vert_collapse_edge` calls it: collapses the two-edge
+    /// vertex `v_kill` into its other neighbour along `e_kill`. Returns the surviving edge.
+    fn join_edge_kill_vert(&mut self, e_kill: usize, v_kill: usize) -> Option<usize> {
+        if !self.vert_in_edge(e_kill, v_kill) || self.disk_count_at_most(v_kill, 3) != 2 {
+            return None;
+        }
+        let e_old = self.disk_next(e_kill, v_kill);
+        let v_target = self.other_vert(e_kill, v_kill);
+        let v_old = self.other_vert(e_old, v_kill);
+        if self.vert_in_edge(e_old, v_kill) && self.vert_in_edge(e_old, v_target) {
+            return None;
+        }
+        let e_splice = self.edge_exists(v_target, v_old);
+        self.disk_vert_replace(e_old, v_target, v_kill);
+        self.disk_edge_remove(e_kill, v_target);
+        let mut degenerate = Vec::new();
+        let mut duplicate_candidates = Vec::new();
+        let head = self.edges[e_kill].l;
+        if head != NONE {
+            let mut l_kill = head;
+            loop {
+                let next = self.loops[l_kill].next;
+                if self.loops[next].v == v_kill {
+                    self.loops[next].v = v_target;
+                }
+                let prev = self.loops[l_kill].prev;
+                self.loops[next].prev = prev;
+                self.loops[prev].next = next;
+                let f = self.loops[l_kill].f;
+                if self.faces[f].first == l_kill {
+                    self.faces[f].first = next;
+                }
+                self.faces[f].len = self.faces[f].len.saturating_sub(1);
+                if self.faces[f].len < 3 {
+                    degenerate.push(f);
+                } else {
+                    duplicate_candidates.push(f);
+                }
+                l_kill = self.loops[l_kill].radial_next;
+                if l_kill == head {
+                    break;
+                }
+            }
+        }
+        self.edges[e_kill].alive = false;
+        self.verts[v_kill].alive = false;
+        if let Some(e_splice) = e_splice {
+            self.edge_splice(e_old, e_splice);
+        }
+        while let Some(f) = degenerate.pop() {
+            if self.faces[f].alive {
+                self.face_kill(f);
+            }
+        }
+        while let Some(f) = duplicate_candidates.pop() {
+            if self.faces[f].alive && self.face_find_double(f).is_some() {
+                self.face_kill(f);
+            }
+        }
+        Some(e_old)
+    }
+
+    /// `BM_edge_splice`: moves the faces of `src` onto `dst`, then kills `src`.
+    fn edge_splice(&mut self, dst: usize, src: usize) {
+        while self.edges[src].l != NONE {
+            let l = self.edges[src].l;
+            self.radial_remove(src, l);
+            self.radial_append(dst, l);
+        }
+        self.edge_kill(src);
+    }
+
+    /// `BM_vert_collapse_faces` with `do_del`, `kill_degenerate_faces` and `kill_duplicate_faces` set.
+    /// With `join_faces` the faces around `v_kill` are joined and the edge between its neighbours is
+    /// split back in.
+    fn vert_collapse_faces(
+        &mut self,
+        e_kill: usize,
+        v_kill: usize,
+        join_faces: bool,
+    ) -> Option<usize> {
+        if !join_faces {
+            return self.join_edge_kill_vert(e_kill, v_kill);
+        }
+        let tv = self.other_vert(e_kill, v_kill);
+        let e2 = self.disk_next(e_kill, v_kill);
+        let tv2 = self.other_vert(e2, v_kill);
+        let faces = self.faces_of_vert(v_kill);
+        if faces.len() < 2 {
+            return None;
+        }
+        let (joined, double) = self.faces_join(&faces, true, true);
+        let f2 = joined?;
+        if let Some(double) = double
+            && self.faces[double].alive
+        {
+            self.face_kill(double);
+        }
+        let la = self.face_vert_share_loop(f2, tv)?;
+        let lb = self.face_vert_share_loop(f2, tv2)?;
+        let (_, l_new) = self.split_face(f2, la, lb, false)?;
+        Some(self.loops[l_new].e)
+    }
+
+    /// `BM_vert_collapse_edge`.
+    fn vert_collapse_edge(&mut self, e_kill: usize, v_kill: usize) -> Option<usize> {
+        self.vert_collapse_faces(e_kill, v_kill, false)
+    }
+
+    /// `BM_edge_share_face_check`.
+    fn edge_share_face(&self, e1: usize, e2: usize) -> bool {
+        self.edges[e1].l != NONE
+            && self.edges[e2].l != NONE
+            && self
+                .radial_loops(e1)
+                .into_iter()
+                .any(|l| self.edge_in_face(e2, self.loops[l].f))
+    }
+
+    /// `BM_edge_in_face`.
+    fn edge_in_face(&self, e: usize, f: usize) -> bool {
+        self.radial_loops(e)
+            .into_iter()
+            .any(|l| self.loops[l].f == f)
+    }
+
+    /// `BM_disk_dissolve`: dissolves a manifold vertex of three or more edges.
+    fn disk_dissolve(&mut self, v: usize) -> bool {
+        if !self.vert_is_manifold(v) {
+            return false;
+        }
+        let base = self.verts[v].edge;
+        let mut keepedge = NONE;
+        let mut baseedge = NONE;
+        let mut len = 0;
+        if base != NONE {
+            let mut e = base;
+            loop {
+                e = self.disk_next(e, v);
+                if !self.edge_share_face(e, base) {
+                    keepedge = e;
+                    baseedge = base;
+                    break;
+                }
+                len += 1;
+                if e == base {
+                    break;
+                }
+            }
+        }
+        if keepedge == NONE && len == 3 {
+            let l = self.edges[base].l;
+            let rn = self.loops[l].radial_next;
+            if self.faces_join_pair(l, rn, true, true).0.is_none() {
+                return false;
+            }
+            let ve = self.verts[v].edge;
+            return self.vert_collapse_faces(ve, v, false).is_some();
+        }
+        if keepedge == NONE && len == 2 {
+            let ve = self.verts[v].edge;
+            let Some(e) = self.vert_collapse_faces(ve, v, true) else {
+                return false;
+            };
+            let l = self.edges[e].l;
+            if l != NONE {
+                let rn = self.loops[l].radial_next;
+                if l != rn && self.faces_join_pair(l, rn, true, true).0.is_none() {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if keepedge != NONE {
+            loop {
+                let mut done = true;
+                let mut e = self.verts[v].edge;
+                loop {
+                    if self.is_manifold(e) && e != baseedge && e != keepedge {
+                        let l = self.edges[e].l;
+                        let rn = self.loops[l].radial_next;
+                        if self.faces_join_pair(l, rn, true, true).0.is_none() {
+                            return false;
+                        }
+                        done = false;
+                        break;
+                    }
+                    e = self.disk_next(e, v);
+                    if e == self.verts[v].edge {
+                        break;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            let join = !self.is_boundary(baseedge);
+            let Some(e) = self.vert_collapse_faces(baseedge, v, join) else {
+                return false;
+            };
+            let l = self.edges[e].l;
+            if l != NONE {
+                let rn = self.loops[l].radial_next;
+                if l != rn && self.faces_join_pair(l, rn, true, true).0.is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// `BM_vert_dissolve`.
+    fn vert_dissolve(&mut self, v: usize) -> bool {
+        let len = self.disk_count_at_most(v, 3);
+        if len == 1 {
+            self.vert_kill(v);
+            return true;
+        }
+        let e = self.verts[v].edge;
+        if !self.vert_is_manifold(v) {
+            if e == NONE {
+                self.vert_kill(v);
+                return true;
+            }
+            if self.edges[e].l == NONE && len == 2 {
+                return self.vert_collapse_edge(e, v).is_some();
+            }
+            return false;
+        }
+        if len == 2 && self.disk_facevert_count(v) == 1 {
+            return self.vert_collapse_edge(e, v).is_some();
+        }
+        self.disk_dissolve(v)
+    }
+
+    /// `overlap_walk`: `BM_face_pair_overlap_check_subset_same_winding` (`swap` false) and
+    /// `..._swap_winding` (`swap` true).
+    fn overlap_walk(&self, mut a: usize, a_end: usize, mut b: usize, swap: bool) -> bool {
+        loop {
+            if self.loops[b].v != self.loops[a].v {
+                return false;
+            }
+            if a == a_end {
+                return true;
+            }
+            a = self.loops[a].next;
+            b = if swap {
+                self.loops[b].prev
+            } else {
+                self.loops[b].next
+            };
+        }
+    }
+
+    /// `BM_face_exists_subset_from_face`: an existing face that holds the `l_a`..`l_b` side of `f_len`.
+    fn face_exists_subset(&self, l_a: usize, l_b: usize, f_len: usize) -> Option<usize> {
+        let e_exists = self.edge_exists(self.loops[l_a].v, self.loops[l_b].v)?;
+        let head = self.edges[e_exists].l;
+        if head == NONE {
+            return None;
+        }
+        let mut it = head;
+        loop {
+            let f = self.loops[it].f;
+            if self.faces[f].len == f_len {
+                let swap = self.loops[it].v == self.loops[l_a].v;
+                let beg = if swap { it } else { self.loops[it].next };
+                let overlap = if swap {
+                    self.overlap_walk(
+                        self.loops[l_a].next,
+                        self.loops[l_b].prev,
+                        self.loops[beg].prev,
+                        true,
+                    )
+                } else {
+                    self.overlap_walk(
+                        self.loops[l_a].next,
+                        self.loops[l_b].prev,
+                        self.loops[beg].next,
+                        false,
+                    )
+                };
+                if overlap {
+                    return Some(f);
+                }
+            }
+            it = self.loops[it].radial_next;
+            if it == head {
+                return None;
+            }
+        }
+    }
+
+    /// `BM_face_split_check_double_face`.
+    fn face_split_check_double(&self, l_a: usize, l_b: usize, f_len: usize) -> bool {
+        let side_b_len = self.faces[self.loops[l_a].f].len + 2 - f_len;
+        self.face_exists_subset(l_a, l_b, f_len).is_some()
+            || self.face_exists_subset(l_b, l_a, side_b_len).is_some()
+    }
+
+    /// `BM_face_exists_multi_edge`: whether a face is bounded by exactly the closed ring `earr`.
+    fn face_exists_multi_edge(&self, earr: &[usize]) -> bool {
+        let mut varr: Vec<usize> = Vec::with_capacity(earr.len());
+        for &e in earr {
+            for v in self.edges[e].v {
+                if !varr.contains(&v) {
+                    varr.push(v);
+                }
+            }
+        }
+        if varr.len() != earr.len() {
+            return false;
+        }
+        self.face_exists_multi(&varr, earr)
+    }
+
+    /// `BM_face_exists_multi`.
+    fn face_exists_multi(&self, varr: &[usize], earr: &[usize]) -> bool {
+        let verts: HashSet<usize> = varr.iter().copied().collect();
+        let edges: HashSet<usize> = earr.iter().copied().collect();
+        let mut faces: HashSet<usize> = HashSet::new();
+        let mut tot_tag = 0;
+        for &e in earr {
+            for f in self.edge_faces(e) {
+                if !faces.contains(&f)
+                    && self
+                        .face_loops(f)
+                        .into_iter()
+                        .all(|l| verts.contains(&self.loops[l].v))
+                {
+                    faces.insert(f);
+                    tot_tag += 1;
+                }
+            }
+        }
+        if tot_tag == 0 {
+            return false;
+        }
+        for &v in varr {
+            for e in self.disk_edges(v) {
+                let [a, b] = self.edges[e].v;
+                if !edges.contains(&e) && verts.contains(&a) && verts.contains(&b) {
+                    let tagged = self
+                        .edge_faces(e)
+                        .into_iter()
+                        .filter(|f| faces.contains(f))
+                        .count();
+                    if tagged != 2 {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The faces of `e`, one per radial loop.
+    fn edge_faces(&self, e: usize) -> Vec<usize> {
+        self.radial_loops(e)
+            .into_iter()
+            .map(|l| self.loops[l].f)
+            .collect()
+    }
+
+    /// `BM_face_calc_normal`. Rings of more than four corners are summed around the ring without
+    /// collecting their positions, in the order [`face_normal`] sums them.
+    fn calc_face_normal(&self, f: usize) -> [f32; 3] {
+        let position = |l: usize| self.verts[self.loops[l].v].co;
+        if self.faces[f].len <= 4 {
+            let cos: Vec<[f32; 3]> = self.face_loop_iter(f).map(position).collect();
+            return face_normal(&cos);
+        }
+        let mut normal = [0.0_f32; 3];
+        let mut previous = position(self.loops[self.faces[f].first].prev);
+        for l in self.face_loop_iter(f) {
+            let current = position(l);
+            newell_step(&mut normal, previous, current);
+            previous = current;
+        }
+        normalize(normal)
+    }
+
+    /// `BM_face_normal_update`.
+    fn face_normal_update(&mut self, f: usize) {
+        self.faces[f].no = self.calc_face_normal(f);
+    }
+}
+
+impl BMesh {
+    /// `bm_vert_loops_from_vert_edges`: the loops at `v` around its edges, in edge order.
+    fn loops_from_vert_edges(&self, v: usize, v_edges: &[usize]) -> Vec<usize> {
+        let mut out = Vec::new();
+        for &e in v_edges {
+            if self.edges[e].l == NONE {
+                continue;
+            }
+            for l in self.radial_loops(e) {
+                if self.loops[l].v == v {
+                    if out.len() == VERT_DISSOLVE_MAX {
+                        return out;
+                    }
+                    out.push(l);
+                }
+            }
+        }
+        out
+    }
+
+    /// `bm_vert_dissolve_fan_makes_double_whole_face`.
+    fn fan_makes_double_whole_face(&self, v_loops: &[usize]) -> bool {
+        let mut ears: Vec<usize> = Vec::with_capacity(v_loops.len());
+        for &l in v_loops {
+            let e_opposite = if self.faces[self.loops[l].f].len > 3 {
+                let prev_v = self.loops[self.loops[l].prev].v;
+                let next_v = self.loops[self.loops[l].next].v;
+                let Some(e) = self.edge_exists(prev_v, next_v) else {
+                    return false;
+                };
+                if ears.len() == VERT_DISSOLVE_MAX {
+                    return false;
+                }
+                e
+            } else {
+                self.loops[self.loops[l].next].e
+            };
+            ears.push(e_opposite);
+        }
+        ears.len() >= 3 && self.face_exists_multi_edge(&ears)
+    }
+
+    /// `bm_vert_dissolve_fan_makes_double_with_existing`.
+    fn fan_makes_double_with_existing(&self, v_loops: &[usize]) -> bool {
+        v_loops.iter().any(|&l| {
+            self.faces[self.loops[l].f].len > 3
+                && self.face_split_check_double(self.loops[l].prev, self.loops[l].next, 3)
+        })
+    }
+
+    /// `verts_canonical_collapsed_fn`: the ring left when the corner's vertex collapses out, rotated to
+    /// start at its smallest vertex and oriented by the smaller of that vertex's neighbours. Vertex
+    /// indices stand in for Blender's vertex pointers, which order the same way for these meshes.
+    fn collapsed_ring(&self, l_vert: usize) -> Vec<usize> {
+        let verts_num = self.faces[self.loops[l_vert].f].len - 1;
+        let mut verts = Vec::with_capacity(verts_num);
+        let mut l = self.loops[l_vert].next;
+        while l != l_vert {
+            verts.push(self.loops[l].v);
+            l = self.loops[l].next;
+        }
+        let mut i_min = 0;
+        for i in 1..verts_num {
+            if verts[i] < verts[i_min] {
+                i_min = i;
+            }
+        }
+        let i_next = if i_min + 1 == verts_num { 0 } else { i_min + 1 };
+        let i_prev = if i_min == 0 { verts_num - 1 } else { i_min - 1 };
+        let step = if verts[i_next] < verts[i_prev] {
+            1
+        } else {
+            verts_num - 1
+        };
+        let mut ordered = Vec::with_capacity(verts_num);
+        let mut j = i_min;
+        for _ in 0..verts_num {
+            ordered.push(verts[j]);
+            j += step;
+            if j >= verts_num {
+                j -= verts_num;
+            }
+        }
+        ordered
+    }
+
+    /// `bm_vert_dissolve_fan_makes_double_with_self`.
+    fn fan_makes_double_with_self(&self, v_loops: &[usize]) -> bool {
+        let mut loops: Vec<usize> = v_loops
+            .iter()
+            .copied()
+            .filter(|&l| self.faces[self.loops[l].f].len > 3)
+            .collect();
+        if loops.len() < 2 {
+            return false;
+        }
+        loops.sort_by_key(|&l| self.faces[self.loops[l].f].len);
+        let mut start = 0;
+        while start < loops.len() {
+            let group_len = self.faces[self.loops[loops[start]].f].len;
+            let mut end = start + 1;
+            while end < loops.len() && self.faces[self.loops[loops[end]].f].len == group_len {
+                end += 1;
+            }
+            if end - start >= 2 {
+                let collapsed: Vec<Vec<usize>> = loops[start..end]
+                    .iter()
+                    .map(|&l| self.collapsed_ring(l))
+                    .collect();
+                for (i, ring) in collapsed.iter().enumerate() {
+                    if collapsed[i + 1..].contains(ring) {
+                        return true;
+                    }
+                }
+            }
+            start = end;
+        }
+        false
+    }
+
+    /// `bm_vert_dissolve_fan_or_chain_test`: the dissolve method of `v`, with the loops around it for
+    /// fans. `check_for_duplicates` also rejects dissolves that would create a duplicate face.
+    fn dissolve_method(
+        &self,
+        v: usize,
+        check_for_duplicates: bool,
+    ) -> Option<(DissolveMethod, Vec<usize>)> {
+        let v_edges = self.disk_edges(v);
+        if v_edges.len() > VERT_DISSOLVE_MAX {
+            return None;
+        }
+        let mut boundary = Vec::new();
+        let mut tot_boundary = 0;
+        let mut tot_manifold = 0;
+        let mut tot_wire = 0;
+        for &e in &v_edges {
+            if self.is_boundary(e) {
+                if boundary.len() < 2 {
+                    boundary.push(e);
+                }
+                tot_boundary += 1;
+            } else if self.is_manifold(e) {
+                tot_manifold += 1;
+            } else if self.is_wire(e) {
+                tot_wire += 1;
+            } else {
+                return None;
+            }
+        }
+        let tot_edge = v_edges.len();
+        if (tot_edge == 4 && tot_boundary == 0 && tot_manifold == 4)
+            || (tot_edge == 3 && tot_boundary == 0 && tot_manifold == 3)
+        {
+            let mut v_loops = Vec::new();
+            if check_for_duplicates {
+                v_loops = self.loops_from_vert_edges(v, &v_edges);
+                if self.fan_makes_double_whole_face(&v_loops)
+                    || self.fan_makes_double_with_existing(&v_loops)
+                    || self.fan_makes_double_with_self(&v_loops)
+                {
+                    return None;
+                }
+            }
+            return Some((DissolveMethod::InteriorFan, v_loops));
+        }
+        if tot_edge == 3 && tot_boundary == 2 && tot_manifold == 1 {
+            let mut v_loops = Vec::new();
+            if check_for_duplicates {
+                let a = self.other_vert(boundary[0], v);
+                let b = self.other_vert(boundary[1], v);
+                // Joining across an existing face would remove vertices other than `v`.
+                if let Some(e_span) = self.edge_exists(a, b)
+                    && self.edges[e_span].l != NONE
+                {
+                    return None;
+                }
+                v_loops = self.loops_from_vert_edges(v, &v_edges);
+                if self.fan_makes_double_with_existing(&v_loops)
+                    || self.fan_makes_double_with_self(&v_loops)
+                {
+                    return None;
+                }
+            }
+            return Some((DissolveMethod::BoundaryFan, v_loops));
+        }
+        if tot_edge == 2 && tot_wire == 2 {
+            return Some((DissolveMethod::WireChain, Vec::new()));
+        }
+        if tot_edge == 2 && tot_manifold == 2 {
+            return Some((DissolveMethod::InteriorChain, Vec::new()));
+        }
+        None
+    }
+
+    /// `bm_vert_dissolve_fan_or_chain`: dissolves `v` alone, re-testing its topology first.
+    fn dissolve_fan_or_chain(&mut self, v: usize) -> bool {
+        let Some((method, v_loops)) = self.dissolve_method(v, true) else {
+            return false;
+        };
+        match method {
+            DissolveMethod::WireChain | DissolveMethod::InteriorChain => {
+                let e = self.verts[v].edge;
+                self.vert_collapse_edge(e, v).is_some()
+            }
+            DissolveMethod::BoundaryFan | DissolveMethod::InteriorFan => {
+                for l in v_loops {
+                    if self.faces[self.loops[l].f].len > 3 {
+                        let f = self.loops[l].f;
+                        let (prev, next) = (self.loops[l].prev, self.loops[l].next);
+                        self.split_face(f, prev, next, true);
+                    }
+                }
+                self.vert_dissolve(v)
+            }
+        }
+    }
+
+    /// `bm_tag_untagged_neighbors`: tags the untagged neighbours of `starts` and returns them.
+    fn tag_neighbors(&self, starts: &[usize], desired: i8, tags: &mut [i8]) -> Vec<usize> {
+        let mut tagged = Vec::new();
+        for &v in starts {
+            for e in self.disk_edges(v) {
+                let other = self.other_vert(e, v);
+                if tags[other] == TAG_INIT {
+                    tags[other] = desired;
+                    tagged.push(other);
+                }
+            }
+        }
+        tagged
+    }
+
+    /// `BM_mesh_decimate_unsubdivide_ex`: each iteration tags the dissolvable vertices in alternating
+    /// regions and dissolves one set, which turns a grid into one of half its density.
+    fn unsubdivide(&mut self, iterations: usize) {
+        for _ in 0..iterations {
+            let mut tags = vec![TAG_IGNORE; self.verts.len()];
+            for (v, tag) in tags.iter_mut().enumerate() {
+                if self.verts[v].alive && self.dissolve_method(v, false).is_some() {
+                    *tag = TAG_INIT;
+                }
+            }
+            let mut marked = false;
+            for start in 0..self.verts.len() {
+                if !self.verts[start].alive || tags[start] != TAG_INIT {
+                    continue;
+                }
+                tags[start] = TAG_IGNORE;
+                let mut ignore = vec![start];
+                loop {
+                    let collapse = self.tag_neighbors(&ignore, TAG_DO_COLLAPSE, &mut tags);
+                    if collapse.is_empty() {
+                        break;
+                    }
+                    marked = true;
+                    let next = self.tag_neighbors(&collapse, TAG_IGNORE, &mut tags);
+                    if next.is_empty() {
+                        break;
+                    }
+                    ignore = next;
+                }
+            }
+            if !marked {
+                break;
+            }
+            for (v, &tag) in tags.iter().enumerate() {
+                if self.verts[v].alive && tag == TAG_DO_COLLAPSE {
+                    self.dissolve_fan_or_chain(v);
+                }
+            }
+        }
+    }
+
+    /// `bm_edge_is_delimiter`. The caller ensures `e` is manifold.
+    fn edge_is_delimiter(&self, e: usize, delim: Delimit) -> bool {
+        let edge = self.edges[e];
+        if delim.seam && edge.seam {
+            return true;
+        }
+        if delim.sharp && !edge.smooth {
+            return true;
+        }
+        let l = edge.l;
+        let other = self.loops[l].radial_next;
+        if delim.material && self.faces[self.loops[l].f].mat != self.faces[self.loops[other].f].mat
+        {
+            return true;
+        }
+        if delim.normal && !self.is_contiguous(e) {
+            return true;
+        }
+        delim.uv && (0..self.uv_layers).any(|layer| !self.is_contiguous_uv(e, layer))
+    }
+
+    /// `bm_vert_is_delimiter`.
+    fn vert_is_delimiter(&self, v: usize, delim: Delimit) -> bool {
+        if !(delim.seam || delim.sharp || delim.material || delim.normal || delim.uv) {
+            return false;
+        }
+        self.disk_edges(v)
+            .into_iter()
+            .any(|e| self.is_manifold(e) && self.edge_is_delimiter(e, delim))
+    }
+
+    /// `bm_edge_calc_dissolve_error`: the cosine of the angle between the two faces, negated when the
+    /// edge is contiguous, or `COST_INVALID`.
+    fn edge_calc_dissolve_error(&self, e: usize, delim: Delimit) -> f32 {
+        if self.is_manifold(e) && !self.edge_is_delimiter(e, delim) {
+            let l = self.edges[e].l;
+            let other = self.loops[l].radial_next;
+            let mut cos_neg = dot(
+                self.faces[self.loops[l].f].no,
+                self.faces[self.loops[other].f].no,
+            );
+            if self.is_contiguous(e) {
+                cos_neg *= -1.0;
+            }
+            return cos_neg;
+        }
+        COST_INVALID
+    }
+
+    /// `bm_vert_edge_face_angle`: the vertex's edge angle, scaled by its manifold edge's face angle.
+    fn vert_edge_face_angle(&self, v: usize, delim: Delimit) -> f32 {
+        let angle = self.vert_calc_edge_angle(v);
+        let e = self.verts[v].edge;
+        if e != NONE && self.is_manifold(e) && !self.vert_is_delimiter(v, delim) {
+            return ((angle * ANGLE_TO_UNIT) * (self.edge_calc_face_angle(e) * ANGLE_TO_UNIT))
+                * UNIT_TO_ANGLE;
+        }
+        angle
+    }
+
+    /// `bm_loop_collapse_is_degenerate`: whether collapsing the ear at `l_ear` would flip a corner or
+    /// leave a vertex inside the new triangle. Coordinates are projected onto the face plane around
+    /// the ear's vertex.
+    fn loop_collapse_is_degenerate(&self, l_ear: usize) -> bool {
+        let center = self.verts[self.loops[l_ear].v].co;
+        let (n1, n2) = ortho_basis(self.faces[self.loops[l_ear].f].no);
+        let project = |vert: usize| {
+            let co = sub(self.verts[vert].co, center);
+            [dot(n1, co), dot(n2, co)]
+        };
+        let prev = self.loops[l_ear].prev;
+        let next = self.loops[l_ear].next;
+        let prev_v = self.loops[prev].v;
+        let next_v = self.loops[next].v;
+        let mut tri = [project(prev_v), [0.0, 0.0], project(next_v)];
+        if !self.vert_is_edge_pair(prev_v) {
+            let adjacent = project(self.loops[self.loops[prev].prev].v);
+            if signum_i(cross_tri(adjacent, tri[0], tri[1]))
+                != signum_i(cross_tri(adjacent, tri[0], tri[2]))
+            {
+                return true;
+            }
+        }
+        if !self.vert_is_edge_pair(next_v) {
+            let adjacent = project(self.loops[self.loops[next].next].v);
+            if signum_i(cross_tri(adjacent, tri[2], tri[1]))
+                != signum_i(cross_tri(adjacent, tri[2], tri[0]))
+            {
+                return true;
+            }
+        }
+        // The triangle may be concave: flip it so the inside test can assume clockwise order.
+        if cross_tri(tri[0], tri[1], tri[2]) < 0.0 {
+            tri.swap(1, 2);
+        }
+        let mut l_iter = self.loops[next].next;
+        loop {
+            if point_in_tri_cw(project(self.loops[l_iter].v), tri) {
+                return true;
+            }
+            l_iter = self.loops[l_iter].next;
+            if l_iter == prev {
+                return false;
+            }
+        }
+    }
+
+    /// `bm_vert_collapse_is_degenerate`.
+    fn vert_collapse_is_degenerate(&self, v: usize) -> bool {
+        let Some((e0, e1)) = self.vert_edge_pair(v) else {
+            return true;
+        };
+        if self.is_wire(e0) || self.is_wire(e1) {
+            return false;
+        }
+        let v0 = self.other_vert(e0, v);
+        let v1 = self.other_vert(e1, v);
+        if cos_v3v3v3(self.verts[v0].co, self.verts[v].co, self.verts[v1].co).abs()
+            < 1.0 - f32::EPSILON
+        {
+            let first = self.edges[e1].l;
+            let mut l_iter = first;
+            loop {
+                if self.faces[self.loops[l_iter].f].len > 3 {
+                    let l_pivot = if self.loops[l_iter].v == v {
+                        l_iter
+                    } else {
+                        self.loops[l_iter].next
+                    };
+                    if self.loop_collapse_is_degenerate(l_pivot) {
+                        return true;
+                    }
+                }
+                l_iter = self.loops[l_iter].radial_next;
+                if l_iter == first {
+                    break;
+                }
+            }
+        }
+        false
+    }
+
+    /// `BM_mesh_decimate_dissolve_ex`: first joins the faces across the flattest edges, then collapses
+    /// the vertices whose angle is below `angle_limit`.
+    fn dissolve(&mut self, angle_limit: f32, do_dissolve_boundaries: bool, delim: Delimit) {
+        let angle_limit_cos_neg = -angle_limit.cos();
+        let einput: Vec<usize> = (0..self.edges.len())
+            .filter(|&e| self.edges[e].alive)
+            .collect();
+        for &e in &einput {
+            self.edges[e].tag = self.is_wire(e);
+        }
+        let mut eheap = DecimateHeap::new(self.edges.len());
+        for &e in &einput {
+            let cost = self.edge_calc_dissolve_error(e, delim);
+            eheap.insert(e, cost);
+        }
+        while let Some(top) = eheap.top() {
+            if eheap.value(top) >= angle_limit_cos_neg {
+                break;
+            }
+            let mut joined = None;
+            if self.is_manifold(top) {
+                let l = self.edges[top].l;
+                let other = self.loops[l].radial_next;
+                joined = self.faces_join_pair(l, other, false, false).0;
+            }
+            match joined {
+                Some(f) => {
+                    eheap.remove(top);
+                    self.face_normal_update(f);
+                    for l in self.face_loop_iter(f) {
+                        let j = self.loops[l].e;
+                        if eheap.contains(j) {
+                            let cost = self.edge_calc_dissolve_error(j, delim);
+                            eheap.update(j, cost);
+                        }
+                    }
+                }
+                None => eheap.update(top, COST_INVALID),
+            }
+        }
+        // Edges left wire by the joins are removed, with the vertices they leave loose.
+        for &e in einput.iter().rev() {
+            if self.edges[e].alive && self.is_wire(e) && !self.edges[e].tag {
+                let [v1, v2] = self.edges[e].v;
+                self.edge_kill(e);
+                if self.verts[v1].edge == NONE {
+                    self.vert_kill(v1);
+                }
+                if self.verts[v2].edge == NONE {
+                    self.vert_kill(v2);
+                }
+            }
+        }
+        if do_dissolve_boundaries {
+            for v in 0..self.verts.len() {
+                if self.verts[v].alive && self.vert_is_edge_pair(v) {
+                    let e = self.verts[v].edge;
+                    self.vert_collapse_edge(e, v);
+                }
+            }
+            return;
+        }
+        let mut vheap = DecimateHeap::new(self.verts.len());
+        for v in 0..self.verts.len() {
+            if self.verts[v].alive {
+                let cost = self.vert_edge_face_angle(v, delim);
+                vheap.insert(v, cost);
+            }
+        }
+        while let Some(v) = vheap.top() {
+            if vheap.value(v) >= angle_limit {
+                break;
+            }
+            let collapsed = if self.vert_collapse_is_degenerate(v) {
+                None
+            } else {
+                let e = self.verts[v].edge;
+                self.vert_collapse_edge(e, v)
+            };
+            let Some(e_new) = collapsed else {
+                vheap.update(v, COST_INVALID);
+                continue;
+            };
+            vheap.remove(v);
+            for l in self.radial_loops(e_new) {
+                let f = self.loops[l].f;
+                self.face_normal_update(f);
+            }
+            for vv in self.edges[e_new].v {
+                if vheap.contains(vv) {
+                    let cost = self.vert_edge_face_angle(vv, delim);
+                    vheap.update(vv, cost);
+                }
+            }
+            // Vertices that could not collapse before may now, around the new edge.
+            for l_iter in self.radial_loops(e_new) {
+                let stop = self.loops[l_iter].prev;
+                let mut l_cycle = self.loops[self.loops[l_iter].next].next;
+                loop {
+                    let j = self.loops[l_cycle].v;
+                    if vheap.contains(j) && vheap.value(j) == COST_INVALID {
+                        let cost = self.vert_edge_face_angle(j, delim);
+                        vheap.update(j, cost);
+                    }
+                    l_cycle = self.loops[l_cycle].next;
+                    if l_cycle == stop {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl BMesh {
+    /// `BKE_mesh_to_bmesh`: edges in mesh order, one loop per face corner in face order, with each
+    /// corner's data taken from the input corner it came from.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Blender stores positions and UVs as float32"
+    )]
+    fn from_mesh(mesh: &Mesh, points: &[DVec3], uv_values: &[Vec<[f64; 2]>]) -> Result<Self> {
+        let index_of = id_indices(mesh);
+        let vertex_index = |id: &u32| {
+            index_of.get(id).copied().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidArgument,
+                    "modifier input references a missing vertex",
+                )
+            })
+        };
+        let flags = decimate_edge_flags(mesh);
+        let mut bm = BMesh {
+            verts: points
+                .iter()
+                .map(|point| BVert {
+                    co: point.as_vec3().to_array(),
+                    edge: NONE,
+                    alive: true,
+                    jf: false,
+                })
+                .collect(),
+            edges: Vec::with_capacity(mesh.edges.len()),
+            loops: Vec::new(),
+            faces: Vec::with_capacity(mesh.faces.len()),
+            free_loops: Vec::new(),
+            edge_mark: Vec::new(),
+            vert_mark: Vec::new(),
+            mark_stamp: 0,
+            ring_verts: Vec::new(),
+            ring_edges: Vec::new(),
+            uv_layers: uv_values.len(),
+        };
+        let mut edge_lookup: HashMap<(usize, usize), usize> =
+            HashMap::with_capacity(mesh.edges.len());
+        for (index, edge) in mesh.edges.iter().enumerate() {
+            let v = [
+                vertex_index(&edge.vertices[0])?,
+                vertex_index(&edge.vertices[1])?,
+            ];
+            let e = bm.edge_create(v[0], v[1], false);
+            bm.edges[e].seam = flags[index].0;
+            bm.edges[e].smooth = !flags[index].1;
+            edge_lookup.insert(edge_key(v[0], v[1]), e);
+        }
+        let mut corner = 0;
+        for (face_index, face) in mesh.faces.iter().enumerate() {
+            let indices = face
+                .vertices
+                .iter()
+                .map(&vertex_index)
+                .collect::<Result<Vec<usize>>>()?;
+            let n = indices.len();
+            let mut edges = Vec::with_capacity(n);
+            for k in 0..n {
+                let (a, b) = (indices[k], indices[(k + 1) % n]);
+                let key = edge_key(a, b);
+                let e = if let Some(&e) = edge_lookup.get(&key) {
+                    e
+                } else {
+                    let e = bm.edge_create(a, b, false);
+                    edge_lookup.insert(key, e);
+                    e
+                };
+                edges.push(e);
+            }
+            let first = bm.loops.len();
+            let f = bm.faces.len();
+            for k in 0..n {
+                let uv = uv_values
+                    .iter()
+                    .map(|layer| {
+                        let [u, v] = layer[corner + k];
+                        [u as f32, v as f32]
+                    })
+                    .collect();
+                bm.loops.push(BLoop {
+                    v: indices[k],
+                    e: edges[k],
+                    f,
+                    next: first + (k + 1) % n,
+                    prev: first + (k + n - 1) % n,
+                    radial_next: NONE,
+                    radial_prev: NONE,
+                    uv,
+                    src: corner + k,
+                });
+                bm.radial_append(edges[k], first + k);
+            }
+            let cos: Vec<[f32; 3]> = indices.iter().map(|&v| bm.verts[v].co).collect();
+            bm.faces.push(BFace {
+                first,
+                len: n,
+                no: face_normal(&cos),
+                mat: face.material_index,
+                origin: Some(face_index),
+                alive: true,
+                jf: false,
+            });
+            corner += n;
+        }
+        Ok(bm)
+    }
+
+    /// `BKE_mesh_from_bmesh`: the live faces with each corner's source corner, the edges that belong to
+    /// no face, and every input vertex (unused ones are dropped by `decimate_compact`).
+    fn to_mesh(&self, points: Vec<DVec3>, source: &Mesh) -> Result<Mesh> {
+        let mut polygons: Vec<Polygon> = Vec::new();
+        let mut face_origins = Vec::new();
+        let mut corners = Vec::new();
+        for (f, face) in self.faces.iter().enumerate() {
+            if !face.alive {
+                continue;
+            }
+            let loops = self.face_loops(f);
+            polygons.push((loops.iter().map(|&l| self.loops[l].v).collect(), face.mat));
+            face_origins.push(face.origin);
+            corners.extend(loops.iter().map(|&l| {
+                let src = self.loops[l].src;
+                if src == NONE {
+                    Vec::new()
+                } else {
+                    vec![(src, 1.0)]
+                }
+            }));
+        }
+        let loose: Vec<[usize; 2]> = self
+            .edges
+            .iter()
+            .filter(|edge| edge.alive && edge.l == NONE)
+            .map(|edge| edge.v)
+            .collect();
+        let mut origin = Origin::copies((0..points.len()).map(Some), face_origins);
+        origin.corners = Some(corners);
+        let keep_vertices: Vec<bool> = self.verts.iter().map(|vert| vert.alive).collect();
+        decimate_compact(points, polygons, loose, origin, source, &keep_vertices)
+    }
+
+    /// `(seam, sharp)` of each live edge keyed by its output vertex pair. `to_mesh` keeps the live
+    /// vertices in index order, so output vertex `k` is the `k`-th live `BMesh` vertex.
+    fn output_edge_flags(&self) -> Vec<([usize; 2], (bool, bool))> {
+        let mut output_index = vec![NONE; self.verts.len()];
+        let mut next = 0;
+        for (v, vert) in self.verts.iter().enumerate() {
+            if vert.alive {
+                output_index[v] = next;
+                next += 1;
+            }
+        }
+        self.edges
+            .iter()
+            .filter(|edge| edge.alive)
+            .map(|edge| {
+                let [a, b] = edge.v.map(|v| output_index[v]);
+                ([a.min(b), a.max(b)], (edge.seam, !edge.smooth))
+            })
+            .collect()
+    }
+}
+
+/// `BM_mesh_decimate_dissolve` and `BM_mesh_decimate_unsubdivide` on the input mesh.
+pub(super) fn decimate_dissolve(
+    mesh: &Mesh,
+    angle_limit: f64,
+    modifier: &Modifier,
+) -> Result<Mesh> {
+    let dissolve_boundaries = bool_param(modifier, "use_dissolve_boundaries")?;
+    if angle_limit == 0.0 || mesh.faces.len() <= 3 {
+        return Ok(mesh.clone());
+    }
+    let points = positions(mesh);
+    let modes: HashSet<&str> = modifier
+        .params
+        .get("delimit")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let (_, uv_values) = collapse_uv_layers(mesh);
+    let delim = Delimit {
+        seam: modes.contains("SEAM"),
+        sharp: modes.contains("SHARP"),
+        material: modes.contains("MATERIAL"),
+        normal: modes.contains("NORMAL"),
+        uv: modes.contains("UV") && !uv_values.is_empty(),
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Blender stores Decimate angle limits as float32"
+    )]
+    let angle_limit = angle_limit as f32;
+    let mut bm = BMesh::from_mesh(mesh, &points, &uv_values)?;
+    bm.dissolve(angle_limit, dissolve_boundaries, delim);
+    let flags = bm.output_edge_flags();
+    let mut result = bm.to_mesh(points, mesh)?;
+    write_dissolve_edge_flags(&mut result, flags)?;
+    Ok(result)
+}
+
+pub(super) fn decimate_unsubdivide(mesh: &Mesh, iterations: usize) -> Result<Mesh> {
+    if iterations == 0 || mesh.faces.len() <= 3 {
+        return Ok(mesh.clone());
+    }
+    let points = positions(mesh);
+    let mut bm = BMesh::from_mesh(mesh, &points, &[])?;
+    bm.unsubdivide(iterations);
+    bm.to_mesh(points, mesh)
+}
+
+/// `(seam, sharp)` of each edge of `mesh`: the compat `blender_edge_flags` OR-ed with the native `seam`
+/// and `sharp` attributes, as COLLAPSE reads them. Native values are keyed `e<edge id>`.
+fn decimate_edge_flags(mesh: &Mesh) -> Vec<(bool, bool)> {
+    let compat = mesh
+        .attributes
+        .get("blender_edge_flags")
+        .and_then(Value::as_array);
+    let native_values = |name: &str| {
+        mesh.attributes
+            .get(name)
+            .and_then(Value::as_object)
+            .and_then(|attribute| attribute.get("values"))
+            .and_then(Value::as_object)
+    };
+    let seam_values = native_values("seam");
+    let sharp_values = native_values("sharp");
+    mesh.edges
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| {
+            let metadata = compat.and_then(|values| values.get(index));
+            let key = format!("e{}", edge.id);
+            let compat_flag = |name: &str| {
+                metadata
+                    .and_then(|flags| flags.get(name))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            };
+            let native_flag = |values: Option<&serde_json::Map<String, Value>>| {
+                values
+                    .and_then(|values| values.get(&key))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            };
+            (
+                compat_flag("seam") || native_flag(seam_values),
+                compat_flag("sharp") || native_flag(sharp_values),
+            )
+        })
+        .collect()
+}
+
+/// A native edge-flag attribute and the `(seam, sharp)` value it stores.
+type DissolveFlagStore = (&'static str, fn(&(bool, bool)) -> bool);
+
+/// Writes the DISSOLVE edge flags onto the output edges the way COLLAPSE does: the native `seam` and
+/// `sharp` attributes and the compat `blender_edge_flags` take the `BMesh` edge header values. `flags`
+/// is keyed by output vertex pair; a pair shared by two live edges keeps the marks of both.
+fn write_dissolve_edge_flags(
+    mesh: &mut Mesh,
+    flags: Vec<([usize; 2], (bool, bool))>,
+) -> Result<()> {
+    let invalid = || {
+        PotError::new(
+            ErrorCode::InternalError,
+            "decimate edge flags do not match the rebuilt mesh",
+        )
+    };
+    let mut by_pair: HashMap<(usize, usize), (bool, bool)> = HashMap::with_capacity(flags.len());
+    for ([first, second], (seam, sharp)) in flags {
+        let entry = by_pair.entry((first, second)).or_default();
+        entry.0 |= seam;
+        entry.1 |= sharp;
+    }
+    let index_of = id_indices(mesh);
+    let mut output = Vec::with_capacity(mesh.edges.len());
+    for edge in &mesh.edges {
+        let [first, second] = edge.vertices.map(|id| index_of.get(&id).copied());
+        let (Some(first), Some(second)) = (first, second) else {
+            return Err(invalid());
+        };
+        output.push(
+            by_pair
+                .remove(&(first.min(second), first.max(second)))
+                .ok_or_else(invalid)?,
+        );
+    }
+    if !by_pair.is_empty() {
+        return Err(invalid());
+    }
+    let natives: [DissolveFlagStore; 2] = [("sharp", |flags| flags.1), ("seam", |flags| flags.0)];
+    for (name, flag) in natives {
+        if let Some(attribute) = mesh.attributes.get_mut(name) {
+            let values = attribute
+                .get_mut("values")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(invalid)?;
+            values.clear();
+            for (edge, flags) in mesh.edges.iter().zip(&output) {
+                values.insert(format!("e{}", edge.id), json!(flag(flags)));
+            }
+        }
+    }
+    if let Some(compat) = mesh.attributes.get_mut("blender_edge_flags") {
+        let values = compat.as_array_mut().ok_or_else(invalid)?;
+        if values.len() != output.len() {
+            return Err(invalid());
+        }
+        for (value, &(seam, sharp)) in values.iter_mut().zip(&output) {
+            let fields = value.as_object_mut().ok_or_else(invalid)?;
+            fields.insert("seam".to_owned(), json!(seam));
+            fields.insert("sharp".to_owned(), json!(sharp));
+        }
+    }
+    Ok(())
+}
+
+/// Blender's `BLI_heap` over a fixed set of nodes, where a node's id is the caller's element index.
+/// Only inserted nodes take part, in insertion order. `heap_up` and `heap_down` compare with `<` as
+/// Blender does, so ties resolve in the same order.
 struct DecimateHeap {
-    nodes: Vec<DecimateHeapNode>,
+    values: Vec<f32>,
     tree: Vec<usize>,
     positions: Vec<Option<usize>>,
 }
 
 impl DecimateHeap {
-    fn new(values: Vec<f32>) -> Self {
-        let mut heap = Self {
-            positions: vec![None; values.len()],
-            nodes: values
-                .into_iter()
-                .map(|value| DecimateHeapNode { value })
-                .collect(),
+    fn new(nodes: usize) -> Self {
+        Self {
+            values: vec![0.0; nodes],
             tree: Vec::new(),
-        };
-        for index in 0..heap.nodes.len() {
-            heap.positions[index] = Some(heap.tree.len());
-            heap.tree.push(index);
-            heap.up(heap.tree.len() - 1);
+            positions: vec![None; nodes],
         }
-        heap
     }
 
+    /// `BLI_heap_top`: the minimum node.
     fn top(&self) -> Option<usize> {
         self.tree.first().copied()
     }
 
-    fn value(&self, index: usize) -> Option<f32> {
-        self.nodes.get(index).map(|node| node.value)
+    fn value(&self, node: usize) -> f32 {
+        self.values[node]
+    }
+
+    fn contains(&self, node: usize) -> bool {
+        self.positions[node].is_some()
+    }
+
+    /// `BLI_heap_insert`.
+    fn insert(&mut self, node: usize, value: f32) {
+        self.values[node] = value;
+        self.positions[node] = Some(self.tree.len());
+        self.tree.push(node);
+        self.up(self.tree.len() - 1);
     }
 
     fn swap(&mut self, first: usize, second: usize) {
@@ -1759,10 +2648,14 @@ impl DecimateHeap {
         self.positions[self.tree[second]] = Some(second);
     }
 
+    fn less(&self, first: usize, second: usize) -> bool {
+        self.values[self.tree[first]] < self.values[self.tree[second]]
+    }
+
     fn up(&mut self, mut index: usize) {
         while index > 0 {
             let parent = (index - 1) >> 1;
-            if self.nodes[self.tree[parent]].value < self.nodes[self.tree[index]].value {
+            if self.less(parent, index) {
                 break;
             }
             self.swap(parent, index);
@@ -1775,14 +2668,10 @@ impl DecimateHeap {
             let left = (index << 1) + 1;
             let right = left + 1;
             let mut smallest = index;
-            if left < self.tree.len()
-                && self.nodes[self.tree[left]].value < self.nodes[self.tree[smallest]].value
-            {
+            if left < self.tree.len() && self.less(left, smallest) {
                 smallest = left;
             }
-            if right < self.tree.len()
-                && self.nodes[self.tree[right]].value < self.nodes[self.tree[smallest]].value
-            {
+            if right < self.tree.len() && self.less(right, smallest) {
                 smallest = right;
             }
             if smallest == index {
@@ -1793,22 +2682,24 @@ impl DecimateHeap {
         }
     }
 
-    fn update(&mut self, index: usize, value: f32) {
-        let Some(position) = self.positions.get(index).copied().flatten() else {
+    /// `BLI_heap_node_value_update`.
+    fn update(&mut self, node: usize, value: f32) {
+        let Some(position) = self.positions[node] else {
             return;
         };
-        let old = self.nodes[index].value;
+        let old = self.values[node];
         if value < old {
-            self.nodes[index].value = value;
+            self.values[node] = value;
             self.up(position);
         } else if value > old {
-            self.nodes[index].value = value;
+            self.values[node] = value;
             self.down(position);
         }
     }
 
-    fn remove(&mut self, index: usize) {
-        let Some(mut position) = self.positions.get(index).copied().flatten() else {
+    /// `BLI_heap_remove`: moves the node to the root, then pops it.
+    fn remove(&mut self, node: usize) {
+        let Some(mut position) = self.positions[node] else {
             return;
         };
         while position > 0 {
@@ -1816,514 +2707,105 @@ impl DecimateHeap {
             self.swap(parent, position);
             position = parent;
         }
-        if let Some(removed) = self.tree.first().copied() {
-            self.positions[removed] = None;
-            if let Some(last) = self.tree.pop()
-                && !self.tree.is_empty()
-            {
-                self.tree[0] = last;
-                self.positions[last] = Some(0);
-                self.down(0);
-            }
+        let last = self.tree.len() - 1;
+        if last > 0 {
+            self.swap(0, last);
+        }
+        self.tree.pop();
+        self.positions[node] = None;
+        if !self.tree.is_empty() {
+            self.down(0);
         }
     }
 }
 
-type DecimateEdge = (usize, usize);
-type DecimateEdgeUses = HashMap<DecimateEdge, Vec<(usize, usize, usize)>>;
-
-fn decimate_dissolve_edge_uses(polygons: &[Polygon]) -> DecimateEdgeUses {
-    let mut uses = HashMap::new();
-    for (face_index, (face, _)) in polygons.iter().enumerate() {
-        for (first, second) in cyclic_pairs(face) {
-            uses.entry(edge_key(*first, *second))
-                .or_insert_with(Vec::new)
-                .push((face_index, *first, *second));
-        }
-    }
-    uses
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn decimate_dissolve_edge_order(
-    mesh: &Mesh,
-    indices: &HashMap<u32, usize>,
-) -> Result<Vec<DecimateEdge>> {
-    mesh.edges
-        .iter()
-        .map(|edge| {
-            let first = indices.get(&edge.vertices[0]).copied().ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidArgument,
-                    "modifier edge references a missing vertex",
-                )
-            })?;
-            let second = indices.get(&edge.vertices[1]).copied().ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidArgument,
-                    "modifier edge references a missing vertex",
-                )
-            })?;
-            Ok(edge_key(first, second))
-        })
-        .collect()
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn decimate_normalize_v3(vector: [f32; 3]) -> [f32; 3] {
-    let dot = vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2];
-    if dot > 1.0e-35 {
-        let inverse = 1.0 / dot.sqrt();
-        [
-            vector[0] * inverse,
-            vector[1] * inverse,
-            vector[2] * inverse,
-        ]
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// `normalize_v3`: the zero vector when `v` is too short to normalize.
+fn normalize(v: [f32; 3]) -> [f32; 3] {
+    let d = dot(v, v);
+    if d > 1.0e-35 {
+        let inverse = 1.0 / d.sqrt();
+        [v[0] * inverse, v[1] * inverse, v[2] * inverse]
     } else {
         [0.0; 3]
     }
 }
 
-fn decimate_saasin(value: f32) -> f32 {
-    if value <= -1.0 {
-        -std::f32::consts::FRAC_PI_2
-    } else if value >= 1.0 {
-        std::f32::consts::FRAC_PI_2
-    } else {
-        value.asin()
-    }
+/// One edge of Newell's method, from corner `previous` to corner `current`.
+fn newell_step(normal: &mut [f32; 3], previous: [f32; 3], current: [f32; 3]) {
+    normal[0] += (previous[1] - current[1]) * (previous[2] + current[2]);
+    normal[1] += (previous[2] - current[2]) * (previous[0] + current[0]);
+    normal[2] += (previous[0] - current[0]) * (previous[1] + current[1]);
 }
 
-fn decimate_angle_normalized_v3v3(first: [f32; 3], second: [f32; 3]) -> f32 {
-    let length = |a: [f32; 3], b: [f32; 3]| {
-        let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-    };
-    let dot = first[0] * second[0] + first[1] * second[1] + first[2] * second[2];
-    if dot >= 0.0 {
-        2.0 * decimate_saasin(length(first, second) / 2.0)
-    } else {
-        let negated = [-second[0], -second[1], -second[2]];
-        std::f32::consts::PI - 2.0 * decimate_saasin(length(first, negated) / 2.0)
-    }
-}
-
-fn decimate_angle_v3v3v3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
-    let first = decimate_normalize_v3([a[0] - b[0], a[1] - b[1], a[2] - b[2]]);
-    let second = decimate_normalize_v3([c[0] - b[0], c[1] - b[1], c[2] - b[2]]);
-    decimate_angle_normalized_v3v3(first, second)
-}
-
-fn decimate_cos_v3v3v3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
-    let first = decimate_normalize_v3([a[0] - b[0], a[1] - b[1], a[2] - b[2]]);
-    let second = decimate_normalize_v3([c[0] - b[0], c[1] - b[1], c[2] - b[2]]);
-    first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
-}
-
-fn decimate_dissolve_normal(points: &[DVec3], face: &[usize]) -> [f32; 3] {
-    let p = |index: usize| points[face[index]].as_vec3().to_array();
-    match face.len() {
-        4 => {
-            let (v1, v2, v3, v4) = (p(0), p(1), p(2), p(3));
-            let n1 = [v1[0] - v3[0], v1[1] - v3[1], v1[2] - v3[2]];
-            let n2 = [v2[0] - v4[0], v2[1] - v4[1], v2[2] - v4[2]];
-            decimate_normalize_v3([
-                n1[1] * n2[2] - n1[2] * n2[1],
-                n1[2] * n2[0] - n1[0] * n2[2],
-                n1[0] * n2[1] - n1[1] * n2[0],
-            ])
-        }
-        3 => {
-            let (v1, v2, v3) = (p(0), p(1), p(2));
-            let n1 = [v1[0] - v2[0], v1[1] - v2[1], v1[2] - v2[2]];
-            let n2 = [v2[0] - v3[0], v2[1] - v3[1], v2[2] - v3[2]];
-            decimate_normalize_v3([
-                n1[1] * n2[2] - n1[2] * n2[1],
-                n1[2] * n2[0] - n1[0] * n2[2],
-                n1[0] * n2[1] - n1[1] * n2[0],
-            ])
-        }
-        length => {
+/// `BM_face_calc_normal` over the corner positions of a face, in face order.
+fn face_normal(cos: &[[f32; 3]]) -> [f32; 3] {
+    match cos.len() {
+        0..=2 => [0.0; 3],
+        3 => normalize(cross(sub(cos[0], cos[1]), sub(cos[1], cos[2]))),
+        4 => normalize(cross(sub(cos[0], cos[2]), sub(cos[1], cos[3]))),
+        _ => {
             let mut normal = [0.0_f32; 3];
-            let mut previous = p(length - 1);
-            for index in 0..length {
-                let current = p(index);
-                normal[0] += (previous[1] - current[1]) * (previous[2] + current[2]);
-                normal[1] += (previous[2] - current[2]) * (previous[0] + current[0]);
-                normal[2] += (previous[0] - current[0]) * (previous[1] + current[1]);
+            let mut previous = cos[cos.len() - 1];
+            for &current in cos {
+                newell_step(&mut normal, previous, current);
                 previous = current;
             }
-            decimate_normalize_v3(normal)
+            normalize(normal)
         }
     }
 }
 
-fn decimate_dissolve_face_normals(points: &[DVec3], polygons: &[Polygon]) -> Vec<[f32; 3]> {
-    polygons
-        .iter()
-        .map(|(face, _)| decimate_dissolve_normal(points, face))
-        .collect()
-}
-
-fn decimate_dissolve_edge_flags(
-    mesh: &Mesh,
-    indices: &HashMap<u32, usize>,
-) -> (HashSet<DecimateEdge>, HashSet<DecimateEdge>) {
-    let Some(flags) = mesh
-        .attributes
-        .get("blender_edge_flags")
-        .and_then(Value::as_array)
-    else {
-        return (HashSet::new(), HashSet::new());
-    };
-    let mut sharp = HashSet::new();
-    let mut seam = HashSet::new();
-    for (index, edge) in mesh.edges.iter().enumerate() {
-        let Some(metadata) = flags.get(index) else {
-            continue;
-        };
-        let (Some(first), Some(second)) = (
-            indices.get(&edge.vertices[0]).copied(),
-            indices.get(&edge.vertices[1]).copied(),
-        ) else {
-            continue;
-        };
-        let edge = edge_key(first, second);
-        if metadata.get("sharp").and_then(Value::as_bool) == Some(true) {
-            sharp.insert(edge);
-        }
-        if metadata.get("seam").and_then(Value::as_bool) == Some(true) {
-            seam.insert(edge);
-        }
-    }
-    (sharp, seam)
-}
-
-fn decimate_dissolve_uv_seams(mesh: &Mesh, polygons: &[Polygon]) -> HashSet<DecimateEdge> {
-    let Some(layers) = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-    else {
-        return HashSet::new();
-    };
-    let mut seams = HashSet::new();
-    for layer in layers {
-        let Some(values) = layer.get("values").and_then(Value::as_array) else {
-            continue;
-        };
-        let mut edge_values: HashMap<DecimateEdge, (&Value, &Value)> = HashMap::new();
-        let mut loop_index = 0;
-        for (face, _) in polygons {
-            if loop_index + face.len() > values.len() {
-                break;
-            }
-            for index in 0..face.len() {
-                let first = face[index];
-                let second = face[(index + 1) % face.len()];
-                let first_uv = &values[loop_index + index];
-                let second_uv = &values[loop_index + (index + 1) % face.len()];
-                let (first_uv, second_uv) = if first < second {
-                    (first_uv, second_uv)
-                } else {
-                    (second_uv, first_uv)
-                };
-                let edge = edge_key(first, second);
-                if let Some((expected_first, expected_second)) = edge_values.get(&edge) {
-                    if *expected_first != first_uv || *expected_second != second_uv {
-                        seams.insert(edge);
-                    }
-                } else {
-                    edge_values.insert(edge, (first_uv, second_uv));
-                }
-            }
-            loop_index += face.len();
-        }
-    }
-    seams
-}
-
-fn decimate_dissolve_is_delimiter(
-    edge: DecimateEdge,
-    uses: &DecimateEdgeUses,
-    polygons: &[Polygon],
-    delimit: &HashSet<&str>,
-    sharp_edges: &HashSet<DecimateEdge>,
-    seam_edges: &HashSet<DecimateEdge>,
-    uv_seams: &HashSet<DecimateEdge>,
-) -> bool {
-    let Some(edge_uses) = uses.get(&edge).filter(|edge_uses| edge_uses.len() == 2) else {
-        return false;
-    };
-    if (delimit.contains("SEAM") && seam_edges.contains(&edge))
-        || (delimit.contains("SHARP") && sharp_edges.contains(&edge))
-        || (delimit.contains("UV") && uv_seams.contains(&edge))
-    {
-        return true;
-    }
-    let [(first_face, first_start, _), (second_face, second_start, _)] = edge_uses.as_slice()
-    else {
-        return false;
-    };
-    (delimit.contains("MATERIAL") && polygons[*first_face].1 != polygons[*second_face].1)
-        || (delimit.contains("NORMAL") && first_start == second_start)
-}
-
-fn decimate_dissolve_edge_cost(
-    edge: DecimateEdge,
-    uses: &DecimateEdgeUses,
-    polygons: &[Polygon],
-    normals: &[[f32; 3]],
-    delimit: &HashSet<&str>,
-    sharp_edges: &HashSet<DecimateEdge>,
-    seam_edges: &HashSet<DecimateEdge>,
-    uv_seams: &HashSet<DecimateEdge>,
-) -> f32 {
-    let Some(edge_uses) = uses.get(&edge).filter(|edge_uses| edge_uses.len() == 2) else {
-        return f32::MAX;
-    };
-    if decimate_dissolve_is_delimiter(
-        edge,
-        uses,
-        polygons,
-        delimit,
-        sharp_edges,
-        seam_edges,
-        uv_seams,
-    ) {
-        return f32::MAX;
-    }
-    let [first, second] = edge_uses.as_slice() else {
-        return f32::MAX;
-    };
-    let first_normal = normals[first.0];
-    let second_normal = normals[second.0];
-    let mut cost = first_normal[0] * second_normal[0]
-        + first_normal[1] * second_normal[1]
-        + first_normal[2] * second_normal[2];
-    if first.1 != second.1 {
-        cost *= -1.0;
-    }
-    cost
-}
-
-fn decimate_dissolve_can_join(
-    first: &[usize],
-    second: &[usize],
-    _edge: DecimateEdge,
-) -> Option<Vec<usize>> {
-    let first_edges: HashSet<DecimateEdge> =
-        cyclic_pairs(first).map(|(a, b)| edge_key(*a, *b)).collect();
-    let second_edges: HashSet<DecimateEdge> = cyclic_pairs(second)
-        .map(|(a, b)| edge_key(*a, *b))
-        .collect();
-    let same_direction = cyclic_pairs(first).any(|(a, b)| {
-        second_edges.contains(&edge_key(*a, *b))
-            && cyclic_pairs(second).any(|(c, d)| c == a && d == b)
-    });
-    let mut second_oriented = second.to_vec();
-    if same_direction {
-        second_oriented.reverse();
-    }
-    let mut next_of: HashMap<usize, usize> = HashMap::new();
-    let mut boundary_count = 0;
-    let mut start = None;
-    for (a, b) in cyclic_pairs(first) {
-        if !second_edges.contains(&edge_key(*a, *b)) {
-            if next_of.insert(*a, *b).is_some() {
-                return None;
-            }
-            boundary_count += 1;
-            start.get_or_insert(*a);
-        }
-    }
-    for (a, b) in cyclic_pairs(&second_oriented) {
-        if !first_edges.contains(&edge_key(*a, *b)) {
-            if next_of.insert(*a, *b).is_some() {
-                return None;
-            }
-            boundary_count += 1;
-            start.get_or_insert(*a);
-        }
-    }
-    let start = start?;
-    if boundary_count < 3 {
-        return None;
-    }
-    let mut merged = Vec::with_capacity(boundary_count);
-    let mut current = start;
-    loop {
-        merged.push(current);
-        current = *next_of.get(&current)?;
-        if current == start {
-            break;
-        }
-        if merged.len() > boundary_count {
-            return None;
-        }
-    }
-    (merged.len() == boundary_count).then_some(merged)
-}
-
-fn decimate_dissolve_active_edges(
-    polygons: &[Polygon],
-    loose: &[[usize; 2]],
-    old_order: &[DecimateEdge],
-) -> Vec<DecimateEdge> {
-    let mut active = HashSet::new();
-    for (face, _) in polygons {
-        for (first, second) in cyclic_pairs(face) {
-            active.insert(edge_key(*first, *second));
-        }
-    }
-    for [first, second] in loose {
-        active.insert(edge_key(*first, *second));
-    }
-    let mut seen = HashSet::new();
-    let mut order = Vec::with_capacity(active.len());
-    for edge in old_order {
-        if active.contains(edge) && seen.insert(*edge) {
-            order.push(*edge);
-        }
-    }
-    for (face, _) in polygons {
-        for (first, second) in cyclic_pairs(face) {
-            let edge = edge_key(*first, *second);
-            if seen.insert(edge) {
-                order.push(edge);
-            }
-        }
-    }
-    for [first, second] in loose {
-        let edge = edge_key(*first, *second);
-        if seen.insert(edge) {
-            order.push(edge);
-        }
-    }
-    order
-}
-
-fn decimate_dissolve_adjacency(
-    vertex_count: usize,
-    edge_order: &[DecimateEdge],
-) -> Vec<Vec<usize>> {
-    let mut adjacency = vec![Vec::new(); vertex_count];
-    for (first, second) in edge_order {
-        adjacency[*first].push(*second);
-        adjacency[*second].push(*first);
-    }
-    adjacency
-}
-
-fn decimate_dissolve_vertex_cost(
-    vertex: usize,
-    points: &[DVec3],
-    adjacency: &[Vec<usize>],
-    uses: &DecimateEdgeUses,
-    normals: &[[f32; 3]],
-    polygons: &[Polygon],
-    delimit: &HashSet<&str>,
-    sharp_edges: &HashSet<DecimateEdge>,
-    seam_edges: &HashSet<DecimateEdge>,
-    uv_seams: &HashSet<DecimateEdge>,
-) -> f32 {
-    let neighbors = &adjacency[vertex];
-    let angle = if neighbors.len() == 2 {
-        std::f32::consts::PI
-            - decimate_angle_v3v3v3(
-                points[neighbors[0]].as_vec3().to_array(),
-                points[vertex].as_vec3().to_array(),
-                points[neighbors[1]].as_vec3().to_array(),
-            )
-    } else {
-        std::f32::consts::FRAC_PI_2
-    };
-    let Some(first_neighbor) = neighbors.first() else {
-        return angle;
-    };
-    let edge = edge_key(vertex, *first_neighbor);
-    if uses
-        .get(&edge)
-        .is_some_and(|edge_uses| edge_uses.len() == 2)
-        && !adjacency[vertex].iter().any(|neighbor| {
-            decimate_dissolve_is_delimiter(
-                edge_key(vertex, *neighbor),
-                uses,
-                polygons,
-                delimit,
-                sharp_edges,
-                seam_edges,
-                uv_seams,
-            )
-        })
-    {
-        let Some(edge_uses) = uses.get(&edge).filter(|edge_uses| edge_uses.len() == 2) else {
-            return angle;
-        };
-        let first_normal = normals[edge_uses[0].0];
-        let second_normal = normals[edge_uses[1].0];
-        let face_angle = decimate_angle_normalized_v3v3(first_normal, second_normal);
-        let inverse_unit_angle = 1.0 / std::f32::consts::FRAC_PI_2;
-        return ((angle * inverse_unit_angle) * (face_angle * inverse_unit_angle))
-            * std::f32::consts::FRAC_PI_2;
-    }
-    angle
-}
-
-fn decimate_dissolve_merge_face(
-    polygons: &mut Vec<Polygon>,
-    first_index: usize,
-    second_index: usize,
-    edge: DecimateEdge,
-) -> Option<usize> {
-    let merged = decimate_dissolve_can_join(
-        &polygons.get(first_index)?.0,
-        &polygons.get(second_index)?.0,
-        edge,
-    )?;
-    let material = polygons[first_index].1;
-    polygons[first_index] = (merged, material);
-    polygons.remove(second_index);
-    Some(first_index)
-}
-
-fn decimate_dissolve_cross(first: [f32; 2], second: [f32; 2], third: [f32; 2]) -> f32 {
-    (first[0] - second[0]) * (second[1] - third[1])
-        + (first[1] - second[1]) * (third[0] - second[0])
-}
-
-fn decimate_dissolve_basis(normal: [f32; 3]) -> [[f32; 3]; 2] {
-    let f = normal[0] * normal[0] + normal[1] * normal[1];
+/// `ortho_basis_v3v3_v3`: two unit vectors orthogonal to `n` and to each other.
+fn ortho_basis(n: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let f = n[0] * n[0] + n[1] * n[1];
     if f > f32::EPSILON {
         let d = 1.0 / f.sqrt();
-        let n1 = [normal[1] * d, -normal[0] * d, 0.0];
-        let n2 = [
-            -normal[2] * n1[1],
-            normal[2] * n1[0],
-            normal[0] * n1[1] - normal[1] * n1[0],
-        ];
-        [n1, n2]
+        let n1 = [n[1] * d, -n[0] * d, 0.0];
+        let n2 = [-n[2] * n1[1], n[2] * n1[0], n[0] * n1[1] - n[1] * n1[0]];
+        (n1, n2)
     } else {
-        [
-            [if normal[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0],
+        (
+            [if n[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0],
             [0.0, 1.0, 0.0],
-        ]
+        )
     }
 }
 
-fn decimate_dissolve_project(point: DVec3, center: DVec3, basis: &[[f32; 3]; 2]) -> [f32; 2] {
-    let point = point.as_vec3().to_array();
-    let center = center.as_vec3().to_array();
-    let co = [
-        point[0] - center[0],
-        point[1] - center[1],
-        point[2] - center[2],
-    ];
-    [
-        basis[0][0] * co[0] + basis[0][1] * co[1] + basis[0][2] * co[2],
-        basis[1][0] * co[0] + basis[1][1] * co[1] + basis[1][2] * co[2],
-    ]
+/// `cross_tri_v2`.
+fn cross_tri(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+    (a[0] - b[0]) * (b[1] - c[1]) + (a[1] - b[1]) * (c[0] - b[0])
 }
 
-fn decimate_signum_i(value: f32) -> i32 {
+/// `line_point_side_v2`.
+fn line_point_side(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
+    (a[0] - p[0]) * (b[1] - p[1]) - (b[0] - p[0]) * (a[1] - p[1])
+}
+
+/// `isect_point_tri_v2_cw`.
+fn point_in_tri_cw(p: [f32; 2], tri: [[f32; 2]; 3]) -> bool {
+    line_point_side(tri[0], tri[1], p) >= 0.0
+        && line_point_side(tri[1], tri[2], p) >= 0.0
+        && line_point_side(tri[2], tri[0], p) >= 0.0
+}
+
+/// `signum_i`.
+fn signum_i(value: f32) -> i32 {
     if value > 0.0 {
         1
     } else if value < 0.0 {
@@ -2333,1001 +2815,37 @@ fn decimate_signum_i(value: f32) -> i32 {
     }
 }
 
-fn decimate_dissolve_point_in_triangle(point: [f32; 2], triangle: [[f32; 2]; 3]) -> bool {
-    let side = |first: [f32; 2], second: [f32; 2]| {
-        (first[0] - point[0]) * (second[1] - point[1])
-            - (second[0] - point[0]) * (first[1] - point[1])
-    };
-    side(triangle[0], triangle[1]) >= 0.0
-        && side(triangle[1], triangle[2]) >= 0.0
-        && side(triangle[2], triangle[0]) >= 0.0
-}
-
-fn decimate_dissolve_loop_is_degenerate(
-    points: &[DVec3],
-    polygons: &[Polygon],
-    adjacency: &[Vec<usize>],
-    vertex: usize,
-    face_index: usize,
-) -> bool {
-    let face = &polygons[face_index].0;
-    let Some(index) = face.iter().position(|item| *item == vertex) else {
-        return false;
-    };
-    if face.len() <= 3 {
-        return false;
-    }
-    let basis = decimate_dissolve_basis(decimate_dissolve_normal(points, face));
-    let center = points[vertex];
-    let previous = face[(index + face.len() - 1) % face.len()];
-    let next = face[(index + 1) % face.len()];
-    let mut triangle = [
-        decimate_dissolve_project(points[previous], center, &basis),
-        [0.0, 0.0],
-        decimate_dissolve_project(points[next], center, &basis),
-    ];
-    if adjacency[previous].len() != 2 {
-        let adjacent = face[(index + face.len() - 2) % face.len()];
-        let adjacent = decimate_dissolve_project(points[adjacent], center, &basis);
-        if decimate_signum_i(decimate_dissolve_cross(adjacent, triangle[0], triangle[1]))
-            != decimate_signum_i(decimate_dissolve_cross(adjacent, triangle[0], triangle[2]))
-        {
-            return true;
-        }
-    }
-    if adjacency[next].len() != 2 {
-        let adjacent = face[(index + 2) % face.len()];
-        let adjacent = decimate_dissolve_project(points[adjacent], center, &basis);
-        if decimate_signum_i(decimate_dissolve_cross(adjacent, triangle[2], triangle[1]))
-            != decimate_signum_i(decimate_dissolve_cross(adjacent, triangle[2], triangle[0]))
-        {
-            return true;
-        }
-    }
-    if decimate_dissolve_cross(triangle[0], triangle[1], triangle[2]) < 0.0 {
-        triangle.swap(1, 2);
-    }
-    for offset in 2..face.len() - 1 {
-        let point = face[(index + offset) % face.len()];
-        if decimate_dissolve_point_in_triangle(
-            decimate_dissolve_project(points[point], center, &basis),
-            triangle,
-        ) {
-            return true;
-        }
-    }
-    false
-}
-
-fn decimate_dissolve_is_degenerate(
-    points: &[DVec3],
-    polygons: &[Polygon],
-    adjacency: &[Vec<usize>],
-    uses: &DecimateEdgeUses,
-    vertex: usize,
-) -> bool {
-    let neighbors = &adjacency[vertex];
-    if neighbors.len() != 2 {
-        return true;
-    }
-    if neighbors.iter().any(|neighbor| {
-        uses.get(&edge_key(vertex, *neighbor))
-            .is_none_or(Vec::is_empty)
-    }) {
-        return false;
-    }
-    let a = points[neighbors[0]].as_vec3().to_array();
-    let b = points[vertex].as_vec3().to_array();
-    let c = points[neighbors[1]].as_vec3().to_array();
-    if decimate_cos_v3v3v3(a, b, c).abs() >= 1.0 - f32::EPSILON {
-        return false;
-    }
-    for (face_index, (face, _)) in polygons.iter().enumerate() {
-        if face.len() > 3
-            && face.contains(&vertex)
-            && decimate_dissolve_loop_is_degenerate(points, polygons, adjacency, vertex, face_index)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn decimate_dissolve_replace_vertex(
-    polygons: Vec<Polygon>,
-    loose: &mut Vec<[usize; 2]>,
-    vertex: usize,
-    target: usize,
-    other: usize,
-) -> Vec<Polygon> {
-    let polygons = polygons
-        .into_iter()
-        .filter_map(|(face, material)| {
-            clean_polygon(
-                face.into_iter()
-                    .map(|index| if index == vertex { target } else { index })
-                    .collect(),
-            )
-            .map(|face| (face, material))
-        })
-        .collect::<Vec<_>>();
-    let mut seen = HashSet::new();
-    *loose = std::mem::take(loose)
-        .into_iter()
-        .filter_map(|[first, second]| {
-            let first = if first == vertex { target } else { first };
-            let second = if second == vertex { target } else { second };
-            (first != second && seen.insert(edge_key(first, second))).then_some([first, second])
-        })
-        .collect();
-    let new_edge = edge_key(target, other);
-    let has_face_edge = polygons.iter().any(|(face, _)| {
-        cyclic_pairs(face).any(|(first, second)| edge_key(*first, *second) == new_edge)
-    });
-    if !has_face_edge && seen.insert(new_edge) {
-        loose.push([new_edge.0, new_edge.1]);
-    }
-    unique_polygons(polygons)
-}
-
-fn decimate_dissolve_remap_edge_set(
-    edges: &mut HashSet<DecimateEdge>,
-    killed_edge: DecimateEdge,
-    retained_edge: DecimateEdge,
-    new_edge: DecimateEdge,
-) {
-    edges.remove(&killed_edge);
-    if edges.remove(&retained_edge) {
-        edges.insert(new_edge);
-    }
-}
-
-fn decimate_dissolve_apply_vertex(
-    polygons: &mut Vec<Polygon>,
-    loose: &mut Vec<[usize; 2]>,
-    edge_order: &mut Vec<DecimateEdge>,
-    vertex: usize,
-    target: usize,
-    other: usize,
-    sharp_edges: &mut HashSet<DecimateEdge>,
-    seam_edges: &mut HashSet<DecimateEdge>,
-    uv_seams: &mut HashSet<DecimateEdge>,
-) {
-    *polygons =
-        decimate_dissolve_replace_vertex(std::mem::take(polygons), loose, vertex, target, other);
-    let killed_edge = edge_key(vertex, target);
-    let retained_edge = edge_key(vertex, other);
-    let new_edge = edge_key(target, other);
-    decimate_dissolve_remap_edge_set(sharp_edges, killed_edge, retained_edge, new_edge);
-    decimate_dissolve_remap_edge_set(seam_edges, killed_edge, retained_edge, new_edge);
-    decimate_dissolve_remap_edge_set(uv_seams, killed_edge, retained_edge, new_edge);
-    let mut seen = HashSet::new();
-    let mut remapped = Vec::with_capacity(edge_order.len());
-    for (first, second) in std::mem::take(edge_order) {
-        let first = if first == vertex { target } else { first };
-        let second = if second == vertex { target } else { second };
-        if first != second {
-            let edge = edge_key(first, second);
-            if seen.insert(edge) {
-                remapped.push(edge);
-            }
-        }
-    }
-    let new_edge = edge_key(target, other);
-    if seen.insert(new_edge) {
-        remapped.push(new_edge);
-    }
-    *edge_order = decimate_dissolve_active_edges(polygons, loose, &remapped);
-}
-
-fn decimate_dissolve_faces(
-    points: &[DVec3],
-    polygons: &mut Vec<Polygon>,
-    edge_order: &[DecimateEdge],
-    angle_limit_cos_neg: f32,
-    delimit: &HashSet<&str>,
-    sharp_edges: &HashSet<DecimateEdge>,
-    seam_edges: &HashSet<DecimateEdge>,
-    uv_seams: &HashSet<DecimateEdge>,
-) -> Vec<usize> {
-    let mut stamps: Vec<usize> = (0..polygons.len()).collect();
-    let mut next_stamp = polygons.len();
-    let mut uses = decimate_dissolve_edge_uses(polygons);
-    let mut normals = decimate_dissolve_face_normals(points, polygons);
-    let mut edge_indices = HashMap::with_capacity(edge_order.len());
-    for (index, edge) in edge_order.iter().enumerate() {
-        edge_indices.insert(*edge, index);
-    }
-    let mut heap = DecimateHeap::new(
-        edge_order
-            .iter()
-            .map(|edge| {
-                decimate_dissolve_edge_cost(
-                    *edge,
-                    &uses,
-                    polygons,
-                    &normals,
-                    delimit,
-                    sharp_edges,
-                    seam_edges,
-                    uv_seams,
-                )
-            })
-            .collect(),
-    );
-    while let Some(edge_index) = heap.top() {
-        if heap
-            .value(edge_index)
-            .is_none_or(|cost| cost >= angle_limit_cos_neg)
-        {
-            break;
-        }
-        let edge = edge_order[edge_index];
-        let Some(edge_uses) = uses.get(&edge).filter(|edge_uses| edge_uses.len() == 2) else {
-            heap.update(edge_index, f32::MAX);
-            continue;
-        };
-        let (newer, older) = if stamps[edge_uses[0].0] > stamps[edge_uses[1].0] {
-            (edge_uses[0].0, edge_uses[1].0)
-        } else {
-            (edge_uses[1].0, edge_uses[0].0)
-        };
-        if decimate_dissolve_merge_face(polygons, newer, older, edge).is_none() {
-            heap.update(edge_index, f32::MAX);
-            continue;
-        }
-        heap.remove(edge_index);
-        stamps[newer] = next_stamp;
-        next_stamp += 1;
-        stamps.remove(older);
-        let first_face = if older < newer { newer - 1 } else { newer };
-        uses = decimate_dissolve_edge_uses(polygons);
-        normals = decimate_dissolve_face_normals(points, polygons);
-        let merged_face = &polygons[first_face].0;
-        for (first, second) in cyclic_pairs(merged_face) {
-            let edge = edge_key(*first, *second);
-            if let Some(index) = edge_indices.get(&edge).copied() {
-                heap.update(
-                    index,
-                    decimate_dissolve_edge_cost(
-                        edge,
-                        &uses,
-                        polygons,
-                        &normals,
-                        delimit,
-                        sharp_edges,
-                        seam_edges,
-                        uv_seams,
-                    ),
-                );
-            }
-        }
-    }
-    stamps
-}
-
-fn decimate_dissolve_collapse_faces(
-    polygons: &mut Vec<Polygon>,
-    stamps: &mut Vec<usize>,
-    loose: &mut Vec<[usize; 2]>,
-    vertex: usize,
-    target: usize,
-    old: usize,
-) {
-    let mut kept_stamps = Vec::with_capacity(stamps.len());
-    let mut seen = HashSet::new();
-    for ((face, _), stamp) in polygons.iter().zip(stamps.iter()) {
-        let cleaned = clean_polygon(
-            face.iter()
-                .map(|index| if *index == vertex { target } else { *index })
-                .collect(),
-        );
-        if let Some(cleaned) = cleaned {
-            let mut key = cleaned;
-            key.sort_unstable();
-            if seen.insert(key) {
-                kept_stamps.push(*stamp);
-            }
-        }
-    }
-    *polygons =
-        decimate_dissolve_replace_vertex(std::mem::take(polygons), loose, vertex, target, old);
-    *stamps = kept_stamps;
-}
-
-pub(super) fn decimate_dissolve(
-    mesh: &Mesh,
-    angle_limit: f64,
-    modifier: &Modifier,
-) -> Result<Mesh> {
-    let dissolve_boundaries = bool_param(modifier, "use_dissolve_boundaries")?;
-    if angle_limit == 0.0 || mesh.faces.len() <= 3 {
-        return Ok(mesh.clone());
-    }
-    let points = positions(mesh);
-    let mut polygons = polygons(mesh)?;
-    let delimit: HashSet<_> = modifier
-        .params
-        .get("delimit")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    let indices = id_indices(mesh);
-    let mut edge_order = decimate_dissolve_edge_order(mesh, &indices)?;
-    let (mut sharp_edges, mut seam_edges) = decimate_dissolve_edge_flags(mesh, &indices);
-    let mut uv_seams = decimate_dissolve_uv_seams(mesh, &polygons);
-    let mut loose = loose_edges(mesh)?;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Blender stores Decimate angle limits as float32"
-    )]
-    let angle_limit = angle_limit as f32;
-    let mut stamps = decimate_dissolve_faces(
-        &points,
-        &mut polygons,
-        &edge_order,
-        -angle_limit.cos(),
-        &delimit,
-        &sharp_edges,
-        &seam_edges,
-        &uv_seams,
-    );
-    edge_order = decimate_dissolve_active_edges(&polygons, &loose, &edge_order);
-    if dissolve_boundaries {
-        for vertex in 0..points.len() {
-            let adjacency = decimate_dissolve_adjacency(points.len(), &edge_order);
-            if adjacency[vertex].len() == 2 {
-                let target = adjacency[vertex][0];
-                let other = adjacency[vertex][1];
-                decimate_dissolve_apply_vertex(
-                    &mut polygons,
-                    &mut loose,
-                    &mut edge_order,
-                    vertex,
-                    target,
-                    other,
-                    &mut sharp_edges,
-                    &mut seam_edges,
-                    &mut uv_seams,
-                );
-            }
-        }
+/// `saasinf`.
+fn saasin(value: f32) -> f32 {
+    if value <= -1.0 {
+        -std::f32::consts::FRAC_PI_2
+    } else if value >= 1.0 {
+        std::f32::consts::FRAC_PI_2
     } else {
-        let orient: HashMap<DecimateEdge, [usize; 2]> = mesh
-            .edges
-            .iter()
-            .filter_map(|edge| {
-                let first = *indices.get(&edge.vertices[0])?;
-                let second = *indices.get(&edge.vertices[1])?;
-                Some((edge_key(first, second), [first, second]))
-            })
-            .collect();
-        let mut edge_table: Vec<[usize; 2]> = edge_order
-            .iter()
-            .map(|edge| orient.get(edge).copied().unwrap_or([edge.0, edge.1]))
-            .collect();
-        let mut disk: Vec<Vec<usize>> = vec![Vec::new(); points.len()];
-        for (id, [first, second]) in edge_table.iter().enumerate() {
-            disk[*first].push(id);
-            disk[*second].push(id);
-        }
-        let adjacency_of = |disk: &[Vec<usize>], table: &[[usize; 2]]| -> Vec<Vec<usize>> {
-            disk.iter()
-                .enumerate()
-                .map(|(vertex, list)| {
-                    list.iter()
-                        .map(|id| {
-                            if table[*id][0] == vertex {
-                                table[*id][1]
-                            } else {
-                                table[*id][0]
-                            }
-                        })
-                        .collect()
-                })
-                .collect()
-        };
-        let live: Vec<usize> = (0..points.len())
-            .filter(|vertex| !disk[*vertex].is_empty())
-            .collect();
-        let mut node_of: Vec<Option<usize>> = vec![None; points.len()];
-        for (node, vertex) in live.iter().enumerate() {
-            node_of[*vertex] = Some(node);
-        }
-        let mut uses = decimate_dissolve_edge_uses(&polygons);
-        let mut adjacency = adjacency_of(&disk, &edge_table);
-        let mut normals = decimate_dissolve_face_normals(&points, &polygons);
-        let costs = live
-            .iter()
-            .map(|vertex| {
-                decimate_dissolve_vertex_cost(
-                    *vertex,
-                    &points,
-                    &adjacency,
-                    &uses,
-                    &normals,
-                    &polygons,
-                    &delimit,
-                    &sharp_edges,
-                    &seam_edges,
-                    &uv_seams,
-                )
-            })
-            .collect();
-        let mut heap = DecimateHeap::new(costs);
-        while let Some(node) = heap.top() {
-            if heap.value(node).is_none_or(|cost| cost >= angle_limit) {
-                break;
-            }
-            let vertex = live[node];
-            let neighbors = &adjacency[vertex];
-            if neighbors.len() != 2
-                || decimate_dissolve_is_degenerate(&points, &polygons, &adjacency, &uses, vertex)
-            {
-                heap.update(node, f32::MAX);
-                continue;
-            }
-            let target = neighbors[0];
-            let old = neighbors[1];
-            let e_kill = disk[vertex][0];
-            let e_old = disk[vertex][1];
-            decimate_dissolve_collapse_faces(
-                &mut polygons,
-                &mut stamps,
-                &mut loose,
-                vertex,
-                target,
-                old,
-            );
-            let killed_edge = edge_key(vertex, target);
-            let retained_edge = edge_key(vertex, old);
-            let new_edge = edge_key(target, old);
-            decimate_dissolve_remap_edge_set(
-                &mut sharp_edges,
-                killed_edge,
-                retained_edge,
-                new_edge,
-            );
-            decimate_dissolve_remap_edge_set(&mut seam_edges, killed_edge, retained_edge, new_edge);
-            decimate_dissolve_remap_edge_set(&mut uv_seams, killed_edge, retained_edge, new_edge);
-            heap.remove(node);
-            node_of[vertex] = None;
-            for slot in &mut edge_table[e_old] {
-                if *slot == vertex {
-                    *slot = target;
-                }
-            }
-            disk[target].retain(|id| *id != e_kill);
-            disk[target].push(e_old);
-            disk[vertex].clear();
-            let spliced = disk[target].iter().copied().find(|id| {
-                let ends = edge_table[*id];
-                *id != e_old && (ends == [target, old] || ends == [old, target])
-            });
-            if let Some(e_splice) = spliced {
-                disk[target].retain(|id| *id != e_splice);
-                disk[old].retain(|id| *id != e_splice);
-            }
-            uses = decimate_dissolve_edge_uses(&polygons);
-            adjacency = adjacency_of(&disk, &edge_table);
-            normals = decimate_dissolve_face_normals(&points, &polygons);
-            for end in edge_table[e_old] {
-                if let Some(end_node) = node_of[end] {
-                    heap.update(
-                        end_node,
-                        decimate_dissolve_vertex_cost(
-                            end,
-                            &points,
-                            &adjacency,
-                            &uses,
-                            &normals,
-                            &polygons,
-                            &delimit,
-                            &sharp_edges,
-                            &seam_edges,
-                            &uv_seams,
-                        ),
-                    );
-                }
-            }
-            let mut radial: Vec<usize> = uses
-                .get(&new_edge)
-                .map(|edge_uses| edge_uses.iter().map(|(face, _, _)| *face).collect())
-                .unwrap_or_default();
-            radial.sort_by_key(|face| std::cmp::Reverse(stamps[*face]));
-            for face_index in radial {
-                let face = &polygons[face_index].0;
-                let length = face.len();
-                let Some(start) = (0..length)
-                    .find(|index| edge_key(face[*index], face[(*index + 1) % length]) == new_edge)
-                else {
-                    continue;
-                };
-                let stop = (start + length - 1) % length;
-                let mut cursor = (start + 2) % length;
-                loop {
-                    let candidate = face[cursor];
-                    if let Some(candidate_node) = node_of[candidate]
-                        && heap.value(candidate_node) == Some(f32::MAX)
-                    {
-                        heap.update(
-                            candidate_node,
-                            decimate_dissolve_vertex_cost(
-                                candidate,
-                                &points,
-                                &adjacency,
-                                &uses,
-                                &normals,
-                                &polygons,
-                                &delimit,
-                                &sharp_edges,
-                                &seam_edges,
-                                &uv_seams,
-                            ),
-                        );
-                    }
-                    cursor = (cursor + 1) % length;
-                    if cursor == stop {
-                        break;
-                    }
-                }
-            }
-        }
+        value.asin()
     }
-    let face_origins = decimate_face_origins(mesh, &polygons)?;
-    let origin = Origin::copies((0..points.len()).map(Some), face_origins);
-    decimate_compact(points, polygons, loose, origin, mesh)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DecimateUnsubdivideMethod {
-    InteriorFan,
-    BoundaryFan,
-    InteriorChain,
-    WireChain,
-}
-
-fn decimate_unsubdivide_method(
-    vertex: usize,
-    adjacency: &[Vec<usize>],
-    uses: &DecimateEdgeUses,
-) -> Option<DecimateUnsubdivideMethod> {
-    let edges = adjacency.get(vertex)?;
-    if edges.len() > 4 {
-        return None;
-    }
-    let mut boundary_edges = 0;
-    let mut manifold_edges = 0;
-    let mut wire_edges = 0;
-    for neighbor in edges {
-        match uses.get(&edge_key(vertex, *neighbor)).map_or(0, Vec::len) {
-            0 => wire_edges += 1,
-            1 => boundary_edges += 1,
-            2 => manifold_edges += 1,
-            _ => return None,
-        }
-    }
-    if (edges.len() == 3 && boundary_edges == 0 && manifold_edges == 3)
-        || (edges.len() == 4 && boundary_edges == 0 && manifold_edges == 4)
-    {
-        Some(DecimateUnsubdivideMethod::InteriorFan)
-    } else if edges.len() == 3 && boundary_edges == 2 && manifold_edges == 1 {
-        Some(DecimateUnsubdivideMethod::BoundaryFan)
-    } else if edges.len() == 2 && wire_edges == 2 {
-        Some(DecimateUnsubdivideMethod::WireChain)
-    } else if edges.len() == 2 && manifold_edges == 2 {
-        Some(DecimateUnsubdivideMethod::InteriorChain)
+/// `angle_normalized_v3v3`.
+fn angle_normalized(first: [f32; 3], second: [f32; 3]) -> f32 {
+    let length = |a: [f32; 3], b: [f32; 3]| {
+        let d = sub(a, b);
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+    };
+    if dot(first, second) >= 0.0 {
+        2.0 * saasin(length(first, second) / 2.0)
     } else {
-        None
+        let negated = [-second[0], -second[1], -second[2]];
+        std::f32::consts::PI - 2.0 * saasin(length(first, negated) / 2.0)
     }
 }
 
-fn decimate_unsubdivide_tag_neighbors(
-    starts: &[usize],
-    desired_tag: i8,
-    tags: &mut [i8],
-    adjacency: &[Vec<usize>],
-) -> Vec<usize> {
-    let mut newly_tagged = Vec::new();
-    for vertex in starts {
-        for neighbor in &adjacency[*vertex] {
-            if tags[*neighbor] == 0 {
-                tags[*neighbor] = desired_tag;
-                newly_tagged.push(*neighbor);
-            }
-        }
-    }
-    newly_tagged
+/// `angle_v3v3v3`.
+fn angle_v3v3v3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    angle_normalized(normalize(sub(a, b)), normalize(sub(c, b)))
 }
 
-fn decimate_unsubdivide_incident_faces(
-    vertex: usize,
-    adjacency: &[Vec<usize>],
-    uses: &DecimateEdgeUses,
-) -> Vec<usize> {
-    let mut seen = HashSet::new();
-    let mut faces = Vec::new();
-    for neighbor in &adjacency[vertex] {
-        if let Some(edge_uses) = uses.get(&edge_key(vertex, *neighbor)) {
-            for (face_index, start, _) in edge_uses {
-                if *start == vertex && seen.insert(*face_index) {
-                    faces.push(*face_index);
-                }
-            }
-        }
-    }
-    faces
-}
-
-fn decimate_unsubdivide_central_face(
-    vertex: usize,
-    polygons: &[Polygon],
-    incident_faces: &[usize],
-) -> (Vec<usize>, Vec<(usize, usize, usize)>) {
-    let mut loops = Vec::with_capacity(incident_faces.len());
-    for face_index in incident_faces {
-        let face = &polygons[*face_index].0;
-        if let Some(index) = face.iter().position(|item| *item == vertex) {
-            loops.push((
-                *face_index,
-                face[(index + 1) % face.len()],
-                face[(index + face.len() - 1) % face.len()],
-            ));
-        }
-    }
-    let mut start = 0;
-    if let Some(index) = loops.iter().enumerate().find_map(|(index, current)| {
-        loops
-            .iter()
-            .enumerate()
-            .all(|(other_index, other)| other_index == index || other.2 != current.1)
-            .then_some(index)
-    }) {
-        start = index;
-    }
-    let mut ordered = Vec::with_capacity(loops.len());
-    let mut used = HashSet::new();
-    let mut current = start;
-    while used.insert(current) {
-        ordered.push(loops[current]);
-        let previous = loops[current].2;
-        let Some(next) = loops.iter().enumerate().find_map(|(index, item)| {
-            (!used.contains(&index) && item.1 == previous).then_some(index)
-        }) else {
-            break;
-        };
-        current = next;
-    }
-    let mut central = Vec::with_capacity(ordered.len() * 2);
-    for (_, next, previous) in &ordered {
-        if central.last() != Some(next) {
-            central.push(*next);
-        }
-        if central.last() != Some(previous) {
-            central.push(*previous);
-        }
-    }
-    if central.len() > 1 && central.first() == central.last() {
-        central.pop();
-    }
-    (central, ordered)
-}
-
-fn decimate_unsubdivide_faces_match(first: &[usize], second: &[usize]) -> bool {
-    if first.len() != second.len() {
-        return false;
-    }
-    for start in 0..second.len() {
-        if second[start] != first[0] {
-            continue;
-        }
-        if (0..first.len()).all(|index| first[index] == second[(start + index) % second.len()])
-            || (0..first.len())
-                .all(|index| first[index] == second[(start + second.len() - index) % second.len()])
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn decimate_unsubdivide_fan_is_duplicate(
-    vertex: usize,
-    method: DecimateUnsubdivideMethod,
-    polygons: &[Polygon],
-    adjacency: &[Vec<usize>],
-    uses: &DecimateEdgeUses,
-    incident_faces: &[usize],
-    central: &[usize],
-    ordered_loops: &[(usize, usize, usize)],
-) -> bool {
-    let incident: HashSet<_> = incident_faces.iter().copied().collect();
-    if ordered_loops.len() >= 3
-        && polygons.iter().enumerate().any(|(index, (face, _))| {
-            !incident.contains(&index) && decimate_unsubdivide_faces_match(central, face)
-        })
-    {
-        return true;
-    }
-    let mut ears = Vec::new();
-    let mut residuals = Vec::new();
-    for (face_index, next, previous) in ordered_loops {
-        let face = &polygons[*face_index].0;
-        if face.len() > 3 {
-            let Some(vertex_index) = face.iter().position(|item| *item == vertex) else {
-                continue;
-            };
-            let ear = vec![*previous, vertex, *next];
-            if polygons.iter().enumerate().any(|(index, (other, _))| {
-                index != *face_index && decimate_unsubdivide_faces_match(&ear, other)
-            }) || ears
-                .iter()
-                .any(|other: &Vec<usize>| decimate_unsubdivide_faces_match(&ear, other))
-            {
-                return true;
-            }
-            ears.push(ear);
-            let mut residual = Vec::with_capacity(face.len() - 1);
-            for offset in 1..face.len() {
-                let item = face[(vertex_index + offset) % face.len()];
-                if item != vertex {
-                    residual.push(item);
-                }
-            }
-            residuals.push((*face_index, residual));
-        }
-    }
-    for first in 0..residuals.len() {
-        for second in first + 1..residuals.len() {
-            if residuals[first].1.len() == residuals[second].1.len()
-                && decimate_unsubdivide_faces_match(&residuals[first].1, &residuals[second].1)
-            {
-                return true;
-            }
-        }
-    }
-    if method == DecimateUnsubdivideMethod::BoundaryFan {
-        let mut boundary_neighbors = adjacency[vertex]
-            .iter()
-            .filter(|neighbor| {
-                uses.get(&edge_key(vertex, **neighbor))
-                    .is_some_and(|edge_uses| edge_uses.len() == 1)
-            })
-            .copied();
-        if let (Some(first), Some(second)) = (boundary_neighbors.next(), boundary_neighbors.next())
-            && uses
-                .get(&edge_key(first, second))
-                .is_some_and(|edge_uses| !edge_uses.is_empty())
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn decimate_unsubdivide_apply_fan(
-    vertex: usize,
-    polygons: &mut Vec<Polygon>,
-    edge_order: &mut Vec<DecimateEdge>,
-    method: DecimateUnsubdivideMethod,
-    adjacency: &[Vec<usize>],
-    uses: &DecimateEdgeUses,
-) -> bool {
-    let incident_faces = decimate_unsubdivide_incident_faces(vertex, adjacency, uses);
-    if incident_faces.is_empty() {
-        return false;
-    }
-    let (central, ordered_loops) =
-        decimate_unsubdivide_central_face(vertex, polygons, &incident_faces);
-    if decimate_unsubdivide_fan_is_duplicate(
-        vertex,
-        method,
-        polygons,
-        adjacency,
-        uses,
-        &incident_faces,
-        &central,
-        &ordered_loops,
-    ) {
-        return false;
-    }
-    if central.len() < 3 {
-        return false;
-    }
-    let incident: HashSet<_> = incident_faces.iter().copied().collect();
-    let first_triangle = incident_faces
-        .iter()
-        .copied()
-        .find(|index| polygons[*index].0.len() == 3);
-    let material = incident_faces.first().map_or(0, |index| polygons[*index].1);
-    let split_edges = ordered_loops
-        .iter()
-        .filter_map(|(face_index, next, previous)| {
-            (polygons[*face_index].0.len() > 3).then_some(edge_key(*next, *previous))
-        })
-        .collect::<Vec<_>>();
-    let mut next = Vec::with_capacity(polygons.len() + ordered_loops.len());
-    let mut central_added = false;
-    for (index, (face, face_material)) in std::mem::take(polygons).into_iter().enumerate() {
-        if !incident.contains(&index) {
-            next.push((face, face_material));
-        } else if face.len() > 3 {
-            next.push((
-                face.into_iter().filter(|item| *item != vertex).collect(),
-                face_material,
-            ));
-        } else if Some(index) == first_triangle {
-            next.push((central.clone(), material));
-            central_added = true;
-        }
-    }
-    if !central_added {
-        next.push((central, material));
-    }
-    *polygons = next;
-    edge_order.retain(|(first, second)| *first != vertex && *second != vertex);
-    for edge in split_edges {
-        if !edge_order.contains(&edge) {
-            edge_order.push(edge);
-        }
-    }
-    true
-}
-
-fn decimate_unsubdivide_apply_chain(
-    vertex: usize,
-    polygons: &mut Vec<Polygon>,
-    loose: &mut Vec<[usize; 2]>,
-    edge_order: &mut Vec<DecimateEdge>,
-    neighbors: &[usize],
-) -> bool {
-    if neighbors.len() != 2 {
-        return false;
-    }
-    let target = neighbors[0];
-    let other = neighbors[1];
-    *polygons =
-        decimate_dissolve_replace_vertex(std::mem::take(polygons), loose, vertex, target, other);
-    let mut seen = HashSet::new();
-    let mut remapped = Vec::with_capacity(edge_order.len());
-    for (first, second) in std::mem::take(edge_order) {
-        let first = if first == vertex { target } else { first };
-        let second = if second == vertex { target } else { second };
-        if first != second {
-            let edge = edge_key(first, second);
-            if seen.insert(edge) {
-                remapped.push(edge);
-            }
-        }
-    }
-    *edge_order = decimate_dissolve_active_edges(polygons, loose, &remapped);
-    true
-}
-
-fn decimate_unsubdivide_dissolve_vertex(
-    vertex: usize,
-    method: DecimateUnsubdivideMethod,
-    polygons: &mut Vec<Polygon>,
-    loose: &mut Vec<[usize; 2]>,
-    edge_order: &mut Vec<DecimateEdge>,
-    adjacency: &[Vec<usize>],
-    uses: &DecimateEdgeUses,
-) -> bool {
-    match method {
-        DecimateUnsubdivideMethod::InteriorFan | DecimateUnsubdivideMethod::BoundaryFan => {
-            decimate_unsubdivide_apply_fan(vertex, polygons, edge_order, method, adjacency, uses)
-        }
-        DecimateUnsubdivideMethod::InteriorChain | DecimateUnsubdivideMethod::WireChain => {
-            decimate_unsubdivide_apply_chain(
-                vertex,
-                polygons,
-                loose,
-                edge_order,
-                &adjacency[vertex],
-            )
-        }
-    }
-}
-
-fn decimate_face_origins(mesh: &Mesh, polygons: &[Polygon]) -> Result<Vec<Option<usize>>> {
-    let vertex_indices = id_indices(mesh);
-    let mut source_faces = HashMap::<Vec<usize>, Option<usize>>::with_capacity(mesh.faces.len());
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        let mut key = face
-            .vertices
-            .iter()
-            .map(|vertex| {
-                vertex_indices.get(vertex).copied().ok_or_else(|| {
-                    PotError::invalid_argument("decimate face references a missing vertex")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        key.sort_unstable();
-        if let Some(source_face) = source_faces.get_mut(&key) {
-            *source_face = None;
-        } else {
-            source_faces.insert(key, Some(face_index));
-        }
-    }
-    polygons
-        .iter()
-        .map(|(vertices, _)| {
-            let mut key = vertices.clone();
-            key.sort_unstable();
-            Ok(source_faces.get(&key).copied().flatten())
-        })
-        .collect()
-}
-
-pub(super) fn decimate_unsubdivide(mesh: &Mesh, iterations: usize) -> Result<Mesh> {
-    if iterations == 0 || mesh.faces.len() <= 3 {
-        return Ok(mesh.clone());
-    }
-    let points = positions(mesh);
-    let mut polygons = polygons(mesh)?;
-    let mut loose = loose_edges(mesh)?;
-    let indices = id_indices(mesh);
-    let mut edge_order = decimate_dissolve_edge_order(mesh, &indices)?;
-    for _ in 0..iterations {
-        edge_order = decimate_dissolve_active_edges(&polygons, &loose, &edge_order);
-        let uses = decimate_dissolve_edge_uses(&polygons);
-        let adjacency = decimate_dissolve_adjacency(points.len(), &edge_order);
-        let mut tags = vec![0_i8; points.len()];
-        for (vertex, tag) in tags.iter_mut().enumerate() {
-            if decimate_unsubdivide_method(vertex, &adjacency, &uses).is_none() {
-                *tag = 1;
-            }
-        }
-        let mut marked = false;
-        for start in 0..points.len() {
-            if tags[start] != 0 {
-                continue;
-            }
-            tags[start] = 1;
-            let mut ignore = vec![start];
-            loop {
-                let collapse =
-                    decimate_unsubdivide_tag_neighbors(&ignore, -1, &mut tags, &adjacency);
-                if collapse.is_empty() {
-                    break;
-                }
-                marked = true;
-                let next_ignore =
-                    decimate_unsubdivide_tag_neighbors(&collapse, 1, &mut tags, &adjacency);
-                if next_ignore.is_empty() {
-                    break;
-                }
-                ignore = next_ignore;
-            }
-        }
-        if !marked {
-            break;
-        }
-        for (vertex, tag) in tags.iter().enumerate() {
-            if *tag != -1 {
-                continue;
-            }
-            let current_uses = decimate_dissolve_edge_uses(&polygons);
-            let current_adjacency = decimate_dissolve_adjacency(points.len(), &edge_order);
-            let Some(method) =
-                decimate_unsubdivide_method(vertex, &current_adjacency, &current_uses)
-            else {
-                continue;
-            };
-            decimate_unsubdivide_dissolve_vertex(
-                vertex,
-                method,
-                &mut polygons,
-                &mut loose,
-                &mut edge_order,
-                &current_adjacency,
-                &current_uses,
-            );
-        }
-    }
-    let face_origins = decimate_face_origins(mesh, &polygons)?;
-    let origin = Origin::copies((0..points.len()).map(Some), face_origins);
-    decimate_compact(points, polygons, loose, origin, mesh)
+/// `cos_v3v3v3`.
+fn cos_v3v3v3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    dot(normalize(sub(a, b)), normalize(sub(c, b)))
 }

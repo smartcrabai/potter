@@ -186,6 +186,8 @@ def run_variant(v):
         for k, val in props.items():
             setattr(extra_mod, k, val)
     out = evaluate_corners(ob)
+    if v["mtype"] == "DECIMATE" or any(mtype == "DECIMATE" for mtype, _ in v["extra"]):
+        out["blender_edge_order"] = [list(edge.vertices) for edge in ob.data.edges]
     doc = dict(variant=v["key"], modifier=v["mtype"], base=v["base"],
                blender_version=bpy.app.version_string, **out)
     with open(os.path.join(OUT, "blender", f"{v['key']}.json"), "w") as f:
