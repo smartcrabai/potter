@@ -1404,6 +1404,7 @@ def object_dump(obj):
         modifier_ids = json.loads(obj.get("potter.modifier_ids_json", "{}"))
     except Exception:
         modifier_ids = {}
+    modifiers = []
     for modifier in obj.modifiers:
         properties = modifier_params(modifier)
         if modifier.type == "NODES":
