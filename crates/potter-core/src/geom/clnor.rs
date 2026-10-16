@@ -978,10 +978,15 @@ fn set_fan_codes(
                 if !vector.is_finite() {
                     return Err(normal_state_error("custom normal vectors must be finite"));
                 }
-                let vector = vector.as_vec3();
-                match setter_input {
-                    SetterInput::NormalizeInput => normalize(vector),
-                    SetterInput::AlreadyNormalized => vector,
+                // Blender replaces already-normalized zero inputs before edge splitting and fan encoding.
+                if *vector == DVec3::ZERO && setter_input == SetterInput::AlreadyNormalized {
+                    base.as_vec3()
+                } else {
+                    let vector = vector.as_vec3();
+                    match setter_input {
+                        SetterInput::NormalizeInput => normalize(vector),
+                        SetterInput::AlreadyNormalized => vector,
+                    }
                 }
             }
             None => base.as_vec3(),
@@ -1008,7 +1013,9 @@ fn set_fan_codes(
         let [first, second] = fans.spaces[fan].encode(average);
         let fan_code = CornerNormalCode::from_pair([short(first), short(second)]);
         for &corner in corners {
-            codes[corner] = if vectors[corner] == Some(DVec3::ZERO) {
+            codes[corner] = if vectors[corner] == Some(DVec3::ZERO)
+                && setter_input == SetterInput::NormalizeInput
+            {
                 CornerNormalCode::ExplicitZero
             } else {
                 fan_code
@@ -1138,29 +1145,56 @@ pub(crate) fn rebuild_custom_normals(
     ))
 }
 
-/// Writes the output's custom-normal state rebuilt from `source`. Without an explicit order, an
-/// identity correspondence keeps the source basis; any other correspondence uses flattened order.
+/// Compacts the source loop basis through a corner correspondence.
+///
+/// Dropped source loops leave gaps, and duplicated source corners become distinct output loops.
+fn compact_corner_order(source_order: &[usize], sources: &[Option<usize>]) -> Vec<usize> {
+    let mut source_loops: Vec<(bool, usize, usize)> = sources
+        .iter()
+        .enumerate()
+        .map(|(output, source)| match source {
+            Some(source) => (false, source_order[*source], output),
+            None => (true, 0, output),
+        })
+        .collect();
+    source_loops.sort_unstable();
+    let mut order = vec![0; sources.len()];
+    for (ordinal, (_, _, output)) in source_loops.into_iter().enumerate() {
+        order[output] = ordinal;
+    }
+    order
+}
+
+/// Writes the output's custom-normal state rebuilt from `source`, compacting loop order through
+/// the source-corner correspondence when the caller does not provide an output basis.
 pub(crate) fn transfer_custom_normals(
     source: &Mesh,
     output: &mut Mesh,
     sources: &[Option<usize>],
     options: NormalCodeOptions<'_>,
 ) -> Result<()> {
+    let source_count = corner_count(source);
     let output_count = corner_count(output);
-    let order: Vec<usize> = match options.corner_order {
-        Some(order) => order.to_vec(),
+    if sources.len() != output_count
+        || sources
+            .iter()
+            .flatten()
+            .any(|&index| index >= source_count)
+    {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "custom normal transfer does not describe the rebuilt corners",
+        ));
+    }
+    let order = match options.corner_order {
+        Some(order) => {
+            validate_corner_order(order, output_count)?;
+            order.to_vec()
+        }
         None => {
-            let identity = sources.len() == output_count
-                && sources
-                    .iter()
-                    .enumerate()
-                    .all(|(corner, mapped)| *mapped == Some(corner));
-            let persisted = if identity {
-                corner_order(source)?
-            } else {
-                None
-            };
-            persisted.unwrap_or_else(|| (0..output_count).collect())
+            let source_order = corner_order(source)?
+                .unwrap_or_else(|| (0..source_count).collect());
+            compact_corner_order(&source_order, sources)
         }
     };
     let codes = rebuild_custom_normals(
@@ -1179,7 +1213,7 @@ pub(crate) fn transfer_custom_normals(
 mod tests {
     #![expect(clippy::expect_used, reason = "small mesh fixtures")]
 
-    use glam::DVec3;
+    use glam::{DVec3, Vec3};
     use serde_json::{Map, Value, json};
 
     use super::{
@@ -1508,8 +1542,105 @@ mod tests {
             "the already-normalized setter keeps the doubled input's out-of-range angle"
         );
     }
-}
 
+    #[test]
+    fn already_normalized_zero_uses_corner_normal_before_fan_encoding() {
+        let source = smooth_cube();
+        let positions = positions_of(&source);
+        let base_normals = corner_normals(&source, &positions).expect("base normals");
+        let identity: Vec<usize> = (0..corner_count(&source)).collect();
+        let source_fans = mesh_fans(&source, &positions, &identity).expect("source fans");
+        let (fan_index, corners) = source_fans
+            .corners
+            .iter()
+            .enumerate()
+            .find(|(_, corners)| corners.len() >= 3)
+            .map(|(fan, corners)| (fan, corners.clone()))
+            .expect("a smooth cube vertex has a multi-corner fan");
+        let zero_corner = corners[0];
+        let tilted_corner = corners[1];
+        let base = base_normals[zero_corner];
+        assert!(
+            corners
+                .iter()
+                .all(|&corner| (base_normals[corner] - base).length() < 1.0e-5),
+            "one smooth fan uses one computed corner normal"
+        );
+
+        let tangent = if base.cross(DVec3::X).length() > 0.5 {
+            base.cross(DVec3::X).normalize()
+        } else {
+            base.cross(DVec3::Y).normalize()
+        };
+        let angle: f64 = 0.01;
+        let tilted = base * angle.cos() + tangent * angle.sin();
+        assert!(base.dot(tilted) > f64::from(super::TRIGO_THRESHOLD));
+        let mut vectors: Vec<Option<DVec3>> = base_normals.iter().copied().map(Some).collect();
+        vectors[zero_corner] = Some(DVec3::ZERO);
+        vectors[tilted_corner] = Some(tilted);
+
+        let mut subdivision_mesh = source.clone();
+        let expected_sum = corners.iter().fold(Vec3::ZERO, |sum, &corner| {
+            let vector = if corner == zero_corner {
+                base
+            } else {
+                vectors[corner].expect("corner input")
+            };
+            sum + vector.as_vec3()
+        });
+        let expected_average = expected_sum * (1.0 / corners.len() as f32);
+        let [first, second] = source_fans.spaces[fan_index].encode(expected_average);
+        let expected = CornerNormalCode::from_pair([super::short(first), super::short(second)]);
+        assert!(
+            matches!(expected, CornerNormalCode::Authored(_)),
+            "the mixed input's fan average must remain authored"
+        );
+        encode_vectors(
+            &mut subdivision_mesh,
+            Some(&vectors),
+            NormalCodeOptions {
+                corner_order: None,
+                setter_input: SetterInput::AlreadyNormalized,
+            },
+        )
+        .expect("Subdivision setter");
+        let output_fans =
+            mesh_fans(&subdivision_mesh, &positions, &identity).expect("output fans");
+        assert_eq!(
+            output_fans.corners[output_fans.fan_of[zero_corner]],
+            corners,
+            "a zero input is replaced by the computed corner normal before fan splitting"
+        );
+        let output_codes = corner_codes(&subdivision_mesh)
+            .expect("output codes")
+            .expect("custom layer");
+        for corner in &corners {
+            assert_eq!(
+                output_codes[*corner], expected,
+                "all corners receive the code of the full fan average"
+            );
+        }
+
+        let mut public_mesh = source;
+        encode_vectors(
+            &mut public_mesh,
+            Some(&vectors),
+            NormalCodeOptions {
+                corner_order: None,
+                setter_input: SetterInput::NormalizeInput,
+            },
+        )
+        .expect("public setter");
+        let public_codes = corner_codes(&public_mesh)
+            .expect("public codes")
+            .expect("custom layer");
+        assert_eq!(
+            public_codes[zero_corner],
+            CornerNormalCode::ExplicitZero,
+            "the native normalized-input zero sentinel remains distinct"
+        );
+    }
+}
 /// Stores `vectors`, one per corner in face order, as `mesh`'s `custom_normal` layer.
 pub(crate) fn store_custom_normals(mesh: &mut Mesh, vectors: &[DVec3]) {
     let keep = vec![true; mesh.faces.len()];

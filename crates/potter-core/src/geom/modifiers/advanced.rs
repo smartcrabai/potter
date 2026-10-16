@@ -2860,8 +2860,11 @@ fn curve_axis_param(modifier: &Modifier, name: &str) -> Result<DVec3> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "geometry modifier unit tests")]
 mod tests {
-    use super::{curve, shrinkwrap};
-    use crate::geom::{Mesh, UvSphereParams};
+    use super::{build, curve, shrinkwrap};
+    use crate::geom::{
+        BoxParams, Mesh, UvSphereParams,
+        clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput},
+    };
     use serde_json::json;
 
     #[test]
@@ -2907,6 +2910,56 @@ mod tests {
         assert!(result.vertex(first).unwrap().co.distance(glam::DVec3::ZERO) < 1.0e-12);
         assert!(result.vertex(second).unwrap().co.distance(glam::DVec3::Z) < 1.0e-12);
     }
+    #[test]
+    fn build_subset_compacts_nonidentity_custom_normal_loop_order() {
+        let mut source = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let corner_count: usize = source.faces.iter().map(|face| face.vertices.len()).sum();
+        let codes: Vec<CornerNormalCode> = (0..corner_count)
+            .map(|corner| {
+                CornerNormalCode::Authored([
+                    i16::try_from(corner + 1).unwrap(),
+                    -1_000,
+                ])
+            })
+            .collect();
+        let mut loop_order: Vec<usize> = (0..corner_count).collect();
+        loop_order[..4].rotate_left(1);
+        clnor::write_codes(
+            &mut source,
+            Some(&codes),
+            NormalCodeOptions {
+                corner_order: Some(&loop_order),
+                setter_input: SetterInput::AlreadyNormalized,
+            },
+        )
+        .unwrap();
+
+        let modifier = modifier_with_target(
+            "build",
+            json!({
+                "frame_start": 0.0,
+                "frame_duration": 2.0,
+                "use_reverse": false,
+                "use_random_order": false,
+                "seed": 0
+            }),
+            Mesh::new(),
+        );
+        let output = build(&source, &modifier, 0.5).unwrap();
+
+        assert_eq!(output.faces.len(), 1);
+        assert_eq!(
+            clnor::corner_order(&output).unwrap(),
+            Some(vec![1, 2, 3, 0]),
+            "the subset basis is compacted from its source loop order"
+        );
+        assert_eq!(
+            clnor::corner_codes(&output).unwrap(),
+            Some(codes[..4].to_vec()),
+            "the subset retains the source codes for its copied loops"
+        );
+    }
+
 
     #[test]
     fn shrinkwrap_offset_moves_each_projected_vertex_by_the_requested_distance() {
