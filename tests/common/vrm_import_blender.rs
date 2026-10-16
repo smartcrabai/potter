@@ -27,7 +27,6 @@ const GENERATOR_PATH: &str = "tests/vrm-import/make_third_party.py";
 const ROUND_TRIP_PATH: &str = "tests/vrm-import/addon_round_trip.py";
 const ADDON_URL_PREFIX: &str =
     "https://github.com/saturday06/VRM-Addon-for-Blender/releases/download/";
-const INSTALLED_MARKER: &str = "STATUS Installed \"vrm\"";
 const GENERATED_MARKER: &str = "POTTER_VRM_GENERATED";
 
 /// A Blender executable and an isolated user-resources directory with the pinned add-on installed.
@@ -217,7 +216,13 @@ fn install(blender: &Path, archive: &Path) -> TestResult<Result<TempDir, String>
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    if output.status.success() && text.contains(INSTALLED_MARKER) {
+    // The installed tree is the result. Concurrent Blender installs can exit 0 without printing the
+    // `STATUS Installed "vrm"` line (it is lost while the tree is complete), so the line is not required.
+    // A real failure (for example a truncated zip) is reported by Blender as an `ERROR` line, also with exit 0.
+    let manifest = user_resources
+        .path()
+        .join("extensions/user_default/vrm/blender_manifest.toml");
+    if output.status.success() && !text.contains("ERROR") && manifest.is_file() {
         return Ok(Ok(user_resources));
     }
     let tail: String = text
