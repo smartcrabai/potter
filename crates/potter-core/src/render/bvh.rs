@@ -511,8 +511,10 @@ mod tests {
                         double_sided: index == target_index || *double_sided,
                         material_index: 0,
                         uv: [[0.0; 2]; 3],
-                        uv_available: false,
+                        layer_uvs: Vec::new(),
                         normals: None,
+                        layer_colors: Vec::new(),
+                        lit_per_pixel: false,
                     }
                 })
                 .collect::<Vec<_>>();

@@ -1,14 +1,15 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
 use glam::{DMat4, DVec3};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
+    geom::uv_layers::MAX_LAYERS,
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
-    shader::{BsdfParams, HitContext, evaluate_surface},
+    shader::{BsdfParams, HitContext, evaluate_surface, fill_uv_maps},
 };
 
 use super::{
@@ -17,7 +18,7 @@ use super::{
         Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
-    scene::{Geometry, ObjectRecord},
+    scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
 };
 
 const RAY_EPSILON: f64 = 1.0e-5;
@@ -350,7 +351,13 @@ pub(super) fn render(
         });
     let bvh = Bvh::build(&geometry.triangles)?;
     let lights = collect_lights(doc, snapshot);
-    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images)?;
+    let volumes = collect_volumes(
+        doc,
+        snapshot,
+        scene.unit.scale_length,
+        images,
+        &geometry.shader_warnings,
+    )?;
     let world_importance = WorldImportanceSampler::build(doc, &snapshot.scene_id, images)?;
     let mut output = RasterOutput {
         rgba: allocate(rgba_len, 0_u8, "RGBA image")?,
@@ -510,12 +517,13 @@ pub(super) fn composite_realtime_volumes(
     film_transparent: bool,
     images: &BTreeMap<String, ImageData>,
     output: &mut RasterOutput,
+    warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<()> {
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
-    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images)?;
+    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images, warnings)?;
     if volumes.is_empty() {
         return Ok(());
     }
@@ -840,13 +848,11 @@ fn trace_path(
             }
             continue;
         }
-        if bounce == 0 {
-            alpha = 1.0;
-        }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
+        alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
             * surface.params.emission_strength.max(0.0);
@@ -1127,14 +1133,6 @@ fn make_surface(
             }
         }
     };
-    let uv = [
-        triangle.uv[0][0] * hit.barycentric[0]
-            + triangle.uv[1][0] * hit.barycentric[1]
-            + triangle.uv[2][0] * hit.barycentric[2],
-        triangle.uv[0][1] * hit.barycentric[0]
-            + triangle.uv[1][1] * hit.barycentric[1]
-            + triangle.uv[2][1] * hit.barycentric[2],
-    ];
     let object = object_for_index(&geometry.objects, triangle.object_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1150,36 +1148,23 @@ fn make_surface(
                 "triangle references an unmapped material",
             )
         })?;
-    let matrix = snapshot
-        .nodes
-        .get(&object.node_id)
-        .map_or(DMat4::IDENTITY, |node| {
-            DMat4::from_cols_array(&node.world_matrix)
-        });
-    let world_to_local = matrix.inverse();
-    let local_is_finite = world_to_local
-        .to_cols_array()
-        .iter()
-        .all(|value| value.is_finite());
-    let object_position = if local_is_finite {
-        world_to_local.transform_point3(point)
-    } else {
-        point
-    };
-    let uv_maps = [("uv_map", uv)];
+    let mut tables = LayerTables::new();
+    let context = layered_context(
+        doc,
+        images,
+        &geometry.shader_warnings,
+        object,
+        triangle,
+        HitPose {
+            point,
+            object: object_space(snapshot, object, point),
+            normal,
+            view: -direction,
+            barycentric: hit.barycentric,
+        },
+        &mut tables,
+    )?;
     let (tangent, bitangent) = triangle_tangent_frame(triangle, normal);
-    let mut context = HitContext::new(&doc.node_groups)
-        .with_images(images)
-        .with_tangent_frame(tangent, bitangent);
-    if triangle.uv_available {
-        context = context.with_uv_maps(&uv_maps);
-    }
-    context.uv = uv;
-    context.generated = object_position;
-    context.position = point;
-    context.object = object_position;
-    context.normal = normal;
-    context.view_direction = -direction;
     let mut params = evaluate_surface(material, &context)?;
     params.alpha = match material.alpha_mode.as_str() {
         "opaque" => 1.0,
@@ -1240,23 +1225,37 @@ fn displacement_sample(
     bitangent: DVec3,
 ) -> Result<f64> {
     let displacement = tangent * uv_offset[0] + bitangent * uv_offset[1];
-    let mut sample_context = context;
+    let mut uv_table: [(&str, [f64; 2]); MAX_LAYERS] = [("", [0.0; 2]); MAX_LAYERS];
+    let mut sample_context: HitContext<'_> = context;
     sample_context.uv[0] += uv_offset[0];
     sample_context.uv[1] += uv_offset[1];
+    if let Some(maps) = context.uv_maps {
+        sample_context.uv_maps = Some(fill_uv_maps(
+            &mut uv_table,
+            maps.iter()
+                .map(|(name, uv)| (*name, [uv[0] + uv_offset[0], uv[1] + uv_offset[1]])),
+        )?);
+    }
     sample_context.generated += displacement;
     sample_context.position += displacement;
     sample_context.object += displacement;
     evaluate_surface(material, &sample_context).map(|params| params.displacement_height)
 }
 
-fn object_for_index(objects: &[ObjectRecord], object_index: u32) -> Option<&ObjectRecord> {
+pub(super) fn object_for_index(
+    objects: &[ObjectRecord],
+    object_index: u32,
+) -> Option<&ObjectRecord> {
     object_index
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
         .and_then(|index| objects.get(index))
 }
 
-fn triangle_tangent_frame(triangle: &super::raster::Triangle, normal: DVec3) -> (DVec3, DVec3) {
+pub(super) fn triangle_tangent_frame(
+    triangle: &super::raster::Triangle,
+    normal: DVec3,
+) -> (DVec3, DVec3) {
     let edge1 = triangle.positions[1] - triangle.positions[0];
     let edge2 = triangle.positions[2] - triangle.positions[0];
     let uv1 = [
@@ -1770,6 +1769,7 @@ fn collect_volumes<'a>(
     snapshot: &'a Snapshot,
     meters_per_unit: f64,
     images: &BTreeMap<String, ImageData>,
+    warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<Vec<VolumeInstance<'a>>> {
     let mut volumes = Vec::new();
     for (node_id, node) in &doc.nodes {
@@ -1840,7 +1840,9 @@ fn collect_volumes<'a>(
             .and_then(|material_id| doc.materials.get(material_id));
         let evaluated_material = if let Some(material) = material {
             let local_center = (bounds_min + bounds_max) * 0.5;
-            let mut context = HitContext::new(&doc.node_groups).with_images(images);
+            let mut context = HitContext::new(&doc.node_groups)
+                .with_images(images)
+                .with_warnings(warnings);
             context.object = local_center;
             context.generated = local_center;
             context.position = matrix.transform_point3(local_center);

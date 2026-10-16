@@ -714,16 +714,7 @@ impl Snapshot {
                                 json!({"node_id":id}),
                             ));
                         }
-                        let values = rigged_source
-                            .vertices
-                            .iter()
-                            .zip(colors)
-                            .map(|(vertex, color)| (format!("v{}", vertex.id), json!(color)))
-                            .collect::<Map<_, _>>();
-                        rigged_source.attributes.insert(
-                            "color".to_owned(),
-                            json!({"domain":"vertices","values":values}),
-                        );
+                        inject_dynamic_paint_colors(&mut rigged_source, colors);
                     }
                     if !has_stack_modifier(node, "dynamic_paint")
                         && let Some(weights) = paint_weights.get(id)
@@ -744,7 +735,7 @@ impl Snapshot {
                             .map(|(vertex, weight)| (format!("v{}", vertex.id), json!(weight)))
                             .collect::<Map<_, _>>();
                         rigged_source.attributes.insert(
-                            "weight".to_owned(),
+                            crate::geom::attribute_keys::storage_key("weight").into_owned(),
                             json!({"domain":"vertices","type":"float","values":values}),
                         );
                     }
@@ -3977,6 +3968,21 @@ fn append_collection_geometry<'a>(
     Ok(())
 }
 
+/// Injects the dynamic-paint colors of one canvas (one per vertex, in storage order) into the evaluation
+/// copy as the point color layer `color`, and renders that layer. A `color` layer already on the mesh is
+/// replaced. Other color layers are kept.
+fn inject_dynamic_paint_colors(mesh: &mut Mesh, colors: &[[f64; 4]]) {
+    let mut store = crate::geom::color_layers::read(mesh);
+    store.layers.retain(|layer| layer.name != "color");
+    store.layers.push(crate::geom::color_layers::ColorLayer {
+        name: "color".to_owned(),
+        domain: crate::geom::color_layers::ColorDomain::Point,
+        values: colors.to_vec(),
+    });
+    store.render = Some("color".to_owned());
+    crate::geom::color_layers::write(mesh, &store);
+}
+
 /// Particle copies: each template's attributes, with its face- and edge-keyed shading remapped.
 fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> Result<()> {
     if output.vertices.is_empty() {
@@ -4032,19 +4038,17 @@ fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> R
             .map_err(|error| PotError::new(ErrorCode::EvaluationFailed, error.to_string()))?;
         face_ids.insert(face.id, id);
     }
-    merge_shading(output, source, &face_ids, &edge_ids, matrix)
+    merge_shading(output, source, &face_ids, &edge_ids)
 }
 
 /// Copies one source's shading attributes into the combined instance mesh under remapped IDs.
-/// Custom normals rotate with the instance matrix, using the inverse transpose of its linear part.
+/// Custom-normal codes are relative to each fan, so they copy unchanged.
 fn merge_shading(
     output: &mut Mesh,
     source: &Mesh,
     face_ids: &BTreeMap<u32, u32>,
     edge_ids: &BTreeMap<u32, u32>,
-    matrix: DMat4,
 ) -> Result<()> {
-    let normal_matrix = crate::geom::normals::normal_matrix(matrix);
     for name in SHADING_ATTRIBUTES {
         let Some(source_attribute) = source.attributes.get(name) else {
             continue;
@@ -4086,12 +4090,7 @@ fn merge_shading(
             else {
                 continue;
             };
-            let value = if name == "custom_normal" {
-                rotate_corner_normals(value, normal_matrix)
-            } else {
-                value.clone()
-            };
-            values.insert(format!("{prefix}{id}"), value);
+            values.insert(format!("{prefix}{id}"), value.clone());
         }
     }
     Ok(())
@@ -4655,5 +4654,32 @@ mod tests {
         doc.nodes.get_mut(&node_id).unwrap().parent = Some(child_id.clone());
         doc.nodes.insert(child_id, child);
         assert!(Snapshot::evaluate(&doc, &EvaluationContext::default()).is_err());
+    }
+
+    #[test]
+    fn dynamic_paint_colors_become_the_render_point_layer() {
+        use crate::geom::color_layers::{self, ColorDomain, ColorLayer};
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+        let mut store = color_layers::read(&mesh);
+        store.layers.push(ColorLayer {
+            name: "color".to_owned(),
+            domain: ColorDomain::Corner,
+            values: vec![[1.0; 4]; corners],
+        });
+        color_layers::write(&mut mesh, &store);
+        let colors: Vec<[f64; 4]> = (0..mesh.vertices.len())
+            .map(|index| [index as f64 / 10.0, 0.25, 0.0, 1.0])
+            .collect();
+
+        super::inject_dynamic_paint_colors(&mut mesh, &colors);
+
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.render.as_deref(), Some("color"));
+        let layer = &store.layers[store.index_of("color").unwrap()];
+        assert_eq!(layer.domain, ColorDomain::Point);
+        assert_eq!(layer.values, colors);
+        assert_eq!(mesh.attributes["color"]["domain"], serde_json::json!("point"));
+        assert!(color_layers::validate(&mesh).is_ok());
     }
 }

@@ -22,6 +22,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
+        color_layers::{self, ColorDomain, ColorStore},
         provenance::{Origin, default_value},
     },
     model::Modifier,
@@ -183,7 +184,12 @@ struct Loop {
     radial_prev: usize,
     /// Triangulation marker: the input face a diagonal loop came from, or -1.
     mark: isize,
+    /// Source loop identity used by normal-code transfer after topology changes.
+    source_corner: Option<usize>,
+    /// CORNER color customdata, in `BMesh::corner_types` order.
+    corner_data: Vec<Value>,
 }
+
 
 struct Face {
     first: usize,
@@ -212,8 +218,11 @@ struct BMesh {
     point_types: Vec<String>,
     /// Data type of each EDGE attribute, in the order of every edge's `attributes` values.
     edge_types: Vec<String>,
+    /// Data type of each CORNER color layer, in loop customdata order.
+    corner_types: Vec<String>,
     track_edge_flags: bool,
 }
+
 impl BMesh {
     fn disk_index(&self, e: usize, v: usize) -> usize {
         usize::from(self.edges[e].v[1] == v)
@@ -466,8 +475,8 @@ impl BMesh {
         e
     }
 
-    /// `BM_face_create`: one loop per corner, each radially appended to its edge. The new face takes the
-    /// normal, material and provenance of `example`; loop UVs are copied by the caller.
+    /// `BM_face_create`: each loop takes its corner values and source identity from the caller.
+    /// The new face takes the normal, material and provenance of `example`.
     fn face_create(&mut self, verts: &[usize], edges: &[usize], example: usize) -> usize {
         let f = self.faces.len();
         let first = self.loops.len();
@@ -482,6 +491,12 @@ impl BMesh {
                 radial_next: NONE,
                 radial_prev: NONE,
                 mark: -1,
+                source_corner: None,
+                corner_data: self
+                    .corner_types
+                    .iter()
+                    .map(|data_type| collapse_customdata_default(data_type))
+                    .collect(),
             });
             self.radial_append(edges[k], first + k);
         }
@@ -762,6 +777,8 @@ impl BMesh {
                     self.uv[new_loop * self.uv_stride + layer] =
                         self.uv[source * self.uv_stride + layer];
                 }
+                self.loops[new_loop].corner_data = self.loops[source].corner_data.clone();
+                self.loops[new_loop].source_corner = self.loops[source].source_corner;
             }
             let mut it = first;
             loop {
@@ -979,12 +996,14 @@ fn blend_origin(keep: &[(usize, f64)], clear: &[(usize, f64)], fac: f32) -> Vec<
     blended.into_iter().collect()
 }
 
-/// A POINT attribute of `blender_attributes` that the collapse blends per vertex, with one value per
-/// input vertex in storage order.
+/// A POINT customdata layer carried by `BMesh`: generic compatibility data or canonical color values.
+/// Its values are in input vertex storage order; `color_layer` marks canonical `ColorStore` data.
 struct PointAttribute {
     name: String,
     data_type: String,
     values: Vec<Value>,
+    /// Canonical `ColorStore` layer index, or `None` for `blender_attributes`.
+    color_layer: Option<usize>,
 }
 
 /// The POINT entries of `blender_attributes`; vertices past the stored values take the type default.
@@ -1013,9 +1032,63 @@ fn collect_point_attributes(mesh: &Mesh) -> Vec<PointAttribute> {
                 name,
                 data_type,
                 values,
+                color_layer: None,
             })
         })
         .collect()
+}
+
+/// A CORNER color layer stored once in the canonical `ColorStore`.
+struct CornerAttribute {
+    color_layer: usize,
+    data_type: String,
+    values: Vec<Value>,
+}
+
+fn color_data_type(mesh: &Mesh, name: &str) -> Result<String> {
+    let data_type = mesh
+        .attributes
+        .get("blender_metadata")
+        .and_then(|metadata| metadata.get("color_data_types"))
+        .and_then(Value::as_object)
+        .and_then(|types| types.get(name))
+        .and_then(Value::as_str);
+    match data_type {
+        None => Ok("FLOAT_COLOR".to_owned()),
+        Some(data_type) if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR") => {
+            Ok(data_type.to_owned())
+        }
+        Some(data_type) => Err(PotError::new(
+            ErrorCode::InvalidArgument,
+            format!("color layer `{name}` has unsupported source type `{data_type}`"),
+        )),
+    }
+}
+
+fn collect_color_attributes(
+    mesh: &Mesh,
+    store: &ColorStore,
+) -> Result<(Vec<PointAttribute>, Vec<CornerAttribute>)> {
+    let mut point = Vec::new();
+    let mut corner = Vec::new();
+    for (color_layer, layer) in store.layers.iter().enumerate() {
+        let data_type = color_data_type(mesh, &layer.name)?;
+        let values = layer.values.iter().map(|value| json!(value)).collect();
+        match layer.domain {
+            ColorDomain::Point => point.push(PointAttribute {
+                name: layer.name.clone(),
+                data_type,
+                values,
+                color_layer: Some(color_layer),
+            }),
+            ColorDomain::Corner => corner.push(CornerAttribute {
+                color_layer,
+                data_type,
+                values,
+            }),
+        }
+    }
+    Ok((point, corner))
 }
 
 /// An EDGE attribute of `blender_attributes` with one value per input edge in storage order.
@@ -1246,11 +1319,12 @@ fn root(parent: &mut [usize], mut f: usize) -> usize {
 
 /// Builds the `BMesh` of `mesh` as `BKE_mesh_to_bmesh_ex` does for decimation: vertices, then edges in
 /// mesh order, then faces with radially appended loops. Face normals are recomputed and vertex normals
-/// are the mesh normals; corner UVs come from `uv_values[layer][corner]`.
+/// are the mesh normals; UVs and native corner colors follow input loop order.
 fn bmesh_from_mesh(
     mesh: &Mesh,
     uv_values: &[Vec<[f64; 2]>],
     point: &[PointAttribute],
+    corner_attributes: &[CornerAttribute],
     edge_attributes: &[EdgeAttribute],
     edge_flags: &[EdgeFlags],
 ) -> BMesh {
@@ -1299,6 +1373,10 @@ fn bmesh_from_mesh(
             .iter()
             .map(|attribute| attribute.data_type.clone())
             .collect(),
+        corner_types: corner_attributes
+            .iter()
+            .map(|attribute| attribute.data_type.clone())
+            .collect(),
         track_edge_flags: !edge_flags.is_empty(),
     };
     let mut edge_lookup = HashMap::with_capacity(mesh.edges.len());
@@ -1332,6 +1410,11 @@ fn bmesh_from_mesh(
                 radial_next: NONE,
                 radial_prev: NONE,
                 mark: -1,
+                source_corner: Some(corner + k),
+                corner_data: corner_attributes
+                    .iter()
+                    .map(|attribute| attribute.values[corner + k].clone())
+                    .collect(),
             });
             bm.radial_append(edges[k], first + k);
         }
@@ -1727,8 +1810,8 @@ impl Decimator {
         }
     }
 
-    /// `bm_edge_collapse_loop_customdata`: interpolates the UV corners around the collapsed edge, layer
-    /// by layer, where a corner still holds its source's value.
+    /// `bm_edge_collapse_loop_customdata`: carries UVs and interpolated corner colors across matching
+    /// loop seams, using the shared source-type customdata interpolation codec.
     fn interpolate_loops(&mut self, l: usize, v_clear: usize, fac: f32) {
         let stride = self.bm.uv_stride;
         let is_manifold = self.bm.edge_is_manifold(self.bm.loops[l].e);
@@ -1760,6 +1843,18 @@ impl Decimator {
                     if float2_equal(value0, self.bm.loop_uv(l_iter, layer)) {
                         let value1 = self.bm.loop_uv(src1, layer);
                         self.bm.uv[l_iter * stride + layer] = interp_float2(&[value0, value1], &w);
+                    }
+                }
+                for layer in 0..self.bm.corner_types.len() {
+                    let value0 = self.bm.loops[src0].corner_data[layer].clone();
+                    if value0 == self.bm.loops[l_iter].corner_data[layer]
+                        && let Some(value) = interp_customdata_value(
+                            &self.bm.corner_types[layer],
+                            [&value0, &self.bm.loops[src1].corner_data[layer]],
+                            w,
+                        )
+                    {
+                        self.bm.loops[l_iter].corner_data[layer] = value;
                     }
                 }
             }
@@ -2034,6 +2129,8 @@ impl Decimator {
         let mut polygons: Vec<Polygon> = Vec::new();
         let mut faces_origin = Vec::new();
         let mut corner_uv: Vec<CornerUv> = Vec::new();
+        let mut corner_colors = Vec::new();
+        let mut corner_sources = Vec::new();
         for members in groups.values() {
             let first_face = members[0];
             let ring = if members.len() == 1 {
@@ -2058,6 +2155,8 @@ impl Decimator {
                         })
                         .collect(),
                 );
+                corner_colors.push(self.bm.loops[l].corner_data.clone());
+                corner_sources.push(self.bm.loops[l].source_corner);
             }
         }
         let loose = self
@@ -2106,6 +2205,8 @@ impl Decimator {
             point,
             faces: faces_origin,
             corner_uv,
+            corner_colors,
+            corner_sources,
             edge_attributes,
             edge_flags,
         }
@@ -2158,6 +2259,10 @@ struct Output {
     point: Vec<Vec<Value>>,
     faces: Vec<Option<usize>>,
     corner_uv: Vec<CornerUv>,
+    /// Native CORNER color values per output loop, in `CornerAttribute` order.
+    corner_colors: Vec<Vec<Value>>,
+    /// Input loop identity for each output corner, used by the shared normal-code transfer.
+    corner_sources: Vec<Option<usize>>,
     /// Per output edge, sorted endpoint indices and EDGE attribute values when present.
     edge_attributes: Vec<([usize; 2], Vec<Value>)>,
     /// Per output edge, sorted endpoint indices and Blender's seam/sharp flags when present.
@@ -2174,7 +2279,7 @@ fn collapse_write_point(
     attributes: &[PointAttribute],
     values: &[Vec<Value>],
 ) -> Result<()> {
-    if attributes.is_empty() {
+    if attributes.iter().all(|attribute| attribute.color_layer.is_some()) {
         return Ok(());
     }
     let dropped = || {
@@ -2191,7 +2296,11 @@ fn collapse_write_point(
         .get_mut("blender_attributes")
         .and_then(Value::as_array_mut)
         .ok_or_else(dropped)?;
-    for (index, attribute) in attributes.iter().enumerate() {
+    for (index, attribute) in attributes
+        .iter()
+        .enumerate()
+        .filter(|(_, attribute)| attribute.color_layer.is_none())
+    {
         let entry = entries
             .iter_mut()
             .find(|entry| {
@@ -2201,6 +2310,69 @@ fn collapse_write_point(
             .ok_or_else(dropped)?;
         entry["values"] = Value::Array(values.iter().map(|row| row[index].clone()).collect());
     }
+    Ok(())
+}
+
+fn rgba_from_value(value: &Value) -> Option<[f64; 4]> {
+    let [red, green, blue, alpha] = value.as_array()?.as_slice() else {
+        return None;
+    };
+    Some([
+        red.as_f64()?,
+        green.as_f64()?,
+        blue.as_f64()?,
+        alpha.as_f64()?,
+    ])
+}
+
+fn collapse_write_colors(
+    mesh: &mut Mesh,
+    store: &mut ColorStore,
+    point_attributes: &[PointAttribute],
+    point_values: &[Vec<Value>],
+    corner_attributes: &[CornerAttribute],
+    corner_values: &[Vec<Value>],
+) -> Result<()> {
+    if store.layers.is_empty() {
+        return Ok(());
+    }
+    let dropped = || {
+        PotError::new(
+            ErrorCode::InternalError,
+            "decimate color values do not match the rebuilt mesh",
+        )
+    };
+    for (index, attribute) in point_attributes.iter().enumerate() {
+        let Some(color_layer) = attribute.color_layer else {
+            continue;
+        };
+        let layer = store.layers.get_mut(color_layer).ok_or_else(dropped)?;
+        layer.values = point_values
+            .iter()
+            .map(|values| {
+                values
+                    .get(index)
+                    .and_then(rgba_from_value)
+                    .ok_or_else(dropped)
+            })
+            .collect::<Result<_>>()?;
+    }
+    for (index, attribute) in corner_attributes.iter().enumerate() {
+        let layer = store
+            .layers
+            .get_mut(attribute.color_layer)
+            .ok_or_else(dropped)?;
+        layer.values = corner_values
+            .iter()
+            .map(|values| {
+                values
+                    .get(index)
+                    .and_then(rgba_from_value)
+                    .ok_or_else(dropped)
+            })
+            .collect::<Result<_>>()?;
+    }
+    color_layers::write(mesh, store);
     Ok(())
 }
 
@@ -2352,13 +2524,17 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
         None
     };
     let (layer_names, layer_values) = super::collapse_uv_layers(mesh);
-    let point_attributes = collect_point_attributes(mesh);
+    let mut color_store = color_layers::read(mesh);
+    let (mut point_colors, corner_attributes) = collect_color_attributes(mesh, &color_store)?;
+    let mut point_attributes = collect_point_attributes(mesh);
+    point_attributes.append(&mut point_colors);
     let edge_attributes = collect_edge_attributes(mesh);
     let edge_flags = collect_edge_flags(mesh);
     let mut bm = bmesh_from_mesh(
         mesh,
         &layer_values,
         &point_attributes,
+        &corner_attributes,
         &edge_attributes,
         &edge_flags,
     );
@@ -2397,11 +2573,15 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
     }
     let output = dec.output(!do_triangulate && has_cut, layer_names.len());
     let keep_vertices = vec![true; output.points.len()];
+    let corners = output
+        .corner_sources
+        .iter()
+        .map(|source| (*source).map(|index| vec![(index, 1.0)]).unwrap_or_default())
+        .collect();
     let origin = Origin {
         vertices: output.origins,
         faces: output.faces,
-        corners: None,
-        raw_normals: false,
+        corners: Some(corners),
     };
     let mut out = super::super::decimate_compact(
         output.points,
@@ -2413,6 +2593,14 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
     )?;
     super::collapse_write_uv(&mut out, &layer_names, &output.corner_uv)?;
     collapse_write_point(&mut out, &point_attributes, &output.point)?;
+    collapse_write_colors(
+        &mut out,
+        &mut color_store,
+        &point_attributes,
+        &output.point,
+        &corner_attributes,
+        &output.corner_colors,
+    )?;
     collapse_write_edge(&mut out, &edge_attributes, output.edge_attributes)?;
     collapse_write_edge_flags(&mut out, output.edge_flags)?;
     Ok(out)
@@ -2420,7 +2608,12 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
 
 #[cfg(test)]
 mod tests {
-    use super::{BMesh, Decimator, Heap, interp_customdata_value};
+    use super::{
+        BMesh, Decimator, Heap, bmesh_from_mesh, collect_color_attributes, collect_point_attributes,
+        interp_customdata_value,
+    };
+    use crate::geom::{Mesh, color_layers::{self, ColorDomain, ColorLayer, ColorStore}};
+    use glam::DVec3;
     use serde_json::json;
 
     #[test]
@@ -2461,6 +2654,61 @@ mod tests {
         assert!((linear - 0.215_860_530_734_062_2).abs() < 1.0e-6);
     }
     #[test]
+    fn canonical_color_layers_keep_source_types_in_collapse_data() {
+        let mut mesh = Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            vec![vec![0, 1, 2]],
+        )
+        .expect("triangle mesh");
+        let point_color = [0.2, 0.4, 0.6, 0.8];
+        let corner_color = [0.1, 0.3, 0.5, 0.7];
+        let store = ColorStore {
+            layers: vec![
+                ColorLayer {
+                    name: "Point Color".to_owned(),
+                    domain: ColorDomain::Point,
+                    values: vec![point_color; 3],
+                },
+                ColorLayer {
+                    name: "Corner Color".to_owned(),
+                    domain: ColorDomain::Corner,
+                    values: vec![corner_color; 3],
+                },
+            ],
+            active: Some("Point Color".to_owned()),
+            render: Some("Corner Color".to_owned()),
+        };
+        color_layers::write(&mut mesh, &store);
+        mesh.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": {
+                "Point Color": "BYTE_COLOR",
+                "Corner Color": "FLOAT_COLOR"
+            }}),
+        );
+
+        let store = color_layers::read(&mesh);
+        let (mut point_colors, corner_attributes) =
+            collect_color_attributes(&mesh, &store).expect("color attributes");
+        let mut point_attributes = collect_point_attributes(&mesh);
+        point_attributes.append(&mut point_colors);
+        let bmesh = bmesh_from_mesh(
+            &mesh,
+            &[],
+            &point_attributes,
+            &corner_attributes,
+            &[],
+            &[],
+        );
+
+        assert_eq!(point_attributes[0].color_layer, Some(0));
+        assert_eq!(bmesh.point_types[0], "BYTE_COLOR");
+        assert_eq!(bmesh.corner_types[0], "FLOAT_COLOR");
+        assert_eq!(bmesh.verts[0].point[0], json!(point_color));
+        assert_eq!(bmesh.loops[0].corner_data[0], json!(corner_color));
+        assert_eq!(bmesh.loops[0].source_corner, Some(0));
+    }
+    #[test]
     fn edge_customdata_interpolates_before_splice() {
         let mut bm = BMesh {
             verts: (0..3)
@@ -2482,6 +2730,7 @@ mod tests {
             totface: 0,
             point_types: Vec::new(),
             edge_types: vec!["INT".to_owned()],
+            corner_types: Vec::new(),
             track_edge_flags: false,
         };
         let destination = bm.edge_create(0, 1, false);

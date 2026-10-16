@@ -8,8 +8,11 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Edge, Face, Mesh, Vertex,
-        uv_layers::{selected_layer_name, uv_map_entry_layer},
+        Edge, Face, Mesh, Vertex, attribute_keys,
+        clnor::{self, NormalCodeOptions, SetterInput},
+        color_layers::{self, ColorDomain, ColorLayer},
+        normals::corner_normals,
+        uv_layers::{self, UvLayer, UvStore},
     },
     model::{CameraData, Modifier},
 };
@@ -107,18 +110,16 @@ fn texture_mask_weights(
         "mask_tex_mapping",
     )
     .is_some();
-    let (mapping, channel, uv_layer) = if has_mask_schema {
+    let (mapping, channel) = if has_mask_schema {
         (
             string(modifier, "mask_tex_mapping")?,
             string(modifier, "mask_tex_use_channel")?,
-            string(modifier, "mask_tex_uv_layer")?,
         )
     } else {
-        ("LOCAL", "INT", "UVMap")
+        ("LOCAL", "INT")
     };
-    let uv_layer = selected_layer_name(mesh, uv_layer);
     let uv_coordinates = if mapping == "UV" {
-        Some(vertex_uv_coordinates(mesh, modifier, uv_layer)?)
+        Some(vertex_uv_coordinates(mesh, modifier)?)
     } else {
         None
     };
@@ -185,29 +186,20 @@ fn texture_mask_weights(
     Ok(Some(weights))
 }
 
-fn vertex_uv_coordinates(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    layer: &str,
-) -> Result<BTreeMap<u32, DVec2>> {
-    let entries = uv_entries(mesh, modifier)?;
+fn vertex_uv_coordinates(mesh: &Mesh, modifier: &Modifier) -> Result<BTreeMap<u32, DVec2>> {
+    let store = uv_layers::read(mesh);
+    let Some(index) = uv_layer_index(&store, modifier, "mask_tex_uv_layer")? else {
+        return Ok(BTreeMap::new());
+    };
+    let layer = &store.layers[index];
     let mut sums = BTreeMap::<u32, (DVec2, u32)>::new();
-    for face in &mesh.faces {
-        let Some(entry) = entries.iter().find(|entry| {
-            entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(face.id))
-                && uv_map_entry_layer(entry) == layer
-        }) else {
-            continue;
-        };
-        let Some(values) = entry.get("uv").and_then(Value::as_array) else {
+    for (face_index, face) in mesh.faces.iter().enumerate() {
+        let Some(values) = layer.faces.get(face_index).and_then(Option::as_ref) else {
             continue;
         };
         for (vertex_id, uv) in face.vertices.iter().zip(values) {
-            let Some(uv) = value2(uv) else {
-                continue;
-            };
             let entry = sums.entry(*vertex_id).or_insert((DVec2::ZERO, 0));
-            entry.0 += uv;
+            entry.0 += DVec2::from_array(*uv);
             entry.1 += 1;
         }
     }
@@ -1086,9 +1078,8 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             incident.entry(*vertex_id).or_default().push(face_index);
         }
     }
-    let mut corner_values = Map::new();
+    let mut vectors: Vec<Option<DVec3>> = Vec::new();
     for (face_index, face) in mesh.faces.iter().enumerate() {
-        let mut corners = Vec::with_capacity(face.vertices.len());
         for vertex_id in &face.vertices {
             let current = normals[face_index];
             let incident_faces = incident.get(vertex_id).map_or(&[][..], Vec::as_slice);
@@ -1157,15 +1148,18 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 }
                 normal = current.lerp(normal, factor).normalize_or_zero();
             }
-            corners.push(json!(normal.to_array()));
+            vectors.push(Some(normal));
         }
-        corner_values.insert(format!("f{}", face.id), Value::Array(corners));
     }
     let mut result = mesh.clone();
-    result.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":corner_values}),
-    );
+    clnor::encode_vectors(
+        &mut result,
+        Some(&vectors),
+        NormalCodeOptions {
+            corner_order: None,
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )?;
     Ok(result)
 }
 
@@ -1258,10 +1252,9 @@ fn normal_edit(
     let invert_group = boolean(modifier, "invert_vertex_group")?;
     let target_origin = target.local_to_subject.transform_point3(DVec3::ZERO);
     let target_direction = (target_origin - offset).normalize_or_zero();
-    let mut values = Map::new();
+    let mut vectors: Vec<Option<DVec3>> = Vec::new();
     for face in &mesh.faces {
         let base = face_normal(mesh, face)?;
-        let mut corners = Vec::with_capacity(face.vertices.len());
         for vertex_id in &face.vertices {
             let vertex = mesh
                 .vertices
@@ -1293,15 +1286,18 @@ fn normal_edit(
                 }
             }
             let normal = base.slerp(mixed, blend_factor).normalize_or_zero();
-            corners.push(json!(normal.to_array()));
+            vectors.push(Some(normal));
         }
-        values.insert(format!("f{}", face.id), Value::Array(corners));
     }
     let mut result = mesh.clone();
-    result.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":values}),
-    );
+    clnor::encode_vectors(
+        &mut result,
+        Some(&vectors),
+        NormalCodeOptions {
+            corner_order: None,
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )?;
     Ok(result)
 }
 
@@ -1329,9 +1325,9 @@ fn uv_project(
     if scale_x <= 0.0 || scale_y <= 0.0 {
         return Err(invalid(modifier, "scale_x", "positive projection scales"));
     }
-    let layer = selected_layer_name(mesh, string(modifier, "uv_layer")?);
-    let mut entries = uv_entries(mesh, modifier)?;
-    for face in &mesh.faces {
+    let mut store = uv_layers::read(mesh);
+    let layer = writer_layer_index(&mut store, mesh.faces.len(), modifier, "uv_layer")?;
+    for (face_index, face) in mesh.faces.iter().enumerate() {
         let normal = face_normal(mesh, face)?;
         // Blender keeps the first projector when two camera directions tie.
         let mut best_index = 0;
@@ -1366,14 +1362,12 @@ fn uv_project(
                 modifier,
             )?
             .unwrap_or(DVec2::ZERO);
-            coords.push(json!([uv.x, uv.y]));
+            coords.push([uv.x, 1.0 - uv.y]);
         }
-        insert_uv(&mut entries, face.id, layer, Value::Array(coords));
+        store.layers[layer].faces[face_index] = Some(coords);
     }
     let mut result = mesh.clone();
-    result
-        .attributes
-        .insert("uv_map".to_owned(), Value::Array(entries));
+    uv_layers::write(&mut result, &store);
     Ok(result)
 }
 
@@ -1471,7 +1465,8 @@ fn uv_warp(
     let offset = vector2(modifier, "offset")?;
     let scale = vector2(modifier, "scale")?;
     let rotation = number(modifier, "rotation")?;
-    let layer = selected_layer_name(mesh, string(modifier, "uv_layer")?);
+    let mut store = uv_layers::read(mesh);
+    let layer = writer_layer_index(&mut store, mesh.faces.len(), modifier, "uv_layer")?;
     let group = optional_string(modifier, "vertex_group")?;
     let weights = group
         .map(|name| get_group_weights(mesh, name))
@@ -1495,11 +1490,13 @@ fn uv_warp(
         }
         _ => None,
     };
-    let mut entries = uv_entries(mesh, modifier)?;
-    for face in &mesh.faces {
+    for (face_index, face) in mesh.faces.iter().enumerate() {
         let mut uv = Vec::with_capacity(face.vertices.len());
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
-            let base = existing_uv(mesh, face.id, layer, corner).unwrap_or(DVec2::ZERO);
+            // Computed UVs run in Blender's V-up space; the store keeps V down.
+            let stored =
+                existing_uv(&store.layers[layer], face_index, corner).unwrap_or(DVec2::ZERO);
+            let base = DVec2::new(stored.x, 1.0 - stored.y);
             let mut mask = weights
                 .as_ref()
                 .map_or(1.0, |values| values.get(vertex_id).copied().unwrap_or(0.0))
@@ -1519,14 +1516,12 @@ fn uv_warp(
                 DVec2::new(mapped.dot(axis_u), mapped.dot(axis_v))
             });
             let output = base.lerp(transformed, mask);
-            uv.push(json!([output.x, output.y]));
+            uv.push([output.x, 1.0 - output.y]);
         }
-        insert_uv(&mut entries, face.id, layer, Value::Array(uv));
+        store.layers[layer].faces[face_index] = Some(uv);
     }
     let mut result = mesh.clone();
-    result
-        .attributes
-        .insert("uv_map".to_owned(), Value::Array(entries));
+    uv_layers::write(&mut result, &store);
     Ok(result)
 }
 fn check_uv_warp_bone_binding(
@@ -1628,11 +1623,11 @@ fn data_transfer(
                     mask_weights.as_ref(),
                     invert_mask,
                 )?,
-                "COLOR_VERTEX" => transfer_vertex_attribute(
+                "COLOR_VERTEX" => transfer_color_layer(
                     &mut result,
                     &source.mesh,
+                    ColorDomain::Point,
                     modifier,
-                    "color",
                     vertex_mapping,
                     source_transform,
                     factor,
@@ -1714,16 +1709,17 @@ fn data_transfer(
                     source_transform,
                     factor,
                 )?,
-                "COLOR_CORNER" => transfer_typed_attribute(
+                "COLOR_CORNER" => transfer_color_layer(
                     &mut result,
                     &source.mesh,
+                    ColorDomain::Corner,
                     modifier,
-                    "color",
-                    "color",
                     loop_mapping,
                     source_transform,
                     factor,
                     mix_mode,
+                    mask_weights.as_ref(),
+                    invert_mask,
                 )?,
                 _ => {
                     return Err(invalid(
@@ -2067,7 +2063,8 @@ fn transfer_vertex_attribute(
     mask_weights: Option<&BTreeMap<u32, f64>>,
     invert_mask: bool,
 ) -> Result<()> {
-    let Some(source_attribute) = source.attributes.get(name) else {
+    let key = attribute_keys::storage_key(name).into_owned();
+    let Some(source_attribute) = source.attributes.get(&key) else {
         return Ok(());
     };
     let source_values = source_attribute
@@ -2075,7 +2072,7 @@ fn transfer_vertex_attribute(
         .and_then(Value::as_object)
         .or_else(|| source_attribute.as_object())
         .ok_or_else(|| invalid(modifier, name, "a vertex-ID keyed source attribute"))?;
-    let destination_attribute = destination.attributes.get(name);
+    let destination_attribute = destination.attributes.get(&key);
     let mut output = destination_attribute
         .and_then(|attribute| attribute.get("values"))
         .and_then(Value::as_object)
@@ -2129,11 +2126,11 @@ fn transfer_vertex_attribute(
         fields.insert("values".to_owned(), Value::Object(output));
         destination
             .attributes
-            .insert(name.to_owned(), Value::Object(fields));
+            .insert(key.clone(), Value::Object(fields));
     } else {
         destination
             .attributes
-            .insert(name.to_owned(), Value::Object(output));
+            .insert(key, Value::Object(output));
     }
     Ok(())
 }
@@ -2284,8 +2281,8 @@ fn transfer_uv(
     mask_weights: Option<&BTreeMap<u32, f64>>,
     invert_mask: bool,
 ) -> Result<()> {
-    let source_entries = uv_entries(source, modifier)?;
-    if source_entries.is_empty() {
+    let source_store = uv_layers::read(source);
+    if source_store.layers.is_empty() {
         return Ok(());
     }
     let source_selection = string(modifier, "layers_uv_select_src")?;
@@ -2297,34 +2294,45 @@ fn transfer_uv(
             json!({"feature_id":"modifier.data_transfer.uv_layer_selection","modifier_id":modifier.id}),
         ));
     }
-    let mut source_layers = source_entries
-        .iter()
-        .filter_map(|entry| entry.get("layer").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect::<std::collections::BTreeSet<_>>();
-    if source_layers.is_empty() {
-        source_layers.insert("UVMap".to_owned());
-    }
-    if source_selection == "ACTIVE" {
-        source_layers = source_layers.into_iter().take(1).collect();
-    }
-    let mut destination_entries = uv_entries(destination, modifier)?;
-    let destination_layers = destination_entries
-        .iter()
-        .filter_map(|entry| entry.get("layer").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    for source_layer in source_layers {
-        let destination_layer = match destination_selection {
-            "NAME" => source_layer.clone(),
-            "ACTIVE" => destination_layers
-                .first()
-                .cloned()
-                .unwrap_or_else(|| source_layer.clone()),
-            "INDEX" => destination_layers
-                .first()
-                .cloned()
-                .unwrap_or_else(|| source_layer.clone()),
+    let source_positions: Vec<usize> = match source_selection {
+        "ACTIVE" => active_index(&source_store).into_iter().collect(),
+        _ => (0..source_store.layers.len()).collect(),
+    };
+    let mut destination_store = uv_layers::read(destination);
+    for source_position in source_positions {
+        let source_layer = &source_store.layers[source_position];
+        let destination_index = match destination_selection {
+            "NAME" => ensure_layer(
+                &mut destination_store,
+                destination.faces.len(),
+                &source_layer.name,
+                modifier,
+            )?,
+            "ACTIVE" => match active_index(&destination_store) {
+                Some(index) => index,
+                None => ensure_layer(
+                    &mut destination_store,
+                    destination.faces.len(),
+                    &source_layer.name,
+                    modifier,
+                )?,
+            },
+            "INDEX" => match source_position.cmp(&destination_store.layers.len()) {
+                std::cmp::Ordering::Less => source_position,
+                std::cmp::Ordering::Equal => push_layer(
+                    &mut destination_store,
+                    destination.faces.len(),
+                    &source_layer.name,
+                    modifier,
+                )?,
+                std::cmp::Ordering::Greater => {
+                    return Err(invalid(
+                        modifier,
+                        "layers_uv_select_dst",
+                        "a destination layer at each source layer index",
+                    ));
+                }
+            },
             _ => {
                 return Err(invalid(
                     modifier,
@@ -2333,31 +2341,44 @@ fn transfer_uv(
                 ));
             }
         };
+        let source_rows: Vec<Option<Vec<Value>>> = source_layer
+            .faces
+            .iter()
+            .map(|corners| {
+                corners
+                    .as_ref()
+                    .map(|corners| corners.iter().map(|uv| json!(uv)).collect::<Vec<Value>>())
+            })
+            .collect();
         for (face_index, face) in destination.faces.iter().enumerate() {
-            let source_face = if mapping == "TOPOLOGY" {
-                source.faces.get(face_index)
+            let source_face_index = if mapping == "TOPOLOGY" {
+                (face_index < source.faces.len()).then_some(face_index)
             } else {
-                nearest_face(destination, face, source, source_transform)
+                nearest_face(destination, face, source, source_transform).and_then(|nearest| {
+                    source
+                        .faces
+                        .iter()
+                        .position(|candidate| candidate.id == nearest.id)
+                })
             };
-            let Some(source_face) = source_face else {
+            let Some(source_face_index) = source_face_index else {
                 continue;
             };
-            let Some(source_uv) = source_entries.iter().find(|entry| {
-                entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(source_face.id))
-                    && uv_map_entry_layer(entry) == source_layer
-            }) else {
+            let source_face = &source.faces[source_face_index];
+            let Some(uv) = source_rows[source_face_index].as_deref() else {
                 continue;
             };
-            let Some(uv) = source_uv.get("uv").and_then(Value::as_array) else {
-                continue;
-            };
-            let mapped = face
+            let mapped: Vec<[f64; 2]> = face
                 .vertices
                 .iter()
                 .enumerate()
                 .map(|(index, vertex_id)| {
-                    let old = existing_uv(destination, face.id, &destination_layer, index)
-                        .unwrap_or(DVec2::ZERO);
+                    let old = existing_uv(
+                        &destination_store.layers[destination_index],
+                        face_index,
+                        index,
+                    )
+                    .unwrap_or(DVec2::ZERO);
                     let mask = mask_weights
                         .map_or(1.0, |weights| {
                             weights.get(vertex_id).copied().unwrap_or(0.0)
@@ -2386,19 +2407,12 @@ fn transfer_uv(
                         mix_vector(old, target, factor * mask, mix_mode).unwrap_or(target)
                     })
                 })
-                .map(|point| json!([point.x, point.y]))
-                .collect::<Vec<_>>();
-            insert_uv(
-                &mut destination_entries,
-                face.id,
-                &destination_layer,
-                Value::Array(mapped),
-            );
+                .map(|value| value.to_array())
+                .collect();
+            destination_store.layers[destination_index].faces[face_index] = Some(mapped);
         }
     }
-    destination
-        .attributes
-        .insert("uv_map".to_owned(), Value::Array(destination_entries));
+    uv_layers::write(destination, &destination_store);
     Ok(())
 }
 
@@ -2410,19 +2424,23 @@ fn transfer_custom_normals(
     source_transform: DMat4,
     factor: f64,
 ) -> Result<()> {
-    let source_values = source
-        .attributes
-        .get("custom_normal")
-        .and_then(|value| value.get("values"))
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid(modifier, "data_types_loops", "source custom normals"))?;
-    let mut values = destination
-        .attributes
-        .get("custom_normal")
-        .and_then(|value| value.get("values"))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    if clnor::corner_codes(source)?.is_none() {
+        return Err(invalid(modifier, "data_types_loops", "source custom normals"));
+    }
+    // Blender transfers the final loop normals: authored vectors, and computed normals where automatic.
+    let source_final = corner_normals(source, &mesh_points(source))?;
+    let source_values = final_normal_rows(source, &source_final);
+    let destination_final = corner_normals(destination, &mesh_points(destination))?;
+    let destination_offsets: Vec<usize> = destination
+        .faces
+        .iter()
+        .scan(0, |total, face| {
+            let start = *total;
+            *total += face.vertices.len();
+            Some(start)
+        })
+        .collect();
+    let mut updates: Vec<(usize, Option<DVec3>)> = Vec::new();
     for (index, face) in destination.faces.iter().enumerate() {
         let source_face = if mapping == "TOPOLOGY" {
             source.faces.get(index)
@@ -2438,47 +2456,57 @@ fn transfer_custom_normals(
         else {
             continue;
         };
-        let normals = face
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(corner, vertex_id)| {
-                let source_normal = destination
-                    .vertices
-                    .iter()
-                    .find(|vertex| vertex.id == *vertex_id)
-                    .and_then(|vertex| {
-                        interpolate_face_corner_value(
-                            source,
-                            source_face,
-                            source_normals,
-                            source_transform,
-                            vertex.co,
-                        )
-                    })
-                    .as_ref()
-                    .and_then(value3)
-                    .unwrap_or(DVec3::Z);
-                let old = values
-                    .get(&format!("f{}", face.id))
-                    .and_then(Value::as_array)
-                    .and_then(|normals| normals.get(corner))
-                    .and_then(value3)
-                    .unwrap_or(DVec3::Z);
-                json!(
-                    old.lerp(source_normal, factor)
-                        .normalize_or_zero()
-                        .to_array()
-                )
-            })
-            .collect::<Vec<_>>();
-        values.insert(format!("f{}", face.id), Value::Array(normals));
+        for (corner, vertex_id) in face.vertices.iter().enumerate() {
+            let source_normal = destination
+                .vertices
+                .iter()
+                .find(|vertex| vertex.id == *vertex_id)
+                .and_then(|vertex| {
+                    interpolate_face_corner_value(
+                        source,
+                        source_face,
+                        source_normals,
+                        source_transform,
+                        vertex.co,
+                    )
+                })
+                .as_ref()
+                .and_then(value3)
+                .unwrap_or(DVec3::Z);
+            let old = destination_final[destination_offsets[index] + corner];
+            let blended = old.lerp(source_normal, factor).normalize_or_zero();
+            updates.push((destination_offsets[index] + corner, Some(blended)));
+        }
     }
-    destination.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":values}),
-    );
-    Ok(())
+    clnor::encode_vector_updates(
+        destination,
+        &updates,
+        NormalCodeOptions {
+            corner_order: None,
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )
+}
+
+/// The vertex coordinates of `mesh` in storage order, as the normal computation takes them.
+fn mesh_points(mesh: &Mesh) -> Vec<DVec3> {
+    mesh.vertices.iter().map(|vertex| vertex.co).collect()
+}
+
+/// Per face `f{id}` rows of the final corner normals of `mesh`, one per corner in face order.
+fn final_normal_rows(mesh: &Mesh, normals: &[DVec3]) -> Map<String, Value> {
+    let mut rows = Map::new();
+    let mut corner = 0;
+    for face in &mesh.faces {
+        let end = corner + face.vertices.len();
+        let row: Vec<Value> = normals[corner..end]
+            .iter()
+            .map(|normal| json!(normal.to_array()))
+            .collect();
+        rows.insert(format!("f{}", face.id), Value::Array(row));
+        corner = end;
+    }
+    rows
 }
 
 fn transfer_typed_attribute(
@@ -2492,7 +2520,9 @@ fn transfer_typed_attribute(
     factor: f64,
     mix_mode: &str,
 ) -> Result<()> {
-    let Some(source_value) = source.attributes.get(source_name) else {
+    let source_key = attribute_keys::storage_key(source_name).into_owned();
+    let destination_key = attribute_keys::storage_key(destination_name).into_owned();
+    let Some(source_value) = source.attributes.get(&source_key) else {
         return Ok(());
     };
     let Some(source_values) = source_value.get("values").and_then(Value::as_object) else {
@@ -2500,7 +2530,7 @@ fn transfer_typed_attribute(
     };
     let mut output = destination
         .attributes
-        .get(destination_name)
+        .get(&destination_key)
         .and_then(|value| value.get("values"))
         .and_then(Value::as_object)
         .cloned()
@@ -2561,10 +2591,119 @@ fn transfer_typed_attribute(
         .and_then(Value::as_str)
         .unwrap_or("float");
     destination.attributes.insert(
-        destination_name.to_owned(),
+        destination_key,
         json!({"domain":domain,"type":kind,"values":output}),
     );
     Ok(())
+}
+
+/// Transfers the render color layer of `source` onto the render color layer of `destination`, in the
+/// domain the transfer writes: point for `COLOR_VERTEX`, corner for `COLOR_CORNER`. A source layer of the
+/// other domain transfers nothing. The destination keeps its render layer when that layer has the same
+/// domain. Otherwise a new layer takes the source layer's name (suffixed when taken) and becomes the render
+/// layer. Values mix as the other transfers do, and the store is rewritten complete.
+fn transfer_color_layer(
+    destination: &mut Mesh,
+    source: &Mesh,
+    domain: ColorDomain,
+    modifier: &Modifier,
+    mapping: &str,
+    source_transform: DMat4,
+    factor: f64,
+    mix_mode: &str,
+    mask_weights: Option<&BTreeMap<u32, f64>>,
+    invert_mask: bool,
+) -> Result<()> {
+    let source_store = color_layers::read(source);
+    let Some(source_layer) = source_store
+        .resolve(None)
+        .0
+        .map(|index| &source_store.layers[index])
+    else {
+        return Ok(());
+    };
+    if source_layer.domain != domain {
+        return Ok(());
+    }
+    let Some(source_attribute) = source
+        .attributes
+        .get(attribute_keys::storage_key(&source_layer.name).as_ref())
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let source_name = source_layer.name.clone();
+    let mut store = color_layers::read(destination);
+    let name = match store.resolve(None).0 {
+        Some(index) if store.layers[index].domain == domain => store.layers[index].name.clone(),
+        _ => {
+            let name = free_attribute_name(destination, &source_name);
+            let count = match domain {
+                ColorDomain::Point => destination.vertices.len(),
+                ColorDomain::Corner => destination.faces.iter().map(|face| face.vertices.len()).sum(),
+            };
+            store.layers.push(ColorLayer {
+                name: name.clone(),
+                domain,
+                values: vec![[0.0, 0.0, 0.0, 1.0]; count],
+            });
+            store.render = Some(name.clone());
+            name
+        }
+    };
+    color_layers::write(destination, &store);
+    // The transfers read the source by name, so the source layer is carried under the destination's name.
+    let mut renamed = source.clone();
+    renamed.attributes.insert(
+        attribute_keys::storage_key(&name).into_owned(),
+        source_attribute,
+    );
+    match domain {
+        ColorDomain::Point => transfer_vertex_attribute(
+            destination,
+            &renamed,
+            modifier,
+            &name,
+            mapping,
+            source_transform,
+            factor,
+            mix_mode,
+            mask_weights,
+            invert_mask,
+        )?,
+        ColorDomain::Corner => transfer_typed_attribute(
+            destination,
+            &renamed,
+            modifier,
+            &name,
+            &name,
+            mapping,
+            source_transform,
+            factor,
+            mix_mode,
+        )?,
+    }
+    let transferred = color_layers::read(destination);
+    color_layers::write(destination, &transferred);
+    Ok(())
+}
+
+/// `base`, or `base.001`, `base.002`, … when the mesh already has an attribute with that name.
+fn free_attribute_name(mesh: &Mesh, base: &str) -> String {
+    if !mesh
+        .attributes
+        .contains_key(attribute_keys::storage_key(base).as_ref())
+    {
+        return base.to_owned();
+    }
+    (1_usize..)
+        .map(|index| format!("{base}.{index:03}"))
+        .find(|name| {
+            !mesh
+                .attributes
+                .contains_key(attribute_keys::storage_key(name).as_ref())
+        })
+        .unwrap_or_else(|| base.to_owned())
 }
 
 fn source_vertex_for(
@@ -2757,93 +2896,110 @@ fn mix_vector(first: DVec2, second: DVec2, factor: f64, mode: &str) -> Option<DV
     }
 }
 
-fn uv_entries(mesh: &Mesh, modifier: &Modifier) -> Result<Vec<Value>> {
-    if let Some(uv_map) = mesh.attributes.get("uv_map") {
-        return match uv_map {
-            Value::Array(entries) => Ok(entries.clone()),
-            _ => Err(invalid(
-                modifier,
-                "uv_layer",
-                "an array of face-keyed UV entries",
-            )),
-        };
+/// Index of the layer that `parameter` names. An empty name is the active layer, as Blender's
+/// empty UV Map field is. `None` only for an empty name on a mesh without layers.
+fn uv_layer_index(store: &UvStore, modifier: &Modifier, parameter: &str) -> Result<Option<usize>> {
+    let name = string(modifier, parameter)?;
+    if name.is_empty() {
+        return Ok(active_index(store));
     }
-    let Some(layers) = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-    else {
-        return Ok(Vec::new());
-    };
-    let mut entries = Vec::new();
-    let mut loop_start = 0_usize;
-    for face in &mesh.faces {
-        let loop_end = loop_start
-            .checked_add(face.vertices.len())
-            .ok_or_else(|| invalid(modifier, "uv_layer", "a valid UV loop count"))?;
-        for layer in layers {
-            let name = layer
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid(modifier, "uv_layer", "named Blender UV layers"))?;
-            let values = layer
-                .get("values")
-                .and_then(Value::as_array)
-                .ok_or_else(|| invalid(modifier, "uv_layer", "Blender UV layer loop values"))?;
-            let corners = values
-                .get(loop_start..loop_end)
-                .ok_or_else(|| invalid(modifier, "uv_layer", "one UV value per mesh loop"))?;
-            entries.push(json!({"face_id":face.id,"layer":name,"uv":corners}));
-        }
-        loop_start = loop_end;
-    }
-    Ok(entries)
+    store
+        .index_of(name)
+        .map(Some)
+        .ok_or_else(|| uv_layer_missing(modifier, parameter, name))
 }
 
-fn insert_uv(entries: &mut Vec<Value>, face_id: u32, layer: &str, uv: Value) {
-    if let Some(entry) = entries.iter_mut().find(|entry| {
-        entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(face_id))
-            && uv_map_entry_layer(entry) == layer
-    }) {
-        if let Some(object) = entry.as_object_mut() {
-            object.insert("uv".to_owned(), uv);
-        }
-    } else {
-        entries.push(json!({"face_id":face_id,"layer":layer,"uv":uv}));
+/// Index of the active layer. A stale or null active name falls back to the first layer, as
+/// `uv_layers::write` does.
+fn active_index(store: &UvStore) -> Option<usize> {
+    store
+        .active
+        .as_deref()
+        .and_then(|name| store.index_of(name))
+        .or((!store.layers.is_empty()).then_some(0))
+}
+
+/// Index of the layer a writing modifier updates. A mesh without layers gets `UVMap`, which is
+/// both active and render, when the parameter is empty.
+fn writer_layer_index(
+    store: &mut UvStore,
+    face_count: usize,
+    modifier: &Modifier,
+    parameter: &str,
+) -> Result<usize> {
+    if let Some(index) = uv_layer_index(store, modifier, parameter)? {
+        return Ok(index);
+    }
+    store
+        .layers
+        .push(UvLayer::new("UVMap", vec![None; face_count]));
+    store.active = Some("UVMap".to_owned());
+    store.render = Some("UVMap".to_owned());
+    Ok(0)
+}
+
+/// Index of the layer named `name`, appended when no layer has that name.
+fn ensure_layer(
+    store: &mut UvStore,
+    face_count: usize,
+    name: &str,
+    modifier: &Modifier,
+) -> Result<usize> {
+    match store.index_of(name) {
+        Some(index) => Ok(index),
+        None => push_layer(store, face_count, name, modifier),
     }
 }
 
-fn existing_uv(mesh: &Mesh, face_id: u32, layer: &str, corner: usize) -> Option<DVec2> {
-    if let Some(entries) = mesh.attributes.get("uv_map").and_then(Value::as_array)
-        && let Some(value) = entries
-            .iter()
-            .find(|entry| {
-                entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(face_id))
-                    && uv_map_entry_layer(entry) == layer
-            })
-            .and_then(|entry| entry.get("uv"))
-            .and_then(Value::as_array)
-            .and_then(|values| values.get(corner))
-            .and_then(value2)
-    {
-        return Some(value);
+/// Appends an empty layer named `name`, within the layer limit and under a name no layer has.
+fn push_layer(
+    store: &mut UvStore,
+    face_count: usize,
+    name: &str,
+    modifier: &Modifier,
+) -> Result<usize> {
+    if store.layers.len() >= uv_layers::MAX_LAYERS {
+        return Err(invalid(
+            modifier,
+            "layers_uv_select_dst",
+            "at most 8 UV layers per mesh",
+        ));
     }
-    let face_index = mesh.faces.iter().position(|face| face.id == face_id)?;
-    let loop_start = mesh.faces[..face_index]
-        .iter()
-        .try_fold(0_usize, |total, face| {
-            total.checked_add(face.vertices.len())
-        })?;
-    let loop_index = loop_start.checked_add(corner)?;
-    mesh.attributes
-        .get("blender_uv_layers")?
-        .as_array()?
-        .iter()
-        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(layer))?
-        .get("values")?
-        .as_array()?
-        .get(loop_index)
-        .and_then(value2)
+    if store.index_of(name).is_some() {
+        return Err(invalid(
+            modifier,
+            "layers_uv_select_dst",
+            "a destination layer name that no layer already has",
+        ));
+    }
+    store
+        .layers
+        .push(UvLayer::new(name, vec![None; face_count]));
+    Ok(store.layers.len() - 1)
+}
+
+/// A named UV layer that the mesh does not store.
+fn uv_layer_missing(modifier: &Modifier, parameter: &str, name: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::InvalidArgument,
+        format!(
+            "modifier `{}` references UV layer `{name}`, which the mesh does not have",
+            modifier.modifier_type
+        ),
+        json!({
+            "code": "modifier.uv_layer_missing",
+            "modifier_id": modifier.id,
+            "parameter": parameter,
+            "pointer": format!("/params/{parameter}"),
+            "uv_layer": name,
+        }),
+    )
+}
+
+/// The corner value of storage face `face_index` in `layer`, when the layer has an entry for it.
+fn existing_uv(layer: &UvLayer, face_index: usize, corner: usize) -> Option<DVec2> {
+    let [u, v] = *layer.faces.get(face_index)?.as_ref()?.get(corner)?;
+    Some(DVec2::new(u, v))
 }
 
 fn face_points(mesh: &Mesh, ids: &[u32]) -> Result<Vec<DVec3>> {

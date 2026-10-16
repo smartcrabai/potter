@@ -9,13 +9,14 @@ use crate::{
 };
 
 use super::super::{
-    gltf::{TextureExport, reads, unsupported_export},
+    gltf::{TexCoords, TextureExport, reads, unsupported_export},
     material_surface::{
         AlphaMode, ResolvedSurface, SampledTexture, TextureChannel, reference_sampled,
         remapped_reference_sampled,
     },
 };
 
+/// The `MToon` texture references that sample mesh UVs. Matcap is view-space and needs none.
 pub(crate) fn uv_textures(mtoon: &AvatarMtoon) -> impl Iterator<Item = &TextureRef> {
     [
         mtoon.shade_multiply_texture.as_ref(),
@@ -78,6 +79,7 @@ pub(super) fn validate_v1(surface: &ResolvedSurface) -> Result<()> {
 pub(super) fn v1(
     surface: &ResolvedSurface,
     mtoon: &AvatarMtoon,
+    tex_coords: &TexCoords,
     doc: &SceneDoc,
     root_path: &Path,
     texture_export: &mut TextureExport,
@@ -110,6 +112,7 @@ pub(super) fn v1(
         value["shadeMultiplyTexture"] = texture_export.sampled_info(
             &reference_sampled(texture),
             reads::RGBA,
+            tex_coords,
             doc,
             root_path,
             binary,
@@ -120,6 +123,7 @@ pub(super) fn v1(
         let mut info = texture_export.sampled_info(
             &reference_sampled(&shift.texture),
             reads::RGBA,
+            tex_coords,
             doc,
             root_path,
             binary,
@@ -144,6 +148,7 @@ pub(super) fn v1(
             value[key] = texture_export.sampled_info(
                 &reference_sampled(texture),
                 reads::RGBA,
+                tex_coords,
                 doc,
                 root_path,
                 binary,

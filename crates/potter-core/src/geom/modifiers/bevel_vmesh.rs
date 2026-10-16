@@ -2520,7 +2520,6 @@ pub(super) fn finish(
         vertices: origins,
         faces,
         corners: Some(corners),
-        raw_normals: false,
     };
     let loose = loose
         .into_iter()

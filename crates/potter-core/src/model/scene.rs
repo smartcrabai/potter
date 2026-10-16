@@ -118,7 +118,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 1,
+            schema_version: 3,
             scene_id,
             revision: 0,
             active_scene,
@@ -145,7 +145,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 {
+        if self.schema_version != 3 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -174,6 +174,13 @@ impl SceneDoc {
         }
         for clip in self.movie_clips.values() {
             clip.validate()?;
+        }
+        for block in self.data_blocks.values() {
+            if let Some(mesh) = &block.mesh {
+                crate::geom::uv_layers::validate(mesh)?;
+                crate::geom::color_layers::validate(mesh)?;
+                crate::geom::clnor::validate(mesh)?;
+            }
         }
         for (scene_id, scene) in &self.scenes {
             if let Some(world) = &scene.rigid_body_world
@@ -1988,7 +1995,7 @@ pub struct Image {
 pub struct TextureRef {
     pub image: Id,
     #[serde(default)]
-    pub uv_map: Option<String>,
+    pub uv_layer: Option<String>,
     #[serde(default)]
     pub interpolation: ImageInterpolation,
 }

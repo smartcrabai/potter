@@ -23,9 +23,11 @@ use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
+pub(crate) mod attribute_keys;
 pub mod boolean;
 pub(crate) mod clnor;
 pub(crate) mod concat;
+pub(crate) mod color_layers;
 pub mod curve;
 pub mod edit;
 pub mod lattice;

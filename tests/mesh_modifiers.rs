@@ -243,9 +243,9 @@ fn uv_unwrap_and_transform_store_per_corner_coordinates() -> Result<(), Box<dyn 
         String::from_utf8_lossy(&applied.stdout)
     );
     let persisted: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let entries = persisted["data_blocks"]["body_mesh"]["mesh"]["attributes"]["uv_map"]
-        .as_array()
-        .ok_or("missing UV map")?;
+    let layers =
+        &persisted["data_blocks"]["body_mesh"]["mesh"]["attributes"]["uv_layers"]["layers"];
+    let entries = layers[0]["faces"].as_array().ok_or("missing UV layer")?;
     assert_eq!(entries.len(), 6);
     for entry in entries {
         let corners = entry["uv"].as_array().ok_or("missing UV corners")?;
@@ -465,9 +465,9 @@ fn uv_pin_and_pack_preserve_pins_and_pack_face_islands() -> Result<(), Box<dyn E
         String::from_utf8_lossy(&applied.stdout)
     );
     let persisted: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let entries = persisted["data_blocks"]["body_mesh"]["mesh"]["attributes"]["uv_map"]
-        .as_array()
-        .ok_or("missing UV map")?;
+    let layers =
+        &persisted["data_blocks"]["body_mesh"]["mesh"]["attributes"]["uv_layers"]["layers"];
+    let entries = layers[0]["faces"].as_array().ok_or("missing UV layer")?;
     assert_eq!(entries.len(), 6);
     let mut bounds = Vec::<[f64; 4]>::new();
     for entry in entries {

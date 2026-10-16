@@ -615,6 +615,30 @@ pub fn validate_with_context(
                         Ok(meshes) => {
                             losses
                                 .extend(crate::exchange::shading::shading_losses(format, &meshes));
+                            losses.extend(crate::exchange::uv_layer_losses(format, &meshes));
+                            if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
+                                let vrm = match (format, doc.avatar.as_ref()) {
+                                    ("vrm", Some(avatar)) => {
+                                        Some((avatar, crate::model::AvatarVersion::V1))
+                                    }
+                                    ("vrm0", Some(avatar)) => {
+                                        Some((avatar, crate::model::AvatarVersion::V0))
+                                    }
+                                    _ => None,
+                                };
+                                match crate::exchange::gltf::uv_layer_losses(doc, snapshot, vrm) {
+                                    Ok(uv_losses) => losses.extend(uv_losses),
+                                    Err(error) => issue(
+                                        &mut issues,
+                                        "error",
+                                        "EVALUATION_FAILED",
+                                        &error.message,
+                                        None,
+                                        None,
+                                        error.details,
+                                    ),
+                                }
+                            }
                         }
                         Err(error) => issue(
                             &mut issues,

@@ -1,5 +1,4 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -14,8 +13,7 @@ use crate::{
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     exchange::{
         self, ExportOptions, Loss,
-        gltf::{is_color_attribute, mesh_default_uv_layer, surface_textures},
-        material_surface::{feature_id, material_is_used, resolve_surface},
+        material_surface::{material_is_used, resolve_surface},
     },
     hash,
     model::{AvatarVersion, LightType, SceneDoc},
@@ -119,6 +117,21 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
         let mut losses = export_losses(&doc, format);
         losses.extend(exchange::shading::shading_losses(format, &meshes));
+        losses.extend(exchange::uv_layer_losses(format, &meshes));
+        if matches!(format, "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl")
+            || matches!(format, "usda" | "usdc" | "usd" | "usdz")
+        {
+            losses.extend(exchange::attribute_losses(format, &doc, &snapshot)?);
+        }
+        let vrm = match (format, doc.avatar.as_ref()) {
+            ("vrm", Some(avatar)) => Some((avatar, AvatarVersion::V1)),
+            ("vrm0", Some(avatar)) => Some((avatar, AvatarVersion::V0)),
+            _ => None,
+        };
+        if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
+            losses.extend(exchange::gltf::uv_layer_losses(&doc, &snapshot, vrm)?);
+            losses.extend(exchange::gltf::mesh_export_losses(&doc, &snapshot)?);
+        }
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
         }
@@ -181,7 +194,10 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                 args.out.clone(),
                 exchange::fbx_binary::export(&doc, &snapshot)?,
             )],
-            "fbx" => vec![(args.out.clone(), exchange::fbx::export(&doc, &snapshot)?)],
+            "fbx" => vec![(
+                args.out.clone(),
+                exchange::fbx::export(&doc, &snapshot)?,
+            )],
             "svg" => vec![(
                 args.out.clone(),
                 exchange::svg::export(&doc, &snapshot, view)?,
@@ -516,7 +532,9 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     }
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
         losses.extend(material_losses(doc));
-        losses.extend(mesh_color_losses(doc));
+    }
+    if matches!(format, "fbx" | "fbx-binary") {
+        losses.extend(exchange::fbx::uv_texture_losses(doc));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);
@@ -524,53 +542,8 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     losses
 }
 
-/// Blender color layers on meshes that nodes use. glTF export does not write them yet (`COLOR_0` is
-/// pending), so each layer is a reported loss rather than a silent drop.
-fn mesh_color_losses(doc: &SceneDoc) -> Vec<Loss> {
-    let data_ids = doc
-        .nodes
-        .values()
-        .filter_map(|node| node.data.as_ref())
-        .collect::<BTreeSet<_>>();
-    let mut losses = Vec::new();
-    for data_id in data_ids {
-        let Some(mesh) = doc
-            .data_blocks
-            .get(data_id)
-            .and_then(|data| data.mesh.as_ref())
-        else {
-            continue;
-        };
-        let Some(entries) = mesh
-            .attributes
-            .get("blender_attributes")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for entry in entries {
-            let is_color = is_color_attribute(entry);
-            let Some(name) = entry["name"].as_str().filter(|_| is_color) else {
-                continue;
-            };
-            losses.push(Loss {
-                feature_id: "mesh.color_attribute".to_owned(),
-                data_id: Some(data_id.to_string()),
-                reason: format!(
-                    "glTF export does not write the Blender color attribute `{name}` on mesh `{data_id}` (COLOR_0 export is not implemented)"
-                ),
-                suggestion: Some(
-                    "export with --allow-lossy to omit the color layer, or remove it before export"
-                        .to_owned(),
-                ),
-            });
-        }
-    }
-    losses
-}
-
-/// Material losses for glTF-family output: graph parts the resolver cannot represent, and texture
-/// samples on a UV layer other than the mesh's default, which glTF exports as `TEXCOORD_0`.
+/// Material losses for glTF-family output: graph parts the resolver cannot represent. Texture
+/// samples on any UV layer export as their own `TEXCOORD_k`, so they need no loss here.
 fn material_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
     for id in doc.materials.keys() {
@@ -578,59 +551,8 @@ fn material_losses(doc: &SceneDoc) -> Vec<Loss> {
             continue;
         }
         // An unresolvable graph is reported by the export itself, so it adds no loss here.
-        let Ok((surface, resolver_losses)) = resolve_surface(doc, id) else {
-            continue;
-        };
-        let layer_loss_reported = resolver_losses.iter().any(|loss| {
-            loss.feature_id == feature_id::TEXTURE_UV_LAYER
-                && loss.data_id.as_deref() == Some(id.as_str())
-        });
-        losses.extend(resolver_losses);
-        if layer_loss_reported {
-            continue;
-        }
-        let layers = surface_textures(&surface)
-            .into_iter()
-            .filter_map(|texture| texture.uv_layer.clone())
-            .collect::<BTreeSet<String>>();
-        let mut mismatches = BTreeMap::<String, BTreeSet<String>>::new();
-        for (node_id, node) in &doc.nodes {
-            if !node.materials.contains(id) {
-                continue;
-            }
-            let Some(data_id) = &node.data else {
-                continue;
-            };
-            let Some(mesh) = doc
-                .data_blocks
-                .get(data_id)
-                .and_then(|data| data.mesh.as_ref())
-            else {
-                continue;
-            };
-            let default_layer = mesh_default_uv_layer(&mesh.attributes);
-            for layer in &layers {
-                if default_layer.as_deref() != Some(layer.as_str()) {
-                    mismatches
-                        .entry(layer.clone())
-                        .or_default()
-                        .insert(format!("{data_id} (node {node_id})"));
-                }
-            }
-        }
-        for (layer, meshes) in mismatches {
-            let meshes = meshes.into_iter().collect::<Vec<_>>().join(", ");
-            losses.push(Loss {
-                feature_id: feature_id::TEXTURE_UV_LAYER.to_owned(),
-                data_id: Some(id.to_string()),
-                reason: format!(
-                    "material `{id}` samples UV layer `{layer}`, which is not the default layer of {meshes}; glTF exports only the default layer as TEXCOORD_0"
-                ),
-                suggestion: Some(
-                    "assign the textured material to the mesh's default UV layer, or export with --allow-lossy to keep the default layer"
-                        .to_owned(),
-                ),
-            });
+        if let Ok((_, resolver_losses)) = resolve_surface(doc, id) {
+            losses.extend(resolver_losses);
         }
     }
     losses

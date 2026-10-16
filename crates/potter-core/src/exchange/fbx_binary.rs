@@ -38,7 +38,8 @@ struct Node {
     children: Vec<Node>,
 }
 
-/// Export an FBX 7.4 binary file from the ASCII adapter's complete supported graph.
+/// Export an FBX 7.4 binary file. Color layers and generic attributes are reported as losses by
+/// `exchange::attribute_losses`, not written.
 pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
     let ascii = super::fbx::export(doc, snapshot)?;
     let text = std::str::from_utf8(&ascii)
@@ -540,8 +541,8 @@ fn property_kind(node: &Node, index: usize, parent: Option<&str>) -> Result<char
 
 fn array_type(parent: &str) -> char {
     match parent {
-        "PolygonVertexIndex" | "NormalsIndex" | "Materials" | "Indexes" | "KeyAttrFlags"
-        | "KeyAttrRefCount" => 'i',
+        "PolygonVertexIndex" | "NormalsIndex" | "UVIndex" | "Materials" | "Indexes"
+        | "KeyAttrFlags" | "KeyAttrRefCount" => 'i',
         "KeyTime" => 'l',
         "KeyValueFloat" | "KeyAttrDataFloat" => 'f',
         _ => 'd',

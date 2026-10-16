@@ -3,11 +3,26 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Face, Mesh},
-    model::Id,
+    geom::{
+        Face, Mesh,
+        uv_layers::{self, UvLayer, UvStore},
+    },
+    model::{AvatarMtoon, Id, Material, SceneDoc, TextureRef},
 };
 
 use super::{ChangeKind, Engine, check_fields, resolve_node_targets};
+
+/// Blender's default margin for `uv.pack_islands` (Blender 5.2.2 oracle). Schema and runtime agree.
+const DEFAULT_PACK_MARGIN: f64 = 0.001;
+/// Blender's name for a new UV map. Unnamed layers take `.001`-style suffixes from it.
+const DEFAULT_LAYER_NAME: &str = "UVMap";
+/// Modifier params that name a UV layer.
+const MODIFIER_LAYER_PARAMS: [&str; 4] = [
+    "uv_layer",
+    "mask_tex_uv_layer",
+    "layers_uv_select_src",
+    "layers_uv_select_dst",
+];
 
 pub(super) fn apply(
     engine: &mut Engine<'_>,
@@ -19,6 +34,11 @@ pub(super) fn apply(
         "uv.transform" => transform(engine, operation),
         "uv.pin" => pin(engine, operation),
         "uv.pack" => pack(engine, operation),
+        "uv.layer_create" => layer_create(engine, operation),
+        "uv.layer_delete" => layer_delete(engine, operation),
+        "uv.layer_rename" => layer_rename(engine, operation),
+        "uv.layer_set_active" => layer_set_role(engine, operation, LayerRole::Active),
+        "uv.layer_set_render" => layer_set_role(engine, operation, LayerRole::Render),
         _ => Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("unsupported UV operation `{name}`"),
@@ -31,10 +51,11 @@ fn unwrap(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     check_fields(
         engine,
         operation,
-        &["op", "target", "elements", "scope", "method"],
+        &["op", "target", "elements", "scope", "method", "uv_layer"],
         &["target"],
     )?;
     let (targets, elements) = selected_targets(engine, operation)?;
+    let layer = uv_layer_field(engine, operation)?;
     let method = operation
         .get("method")
         .and_then(Value::as_str)
@@ -48,27 +69,31 @@ fn unwrap(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     }
     edit_targets(engine, targets, operation.get("scope"), |mesh| {
         let selected = selected_faces(mesh, elements.as_ref())?;
-        let mut uv_map = read_uv_map(mesh)?;
-        if matches!(method, "angle_based" | "conformal") {
-            unwrap_advanced(mesh, &selected, &mut uv_map, method)?;
-        } else {
-            for face in mesh.faces.iter().filter(|face| selected.contains(&face.id)) {
-                let corners = project_face(mesh, face, method)?;
-                let pinned = uv_map
-                    .get(&face.id)
-                    .and_then(|face_uv| face_uv.pinned.clone())
-                    .filter(|pinned| pinned.len() == corners.len());
-                uv_map.insert(
-                    face.id,
-                    UvFace {
-                        uv: corners,
-                        pinned,
-                    },
-                );
+        edit_layer_map(mesh, layer.as_deref(), true, |layer_mesh, uv_map| {
+            if matches!(method, "angle_based" | "conformal") {
+                unwrap_advanced(layer_mesh, &selected, uv_map, method)?;
+            } else {
+                for face in layer_mesh
+                    .faces
+                    .iter()
+                    .filter(|face| selected.contains(&face.id))
+                {
+                    let corners = project_face(layer_mesh, face, method)?;
+                    let pinned = uv_map
+                        .get(&face.id)
+                        .and_then(|face_uv| face_uv.pinned.clone())
+                        .filter(|pinned| pinned.len() == corners.len());
+                    uv_map.insert(
+                        face.id,
+                        UvFace {
+                            uv: corners,
+                            pinned,
+                        },
+                    );
+                }
             }
-        }
-        write_uv_map(mesh, &uv_map);
-        Ok(())
+            Ok(())
+        })
     })
 }
 
@@ -84,10 +109,12 @@ fn transform(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<
             "translation",
             "scale",
             "rotation",
+            "uv_layer",
         ],
         &["target"],
     )?;
     let (targets, elements) = selected_targets(engine, operation)?;
+    let layer = uv_layer_field(engine, operation)?;
     let translation = read_vec2(
         engine,
         operation.get("translation"),
@@ -99,26 +126,20 @@ fn transform(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<
     let (sin, cos) = rotation.sin_cos();
     edit_targets(engine, targets, operation.get("scope"), |mesh| {
         let selected = selected_faces(mesh, elements.as_ref())?;
-        let mut uv_map = read_uv_map(mesh)?;
-        if uv_map.is_empty() {
-            return Err(PotError::new(
-                ErrorCode::InvalidOperation,
-                "uv.transform requires an existing UV map",
-            ));
-        }
-        for (face_id, face_uv) in &mut uv_map {
-            if !selected.contains(face_id) {
-                continue;
+        edit_layer_map(mesh, layer.as_deref(), false, |_, uv_map| {
+            for (face_id, face_uv) in uv_map.iter_mut() {
+                if !selected.contains(face_id) {
+                    continue;
+                }
+                for uv in &mut face_uv.uv {
+                    let u = uv[0] * scale[0];
+                    let v = uv[1] * scale[1];
+                    uv[0] = u.mul_add(cos, -v * sin) + translation[0];
+                    uv[1] = u.mul_add(sin, v * cos) + translation[1];
+                }
             }
-            for uv in &mut face_uv.uv {
-                let u = uv[0] * scale[0];
-                let v = uv[1] * scale[1];
-                uv[0] = u.mul_add(cos, -v * sin) + translation[0];
-                uv[1] = u.mul_add(sin, v * cos) + translation[1];
-            }
-        }
-        write_uv_map(mesh, &uv_map);
-        Ok(())
+            Ok(())
+        })
     })
 }
 
@@ -126,10 +147,11 @@ fn pin(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> 
     check_fields(
         engine,
         operation,
-        &["op", "target", "elements", "scope", "pinned"],
+        &["op", "target", "elements", "scope", "pinned", "uv_layer"],
         &["target"],
     )?;
     let (targets, elements) = selected_targets(engine, operation)?;
+    let layer = uv_layer_field(engine, operation)?;
     let pinned = match operation.get("pinned") {
         None => true,
         Some(Value::Bool(value)) => *value,
@@ -143,37 +165,31 @@ fn pin(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> 
     };
     edit_targets(engine, targets, operation.get("scope"), |mesh| {
         let selected = selected_faces(mesh, elements.as_ref())?;
-        let mut uv_map = read_uv_map(mesh)?;
-        if uv_map.is_empty() {
-            return Err(PotError::new(
-                ErrorCode::InvalidOperation,
-                "uv.pin requires an existing UV map",
-            ));
-        }
-        for face_id in selected {
-            let face = mesh
-                .faces
-                .iter()
-                .find(|face| face.id == face_id)
-                .ok_or_else(|| {
-                    PotError::new(ErrorCode::TargetNotFound, "selected UV face was not found")
+        edit_layer_map(mesh, layer.as_deref(), false, |layer_mesh, uv_map| {
+            for face_id in selected {
+                let face = layer_mesh
+                    .faces
+                    .iter()
+                    .find(|face| face.id == face_id)
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::TargetNotFound, "selected UV face was not found")
+                    })?;
+                let face_uv = uv_map.get_mut(&face_id).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InvalidOperation,
+                        format!("uv.pin requires UV coordinates for face f{face_id}"),
+                    )
                 })?;
-            let face_uv = uv_map.get_mut(&face_id).ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidOperation,
-                    format!("uv.pin requires UV coordinates for face f{face_id}"),
-                )
-            })?;
-            if face_uv.uv.len() != face.vertices.len() {
-                return Err(PotError::new(
-                    ErrorCode::InvalidOperation,
-                    format!("UV corner count does not match face f{face_id}"),
-                ));
+                if face_uv.uv.len() != face.vertices.len() {
+                    return Err(PotError::new(
+                        ErrorCode::InvalidOperation,
+                        format!("UV corner count does not match face f{face_id}"),
+                    ));
+                }
+                face_uv.pinned = Some(vec![pinned; face_uv.uv.len()]);
             }
-            face_uv.pinned = Some(vec![pinned; face_uv.uv.len()]);
-        }
-        write_uv_map(mesh, &uv_map);
-        Ok(())
+            Ok(())
+        })
     })
 }
 
@@ -181,11 +197,17 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
     check_fields(
         engine,
         operation,
-        &["op", "target", "elements", "scope", "margin"],
+        &["op", "target", "elements", "scope", "margin", "uv_layer"],
         &["target"],
     )?;
     let (targets, elements) = selected_targets(engine, operation)?;
-    let margin = read_number(engine, operation.get("margin"), 0.0, "/margin")?;
+    let layer = uv_layer_field(engine, operation)?;
+    let margin = read_number(
+        engine,
+        operation.get("margin"),
+        DEFAULT_PACK_MARGIN,
+        "/margin",
+    )?;
     if !(0.0..=0.5).contains(&margin) {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -195,17 +217,300 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
     }
     edit_targets(engine, targets, operation.get("scope"), |mesh| {
         let selected = selected_faces(mesh, elements.as_ref())?;
-        let mut uv_map = read_uv_map(mesh)?;
-        if uv_map.is_empty() {
-            return Err(PotError::new(
-                ErrorCode::InvalidOperation,
-                "uv.pack requires an existing UV map",
-            ));
+        edit_layer_map(mesh, layer.as_deref(), false, |_, uv_map| {
+            pack_selected_uvs(uv_map, &selected, margin)
+        })
+    })
+}
+
+fn layer_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
+    check_fields(
+        engine,
+        operation,
+        &["op", "target", "scope", "name"],
+        &["target"],
+    )?;
+    let (targets, elements) = selected_targets(engine, operation)?;
+    reject_elements(engine, elements.as_ref())?;
+    let requested = operation
+        .contains_key("name")
+        .then(|| layer_name(engine, operation, "name"))
+        .transpose()?;
+    edit_targets(engine, targets, operation.get("scope"), |mesh| {
+        let mut store = uv_layers::read(mesh);
+        if store.layers.len() >= uv_layers::MAX_LAYERS {
+            return Err(layer_limit());
         }
-        pack_selected_uvs(&mut uv_map, &selected, margin)?;
-        write_uv_map(mesh, &uv_map);
+        let name = match &requested {
+            Some(name) if store.index_of(name).is_some() => return Err(layer_exists(name)),
+            Some(name) => name.clone(),
+            None => unnamed_layer_name(&store)?,
+        };
+        // Blender copies the active layer's values; corners without a source value get [0, 0].
+        let source = store
+            .active
+            .as_deref()
+            .and_then(|active| store.index_of(active))
+            .and_then(|index| store.layers.get(index))
+            .map(|layer| layer.faces.clone());
+        let faces: Vec<Option<Vec<[f64; 2]>>> = mesh
+            .faces
+            .iter()
+            .enumerate()
+            .map(|(index, face)| {
+                let copied = source
+                    .as_ref()
+                    .and_then(|faces| faces.get(index).cloned().flatten());
+                Some(copied.unwrap_or_else(|| vec![[0.0, 0.0]; face.vertices.len()]))
+            })
+            .collect();
+        let first = store.layers.is_empty();
+        store.layers.push(UvLayer::new(name.clone(), faces));
+        if first {
+            store.active = Some(name.clone());
+            store.render = Some(name);
+        }
+        uv_layers::write(mesh, &store);
         Ok(())
     })
+}
+
+fn layer_delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
+    check_fields(
+        engine,
+        operation,
+        &["op", "target", "scope", "name"],
+        &["target", "name"],
+    )?;
+    let (targets, elements) = selected_targets(engine, operation)?;
+    reject_elements(engine, elements.as_ref())?;
+    let name = layer_name(engine, operation, "name")?;
+    let referrers = layer_referrers(engine.doc, &name);
+    if !referrers.is_empty() {
+        let mut error = engine.error(
+            ErrorCode::InvalidOperation,
+            format!("UV layer `{name}` is used by {}", referrers.join(", ")),
+            "/name",
+        );
+        error.details["referrers"] = json!(referrers);
+        return Err(feature(error, "uv.layer_in_use"));
+    }
+    edit_targets(engine, targets, operation.get("scope"), |mesh| {
+        let mut store = uv_layers::read(mesh);
+        let index = store
+            .index_of(&name)
+            .ok_or_else(|| layer_missing(Some(&name)))?;
+        // Blender keeps the numeric active and render indices, clamped to the new last layer.
+        let active = store
+            .active
+            .as_deref()
+            .and_then(|active| store.index_of(active));
+        let render = store
+            .render
+            .as_deref()
+            .and_then(|render| store.index_of(render));
+        store.layers.remove(index);
+        store.active = clamped_layer_name(&store, active);
+        store.render = clamped_layer_name(&store, render);
+        uv_layers::write(mesh, &store);
+        Ok(())
+    })
+}
+
+fn layer_rename(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
+    check_fields(
+        engine,
+        operation,
+        &["op", "target", "scope", "name", "to"],
+        &["target", "name", "to"],
+    )?;
+    let (targets, elements) = selected_targets(engine, operation)?;
+    reject_elements(engine, elements.as_ref())?;
+    let name = layer_name(engine, operation, "name")?;
+    let to = layer_name(engine, operation, "to")?;
+    let changed = edit_targets(engine, targets, operation.get("scope"), |mesh| {
+        let mut store = uv_layers::read(mesh);
+        let index = store
+            .index_of(&name)
+            .ok_or_else(|| layer_missing(Some(&name)))?;
+        if store
+            .index_of(&to)
+            .is_some_and(|existing| existing != index)
+        {
+            return Err(layer_exists(&to));
+        }
+        if let Some(layer) = store.layers.get_mut(index) {
+            layer.name.clone_from(&to);
+        }
+        if store.active.as_deref() == Some(name.as_str()) {
+            store.active = Some(to.clone());
+        }
+        if store.render.as_deref() == Some(name.as_str()) {
+            store.render = Some(to.clone());
+        }
+        uv_layers::write(mesh, &store);
+        Ok(())
+    })?;
+    let references = rename_layer_references(engine.doc, &name, &to);
+    for id in &references.materials {
+        engine.mark("materials", id, ChangeKind::Updated);
+    }
+    for id in &references.nodes {
+        engine.mark("nodes", id, ChangeKind::Updated);
+    }
+    for id in &references.node_groups {
+        engine.mark("node_groups", id, ChangeKind::Updated);
+    }
+    if references.avatar {
+        engine.changes.avatar = true;
+    }
+    Ok(changed || !references.is_empty())
+}
+
+#[derive(Clone, Copy)]
+enum LayerRole {
+    Active,
+    Render,
+}
+
+fn layer_set_role(
+    engine: &mut Engine<'_>,
+    operation: &Map<String, Value>,
+    role: LayerRole,
+) -> Result<bool> {
+    check_fields(
+        engine,
+        operation,
+        &["op", "target", "scope", "name"],
+        &["target", "name"],
+    )?;
+    let (targets, elements) = selected_targets(engine, operation)?;
+    reject_elements(engine, elements.as_ref())?;
+    let name = layer_name(engine, operation, "name")?;
+    edit_targets(engine, targets, operation.get("scope"), |mesh| {
+        let mut store = uv_layers::read(mesh);
+        if store.index_of(&name).is_none() {
+            return Err(layer_missing(Some(&name)));
+        }
+        match role {
+            LayerRole::Active => store.active = Some(name.clone()),
+            LayerRole::Render => store.render = Some(name.clone()),
+        }
+        uv_layers::write(mesh, &store);
+        Ok(())
+    })
+}
+
+/// Tags `error` with the UV-layer contract it reports (`feature_id`).
+fn feature(mut error: PotError, feature_id: &str) -> PotError {
+    error.details["feature_id"] = json!(feature_id);
+    error
+}
+
+/// `uv.layer_missing`: the named layer does not exist, or the mesh has no UV layers.
+pub(super) fn layer_missing(name: Option<&str>) -> PotError {
+    let message = match name {
+        Some(name) => format!("UV layer `{name}` was not found"),
+        None => "mesh has no UV layers".to_owned(),
+    };
+    feature(
+        PotError::new(ErrorCode::InvalidOperation, message),
+        "uv.layer_missing",
+    )
+}
+
+/// `uv.layer_exists`: a create or rename wanted a name that another layer already has (D-U5).
+fn layer_exists(name: &str) -> PotError {
+    feature(
+        PotError::new(
+            ErrorCode::InvalidOperation,
+            format!("UV layer `{name}` already exists"),
+        ),
+        "uv.layer_exists",
+    )
+}
+
+/// `uv.layer_limit`: the mesh already stores the maximum number of UV layers.
+pub(super) fn layer_limit() -> PotError {
+    feature(
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            format!(
+                "mesh already has {} UV layers, the limit",
+                uv_layers::MAX_LAYERS
+            ),
+        ),
+        "uv.layer_limit",
+    )
+}
+
+/// Blender's name for an unnamed layer: `UVMap`, then the first free `UVMap.001` to `UVMap.999`.
+fn unnamed_layer_name(store: &UvStore) -> Result<String> {
+    if store.index_of(DEFAULT_LAYER_NAME).is_none() {
+        return Ok(DEFAULT_LAYER_NAME.to_owned());
+    }
+    (1..=999)
+        .map(|number| format!("{DEFAULT_LAYER_NAME}.{number:03}"))
+        .find(|candidate| store.index_of(candidate).is_none())
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "no free UV layer name below UVMap.999",
+            )
+        })
+}
+
+/// The layer at numeric position `position`, clamped to the last layer. `None` once no layer is left.
+fn clamped_layer_name(store: &UvStore, position: Option<usize>) -> Option<String> {
+    let last = store.layers.len().checked_sub(1)?;
+    store
+        .layers
+        .get(position?.min(last))
+        .map(|layer| layer.name.clone())
+}
+
+/// A required non-empty layer name field.
+fn layer_name(engine: &Engine<'_>, operation: &Map<String, Value>, key: &str) -> Result<String> {
+    let pointer = format!("/{key}");
+    let name = operation.get(key).and_then(Value::as_str).ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            format!("{key} must be a string"),
+            &pointer,
+        )
+    })?;
+    if name.is_empty() {
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            format!("{key} must not be empty"),
+            &pointer,
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn reject_elements(engine: &Engine<'_>, elements: Option<&Value>) -> Result<()> {
+    if elements.is_some() {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "UV layer operations do not take elements",
+            "/elements",
+        ));
+    }
+    Ok(())
+}
+
+/// The optional `uv_layer` name of a UV operation. Absent means the active layer.
+fn uv_layer_field(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result<Option<String>> {
+    match operation.get("uv_layer") {
+        None => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.clone())),
+        Some(_) => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "uv_layer must be a string",
+            "/uv_layer",
+        )),
+    }
 }
 
 fn selected_targets(
@@ -234,6 +539,250 @@ fn selected_targets(
     let elements = operation.get("elements").cloned().or(nested_elements);
     let targets = resolve_node_targets(engine, &Value::Object(target_without_elements), true)?;
     Ok((targets, elements))
+}
+
+/// Runs `edit` on the face map of one UV layer of `mesh` and stores the result. `requested` names
+/// the layer; `None` is the active layer. With `create_default`, a mesh with no layers gets `UVMap`,
+/// which becomes active and render.
+fn edit_layer_map(
+    mesh: &mut Mesh,
+    requested: Option<&str>,
+    create_default: bool,
+    edit: impl FnOnce(&Mesh, &mut UvMap) -> Result<()>,
+) -> Result<()> {
+    let mut store = uv_layers::read(mesh);
+    let index = if create_default && requested.is_none() && store.layers.is_empty() {
+        store.layers.push(UvLayer::new(
+            DEFAULT_LAYER_NAME,
+            vec![None; mesh.faces.len()],
+        ));
+        store.active = Some(DEFAULT_LAYER_NAME.to_owned());
+        store.render = Some(DEFAULT_LAYER_NAME.to_owned());
+        0
+    } else {
+        layer_index(&store, requested)?
+    };
+    let layer = store
+        .layers
+        .get_mut(index)
+        .ok_or_else(|| layer_missing(requested))?;
+    let mut uv_map = layer_uv_map(mesh, layer);
+    edit(&*mesh, &mut uv_map)?;
+    set_layer_uv_map(mesh, layer, &uv_map);
+    uv_layers::write(mesh, &store);
+    Ok(())
+}
+
+/// Position of the layer `requested` names, or of the active layer when `requested` is `None`.
+fn layer_index(store: &UvStore, requested: Option<&str>) -> Result<usize> {
+    let index = match requested {
+        Some(name) => store.index_of(name),
+        None => store
+            .active
+            .as_deref()
+            .and_then(|active| store.index_of(active)),
+    };
+    index.ok_or_else(|| layer_missing(requested))
+}
+
+/// Material and `MToon` texture slots, by field name. The referrer scan and rename share these lists.
+fn material_textures(material: &Material) -> [(&'static str, Option<&TextureRef>); 4] {
+    [
+        ("base_color_texture", material.base_color_texture.as_ref()),
+        ("roughness_texture", material.roughness_texture.as_ref()),
+        ("metallic_texture", material.metallic_texture.as_ref()),
+        ("normal_texture", material.normal_texture.as_ref()),
+    ]
+}
+
+fn material_textures_mut(material: &mut Material) -> [(&'static str, Option<&mut TextureRef>); 4] {
+    [
+        ("base_color_texture", material.base_color_texture.as_mut()),
+        ("roughness_texture", material.roughness_texture.as_mut()),
+        ("metallic_texture", material.metallic_texture.as_mut()),
+        ("normal_texture", material.normal_texture.as_mut()),
+    ]
+}
+
+fn mtoon_textures(mtoon: &AvatarMtoon) -> [(&'static str, Option<&TextureRef>); 6] {
+    [
+        (
+            "shade_multiply_texture",
+            mtoon.shade_multiply_texture.as_ref(),
+        ),
+        (
+            "shading_shift_texture",
+            mtoon
+                .shading_shift_texture
+                .as_ref()
+                .map(|shift| &shift.texture),
+        ),
+        ("matcap_texture", mtoon.matcap_texture.as_ref()),
+        ("rim_multiply_texture", mtoon.rim_multiply_texture.as_ref()),
+        (
+            "outline_width_multiply_texture",
+            mtoon.outline_width_multiply_texture.as_ref(),
+        ),
+        (
+            "uv_animation_mask_texture",
+            mtoon.uv_animation_mask_texture.as_ref(),
+        ),
+    ]
+}
+
+fn mtoon_textures_mut(mtoon: &mut AvatarMtoon) -> [(&'static str, Option<&mut TextureRef>); 6] {
+    [
+        (
+            "shade_multiply_texture",
+            mtoon.shade_multiply_texture.as_mut(),
+        ),
+        (
+            "shading_shift_texture",
+            mtoon
+                .shading_shift_texture
+                .as_mut()
+                .map(|shift| &mut shift.texture),
+        ),
+        ("matcap_texture", mtoon.matcap_texture.as_mut()),
+        ("rim_multiply_texture", mtoon.rim_multiply_texture.as_mut()),
+        (
+            "outline_width_multiply_texture",
+            mtoon.outline_width_multiply_texture.as_mut(),
+        ),
+        (
+            "uv_animation_mask_texture",
+            mtoon.uv_animation_mask_texture.as_mut(),
+        ),
+    ]
+}
+
+/// Describes every stored reference to the UV layer `name`: material and `MToon` textures, graph
+/// `ShaderNodeUVMap` nodes, and modifier params. References are name-based and matched scene-wide.
+fn layer_referrers(doc: &SceneDoc, name: &str) -> Vec<String> {
+    let mut referrers = Vec::new();
+    for (material_id, material) in &doc.materials {
+        for (field, texture) in material_textures(material) {
+            if texture.and_then(|texture| texture.uv_layer.as_deref()) == Some(name) {
+                referrers.push(format!("material `{material_id}` {field}"));
+            }
+        }
+    }
+    if let Some(avatar) = &doc.avatar {
+        for (material_id, mtoon) in &avatar.mtoon {
+            for (field, texture) in mtoon_textures(mtoon) {
+                if texture.and_then(|texture| texture.uv_layer.as_deref()) == Some(name) {
+                    referrers.push(format!("avatar MToon `{material_id}` {field}"));
+                }
+            }
+        }
+    }
+    for (node_id, node) in &doc.nodes {
+        for modifier in &node.modifiers {
+            for key in MODIFIER_LAYER_PARAMS {
+                if modifier.params.get(key).and_then(Value::as_str) == Some(name) {
+                    referrers.push(format!(
+                        "modifier `{}` on node `{node_id}` param {key}",
+                        modifier.id
+                    ));
+                }
+            }
+        }
+    }
+    for (group_id, group) in &doc.node_groups {
+        for (node_id, node) in &group.nodes {
+            if node.node_type == "ShaderNodeUVMap"
+                && node.properties.get("uv_map").and_then(Value::as_str) == Some(name)
+            {
+                referrers.push(format!(
+                    "ShaderNodeUVMap node `{node_id}` in node group `{group_id}` property `uv_map`"
+                ));
+            }
+        }
+    }
+    referrers
+}
+
+/// Objects whose stored layer references a rename changed.
+#[derive(Default)]
+struct ReferenceChanges {
+    materials: Vec<Id>,
+    nodes: Vec<Id>,
+    node_groups: Vec<Id>,
+    avatar: bool,
+}
+
+impl ReferenceChanges {
+    fn is_empty(&self) -> bool {
+        self.materials.is_empty()
+            && self.nodes.is_empty()
+            && self.node_groups.is_empty()
+            && !self.avatar
+    }
+}
+
+/// Renames every stored reference to the layer `from` so that it names `to`.
+fn rename_layer_references(doc: &mut SceneDoc, from: &str, to: &str) -> ReferenceChanges {
+    let mut changes = ReferenceChanges::default();
+    if from == to {
+        return changes;
+    }
+    for (material_id, material) in &mut doc.materials {
+        let mut changed = false;
+        for (_, texture) in material_textures_mut(material) {
+            if let Some(texture) = texture
+                && texture.uv_layer.as_deref() == Some(from)
+            {
+                texture.uv_layer = Some(to.to_owned());
+                changed = true;
+            }
+        }
+        if changed {
+            changes.materials.push(material_id.clone());
+        }
+    }
+    if let Some(avatar) = &mut doc.avatar {
+        for mtoon in avatar.mtoon.values_mut() {
+            for (_, texture) in mtoon_textures_mut(mtoon) {
+                if let Some(texture) = texture
+                    && texture.uv_layer.as_deref() == Some(from)
+                {
+                    texture.uv_layer = Some(to.to_owned());
+                    changes.avatar = true;
+                }
+            }
+        }
+    }
+    for (node_id, node) in &mut doc.nodes {
+        let mut changed = false;
+        for modifier in &mut node.modifiers {
+            for key in MODIFIER_LAYER_PARAMS {
+                if let Some(value) = modifier.params.get_mut(key)
+                    && value.as_str() == Some(from)
+                {
+                    *value = json!(to);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            changes.nodes.push(node_id.clone());
+        }
+    }
+    for (group_id, group) in &mut doc.node_groups {
+        let mut changed = false;
+        for node in group.nodes.values_mut() {
+            if node.node_type == "ShaderNodeUVMap"
+                && node.properties.get("uv_map").and_then(Value::as_str) == Some(from)
+            {
+                node.properties.insert("uv_map".to_owned(), json!(to));
+                changed = true;
+            }
+        }
+        if changed {
+            changes.node_groups.push(group_id.clone());
+        }
+    }
+    changes
 }
 
 fn edit_targets(
@@ -1282,97 +1831,32 @@ struct UvFace {
 
 type UvMap = std::collections::BTreeMap<u32, UvFace>;
 
-fn read_uv_map(mesh: &Mesh) -> Result<UvMap> {
-    let mut result = UvMap::new();
-    let entries = match mesh.attributes.get("uv_map") {
-        None => return Ok(result),
-        Some(Value::Array(entries)) => entries,
-        Some(_) => {
-            return Err(PotError::new(
-                ErrorCode::SceneInvalid,
-                "uv_map must be an array",
-            ));
-        }
-    };
-    for entry in entries {
-        let face_id = entry
-            .get("face_id")
-            .and_then(Value::as_u64)
-            .and_then(|id| u32::try_from(id).ok())
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "uv_map contains an invalid face ID",
-                )
-            })?;
-        let coords = entry.get("uv").and_then(Value::as_array).ok_or_else(|| {
-            PotError::new(ErrorCode::SceneInvalid, "uv_map entry has no corner array")
-        })?;
-        let mut corners = Vec::with_capacity(coords.len());
-        for coord in coords {
-            let pair = coord
-                .as_array()
-                .filter(|pair| pair.len() == 2)
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "UV corner must contain two coordinates",
-                    )
-                })?;
-            let u = pair[0].as_f64().ok_or_else(|| {
-                PotError::new(ErrorCode::SceneInvalid, "UV coordinate must be numeric")
-            })?;
-            let v = pair[1].as_f64().ok_or_else(|| {
-                PotError::new(ErrorCode::SceneInvalid, "UV coordinate must be numeric")
-            })?;
-            corners.push([u, v]);
-        }
-        let pinned = entry
-            .get("pinned")
-            .map(|value| {
-                let values = value.as_array().ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "UV pin data must be an array")
-                })?;
-                if values.len() != corners.len() {
-                    return Err(PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "UV pin count must match the corner count",
-                    ));
-                }
-                values
-                    .iter()
-                    .map(|value| {
-                        value.as_bool().ok_or_else(|| {
-                            PotError::new(ErrorCode::SceneInvalid, "UV pin values must be boolean")
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?;
-        result.insert(
-            face_id,
-            UvFace {
-                uv: corners,
-                pinned,
-            },
-        );
-    }
-    Ok(result)
+/// The face map of one stored layer, keyed by face ID. Storage face index `i` of `layer` is
+/// `mesh.faces[i]`; faces without an entry are absent.
+fn layer_uv_map(mesh: &Mesh, layer: &UvLayer) -> UvMap {
+    mesh.faces
+        .iter()
+        .enumerate()
+        .filter_map(|(index, face)| {
+            let uv = layer.faces.get(index)?.clone()?;
+            let pinned = layer.pinned.get(index).cloned().flatten();
+            Some((face.id, UvFace { uv, pinned }))
+        })
+        .collect()
 }
 
-fn write_uv_map(mesh: &mut Mesh, uv_map: &UvMap) {
-    let entries = uv_map
+/// Stores `uv_map` as the faces of `layer`. Face ID rows go to their storage face index.
+fn set_layer_uv_map(mesh: &Mesh, layer: &mut UvLayer, uv_map: &UvMap) {
+    for ((face, faces), pinned) in mesh
+        .faces
         .iter()
-        .map(|(face_id, face_uv)| {
-            let mut entry = json!({"face_id":face_id,"uv":face_uv.uv});
-            if let Some(pinned) = &face_uv.pinned {
-                entry["pinned"] = json!(pinned);
-            }
-            entry
-        })
-        .collect::<Vec<_>>();
-    mesh.attributes
-        .insert("uv_map".to_owned(), Value::Array(entries));
+        .zip(layer.faces.iter_mut())
+        .zip(layer.pinned.iter_mut())
+    {
+        let entry = uv_map.get(&face.id);
+        *faces = entry.map(|face_uv| face_uv.uv.clone());
+        *pinned = entry.and_then(|face_uv| face_uv.pinned.clone());
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1587,6 +2071,11 @@ mod tests {
 
     use super::*;
 
+    /// A `uv_layers` attribute holding one layer named `UVMap`, active and render.
+    fn uv_layers_attribute(entries: &[Value]) -> Value {
+        json!({"layers":[{"name":"UVMap","faces":entries}],"active":"UVMap","render":"UVMap"})
+    }
+
     fn document_with_uvs(rectangles: &[(f64, f64)]) -> crate::model::SceneDoc {
         let initial = crate::model::SceneDoc::new("scene-test".to_owned());
         let outcome = super::super::apply_batch(
@@ -1627,7 +2116,8 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        mesh.attributes.insert("uv_map".to_owned(), json!(entries));
+        mesh.attributes
+            .insert("uv_layers".to_owned(), uv_layers_attribute(&entries));
         doc
     }
 
@@ -1710,7 +2200,7 @@ mod tests {
 
     fn uv_entries(doc: &crate::model::SceneDoc) -> Vec<Value> {
         let data_id = Id::new("body_mesh").unwrap();
-        doc.data_blocks[&data_id].mesh.as_ref().unwrap().attributes["uv_map"]
+        doc.data_blocks[&data_id].mesh.as_ref().unwrap().attributes["uv_layers"]["layers"][0]["faces"]
             .as_array()
             .unwrap()
             .clone()
@@ -1822,10 +2312,11 @@ mod tests {
             .id;
         let mut seam_values = serde_json::Map::new();
         seam_values.insert(format!("e{seam_edge_id}"), json!(true));
-        mesh.attributes.insert("uv_map".to_owned(), json!(entries));
+        mesh.attributes
+            .insert("uv_layers".to_owned(), uv_layers_attribute(&entries));
         mesh.attributes.insert(
             "seam".to_owned(),
-            json!({"domain":"edge","values":seam_values}),
+            json!({"domain":"edge","type":"bool","values":seam_values}),
         );
         run_uv(
             &mut doc,
@@ -1997,5 +2488,260 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(unpinned, vec![json!(false); 4]);
+    }
+
+    fn uv_store(doc: &crate::model::SceneDoc) -> Value {
+        let data_id = Id::new("body_mesh").unwrap();
+        doc.data_blocks[&data_id].mesh.as_ref().unwrap().attributes["uv_layers"].clone()
+    }
+
+    fn layer_names(doc: &crate::model::SceneDoc) -> Vec<String> {
+        uv_store(doc)["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|layer| layer["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn feature_of(error: &PotError) -> Option<&str> {
+        error.details["feature_id"].as_str()
+    }
+
+    fn create_layer(doc: &mut crate::model::SceneDoc, name: Option<&str>) -> Result<bool> {
+        let mut operation = json!({"op":"uv.layer_create","target":{"id":"body"}});
+        if let Some(name) = name {
+            operation["name"] = json!(name);
+        }
+        run_uv(doc, operation)
+    }
+
+    #[test]
+    fn layers_create_rename_and_select_by_name() {
+        let mut doc = document_with_planar_grid();
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.unwrap","target":{"id":"body"},"method":"box"}),
+        )
+        .unwrap();
+        assert_eq!(uv_store(&doc)["active"], json!("UVMap"));
+        assert_eq!(uv_store(&doc)["render"], json!("UVMap"));
+
+        create_layer(&mut doc, None).unwrap();
+        create_layer(&mut doc, None).unwrap();
+        create_layer(&mut doc, Some("Detail")).unwrap();
+        assert_eq!(
+            layer_names(&doc),
+            ["UVMap", "UVMap.001", "UVMap.002", "Detail"]
+        );
+        assert_eq!(
+            uv_store(&doc)["active"],
+            json!("UVMap"),
+            "a later layer leaves the active and render layers unchanged"
+        );
+
+        let taken = create_layer(&mut doc, Some("Detail")).unwrap_err();
+        assert_eq!(feature_of(&taken), Some("uv.layer_exists"));
+        let clash = run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_rename","target":{"id":"body"},"name":"Detail","to":"UVMap"}),
+        )
+        .unwrap_err();
+        assert_eq!(feature_of(&clash), Some("uv.layer_exists"));
+
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_rename","target":{"id":"body"},"name":"Detail","to":"Lightmap"}),
+        )
+        .unwrap();
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_set_render","target":{"id":"body"},"name":"Lightmap"}),
+        )
+        .unwrap();
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_set_active","target":{"id":"body"},"name":"UVMap.001"}),
+        )
+        .unwrap();
+        assert_eq!(
+            layer_names(&doc),
+            ["UVMap", "UVMap.001", "UVMap.002", "Lightmap"]
+        );
+        assert_eq!(uv_store(&doc)["render"], json!("Lightmap"));
+        assert_eq!(uv_store(&doc)["active"], json!("UVMap.001"));
+    }
+
+    #[test]
+    fn layer_delete_refuses_referenced_layers_and_clamps_positions() {
+        let initial = crate::model::SceneDoc::new("scene-test".to_owned());
+        let outcome = super::super::apply_batch(
+            &initial,
+            &json!({
+                "schema_version": 1,
+                "base_revision": initial.revision,
+                "operations": [
+                    {"op":"node.create","id":"body","kind":"box","params":{"size":1.0}},
+                    {"op":"material.create","id":"surface"}
+                ]
+            }),
+        )
+        .unwrap();
+        let mut doc = outcome.doc;
+        let surface = Id::new("surface").unwrap();
+        doc.materials.get_mut(&surface).unwrap().roughness_texture =
+            Some(crate::model::TextureRef {
+                image: Id::new("paint").unwrap(),
+                uv_layer: Some("Mid".to_owned()),
+                interpolation: crate::image::ImageInterpolation::Linear,
+            });
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.unwrap","target":{"id":"body"},"method":"box"}),
+        )
+        .unwrap();
+        create_layer(&mut doc, Some("Mid")).unwrap();
+        create_layer(&mut doc, Some("Top")).unwrap();
+        doc.nodes
+            .get_mut(&Id::new("body").unwrap())
+            .unwrap()
+            .modifiers
+            .push(crate::model::Modifier {
+                id: Id::new("uv_project").unwrap(),
+                modifier_type: "uv_project".to_owned(),
+                name: "UV Project".to_owned(),
+                enabled: true,
+                params: serde_json::Map::from_iter([("uv_layer".to_owned(), json!("Mid"))]),
+                binding_data: None,
+                runtime: crate::model::ModifierRuntime::default(),
+            });
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_set_render","target":{"id":"body"},"name":"Top"}),
+        )
+        .unwrap();
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_set_active","target":{"id":"body"},"name":"Top"}),
+        )
+        .unwrap();
+        let graph_id = Id::new("surface_graph").unwrap();
+        let uv_node_id = Id::new("uv_input").unwrap();
+        let mut graph = crate::graph::NodeGroup::new("Surface", crate::graph::GraphKind::Shader);
+        let mut uv_node = crate::graph::GraphNode::new("ShaderNodeUVMap");
+        uv_node.properties.insert("uv_map".to_owned(), json!("Top"));
+        graph.nodes.insert(uv_node_id.clone(), uv_node);
+        doc.node_groups.insert(graph_id.clone(), graph);
+        doc.materials.get_mut(&surface).unwrap().node_tree = Some(graph_id.clone());
+
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_rename","target":{"id":"body"},"name":"Mid","to":"Center"}),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.materials[&surface]
+                .roughness_texture
+                .as_ref()
+                .unwrap()
+                .uv_layer
+                .as_deref(),
+            Some("Center"),
+            "rename updates the texture reference in the same operation"
+        );
+        assert_eq!(
+            doc.nodes[&Id::new("body").unwrap()].modifiers[0].params["uv_layer"],
+            json!("Center"),
+            "rename updates modifier UV layer references"
+        );
+
+        let refused = run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_delete","target":{"id":"body"},"name":"Center"}),
+        )
+        .unwrap_err();
+        assert_eq!(feature_of(&refused), Some("uv.layer_in_use"));
+        assert!(
+            refused.details["referrers"][0]
+                .as_str()
+                .unwrap()
+                .contains("surface")
+        );
+        assert!(
+            refused.details["referrers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|referrer| referrer.as_str().unwrap().contains("modifier `uv_project`"))
+        );
+        let graph_refused = run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_delete","target":{"id":"body"},"name":"Top"}),
+        )
+        .unwrap_err();
+        assert_eq!(feature_of(&graph_refused), Some("uv.layer_in_use"));
+        assert!(
+            graph_refused.details["referrers"][0]
+                .as_str()
+                .unwrap()
+                .contains("surface_graph")
+        );
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_rename","target":{"id":"body"},"name":"Top","to":"Top2"}),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.node_groups[&graph_id].nodes[&uv_node_id].properties["uv_map"],
+            json!("Top2")
+        );
+
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.layer_delete","target":{"id":"body"},"name":"UVMap"}),
+        )
+        .unwrap();
+        assert_eq!(layer_names(&doc), ["Center", "Top2"]);
+        assert_eq!(
+            uv_store(&doc)["active"],
+            json!("Top2"),
+            "index 2 clamps to 1"
+        );
+        assert_eq!(
+            uv_store(&doc)["render"],
+            json!("Top2"),
+            "index 2 clamps to 1"
+        );
+    }
+
+    #[test]
+    fn layers_require_existing_names_and_stop_at_eight() {
+        let mut doc = document_with_planar_grid();
+        let missing = run_uv(
+            &mut doc,
+            json!({"op":"uv.transform","target":{"id":"body"},"translation":[1.0,0.0]}),
+        )
+        .unwrap_err();
+        assert_eq!(feature_of(&missing), Some("uv.layer_missing"));
+
+        run_uv(
+            &mut doc,
+            json!({"op":"uv.unwrap","target":{"id":"body"},"method":"box"}),
+        )
+        .unwrap();
+        let unknown = run_uv(
+            &mut doc,
+            json!({"op":"uv.pack","target":{"id":"body"},"uv_layer":"Nope"}),
+        )
+        .unwrap_err();
+        assert_eq!(feature_of(&unknown), Some("uv.layer_missing"));
+
+        for _ in 1..uv_layers::MAX_LAYERS {
+            create_layer(&mut doc, None).unwrap();
+        }
+        assert_eq!(layer_names(&doc).len(), uv_layers::MAX_LAYERS);
+        let limit = create_layer(&mut doc, None).unwrap_err();
+        assert!(matches!(limit.code, ErrorCode::LimitExceeded));
+        assert_eq!(feature_of(&limit), Some("uv.layer_limit"));
     }
 }

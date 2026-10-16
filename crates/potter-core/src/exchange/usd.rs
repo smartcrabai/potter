@@ -647,21 +647,7 @@ fn write_mesh(
             normals.join(", ")
         ),
     );
-    let uv = generated_uvs(positions);
-    let uv = uv
-        .iter()
-        .map(|value| -> Result<String> {
-            Ok(format!("({}, {})", number(value[0])?, number(value[1])?))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    line(
-        output,
-        &format!(
-            "{}texCoord2f[] primvars:st = [{}] (interpolation = \"vertex\")",
-            spaces(d),
-            uv.join(", ")
-        ),
-    );
+    write_uv_primvars(output, exchange, d)?;
     line(
         output,
         &format!(
@@ -3076,28 +3062,60 @@ fn integral_index(value: f64) -> Result<usize> {
     Ok(value as usize)
 }
 
-fn generated_uvs(points: &[[f64; 3]]) -> Vec<[f64; 2]> {
-    let mut min = [f64::INFINITY; 2];
-    let mut max = [f64::NEG_INFINITY; 2];
-    for point in points {
-        for axis in 0..2 {
-            min[axis] = min[axis].min(point[axis]);
-            max[axis] = max[axis].max(point[axis]);
+/// Writes each UV layer as an indexed `faceVarying` primvar. Blender's USD exporter layout: the
+/// render layer is `primvars:st` and every other layer is `primvars:<layer name>`. Each primvar
+/// holds its distinct values in first-use order, and `:indices` gives every corner's value. Storage
+/// V points down; USD's V points up, as in Blender, so `t` is flipped.
+fn write_uv_primvars(output: &mut String, exchange: &ExchangeMesh, depth: usize) -> Result<()> {
+    let mut names = BTreeSet::<String>::new();
+    for (index, layer) in exchange.uv_layers.iter().enumerate() {
+        let name = if Some(index) == exchange.uv_render {
+            "st".to_owned()
+        } else {
+            prim_identifier(&layer.name)
+        };
+        if !names.insert(name.clone()) {
+            return Err(PotError::with_details(
+                ErrorCode::ExportFailed,
+                "USD UV layer names collide after conversion to primvar names",
+                json!({ "layer": layer.name }),
+            ));
         }
-    }
-    points
-        .iter()
-        .map(|point| {
-            std::array::from_fn(|axis| {
-                let span = max[axis] - min[axis];
-                if span > 0.0 {
-                    (point[axis] - min[axis]) / span
-                } else {
-                    0.5
-                }
+        let mut values = Vec::<[f64; 2]>::new();
+        let mut lookup = BTreeMap::<[u64; 2], usize>::new();
+        let mut indices = Vec::<String>::new();
+        for uv in layer.corners.iter().flatten() {
+            let value = [uv[0], 1.0 - uv[1]];
+            let index = *lookup.entry(value.map(f64::to_bits)).or_insert_with(|| {
+                values.push(value);
+                values.len() - 1
+            });
+            indices.push(index.to_string());
+        }
+        let texcoords = values
+            .iter()
+            .map(|value| -> Result<String> {
+                Ok(format!("({}, {})", number(value[0])?, number(value[1])?))
             })
-        })
-        .collect()
+            .collect::<Result<Vec<String>>>()?;
+        line(
+            output,
+            &format!(
+                "{}texCoord2f[] primvars:{name} = [{}] (interpolation = \"faceVarying\")",
+                spaces(depth),
+                texcoords.join(", ")
+            ),
+        );
+        line(
+            output,
+            &format!(
+                "{}int[] primvars:{name}:indices = [{}]",
+                spaces(depth),
+                indices.join(", ")
+            ),
+        );
+    }
+    Ok(())
 }
 
 fn matrix4d(matrix: DMat4) -> Result<String> {
@@ -3483,4 +3501,37 @@ fn get_u32(bytes: &[u8], offset: usize) -> Result<u32> {
         .get(offset..offset.saturating_add(4))
         .ok_or_else(|| import_error("USDZ archive is truncated"))?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_uv_primvars;
+    use crate::{error::Result, exchange::test_support::triangle_with_layers};
+
+    #[test]
+    fn render_layer_is_st_and_other_layers_are_named_faces_indexed() -> Result<()> {
+        let mut output = String::new();
+        write_uv_primvars(&mut output, &triangle_with_layers(), 0)?;
+        // UVMap is the render layer; Lightmap keeps its name. Each has one value per corner, so
+        // the index arrays are 0, 1, 2 in corner order.
+        assert!(output.contains("texCoord2f[] primvars:st = ["), "{output}");
+        assert!(output.contains("int[] primvars:st:indices = [0, 1, 2]"));
+        assert!(output.contains("texCoord2f[] primvars:Lightmap = ["));
+        assert!(output.contains("int[] primvars:Lightmap:indices = [0, 1, 2]"));
+        assert!(output.contains("(interpolation = \"faceVarying\")"));
+        assert!(!output.contains("primvars:UVMap"));
+        Ok(())
+    }
+
+    #[test]
+    fn meshes_without_layers_write_no_primvars() -> Result<()> {
+        let mut mesh = triangle_with_layers();
+        mesh.uv_layers.clear();
+        mesh.uv_active = None;
+        mesh.uv_render = None;
+        let mut output = String::new();
+        write_uv_primvars(&mut output, &mesh, 0)?;
+        assert_eq!(output, "");
+        Ok(())
+    }
 }

@@ -1119,6 +1119,33 @@ pub fn feature_catalog() -> Value {
             [false, true, true, false, false, false, false],
         ),
         supported(
+            "uv.layers",
+            "Multiple UV layers per mesh with names, an active layer, and a render layer",
+            "UVMap",
+            &[
+                "uv.layer_create",
+                "uv.layer_delete",
+                "uv.layer_rename",
+                "uv.layer_set_active",
+                "uv.layer_set_render",
+            ],
+            [false, true, true, false, false, false, false],
+        ),
+        supported(
+            "mesh.uv_layer",
+            "UV layer store: up to eight named layers per mesh, carried to formats that can hold them",
+            "UVMap",
+            &["uv.layer_create", "uv.layer_delete", "uv.layer_rename"],
+            [false, true, true, false, false, false, false],
+        ),
+        supported(
+            "uv.layer_missing",
+            "Named UV layer that does not exist: an error for UV and paint ops, a render-layer fallback with a warning for stored references",
+            "UVMap",
+            &["uv.transform", "uv.pin", "uv.pack", "paint.texture"],
+            [false, false, true, false, false, false, false],
+        ),
+        supported(
             "animation.action_authoring",
             "Action authoring",
             "Action",
@@ -2069,7 +2096,7 @@ pub fn formats_catalog() -> Value {
             &[],
             &[
                 "Only the adapter's implemented GLTF feature subset is supported; unsupported source features are rejected or reported as losses.",
-                "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture samples on a non-default UV layer are reported as losses (material.texture_uv_set).",
+                "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture references to a missing UV layer fall back to the render layer and are reported as losses (uv.layer_missing).",
             ],
         ),
         format_row(
@@ -2087,7 +2114,7 @@ pub fn formats_catalog() -> Value {
             &[],
             &[
                 "Only the adapter's implemented GLTF feature subset is supported; unsupported source features are rejected or reported as losses.",
-                "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture samples on a non-default UV layer are reported as losses (material.texture_uv_set).",
+                "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture references to a missing UV layer fall back to the render layer and are reported as losses (uv.layer_missing).",
             ],
         ),
         vrm_format_row("vrm"),
@@ -2280,7 +2307,7 @@ fn vrm_format_row(format: &str) -> Value {
         &[],
         &[
             "Export: settings not representable by this VRM version are rejected during validation and export.",
-            "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture samples on a non-default UV layer are reported as losses (material.texture_uv_set).",
+            "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture references to a missing UV layer fall back to the render layer and are reported as losses (uv.layer_missing).",
             "Import: the file must carry the matching extension (VRMC_vrm for vrm, VRM for vrm0); a glTF extension Potter does not decode and a VRM feature Potter cannot hold are reported as losses (vrm.extension.*, vrm.meta.*, vrm.humanoid.*, vrm.expression.*, vrm.first_person.*, vrm.look_at, vrm.spring.*, vrm.mtoon.*).",
             "Import append: the avatar is not attached when the scene already has an avatar or an imported node, data, material or image ID already exists (vrm.avatar).",
         ],

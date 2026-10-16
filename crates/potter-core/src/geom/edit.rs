@@ -5,7 +5,13 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{PotError, Result},
-    geom::{Face, Mesh, MeshError, edge_key},
+    geom::{
+        Face, Mesh, MeshError, edge_key,
+        attribute_keys::storage_key,
+        clnor::{self, NormalCodeOptions, SetterInput},
+        color_layers::{self, ColorDomain, ColorLayer},
+        uv_layers::{self, UvLayer, UvStore},
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -346,7 +352,7 @@ fn resolve_selector(mesh: &Mesh, domain: Domain, value: &Value) -> Result<Vec<u3
                 .ok_or_else(|| invalid("attribute selector requires value"))?;
             let values = mesh
                 .attributes
-                .get(name)
+                .get(&*storage_key(name))
                 .and_then(Value::as_object)
                 .and_then(|attribute| attribute.get("values"))
                 .and_then(Value::as_object)
@@ -2238,11 +2244,10 @@ fn attribute_type(value: &Value) -> Result<&'static str> {
         Some("float2") => Ok("float2"),
         Some("float3") => Ok("float3"),
         Some("color") => Ok("color"),
-        Some("byte_color") => Ok("byte_color"),
         Some("bool") => Ok("bool"),
         Some("quaternion") => Ok("quaternion"),
         _ => Err(invalid(
-            "attribute type must be float, int, float2, float3, color, byte_color, bool, or quaternion",
+            "attribute type must be float, int, float2, float3, color, bool, or quaternion",
         )),
     }
 }
@@ -2254,7 +2259,6 @@ fn default_attribute_value(attribute_type: &str) -> Value {
         "float2" => json!([0.0, 0.0]),
         "float3" => json!([0.0, 0.0, 0.0]),
         "color" | "quaternion" => json!([0.0, 0.0, 0.0, 1.0]),
-        "byte_color" => json!([0, 0, 0, 255]),
         "bool" => json!(false),
         _ => Value::Null,
     }
@@ -2287,7 +2291,7 @@ fn validate_attribute_value(attribute_type: &str, value: &Value) -> Result<Value
         }
         "float2" => 2,
         "float3" => 3,
-        "color" | "byte_color" | "quaternion" => 4,
+        "color" | "quaternion" => 4,
         _ => return Err(invalid("unknown mesh attribute type")),
     };
     let values = value
@@ -2299,19 +2303,6 @@ fn validate_attribute_value(attribute_type: &str, value: &Value) -> Result<Value
             ))
         })?;
     match attribute_type {
-        "byte_color" => {
-            let mut output = Vec::with_capacity(4);
-            for component in values {
-                let value = component
-                    .as_u64()
-                    .filter(|value| u8::try_from(*value).is_ok())
-                    .ok_or_else(|| {
-                        invalid("byte_color components must be integers from 0 to 255")
-                    })?;
-                output.push(json!(value));
-            }
-            Ok(Value::Array(output))
-        }
         "quaternion" => {
             let mut components = [0.0; 4];
             for (index, component) in values.iter().enumerate() {
@@ -2353,13 +2344,65 @@ fn attribute_values_mut<'a>(mesh: &'a mut Mesh, name: &str) -> Result<&'a mut Ma
         .ok_or_else(|| invalid(format!("mesh attribute `{name}` has no values object")))
 }
 
+/// Reads one validated `[r, g, b, a]` value.
+fn color_components(value: &Value) -> Result<[f64; 4]> {
+    let components = value
+        .as_array()
+        .filter(|components| components.len() == 4)
+        .ok_or_else(|| invalid("color attribute values need 4 components"))?;
+    let mut color = [0.0; 4];
+    for (slot, component) in color.iter_mut().zip(components) {
+        *slot = component
+            .as_f64()
+            .ok_or_else(|| invalid("color components must be finite numbers"))?;
+    }
+    Ok(color)
+}
+
+/// Creates a native color attribute and registers it in the color layer store, which render and
+/// glTF read. The new layer goes last. It becomes the active or render layer only when the store
+/// has no layer for that role.
+fn create_color_layer(
+    mesh: &mut Mesh,
+    name: &str,
+    domain: ColorDomain,
+    default: &Value,
+) -> Result<()> {
+    let color = color_components(default)?;
+    let count: usize = match domain {
+        ColorDomain::Point => mesh.vertices.len(),
+        ColorDomain::Corner => mesh.faces.iter().map(|face| face.vertices.len()).sum(),
+    };
+    color_layers::validate(mesh)?;
+    let mut store = color_layers::read(mesh);
+    let active_unset = store
+        .active
+        .as_deref()
+        .and_then(|active| store.index_of(active))
+        .is_none();
+    let render_unset = store.render_index().is_none();
+    store.layers.push(ColorLayer {
+        name: name.to_owned(),
+        domain,
+        values: vec![color; count],
+    });
+    if active_unset {
+        store.active = Some(name.to_owned());
+    }
+    if render_unset {
+        store.render = Some(name.to_owned());
+    }
+    color_layers::write(mesh, &store);
+    Ok(())
+}
+
 fn apply_attribute_create(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
     let name = args
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_create requires a non-empty name"))?;
-    if mesh.attributes.contains_key(name) {
+    if mesh.attributes.contains_key(&*storage_key(name)) {
         return Err(invalid(format!("mesh attribute `{name}` already exists")));
     }
     let (domain_name, _) = attribute_domain(
@@ -2374,6 +2417,15 @@ fn apply_attribute_create(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         || Ok(default_attribute_value(attribute_type)),
         |value| validate_attribute_value(attribute_type, value),
     )?;
+    if attribute_type == "color" {
+        let domain = match domain_name {
+            "point" => ColorDomain::Point,
+            "corner" => ColorDomain::Corner,
+            _ => return Err(invalid("color attributes use the point or corner domain")),
+        };
+        create_color_layer(mesh, name, domain, &default)?;
+        return Ok(IdChanges::default());
+    }
     let mut values = Map::new();
     match domain_name {
         "point" => {
@@ -2402,7 +2454,7 @@ fn apply_attribute_create(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         _ => return Err(invalid("unsupported attribute domain")),
     }
     mesh.attributes.insert(
-        name.to_owned(),
+        storage_key(name).into_owned(),
         json!({"domain":domain_name, "type":attribute_type, "values":values}),
     );
     Ok(IdChanges::default())
@@ -2414,9 +2466,11 @@ fn apply_attribute_update(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_update requires a non-empty name"))?;
+    let storage = storage_key(name);
+    let key: &str = &storage;
     let attribute = mesh
         .attributes
-        .get(name)
+        .get(key)
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(format!("mesh attribute `{name}` does not exist")))?;
     let stored_domain = attribute
@@ -2457,7 +2511,7 @@ fn apply_attribute_update(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
             Ok((key, updated))
         })
         .collect::<Result<Vec<_>>>()?;
-    let values = attribute_values_mut(mesh, name)?;
+    let values = attribute_values_mut(mesh, key)?;
     for (key, updated) in updates {
         values.insert(key, updated);
     }
@@ -2470,17 +2524,35 @@ fn apply_attribute_delete(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_delete requires a non-empty name"))?;
-    if !mesh.attributes.contains_key(name) {
+    let storage = storage_key(name);
+    let key: &str = &storage;
+    if !mesh.attributes.contains_key(key) {
         return Err(invalid(format!("mesh attribute `{name}` does not exist")));
     }
+    let is_color = mesh.attributes[key].get("type").and_then(Value::as_str) == Some("color");
     let Some(elements) = args.get("elements") else {
-        mesh.attributes.remove(name);
+        if is_color {
+            // The registry owns a color layer's values, so dropping the layer from it removes them.
+            color_layers::validate(mesh)?;
+            let mut store = color_layers::read(mesh);
+            store.layers.retain(|layer| layer.name != name);
+            mesh.attributes.remove(key);
+            color_layers::write(mesh, &store);
+        } else {
+            mesh.attributes.remove(key);
+        }
         return Ok(IdChanges::default());
     };
+    if is_color {
+        // A color layer holds a value for every element, so selected elements reset to opaque black.
+        let mut reset = args.clone();
+        reset.insert("value".to_owned(), json!([0.0, 0.0, 0.0, 1.0]));
+        return apply_attribute_update(mesh, &reset);
+    }
     let mut selection_args = Map::new();
     selection_args.insert("elements".to_owned(), elements.clone());
     let selected = required_selection(mesh, &selection_args)?;
-    let attribute_domain_name = mesh.attributes[name]
+    let attribute_domain_name = mesh.attributes[key]
         .get("domain")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid(format!("mesh attribute `{name}` has no domain")))?;
@@ -2490,7 +2562,7 @@ fn apply_attribute_delete(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
             "mesh attribute `{name}` uses the {attribute_domain_name} domain"
         )));
     }
-    let values = attribute_values_mut(mesh, name)?;
+    let values = attribute_values_mut(mesh, key)?;
     for id in selected.ids {
         values.remove(&format!("{}{id}", domain.prefix()));
     }
@@ -2830,100 +2902,101 @@ fn interpolate_legacy_attribute(
     Ok(())
 }
 
-fn interpolate_uv_map(source: &Mesh, target: &mut Mesh) -> Result<()> {
-    let Some(source_entries) = source.attributes.get("uv_map") else {
+/// Interpolates every UV layer of `source` onto `target`, keeping layer order, names, and the
+/// active and render layers. A target face copies its source face's corners when both share the
+/// face ID; otherwise each corner takes the nearest source corner value. Ambiguous corners leave
+/// the face without an entry.
+fn interpolate_uv_layers(source: &Mesh, target: &mut Mesh) -> Result<()> {
+    let source_store = uv_layers::read(source);
+    if source_store.layers.is_empty() {
         return Ok(());
-    };
-    let source_entries = source_entries
-        .as_array()
-        .ok_or_else(|| invalid("uv_map must be an array"))?;
-    let entries_by_face: HashMap<u32, &Value> = source_entries
+    }
+    let source_index: HashMap<u32, usize> = source
+        .faces
         .iter()
-        .filter_map(|entry| Some((u32::try_from(entry.get("face_id")?.as_u64()?).ok()?, entry)))
+        .enumerate()
+        .map(|(index, face)| (face.id, index))
         .collect();
-    let has_pins = source_entries.iter().any(|entry| {
-        entry
-            .get("pinned")
-            .and_then(Value::as_array)
-            .is_some_and(|pinned| !pinned.is_empty())
-    });
-    let mut target_entries = Vec::with_capacity(target.faces.len());
-    for face in &target.faces {
-        if let Some(existing) = entries_by_face.get(&face.id)
-            && existing
-                .get("uv")
-                .and_then(Value::as_array)
-                .is_some_and(|uv| uv.len() == face.vertices.len())
-        {
-            target_entries.push((*existing).clone());
-            continue;
-        }
-        let mut uv = Vec::with_capacity(face.vertices.len());
-        let mut pinned = Vec::with_capacity(face.vertices.len());
-        for vertex_id in &face.vertices {
-            let position = target
-                .vertex(*vertex_id)
-                .ok_or_else(|| invalid("UV face references a missing vertex"))?
-                .co;
-            let mut candidates = Vec::new();
-            let mut nearest_pin: Option<(f64, bool)> = None;
-            for source_face in &source.faces {
-                let Some(entry) = entries_by_face.get(&source_face.id) else {
-                    continue;
-                };
-                let Some(corners) = entry
-                    .get("uv")
-                    .and_then(Value::as_array)
-                    .filter(|corners| corners.len() == source_face.vertices.len())
-                else {
-                    continue;
-                };
-                let pin_values = entry.get("pinned").and_then(Value::as_array);
-                for (index, source_vertex) in source_face.vertices.iter().enumerate() {
-                    let Some(source_vertex) = source.vertex(*source_vertex) else {
+    let mut layers = Vec::with_capacity(source_store.layers.len());
+    for source_layer in &source_store.layers {
+        let has_pins = source_layer
+            .pinned
+            .iter()
+            .any(|flags| flags.as_ref().is_some_and(|flags| !flags.is_empty()));
+        let mut layer = UvLayer::new(source_layer.name.clone(), vec![None; target.faces.len()]);
+        for (target_index, face) in target.faces.iter().enumerate() {
+            if let Some(&source_face) = source_index.get(&face.id)
+                && let Some(corners) = source_layer.faces[source_face].as_ref()
+                && corners.len() == face.vertices.len()
+            {
+                layer.faces[target_index] = Some(corners.clone());
+                layer.pinned[target_index].clone_from(&source_layer.pinned[source_face]);
+                continue;
+            }
+            let mut uv = Vec::with_capacity(face.vertices.len());
+            let mut pinned = Vec::with_capacity(face.vertices.len());
+            for vertex_id in &face.vertices {
+                let position = target
+                    .vertex(*vertex_id)
+                    .ok_or_else(|| invalid("UV face references a missing vertex"))?
+                    .co;
+                let mut candidates = Vec::new();
+                let mut nearest_pin: Option<(f64, bool)> = None;
+                for (source_face_index, source_face) in source.faces.iter().enumerate() {
+                    let Some(corners) = source_layer.faces[source_face_index]
+                        .as_ref()
+                        .filter(|corners| corners.len() == source_face.vertices.len())
+                    else {
                         continue;
                     };
-                    let Some(corner_uv) = corners.get(index) else {
-                        continue;
-                    };
-                    candidates.push((source_vertex.co, corner_uv.clone()));
-                    if let Some(is_pinned) = pin_values
-                        .and_then(|values| values.get(index))
-                        .and_then(Value::as_bool)
-                    {
-                        let distance = position.distance(source_vertex.co);
-                        if nearest_pin
-                            .is_none_or(|(nearest_distance, _)| distance < nearest_distance)
+                    let pin_values = source_layer.pinned[source_face_index].as_ref();
+                    for (index, source_vertex) in source_face.vertices.iter().enumerate() {
+                        let Some(source_vertex) = source.vertex(*source_vertex) else {
+                            continue;
+                        };
+                        let Some(corner_uv) = corners.get(index) else {
+                            continue;
+                        };
+                        candidates.push((source_vertex.co, json!(corner_uv)));
+                        if let Some(is_pinned) =
+                            pin_values.and_then(|values| values.get(index)).copied()
                         {
-                            nearest_pin = Some((distance, is_pinned));
+                            let distance = position.distance(source_vertex.co);
+                            if nearest_pin
+                                .is_none_or(|(nearest_distance, _)| distance < nearest_distance)
+                            {
+                                nearest_pin = Some((distance, is_pinned));
+                            }
                         }
                     }
                 }
+                let Some(coordinate) = nearest_untyped_attribute_value(&candidates, position)
+                else {
+                    uv.clear();
+                    break;
+                };
+                uv.push(
+                    serde_json::from_value::<[f64; 2]>(coordinate)
+                        .map_err(|_| invalid("interpolated UV corner is not a coordinate pair"))?,
+                );
+                if has_pins {
+                    pinned.push(nearest_pin.is_some_and(|(_, value)| value));
+                }
             }
-            let Some(coordinate) = nearest_untyped_attribute_value(&candidates, position) else {
-                uv.clear();
-                break;
-            };
-            uv.push(coordinate);
-            if has_pins {
-                pinned.push(Value::Bool(nearest_pin.is_some_and(|(_, value)| value)));
+            if uv.len() != face.vertices.len() {
+                continue;
             }
+            layer.faces[target_index] = Some(uv);
+            layer.pinned[target_index] = has_pins.then_some(pinned);
         }
-        if uv.len() != face.vertices.len() {
-            continue;
-        }
-        let mut entry = Map::from_iter([
-            ("face_id".to_owned(), json!(face.id)),
-            ("uv".to_owned(), Value::Array(uv)),
-        ]);
-        if has_pins {
-            entry.insert("pinned".to_owned(), Value::Array(pinned));
-        }
-        target_entries.push(Value::Object(entry));
+        layers.push(layer);
     }
-    target
-        .attributes
-        .insert("uv_map".to_owned(), Value::Array(target_entries));
+    let store = UvStore {
+        layers,
+        active: source_store.active,
+        render: source_store.render,
+    };
+    uv_layers::write(target, &store);
     Ok(())
 }
 
@@ -3121,12 +3194,12 @@ fn interpolate_attributes(source: &Mesh, target: &mut Mesh) -> Result<()> {
         };
         interpolate_legacy_attribute(source, target, name, domain, values)?;
     }
-    interpolate_uv_map(source, target)?;
+    interpolate_uv_layers(source, target)?;
     Ok(())
 }
 
 fn has_interpolatable_attributes(mesh: &Mesh) -> bool {
-    mesh.attributes.contains_key("uv_map")
+    mesh.attributes.contains_key(uv_layers::ATTRIBUTE)
         || mesh.attributes.values().any(|attribute| {
             attribute.as_object().is_some_and(|fields| {
                 fields.contains_key("domain") && fields.contains_key("values")
@@ -3281,13 +3354,21 @@ fn apply_custom_normals(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<Id
         .get("normals")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid("custom normals requires a face-keyed normals object"))?;
-    let mut updates = Map::new();
+    let mut face_offsets = Vec::with_capacity(mesh.faces.len());
+    let mut corner_total = 0;
+    for face in &mesh.faces {
+        face_offsets.push(corner_total);
+        corner_total += face.vertices.len();
+    }
+    // Every selected corner is validated before the setter runs, so bad input changes nothing.
+    let mut updates: Vec<(usize, Option<DVec3>)> = Vec::new();
     for id in selected.ids {
-        let face = mesh
+        let index = mesh
             .faces
             .iter()
-            .find(|face| face.id == id)
+            .position(|face| face.id == id)
             .ok_or_else(|| invalid(format!("face f{id} does not exist")))?;
+        let face = &mesh.faces[index];
         let normals = normal_values
             .get(&format!("f{id}"))
             .and_then(Value::as_array)
@@ -3297,34 +3378,29 @@ fn apply_custom_normals(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<Id
                     "custom normals for face f{id} must match its corners"
                 ))
             })?;
-        let mut corners = Vec::with_capacity(normals.len());
-        for normal in normals {
-            let normal = vector(normal, "normals")?;
-            if normal.length_squared() <= f64::EPSILON {
-                return Err(invalid("custom normals must be non-zero"));
-            }
-            corners.push(json!(normal.normalize().to_array()));
+        for (corner, normal) in normals.iter().enumerate() {
+            // `null` resets the corner to automatic: it takes the computed normal again.
+            let entry = if normal.is_null() {
+                None
+            } else {
+                let normal = vector(normal, "normals")?;
+                if normal.length_squared() <= f64::EPSILON {
+                    return Err(invalid("custom normals must be non-zero"));
+                }
+                Some(normal.normalize())
+            };
+            updates.push((face_offsets[index] + corner, entry));
         }
-        updates.insert(format!("f{id}"), Value::Array(corners));
     }
-    let attribute = mesh
-        .attributes
-        .entry("custom_normal".to_owned())
-        .or_insert_with(|| json!({"domain":"corner","type":"float3","values":{}}));
-    let fields = attribute
-        .as_object_mut()
-        .ok_or_else(|| invalid("custom_normal attribute must be an object"))?;
-    if fields.get("domain").and_then(Value::as_str) != Some("corner")
-        || fields.get("type").and_then(Value::as_str) != Some("float3")
-    {
-        return Err(invalid("custom_normal must be a float3 corner attribute"));
-    }
-    fields
-        .entry("values")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| invalid("custom_normal values must be an object"))?
-        .extend(updates);
+    // Only the selected corners are re-encoded; the shared setter keeps every other code it can.
+    clnor::encode_vector_updates(
+        mesh,
+        &updates,
+        NormalCodeOptions {
+            corner_order: None,
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )?;
     Ok(IdChanges::default())
 }
 
@@ -3339,10 +3415,18 @@ fn apply_set_attribute(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdC
         .get("value")
         .cloned()
         .ok_or_else(|| invalid("set_attribute requires value"))?;
-    if name != "material_index"
+    // Shading names address Potter's native flags; every other name is a user attribute.
+    let shading = matches!(name, "seam" | "sharp" | "shade_smooth");
+    let storage = if shading {
+        name.to_owned()
+    } else {
+        storage_key(name).into_owned()
+    };
+    if !shading
+        && name != "material_index"
         && mesh
             .attributes
-            .get(name)
+            .get(&storage)
             .and_then(Value::as_object)
             .is_some_and(|attribute| attribute.contains_key("type"))
     {
@@ -3390,9 +3474,6 @@ fn apply_set_attribute(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdC
                 ));
             }
         }
-        "custom_normal" => {
-            return Err(invalid("set custom normals with mesh.set_custom_normals"));
-        }
         _ => {}
     }
     let values = selected
@@ -3408,7 +3489,7 @@ fn apply_set_attribute(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdC
     };
     let attribute = mesh
         .attributes
-        .entry(name.to_owned())
+        .entry(storage)
         .or_insert_with(|| match kind {
             Some(kind) => json!({ "domain": domain_name, "type": kind, "values": {} }),
             None => json!({ "domain": domain_name, "values": {} }),
@@ -4590,6 +4671,7 @@ mod tests {
 
     use super::apply;
     use crate::geom::{BoxParams, Mesh, PlaneParams};
+    use crate::geom::color_layers::{self, ColorDomain};
 
     #[test]
     fn triangulate_replaces_selected_ngon_with_winding_preserving_triangles() {
@@ -5045,5 +5127,226 @@ mod tests {
                 .iter()
                 .any(|vertex| vertex.co == DVec3::new(-1.0, 0.0, 0.0))
         );
+    }
+
+    fn create_color(mesh: &mut Mesh, name: &str, domain: &str, default: serde_json::Value) {
+        apply(
+            mesh,
+            "attribute_create",
+            &json!({ "name": name, "domain": domain, "type": "color", "default": default }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn attribute_create_color_registers_a_point_layer_that_reads_back() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        create_color(&mut mesh, "Tint", "point", json!([0.5, 0.25, 0.0, 1.0]));
+
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.layers.len(), 1);
+        assert_eq!(store.layers[0].name, "Tint");
+        assert_eq!(store.layers[0].domain, ColorDomain::Point);
+        assert_eq!(
+            store.layers[0].values,
+            vec![[0.5, 0.25, 0.0, 1.0]; mesh.vertices.len()]
+        );
+        assert_eq!(store.active.as_deref(), Some("Tint"));
+        assert_eq!(store.render.as_deref(), Some("Tint"));
+        assert_eq!(mesh.attributes["Tint"]["type"], json!("color"));
+        assert_eq!(
+            mesh.attributes[color_layers::ATTRIBUTE]["layers"],
+            json!(["Tint"])
+        );
+        color_layers::validate(&mesh).unwrap();
+    }
+
+    #[test]
+    fn attribute_create_color_corner_layer_has_one_value_per_corner() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        create_color(&mut mesh, "Paint", "corner", json!([1.0, 1.0, 1.0, 1.0]));
+
+        let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.layers[0].domain, ColorDomain::Corner);
+        assert_eq!(store.layers[0].values, vec![[1.0, 1.0, 1.0, 1.0]; corners]);
+        color_layers::validate(&mesh).unwrap();
+    }
+
+    #[test]
+    fn attribute_create_color_appends_and_keeps_existing_designations() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        create_color(&mut mesh, "First", "point", json!([1.0, 0.0, 0.0, 1.0]));
+        create_color(&mut mesh, "Second", "corner", json!([0.0, 1.0, 0.0, 1.0]));
+
+        let store = color_layers::read(&mesh);
+        let names: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        assert_eq!(names, ["First", "Second"]);
+        assert_eq!(store.active.as_deref(), Some("First"));
+        assert_eq!(store.render.as_deref(), Some("First"));
+        color_layers::validate(&mesh).unwrap();
+    }
+
+    #[test]
+    fn attribute_create_non_color_attribute_leaves_the_color_store_alone() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        apply(
+            &mut mesh,
+            "attribute_create",
+            &json!({ "name": "weight", "domain": "point", "type": "float" }),
+        )
+        .unwrap();
+
+        assert!(!mesh.attributes.contains_key(color_layers::ATTRIBUTE));
+        assert!(color_layers::read(&mesh).layers.is_empty());
+    }
+
+    #[test]
+    fn attribute_create_color_rejects_edge_and_face_domains_and_byte_color() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        for (domain, kind) in [("edge", "color"), ("face", "color"), ("point", "byte_color")] {
+            let result = apply(
+                &mut mesh,
+                "attribute_create",
+                &json!({ "name": "Bad", "domain": domain, "type": kind }),
+            );
+            assert!(result.is_err(), "{domain} {kind} must be rejected");
+        }
+        assert!(!mesh.attributes.contains_key("Bad"));
+        assert!(!mesh.attributes.contains_key(color_layers::ATTRIBUTE));
+    }
+
+    #[test]
+    fn user_attribute_named_like_the_color_store_is_escaped_and_leaves_the_store_alone() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        create_color(&mut mesh, "Tint", "point", json!([0.0, 0.0, 0.0, 1.0]));
+        let registry = mesh.attributes[color_layers::ATTRIBUTE].clone();
+        let vertex = format!("v{}", mesh.vertices[0].id);
+        apply(
+            &mut mesh,
+            "attribute_create",
+            &json!({ "name": color_layers::ATTRIBUTE, "domain": "point", "type": "float" }),
+        )
+        .unwrap();
+        assert!(mesh.attributes.contains_key("user:color_layers"));
+        apply(
+            &mut mesh,
+            "attribute_update",
+            &json!({
+                "name": color_layers::ATTRIBUTE,
+                "elements": { "domain": "point", "ids": [vertex.clone()] },
+                "value": 2.0
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mesh.attributes["user:color_layers"]["values"][vertex.as_str()],
+            json!(2.0)
+        );
+        apply(
+            &mut mesh,
+            "attribute_delete",
+            &json!({ "name": color_layers::ATTRIBUTE }),
+        )
+        .unwrap();
+        assert!(!mesh.attributes.contains_key("user:color_layers"));
+        assert_eq!(mesh.attributes[color_layers::ATTRIBUTE], registry);
+        color_layers::validate(&mesh).unwrap();
+    }
+
+    #[test]
+    fn attribute_update_writes_color_values_and_keeps_the_registry() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        create_color(&mut mesh, "Tint", "point", json!([0.0, 0.0, 0.0, 1.0]));
+        create_color(&mut mesh, "Paint", "corner", json!([0.0, 0.0, 0.0, 1.0]));
+        let vertex = format!("v{}", mesh.vertices[0].id);
+        apply(
+            &mut mesh,
+            "attribute_update",
+            &json!({
+                "name": "Tint",
+                "elements": { "domain": "point", "ids": [vertex.clone()] },
+                "value": [1.0, 0.5, 0.0, 1.0]
+            }),
+        )
+        .unwrap();
+        apply(
+            &mut mesh,
+            "set_attribute",
+            &json!({
+                "name": "Paint",
+                "elements": { "domain": "face", "ids": ["f0"] },
+                "value": [0.25, 0.5, 0.75, 1.0]
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mesh.attributes["Tint"]["values"][&vertex],
+            json!([1.0, 0.5, 0.0, 1.0])
+        );
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.layers[0].values[0], [1.0, 0.5, 0.0, 1.0]);
+        assert_eq!(store.layers[0].values.len(), mesh.vertices.len());
+        assert!(store.layers[1].values.contains(&[0.25, 0.5, 0.75, 1.0]));
+        assert_eq!(
+            mesh.attributes[color_layers::ATTRIBUTE]["layers"],
+            json!(["Tint", "Paint"])
+        );
+        color_layers::validate(&mesh).unwrap();
+    }
+
+    #[test]
+    fn attribute_delete_drops_a_color_layer_from_the_registry() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        create_color(&mut mesh, "First", "point", json!([1.0, 0.0, 0.0, 1.0]));
+        create_color(&mut mesh, "Second", "corner", json!([0.0, 1.0, 0.0, 1.0]));
+
+        apply(&mut mesh, "attribute_delete", &json!({ "name": "First" })).unwrap();
+        let store = color_layers::read(&mesh);
+        let names: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        assert_eq!(names, ["Second"]);
+        assert_eq!(store.active.as_deref(), Some("Second"));
+        assert_eq!(store.render.as_deref(), Some("Second"));
+        assert!(!mesh.attributes.contains_key("First"));
+        color_layers::validate(&mesh).unwrap();
+
+        apply(&mut mesh, "attribute_delete", &json!({ "name": "Second" })).unwrap();
+        assert!(!mesh.attributes.contains_key("Second"));
+        assert!(!mesh.attributes.contains_key(color_layers::ATTRIBUTE));
+        color_layers::validate(&mesh).unwrap();
+    }
+
+    #[test]
+    fn attribute_delete_of_selected_color_elements_resets_them_to_opaque_black() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        create_color(&mut mesh, "Tint", "point", json!([1.0, 1.0, 1.0, 1.0]));
+        create_color(&mut mesh, "Paint", "corner", json!([1.0, 1.0, 1.0, 1.0]));
+        let vertex = format!("v{}", mesh.vertices[0].id);
+        apply(
+            &mut mesh,
+            "attribute_delete",
+            &json!({ "name": "Tint", "elements": { "domain": "point", "ids": [vertex] } }),
+        )
+        .unwrap();
+        apply(
+            &mut mesh,
+            "attribute_delete",
+            &json!({ "name": "Paint", "elements": { "domain": "face", "ids": ["f0"] } }),
+        )
+        .unwrap();
+
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.layers.len(), 2);
+        assert_eq!(store.layers[0].values[0], [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(store.layers[0].values[1], [1.0, 1.0, 1.0, 1.0]);
+        let face = mesh.faces.iter().find(|face| face.id == 0).unwrap();
+        let black = store.layers[1]
+            .values
+            .iter()
+            .filter(|color| **color == [0.0, 0.0, 0.0, 1.0])
+            .count();
+        assert_eq!(black, face.vertices.len());
+        color_layers::validate(&mesh).unwrap();
     }
 }

@@ -444,10 +444,19 @@ fn mesh_positions(mesh: &Mesh) -> Vec<DVec3> {
     mesh.vertices.iter().map(|vertex| vertex.co).collect()
 }
 
+/// Corner UVs of `UVMap` as (x, y, z, u, v). The store holds v down; v is flipped to Blender's v up.
 fn uv_records(mesh: &Mesh) -> TestResult<Vec<[f64; 5]>> {
-    let entries = mesh.attributes["uv_map"]
-        .as_array()
-        .ok_or("evaluated Data Transfer output has no UV map")?;
+    let entries = mesh
+        .attributes
+        .get("uv_layers")
+        .and_then(|store| store["layers"].as_array())
+        .and_then(|layers| {
+            layers
+                .iter()
+                .find(|layer| layer["name"].as_str() == Some("UVMap"))
+        })
+        .and_then(|layer| layer["faces"].as_array())
+        .ok_or("evaluated Data Transfer output has no UVMap layer")?;
     let positions: HashMap<_, _> = mesh
         .vertices
         .iter()
@@ -457,10 +466,7 @@ fn uv_records(mesh: &Mesh) -> TestResult<Vec<[f64; 5]>> {
     for face in &mesh.faces {
         let uv = entries
             .iter()
-            .find(|entry| {
-                entry["face_id"].as_u64() == Some(u64::from(face.id))
-                    && entry["layer"].as_str().unwrap_or("UVMap") == "UVMap"
-            })
+            .find(|entry| entry["face_id"].as_u64() == Some(u64::from(face.id)))
             .and_then(|entry| entry["uv"].as_array())
             .ok_or("Data Transfer output face has no UV values")?;
         if uv.len() != face.vertices.len() {
@@ -479,7 +485,7 @@ fn uv_records(mesh: &Mesh) -> TestResult<Vec<[f64; 5]>> {
                 position.y,
                 position.z,
                 uv[0].as_f64().ok_or("invalid UV u coordinate")?,
-                uv[1].as_f64().ok_or("invalid UV v coordinate")?,
+                1.0 - uv[1].as_f64().ok_or("invalid UV v coordinate")?,
             ]);
         }
     }

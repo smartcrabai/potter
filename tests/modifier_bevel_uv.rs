@@ -71,9 +71,15 @@ fn uv_cube() -> TestResult<Mesh> {
             json!([0.2 + 0.5 * x + 0.1 * y, 0.3 + 0.6 * z])
         })
         .collect();
+    let faces: Vec<Value> = mesh
+        .faces
+        .iter()
+        .zip(values.chunks(4))
+        .map(|(face, uv)| json!({"face_id": face.id, "uv": uv}))
+        .collect();
     mesh.attributes.insert(
-        "blender_uv_layers".to_owned(),
-        json!([{"name": "UVMap", "values": values}]),
+        "uv_layers".to_owned(),
+        json!({"layers": [{"name": "UVMap", "faces": faces}], "active": "UVMap", "render": "UVMap"}),
     );
     Ok(mesh)
 }

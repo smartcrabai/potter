@@ -18,16 +18,14 @@ use crate::{
     params::{self, ParameterFamily},
 };
 
-use super::clnor::{corner_normal_attribute, settle_custom_normals, transfer_custom_normals};
+use super::attribute_keys;
+use super::clnor::{self, CornerNormalCode, NormalCodeOptions, settle_custom_normals};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
-    normals::{
-        average_custom_normals_by_fan, corner_normals, face_normal, safe_acos_approx,
-        sharp_edge_flags, vector3,
-    },
-    provenance::{Origin, mean_value_corners, normalize_custom_normals, remap_attributes},
-    uv_layers::{self, uv_default, uv_map_entry_layer},
+    normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
+    provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
+    uv_layers,
 };
 
 mod advanced;
@@ -277,9 +275,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             continue;
         }
         // Blender's setter has settled custom normals before a modifier reads them (clnor.rs).
-        if let Some(settled) = settle_custom_normals(&evaluated)? {
-            evaluated = settled;
-        }
+        settle_custom_normals(&mut evaluated)?;
         let attributes_before = attribute_labels(&evaluated);
         evaluated = match modifier.modifier_type.as_str() {
             "mirror" => mirror(&evaluated, modifier)?,
@@ -1002,39 +998,134 @@ fn without_custom_normals(mut mesh: Mesh) -> Mesh {
     mesh
 }
 
-/// Custom normals follow their mirror copy: each axis a copy reflects negates that component of its
-/// corners' normals. `copy_masks` holds each output face's copy mask, bit `b` for `axes[b]`.
-fn reflect_custom_normals(mesh: &mut Mesh, copy_masks: &[usize], axes: &[usize]) {
-    let Some(values) = mesh
-        .attributes
-        .get_mut("custom_normal")
-        .and_then(|attribute| attribute.get_mut("values"))
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    for (face, mask) in mesh.faces.iter().zip(copy_masks) {
-        let Some(corners) = values
-            .get_mut(&format!("f{}", face.id))
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        let mut negate = [false; 3];
-        for (bit, axis) in axes.iter().enumerate() {
-            if mask & (1 << bit) != 0 {
-                negate[*axis] = true;
-            }
-        }
-        for corner in corners {
-            if let Some(normal) = vector3(corner) {
-                let sign = |flip: bool| if flip { -1.0 } else { 1.0 };
-                let reflected =
-                    normal * DVec3::new(sign(negate[0]), sign(negate[1]), sign(negate[2]));
-                *corner = json!(reflected.to_array());
-            }
+/// `vector` mirrored across each axis `axes[bit]` whose bit is set in `mask`.
+fn reflect_vector(mut vector: DVec3, mask: usize, axes: &[usize]) -> DVec3 {
+    for (bit, &axis) in axes.iter().enumerate() {
+        if mask & (1 << bit) != 0 {
+            vector[axis] = -vector[axis];
         }
     }
+    vector
+}
+
+/// Builds the unmerged mirror copies and each copy corner's reflected vector (`None` for automatic
+/// corners). The vectors are encoded in the copy's own fan spaces, so the copies carry codes whose
+/// evaluation is the reflection, before any merge.
+fn mirror_copy_normals(
+    mesh: &Mesh,
+    source_vectors: &[Option<DVec3>],
+    points: &[DVec3],
+    polygons: &[Polygon],
+    loose_edges: &[[usize; 2]],
+    axes: &[usize],
+) -> Result<(Mesh, Vec<Option<DVec3>>)> {
+    let source_count = mesh.faces.len();
+    let vertex_count = mesh.vertices.len();
+    let origin = Origin::copies(
+        (0..points.len()).map(|point| Some(point % vertex_count)),
+        (0..polygons.len())
+            .map(|polygon| Some(polygon % source_count))
+            .collect(),
+    );
+    let mut copies = build_mesh(
+        points.to_vec(),
+        polygons.to_vec(),
+        loose_edges.to_vec(),
+        &origin,
+        mesh,
+    )?;
+    let mut source_offsets = Vec::with_capacity(source_count);
+    let mut corner_total = 0;
+    for face in &mesh.faces {
+        source_offsets.push(corner_total);
+        corner_total += face.vertices.len();
+    }
+    let mut vectors = Vec::new();
+    for (index, (face, _)) in polygons.iter().enumerate() {
+        let copy = index / source_count;
+        let source_face = index % source_count;
+        // An odd number of reflections reverses the copy's polygon: its corner `k` copies source
+        // corner `size - 1 - k`.
+        let reversed = copy.count_ones() % 2 == 1;
+        let size = face.len();
+        for corner in 0..size {
+            let position = if reversed { size - 1 - corner } else { corner };
+            let source_corner = source_offsets[source_face] + position;
+            vectors.push(
+                source_vectors[source_corner].map(|vector| reflect_vector(vector, copy, axes)),
+            );
+        }
+    }
+    let identity = clnor::stored_corner_order(&copies);
+    let fans = clnor::mesh_fans(&copies, &positions(&copies), &identity)?;
+    let codes: Vec<CornerNormalCode> = vectors
+        .iter()
+        .enumerate()
+        .map(|(corner, vector)| match vector {
+            Some(vector) => {
+                clnor::encode_vector_in_space(&fans.spaces[fans.fan_of[corner]], *vector)
+            }
+            None => CornerNormalCode::Auto,
+        })
+        .collect();
+    clnor::write_codes(&mut copies, Some(&codes), NormalCodeOptions::default())?;
+    Ok((copies, vectors))
+}
+
+/// Each merged output corner's pre-merge vector: the copy corner, of the copy its polygon came from,
+/// whose point merged into the output corner's point.
+fn merged_copy_vectors(
+    copies: &Mesh,
+    vectors: &[Option<DVec3>],
+    merged: &MergedGeometry,
+) -> Result<Vec<Option<DVec3>>> {
+    let indices = id_indices(copies);
+    let mut offsets = Vec::with_capacity(copies.faces.len());
+    let mut corner_total = 0;
+    for face in &copies.faces {
+        offsets.push(corner_total);
+        corner_total += face.vertices.len();
+    }
+    let mut merged_vectors = Vec::new();
+    for ((polygon, _), &source) in merged.polygons.iter().zip(&merged.polygon_sources) {
+        let copy_points: Vec<usize> = copies.faces[source]
+            .vertices
+            .iter()
+            .map(|id| indices[id])
+            .collect();
+        for &point in polygon {
+            let members = &merged.point_members[point];
+            let corner = copy_points
+                .iter()
+                .position(|copy_point| members.contains(copy_point))
+                .ok_or_else(|| {
+                    PotError::new(ErrorCode::InternalError, "mirror merge lost a copy corner")
+                })?;
+            merged_vectors.push(vectors[offsets[source] + corner]);
+        }
+    }
+    Ok(merged_vectors)
+}
+
+/// Writes the merged mirror's vectors through the setter. Each output fan with a vector is re-encoded
+/// with the average of its vectors; fans without one keep their codes.
+fn mirror_merged_normals(result: &mut Mesh, vectors: &[Option<DVec3>]) -> Result<()> {
+    let fans = clnor::mesh_fans(
+        result,
+        &positions(result),
+        &clnor::stored_corner_order(result),
+    )?;
+    let mut fan_has_vector = vec![false; fans.corners.len()];
+    for (corner, vector) in vectors.iter().enumerate() {
+        fan_has_vector[fans.fan_of[corner]] |= vector.is_some();
+    }
+    let updates: Vec<(usize, Option<DVec3>)> = vectors
+        .iter()
+        .enumerate()
+        .filter(|(corner, _)| fan_has_vector[fans.fan_of[*corner]])
+        .map(|(corner, vector)| (corner, *vector))
+        .collect();
+    clnor::encode_vector_updates(result, &updates, NormalCodeOptions::default())
 }
 
 fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -1134,6 +1225,22 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .map(|[a, b]| [base + *a, base + *b]),
         );
     }
+    // The copies are built before the merge: their reflected custom normals are encoded in their own
+    // fan spaces, and the merged output then averages each fan through the setter.
+    let source_vectors =
+        clnor::corner_custom_normals(mesh, &source_points, NormalCodeOptions::default())?;
+    let copy_normals = source_vectors
+        .map(|vectors| {
+            mirror_copy_normals(
+                mesh,
+                &vectors,
+                &points,
+                &output_polygons,
+                &output_loose_edges,
+                &selected,
+            )
+        })
+        .transpose()?;
     let merged = if merge {
         merge_geometry(&points, output_polygons, output_loose_edges, threshold)?
     } else {
@@ -1167,7 +1274,6 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .map(|&polygon| Some(polygon % source_polygons.len()))
             .collect(),
         corners: None,
-        raw_normals: false,
     };
     // Each copy has one mirror pass per mirrored axis in its copy mask, so its UVs take that many
     // passes; merged polygons keep the lowest copy they came from, as in the origin above.
@@ -1176,20 +1282,17 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .iter()
         .map(|&polygon| (polygon / source_polygons.len()).count_ones() as usize)
         .collect();
-    let copy_masks: Vec<usize> = merged
-        .polygon_sources
-        .iter()
-        .map(|&polygon| polygon / source_polygons.len())
-        .collect();
+    let merged_normals = copy_normals
+        .map(|(copies, vectors)| merged_copy_vectors(&copies, &vectors, &merged))
+        .transpose()?;
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     if let Some(first) = &first_sources {
         let edge_count = mesh.edges.len();
         apply_first_source_edge_flags(&mut result, mesh, first, |edge| edge % edge_count)?;
     }
-    reflect_custom_normals(&mut result, &copy_masks, &selected);
-    // Blender averages the custom normals of each merged fan when it reads them back; a seam's copies
-    // join one fan, so their mirrored values meet here.
-    average_custom_normals_by_fan(&mut result)?;
+    if let Some(vectors) = &merged_normals {
+        mirror_merged_normals(&mut result, vectors)?;
+    }
     if bool_param(modifier, "use_mirror_vertex_groups")? {
         mirror_vertex_groups(mesh, &mut result, &merged.point_members, vertex_count);
     }
@@ -1454,7 +1557,7 @@ fn array(
     });
     // Blender's merge keeps one source edge's flags per merged edge (see `first_source_edges`). The
     // pre-merge edges are every edge of each copy and cap, in the order `provenance_source` lists them.
-    let pre_merge_edges = ["sharp", "blender_edge_flags"]
+    let pre_merge_edges = ["sharp", "seam"]
         .iter()
         .any(|name| provenance_source.attributes.contains_key(*name))
         .then(|| -> Result<Vec<[usize; 2]>> {
@@ -1546,7 +1649,6 @@ fn array(
             provenance_source,
             source_face,
         )),
-        raw_normals: false,
     };
     let passes: Vec<usize> = merged
         .polygon_sources
@@ -1722,47 +1824,15 @@ fn copy_keyed_value(cap: &Mesh, source: &mut Mesh, name: &str, from: &str, to: S
 /// Storage order is the input, then the start cap, then the end cap, matching the source indices
 /// `array` reports. Input elements keep their IDs; cap elements get fresh IDs after them. Like
 /// Blender's array modifier, a cap contributes UV data only: each input UV layer gains the matching
-/// cap layer's corner values (default where the cap lacks the layer), and cap `uv_map` entries join
-/// the layers the input maps. Every other attribute stays input-only, so cap elements take defaults.
+/// cap layer's corner values, face by face (default `[0, 0]` where the cap lacks the layer). Every
+/// other attribute stays input-only, so cap elements take defaults.
 fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
     let mut source = mesh.clone();
     let mut vertex_next = next_element_id(mesh.vertices.iter().map(|vertex| vertex.id))?;
     let mut edge_next = next_element_id(mesh.edges.iter().map(|edge| edge.id))?;
     let mut face_next = next_element_id(mesh.faces.iter().map(|face| face.id))?;
-    let input_corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
-    let input_uv_map_layers: HashSet<String> = mesh
-        .attributes
-        .get("uv_map")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|entry| uv_map_entry_layer(entry).to_owned())
-        .collect();
-    let mut uv_map = mesh
-        .attributes
-        .get("uv_map")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    // Input `blender_uv_layers` layers, each with its values extended by every cap in turn.
-    let uv_layers = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut uv_values: Vec<Vec<Value>> = uv_layers
-        .iter()
-        .map(|layer| {
-            let mut values = layer
-                .get("values")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            values.resize(values.len().max(input_corners), uv_default());
-            values
-        })
-        .collect();
+    // Input UV layers, each extended face by face with every cap in turn.
+    let mut uv_store = uv_layers::read(mesh);
     for cap in caps {
         let mut vertex_ids = HashMap::with_capacity(cap.vertices.len());
         for vertex in &cap.vertices {
@@ -1800,15 +1870,13 @@ fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
             });
         }
         for (old, new) in &face_ids {
-            for name in ["shade_smooth", "custom_normal"] {
-                copy_keyed_value(
-                    cap,
-                    &mut source,
-                    name,
-                    &format!("f{old}"),
-                    format!("f{new}"),
-                );
-            }
+            copy_keyed_value(
+                cap,
+                &mut source,
+                "shade_smooth",
+                &format!("f{old}"),
+                format!("f{new}"),
+            );
         }
         for (old, new) in &edge_ids {
             copy_keyed_value(
@@ -1819,71 +1887,65 @@ fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
                 format!("e{new}"),
             );
         }
-        let cap_corners: usize = cap.faces.iter().map(|face| face.vertices.len()).sum();
-        let cap_uv = cap_uv_layers(cap);
-        for (layer, values) in uv_layers.iter().zip(&mut uv_values) {
-            let name = layer.get("name").and_then(Value::as_str);
-            let cap_values = cap_uv
-                .iter()
-                .find(|(known, _)| Some(known.as_str()) == name)
-                .map(|(_, values)| values);
-            values.extend((0..cap_corners).map(|corner| {
-                cap_values
-                    .and_then(|cap_values| cap_values.get(corner))
+        let cap_uv = uv_layers::read_layers(cap);
+        for layer in &mut uv_store.layers {
+            let cap_layer = cap_uv.iter().find(|known| known.name == layer.name);
+            for (index, face) in cap.faces.iter().enumerate() {
+                let uv = cap_layer
+                    .and_then(|known| known.faces.get(index))
                     .cloned()
-                    .unwrap_or_else(uv_default)
-            }));
-        }
-        let mut start = 0;
-        for face in &cap.faces {
-            let count = face.vertices.len();
-            for (name, values) in &cap_uv {
-                if input_uv_map_layers.contains(name) {
-                    let uv: Vec<Value> = (start..start + count)
-                        .map(|corner| values.get(corner).cloned().unwrap_or_else(uv_default))
-                        .collect();
-                    uv_map.push(json!({"face_id": face_ids[&face.id], "layer": name, "uv": uv}));
-                }
+                    .flatten()
+                    .unwrap_or_else(|| vec![[0.0, 0.0]; face.vertices.len()]);
+                layer.faces.push(Some(uv));
+                layer.pinned.push(None);
             }
-            start += count;
         }
     }
-    if let Some(layers) = source
-        .attributes
-        .get_mut("blender_uv_layers")
-        .and_then(Value::as_array_mut)
-    {
-        for (layer, values) in layers.iter_mut().zip(uv_values) {
-            layer["values"] = Value::Array(values);
-        }
-    }
-    if mesh.attributes.contains_key("uv_map") {
-        source
-            .attributes
-            .insert("uv_map".to_owned(), Value::Array(uv_map));
-    }
+    array_provenance_normals(mesh, caps, &mut source)?;
+    uv_layers::write(&mut source, &uv_store);
     Ok(source)
 }
 
-/// A cap's UV layers by name, as per-corner values over the cap's faces, default where a face has no
-/// value.
-fn cap_uv_layers(cap: &Mesh) -> Vec<(String, Vec<Value>)> {
-    uv_layers::read_layers(cap)
-        .into_iter()
-        .map(|layer| {
-            let values = layer
-                .faces
-                .iter()
-                .zip(&cap.faces)
-                .flat_map(|(uv, face)| {
-                    (0..face.vertices.len()).map(move |corner| {
-                        uv.as_ref().map_or_else(uv_default, |uv| json!(uv[corner]))
-                    })
-                })
-                .collect();
-            (layer.name, values)
-        })
-        .collect()
+/// Extends `source`'s custom-normal state over the appended caps, in storage order. A part without a
+/// normal layer is automatic, and each part's loop ordinals follow the corners before it.
+fn array_provenance_normals(mesh: &Mesh, caps: &[&Mesh], source: &mut Mesh) -> Result<()> {
+    let parts: Vec<&Mesh> = std::iter::once(mesh).chain(caps.iter().copied()).collect();
+    let layers: Vec<Option<Vec<CornerNormalCode>>> = parts
+        .iter()
+        .map(|part| clnor::corner_codes(part))
+        .collect::<Result<_>>()?;
+    let orders: Vec<Option<Vec<usize>>> = parts
+        .iter()
+        .map(|part| clnor::corner_order(part))
+        .collect::<Result<_>>()?;
+    source.attributes.remove("custom_normal");
+    let has_layer = layers.iter().any(Option::is_some);
+    let has_order = orders.iter().any(Option::is_some);
+    if !has_layer && !has_order {
+        return Ok(());
+    }
+    let mut codes = Vec::new();
+    let mut order = Vec::new();
+    for ((part, layer), part_order) in parts.iter().zip(layers).zip(orders) {
+        let base = order.len();
+        let count: usize = part.faces.iter().map(|face| face.vertices.len()).sum();
+        match layer {
+            Some(part_codes) => codes.extend(part_codes),
+            None => codes.extend(std::iter::repeat_n(CornerNormalCode::Auto, count)),
+        }
+        match part_order {
+            Some(part_order) => order.extend(part_order.into_iter().map(|ordinal| base + ordinal)),
+            None => order.extend(base..base + count),
+        }
+    }
+    clnor::write_codes(
+        source,
+        has_layer.then_some(codes.as_slice()),
+        NormalCodeOptions {
+            corner_order: has_order.then_some(order.as_slice()),
+            ..NormalCodeOptions::default()
+        },
+    )
 }
 
 /// The first element ID after `ids`, or zero when there are none.
@@ -1944,18 +2006,23 @@ fn array_corner_origin(
 }
 
 /// Rewrites the UV values of a rebuilt `mesh` in every store of each layer. `transform(face, corner,
-/// uv)` maps one corner's `[u, v]`, where `face` is the output polygon index and `corner` the corner
-/// position within it.
+/// uv)` maps one corner's `[u, v]` in Blender's V-up convention, where `face` is the output polygon
+/// index and `corner` the corner position within it. The store is V-down, so values convert here.
 fn map_uv_values(mesh: &mut Mesh, transform: impl Fn(usize, usize, [f64; 2]) -> [f64; 2]) {
     let mut layers = uv_layers::read_layers(mesh);
     for layer in &mut layers {
         for (face, values) in layer.faces.iter_mut().enumerate() {
             for (corner, uv) in values.iter_mut().flatten().enumerate() {
-                *uv = transform(face, corner, *uv);
+                *uv = flip_v(transform(face, corner, flip_v(*uv)));
             }
         }
     }
     uv_layers::write_layers(mesh, &layers);
+}
+
+/// Converts `[u, v]` between the store's V-down and Blender's V-up. The map is its own inverse.
+fn flip_v([u, v]: [f64; 2]) -> [f64; 2] {
+    [u, 1.0 - v]
 }
 
 /// Each merged edge's first source: the pre-merge edge with the lowest index among those merging onto
@@ -1981,9 +2048,9 @@ fn first_source_edges(
     first
 }
 
-/// Writes the edge flags of `result`'s edges: each takes the `sharp` flag and the `blender_edge_flags`
-/// entry of its first source edge (see [`first_source_edges`]). `source_edge` maps a pre-merge edge to
-/// its index in `provenance`, whose flags are read.
+/// Writes the shading flags of `result`'s edges: `sharp` and `seam` each take the flag of the first
+/// source edge (see [`first_source_edges`]). `source_edge` maps a pre-merge edge to its index in
+/// `provenance`, whose flags are read.
 fn apply_first_source_edge_flags(
     result: &mut Mesh,
     provenance: &Mesh,
@@ -2007,37 +2074,20 @@ fn apply_first_source_edge_flags(
                 .map(|&pre_merge| source_edge(pre_merge))
         })
         .collect();
-    if let Some(values) = result
-        .attributes
-        .get_mut("sharp")
-        .and_then(|attribute| attribute.get_mut("values"))
-        .and_then(Value::as_object_mut)
-    {
-        let sharp = sharp_edge_flags(provenance)?;
-        for (edge, source) in result.edges.iter().zip(&sources) {
-            let flag = source.and_then(|source| sharp.get(source)).copied();
-            values.insert(format!("e{}", edge.id), json!(flag == Some(true)));
-        }
-    }
-    if let Some(flags) = provenance
-        .attributes
-        .get("blender_edge_flags")
-        .and_then(Value::as_array)
-    {
-        let flag = |source: Option<usize>, key: &str| {
-            source
-                .and_then(|source| flags.get(source))
-                .and_then(|entry| entry.get(key))
-                .and_then(Value::as_bool)
-                == Some(true)
-        };
-        let entries = sources
-            .iter()
-            .map(|&source| json!({"sharp": flag(source, "sharp"), "seam": flag(source, "seam")}))
-            .collect();
-        result
+    let sharp = sharp_edge_flags(provenance)?;
+    let seam = edge_flags(provenance, "seam");
+    for (name, flags) in [("sharp", sharp.as_slice()), ("seam", seam.as_slice())] {
+        if let Some(values) = result
             .attributes
-            .insert("blender_edge_flags".to_owned(), Value::Array(entries));
+            .get_mut(name)
+            .and_then(|attribute| attribute.get_mut("values"))
+            .and_then(Value::as_object_mut)
+        {
+            for (edge, source) in result.edges.iter().zip(&sources) {
+                let flag = source.and_then(|source| flags.get(source)).copied();
+                values.insert(format!("e{}", edge.id), json!(flag == Some(true)));
+            }
+        }
     }
     Ok(())
 }
@@ -2127,8 +2177,6 @@ fn merge_geometry_pairs(
 struct SubdivisionOptions {
     preserve_corners: bool,
     use_creases: bool,
-    /// Blend custom normals unnormalised across levels; the caller normalises the final mesh.
-    raw_normals: bool,
 }
 
 fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -2194,7 +2242,6 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let options = SubdivisionOptions {
         preserve_corners: boundary_smooth == "PRESERVE_CORNERS",
         use_creases: bool_param(modifier, "use_creases")?,
-        raw_normals: true,
     };
     let uv_options = subdivision_uv::UvOptions {
         linear: subdivision_uv::FvarLinear::from_uv_smooth(uv_smooth, simple),
@@ -2226,11 +2273,17 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             uv_layer_count,
         )?;
     }
+    let use_custom_normals = bool_param(modifier, "use_custom_normals")?;
     let mut result = mesh.clone();
-    // Blender's subdivision keeps custom normals only with Use Custom Normals; without it they drop.
-    if !bool_param(modifier, "use_custom_normals")? {
+    // With levels, write_back owns the custom-normal state; with none, only Use Custom Normals keeps it.
+    if levels > 0 || !use_custom_normals {
         result.attributes.remove("custom_normal");
     }
+    let mut normals = if levels > 0 {
+        Some(subdivision_uv::NormalSubdivision::new(mesh, use_custom_normals)?)
+    } else {
+        None
+    };
     let mut uv = if levels > 0 {
         Some(subdivision_uv::UvSubdivision::new(mesh, uv_options)?)
     } else {
@@ -2241,7 +2294,6 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             subdivision_uv::subdivide_simple_once(
                 &result,
                 options.use_creases,
-                options.raw_normals,
             )?
         } else {
             subdivide_once(&result, options)?
@@ -2249,9 +2301,11 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         if let Some(uv) = uv.as_mut() {
             uv.refine(&result)?;
         }
+        if let Some(normals) = normals.as_mut() {
+            normals.refine();
+        }
         result = next;
     }
-    normalize_custom_normals(&mut result);
     if use_limit_surface {
         let output_vertex_count = result.vertices.len();
         let limit_positions = limit_surface_positions(&result, options)?;
@@ -2267,6 +2321,9 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     if let Some(uv) = uv {
         uv.write_back(&mut result, use_limit_surface.then_some(quality))?;
+    }
+    if let Some(normals) = normals {
+        normals.write_back(&mut result)?;
     }
     Ok(result)
 }
@@ -2914,7 +2971,6 @@ fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
         &edge_point_indices,
         &edge_creases,
         options.use_creases,
-        options.raw_normals,
     )
 }
 
@@ -3021,20 +3077,17 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &origin,
         mesh,
     )?;
-    if keep_custom_normals && !mesh.attributes.contains_key("custom_normal") {
+    if keep_custom_normals && clnor::corner_codes(mesh)?.is_none() {
         // MOD_triangulate.cc keeps the pre-split corner normals as custom normals, so the triangles
         // keep the shading of the faces they were cut from.
         let computed = corner_normals(mesh, &positions(mesh))?;
-        let vectors: Vec<DVec3> = sources
+        let vectors: Vec<Option<DVec3>> = sources
             .iter()
-            .map(|source| source.map_or(DVec3::ZERO, |corner| computed[corner]))
+            .map(|source| source.map(|corner| computed[corner]))
             .collect();
-        let keep = vec![true; result.faces.len()];
-        if let Some(value) = corner_normal_attribute(&result, &vectors, &keep) {
-            result.attributes.insert("custom_normal".to_owned(), value);
-        }
+        clnor::encode_vectors(&mut result, Some(&vectors), NormalCodeOptions::default())?;
     } else if !keep_custom_normals {
-        transfer_custom_normals(mesh, &mut result, &sources)?;
+        clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     }
     Ok(result)
 }
@@ -3234,7 +3287,12 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let origin = Origin::copies(point_sources.into_iter().map(Some), face_sources);
     let mut result = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
-    transfer_custom_normals(mesh, &mut result, &corner_sources)?;
+    clnor::transfer_custom_normals(
+        mesh,
+        &mut result,
+        &corner_sources,
+        NormalCodeOptions::default(),
+    )?;
     Ok(result)
 }
 
@@ -3307,9 +3365,32 @@ fn angle_weighted_midpoint(first: DVec3, second: DVec3) -> DVec3 {
     sum.normalize_or_zero() * (4.0 / std::f64::consts::PI * (length / 2.0).min(1.0).acos())
 }
 
-fn mesh_attribute_values<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a [Value]> {
-    if let Some(values) = mesh.attributes.get(name).and_then(Value::as_array) {
-        return Some(values);
+/// The values of the element attribute `name` in storage order. A native point or edge attribute is read
+/// through its element IDs. Otherwise a `blender_attributes` entry is read by position.
+fn mesh_attribute_values(mesh: &Mesh, name: &str) -> Option<Vec<Value>> {
+    if let Some(attribute) = mesh
+        .attributes
+        .get(attribute_keys::storage_key(name).as_ref())
+    {
+        let keyed = attribute.get("values").and_then(Value::as_object)?;
+        let keys: Vec<String> = match attribute.get("domain").and_then(Value::as_str)? {
+            "point" => mesh
+                .vertices
+                .iter()
+                .map(|vertex| format!("v{}", vertex.id))
+                .collect(),
+            "edge" => mesh
+                .edges
+                .iter()
+                .map(|edge| format!("e{}", edge.id))
+                .collect(),
+            _ => return None,
+        };
+        return Some(
+            keys.iter()
+                .map(|key| keyed.get(key).cloned().unwrap_or(Value::Null))
+                .collect(),
+        );
     }
     mesh.attributes
         .get("blender_attributes")?
@@ -3318,7 +3399,7 @@ fn mesh_attribute_values<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a [Value]> 
         .find(|attribute| attribute.get("name").and_then(Value::as_str) == Some(name))?
         .get("values")?
         .as_array()
-        .map(Vec::as_slice)
+        .cloned()
 }
 #[expect(
     clippy::float_cmp,
@@ -3576,15 +3657,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let mark_sharp = bool_param(modifier, "mark_sharp")?;
     // Blender's mark_seam copies the input's seams onto the new rungs (check_edge_data_seam_sharp_edges),
     // so it changes nothing on a mesh without seams.
-    let input_seam = mesh
-        .attributes
-        .get("blender_edge_flags")
-        .and_then(Value::as_array)
-        .is_some_and(|flags| {
-            flags
-                .iter()
-                .any(|entry| entry.get("seam").and_then(Value::as_bool) == Some(true))
-        });
+    let input_seam = edge_flags(mesh, "seam").contains(&true);
     if bool_param(modifier, "mark_seam")? && input_seam {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -3665,6 +3738,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .or(Some("bevel_weight_edge"))
     };
     let weight_attribute = weight_attribute_name.and_then(|name| mesh_attribute_values(mesh, name));
+    let weight_attribute = weight_attribute.as_deref();
     let vertex_id_indices = id_indices(mesh);
     let edge_id_indices: HashMap<_, _> = mesh
         .edges
@@ -4030,7 +4104,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     } else {
         Vec::new()
     };
-    let input_custom = mesh.attributes.contains_key("custom_normal");
+    let input_custom = clnor::corner_codes(mesh)?.is_some();
     let mut incident_faces = vec![Vec::new(); source_points.len()];
     for (face_index, (face, material)) in source_polygons.iter().enumerate() {
         for (corner, vertex) in face.iter().copied().enumerate() {
@@ -4564,7 +4638,6 @@ fn bevel_vertices(
         vertices: compact_origins,
         faces: face_sources,
         corners: Some(corners),
-        raw_normals: false,
     };
     build_mesh(
         compact_points,
@@ -4668,7 +4741,6 @@ fn decimate_compact(
         vertices: compact_origin,
         faces: origin.faces,
         corners: origin.corners,
-        raw_normals: origin.raw_normals,
     };
     build_mesh(compact_points, polygons, loose, &origin, source)
 }
@@ -4737,10 +4809,9 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .map(|&face| Some(face))
             .collect(),
         corners: None,
-        raw_normals: false,
     };
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
-    transfer_custom_normals(mesh, &mut result, &sources)?;
+    clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     Ok(result)
 }
 
@@ -5188,7 +5259,10 @@ mod tests {
 
     use crate::{
         error::{ErrorCode, PotError},
-        geom::{BoxParams, Mesh},
+        geom::{
+            BoxParams, Mesh,
+            uv_layers::{self, UvLayer},
+        },
         model::{CurveData, CurvePoint, CurveSpline, Id, Modifier},
     };
 
@@ -5256,12 +5330,12 @@ mod tests {
             vec![vec![0, 1, 2]],
         )
         .unwrap();
-        mesh.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            json!([{
-                "name": "UVMap",
-                "values": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
-            }]),
+        uv_layers::write_layers(
+            &mut mesh,
+            &[UvLayer::new(
+                "UVMap",
+                vec![Some(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])],
+            )],
         );
         let modifier = with_params(
             "array",
@@ -5276,16 +5350,15 @@ mod tests {
 
         let result = evaluate_modifiers(&mesh, &[modifier]).unwrap();
 
+        let layers = uv_layers::read_layers(&result);
+        assert_eq!(layers.len(), 1);
         assert_eq!(
-            result.attributes["blender_uv_layers"][0]["values"],
-            json!([
-                [0.0, 0.0],
-                [1.0, 0.0],
-                [1.0, 1.0],
-                [0.25, -0.5],
-                [1.25, -0.5],
-                [1.25, 0.5]
-            ])
+            layers[0].faces,
+            vec![
+                Some(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+                // Offsets apply in Blender's V-up space, so stored v is 1 - (Blender v + offset_v).
+                Some(vec![[0.25, 0.5], [1.25, 0.5], [1.25, 1.5]]),
+            ]
         );
     }
 
@@ -5301,18 +5374,20 @@ mod tests {
         assert_eq!(mirrored([1.25, 0.25]), [1.75, 0.75]);
     }
 
-    /// A UV tool writes `uv_map` and leaves the imported `blender_uv_layers` stale. A later mirror
-    /// must carry the `uv_map` UVs into both stores, never the stale imported ones.
+    /// A UV warp followed by a mirror carries the warped store UVs into every mirrored face.
     #[test]
-    fn uv_map_overrides_stale_blender_uv_layer_through_later_rebuild() {
+    fn uv_warp_then_mirror_rebuilds_every_store_face() {
         let mut mesh = Mesh::from_positions_and_faces(
             vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
             vec![vec![0, 1, 2, 3]],
         )
         .unwrap();
-        mesh.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            json!([{"name": "UVMap", "values": [[0.1, 0.2], [0.3, 0.2], [0.3, 0.4], [0.1, 0.4]]}]),
+        uv_layers::write_layers(
+            &mut mesh,
+            &[UvLayer::new(
+                "UVMap",
+                vec![Some(vec![[0.1, 0.2], [0.3, 0.2], [0.3, 0.4], [0.1, 0.4]])],
+            )],
         );
         let warp = with_params(
             "uv_warp",
@@ -5324,22 +5399,18 @@ mod tests {
         );
         let out = evaluate_modifiers(&mesh, &[warp, mirror]).unwrap();
         let warped: [[f64; 2]; 4] = [[0.6, 0.2], [0.8, 0.2], [0.8, 0.4], [0.6, 0.4]];
-        let is_warped = |uv: &serde_json::Value| {
-            warped.iter().any(|want| {
-                (want[0] - uv[0].as_f64().unwrap()).abs() < 1e-9
-                    && (want[1] - uv[1].as_f64().unwrap()).abs() < 1e-9
-            })
+        let is_warped = |uv: &[f64; 2]| {
+            warped
+                .iter()
+                .any(|want| (want[0] - uv[0]).abs() < 1e-9 && (want[1] - uv[1]).abs() < 1e-9)
         };
-        let stored = out.attributes["blender_uv_layers"][0]["values"]
-            .as_array()
-            .unwrap();
-        assert_eq!(stored.len(), 8);
-        assert!(stored.iter().all(is_warped), "stale blender UV: {stored:?}");
-        let entries = out.attributes["uv_map"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        for entry in entries {
-            let uv = entry["uv"].as_array().unwrap();
-            assert!(uv.iter().all(is_warped), "stale uv_map UV: {uv:?}");
+        let layers = uv_layers::read_layers(&out);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].faces.len(), 2);
+        for face in &layers[0].faces {
+            let uv = face.as_ref().unwrap();
+            assert_eq!(uv.len(), 4);
+            assert!(uv.iter().all(is_warped), "stale store UV: {uv:?}");
         }
     }
 
@@ -5405,22 +5476,24 @@ mod tests {
     fn smooth_box_with_custom(faces: &[(usize, DVec3)]) -> Mesh {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
         crate::geom::normals::shade_faces_smooth(&mut mesh);
-        let values: serde_json::Map<String, serde_json::Value> = mesh
+        let vectors: Vec<Option<DVec3>> = mesh
             .faces
             .iter()
             .enumerate()
-            .filter_map(|(index, face)| {
-                let (_, normal) = faces.iter().find(|(face_index, _)| *face_index == index)?;
-                Some((
-                    format!("f{}", face.id),
-                    json!(vec![normal.to_array(); face.vertices.len()]),
-                ))
+            .flat_map(|(index, face)| {
+                let normal = faces
+                    .iter()
+                    .find(|(face_index, _)| *face_index == index)
+                    .map(|(_, normal)| *normal);
+                std::iter::repeat_n(normal, face.vertices.len())
             })
             .collect();
-        mesh.attributes.insert(
-            "custom_normal".to_owned(),
-            json!({"domain": "corner", "type": "float3", "values": values}),
-        );
+        crate::geom::clnor::encode_vectors(
+            &mut mesh,
+            Some(&vectors),
+            crate::geom::clnor::NormalCodeOptions::default(),
+        )
+        .unwrap();
         mesh
     }
 
@@ -5448,9 +5521,8 @@ mod tests {
             })
             .unwrap();
         let mesh = smooth_box_with_custom(&[(bottom, authored)]);
-        let settled = crate::geom::clnor::settle_custom_normals(&mesh)
-            .unwrap()
-            .unwrap();
+        let mut settled = mesh.clone();
+        crate::geom::clnor::settle_custom_normals(&mut settled).unwrap();
         let input_normals = crate::geom::normals::corner_normals(
             &settled,
             &mesh
@@ -5476,14 +5548,6 @@ mod tests {
             "the four bottom edges split the bottom fan"
         );
 
-        let rows = result.attributes["custom_normal"]["values"]
-            .as_object()
-            .unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "only the two triangles of the authored face keep a vector"
-        );
         let output = crate::geom::normals::corner_normals(
             &result,
             &result
@@ -5742,15 +5806,13 @@ mod tests {
         .unwrap();
 
         let mut seamed = mesh.clone();
-        let edges: Vec<serde_json::Value> = seamed
-            .edges
-            .iter()
-            .enumerate()
-            .map(|(index, _)| json!({"sharp": false, "seam": index == 0}))
-            .collect();
-        seamed
-            .attributes
-            .insert("blender_edge_flags".to_owned(), json!(edges));
+        let first_edge = seamed.edges[0].id;
+        let mut seam_values = serde_json::Map::new();
+        seam_values.insert(format!("e{first_edge}"), json!(true));
+        seamed.attributes.insert(
+            "seam".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": seam_values}),
+        );
         let error = evaluate_modifiers(
             &seamed,
             &[with_params(
@@ -5849,19 +5911,20 @@ mod tests {
         })
         .unwrap();
         let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
-        let layers: Vec<serde_json::Value> = ["UV0", "UV1", "UV2", "UV3"]
+        let layers: Vec<UvLayer> = ["UV0", "UV1", "UV2", "UV3"]
             .into_iter()
             .map(|name| {
-                let values: Vec<serde_json::Value> = (0..corners)
-                    .map(|index| json!([(index % 7) as f64 / 7.0, (index % 5) as f64 / 5.0]))
+                let mut values =
+                    (0..corners).map(|index| [(index % 7) as f64 / 7.0, (index % 5) as f64 / 5.0]);
+                let faces: Vec<Option<Vec<[f64; 2]>>> = mesh
+                    .faces
+                    .iter()
+                    .map(|face| Some(values.by_ref().take(face.vertices.len()).collect()))
                     .collect();
-                json!({"name": name, "values": values})
+                UvLayer::new(name, faces)
             })
             .collect();
-        mesh.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            serde_json::Value::Array(layers),
-        );
+        uv_layers::write_layers(&mut mesh, &layers);
         let error = evaluate_modifiers(&mesh, &[with_params("subdivision", json!({"levels": 5}))])
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::LimitExceeded);

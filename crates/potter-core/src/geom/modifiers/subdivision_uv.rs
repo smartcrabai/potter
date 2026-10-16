@@ -4,7 +4,7 @@
 //   source/blender/blenkernel/intern/subdiv_converter_mesh.cc, source/blender/modifiers/intern/MOD_subsurf.cc, SPDX-FileCopyrightText: 2018 Blender Authors, GPL-2.0-or-later.
 //   OpenSubdiv (https://graphics.pixar.com/opensubdiv) vtr/fvarLevel.cpp, far/primvarRefiner.h, Apache-2.0.
 
-//! Face-varying UV refinement and bilinear (`SIMPLE`) subdivision.
+//! Face-varying UV and loop-normal refinement, and bilinear (`SIMPLE`) subdivision.
 //!
 //! Blender refines each UV layer as an `OpenSubdiv` face-varying channel. A channel value is a position
 //! vertex with one UV, so a vertex splits wherever its UVs differ between faces. Each level derives the
@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use glam::{DVec2, DVec3};
+use glam::{DVec2, DVec3, Vec3};
 use serde_json::{Map, json};
 
 use super::{
@@ -24,7 +24,9 @@ use super::{
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Mesh, edge_key,
+        Mesh,
+        clnor::{self, NormalCodeOptions, SetterInput},
+        edge_key,
         provenance::Origin,
         uv_layers::{self, UvLayer},
     },
@@ -977,23 +979,393 @@ impl UvSubdivision {
                     )
                 })
                 .collect();
-            layers.push(UvLayer {
-                name: layer.name.clone(),
-                faces,
-            });
+            layers.push(UvLayer::new(layer.name.clone(), faces));
         }
         uv_layers::write_layers(result, &layers);
         Ok(())
     }
 }
 
+/// One sample of a Subsurf face on Blender's ptex grid: the input corner whose ptex face holds it, the
+/// lower-left grid point of its square, and the grid slot of its first corner.
+#[derive(Clone, Copy)]
+struct NormalSample {
+    corner: usize,
+    x: usize,
+    y: usize,
+    rotation: usize,
+}
+
+/// Grid offset of each slot's corner within its square, counter-clockwise from the lower-left corner.
+const SLOT_OFFSETS: [(usize, usize); 4] = [(0, 0), (1, 0), (1, 1), (0, 1)];
+
+/// Corner range of one input face.
+struct NormalFace {
+    start: usize,
+    count: usize,
+}
+
+/// Custom-normal state of one Subsurf modifier, advanced once per level beside the UV channels.
+///
+/// Vectors follow Blender's loop-normal interpolation (`subdiv_mesh.cc`): a quad face is one ptex patch of
+/// its raw corner vectors, an n-gon corner is the patch `[corner, edge to next, face mean, edge to
+/// previous]` with each mixed value normalized, and each output loop is the normalized bilinear mix at its
+/// grid point. Automatic corners carry their evaluated fan normal, so they take part whenever the input has
+/// a custom layer. The loop numbering places each sample on Blender's grid (`subdiv_foreach.cc`): a quad is
+/// one ptex face of side `2^level`, an n-gon corner one ptex face of side `2^(level-1)`.
+pub(super) struct NormalSubdivision {
+    /// Interpolation patch of each input corner in slot order; `None` without an enabled custom layer.
+    patches: Option<Vec<[DVec3; 4]>>,
+    faces: Vec<NormalFace>,
+    /// Face of each input corner.
+    corner_face: Vec<usize>,
+    /// Blender loop position of each input corner within its face.
+    corner_local: Vec<usize>,
+    samples: Vec<NormalSample>,
+    /// Corner grid side of the current level: 0 before the first refinement, then `2^(level - 1)`.
+    grid: usize,
+}
+
+impl NormalSubdivision {
+    /// The input's custom-normal patches, with automatic corners evaluated by the input fans, and its loop
+    /// basis. Patches exist only when `use_custom_normals` is set and the input has a custom layer.
+    pub(super) fn new(mesh: &Mesh, use_custom_normals: bool) -> Result<Self> {
+        let corner_local = input_locals(mesh)?;
+        let mut faces = Vec::with_capacity(mesh.faces.len());
+        let mut corner_face = Vec::with_capacity(corner_local.len());
+        for (index, face) in mesh.faces.iter().enumerate() {
+            let count = face.vertices.len();
+            faces.push(NormalFace {
+                start: corner_face.len(),
+                count,
+            });
+            corner_face.extend(std::iter::repeat_n(index, count));
+        }
+        let patches = match clnor::corner_codes(mesh)? {
+            Some(codes) if use_custom_normals => {
+                let vectors = clnor::evaluate_codes(
+                    mesh,
+                    &codes,
+                    &positions(mesh),
+                    NormalCodeOptions {
+                        corner_order: None,
+                        setter_input: SetterInput::NormalizeInput,
+                    },
+                )?;
+                Some(corner_patches(&vectors, &faces, &corner_local))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            patches,
+            faces,
+            corner_face,
+            corner_local,
+            samples: Vec::new(),
+            grid: 0,
+        })
+    }
+
+    /// Advances the numbering one level. The first level has one sample per input corner: a quad corner is
+    /// the child of its face's 2x2 grid at its slot, and an n-gon corner is its whole ptex face.
+    pub(super) fn refine(&mut self) {
+        self.samples = if self.grid == 0 {
+            (0..self.corner_face.len())
+                .map(|corner| self.root(corner))
+                .collect()
+        } else {
+            self.samples
+                .iter()
+                .flat_map(|sample| {
+                    (0..4).map(move |corner| {
+                        let slot = (sample.rotation + corner) % 4;
+                        let (dx, dy) = SLOT_OFFSETS[slot];
+                        NormalSample {
+                            corner: sample.corner,
+                            x: sample.x * 2 + dx,
+                            y: sample.y * 2 + dy,
+                            rotation: slot,
+                        }
+                    })
+                })
+                .collect()
+        };
+        self.grid = if self.grid == 0 { 1 } else { self.grid * 2 };
+    }
+
+    /// First sample of an input corner.
+    fn root(&self, corner: usize) -> NormalSample {
+        let face = &self.faces[self.corner_face[corner]];
+        if face.count == 4 {
+            let slot = (self.corner_local[face.start] + corner - face.start) % 4;
+            let (x, y) = SLOT_OFFSETS[slot];
+            NormalSample {
+                corner,
+                x,
+                y,
+                rotation: slot,
+            }
+        } else {
+            NormalSample {
+                corner,
+                x: 0,
+                y: 0,
+                rotation: 0,
+            }
+        }
+    }
+
+    /// Grid side of a face's ptex squares at the current level: a quad is one ptex face of twice the
+    /// corner side.
+    fn side(&self, face: usize) -> usize {
+        if self.faces[face].count == 4 {
+            2 * self.grid
+        } else {
+            self.grid
+        }
+    }
+
+    /// Blender face index and loop-start slot of each sample in the current ptex grid.
+    fn blender_faces(&self) -> Vec<(usize, usize)> {
+        let mut offsets = Vec::with_capacity(self.faces.len());
+        let mut total = 0;
+        for (index, face) in self.faces.iter().enumerate() {
+            let side = self.side(index);
+            let ptex_faces = if face.count == 4 { 1 } else { face.count };
+            offsets.push(total);
+            total += ptex_faces * side * side;
+        }
+        self.samples
+            .iter()
+            .map(|sample| {
+                let face = self.corner_face[sample.corner];
+                let side = self.side(face);
+                if self.faces[face].count == 4 {
+                    (
+                        offsets[face] + quad_index(sample.x, sample.y, side),
+                        boundary_run(sample.x, sample.y, side),
+                    )
+                } else {
+                    let (index, run) = ngon_square_order(
+                        self.corner_local[sample.corner],
+                        sample.x,
+                        sample.y,
+                        side,
+                        self.faces[face].count,
+                    );
+                    (offsets[face] + index, run)
+                }
+            })
+            .collect()
+    }
+
+    /// Blender loop ordinal of each output corner, in Potter order.
+    fn loop_order(&self) -> Vec<usize> {
+        let faces = self.blender_faces();
+        let mut order = Vec::with_capacity(self.samples.len() * 4);
+        for (sample, &(face, run)) in self.samples.iter().zip(&faces) {
+            for corner in 0..4 {
+                order.push(4 * face + (sample.rotation + corner + 4 - run) % 4);
+            }
+        }
+        order
+    }
+
+    /// Writes the output custom normals through the Subdivision setter, with the output loop numbering as
+    /// the basis when it differs from storage order. Without a custom layer only that basis remains.
+    pub(super) fn write_back(&self, result: &mut Mesh) -> Result<()> {
+        let order = self.loop_order();
+        let identity = order.iter().enumerate().all(|(index, &ordinal)| index == ordinal);
+        let options = NormalCodeOptions {
+            corner_order: (!identity).then_some(order.as_slice()),
+            setter_input: SetterInput::AlreadyNormalized,
+        };
+        let Some(patches) = &self.patches else {
+            return clnor::write_codes(result, None, options);
+        };
+        let normals: Vec<Option<DVec3>> = self
+            .samples
+            .iter()
+            .enumerate()
+            .flat_map(|(sample_index, sample)| {
+                let order = &order;
+                let side = usize_as_f32(self.side(self.corner_face[sample.corner]));
+                let patch = patches[sample.corner];
+                (0..4).map(move |corner| {
+                    let loop_slot = order[sample_index * 4 + corner] % 4;
+                    let (dx, dy) = SLOT_OFFSETS[loop_slot];
+                    let u = usize_as_f32(sample.x + dx) / side;
+                    let v = usize_as_f32(sample.y + dy) / side;
+                    let weights = [
+                        (1.0 - u) * (1.0 - v),
+                        u * (1.0 - v),
+                        u * v,
+                        (1.0 - u) * v,
+                    ];
+                    let mut value = Vec3::ZERO;
+                    for (&point, weight) in patch.iter().zip(weights) {
+                        value += point.as_vec3() * weight;
+                    }
+                    Some(clnor::normalize(value).as_dvec3())
+                })
+            })
+            .collect();
+        clnor::encode_vectors(result, Some(normals.as_slice()), options)
+    }
+}
+
+/// Blender loop position of each input corner within its face, from the input's loop order (storage order
+/// without one). Blender numbers a face's loops as one rotation of its own cycle, so a reversed or
+/// interleaved run has no polygon numbering.
+fn input_locals(mesh: &Mesh) -> Result<Vec<usize>> {
+    let order = clnor::corner_order(mesh)?;
+    let mut locals = Vec::new();
+    let mut start = 0;
+    for face in &mesh.faces {
+        let count = face.vertices.len();
+        let ordinals: Vec<usize> = (start..start + count)
+            .map(|corner| order.as_ref().map_or(corner, |order| order[corner]))
+            .collect();
+        let base = ordinals.iter().copied().min().unwrap_or(start);
+        let local: Vec<usize> = ordinals.iter().map(|ordinal| ordinal - base).collect();
+        let rotation = local.first().copied().unwrap_or(0);
+        if local
+            .iter()
+            .enumerate()
+            .any(|(corner, &index)| index != (rotation + corner) % count)
+        {
+            return Err(PotError::new(
+                ErrorCode::InvalidArgument,
+                "custom normal corner_order is not a Blender polygon loop order",
+            ));
+        }
+        locals.extend(local);
+        start += count;
+    }
+    Ok(locals)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Subdivision interpolation matches Blender's f32 loop weights"
+)]
+fn usize_as_f32(value: usize) -> f32 {
+    value as f32
+}
+
+/// Blender's interpolation patch of every input corner. A quad face is one patch of its raw corners in
+/// slot order; an n-gon corner is `[corner, edge to next, face mean, edge to previous]`, with mixed values
+/// normalized as `mix_normals` does.
+fn corner_patches(vectors: &[DVec3], faces: &[NormalFace], locals: &[usize]) -> Vec<[DVec3; 4]> {
+    let mut patches = vec![[DVec3::ZERO; 4]; vectors.len()];
+    for face in faces {
+        let corners = &vectors[face.start..face.start + face.count];
+        if face.count == 4 {
+            let rotation = locals[face.start];
+            let patch: [DVec3; 4] = std::array::from_fn(|slot| corners[(slot + 4 - rotation) % 4]);
+            patches[face.start..face.start + 4].fill(patch);
+        } else {
+            let weight = 1.0 / usize_as_f32(face.count);
+            let mut sum = Vec3::ZERO;
+            for &corner in corners {
+                sum += corner.as_vec3() * weight;
+            }
+            let mean = clnor::normalize(sum).as_dvec3();
+            for (index, &current) in corners.iter().enumerate() {
+                let next = corners[(index + 1) % face.count];
+                let previous = corners[(index + face.count - 1) % face.count];
+                patches[face.start + index] = [
+                    current,
+                    clnor::normalize(current.as_vec3() * 0.5 + next.as_vec3() * 0.5)
+                        .as_dvec3(),
+                    mean,
+                    clnor::normalize(previous.as_vec3() * 0.5 + current.as_vec3() * 0.5)
+                        .as_dvec3(),
+                ];
+            }
+        }
+    }
+    patches
+}
+
+/// The boundary run of a square on a `side × side` patch: 0 bottom, 1 right, 2 top, 3 left. Interior
+/// squares report 0, where loops start at the lower-left corner.
+fn boundary_run(x: usize, y: usize, side: usize) -> usize {
+    let last = side - 1;
+    if y == 0 && x < last {
+        0
+    } else if x == last && y < last {
+        1
+    } else if y == last && x >= 1 {
+        2
+    } else if x == 0 && y >= 1 {
+        3
+    } else {
+        0
+    }
+}
+
+/// Blender's special n-gon ptex traversal order: inner squares, patch connections, centre squares, then
+/// U and V boundary squares. Returns the face index within the parent polygon and loop-start slot.
+fn ngon_square_order(
+    corner: usize,
+    x: usize,
+    y: usize,
+    side: usize,
+    corners: usize,
+) -> (usize, usize) {
+    let inner = side.saturating_sub(1);
+    let boundary = side.saturating_sub(2);
+    let inner_per_corner = inner * boundary;
+    let inner_faces = corners * inner_per_corner;
+    let connection_faces = corners * boundary;
+    let centre_per_corner = usize::from(side >= 2);
+    let centre_faces = corners * centre_per_corner;
+
+    if side >= 2 && (1..side).contains(&x) && (1..side - 1).contains(&y) {
+        return (
+            corner * inner_per_corner + (y - 1) * inner + (x - 1),
+            0,
+        );
+    }
+    if side >= 3 && y == side - 1 && (1..side - 1).contains(&x) {
+        return (inner_faces + corner * boundary + x - 1, 1);
+    }
+    if side >= 2 && x == side - 1 && y == side - 1 {
+        return (inner_faces + connection_faces + corner, 2);
+    }
+
+    let boundary_start = inner_faces + connection_faces + centre_faces;
+    if y == 0 {
+        (boundary_start + corner * side + x, 0)
+    } else {
+        (
+            boundary_start + corners * side + corner * inner + (y - 1),
+            3,
+        )
+    }
+}
+
+/// Blender's face index of square `(x, y)` in a quad's `side × side` ptex grid (`subdiv_foreach.cc`
+/// `loops_regular`): interior squares row by row, then the boundary runs of corners 0 to 3.
+fn quad_index(x: usize, y: usize, side: usize) -> usize {
+    let last = side - 1;
+    let inner = side - 2;
+    if (1..last).contains(&x) && (1..last).contains(&y) {
+        return (y - 1) * inner + (x - 1);
+    }
+    let ring = inner * inner;
+    match boundary_run(x, y, side) {
+        0 => ring + x,
+        1 => ring + last + y,
+        2 => ring + 2 * last + (last - x),
+        _ => ring + 3 * last + (last - y),
+    }
+}
+
 /// One level of bilinear (`SIMPLE`) subdivision: original points stay, each edge gets its midpoint,
 /// and each face its centroid. Every corner becomes one quad, as in `subdivide_once`.
-pub(super) fn subdivide_simple_once(
-    mesh: &Mesh,
-    use_creases: bool,
-    raw_normals: bool,
-) -> Result<Mesh> {
+pub(super) fn subdivide_simple_once(mesh: &Mesh, use_creases: bool) -> Result<Mesh> {
     let source_points = positions(mesh);
     let source_polygons = polygons(mesh)?;
     let source_edges = loose_edges(mesh)?;
@@ -1030,7 +1402,6 @@ pub(super) fn subdivide_simple_once(
         &edge_point_indices,
         &edge_creases,
         use_creases,
-        raw_normals,
     )
 }
 
@@ -1047,7 +1418,6 @@ pub(super) fn subdivided_mesh(
     edge_points: &BTreeMap<(usize, usize), usize>,
     edge_creases: &BTreeMap<(usize, usize), f64>,
     use_creases: bool,
-    raw_normals: bool,
 ) -> Result<Mesh> {
     let face_point_base = points.len() - source_polygons.len();
     let mut output_polygons =
@@ -1095,7 +1465,6 @@ pub(super) fn subdivided_mesh(
             .flat_map(|(index, (face, _))| std::iter::repeat_n(Some(index), face.len()))
             .collect(),
         corners: None,
-        raw_normals,
     };
     let mut output = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
     if use_creases && mesh.attributes.contains_key("crease_edge") {
@@ -1136,4 +1505,72 @@ pub(super) fn subdivided_mesh(
         );
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quads(count: usize) -> NormalSubdivision {
+        NormalSubdivision {
+            patches: None,
+            faces: (0..count)
+                .map(|index| NormalFace {
+                    start: index * 4,
+                    count: 4,
+                })
+                .collect(),
+            corner_face: (0..count * 4).map(|corner| corner / 4).collect(),
+            corner_local: (0..count * 4).map(|corner| corner % 4).collect(),
+            samples: Vec::new(),
+            grid: 0,
+        }
+    }
+
+    fn ngon() -> NormalSubdivision {
+        NormalSubdivision {
+            patches: None,
+            faces: vec![NormalFace { start: 0, count: 5 }],
+            corner_face: vec![0; 5],
+            corner_local: (0..5).collect(),
+            samples: Vec::new(),
+            grid: 0,
+        }
+    }
+
+    #[test]
+    fn loop_numbering_is_identity_on_level_one_and_a_permutation_on_level_two() {
+        let mut state = quads(2);
+        state.refine();
+        assert_eq!(state.loop_order(), (0..32).collect::<Vec<_>>());
+        state.refine();
+        let mut order = state.loop_order();
+        order.sort_unstable();
+        assert_eq!(order, (0..128).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ngon_loop_numbering_covers_blender_ptex_passes() {
+        let mut state = ngon();
+        state.refine();
+        assert_eq!(state.loop_order(), (0..20).collect::<Vec<_>>());
+        state.refine();
+        let mut order = state.loop_order();
+        order.sort_unstable();
+        assert_eq!(order, (0..80).collect::<Vec<_>>());
+        state.refine();
+        let mut order = state.loop_order();
+        order.sort_unstable();
+        assert_eq!(order, (0..320).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn quad_patch_is_read_in_slot_order_from_the_input_rotation() {
+        let corners = [DVec3::X, DVec3::Y, DVec3::Z, DVec3::NEG_X];
+        let faces = [NormalFace { start: 0, count: 4 }];
+        let patches = corner_patches(&corners, &faces, &[1, 2, 3, 0]);
+        // Corner 0 sits in slot 1, so slot 0 holds corner 3.
+        assert_eq!(patches[0][0], DVec3::NEG_X);
+        assert_eq!(patches[0][1], DVec3::X);
+    }
 }

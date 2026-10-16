@@ -257,6 +257,11 @@ pub const OP_NAMES: &[&str] = &[
     "tracking.track",
     "tracking.track_add",
     "tracking.undistort",
+    "uv.layer_create",
+    "uv.layer_delete",
+    "uv.layer_rename",
+    "uv.layer_set_active",
+    "uv.layer_set_render",
     "uv.pack",
     "uv.pin",
     "uv.transform",
@@ -759,9 +764,15 @@ fn apply_batch_internal(
             "paint.vertex" | "paint.weight" | "paint.texture" => {
                 paint::apply(&mut engine, name, object)
             }
-            "uv.pin" | "uv.pack" | "uv.unwrap" | "uv.transform" => {
-                uv::apply(&mut engine, name, object)
-            }
+            "uv.pin"
+            | "uv.pack"
+            | "uv.unwrap"
+            | "uv.transform"
+            | "uv.layer_create"
+            | "uv.layer_delete"
+            | "uv.layer_rename"
+            | "uv.layer_set_active"
+            | "uv.layer_set_render" => uv::apply(&mut engine, name, object),
             "action.create" | "action.update" | "action.delete" | "keyframe.insert"
             | "keyframe.delete" | "fcurve.update" => animation::apply(&mut engine, name, object),
             "grease_pencil.layer_create"

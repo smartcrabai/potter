@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::animation::animated_transform,
-    geom::Mesh,
+    geom::{Mesh, uv_layers},
     model::{
         ArmatureData, Constraint, ConstraintType, DataBlock, Driver, DriverType, DriverVariable,
         DriverVariableType, Id, Modifier, Node, ParentType, PoseBone, SceneDoc, ShapeKeyData,
@@ -3654,6 +3654,40 @@ fn geometry_attribute_value(
             .min(domain_count - 1);
         return Ok(json!(mesh.vertices[sample_index].co.to_array()));
     }
+    let uv_store = uv_layers::read(mesh);
+    if let Some(layer) = uv_store.index_of(name).map(|index| &uv_store.layers[index]) {
+        if domain != "FACE_CORNER" {
+            return Err(evaluation_error_with(
+                "Geometry Attribute domain does not match the target attribute",
+                json!({"constraint_id":constraint.id,"domain":domain,"attribute_domain":"corner"}),
+            ));
+        }
+        let corner_count: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+        if corner_count == 0 {
+            return Err(evaluation_error(
+                "Geometry Attribute domain has no sampleable elements",
+            ));
+        }
+        let mut current_index = param_usize(&constraint.params, "sample_index")?
+            .unwrap_or(0)
+            .min(corner_count - 1);
+        for (face_index, face) in mesh.faces.iter().enumerate() {
+            if current_index < face.vertices.len() {
+                let uv = layer
+                    .faces
+                    .get(face_index)
+                    .and_then(|entry| entry.as_deref())
+                    .and_then(|corners| corners.get(current_index))
+                    .copied()
+                    .unwrap_or([0.0, 0.0]);
+                return Ok(json!(uv));
+            }
+            current_index -= face.vertices.len();
+        }
+        return Err(evaluation_error(
+            "Geometry Attribute corner sample index is out of range",
+        ));
+    }
     let blender_attribute = mesh
         .attributes
         .get("blender_attributes")
@@ -3713,12 +3747,6 @@ fn geometry_attribute_value(
                     .and_then(Value::as_array)
                     .and_then(|values| values.get(sample_index))
             })
-            .or_else(|| {
-                (name == "uv_map")
-                    .then_some(attribute)
-                    .and_then(Value::as_array)
-                    .and_then(|values| values.get(sample_index))
-            })
             .ok_or_else(|| {
                 evaluation_error_with(
                     "Geometry Attribute sample index is out of range",
@@ -3742,7 +3770,7 @@ fn geometry_attribute_value(
     let stored_domain = attribute
         .get("domain")
         .and_then(Value::as_str)
-        .unwrap_or(if name == "uv_map" { "corner" } else { "" });
+        .unwrap_or("");
     let domain_matches = match domain {
         "POINT" => {
             stored_domain.eq_ignore_ascii_case("point")
