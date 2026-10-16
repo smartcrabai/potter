@@ -2232,6 +2232,11 @@ fn object_mesh_dependencies(
                     modifier.params.get("armature"),
                 );
             }
+            if modifier.modifier_type == "uv_warp"
+                && let Some(owner_dependencies) = dependencies.other.get_mut(owner_id)
+            {
+                add_uv_warp_pose_armature_references(doc, modifier, owner_dependencies);
+            }
             if modifier.modifier_type == "boolean"
                 && let Some(collection_text) = modifier
                     .params
