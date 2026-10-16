@@ -10,9 +10,12 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Aabb, CylinderParams, IcosphereParams, Mesh, normals::SHADING_ATTRIBUTES},
+    geom::{
+        Aabb, CylinderParams, IcosphereParams, Mesh, modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
+        normals::SHADING_ATTRIBUTES,
+    },
     hash,
-    model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
+    model::{ConstraintType, DataBlock, Id, Modifier, Node, Scene, SceneDoc, VertexGroup},
     params::{self, ParameterFamily},
 };
 
@@ -29,7 +32,26 @@ fn mesh_to_volume_default(parameter: &str) -> Result<&'static Value> {
 pub mod animation;
 mod ik_solver;
 pub mod rig;
-const EVALUATION_ENGINE: &str = "potter-eval-4";
+const EVALUATION_ENGINE: &str = "potter-eval-5";
+
+/// A render camera explicitly chosen by a preview view rather than a scene camera node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveCameraOverride {
+    pub data: CameraData,
+    pub world_to_camera: [f64; 16],
+}
+
+/// Camera-dependent dicing inputs attached only to native path render requests.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveRenderRequest {
+    pub camera_id: Option<Id>,
+    pub camera_override: Option<AdaptiveCameraOverride>,
+    pub resolution: [u32; 2],
+    /// Preview or final-render dicing rate, selected at the existing render boundary.
+    pub dicing_rate: f64,
+}
 
 /// Scene context used to produce one immutable evaluated snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -41,7 +63,87 @@ pub struct EvaluationContext {
     pub view_layer: Option<Id>,
     #[serde(default)]
     pub frame: Option<f64>,
+    #[serde(default)]
+    pub adaptive_render: Option<AdaptiveRenderRequest>,
 }
+fn adaptive_render_context<'a>(
+    doc: &'a SceneDoc,
+    scene: &'a Scene,
+    matrices: &BTreeMap<Id, DMat4>,
+    request: &'a AdaptiveRenderRequest,
+) -> Result<AdaptiveRenderContext<'a>> {
+    if request.resolution.contains(&0)
+        || !request.dicing_rate.is_finite()
+        || request.dicing_rate <= 0.0
+    {
+        return Err(PotError::invalid_argument(
+            "adaptive render raster size and dicing rate must be positive and finite",
+        ));
+    }
+    let camera = if let Some(camera_id) = scene
+        .render
+        .dicing_camera
+        .as_ref()
+        .or(request.camera_id.as_ref())
+    {
+        let node = doc
+            .nodes
+            .get(camera_id)
+            .filter(|node| node.kind == "camera")
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "adaptive dicing camera object does not exist",
+                    json!({"camera_id": camera_id}),
+                )
+            })?;
+        let data = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|data_block| data_block.camera.as_ref())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "adaptive dicing camera has no camera data",
+                    json!({"camera_id": camera_id}),
+                )
+            })?;
+        let world = matrices.get(camera_id).copied().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "adaptive dicing camera has no evaluated world transform",
+                json!({"camera_id": camera_id}),
+            )
+        })?;
+        let world_to_camera = world.inverse();
+        if !world_to_camera.is_finite() {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "adaptive dicing camera transform is singular",
+                json!({"camera_id": camera_id}),
+            ));
+        }
+        Some(AdaptiveRenderCamera {
+            data,
+            world_to_camera,
+        })
+    } else if let Some(camera) = request.camera_override.as_ref() {
+        Some(AdaptiveRenderCamera {
+            data: &camera.data,
+            world_to_camera: DMat4::from_cols_array(&camera.world_to_camera),
+        })
+    } else {
+        None
+    };
+    Ok(AdaptiveRenderContext {
+        settings: &scene.render,
+        resolution: request.resolution,
+        dicing_rate: request.dicing_rate,
+        camera,
+    })
+}
+
 
 /// Evaluated node state for the selected scene and frame.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -179,6 +281,7 @@ impl Snapshot {
                         "scene_id": snapshot.scene_id,
                         "view_layer": snapshot.view_layer,
                         "frame": snapshot.frame,
+                        "adaptive_render": context.adaptive_render,
                         "simulation_cache_key": snapshot.simulation_cache_key,
                     });
                     snapshot.evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
@@ -316,6 +419,11 @@ impl Snapshot {
             scene.fps,
             scene.fps_base,
         )?;
+        let adaptive_render = context
+            .adaptive_render
+            .as_ref()
+            .map(|request| adaptive_render_context(doc, scene, &matrices, request))
+            .transpose()?;
         let object_meshes: BTreeMap<_, _> = doc
             .nodes
             .iter()
@@ -474,6 +582,7 @@ impl Snapshot {
             "scene_id": scene_id,
             "view_layer": view_layer,
             "frame": frame,
+            "adaptive_render": context.adaptive_render,
             "simulation_cache_key": simulation_cache_key,
         });
         let evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
@@ -580,18 +689,20 @@ impl Snapshot {
                         );
                     }
                     attach_vertex_group_weights(&mut rigged_source, data_block);
-                    let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
-                        rigged_source,
-                        &node.modifiers,
-                        &doc.node_groups,
-                        frame,
-                        matrix,
-                        &matrices,
-                        &object_meshes,
-                        &meshes,
-                        &curve_path_lengths,
-                        |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                            "armature" => rig::apply_armature_modifier_with_drivers(
+                    let evaluated =
+                        crate::geom::modifiers::evaluate_modifiers_with_scene_context(
+                            rigged_source,
+                            &node.modifiers,
+                            &doc.node_groups,
+                            frame,
+                            matrix,
+                            &matrices,
+                            &object_meshes,
+                            &meshes,
+                            &curve_path_lengths,
+                            adaptive_render.as_ref(),
+                            |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
+                                "armature" => rig::apply_armature_modifier_with_drivers(
                                 mesh,
                                 data_block,
                                 modifier,
@@ -850,18 +961,20 @@ impl Snapshot {
                         }
                     };
                     attach_vertex_group_weights(&mut source_mesh, data_block);
-                    let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
-                        source_mesh,
-                        &node.modifiers,
-                        &doc.node_groups,
-                        frame,
-                        matrix,
-                        &matrices,
-                        &object_meshes,
-                        &meshes,
-                        &curve_path_lengths,
-                        |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                            "armature" => rig::apply_armature_modifier_with_drivers(
+                    let evaluated =
+                        crate::geom::modifiers::evaluate_modifiers_with_scene_context(
+                            source_mesh,
+                            &node.modifiers,
+                            &doc.node_groups,
+                            frame,
+                            matrix,
+                            &matrices,
+                            &object_meshes,
+                            &meshes,
+                            &curve_path_lengths,
+                            adaptive_render.as_ref(),
+                            |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
+                                "armature" => rig::apply_armature_modifier_with_drivers(
                                 mesh,
                                 data_block,
                                 modifier,

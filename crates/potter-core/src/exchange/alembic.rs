@@ -176,6 +176,7 @@ pub(crate) fn export(
                     scene_id: Some(snapshot.scene_id.clone()),
                     view_layer: snapshot.view_layer.clone(),
                     frame: Some(*frame),
+                    adaptive_render: None,
                 },
             )?;
             &owned

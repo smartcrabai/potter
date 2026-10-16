@@ -112,6 +112,7 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 scene_id: None,
                 view_layer: None,
                 frame: Some(engine.evaluation_frame),
+                adaptive_render: None,
             },
             None,
             &bind_nodes,
@@ -910,6 +911,7 @@ fn apply_modifier(
                     &base_object_meshes,
                     evaluated_operand_meshes,
                     &BTreeMap::new(),
+                    None,
                     |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                         "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
                             mesh,

@@ -69,6 +69,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             .map(parse_id)
             .transpose()?,
         frame: None,
+        adaptive_render: None,
     };
     let cache_directory = project.path().to_path_buf();
     let mut stage = BakeStage::create(&args.out)?;

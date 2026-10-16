@@ -155,6 +155,7 @@ fn render_candidate_preview(
         scene_id,
         view_layer,
         frame,
+        adaptive_render: None,
     };
     render_previews(
         candidate,

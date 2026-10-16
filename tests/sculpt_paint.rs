@@ -9,6 +9,12 @@ use glam::DVec3;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+#[path = "common/process.rs"]
+mod process;
+#[path = "common/blender_checked.rs"]
+mod blender_checked;
+
+use blender_checked::blender_executable;
 
 use potter_core::{
     geom::{Mesh, sculpt},
@@ -28,11 +34,19 @@ fn create_scene() -> Result<(tempfile::TempDir, std::path::PathBuf), Box<dyn Err
 }
 
 fn apply(scene: &std::path::Path, operations: &Value) -> Result<Value, Box<dyn Error>> {
+    apply_at_revision(scene, operations, 0)
+}
+
+fn apply_at_revision(
+    scene: &std::path::Path,
+    operations: &Value,
+    base_revision: u64,
+) -> Result<Value, Box<dyn Error>> {
     let file = scene.with_extension("operations.json");
     fs::write(
         &file,
         serde_json::to_vec(
-            &json!({"schema_version": 1, "base_revision": 0, "operations": operations}),
+            &json!({"schema_version": 1, "base_revision": base_revision, "operations": operations}),
         )?,
     )?;
     let output = Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -54,6 +68,370 @@ fn stored_mesh(scene: &std::path::Path) -> Result<Value, Box<dyn Error>> {
     let bytes = fs::read(scene.join("scene.json"))?;
     let document: Value = serde_json::from_slice(&bytes)?;
     Ok(document["data_blocks"]["body_mesh"]["mesh"].clone())
+}
+
+fn inspected_geometry(scene: &std::path::Path) -> Result<Value, Box<dyn Error>> {
+    inspected_geometry_for(scene, "body")
+}
+
+fn inspected_geometry_for(
+    scene: &std::path::Path,
+    id: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("inspect")
+        .arg(scene)
+        .arg("--id")
+        .arg(id)
+        .arg("--json")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout)?;
+    Ok(envelope["result"]["items"][0]["evaluated_geometry"].clone())
+}
+
+fn has_nonzero_number(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
+        Value::Array(values) => values.iter().any(has_nonzero_number),
+        _ => false,
+    }
+}
+
+#[test]
+fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
+-> Result<(), Box<dyn Error>> {
+    let (_baseline_directory, baseline_scene) = create_scene()?;
+    apply(
+        &baseline_scene,
+        &json!([
+            {"op":"node.create", "id":"body", "kind":"box", "params":{}},
+            {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1}
+        ]),
+    )?;
+    let baseline_mesh = stored_mesh(&baseline_scene)?;
+    let baseline_displacement =
+        baseline_mesh["attributes"]["multires_displacement"].clone();
+    let baseline_geometry = inspected_geometry(&baseline_scene)?;
+
+    let stroke = json!({
+        "op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
+        "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+        "falloff":"linear", "seed":7
+    });
+    let (_multires_directory, multires_scene) = create_scene()?;
+    apply(
+        &multires_scene,
+        &json!([
+            {"op":"node.create", "id":"body", "kind":"box", "params":{}},
+            {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1},
+            stroke
+        ]),
+    )?;
+    let multires_mesh = stored_mesh(&multires_scene)?;
+    let multires_displacement = &multires_mesh["attributes"]["multires_displacement"];
+    assert_ne!(multires_displacement["values"], baseline_displacement["values"]);
+    assert!(
+        multires_displacement["values"]
+            .as_object()
+            .is_some_and(|values| values.values().any(has_nonzero_number)),
+        "native multires stroke wrote no nonzero MDisps values"
+    );
+    let multires_geometry = inspected_geometry(&multires_scene)?;
+    assert_ne!(
+        multires_geometry["positions"],
+        baseline_geometry["positions"],
+        "native multires stroke did not change evaluated geometry"
+    );
+
+    let (_base_directory, base_scene) = create_scene()?;
+    apply(
+        &base_scene,
+        &json!([
+            {"op":"node.create", "id":"body", "kind":"box", "params":{}},
+            {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1},
+            {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
+             "set":{"params":{"levels":1,"sculpt_levels":1,"render_levels":1,"total_levels":1,"use_sculpt_base_mesh":true}}},
+            stroke
+        ]),
+    )?;
+    let base_mesh = stored_mesh(&base_scene)?;
+    assert_ne!(base_mesh["vertices"], baseline_mesh["vertices"]);
+    assert_eq!(
+        base_mesh["attributes"]["multires_displacement"],
+        baseline_displacement,
+        "base-mesh sculpting unexpectedly edited MDisps"
+    );
+    Ok(())
+}
+
+
+#[test]
+fn multires_sculpt_levels_select_native_grid_resolution() -> Result<(), Box<dyn Error>> {
+    let mut grid_values = Vec::new();
+    for sculpt_levels in [1, 2] {
+        let (_directory, scene) = create_scene()?;
+        apply(
+            &scene,
+            &json!([
+                {"op":"node.create", "id":"body", "kind":"box", "params":{}},
+                {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":2, "render_levels":2},
+                {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
+                 "set":{"params":{"levels":2,"sculpt_levels":sculpt_levels,"render_levels":2,"total_levels":2}}},
+                {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
+                 "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+                 "falloff":"linear", "seed":7}
+            ]),
+        )?;
+        let mesh = stored_mesh(&scene)?;
+        let values = mesh["attributes"]["multires_displacement"]["values"].clone();
+        assert!(
+            values
+                .as_object()
+                .is_some_and(|faces| faces.values().any(has_nonzero_number)),
+            "sculpt level {sculpt_levels} wrote no nonzero MDisps values"
+        );
+        grid_values.push(values);
+    }
+    assert_ne!(
+        grid_values[0], grid_values[1],
+        "sculpt_levels did not select a different MDisps sample resolution"
+    );
+    Ok(())
+}
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one Blender round trip covers packed/external MDisps, continued sculpt, and apply"
+)]
+fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        return Ok(());
+    };
+    let (source_directory, source_scene) = create_scene()?;
+    apply(
+        &source_scene,
+        &json!([
+            {"op":"node.create", "id":"body", "kind":"box", "params":{}},
+            {"op":"camera.create", "id":"multires_camera", "transform":{"translation":[0.0,0.0,4.0]},
+             "projection":"orthographic", "ortho_scale":3.0},
+            {"op":"scene.update", "target":{"id":"scene_main"}, "set":{"camera":"multires_camera"}},
+            {"op":"render.update", "target":{"id":"scene_main"},
+             "set":{"resolution_x":16,"resolution_y":16,"samples":1,"seed":0,"dicing_rate":1.25,
+                    "preview_dicing_rate":6.0,"max_subdivisions":5,"offscreen_dicing_scale":2.0,
+                    "dicing_camera":"multires_camera"}},
+            {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1},
+            {"op":"modifier.update", "target":{"id":"body"}, "id":"multi_one",
+             "set":{"params":{"show_only_control_edges":false,"use_sculpt_base_mesh":false}}},
+            {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
+             "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+             "falloff":"linear", "seed":7}
+        ]),
+    )?;
+    let source_document: Value =
+        serde_json::from_slice(&fs::read(source_scene.join("scene.json"))?)?;
+    let source_mesh = &source_document["data_blocks"]["body_mesh"]["mesh"];
+    let source_record = &source_mesh["attributes"]["multires_displacement"];
+    assert!(
+        source_record["values"]
+            .as_object()
+            .is_some_and(|values| values.values().any(has_nonzero_number)),
+        "source sculpt wrote no nonzero MDisps values"
+    );
+
+    for (stem, pack) in [("external", false), ("packed", true)] {
+        let output = source_directory
+            .path()
+            .join(format!("continuation-{stem}.blend"));
+        let mut export = Command::new(env!("CARGO_BIN_EXE_pot"));
+        export
+            .args(["export"])
+            .arg(&source_scene)
+            .args(["--format", "blend", "--out"])
+            .arg(&output)
+            .args(["--blender"])
+            .arg(&blender)
+            .arg("--json");
+        if pack {
+            export.arg("--pack");
+        }
+        let result = export.output()?;
+        assert!(
+            result.status.success(),
+            "Blender export failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let sidecar = source_directory
+            .path()
+            .join(format!("continuation-{stem}_assets"));
+        assert_eq!(sidecar.exists(), !pack);
+        let moved_directory = source_directory.path().join(format!("moved-{stem}"));
+        fs::create_dir(&moved_directory)?;
+        let moved_output = moved_directory.join(output.file_name().ok_or("missing blend filename")?);
+        fs::rename(&output, &moved_output)?;
+        if !pack {
+            fs::rename(
+                &sidecar,
+                moved_directory.join(sidecar.file_name().ok_or("missing sidecar name")?),
+            )?;
+        }
+
+        let (_import_directory, import_scene) = create_scene()?;
+        let imported = Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args(["import"])
+            .arg(&import_scene)
+            .args(["--file"])
+            .arg(&moved_output)
+            .args([
+                "--format",
+                "blend",
+                "--mode",
+                "replace",
+                "--base-revision",
+                "0",
+                "--blender",
+            ])
+            .arg(&blender)
+            .arg("--json")
+            .output()?;
+        assert!(
+            imported.status.success(),
+            "Blender import failed:\n{}\n{}",
+            String::from_utf8_lossy(&imported.stdout),
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        let imported_document: Value =
+            serde_json::from_slice(&fs::read(import_scene.join("scene.json"))?)?;
+        let imported_scene_id = imported_document["active_scene"]
+            .as_str()
+            .ok_or("imported active scene is missing")?;
+        let imported_render = &imported_document["scenes"][imported_scene_id]["render"];
+        assert_eq!(imported_render["dicing_rate"], json!(1.25));
+        assert_eq!(imported_render["preview_dicing_rate"], json!(6.0));
+        assert_eq!(imported_render["max_subdivisions"], json!(5));
+        assert_eq!(imported_render["offscreen_dicing_scale"], json!(2.0));
+        assert_eq!(imported_render["dicing_camera"], json!("multires_camera"));
+        let (node_id, data_id, modifier_id) = imported_document["nodes"]
+            .as_object()
+            .and_then(|nodes| {
+                nodes.iter().find_map(|(node_id, node)| {
+                    let modifier = node
+                        .get("modifiers")?
+                        .as_array()?
+                        .iter()
+                        .find(|modifier| modifier.get("type").and_then(Value::as_str) == Some("multires"))?;
+                    Some((
+                        node_id.clone(),
+                        node.get("data")?.as_str()?.to_owned(),
+                        modifier.get("id")?.as_str()?.to_owned(),
+                    ))
+                })
+            })
+            .ok_or("imported multires node is missing")?;
+        let imported_record = imported_document["data_blocks"][data_id.as_str()]["mesh"]
+            ["attributes"]["multires_displacement"];
+        let imported_modifier = imported_document["nodes"][node_id.as_str()]["modifiers"]
+            .as_array()
+            .and_then(|modifiers| {
+                modifiers
+                    .iter()
+                    .find(|modifier| modifier["type"] == "multires")
+            })
+            .ok_or("imported Multires modifier is missing")?;
+        assert_eq!(
+            imported_modifier["params"]["is_external"],
+            json!(!pack)
+        );
+        assert_eq!(imported_modifier["params"]["show_only_control_edges"], json!(false));
+        assert_eq!(imported_modifier["params"]["use_sculpt_base_mesh"], json!(false));
+        assert_eq!(imported_modifier["params"]["levels"], json!(1));
+        assert_eq!(imported_modifier["params"]["sculpt_levels"], json!(1));
+        assert_eq!(imported_modifier["params"]["render_levels"], json!(1));
+        assert_eq!(imported_modifier["params"]["total_levels"], json!(1));
+        if !pack {
+            let filepath = imported_record["external"]["filepath"]
+                .as_str()
+                .ok_or("external MDisps filepath is missing")?;
+            assert!(filepath.starts_with("//continuation-external_assets/"));
+            assert!(!filepath.contains("/tmp"));
+        }
+
+        let before_geometry = inspected_geometry_for(&import_scene, &node_id)?;
+        let base_revision = imported_document["revision"]
+            .as_u64()
+            .ok_or("imported project revision is missing")?;
+        apply_at_revision(
+            &import_scene,
+            &json!([{
+                "op":"sculpt.stroke", "target":{"id":node_id}, "brush":"draw", "scope":"shared",
+                "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+                "falloff":"linear", "seed":19
+            }]),
+            base_revision,
+        )?;
+        let continued_document: Value =
+            serde_json::from_slice(&fs::read(import_scene.join("scene.json"))?)?;
+        let continued_record = continued_document["data_blocks"][data_id.as_str()]["mesh"]
+            ["attributes"]["multires_displacement"];
+        assert_ne!(continued_record["values"], imported_record["values"]);
+        assert!(
+            continued_record["values"]
+                .as_object()
+                .is_some_and(|values| values.values().any(has_nonzero_number)),
+            "{stem} continuation stroke wrote no nonzero MDisps values"
+        );
+        let continued_geometry = inspected_geometry_for(&import_scene, &node_id)?;
+        assert_ne!(
+           continued_geometry["positions"],
+            before_geometry["positions"],
+            "{stem} continuation stroke did not affect evaluated geometry"
+        );
+        let render_output = import_scene.join(format!("render-{stem}"));
+        let rendered = Command::new(env!("CARGO_BIN_EXE_pot"))
+            .arg("render")
+            .arg(&import_scene)
+            .args(["--engine", "path", "--frames", "1", "--format", "png", "--out"])
+            .arg(&render_output)
+            .arg("--json")
+            .output()?;
+        assert!(
+            rendered.status.success(),
+            "{stem} native render failed:\n{}\n{}",
+            String::from_utf8_lossy(&rendered.stdout),
+            String::from_utf8_lossy(&rendered.stderr)
+        );
+        let rendered_image = render_output.join("frame_0001.png");
+        assert!(
+            fs::metadata(&rendered_image)?.len() > 0,
+            "{stem} native render produced no image"
+        );
+
+        let continued_revision = continued_document["revision"]
+            .as_u64()
+            .ok_or("continued project revision is missing")?;
+        apply_at_revision(
+            &import_scene,
+            &json!([{
+                "op":"modifier.apply",
+                "target":{"id":node_id},
+                "modifier_id":modifier_id
+            }]),
+            continued_revision,
+        )?;
+        let applied_geometry = inspected_geometry_for(&import_scene, &node_id)?;
+        assert_eq!(
+            applied_geometry["positions"],
+            continued_geometry["positions"],
+            "{stem} native modifier apply changed the sculpted result"
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -183,6 +561,16 @@ fn sculpt_multires_runs_catmull_clark_evaluation() -> Result<(), Box<dyn Error>>
     let item = &envelope["result"]["items"][0];
     assert_eq!(item["evaluated_geometry"]["vertex_count"], json!(26));
     assert_eq!(item["evaluated_geometry"]["face_count"], json!(24));
+    let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    assert_eq!(
+        document["data_blocks"]["body_mesh"]["mesh"]["attributes"]["multires_displacement"]
+            ["total_levels"],
+        json!(1)
+    );
+    assert_eq!(
+        document["nodes"]["body"]["modifiers"][0]["params"]["total_levels"],
+        json!(1)
+    );
     Ok(())
 }
 #[test]

@@ -26,6 +26,7 @@ const INTERNAL_KEYS: &[&str] = &[
     "color_layers",
     "crease_edge",
     "custom_normal",
+    "multires_displacement",
     "seam",
     "sharp",
     "shade_smooth",

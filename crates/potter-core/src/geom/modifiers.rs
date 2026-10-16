@@ -13,8 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     graph::{self, NodeGroup},
-    model::{Id, Modifier, Registry},
-    params::{self, ParameterFamily},
+    model::{CameraData, Id, Modifier, Registry, RenderSettings},
 };
 
 use super::attribute_keys;
@@ -28,9 +27,12 @@ use super::{
 };
 
 mod advanced;
+mod adaptive_dicing;
+mod adaptive_mesh;
 pub mod attributes;
 mod bevel_shading;
 mod bevel_vmesh;
+mod multires;
 mod decimate;
 pub(crate) mod deform;
 mod ocean;
@@ -67,7 +69,15 @@ impl MergedGeometry {
     }
 }
 const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
-const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
+pub(crate) const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
+pub(crate) fn check_multires_grid_capacity(
+    corner_count: usize,
+    total_levels: u32,
+    additional_bytes: u64,
+) -> Result<()> {
+    let grid_vectors = super::multires_external::grid_vector_count(total_levels)?;
+    multires::check_grid_capacity_for_corners(corner_count, grid_vectors, additional_bytes)
+}
 
 /// Result of evaluating a modifier stack, including realized graph instance paths.
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +85,22 @@ pub struct ModifierEvaluation {
     pub mesh: Mesh,
     pub instance_paths: Vec<Vec<Id>>,
     pub warnings: Vec<PotError>,
+}
+
+/// Camera and raster inputs passed from the native path-render boundary for adaptive Subsurf.
+#[derive(Clone, Copy)]
+pub(crate) struct AdaptiveRenderContext<'a> {
+    pub(crate) settings: &'a RenderSettings,
+    pub(crate) resolution: [u32; 2],
+    /// Source render or preview dicing rate selected by the existing render boundary.
+    pub(crate) dicing_rate: f64,
+    pub(crate) camera: Option<AdaptiveRenderCamera<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AdaptiveRenderCamera<'a> {
+    pub(crate) data: &'a CameraData,
+    pub(crate) world_to_camera: DMat4,
 }
 
 /// Evaluate the enabled modifier stack over a source mesh without node-group context.
@@ -137,9 +163,11 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
+        None,
         custom_modifier,
     )
 }
+
 
 pub(crate) fn evaluate_modifiers_with_scene_context(
     mut evaluated: Mesh,
@@ -151,6 +179,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     object_meshes: &BTreeMap<Id, &Mesh>,
     evaluated_object_meshes: &BTreeMap<Id, Mesh>,
     curve_path_lengths: &BTreeMap<Id, f64>,
+    adaptive_render: Option<&AdaptiveRenderContext<'_>>,
     mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     if !frame.is_finite() {
@@ -288,7 +317,17 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 evaluated_object_meshes,
                 curve_path_lengths,
             )?,
-            "subdivision" | "multires" => subdivision(&evaluated, modifier)?,
+            "subdivision" => subdivision_with_adaptive_context(
+                &evaluated,
+                modifier,
+                owner_world_matrix,
+                if modifier_index + 1 == modifiers.len() {
+                    adaptive_render
+                } else {
+                    None
+                },
+            )?,
+            "multires" => subdivision(&evaluated, modifier)?,
             "solidify" => solidify(&evaluated, modifier)?,
             "triangulate" => triangulate(&evaluated, modifier)?,
             "bevel" => bevel(&evaluated, modifier)?,
@@ -2180,20 +2219,256 @@ struct SubdivisionOptions {
 }
 
 fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+    Ok(subdivision_with_samples(mesh, modifier)?.0)
+}
+
+fn subdivision_with_adaptive_context(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    owner_world_matrix: DMat4,
+    adaptive_render: Option<&AdaptiveRenderContext<'_>>,
+) -> Result<Mesh> {
+    if modifier.modifier_type == "subdivision"
+        && adaptive_render.is_some()
+        && bool_param(modifier, "use_adaptive_subdivision")?
+    {
+        return adaptive_subdivision(
+            mesh,
+            modifier,
+            owner_world_matrix,
+            adaptive_render.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "adaptive subdivision render context is missing",
+                )
+            })?,
+        );
+    }
+    subdivision(mesh, modifier)
+}
+
+fn adaptive_subdivision(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    owner_world_matrix: DMat4,
+    adaptive_render: &AdaptiveRenderContext<'_>,
+) -> Result<Mesh> {
     validated(mesh)?;
+    let boundary_smooth =
+        string_param_with_expected(modifier, "boundary_smooth", "ALL or PRESERVE_CORNERS")?;
+    if !matches!(boundary_smooth, "ALL" | "PRESERVE_CORNERS") {
+        return Err(invalid_parameter(
+            modifier,
+            "boundary_smooth",
+            "ALL or PRESERVE_CORNERS",
+        ));
+    }
+    let uv_smooth =
+        string_param_with_expected(modifier, "uv_smooth", "a Blender UV smoothing mode")?;
+    if !matches!(
+        uv_smooth,
+        "NONE"
+            | "PRESERVE_CORNERS"
+            | "PRESERVE_CORNERS_AND_JUNCTIONS"
+            | "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE"
+            | "PRESERVE_BOUNDARIES"
+            | "SMOOTH_ALL"
+    ) {
+        return Err(invalid_parameter(
+            modifier,
+            "uv_smooth",
+            "a Blender UV smoothing mode",
+        ));
+    }
+    let quality = uint_param(modifier, "quality")?;
+    if !(1..=10).contains(&quality) {
+        return Err(invalid_parameter(
+            modifier,
+            "quality",
+            "an integer between 1 and 10",
+        ));
+    }
+    let simple = match modifier.params.get("subdivision_type").map(Value::as_str) {
+        None | Some(Some("CATMULL_CLARK")) => false,
+        Some(Some("SIMPLE")) => true,
+        Some(_) => {
+            return Err(invalid_parameter(
+                modifier,
+                "subdivision_type",
+                "CATMULL_CLARK or SIMPLE",
+            ));
+        }
+    };
+    let options = SubdivisionOptions {
+        preserve_corners: boundary_smooth == "PRESERVE_CORNERS",
+        use_creases: bool_param(modifier, "use_creases")?,
+    };
+    let adaptive_space = string_param_with_expected(modifier, "adaptive_space", "PIXEL or OBJECT")?;
+    let (space, size_parameter) = match adaptive_space {
+        "PIXEL" => (
+            adaptive_dicing::AdaptiveSpace::Pixel,
+            "adaptive_pixel_size",
+        ),
+        "OBJECT" => (
+            adaptive_dicing::AdaptiveSpace::Object,
+            "adaptive_object_edge_length",
+        ),
+        _ => {
+            return Err(invalid_parameter(
+                modifier,
+                "adaptive_space",
+                "PIXEL or OBJECT",
+            ));
+        }
+    };
+    let target_size = number_param(modifier, size_parameter)? * adaptive_render.dicing_rate;
+    if !target_size.is_finite() || target_size <= 0.0 {
+        return Err(invalid_parameter(
+            modifier,
+            size_parameter,
+            "a positive finite adaptive target size",
+        ));
+    }
+
+    let source_polygons = polygons(mesh)?;
+    let base_faces: Vec<Vec<usize>> = source_polygons
+        .iter()
+        .map(|(face, _)| face.clone())
+        .collect();
+    let source_edges = loose_edges(mesh)?;
+    let edge_creases = subdivision_uv::Creases::from_values(edge_crease_values(
+        mesh,
+        options.use_creases,
+    )?);
+    let position = subdivision_uv::Position::new(
+        &source_polygons,
+        &source_edges,
+        &edge_creases.sharpness,
+        mesh.vertices.len(),
+    );
+    let uv_maps = subdivision_uv::value_maps(mesh, &position);
+    let non_manifold = NonManifold::new(
+        mesh.vertices.len(),
+        base_faces.iter().map(Vec::as_slice),
+    );
+    let edge_sharpness = non_manifold.sharpened(&edge_creases.sharpness);
+    let non_manifold_vertices: Vec<bool> = (0..mesh.vertices.len())
+        .map(|vertex| non_manifold.corner(vertex))
+        .collect();
+    let sharpness = if simple {
+        subdivision_limit::BaseSharpness::Simple
+    } else {
+        subdivision_limit::BaseSharpness::Creases {
+            edges: &edge_sharpness,
+            non_manifold: &non_manifold_vertices,
+            preserve_corners: options.preserve_corners,
+        }
+    };
+    let limit = subdivision_limit::LimitSurface::build(
+        &base_faces,
+        &positions(mesh),
+        sharpness,
+        if simple { 1 } else { quality as usize },
+    );
+    let camera = if space == adaptive_dicing::AdaptiveSpace::Pixel {
+        adaptive_render.camera.map(|camera| adaptive_dicing::AdaptiveCamera {
+            world_to_camera: camera.world_to_camera,
+            projection: camera.data.projection,
+            lens_mm: camera.data.lens_mm,
+            sensor_width_mm: camera.data.sensor_width_mm,
+            sensor_height_mm: camera.data.sensor_height_mm,
+            sensor_fit: camera.data.sensor_fit.clone(),
+            panorama_type: camera.data.panorama_type.clone(),
+            clip_start: camera.data.clip_start,
+            ortho_scale: camera.data.ortho_scale,
+            shift_x: camera.data.shift[0],
+            shift_y: camera.data.shift[1],
+            resolution: adaptive_render.resolution,
+        })
+    } else {
+        None
+    };
+    let topology = adaptive_dicing::dice(
+        &base_faces,
+        &limit,
+        &adaptive_dicing::AdaptiveDicingConfig {
+            space,
+            object_to_world: owner_world_matrix,
+            target_size,
+            max_subdivisions: adaptive_render.settings.max_subdivisions,
+            offscreen_scale: adaptive_render.settings.offscreen_dicing_scale,
+            camera,
+        },
+    )?;
+    let use_custom_normals = bool_param(modifier, "use_custom_normals")?;
+    let input_normals = if use_custom_normals && corner_normal_domain(mesh)? {
+        match clnor::corner_codes(mesh)? {
+            Some(codes) => Some(clnor::evaluate_codes(
+                mesh,
+                &codes,
+                &positions(mesh),
+                NormalCodeOptions {
+                    corner_order: None,
+                    setter_input: SetterInput::AlreadyNormalized,
+                },
+            )?),
+            None => Some(corner_normals(mesh, &positions(mesh))?),
+        }
+    } else {
+        None
+    };
+    adaptive_mesh::assemble(
+        mesh,
+        &base_faces,
+        &topology,
+        &limit,
+        &uv_maps,
+        subdivision_uv::FvarLinear::from_uv_smooth(uv_smooth),
+        options.preserve_corners,
+        input_normals.as_deref(),
+    )
+}
+
+fn subdivision_with_samples(
+    mesh: &Mesh,
+    modifier: &Modifier,
+) -> Result<(Mesh, Option<Samples>, Option<subdivision_limit::LimitSurface>)> {
+    validated(mesh)?;
+    let multires_data = if modifier.modifier_type == "multires" {
+        let data = multires::read(mesh)?;
+        if let Some(data) = &data
+            && data.corner_grids.is_none()
+            && data.external_filepath.is_some()
+        {
+            return Err(PotError::new(
+                ErrorCode::FileNotFound,
+                format!(
+                    "multires displacement data is unavailable from external file `{}`",
+                    data.external_filepath.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+        data
+    } else {
+        None
+    };
     let level_name = if modifier.runtime.use_render_levels {
         "render_levels"
     } else {
         "levels"
     };
-    let levels = uint_param(modifier, level_name)?;
-    if levels > 5 {
-        return Err(invalid_parameter(
-            modifier,
-            level_name,
-            "an integer between 0 and 5",
-        ));
-    }
+    // Subsurf is schema-bounded to 11 and the capacity policy below limits the actual allocation.
+    // Multires levels are dynamically bounded by its stored top level, as in Blender's RNA range.
+    let requested_levels = uint_param(modifier, level_name)?;
+    let levels = if let Some(data) = &multires_data {
+        requested_levels.min(u64::from(data.total_levels))
+    } else if modifier.modifier_type == "multires"
+        && modifier.params.contains_key("total_levels")
+    {
+        requested_levels.min(uint_param(modifier, "total_levels")?)
+    } else {
+        requested_levels
+    };
     let boundary_smooth =
         string_param_with_expected(modifier, "boundary_smooth", "ALL or PRESERVE_CORNERS")?;
     if !matches!(boundary_smooth, "ALL" | "PRESERVE_CORNERS") {
@@ -2245,12 +2520,10 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 
     };
     let linear = subdivision_uv::FvarLinear::from_uv_smooth(uv_smooth);
-    // Bilinear subdivision has no limit surface: its positions are already the limit.
-    // `use_limit_surface` is not in the multires schema; multires uses `true` when it is unset.
-    let multires_unset =
-        modifier.modifier_type == "multires" && !modifier.params.contains_key("use_limit_surface");
-    let use_limit_surface =
-        levels > 0 && !simple && (multires_unset || bool_param(modifier, "use_limit_surface")?);
+    // Multires displacement is defined relative to the limit surface.
+    let use_limit_surface = levels > 0
+        && !simple
+        && (modifier.modifier_type == "multires" || bool_param(modifier, "use_limit_surface")?);
     let uv_layer_count = uv_layers::layer_count(mesh);
     if levels > 0 {
         let first_level_faces = mesh
@@ -2272,7 +2545,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let use_custom_normals = bool_param(modifier, "use_custom_normals")?;
     if levels == 0 {
-        return Ok(mesh.clone());
+        return Ok((mesh.clone(), None, None));
     }
     let input_normals = if use_custom_normals && corner_normal_domain(mesh)? {
         match clnor::corner_codes(mesh)? {
@@ -2378,6 +2651,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // Positions and UVs share the base level of the limit surface. SIMPLE is evaluated at isolation 1
     // whatever the quality; without `use_limit_surface` only the base level serves the UVs.
     let limit_samples = samples.as_ref().filter(|_| simple || use_limit_surface);
+    let mut limit_surface = None;
     if levels > 0 && (simple || use_limit_surface || !uv_maps.is_empty()) {
         let base_faces: Vec<Vec<usize>> = polygons(mesh)?
             .into_iter()
@@ -2427,6 +2701,13 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 }
             }
         }
+        if modifier.modifier_type == "multires"
+            && let Some(data) = multires_data.as_ref()
+            && data.corner_grids.is_some()
+            && let Some(samples) = limit_samples
+        {
+            apply_multires_displacements(mesh, data, &mut result, samples, &limit)?;
+        }
         if !uv_maps.is_empty() {
             let loops: Vec<_> = uv_maps
                 .into_iter()
@@ -2450,6 +2731,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .collect();
             subdivision_uv::write_loop_uvs(&mut result, loops);
         }
+        limit_surface = Some(limit);
     }
     let face_sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
     let subdivided_levels = u32::try_from(levels).map_err(|_| {
@@ -2458,27 +2740,491 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "subdivision level does not fit its sample mapping",
         )
     })?;
-    let samples = samples.as_ref().ok_or_else(|| {
+    let sample_map = samples.as_ref().ok_or_else(|| {
         PotError::new(
             ErrorCode::InternalError,
             "subdivision sample map is missing",
         )
     })?;
     let numbering =
-        subdivision_normals::corner_numbering(&samples.corners, &face_sizes, subdivided_levels);
+        subdivision_normals::corner_numbering(&sample_map.corners, &face_sizes, subdivided_levels);
     let normal_options = NormalCodeOptions {
         corner_order: Some(&numbering),
         setter_input: SetterInput::AlreadyNormalized,
     };
     if let Some(input_normals) = input_normals {
         let loops =
-            subdivision_normals::loop_normals(&input_normals, &face_sizes, &samples.corners);
+            subdivision_normals::loop_normals(&input_normals, &face_sizes, &sample_map.corners);
         let loop_normals: Vec<Option<DVec3>> = loops.into_iter().map(Some).collect();
         clnor::encode_vectors(&mut result, Some(&loop_normals), normal_options)?;
     } else {
         clnor::write_codes(&mut result, None, normal_options)?;
     }
-    Ok(result)
+    Ok((result, samples, limit_surface))
+}
+
+#[derive(Clone, Copy)]
+struct MultiresSculptCell {
+    ptex_face: usize,
+    u: usize,
+    v: usize,
+    vertices: [usize; 4],
+}
+struct MultiresSculptMap {
+    denominators: HashMap<usize, usize>,
+    active_cells: Vec<MultiresSculptCell>,
+}
+
+fn multires_lattice_value(coordinate: f64, denominator: usize) -> Result<f64> {
+    let denominator = u32::try_from(denominator).map_err(|_| {
+        PotError::new(ErrorCode::LimitExceeded, "multires ptex resolution overflows")
+    })?;
+    if !coordinate.is_finite() || !(0.0..=1.0).contains(&coordinate) {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "multires sample coordinate is outside its ptex face",
+        ));
+    }
+    Ok(coordinate * f64::from(denominator))
+}
+
+fn multires_lattice_index(value: f64, denominator: usize) -> Result<usize> {
+    let denominator = u32::try_from(denominator).map_err(|_| {
+        PotError::new(ErrorCode::LimitExceeded, "multires ptex resolution overflows")
+    })?;
+    let maximum = f64::from(denominator);
+    let rounded = value.round();
+    if !value.is_finite()
+        || value < 0.0
+        || rounded > maximum
+        || (value - rounded).abs() > f64::EPSILON * maximum.max(1.0)
+    {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "multires sample is not on its ptex lattice",
+        ));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the rounded lattice index is validated to be an integer in the bounded grid"
+    )]
+    let index = rounded as u32;
+    usize::try_from(index)
+        .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "multires lattice index overflows"))
+}
+
+/// Apply a stroke at the configured sculpt level, then interpolate its deltas into the top-level MDisps grids.
+pub(crate) fn sculpt_multires(
+    source: &Mesh,
+    modifier: &Modifier,
+    stroke: &crate::geom::sculpt::Stroke,
+    world: DMat4,
+) -> Result<(Mesh, bool)> {
+    let sculpt_levels = uint_param(modifier, "sculpt_levels")?;
+    if sculpt_levels == 0 {
+        return Err(invalid_parameter(
+            modifier,
+            "sculpt_levels",
+            "a positive multires sculpt level",
+        ));
+    }
+    let inverse = world.inverse();
+    if !inverse.is_finite() {
+        return Err(PotError::new(
+            ErrorCode::InvalidArgument,
+            "multires sculpt target has a singular world transform",
+        ));
+    }
+    let data = multires::read(source)?.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InvalidArgument,
+            "multires sculpt requires a multires_displacement record",
+        )
+    })?;
+    if data.corner_grids.is_none()
+        && let Some(filepath) = &data.external_filepath
+    {
+        return Err(PotError::with_details(
+            ErrorCode::FileNotFound,
+            format!("multires external grid values are unavailable from `{filepath}`"),
+            json!({"filepath": filepath}),
+        ));
+    }
+    let effective_sculpt_levels =
+        u32::try_from(sculpt_levels.min(u64::from(data.total_levels))).map_err(|_| {
+            PotError::new(ErrorCode::LimitExceeded, "multires sculpt level overflows")
+        })?;
+    if effective_sculpt_levels == 0 {
+        return Err(invalid_parameter(
+            modifier,
+            "sculpt_levels",
+            "a level supported by multires_displacement.total_levels",
+        ));
+    }
+    let mut sculpt_modifier = modifier.clone();
+    sculpt_modifier
+        .params
+        .insert("levels".to_owned(), json!(effective_sculpt_levels));
+    sculpt_modifier.runtime.use_render_levels = false;
+    let (mut sculpt_mesh, samples, limit) = subdivision_with_samples(source, &sculpt_modifier)?;
+    let samples = samples.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "multires sculpt sample map is missing",
+        )
+    })?;
+    let limit = limit.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "multires sculpt limit surface is missing",
+        )
+    })?;
+    let before_world: Vec<DVec3> = sculpt_mesh
+        .vertices
+        .iter()
+        .map(|vertex| world.transform_point3(vertex.co))
+        .collect();
+    for (vertex, &position) in sculpt_mesh.vertices.iter_mut().zip(&before_world) {
+        vertex.co = position;
+    }
+    if !crate::geom::sculpt::apply_stroke(&mut sculpt_mesh, stroke)? {
+        return Ok((source.clone(), false));
+    }
+    let sculpt_map = build_multires_sculpt_map(
+        source,
+        &data,
+        &sculpt_mesh,
+        &before_world,
+        &samples,
+        effective_sculpt_levels,
+    )?;
+    if sculpt_map.active_cells.is_empty() {
+        return Ok((source.clone(), false));
+    }
+    let mut displacement = data;
+    if !apply_multires_sculpt_map(
+        source,
+        &mut displacement,
+        &sculpt_mesh,
+        &before_world,
+        inverse,
+        &limit,
+        &sculpt_map,
+    )? {
+        return Ok((source.clone(), false));
+    }
+    let mut result = source.clone();
+    multires::write(&mut result, &displacement)?;
+    Ok((result, true))
+}
+
+fn build_multires_sculpt_map(
+    source: &Mesh,
+    data: &multires::DisplacementData,
+    sculpt_mesh: &Mesh,
+    before_world: &[DVec3],
+    samples: &Samples,
+    sculpt_levels: u32,
+) -> Result<MultiresSculptMap> {
+    if samples.corners.len() != sculpt_mesh.faces.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "multires sculpt sample faces do not match the evaluated mesh",
+        ));
+    }
+    let index_by_id: HashMap<u32, usize> = sculpt_mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let mut denominators = HashMap::new();
+    let mut active_cells = Vec::new();
+    for (face, face_samples) in sculpt_mesh.faces.iter().zip(&samples.corners) {
+        if face.vertices.len() != 4 || face_samples.len() != 4 {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "multires sculpt subdivision did not produce quad samples",
+            ));
+        }
+        let first = face_samples[0];
+        let ptex_face =
+            multires::ptex_face_for_sample(source, data, first.face, first.ptex)?;
+        let denominator = *denominators.entry(ptex_face).or_insert(
+            multires::ptex_grid_denominator(source, data, ptex_face, sculpt_levels)?,
+        );
+        let mut coordinates = [(0_usize, 0_usize); 4];
+        let mut minimum_u = usize::MAX;
+        let mut minimum_v = usize::MAX;
+        let mut maximum_u = 0_usize;
+        let mut maximum_v = 0_usize;
+        let mut vertices = [0_usize; 4];
+        for (corner, (&vertex_id, sample)) in face.vertices.iter().zip(face_samples).enumerate() {
+            let sample_ptex_face =
+                multires::ptex_face_for_sample(source, data, sample.face, sample.ptex)?;
+            if sample_ptex_face != ptex_face {
+                return Err(PotError::new(
+                    ErrorCode::InternalError,
+                    "multires sculpt face crosses ptex sample domains",
+                ));
+            }
+            let u = multires_lattice_index(
+                multires_lattice_value(sample.u, denominator)?,
+                denominator,
+            )?;
+            let v = multires_lattice_index(
+                multires_lattice_value(sample.v, denominator)?,
+                denominator,
+            )?;
+            coordinates[corner] = (u, v);
+            minimum_u = minimum_u.min(u);
+            minimum_v = minimum_v.min(v);
+            maximum_u = maximum_u.max(u);
+            maximum_v = maximum_v.max(v);
+            vertices[corner] = index_by_id.get(&vertex_id).copied().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "multires sculpt face references a missing vertex",
+                )
+            })?;
+        }
+        if maximum_u != minimum_u + 1 || maximum_v != minimum_v + 1 {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "multires sculpt face does not occupy one ptex sample cell",
+            ));
+        }
+        let mut cell_vertices = [None; 4];
+        for (corner, &(u, v)) in coordinates.iter().enumerate() {
+            let cell_corner = match (u == minimum_u, v == minimum_v) {
+                (true, true) => 0,
+                (false, true) if u == maximum_u => 1,
+                (false, false) if u == maximum_u && v == maximum_v => 2,
+                (true, false) if v == maximum_v => 3,
+                _ => {
+                    return Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "multires sculpt sample is not a ptex cell corner",
+                    ));
+                }
+            };
+            cell_vertices[cell_corner] = Some(vertices[corner]);
+        }
+        let [Some(bottom_left), Some(bottom_right), Some(top_right), Some(top_left)] =
+            cell_vertices
+        else {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "multires sculpt ptex cell is missing a corner",
+            ));
+        };
+        let cell_vertices = [bottom_left, bottom_right, top_right, top_left];
+        if cell_vertices
+            .iter()
+            .any(|&index| sculpt_mesh.vertices[index].co != before_world[index])
+        {
+            active_cells.push(MultiresSculptCell {
+                ptex_face,
+                u: minimum_u,
+                v: minimum_v,
+                vertices: cell_vertices,
+            });
+        }
+    }
+    active_cells.sort_unstable_by_key(|cell: &MultiresSculptCell| {
+        (cell.ptex_face, cell.u, cell.v)
+    });
+    if active_cells
+        .windows(2)
+        .any(|cells| (cells[0].ptex_face, cells[0].u, cells[0].v)
+            == (cells[1].ptex_face, cells[1].u, cells[1].v))
+    {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "multires sculpt produced duplicate ptex cells",
+        ));
+    }
+    Ok(MultiresSculptMap {
+        denominators,
+        active_cells,
+    })
+}
+
+fn apply_multires_sculpt_map(
+    source: &Mesh,
+    displacement: &mut multires::DisplacementData,
+    sculpt_mesh: &Mesh,
+    before_world: &[DVec3],
+    inverse: DMat4,
+    limit: &subdivision_limit::LimitSurface,
+    sculpt_map: &MultiresSculptMap,
+) -> Result<bool> {
+    let grid_area = displacement
+        .grid_side
+        .checked_mul(displacement.grid_side)
+        .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "multires grid size overflows"))?;
+    let mut changed = false;
+    for loop_index in 0..displacement.loop_face_corners.len() {
+        for vector_index in 0..grid_area {
+            let location =
+                multires::grid_sample_location(source, displacement, loop_index, vector_index)?;
+            let denominator = *sculpt_map
+                .denominators
+                .get(&location.ptex_face_index)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "multires sculpt ptex denominator is missing",
+                    )
+                })?;
+            let grid_u = multires_lattice_value(f64::from(location.u), denominator)?;
+            let grid_v = multires_lattice_value(f64::from(location.v), denominator)?;
+            let last_cell = denominator.checked_sub(1).ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "multires ptex grid has no cells")
+            })?;
+            let last_cell = f64::from(u32::try_from(last_cell).map_err(|_| {
+                PotError::new(ErrorCode::LimitExceeded, "multires ptex resolution overflows")
+            })?);
+            let cell_u = multires_lattice_index(grid_u.floor().min(last_cell), denominator)?;
+            let cell_v = multires_lattice_index(grid_v.floor().min(last_cell), denominator)?;
+            let cell_key = (location.ptex_face_index, cell_u, cell_v);
+            let Ok(cell_index) = sculpt_map.active_cells.binary_search_by_key(&cell_key, |cell| {
+                (cell.ptex_face, cell.u, cell.v)
+            }) else {
+                continue;
+            };
+            let cell = sculpt_map.active_cells[cell_index];
+            let corner_deltas = cell.vertices.map(|index| {
+                sculpt_mesh.vertices[index].co - before_world[index]
+            });
+            let cell_u_value = f64::from(u32::try_from(cell_u).map_err(|_| {
+                PotError::new(ErrorCode::LimitExceeded, "multires ptex index overflows")
+            })?);
+            let cell_v_value = f64::from(u32::try_from(cell_v).map_err(|_| {
+                PotError::new(ErrorCode::LimitExceeded, "multires ptex index overflows")
+            })?);
+            let u = grid_u - cell_u_value;
+            let v = grid_v - cell_v_value;
+            let world_delta = corner_deltas[0] * ((1.0 - u) * (1.0 - v))
+                + corner_deltas[1] * (u * (1.0 - v))
+                + corner_deltas[2] * (u * v)
+                + corner_deltas[3] * ((1.0 - u) * v);
+            if world_delta == DVec3::ZERO {
+                continue;
+            }
+            let (face, ptex) = multires::ptex_sample_for_face(
+                source,
+                displacement,
+                location.ptex_face_index,
+            )?;
+            let surface_sample = subdivision_limit::Sample {
+                face,
+                ptex,
+                u: f64::from(location.u),
+                v: f64::from(location.v),
+            };
+            let (_, du, dv) = limit.point_and_derivatives(surface_sample)?;
+            let object_delta = inverse.transform_vector3(world_delta);
+            let tangent_delta = multires::tangent_from_object(
+                du,
+                dv,
+                location.tangent_corner,
+                object_delta,
+            )?;
+            let old = multires::grid_sample_value(displacement, location)?;
+            let value = [
+                (f64::from(old[0]) + f64::from(tangent_delta[0])) as f32,
+                (f64::from(old[1]) + f64::from(tangent_delta[1])) as f32,
+                (f64::from(old[2]) + f64::from(tangent_delta[2])) as f32,
+            ];
+            multires::set_grid_sample_value(source, displacement, location, value)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn apply_multires_displacements(
+    source: &Mesh,
+    data: &multires::DisplacementData,
+    output: &mut Mesh,
+    samples: &Samples,
+    limit: &subdivision_limit::LimitSurface,
+) -> Result<()> {
+    let index_by_id: HashMap<u32, usize> = output
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let mut positions = vec![DVec3::ZERO; output.vertices.len()];
+    let mut counts = vec![0_usize; output.vertices.len()];
+    if samples.corners.len() != output.faces.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "multires sample faces do not match the evaluated mesh",
+        ));
+    }
+    for (face, face_samples) in output.faces.iter().zip(&samples.corners) {
+        if face.vertices.len() != face_samples.len() {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "multires sample corners do not match the evaluated face",
+            ));
+        }
+        for (&vertex_id, sample) in face.vertices.iter().zip(face_samples) {
+            let target_ptex_face =
+                multires::ptex_face_for_sample(source, data, sample.face, sample.ptex)?;
+            let (sample_u, sample_v) = (sample.u as f32, sample.v as f32);
+            let mut surface_point = None;
+            let mut derivatives = |evaluated_ptex_face: usize, u: f32, v: f32| {
+                let (face, ptex) =
+                    multires::ptex_sample_for_face(source, data, evaluated_ptex_face)?;
+                let surface_sample = subdivision_limit::Sample {
+                    face,
+                    ptex,
+                    u: f64::from(u),
+                    v: f64::from(v),
+                };
+                let (point, du, dv) = limit.point_and_derivatives(surface_sample)?;
+                if evaluated_ptex_face == target_ptex_face && u == sample_u && v == sample_v {
+                    surface_point = Some(point);
+                }
+                Ok((du, dv))
+            };
+            let displacement = multires::evaluate_sample(
+                source,
+                data,
+                target_ptex_face,
+                sample_u,
+                sample_v,
+                &mut derivatives,
+            )?;
+            let point = surface_point.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "multires limit evaluator did not return the sample point",
+                )
+            })?;
+            let vertex_index = index_by_id.get(&vertex_id).copied().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "multires output face references a missing vertex",
+                )
+            })?;
+            positions[vertex_index] += point + displacement;
+            counts[vertex_index] = counts[vertex_index].checked_add(1).ok_or_else(|| {
+                PotError::new(ErrorCode::LimitExceeded, "multires corner count overflows")
+            })?;
+        }
+    }
+    for (vertex_index, (vertex, count)) in output.vertices.iter_mut().zip(counts).enumerate() {
+        if count > 0 {
+            vertex.co = positions[vertex_index] / count as f64;
+        }
+    }
+    Ok(())
 }
 
 fn check_subdivision_budget(

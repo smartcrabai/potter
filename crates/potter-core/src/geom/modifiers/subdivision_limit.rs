@@ -139,7 +139,6 @@ impl LimitSurface {
 
     /// Evaluates the limit point and its object-space derivatives with respect to the sample's
     /// ptex-local `u` and `v`, using OpenSubdiv's patch basis derivative rules.
-    #[expect(dead_code, reason = "consumed by the shared Multires displacement evaluator")]
     pub(super) fn point_and_derivatives(
         &self,
         sample: Sample,
@@ -392,7 +391,6 @@ fn leaf_point<T: Point>(
 
 /// Evaluates a position patch and OpenSubdiv's default (approximate Gregory) derivatives in local
 /// patch coordinates. The point-only path remains separate and does not compute unused derivatives.
-#[expect(dead_code, reason = "consumed by the shared Multires displacement evaluator")]
 fn leaf_point_and_derivatives(
     level: &Level,
     positions: &[DVec3],

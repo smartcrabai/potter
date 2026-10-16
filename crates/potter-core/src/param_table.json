@@ -2422,6 +2422,16 @@
           "minimum": 0,
           "maximum": 255
         },
+        "total_levels": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 13
+        },
+        "is_external": {
+          "type": "boolean",
+          "default": false
+        },
         "filepath": {
           "type": "string",
           "default": ""

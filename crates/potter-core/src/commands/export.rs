@@ -295,6 +295,7 @@ fn evaluation_context(context: &crate::cli::Context) -> Result<EvaluationContext
         scene_id: context.scene_id.as_deref().map(Id::new).transpose()?,
         view_layer: context.view_layer.as_deref().map(Id::new).transpose()?,
         frame: context.frame,
+        adaptive_render: None,
     })
 }
 

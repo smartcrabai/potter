@@ -106,6 +106,7 @@ pub(super) fn evaluation_context(
             .map(|value| Id::new(value.to_owned()))
             .transpose()?,
         frame,
+        adaptive_render: None,
     })
 }
 

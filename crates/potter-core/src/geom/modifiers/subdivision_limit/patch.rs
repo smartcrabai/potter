@@ -37,7 +37,6 @@ fn bspline_basis(t: f64) -> [f64; 4] {
     ]
 }
 /// Derivative of the cubic B-spline basis with respect to its parameter.
-#[expect(dead_code, reason = "used by the shared Multires derivative API")]
 fn bspline_basis_derivative(t: f64) -> [f64; 4] {
     let t2 = t * t;
     [
@@ -54,7 +53,6 @@ fn bezier_basis(t: f64) -> [f64; 4] {
     [it * it * it, 3.0 * t * it * it, 3.0 * t * t * it, t * t * t]
 }
 /// Derivative of the cubic Bezier basis with respect to its parameter.
-#[expect(dead_code, reason = "used by the shared Multires derivative API")]
 fn bezier_basis_derivative(t: f64) -> [f64; 4] {
     let it = 1.0 - t;
     [
@@ -165,7 +163,6 @@ pub(super) fn bspline_weights(s: f64, t: f64, mask: u8) -> [f64; 16] {
 }
 
 /// B-spline weights and their derivatives with respect to the patch's local `s` and `t`.
-#[expect(dead_code, reason = "used by the shared Multires derivative API")]
 pub(super) fn bspline_weights_and_derivatives(
     s: f64,
     t: f64,
@@ -253,7 +250,6 @@ pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
 
 /// OpenSubdiv's default Gregory derivative approximation: differentiate the Bezier basis while
 /// holding the rational interior-point blend factors fixed.
-#[expect(dead_code, reason = "used by the shared Multires derivative API")]
 pub(super) fn gregory_weights_and_derivatives(
     s: f64,
     t: f64,

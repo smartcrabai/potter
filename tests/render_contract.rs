@@ -305,8 +305,21 @@ fn render_settings_have_spec_defaults_and_update_atomically() -> Result<(), Box<
     );
     assert_eq!(initial["scenes"]["scene_main"]["render"]["samples"], 64);
     assert_eq!(initial["scenes"]["scene_main"]["render"]["max_bounces"], 4);
+    assert_eq!(initial["scenes"]["scene_main"]["render"]["dicing_rate"], 1.0);
+    assert_eq!(
+        initial["scenes"]["scene_main"]["render"]["preview_dicing_rate"],
+        8.0
+    );
+    assert_eq!(
+        initial["scenes"]["scene_main"]["render"]["max_subdivisions"],
+        12
+    );
+    assert_eq!(
+        initial["scenes"]["scene_main"]["render"]["offscreen_dicing_scale"],
+        4.0
+    );
 
-    let update = r#"{"schema_version":1,"base_revision":0,"operations":[{"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":320,"resolution_y":240,"resolution_percentage":50,"samples":8,"seed":42,"max_bounces":3,"film_transparent":true,"engine":"realtime"}}]}"#;
+    let update = r#"{"schema_version":1,"base_revision":0,"operations":[{"op":"camera.create","id":"dicing_camera"},{"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":320,"resolution_y":240,"resolution_percentage":50,"samples":8,"seed":42,"max_bounces":3,"film_transparent":true,"engine":"realtime","dicing_rate":2.5,"preview_dicing_rate":6.0,"max_subdivisions":10,"offscreen_dicing_scale":3.5,"dicing_camera":"dicing_camera"}}]}"#;
     let updated = apply_operations(&scene, update, &["--json"])?;
     let updated_json = assert_success(&updated)?;
     assert_eq!(updated_json["scene"]["revision"], 1);
@@ -320,6 +333,23 @@ fn render_settings_have_spec_defaults_and_update_atomically() -> Result<(), Box<
     assert_eq!(saved["scenes"]["scene_main"]["render"]["samples"], 8);
     assert_eq!(saved["scenes"]["scene_main"]["render"]["seed"], 42);
     assert_eq!(saved["scenes"]["scene_main"]["render"]["max_bounces"], 3);
+    assert_eq!(saved["scenes"]["scene_main"]["render"]["dicing_rate"], 2.5);
+    assert_eq!(
+        saved["scenes"]["scene_main"]["render"]["preview_dicing_rate"],
+        6.0
+    );
+    assert_eq!(
+        saved["scenes"]["scene_main"]["render"]["max_subdivisions"],
+        10
+    );
+    assert_eq!(
+        saved["scenes"]["scene_main"]["render"]["offscreen_dicing_scale"],
+        3.5
+    );
+    assert_eq!(
+        saved["scenes"]["scene_main"]["render"]["dicing_camera"],
+        "dicing_camera"
+    );
     assert!(
         saved["scenes"]["scene_main"]["render"]["film_transparent"]
             .as_bool()
@@ -334,11 +364,72 @@ fn render_settings_have_spec_defaults_and_update_atomically() -> Result<(), Box<
     let rejected = apply_operations(&scene, invalid, &["--json"])?;
     assert_eq!(rejected.status.code(), Some(2));
     assert_eq!(json(&rejected)?["error"]["code"], "INVALID_OPERATION");
+    let invalid_dicing = r#"{"schema_version":1,"base_revision":1,"operations":[{"op":"render.update","target":{"id":"scene_main"},"set":{"dicing_rate":0.05}}]}"#;
+    let rejected_dicing = apply_operations(&scene, invalid_dicing, &["--json"])?;
+    assert_eq!(rejected_dicing.status.code(), Some(2));
+    assert_eq!(
+        json(&rejected_dicing)?["error"]["code"],
+        "INVALID_OPERATION"
+    );
     let unchanged: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     assert_eq!(unchanged["revision"], 1);
     assert_eq!(
         unchanged["scenes"]["scene_main"]["render"]["resolution_percentage"],
         50
+    );
+    assert_eq!(
+        unchanged["scenes"]["scene_main"]["render"]["dicing_rate"],
+        2.5
+    );
+    Ok(())
+}
+
+#[test]
+fn path_render_applies_pixel_and_object_adaptive_subdivision() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let render_case = |name: &str, adaptive: bool, space: &str| {
+        let scene = directory.path().join(name);
+        init_scene(&scene)?;
+        let operations = serde_json::json!([
+            {"op":"node.create","id":"body","kind":"box","params":{"size":2.0}},
+            {"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,4.0]},
+             "projection":"orthographic","ortho_scale":3.0},
+            {"op":"light.create","id":"adaptive_key","light_type":"point","energy":20.0,
+             "transform":{"translation":[2.0,-2.0,4.0]}},
+            {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
+            {"op":"render.update","target":{"id":"scene_main"},
+             "set":{"engine":"path","resolution_x":32,"resolution_y":32,"samples":1,"seed":0,
+                    "max_bounces":0,"dicing_rate":1.0,"preview_dicing_rate":8.0,
+                    "max_subdivisions":3,"offscreen_dicing_scale":1.0}},
+            {"op":"modifier.create","target":{"id":"body"},"id":"subd","type":"subdivision",
+             "params":{"levels":0,"render_levels":0,"use_adaptive_subdivision":adaptive,
+                       "adaptive_space":space,"adaptive_pixel_size":0.5,
+                       "adaptive_object_edge_length":0.25}}
+        ]);
+        let operations = serde_json::to_string(&operations)?;
+        let applied = apply_operations(&scene, &operations, &["--json"])?;
+        assert_success(&applied)?;
+        let output = directory.path().join(format!("{name}-render"));
+        let rendered = pot()
+            .arg("render")
+            .arg(&scene)
+            .args(["--engine", "path", "--format", "png", "--out"])
+            .arg(&output)
+            .arg("--json")
+            .output()?;
+        assert_success(&rendered)?;
+        Ok::<_, Box<dyn Error>>(fs::read(output.join("frame_0001.png"))?)
+    };
+    let fixed = render_case("fixed", false, "OBJECT")?;
+    let object_diced = render_case("object-diced", true, "OBJECT")?;
+    let pixel_diced = render_case("pixel-diced", true, "PIXEL")?;
+    assert_ne!(
+        object_diced, fixed,
+        "OBJECT adaptive dicing did not affect the native path render"
+    );
+    assert_ne!(
+        pixel_diced, fixed,
+        "PIXEL adaptive dicing did not affect the native path render"
     );
     Ok(())
 }

@@ -12,6 +12,25 @@ const MAX_MODIFIERS_PER_OBJECT: usize = 100_000;
 const MAX_BOUND_MODIFIERS: usize = 100_000;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
+fn multires_grid_len(total_levels: u32) -> Result<usize, String> {
+    if total_levels == 0 {
+        return Err("Blender multires total level must be nonzero".into());
+    }
+    let intervals = 1_usize
+        .checked_shl(total_levels - 1)
+        .ok_or_else(|| "Blender multires total level exceeds the grid limit".to_owned())?;
+    let side = intervals
+        .checked_add(1)
+        .ok_or_else(|| "Blender multires grid side overflow".to_owned())?;
+    let samples = side
+        .checked_mul(side)
+        .ok_or_else(|| "Blender multires grid size overflow".to_owned())?;
+    if samples > MAX_ARRAY_ELEMENTS {
+        return Err("Blender multires grid exceeds the element limit".into());
+    }
+    Ok(samples)
+}
+
 /// Read native bound-data fields from Blender's serialized modifier structs.
 ///
 /// Pointer-valued members in the returned JSON retain their serialized old-address value;
@@ -31,6 +50,24 @@ pub(crate) fn read_modifier_bindings(
 
     let file = BlendFile::parse(bytes)?;
     file.read_bindings()
+}
+/// Read native Mesh corner displacement layers from Blender DNA.
+///
+/// Results are keyed by Blender Mesh datablock name. Blender 5.2 stores corner data in
+/// `corner_data`, and `face_offset_indices` maps face order to corner ranges; face `i` becomes
+/// Potter face ID `f{i + 1}`.
+pub(crate) fn read_multires_displacements(bytes: &[u8]) -> Result<BTreeMap<String, Value>, String> {
+    let decompressed;
+    let bytes = if bytes.starts_with(b"BLENDER") {
+        bytes
+    } else if bytes.starts_with(&ZSTD_MAGIC) {
+        decompressed = decompress_blend(bytes)?;
+        decompressed.as_slice()
+    } else {
+        return Err("input is neither a Blender file nor a zstd-compressed Blender file".into());
+    };
+
+    BlendFile::parse(bytes)?.read_multires_displacements()
 }
 
 fn decompress_blend(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -1213,6 +1250,594 @@ impl<'a> BlendFile<'a> {
         }
         Ok(output)
     }
+
+    fn read_multires_displacements(&self) -> Result<BTreeMap<String, Value>, String> {
+        const CD_MDISPS: i64 = 19;
+        const CD_FLAG_EXTERNAL: i64 = 1 << 3;
+        let object_struct = self
+            .schema
+            .struct_index("Object")
+            .ok_or_else(|| "Blender DNA schema does not contain Object".to_owned())?;
+        let mesh_struct = self
+            .schema
+            .struct_index("Mesh")
+            .ok_or_else(|| "Blender DNA schema does not contain Mesh".to_owned())?;
+        let multires_struct = self
+            .schema
+            .struct_index("MultiresModifierData")
+            .ok_or_else(|| "Blender DNA schema does not contain MultiresModifierData".to_owned())?;
+        let mesh_size = self.schema.structs[mesh_struct].size;
+        let mut mesh_levels = BTreeMap::<String, u32>::new();
+
+        for block in &self.blocks {
+            if block.sdna_index >= self.schema.structs.len()
+                || self.schema.structs[block.sdna_index].type_index
+                    != self.schema.structs[object_struct].type_index
+            {
+                continue;
+            }
+            if block.count > MAX_ARRAY_ELEMENTS {
+                return Err("Blender Object block exceeds the element limit".into());
+            }
+            let object_size = self.schema.structs[object_struct].size;
+            if object_size == 0
+                || object_size
+                    .checked_mul(block.count)
+                    .is_none_or(|size| size > block.len)
+            {
+                return Err("Blender Object block is shorter than its SDNA count".into());
+            }
+            for object_index in 0..block.count {
+                let object_offset =
+                    checked_array_item_offset(block.data_offset, object_index, object_size)?;
+                let mesh_pointer = self.schema.optional_pointer_at_path(
+                    self.bytes,
+                    object_struct,
+                    object_offset,
+                    &["data"],
+                    self.header.endian,
+                    self.header.pointer_size,
+                )?;
+                if mesh_pointer == 0 {
+                    continue;
+                }
+                let Ok((mesh_block, mesh_offset)) = self.resolve(mesh_pointer, mesh_size) else {
+                    continue;
+                };
+                if mesh_block.sdna_index >= self.schema.structs.len()
+                    || self.schema.structs[mesh_block.sdna_index].type_index
+                        != self.schema.structs[mesh_struct].type_index
+                    || (mesh_offset - mesh_block.data_offset) % mesh_size != 0
+                {
+                    continue;
+                }
+                let full_mesh_name = self
+                    .schema
+                    .string_at_path(self.bytes, mesh_struct, mesh_offset, &["id", "name"])?;
+                let mesh_name = full_mesh_name
+                    .get(2..)
+                    .unwrap_or(&full_mesh_name)
+                    .to_owned();
+                let mut modifier_address = self.schema.optional_pointer_at_path(
+                    self.bytes,
+                    object_struct,
+                    object_offset,
+                    &["modifiers", "first"],
+                    self.header.endian,
+                    self.header.pointer_size,
+                )?;
+                let mut visited = HashSet::new();
+                while modifier_address != 0 {
+                    if visited.len() >= MAX_MODIFIERS_PER_OBJECT
+                        || !visited.insert(modifier_address)
+                    {
+                        return Err("invalid or excessively long Blender modifier list".into());
+                    }
+                    let (candidate_block, _) = self.resolve(modifier_address, 1)?;
+                    let modifier_struct = candidate_block.sdna_index;
+                    if modifier_struct >= self.schema.structs.len() {
+                        return Err("Blender modifier block has an invalid SDNA index".into());
+                    }
+                    let modifier_size = self.schema.structs[modifier_struct].size;
+                    let (modifier_block, modifier_offset) =
+                        self.resolve(modifier_address, modifier_size)?;
+                    if modifier_struct != modifier_block.sdna_index
+                        || modifier_size == 0
+                        || (modifier_offset - modifier_block.data_offset) % modifier_size != 0
+                    {
+                        return Err("Blender modifier pointer is not structure-aligned".into());
+                    }
+                    if modifier_struct == multires_struct {
+                        let levels = self
+                            .schema
+                            .integer_at_path(
+                                self.bytes,
+                                modifier_struct,
+                                modifier_offset,
+                                &["totlvl"],
+                                self.header.endian,
+                            )?
+                            .ok_or_else(|| {
+                                "Blender MultiresModifierData has no total level field".to_owned()
+                            })?;
+                        let levels = u32::try_from(levels)
+                            .map_err(|_| "Blender multires total level is out of range")?;
+                        if levels != 0 {
+                            match mesh_levels.entry(mesh_name.clone()) {
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    entry.insert(levels);
+                                }
+                                std::collections::btree_map::Entry::Occupied(entry)
+                                    if *entry.get() != levels =>
+                                {
+                                    return Err(format!(
+                                        "Mesh {mesh_name} has multires modifiers with conflicting total levels"
+                                    ));
+                                }
+                                std::collections::btree_map::Entry::Occupied(_) => {}
+                            }
+                        }
+                    }
+                    modifier_address = self.schema.optional_pointer_at_path(
+                        self.bytes,
+                        modifier_struct,
+                        modifier_offset,
+                        &["modifier", "next"],
+                        self.header.endian,
+                        self.header.pointer_size,
+                    )?;
+                }
+            }
+        }
+
+        let custom_data_struct = self
+            .schema
+            .struct_index("CustomData")
+            .ok_or_else(|| "Blender DNA schema does not contain CustomData".to_owned())?;
+        let layer_struct = self
+            .schema
+            .struct_index("CustomDataLayer")
+            .ok_or_else(|| "Blender DNA schema does not contain CustomDataLayer".to_owned())?;
+        let external_struct = self
+            .schema
+            .struct_index("CustomDataExternal")
+            .ok_or_else(|| "Blender DNA schema does not contain CustomDataExternal".to_owned())?;
+        let mdisps_struct = self
+            .schema
+            .struct_index("MDisps")
+            .ok_or_else(|| "Blender DNA schema does not contain MDisps".to_owned())?;
+        let mut output = BTreeMap::new();
+        for block in &self.blocks {
+            if block.sdna_index >= self.schema.structs.len()
+                || self.schema.structs[block.sdna_index].type_index
+                    != self.schema.structs[mesh_struct].type_index
+            {
+                continue;
+            }
+            if block.count > MAX_ARRAY_ELEMENTS {
+                return Err("Blender Mesh block exceeds the element limit".into());
+            }
+            for mesh_index in 0..block.count {
+                let mesh_offset = checked_array_item_offset(block.data_offset, mesh_index, mesh_size)?;
+                let full_mesh_name = self
+                    .schema
+                    .string_at_path(self.bytes, mesh_struct, mesh_offset, &["id", "name"])?;
+                let mesh_name = full_mesh_name
+                    .get(2..)
+                    .unwrap_or(&full_mesh_name)
+                    .to_owned();
+                let Some(&total_levels) = mesh_levels.get(&mesh_name) else {
+                    continue;
+                };
+                let loop_count = self
+                    .schema
+                    .integer_at_path(
+                        self.bytes,
+                        mesh_struct,
+                        mesh_offset,
+                        &["corners_num"],
+                        self.header.endian,
+                    )?
+                    .or(self.schema.integer_at_path(
+                        self.bytes,
+                        mesh_struct,
+                        mesh_offset,
+                        &["totloop"],
+                        self.header.endian,
+                    )?)
+                    .ok_or_else(|| "Blender Mesh has no corner count".to_owned())?;
+                let loop_count = checked_count(loop_count, "Mesh corner")?;
+                let corner_data_name = if self.schema.field(mesh_struct, "corner_data").is_some() {
+                    "corner_data"
+                } else {
+                    "ldata"
+                };
+                let (ldata_offset, ldata_field) = self.schema.field_address(
+                    mesh_struct,
+                    mesh_offset,
+                    &[corner_data_name],
+                )?;
+                if ldata_field.pointer
+                    || self.schema.struct_for_type(ldata_field.type_index) != Some(custom_data_struct)
+                {
+                    return Err("Blender Mesh corner data is not inline CustomData".into());
+                }
+                let layer_count = self
+                    .schema
+                    .integer_at_path(
+                        self.bytes,
+                        custom_data_struct,
+                        ldata_offset,
+                        &["totlayer"],
+                        self.header.endian,
+                    )?
+                    .ok_or_else(|| "Blender CustomData has no layer count".to_owned())?;
+                let layer_count = checked_count(layer_count, "CustomData layer")?;
+                let layers_pointer = self.schema.optional_pointer_at_path(
+                    self.bytes,
+                    custom_data_struct,
+                    ldata_offset,
+                    &["layers"],
+                    self.header.endian,
+                    self.header.pointer_size,
+                )?;
+                if layers_pointer == 0 && layer_count != 0 {
+                    return Err("Blender CustomData layers pointer is null".into());
+                }
+                let external_pointer = self.schema.optional_pointer_at_path(
+                    self.bytes,
+                    custom_data_struct,
+                    ldata_offset,
+                    &["external"],
+                    self.header.endian,
+                    self.header.pointer_size,
+                )?;
+                let filepath = if external_pointer == 0 {
+                    String::new()
+                } else {
+                    let (external_block, external_offset) = self.resolve(
+                        external_pointer,
+                        self.schema.structs[external_struct].size,
+                    )?;
+                    if external_block.sdna_index != external_struct {
+                        return Err("Blender CustomData external pointer has an invalid type".into());
+                    }
+                    self.schema.string_at_path(
+                        self.bytes,
+                        external_struct,
+                        external_offset,
+                        &["filepath"],
+                    )?
+                };
+                let layers =
+                    self.read_struct_array(layers_pointer, layer_count, layer_struct)?;
+                let mut mdisps_layer = false;
+                let mut mdisps_external = false;
+                let mut mdisps_data = 0_u64;
+                for layer in layers {
+                    if layer.get("type").and_then(Value::as_i64) == Some(CD_MDISPS) {
+                        if mdisps_layer {
+                            return Err(format!("Mesh {mesh_name} has multiple CD_MDISPS layers"));
+                        }
+                        mdisps_layer = true;
+                        let flags = layer
+                            .get("flag")
+                            .and_then(Value::as_i64)
+                            .ok_or_else(|| "Blender CD_MDISPS layer has no flags".to_owned())?;
+                        // Blender 5.2 clears CD_FLAG_EXTERNAL when packing the vectors inline.
+                        mdisps_external = flags & CD_FLAG_EXTERNAL != 0;
+                        mdisps_data = layer
+                            .get("data")
+                            .and_then(Value::as_u64)
+                            .ok_or_else(|| {
+                                "Blender CD_MDISPS layer has no data pointer".to_owned()
+                            })?;
+                    }
+                }
+                if !mdisps_layer || total_levels == 0 || (!mdisps_external && mdisps_data == 0) {
+                    continue;
+                }
+                let mut record = Map::new();
+                record.insert("total_levels".to_owned(), Value::from(total_levels));
+                if mdisps_external {
+                    if filepath.is_empty() {
+                        return Err(format!(
+                            "Mesh {mesh_name} has external CD_MDISPS data without a filepath"
+                        ));
+                    }
+                    record.insert(
+                        "external".to_owned(),
+                        Value::Object(Map::from_iter([(
+                            "filepath".to_owned(),
+                            Value::String(filepath),
+                        )])),
+                    );
+                } else {
+                    record.insert(
+                        "values".to_owned(),
+                        self.read_inline_mdisps(
+                            mesh_struct,
+                            mesh_offset,
+                            mdisps_data,
+                            loop_count,
+                            total_levels,
+                            mdisps_struct,
+                            &mesh_name,
+                        )?,
+                    );
+                }
+                if output.insert(mesh_name.clone(), Value::Object(record)).is_some() {
+                    return Err(format!("duplicate Blender Mesh name {mesh_name}"));
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn read_inline_mdisps(
+        &self,
+        mesh_struct: usize,
+        mesh_offset: usize,
+        data_pointer: u64,
+        loop_count: usize,
+        total_levels: u32,
+        mdisps_struct: usize,
+        mesh_name: &str,
+    ) -> Result<Value, String> {
+        let expected_grid_len = multires_grid_len(total_levels)?;
+        let vector_count = expected_grid_len
+            .checked_mul(loop_count)
+            .ok_or_else(|| "Blender MDisps vector count overflow".to_owned())?;
+        if vector_count > MAX_ARRAY_ELEMENTS {
+            return Err("Blender MDisps grids exceed the element limit".into());
+        }
+        let mdisps_size = self.schema.structs[mdisps_struct].size;
+        let data_size = mdisps_size
+            .checked_mul(loop_count)
+            .ok_or_else(|| "Blender MDisps layer byte size overflow".to_owned())?;
+        let (block, data_offset) = self.resolve(data_pointer, data_size)?;
+        if block.sdna_index != mdisps_struct
+            || mdisps_size == 0
+            || (data_offset - block.data_offset) % mdisps_size != 0
+        {
+            return Err("Blender CD_MDISPS data pointer is misaligned".into());
+        }
+        let mut corners = Vec::with_capacity(loop_count);
+        for corner_index in 0..loop_count {
+            let corner_offset =
+                checked_array_item_offset(data_offset, corner_index, mdisps_size)?;
+            let totdisp = self
+                .schema
+                .integer_at_path(
+                    self.bytes,
+                    mdisps_struct,
+                    corner_offset,
+                    &["totdisp"],
+                    self.header.endian,
+                )?
+                .ok_or_else(|| "Blender MDisps has no totdisp field".to_owned())?;
+            let totdisp = checked_count(totdisp, "MDisps displacement")?;
+            let _level = self
+                .schema
+                .integer_at_path(
+                    self.bytes,
+                    mdisps_struct,
+                    corner_offset,
+                    &["level"],
+                    self.header.endian,
+                )?
+                .ok_or_else(|| "Blender MDisps has no level field".to_owned())?;
+            if totdisp != expected_grid_len {
+                return Err(format!(
+                    "Mesh {mesh_name} corner {corner_index} has {totdisp} MDisps samples; expected {expected_grid_len} for total level {total_levels}"
+                ));
+            }
+            let disps = self.schema.optional_pointer_at_path(
+                self.bytes,
+                mdisps_struct,
+                corner_offset,
+                &["disps"],
+                self.header.endian,
+                self.header.pointer_size,
+            )?;
+            corners.push(self.read_mdisps_grid(disps, totdisp)?);
+        }
+
+        let polygon_count = self
+            .schema
+            .integer_at_path(
+                self.bytes,
+                mesh_struct,
+                mesh_offset,
+                &["faces_num"],
+                self.header.endian,
+            )?
+            .or(self.schema.integer_at_path(
+                self.bytes,
+                mesh_struct,
+                mesh_offset,
+                &["totpoly"],
+                self.header.endian,
+            )?)
+            .ok_or_else(|| "Blender Mesh has no polygon count".to_owned())?;
+        let polygon_count = checked_count(polygon_count, "Mesh polygon")?;
+        let face_offsets_field = ["face_offset_indices", "poly_offset_indices"]
+            .into_iter()
+            .find(|name| self.schema.field(mesh_struct, name).is_some());
+        let face_ranges = if let Some(field_name) = face_offsets_field {
+            let (_, field) =
+                self.schema
+                    .field_address(mesh_struct, mesh_offset, &[field_name])?;
+            if !field.pointer
+                || !field.dimensions.is_empty()
+                || self.schema.type_names[field.type_index] != "int"
+            {
+                return Err("Blender Mesh face offsets are not an int pointer".into());
+            }
+            let offsets = if polygon_count == 0 {
+                Vec::new()
+            } else {
+                let offset_count = polygon_count
+                    .checked_add(1)
+                    .ok_or_else(|| "Blender face offset count overflow".to_owned())?;
+                let pointer = self.schema.pointer_at_path(
+                    self.bytes,
+                    mesh_struct,
+                    mesh_offset,
+                    &[field_name],
+                    self.header.endian,
+                    self.header.pointer_size,
+                )?;
+                self.read_scalar_array(pointer, offset_count, field.type_index)?
+            };
+            let mut ranges = Vec::with_capacity(polygon_count);
+            let mut next_corner = 0_usize;
+            for face_index in 0..polygon_count {
+                let loop_start = offsets
+                    .get(face_index)
+                    .and_then(json_nonnegative_index)
+                    .ok_or_else(|| "Blender Mesh face offset is invalid".to_owned())?;
+                let end = offsets
+                    .get(face_index + 1)
+                    .and_then(json_nonnegative_index)
+                    .ok_or_else(|| "Blender Mesh face offset is invalid".to_owned())?;
+                if loop_start != next_corner || end < loop_start {
+                    return Err(format!(
+                        "Mesh {mesh_name} polygons are not in contiguous loop order"
+                    ));
+                }
+                ranges.push((loop_start, end));
+                next_corner = end;
+            }
+            let final_offset = if polygon_count == 0 {
+                0
+            } else {
+                offsets
+                    .last()
+                    .and_then(json_nonnegative_index)
+                    .ok_or_else(|| "Blender Mesh final face offset is invalid".to_owned())?
+            };
+            if next_corner != loop_count || final_offset != loop_count {
+                return Err(format!(
+                    "Mesh {mesh_name} polygon corners ({final_offset}) do not match MDisps corners ({loop_count})"
+                ));
+            }
+            ranges
+        } else {
+            let mpoly_struct = self
+                .schema
+                .type_names
+                .iter()
+                .position(|name| name == "MPoly")
+                .and_then(|type_index| self.schema.struct_for_type(type_index))
+                .ok_or_else(|| "Blender DNA schema has no polygon offsets or MPoly".to_owned())?;
+            let polygon_pointer = self.schema.optional_pointer_at_path(
+                self.bytes,
+                mesh_struct,
+                mesh_offset,
+                &["mpoly"],
+                self.header.endian,
+                self.header.pointer_size,
+            )?;
+            if polygon_pointer == 0 && polygon_count != 0 {
+                return Err("Blender Mesh polygon pointer is null".into());
+            }
+            let polygons = self.read_struct_array(polygon_pointer, polygon_count, mpoly_struct)?;
+            let mut ranges = Vec::with_capacity(polygon_count);
+            let mut next_corner = 0_usize;
+            for polygon in polygons {
+                let loop_start = polygon
+                    .get("loopstart")
+                    .and_then(json_nonnegative_index)
+                    .ok_or_else(|| "Blender MPoly loopstart is invalid".to_owned())?;
+                let face_corner_count = polygon
+                    .get("totloop")
+                    .and_then(json_nonnegative_index)
+                    .ok_or_else(|| "Blender MPoly totloop is invalid".to_owned())?;
+                if loop_start != next_corner {
+                    return Err(format!(
+                        "Mesh {mesh_name} polygons are not in contiguous loop order"
+                    ));
+                }
+                let end = next_corner
+                    .checked_add(face_corner_count)
+                    .ok_or_else(|| "Blender polygon corner range overflow".to_owned())?;
+                ranges.push((next_corner, end));
+                next_corner = end;
+            }
+            if next_corner != loop_count {
+                return Err(format!(
+                    "Mesh {mesh_name} polygon corners ({next_corner}) do not match MDisps corners ({loop_count})"
+                ));
+            }
+            ranges
+        };
+        let mut values = Map::new();
+        for (face_index, (start, end)) in face_ranges.into_iter().enumerate() {
+            let face_values = corners
+                .get(start..end)
+                .ok_or_else(|| "Blender polygon corners exceed MDisps data".to_owned())?;
+            let face_id = face_index
+                .checked_add(1)
+                .ok_or_else(|| "Blender polygon face ID overflows".to_owned())?;
+            values.insert(
+                format!("f{face_id}"),
+                Value::Array(face_values.to_vec()),
+            );
+        }
+        Ok(Value::Object(values))
+    }
+
+    fn read_mdisps_grid(&self, pointer: u64, totdisp: usize) -> Result<Value, String> {
+        if pointer == 0 {
+            return Ok(Value::Array(vec![
+                Value::Array(vec![Value::from(0.0); 3]);
+                totdisp
+            ]));
+        }
+        let float_type = self
+            .schema
+            .type_names
+            .iter()
+            .position(|name| name == "float")
+            .ok_or_else(|| "Blender DNA schema does not contain float".to_owned())?;
+        if self.schema.type_lengths[float_type] != 4 {
+            return Err("Blender MDisps float width is unsupported".into());
+        }
+        let float_count = totdisp
+            .checked_mul(3)
+            .ok_or_else(|| "Blender MDisps float count overflow".to_owned())?;
+        let byte_count = float_count
+            .checked_mul(4)
+            .ok_or_else(|| "Blender MDisps byte count overflow".to_owned())?;
+        let (block, offset) = self.resolve(pointer, byte_count)?;
+        if (offset - block.data_offset) % 4 != 0 {
+            return Err("Blender MDisps float array is misaligned".into());
+        }
+        let mut values = Vec::with_capacity(totdisp);
+        for sample in 0..totdisp {
+            let mut vector = Vec::with_capacity(3);
+            for axis in 0..3 {
+                let index = sample
+                    .checked_mul(3)
+                    .and_then(|value| value.checked_add(axis))
+                    .ok_or_else(|| "Blender MDisps float index overflow".to_owned())?;
+                let address = offset
+                    .checked_add(
+                        index
+                            .checked_mul(4)
+                            .ok_or_else(|| "Blender MDisps float offset overflow".to_owned())?,
+                    )
+                    .ok_or_else(|| "Blender MDisps float offset overflow".to_owned())?;
+                let bytes = checked_slice(self.bytes, address, 4)?;
+                let bits = self.header.endian.read_u32(bytes)?;
+                vector.push(float_value(f64::from(f32::from_bits(bits)))?);
+            }
+            values.push(Value::Array(vector));
+        }
+        Ok(Value::Array(values))
+    }
+
 
     fn read_modifier_payload(
         &self,

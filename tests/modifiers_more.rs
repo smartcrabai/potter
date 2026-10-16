@@ -4,6 +4,7 @@
 )]
 
 use glam::{DQuat, DVec3, EulerRot};
+use potter_core::error::ErrorCode;
 use potter_core::geom::{
     BoxParams, CylinderParams, Mesh, boolean::boolean_mesh, modifiers::evaluate_modifiers,
 };
@@ -440,6 +441,120 @@ fn boolean_modifier_apply_resolves_scene_object_operand() -> Result<(), Box<dyn 
             > 6
     );
     Ok(())
+}
+
+#[test]
+fn subdivision_accepts_level_six_within_the_evaluated_budget() {
+    let source = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let result = evaluate_modifiers(&source, &[modifier("subdivision", json!({"levels": 6}))])
+        .unwrap();
+    assert_eq!(result.faces.len(), 24_576);
+    assert_eq!(result.vertices.len(), 24_578);
+    let clamped = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "multires",
+            json!({"levels": 6, "total_levels": 1}),
+        )],
+    )
+    .unwrap();
+    assert_eq!(clamped.faces.len(), 24);
+    assert_eq!(clamped.vertices.len(), 26);
+    let multires_level_six = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "multires",
+            json!({"levels": 6, "total_levels": 6}),
+        )],
+    )
+    .unwrap();
+    assert_eq!(multires_level_six.faces.len(), 24_576);
+    assert_eq!(multires_level_six.vertices.len(), 24_578);
+    let resource_limited = evaluate_modifiers(
+        &source,
+        &[modifier("multires", json!({"levels": 11, "total_levels": 11}))],
+    )
+    .unwrap_err();
+    assert_eq!(resource_limited.code, ErrorCode::LimitExceeded);
+
+}
+
+#[test]
+fn multires_custom_normals_follow_corner_layer_presence() {
+    let source = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let mut sharp_only = source.clone();
+    sharp_only.attributes.insert(
+        "blender_edge_flags".to_owned(),
+        Value::Array(
+            (0..sharp_only.edges.len())
+                .map(|_| json!({"sharp": true, "seam": false}))
+                .collect(),
+        ),
+    );
+
+    let mut mixed_sharp = source.clone();
+    let mut edge_flags = (0..mixed_sharp.edges.len())
+        .map(|_| json!({"sharp": false, "seam": false}))
+        .collect::<Vec<_>>();
+    edge_flags[0] = json!({"sharp": true, "seam": false});
+    mixed_sharp
+        .attributes
+        .insert("blender_edge_flags".to_owned(), Value::Array(edge_flags));
+    let mixed_result = evaluate_modifiers(
+        &mixed_sharp,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+    )
+    .unwrap();
+    assert!(
+        mixed_result.attributes.contains_key("custom_normal"),
+        "mixed sharp inputs use the corner-normal domain when custom normals are enabled"
+    );
+    let sharp_result = evaluate_modifiers(
+        &sharp_only,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+    )
+    .unwrap();
+    assert!(!sharp_result.attributes.contains_key("custom_normal"));
+
+    let mut with_layer = source;
+    let values = with_layer
+        .faces
+        .iter()
+        .map(|face| {
+            (
+                format!("f{}", face.id),
+                json!(vec![[8192_i32, 0]; face.vertices.len()]),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    with_layer.attributes.insert(
+        "custom_normal".to_owned(),
+        json!({"domain": "corner", "type": "normal_code", "values": values}),
+    );
+    let enabled = evaluate_modifiers(
+        &with_layer,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": true}),
+        )],
+    )
+    .unwrap();
+    assert!(enabled.attributes.contains_key("custom_normal"));
+    let disabled = evaluate_modifiers(
+        &with_layer,
+        &[modifier(
+            "multires",
+            json!({"levels": 1, "use_custom_normals": false}),
+        )],
+    )
+    .unwrap();
+    assert!(!disabled.attributes.contains_key("custom_normal"));
 }
 #[test]
 fn skin_modifier_builds_a_closed_profile_around_skeleton_edges() {

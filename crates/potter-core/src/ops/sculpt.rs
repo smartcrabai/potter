@@ -11,6 +11,9 @@ use crate::{
 
 use super::{ChangeKind, Engine, check_fields, resolve_node_targets};
 
+/// Blender's subdivision/multires level range (`rna_modifier.cc` `levels` hard maximum).
+const MAX_MULTIRES_LEVELS: u64 = 11;
+
 pub(super) fn apply(
     engine: &mut Engine<'_>,
     name: &str,
@@ -68,20 +71,53 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
                     "/target",
                 )
             })?;
-        let mut world_mesh = before.clone();
-        for vertex in &mut world_mesh.vertices {
-            vertex.co = world.transform_point3(vertex.co);
-        }
-        let mesh_changed =
-            sculpt_geom::apply_stroke_with_dyntopo(&mut world_mesh, &stroke, dyntopo_edge_length)?;
-        if mesh_changed {
+        let multires_modifier = engine
+            .doc
+            .nodes
+            .get(&node_id)
+            .and_then(|node| {
+                node.modifiers
+                    .iter()
+                    .find(|modifier| modifier.enabled && modifier.modifier_type == "multires")
+            })
+            .filter(|modifier| {
+                dyntopo_edge_length.is_none()
+                    && modifier
+                    .params
+                    .get("sculpt_levels")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|levels| levels > 0)
+                    && !modifier
+                        .params
+                        .get("use_sculpt_base_mesh")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            })
+            .cloned();
+        let (sculpted_mesh, mesh_changed) = if let Some(modifier) = multires_modifier {
+            crate::geom::modifiers::sculpt_multires(&before, &modifier, &stroke, world)?
+        } else {
+            let mut world_mesh = before;
             for vertex in &mut world_mesh.vertices {
-                vertex.co = inverse.transform_point3(vertex.co);
+                vertex.co = world.transform_point3(vertex.co);
             }
+            let mesh_changed = sculpt_geom::apply_stroke_with_dyntopo(
+                &mut world_mesh,
+                &stroke,
+                dyntopo_edge_length,
+            )?;
+            if mesh_changed {
+                for vertex in &mut world_mesh.vertices {
+                    vertex.co = inverse.transform_point3(vertex.co);
+                }
+            }
+            (world_mesh, mesh_changed)
+        };
+        if mesh_changed {
             let block = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
                 PotError::new(ErrorCode::TargetNotFound, "mesh data block disappeared")
             })?;
-            block.mesh = Some(world_mesh);
+            block.mesh = Some(sculpted_mesh);
             block.descriptor = None;
             engine.mark("data_blocks", &data_id, ChangeKind::Updated);
             super::clear_primitive_metadata(engine, &data_id);
@@ -377,11 +413,11 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
     let levels = operation
         .get("levels")
         .and_then(Value::as_u64)
-        .filter(|value| (1..=5).contains(value))
+        .filter(|value| (1..=MAX_MULTIRES_LEVELS).contains(value))
         .ok_or_else(|| {
             engine.error(
                 ErrorCode::InvalidOperation,
-                "levels must be between 1 and 5",
+                "levels must be between 1 and 11",
                 "/levels",
             )
         })?;
@@ -395,13 +431,14 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
             )
         })?,
     };
-    if render_levels > 5 {
+    if render_levels > MAX_MULTIRES_LEVELS {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
-            "render_levels must not exceed 5",
+            "render_levels must not exceed 11",
             "/render_levels",
         ));
     }
+    let render_levels = render_levels.min(levels);
     let mut changed = false;
     for node_id in targets {
         if engine.doc.nodes.get(&node_id).is_some_and(|node| {
@@ -415,6 +452,43 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
                 "/id",
             ));
         }
+        let data_id = engine
+            .doc
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.data.clone());
+        let mut total_levels = levels;
+        let mut data_changed = false;
+        if let Some(data_id) = &data_id
+            && let Some(data) = engine.doc.data_blocks.get_mut(data_id)
+            && let Some(mesh) = data.mesh.as_mut()
+        {
+            if let Some(record) = mesh.attributes.get("multires_displacement") {
+                total_levels = record
+                    .get("total_levels")
+                    .and_then(Value::as_u64)
+                    .filter(|value| (1..=13).contains(value))
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InvalidOperation,
+                            "existing multires_displacement has an invalid total_levels",
+                        )
+                    })?;
+            } else {
+                mesh.attributes.insert(
+                    "multires_displacement".to_owned(),
+                    json!({"total_levels": levels}),
+                );
+                data_changed = true;
+            }
+        }
+        if data_changed
+            && let Some(data_id) = &data_id
+        {
+            engine.mark("data_blocks", data_id, ChangeKind::Updated);
+        }
+        let levels = levels.min(total_levels);
+        let render_levels = render_levels.min(levels);
         let node = engine
             .doc
             .nodes
@@ -427,7 +501,9 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
             enabled: true,
             params: Map::from_iter([
                 ("levels".to_owned(), json!(levels)),
+                ("sculpt_levels".to_owned(), json!(levels)),
                 ("render_levels".to_owned(), json!(render_levels)),
+                ("total_levels".to_owned(), json!(levels)),
             ]),
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),

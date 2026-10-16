@@ -11,12 +11,15 @@ import json
 import math
 import os
 import sys
+import tempfile
 import traceback
 from mathutils import Euler, Matrix, Quaternion
 DEFERRED_ID_ASSIGNMENTS = []
 CACHE_FILES_BY_IDENTITY = {}
 ALPHA_MODE_PROPERTY = "potter.alpha_mode"
 ALPHA_MODES = ("opaque", "clip", "blend")
+DEFERRED_MDISPS_FILEPATHS = {}
+RESTORED_MDISPS_MESHES = {}
 POTTER_TO_BLENDER_ANIMATION_PATH = {
     "transform.translation": "location",
     "transform.rotation_euler": "rotation_euler",
@@ -388,6 +391,9 @@ def modifier_params(modifier):
             {"object": plain(projector.object) if projector.object else None}
             for projector in modifier.projectors
         ]
+    if modifier.type == "MULTIRES":
+        params["total_levels"] = int(modifier.total_levels)
+        params["is_external"] = bool(modifier.is_external)
     return params
 def _curve_mapping_points(mapping):
     if mapping is None or not mapping.curves:
@@ -1232,6 +1238,7 @@ def _uv_layer_index(layers, attribute):
 MESH_HANDLED_KEYS = frozenset((
     "alembic_normals", "alembic_time_samples", "alembic_velocity", "blender_attributes", "blender_metadata", "blender_skin_vertices",
     "color_layers", "crease_edge", "custom_normal", "seam", "sharp", "shade_smooth", "skin_radii", "skin_roots",
+    "multires_displacement",
     "uv_layers",
     "vertex_groups",
 ))
@@ -1861,6 +1868,8 @@ def dump_scene(scene):
         seed = int(scene.cycles.seed)
     elif render_engine in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT") and hasattr(scene, "eevee"):
         samples = int(scene.eevee.taa_render_samples)
+    cycles = getattr(scene, "cycles", None)
+    dicing_camera = getattr(cycles, "dicing_camera", None)
     return {"name": scene.name_full, "potter_id": scene.get("potter.id"),
             "frame_current": float(scene.frame_current) + float(getattr(scene, "frame_subframe", 0.0)),
             "frame_start": int(scene.frame_start), "frame_end": int(scene.frame_end), "fps": int(scene.render.fps),
@@ -1880,6 +1889,11 @@ def dump_scene(scene):
                 "film_transparent": bool(scene.render.film_transparent),
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
                 "engine_native": render_engine,
+                "dicing_rate": float(getattr(cycles, "dicing_rate", 1.0)),
+                "preview_dicing_rate": float(getattr(cycles, "preview_dicing_rate", 8.0)),
+                "max_subdivisions": int(getattr(cycles, "max_subdivisions", 12)),
+                "offscreen_dicing_scale": float(getattr(cycles, "offscreen_dicing_scale", 4.0)),
+                "dicing_camera": dicing_camera.name_full if dicing_camera else None,
                 "passes": _render_passes(scene),
             },
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
@@ -2298,7 +2312,100 @@ def _bake_point_cache(obj, cache):
             scene.collection.objects.unlink(obj)
 
 
-def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
+def _force_multires_external_read(obj, modifier):
+    scene = next((scene for scene in bpy.data.scenes if obj in scene.objects),
+                 bpy.context.scene)
+    view_layer = scene.view_layers[0]
+    levels = int(modifier.levels)
+    show_viewport = bool(modifier.show_viewport)
+    modifier.levels = max(levels, 1)
+    modifier.show_viewport = True
+    try:
+        with bpy.context.temp_override(
+                scene=scene, view_layer=view_layer, object=obj, active_object=obj,
+                selected_objects=[obj], selected_editable_objects=[obj]):
+            bpy.context.view_layer.update()
+            obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).data
+    finally:
+        modifier.levels = levels
+        modifier.show_viewport = show_viewport
+
+
+def _pack_multires_displacement(obj, modifier):
+    scene = next((scene for scene in bpy.data.scenes if obj in scene.objects),
+                 bpy.context.scene)
+    with bpy.context.temp_override(
+            scene=scene, view_layer=scene.view_layers[0], object=obj,
+            active_object=obj, selected_objects=[obj],
+            selected_editable_objects=[obj]):
+        result = bpy.ops.object.multires_external_pack()
+    if "FINISHED" not in result:
+        raise ValueError("Blender could not pack multires displacement grids")
+    modifier.filepath = ""
+    if modifier.is_external or modifier.filepath:
+        raise ValueError("Blender did not pack multires displacement grids")
+
+
+# Blender exposes MDisps through its native external-layer loader, not mesh.attributes.
+def _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
+    node = doc.get("nodes", {}).get(node_id, {})
+    data_id = node.get("data")
+    data = doc.get("data_blocks", {}).get(data_id, {})
+    mesh = data.get("mesh", {})
+    record = mesh.get("attributes", {}).get("multires_displacement")
+    if not isinstance(record, dict):
+        return False
+    if not record.get("values") and not record.get("external"):
+        return False
+    external = record.get("external") or {}
+    filepath = external.get("filepath")
+    if not isinstance(filepath, str) or not filepath:
+        raise ValueError("multires displacement grids have no external filepath")
+    if int(record.get("total_levels", 0)) != int(modifier.total_levels):
+        raise ValueError("multires displacement level does not match the modifier")
+    target_directory = os.path.dirname(os.path.abspath(target))
+    external_path = os.path.abspath(
+        os.path.join(target_directory, filepath[2:] if filepath.startswith("//") else filepath))
+    if not os.path.isfile(external_path):
+        raise FileNotFoundError("multires displacement sidecar is missing: " + external_path)
+    mesh_key = obj.data.as_pointer()
+    restored = RESTORED_MDISPS_MESHES.get(mesh_key)
+    if restored is not None:
+        if restored != (filepath, bool(pack)):
+            raise ValueError("shared multires mesh has conflicting displacement state")
+        return True
+    seed_path = None
+    try:
+        if not modifier.is_external:
+            seed_fd, seed_path = tempfile.mkstemp(suffix=".btx")
+            os.close(seed_fd)
+            os.unlink(seed_path)
+            scene = next((scene for scene in bpy.data.scenes if obj in scene.objects),
+                         bpy.context.scene)
+            with bpy.context.temp_override(
+                    scene=scene, view_layer=scene.view_layers[0], object=obj,
+                    active_object=obj, selected_objects=[obj],
+                    selected_editable_objects=[obj]):
+                result = bpy.ops.object.multires_external_save(
+                    modifier=modifier.name, filepath=seed_path, relative_path=False)
+            if "FINISHED" not in result:
+                raise ValueError("Blender could not initialize external multires grids")
+        modifier.filepath = external_path
+        if not modifier.is_external:
+            raise ValueError("Blender did not mark multires grids as external")
+        _force_multires_external_read(obj, modifier)
+        if pack:
+            _pack_multires_displacement(obj, modifier)
+        else:
+            DEFERRED_MDISPS_FILEPATHS[mesh_key] = (modifier, obj, filepath)
+        RESTORED_MDISPS_MESHES[mesh_key] = (filepath, bool(pack))
+        return True
+    finally:
+        if seed_path and os.path.exists(seed_path):
+            os.unlink(seed_path)
+
+
+def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pack):
     params = item.get("params", {})
     kind = item.get("type")
     physics_property = {
@@ -2325,8 +2432,32 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
     rna_params = dict(params)
     for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve"):
         rna_params.pop(parameter, None)
+    if kind == "multires":
+        for parameter in (
+            "total_levels", "is_external", "levels", "sculpt_levels", "render_levels", "filepath",
+        ):
+            rna_params.pop(parameter, None)
     set_rna(modifier, rna_params, id_lookup)
     _restore_modifier_id_references(modifier, rna_params, id_lookup)
+    if kind == "multires":
+        total_levels = int(params.get("total_levels", modifier.total_levels))
+        if not 0 <= total_levels <= 13:
+            raise ValueError("Multires total_levels must be between 0 and 13")
+        with bpy.context.temp_override(
+                object=obj, active_object=obj,
+                selected_objects=[obj], selected_editable_objects=[obj]):
+            if total_levels < modifier.total_levels:
+                modifier.levels = total_levels
+                bpy.ops.object.multires_higher_levels_delete(modifier=modifier.name)
+            while modifier.total_levels < total_levels:
+                bpy.ops.object.multires_subdivide(
+                    modifier=modifier.name, mode="CATMULL_CLARK")
+        modifier.levels = min(int(params.get("levels", 0)), total_levels)
+        modifier.sculpt_levels = min(int(params.get("sculpt_levels", 0)), total_levels)
+        modifier.render_levels = min(int(params.get("render_levels", 0)), total_levels)
+        if not _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
+            if "filepath" in params:
+                modifier.filepath = params["filepath"]
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
         _set_curve_mapping(modifier, params["map_curve"])
     if kind == "mesh_cache" and params.get("resource"):
@@ -5054,7 +5185,8 @@ def _text_from_string(name, body):
 def export_doc(doc, target, pack, scene_hash, context):
     CACHE_FILES_BY_IDENTITY.clear()
     DEFERRED_ID_ASSIGNMENTS.clear()
-    # Factory startup is already clean, but remove all scene objects to make this robust
+    DEFERRED_MDISPS_FILEPATHS.clear()
+    RESTORED_MDISPS_MESHES.clear()
     # when invoked by Blender builds that ignore the startup flag.
     for scene in bpy.data.scenes:
         scene.camera = None
@@ -5125,6 +5257,11 @@ def export_doc(doc, target, pack, scene_hash, context):
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
         scene.render.engine = engine
+        if hasattr(scene, "cycles"):
+            scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
+            scene.cycles.preview_dicing_rate = float(render.get("preview_dicing_rate", 8.0))
+            scene.cycles.max_subdivisions = int(render.get("max_subdivisions", 12))
+            scene.cycles.offscreen_dicing_scale = float(render.get("offscreen_dicing_scale", 4.0))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.samples = int(render.get("samples", 64))
             scene.cycles.seed = int(render.get("seed", 0))
@@ -5694,7 +5831,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 modifier.show_viewport = modifier_item.get("enabled", True)
                 modifier.show_render = modifier_item.get("enabled", True)
                 set_modifier_params(
-                    modifier, modifier_item, id_lookup, doc, target, node_id, obj)
+                    modifier, modifier_item, id_lookup, doc, target, node_id, obj, pack)
                 if modifier_item.get("type") == "mesh_sequence_cache":
                     cache_file = _cache_file_for_resource(
                         doc, params["resource"], target, params)
@@ -5963,6 +6100,17 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.camera = object_map[item["camera"]]
         if item.get("world") in world_map:
             scene.world = world_map[item["world"]]
+        dicing_camera_id = item.get("render", {}).get("dicing_camera")
+        if hasattr(scene, "cycles"):
+            if dicing_camera_id is None:
+                scene.cycles.dicing_camera = None
+            else:
+                dicing_camera = object_map.get(dicing_camera_id)
+                if dicing_camera is None or dicing_camera.type != "CAMERA":
+                    raise ValueError("adaptive subdivision dicing camera is missing or invalid")
+                scene.cycles.dicing_camera = dicing_camera
+        elif dicing_camera_id is not None:
+            raise ValueError("Blender build cannot restore the Cycles dicing camera")
     context_scene_id = context.get("scene_id") or doc.get("active_scene")
     active_scene = scene_map.get(context_scene_id)
     if active_scene:
@@ -5997,13 +6145,21 @@ def export_doc(doc, target, pack, scene_hash, context):
     os.makedirs(output_dir, exist_ok=True)
     if pack:
         bpy.ops.file.pack_all()
+    # Resolve `//` MDisps paths after Blender knows the saved .blend path.
     bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False,
                                 relative_remap=False)
+    needs_resave = bool(DEFERRED_MDISPS_FILEPATHS or bpy.data.movieclips)
+    for modifier, obj, filepath in DEFERRED_MDISPS_FILEPATHS.values():
+        modifier.filepath = filepath
+        if not modifier.is_external:
+            raise ValueError("Blender did not retain external multires grid state")
+        _force_multires_external_read(obj, modifier)
     if bpy.data.movieclips:
         for clip in bpy.data.movieclips:
             if clip.filepath:
                 clip.filepath = _relative_blend_path(
                     bpy.path.abspath(clip.filepath), target)
+    if needs_resave:
         bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False,
                                     relative_remap=False)
 

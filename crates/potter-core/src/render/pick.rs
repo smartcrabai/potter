@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     cli::PickDomain,
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{AdaptiveRenderRequest, EvaluationContext, Snapshot},
     hash,
     model::{Id, SceneDoc},
 };
@@ -47,6 +47,8 @@ struct Manifest {
     render_key: String,
     width: u32,
     height: u32,
+    #[serde(default)]
+    adaptive_render: Option<AdaptiveRenderRequest>,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -171,6 +173,7 @@ pub fn pick(
         scene_id: Some(scene_id),
         view_layer: manifest.view_layer.clone(),
         frame: Some(manifest.frame),
+        adaptive_render: manifest.adaptive_render.clone(),
     };
     let snapshot = Snapshot::evaluate_with_cache(doc, &context, Some(cache_directory))?;
     if snapshot.revision != manifest.revision

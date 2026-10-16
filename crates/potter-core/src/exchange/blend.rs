@@ -138,7 +138,8 @@ pub fn export_blend(
     }
     add_blender_uv_fields(doc, &mut document);
     add_blender_mesh_fields(doc, &mut document)?;
-    let (document, asset_files) = prepare_blend_export_resources(document, project, out)?;
+    let (document, mut asset_files, multires_sidecars) =
+        prepare_blend_export_resources(document, project, out)?;
     let input = temporary_path("blend-export-input.json")?;
     let script = temporary_path("blend-bridge.py")?;
     let blend_temp = temporary_blend_path(parent)?;
@@ -205,7 +206,16 @@ pub fn export_blend(
         Ok(())
     })();
     cleanup(&[input, script, blend_temp, validation]);
-    operation?;
+    if let Err(error) = operation {
+        if opts.pack {
+            let _ = remove_multires_sidecars(&multires_sidecars);
+        }
+        return Err(error);
+    }
+    if opts.pack {
+        remove_multires_sidecars(&multires_sidecars)?;
+        asset_files.retain(|file| !multires_sidecars.contains(file));
+    }
 
     let (scene_count, object_count, mesh_count, material_count, action_count) = (
         doc.scenes.len(),
@@ -393,7 +403,7 @@ fn prepare_blend_export_resources(
     mut document: Value,
     project: &Project,
     out: &Path,
-) -> Result<(Value, Vec<PathBuf>)> {
+) -> Result<(Value, Vec<PathBuf>, Vec<PathBuf>)> {
     let original_blend_path = document
         .get("compatibility")
         .and_then(Value::as_object)
@@ -431,6 +441,7 @@ fn prepare_blend_export_resources(
     let sidecar = parent.join(format!("{stem}_assets"));
     let mut sidecar_created = false;
     let mut files = Vec::new();
+    let mut multires_sidecars = Vec::new();
     let library_base = library_layout_base(&document);
     for id in resource_ids {
         let resource = document
@@ -553,7 +564,310 @@ fn prepare_blend_export_resources(
         }
     }
     add_blender_image_pixels(&mut document, project)?;
-    Ok((document, files))
+
+    prepare_multires_external_sidecars(
+        &mut document,
+        out,
+        &sidecar,
+        &mut files,
+        &mut multires_sidecars,
+    )?;
+    Ok((document, files, multires_sidecars))
+}
+
+fn remove_multires_sidecars(files: &[PathBuf]) -> Result<()> {
+    let mut parents = BTreeSet::new();
+    for file in files.iter().cloned().collect::<BTreeSet<_>>() {
+        fs::remove_file(&file).map_err(|error| PotError::io(&error))?;
+        if let Some(parent) = file.parent() {
+            parents.insert(parent.to_path_buf());
+        }
+    }
+    for parent in parents {
+        let mut entries = fs::read_dir(&parent).map_err(|error| PotError::io(&error))?;
+        match entries.next() {
+            None => fs::remove_dir(&parent).map_err(|error| PotError::io(&error))?,
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Err(PotError::io(&error)),
+        }
+    }
+    Ok(())
+}
+
+fn prepare_multires_external_sidecars(
+    document: &mut Value,
+    out: &Path,
+    sidecar: &Path,
+    files: &mut Vec<PathBuf>,
+    multires_sidecars: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let mut exports = Vec::new();
+    if let Some(data_blocks) = document.get("data_blocks").and_then(Value::as_object) {
+        for (data_id, data) in data_blocks {
+            let Some(mesh) = data.get("mesh").filter(|mesh| mesh.is_object()) else {
+                continue;
+            };
+            let Some(record) = mesh
+                .get("attributes")
+                .and_then(Value::as_object)
+                .and_then(|attributes| attributes.get("multires_displacement"))
+            else {
+                continue;
+            };
+            let has_multires_modifier = document
+                .get("nodes")
+                .and_then(Value::as_object)
+                .is_some_and(|nodes| {
+                    nodes.values().any(|node| {
+                        node.get("data").and_then(Value::as_str) == Some(data_id)
+                            && node
+                                .get("modifiers")
+                                .and_then(Value::as_array)
+                                .is_some_and(|modifiers| {
+                                    modifiers.iter().any(|modifier| {
+                                        modifier.get("type").and_then(Value::as_str)
+                                            == Some("multires")
+                                    })
+                                })
+                    })
+                });
+            if !has_multires_modifier {
+                continue;
+            }
+            let total_levels = record
+                .get("total_levels")
+                .and_then(Value::as_u64)
+                .and_then(|levels| u32::try_from(levels).ok())
+                .filter(|levels| (1..=13).contains(levels))
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "multires_displacement.total_levels must be between 1 and 13",
+                    )
+                })?;
+            let Some(values) = record.get("values") else {
+                if let Some(filepath) = record
+                    .get("external")
+                    .and_then(|external| external.get("filepath"))
+                    .and_then(Value::as_str)
+                {
+                    return Err(PotError::with_details(
+                        ErrorCode::FileNotFound,
+                        "multires external grid values are unavailable for export",
+                        json!({"data_block": data_id, "filepath": filepath}),
+                    ));
+                }
+                continue;
+            };
+            let grids = multires_grids_for_export(mesh, values, total_levels)?;
+            let bytes =
+                crate::geom::multires_external::write_external_grids(&grids, total_levels)?;
+            let filename = record
+                .get("external")
+                .and_then(|external| external.get("filepath"))
+                .and_then(Value::as_str)
+                .and_then(|filepath| {
+                    Path::new(filepath.strip_prefix("//").unwrap_or(filepath))
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                })
+                .filter(|name| {
+                    *name != "."
+                        && *name != ".."
+                        && Path::new(name).file_name().and_then(|value| value.to_str()) == Some(*name)
+                })
+                .unwrap_or("multires.btx")
+                .to_owned();
+            let digest = crate::hash::sha256(&bytes);
+            exports.push((data_id.clone(), total_levels, filename, bytes, digest));
+        }
+    }
+    if exports.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(sidecar).map_err(|error| PotError::io(&error))?;
+    let output_parent = out
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    for (data_id, total_levels, filename, bytes, digest) in exports {
+        let destination = sidecar_destination(sidecar, &filename, &digest, &bytes)?;
+        if !destination.is_file() {
+            write_asset_sidecar(&destination, &bytes)?;
+        }
+        let relative_path = destination.strip_prefix(output_parent).map_err(|_| {
+            PotError::new(
+                ErrorCode::ExportFailed,
+                "multires external sidecar is outside the Blender output directory",
+            )
+        })?;
+        let blender_filepath = format!("//{}", relative_path.to_string_lossy().replace('\\', "/"));
+        if !files.contains(&destination) {
+            files.push(destination.clone());
+        }
+        if !multires_sidecars.contains(&destination) {
+            multires_sidecars.push(destination.clone());
+        }
+
+        if let Some(record) = document
+            .get_mut("data_blocks")
+            .and_then(Value::as_object_mut)
+            .and_then(|data_blocks| data_blocks.get_mut(&data_id))
+            .and_then(|data| data.get_mut("mesh"))
+            .and_then(|mesh| mesh.get_mut("attributes"))
+            .and_then(Value::as_object_mut)
+            .and_then(|attributes| attributes.get_mut("multires_displacement"))
+            .and_then(Value::as_object_mut)
+        {
+            record.insert(
+                "external".to_owned(),
+                json!({"filepath": blender_filepath}),
+            );
+        }
+        if let Some(nodes) = document.get_mut("nodes").and_then(Value::as_object_mut) {
+            for node in nodes.values_mut() {
+                if node.get("data").and_then(Value::as_str) != Some(data_id.as_str()) {
+                    continue;
+                }
+                let Some(modifiers) = node.get_mut("modifiers").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                for modifier in modifiers {
+                    if modifier.get("type").and_then(Value::as_str) != Some("multires") {
+                        continue;
+                    }
+                    let params = modifier
+                        .as_object_mut()
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "multires modifier record must be an object",
+                            )
+                        })?
+                        .entry("params")
+                        .or_insert_with(|| Value::Object(Map::new()))
+                        .as_object_mut()
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "multires modifier params must be an object",
+                            )
+                        })?;
+                    params.insert("filepath".to_owned(), json!(blender_filepath));
+                    params.insert("is_external".to_owned(), Value::Bool(true));
+                    params.insert("total_levels".to_owned(), Value::from(total_levels));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn multires_grids_for_export(
+    mesh: &Value,
+    values: &Value,
+    total_levels: u32,
+) -> Result<Vec<Vec<[f32; 3]>>> {
+    let faces = mesh
+        .get("faces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "multires mesh faces are invalid"))?;
+    let values = values.as_object().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "multires_displacement.values must be keyed by face ID",
+        )
+    })?;
+    if values.len() != faces.len() {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "multires_displacement.values must contain every mesh face",
+        ));
+    }
+    let grid_vectors = crate::geom::multires_external::grid_vector_count(total_levels)?;
+    let corner_count = faces.iter().try_fold(0_usize, |count, face| {
+        count.checked_add(face.get("vertices")?.as_array()?.len())
+    });
+    let corner_count = corner_count.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "multires mesh corner count is invalid or overflows",
+        )
+    })?;
+    let external_size =
+        crate::geom::multires_external::expected_external_file_size(total_levels, corner_count)?;
+    crate::geom::modifiers::check_multires_grid_capacity(
+        corner_count,
+        total_levels,
+        external_size,
+    )?;
+    let mut grids = Vec::with_capacity(corner_count);
+    for face in faces {
+        let face_id = face
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "multires face ID is invalid"))?;
+        let face_corners = face
+            .get("vertices")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "multires face corners are invalid")
+            })?;
+        let face_values = values
+            .get(&format!("f{face_id}"))
+            .and_then(Value::as_array)
+            .filter(|corners| corners.len() == face_corners.len())
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    format!("multires face f{face_id} has invalid corner grids"),
+                )
+            })?;
+        for (corner, raw_grid) in face_values.iter().enumerate() {
+            let raw_grid = raw_grid
+                .as_array()
+                .filter(|grid| grid.len() == grid_vectors)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        format!("multires grid f{face_id}[{corner}] has an invalid size"),
+                    )
+                })?;
+            let mut grid = Vec::with_capacity(grid_vectors);
+            for (sample, raw_vector) in raw_grid.iter().enumerate() {
+                let components = raw_vector
+                    .as_array()
+                    .filter(|components| components.len() == 3)
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::SceneInvalid,
+                            format!("multires vector f{face_id}[{corner}][{sample}] is invalid"),
+                        )
+                    })?;
+                let mut vector = [0.0_f32; 3];
+                for (axis, component) in components.iter().enumerate() {
+                    let value = component.as_f64().filter(|value| value.is_finite()).ok_or_else(
+                        || {
+                            PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "multires displacement components must be finite numbers",
+                            )
+                        },
+                    )?;
+                    vector[axis] = value as f32;
+                    if !vector[axis].is_finite() {
+                        return Err(PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "multires displacement component exceeds the f32 range",
+                        ));
+                    }
+                }
+                grid.push(vector);
+            }
+            grids.push(grid);
+        }
+    }
+    Ok(grids)
 }
 
 /// Libraries reference each other with paths relative to their own file, so
@@ -716,6 +1030,16 @@ pub fn import_blend(file: &Path, blender: Option<&Path>) -> Result<ImportedGraph
                     json!({"file": file.display().to_string()}),
                 )
             })?;
+        let mut native_multires =
+            super::blend_dna::read_multires_displacements(&original).map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    format!("could not read native Blender multires data: {error}"),
+                    json!({"file": file.display().to_string()}),
+                )
+            })?;
+        load_external_multires(&raw, &mut native_multires, file)?;
+        attach_native_multires(&mut raw, &native_multires)?;
         attach_native_target_vertices(&mut raw, &mut native_bindings)?;
         build_imported_graph(&raw, file, original, &native_bindings)
     })();
@@ -775,8 +1099,244 @@ fn attach_native_target_vertices(
             }
         }
     }
+
     Ok(())
 }
+fn attach_native_multires(
+    raw: &mut Value,
+    native_multires: &BTreeMap<String, Value>,
+) -> Result<()> {
+    if let Some(meshes) = raw.get_mut("meshes").and_then(Value::as_array_mut) {
+        for mesh in meshes {
+            let Some(name) = mesh.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(record) = native_multires.get(name) {
+                let properties = mesh.as_object_mut().ok_or_else(|| {
+                    invalid_intermediate("native multires mesh record target is invalid")
+                })?;
+                properties.insert("native_multires_displacement".to_owned(), record.clone());
+            }
+        }
+    }
+
+    if let Some(objects) = raw.get_mut("objects").and_then(Value::as_array_mut) {
+        for object in objects {
+            let Some(mesh_name) = object
+                .get("data_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Some(record) = native_multires.get(&mesh_name) else {
+                continue;
+            };
+            let total_levels = record.get("total_levels").cloned().ok_or_else(|| {
+                invalid_intermediate("native multires record has no total_levels")
+            })?;
+            let external = record.get("external").and_then(Value::as_object);
+            let is_external = external.is_some();
+            let filepath = external
+                .and_then(|value| value.get("filepath"))
+                .filter(|value| value.as_str().is_some())
+                .cloned();
+            let Some(modifiers) = object.get_mut("modifiers").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for modifier in modifiers {
+                if modifier.get("type").and_then(Value::as_str) != Some("MULTIRES") {
+                    continue;
+                }
+                let properties = modifier
+                    .get_mut("properties")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        invalid_intermediate("Blender multires modifier properties are invalid")
+                    })?;
+                properties
+                    .entry("total_levels".to_owned())
+                    .or_insert_with(|| total_levels.clone());
+                properties
+                    .entry("is_external".to_owned())
+                    .or_insert_with(|| Value::Bool(is_external));
+                if let Some(filepath) = &filepath {
+                    properties
+                        .entry("filepath".to_owned())
+                        .or_insert_with(|| filepath.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn load_external_multires(
+    raw: &Value,
+    native_multires: &mut BTreeMap<String, Value>,
+    blend_file: &Path,
+) -> Result<()> {
+    let Some(meshes) = raw.get("meshes").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for mesh in meshes {
+        let Some(name) = mesh.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(record) = native_multires.get_mut(name) else {
+            continue;
+        };
+        let Some(filepath) = record
+            .get("external")
+            .and_then(|external| external.get("filepath"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let external_path = resolve_blender_external_path(filepath, blend_file);
+        let total_levels = record
+            .get("total_levels")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| invalid_intermediate("native multires total_levels is invalid"))?;
+        if !(1..=13).contains(&total_levels) {
+            return Err(invalid_intermediate(
+                "native multires total_levels must be between 1 and 13",
+            ));
+        }
+        let polygons = mesh
+            .get("polygons")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_intermediate("external multires mesh polygons are invalid"))?;
+        let mut face_corner_counts = Vec::with_capacity(polygons.len());
+        let mut corner_count = 0_usize;
+        for polygon in polygons {
+            let face_corner_count = polygon
+                .get("v")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    invalid_intermediate("external multires polygon corners are invalid")
+                })?
+                .len();
+            corner_count = corner_count
+                .checked_add(face_corner_count)
+                .ok_or_else(|| invalid_intermediate("external multires corner count overflows"))?;
+            face_corner_counts.push(face_corner_count);
+        }
+        let expected_file_size =
+            crate::geom::multires_external::expected_external_file_size(total_levels, corner_count)?;
+        crate::geom::modifiers::check_multires_grid_capacity(
+            corner_count,
+            total_levels,
+            expected_file_size,
+        )?;
+        let metadata = match fs::metadata(&external_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PotError::with_details(
+                    ErrorCode::FileNotFound,
+                    "Blender multires external grid file is missing",
+                    json!({
+                        "mesh": name,
+                        "filepath": filepath,
+                        "resolved_path": external_path.display().to_string(),
+                    }),
+                ));
+            }
+            Err(error) => return Err(PotError::io(&error)),
+        };
+        if metadata.len() != expected_file_size {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "Blender multires external grid file has an invalid size",
+                json!({
+                    "mesh": name,
+                    "filepath": filepath,
+                    "expected_bytes": expected_file_size,
+                    "actual_bytes": metadata.len(),
+                }),
+            ));
+        }
+        let read_limit = expected_file_size.checked_add(1).ok_or_else(|| {
+            PotError::new(ErrorCode::LimitExceeded, "multires sidecar size overflows")
+        })?;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(expected_file_size).map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "multires sidecar exceeds this platform's address space",
+                )
+            })?,
+        );
+        fs::File::open(&external_path)
+            .map_err(|error| PotError::io(&error))?
+            .take(read_limit)
+            .read_to_end(&mut bytes)
+            .map_err(|error| PotError::io(&error))?;
+        if u64::try_from(bytes.len()).ok() != Some(expected_file_size) {
+            return Err(PotError::new(
+                ErrorCode::ImportFailed,
+                "Blender multires external grid file changed size while reading",
+            ));
+        }
+        let grids = crate::geom::multires_external::read_external_grids(
+            &bytes,
+            total_levels,
+            corner_count,
+        )?;
+        let mut values = Map::new();
+        let mut first_corner = 0_usize;
+        for (face_index, face_corner_count) in face_corner_counts.into_iter().enumerate() {
+            let end_corner = first_corner
+                .checked_add(face_corner_count)
+                .ok_or_else(|| invalid_intermediate("external multires corner range overflows"))?;
+            let face_grids = grids.get(first_corner..end_corner).ok_or_else(|| {
+                invalid_intermediate("external multires grids do not cover mesh polygons")
+            })?;
+            let corners = face_grids
+                .iter()
+                .map(|grid| {
+                    Value::Array(
+                        grid.iter()
+                            .map(|[x, y, z]| {
+                                json!([f64::from(*x), f64::from(*y), f64::from(*z)])
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            let face_id = face_index
+                .checked_add(1)
+                .ok_or_else(|| invalid_intermediate("external multires face ID overflows"))?;
+            values.insert(format!("f{face_id}"), Value::Array(corners));
+            first_corner = end_corner;
+        }
+        if first_corner != grids.len() {
+            return Err(invalid_intermediate(
+                "external multires grids do not match mesh polygon corners",
+            ));
+        }
+        record
+            .as_object_mut()
+            .ok_or_else(|| invalid_intermediate("native multires record is invalid"))?
+            .insert("values".to_owned(), Value::Object(values));
+    }
+    Ok(())
+}
+
+fn resolve_blender_external_path(filepath: &str, blend_file: &Path) -> PathBuf {
+    let directory = blend_file.parent().unwrap_or_else(|| Path::new("."));
+    if let Some(relative) = filepath.strip_prefix("//") {
+        directory.join(relative)
+    } else {
+        let path = Path::new(filepath);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            directory.join(path)
+        }
+    }
+}
+
 fn check_blender_version(blender: &Path) -> Result<()> {
     let output = Command::new(blender)
         .arg("--version")
@@ -1298,6 +1858,12 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("render seed is out of range"))?,
             max_bounces: u32::try_from(integer_field(&render, "max_bounces", 4))
                 .map_err(|_| invalid_intermediate("render max_bounces is out of range"))?,
+            dicing_rate: number_field(&render, "dicing_rate", 1.0),
+            preview_dicing_rate: number_field(&render, "preview_dicing_rate", 8.0),
+            max_subdivisions: u32::try_from(integer_field(&render, "max_subdivisions", 12))
+                .map_err(|_| invalid_intermediate("render max_subdivisions is out of range"))?,
+            offscreen_dicing_scale: number_field(&render, "offscreen_dicing_scale", 4.0),
+            dicing_camera: None,
             film_transparent: render
                 .get("film_transparent")
                 .and_then(Value::as_bool)
@@ -2468,6 +3034,22 @@ fn build_imported_graph(
                 .and_then(Value::as_str)
                 .and_then(|camera_name| object_ids.get(camera_name))
                 .cloned();
+            scene.render.dicing_camera = match item
+                .get("render")
+                .and_then(|render| render.get("dicing_camera"))
+            {
+                None | Some(Value::Null) => None,
+                Some(Value::String(camera_name)) => Some(
+                    object_ids.get(camera_name).cloned().ok_or_else(|| {
+                        invalid_intermediate("render dicing_camera references a missing object")
+                    })?,
+                ),
+                Some(_) => {
+                    return Err(invalid_intermediate(
+                        "render dicing_camera must be an object name or null",
+                    ));
+                }
+            };
         }
     }
     let mut generic_ids = BTreeMap::<String, BTreeMap<String, Id>>::new();
@@ -4532,6 +5114,13 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             Value::Array(blender_attributes),
         );
     }
+    if let Some(native_multires) = item
+        .get("native_multires_displacement")
+        .filter(|value| value.is_object())
+    {
+        mesh.attributes
+            .insert("multires_displacement".to_owned(), native_multires.clone());
+    }
     if let Some(skin_vertices) = item
         .get("skin_vertices")
         .and_then(Value::as_array)
@@ -4578,13 +5167,14 @@ const BLENDER_MANAGED_ATTRIBUTES: [&str; 6] = [
 ];
 
 /// Mesh-level keys that the `.blend` writer recreates or restores itself.
-const BLENDER_HANDLED_MESH_KEYS: [&str; 11] = [
+const BLENDER_HANDLED_MESH_KEYS: [&str; 12] = [
     "uv_layers",
     "color_layers",
     "shade_smooth",
     "sharp",
     "seam",
     "custom_normal",
+    "multires_displacement",
     "blender_metadata",
     "blender_attributes",
     "blender_skin_vertices",
@@ -10617,6 +11207,232 @@ print("UNSUPPORTED_POSE " + json.dumps({
             "reconstruction cameras must not survive the round trip"
         );
         assert!(!reopened_clip.tracking.reconstruction.is_valid);
+        Ok(())
+    }
+    #[test]
+    fn multires_import_fails_when_external_grid_file_is_missing() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let blend_file = directory.path().join("scene.blend");
+        let raw = json!({"meshes":[{"name":"Mesh"}]});
+        let mut native_multires = BTreeMap::from([(
+            "Mesh".to_owned(),
+            json!({"total_levels":2,"external":{"filepath":"//missing.btx"}}),
+        )]);
+        let error = load_external_multires(&raw, &mut native_multires, &blend_file)
+            .expect_err("missing external displacement data must fail import");
+        assert_eq!(error.code, ErrorCode::FileNotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn multires_dna_imports_inline_and_external_corner_grids() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/multires");
+        let inline_path = fixture_dir.join("mr_inline.blend");
+        let external_path = fixture_dir.join("mr_external.blend");
+        assert!(inline_path.is_file(), "inline multires fixture is missing");
+        assert!(external_path.is_file(), "external multires fixture is missing");
+
+        fn record(imported: &ImportedGraph) -> Value {
+            imported
+                .doc
+                .data_blocks
+                .values()
+                .filter_map(|data| data.mesh.as_ref())
+                .find_map(|mesh| mesh.attributes.get("multires_displacement"))
+                .cloned()
+                .expect("imported mesh has no multires_displacement record")
+        }
+
+        fn check_grids(record: &Value) -> (usize, f64, bool) {
+            assert_eq!(record.get("total_levels").and_then(Value::as_u64), Some(2));
+            let values = record
+                .get("values")
+                .and_then(Value::as_object)
+                .expect("multires record has no values");
+            assert_eq!(values.len(), 6);
+            let mut corner_count = 0;
+            let mut z_sum = 0.0;
+            let mut nonzero = false;
+            for face_index in 1..=6 {
+                let corners = values
+                    .get(&format!("f{face_index}"))
+                    .and_then(Value::as_array)
+                    .expect("multires face is missing or invalid");
+                assert_eq!(corners.len(), 4);
+                corner_count += corners.len();
+                for grid in corners {
+                    let samples = grid.as_array().expect("multires corner grid is invalid");
+                    assert_eq!(samples.len(), 9);
+                    for sample in samples {
+                        let vector = sample.as_array().expect("multires vector is invalid");
+                        assert_eq!(vector.len(), 3);
+                        let components = vector
+                            .iter()
+                            .map(|component| component.as_f64().unwrap())
+                            .collect::<Vec<_>>();
+                        assert!(components.iter().all(|component| component.is_finite()));
+                        z_sum += components[2];
+                        nonzero |= components.iter().any(|component| component.abs() > 1.0e-7);
+                    }
+                }
+            }
+            assert_eq!(corner_count, 24);
+            assert!(z_sum.is_finite());
+            (corner_count, z_sum, nonzero)
+        }
+
+        let inline = import_blend(inline_path, Some(&blender))?;
+        let inline_record = record(&inline);
+        assert!(inline_record.get("external").is_none());
+        let (_, inline_z_sum, inline_nonzero) = check_grids(&inline_record);
+        assert!(inline_nonzero, "reshaped multires grids are all zero");
+        assert!(
+            inline_z_sum.abs() < 100.0,
+            "inline tangent-space z sum is inconsistent with the small reference offsets: {inline_z_sum}"
+        );
+        let inline_modifier = inline
+            .doc
+            .nodes
+            .values()
+            .flat_map(|node| &node.modifiers)
+            .find(|modifier| modifier.modifier_type == "multires")
+            .expect("inline Multires modifier was not imported");
+        assert_eq!(
+            inline_modifier.params.get("total_levels").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            inline_modifier
+                .params
+                .get("is_external")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let roundtrip_directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(roundtrip_directory.path().join("project"))?;
+        let context = crate::eval::EvaluationContext::default();
+        for (stem, pack) in [("external", false), ("packed", true)] {
+            let output = roundtrip_directory
+                .path()
+                .join(format!("multires-{stem}.blend"));
+            let options = ExportOptions {
+                allow_lossy: false,
+                pack,
+                blender: Some(&blender),
+                context: &context,
+            };
+            let report = export_blend(&inline.doc, &project, &output, &options)?;
+            let sidecar = roundtrip_directory
+                .path()
+                .join(format!("multires-{stem}_assets"));
+            let has_displacement_sidecar = report.files.iter().any(|file| {
+                file.extension().is_some_and(|ext| ext == "btx") && file.starts_with(&sidecar)
+            });
+            assert_eq!(
+                has_displacement_sidecar,
+                !pack,
+                "only external MDisps exports should report a displacement sidecar"
+            );
+            assert!(report.files.iter().any(|file| file == &output));
+            assert_eq!(sidecar.exists(), !pack);
+
+            let moved_directory = roundtrip_directory.path().join(format!("moved-{stem}"));
+            fs::create_dir(&moved_directory).map_err(|error| PotError::io(&error))?;
+            let moved_output = moved_directory.join(output.file_name().unwrap());
+            fs::rename(&output, &moved_output).map_err(|error| PotError::io(&error))?;
+            if !pack {
+                let moved_sidecar = moved_directory.join(sidecar.file_name().unwrap());
+                fs::rename(&sidecar, moved_sidecar).map_err(|error| PotError::io(&error))?;
+            }
+
+            let roundtrip = import_blend(&moved_output, Some(&blender))?;
+            let roundtrip_record = record(&roundtrip);
+            assert_eq!(
+                roundtrip_record.get("values"),
+                inline_record.get("values"),
+                "{stem} .blend round trip changed the MDisps grids"
+            );
+            let multires_modifier = roundtrip
+                .doc
+                .nodes
+                .values()
+                .flat_map(|node| &node.modifiers)
+                .find(|modifier| modifier.modifier_type == "multires")
+                .expect("round-tripped Multires modifier was not imported");
+            assert_eq!(
+                multires_modifier
+                    .params
+                    .get("is_external")
+                    .and_then(Value::as_bool),
+                Some(!pack)
+            );
+            if pack {
+                assert!(roundtrip_record.get("external").is_none());
+            } else {
+                let filepath = roundtrip_record
+                    .get("external")
+                    .and_then(|value| value.get("filepath"))
+                    .and_then(Value::as_str)
+                    .expect("external multires filepath was not imported");
+                assert!(
+                    filepath.starts_with(&format!("//multires-{stem}_assets/")),
+                    "external filepath must be relative to the output and its _assets folder: {filepath}"
+                );
+            }
+            let (_, _, nonzero) = check_grids(&roundtrip_record);
+            assert!(nonzero, "{stem} MDisps grids became zero");
+        }
+        let external = import_blend(external_path, Some(&blender))?;
+        let external_record = record(&external);
+        let filepath = external_record
+            .get("external")
+            .and_then(|value| value.get("filepath"))
+            .and_then(Value::as_str)
+            .expect("external multires filepath was not imported");
+        assert!(
+            filepath.contains("ext_probe.btx"),
+            "unexpected Blender external filepath: {filepath}"
+        );
+        assert!(filepath.starts_with("//"));
+        check_grids(&external_record);
+        let external_modifier = external
+            .doc
+            .nodes
+            .values()
+            .flat_map(|node| &node.modifiers)
+            .find(|modifier| modifier.modifier_type == "multires")
+            .expect("external Multires modifier was not imported");
+        assert_eq!(
+            external_modifier
+                .params
+                .get("is_external")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            external_modifier
+                .params
+                .get("filepath")
+                .and_then(Value::as_str)
+                .map(|value| value.contains("ext_probe.btx")),
+            Some(true)
+        );
+
+        let missing_sidecar_directory =
+            tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let missing_sidecar_blend = missing_sidecar_directory.path().join("external.blend");
+        fs::copy(external_path, &missing_sidecar_blend).map_err(|error| PotError::io(&error))?;
+        let missing_sidecar_error =
+            import_blend(&missing_sidecar_blend, Some(&blender)).unwrap_err();
+        assert_eq!(missing_sidecar_error.code, ErrorCode::FileNotFound);
+        eprintln!(
+            "multires oracle: inline corners=24 grid=9 z_sum={inline_z_sum}; external filepath={filepath}"
+        );
         Ok(())
     }
 }
