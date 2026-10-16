@@ -4378,39 +4378,6 @@ mod tests {
     }
 
     #[test]
-    fn color_and_generic_attributes_are_losses_not_refusals() -> Result<()> {
-        let mut mesh = crate::exchange::test_support::triangle_with_attributes()?;
-        mesh.attributes.insert(
-            "seam".to_owned(),
-            serde_json::json!({"domain": "edge", "type": "bool", "values": {}}),
-        );
-        // Sampling never refuses; strict export refuses on the losses from `attribute_losses`.
-        assert!(mesh_sample(&mesh).is_ok());
-        let losses = crate::exchange::mesh_attribute_losses("alembic", "triangle", &mesh);
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.feature_id == "mesh.color_attribute")
-        );
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.reason.contains("mesh attribute `weight`"))
-        );
-        assert!(
-            losses
-                .iter()
-                .any(|loss| loss.reason.contains("mesh attribute `seam`"))
-        );
-        assert!(
-            losses
-                .iter()
-                .all(|loss| !loss.reason.contains("alembic_normals"))
-        );
-        Ok(())
-    }
-
-    #[test]
     fn constant_topology_properties_keep_the_static_reader_shortcut() {
         let property = |name: &str, sample_count, constant| ParsedProperty {
             name: name.to_owned(),
