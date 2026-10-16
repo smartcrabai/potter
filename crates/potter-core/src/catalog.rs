@@ -1935,7 +1935,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "asset.resource_pack",
-            "Pack and unpack byte-backed resources",
+            "Pack and unpack binary resources, including explicit Alembic frame sequences",
             "Resource",
             &["resource.pack", "resource.unpack"],
             [true, true, true, false, false, false, false],
