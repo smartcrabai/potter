@@ -1346,18 +1346,17 @@ fn modifier_to_apply(engine: &Engine<'_>, target: &Id, modifier_id: &Id) -> Resu
             )
         })?;
     if stack[index].modifier_type == "boolean" {
-        let validator_stack: Vec<Modifier> = stack
-            .iter()
-            .enumerate()
-            .map(|(position, modifier)| {
+        crate::geom::modifiers::validate_boolean_topology_suffix(
+            stack,
+            index,
+            &|position, modifier| {
                 if position == index {
-                    modifier.clone()
+                    modifier.enabled
                 } else {
-                    modifier.for_purpose(EvaluationPurpose::Preview)
+                    modifier.is_active(EvaluationPurpose::Preview)
                 }
-            })
-            .collect();
-        crate::geom::modifiers::validate_boolean_topology_suffix(&validator_stack, index)?;
+            },
+        )?;
     }
     Ok(stack[index].clone())
 }
@@ -1585,6 +1584,7 @@ fn evaluate_modifier_output(
                     project_root: engine.asset_root,
                     cache_directory: engine.cache_directory,
                 },
+                |_, modifier| modifier.enabled,
                 &mut texture_rng,
                 |mesh, modifier, modifier_warnings, multi_input, texture_rng| {
                     match modifier.modifier_type.as_str() {
@@ -1620,6 +1620,40 @@ fn evaluate_modifier_output(
                             &world_matrices,
                         ),
                         "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
+18:     is_active: impl Fn(usize, &Modifier) -> bool,
+    texture_rng: &mut BlenderRng,
+    mut custom_modifier: impl FnMut(
+        &mut Mesh,
+        &Modifier,
+        &mut Vec<PotError>,
+        Option<&[DVec3]>,
+        &mut BlenderRng,
+    ) -> Result<()>,
+19:         validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
+        let uses_multi_armature = |modifier: &Modifier| {
+            modifier.modifier_type == "armature"
+                && modifier
+                    .params
+                    .get("use_multi_modifier")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        };
+        let keep = uses_multi_armature(modifier) && run_input.is_some();
+        let incoming = if keep { run_input.clone() } else { None };
+        if !keep {
+            let next_reads_previous = modifiers[modifier_index + 1..]
+                .iter()
+                .enumerate()
+                .find_map(|(offset, next)| {
+                    is_active(modifier_index + 1 + offset, next).then_some(next)
+                })
+                .is_some_and(uses_multi_armature);
+            run_input = (matches!(
+                modifier.modifier_type.as_str(),
+                "armature" | "lattice" | "mesh_deform"
+            ) && next_reads_previous)
+                .then(|| Rc::new(evaluated.vertices.iter().map(|vertex| vertex.co).collect()));
+        }
                             mesh,
                             modifier,
                             target,

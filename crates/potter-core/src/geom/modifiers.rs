@@ -147,6 +147,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         ModifierEvaluationContext::default(),
+        |_, modifier| modifier.enabled,
         &mut texture_rng,
         custom_modifier,
     )
@@ -163,6 +164,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     evaluated_object_meshes: &BTreeMap<Id, Mesh>,
     curve_path_lengths: &BTreeMap<Id, f64>,
     context: ModifierEvaluationContext<'_>,
+    is_active: impl Fn(usize, &Modifier) -> bool,
     texture_rng: &mut BlenderRng,
     mut custom_modifier: impl FnMut(
         &mut Mesh,
@@ -179,7 +181,10 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     }
     let stack_input = modifiers
         .iter()
-        .any(|modifier| modifier.enabled && modifier.modifier_type == "corrective_smooth")
+        .enumerate()
+        .any(|(index, modifier)| {
+            is_active(index, modifier) && modifier.modifier_type == "corrective_smooth"
+        })
         .then(|| evaluated.clone());
     let mut instance_paths = Vec::new();
     let mut warnings = Vec::new();
@@ -188,9 +193,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     for (modifier_index, modifier) in modifiers
         .iter()
         .enumerate()
-        .filter(|(_, modifier)| modifier.enabled)
+        .filter(|&(modifier_index, modifier)| is_active(modifier_index, modifier))
     {
-        validate_boolean_topology_suffix(modifiers, modifier_index)?;
+        validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
         let uses_multi_armature = |modifier: &Modifier| {
             modifier.modifier_type == "armature"
                 && modifier
@@ -204,7 +209,10 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         if !keep {
             let next_reads_previous = modifiers[modifier_index + 1..]
                 .iter()
-                .find(|next| next.enabled)
+                .enumerate()
+                .find_map(|(offset, next)| {
+                    is_active(modifier_index + 1 + offset, next).then_some(next)
+                })
                 .is_some_and(uses_multi_armature);
             run_input = (matches!(
                 modifier.modifier_type.as_str(),
@@ -527,20 +535,25 @@ fn modifier_depends_on_topology(modifier: &Modifier) -> bool {
 pub(crate) fn validate_boolean_topology_suffix(
     modifiers: &[Modifier],
     modifier_index: usize,
+    is_active: &impl Fn(usize, &Modifier) -> bool,
 ) -> Result<()> {
     let Some(boolean_modifier) = modifiers.get(modifier_index) else {
         return Ok(());
     };
-    if !boolean_modifier.enabled || boolean_modifier.modifier_type != "boolean" {
+    if !is_active(modifier_index, boolean_modifier) || boolean_modifier.modifier_type != "boolean" {
         return Ok(());
     }
     let Some(downstream) = modifiers
         .iter()
+        .enumerate()
         .skip(modifier_index + 1)
-        .find(|candidate| candidate.enabled && modifier_depends_on_topology(candidate))
+        .find(|(index, candidate)| {
+            is_active(*index, candidate) && modifier_depends_on_topology(candidate)
+        })
+        .map(|(_, modifier)| modifier)
     else {
         return Ok(());
-    };
+    }
     Err(PotError::with_details(
         ErrorCode::UnsupportedFeature,
         "Boolean output topology is not Blender-compatible for a downstream topology-dependent modifier",

@@ -913,7 +913,7 @@ impl Snapshot {
                     };
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         rigged_source,
-                        &gate.stack(id, &node.modifiers),
+                        &node.modifiers,
                         &doc.node_groups,
                         frame,
                         matrix,
@@ -922,6 +922,7 @@ impl Snapshot {
                         &meshes,
                         &curve_path_lengths,
                         gate.context,
+                        |index, modifier| gate.is_active_at(id, index, modifier),
                         &mut texture_rng,
                         |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
@@ -1197,7 +1198,7 @@ impl Snapshot {
                     };
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
                         source_mesh,
-                        &gate.stack(id, &node.modifiers),
+                        &node.modifiers,
                         &doc.node_groups,
                         frame,
                         matrix,
@@ -1206,6 +1207,7 @@ impl Snapshot {
                         &meshes,
                         &curve_path_lengths,
                         gate.context,
+                        |index, modifier| gate.is_active_at(id, index, modifier),
                         &mut texture_rng,
                         |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
@@ -1879,27 +1881,7 @@ impl ModifierGate<'_> {
         linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
     }
 
-    /// Borrow the stack when enabled state already matches; otherwise copy for evaluation.
-    pub(crate) fn stack<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> Cow<'m, [Modifier]> {
-        let modifiers = self.stack_modifiers(node_id, modifiers);
-        let matches = |(index, modifier): (usize, &Modifier)| {
-            modifier.enabled == self.is_active_at(node_id, index, modifier)
-        };
-        if modifiers.iter().enumerate().all(matches) {
-            return Cow::Borrowed(modifiers);
-        }
-        Cow::Owned(
-            modifiers
-                .iter()
-                .enumerate()
-                .map(|(index, modifier)| {
-                    let mut applied = modifier.clone();
-                    applied.enabled = self.is_active_at(node_id, index, modifier);
-                    applied
-                })
-                .collect(),
-        )
-    }
+
 }
 /// Read and verify a cache resource from the scene's asset registry.
 ///
