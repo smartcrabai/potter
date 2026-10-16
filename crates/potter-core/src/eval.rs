@@ -1683,7 +1683,6 @@ impl ModifierGate<'_> {
         };
         linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
     }
-
 }
 
 /// Read and verify a cache resource from the scene's asset registry.
