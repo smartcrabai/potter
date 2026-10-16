@@ -13,8 +13,8 @@ use crate::model::Modifier;
 
 use super::{
     bool_param, build_mesh, closest_point_triangle, id_indices, invalid_parameter, loose_edges,
-    number_param, polygons, positions, string_param, uint_param, usize_as_f64, validated,
-    vec3_param,
+    number_param, polygons, positions, schema_value, string_param, uint_param, usize_as_f64,
+    validated, vec3_param,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -36,7 +36,7 @@ enum SimpleDeformMethod {
 const SIMPLE_DEFORM_AXIS_MAP: [[usize; 3]; 3] = [[1, 2, 0], [2, 0, 1], [0, 1, 2]];
 
 pub(super) fn simple_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let method = match string_param(modifier, "deform_method", "TWIST")? {
+    let method = match string_param(modifier, "deform_method")? {
         "TWIST" | "twist" => SimpleDeformMethod::Twist,
         "BEND" | "bend" => SimpleDeformMethod::Bend,
         "TAPER" | "taper" => SimpleDeformMethod::Taper,
@@ -50,9 +50,9 @@ pub(super) fn simple_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     };
     let amount = if matches!(method, SimpleDeformMethod::Twist | SimpleDeformMethod::Bend) {
-        number_param(modifier, "angle", f64::from(std::f32::consts::FRAC_PI_4))?
+        number_param(modifier, "angle")?
     } else {
-        number_param(modifier, "factor", 1.0)?
+        number_param(modifier, "factor")?
     };
     let axis = simple_deform_axis(modifier)?;
     let limits = simple_deform_limits(modifier)?;
@@ -88,7 +88,7 @@ pub(super) fn simple_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 }
 
 fn simple_deform_axis(modifier: &Modifier) -> Result<usize> {
-    match string_param(modifier, "deform_axis", "X")? {
+    match string_param(modifier, "deform_axis")? {
         "X" | "x" => Ok(0),
         "Y" | "y" => Ok(1),
         "Z" | "z" => Ok(2),
@@ -97,9 +97,7 @@ fn simple_deform_axis(modifier: &Modifier) -> Result<usize> {
 }
 
 fn simple_deform_limits(modifier: &Modifier) -> Result<[f64; 2]> {
-    let Some(value) = modifier.params.get("limits") else {
-        return Ok([0.0, 1.0]);
-    };
+    let value = schema_value(modifier, "limits")?;
     let Some(values) = value.as_array().filter(|values| values.len() == 2) else {
         return Err(invalid_parameter(
             modifier,
@@ -206,7 +204,7 @@ fn simple_deform_bend(coordinates: [f64; 3], cut: [f64; 3], axis: usize, factor:
 }
 
 pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let steps = usize::try_from(uint_param(modifier, "steps", 16)?)
+    let steps = usize::try_from(uint_param(modifier, "steps")?)
         .map_err(|_| invalid_parameter(modifier, "steps", "an integer from 1 to 4096"))?;
     if !(1..=4096).contains(&steps) {
         return Err(invalid_parameter(
@@ -215,28 +213,20 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "an integer from 1 to 4096",
         ));
     }
-    let angle = number_param(modifier, "angle", std::f64::consts::TAU)?;
-    let axis_parameter = modifier.params.get("axis").or_else(|| {
-        crate::params::default_value(
-            crate::params::ParameterFamily::Modifier,
-            &modifier.modifier_type,
-            "axis",
-        )
-    });
-    let axis = match axis_parameter {
-        None => DVec3::Z,
-        Some(Value::String(axis)) => match axis.as_str() {
+    let angle = number_param(modifier, "angle")?;
+    let axis = match schema_value(modifier, "axis")? {
+        Value::String(axis) => match axis.as_str() {
             "X" => DVec3::X,
             "Y" => DVec3::Y,
             "Z" => DVec3::Z,
             _ => return Err(invalid_parameter(modifier, "axis", "X, Y, or Z")),
         },
-        Some(_) => return Err(invalid_parameter(modifier, "axis", "X, Y, or Z")),
+        _ => return Err(invalid_parameter(modifier, "axis", "X, Y, or Z")),
     };
     let center = DVec3::ZERO;
-    let height = number_param(modifier, "screw_offset", 0.0)?;
-    let stretch_u = bool_param(modifier, "use_stretch_u", false)?;
-    let stretch_v = bool_param(modifier, "use_stretch_v", false)?;
+    let height = number_param(modifier, "screw_offset")?;
+    let stretch_u = bool_param(modifier, "use_stretch_u")?;
+    let stretch_v = bool_param(modifier, "use_stretch_v")?;
     let source_positions = positions(mesh);
     let vertex_indices = id_indices(mesh);
     let source_edges = mesh
@@ -285,7 +275,7 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let segments = if closed { ring_count } else { ring_count - 1 };
     let mut faces = Vec::with_capacity(segments * source_edges.len());
-    let flip = bool_param(modifier, "use_normal_flip", false)?;
+    let flip = bool_param(modifier, "use_normal_flip")?;
     for step in 0..segments {
         let next_step = (step + 1) % ring_count;
         for [first, second] in &source_edges {
@@ -394,7 +384,7 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         })
         .collect();
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
-    if bool_param(modifier, "use_smooth_shade", false)? {
+    if bool_param(modifier, "use_smooth_shade")? {
         crate::geom::normals::shade_faces_smooth(&mut result);
     }
     super::map_uv_values(&mut result, |face, corner, [u, v]| {
@@ -416,10 +406,9 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     if target.vertices.is_empty() {
         return Err(invalid_parameter(modifier, "target", "a non-empty mesh"));
     }
-    let method =
-        string_param(modifier, "wrap_method", "NEAREST_SURFACEPOINT")?.to_ascii_uppercase();
-    let offset = number_param(modifier, "offset", 0.0)?;
-    let wrap_mode = string_param(modifier, "wrap_mode", "ON_SURFACE")?.to_ascii_uppercase();
+    let method = string_param(modifier, "wrap_method")?.to_ascii_uppercase();
+    let offset = number_param(modifier, "offset")?;
+    let wrap_mode = string_param(modifier, "wrap_mode")?.to_ascii_uppercase();
     let mut result = mesh.clone();
     let triangles = target_triangles(&target)?;
     for vertex in &mut result.vertices {
@@ -443,12 +432,11 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                     invalid_parameter(modifier, "target", "a mesh with at least one face")
                 })?
             }
-            "PROJECT" => project_surface(
-                &triangles,
-                vertex.co,
-                vec3_param(modifier, "project_axis", -DVec3::Z)?,
-                modifier,
-            )?,
+            "PROJECT" => {
+                // not a schema parameter; removed by PR18 PR-E
+                let project_axis = -DVec3::Z;
+                project_surface(&triangles, vertex.co, project_axis, modifier)?
+            }
             _ => {
                 return Err(invalid_parameter(
                     modifier,
@@ -478,13 +466,13 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 }
 
 pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let cast_type = string_param(modifier, "cast_type", "SPHERE")?.to_ascii_uppercase();
-    let factor = number_param(modifier, "factor", 1.0)?;
+    let cast_type = string_param(modifier, "cast_type")?.to_ascii_uppercase();
+    let factor = number_param(modifier, "factor")?;
     if factor == 0.0 {
         return Ok(mesh.clone());
     }
-    let radius = number_param(modifier, "radius", 1.0)?;
-    let size = number_param(modifier, "size", 1.0)?;
+    let radius = number_param(modifier, "radius")?;
+    let size = number_param(modifier, "size")?;
     if radius <= 0.0 || size <= 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -492,9 +480,14 @@ pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "positive radius and size",
         ));
     }
-    let use_radius_as_size = bool_param(modifier, "use_radius_as_size", true)?;
+    let use_radius_as_size = bool_param(modifier, "use_radius_as_size")?;
     let cast_size = if use_radius_as_size { radius } else { size };
-    let center = vec3_param(modifier, "origin", DVec3::ZERO)?;
+    // `origin` is not in the cast schema; an explicit value is honoured, else the zero origin applies.
+    let center = if modifier.params.contains_key("origin") {
+        vec3_param(modifier, "origin")?
+    } else {
+        DVec3::ZERO
+    };
     let mut result = mesh.clone();
     for vertex in &mut result.vertices {
         let point = vertex.co - center;
@@ -531,19 +524,19 @@ pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 }
 
 pub(super) fn wave(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh> {
-    let speed = number_param(modifier, "speed", 0.25)?;
-    let height = number_param(modifier, "height", 0.5)?;
-    let width = number_param(modifier, "width", 1.5)?;
-    let narrowness = number_param(modifier, "narrowness", 1.5)?;
-    let time_offset = number_param(modifier, "time_offset", 0.0)?;
-    let lifetime = number_param(modifier, "lifetime", 0.0)?;
-    let mut damping_time = number_param(modifier, "damping_time", 10.0)?;
-    let falloff_radius = number_param(modifier, "falloff_radius", 0.0)?;
-    let start_x = number_param(modifier, "start_position_x", 0.0)?;
-    let start_y = number_param(modifier, "start_position_y", 0.0)?;
-    let use_x = bool_param(modifier, "use_x", true)?;
-    let use_y = bool_param(modifier, "use_y", true)?;
-    let use_cyclic = bool_param(modifier, "use_cyclic", true)?;
+    let speed = number_param(modifier, "speed")?;
+    let height = number_param(modifier, "height")?;
+    let width = number_param(modifier, "width")?;
+    let narrowness = number_param(modifier, "narrowness")?;
+    let time_offset = number_param(modifier, "time_offset")?;
+    let lifetime = number_param(modifier, "lifetime")?;
+    let mut damping_time = number_param(modifier, "damping_time")?;
+    let falloff_radius = number_param(modifier, "falloff_radius")?;
+    let start_x = number_param(modifier, "start_position_x")?;
+    let start_y = number_param(modifier, "start_position_y")?;
+    let use_x = bool_param(modifier, "use_x")?;
+    let use_y = bool_param(modifier, "use_y")?;
+    let use_cyclic = bool_param(modifier, "use_cyclic")?;
     if width <= 0.0 || narrowness <= 0.0 || falloff_radius < 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -568,7 +561,7 @@ pub(super) fn wave(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh>
         return Ok(mesh.clone());
     }
     let min_factor = (-(width * narrowness).powi(2)).exp();
-    let use_normal = bool_param(modifier, "use_normal", false)?;
+    let use_normal = bool_param(modifier, "use_normal")?;
     let mut result = mesh.clone();
     let normals = if use_normal {
         let indices = id_indices(mesh);
@@ -597,9 +590,9 @@ pub(super) fn wave(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh>
     } else {
         Vec::new()
     };
-    let use_normal_x = bool_param(modifier, "use_normal_x", true)?;
-    let use_normal_y = bool_param(modifier, "use_normal_y", true)?;
-    let use_normal_z = bool_param(modifier, "use_normal_z", true)?;
+    let use_normal_x = bool_param(modifier, "use_normal_x")?;
+    let use_normal_y = bool_param(modifier, "use_normal_y")?;
+    let use_normal_z = bool_param(modifier, "use_normal_z")?;
     for (index, vertex) in result.vertices.iter_mut().enumerate() {
         let x = vertex.co.x - start_x;
         let y = vertex.co.y - start_y;
@@ -653,9 +646,9 @@ pub(super) fn warp(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .map_or(DVec3::ZERO, DVec3::from_array);
     let to = modifier.runtime.warp_to.map_or(DVec3::Z, DVec3::from_array);
     let displacement = to - from;
-    let strength = number_param(modifier, "strength", 0.0)?;
-    let radius = number_param(modifier, "falloff_radius", 0.0)?;
-    let falloff = string_param(modifier, "falloff_type", "SMOOTH")?.to_ascii_uppercase();
+    let strength = number_param(modifier, "strength")?;
+    let radius = number_param(modifier, "falloff_radius")?;
+    let falloff = string_param(modifier, "falloff_type")?.to_ascii_uppercase();
     let mut result = mesh.clone();
     for vertex in &mut result.vertices {
         let distance = vertex.co.distance(from);
@@ -689,7 +682,7 @@ pub(super) fn warp(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 }
 
 pub(super) fn laplacian_smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let iterations = usize::try_from(uint_param(modifier, "iterations", 1)?)
+    let iterations = usize::try_from(uint_param(modifier, "iterations")?)
         .map_err(|_| invalid_parameter(modifier, "iterations", "an integer from 0 to 10000"))?;
     if iterations > 10000 {
         return Err(invalid_parameter(
@@ -698,14 +691,14 @@ pub(super) fn laplacian_smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh>
             "an integer from 0 to 10000",
         ));
     }
-    let lambda = number_param(modifier, "lambda_factor", 0.5)?;
-    let lambda_border = number_param(modifier, "lambda_border", 0.5)?;
-    let normalized = bool_param(modifier, "use_normalized", false)?;
-    let preserve_volume = bool_param(modifier, "use_volume_preserve", false)?;
+    let lambda = number_param(modifier, "lambda_factor")?;
+    let lambda_border = number_param(modifier, "lambda_border")?;
+    let normalized = bool_param(modifier, "use_normalized")?;
+    let preserve_volume = bool_param(modifier, "use_volume_preserve")?;
     let axes = [
-        bool_param(modifier, "use_x", true)?,
-        bool_param(modifier, "use_y", true)?,
-        bool_param(modifier, "use_z", true)?,
+        bool_param(modifier, "use_x")?,
+        bool_param(modifier, "use_y")?,
+        bool_param(modifier, "use_z")?,
     ];
     laplacian_smooth_mesh(
         mesh,
@@ -1156,7 +1149,7 @@ fn sparse_norm(vector: &[f64]) -> f64 {
 }
 
 pub(super) fn corrective_smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let iterations = usize::try_from(uint_param(modifier, "iterations", 5)?)
+    let iterations = usize::try_from(uint_param(modifier, "iterations")?)
         .map_err(|_| invalid_parameter(modifier, "iterations", "an integer from 0 to 10000"))?;
     if iterations > 10000 {
         return Err(invalid_parameter(
@@ -1165,14 +1158,14 @@ pub(super) fn corrective_smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh
             "an integer from 0 to 10000",
         ));
     }
-    let factor = number_param(modifier, "factor", 0.5)?;
+    let factor = number_param(modifier, "factor")?;
     let mut smoothed = smooth_positions(mesh, iterations, factor)?;
     let original: HashMap<_, _> = mesh
         .vertices
         .iter()
         .map(|vertex| (vertex.id, vertex.co))
         .collect();
-    let scale = number_param(modifier, "scale", 1.0)?.clamp(0.0, 1.0);
+    let scale = number_param(modifier, "scale")?.clamp(0.0, 1.0);
     for vertex in &mut smoothed.vertices {
         if let Some(point) = original.get(&vertex.id) {
             vertex.co = vertex.co.lerp(*point, scale);
@@ -1182,13 +1175,13 @@ pub(super) fn corrective_smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh
 }
 
 pub(super) fn build(mesh: &Mesh, modifier: &Modifier, frame: f64) -> Result<Mesh> {
-    let start = number_param(modifier, "frame_start", 1.0)?;
-    let duration = number_param(modifier, "frame_duration", 100.0)?.max(1.0);
+    let start = number_param(modifier, "frame_start")?;
+    let duration = number_param(modifier, "frame_duration")?.max(1.0);
     let factor = ((frame - start) / duration).clamp(0.0, 1.0);
-    let reverse = bool_param(modifier, "use_reverse", false)?;
+    let reverse = bool_param(modifier, "use_reverse")?;
     let threshold = if reverse { 1.0 - factor } else { factor };
-    let use_random_order = bool_param(modifier, "use_random_order", false)?;
-    let seed = uint_param(modifier, "seed", 0)?;
+    let use_random_order = bool_param(modifier, "use_random_order")?;
+    let seed = uint_param(modifier, "seed")?;
     let mut face_order: Vec<usize> = (0..mesh.faces.len()).collect();
     if use_random_order {
         randomize_build_order(&mut face_order, seed);
@@ -1290,9 +1283,9 @@ fn randomize_build_order(indices: &mut [usize], seed: u64) {
 
 pub(super) fn edge_split(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // Blender's defaults: 30 degrees, angle and sharp-edge splitting both on (DNA defaults).
-    let angle = number_param(modifier, "split_angle", std::f64::consts::FRAC_PI_6)?;
-    let use_edge_angle = bool_param(modifier, "use_edge_angle", true)?;
-    let split_sharp = bool_param(modifier, "use_edge_sharp", true)?;
+    let angle = number_param(modifier, "split_angle")?;
+    let use_edge_angle = bool_param(modifier, "use_edge_angle")?;
+    let split_sharp = bool_param(modifier, "use_edge_sharp")?;
     let face_polygons = polygons(mesh)?;
     let source_positions = positions(mesh);
     let vertex_indices = id_indices(mesh);
@@ -1572,7 +1565,7 @@ fn project_surface(
 }
 
 pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let group_name = string_param(modifier, "vertex_group", "")?;
+    let group_name = string_param(modifier, "vertex_group")?;
     if group_name.is_empty() {
         return Err(invalid_parameter(
             modifier,
@@ -1593,8 +1586,8 @@ pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 "a group present in mesh vertex_groups attributes",
             )
         })?;
-    let threshold = number_param(modifier, "threshold", 0.0)?;
-    let invert = bool_param(modifier, "invert_vertex_group", false)?;
+    let threshold = number_param(modifier, "threshold")?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
     let mut selected = HashSet::new();
     for vertex in &mesh.vertices {
         let weight = weights
@@ -1683,8 +1676,8 @@ pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     reason = "matches Blender's float evaluation order for parity"
 )]
 pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let thickness = number_param(modifier, "thickness", 0.02)?;
-    let offset = number_param(modifier, "offset", 0.0)?;
+    let thickness = number_param(modifier, "thickness")?;
+    let offset = number_param(modifier, "offset")?;
     if thickness < 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -1692,12 +1685,12 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a non-negative number",
         ));
     }
-    let use_boundary = bool_param(modifier, "use_boundary", false)?;
-    let use_replace = bool_param(modifier, "use_replace", true)?;
-    let use_even_offset = bool_param(modifier, "use_even_offset", false)?;
-    let use_relative_offset = bool_param(modifier, "use_relative_offset", false)?;
-    let use_crease = bool_param(modifier, "use_crease", false)?;
-    let crease_weight = number_param(modifier, "crease_weight", 0.0)?;
+    let use_boundary = bool_param(modifier, "use_boundary")?;
+    let use_replace = bool_param(modifier, "use_replace")?;
+    let use_even_offset = bool_param(modifier, "use_even_offset")?;
+    let use_relative_offset = bool_param(modifier, "use_relative_offset")?;
+    let use_crease = bool_param(modifier, "use_crease")?;
+    let crease_weight = number_param(modifier, "crease_weight")?;
     let material_offset = modifier
         .params
         .get("material_offset")
@@ -2194,12 +2187,12 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a skeleton mesh with at least one edge",
         ));
     }
-    let _branch_smoothing = number_param(modifier, "branch_smoothing", 0.0)?;
-    let smooth_shade = bool_param(modifier, "use_smooth_shade", false)?;
+    let _branch_smoothing = number_param(modifier, "branch_smoothing")?;
+    let smooth_shade = bool_param(modifier, "use_smooth_shade")?;
     let _symmetry = [
-        bool_param(modifier, "use_x_symmetry", false)?,
-        bool_param(modifier, "use_y_symmetry", false)?,
-        bool_param(modifier, "use_z_symmetry", false)?,
+        bool_param(modifier, "use_x_symmetry")?,
+        bool_param(modifier, "use_y_symmetry")?,
+        bool_param(modifier, "use_z_symmetry")?,
     ];
     let mut node_positions = source_positions.clone();
     let mut node_origins: Vec<Vec<(usize, f64)>> = (0..mesh.vertices.len())
@@ -2688,9 +2681,9 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .runtime
         .hook_target_position
         .map_or(DVec3::ZERO, DVec3::from_array);
-    let center = vec3_param(modifier, "center", DVec3::ZERO)?;
-    let strength = number_param(modifier, "strength", 1.0)?;
-    let radius = number_param(modifier, "falloff_radius", 0.0)?;
+    let center = vec3_param(modifier, "center")?;
+    let strength = number_param(modifier, "strength")?;
+    let radius = number_param(modifier, "falloff_radius")?;
     let group_weights = modifier
         .params
         .get("vertex_group")
@@ -2730,7 +2723,7 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 }
 
 fn curve_axis_param(modifier: &Modifier, name: &str) -> Result<DVec3> {
-    let axis = string_param(modifier, name, "POS_X")?.to_ascii_uppercase();
+    let axis = string_param(modifier, name)?.to_ascii_uppercase();
     match axis.as_str() {
         "POS_X" => Ok(DVec3::X),
         "NEG_X" => Ok(-DVec3::X),

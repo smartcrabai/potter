@@ -28,7 +28,7 @@ pub fn particle_instance(
             "particle instance frame rate must be finite and positive",
         ));
     }
-    let space = string_param(params, "space", "WORLD")?;
+    let space = string_param("particle_instance", params, "space")?;
     if !matches!(space, "WORLD" | "LOCAL") {
         return Err(unsupported(
             "modifier.particle_instance.space",
@@ -40,26 +40,31 @@ pub fn particle_instance(
     } else {
         None
     };
-    let show_alive = bool_param(params, "show_alive", true)?;
-    let show_dead = bool_param(params, "show_dead", false)?;
-    let show_unborn = bool_param(params, "show_unborn", false)?;
-    let use_children = bool_param(params, "use_children", false)?;
-    let use_normal = bool_param(params, "use_normal", true)?;
-    let use_size = bool_param(params, "use_size", false)?;
-    if bool_param(params, "use_path", false)? {
+    let show_alive = bool_param("particle_instance", params, "show_alive")?;
+    let show_dead = bool_param("particle_instance", params, "show_dead")?;
+    let show_unborn = bool_param("particle_instance", params, "show_unborn")?;
+    let use_children = bool_param("particle_instance", params, "use_children")?;
+    let use_normal = bool_param("particle_instance", params, "use_normal")?;
+    let use_size = bool_param("particle_instance", params, "use_size")?;
+    if bool_param("particle_instance", params, "use_path")? {
         return Err(unsupported(
             "modifier.particle_instance.use_path",
             "Blender sampled paths require particle cache trajectories, which are not represented by the current particle states",
         ));
     }
-    let axis = string_param(params, "axis", "X")?;
+    let axis = string_param("particle_instance", params, "axis")?;
     let axis_index = match axis {
         "X" => 0,
         "Y" => 1,
         "Z" => 2,
         _ => return Err(invalid("axis must be X, Y, or Z")),
     };
-    let track_axis = string_param(params, "track_axis", axis)?;
+    let track_axis = if params.contains_key("track_axis") {
+        string_param("particle_instance", params, "track_axis")?
+    } else {
+        // `track_axis` has no schema default; it follows `axis`.
+        axis
+    };
     let track_index = match track_axis {
         "X" | "POS_X" | "NEG_X" => 0,
         "Y" | "POS_Y" | "NEG_Y" => 1,
@@ -148,12 +153,12 @@ pub fn explode(
     _frame: f64,
     _lifetime: f64,
 ) -> Result<Mesh> {
-    let show_alive = bool_param(params, "show_alive", true)?;
-    let show_dead = bool_param(params, "show_dead", false)?;
-    let show_unborn = bool_param(params, "show_unborn", false)?;
-    let use_edge_cut = bool_param(params, "use_edge_cut", false)?;
-    let use_size = bool_param(params, "use_size", false)?;
-    let protect = number_param(params, "protect", 0.0)?;
+    let show_alive = bool_param("explode", params, "show_alive")?;
+    let show_dead = bool_param("explode", params, "show_dead")?;
+    let show_unborn = bool_param("explode", params, "show_unborn")?;
+    let use_edge_cut = bool_param("explode", params, "use_edge_cut")?;
+    let use_size = bool_param("explode", params, "use_size")?;
+    let protect = number_param("explode", params, "protect")?;
     if !(0.0..=1.0).contains(&protect) {
         return Err(invalid("protect must be in [0, 1]"));
     }
@@ -524,7 +529,7 @@ pub fn displace_volume(
     volume_world: DMat4,
     texture_map_object_world: Option<DMat4>,
 ) -> Result<VolumeData> {
-    let strength = number_param(params, "strength", 0.5)?;
+    let strength = number_param("volume_displace", params, "strength")?;
     if !matches!(texture_type, "NONE" | "NOISE" | "IMAGE") {
         return Err(unsupported(
             "modifier.volume_displace.texture_type",
@@ -592,7 +597,7 @@ impl<'a> VolumeDisplacement<'a> {
                 "image texture source is unavailable",
             ));
         }
-        let sample_radius = number_param(params, "texture_sample_radius", 1.0)?;
+        let sample_radius = number_param("volume_displace", params, "texture_sample_radius")?;
         if sample_radius < 0.0 {
             return Err(invalid("texture_sample_radius must be non-negative"));
         }
@@ -601,7 +606,7 @@ impl<'a> VolumeDisplacement<'a> {
                 "texture_sample_radius exceeds the 16-voxel output padding limit",
             ));
         }
-        let mode = string_param(params, "texture_map_mode", "LOCAL")?;
+        let mode = string_param("volume_displace", params, "texture_map_mode")?;
         let mapping = match mode {
             "LOCAL" => DMat4::IDENTITY,
             "GLOBAL" => volume_world,
@@ -629,7 +634,7 @@ impl<'a> VolumeDisplacement<'a> {
             image,
             mapping,
             strength,
-            mid_level: vector_param(params, "texture_mid_level", [0.5; 3])?,
+            mid_level: vector_param("volume_displace", params, "texture_mid_level")?,
             sample_radius,
         })
     }
@@ -1226,28 +1231,49 @@ fn invert(matrix: DMat4) -> Result<DMat4> {
     Ok(matrix.inverse())
 }
 
-fn bool_param(params: &Map<String, Value>, name: &str, default: bool) -> Result<bool> {
+/// The Blender default for `name` on modifier type `kind`, from `param_table.json`.
+fn schema_default(kind: &str, name: &str) -> Result<&'static Value> {
+    crate::params::default_value(crate::params::ParameterFamily::Modifier, kind, name).ok_or_else(
+        || {
+            PotError::with_details(
+                ErrorCode::InternalError,
+                format!("modifier type `{kind}` has no schema default for parameter `{name}`"),
+                json!({"modifier_type": kind, "parameter": name}),
+            )
+        },
+    )
+}
+
+/// The modifier's own `name` value, else the table default for modifier type `kind`.
+fn value_or_default<'a>(
+    kind: &str,
+    params: &'a Map<String, Value>,
+    name: &str,
+) -> Result<&'a Value> {
     match params.get(name) {
-        Some(Value::Bool(value)) => Ok(*value),
-        None => Ok(default),
-        _ => Err(invalid(&format!("{name} must be a boolean"))),
+        Some(value) => Ok(value),
+        None => schema_default(kind, name),
     }
 }
 
-fn number_param(params: &Map<String, Value>, name: &str, default: f64) -> Result<f64> {
-    let value = params.get(name).and_then(Value::as_f64).unwrap_or(default);
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(invalid(&format!("{name} must be finite")))
-    }
+fn bool_param(kind: &str, params: &Map<String, Value>, name: &str) -> Result<bool> {
+    value_or_default(kind, params, name)?
+        .as_bool()
+        .ok_or_else(|| invalid(&format!("{name} must be a boolean")))
 }
 
-fn vector_param(params: &Map<String, Value>, name: &str, default: [f64; 3]) -> Result<[f64; 3]> {
-    let Some(values) = params.get(name) else {
-        return Ok(default);
-    };
-    let Some(values) = values.as_array().filter(|values| values.len() == 3) else {
+fn number_param(kind: &str, params: &Map<String, Value>, name: &str) -> Result<f64> {
+    value_or_default(kind, params, name)?
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| invalid(&format!("{name} must be a finite number")))
+}
+
+fn vector_param(kind: &str, params: &Map<String, Value>, name: &str) -> Result<[f64; 3]> {
+    let Some(values) = value_or_default(kind, params, name)?
+        .as_array()
+        .filter(|values| values.len() == 3)
+    else {
         return Err(invalid(&format!(
             "{name} must contain three finite numbers"
         )));
@@ -1262,12 +1288,10 @@ fn vector_param(params: &Map<String, Value>, name: &str, default: [f64; 3]) -> R
     Ok(result)
 }
 
-fn string_param<'a>(
-    params: &'a Map<String, Value>,
-    name: &str,
-    default: &'a str,
-) -> Result<&'a str> {
-    let value = params.get(name).and_then(Value::as_str).unwrap_or(default);
+fn string_param<'a>(kind: &str, params: &'a Map<String, Value>, name: &str) -> Result<&'a str> {
+    let value = value_or_default(kind, params, name)?
+        .as_str()
+        .ok_or_else(|| invalid(&format!("{name} must be a string")))?;
     if value.is_empty() {
         Err(invalid(&format!("{name} must not be empty")))
     } else {

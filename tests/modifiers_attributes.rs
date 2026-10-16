@@ -178,6 +178,53 @@ fn uv_warp_preserves_unknown_attributes_and_updates_named_uv_layer() -> Result<(
 }
 
 #[test]
+fn uv_warp_empty_layer_selector_uses_active_layer() -> Result<(), Box<dyn Error>> {
+    let mut mesh =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
+    mesh.attributes.insert(
+        "blender_uv_layers".to_owned(),
+        json!([
+            {"name":"Inactive","active":false,"values":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]},
+            {"name":"Active","active":true,"values":[[0.1,0.2],[0.3,0.4],[0.5,0.6]]}
+        ]),
+    );
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "uv_warp",
+            json!({"uv_layer":"","offset":[0.25,0.0]}),
+        )?],
+    )?;
+    let entries = result.attributes["uv_map"]
+        .as_array()
+        .ok_or("UV warp did not write UV entries")?;
+    let uv_layer = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["layer"] == name)
+            .and_then(|entry| entry["uv"].as_array())
+            .cloned()
+    };
+    assert_eq!(
+        uv_layer("Active"),
+        Some(vec![
+            json!([0.35, 0.2]),
+            json!([0.55, 0.4]),
+            json!([0.75, 0.6])
+        ])
+    );
+    assert_eq!(
+        uv_layer("Inactive"),
+        Some(vec![
+            json!([0.0, 0.0]),
+            json!([1.0, 0.0]),
+            json!([0.0, 1.0])
+        ])
+    );
+    Ok(())
+}
+
+#[test]
 fn attribute_modifiers_do_not_mutate_the_source_mesh() -> Result<(), Box<dyn Error>> {
     let source = weighted_line()?;
     let original = source.clone();

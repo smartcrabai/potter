@@ -659,6 +659,27 @@ fn physics_property(system: &str) -> &'static str {
     }
 }
 
+/// Modifier-level properties (base flags and the fluid and dynamic-paint type selectors) are not
+/// physics settings: they move out of `settings` and stay on the modifier.
+fn split_modifier_flags(settings: &mut Map<String, Value>) -> Map<String, Value> {
+    let mut flags = Map::new();
+    for flag in [
+        "show_in_editmode",
+        "show_on_cage",
+        "show_expanded",
+        "is_active",
+        "use_pin_to_last",
+        "use_apply_on_spline",
+        "fluid_type",
+        "ui_type",
+    ] {
+        if let Some(value) = settings.remove(flag) {
+            flags.insert(flag.to_owned(), value);
+        }
+    }
+    flags
+}
+
 pub(super) fn create_linked_modifier_settings(
     engine: &mut Engine<'_>,
     target: &Id,
@@ -679,6 +700,7 @@ pub(super) fn create_linked_modifier_settings(
             "/params/settings_id",
         ));
     }
+    let mut modifier_flags = split_modifier_flags(&mut settings);
     let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     validate_system_target(engine, target, &node)?;
     validate_physics_settings(engine, system, &settings)?;
@@ -728,10 +750,11 @@ pub(super) fn create_linked_modifier_settings(
         }
     }
     engine.mark("nodes", target, ChangeKind::Updated);
-    Ok(Map::from_iter([(
+    modifier_flags.insert(
         "settings_id".to_owned(),
         Value::String(modifier_id.to_string()),
-    )]))
+    );
+    Ok(modifier_flags)
 }
 
 pub(super) fn update_linked_modifier_settings(
@@ -756,6 +779,7 @@ pub(super) fn update_linked_modifier_settings(
     }
     let mut settings = params.clone();
     settings.remove("settings_id");
+    let mut modifier_flags = split_modifier_flags(&mut settings);
     let property = physics_property(system);
     let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     let is_particle_registry_entry = system == "particle_emitter"
@@ -807,10 +831,11 @@ pub(super) fn update_linked_modifier_settings(
         }
     }
     engine.mark("nodes", target, ChangeKind::Updated);
-    Ok(Map::from_iter([(
+    modifier_flags.insert(
         "settings_id".to_owned(),
         Value::String(modifier_id.to_string()),
-    )]))
+    );
+    Ok(modifier_flags)
 }
 
 pub(super) fn delete_linked_modifier_settings(

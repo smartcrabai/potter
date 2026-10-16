@@ -1,0 +1,52 @@
+{
+  "description": "Diagnostic coverage inventory only; tests do not consume this file as an allow-list. A family below means its schema properties are not behaviorally covered by PR18-A except for the exact type.parameter scenarios named here. No unexercised entry asserts a Blender divergence or no-op.",
+  "behavior_scenarios": {
+    "edge_split.use_edge_angle": "edge_split_no_angle",
+    "triangulate.min_vertices": "triangulate_min_vertices5",
+    "solidify.solidify_mode": "solidify_nonmanifold",
+    "decimate.ratio": "decimate_half",
+    "screw.angle": "screw_default_angle",
+    "array.fit_length": "array_fit_length_fixed_count (inert only while fit_type=FIXED_COUNT)",
+    "array.use_apply_on_spline": "apply_on_spline_mesh (mesh-only no-op check)"
+  },
+  "unexercised_by_owner": {
+    "B": ["mirror.*"],
+    "C": ["edge_split.* except use_edge_angle", "triangulate.* except min_vertices"],
+    "D": ["solidify.* except solidify_mode"],
+    "E": ["shrinkwrap.*"],
+    "F": [
+      "armature.*", "cast.*", "corrective_smooth.*", "curve.*", "displace.*", "hook.*",
+      "laplacian_deform.*", "laplacian_smooth.*", "lattice.*", "mesh_deform.*",
+      "simple_deform.*", "skin.*", "smooth.*", "surface_deform.*", "warp.*", "wave.*"
+    ],
+    "H": ["remesh.*"],
+    "I": [
+      "data_transfer.*", "mask.*", "normal_edit.*", "uv_project.*", "uv_warp.*",
+      "vertex_weight_edit.*", "vertex_weight_mix.*", "vertex_weight_proximity.*",
+      "weighted_normal.*"
+    ],
+    "J": ["explode.*", "particle_instance.*", "particle_system.*"],
+    "K": ["ocean.*"],
+    "L": ["use_pin_to_last across modifier types (stack ordering is not tested here)"],
+    "M": [
+      "multires.* except quality/use_creases", "subdivision.* except quality/use_creases"
+    ],
+    "N": ["nodes.*"],
+    "O": [
+      "cloth.*", "collision.*", "dynamic_paint.*", "fluid.*", "mesh_to_volume.*",
+      "soft_body.*", "volume_displace.*", "volume_to_mesh.*"
+    ],
+    "P": [
+      "array.* except fit_length and the array.use_apply_on_spline scenario", "build.*",
+      "screw.* except angle", "weld.*", "wireframe.*"
+    ],
+    "Q": ["mesh_cache.*", "mesh_sequence_cache.*"],
+    "PR14": ["bevel.*"],
+    "PR15": ["decimate.* except ratio"],
+    "PR16": [
+      "multires.quality", "multires.use_creases", "subdivision.quality", "subdivision.use_creases"
+    ],
+    "PR17": ["boolean.*"]
+  },
+  "interpretation": "Runtime-default and schema/op acceptance tests do not count as parameter-behavior coverage. Properties outside the named scenarios remain unexercised, not silently supported, inert, or divergent. Their owners remain the audit implementation slices listed above."
+}
