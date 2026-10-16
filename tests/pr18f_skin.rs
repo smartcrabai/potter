@@ -3,8 +3,8 @@
     reason = "integration tests use concise assertions"
 )]
 
-//! Skin parity against Blender 5.2.2. Expected geometry is the `skin` modifier evaluated headless
-//! (oracle: /tmp/pr18f/SkinExtras/oracle.py). Vertices match by position and faces by vertex cycle,
+//! Skin parity against Blender 5.2.2. Expected geometry is captured by
+//! `tests/fixtures/pr18f_skin_oracle.py`; vertices match by position and faces by vertex cycle,
 //! so storage order does not matter.
 
 use std::collections::HashMap;
@@ -695,7 +695,7 @@ fn loose_skin_branch_skips_edge_subdivision() {
                 .iter()
                 .enumerate()
                 .map(|(index, (radius, root))| {
-                    json!({"radius": radius, "root": root, "loose": index == 0})
+                    json!({"radius": radius, "root": root, "loose": index == 1})
                 })
                 .collect(),
         ),
