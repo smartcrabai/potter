@@ -24,7 +24,7 @@ use super::{
 };
 use crate::error::{ErrorCode, PotError, Result};
 
-/// Combined input, octree, patch-path, and output item budget for one DualCon run.
+/// Combined input, octree, patch-path, and output item budget for one `DualCon` run.
 pub(super) const MAX_DUALCON_WORK_ITEMS: usize = 4_000_000;
 
 #[derive(Clone, Copy)]
