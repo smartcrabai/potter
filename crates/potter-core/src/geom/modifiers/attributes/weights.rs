@@ -411,19 +411,26 @@ pub(super) fn vertex_weight_proximity(
             "proximity target Blender matrices are missing",
         )
     })?;
-    let subject_world_f32 = weight_matrix_f32(subject_world);
-    let subject_origin = glam::Vec3::new(
-        subject_world_f32[12],
-        subject_world_f32[13],
-        subject_world_f32[14],
-    );
-    let target_origin = glam::Vec3::new(
-        matrices.world[12],
-        matrices.world[13],
-        matrices.world[14],
-    );
-    let object_distance = f64::from((subject_origin - target_origin).length());
-    let target_inverse = if mode == "GEOMETRY" {
+    let use_origin_distance = mode == "OBJECT" || (mode == "GEOMETRY" && geometry.is_empty());
+    let origin_distance = if use_origin_distance {
+        let target_world = matrices.world.as_ref().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "proximity target Blender world matrix is missing",
+            )
+        })?;
+        let subject_world_f32 = weight_matrix_f32(subject_world);
+        let subject_origin = glam::Vec3::new(
+            subject_world_f32[12],
+            subject_world_f32[13],
+            subject_world_f32[14],
+        );
+        let target_origin = glam::Vec3::new(target_world[12], target_world[13], target_world[14]);
+        Some((subject_world_f32, target_origin, f64::from((subject_origin - target_origin).length())))
+    } else {
+        None
+    };
+    let target_inverse = if mode == "GEOMETRY" && !geometry.is_empty() {
         Some(matrices.subject_to_local.ok_or_else(|| {
             PotError::new(
                 ErrorCode::EvaluationFailed,
@@ -451,7 +458,6 @@ pub(super) fn vertex_weight_proximity(
                 Some([
                     *positions.get(&triangle[0])?,
                     *positions.get(&triangle[1])?,
-                    *positions.get(&triangle[2])?,
                 ])
             })
             .collect::<Vec<_>>()
@@ -484,14 +490,20 @@ pub(super) fn vertex_weight_proximity(
             continue;
         };
         let distance = match mode {
-            "OBJECT" => object_distance,
+            "OBJECT" => origin_distance
+                .as_ref()
+                .map(|(_, _, distance)| *distance)
+                .ok_or_else(|| PotError::new(ErrorCode::EvaluationFailed, "proximity object world matrices are missing"))?,
             "GEOMETRY" if geometry.is_empty() => {
+                let (subject_world_f32, target_origin, _) = origin_distance
+                    .as_ref()
+                    .ok_or_else(|| PotError::new(ErrorCode::EvaluationFailed, "proximity origin world matrices are missing"))?;
                 f64::from(
                     crate::geom::modifiers::blender_transform_point_f32(
-                        &subject_world_f32,
+                        subject_world_f32,
                         vertex.co.as_vec3(),
                     )
-                    .distance(target_origin),
+                    .distance(*target_origin),
                 )
             }
             "GEOMETRY" => {

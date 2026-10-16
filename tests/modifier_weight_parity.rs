@@ -322,6 +322,8 @@ result["proximity_mask_invert"] = proximity_mask_case("Proximity Mask Invert", T
 
 
 result["proximity_object"] = proximity_case("Proximity Object", "OBJECT", {"VERTEX", "EDGE", "FACE"})
+result["proximity_geometry_empty"] = proximity_case(
+    "Proximity Geometry Empty", "GEOMETRY", set())
 result["proximity_geometry"] = {}
 for geometry in ["VERTEX", "EDGE", "FACE"]:
     result["proximity_geometry"][geometry] = proximity_case(
@@ -570,13 +572,15 @@ fn texture_oracle(root: &Path) -> Result<Option<Value>, Box<dyn Error>> {
 
 fn operand(
     mesh: Mesh,
-    world_matrix_f32: [f32; 16],
+    world_matrix_f32: Option<[f32; 16]>,
     local_to_subject_f32: Option<[f32; 16]>,
     subject_to_local_f32: Option<[f32; 16]>,
 ) -> SceneOperand {
+    let local_to_subject = local_to_subject_f32
+        .map(|matrix| DMat4::from_cols_array(&matrix.map(f64::from)));
     SceneOperand {
         mesh,
-        local_to_subject: None,
+        local_to_subject,
         blender_matrices_f32: Some(SceneOperandMatricesF32 {
             world: world_matrix_f32,
             local_to_subject: local_to_subject_f32,
@@ -835,12 +839,14 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     let matrices = &expected["proximity_matrices"];
     let subject_world_f32 = blender_matrix_f32(&matrices["subject_world"])?;
     let target_world_f32 = blender_matrix_f32(&matrices["target_world"])?;
+    let local_to_subject_f32 = blender_matrix_f32(&matrices["local_to_subject"])?;
+    let subject_to_local_f32 = blender_matrix_f32(&matrices["subject_to_local"])?;
     let subject_transform = DMat4::from_cols_array(&subject_world_f32.map(f64::from));
     let target_mesh = target_mesh()?;
-    let object_target = operand(target_mesh.clone(), target_world_f32, None, None);
+    let object_target = operand(target_mesh.clone(), Some(target_world_f32), None, None);
     let geometry_target = operand(
         target_mesh,
-        target_world_f32,
+        None,
         Some(local_to_subject_f32),
         Some(subject_to_local_f32),
     );
@@ -860,6 +866,22 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         subject_transform,
         "Proximity Object",
         &expected["proximity_object"],
+    )?;
+    let geometry_empty = modifier(
+        "vertex_weight_proximity",
+        json!({
+            "vertex_group":"A","target":"target","proximity_mode":"GEOMETRY",
+            "proximity_geometry":[],"min_dist":0.2,"max_dist":5.0
+        }),
+    )?;
+    assert_case(
+        "weight proximity GEOMETRY empty set",
+        &mesh,
+        &geometry_empty,
+        &object_operands,
+        subject_transform,
+        "Proximity Geometry Empty",
+        &expected["proximity_geometry_empty"],
     )?;
     for geometry in ["VERTEX", "EDGE", "FACE"] {
         let modifier = modifier(

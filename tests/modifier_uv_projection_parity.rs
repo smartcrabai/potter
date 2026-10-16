@@ -361,7 +361,7 @@ fn operand(world_matrix: DMat4, camera: Option<CameraData>, armature: bool) -> S
         mesh: Mesh::default(),
         local_to_subject: None,
         blender_matrices_f32: Some(SceneOperandMatricesF32 {
-            world: world_matrix.to_cols_array().map(|value| value as f32),
+            world: Some(world_matrix.to_cols_array().map(|value| value as f32)),
             local_to_subject: None,
             subject_to_local: None,
         }),

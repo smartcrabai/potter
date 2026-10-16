@@ -38,8 +38,7 @@ pub struct AttributeLayerSelection {
 #[derive(Clone, Copy, Debug)]
 /// Original Blender f32 world and relative matrices for I modifier operands.
 pub struct SceneOperandMatricesF32 {
-    /// The operand's original object-to-world matrix.
-    pub world: [f32; 16],
+    pub world: Option<[f32; 16]>,
     /// Blender-order object-local to subject-local matrix.
     pub local_to_subject: Option<[f32; 16]>,
     /// Blender-order subject-local to object-local inverse matrix.

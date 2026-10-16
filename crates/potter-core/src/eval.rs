@@ -1818,9 +1818,14 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         "wave" => &["texture_coords_object", "start_position_object"],
         "warp" => &["object_from", "object_to", "texture_coords_object"],
         "shrinkwrap" => &["target", "auxiliary_target"],
-        "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity" => {
-            &["mask_tex_map_object"]
-        }
+        "normal_edit" => &["target"],
+        "vertex_weight_proximity" => &[
+            "target",
+            "mask_tex_map_object",
+        ],
+        "vertex_weight_edit" | "vertex_weight_mix" => &[
+            "mask_tex_map_object",
+        ],
         "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
             &["armature"]
         }
@@ -2206,7 +2211,8 @@ fn object_mesh_dependencies(
                     &["object"]
                 }
                 "shrinkwrap" => &["target", "auxiliary_target"],
-                "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
+                "surface_deform" => &["target"],
+                "vertex_weight_proximity" if proximity_uses_geometry_mesh(modifier) => &["target"],
                 "array" => &["start_cap", "end_cap"],
                 _ => &[],
             };
@@ -2697,8 +2703,8 @@ pub(crate) fn resolve_modifier_object_operands(
         "uv_project" => &["projectors"],
         "warp" => &["object_from", "object_to"],
         "shrinkwrap" => &["target", "auxiliary_target"],
-        "vertex_weight_edit" | "vertex_weight_mix" => &["mask_tex_map_object"],
-        "vertex_weight_proximity" => &["target", "mask_tex_map_object"],
+        "vertex_weight_edit" | "vertex_weight_mix" => &[],
+        "vertex_weight_proximity" => &["target"],
         "normal_edit" | "surface_deform" => &["target"],
         "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
             &["armature"]
@@ -2854,8 +2860,8 @@ pub(crate) fn resolve_modifier_object_operands(
             let is_normal_edit = modifier.modifier_type == "normal_edit";
             let is_geometry_proximity = modifier.modifier_type == "vertex_weight_proximity"
                 && proximity_mode_is_geometry(modifier);
-            let proximity_geometry_empty =
-                is_geometry_proximity && proximity_geometry_is_empty(modifier);
+            let proximity_geometry_empty = is_geometry_proximity
+                && proximity_geometry_is_empty(modifier);
             let needs_world_matrix = modifier.modifier_type == "uv_project"
                 || (modifier.modifier_type == "vertex_weight_proximity"
                     && (!is_geometry_proximity || proximity_geometry_empty));
@@ -2864,14 +2870,13 @@ pub(crate) fn resolve_modifier_object_operands(
                 || (is_geometry_proximity && !proximity_geometry_empty)
                 || needs_world_matrix;
             let blender_matrices_f32 = needs_matrix_data.then(|| {
-                let world = object_world.to_cols_array().map(|value| value as f32);
-                let (local_to_subject, subject_to_local) = if use_transfer_transform {
+                let (world, local_to_subject, subject_to_local) = if use_transfer_transform {
                     let (forward, inverse) =
                         crate::geom::modifiers::blender_space_transform_f32(
                             object_world,
                             subject_world,
                         );
-                    (Some(forward), Some(inverse))
+                    (None, Some(forward), Some(inverse))
                 } else if is_normal_edit {
                     let subject_world_f32 =
                         subject_world.to_cols_array().map(|value| value as f32);
@@ -2880,6 +2885,7 @@ pub(crate) fn resolve_modifier_object_operands(
                     let object_world_f32 =
                         object_world.to_cols_array().map(|value| value as f32);
                     (
+                        None,
                         Some(crate::geom::modifiers::blender_multiply_m4(
                             inverse_subject,
                             object_world_f32,
@@ -2895,13 +2901,19 @@ pub(crate) fn resolve_modifier_object_operands(
                         crate::geom::modifiers::blender_inverse_m4(object_world_f32);
                     (
                         None,
+                        None,
                         Some(crate::geom::modifiers::blender_multiply_m4(
                             inverse_target,
                             subject_world_f32,
                         )),
                     )
                 } else {
-                    (None, None)
+                    (
+                        needs_world_matrix
+                            .then(|| object_world.to_cols_array().map(|value| value as f32)),
+                        None,
+                        None,
+                    )
                 };
                 crate::geom::modifiers::attributes::SceneOperandMatricesF32 {
                     world,

@@ -64,7 +64,7 @@ fn scene_operand(mesh: Mesh, world: DMat4, camera: Option<CameraData>) -> SceneO
         local_to_subject: None,
         blender_matrices_f32: Some(
             potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                world: world.to_cols_array().map(|value| value as f32),
+                world: Some(world.to_cols_array().map(|value| value as f32)),
                 local_to_subject: None,
                 subject_to_local: None,
             },
@@ -81,7 +81,6 @@ fn scene_operand(mesh: Mesh, world: DMat4, camera: Option<CameraData>) -> SceneO
 
 fn scene_operand_with_space(
     mesh: Mesh,
-    world: [f32; 16],
     local_to_subject: [f32; 16],
     subject_to_local: [f32; 16],
     camera: Option<CameraData>,
@@ -91,7 +90,7 @@ fn scene_operand_with_space(
         local_to_subject: None,
         blender_matrices_f32: Some(
             potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                world,
+                world: None,
                 local_to_subject: Some(local_to_subject),
                 subject_to_local: Some(subject_to_local),
             },
@@ -110,7 +109,7 @@ fn scene_operand_with_identity_space(mesh: Mesh, camera: Option<CameraData>) -> 
     const IDENTITY: [f32; 16] = [
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ];
-    scene_operand_with_space(mesh, IDENTITY, IDENTITY, IDENTITY, camera)
+    scene_operand_with_space(mesh, IDENTITY, IDENTITY, camera)
 }
 
 #[test]
@@ -1781,9 +1780,9 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             local_to_subject: None,
             blender_matrices_f32: Some(
                 potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                    world: [
+                    world: Some([
                         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 3.5, -1.0, 0.0, 1.0,
-                    ],
+                    ]),
                     local_to_subject: Some([
                         0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.75, 0.0, 0.0, 1.0,
                     ]),
@@ -1892,7 +1891,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "target".to_owned(),
         vec![scene_operand_with_space(
             proximity_surface_mesh,
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             None,
@@ -2028,7 +2026,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         vec![scene_operand_with_space(
             Mesh::default(),
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0],
             None,
         )],
@@ -2058,7 +2055,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "target".to_owned(),
         vec![scene_operand_with_space(
             Mesh::default(),
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, -1.0, 0.0, 1.0],
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, -1.0, 0.0, 1.0],
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 1.0, 0.0, 1.0],
             None,

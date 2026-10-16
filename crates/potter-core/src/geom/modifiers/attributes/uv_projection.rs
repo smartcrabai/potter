@@ -180,7 +180,7 @@ fn make_projector_f32(
     let world = projector
         .blender_matrices_f32
         .as_ref()
-        .map(|matrices| matrices.world)
+        .and_then(|matrices| matrices.world)
         .ok_or_else(|| {
             PotError::with_details(
                 ErrorCode::EvaluationFailed,

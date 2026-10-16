@@ -45,7 +45,7 @@ fn operand(mesh: Mesh, _local_to_subject: DMat4, groups: &[&str], active: Option
         mesh,
         local_to_subject: None,
         blender_matrices_f32: Some(SceneOperandMatricesF32 {
-            world: identity,
+            world: None,
             local_to_subject: Some(identity),
             subject_to_local: Some(identity),
         }),
@@ -389,9 +389,6 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     let destination_world = DMat4::from_scale_rotation_translation(
         DVec3::new(0.9,1.1,1.0), glam::DQuat::IDENTITY, DVec3::new(-0.1,0.15,0.0));
     let source_to_destination = destination_world.inverse() * source_world;
-    let source_world_f32 = [
-        1.2,0.0,0.0,0.0,0.0,0.8,0.0,0.0,0.0,0.0,1.1,0.0,0.2,-0.1,0.0,1.0,
-    ];
     let local_to_subject_f32 = [
         1.3333335,0.0,0.0,0.0,0.0,0.7272727,0.0,0.0,0.0,0.0,1.1,0.0,
         0.33333337,-0.22727272,0.0,1.0,
@@ -402,7 +399,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     ];
     let mut source_operand=operand(source.clone(),source_to_destination,&["A"],Some(0));
     source_operand.blender_matrices_f32=Some(SceneOperandMatricesF32 {
-        world:source_world_f32,
+        world:None,
         local_to_subject:Some(local_to_subject_f32),
         subject_to_local:Some(subject_to_local_f32),
     });

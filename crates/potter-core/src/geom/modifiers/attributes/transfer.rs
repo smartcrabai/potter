@@ -4152,7 +4152,7 @@ mod tests {
             mesh: source,
             local_to_subject: None,
             blender_matrices_f32: Some(SceneOperandMatricesF32 {
-                world: identity,
+                world: None,
                 local_to_subject: Some(identity),
                 subject_to_local: Some(identity),
             }),

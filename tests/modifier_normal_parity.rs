@@ -697,7 +697,6 @@ fn evaluate_case(case: &Value, transform: Option<&Value>) -> Result<Mesh, Box<dy
         };
         let transform = transform.ok_or("Blender target transform matrix is missing")?;
         let local_to_subject_f32 = f32_matrix(&transform["local_to_subject"])?;
-        let world_matrix_f32 = f32_matrix(&transform["world"])?;
         let subject_to_local_f32 = f32_matrix(&transform["subject_to_local"])?;
         operands.insert(
             "target".to_owned(),
@@ -706,7 +705,7 @@ fn evaluate_case(case: &Value, transform: Option<&Value>) -> Result<Mesh, Box<dy
                 local_to_subject: None,
                 blender_matrices_f32: Some(
                     potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                        world: world_matrix_f32,
+                        world: None,
                         local_to_subject: Some(local_to_subject_f32),
                         subject_to_local: Some(subject_to_local_f32),
                     },
@@ -958,7 +957,7 @@ fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>
         local_to_subject: None,
         blender_matrices_f32: Some(
             potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                world: local_to_subject_f32,
+                world: None,
                 local_to_subject: Some(local_to_subject_f32),
                 subject_to_local: Some(subject_to_local_f32),
             },
