@@ -40,6 +40,8 @@ fn modifier(params: &Value) -> TestResult<Modifier> {
         modifier_type: "bevel".to_owned(),
         name: "bevel".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("bevel params must be an object")?

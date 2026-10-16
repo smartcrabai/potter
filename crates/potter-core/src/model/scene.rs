@@ -1422,6 +1422,14 @@ pub struct Modifier {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Blender `show_viewport`: active in viewport previews (`EvaluationPurpose::Preview`).
+    /// Serialized only when false; a missing key reads as true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_viewport: bool,
+    /// Blender `show_render`: active in saved renders and the exports whose Blender writer evaluates the render stack (`EvaluationPurpose::Render`).
+    /// Serialized only when false; a missing key reads as true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_render: bool,
     #[serde(default)]
     pub params: Map<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1430,6 +1438,28 @@ pub struct Modifier {
     #[serde(skip)]
     #[doc(hidden)]
     pub runtime: ModifierRuntime,
+}
+
+impl Modifier {
+    /// Whether the modifier takes part in an evaluation for `purpose`. `enabled` is the global
+    /// switch; the purpose's `show_*` flag selects the viewport or render stack.
+    #[must_use]
+    pub fn is_active(&self, purpose: crate::eval::EvaluationPurpose) -> bool {
+        self.enabled
+            && match purpose {
+                crate::eval::EvaluationPurpose::Preview => self.show_viewport,
+                crate::eval::EvaluationPurpose::Render => self.show_render,
+            }
+    }
+
+    /// Copy whose `enabled` means "active for `purpose`", so evaluators that read only `enabled`
+    /// see that purpose's stack.
+    #[must_use]
+    pub fn for_purpose(&self, purpose: crate::eval::EvaluationPurpose) -> Self {
+        let mut modifier = self.clone();
+        modifier.enabled = self.is_active(purpose);
+        modifier
+    }
 }
 
 #[doc(hidden)]
@@ -1442,7 +1472,7 @@ pub struct ModifierRuntime {
     pub warp_from: Option<[f64; 3]>,
     pub warp_to: Option<[f64; 3]>,
     pub hook_target_position: Option<[f64; 3]>,
-    pub use_render_levels: bool,
+    pub use_render_settings: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1585,6 +1615,14 @@ impl Node {
 
 fn default_true() -> bool {
     true
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

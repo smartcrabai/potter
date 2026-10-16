@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ValidateArgs,
-    commands::util::exchange_format_name,
+    commands::{export::export_purpose, util::exchange_format_name},
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot},
     model::AvatarVersion,
@@ -22,7 +22,12 @@ pub fn run(args: ValidateArgs) -> Result<(Option<SceneInfo>, Value)> {
         }
         _ => None,
     };
-    let mut report = validate::validate(project.doc(), format)?;
+    let mut report = validate::validate_with_context(
+        project.doc(),
+        format,
+        Some(project.path()),
+        Some(project.cache_directory()),
+    )?;
     if let Some(format @ ("vrm" | "vrm0")) = format {
         let version = if format == "vrm" {
             AvatarVersion::V1
@@ -32,8 +37,16 @@ pub fn run(args: ValidateArgs) -> Result<(Option<SceneInfo>, Value)> {
         if let Some(error) = settings_error {
             append_vrm_preflight_error(&mut report, format, &error)?;
         } else {
-            let context = EvaluationContext::default();
-            match Snapshot::evaluate_with_cache(project.doc(), &context, Some(project.path())) {
+            let context = EvaluationContext {
+                purpose: export_purpose(format),
+                ..EvaluationContext::default()
+            };
+            match Snapshot::evaluate_with_cache(
+                project.doc(),
+                &context,
+                Some(project.path()),
+                Some(project.cache_directory()),
+            ) {
                 Ok(snapshot) => {
                     if let Err(error) =
                         crate::exchange::vrm::validate_output(project.doc(), &snapshot, version)

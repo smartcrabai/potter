@@ -65,6 +65,8 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::from_value(params)?,
         binding_data: None,
         runtime: potter_core::model::ModifierRuntime::default(),
@@ -1840,6 +1842,8 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
             modifier_type: "ocean".to_owned(),
             name: "Ocean".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params: serde_json::from_value(json!({
                 "geometry_mode":"DISPLACE","resolution":4,"viewport_resolution":4,
                 "spatial_size":8.0,"wave_scale":1.0,"wind_velocity":20.0,

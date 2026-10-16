@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::EvaluationPurpose,
     geom::modifiers::evaluate_modifiers_with_groups_at_frame,
     model::{DataBlock, Id, Modifier, SceneDoc, ShapeKey, ShapeKeyData},
     params::{self, ParameterFamily},
@@ -112,7 +113,9 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 scene_id: None,
                 view_layer: None,
                 frame: Some(engine.evaluation_frame),
+                purpose: EvaluationPurpose::Preview,
             },
+            engine.asset_root,
             None,
             &bind_nodes,
         )?;
@@ -292,7 +295,17 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     check_fields(
         engine,
         operation,
-        &["op", "target", "id", "type", "name", "enabled", "params"],
+        &[
+            "op",
+            "target",
+            "id",
+            "type",
+            "name",
+            "enabled",
+            "show_viewport",
+            "show_render",
+            "params",
+        ],
         &["target", "id", "type"],
     )?;
     let targets = targets(engine, operation)?;
@@ -315,6 +328,8 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             .to_owned(),
     };
     let enabled = read_bool(engine, operation, "enabled", true)?;
+    let show_viewport = read_bool(engine, operation, "show_viewport", true)?;
+    let show_render = read_bool(engine, operation, "show_render", true)?;
     let params = read_params(engine, operation.get("params"), "params")?;
     validate_parameter_map(
         engine,
@@ -363,15 +378,25 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             .nodes
             .get_mut(&target)
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "node disappeared"))?;
-        node.modifiers.push(Modifier {
-            id: id.clone(),
-            modifier_type: modifier_type.clone(),
-            name: name.clone(),
-            enabled,
-            params: modifier_params,
-            binding_data: None,
-            runtime: crate::model::ModifierRuntime::default(),
-        });
+        let index = insertion_index(&node.modifiers, &modifier_type);
+        let pinned = pin_flag(&modifier_params);
+        node.modifiers.insert(
+            index,
+            Modifier {
+                id: id.clone(),
+                modifier_type: modifier_type.clone(),
+                name: name.clone(),
+                enabled,
+                show_viewport,
+                show_render,
+                params: modifier_params,
+                binding_data: None,
+                runtime: crate::model::ModifierRuntime::default(),
+            },
+        );
+        if pinned {
+            settle_pin(&mut node.modifiers, index);
+        }
         engine.mark("nodes", &target, ChangeKind::Updated);
         changed = true;
     }
@@ -394,7 +419,16 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine.error(ErrorCode::InvalidOperation, "set must be an object", "/set")
         })?;
     for key in set.keys() {
-        if !["name", "enabled", "params", "type"].contains(&key.as_str()) {
+        if ![
+            "name",
+            "enabled",
+            "show_viewport",
+            "show_render",
+            "params",
+            "type",
+        ]
+        .contains(&key.as_str())
+        {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown modifier set field `{key}`"),
@@ -514,11 +548,37 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 )
             })?;
         }
+        if let Some(value) = set.get("show_viewport") {
+            modifier.show_viewport = value.as_bool().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "modifier show_viewport must be a boolean",
+                )
+            })?;
+        }
+        if let Some(value) = set.get("show_render") {
+            modifier.show_render = value.as_bool().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "modifier show_render must be a boolean",
+                )
+            })?;
+        }
         modifier_type.clone_into(&mut modifier.modifier_type);
         if let Some(params) = modifier_params {
             modifier.params = params;
         }
-        if modifier != &before {
+        let pin_changed = pin_flag(&before.params) != pin_flag(&modifier.params);
+        let modified = modifier != &before;
+        if pin_changed
+            && let Some(index) = node
+                .modifiers
+                .iter()
+                .position(|candidate| candidate.id == id)
+        {
+            settle_pin(&mut node.modifiers, index);
+        }
+        if modified {
             engine.mark("nodes", &target, ChangeKind::Updated);
             changed = true;
         }
@@ -624,13 +684,144 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
             ));
         }
         if current != index {
-            let modifier = node.modifiers.remove(current);
-            node.modifiers.insert(index, modifier);
+            let reached = partial_move_target(&node.modifiers, current, index);
+            if reached != index {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!(
+                        "modifier `{id}` cannot move to index {index}: pin-to-last or original-data order stops it at index {reached}"
+                    ),
+                    "/index",
+                ));
+            }
+            move_modifier(&mut node.modifiers, current, index);
             engine.mark("nodes", &target, ChangeKind::Updated);
             changed = true;
         }
     }
     Ok(changed)
+}
+
+/// Blender's `ModifierTypeType::OnlyDeform` for each Potter modifier type.
+fn only_deform(modifier_type: &str) -> bool {
+    matches!(
+        modifier_type,
+        "armature"
+            | "cast"
+            | "cloth"
+            | "collision"
+            | "corrective_smooth"
+            | "curve"
+            | "displace"
+            | "hook"
+            | "laplacian_deform"
+            | "laplacian_smooth"
+            | "lattice"
+            | "mesh_cache"
+            | "mesh_deform"
+            | "particle_system"
+            | "shrinkwrap"
+            | "simple_deform"
+            | "smooth"
+            | "soft_body"
+            | "surface_deform"
+            | "warp"
+            | "wave"
+    )
+}
+
+/// Blender's `eModifierTypeFlag_RequiresOriginalData` modifier types.
+fn requires_original_data(modifier_type: &str) -> bool {
+    matches!(modifier_type, "multires" | "soft_body")
+}
+
+/// Blender's `eModifierFlag_PinLast`, stored as the `use_pin_to_last` parameter.
+fn pin_flag(params: &Map<String, Value>) -> bool {
+    params
+        .get("use_pin_to_last")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn is_pinned(modifier: &Modifier) -> bool {
+    pin_flag(&modifier.params)
+}
+
+/// Blender's `BKE_modifiers_add_at_end_if_possible`: a new modifier goes before the trailing pinned
+/// block. Hook and original-data types go before the first modifier that is not deform-only.
+pub(crate) fn insertion_index(stack: &[Modifier], modifier_type: &str) -> usize {
+    if modifier_type == "hook" || requires_original_data(modifier_type) {
+        let mut index = 0;
+        while index < stack.len() && only_deform(&stack[index].modifier_type) {
+            if stack.get(index + 1).is_some_and(is_pinned) {
+                break;
+            }
+            index += 1;
+        }
+        return index;
+    }
+    let mut index = stack.len();
+    while index > 0 && is_pinned(&stack[index - 1]) {
+        index -= 1;
+    }
+    index
+}
+
+/// Blender's `object_modifier_check_move_before`: whether `modifier` may move above `previous`.
+fn may_move_before(modifier: &Modifier, previous: &Modifier) -> bool {
+    let unpins_past_pinned = is_pinned(modifier) && !is_pinned(previous);
+    let past_original_data =
+        requires_original_data(&previous.modifier_type) && !only_deform(&modifier.modifier_type);
+    !unpins_past_pinned && !past_original_data
+}
+
+/// Blender's `object_modifier_check_move_after`: whether `modifier` may move below `next`.
+fn may_move_after(modifier: &Modifier, next: &Modifier) -> bool {
+    let unpins_before_pinned = is_pinned(next) && !is_pinned(modifier);
+    let past_non_deform =
+        requires_original_data(&modifier.modifier_type) && !only_deform(&next.modifier_type);
+    !unpins_before_pinned && !past_non_deform
+}
+
+/// Index reached when moving `stack[from]` towards `to`: stops before the first refused step, as
+/// Blender's `modifier_move_to_index` does with `allow_partial`. Returns `from` when blocked at once.
+fn partial_move_target(stack: &[Modifier], from: usize, to: usize) -> usize {
+    let moving = &stack[from];
+    let mut current = from;
+    if from < to {
+        while current < to && may_move_after(moving, &stack[current + 1]) {
+            current += 1;
+        }
+    } else {
+        while current > to && may_move_before(moving, &stack[current - 1]) {
+            current -= 1;
+        }
+    }
+    current
+}
+
+fn move_modifier(stack: &mut Vec<Modifier>, from: usize, to: usize) {
+    let modifier = stack.remove(from);
+    stack.insert(to, modifier);
+}
+
+/// Blender's `rna_Modifier_use_pin_to_last_set` move: a pinned modifier moves down past the
+/// unpinned modifiers after it; an unpinned one moves up past the pinned modifiers before it.
+fn settle_pin(stack: &mut Vec<Modifier>, index: usize) {
+    let mut target = index;
+    if is_pinned(&stack[index]) {
+        while target + 1 < stack.len() && !is_pinned(&stack[target + 1]) {
+            target += 1;
+        }
+    } else {
+        while target > 0 && is_pinned(&stack[target - 1]) {
+            target -= 1;
+        }
+    }
+    let reached = partial_move_target(stack, index, target);
+    if reached != index {
+        move_modifier(stack, index, reached);
+    }
 }
 
 /// `modifier.attribute_dropped` reports output that was applied with attributes lost, so it is
@@ -734,13 +925,13 @@ fn apply_modifier(
         if edited_data.contains(&data_id) {
             continue;
         }
-        let modifiers = engine
+        let stack = engine
             .doc
             .nodes
             .get(&target)
-            .map(|node| node.modifiers.clone())
+            .map(|node| node.modifiers.as_slice())
             .unwrap_or_default();
-        let index = modifiers
+        let index = stack
             .iter()
             .position(|modifier| modifier.id == modifier_id)
             .ok_or_else(|| {
@@ -749,7 +940,26 @@ fn apply_modifier(
                     format!("modifier `{modifier_id}` was not found on node `{target}`"),
                 )
             })?;
-        crate::geom::modifiers::validate_boolean_topology_suffix(&modifiers, index)?;
+        // Only a boolean target can trip the guard. Downstream modifiers are judged by their Preview
+        // activeness, as before; the target keeps its own flags.
+        if stack[index].modifier_type == "boolean" {
+            let validator_stack: Vec<Modifier> = stack
+                .iter()
+                .enumerate()
+                .map(|(position, modifier)| {
+                    if position == index {
+                        modifier.clone()
+                    } else {
+                        modifier.for_purpose(EvaluationPurpose::Preview)
+                    }
+                })
+                .collect();
+            crate::geom::modifiers::validate_boolean_topology_suffix(&validator_stack, index)?;
+        }
+        // Blender's modifier_apply evaluates only the applied modifier on the base data, whatever
+        // its show_viewport. Earlier and later modifiers stay in the stack and are not evaluated.
+        let target_modifier = stack[index].clone();
+        let modifier_stack = std::slice::from_ref(&target_modifier);
         let evaluated = {
             let data_block = engine.doc.data_blocks.get(&data_id).ok_or_else(|| {
                 PotError::new(
@@ -763,7 +973,6 @@ fn apply_modifier(
                     format!("data block `{data_id}` has no mesh"),
                 )
             })?;
-            let modifier_stack = &modifiers[..=index];
             let uses_armature = modifier_stack
                 .iter()
                 .any(|modifier| modifier.enabled && modifier.modifier_type == "armature");
@@ -852,6 +1061,7 @@ fn apply_modifier(
                             ..crate::eval::EvaluationContext::default()
                         },
                         engine.asset_root,
+                        None,
                     )?)
                 } else {
                     None
@@ -910,6 +1120,7 @@ fn apply_modifier(
                     &base_object_meshes,
                     evaluated_operand_meshes,
                     &BTreeMap::new(),
+                    crate::eval::ModifierEvaluationContext::default(),
                     |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                         "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
                             mesh,
@@ -1036,7 +1247,7 @@ fn apply_modifier(
             }
         }
         if let Some(node) = engine.doc.nodes.get_mut(&target) {
-            node.modifiers.drain(..=index);
+            node.modifiers.retain(|modifier| modifier.id != modifier_id);
         }
         if mesh_changed {
             super::clear_primitive_metadata(engine, &data_id);
@@ -1212,12 +1423,12 @@ fn apply_modifier_as_shape_key(
         );
         if !keep_modifier
             && let Some(node) = engine.doc.nodes.get_mut(&target)
-            && let Some(index) = node
+            && node
                 .modifiers
                 .iter()
-                .position(|modifier| modifier.id == modifier_id)
+                .any(|modifier| modifier.id == modifier_id)
         {
-            node.modifiers.drain(..=index);
+            node.modifiers.retain(|modifier| modifier.id != modifier_id);
             engine.mark("nodes", &target, ChangeKind::Updated);
         }
         engine.mark("data_blocks", &original_data_id, ChangeKind::Updated);

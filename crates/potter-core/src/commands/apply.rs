@@ -6,7 +6,7 @@ use crate::{
     cli::ApplyArgs,
     commands::util::check_base_revision,
     error::{ErrorCode, PotError, Result},
-    eval::EvaluationContext,
+    eval::{EvaluationContext, EvaluationPurpose},
     model::Id,
     ops,
     render::{PreviewRequest, render_previews},
@@ -66,6 +66,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
         render_candidate_preview(
             &candidate,
             project.path(),
+            project.cache_directory(),
             &batch,
             &outcome.asset_blobs,
             views_csv,
@@ -112,6 +113,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
 fn render_candidate_preview(
     candidate: &crate::model::SceneDoc,
     scene_root: &Path,
+    cache_directory: &Path,
     batch: &Value,
     staged_assets: &std::collections::BTreeMap<String, Vec<u8>>,
     views_csv: &str,
@@ -155,10 +157,12 @@ fn render_candidate_preview(
         scene_id,
         view_layer,
         frame,
+        purpose: EvaluationPurpose::Preview,
     };
     render_previews(
         candidate,
         scene_root,
+        cache_directory,
         &PreviewRequest {
             views: &views,
             camera_id: camera_id.as_deref(),
@@ -167,7 +171,6 @@ fn render_candidate_preview(
             out: None,
             overwrite: false,
             context: &context,
-            render_visibility: false,
             staged_assets: Some(staged_assets),
         },
     )

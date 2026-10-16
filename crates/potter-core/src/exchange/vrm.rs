@@ -1127,9 +1127,10 @@ fn spring_terminal_has_skin_weights(
     if !bone.deform {
         return false;
     }
+    // Settings validation runs before evaluation, so it reads the stack the VRM 0.x export evaluates.
     doc.nodes.values().any(|node| {
         node.modifiers.iter().any(|modifier| {
-            modifier.enabled
+            modifier.is_active(crate::commands::export::export_purpose("vrm0"))
                 && modifier.modifier_type == "armature"
                 && modifier.params.get("object").and_then(Value::as_str)
                     == Some(armature_node_id.as_str())

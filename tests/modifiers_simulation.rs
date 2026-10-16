@@ -1737,11 +1737,13 @@ with open(os.path.join(root, 'subdivision_expected.json'), 'w', encoding='utf-8'
             modifier_type: "subdivision".to_owned(),
             name: "Subdivision".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params,
             binding_data: None,
             runtime: potter_core::model::ModifierRuntime::default(),
         };
-        modifier.runtime.use_render_levels = use_render_levels;
+        modifier.runtime.use_render_settings = use_render_levels;
         let evaluated = potter_core::geom::modifiers::evaluate_modifiers(&mesh, &[modifier])?;
         let blender_positions = blender_points(&expected[name]["points"])?;
         assert_eq!(
@@ -2197,6 +2199,7 @@ fn volume_displace_resamples_inline_density_with_object_texture_mapping()
         &document,
         &potter_core::eval::EvaluationContext::default(),
         Some(&scene),
+        Some(&scene.join(".potter/cache")),
     )?;
     let values = snapshot
         .volume_data

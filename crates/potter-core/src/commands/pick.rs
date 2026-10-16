@@ -7,6 +7,7 @@ pub fn run(args: PickArgs) -> Result<(Option<SceneInfo>, Value)> {
     let result = pick(
         project.doc(),
         project.path(),
+        project.cache_directory(),
         &args.render,
         args.pixel,
         args.domain,

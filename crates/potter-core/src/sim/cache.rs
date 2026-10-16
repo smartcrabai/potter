@@ -13,8 +13,9 @@ use super::{SOLVER_VERSION, SimulationResult};
 use crate::geom::Mesh;
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::ModifierGate,
     hash,
-    model::{Id, SceneDoc},
+    model::Id,
 };
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -26,11 +27,19 @@ struct ModifierSimulationCache {
     particles: Option<Vec<super::ParticleState>>,
 }
 
+/// Borrowed write-side form of `ModifierSimulationCache`, so storing an entry does not copy its mesh.
+#[derive(serde::Serialize)]
+struct ModifierSimulationCacheRef<'a> {
+    cache_key: &'a str,
+    mesh: &'a Mesh,
+    particles: Option<&'a [super::ParticleState]>,
+}
+
 pub(super) fn load_modifier_simulation(
-    directory: &Path,
+    cache_directory: &Path,
     key: &str,
 ) -> Result<Option<(Mesh, Option<Vec<super::ParticleState>>)>> {
-    let path = cache_path(directory, key);
+    let path = cache_path(cache_directory, key);
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -67,18 +76,17 @@ pub(super) fn load_modifier_simulation(
 }
 
 pub(super) fn store_modifier_simulation(
-    directory: &Path,
+    cache_directory: &Path,
     key: &str,
     mesh: &Mesh,
     particles: Option<&[super::ParticleState]>,
 ) -> Result<()> {
-    let cache_directory = directory.join(".potter").join("cache");
-    fs::create_dir_all(&cache_directory).map_err(|error| PotError::io(&error))?;
-    let destination = cache_path(directory, key);
-    let bytes = serde_json::to_vec(&ModifierSimulationCache {
-        cache_key: key.to_owned(),
-        mesh: mesh.clone(),
-        particles: particles.map(<[super::ParticleState]>::to_vec),
+    fs::create_dir_all(cache_directory).map_err(|error| PotError::io(&error))?;
+    let destination = cache_path(cache_directory, key);
+    let bytes = serde_json::to_vec(&ModifierSimulationCacheRef {
+        cache_key: key,
+        mesh,
+        particles,
     })
     .map_err(|error| {
         PotError::with_details(
@@ -87,7 +95,7 @@ pub(super) fn store_modifier_simulation(
             json!({"cause": error.to_string()}),
         )
     })?;
-    let (temporary_path, mut file) = create_temporary(&cache_directory)?;
+    let (temporary_path, mut file) = create_temporary(cache_directory)?;
     let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temporary_path);
@@ -98,7 +106,7 @@ pub(super) fn store_modifier_simulation(
         let _ = fs::remove_file(&temporary_path);
         return Err(PotError::io(&error));
     }
-    if let Ok(directory_file) = File::open(&cache_directory) {
+    if let Ok(directory_file) = File::open(cache_directory) {
         let _ = directory_file.sync_all();
     }
     Ok(())
@@ -107,23 +115,17 @@ pub(super) fn store_modifier_simulation(
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn cache_key(
-    doc: &SceneDoc,
+    scene_hash: &str,
     scene_id: &Id,
     frame: f64,
     base_world_matrices: &BTreeMap<Id, DMat4>,
+    gate: ModifierGate<'_>,
 ) -> Result<String> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "simulation frame must be finite",
         ));
     }
-    if !doc.scenes.contains_key(scene_id) {
-        return Err(PotError::new(
-            ErrorCode::SceneNotFound,
-            format!("scene `{scene_id}` was not found"),
-        ));
-    }
-
     let mut matrices = BTreeMap::new();
     for (id, matrix) in base_world_matrices {
         if !matrix.is_finite() {
@@ -133,26 +135,22 @@ pub(super) fn cache_key(
         }
         matrices.insert(id.to_string(), matrix.to_cols_array());
     }
-    let snapshot = serde_json::to_value(doc).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "could not serialize the simulation input snapshot",
-            json!({"cause": error.to_string()}),
-        )
-    })?;
+
     let input = json!({
         "solver_version": SOLVER_VERSION,
         "scene_id": scene_id.as_str(),
         "frame": frame,
-        "scene_snapshot": snapshot,
+        "purpose": gate.context.purpose,
+        "suppressed_nodes": gate.suppressed,
+        "scene_hash": scene_hash,
         "base_world_matrices": matrices,
     });
     let canonical = hash::canonicalize(&input)?;
     Ok(hash::sha256(&canonical))
 }
 
-pub(super) fn load(directory: &Path, key: &str) -> Result<Option<SimulationResult>> {
-    let path = cache_path(directory, key);
+pub(super) fn load(cache_directory: &Path, key: &str) -> Result<Option<SimulationResult>> {
+    let path = cache_path(cache_directory, key);
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -244,10 +242,9 @@ fn valid_result(result: &SimulationResult, key: &str) -> bool {
         })
 }
 
-pub(super) fn store(directory: &Path, result: &SimulationResult) -> Result<()> {
-    let cache_directory = directory.join(".potter").join("cache");
-    fs::create_dir_all(&cache_directory).map_err(|error| PotError::io(&error))?;
-    let destination = cache_path(directory, &result.cache_key);
+pub(super) fn store(cache_directory: &Path, result: &SimulationResult) -> Result<()> {
+    fs::create_dir_all(cache_directory).map_err(|error| PotError::io(&error))?;
+    let destination = cache_path(cache_directory, &result.cache_key);
     let bytes = serde_json::to_vec(result).map_err(|error| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -256,7 +253,7 @@ pub(super) fn store(directory: &Path, result: &SimulationResult) -> Result<()> {
         )
     })?;
 
-    let (temporary_path, mut file) = create_temporary(&cache_directory)?;
+    let (temporary_path, mut file) = create_temporary(cache_directory)?;
     let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temporary_path);
@@ -267,18 +264,15 @@ pub(super) fn store(directory: &Path, result: &SimulationResult) -> Result<()> {
         let _ = fs::remove_file(&temporary_path);
         return Err(PotError::io(&error));
     }
-    if let Ok(directory_file) = File::open(&cache_directory) {
+    if let Ok(directory_file) = File::open(cache_directory) {
         let _ = directory_file.sync_all();
     }
     Ok(())
 }
 
-fn cache_path(directory: &Path, key: &str) -> PathBuf {
+fn cache_path(cache_directory: &Path, key: &str) -> PathBuf {
     let digest = key.strip_prefix("sha256:").unwrap_or(key);
-    directory
-        .join(".potter")
-        .join("cache")
-        .join(format!("sha256-{digest}.json"))
+    cache_directory.join(format!("sha256-{digest}.json"))
 }
 
 fn create_temporary(directory: &Path) -> Result<(PathBuf, File)> {
