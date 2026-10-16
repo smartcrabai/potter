@@ -4571,7 +4571,7 @@ mod tests {
             suppressed: &suppressed,
         };
         let evaluated_nodes = std::collections::BTreeSet::from([emitter_id.clone()]);
-        let error = match super::render_simulated_particles(
+        let Err(error) = super::render_simulated_particles(
             &doc,
             gate,
             &particles,
@@ -4579,9 +4579,8 @@ mod tests {
             &mut std::collections::BTreeMap::new(),
             &mut std::collections::BTreeMap::new(),
             &evaluated_nodes,
-        ) {
-            Ok(_) => return Err("combined visible systems must exceed the per-emitter limit"),
-            Err(error) => error,
+        ) else {
+            return Err("combined visible systems must exceed the per-emitter limit");
         };
         assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
         assert_eq!(error.details["count"], serde_json::json!(120_002));
