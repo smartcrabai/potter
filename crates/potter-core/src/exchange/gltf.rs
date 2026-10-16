@@ -4733,6 +4733,45 @@ fn node_world_matrices(nodes: &[Value], parents: &[Option<usize>]) -> Result<Vec
         .collect()
 }
 
+/// The rest-world matrix of each imported skin bone, using the armature and glTF node frames.
+fn imported_bone_world_matrices(
+    doc: &SceneDoc,
+    skins: &[ImportedSkin],
+    node_ids: &[Id],
+    node_worlds: &[DMat4],
+    basis: DMat4,
+) -> Result<BTreeMap<(Id, Id), DMat4>> {
+    let mut worlds = BTreeMap::new();
+    let mut armatures = BTreeSet::new();
+    let inverse_basis = basis.inverse();
+    for skin in skins {
+        if !armatures.insert(skin.armature_node.clone()) {
+            continue;
+        }
+        let armature = doc
+            .data_blocks
+            .get(&skin.armature_data_id)
+            .and_then(|data| data.armature.as_ref())
+            .ok_or_else(|| import_error("imported skin armature data is missing"))?;
+        let armature_world = node_ids
+            .iter()
+            .position(|id| id == &skin.armature_node)
+            .map_or(DMat4::IDENTITY, |index| {
+                inverse_basis * node_worlds[index] * basis
+            });
+        for (bone_id, matrices) in
+            crate::eval::rig::evaluate_bone_matrices(armature, &BTreeMap::new())?
+        {
+            let world = armature_world * matrices.rest;
+            if !finite_matrix(world) {
+                return Err(import_error("imported skin bone transform is non-finite"));
+            }
+            worlds.insert((skin.armature_node.clone(), bone_id), world);
+        }
+    }
+    Ok(worlds)
+}
+
 type ImportedSkinGraph = (
     Vec<ImportedSkin>,
     BTreeSet<usize>,
@@ -4819,6 +4858,7 @@ fn import_skins(
     buffers: &[Vec<u8>],
     node_values: &[Value],
     parents: &[Option<usize>],
+    source_node_worlds: &[DMat4],
     node_ids: &[Id],
     doc: &mut SceneDoc,
     used_data_ids: &mut BTreeSet<Id>,
@@ -4826,7 +4866,7 @@ fn import_skins(
     basis: DMat4,
 ) -> Result<ImportedSkinGraph> {
     let skin_values = root["skins"].as_array().map_or(&[][..], Vec::as_slice);
-    let world_matrices = node_world_matrices(node_values, parents)?;
+    let world_matrices = source_node_worlds;
     // Skins with the same `ArmatureKey` form one armature.
     let mut groups = Vec::<SkinGroup>::new();
     let mut group_by_key = BTreeMap::<ArmatureKey, usize>::new();
@@ -6062,6 +6102,8 @@ pub(crate) fn import_indexed(
     let light_ids = import_lights(&root, &mut doc, &mut used_data_ids)?;
     let node_values = root["nodes"].as_array().map_or(&[][..], Vec::as_slice);
     let parents = node_parent_indices(node_values)?;
+    let source_node_worlds = node_world_matrices(node_values, &parents)?;
+    let inverse_basis = basis.inverse();
     let mut used_node_ids = BTreeSet::new();
     let node_ids = node_values
         .iter()
@@ -6079,6 +6121,7 @@ pub(crate) fn import_indexed(
         &binaries,
         node_values,
         &parents,
+        &source_node_worlds,
         &node_ids,
         &mut doc,
         &mut used_data_ids,
@@ -6091,16 +6134,37 @@ pub(crate) fn import_indexed(
             joint_bones.insert(*joint_index, (skin.armature_node.clone(), joint_id.clone()));
         }
     }
+    let bone_worlds =
+        imported_bone_world_matrices(&doc, &imported_skins, &node_ids, &source_node_worlds, basis)?;
     let mut restored_skins = BTreeMap::<Id, Id>::new();
     for (index, node_value) in node_values.iter().enumerate() {
         if joint_nodes.contains(&index) {
             continue;
         }
+        let bone_parent =
+            parents[index].and_then(|parent_index| joint_bones.get(&parent_index).cloned());
         let mut gltf_local = node_matrix(node_value)?;
         if let Some(scale) = baked_node_scale(node_value)? {
             gltf_local *= DMat4::from_scale(scale);
         }
-        let local = basis.inverse() * gltf_local * basis;
+        let local = if let Some((armature, bone)) = &bone_parent {
+            let bone_world = bone_worlds
+                .get(&(armature.clone(), bone.clone()))
+                .copied()
+                .ok_or_else(|| {
+                    import_error("glTF bone-parented node has no imported bone frame")
+                })?;
+            let gltf_parent_world =
+                parents[index].map_or(DMat4::IDENTITY, |parent| source_node_worlds[parent]);
+            let source_world = inverse_basis * gltf_parent_world * gltf_local * basis;
+            let inverse_bone = bone_world.inverse();
+            if !finite_matrix(inverse_bone) {
+                return Err(import_error("glTF bone-parent frame is singular"));
+            }
+            inverse_bone * source_world
+        } else {
+            inverse_basis * gltf_local * basis
+        };
         let (scale, rotation, translation) = local.to_scale_rotation_translation();
         if !scale.is_finite() || !rotation.is_finite() || !translation.is_finite() {
             return Err(import_error(
@@ -6242,19 +6306,6 @@ pub(crate) fn import_indexed(
                 str::to_owned,
             )
         };
-        let bone_parent = parents[index].and_then(|parent_index| {
-            imported_skins.iter().find_map(|skin| {
-                skin.joint_node_indices
-                    .iter()
-                    .position(|joint_index| *joint_index == parent_index)
-                    .map(|joint_offset| {
-                        (
-                            skin.armature_node.clone(),
-                            skin.joint_ids[joint_offset].clone(),
-                        )
-                    })
-            })
-        });
         let (parent, parent_type, parent_bone) = if let Some((armature, bone)) = bone_parent {
             (Some(armature), crate::model::ParentType::Bone, Some(bone))
         } else {
@@ -6361,7 +6412,7 @@ pub(crate) fn import_indexed(
         });
     }
     doc.validate()?;
-    let node_worlds = node_world_matrices(node_values, &parents)?;
+    let node_worlds = source_node_worlds;
     let index = GltfIndex {
         root,
         basis,

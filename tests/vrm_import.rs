@@ -637,6 +637,40 @@ fn potter_vrm0_export_reimports_to_the_same_avatar_and_reexports_identically() -
 }
 
 #[test]
+fn vrm_versions_preserve_bone_parented_accessory_transforms() -> TestResult {
+    let (directory, source) = new_fixture()?;
+    let source_scene: Value = serde_json::from_slice(&fs::read(source.join("scene.json"))?)?;
+    for (format, filename) in [("vrm", "v1.vrm"), ("vrm0", "v0.vrm")] {
+        let file = directory.path().join(filename);
+        export(&source, format, &file)?;
+        let (_fresh_directory, imported) = init_project()?;
+        assert_eq!(import_losses(&imported, &file, format)?, loss_ids(&[]));
+        let imported_scene: Value =
+            serde_json::from_slice(&fs::read(imported.join("scene.json"))?)?;
+        for id in ["hat", "ribbon", "ribbon_mirror"] {
+            let original = &source_scene["nodes"][id];
+            let reimported = &imported_scene["nodes"][id];
+            assert_eq!(reimported["parent"], original["parent"], "{format} {id}");
+            assert_eq!(
+                reimported["parent_type"], original["parent_type"],
+                "{format} {id}"
+            );
+            assert_eq!(
+                reimported["parent_bone"], original["parent_bone"],
+                "{format} {id}"
+            );
+            assert_json_close(
+                &format!("{format}/{id}/transform"),
+                &reimported["transform"],
+                &original["transform"],
+                TOLERANCE,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn vrm_import_rejects_the_other_version_and_a_missing_vrm_extension() -> TestResult {
     let (directory, source) = new_fixture()?;
     let vrm1 = directory.path().join("v1.vrm");
