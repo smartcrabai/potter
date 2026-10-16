@@ -938,11 +938,6 @@ struct ExportVertexLayout {
     face_indices: BTreeMap<u32, BTreeMap<u32, u32>>,
 }
 
-/// Whether glTF export writes a `TEXCOORD_0`: the UV store has at least one layer, as consumed by
-/// [`export_vertex_layout`]. Missing face rows use the V-down equivalent of Blender UV `(0, 0)`: `[0, 1]`.
-pub(crate) fn exports_texcoord0(mesh: &Mesh) -> bool {
-    uv_layers::has_uv_layers(mesh)
-}
 fn export_vertex_layout(
     mesh: &Mesh,
     layers: &[Vec<DVec3>],
@@ -3192,26 +3187,6 @@ pub(crate) fn uv_layer_diagnostics(
     let surfaces = resolve_material_surfaces(doc)?;
     let plan = tex_coord_plan(doc, snapshot, &surfaces, vrm)?;
     Ok((plan.losses, plan.warnings))
-}
-
-/// UV layer losses that block lossless glTF or VRM export.
-pub(crate) fn uv_layer_losses(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    vrm: Option<(&AvatarSettings, AvatarVersion)>,
-) -> Result<Vec<Loss>> {
-    let (losses, _) = uv_layer_diagnostics(doc, snapshot, vrm)?;
-    Ok(losses)
-}
-
-/// UV selector fallbacks reported as warnings, not lossy-export gates.
-pub(crate) fn uv_layer_warnings(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    vrm: Option<(&AvatarSettings, AvatarVersion)>,
-) -> Result<Vec<PotError>> {
-    let (_, warnings) = uv_layer_diagnostics(doc, snapshot, vrm)?;
-    Ok(warnings)
 }
 
 fn preserve_vrm_material_variants(
@@ -8285,7 +8260,7 @@ mod tests {
 
     use super::{
         axis_from_gltf, axis_to_gltf, export_with_root, gltf_import_losses, import, to_glb,
-        uv_layer_losses, uv_layer_warnings,
+        uv_layer_diagnostics,
     };
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -10766,14 +10741,14 @@ mod tests {
             .ok_or("second slot binding is missing")?;
         assert_eq!(second_binding.uv.available_mask, 2);
         assert_eq!(second_binding.uv.render_index, Some(1));
-        let warnings = uv_layer_warnings(&doc, &snapshot, None)?;
+        let (losses, warnings) = uv_layer_diagnostics(&doc, &snapshot, None)?;
         assert!(warnings.iter().any(|warning| {
             warning.details["feature_id"] == "uv.layer_missing"
                 && warning.details["status"] == "fallback"
                 && warning.details["node_id"] == "instance"
                 && warning.details["material_id"] == "shared"
         }));
-        assert!(uv_layer_losses(&doc, &snapshot, None)?.is_empty());
+        assert!(losses.is_empty());
 
         let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
         let instance_mesh = document["meshes"]
@@ -10848,7 +10823,7 @@ mod tests {
             .uv_layer = Some("Missing".to_owned());
 
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let warnings = uv_layer_warnings(&doc, &snapshot, None)?;
+        let (losses, warnings) = uv_layer_diagnostics(&doc, &snapshot, None)?;
         assert!(
             warnings.iter().any(|warning| {
                 warning.details["feature_id"] == "uv.layer_missing"
@@ -10857,7 +10832,7 @@ mod tests {
             }),
             "{warnings:?}"
         );
-        assert!(uv_layer_losses(&doc, &snapshot, None)?.is_empty());
+        assert!(losses.is_empty());
         // The texture still exports, sampling the render layer.
         let (document, _) = export_root_and_binary_at_root(&doc, root.path())?;
         assert_eq!(
