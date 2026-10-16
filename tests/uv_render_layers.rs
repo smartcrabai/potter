@@ -52,6 +52,7 @@ impl Layers {
             positions: POSITIONS,
             barycentric: CENTRE,
             render: self.render,
+            available_mask: None,
         }
     }
 }

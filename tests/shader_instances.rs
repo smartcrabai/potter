@@ -394,6 +394,7 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
         positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
         barycentric: [1.0 / 3.0; 3],
         render: Some(0),
+        available_mask: None,
     };
     let mut context = HitContext::new(&groups)
         .with_images(&image_data)
@@ -461,6 +462,7 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
         positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
         barycentric: [1.0 / 3.0; 3],
         render: Some(0),
+        available_mask: None,
     };
 
     let (named_material, named_groups) = uv_map_material("Detail");
