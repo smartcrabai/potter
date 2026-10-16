@@ -2130,7 +2130,23 @@ fn apply_mesh_sequence_cache_modifier(
         )
     })?;
     let (bytes, actual_hash) = read_cache_resource(doc, project_root, &resource_id)?;
-    crate::geom::mesh_cache::evaluate(mesh, modifier, frame, fps, fps_base, &actual_hash, &bytes)
+    let is_sequence = doc
+        .resources
+        .get(&resource_id)
+        .and_then(|resource| resource.get("cache_file"))
+        .and_then(|settings| settings.get("is_sequence"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    crate::geom::mesh_cache::evaluate(
+        mesh,
+        modifier,
+        frame,
+        fps,
+        fps_base,
+        &actual_hash,
+        &bytes,
+        is_sequence,
+    )
 }
 
 const MAX_RENDERED_PARTICLES: usize = 100_000;

@@ -1,8 +1,9 @@
 //! Mesh Sequence Cache reads every UV geom parameter into the layer its `sourceName` names.
 //!
-//! `fixtures/mesh_cache_uv/two_layers.abc` is a Blender 5.2.2 export with asymmetric UVs that
-//! identify every loop. The expected UVs are matched to Blender's cache-evaluated corner positions,
-//! not to a presumed file or face order. Blender stores V up; Potter stores V down.
+//! `two_layers.abc` checks named UV parameters; `reordered_topology.abc` is one animated Blender
+//! archive where frame 2 reverses face-corner connectivity without changing counts. Expected UVs
+//! are paired with Blender-evaluated corner positions, not a presumed file or face order. Blender
+//! stores V up; Potter stores V down.
 
 use std::{
     error::Error,
@@ -11,6 +12,8 @@ use std::{
     process::Command,
 };
 
+use glam::DVec3;
+use potter_core::geom::Mesh;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -79,25 +82,27 @@ fn apply(scene: &Path, operations: &Value) -> TestResult {
     )?;
     Ok(())
 }
-
-/// Creates a plane `body`, packs the fixture as the `cache` resource, and applies `operations`.
-/// The archive is then moved into the project's asset store, as `alembic_cache.rs` does.
-fn scene_with_cache(scene: &Path, operations: Vec<Value>) -> TestResult {
+/// Creates a plane `body`, packs an Alembic archive as the `cache` resource, and applies `operations`.
+fn scene_with_archive(scene: &Path, archive: &Path, operations: Vec<Value>) -> TestResult {
     init(scene)?;
     let mut batch = vec![
         json!({"op":"node.create","id":"body","kind":"plane","params":{}}),
-        json!({"op":"resource.pack","id":"cache","uri":fixture(),"kind":"alembic"}),
+        json!({"op":"resource.pack","id":"cache","uri":archive,"kind":"alembic"}),
     ];
     batch.extend(operations);
     apply(scene, &Value::Array(batch))?;
 
-    let archive = fs::read(fixture())?;
-    let archive_hash = potter_core::hash::sha256(&archive);
+    let archive_bytes = fs::read(archive)?;
+    let archive_hash = potter_core::hash::sha256(&archive_bytes);
     let hash_hex = archive_hash.strip_prefix("sha256:").unwrap_or_default();
-    let asset_uri = format!("assets/sha256/{hash_hex}/two_layers.abc");
+    let archive_name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("cache fixture filename is not UTF-8")?;
+    let asset_uri = format!("assets/sha256/{hash_hex}/{archive_name}");
     let asset_path = scene.join(&asset_uri);
     fs::create_dir_all(asset_path.parent().ok_or("asset path has no parent")?)?;
-    fs::write(&asset_path, &archive)?;
+    fs::write(&asset_path, &archive_bytes)?;
     let scene_path = scene.join("scene.json");
     let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
     document["resources"]["cache"]["uri"] = json!(asset_uri);
@@ -109,7 +114,25 @@ fn scene_with_cache(scene: &Path, operations: Vec<Value>) -> TestResult {
     Ok(())
 }
 
+fn scene_with_cache(scene: &Path, operations: Vec<Value>) -> TestResult {
+    scene_with_archive(scene, &fixture(), operations)
+}
+fn replace_body_mesh(scene: &Path, mesh: &Mesh) -> TestResult {
+    let scene_path = scene.join("scene.json");
+    let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let data_id = document["nodes"]["body"]["data"]
+        .as_str()
+        .ok_or("body mesh data block is missing")?;
+    document["data_blocks"][data_id]["mesh"] = serde_json::to_value(mesh)?;
+    fs::write(scene_path, serde_json::to_vec_pretty(&document)?)?;
+    Ok(())
+}
+
 fn cache_modifier(read_data: &[&str]) -> Value {
+    cache_modifier_for(read_data, "/Plane/Plane")
+}
+
+fn cache_modifier_for(read_data: &[&str], object_path: &str) -> Value {
     json!({
         "op":"modifier.create",
         "target":{"id":"body"},
@@ -117,7 +140,7 @@ fn cache_modifier(read_data: &[&str]) -> Value {
         "type":"mesh_sequence_cache",
         "params":{
             "resource":"cache",
-            "object_path":"/Plane/Plane",
+            "object_path":object_path,
             "read_data":read_data,
         }
     })
@@ -135,11 +158,15 @@ struct Evaluated {
 }
 
 fn evaluate_body(scene: &Path) -> TestResult<Evaluated> {
+    evaluate_body_at(scene, 1.0)
+}
+
+fn evaluate_body_at(scene: &Path, frame: f64) -> TestResult<Evaluated> {
     let project = potter_core::store::Project::open(scene)?;
     let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
         project.doc(),
         &potter_core::eval::EvaluationContext {
-            frame: Some(1.0),
+            frame: Some(frame),
             ..potter_core::eval::EvaluationContext::default()
         },
         Some(project.path()),
@@ -399,5 +426,95 @@ fn cache_writes_named_layers_past_the_first_and_reports_the_one_without_room() -
     assert_eq!(warning["status"], json!("dropped"));
     assert_eq!(warning["layer"], json!("Light"));
     assert_eq!(warning["limit"], json!(8));
+    Ok(())
+}
+
+#[test]
+fn topology_change_reloads_uvs_for_same_count_corner_reorder() -> TestResult {
+    let directory = tempdir()?;
+    let scene = directory.path().join("reordered.pot");
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mesh_cache_uv");
+    let archive = fixture_dir.join("reordered_topology.abc");
+    let oracle: Value =
+        serde_json::from_slice(&fs::read(fixture_dir.join("reordered_topology.json"))?)?;
+    let frames = oracle["frames"]
+        .as_array()
+        .ok_or("topology UV oracle frames are missing")?;
+    let frame_one = frames
+        .iter()
+        .find(|frame| frame["frame"] == 1)
+        .ok_or("frame-one topology UV oracle is missing")?;
+    let frame_two = frames
+        .iter()
+        .find(|frame| frame["frame"] == 2)
+        .ok_or("frame-two topology UV oracle is missing")?;
+    let faces_one: Vec<Vec<usize>> = serde_json::from_value(frame_one["faces"].clone())?;
+    let faces_two: Vec<Vec<usize>> = serde_json::from_value(frame_two["faces"].clone())?;
+    assert_eq!(
+        faces_one.iter().map(Vec::len).collect::<Vec<_>>(),
+        faces_two.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    assert_ne!(
+        faces_one, faces_two,
+        "the animated archive must reorder face corners without changing counts"
+    );
+
+    scene_with_archive(&scene, &archive, Vec::new())?;
+    let positions: Vec<[f64; 3]> = serde_json::from_value(frame_one["positions"].clone())?;
+    let mut receiver = Mesh::from_positions_and_faces(
+        positions.iter().copied().map(DVec3::from_array).collect(),
+        faces_one.clone(),
+    )?;
+    let stale_uv = [[0.91, 0.13], [0.82, 0.24], [0.73, 0.35], [0.64, 0.46]];
+    receiver.attributes.insert(
+        "uv_layers".to_owned(),
+        json!({
+            "layers":[{"name":"UVMap","faces":[{"face_id":receiver.faces[0].id,"uv":stale_uv}]}],
+            "active":"UVMap",
+            "render":"UVMap"
+        }),
+    );
+    replace_body_mesh(&scene, &receiver)?;
+    apply(
+        &scene,
+        &json!([cache_modifier_for(&["VERT"], "/Reordered/Reordered")]),
+    )?;
+
+    let before_reorder = evaluate_body_at(&scene, 1.0)?;
+    let before_layers = layers(&before_reorder.store)?;
+    assert_corners(
+        layer(&before_layers, "UVMap")?,
+        &stale_uv,
+        "unchanged topology keeps input UVs",
+    );
+
+    let after_reorder = evaluate_body_at(&scene, 2.0)?;
+    let after_layers = layers(&after_reorder.store)?;
+    let cached_uvs = layer(&after_layers, "UVMap")?;
+    let positions: Vec<[f64; 3]> = serde_json::from_value(frame_two["positions"].clone())?;
+    let faces: Vec<Vec<usize>> = serde_json::from_value(frame_two["faces"].clone())?;
+    let uv_values = frame_two["uvs"]
+        .as_array()
+        .ok_or("frame-two UV oracle values are missing")?;
+    let mut expected = Vec::with_capacity(uv_values.len());
+    let mut corner = 0;
+    for face in faces {
+        for vertex in face {
+            let [u, v] = pair(
+                uv_values
+                    .get(corner)
+                    .ok_or("frame-two UV oracle row is truncated")?,
+            )?;
+            expected.push((positions[vertex], [u, 1.0 - v]));
+            corner += 1;
+        }
+    }
+    assert_eq!(corner, uv_values.len());
+    assert_corner_associations(
+        &after_reorder.corner_positions,
+        cached_uvs,
+        &expected,
+        "reordered cache UVs",
+    );
     Ok(())
 }

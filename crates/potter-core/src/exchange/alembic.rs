@@ -4387,10 +4387,26 @@ mod tests {
         // Sampling never refuses; strict export refuses on the losses from `attribute_losses`.
         assert!(mesh_sample(&mesh).is_ok());
         let losses = crate::exchange::mesh_attribute_losses("alembic", "triangle", &mesh);
-        assert!(losses.iter().any(|loss| loss.feature_id == "mesh.color_attribute"));
-        assert!(losses.iter().any(|loss| loss.reason.contains("mesh attribute `weight`")));
-        assert!(losses.iter().any(|loss| loss.reason.contains("mesh attribute `seam`")));
-        assert!(losses.iter().all(|loss| !loss.reason.contains("alembic_normals")));
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "mesh.color_attribute")
+        );
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.reason.contains("mesh attribute `weight`"))
+        );
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.reason.contains("mesh attribute `seam`"))
+        );
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("alembic_normals"))
+        );
         Ok(())
     }
 
@@ -4403,7 +4419,11 @@ mod tests {
             extent: 1,
             sample_count,
             first_changed: if constant { 0 } else { 1 },
-            last_changed: if constant { 0 } else { sample_count.saturating_sub(1) },
+            last_changed: if constant {
+                0
+            } else {
+                sample_count.saturating_sub(1)
+            },
             constant,
             time_sampling_index: 0,
             metadata: BTreeMap::new(),

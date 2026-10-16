@@ -43,6 +43,7 @@ pub(crate) fn evaluate(
     fps_base: f64,
     resource_hash: &str,
     archive_bytes: &[u8],
+    is_sequence: bool,
 ) -> Result<Vec<PotError>> {
     let resource = string_param(modifier, "resource")?;
     let object_path = string_param(modifier, "object_path")?;
@@ -60,7 +61,7 @@ pub(crate) fn evaluate(
         ),
     };
     let interpolate = bool_param(modifier, "use_vertex_interpolation")?;
-    let read = read_params(modifier)?;
+    let mut read = read_params(modifier)?;
     let rate = f64::from(fps) / fps_base;
     if !rate.is_finite() || rate <= 0.0 {
         return Err(PotError::with_details(
@@ -79,44 +80,15 @@ pub(crate) fn evaluate(
         ));
     }
 
-    let key = format!(
-        "{resource_hash}\0{object_path}\0{}\0{}\0{}",
-        read.uv,
-        read.color,
-        velocity_scale != 0.0
-    );
-    let samples = {
-        let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "Alembic mesh cache lock is poisoned",
-            )
-        })?;
-        if let Some(samples) = parsed.get(&key) {
-            Arc::clone(samples)
-        } else {
-            let samples = Arc::new(alembic::read_mesh_cache(
-                archive_bytes,
-                object_path,
-                read.uv,
-                read.color,
-                velocity_scale != 0.0,
-            )?);
-            if samples.windows(2).any(|pair| {
-                pair.first()
-                    .zip(pair.get(1))
-                    .is_some_and(|(first, second)| first.time_seconds > second.time_seconds)
-            }) {
-                return Err(PotError::with_details(
-                    ErrorCode::EvaluationFailed,
-                    "Alembic mesh cache sample times are not ordered",
-                    json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
-                ));
-            }
-            parsed.insert(key, Arc::clone(&samples));
-            samples
-        }
-    };
+    let mut samples = cached_mesh_cache_samples(
+        archive_bytes,
+        resource_hash,
+        &resource,
+        &object_path,
+        read,
+        velocity_scale != 0.0,
+        modifier,
+    )?;
     if samples.is_empty() {
         return Err(PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -132,19 +104,28 @@ pub(crate) fn evaluate(
                 json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
             )
         })?;
-        !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces)
+        let input_corners = mesh
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
+        let cache_corners = sample.sample.faces.iter().map(Vec::len).sum::<usize>();
+        let dimensions_changed = mesh.vertices.len() != sample.sample.positions.len()
+            || mesh.faces.len() != sample.sample.faces.len()
+            || input_corners != cache_corners;
+        dimensions_changed
+            || ((is_sequence || sample.sample.connectivity_is_animated)
+                && !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces))
     };
     if topology_changed {
-        // Blender's file-sequence reader rereads all supported streams for changed connectivity.
         read = ReadAttributes::ALL;
         samples = cached_mesh_cache_samples(
             archive_bytes,
             resource_hash,
-            resource,
-            object_path,
+            &resource,
+            &object_path,
             read,
-            velocity_name,
-            velocity_factor != 0.0,
+            velocity_scale != 0.0,
             modifier,
         )?;
         if samples.is_empty() {
@@ -258,14 +239,12 @@ fn cached_mesh_cache_samples(
     resource: &str,
     object_path: &str,
     read: ReadAttributes,
-    velocity_name: &str,
     read_velocity: bool,
     modifier: &Modifier,
 ) -> Result<Arc<Vec<MeshCacheSample>>> {
-    let velocity_parameter = if read_velocity { velocity_name } else { "" };
     let key = format!(
-        "{resource_hash}\0{object_path}\0{}\0{}\0{}\0{}",
-        read.uv, read.color, read.polygons, velocity_parameter
+        "{resource_hash}\0{object_path}\0{}\0{}\0{}",
+        read.uv, read.color, read_velocity
     );
     let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
         PotError::new(
@@ -281,8 +260,7 @@ fn cached_mesh_cache_samples(
         object_path,
         read.uv,
         read.color,
-        read.polygons,
-        velocity_parameter,
+        read_velocity,
     )?);
     if samples.windows(2).any(|pair| {
         pair.first()
