@@ -1,46 +1,28 @@
-//! Exact-predicate polygon Boolean operations using a BSP boundary representation.
+//! Boolean operations on polygon meshes.
 //!
-//! Plane-side classification uses adaptive exact `orient3d` predicates outside a small,
-//! scale-relative coplanar tolerance that absorbs transform roundoff on planar faces.
-//! The same tolerance reunites coordinates introduced by floating-point edge interpolation.
+//! `EXACT` (the default solver) is Blender's Mesh Arrangements, ported under `boolean/`: exact
+//! rational intersection, classification of the intersected triangles, and assembly of the output
+//! polygons with Blender's attribute rules.
+//!
+//! `FLOAT` runs the BSP boundary representation below: plane-side classification with exact
+//! `orient3d` predicates outside a small, scale-relative coplanar tolerance, f64 intersections, and
+//! post-hoc coplanar merging. It is a shortcut until `PR17b` ports Blender's float path.
 
-// Mesh Arrangements modules: exercised by unit tests until PR17a-2 wires them into the modifier.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
-)]
 mod cdt;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
-)]
+mod classify;
+mod dissolve;
 mod exact;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
-)]
 mod imesh;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
-)]
 mod input;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
-)]
 mod intersect;
+mod output;
 #[cfg(test)]
 mod tests;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
-)]
 mod triangulate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use glam::DVec3;
+use glam::{DMat4, DVec3};
 use robust::{Coord3D, orient3d};
 
 use crate::{
@@ -51,15 +33,21 @@ use crate::{
     },
 };
 
+use classify::{BoolOp, boolean_tris};
+use dissolve::polymesh_from_tris;
+use imesh::Arena;
+use input::{Operand, meshes_to_tris};
+use output::{OutputMaterials, polys_to_mesh};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Operation {
+pub(crate) enum Operation {
     Union,
     Difference,
     Intersect,
 }
 
 impl Operation {
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_uppercase().as_str() {
             "UNION" => Ok(Self::Union),
             "DIFFERENCE" => Ok(Self::Difference),
@@ -71,6 +59,147 @@ impl Operation {
             )),
         }
     }
+}
+
+/// Blender `material_mode`: how operand material indices map to output material indices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MaterialMode {
+    /// Each operand slot takes the subject slot holding the same material, or keeps its index.
+    Index,
+    /// The subject's slots come first, then each operand's new materials are appended to one pool.
+    Transfer,
+}
+
+/// One operand of the N-ary EXACT Boolean, resolved by the evaluator in the subject's space.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanOperand {
+    /// The operand's mesh in its object space.
+    pub mesh: Mesh,
+    /// Object space to subject space (Blender `world_to_object * operand_world`).
+    pub to_subject: DMat4,
+    /// Output material index for each local material index; empty keeps every index.
+    pub material_remap: Vec<u32>,
+}
+
+/// Blender `non_float_boolean_mesh` for the EXACT solver: `subject` is operand 0 with the identity
+/// transform, and `operands` follow in order. One N-ary call, so a collection is never folded
+/// pairwise.
+///
+/// # Errors
+/// Returns `INVALID_ARGUMENT` for an invalid operand mesh, and the errors of the exact pipeline
+/// stages.
+pub(crate) fn exact_boolean(
+    subject: &Mesh,
+    operands: &[BooleanOperand],
+    operation: Operation,
+    use_self: bool,
+    hole_tolerant: bool,
+) -> Result<Mesh> {
+    let mut joined = Vec::with_capacity(operands.len() + 1);
+    joined.push(Operand {
+        mesh: subject,
+        transform: DMat4::IDENTITY,
+    });
+    joined.extend(operands.iter().map(|operand| Operand {
+        mesh: &operand.mesh,
+        transform: operand.to_subject,
+    }));
+    // The subject keeps its own indices (empty remap); each operand uses its table.
+    let mut remap = vec![Vec::new()];
+    remap.extend(
+        operands
+            .iter()
+            .map(|operand| operand.material_remap.clone()),
+    );
+
+    // Blender `mesh_id_for_face`: a triangle's `orig` is a global face index, mapped to the
+    // operand whose face range holds it.
+    let mut face_starts = Vec::with_capacity(joined.len());
+    let mut face_total = 0_usize;
+    for operand in &joined {
+        face_starts.push(face_total);
+        face_total += operand.mesh.faces.len();
+    }
+    let shape_of = |orig: i32| -> usize {
+        usize::try_from(orig).map_or(0, |face| {
+            face_starts
+                .partition_point(|&start| start <= face)
+                .saturating_sub(1)
+        })
+    };
+
+    let mut arena = Arena::new();
+    let tris = meshes_to_tris(&joined, &mut arena)?;
+    let intersected = boolean_tris(
+        &mut arena,
+        &tris,
+        joined.len(),
+        &shape_of,
+        bool_op(operation),
+        use_self,
+        hole_tolerant,
+    )?;
+    let polys = polymesh_from_tris(&arena, &intersected);
+    polys_to_mesh(&polys, &arena, &joined, &OutputMaterials { remap: &remap })
+}
+
+/// Blender `BoolOpType` for an operation.
+fn bool_op(operation: Operation) -> BoolOp {
+    match operation {
+        Operation::Union => BoolOp::Union,
+        Operation::Difference => BoolOp::Difference,
+        Operation::Intersect => BoolOp::Intersect,
+    }
+}
+
+/// Blender `material_remaps` (`non_float_boolean_mesh`): output material indices for each operand.
+///
+/// `subject` and every entry of `operands` list one object's material slots by material identity,
+/// in slot order. The result has one entry per operand, subject first. The subject's entry is
+/// empty, so its indices stay. An operand's entry maps its local index to the output index:
+/// - INDEX: the subject slot holding the same material, or the local index when none does.
+/// - TRANSFER: the pooled index. The pool starts with the subject's slots, and each operand's
+///   materials not yet in it are appended.
+///
+/// Potter's evaluated meshes carry no slot list, so the TRANSFER pool exists only as the index
+/// space of the output faces.
+#[must_use]
+pub(crate) fn material_remaps<'a>(
+    mode: MaterialMode,
+    subject: &[&'a str],
+    operands: &[Vec<&'a str>],
+) -> Vec<Vec<u32>> {
+    let mut pool: Vec<&'a str> = subject.to_vec();
+    let mut remaps = vec![Vec::new()];
+    for slots in operands {
+        let remap = slots
+            .iter()
+            .enumerate()
+            .map(|(local, &material)| {
+                let index = match mode {
+                    MaterialMode::Index => subject
+                        .iter()
+                        .position(|&slot| slot == material)
+                        .unwrap_or(local),
+                    MaterialMode::Transfer => pool
+                        .iter()
+                        .position(|&slot| slot == material)
+                        .unwrap_or_else(|| {
+                            pool.push(material);
+                            pool.len() - 1
+                        }),
+                };
+                slot_index(index)
+            })
+            .collect();
+        remaps.push(remap);
+    }
+    remaps
+}
+
+/// Output material indices are slot numbers, which always fit in `u32`.
+fn slot_index(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX)
 }
 
 #[derive(Clone, Debug)]
@@ -429,13 +558,19 @@ impl BspNode {
 /// # Errors
 /// Returns `INVALID_ARGUMENT` for invalid meshes, degenerate output, or an unknown operation.
 pub fn boolean_mesh(source: &Mesh, operand: &Mesh, operation: &str) -> Result<Mesh> {
+    boolean_mesh_op(source, operand, Operation::parse(operation)?)
+}
+
+/// The FLOAT-solver BSP Boolean with the operation already parsed (see [`boolean_mesh`]).
+///
+/// shortcut: FLOAT is the pre-PR17 BSP until `PR17b` ports Blender's float path. EXACT never calls it.
+pub(crate) fn boolean_mesh_op(source: &Mesh, operand: &Mesh, operation: Operation) -> Result<Mesh> {
     source.validate().map_err(|error| {
         PotError::invalid_argument(format!("invalid boolean source mesh: {error}"))
     })?;
     operand.validate().map_err(|error| {
         PotError::invalid_argument(format!("invalid boolean operand mesh: {error}"))
     })?;
-    let operation = Operation::parse(operation)?;
     if source.faces.is_empty() {
         return if operation == Operation::Union {
             let mut result = operand.clone();

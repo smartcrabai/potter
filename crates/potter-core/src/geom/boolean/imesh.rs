@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 
-use super::exact::{Rat3, rat_to_f64, rat3_from_dvec3};
+#[cfg(test)]
+use super::exact::rat3_from_dvec3;
+use super::exact::{Rat3, rat_to_f64};
 
 /// Blender `NO_INDEX`: "no original element" (created by the algorithm).
 pub const NO_INDEX: i32 = -1;
@@ -40,6 +42,7 @@ impl Arena {
         &self.verts[id as usize]
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn num_verts(&self) -> usize {
         self.verts.len()
@@ -59,6 +62,7 @@ impl Arena {
     }
 
     /// Adds a vertex from its double position (exact value of the double).
+    #[cfg(test)]
     pub fn add_or_find_dvec(&mut self, co: DVec3, orig: i32) -> u32 {
         self.add_or_find_vert(rat3_from_dvec3(co), orig)
     }

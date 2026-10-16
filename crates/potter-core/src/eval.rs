@@ -3211,6 +3211,19 @@ pub(crate) fn apply_scene_operand_modifier(
     if modifier.modifier_type == "hook" {
         return apply_scene_hook_modifier(mesh, modifier, subject_id, doc, world_matrices);
     }
+    if modifier.modifier_type == "boolean"
+        && crate::geom::modifiers::BooleanSettings::parse(modifier)?.solver
+            != crate::geom::modifiers::BooleanSolver::Float
+    {
+        return apply_boolean_operands_modifier(
+            mesh,
+            modifier,
+            subject_id,
+            doc,
+            world_matrices,
+            evaluated_meshes,
+        );
+    }
     if matches!(
         modifier.modifier_type.as_str(),
         "boolean" | "shrinkwrap" | "curve"
@@ -3514,11 +3527,64 @@ fn apply_scene_hook_modifier(
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
 }
-fn collect_modifier_collection_objects(
+/// Object IDs that a Boolean modifier takes as operands for `operand_type`: the `object` parameter,
+/// or, for COLLECTION, every object of the `collection` parameter in collection order.
+fn boolean_operand_object_ids(
+    modifier: &Modifier,
+    doc: &SceneDoc,
+    operand_type: crate::geom::modifiers::BooleanOperandType,
+) -> Result<Vec<Id>> {
+    use crate::geom::modifiers::BooleanOperandType;
+    let (parameter, kind) = match operand_type {
+        BooleanOperandType::Object => ("object", "object"),
+        BooleanOperandType::Collection => ("collection", "collection"),
+    };
+    let text = modifier
+        .params
+        .get(parameter)
+        .ok_or_else(|| boolean_operand_required(modifier, parameter))?
+        .as_str()
+        .ok_or_else(|| {
+            PotError::invalid_argument(format!(
+                "modifier `{}` `{parameter}` must be a {kind} ID",
+                modifier.modifier_type
+            ))
+        })?;
+    let id = Id::new(text).map_err(|_| {
+        PotError::invalid_argument(format!(
+            "modifier `{}` `{parameter}` must be a valid {kind} ID",
+            modifier.modifier_type
+        ))
+    })?;
+    if operand_type == BooleanOperandType::Object {
+        return Ok(vec![id]);
+    }
+    let mut object_ids = Vec::new();
+    collect_collection_objects_in_order(doc, &id, &mut BTreeSet::new(), &mut object_ids)?;
+    if object_ids.is_empty() {
+        return Err(boolean_operand_required(modifier, parameter));
+    }
+    Ok(object_ids)
+}
+
+fn boolean_operand_required(modifier: &Modifier, parameter: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::InvalidArgument,
+        format!(
+            "modifier `{}` requires an object or collection operand",
+            modifier.modifier_type
+        ),
+        json!({"modifier_id":modifier.id,"pointer":format!("/params/{parameter}")}),
+    )
+}
+
+/// Blender `FOREACH_COLLECTION_OBJECT_RECURSIVE` order: a collection's objects, then its child
+/// collections, each object once.
+fn collect_collection_objects_in_order(
     doc: &SceneDoc,
     collection_id: &Id,
     visited: &mut BTreeSet<Id>,
-    object_ids: &mut BTreeSet<Id>,
+    object_ids: &mut Vec<Id>,
 ) -> Result<()> {
     if !visited.insert(collection_id.clone()) {
         return Ok(());
@@ -3530,13 +3596,166 @@ fn collect_modifier_collection_objects(
             json!({"collection":collection_id}),
         )
     })?;
-    object_ids.extend(collection.objects.iter().cloned());
+    for object_id in &collection.objects {
+        if !object_ids.contains(object_id) {
+            object_ids.push(object_id.clone());
+        }
+    }
     for child in &collection.children {
-        collect_modifier_collection_objects(doc, child, visited, object_ids)?;
+        collect_collection_objects_in_order(doc, child, visited, object_ids)?;
     }
     Ok(())
 }
+
+fn collect_modifier_collection_objects(
+    doc: &SceneDoc,
+    collection_id: &Id,
+    visited: &mut BTreeSet<Id>,
+    object_ids: &mut BTreeSet<Id>,
+) -> Result<()> {
+    let mut ordered = Vec::new();
+    collect_collection_objects_in_order(doc, collection_id, visited, &mut ordered)?;
+    object_ids.extend(ordered);
+    Ok(())
+}
+
+/// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
+/// its vertex groups) and its transform into the subject's space. Also returns its material slots.
+fn boolean_operand<'d>(
+    modifier: &Modifier,
+    doc: &'d SceneDoc,
+    object_id: &Id,
+    subject_inverse: DMat4,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+) -> Result<(crate::geom::boolean::BooleanOperand, &'d [Id])> {
+    let object = doc.nodes.get(object_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier operand object `{object_id}` was not found"),
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    let data_id = object.data.as_ref().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            format!("modifier operand object `{object_id}` has no geometry"),
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    let data = doc.data_blocks.get(data_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier operand data `{data_id}` was not found"),
+            json!({"modifier_id":modifier.id,"data":data_id}),
+        )
+    })?;
+    if data.data_type != "mesh" {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Boolean operands must be mesh objects",
+            json!({"feature_id":"modifier.boolean","modifier_id":modifier.id,"object":object_id}),
+        ));
+    }
+    let mesh = if let Some(evaluated) = evaluated_meshes.get(object_id) {
+        evaluated.clone()
+    } else {
+        let mut base = data.mesh.clone().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "mesh modifier operand has no mesh payload",
+                json!({"modifier_id":modifier.id,"object":object_id}),
+            )
+        })?;
+        attach_vertex_group_weights(&mut base, data);
+        base
+    };
+    let object_world = world_matrices.get(object_id).copied().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "modifier operand world matrix is missing",
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    let operand = crate::geom::boolean::BooleanOperand {
+        mesh,
+        to_subject: subject_inverse * object_world,
+        material_remap: Vec::new(),
+    };
+    Ok((operand, object.materials.as_slice()))
+}
+
+/// The Boolean operands of an EXACT (or MANIFOLD, refused by the modifier) solver. The subject is
+/// operand 0 and is not listed; each operand object keeps its own mesh and transform, and the
+/// modifier combines them in one N-ary call, so a collection is never folded pairwise.
+fn apply_boolean_operands_modifier(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+) -> Result<()> {
+    let settings = crate::geom::modifiers::BooleanSettings::parse(modifier)?;
+    let object_ids = boolean_operand_object_ids(modifier, doc, settings.operand_type)?;
+    let subject = doc.nodes.get(subject_id).ok_or_else(|| {
+        PotError::new(ErrorCode::InternalError, "modifier subject node is missing")
+    })?;
+    let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "modifier subject world matrix is missing",
+        )
+    })?;
+    let subject_inverse = subject_world.inverse();
+    if !subject_inverse.is_finite() {
+        return Err(PotError::invalid_argument(
+            "modifier subject transform must be invertible",
+        ));
+    }
+    let mut operands = Vec::new();
+    let mut operand_slots = Vec::new();
+    for object_id in object_ids
+        .iter()
+        .filter(|object_id| *object_id != subject_id)
+    {
+        let (operand, slots) = boolean_operand(
+            modifier,
+            doc,
+            object_id,
+            subject_inverse,
+            world_matrices,
+            evaluated_meshes,
+        )?;
+        operands.push(operand);
+        operand_slots.push(slots);
+    }
+    if operands.is_empty() {
+        return Err(PotError::invalid_argument("modifier operand is empty"));
+    }
+    let operand_slot_names: Vec<Vec<&str>> = operand_slots
+        .iter()
+        .map(|slots| slots.iter().map(Id::as_str).collect())
+        .collect();
+    let subject_slots: Vec<&str> = subject.materials.iter().map(Id::as_str).collect();
+    let remaps = crate::geom::boolean::material_remaps(
+        settings.material_mode,
+        &subject_slots,
+        &operand_slot_names,
+    );
+    for (operand, remap) in operands.iter_mut().zip(remaps.into_iter().skip(1)) {
+        operand.material_remap = remap;
+    }
+    let mut resolved = modifier.clone();
+    for parameter in ["object", "collection", "target"] {
+        resolved.params.remove(parameter);
+    }
+    resolved.runtime.boolean_operands = operands;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    Ok(())
+}
 fn combine_scene_operand_meshes(first: &Mesh, second: &Mesh, modifier_type: &str) -> Result<Mesh> {
+    // shortcut: FLOAT folds collection members pairwise until PR17b; EXACT never reaches here.
     if modifier_type == "boolean" {
         return crate::geom::boolean::boolean_mesh(first, second, "UNION");
     }

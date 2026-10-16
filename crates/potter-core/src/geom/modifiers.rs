@@ -522,17 +522,143 @@ fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> Po
     )
 }
 
+/// Blender `solver` of the Boolean modifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BooleanSolver {
+    /// Mesh Arrangements (`geom::boolean`).
+    Exact,
+    /// Blender's FLOAT solver. Potter uses the BSP shortcut until `PR17b` ports Blender's float path.
+    Float,
+    /// Blender's MANIFOLD solver, which Potter does not implement.
+    Manifold,
+}
+
+/// Blender `operand_type` of the Boolean modifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BooleanOperandType {
+    Object,
+    Collection,
+}
+
+/// Validated Boolean modifier parameters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BooleanSettings {
+    pub solver: BooleanSolver,
+    pub operation: super::boolean::Operation,
+    pub operand_type: BooleanOperandType,
+    pub use_self: bool,
+    pub hole_tolerant: bool,
+    pub material_mode: super::boolean::MaterialMode,
+}
+
+impl BooleanSettings {
+    /// Reads the Boolean parameters with Blender's defaults. `debug_options` is not read (Blender
+    /// reads it only in debug builds), and `double_threshold` is FLOAT-only.
+    pub(crate) fn parse(modifier: &Modifier) -> Result<Self> {
+        let solver = match boolean_text(modifier, "solver", "EXACT")? {
+            "EXACT" => BooleanSolver::Exact,
+            "FLOAT" => BooleanSolver::Float,
+            "MANIFOLD" => BooleanSolver::Manifold,
+            _ => {
+                return Err(invalid_parameter(
+                    modifier,
+                    "solver",
+                    "EXACT, FLOAT, or MANIFOLD",
+                ));
+            }
+        };
+        let operation =
+            super::boolean::Operation::parse(boolean_text(modifier, "operation", "DIFFERENCE")?)
+                .map_err(|_| {
+                    invalid_parameter(modifier, "operation", "UNION, DIFFERENCE, or INTERSECT")
+                })?;
+        let operand_type = match boolean_text(modifier, "operand_type", "OBJECT")? {
+            "OBJECT" => BooleanOperandType::Object,
+            "COLLECTION" => BooleanOperandType::Collection,
+            _ => {
+                return Err(invalid_parameter(
+                    modifier,
+                    "operand_type",
+                    "OBJECT or COLLECTION",
+                ));
+            }
+        };
+        let material_mode = match boolean_text(modifier, "material_mode", "INDEX")? {
+            "INDEX" => super::boolean::MaterialMode::Index,
+            "TRANSFER" => super::boolean::MaterialMode::Transfer,
+            _ => {
+                return Err(invalid_parameter(
+                    modifier,
+                    "material_mode",
+                    "INDEX or TRANSFER",
+                ));
+            }
+        };
+        Ok(Self {
+            solver,
+            operation,
+            operand_type,
+            use_self: boolean_flag(modifier, "use_self")?,
+            hole_tolerant: boolean_flag(modifier, "use_hole_tolerant")?,
+            material_mode,
+        })
+    }
+}
+
+/// A Boolean string parameter, or `default` when it is absent.
+fn boolean_text<'m>(
+    modifier: &'m Modifier,
+    parameter: &str,
+    default: &'static str,
+) -> Result<&'m str> {
+    match modifier.params.get(parameter) {
+        None => Ok(default),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| invalid_parameter(modifier, parameter, "a string")),
+    }
+}
+
+/// A Boolean flag parameter, `false` when it is absent.
+fn boolean_flag(modifier: &Modifier, parameter: &str) -> Result<bool> {
+    match modifier.params.get(parameter) {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid_parameter(modifier, parameter, "true or false")),
+    }
+}
+
 fn boolean_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let operand = modifier
-        .runtime
-        .operand_mesh
-        .clone()
-        .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh object operand"))?;
-    let operand: Mesh = serde_json::from_value(operand)
-        .map_err(|_| invalid_parameter(modifier, "object", "a mesh object operand"))?;
-    let operation =
-        string_param_with_expected(modifier, "operation", "UNION, DIFFERENCE, or INTERSECT")?;
-    super::boolean::boolean_mesh(mesh, &operand, operation)
+    let settings = BooleanSettings::parse(modifier)?;
+    match settings.solver {
+        BooleanSolver::Exact => super::boolean::exact_boolean(
+            mesh,
+            &modifier.runtime.boolean_operands,
+            settings.operation,
+            settings.use_self,
+            settings.hole_tolerant,
+        ),
+        BooleanSolver::Manifold => Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Boolean MANIFOLD solver is not supported",
+            json!({
+                "feature_id": "modifier.boolean.solver_manifold",
+                "modifier_id": modifier.id,
+                "solver": "MANIFOLD",
+            }),
+        )),
+        // shortcut: FLOAT is the pre-PR17 BSP until PR17b ports Blender's float path.
+        BooleanSolver::Float => {
+            let operand =
+                modifier.runtime.operand_mesh.clone().ok_or_else(|| {
+                    invalid_parameter(modifier, "object", "a mesh object operand")
+                })?;
+            let operand: Mesh = serde_json::from_value(operand)
+                .map_err(|_| invalid_parameter(modifier, "object", "a mesh object operand"))?;
+            super::boolean::boolean_mesh_op(mesh, &operand, settings.operation)
+        }
+    }
 }
 
 fn mesh_error(error: &MeshError) -> PotError {

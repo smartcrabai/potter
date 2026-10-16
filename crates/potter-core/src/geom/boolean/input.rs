@@ -148,7 +148,7 @@ fn to_index(index: usize) -> Result<i32> {
 }
 
 /// Blender `clean_transform`: entries within `1e-6` of `0`, `1`, or `-1` snap to that value.
-fn clean_transform(mat: Mat4) -> Mat4 {
+pub(crate) fn clean_transform(mat: Mat4) -> Mat4 {
     Mat4::from_cols_array_2d(&mat.to_cols_array_2d().map(|column| column.map(clean_entry)))
 }
 

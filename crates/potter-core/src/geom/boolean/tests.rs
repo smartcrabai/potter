@@ -123,3 +123,19 @@ fn subdivision_conserves_exact_vector_area_per_input_face() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn material_remaps_index_matches_subject_slots_and_transfer_pools_new_materials() {
+    use crate::geom::boolean::{MaterialMode, material_remaps};
+    let subject = ["A0", "A1"];
+    let operands = [vec!["A1", "B0"], vec!["B0", "C0"]];
+    assert_eq!(
+        material_remaps(MaterialMode::Index, &subject, &operands),
+        vec![vec![], vec![1, 1], vec![0, 1]]
+    );
+    assert_eq!(
+        material_remaps(MaterialMode::Transfer, &subject, &operands),
+        vec![vec![], vec![1, 2], vec![2, 3]]
+    );
+}
+
