@@ -944,7 +944,7 @@ fn apply_modifier(
             continue;
         }
         let target_modifier = modifier_to_apply(engine, &target, &modifier_id)?;
-        let evaluated = evaluate_modifier_output(
+        let (evaluated, material_slots) = evaluate_modifier_output(
             engine,
             &target,
             &data_id,
@@ -982,6 +982,7 @@ fn apply_modifier(
         }
         if let Some(node) = engine.doc.nodes.get_mut(&target) {
             node.modifiers.retain(|modifier| modifier.id != modifier_id);
+            node.materials = material_slots;
         }
         if mesh_changed {
             super::clear_primitive_metadata(engine, &data_id);
@@ -1037,9 +1038,15 @@ fn evaluate_modifier_output(
     data_id: &Id,
     target_modifier: &Modifier,
     allow_shape_keys: bool,
-) -> Result<crate::geom::Mesh> {
+) -> Result<(crate::geom::Mesh, Vec<Option<Id>>)> {
     let modifier_id = &target_modifier.id;
     let modifier_stack = std::slice::from_ref(target_modifier);
+    let mut material_slots = engine
+        .doc
+        .nodes
+        .get(target)
+        .map(|node| node.materials.clone())
+        .unwrap_or_default();
     let evaluated = {
         let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
             PotError::new(
@@ -1069,7 +1076,18 @@ fn evaluate_modifier_output(
                 return false;
             }
             match modifier.modifier_type.as_str() {
-                "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform" => {
+                "boolean" => {
+                    // Every EXACT Boolean takes the scene path, which owns its material slots.
+                    let exact = crate::geom::modifiers::BooleanSettings::parse(modifier)
+                        .is_ok_and(|settings| {
+                            settings.solver != crate::geom::modifiers::BooleanSolver::Float
+                        });
+                    exact
+                        || ["object", "collection", "target"]
+                            .iter()
+                            .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
+                }
+                "shrinkwrap" | "surface_deform" | "mesh_deform" => {
                     ["object", "collection", "target"]
                         .iter()
                         .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
@@ -1304,6 +1322,7 @@ fn evaluate_modifier_output(
                             engine.doc,
                             &world_matrices,
                             evaluated_operand_meshes,
+                            &mut material_slots,
                         )
                     }
                     "vertex_weight_edit"
@@ -1342,7 +1361,7 @@ fn evaluate_modifier_output(
             evaluation.mesh
         }
     };
-    Ok(evaluated)
+    Ok((evaluated, material_slots))
 }
 fn apply_modifier_as_shape_key(
     engine: &mut Engine<'_>,
@@ -1435,7 +1454,7 @@ fn apply_modifier_as_shape_key(
                 evaluated.clone()
             } else {
                 let target_modifier = modifier_to_apply(engine, &target, &modifier_id)?;
-                let evaluated = evaluate_modifier_output(
+                let (evaluated, _) = evaluate_modifier_output(
                     engine,
                     &target,
                     &original_data_id,

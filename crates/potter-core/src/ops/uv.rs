@@ -726,7 +726,7 @@ fn reach<'a>(doc: &SceneDoc, nodes: impl IntoIterator<Item = &'a Id>) -> Reach {
     let mut pending: Vec<Id> = Vec::new();
     for node_id in nodes {
         if let Some(node) = doc.nodes.get(node_id) {
-            reached.materials.extend(node.materials.iter().cloned());
+            reached.materials.extend(node.materials.iter().flatten().cloned());
             pending.extend(node.modifiers.iter().filter_map(modifier_node_group));
         }
     }
@@ -2799,7 +2799,7 @@ mod tests {
             .get_mut(&Id::new("body").unwrap())
             .unwrap()
             .materials
-            .push(surface.clone());
+            .push(Some(surface.clone()));
         create_layer(&mut doc, Some("Mid")).unwrap();
         create_layer(&mut doc, Some("Top")).unwrap();
         doc.nodes

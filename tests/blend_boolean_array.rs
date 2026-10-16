@@ -15,6 +15,8 @@ use tempfile::tempdir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
+const BLENDER_REQUIRED: &str = "Blender is required for the array Boolean parity test: install Blender 5.2, or set POTTER_BLENDER to its executable";
+
 const ARRAY_BOOLEAN_FIXTURE: &str = r#"
 import bpy
 import json
@@ -335,10 +337,7 @@ fn assert_boolean_geometry(actual: &Surface, expected: &Surface, context: &str) 
 
 #[test]
 fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestResult<()> {
-    let Some(blender) = blender_executable() else {
-        eprintln!("skipping array Boolean parity test: Blender is unavailable");
-        return Ok(());
-    };
+    let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
     let directory = tempdir()?;
     let root = directory.path();
     let script = root.join("array_boolean.py");

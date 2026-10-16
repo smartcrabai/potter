@@ -120,7 +120,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         )?;
         let mut warnings = snapshot.warnings.clone();
         let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
-        let mut losses = export_losses(&doc, format);
+        let mut losses = export_losses(&doc, format, Some(&snapshot));
         losses.extend(exchange::shading::shading_losses(format, &meshes));
         losses.extend(exchange::uv_layer_losses(format, &meshes));
         let vrm = match (format, doc.avatar.as_ref()) {
@@ -377,7 +377,11 @@ fn blend_export_context_json(doc: &SceneDoc, context: &EvaluationContext) -> Res
     }))
 }
 
-pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
+pub(crate) fn export_losses(
+    doc: &SceneDoc,
+    format: &str,
+    snapshot: Option<&Snapshot>,
+) -> Vec<Loss> {
     let supports_scene = matches!(
         format,
         "glb"
@@ -459,7 +463,13 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
                     suggestion: Some("export as blend to preserve node visibility".to_owned()),
                 });
             }
-            if !node.materials.is_empty() {
+            if snapshot
+                .map_or(node.materials.as_slice(), |snapshot| {
+                    snapshot.material_slots(id, node)
+                })
+                .iter()
+                .any(Option::is_some)
+            {
                 losses.push(Loss {
                     feature_id: "material.binding".to_owned(),
                     data_id: Some(id.to_string()),

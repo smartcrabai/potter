@@ -11,12 +11,15 @@ use glam::{DMat4, DVec3};
 use num_traits::Zero;
 
 use super::{
+    MaterialMode,
     exact::{Rat, Rat3, add3, cross3, rat_from_f64, sub3},
     imesh::{Arena, Tri},
     input::{Operand, meshes_to_tris},
     intersect::trimesh_nary_intersect,
+    material_remaps,
 };
 use crate::geom::{BoxParams, Mesh};
+use crate::model::Id;
 
 type TestResult = Result<(), String>;
 
@@ -126,16 +129,139 @@ fn subdivision_conserves_exact_vector_area_per_input_face() -> TestResult {
 
 #[test]
 fn material_remaps_index_matches_subject_slots_and_transfer_pools_new_materials() {
-    use crate::geom::boolean::{MaterialMode, material_remaps};
-    let subject = ["A0", "A1"];
-    let operands = [vec!["A1", "B0"], vec!["B0", "C0"]];
+    let subject = [Some("a0"), Some("a1")];
+    let operands = [vec![Some("a1"), Some("b0")], vec![Some("b0"), Some("c0")]];
     assert_eq!(
-        material_remaps(MaterialMode::Index, &subject, &operands),
-        vec![vec![], vec![1, 1], vec![0, 1]]
+        run_remaps(MaterialMode::Index, &subject, &operands),
+        (vec![vec![], vec![1, 1], vec![0, 1]], owned_slots(&subject))
     );
     assert_eq!(
-        material_remaps(MaterialMode::Transfer, &subject, &operands),
-        vec![vec![], vec![1, 2], vec![2, 3]]
+        run_remaps(MaterialMode::Transfer, &subject, &operands),
+        (
+            vec![vec![], vec![1, 2], vec![2, 3]],
+            owned_slots(&[Some("a0"), Some("a1"), Some("b0"), Some("c0")])
+        )
     );
 }
 
+#[test]
+fn material_remaps_index_prefers_same_slot_over_earlier_match() {
+    // Slot 1 holds `a` in both, so it keeps index 1 although subject slot 0 also holds `a`.
+    let subject = [Some("a"), Some("a")];
+    let operands = [vec![Some("x"), Some("a")]];
+    assert_eq!(
+        run_remaps(MaterialMode::Index, &subject, &operands),
+        (vec![vec![], vec![0, 1]], owned_slots(&subject))
+    );
+}
+
+#[test]
+fn material_remaps_index_takes_first_matching_subject_slot() {
+    // Blender's material map keeps the first subject slot per material, so `a` maps to 0.
+    let subject = [Some("a"), Some("b"), Some("a")];
+    let operands = [vec![Some("c"), Some("a")]];
+    assert_eq!(
+        run_remaps(MaterialMode::Index, &subject, &operands),
+        (vec![vec![], vec![0, 0]], owned_slots(&subject))
+    );
+}
+
+#[test]
+fn material_remaps_index_unmatched_slot_keeps_local_index_in_range_else_zero() {
+    let subject = [Some("a"), Some("b")];
+    let operands = [
+        vec![Some("x"), Some("y")],
+        vec![Some("x"), Some("y"), Some("z")],
+    ];
+    assert_eq!(
+        run_remaps(MaterialMode::Index, &subject, &operands),
+        (
+            vec![vec![], vec![0, 1], vec![0, 1, 0]],
+            owned_slots(&subject)
+        )
+    );
+}
+
+#[test]
+fn material_remaps_empty_operand_maps_by_mode() {
+    let subject = [Some("a")];
+    let operands = [vec![]];
+    assert_eq!(
+        run_remaps(MaterialMode::Index, &subject, &operands),
+        (vec![vec![], vec![0]], owned_slots(&subject))
+    );
+    assert_eq!(
+        run_remaps(MaterialMode::Transfer, &subject, &operands),
+        (vec![vec![], vec![]], owned_slots(&subject))
+    );
+}
+
+#[test]
+fn material_remaps_transfer_empty_subject_starts_pool_with_none() {
+    let subject: [Option<&str>; 0] = [];
+    let operands = [vec![Some("a"), None]];
+    assert_eq!(
+        run_remaps(MaterialMode::Transfer, &subject, &operands),
+        (vec![vec![], vec![1, 0]], owned_slots(&[None, Some("a")]))
+    );
+    // With no subject slots, INDEX has no pool and each operand slot falls back to 0.
+    assert_eq!(
+        run_remaps(MaterialMode::Index, &subject, &operands),
+        (vec![vec![], vec![0, 0]], owned_slots(&[]))
+    );
+}
+
+#[test]
+fn material_remaps_transfer_matches_none_to_pooled_none() {
+    let subject = [None, Some("a")];
+    let operands = [vec![None, Some("b"), None]];
+    assert_eq!(
+        run_remaps(MaterialMode::Transfer, &subject, &operands),
+        (
+            vec![vec![], vec![0, 2, 0]],
+            owned_slots(&[None, Some("a"), Some("b")])
+        )
+    );
+}
+
+#[test]
+fn material_remaps_transfer_pools_each_subject_material_once() {
+    // Blender's pool is a VectorSet, so the duplicate `a` takes one pool entry.
+    let subject = [Some("a"), Some("a"), Some("b")];
+    let operands = [vec![Some("b"), Some("c")]];
+    assert_eq!(
+        run_remaps(MaterialMode::Transfer, &subject, &operands),
+        (
+            vec![vec![], vec![1, 2]],
+            owned_slots(&[Some("a"), Some("b"), Some("c")])
+        )
+    );
+}
+
+/// Owned material slots for the remap tests; `None` is an empty slot.
+fn owned_slots(names: &[Option<&str>]) -> Vec<Option<Id>> {
+    names
+        .iter()
+        .map(|&name| name.map(Id::from_static))
+        .collect()
+}
+
+/// Borrows owned slots in the shape `material_remaps` takes.
+fn borrowed(slots: &[Option<Id>]) -> Vec<Option<&Id>> {
+    slots.iter().map(Option::as_ref).collect()
+}
+
+/// Runs `material_remaps` on named slots and returns `(remaps, pool)`.
+fn run_remaps(
+    mode: MaterialMode,
+    subject: &[Option<&str>],
+    operands: &[Vec<Option<&str>>],
+) -> (Vec<Vec<u32>>, Vec<Option<Id>>) {
+    let subject_slots = owned_slots(subject);
+    let operand_slots: Vec<Vec<Option<Id>>> =
+        operands.iter().map(|names| owned_slots(names)).collect();
+    let subject_refs = borrowed(&subject_slots);
+    let operand_refs: Vec<Vec<Option<&Id>>> =
+        operand_slots.iter().map(|slots| borrowed(slots)).collect();
+    material_remaps(mode, &subject_refs, &operand_refs)
+}

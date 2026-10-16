@@ -22,8 +22,11 @@
 //! entries of `blender_attributes` take the global edge index of each output edge (`Poly::edge_orig`,
 //! last writer wins, as in Blender's `dst_to_src_edge`). `remap_attributes` would derive edges from
 //! the vertex origins, and the POINT origin above is not an edge origin. FACE stores
-//! (`blender_polygon_smooth`, `shade_smooth`, `custom_normal`) are joined into `J` and gathered by
-//! the remap.
+//! (`blender_polygon_smooth`, `shade_smooth`) are joined into `J` and gathered by the remap.
+//!
+//! `custom_normal` is a CORNER store. Blender realizes each operand's custom normals through its
+//! transform, so [`joined_custom_normals`] builds them per joined corner. The remap interpolates
+//! them without normalising, and [`negate_flipped_custom_normals`] negates the flipped faces.
 //!
 //! Stores that are neither gathered nor structured (shading and metadata keys) are copied from
 //! operand A, as the BSP path does.
@@ -42,12 +45,13 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use glam::{DVec3, Mat4};
+use glam::{DMat3, DMat4, DVec3, Mat4};
 use serde_json::{Map, Value, json};
 
 use crate::error::{PotError, Result};
 use crate::geom::{
     Face, Mesh, Vertex, edge_key,
+    normals::{face_normal, normal_matrix, vector3},
     provenance::{Origin, default_value, mean_value_corners, remap_attributes},
     uv_layers::uv_default,
 };
@@ -117,6 +121,7 @@ pub(crate) fn polys_to_mesh(
     )
     .map_err(|error| PotError::invalid_argument(format!("boolean output face failed: {error}")))?;
 
+    let flipped = flipped_faces(&joined, &planned, &positions);
     let origin = Origin {
         vertices: arena_ids
             .iter()
@@ -124,9 +129,11 @@ pub(crate) fn polys_to_mesh(
             .collect(),
         faces: planned.iter().map(|face| Some(face.joined_face)).collect(),
         corners: Some(corner_sources(&joined, &planned, &positions)),
-        raw_normals: false,
+        // Blender interpolates custom normals without normalising them.
+        raw_normals: true,
     };
     remap_attributes(&joined.mesh, &mut mesh, &origin)?;
+    negate_flipped_custom_normals(&mut mesh, &flipped);
 
     let sources = edge_sources(&mesh, polys, &planned, &vertex_ids);
     let crease = keyed_edge_attribute(operands, &layout, &mesh, &sources, "crease_edge");
@@ -417,6 +424,69 @@ fn unchanged_corners(
     })
 }
 
+/// Blender's flip test in `copy_or_interp_loop_attributes`: an output face is flipped when its
+/// normal points against the normal of its source face in the joined mesh.
+fn flipped_faces(joined: &Joined, planned: &[PlannedFace], positions: &[DVec3]) -> Vec<bool> {
+    planned
+        .iter()
+        .map(|face| {
+            let source: Vec<DVec3> = joined.rings[face.joined_face]
+                .iter()
+                .map(|&vertex| joined.mesh.vertices[vertex].co)
+                .collect();
+            let output: Vec<DVec3> = face.ring.iter().map(|&vertex| positions[vertex]).collect();
+            ring_normal(&source).dot(ring_normal(&output)) < 0.0
+        })
+        .collect()
+}
+
+/// Newell's normal of a ring, not normalised, as Blender's `face_normal_calc` sums it. A degenerate
+/// ring has a zero normal, so it is never flipped.
+fn ring_normal(points: &[DVec3]) -> DVec3 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .fold(DVec3::ZERO, |sum, (current, next)| {
+            sum + DVec3::new(
+                (current.y - next.y) * (current.z + next.z),
+                (current.z - next.z) * (current.x + next.x),
+                (current.x - next.x) * (current.y + next.y),
+            )
+        })
+}
+
+/// Blender negates the interpolated `custom_normal` corners of flipped faces. A flipped face never
+/// copies its source corners (its ring runs the other way), so every corner of one is negated here.
+fn negate_flipped_custom_normals(mesh: &mut Mesh, flipped: &[bool]) {
+    let Some(values) = mesh
+        .attributes
+        .get_mut("custom_normal")
+        .and_then(|attribute| attribute.get_mut("values"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for (face, _) in mesh
+        .faces
+        .iter()
+        .zip(flipped)
+        .filter(|(_, flipped)| **flipped)
+    {
+        let Some(rows) = values
+            .get_mut(&format!("f{}", face.id))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for row in rows.iter_mut() {
+            if let Some(normal) = vector3(row) {
+                *row = json!((-normal).to_array());
+            }
+        }
+    }
+}
+
 /// Global edge index each output edge takes its attributes from (Blender `dst_to_src_edge`). The
 /// last ring edge that names an input edge wins.
 fn edge_sources(
@@ -501,7 +571,7 @@ fn join_attributes(operands: &[Operand<'_>], layout: &Layout) -> Map<String, Val
     insert_if(
         &mut attributes,
         "custom_normal",
-        joined_face_attribute(operands, &face_ids, layout, "custom_normal"),
+        joined_custom_normals(operands, layout),
     );
     insert_if(
         &mut attributes,
@@ -839,8 +909,8 @@ fn edge_entry(
     with_values(template.entry, Value::Array(values))
 }
 
-/// A face-keyed object store (`{"domain","type","values":{"f{id}": value}}`, as `shade_smooth` and
-/// `custom_normal`), with each face key moved to its joined face ID.
+/// A face-keyed object store (`{"domain","type","values":{"f{id}": value}}`, as `shade_smooth`),
+/// with each face key moved to its joined face ID.
 fn joined_face_attribute(
     operands: &[Operand<'_>],
     face_ids: &[HashMap<u32, usize>],
@@ -880,6 +950,99 @@ fn joined_face_attribute(
         }
     }
     Some(with_values(template, Value::Object(values)))
+}
+
+/// Relative tolerance of the similarity test in [`NormalTransform::new`].
+const SIMILARITY_TOLERANCE: f64 = 1.0e-6;
+
+/// An operand transform as Blender's realize step applies it to `custom_normal`. The direction goes
+/// through the inverse transpose. A similarity transform (rotation, mirror, translation, or uniform
+/// scale) keeps the length of the normal; any other transform normalises the result. Measured on
+/// Blender 5.2.2.
+struct NormalTransform {
+    linear: DMat3,
+    similarity: bool,
+}
+
+impl NormalTransform {
+    fn new(transform: DMat4) -> Self {
+        let linear = DMat3::from_mat4(transform);
+        let columns = [linear.x_axis, linear.y_axis, linear.z_axis];
+        let squared = columns.map(DVec3::length_squared);
+        let scale = squared[0];
+        let equal_lengths = squared
+            .iter()
+            .all(|length| (length - scale).abs() <= SIMILARITY_TOLERANCE * scale);
+        let orthogonal = [(0_usize, 1_usize), (0, 2), (1, 2)]
+            .iter()
+            .all(|&(a, b)| columns[a].dot(columns[b]).abs() <= SIMILARITY_TOLERANCE * scale);
+        Self {
+            // The cofactor matrix signed by the determinant is a positive multiple of the inverse
+            // transpose, so its direction is the transformed normal's direction.
+            linear: normal_matrix(transform),
+            similarity: scale > 0.0 && equal_lengths && orthogonal,
+        }
+    }
+
+    fn apply(&self, normal: DVec3) -> DVec3 {
+        let direction = (self.linear * normal).normalize_or_zero();
+        if self.similarity {
+            direction * normal.length()
+        } else {
+            direction
+        }
+    }
+}
+
+/// Blender's joined `custom_normal`: one row per joined corner. An operand's authored normals pass
+/// through its transform ([`NormalTransform`]). A face without authored normals takes its flat
+/// normal, passed through the same transform. `None` when no operand has the attribute.
+fn joined_custom_normals(operands: &[Operand<'_>], layout: &Layout) -> Option<Value> {
+    let template = operands.iter().find_map(|operand| {
+        operand
+            .mesh
+            .attributes
+            .get("custom_normal")
+            .filter(|value| value.is_object())
+    })?;
+    let mut joined = Map::new();
+    for (index, operand) in operands.iter().enumerate() {
+        let transform = NormalTransform::new(operand.transform);
+        let authored = object_of(operand.mesh, "custom_normal")
+            .and_then(|attribute| attribute.get("values"))
+            .and_then(Value::as_object);
+        let positions: HashMap<u32, DVec3> = operand
+            .mesh
+            .vertices
+            .iter()
+            .map(|vertex| (vertex.id, vertex.co))
+            .collect();
+        for (local, face) in operand.mesh.faces.iter().enumerate() {
+            let points: Vec<DVec3> = face
+                .vertices
+                .iter()
+                .filter_map(|id| positions.get(id).copied())
+                .collect();
+            let flat = transform.apply(face_normal(&points));
+            let rows = authored
+                .and_then(|entries| entries.get(&format!("f{}", face.id)))
+                .and_then(Value::as_array);
+            let corners: Vec<Value> = (0..face.vertices.len())
+                .map(|corner| {
+                    let normal = rows
+                        .and_then(|rows| rows.get(corner))
+                        .and_then(vector3)
+                        .map_or(flat, |value| transform.apply(value));
+                    json!(normal.to_array())
+                })
+                .collect();
+            joined.insert(
+                format!("f{}", layout.faces[index].start + local),
+                Value::Array(corners),
+            );
+        }
+    }
+    Some(with_values(template, Value::Object(joined)))
 }
 
 /// An edge-keyed object store (`{"domain","type","values":{"e{id}": value}}`, as `crease_edge` and
@@ -1362,6 +1525,86 @@ mod tests {
                 {"sharp": true, "seam": false},
                 {"sharp": false, "seam": false}
             ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_normals_of_flipped_faces_are_negated() -> TestResult {
+        let mut a = mesh_from(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+                DVec3::new(5.0, 0.0, 0.0),
+                DVec3::new(6.0, 0.0, 0.0),
+                DVec3::new(5.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2], vec![3, 4, 5]],
+        )?;
+        let authored = json!([[0.0, 0.0, 2.0], [0.0, 0.0, 2.0], [0.0, 0.0, 2.0]]);
+        set_attribute(
+            &mut a,
+            "custom_normal",
+            json!({
+                "domain": "corner",
+                "type": "float3",
+                "values": {"f0": authored.clone(), "f1": authored}
+            }),
+        );
+        let mut arena = Arena::new();
+        let ids = arena_vertices(&mut arena, &a)?;
+        let polys = [
+            poly(vec![ids[0], ids[1], ids[2]], 0),
+            poly(vec![ids[5], ids[4], ids[3]], 1),
+        ];
+        let mesh = build(&polys, &arena, &[operand(&a)], &[])?;
+        let values = attribute(&mesh, "custom_normal")["values"].clone();
+        let row = |index: usize| values.get(format!("f{}", mesh.faces[index].id)).cloned();
+        // The kept face copies its source; the reversed face is flipped, so its normals negate.
+        assert_eq!(
+            row(0),
+            Some(json!([[0.0, 0.0, 2.0], [0.0, 0.0, 2.0], [0.0, 0.0, 2.0]]))
+        );
+        assert_eq!(
+            row(1),
+            Some(json!([
+                [0.0, 0.0, -2.0],
+                [0.0, 0.0, -2.0],
+                [0.0, 0.0, -2.0]
+            ]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_normals_follow_a_non_similarity_transform_as_unit_directions() -> TestResult {
+        let mut a = triangle(0.0)?;
+        set_attribute(
+            &mut a,
+            "custom_normal",
+            json!({
+                "domain": "corner",
+                "type": "float3",
+                "values": {"f0": [[0.0, 0.0, 2.0], [0.0, 0.0, 2.0], [0.0, 0.0, 2.0]]}
+            }),
+        );
+        let mut arena = Arena::new();
+        let mut ids = Vec::with_capacity(a.vertices.len());
+        for (index, vertex) in a.vertices.iter().enumerate() {
+            let orig = i32::try_from(index).map_err(|error| error.to_string())?;
+            let co = DVec3::new(2.0 * vertex.co.x, vertex.co.y, vertex.co.z);
+            ids.push(arena.add_or_find_dvec(co, orig));
+        }
+        let scaled = Operand {
+            mesh: &a,
+            transform: DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)),
+        };
+        let mesh = build(&[poly(ids, 0)], &arena, &[scaled], &[])?;
+        let values = attribute(&mesh, "custom_normal")["values"].clone();
+        assert_eq!(
+            values.get(format!("f{}", mesh.faces[0].id)).cloned(),
+            Some(json!([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]))
         );
         Ok(())
     }

@@ -75,6 +75,14 @@
 - Fixed glTF coordinate conversion for node matrices and quaternion rotations; morph POSITION accessors now include bounds, bone-parented objects round-trip under their bone nodes, and imported rotation curves use Blender's `(w,x,y,z)` component order.
 - `rig.generate_basic_human` now creates a pelvis-height `hips` bone parenting the spine and legs, while retaining the root control, and pre-bends knees forward and elbows backward by `0.025 * scale` toward their IK poles so leg and arm IK can bend (Blender leaves perfectly straight chains straight); IK targets on ordinary object controls now evaluate correctly.
 - Bevel with the square profile (`profile` 1) and an even segment count builds Blender's square corner mesh on three-edge cube-like corners, so two- and four-segment square bevels match Blender instead of falling back to an approximate corner. Bevel with UV layers rejects the corners its construction does not cover with `modifier.bevel.uv_profile` and a non-empty `rejected_corners` list; profile 0 (square inward) on UV layers is rejected naming `profile` as the parameter.
+- Boolean with an unset OBJECT operand returns the subject unchanged.
+- An empty COLLECTION operand under EXACT runs on the subject alone, which removes the subject's self-intersections, as Blender does.
+- A collection that contains the Boolean's own object skips that member, as Blender does, so it no longer creates a dependency cycle.
+- Boolean material INDEX and TRANSFER remap operand slots onto the subject's slot list; TRANSFER appends materials the subject lacks to a pooled list. Empty slots are kept as null entries in `Node.materials`, and a face on an empty slot has no material.
+- The TRANSFER pooled slot list is stored on the evaluated node and on the node written by `modifier.apply`.
+- In DIFFERENCE, a cutter face reversed in the output negates its custom normal, as Blender does.
+- Operand-to-subject transforms are computed in f32 (the inverse subject matrix times the operand matrix, each product in f32), as Blender computes them, so operand vertices land on Blender's f32 positions.
+- Open operands and results that are not PWN after intersection use a BVH for the non-PWN ray tests instead of scanning every triangle.
 
 ## 0.2.0 - 2026-10-13
 - `pot workflow refine` now requires `-p/--provider <NAME>` and `-m/--model <ID>`, sent to jcode as `<NAME>:<ID>` (examples: `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`) for the modeler and every reviewer; agents no longer fall back to jcode's default model.

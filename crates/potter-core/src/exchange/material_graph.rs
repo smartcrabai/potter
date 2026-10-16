@@ -819,7 +819,7 @@ fn has_texture_field(material: &Material) -> bool {
 fn material_users<'a>(doc: &'a SceneDoc, material_id: &Id) -> Vec<&'a Mesh> {
     doc.nodes
         .values()
-        .filter(|node| node.materials.contains(material_id))
+        .filter(|node| node.materials.iter().flatten().any(|id| id == material_id))
         .filter_map(|node| {
             node.data
                 .as_ref()
@@ -1351,7 +1351,7 @@ mod tests {
                     name: node.to_owned(),
                     kind: "mesh".to_owned(),
                     data: Some(data),
-                    materials: vec![Id::new("shared")?],
+                    materials: vec![Some(Id::new("shared")?)],
                     ..Node::default()
                 },
             );

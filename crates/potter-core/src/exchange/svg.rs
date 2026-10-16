@@ -212,7 +212,7 @@ pub fn import(path: &Path, scene_id: String) -> Result<ImportedGraph> {
                 ..Material::default()
             },
         );
-        material_ids.push(material_id.clone());
+        material_ids.push(Some(material_id.clone()));
         let points = stroke
             .points
             .iter()

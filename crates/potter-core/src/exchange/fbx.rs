@@ -336,14 +336,7 @@ pub(crate) fn export_with_root_allow_lossy(
                 .data
                 .as_ref()
                 .and_then(|data_id| doc.data_blocks.get(data_id));
-            let has_deformations = data_block.is_some_and(|data| {
-                data.shape_keys
-                    .as_ref()
-                    .is_some_and(|keys| !keys.keys.is_empty())
-                    || !data.vertex_groups.is_empty()
-                    || !data.vertex_weights.is_empty()
-            });
-            let mesh = if has_deformations {
+            let mesh = if writes_source_mesh(data_block) {
                 data_block
                     .and_then(|data| data.mesh.as_ref())
                     .ok_or_else(|| {
@@ -360,13 +353,14 @@ pub(crate) fn export_with_root_allow_lossy(
                     )
                 })?
             };
+            let material_slots = fbx_material_slots(doc, snapshot, node_id, node);
             write_geometry(
                 &mut output,
                 geometry_id,
                 node,
                 mesh,
+                &material_slots,
                 data_block,
-                snapshot.slot_count(node_id, node),
                 allow_lossy,
                 snapshot.purpose,
             )?;
@@ -1483,13 +1477,48 @@ fn write_morph_export(output: &mut String, morph: &MorphExport) -> Result<()> {
     Ok(())
 }
 
+/// FBX material index of a node slot. Connected slots are numbered in slot order; an empty slot
+/// has no connection, so its faces take index 0, as Blender's FBX exporter maps faces on empty
+/// slots to its first exported material.
+fn fbx_material_index(materials: &[Option<Id>], slot: usize) -> usize {
+    match materials.get(slot) {
+        Some(Some(_)) => materials[..slot].iter().flatten().count(),
+        _ => 0,
+    }
+}
+
+/// Whether FBX writes a node's document source mesh rather than its evaluated mesh. Deformers
+/// (shape keys, vertex groups, vertex weights) are written against the source mesh.
+fn writes_source_mesh(data_block: Option<&DataBlock>) -> bool {
+    data_block.is_some_and(|data| {
+        data.shape_keys
+            .as_ref()
+            .is_some_and(|keys| !keys.keys.is_empty())
+            || !data.vertex_groups.is_empty()
+            || !data.vertex_weights.is_empty()
+    })
+}
+
+/// The material table the FBX mesh of `node` addresses: the node's own slots for its source mesh
+/// (deformers are written against it), otherwise the evaluated slots that the evaluated mesh's
+/// face indices name. One entry per face slot; `None` is an empty slot.
+fn fbx_material_slots(doc: &SceneDoc, snapshot: &Snapshot, node_id: &Id, node: &Node) -> Vec<Option<Id>> {
+    let data_block = node.data.as_ref().and_then(|data_id| doc.data_blocks.get(data_id));
+    if writes_source_mesh(data_block) {
+        return node.materials.clone();
+    }
+    (0..snapshot.slot_count(node_id, node))
+        .map(|slot| snapshot.slot_material(node_id, node, slot).cloned())
+        .collect()
+}
+
 fn write_geometry(
     output: &mut String,
     id: i64,
     node: &Node,
     mesh: &Mesh,
+    material_slots: &[Option<Id>],
     data_block: Option<&DataBlock>,
-    material_slot_count: usize,
     allow_lossy: bool,
     purpose: EvaluationPurpose,
 ) -> Result<()> {
@@ -1649,26 +1678,30 @@ fn write_geometry(
     output.push_str("\n\t\t}\n");
     write_normal_layer(output, mesh)?;
     write_uv_layers(output, mesh)?;
-    if material_slot_count > 0 {
+    // Empty slots have no connection, so a node whose slots are all empty has no material layer.
+    let has_material_layer = material_slots.iter().any(Option::is_some);
+    if has_material_layer {
         write!(output, "\t\tLayerElementMaterial: 0 {{\n\t\t\tVersion: 101\n\t\t\tName: \"\"\n\t\t\tMappingInformationType: \"ByPolygon\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tMaterials: *{} {{\n\t\t\t\ta: ", mesh.faces.len()).map_err(write_error)?;
         for (index, face) in mesh.faces.iter().enumerate() {
-            if usize::try_from(face.material_index).map_or(true, |slot| slot >= material_slot_count)
-            {
-                return Err(PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "mesh face material slot is outside the evaluated material slot list",
-                    json!({"face_id":face.id,"slot":face.material_index,"material_count":material_slot_count}),
-                ));
-            }
+            let slot = usize::try_from(face.material_index)
+                .ok()
+                .filter(|slot| *slot < material_slots.len())
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "mesh face material slot is outside the evaluated material slot list",
+                        json!({"face_id":face.id,"slot":face.material_index,"material_count":material_slots.len()}),
+                    )
+                })?;
             if index != 0 {
                 output.push(',');
             }
-            write!(output, "{}", face.material_index).map_err(write_error)?;
+            write!(output, "{}", fbx_material_index(material_slots, slot)).map_err(write_error)?;
         }
         output.push_str("\n\t\t\t}\n\t\t}\n");
     }
     output.push_str("\t\tLayer: 0 {\n\t\t\tVersion: 100\n\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementNormal\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
-    if material_slot_count > 0 {
+    if has_material_layer {
         output.push_str("\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementMaterial\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
     }
     // Blender keeps the first UV layer in layer 0 and gives each further layer its own layer.
@@ -2169,13 +2202,13 @@ fn import_bytes_with_base(
         let parent = parent_by_model
             .get(numeric_id)
             .and_then(|parent| model_ids.get(parent).cloned());
-        let mut node_materials = Vec::<Id>::new();
+        let mut node_materials = Vec::<Option<Id>>::new();
         if let Some(material_numbers) = material_links.get(numeric_id) {
             for material_number in material_numbers {
                 if let Some(id) = material_ids.get(material_number)
-                    && !node_materials.contains(id)
+                    && !node_materials.iter().flatten().any(|bound| bound == id)
                 {
-                    node_materials.push(id.clone());
+                    node_materials.push(Some(id.clone()));
                 }
             }
         }
@@ -2208,6 +2241,10 @@ fn import_bytes_with_base(
                 geometry.uv_active,
                 geometry.uv_render,
             );
+            // A material layer that binds faces with no connected material is one empty slot.
+            if node_materials.is_empty() && !geometry.material_indices.is_empty() {
+                node_materials.push(None);
+            }
             for (face_index, face) in mesh.faces.iter_mut().enumerate() {
                 let slot = geometry
                     .material_indices
@@ -3718,7 +3755,7 @@ mod tests {
                 name: node_name.to_owned(),
                 kind: "mesh".to_owned(),
                 data: Some(data_id),
-                materials: vec![material_id.clone()],
+                materials: vec![Some(material_id.clone())],
                 ..Node::default()
             },
         );
@@ -3736,10 +3773,7 @@ mod tests {
             .values()
             .find(|node| node.name == node_name)
             .ok_or("FBX test mesh is missing")?;
-        let material_id = node
-            .materials
-            .first()
-            .ok_or("FBX test mesh has no material")?;
+        let material_id = node.material_slot(0).ok_or("FBX test mesh has no material")?;
         doc.materials
             .get(material_id)
             .and_then(|material| material.base_color_texture.as_ref())
@@ -3758,10 +3792,7 @@ mod tests {
             .get(data_id)
             .and_then(|data| data.mesh.as_ref())
             .ok_or("FBX test mesh data is missing")?;
-        let material_id = node
-            .materials
-            .first()
-            .ok_or("FBX test mesh has no material")?;
+        let material_id = node.material_slot(0).ok_or("FBX test mesh has no material")?;
         let material = doc
             .materials
             .get(material_id)

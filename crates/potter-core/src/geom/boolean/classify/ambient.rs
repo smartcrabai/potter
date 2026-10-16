@@ -6,7 +6,7 @@
 use glam::DVec3;
 use num_traits::{One, Signed, Zero};
 
-use super::super::exact::{Rat, Rat3, add3, cross3, dot3, scale3, sgn, sub3};
+use super::super::exact::{Rat, Rat3, add3, cross3, dot3, rat_to_f64, scale3, sgn, sub3};
 use super::super::imesh::{Arena, NO_INDEX, Tri};
 use super::invariant;
 use super::patches::{CellsInfo, PatchesInfo, Side, find_patch_components, merge_cells};
@@ -55,6 +55,40 @@ impl BBox {
     fn might_intersect(&self, other: &Self) -> bool {
         self.min.cmple(other.max).all() && other.min.cmple(self.max).all()
     }
+
+    /// Lower bound on the squared distance from `p` to the box. Both the box and `p` are double
+    /// approximations of exact points, so the distance is reduced by a slack for their rounding.
+    fn distance_sq_lower_bound(&self, p: DVec3) -> f64 {
+        let gap = (self.min - p).max(p - self.max).max(DVec3::ZERO);
+        let scale = 1.0
+            + self
+                .min
+                .abs()
+                .max(self.max.abs())
+                .max(p.abs())
+                .max_element();
+        let distance = (gap.length() - F64_SLACK * scale).max(0.0);
+        distance * distance
+    }
+}
+
+/// Relative slack for the double rounding of exact coordinates in the float bounds of
+/// [`BBox::distance_sq_lower_bound`] and [`upper_bound_f64`]. Each rounding is `2^-53` relative.
+const F64_SLACK: f64 = 1.0e-12;
+
+/// Double box of a triangle's approximate vertices.
+fn triangle_bbox(arena: &Arena, tri: &Tri) -> BBox {
+    let mut bbox = BBox::empty();
+    for &v in &tri.v {
+        bbox.include(arena.vert(v).co_f);
+    }
+    bbox
+}
+
+/// Upper bound on the double nearest to an exact squared distance, covering `rat_to_f64` rounding.
+fn upper_bound_f64(value: &Rat) -> f64 {
+    let approx = rat_to_f64(value);
+    approx + approx.abs() * F64_SLACK + f64::MIN_POSITIVE
 }
 
 /// `checked` division: `num / den`, or an invariant error for a zero denominator (degenerate
@@ -298,6 +332,11 @@ fn find_containing_cell(
 
 /// Blender `find_component_containers`: components other than `comp` whose cells contain a
 /// vertex of `comp`, with the nearest such cell.
+///
+/// Cost: one double box test per triangle of each other component whose box overlaps `comp`'s.
+/// The exact closest-point test runs only on triangles whose box lower bound does not exceed the
+/// nearest exact distance found so far, which cannot change the nearest triangle (the first
+/// triangle, in patch order, at the minimum distance).
 fn find_component_containers(
     arena: &mut Arena,
     tris: &[Tri],
@@ -318,14 +357,21 @@ fn find_component_containers(
         .ok_or_else(|| invariant("patch without triangles"))?;
     let test_v = tris[test_t].v[0];
     let test_co = arena.vert(test_v).co.clone();
+    let test_co_f = arena.vert(test_v).co_f;
     for (comp_other, members) in components.iter().enumerate() {
         if comp == comp_other || !comp_bb[comp].might_intersect(&comp_bb[comp_other]) {
             continue;
         }
         let mut nearest: Option<(usize, Rat, Closest)> = None;
+        // Upper bound on the double distance of `nearest`. A triangle whose lower bound exceeds it
+        // is strictly farther than `nearest` and cannot replace it.
+        let mut nearest_upper = f64::INFINITY;
         for &p in members {
             for &t in &pinfo.patches[p].tris {
                 let tri = tris[t];
+                if triangle_bbox(arena, &tri).distance_sq_lower_bound(test_co_f) > nearest_upper {
+                    continue;
+                }
                 let (d2, closest) = closest_on_tri_to_point(
                     &test_co,
                     &arena.vert(tri.v[0]).co,
@@ -333,6 +379,7 @@ fn find_component_containers(
                     &arena.vert(tri.v[2]).co,
                 )?;
                 if nearest.as_ref().is_none_or(|(_, best, _)| d2 < *best) {
+                    nearest_upper = upper_bound_f64(&d2);
                     nearest = Some((t, d2, closest));
                 }
             }

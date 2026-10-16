@@ -7,6 +7,9 @@
 //! `FLOAT` runs the BSP boundary representation below: plane-side classification with exact
 //! `orient3d` predicates outside a small, scale-relative coplanar tolerance, f64 intersections, and
 //! post-hoc coplanar merging. It is a shortcut until `PR17b` ports Blender's float path.
+//!
+//! Operand and material semantics follow Blender's `non_float_boolean_mesh`: an unset Object
+//! operand leaves the mesh unchanged, and `material_remaps` gives the INDEX and TRANSFER slot maps.
 
 mod cdt;
 mod classify;
@@ -31,6 +34,7 @@ use crate::{
         Mesh,
         provenance::{Origin, mean_value_corners, remap_attributes},
     },
+    model::Id,
 };
 
 use classify::{BoolOp, boolean_tris};
@@ -77,13 +81,15 @@ pub struct BooleanOperand {
     pub mesh: Mesh,
     /// Object space to subject space (Blender `world_to_object * operand_world`).
     pub to_subject: DMat4,
-    /// Output material index for each local material index; empty keeps every index.
+    /// Output material index for each local material index, from [`material_remaps`]. An empty
+    /// list keeps every index.
     pub material_remap: Vec<u32>,
 }
 
 /// Blender `non_float_boolean_mesh` for the EXACT solver: `subject` is operand 0 with the identity
 /// transform, and `operands` follow in order. One N-ary call, so a collection is never folded
-/// pairwise.
+/// pairwise. An empty `operands` runs the solver on the subject alone, which removes its
+/// self-intersections (a collection with no members).
 ///
 /// # Errors
 /// Returns `INVALID_ARGUMENT` for an invalid operand mesh, and the errors of the exact pipeline
@@ -152,49 +158,102 @@ fn bool_op(operation: Operation) -> BoolOp {
     }
 }
 
-/// Blender `material_remaps` (`non_float_boolean_mesh`): output material indices for each operand.
+/// Blender `material_remaps` (`non_float_boolean_mesh`): the output slot index of each operand's
+/// local slot, and the output node's slot list.
 ///
 /// `subject` and every entry of `operands` list one object's material slots by material identity,
-/// in slot order. The result has one entry per operand, subject first. The subject's entry is
-/// empty, so its indices stay. An operand's entry maps its local index to the output index:
-/// - INDEX: the subject slot holding the same material, or the local index when none does.
-/// - TRANSFER: the pooled index. The pool starts with the subject's slots, and each operand's
-///   materials not yet in it are appended.
+/// in slot order; `None` is an empty slot. `remaps` has one entry per operand, subject first. The
+/// subject's entry is empty, so its indices stay. `pool` is the output node's slot list.
 ///
-/// Potter's evaluated meshes carry no slot list, so the TRANSFER pool exists only as the index
-/// space of the output faces.
+/// - INDEX: `pool` is the subject's slots. An operand slot maps to the subject slot at its index
+///   when that slot holds the same material. Otherwise it maps to the first subject slot holding
+///   the material (`BKE_object_material_remap_calc`, material.cc:1307-1351, and `Map::add`, which
+///   keeps the first key, BLI_map.hh:289-295). Otherwise it keeps its local index when the subject
+///   has that slot, and maps to 0 when it does not. An operand with no slots maps to `[0]`
+///   (MOD_boolean.cc:366-375).
+/// - TRANSFER: `pool` is the subject's distinct materials in first-occurrence order (Blender's
+///   `VectorSet`, MOD_boolean.cc:422-430), or `[None]` when the subject has no slots. Each operand
+///   slot maps to the pool index of its material, appending a material the pool lacks. An empty
+///   operand slot maps to the pooled `None`. Blender writes `-1` there (`MOD_boolean.cc:387` and
+///   `geometry_mesh_boolean.cc:276-280`), which `u32` cannot hold: both mean no material.
+///
+/// As in Blender, the subject keeps its own indices, so with duplicate subject slots a face index
+/// can point past the end of `pool`.
 #[must_use]
 pub(crate) fn material_remaps<'a>(
     mode: MaterialMode,
-    subject: &[&'a str],
-    operands: &[Vec<&'a str>],
-) -> Vec<Vec<u32>> {
-    let mut pool: Vec<&'a str> = subject.to_vec();
+    subject: &[Option<&'a Id>],
+    operands: &[Vec<Option<&'a Id>>],
+) -> (Vec<Vec<u32>>, Vec<Option<Id>>) {
+    let mut pool: Vec<Option<Id>> = match mode {
+        MaterialMode::Index => subject.iter().map(|&slot| slot.cloned()).collect(),
+        MaterialMode::Transfer => transfer_pool(subject),
+    };
     let mut remaps = vec![Vec::new()];
     for slots in operands {
-        let remap = slots
-            .iter()
-            .enumerate()
-            .map(|(local, &material)| {
-                let index = match mode {
-                    MaterialMode::Index => subject
-                        .iter()
-                        .position(|&slot| slot == material)
-                        .unwrap_or(local),
-                    MaterialMode::Transfer => pool
-                        .iter()
-                        .position(|&slot| slot == material)
-                        .unwrap_or_else(|| {
-                            pool.push(material);
-                            pool.len() - 1
-                        }),
-                };
-                slot_index(index)
-            })
-            .collect();
-        remaps.push(remap);
+        remaps.push(match mode {
+            MaterialMode::Index => index_remap(subject, slots),
+            MaterialMode::Transfer => transfer_remap(&mut pool, slots),
+        });
     }
-    remaps
+    (remaps, pool)
+}
+
+/// The TRANSFER pool: the subject's distinct materials in first-occurrence order, or one empty slot
+/// when the subject has none.
+fn transfer_pool(subject: &[Option<&Id>]) -> Vec<Option<Id>> {
+    if subject.is_empty() {
+        return vec![None];
+    }
+    let mut pool: Vec<Option<Id>> = Vec::with_capacity(subject.len());
+    for &slot in subject {
+        if !pool.iter().any(|pooled| pooled.as_ref() == slot) {
+            pool.push(slot.cloned());
+        }
+    }
+    pool
+}
+
+/// The INDEX remap of one operand (Blender `BKE_object_material_remap_calc`, see
+/// [`material_remaps`]). An operand with no slots maps to `[0]`.
+fn index_remap(subject: &[Option<&Id>], slots: &[Option<&Id>]) -> Vec<u32> {
+    if slots.is_empty() {
+        return vec![0];
+    }
+    slots
+        .iter()
+        .enumerate()
+        .map(|(local, &slot)| {
+            let index = if subject.get(local).copied() == Some(slot) {
+                local
+            } else if let Some(first) = subject.iter().position(|&held| held == slot) {
+                first
+            } else if local < subject.len() {
+                local
+            } else {
+                0
+            };
+            slot_index(index)
+        })
+        .collect()
+}
+
+/// The TRANSFER remap of one operand: each slot's index in `pool`, appending the materials the
+/// pool lacks (Blender `VectorSet::index_of_or_add`).
+fn transfer_remap(pool: &mut Vec<Option<Id>>, slots: &[Option<&Id>]) -> Vec<u32> {
+    slots
+        .iter()
+        .map(|&slot| {
+            let index = pool
+                .iter()
+                .position(|pooled| pooled.as_ref() == slot)
+                .unwrap_or_else(|| {
+                    pool.push(slot.cloned());
+                    pool.len() - 1
+                });
+            slot_index(index)
+        })
+        .collect()
 }
 
 /// Output material indices are slot numbers, which always fit in `u32`.

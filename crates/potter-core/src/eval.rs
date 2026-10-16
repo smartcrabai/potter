@@ -82,6 +82,10 @@ pub struct EvaluatedNode {
     pub bounds: Option<Aabb>,
     /// World-space bounds size, or null for geometry-free nodes.
     pub dimensions: Option<[f64; 3]>,
+    /// Material slots after the node's modifier stack: its own slots unless a Boolean changed them
+    /// (the TRANSFER pool). Null entries are empty slots. Not serialized, like `Snapshot::meshes`.
+    #[serde(skip)]
+    pub materials: Vec<Option<Id>>,
 }
 
 /// Evaluated world-space Grease Pencil stroke used by vector exporters and preview.
@@ -200,8 +204,9 @@ impl Snapshot {
             self.slot_binding(node_id, node, slot)
                 .and_then(|binding| binding.material.as_ref())
         } else {
-            let last = node.materials.len().checked_sub(1)?;
-            node.materials.get(slot.min(last))
+            let slots = self.material_slots(node_id, node);
+            let last = slots.len().checked_sub(1)?;
+            slots.get(slot.min(last)).and_then(Option::as_ref)
         }
     }
 
@@ -210,7 +215,7 @@ impl Snapshot {
     pub fn slot_count(&self, node_id: &Id, node: &Node) -> usize {
         self.slot_bindings
             .get(node_id)
-            .map_or(node.materials.len(), Vec::len)
+            .map_or(self.material_slots(node_id, node).len(), Vec::len)
     }
 }
 
@@ -705,6 +710,7 @@ impl Snapshot {
             let node = doc.nodes.get(id).ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "mesh evaluation node is missing")
             })?;
+            let mut node_materials = node.materials.clone();
             let matrix = matrices.get(id).copied().ok_or_else(|| {
                 PotError::new(
                     ErrorCode::InternalError,
@@ -846,7 +852,13 @@ impl Snapshot {
                             ),
                             "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
                                 apply_scene_operand_modifier(
-                                    mesh, modifier, id, doc, &matrices, &meshes,
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    &matrices,
+                                    &meshes,
+                                    &mut node_materials,
                                 )
                             }
                             "vertex_weight_edit"
@@ -1122,7 +1134,13 @@ impl Snapshot {
                             ),
                             "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
                                 apply_scene_operand_modifier(
-                                    mesh, modifier, id, doc, &matrices, &meshes,
+                                    mesh,
+                                    modifier,
+                                    id,
+                                    doc,
+                                    &matrices,
+                                    &meshes,
+                                    &mut node_materials,
                                 )
                             }
                             "vertex_weight_edit"
@@ -1395,6 +1413,7 @@ impl Snapshot {
                     world_matrix: matrix.to_cols_array(),
                     bounds,
                     dimensions,
+                    materials: node_materials,
                 },
             );
         }
@@ -1540,6 +1559,19 @@ impl Snapshot {
             paint_weights,
             warnings: modifier_warnings,
         })
+    }
+
+    /// The slot table that the evaluated mesh's face material indices refer to. A TRANSFER Boolean
+    /// replaces its subject's slots with the operand pool, so anything that draws or exports
+    /// `meshes` must resolve face slots here rather than through the document node. Falls back to
+    /// `node.materials` when the snapshot holds no evaluated entry for `node_id`.
+    #[must_use]
+    pub fn material_slots<'a>(&'a self, node_id: &Id, node: &'a Node) -> &'a [Option<Id>] {
+        self.nodes
+            .get(node_id)
+            .map_or(node.materials.as_slice(), |evaluated| {
+                evaluated.materials.as_slice()
+            })
     }
 }
 
@@ -1953,6 +1985,49 @@ fn add_mesh_operand_dependency(
     }
 }
 
+/// Adds a Boolean's operand objects as dependencies of `owner_id`: its `object`, and every object
+/// of its `collection`. The subject is never its own operand (`apply_boolean_operands_modifier`
+/// drops it), so a self reference is skipped rather than reported as a dependency cycle.
+fn add_boolean_operand_dependencies(
+    dependencies: &mut BTreeMap<Id, BTreeSet<Id>>,
+    owner_id: &Id,
+    modifier: &Modifier,
+    doc: &SceneDoc,
+) -> Result<()> {
+    let mut operand_ids = BTreeSet::new();
+    if let Some(object_id) = modifier
+        .params
+        .get("object")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| Id::new(text).ok())
+    {
+        operand_ids.insert(object_id);
+    }
+    if let Some(collection_id) = modifier
+        .params
+        .get("collection")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| Id::new(text).ok())
+        && doc.collections.contains_key(&collection_id)
+    {
+        collect_modifier_collection_objects(
+            doc,
+            &collection_id,
+            &mut BTreeSet::new(),
+            &mut operand_ids,
+        )?;
+    }
+    for target_id in operand_ids {
+        if target_id != *owner_id
+            && dependencies.contains_key(&target_id)
+            && let Some(owner_dependencies) = dependencies.get_mut(owner_id)
+        {
+            owner_dependencies.insert(target_id);
+        }
+    }
+    Ok(())
+}
+
 struct ObjectMeshDependencies {
     modifiers: BTreeMap<Id, BTreeSet<Id>>,
     other: BTreeMap<Id, BTreeSet<Id>>,
@@ -1984,10 +2059,17 @@ fn object_mesh_dependencies(
                 gate.is_active(owner_id, modifier)
             }
         }) {
+            if modifier.modifier_type == "boolean" {
+                add_boolean_operand_dependencies(
+                    &mut dependencies.modifiers,
+                    owner_id,
+                    modifier,
+                    doc,
+                )?;
+                continue;
+            }
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
-                "boolean" | "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => {
-                    &["object"]
-                }
+                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => &["object"],
                 "shrinkwrap" => {
                     if modifier
                         .params
@@ -2009,29 +2091,6 @@ fn object_mesh_dependencies(
                     owner_id,
                     modifier.params.get(*parameter),
                 );
-            }
-            if modifier.modifier_type == "boolean"
-                && let Some(collection_text) = modifier
-                    .params
-                    .get("collection")
-                    .and_then(serde_json::Value::as_str)
-                && let Ok(collection_id) = Id::new(collection_text.to_owned())
-                && doc.collections.contains_key(&collection_id)
-            {
-                let mut object_ids = BTreeSet::new();
-                collect_modifier_collection_objects(
-                    doc,
-                    &collection_id,
-                    &mut BTreeSet::new(),
-                    &mut object_ids,
-                )?;
-                for target_id in object_ids {
-                    if dependencies.modifiers.contains_key(&target_id)
-                        && let Some(owner_dependencies) = dependencies.modifiers.get_mut(owner_id)
-                    {
-                        owner_dependencies.insert(target_id);
-                    }
-                }
             }
         }
         if let Some(collection_id) = instance_collection_target(node)? {
@@ -3204,6 +3263,7 @@ pub(crate) fn apply_scene_operand_modifier(
     doc: &SceneDoc,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
+    material_slots: &mut Vec<Option<Id>>,
 ) -> Result<()> {
     if modifier.modifier_type == "warp" {
         return apply_scene_warp_modifier(mesh, modifier, subject_id, doc, world_matrices);
@@ -3215,14 +3275,16 @@ pub(crate) fn apply_scene_operand_modifier(
         && crate::geom::modifiers::BooleanSettings::parse(modifier)?.solver
             != crate::geom::modifiers::BooleanSolver::Float
     {
-        return apply_boolean_operands_modifier(
+        *material_slots = apply_boolean_operands_modifier(
             mesh,
             modifier,
             subject_id,
             doc,
             world_matrices,
             evaluated_meshes,
-        );
+            material_slots.as_slice(),
+        )?;
+        return Ok(());
     }
     if matches!(
         modifier.modifier_type.as_str(),
@@ -3528,7 +3590,8 @@ fn apply_scene_hook_modifier(
     Ok(())
 }
 /// Object IDs that a Boolean modifier takes as operands for `operand_type`: the `object` parameter,
-/// or, for COLLECTION, every object of the `collection` parameter in collection order.
+/// or, for COLLECTION, every object of the `collection` parameter in collection order. A missing or
+/// null parameter has no operands; a named object that does not exist is an error when it is read.
 fn boolean_operand_object_ids(
     modifier: &Modifier,
     doc: &SceneDoc,
@@ -3539,17 +3602,15 @@ fn boolean_operand_object_ids(
         BooleanOperandType::Object => ("object", "object"),
         BooleanOperandType::Collection => ("collection", "collection"),
     };
-    let text = modifier
-        .params
-        .get(parameter)
-        .ok_or_else(|| boolean_operand_required(modifier, parameter))?
-        .as_str()
-        .ok_or_else(|| {
+    let text = match modifier.params.get(parameter) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_str().ok_or_else(|| {
             PotError::invalid_argument(format!(
                 "modifier `{}` `{parameter}` must be a {kind} ID",
                 modifier.modifier_type
             ))
-        })?;
+        })?,
+    };
     let id = Id::new(text).map_err(|_| {
         PotError::invalid_argument(format!(
             "modifier `{}` `{parameter}` must be a valid {kind} ID",
@@ -3561,21 +3622,7 @@ fn boolean_operand_object_ids(
     }
     let mut object_ids = Vec::new();
     collect_collection_objects_in_order(doc, &id, &mut BTreeSet::new(), &mut object_ids)?;
-    if object_ids.is_empty() {
-        return Err(boolean_operand_required(modifier, parameter));
-    }
     Ok(object_ids)
-}
-
-fn boolean_operand_required(modifier: &Modifier, parameter: &str) -> PotError {
-    PotError::with_details(
-        ErrorCode::InvalidArgument,
-        format!(
-            "modifier `{}` requires an object or collection operand",
-            modifier.modifier_type
-        ),
-        json!({"modifier_id":modifier.id,"pointer":format!("/params/{parameter}")}),
-    )
 }
 
 /// Blender `FOREACH_COLLECTION_OBJECT_RECURSIVE` order: a collection's objects, then its child
@@ -3619,16 +3666,23 @@ fn collect_modifier_collection_objects(
     Ok(())
 }
 
+/// Blender keeps object transforms in f32, so the world matrix is quantized to f32 before the
+/// product (`world_to_object * object_world` in `non_float_boolean_mesh`).
+fn world_matrix_f32(matrix: DMat4) -> glam::Mat4 {
+    glam::Mat4::from_cols_array(&matrix.to_cols_array().map(|value| value as f32))
+}
+
 /// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
-/// its vertex groups) and its transform into the subject's space. Also returns its material slots.
+/// its vertex groups) and its f32 transform into the subject's space. Also returns its material
+/// slots.
 fn boolean_operand<'d>(
     modifier: &Modifier,
     doc: &'d SceneDoc,
     object_id: &Id,
-    subject_inverse: DMat4,
+    subject_inverse: glam::Mat4,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
-) -> Result<(crate::geom::boolean::BooleanOperand, &'d [Id])> {
+) -> Result<(crate::geom::boolean::BooleanOperand, &'d [Option<Id>])> {
     let object = doc.nodes.get(object_id).ok_or_else(|| {
         PotError::with_details(
             ErrorCode::TargetNotFound,
@@ -3677,9 +3731,10 @@ fn boolean_operand<'d>(
             json!({"modifier_id":modifier.id,"object":object_id}),
         )
     })?;
+    let to_subject = subject_inverse * world_matrix_f32(object_world);
     let operand = crate::geom::boolean::BooleanOperand {
         mesh,
-        to_subject: subject_inverse * object_world,
+        to_subject: DMat4::from_cols_array(&to_subject.to_cols_array().map(f64::from)),
         material_remap: Vec::new(),
     };
     Ok((operand, object.materials.as_slice()))
@@ -3687,7 +3742,8 @@ fn boolean_operand<'d>(
 
 /// The Boolean operands of an EXACT (or MANIFOLD, refused by the modifier) solver. The subject is
 /// operand 0 and is not listed; each operand object keeps its own mesh and transform, and the
-/// modifier combines them in one N-ary call, so a collection is never folded pairwise.
+/// modifier combines them in one N-ary call, so a collection is never folded pairwise. Returns the
+/// output material slots: the subject's own slots for INDEX, or the pool for TRANSFER.
 fn apply_boolean_operands_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -3695,19 +3751,26 @@ fn apply_boolean_operands_modifier(
     doc: &SceneDoc,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
-) -> Result<()> {
+    subject_slots: &[Option<Id>],
+) -> Result<Vec<Option<Id>>> {
     let settings = crate::geom::modifiers::BooleanSettings::parse(modifier)?;
     let object_ids = boolean_operand_object_ids(modifier, doc, settings.operand_type)?;
-    let subject = doc.nodes.get(subject_id).ok_or_else(|| {
-        PotError::new(ErrorCode::InternalError, "modifier subject node is missing")
-    })?;
+    // Blender `non_float_boolean_mesh` returns the mesh unchanged for an OBJECT operand that is
+    // unset (MOD_boolean.cc:406), so neither geometry nor material slots change.
+    if settings.operand_type == crate::geom::modifiers::BooleanOperandType::Object
+        && object_ids.is_empty()
+    {
+        return Ok(subject_slots.to_vec());
+    }
     let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
         PotError::new(
             ErrorCode::InternalError,
             "modifier subject world matrix is missing",
         )
     })?;
-    let subject_inverse = subject_world.inverse();
+    // Blender keeps object transforms in f32; the operand transform is the f32 subject inverse
+    // times the f32 operand world matrix.
+    let subject_inverse = world_matrix_f32(subject_world).inverse();
     if !subject_inverse.is_finite() {
         return Err(PotError::invalid_argument(
             "modifier subject transform must be invertible",
@@ -3730,19 +3793,13 @@ fn apply_boolean_operands_modifier(
         operands.push(operand);
         operand_slots.push(slots);
     }
-    if operands.is_empty() {
-        return Err(PotError::invalid_argument("modifier operand is empty"));
-    }
-    let operand_slot_names: Vec<Vec<&str>> = operand_slots
+    let subject_refs: Vec<Option<&Id>> = subject_slots.iter().map(Option::as_ref).collect();
+    let operand_refs: Vec<Vec<Option<&Id>>> = operand_slots
         .iter()
-        .map(|slots| slots.iter().map(Id::as_str).collect())
+        .map(|slots| slots.iter().map(Option::as_ref).collect())
         .collect();
-    let subject_slots: Vec<&str> = subject.materials.iter().map(Id::as_str).collect();
-    let remaps = crate::geom::boolean::material_remaps(
-        settings.material_mode,
-        &subject_slots,
-        &operand_slot_names,
-    );
+    let (remaps, pool) =
+        crate::geom::boolean::material_remaps(settings.material_mode, &subject_refs, &operand_refs);
     for (operand, remap) in operands.iter_mut().zip(remaps.into_iter().skip(1)) {
         operand.material_remap = remap;
     }
@@ -3752,8 +3809,9 @@ fn apply_boolean_operands_modifier(
     }
     resolved.runtime.boolean_operands = operands;
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
-    Ok(())
+    Ok(pool)
 }
+
 fn combine_scene_operand_meshes(first: &Mesh, second: &Mesh, modifier_type: &str) -> Result<Mesh> {
     // shortcut: FLOAT folds collection members pairwise until PR17b; EXACT never reaches here.
     if modifier_type == "boolean" {
@@ -4266,7 +4324,7 @@ fn member_slots(node: &Node) -> Vec<Option<Id>> {
     if node.materials.is_empty() {
         vec![None]
     } else {
-        node.materials.iter().cloned().map(Some).collect()
+        node.materials.clone()
     }
 }
 
@@ -5539,7 +5597,7 @@ mod tests {
             Node {
                 name: "Prefix".to_owned(),
                 kind: "mesh".to_owned(),
-                materials: vec![prefix_material],
+                materials: vec![Some(prefix_material)],
                 ..Node::default()
             },
         );
@@ -5548,7 +5606,7 @@ mod tests {
             Node {
                 name: "First".to_owned(),
                 kind: "mesh".to_owned(),
-                materials: vec![shared_material.clone(), shared_material.clone()],
+                materials: vec![Some(shared_material.clone()), Some(shared_material.clone())],
                 ..Node::default()
             },
         );
@@ -5557,7 +5615,7 @@ mod tests {
             Node {
                 name: "Second".to_owned(),
                 kind: "mesh".to_owned(),
-                materials: vec![shared_material.clone()],
+                materials: vec![Some(shared_material.clone())],
                 ..Node::default()
             },
         );
@@ -5702,7 +5760,7 @@ mod tests {
         let last = Id::new("last_material").unwrap();
         let ordinary_id = Id::new("ordinary").unwrap();
         let ordinary = Node {
-            materials: vec![first, last.clone()],
+            materials: vec![Some(first), Some(last.clone())],
             ..Node::default()
         };
         assert_eq!(

@@ -2168,8 +2168,12 @@ fn build_imported_graph(
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(Value::as_str)
-            .filter_map(|material_name| material_ids.get(material_name).cloned())
+            .filter_map(|slot| match slot {
+                // Blender's empty material slot (`None` in the dump) stays an empty slot.
+                Value::Null => Some(None),
+                Value::String(material_name) => material_ids.get(material_name).cloned().map(Some),
+                _ => None,
+            })
             .collect();
         let parent = item
             .get("parent")
@@ -7056,8 +7060,10 @@ mod tests {
             Some("mesh_shared")
         );
         assert_eq!(
-            test_node_ref(&imported.doc, "node_child")?.materials[0].as_str(),
-            "material_red"
+            test_node_ref(&imported.doc, "node_child")?
+                .material_slot(0)
+                .map(Id::as_str),
+            Some("material_red")
         );
         assert!(!test_node_ref(&imported.doc, "node_child")?.modifiers[0].enabled);
         assert_eq!(
@@ -7357,7 +7363,7 @@ mod tests {
             parent_inverse: None,
             transform: Transform::default(),
             data: Some(Id::new(data)?),
-            materials: vec![Id::new("mat_red")?],
+            materials: vec![Some(Id::new("mat_red")?)],
             modifiers: Vec::new(),
             visible: true,
             render_visible: true,
@@ -7893,7 +7899,7 @@ mod tests {
         );
         let node_id = Id::new("body")?;
         let mut body = test_node("Body", data_id.as_str(), None, None)?;
-        body.materials = vec![material_id.clone()];
+        body.materials = vec![Some(material_id.clone())];
         doc.nodes.insert(node_id.clone(), body);
         doc.collections
             .get_mut(&Id::new("collection_root")?)
@@ -8436,7 +8442,7 @@ mod tests {
         ] {
             let node_id = Id::new(node_id)?;
             let mut body = test_node(name, data_id.as_str(), None, None)?;
-            body.materials = vec![material_id.clone()];
+            body.materials = vec![Some(material_id.clone())];
             doc.nodes.insert(node_id.clone(), body);
             doc.collections
                 .get_mut(&Id::new("collection_root")?)
@@ -8903,8 +8909,10 @@ mod tests {
             test_node_ref(&imported.doc, "box_child")?.data
         );
         assert_eq!(
-            test_node_ref(&imported.doc, "box_child")?.materials[0].as_str(),
-            "mat_red"
+            test_node_ref(&imported.doc, "box_child")?
+                .material_slot(0)
+                .map(Id::as_str),
+            Some("mat_red")
         );
         assert_eq!(
             test_action_ref(&imported.doc, "act_move")?.fcurves[0]
@@ -9371,8 +9379,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             0.1
         ));
         let material_id = cube
-            .materials
-            .first()
+            .material_slot(0)
             .ok_or_else(|| invalid_intermediate("fixture material slot was not imported"))?;
         let material = imported
             .doc
@@ -9581,10 +9588,13 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .map(|curve| curve.keyframes.len()),
             Some(2)
         );
+        let roundtrip_material_id = roundtrip_cube
+            .material_slot(0)
+            .ok_or_else(|| invalid_intermediate("round-trip material slot is missing"))?;
         let roundtrip_material = roundtrip
             .doc
             .materials
-            .get(&roundtrip_cube.materials[0])
+            .get(roundtrip_material_id)
             .ok_or_else(|| invalid_intermediate("round-trip material is missing"))?;
         for (actual, expected) in roundtrip_material
             .base_color
@@ -10550,8 +10560,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .map(|modifier| modifier.id.clone())
             .ok_or_else(|| invalid_intermediate("bevel modifier is missing"))?;
         let material_id = tabletop
-            .materials
-            .first()
+            .material_slot(0)
             .cloned()
             .ok_or_else(|| invalid_intermediate("tabletop material is missing"))?;
         let rod = test_node_ref(&doc, "node_riggedrod")?.clone();

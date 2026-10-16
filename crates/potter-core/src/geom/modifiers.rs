@@ -632,13 +632,22 @@ fn boolean_flag(modifier: &Modifier, parameter: &str) -> Result<bool> {
 fn boolean_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let settings = BooleanSettings::parse(modifier)?;
     match settings.solver {
-        BooleanSolver::Exact => super::boolean::exact_boolean(
-            mesh,
-            &modifier.runtime.boolean_operands,
-            settings.operation,
-            settings.use_self,
-            settings.hole_tolerant,
-        ),
+        BooleanSolver::Exact => {
+            // Blender `non_float_boolean_mesh` returns the mesh unchanged when no Object is set. A
+            // collection with no members still runs the solver, which removes self-intersections.
+            if settings.operand_type == BooleanOperandType::Object
+                && modifier.runtime.boolean_operands.is_empty()
+            {
+                return Ok(mesh.clone());
+            }
+            super::boolean::exact_boolean(
+                mesh,
+                &modifier.runtime.boolean_operands,
+                settings.operation,
+                settings.use_self,
+                settings.hole_tolerant,
+            )
+        }
         BooleanSolver::Manifold => Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
             "Boolean MANIFOLD solver is not supported",

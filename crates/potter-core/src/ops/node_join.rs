@@ -415,8 +415,8 @@ fn append_mesh(
     destination: &mut Mesh,
     source: &Mesh,
     transform: DMat4,
-    destination_materials: &mut Vec<Id>,
-    source_materials: &[Id],
+    destination_materials: &mut Vec<Option<Id>>,
+    source_materials: &[Option<Id>],
 ) -> Result<ElementMapping> {
     let mut mapping = ElementMapping::default();
     // Source face `i` lands at storage index `face_offset + i` once appended.
@@ -562,7 +562,7 @@ fn remap_element_id(
     Ok(id)
 }
 
-fn merge_material_slots(destination: &mut Vec<Id>, source: &[Id]) -> Vec<usize> {
+fn merge_material_slots(destination: &mut Vec<Option<Id>>, source: &[Option<Id>]) -> Vec<usize> {
     source
         .iter()
         .map(|material| {
@@ -1232,12 +1232,12 @@ mod tests {
             .get_mut(&Id::new("target").unwrap())
             .unwrap()
             .materials
-            .push(Id::new("target_material").unwrap());
+            .push(Some(Id::new("target_material").unwrap()));
         doc.nodes
             .get_mut(&Id::new("source").unwrap())
             .unwrap()
             .materials
-            .push(Id::new("source_material").unwrap());
+            .push(Some(Id::new("source_material").unwrap()));
         let root_collection = doc
             .collections
             .get_mut(&Id::new("collection_root").unwrap())
@@ -1275,7 +1275,7 @@ mod tests {
         );
         assert_eq!(
             engine.doc.nodes[&target].materials[1],
-            Id::new("source_material").unwrap()
+            Some(Id::new("source_material").unwrap())
         );
         assert_eq!(joined.faces[1].material_index, 1);
         assert!(!engine.doc.nodes.contains_key(&source));

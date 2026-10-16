@@ -328,10 +328,11 @@ fn write_node(
             "{}custom string[] potter:materials = {}",
             spaces(child_depth),
             string_array(
+                // An empty slot is written as an empty string, since USD string arrays cannot hold null.
                 &node
                     .materials
                     .iter()
-                    .map(ToString::to_string)
+                    .map(|slot| slot.as_ref().map_or_else(String::new, ToString::to_string))
                     .collect::<Vec<_>>()
             )?
         ),
@@ -508,6 +509,7 @@ fn write_node(
             output,
             doc,
             snapshot,
+            id,
             node,
             exchange,
             evaluated_mesh,
@@ -550,6 +552,7 @@ fn write_mesh(
     output: &mut String,
     doc: &SceneDoc,
     snapshot: &Snapshot,
+    id: &Id,
     node: &Node,
     exchange: &ExchangeMesh,
     source: &crate::geom::Mesh,
@@ -668,7 +671,11 @@ fn write_mesh(
         ),
     );
     write_deformation(output, doc, snapshot, node, &exchange.id, d)?;
-    if let Some(material_id) = node.materials.first() {
+    let bound_material = snapshot
+        .material_slots(id, node)
+        .first()
+        .and_then(Option::as_ref);
+    if let Some(material_id) = bound_material {
         if !doc.materials.contains_key(material_id) {
             return Err(PotError::new(
                 ErrorCode::SceneInvalid,
@@ -1981,17 +1988,23 @@ fn import_node_tree(
             let material = materials
                 .get(name)
                 .ok_or_else(|| import_error("USD mesh references a missing material"))?;
-            node_materials.push(material.clone());
+            node_materials.push(Some(material.clone()));
         }
         if let Some(list) = property_strings(prim, "potter:materials") {
             for raw in list {
-                let material =
-                    Id::new(raw).map_err(|_| import_error("USD material ID is invalid"))?;
-                if !doc.materials.contains_key(&material) {
-                    return Err(import_error("USD node references a missing material"));
-                }
-                if !node_materials.contains(&material) {
-                    node_materials.push(material);
+                // An empty string is an empty slot (see the potter:materials writer).
+                let slot = if raw.is_empty() {
+                    None
+                } else {
+                    let material =
+                        Id::new(raw).map_err(|_| import_error("USD material ID is invalid"))?;
+                    if !doc.materials.contains_key(&material) {
+                        return Err(import_error("USD node references a missing material"));
+                    }
+                    Some(material)
+                };
+                if !node_materials.contains(&slot) {
+                    node_materials.push(slot);
                 }
             }
         }

@@ -1770,9 +1770,10 @@ fn collect_volumes<'a>(
                 });
                 (grid.origin, bounds_max, grid.voxel_size, density_range)
             };
-        let material = node
-            .materials
+        let material = snapshot
+            .material_slots(node_id, node)
             .first()
+            .and_then(Option::as_ref)
             .and_then(|material_id| doc.materials.get(material_id));
         let evaluated_material = if let Some(material) = material {
             let local_center = (bounds_min + bounds_max) * 0.5;
