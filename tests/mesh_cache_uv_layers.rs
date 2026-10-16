@@ -122,8 +122,9 @@ fn replace_body_mesh(scene: &Path, mesh: &Mesh) -> TestResult {
     let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
     let data_id = document["nodes"]["body"]["data"]
         .as_str()
-        .ok_or("body mesh data block is missing")?;
-    document["data_blocks"][data_id]["mesh"] = serde_json::to_value(mesh)?;
+        .ok_or("body mesh data block is missing")?
+        .to_owned();
+    document["data_blocks"][&data_id]["mesh"] = serde_json::to_value(mesh)?;
     fs::write(scene_path, serde_json::to_vec_pretty(&document)?)?;
     Ok(())
 }
