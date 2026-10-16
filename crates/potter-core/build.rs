@@ -6,9 +6,9 @@ fn main() -> Result<(), io::Error> {
             io::Error::new(io::ErrorKind::NotFound, "CARGO_MANIFEST_DIR is not set")
         })?,
     );
+
     let skin_native = manifest_dir.join("src/geom/modifiers/skin_native");
     let bullet = skin_native.join("bullet/LinearMath");
-
     cc::Build::new()
         .cpp(true)
         .std("c++11")
@@ -18,7 +18,6 @@ fn main() -> Result<(), io::Error> {
         .file(bullet.join("btConvexHullComputer.cpp"))
         .file(bullet.join("btAlignedAllocator.cpp"))
         .compile("potter_skin_hull");
-
     println!("cargo:rerun-if-changed=src/geom/modifiers/skin_native/skin_hull.cpp");
     println!("cargo:rerun-if-changed=src/geom/modifiers/skin_native/bullet/source-pin.txt");
     for source in [
@@ -33,5 +32,30 @@ fn main() -> Result<(), io::Error> {
     ] {
         println!("cargo:rerun-if-changed={}", bullet.join(source).display());
     }
+
+    let eigen_dir = manifest_dir.join("vendor/eigen");
+    if !eigen_dir.join("Eigen/LU").is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Eigen submodule is missing; run `git submodule update --init --recursive`",
+        ));
+    }
+    let target = env::var("TARGET").map_err(|error| io::Error::other(error.to_string()))?;
+    let mut eigen = cc::Build::new();
+    eigen
+        .cpp(true)
+        .std("c++14")
+        .file(manifest_dir.join("native/blender_inverse_m4.cc"))
+        .include(&eigen_dir);
+    if target == "aarch64-apple-darwin" {
+        eigen
+            .opt_level(2)
+            .flag("-mdynamic-no-pic")
+            .flag("-ffp-contract=off");
+    }
+    eigen.compile("potter_blender_inverse");
+    println!("cargo:rerun-if-changed=native/blender_inverse_m4.cc");
+    println!("cargo:rerun-if-changed=vendor/eigen/Eigen/LU");
+    println!("cargo:rerun-if-changed=vendor/eigen/Eigen/src/LU/InverseImpl.h");
     Ok(())
 }

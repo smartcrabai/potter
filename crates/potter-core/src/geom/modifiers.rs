@@ -113,44 +113,14 @@ fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
     result
 }
 
-fn blender_cofactor_4x4(matrix: &[f32; 16], row: usize, column: usize) -> f32 {
-    let i1 = (row + 1) % 4;
-    let i2 = (row + 2) % 4;
-    let i3 = (row + 3) % 4;
-    let j1 = (column + 1) % 4;
-    let j2 = (column + 2) % 4;
-    let j3 = (column + 3) % 4;
-    let det3 = |i1, i2, i3, j1, j2, j3| {
-        matrix[j1 * 4 + i1]
-            * (matrix[j2 * 4 + i2] * matrix[j3 * 4 + i3]
-                - matrix[j3 * 4 + i2] * matrix[j2 * 4 + i3])
-    };
-    det3(i1, i2, i3, j1, j2, j3)
-        + det3(i2, i3, i1, j1, j2, j3)
-        + det3(i3, i1, i2, j1, j2, j3)
+unsafe extern "C" {
+    fn potter_blender_inverse_m4(matrix: *const f32, inverse: *mut f32);
 }
 
 pub(crate) fn blender_inverse_m4(matrix: [f32; 16]) -> [f32; 16] {
     let mut result = [0.0; 16];
-    for row in 0..4 {
-        for column in 0..4 {
-            let cofactor = blender_cofactor_4x4(&matrix, column, row);
-            result[column * 4 + row] = if (row + column) & 1 == 0 {
-                cofactor
-            } else {
-                -cofactor
-            };
-        }
-    }
-    let determinant = matrix[0] * result[0]
-        + matrix[1] * result[4]
-        + matrix[2] * result[8]
-        + matrix[3] * result[12];
-    if determinant == 0.0 || !determinant.is_finite() {
-        return [0.0; 16];
-    }
-    for value in &mut result {
-        *value /= determinant;
+    unsafe {
+        potter_blender_inverse_m4(matrix.as_ptr(), result.as_mut_ptr());
     }
     result
 }
