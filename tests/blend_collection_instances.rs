@@ -1,11 +1,15 @@
 //! Blender parity for collection instances. Each case in `fixtures/blend_collection_instances.py` is
-//! one `.blend` scene. Potter imports it and exports GLB, and Blender exports the same scene
-//! itself. Every glTF primitive is reduced to its triangle corners in world space, each corner
-//! being a (position, normal, TEXCOORD values) tuple, and the corner multisets must match with
-//! tolerance: no deduplication, no sorted-normal shortcut. Potter's `.blend` export and Blender's
-//! reading of it must also agree on each member's color attributes, vertex groups, and seams,
-//! which glTF cannot carry. Blender-gated: `POTTER_REQUIRE_BLENDER` turns a missing Blender into a
-//! failure.
+//! one `.blend` scene, written in full and as a geometry-only variant whose members have no color
+//! attributes, vertex groups, or seams. Potter imports the geometry-only variant and exports GLB,
+//! and Blender exports the same variant itself. glTF export refuses `blender_attributes`, so only
+//! geometry is compared there: every primitive is reduced to its triangles' world-space corners, each
+//! corner a (position, normal, TEXCOORD values) tuple. Triangles sharing an edge form a patch, and
+//! patches must match with tolerance by triangle count and unique corner set, and each primitive's
+//! total corner count (with multiplicity) must agree. Per-corner multiplicity inside a patch is not
+//! compared, since diagonal choice inside a quad changes it. Cases that
+//! carry attributes also round-trip the full scene through Potter's `.blend` export, and Blender's
+//! reading of both files must agree on each member's color attributes, vertex groups, and seams.
+//! Blender-gated: `POTTER_REQUIRE_BLENDER` turns a missing Blender into a failure.
 
 use std::{collections::BTreeSet, error::Error, fs, path::Path, process::Command};
 
@@ -26,7 +30,7 @@ const DUMPER: &str = include_str!("fixtures/blend_collection_instances_dump.py")
 const POSITION_TOLERANCE: f64 = 1.0e-4;
 const NORMAL_TOLERANCE: f64 = 1.0e-3;
 const UV_TOLERANCE: f64 = 1.0e-4;
-/// BYTE_COLOR quantizes to 1/255, so colors compare to two steps of that.
+/// `BYTE_COLOR` quantizes to 1/255, so colors compare to two steps of that.
 const COLOR_TOLERANCE: f64 = 0.01;
 const WEIGHT_TOLERANCE: f64 = 1.0e-5;
 const SEAM_TOLERANCE: f64 = 1.0e-5;
@@ -42,13 +46,16 @@ const IDENTITY: [f64; 16] = [
 enum Check {
     /// Every primitive's world-space corners match Blender's export.
     Geometry,
+    /// Geometry, and a face whose material index exceeds the table clamps to the last slot: the
+    /// exported primitives must include that slot's material with the clamped faces' corner count.
+    ClampToLastSlot,
     /// Geometry, then each member's color, vertex group, and seam records match Blender's
     /// `.blend` round trip of the same scene.
     GeometryAndAttributes,
     /// Blender-authored members joined with a Potter `uv.unwrap` member. Blender's members match
     /// Blender's export; the Potter member matches its own standalone export.
     MixedWithPotterUnwrap,
-    /// A textured member without UVs is refused, and Blender exports it without TEXCOORD_0.
+    /// A textured member without UVs is refused, and Blender exports it without `TEXCOORD_0`.
     TexturedWithoutUv,
     /// A user metadata conflict fails only the instance that owns it.
     ConflictIsolated,
@@ -64,7 +71,7 @@ const CASES: [(&str, Check); 13] = [
     ("missing_uv_textured", Check::TexturedWithoutUv),
     ("mixed_smooth", Check::Geometry),
     ("custom_normals_rotated", Check::Geometry),
-    ("out_of_range_material", Check::Geometry),
+    ("out_of_range_material", Check::ClampToLastSlot),
     ("color_type_conflict", Check::GeometryAndAttributes),
     ("potter_id_reimport", Check::Geometry),
     ("metadata_conflict", Check::ConflictIsolated),
@@ -102,7 +109,9 @@ fn path_str(path: &Path) -> TestResult<&str> {
 
 /// Runs `pot` and asserts success. The caller appends `--json`.
 fn run_pot_json(args: &[&str]) -> TestResult<Value> {
-    let output = Command::new(env!("CARGO_BIN_EXE_pot")).args(args).output()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(args)
+        .output()?;
     assert!(
         output.status.success(),
         "pot {} failed: stdout={} stderr={}",
@@ -115,7 +124,9 @@ fn run_pot_json(args: &[&str]) -> TestResult<Value> {
 
 /// Runs `pot` and asserts that it refuses, returning the failure envelope it printed.
 fn run_pot_refusal(args: &[&str]) -> TestResult<Value> {
-    let output = Command::new(env!("CARGO_BIN_EXE_pot")).args(args).output()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(args)
+        .output()?;
     assert!(
         !output.status.success(),
         "pot {} unexpectedly succeeded",
@@ -135,7 +146,10 @@ fn run_blender(blender: &Path, script: &Path, arguments: &[&str]) -> TestResult 
     let stderr = String::from_utf8_lossy(&output.stderr);
     ensure(
         output.status.success() && !stdout.contains("Traceback") && !stderr.contains("Traceback"),
-        format!("Blender script {} failed: stdout={stdout} stderr={stderr}", script.display()),
+        format!(
+            "Blender script {} failed: stdout={stdout} stderr={stderr}",
+            script.display()
+        ),
     )
 }
 
@@ -159,7 +173,11 @@ fn read_glb(path: &Path) -> TestResult<(Value, Vec<u8>)> {
 }
 
 /// Byte offset, element stride, and element count of an accessor.
-fn accessor_layout(gltf: &Value, accessor: &Value, width: usize) -> TestResult<(usize, usize, usize)> {
+fn accessor_layout(
+    gltf: &Value,
+    accessor: &Value,
+    width: usize,
+) -> TestResult<(usize, usize, usize)> {
     let view_index = accessor["bufferView"]
         .as_u64()
         .ok_or("accessor has no buffer view")?;
@@ -174,7 +192,12 @@ fn accessor_layout(gltf: &Value, accessor: &Value, width: usize) -> TestResult<(
 }
 
 /// Float elements of `width` components, unrounded.
-fn float_values(gltf: &Value, bin: &[u8], accessor: &Value, width: usize) -> TestResult<Vec<Vec<f64>>> {
+fn float_values(
+    gltf: &Value,
+    bin: &[u8],
+    accessor: &Value,
+    width: usize,
+) -> TestResult<Vec<Vec<f64>>> {
     let (start, stride, count) = accessor_layout(gltf, accessor, width * 4)?;
     let mut elements = Vec::with_capacity(count);
     for item in 0..count {
@@ -184,8 +207,12 @@ fn float_values(gltf: &Value, bin: &[u8], accessor: &Value, width: usize) -> Tes
             .ok_or("accessor exceeds the binary chunk")?;
         elements.push(
             bytes
-                .chunks_exact(4)
-                .map(|chunk| f64::from(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| {
+                    f64::from(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                })
                 .collect(),
         );
     }
@@ -215,7 +242,11 @@ fn index_elements(gltf: &Value, bin: &[u8], accessor: &Value) -> TestResult<Vec<
         .collect())
 }
 
-fn attribute_accessor<'a>(gltf: &'a Value, attributes: &Value, name: &str) -> TestResult<&'a Value> {
+fn attribute_accessor<'a>(
+    gltf: &'a Value,
+    attributes: &Value,
+    name: &str,
+) -> TestResult<&'a Value> {
     let index = attributes[name]
         .as_u64()
         .ok_or_else(|| format!("primitive has no {name} attribute"))?;
@@ -231,7 +262,11 @@ fn json_numbers<const N: usize>(value: &Value) -> TestResult<[f64; N]> {
         .as_array()
         .ok_or("glTF transform value must be an array")?
         .iter()
-        .map(|number| number.as_f64().ok_or("glTF transform value must be a number"))
+        .map(|number| {
+            number
+                .as_f64()
+                .ok_or("glTF transform value must be a number")
+        })
         .collect::<Result<Vec<f64>, &str>>()?;
     array_from::<N>(&numbers)
 }
@@ -259,9 +294,21 @@ fn local_matrix(node: &Value) -> TestResult<[f64; 16]> {
     };
     let [x, y, z, w] = rotation;
     let rows = [
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
     ];
     let mut matrix = [0.0; 16];
     for column in 0..3 {
@@ -290,19 +337,25 @@ fn transform_point(m: &[f64; 16], p: [f64; 3]) -> [f64; 3] {
     [0_usize, 1, 2].map(|row| m[row] * p[0] + m[4 + row] * p[1] + m[8 + row] * p[2] + m[12 + row])
 }
 
-/// Normals transform by the cofactor matrix of the upper 3x3, which equals the inverse transpose
-/// up to scale; the result is normalized, so mirrored members need no sign handling.
+/// Normals transform by the inverse transpose of the upper 3x3. The cofactor matrix equals
+/// `det(M) * M^-T`, so a mirrored matrix (negative determinant) needs its sign flipped back; without
+/// that, mirrored members get inward normals and fail against the outward ones Potter writes.
 fn transform_normal(m: &[f64; 16], n: [f64; 3]) -> [f64; 3] {
     let a = |row: usize, column: usize| m[column * 4 + row];
+    let determinant = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1))
+        - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
+        + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
+    let sign = if determinant < 0.0 { -1.0 } else { 1.0 };
     let mut out = [0.0; 3];
     for (i, value) in out.iter_mut().enumerate() {
-        *value = (0..3)
-            .map(|j| {
-                let (r1, r2) = ((i + 1) % 3, (i + 2) % 3);
-                let (c1, c2) = ((j + 1) % 3, (j + 2) % 3);
-                (a(r1, c1) * a(r2, c2) - a(r1, c2) * a(r2, c1)) * n[j]
-            })
-            .sum::<f64>();
+        *value = sign
+            * (0..3)
+                .map(|j| {
+                    let (r1, r2) = ((i + 1) % 3, (i + 2) % 3);
+                    let (c1, c2) = ((j + 1) % 3, (j + 2) % 3);
+                    (a(r1, c1) * a(r2, c2) - a(r1, c2) * a(r2, c1)) * n[j]
+                })
+                .sum::<f64>();
     }
     let length = out.iter().map(|value| value * value).sum::<f64>().sqrt();
     if length > 0.0 {
@@ -324,8 +377,18 @@ fn read_primitive(
         .as_u64()
         .ok_or("primitive has no indices")? as usize];
     let indices = index_elements(gltf, bin, index_accessor)?;
-    let positions = float_values(gltf, bin, attribute_accessor(gltf, attributes, "POSITION")?, 3)?;
-    let normals = float_values(gltf, bin, attribute_accessor(gltf, attributes, "NORMAL")?, 3)?;
+    let positions = float_values(
+        gltf,
+        bin,
+        attribute_accessor(gltf, attributes, "POSITION")?,
+        3,
+    )?;
+    let normals = float_values(
+        gltf,
+        bin,
+        attribute_accessor(gltf, attributes, "NORMAL")?,
+        3,
+    )?;
     let texcoord_sets = attributes
         .as_object()
         .into_iter()
@@ -343,7 +406,9 @@ fn read_primitive(
         let normal = array_from::<3>(normals.get(vertex).ok_or("index exceeds NORMAL")?)?;
         let mut uvs = Vec::with_capacity(uv_sets.len());
         for set in &uv_sets {
-            uvs.push(array_from::<2>(set.get(vertex).ok_or("index exceeds TEXCOORD")?)?);
+            uvs.push(array_from::<2>(
+                set.get(vertex).ok_or("index exceeds TEXCOORD")?,
+            )?);
         }
         corners.push(Corner {
             position: transform_point(world, position),
@@ -419,15 +484,96 @@ fn corner_matches(expected: &Corner, actual: &Corner) -> bool {
             .all(|(e, a)| close(e, a, UV_TOLERANCE))
 }
 
-/// Greedy one-to-one matching of corners: every expected corner takes an unused actual corner
-/// with the same world position, normal, and UVs, so duplicate corners keep their multiplicity.
-fn corners_match(expected: &[Corner], actual: &[Corner]) -> bool {
+/// A polygon-level piece of a primitive: the triangles of one edge-connected run, their count, and
+/// the run's unique corners. What is checked, with tolerance: each primitive's total corner count
+/// (with multiplicity), and for every patch its triangle count and its unique (position, normal,
+/// TEXCOORD) corner set, matched one-to-one. Per-corner multiplicity inside a patch is not checked:
+/// Blender and Potter may split one quad along different diagonals, which changes how many times
+/// each corner appears without changing the polygon, so no multiplicity is invariant across them.
+struct Patch<'a> {
+    triangles: usize,
+    corners: Vec<&'a Corner>,
+}
+
+/// Union-find root with path halving.
+fn root(parent: &mut [usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        parent[index] = parent[parent[index]];
+        index = parent[index];
+    }
+    index
+}
+
+fn patches(primitive: &Primitive) -> Vec<Patch<'_>> {
+    let triangles: Vec<&[Corner]> = primitive.corners.chunks(3).collect();
+    let mut parent: Vec<usize> = (0..triangles.len()).collect();
+    for first in 0..triangles.len() {
+        for second in first + 1..triangles.len() {
+            let shared = triangles[first]
+                .iter()
+                .filter(|corner| {
+                    triangles[second]
+                        .iter()
+                        .any(|other| corner_matches(corner, other))
+                })
+                .count();
+            if shared >= 2 {
+                let (a, b) = (root(&mut parent, first), root(&mut parent, second));
+                parent[a] = b;
+            }
+        }
+    }
+    let mut grouped: Vec<Option<Patch<'_>>> = (0..triangles.len()).map(|_| None).collect();
+    for (index, &triangle) in triangles.iter().enumerate() {
+        let patch = grouped[root(&mut parent, index)].get_or_insert_with(|| Patch {
+            triangles: 0,
+            corners: Vec::new(),
+        });
+        patch.triangles += 1;
+        for corner in triangle {
+            if !patch
+                .corners
+                .iter()
+                .any(|known| corner_matches(known, corner))
+            {
+                patch.corners.push(corner);
+            }
+        }
+    }
+    grouped.into_iter().flatten().collect()
+}
+
+fn patch_matches(expected: &Patch<'_>, actual: &Patch<'_>) -> bool {
+    expected.triangles == actual.triangles
+        && expected.corners.len() == actual.corners.len()
+        && expected.corners.iter().all(|corner| {
+            actual
+                .corners
+                .iter()
+                .any(|other| corner_matches(corner, other))
+        })
+        && actual.corners.iter().all(|corner| {
+            expected
+                .corners
+                .iter()
+                .any(|other| corner_matches(other, corner))
+        })
+}
+
+/// One-to-one matching of patches: every expected patch takes an unused actual patch with the same
+/// triangle count and corner set.
+fn patches_match(expected: &Primitive, actual: &Primitive) -> bool {
+    let expected = patches(expected);
+    let actual = patches(actual);
+    if expected.len() != actual.len() {
+        return false;
+    }
     let mut used = vec![false; actual.len()];
-    expected.iter().all(|corner| {
+    expected.iter().all(|patch| {
         let found = actual
             .iter()
             .enumerate()
-            .position(|(index, candidate)| !used[index] && corner_matches(corner, candidate));
+            .position(|(index, candidate)| !used[index] && patch_matches(patch, candidate));
         match found {
             Some(index) => {
                 used[index] = true;
@@ -444,7 +590,7 @@ fn primitive_matches(expected: &Primitive, actual: &Primitive) -> bool {
     expected.material == actual.material
         && expected.corners.len() == actual.corners.len()
         && actual.texcoord_sets >= expected.texcoord_sets
-        && corners_match(&expected.corners, &actual.corners)
+        && patches_match(expected, actual)
 }
 
 fn summarize(primitives: &[Primitive]) -> Vec<(Option<String>, usize)> {
@@ -452,6 +598,106 @@ fn summarize(primitives: &[Primitive]) -> Vec<(Option<String>, usize)> {
         .iter()
         .map(|primitive| (primitive.material.clone(), primitive.corners.len()))
         .collect()
+}
+
+fn fmt_values(values: &[f64]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:.5}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn describe_corner(corner: &Corner) -> String {
+    let uvs: Vec<String> = corner
+        .uvs
+        .iter()
+        .map(|uv| format!("[{}]", fmt_values(uv)))
+        .collect();
+    format!(
+        "pos [{}] normal [{}] uv {}",
+        fmt_values(&corner.position),
+        fmt_values(&corner.normal),
+        uvs.join(" ")
+    )
+}
+
+fn max_delta(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// Largest per-component difference of a corner's position, normal, and UV sets.
+fn corner_deltas(expected: &Corner, actual: &Corner) -> (f64, f64, f64) {
+    let uv = expected
+        .uvs
+        .iter()
+        .zip(&actual.uvs)
+        .map(|(e, a)| max_delta(e, a))
+        .fold(0.0, f64::max);
+    (
+        max_delta(&expected.position, &actual.position),
+        max_delta(&expected.normal, &actual.normal),
+        uv,
+    )
+}
+
+/// Describes the first unmatched expected corners of `expected` against the first exported
+/// primitive with the same material and corner count: the first corners of both, and for each
+/// unmatched corner its nearest candidate corner with per-field deltas.
+fn mismatch_report(expected: &Primitive, actual: &[Primitive]) -> String {
+    let Some(candidate) = actual.iter().find(|candidate| {
+        candidate.material == expected.material && candidate.corners.len() == expected.corners.len()
+    }) else {
+        return "no exported primitive has the same material and corner count".to_owned();
+    };
+    let mut lines = vec!["first expected corners:".to_owned()];
+    lines.extend(
+        expected
+            .corners
+            .iter()
+            .take(3)
+            .map(|corner| format!("  {}", describe_corner(corner))),
+    );
+    lines.push("first candidate corners:".to_owned());
+    lines.extend(
+        candidate
+            .corners
+            .iter()
+            .take(3)
+            .map(|corner| format!("  {}", describe_corner(corner))),
+    );
+    lines.push(
+        "unmatched expected corners, nearest candidate (max delta pos/normal/uv):".to_owned(),
+    );
+    for corner in expected
+        .corners
+        .iter()
+        .filter(|corner| {
+            !candidate
+                .corners
+                .iter()
+                .any(|other| corner_matches(corner, other))
+        })
+        .take(3)
+    {
+        let nearest = candidate.corners.iter().min_by(|a, b| {
+            let (ap, an, au) = corner_deltas(corner, a);
+            let (bp, bn, bu) = corner_deltas(corner, b);
+            ap.max(an).max(au).total_cmp(&bp.max(bn).max(bu))
+        });
+        if let Some(nearest) = nearest {
+            let (position, normal, uv) = corner_deltas(corner, nearest);
+            lines.push(format!(
+                "  expected {}\n    nearest {}\n    delta pos {position:.6} normal {normal:.6} uv {uv:.6}",
+                describe_corner(corner),
+                describe_corner(nearest)
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 fn assert_primitives_match(expected: &[Primitive], actual: &[Primitive], case: &str) -> TestResult {
@@ -473,9 +719,10 @@ fn assert_primitives_match(expected: &[Primitive], actual: &[Primitive], case: &
             Some(index) => used[index] = true,
             None => {
                 return Err(format!(
-                    "{case}: no exported primitive matches material {:?} with {} corners; expected {:?}, got {:?}",
+                    "{case}: no exported primitive matches material {:?} with {} corners\n{}\nexpected primitives {:?}\ngot primitives {:?}",
                     primitive.material,
                     primitive.corners.len(),
+                    mismatch_report(primitive, actual),
                     summarize(expected),
                     summarize(actual)
                 )
@@ -514,9 +761,10 @@ fn same_records(expected: &[Vec<f64>], actual: &[Vec<f64>], tolerance: f64) -> b
     }
     let mut used = vec![false; actual.len()];
     expected.iter().all(|record| {
-        let found = actual.iter().enumerate().position(|(index, candidate)| {
-            !used[index] && close(record, candidate, tolerance)
-        });
+        let found = actual
+            .iter()
+            .enumerate()
+            .position(|(index, candidate)| !used[index] && close(record, candidate, tolerance));
         match found {
             Some(index) => {
                 used[index] = true;
@@ -665,7 +913,9 @@ fn run_case(
     run_blender(blender, builder, &[path_str(case_root)?, case])?;
     let oracle = case_root.join(format!("{case}.blend"));
     let oracle_text = path_str(&oracle)?;
-    let blender_glb = case_root.join(format!("{case}.blender.glb"));
+    let geometry = case_root.join(format!("{case}-geometry.blend"));
+    let geometry_text = path_str(&geometry)?;
+    let blender_glb = case_root.join(format!("{case}-geometry.blender.glb"));
     let project = case_root.join("project");
     let project_text = path_str(&project)?;
     let blender_text = path_str(blender)?;
@@ -677,7 +927,7 @@ fn run_case(
         "import",
         project_text,
         "--file",
-        oracle_text,
+        geometry_text,
         "--format",
         "blend",
         "--mode",
@@ -769,7 +1019,7 @@ fn run_case(
                 "--json",
             ])?;
         }
-        Check::Geometry | Check::GeometryAndAttributes => {}
+        Check::Geometry | Check::GeometryAndAttributes | Check::ClampToLastSlot => {}
     }
 
     run_pot_json(&[
@@ -787,14 +1037,50 @@ fn run_case(
     if check == Check::MixedWithPotterUnwrap {
         expected.extend(standalone_unwrap_primitives(case_root)?);
     }
-    assert_primitives_match(&expected, &primitives(&potter_glb)?, case)?;
+    let exported = primitives(&potter_glb)?;
+    assert_primitives_match(&expected, &exported, case)?;
+    if check == Check::ClampToLastSlot {
+        // Faces 3..5 of the two-slot member carry index 5, which clamps to slot 1 (blue): 3 faces,
+        // 18 corners. Slot 0 (red) keeps faces 0..2, 18 corners.
+        let blue_corners: usize = exported
+            .iter()
+            .filter(|primitive| primitive.material.as_deref() == Some("blue"))
+            .map(|primitive| primitive.corners.len())
+            .sum();
+        ensure(
+            blue_corners == 18,
+            format!(
+                "{case}: clamped faces must export on blue with 18 corners, got {blue_corners}"
+            ),
+        )?;
+    }
 
     if check == Check::GeometryAndAttributes {
+        // The attribute round trip keeps the full scene. The glTF comparison above used the
+        // geometry-only variant, because glTF export refuses `blender_attributes`.
+        let attribute_project = case_root.join("attribute-project");
+        let attribute_project_text = path_str(&attribute_project)?;
         let potter_blend = case_root.join("potter.blend");
         let potter_blend_text = path_str(&potter_blend)?;
+        run_pot_json(&["init", attribute_project_text, "--json"])?;
+        run_pot_json(&[
+            "import",
+            attribute_project_text,
+            "--file",
+            oracle_text,
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+            blender_text,
+            "--json",
+        ])?;
         run_pot_json(&[
             "export",
-            project_text,
+            attribute_project_text,
             "--format",
             "blend",
             "--out",
@@ -808,7 +1094,11 @@ fn run_case(
         let expected_dump = case_root.join("oracle.json");
         let actual_dump = case_root.join("potter.json");
         run_blender(blender, dumper, &[oracle_text, path_str(&expected_dump)?])?;
-        run_blender(blender, dumper, &[potter_blend_text, path_str(&actual_dump)?])?;
+        run_blender(
+            blender,
+            dumper,
+            &[potter_blend_text, path_str(&actual_dump)?],
+        )?;
         assert_attribute_records_match(
             &read_json(&expected_dump)?,
             &read_json(&actual_dump)?,
@@ -940,7 +1230,15 @@ fn public_cli_nested_instances_preview_render_and_export_member_materials() -> T
 
     let glb = root.join("assembly.glb");
     let glb_text = path_str(&glb)?;
-    run_pot_json(&["export", project_text, "--format", "glb", "--out", glb_text, "--json"])?;
+    run_pot_json(&[
+        "export",
+        project_text,
+        "--format",
+        "glb",
+        "--out",
+        glb_text,
+        "--json",
+    ])?;
     let exported = primitives(&glb)?;
     let exported_materials: BTreeSet<Option<String>> = exported
         .iter()

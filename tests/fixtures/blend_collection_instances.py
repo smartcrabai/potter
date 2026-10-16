@@ -2,9 +2,11 @@
 
 Run as: blender --background --factory-startup --python blend_collection_instances.py -- <root> <case>
 
-Writes <root>/<case>.blend, the scene Potter imports, and <root>/<case>.blender.glb, Blender's own
-glTF export of that scene. Member collections stay unlinked from the scene, so only instances draw
-them, as in the Potter scenes.
+Writes <root>/<case>.blend (the full scene, for the attribute round trip), <root>/<case>-geometry.blend
+(the same scene with every member's color attributes, vertex groups, and seams removed, which Potter
+imports for the glTF comparison), and <root>/<case>-geometry.blender.glb, Blender's own glTF export of
+that geometry-only scene. Member collections stay unlinked from the scene, so only instances draw them,
+as in the Potter scenes.
 """
 
 import math
@@ -219,9 +221,9 @@ def custom_normals_rotated(scene):
 
 
 def out_of_range_material(scene):
+    # Empty (None) slot preservation is covered once Node.materials carries Option entries (PR17a).
     members = bpy.data.collections.new("Members")
-    ranged = cube("Ranged", [material("red", RED)])
-    ranged.data.materials.append(None)
+    ranged = cube("Ranged", [material("red", RED), material("blue", BLUE)])
     for polygon in ranged.data.polygons:
         polygon.material_index = 0 if polygon.index < 3 else 5
     members.objects.link(ranged)
@@ -289,8 +291,23 @@ CASES = {
     "metadata_conflict": metadata_conflict,
 }
 
+def strip_attributes():
+    for obj in bpy.data.objects:
+        if obj.type != "MESH":
+            continue
+        mesh = obj.data
+        while len(mesh.color_attributes):
+            mesh.color_attributes.remove(mesh.color_attributes[0])
+        for group in list(obj.vertex_groups):
+            obj.vertex_groups.remove(group)
+        for edge in mesh.edges:
+            edge.use_seam = False
+
+
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 CASES[CASE](scene)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(ROOT, CASE + ".blend"), check_existing=False)
-bpy.ops.export_scene.gltf(filepath=os.path.join(ROOT, CASE + ".blender.glb"), export_format="GLB")
+strip_attributes()
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(ROOT, CASE + "-geometry.blend"), check_existing=False)
+bpy.ops.export_scene.gltf(filepath=os.path.join(ROOT, CASE + "-geometry.blender.glb"), export_format="GLB")

@@ -2554,10 +2554,12 @@ def _bind_blender_modifiers(doc, object_map, preserved_native_binds):
 
 
 def _native_values(attributes, name):
-    """Potter's native values for a mesh attribute keyed by element ID ('f3', 'e7'), or None."""
+    """Potter's native values for a mesh attribute keyed by element ID ('f3', 'e7'), or None when
+    the attribute is absent. An empty mapping is still the current state and wins over raw data."""
     attribute = attributes.get(name)
-    values = attribute.get("values") if isinstance(attribute, dict) else None
-    return values or None
+    if not isinstance(attribute, dict) or not isinstance(attribute.get("values"), dict):
+        return None
+    return attribute["values"]
 
 
 def _set_native_custom_normals(mesh, values, face_ids):

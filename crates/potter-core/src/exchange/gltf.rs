@@ -1064,6 +1064,14 @@ fn export_uv_sets(mesh: &Mesh) -> Result<Vec<BTreeMap<u32, Vec<[f64; 2]>>>> {
         .collect()
 }
 
+/// Whether the glTF exporter writes a `TEXCOORD_0` for `mesh`: set 0 of [`export_uv_sets`] exists, which
+/// is a `uv_map` attribute (even empty) or any `blender_uv_layers` layer. A face without a value in set 0
+/// exports as `[0, 0]`, so this is the coverage a textured material is validated against. A mesh whose
+/// UVs fail to parse exports no set and reports `false`; the export itself then fails.
+pub(crate) fn exports_texcoord0(mesh: &Mesh) -> bool {
+    export_uv_sets(mesh).is_ok_and(|sets| !sets.is_empty())
+}
+
 fn export_vertex_layout(
     mesh: &Mesh,
     layers: &[Vec<DVec3>],

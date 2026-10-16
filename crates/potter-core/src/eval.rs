@@ -140,7 +140,9 @@ impl Snapshot {
         slot: usize,
     ) -> Option<&'a Id> {
         match self.instance_bindings.get(node_id) {
-            Some(table) => table.get(slot).and_then(|binding| binding.material.as_ref()),
+            Some(table) => table
+                .get(slot)
+                .and_then(|binding| binding.material.as_ref()),
             None => node.material_slot(slot),
         }
     }
@@ -153,13 +155,17 @@ impl Snapshot {
             .map_or(node.materials.len(), Vec::len)
     }
 
-    /// Per slot, whether every face using it has UVs in the layer exported as `TEXCOORD_0`. An
-    /// instance's table carries this; a plain node's is computed from `mesh`, its exported mesh.
+    /// Per slot, whether the slot's faces have UVs for export. Two rules, one per node kind:
+    /// - Instance: an instance's table carries, per used slot, whether every face indexing it is
+    ///   covered by its member's first UV layer (`concat::uv_covered_faces`); a corner without a value
+    ///   joins as `[0, 0]`, so coverage is per face rather than whole-mesh.
+    /// - Plain node: every slot is the exporter's rule (`exports_texcoord0`): set 0 exists, since the
+    ///   exporter writes `TEXCOORD_0` for the whole mesh and fills missing face values with `[0, 0]`.
     #[must_use]
     pub fn slot_uv_table(&self, node_id: &Id, node: &Node, mesh: &Mesh) -> Vec<bool> {
         match self.instance_bindings.get(node_id) {
             Some(table) => table.iter().map(|binding| binding.uv).collect(),
-            None => fold_slot_coverage(mesh, &exported_uv_coverage(mesh), node.materials.len()),
+            None => vec![crate::exchange::gltf::exports_texcoord0(mesh); node.materials.len()],
         }
     }
 }
@@ -242,7 +248,7 @@ impl Snapshot {
                     }
                     return Ok((snapshot, node_errors));
                 }
-            Err(error) if is_isolated_failure(&error) => {
+                Err(error) if is_isolated_failure(&error) => {
                     let source_doc = evaluation_doc.as_ref().unwrap_or(doc);
                     let Some(node_id) = unsupported_feature_owner(source_doc, &error) else {
                         return Err(error);
@@ -268,7 +274,7 @@ impl Snapshot {
                             modifier.enabled = false;
                         }
                         if instance {
-                            node.kind = "empty".to_owned();
+                            "empty".clone_into(&mut node.kind);
                             node.properties.remove(INSTANCE_COLLECTION_PROPERTY);
                         }
                     }
@@ -3542,62 +3548,6 @@ fn member_slots(node: &Node) -> Vec<Option<Id>> {
 /// UV coverage), and each member's source path.
 type CollectionEvaluation = (Mesh, Vec<Vec<Id>>, Vec<SlotBinding>);
 
-/// Per face of a plain node's exported mesh: whether the exporter's `TEXCOORD_0` set has a finite
-/// value on every corner. The exporter takes `uv_map` alone as the set when the mesh has one;
-/// otherwise the first `blender_uv_layers` layer is set 0.
-fn exported_uv_coverage(mesh: &Mesh) -> Vec<bool> {
-    let valid_uv = |value: &Value| {
-        value.as_array().is_some_and(|pair| {
-            pair.len() == 2
-                && pair
-                    .iter()
-                    .all(|component| component.as_f64().is_some_and(f64::is_finite))
-        })
-    };
-    let mut covered = vec![false; mesh.faces.len()];
-    if let Some(entries) = mesh.attributes.get("uv_map").and_then(Value::as_array) {
-        let faces: BTreeMap<u64, usize> = mesh
-            .faces
-            .iter()
-            .enumerate()
-            .map(|(index, face)| (u64::from(face.id), index))
-            .collect();
-        for entry in entries {
-            let Some(&index) = entry
-                .get("face_id")
-                .and_then(Value::as_u64)
-                .and_then(|id| faces.get(&id))
-            else {
-                continue;
-            };
-            let corners = mesh.faces[index].vertices.len();
-            covered[index] = entry
-                .get("uv")
-                .and_then(Value::as_array)
-                .is_some_and(|row| row.len() == corners && row.iter().all(valid_uv));
-        }
-        return covered;
-    }
-    let values = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .and_then(|layers| layers.first())
-        .and_then(|layer| layer.get("values"))
-        .and_then(Value::as_array);
-    if let Some(values) = values {
-        let mut corner = 0;
-        for (index, face) in mesh.faces.iter().enumerate() {
-            let end = corner + face.vertices.len();
-            covered[index] = values
-                .get(corner..end)
-                .is_some_and(|row| row.iter().all(valid_uv));
-            corner = end;
-        }
-    }
-    covered
-}
-
 /// Per slot of a `slot_count`-entry table: whether every face indexing the slot is covered. Unused
 /// slots are `false`; a face past the table is ignored, since export rejects it.
 fn fold_slot_coverage(mesh: &Mesh, covered: &[bool], slot_count: usize) -> Vec<bool> {
@@ -3647,11 +3597,11 @@ fn is_isolated_failure(error: &PotError) -> bool {
 }
 
 /// Joins a collection instance's members and nested instances into one mesh.
-fn evaluate_collection_instance<'a>(
+fn evaluate_collection_instance(
     doc: &SceneDoc,
     instance_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
-    meshes: &'a BTreeMap<Id, Mesh>,
+    meshes: &BTreeMap<Id, Mesh>,
     active_instances: &mut BTreeSet<Id>,
 ) -> Result<CollectionEvaluation> {
     let instance_node = doc.nodes.get(instance_id).ok_or_else(|| {
@@ -3706,7 +3656,8 @@ fn evaluate_collection_instance<'a>(
         });
         slots.extend(member.slots);
     }
-    // Coverage is read from the members before `concatenate` consumes them.
+    // Per joined face: whether its member has a value on every corner of its first UV layer. Read
+    // before `concatenate` consumes the members; a joined corner without a value is `[0, 0]`.
     let covered = uv_covered_faces(&parts);
     let mesh = concatenate(parts).map_err(|error| instance_join_error(error, instance_id))?;
     if covered.len() != mesh.faces.len() {
@@ -3767,8 +3718,10 @@ fn append_collection_geometry<'a>(
         let member = if instance_collection_target(source_node)?.is_some() {
             let (mesh, paths, bindings) =
                 evaluate_collection_instance(doc, object_id, matrices, meshes, active_instances)?;
-            let slots: Vec<Option<Id>> =
-                bindings.into_iter().map(|binding| binding.material).collect();
+            let slots: Vec<Option<Id>> = bindings
+                .into_iter()
+                .map(|binding| binding.material)
+                .collect();
             Some((Cow::Owned(mesh), paths, slots))
         } else {
             meshes.get(object_id).map(|source_mesh| {

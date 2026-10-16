@@ -5736,7 +5736,8 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ));
         }
         if let Some(mesh) = &data.mesh {
-            let raw_custom_normal = has_raw_custom_normal(mesh.attributes.get("blender_attributes"));
+            let raw_custom_normal =
+                has_raw_custom_normal(mesh.attributes.get("blender_attributes"));
             for attribute in mesh.attributes.keys().filter(|name| {
                 !(raw_custom_normal && matches!(name.as_str(), "custom_normal" | "shade_smooth"))
             }) {
@@ -6919,7 +6920,7 @@ mod tests {
             "name": "custom_normal",
             "domain": "CORNER",
             "data_type": "INT16_2D",
-            "values": vec![json!([0, 0]); corners],
+            "values": Value::Array(vec![json!([0, 0]); corners]),
         })
     }
 
@@ -6951,8 +6952,14 @@ mod tests {
     #[test]
     fn custom_normal_attributes_export_only_beside_raw_entry() -> Result<()> {
         let shading = vec![
-            ("custom_normal", json!({"domain": "corner", "type": "float3", "values": {}})),
-            ("shade_smooth", json!({"domain": "face", "type": "bool", "values": {}})),
+            (
+                "custom_normal",
+                json!({"domain": "corner", "type": "float3", "values": {}}),
+            ),
+            (
+                "shade_smooth",
+                json!({"domain": "face", "type": "bool", "values": {}}),
+            ),
         ];
         let mut with_raw = shading.clone();
         with_raw.push(("blender_attributes", json!([raw_custom_normal_entry(24)])));
@@ -6963,7 +6970,10 @@ mod tests {
             "native custom normals without the raw entry are a loss"
         );
         let unknown = vec![
-            ("scratch", json!({"domain": "point", "type": "float", "values": {}})),
+            (
+                "scratch",
+                json!({"domain": "point", "type": "float", "values": {}}),
+            ),
             ("blender_attributes", json!([raw_custom_normal_entry(24)])),
         ];
         assert_eq!(
@@ -6974,7 +6984,7 @@ mod tests {
         Ok(())
     }
 
-    fn quad_import_item(corner_normals: Value) -> Value {
+    fn quad_import_item(corner_normals: &Value) -> Value {
         json!({
             "name": "Quad",
             "potter_id": null,
@@ -6994,13 +7004,20 @@ mod tests {
 
     #[test]
     fn imported_custom_normals_decode_loop_normals_with_polygon_smooth() -> Result<()> {
-        let tilted = json!([[0.0, 0.6, 0.8], [0.0, 0.6, 0.8], [0.0, 0.6, 0.8], [0.0, 0.6, 0.8]]);
-        let mesh = convert_mesh(&quad_import_item(tilted))?;
+        let tilted = json!([
+            [0.0, 0.6, 0.8],
+            [0.0, 0.6, 0.8],
+            [0.0, 0.6, 0.8],
+            [0.0, 0.6, 0.8]
+        ]);
+        let mesh = convert_mesh(&quad_import_item(&tilted))?;
+        // Element IDs are 1-based (`checked_element_id`), so the first face is `f1`.
+        let key = format!("f{}", mesh.faces[0].id);
         let native = |name: &str| {
             mesh.attributes
                 .get(name)
                 .and_then(|attribute| attribute.get("values"))
-                .and_then(|values| values.get("f0"))
+                .and_then(|values| values.get(&key))
                 .cloned()
         };
         let custom = native("custom_normal")
@@ -7050,7 +7067,7 @@ mod tests {
             .map(|face| {
                 (
                     format!("f{}", face.id),
-                    json!(vec![[1.0, 0.0, 0.0]; face.vertices.len()]),
+                    Value::Array(vec![json!([1.0, 0.0, 0.0]); face.vertices.len()]),
                 )
             })
             .collect::<serde_json::Map<String, Value>>();
@@ -7084,31 +7101,17 @@ mod tests {
             .filter_map(|data| data.mesh.as_ref())
             .find(|mesh| mesh.attributes.contains_key("custom_normal"))
             .ok_or_else(|| invalid_intermediate("imported custom normals are missing"))?;
-        let values = imported_mesh.attributes["custom_normal"]["values"]
-            .as_object()
-            .ok_or_else(|| invalid_intermediate("imported custom normal values are missing"))?;
-        for face in &imported_mesh.faces {
-            let corners = values
-                .get(&format!("f{}", face.id))
-                .and_then(Value::as_array)
-                .ok_or_else(|| invalid_intermediate("imported face custom normals are missing"))?;
-            assert_eq!(corners.len(), face.vertices.len());
-            for corner in corners {
-                let components = corner
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_f64)
-                    .collect::<Vec<_>>();
-                assert!(
-                    components.len() == 3
-                        && (components[0] - 1.0).abs() < 1e-3
-                        && components[1].abs() < 1e-3
-                        && components[2].abs() < 1e-3,
-                    "face f{} corner {corner}",
-                    face.id
-                );
-            }
+        // Import omits an entry on faces whose flat normal already is +X, so judge the effective
+        // corner normals instead: the native +X must win over the raw entry on every corner.
+        let points = imported_mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let effective = crate::geom::normals::corner_normals(imported_mesh, &points)?;
+        assert_eq!(effective.len(), corner_count);
+        for normal in effective {
+            assert!(normal.abs_diff_eq(glam::DVec3::X, 1e-3), "{normal:?}");
         }
         Ok(())
     }

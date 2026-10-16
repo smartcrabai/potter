@@ -98,7 +98,7 @@ pub(crate) fn remap_attributes_skipping(
         output.attributes.clear();
         return Ok(());
     }
-    let kept = |key: &str| !skipped.iter().any(|name| *name == key);
+    let kept = |key: &str| !skipped.contains(&key);
     let has = |key: &str| kept(key) && source.attributes.contains_key(key);
     let entries = if kept("blender_attributes") {
         source
@@ -121,7 +121,9 @@ pub(crate) fn remap_attributes_skipping(
     let needs_corners = has("blender_uv_layers")
         || has("uv_map")
         || has("custom_normal")
-        || entries.iter().any(|entry| text(entry, "domain") == "CORNER")
+        || entries
+            .iter()
+            .any(|entry| text(entry, "domain") == "CORNER")
         || source
             .attributes
             .iter()

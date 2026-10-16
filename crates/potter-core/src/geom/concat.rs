@@ -319,13 +319,7 @@ fn blender_uv_map(source: &Mesh, placed: &Mesh) -> Vec<Value> {
                 .get("uv")
                 .and_then(Value::as_array)?
                 .iter()
-                .map(|corner| {
-                    if flip {
-                        flip_v(corner)
-                    } else {
-                        corner.clone()
-                    }
-                })
+                .map(|corner| if flip { flip_v(corner) } else { corner.clone() })
                 .collect();
             Some(json!({
                 "face_id": *face,
@@ -564,30 +558,45 @@ fn merge_positional(
 
 /// `blender_attributes` entries, keyed by domain and name. Each member's values concatenate in
 /// member order, and a member without the entry contributes the default of the joined data type.
+/// UV mirrors are left out: the joined UV layers are rebuilt from `blender_uv_layers`, and a mirror
+/// named after a member's layer would otherwise name a layer the joined store does not carry.
 fn merge_blender_attributes(name: &str, members: &[Member<'_>]) -> Result<Value> {
+    let uv_names: Vec<&str> = members
+        .iter()
+        .flat_map(|(_, piece)| piece.uv_layers.iter().map(|layer| layer.name.as_str()))
+        .collect();
+    let kept: Vec<Vec<&Value>> = members
+        .iter()
+        .map(|(value, _)| {
+            value
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|entry| !is_uv_mirror(entry, &uv_names))
+                .collect()
+        })
+        .collect();
     // First-seen order, each key's header (every field but `values`) with its joined data type.
     let mut headers: Vec<(String, Value)> = Vec::new();
-    for (value, _) in members {
-        for entry in value.and_then(Value::as_array).into_iter().flatten() {
-            let key = attribute_key(entry);
-            match headers.iter().position(|(known, _)| *known == key) {
-                Some(index) => {
-                    let header = &mut headers[index].1;
-                    let known = text(header, "data_type");
-                    let next = text(entry, "data_type");
-                    if known != next {
-                        let joined = promoted_data_type(name, known, next)?;
-                        header["data_type"] = json!(joined);
-                    }
+    for entry in kept.iter().flatten() {
+        let key = attribute_key(entry);
+        match headers.iter().position(|(known, _)| *known == key) {
+            Some(index) => {
+                let header = &mut headers[index].1;
+                let known = text(header, "data_type");
+                let next = text(entry, "data_type");
+                if known != next {
+                    let joined = promoted_data_type(text(entry, "name"), known, next)?;
+                    header["data_type"] = json!(joined);
                 }
-                None => headers.push((key, header_of(entry))),
             }
+            None => headers.push((key, header_of(entry))),
         }
     }
     let mut output = Vec::with_capacity(headers.len());
     for (key, header) in headers {
         let mut values = Vec::new();
-        for (value, piece) in members {
+        for ((_, piece), member_entries) in members.iter().zip(&kept) {
             let count = entry_length(&header, piece).ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::UnsupportedFeature,
@@ -595,10 +604,8 @@ fn merge_blender_attributes(name: &str, members: &[Member<'_>]) -> Result<Value>
                     json!({ "attribute": name }),
                 )
             })?;
-            let found = value
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
+            let found = member_entries
+                .iter()
                 .find(|entry| attribute_key(entry) == key);
             match found {
                 Some(entry) => {
@@ -620,6 +627,14 @@ fn merge_blender_attributes(name: &str, members: &[Member<'_>]) -> Result<Value>
         output.push(Value::Object(merged));
     }
     Ok(Value::Array(output))
+}
+
+/// A UV mirror: a `CORNER` `FLOAT2` `blender_attributes` entry named after a UV layer, which Blender
+/// lists beside the layer (see [`write_layers`]).
+fn is_uv_mirror(entry: &Value, uv_names: &[&str]) -> bool {
+    text(entry, "domain") == "CORNER"
+        && text(entry, "data_type") == "FLOAT2"
+        && uv_names.contains(&text(entry, "name"))
 }
 
 /// The join key of a `blender_attributes` entry: its domain and name.
@@ -653,14 +668,16 @@ fn entry_length(entry: &Value, piece: &Piece) -> Option<usize> {
 
 /// The data type two same-named `blender_attributes` entries join as. Byte colors are float colors at
 /// lower precision, so they join as `FLOAT_COLOR` with each value kept as it is. Any other pair of
-/// types cannot be combined, and the error names them.
-fn promoted_data_type(name: &str, known: &str, next: &str) -> Result<&'static str> {
+/// types cannot be combined; the error names the entry (`attribute`) and both types.
+fn promoted_data_type(attribute: &str, known: &str, next: &str) -> Result<&'static str> {
     match (known, next) {
         ("BYTE_COLOR" | "FLOAT_COLOR", "BYTE_COLOR" | "FLOAT_COLOR") => Ok("FLOAT_COLOR"),
         _ => Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
-            format!("collection members store `{name}` as {known} and {next}, which cannot be combined"),
-            json!({ "attribute": name, "types": [known, next] }),
+            format!(
+                "collection members store attribute `{attribute}` as {known} and {next}, which cannot be combined"
+            ),
+            json!({ "attribute": attribute, "types": [known, next] }),
         )),
     }
 }
@@ -870,7 +887,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             smooth_face_flags(&joined).unwrap(),
-            [true, false, false, false, false, false, false, true, false, false, false, false]
+            [
+                true, false, false, false, false, false, false, true, false, false, false, false
+            ]
         );
     }
 
@@ -1093,7 +1112,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
         assert_eq!(error.details["attribute"], json!("Col"));
-        assert_eq!(error.details["types"], json!(["FLOAT_COLOR", "FLOAT_VECTOR"]));
+        assert_eq!(
+            error.details["types"],
+            json!(["FLOAT_COLOR", "FLOAT_VECTOR"])
+        );
     }
 
     #[test]
@@ -1136,5 +1158,33 @@ mod tests {
         // Slot 5 clamps to the member's last slot (1), then joins at the member's offset (3).
         assert_eq!(joined.faces[0].material_index, 4);
         assert_eq!(joined.faces[1].material_index, 3);
+    }
+
+    #[test]
+    fn uv_mirrors_of_member_layers_are_not_carried() {
+        let mut first = cube();
+        first.attributes.insert(
+            "blender_uv_layers".to_owned(),
+            json!([{"name": "Body", "values": vec![json!([0.5, 0.5]); 24]}]),
+        );
+        first.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([
+                {"name": "Body", "domain": "CORNER", "data_type": "FLOAT2", "values": vec![json!([0.5, 0.5]); 24]},
+                {"name": "LoopColor", "domain": "CORNER", "data_type": "FLOAT_COLOR", "values": vec![json!([1.0, 0.0, 0.0, 1.0]); 24]}
+            ]),
+        );
+        let joined = concatenate(vec![member(&first, DMat4::IDENTITY, 0, 1)]).unwrap();
+        let names: Vec<Value> = joined.attributes["blender_attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].clone())
+            .collect();
+        assert_eq!(names, vec![json!("LoopColor")]);
+        assert_eq!(
+            joined.attributes["blender_uv_layers"][0]["name"],
+            json!("Body")
+        );
     }
 }
