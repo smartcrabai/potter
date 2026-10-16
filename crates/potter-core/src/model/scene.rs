@@ -1505,7 +1505,6 @@ pub struct ModifierRuntime {
     /// matrix. A named bone's `texture_world` is `armature_world * pose_mat`; unknown names use
     /// the map object's world matrix.
     pub texture_matrix: Option<[f64; 16]>,
-    pub use_render_settings: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

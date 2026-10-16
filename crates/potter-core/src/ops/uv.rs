@@ -2383,6 +2383,7 @@ mod tests {
             operation_index: 0,
             evaluation_frame: 1.0,
             asset_root: None,
+            cache_directory: None,
             pending_assets: std::collections::BTreeMap::new(),
             warnings: Vec::new(),
         };

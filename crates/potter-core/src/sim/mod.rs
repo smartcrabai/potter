@@ -238,23 +238,16 @@ pub(crate) fn evaluate_stack_modifier(
     gate: ModifierGate<'_>,
 ) -> Result<StackModifierResult> {
     let cache_directory = gate.context.cache_directory;
-    let (property, system) = match modifier.modifier_type.as_str() {
-        "cloth" => ("physics_cloth", "cloth"),
-        "soft_body" => ("physics_soft_body", "soft_body"),
-        "collision" => ("physics_collision", "collision"),
-        "dynamic_paint" => ("physics_dynamic_paint", "dynamic_paint"),
-        "fluid" => ("physics_fluid", "fluid"),
-        "particle_system" => ("physics_particle_emitter", "particle_system"),
-        _ => {
-            return Err(PotError::new(
+    let (property, system) =
+        physics_stack_classification(&modifier.modifier_type).ok_or_else(|| {
+            PotError::new(
                 ErrorCode::InvalidOperation,
                 format!(
                     "`{}` is not a physics stack modifier",
                     modifier.modifier_type
                 ),
-            ));
-        }
-    };
+            )
+        })?;
     let node = doc.nodes.get(node_id).ok_or_else(|| {
         PotError::new(
             ErrorCode::TargetNotFound,
@@ -303,13 +296,7 @@ pub(crate) fn evaluate_stack_modifier(
             json!({"node_id":node_id,"modifier_id":modifier.id,"property":property}),
         )
     })?;
-    let system_index = node
-        .modifiers
-        .iter()
-        .filter(|candidate| candidate.modifier_type == "particle_system")
-        .position(|candidate| candidate.id == modifier.id)
-        .and_then(|index| u32::try_from(index).ok())
-        .unwrap_or(0);
+    let system_index = particle_system_index(node, modifier.id.as_str());
     let emit_unborn = system == "particle_system"
         && doc.nodes.iter().any(|(target_id, target)| {
             target.modifiers.iter().any(|candidate| {
@@ -390,7 +377,7 @@ pub(crate) fn evaluate_stack_modifier(
             DVec3::from_array(world.gravity)
         });
     let members = scene_members(doc, scene_id)?;
-    let collision_meshes = collider_triangles(doc, matrices, &members)?;
+    let collision_meshes = collider_triangles(doc, matrices, &members, gate)?;
     let local_colliders = if setting_bool(settings, "collision_enabled") == Some(false)
         || setting_bool(settings, "use_collision") == Some(false)
     {
@@ -489,7 +476,7 @@ pub(crate) fn evaluate_stack_modifier(
             mesh = fluid_surface(&samples, matrix, settings)?;
         }
         "dynamic_paint" => {
-            let brushes = dynamic_paint_brush_settings(doc, matrices, settings, &members)?;
+            let brushes = dynamic_paint_brush_settings(doc, matrices, settings, &members, gate)?;
             let mut colors = vec![[0.0; 4]; mesh.vertices.len()];
             if brushes.is_empty() {
                 colors = dynamic_paint::paint(
@@ -559,6 +546,27 @@ pub(crate) fn evaluate_stack_modifier(
         cache::store_modifier_simulation(directory, &cache_key, &mesh, particles.as_deref())?;
     }
     Ok(StackModifierResult { mesh, particles })
+}
+
+fn physics_stack_classification(modifier_type: &str) -> Option<(&'static str, &'static str)> {
+    Some(match modifier_type {
+        "cloth" => ("physics_cloth", "cloth"),
+        "soft_body" => ("physics_soft_body", "soft_body"),
+        "collision" => ("physics_collision", "collision"),
+        "dynamic_paint" => ("physics_dynamic_paint", "dynamic_paint"),
+        "fluid" => ("physics_fluid", "fluid"),
+        "particle_system" => ("physics_particle_emitter", "particle_system"),
+        _ => return None,
+    })
+}
+
+fn particle_system_index(node: &Node, modifier_id: &str) -> u32 {
+    node.modifiers
+        .iter()
+        .filter(|modifier| modifier.modifier_type == "particle_system")
+        .position(|modifier| modifier.id.as_str() == modifier_id)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or(0)
 }
 
 fn normalize_solver_settings(settings: &Value, system: &str) -> Value {
@@ -709,14 +717,17 @@ pub(crate) fn evaluate(
     let has_physics = members.iter().any(|id| {
         doc.nodes.get(id).is_some_and(|node| {
             [
-                "physics_cloth",
-                "physics_soft_body",
-                "physics_particle_emitter",
-                "physics_fluid",
-                "physics_dynamic_paint",
+                ("physics_cloth", "cloth"),
+                ("physics_soft_body", "soft_body"),
+                ("physics_particle_emitter", "particle_system"),
+                ("physics_fluid", "fluid"),
+                ("physics_dynamic_paint", "dynamic_paint"),
             ]
             .iter()
-            .any(|property| node.properties.contains_key(*property))
+            .any(|(property, modifier_type)| {
+                node.properties.contains_key(*property)
+                    && gate.is_property_active(id, node, *property, *modifier_type)
+            })
         })
     });
     if !has_physics {
@@ -737,7 +748,7 @@ pub(crate) fn evaluate(
         }
         result = Some(cached);
     }
-    let physics = evaluate_physics(doc, scene_id, frame, base_world_matrices, &members)?;
+    let physics = evaluate_physics(doc, scene_id, frame, base_world_matrices, &members, gate)?;
     let mut result = result.unwrap_or_else(|| empty_result(key.clone()));
     result.deformed_vertices = physics.deformed_vertices;
     result.fluid_particles = physics.fluid_particles;
@@ -790,6 +801,7 @@ fn evaluate_physics(
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
     members: &BTreeSet<Id>,
+    gate: ModifierGate<'_>,
 ) -> Result<PhysicsResult> {
     let scene = doc.scenes.get(scene_id).ok_or_else(|| {
         PotError::new(
@@ -809,7 +821,7 @@ fn evaluate_physics(
         .map_or(DVec3::new(0.0, 0.0, -9.81), |world| {
             DVec3::from_array(world.gravity)
         });
-    let collision_meshes = collider_triangles(doc, matrices, members)?;
+    let collision_meshes = collider_triangles(doc, matrices, members, gate)?;
     let force_fields = force_field_inputs(doc, matrices, members)?;
     let mut result = PhysicsResult {
         deformed_vertices: BTreeMap::new(),
@@ -826,7 +838,9 @@ fn evaluate_physics(
         let Some(matrix) = matrices.get(id).copied() else {
             continue;
         };
-        if let Some(settings) = node.properties.get("physics_cloth") {
+        if let Some(settings) = node.properties.get("physics_cloth")
+            && gate.is_property_active(id, node, "physics_cloth", "cloth")
+        {
             let mut mesh = mesh_for_node(doc, node, id)?.clone();
             if let Some(data_block) = node
                 .data
@@ -855,7 +869,9 @@ fn evaluate_physics(
                 .deformed_vertices
                 .insert(id.clone(), checked_positions(id, positions)?);
         }
-        if let Some(settings) = node.properties.get("physics_soft_body") {
+        if let Some(settings) = node.properties.get("physics_soft_body")
+            && gate.is_property_active(id, node, "physics_soft_body", "soft_body")
+        {
             let mut mesh = mesh_for_node(doc, node, id)?.clone();
             if let Some(data_block) = node
                 .data
@@ -873,7 +889,9 @@ fn evaluate_physics(
                 .deformed_vertices
                 .insert(id.clone(), checked_positions(id, positions)?);
         }
-        if let Some(settings) = node.properties.get("physics_particle_emitter") {
+        if let Some(settings) = node.properties.get("physics_particle_emitter")
+            && gate.is_property_active(id, node, "physics_particle_emitter", "particle_system")
+        {
             let mesh = mesh_for_node(doc, node, id)?;
             let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
                 scene
@@ -907,6 +925,12 @@ fn evaluate_physics(
                     format!("particle state for `{id}` is not finite"),
                 ));
             }
+            let system_index = node
+                .properties
+                .get("physics_particle_emitter_modifier_id")
+                .and_then(Value::as_str)
+                .map(|modifier_id| particle_system_index(node, modifier_id))
+                .unwrap_or(0);
             result.particles.insert(
                 id.clone(),
                 particles
@@ -921,7 +945,7 @@ fn evaluate_physics(
                         birth_frame: particle.birth_frame,
                         death_frame: particle.death_frame,
                         life_state: particle.life_state,
-                        system_index: 0,
+                        system_index,
                         is_child: particle.is_child,
                         size: particle.size,
                         mass: particle.mass,
@@ -929,7 +953,9 @@ fn evaluate_physics(
                     .collect(),
             );
         }
-        if let Some(settings) = node.properties.get("physics_fluid") {
+        if let Some(settings) = node.properties.get("physics_fluid")
+            && gate.is_property_active(id, node, "physics_fluid", "fluid")
+        {
             let domain = mesh_for_node(doc, node, id)?;
             let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
                 scene
@@ -960,10 +986,11 @@ fn evaluate_physics(
             }
         }
         if let Some(settings) = node.properties.get("physics_dynamic_paint")
+            && gate.is_property_active(id, node, "physics_dynamic_paint", "dynamic_paint")
             && setting_string(settings, "role").unwrap_or("canvas") == "canvas"
         {
             let canvas = mesh_for_node(doc, node, id)?;
-            let brushes = dynamic_paint_brush_settings(doc, matrices, settings, members)?;
+            let brushes = dynamic_paint_brush_settings(doc, matrices, settings, members, gate)?;
             let mut colors = vec![[0.0; 4]; canvas.vertices.len()];
             if brushes.is_empty() {
                 colors = dynamic_paint::paint(
@@ -1039,6 +1066,7 @@ fn collider_triangles(
     doc: &SceneDoc,
     matrices: &BTreeMap<Id, DMat4>,
     members: &BTreeSet<Id>,
+    gate: ModifierGate<'_>,
 ) -> Result<Vec<(Id, [DVec3; 3])>> {
     let mut triangles = Vec::new();
     for (id, node) in &doc.nodes {
@@ -1049,7 +1077,8 @@ fn collider_triangles(
             .rigid_body
             .as_ref()
             .is_some_and(|body| body.body_type == RigidBodyType::Passive)
-            || node.properties.contains_key("physics_collision")
+            || (node.properties.contains_key("physics_collision")
+                && gate.is_property_active(id, node, "physics_collision", "collision"))
             || node
                 .properties
                 .get("collision_enabled")
@@ -1175,6 +1204,7 @@ fn dynamic_paint_brush_settings(
     matrices: &BTreeMap<Id, DMat4>,
     canvas_settings: &Value,
     members: &BTreeSet<Id>,
+    gate: ModifierGate<'_>,
 ) -> Result<Vec<DynamicPaintBrush>> {
     let mut brush_ids = BTreeSet::new();
     if let Some(values) = canvas_settings.get("brushes").and_then(Value::as_array) {
@@ -1187,6 +1217,11 @@ fn dynamic_paint_brush_settings(
             })?;
             let id = Id::new(value.to_owned())
                 .map_err(|error| PotError::new(ErrorCode::InvalidOperation, error.message))?;
+            if doc.nodes.get(&id).is_some_and(|node| {
+                !gate.is_property_active(&id, node, "physics_dynamic_paint", "dynamic_paint")
+            }) {
+                continue;
+            }
             if !members.contains(&id) {
                 return Err(PotError::with_details(
                     ErrorCode::TargetNotFound,
@@ -1199,6 +1234,7 @@ fn dynamic_paint_brush_settings(
     } else {
         for (id, node) in &doc.nodes {
             if members.contains(id)
+                && gate.is_property_active(id, node, "physics_dynamic_paint", "dynamic_paint")
                 && node
                     .properties
                     .get("physics_dynamic_paint")

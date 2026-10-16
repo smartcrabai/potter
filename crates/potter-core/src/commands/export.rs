@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ExportArgs,
-    commands::util::{check_extension, evaluation_context, exchange_format_name, with_load_warnings},
+    commands::util::{
+        check_extension, evaluation_context, exchange_format_name, with_load_warnings,
+    },
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     exchange::{

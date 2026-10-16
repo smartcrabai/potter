@@ -71,7 +71,7 @@ pub(super) fn ocean(
     mesh: &Mesh,
     modifier: &Modifier,
     _frame: f64,
-    _context: ModifierEvaluationContext<'_>,
+    context: ModifierEvaluationContext<'_>,
 ) -> Result<Mesh> {
     let geometry_mode =
         string_param_with_expected(modifier, "geometry_mode", "a Blender enum or string")?;
@@ -82,7 +82,7 @@ pub(super) fn ocean(
             "GENERATE or DISPLACE",
         ));
     }
-    let resolution_name = if modifier.runtime.use_render_settings {
+    let resolution_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
         "resolution"
     } else {
         "viewport_resolution"

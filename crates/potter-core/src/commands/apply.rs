@@ -44,7 +44,12 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
     let mut project = Project::open_exclusive(args.scene)?;
     check_base_revision(project.doc(), base_revision)?;
     let before = project.doc().clone();
-    let outcome = ops::apply_batch_with_asset_root(&before, &batch, project.path())?;
+    let outcome = ops::apply_batch_with_project_context(
+        &before,
+        &batch,
+        project.path(),
+        Some(project.cache_directory()),
+    )?;
     let warnings = with_load_warnings(&outcome.warnings, &project)?;
     let candidate_revision = if outcome.changed {
         base_revision

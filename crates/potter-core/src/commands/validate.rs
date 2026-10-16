@@ -2,7 +2,10 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ValidateArgs,
-    commands::{export::export_purpose, util::{exchange_format_name, with_load_warnings}},
+    commands::{
+        export::export_purpose,
+        util::{exchange_format_name, with_load_warnings},
+    },
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot},
     model::AvatarVersion,

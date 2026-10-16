@@ -346,7 +346,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 evaluated_object_meshes,
                 curve_path_lengths,
             )?,
-            "subdivision" | "multires" => subdivision(&evaluated, modifier)?,
+            "subdivision" | "multires" => subdivision(&evaluated, modifier, context)?,
             "solidify" => solidify(&evaluated, modifier)?,
             "triangulate" => triangulate(&evaluated, modifier)?,
             "bevel" => bevel(&evaluated, modifier)?,
@@ -355,7 +355,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "displace" => displace_textured(&evaluated, modifier, owner_world_matrix, None, texture_rng)?,
             "smooth" => smooth(&evaluated, modifier)?,
             "simple_deform" => advanced::simple_deform(&evaluated, modifier)?,
-            "screw" => advanced::screw(&evaluated, modifier)?,
+            "screw" => advanced::screw(&evaluated, modifier, context)?,
             "shrinkwrap" => advanced::shrinkwrap(&evaluated, modifier)?,
             "curve" => advanced::curve(&evaluated, modifier)?,
             "hook" => advanced::hook(&evaluated, modifier)?,
@@ -2239,9 +2239,13 @@ struct SubdivisionOptions {
     use_creases: bool,
 }
 
-fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+fn subdivision(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    context: ModifierEvaluationContext<'_>,
+) -> Result<Mesh> {
     validated(mesh)?;
-    let level_name = if modifier.runtime.use_render_settings {
+    let level_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
         "render_levels"
     } else {
         "levels"
