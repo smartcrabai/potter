@@ -124,6 +124,37 @@ pub(crate) fn evaluate(
             json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
         ));
     }
+    let topology_changed = {
+        let sample = sample_at_time(&samples, time_seconds, interpolate).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic PolyMesh has no samples",
+                json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+            )
+        })?;
+        !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces)
+    };
+    if topology_changed {
+        // Blender's file-sequence reader rereads all supported streams for changed connectivity.
+        read = ReadAttributes::ALL;
+        samples = cached_mesh_cache_samples(
+            archive_bytes,
+            resource_hash,
+            resource,
+            object_path,
+            read,
+            velocity_name,
+            velocity_factor != 0.0,
+            modifier,
+        )?;
+        if samples.is_empty() {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic PolyMesh has no samples",
+                json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+            ));
+        }
+    }
     let sample = sample_at_time(&samples, time_seconds, interpolate).ok_or_else(|| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -131,37 +162,33 @@ pub(crate) fn evaluate(
             json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
         )
     })?;
-    if (!read.vertices || !read.polygons) && mesh.vertices.len() != sample.sample.positions.len() {
-        return Err(PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "Alembic vertex count does not match the input mesh when topology replacement is disabled",
-            json!({
-                "modifier_id":modifier.id,
-                "resource":resource,
-                "object_path":object_path,
-                "input_vertex_count":mesh.vertices.len(),
-                "cache_vertex_count":sample.sample.positions.len(),
-                "read_vertices":read.vertices,
-                "read_polygons":read.polygons,
-            }),
-        ));
-    }
     let mut warnings = Vec::new();
-    if !read.polygons {
-        if read.vertices {
-            for (index, vertex) in mesh.vertices.iter_mut().enumerate() {
-                vertex.co = evaluated_position(&sample, index, modifier)?;
-            }
-        }
+    if topology_changed {
+        let positions = sample
+            .sample
+            .positions
+            .iter()
+            .enumerate()
+            .map(|(index, _)| evaluated_position(&sample, index, modifier))
+            .collect::<Result<Vec<_>>>()?;
+        let mut evaluated = Mesh::from_positions_and_faces(positions, sample.sample.faces.clone())
+            .map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "Alembic cache topology is invalid for the selected vertex sample",
+                    json!({"modifier_id":modifier.id,"reason":error.to_string()}),
+                )
+            })?;
         apply_cache_attributes(
-            mesh,
+            &mut evaluated,
             sample.sample,
             read,
             velocity_scale,
             modifier,
             &mut warnings,
         )?;
-        validate_cache_output(mesh, modifier)?;
+        validate_cache_output(&evaluated, modifier)?;
+        *mesh = evaluated;
         return Ok(warnings);
     }
     let positions = if read.vertices {
@@ -193,6 +220,82 @@ pub(crate) fn evaluate(
     Ok(warnings)
 }
 
+fn topology_matches(
+    mesh: &Mesh,
+    cache_vertex_count: usize,
+    cache_faces: &[Vec<usize>],
+) -> bool {
+    let corner_count = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+    if mesh.vertices.is_empty()
+        || mesh.vertices.len() != cache_vertex_count
+        || mesh.faces.len() != cache_faces.len()
+        || corner_count != cache_faces.iter().map(Vec::len).sum::<usize>()
+    {
+        return false;
+    }
+    let indices = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<HashMap<_, _>>();
+    mesh.faces.iter().zip(cache_faces).all(|(face, cache_face)| {
+        face.vertices.len() == cache_face.len()
+            && face.vertices.iter().zip(cache_face).all(|(id, index)| {
+                indices.get(id).is_some_and(|mesh_index| mesh_index == index)
+            })
+    })
+}
+
+fn cached_mesh_cache_samples(
+    archive_bytes: &[u8],
+    resource_hash: &str,
+    resource: &str,
+    object_path: &str,
+    read: ReadAttributes,
+    velocity_name: &str,
+    read_velocity: bool,
+    modifier: &Modifier,
+) -> Result<Arc<Vec<MeshCacheSample>>> {
+    let velocity_parameter = if read_velocity { velocity_name } else { "" };
+    let key = format!(
+        "{resource_hash}\0{object_path}\0{}\0{}\0{}\0{}",
+        read.uv,
+        read.color,
+        read.polygons,
+        velocity_parameter
+    );
+    let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "Alembic mesh cache lock is poisoned",
+        )
+    })?;
+    if let Some(samples) = parsed.get(&key) {
+        return Ok(Arc::clone(samples));
+    }
+    let samples = Arc::new(alembic::read_mesh_cache(
+        archive_bytes,
+        object_path,
+        read.uv,
+        read.color,
+        read.polygons,
+        velocity_parameter,
+    )?);
+    if samples.windows(2).any(|pair| {
+        pair.first()
+            .zip(pair.get(1))
+            .is_some_and(|(first, second)| first.time_seconds > second.time_seconds)
+    }) {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic mesh cache sample times are not ordered",
+            json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+        ));
+    }
+    parsed.insert(key, Arc::clone(&samples));
+    Ok(samples)
+}
 fn apply_cache_attributes(
     mesh: &mut Mesh,
     sample: &MeshCacheSample,
@@ -488,6 +591,14 @@ struct ReadAttributes {
     uv: bool,
     color: bool,
 }
+impl ReadAttributes {
+    const ALL: Self = Self {
+        vertices: true,
+        polygons: true,
+        uv: true,
+        color: true,
+    };
+}
 
 fn read_params(modifier: &Modifier) -> Result<ReadAttributes> {
     let Some(value) = modifier.params.get("read_data").or_else(|| {
@@ -497,12 +608,7 @@ fn read_params(modifier: &Modifier) -> Result<ReadAttributes> {
             "read_data",
         )
     }) else {
-        return Ok(ReadAttributes {
-            vertices: true,
-            polygons: true,
-            uv: true,
-            color: true,
-        });
+        return Ok(ReadAttributes::ALL);
     };
     let values = value.as_array().ok_or_else(|| {
         invalid_parameter(modifier, "read_data", "an array of Blender read-data flags")
@@ -652,7 +758,20 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::{Value, json};
 
-    use super::lerp_position;
+    use super::{lerp_position, topology_matches};
+    use crate::geom::Mesh;
+
+    #[test]
+    fn topology_identity_detects_same_size_corner_reorder() -> Result<(), Box<dyn std::error::Error>> {
+        let mesh = Mesh::from_positions_and_faces(
+            vec![glam::DVec3::ZERO, glam::DVec3::X, glam::DVec3::ONE, glam::DVec3::Y],
+            vec![vec![0, 1, 2, 3]],
+        )?;
+        assert!(topology_matches(&mesh, 4, &[vec![0, 1, 2, 3]]));
+        assert!(!topology_matches(&mesh, 4, &[vec![3, 2, 1, 0]]));
+        assert!(!topology_matches(&mesh, 5, &[vec![0, 1, 2, 3]]));
+        Ok(())
+    }
 
     #[test]
     fn cache_colors_map_to_point_and_corner_mesh_domains() -> Result<(), Box<dyn std::error::Error>>
