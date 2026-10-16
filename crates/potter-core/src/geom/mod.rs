@@ -25,6 +25,7 @@ use serde_json::{Map, Value};
 
 pub mod boolean;
 pub(crate) mod clnor;
+pub(crate) mod concat;
 pub mod curve;
 pub mod edit;
 pub mod lattice;
