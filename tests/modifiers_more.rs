@@ -232,6 +232,126 @@ fn simple_deform_zero_angle_is_identity() {
     assert_eq!(result, source);
 }
 
+/// A cube whose vertex 0 is moved to (-2,-1,-1), so the vertices are not equidistant from the origin.
+fn cast_uneven_cube() -> Mesh {
+    let positions = vec![
+        DVec3::new(-2.0, -1.0, -1.0),
+        DVec3::new(1.0, -1.0, -1.0),
+        DVec3::new(1.0, 1.0, -1.0),
+        DVec3::new(-1.0, 1.0, -1.0),
+        DVec3::new(-1.0, -1.0, 1.0),
+        DVec3::new(1.0, -1.0, 1.0),
+        DVec3::new(1.0, 1.0, 1.0),
+        DVec3::new(-1.0, 1.0, 1.0),
+    ];
+    Mesh::from_positions_and_faces(positions, cast_cube_faces()).unwrap()
+}
+
+fn cast_cube_faces() -> Vec<Vec<usize>> {
+    vec![
+        vec![0, 3, 2, 1],
+        vec![4, 5, 6, 7],
+        vec![0, 1, 5, 4],
+        vec![2, 3, 7, 6],
+        vec![1, 2, 6, 5],
+        vec![0, 4, 7, 3],
+    ]
+}
+
+fn assert_cast_positions(mesh: &Mesh, expected: [[f64; 3]; 8], label: &str) {
+    for (index, (vertex, wanted)) in mesh.vertices.iter().zip(expected).enumerate() {
+        for (axis, (actual, wanted)) in vertex.co.to_array().into_iter().zip(wanted).enumerate() {
+            assert!(
+                (actual - wanted).abs() < 1.0e-5,
+                "{label}: vertex {index} axis {axis} is {actual}, Blender has {wanted}"
+            );
+        }
+    }
+}
+
+/// Blender 5.2.2 oracle (Cast factor 0.5) for the uneven cube above and the all-zero cube.
+#[test]
+fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
+    const UNEVEN_SPHERE_DEFAULT: [[f64; 3]; 8] = [
+        [-1.743_718, -0.871_859, -0.871_859],
+        [1.025_888, -1.025_888, -1.025_888],
+        [1.025_888, 1.025_888, -1.025_888],
+        [-1.025_888, 1.025_888, -1.025_888],
+        [-1.025_888, -1.025_888, 1.025_888],
+        [1.025_888, -1.025_888, 1.025_888],
+        [1.025_888, 1.025_888, 1.025_888],
+        [-1.025_888, 1.025_888, 1.025_888],
+    ];
+    const UNEVEN_SOURCE: [[f64; 3]; 8] = [
+        [-2.0, -1.0, -1.0],
+        [1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+    ];
+    const UNEVEN_CUBOID_SIZE: [[f64; 3]; 8] = [
+        [-1.75, -0.875, -0.875],
+        [1.25, -1.25, -1.25],
+        [1.25, 1.25, -1.25],
+        [-1.25, 1.25, -1.25],
+        [-1.25, -1.25, 1.25],
+        [1.25, -1.25, 1.25],
+        [1.25, 1.25, 1.25],
+        [-1.25, 1.25, 1.25],
+    ];
+    const UNEVEN_CYLINDER_DEFAULT: [[f64; 3]; 8] = [
+        [-1.814_703, -0.907_351, -1.0],
+        [1.144_079, -1.144_079, -1.0],
+        [1.144_079, 1.144_079, -1.0],
+        [-1.144_079, 1.144_079, -1.0],
+        [-1.144_079, -1.144_079, 1.0],
+        [1.144_079, -1.144_079, 1.0],
+        [1.144_079, 1.144_079, 1.0],
+        [-1.144_079, 1.144_079, 1.0],
+    ];
+    let uneven = cast_uneven_cube();
+    // `{}` is the schema default: SPHERE, factor 0.5, radius 0, size 0, use_radius_as_size true.
+    let sphere = evaluate_modifiers(&uneven, &[modifier("cast", json!({}))]).unwrap();
+    assert_cast_positions(&sphere, UNEVEN_SPHERE_DEFAULT, "uneven sphere default");
+    let cuboid = evaluate_modifiers(
+        &uneven,
+        &[modifier(
+            "cast",
+            json!({"cast_type": "CUBOID", "use_radius_as_size": false, "size": 1.5}),
+        )],
+    )
+    .unwrap();
+    assert_cast_positions(&cuboid, UNEVEN_CUBOID_SIZE, "uneven cuboid size 1.5");
+    let cylinder = evaluate_modifiers(
+        &uneven,
+        &[modifier("cast", json!({"cast_type": "CYLINDER"}))],
+    )
+    .unwrap();
+    assert_cast_positions(
+        &cylinder,
+        UNEVEN_CYLINDER_DEFAULT,
+        "uneven cylinder default",
+    );
+    // Every vertex is farther than 1.2 from the origin, so the radius limit leaves all of them.
+    let limited = evaluate_modifiers(
+        &uneven,
+        &[modifier("cast", json!({"factor": 0.5, "radius": 1.2}))],
+    )
+    .unwrap();
+    assert_cast_positions(&limited, UNEVEN_SOURCE, "uneven radius limit");
+    // All-zero geometry: the automatic sphere/cylinder size is 10 and the cuboid bounds are zero.
+    let zero = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 8], cast_cube_faces()).unwrap();
+    for cast_type in ["SPHERE", "CUBOID", "CYLINDER"] {
+        let result =
+            evaluate_modifiers(&zero, &[modifier("cast", json!({"cast_type": cast_type}))])
+                .unwrap();
+        assert_cast_positions(&result, [[0.0; 3]; 8], cast_type);
+    }
+}
+
 #[test]
 fn modifier_parameter_errors_include_a_json_pointer() {
     let source = Mesh::box_mesh(BoxParams::default()).unwrap();

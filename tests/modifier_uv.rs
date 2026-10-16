@@ -136,6 +136,49 @@ fn input_mesh(input: &Value) -> TestResult<Mesh> {
         }
         mesh.insert_edge(ids)?;
     }
+    if let Some(edge_order) = input.get("blender_edge_order") {
+        let edge_order = edge_order
+            .as_array()
+            .ok_or("blender_edge_order must be an array")?;
+        let mut remaining = std::mem::take(&mut mesh.edges);
+        let mut ordered = Vec::with_capacity(edge_order.len());
+        let edge_key =
+            |vertices: [u32; 2]| (vertices[0].min(vertices[1]), vertices[0].max(vertices[1]));
+        for pair in edge_order {
+            let [first, second] = pair
+                .as_array()
+                .ok_or("blender_edge_order edge must be an array")?
+                .as_slice()
+            else {
+                return Err("blender_edge_order edge must have two vertex indices".into());
+            };
+            let mut ids = [0_u32; 2];
+            for (id, index) in ids.iter_mut().zip([first, second]) {
+                let index = usize::try_from(
+                    index
+                        .as_u64()
+                        .ok_or("blender_edge_order vertex index must be a number")?,
+                )?;
+                *id = mesh
+                    .vertices
+                    .get(index)
+                    .ok_or("blender_edge_order vertex index out of range")?
+                    .id;
+            }
+            let key = edge_key(ids);
+            let position = remaining
+                .iter()
+                .position(|edge| edge_key(edge.vertices) == key)
+                .ok_or("Blender edge order contains an edge missing from the Potter mesh")?;
+            let mut edge = remaining.remove(position);
+            edge.vertices = ids;
+            ordered.push(edge);
+        }
+        if !remaining.is_empty() {
+            return Err("Potter mesh has edges missing from blender_edge_order".into());
+        }
+        mesh.edges = ordered;
+    }
     Ok(mesh)
 }
 
@@ -622,17 +665,12 @@ fn screw_loose_edges_full_turn_offset_stretch_v_matches_blender_oracle() -> Test
     Ok(())
 }
 
-// Decimate (collapse, ratio 0.5). Blender moves 10 of 21 corners to other positions, so only the
-// 11 corners present at the same face centroid and corner position are compared.
+
+// Decimate (collapse, ratio 0.5). Blender's corner positions and UVs are matched exactly by the port.
 
 #[test]
-fn decimate_collapse_matches_blender_oracle_on_matched_corners() -> TestResult {
-    let fixture = fixture("decimate_uv")?;
-    let snapshot = evaluate(&fixture_scene(&fixture["input"])?)?;
-    assert_eq!(
-        matched_oracle_corners(subject_mesh(&snapshot)?, &fixture, true)?,
-        11
-    );
+fn decimate_collapse_matches_blender_oracle_on_every_corner() -> TestResult {
+    assert_eq!(check_fixture("decimate_uv")?, 21);
     Ok(())
 }
 

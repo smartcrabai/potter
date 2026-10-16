@@ -15,17 +15,15 @@ use crate::{
     model::Modifier,
 };
 
-use super::{bool_param, invalid_parameter, number_param, uint_param, validated};
+use super::{
+    bool_param, invalid_parameter, number_param, string_param_with_expected, uint_param, validated,
+};
 mod dual_contour;
 mod voxel;
 mod voxel_edge_groups;
 
 pub(super) fn remesh_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let mode = modifier
-        .params
-        .get("mode")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("VOXEL");
+    let mode = string_param_with_expected(modifier, "mode", "BLOCKS, SMOOTH, SHARP, or VOXEL")?;
     match mode {
         "VOXEL" => voxel_remesh(mesh, modifier),
         "BLOCKS" | "SMOOTH" | "SHARP" => octree_remesh(mesh, modifier, mode),
@@ -38,7 +36,7 @@ pub(super) fn remesh_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
 }
 
 fn voxel_remesh(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let voxel_size = number_param(modifier, "voxel_size", 0.1)?;
+    let voxel_size = number_param(modifier, "voxel_size")?;
     if voxel_size <= 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -46,7 +44,7 @@ fn voxel_remesh(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a finite positive number",
         ));
     }
-    let adaptivity = number_param(modifier, "adaptivity", 0.0)?;
+    let adaptivity = number_param(modifier, "adaptivity")?;
     if !(0.0..=1.0).contains(&adaptivity) {
         return Err(invalid_parameter(
             modifier,
@@ -74,12 +72,12 @@ fn voxel_remesh(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a positive float32 value",
         ));
     }
-    let smooth_shade = bool_param(modifier, "use_smooth_shade", false)?;
+    let smooth_shade = bool_param(modifier, "use_smooth_shade")?;
     voxel::remesh(mesh, voxel_size, smooth_shade)
 }
 
 fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
-    let depth = uint_param(modifier, "octree_depth", 4)?;
+    let depth = uint_param(modifier, "octree_depth")?;
     if depth == 0 || depth > 24 {
         return Err(invalid_parameter(
             modifier,
@@ -95,7 +93,7 @@ fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
             ),
         ));
     }
-    let scale = number_param(modifier, "scale", 0.9)?;
+    let scale = number_param(modifier, "scale")?;
     if !scale.is_finite() || !(0.0..=0.99).contains(&scale) || scale <= 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -103,13 +101,13 @@ fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
             "a finite number in (0, 0.99]",
         ));
     }
-    let sharpness = number_param(modifier, "sharpness", 1.0)?;
+    let sharpness = number_param(modifier, "sharpness")?;
     if !sharpness.is_finite() {
         return Err(invalid_parameter(modifier, "sharpness", "a finite number"));
     }
-    let remove_disconnected = bool_param(modifier, "use_remove_disconnected", true)?;
-    let smooth_shade = bool_param(modifier, "use_smooth_shade", false)?;
-    let threshold = number_param(modifier, "threshold", 1.0)?;
+    let remove_disconnected = bool_param(modifier, "use_remove_disconnected")?;
+    let smooth_shade = bool_param(modifier, "use_smooth_shade")?;
+    let threshold = number_param(modifier, "threshold")?;
     if !(0.0..=1.0).contains(&threshold) {
         return Err(invalid_parameter(
             modifier,

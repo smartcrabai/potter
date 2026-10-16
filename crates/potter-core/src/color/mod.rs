@@ -70,6 +70,15 @@ pub(crate) fn linear_to_srgb_unclamped(value: f64) -> f64 {
     linear_to_srgb_impl(value, false)
 }
 
+/// Decodes an sRGB-encoded value to linear light, the inverse of [`linear_to_srgb`].
+pub(crate) fn srgb_to_linear(value: f64) -> f64 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 fn linear_to_srgb_impl(value: f64, clamp_high_branch: bool) -> f64 {
     if value <= 0.003_130_8 {
         12.92 * value

@@ -1417,7 +1417,8 @@ fn validate_parameter_map(
             error.pointer.trim_start_matches('/'),
         );
         engine.error(ErrorCode::InvalidArgument, error.message, &pointer)
-    })
+    })?;
+    Ok(())
 }
 fn validate_modifier_resource(
     engine: &Engine<'_>,
@@ -1529,144 +1530,6 @@ fn validate_attribute_modifier_params_inner(
     modifier_type: &str,
     params: &Map<String, Value>,
 ) -> Result<()> {
-    let fields: &[&str] = match modifier_type {
-        "vertex_weight_edit" => &[
-            "vertex_group",
-            "default_weight",
-            "use_add",
-            "add_threshold",
-            "use_remove",
-            "remove_threshold",
-            "normalize",
-            "falloff_type",
-            "invert_falloff",
-            "map_curve",
-            "mask_constant",
-            "mask_vertex_group",
-            "invert_mask_vertex_group",
-            "mask_texture",
-            "mask_tex_use_channel",
-            "mask_tex_mapping",
-            "mask_tex_uv_layer",
-            "mask_tex_map_object",
-        ],
-        "vertex_weight_mix" => &[
-            "vertex_group_a",
-            "vertex_group_b",
-            "invert_vertex_group_a",
-            "invert_vertex_group_b",
-            "default_weight_a",
-            "default_weight_b",
-            "mix_mode",
-            "mix_set",
-            "normalize",
-            "mask_constant",
-            "mask_vertex_group",
-            "invert_mask_vertex_group",
-            "mask_texture",
-            "mask_tex_use_channel",
-            "mask_tex_mapping",
-            "mask_tex_uv_layer",
-            "mask_tex_map_object",
-        ],
-        "vertex_weight_proximity" => &[
-            "target",
-            "vertex_group",
-            "proximity_mode",
-            "proximity_geometry",
-            "min_dist",
-            "max_dist",
-            "falloff_type",
-            "invert_falloff",
-            "normalize",
-            "map_curve",
-            "mask_constant",
-            "mask_vertex_group",
-            "invert_mask_vertex_group",
-            "mask_texture",
-            "mask_tex_use_channel",
-            "mask_tex_mapping",
-            "mask_tex_uv_layer",
-            "mask_tex_map_object",
-        ],
-        "weighted_normal" => &[
-            "mode",
-            "weight",
-            "thresh",
-            "keep_sharp",
-            "vertex_group",
-            "invert_vertex_group",
-            "use_face_influence",
-        ],
-        "normal_edit" => &[
-            "mode",
-            "target",
-            "offset",
-            "mix_mode",
-            "mix_factor",
-            "mix_limit",
-            "no_polynors_fix",
-            "vertex_group",
-            "invert_vertex_group",
-            "use_direction_parallel",
-        ],
-        "uv_project" => &[
-            "projectors",
-            "aspect_x",
-            "aspect_y",
-            "scale_x",
-            "scale_y",
-            "uv_layer",
-        ],
-        "uv_warp" => &[
-            "center",
-            "axis_u",
-            "axis_v",
-            "object_from",
-            "object_to",
-            "bone_from",
-            "bone_to",
-            "offset",
-            "scale",
-            "rotation",
-            "uv_layer",
-            "vertex_group",
-            "invert_vertex_group",
-        ],
-        "data_transfer" => &[
-            "object",
-            "use_object_transform",
-            "use_vert_data",
-            "use_edge_data",
-            "use_loop_data",
-            "use_poly_data",
-            "data_types_verts",
-            "data_types_edges",
-            "data_types_loops",
-            "data_types_polys",
-            "vert_mapping",
-            "edge_mapping",
-            "loop_mapping",
-            "poly_mapping",
-            "mix_mode",
-            "mix_factor",
-            "vertex_group",
-            "invert_vertex_group",
-            "layers_uv_select_src",
-            "layers_uv_select_dst",
-        ],
-        _ => return Ok(()),
-    };
-    if let Some(field) = params
-        .keys()
-        .find(|field| !fields.contains(&field.as_str()))
-    {
-        return Err(invalid_attribute_modifier_parameter(
-            modifier_type,
-            field,
-            "a modeled Blender RNA parameter",
-        ));
-    }
     let required: &[&str] = match modifier_type {
         "vertex_weight_edit" => &["vertex_group"],
         "vertex_weight_mix" => &["vertex_group_a", "vertex_group_b"],
@@ -1676,7 +1539,11 @@ fn validate_attribute_modifier_params_inner(
         "data_transfer" => &["object"],
         _ => &[],
     };
-    if let Some(field) = required.iter().find(|field| !params.contains_key(**field)) {
+    // An explicit null is no reference at all, so a required reference counts as missing.
+    if let Some(field) = required
+        .iter()
+        .find(|field| params.get(**field).is_none_or(Value::is_null))
+    {
         return Err(invalid_attribute_modifier_parameter(
             modifier_type,
             field,
@@ -1801,11 +1668,7 @@ fn validate_attribute_modifier_params_inner(
                 .as_str()
                 .is_some_and(|identifier| values.contains(&identifier))
         }) {
-            return Err(invalid_attribute_modifier_parameter(
-                modifier_type,
-                field,
-                "a valid Blender enum identifier",
-            ));
+            return Err(unsupported_attribute_modifier_value(modifier_type, field));
         }
     }
     for (field, values) in [
@@ -1833,11 +1696,7 @@ fn validate_attribute_modifier_params_inner(
                 .iter()
                 .any(|item| !item.as_str().is_some_and(|item| values.contains(&item)))
             {
-                return Err(invalid_attribute_modifier_parameter(
-                    modifier_type,
-                    field,
-                    "an array of supported Blender enum identifiers",
-                ));
+                return Err(unsupported_attribute_modifier_value(modifier_type, field));
             }
         }
     }
@@ -1946,7 +1805,7 @@ fn validate_attribute_modifier_params_inner(
         "object_to",
         "mask_tex_map_object",
     ] {
-        if let Some(value) = params.get(field) {
+        if let Some(value) = params.get(field).filter(|value| !value.is_null()) {
             let identifier = value.as_str().ok_or_else(|| {
                 invalid_attribute_modifier_parameter(modifier_type, field, "a Potter object ID")
             })?;
@@ -2038,6 +1897,16 @@ fn invalid_attribute_modifier_parameter(
     )
 }
 
+fn unsupported_attribute_modifier_value(modifier_type: &str, parameter: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!(
+            "modifier `{modifier_type}` parameter `{parameter}` uses a Blender value Potter does not evaluate yet"
+        ),
+        json!({"feature_id":format!("modifier.{modifier_type}.{parameter}"),"parameter":parameter}),
+    )
+}
+
 fn is_physics_modifier(modifier_type: &str) -> bool {
     matches!(
         modifier_type,
@@ -2046,24 +1915,6 @@ fn is_physics_modifier(modifier_type: &str) -> bool {
 }
 
 fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Value>) -> Result<()> {
-    const FIELDS: &[&str] = &[
-        "strength",
-        "texture",
-        "texture_map_mode",
-        "texture_mid_level",
-        "texture_sample_radius",
-        "texture_map_object",
-    ];
-    if let Some(field) = params
-        .keys()
-        .find(|field| !FIELDS.contains(&field.as_str()))
-    {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            format!("unknown Volume Displace parameter `{field}`"),
-            &format!("/params/{field}"),
-        ));
-    }
     for field in ["strength", "texture_sample_radius"] {
         if params
             .get(field)
@@ -2114,14 +1965,17 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
         .get("texture_map_mode")
         .and_then(Value::as_str)
         .unwrap_or("LOCAL");
-    if mapping_mode == "OBJECT" && !params.contains_key("texture_map_object") {
+    if mapping_mode == "OBJECT" && params.get("texture_map_object").is_none_or(Value::is_null) {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "Volume Displace OBJECT mapping requires texture_map_object",
             "/params/texture_map_object",
         ));
     }
-    if let Some(object) = params.get("texture_map_object") {
+    if let Some(object) = params
+        .get("texture_map_object")
+        .filter(|value| !value.is_null())
+    {
         let Some(object_text) = object.as_str() else {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
@@ -2144,7 +1998,7 @@ fn validate_volume_displace_params(engine: &Engine<'_>, params: &Map<String, Val
             ));
         }
     }
-    if let Some(texture) = params.get("texture") {
+    if let Some(texture) = params.get("texture").filter(|value| !value.is_null()) {
         let unsupported = || {
             PotError::with_details(
                 ErrorCode::UnsupportedFeature,
@@ -2177,45 +2031,8 @@ fn validate_particle_modifier_params(
     modifier_type: &str,
     params: &Map<String, Value>,
 ) -> Result<()> {
-    let allowed: &[&str] = match modifier_type {
-        "particle_instance" => &[
-            "object",
-            "particle_system_index",
-            "use_normal",
-            "use_children",
-            "use_size",
-            "show_alive",
-            "show_dead",
-            "show_unborn",
-            "position",
-            "random_position",
-            "axis",
-            "rotation",
-            "random_rotation",
-            "space",
-            "use_path",
-        ],
-        "explode" => &[
-            "particle_system_index",
-            "use_edge_cut",
-            "show_alive",
-            "show_dead",
-            "show_unborn",
-            "use_size",
-            "protect",
-            "vertex_group",
-        ],
-        _ => return Ok(()),
-    };
-    if let Some(field) = params
-        .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
-    {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            format!("unknown {modifier_type} parameter `{field}`"),
-            &format!("/params/{field}"),
-        ));
+    if modifier_type != "particle_instance" {
+        return Ok(());
     }
     if modifier_type == "particle_instance" {
         let object = params
@@ -2316,16 +2133,6 @@ fn validate_particle_modifier_params(
                 &format!("/params/{field}"),
             ));
         }
-    }
-    if params
-        .get("position")
-        .is_some_and(|value| value.as_i64().is_none() && value.as_u64().is_none())
-    {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "particle_instance position must be an integer",
-            "/params/position",
-        ));
     }
     if params
         .get("random_position")

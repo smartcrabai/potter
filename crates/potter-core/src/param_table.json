@@ -445,8 +445,7 @@
         },
         "object_path": {
           "type": "string",
-          "default": "",
-          "minLength": 1
+          "default": ""
         },
         "read_data": {
           "type": "array",
@@ -1841,7 +1840,7 @@
         "seed": {
           "type": "integer",
           "default": 0,
-          "minimum": 1,
+          "minimum": 0,
           "maximum": 1048574
         }
       },
@@ -2298,11 +2297,11 @@
         },
         "show_expanded": {
           "type": "boolean",
-          "default": false
+          "default": true
         },
         "is_active": {
           "type": "boolean",
-          "default": false
+          "default": true
         },
         "use_pin_to_last": {
           "type": "boolean",
@@ -2333,23 +2332,23 @@
         },
         "voxel_size": {
           "type": "number",
-          "default": 0.0,
+          "default": 0.10000000149011612,
           "minimum": 0.0
         },
         "voxel_amount": {
           "type": "integer",
-          "default": 0,
+          "default": 32,
           "minimum": 0,
           "maximum": 2147483647
         },
         "interior_band_width": {
           "type": "number",
-          "default": 0.0,
+          "default": 0.20000000298023224,
           "minimum": 0.0
         },
         "density": {
           "type": "number",
-          "default": 0.0,
+          "default": 1.0,
           "minimum": 0.0
         }
       },
@@ -4632,11 +4631,11 @@
         },
         "show_expanded": {
           "type": "boolean",
-          "default": false
+          "default": true
         },
         "is_active": {
           "type": "boolean",
-          "default": false
+          "default": true
         },
         "use_pin_to_last": {
           "type": "boolean",
@@ -4648,7 +4647,7 @@
         },
         "strength": {
           "type": "number",
-          "default": 0.0
+          "default": 0.5
         },
         "texture": {
           "oneOf": [
@@ -4690,14 +4689,14 @@
           "minItems": 3,
           "maxItems": 3,
           "default": [
-            0.0,
-            0.0,
-            0.0
+            0.5,
+            0.5,
+            0.5
           ]
         },
         "texture_sample_radius": {
           "type": "number",
-          "default": 0.0,
+          "default": 1.0,
           "minimum": 0.0
         }
       },

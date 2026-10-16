@@ -1,0 +1,62 @@
+{
+  "description": "Diagnostic coverage inventory only; tests do not consume this file as an allow-list. A family below means its schema properties are not behaviorally covered by PR18-A except for the exact type.parameter scenarios named here, and each label states the only values that were compared. No unexercised entry asserts a Blender divergence or no-op.",
+  "behavior_scenarios": {
+    "edge_split.use_edge_angle (use_edge_angle=false)": "edge_split_no_angle",
+    "triangulate.min_vertices (min_vertices=5)": "triangulate_min_vertices5",
+    "solidify.solidify_mode (NON_MANIFOLD)": "solidify_nonmanifold",
+    "decimate.ratio (0.5)": "decimate_half",
+    "screw.angle (default 2π only)": "screw_default_angle",
+    "array.fit_length (FIXED_COUNT no-op only)": "array_fit_length_fixed_count",
+    "array.use_apply_on_spline (mesh-only no-op only)": "apply_on_spline_mesh",
+    "cast.cast_type (CYLINDER at factor 0.5, CUBOID with explicit size; SPHERE default is a no-op on a box)": "cast_cylinder, cast_cuboid_size, cast_default",
+    "cast.cast_type CUBOID with auto bounds (no-op on a box)": "cast_cuboid_auto_bounds",
+    "cast.radius and cast.size (radius-as-size and explicit-size paths)": "cast_radius_sets_length, cast_size_sets_length, cast_radius_excludes_all",
+    "cast.use_radius_as_size (false only in cast_size_sets_length and cast_radius_excludes_all)": "cast_size_sets_length, cast_radius_excludes_all"
+  },
+  "unexercised_by_owner": {
+    "B": ["mirror.*"],
+    "C": ["edge_split.* except use_edge_angle", "triangulate.* except min_vertices"],
+    "D": ["solidify.* except solidify_mode"],
+    "E": ["shrinkwrap.*"],
+    "F": [
+      "armature.*",
+      "cast.factor except 0.5",
+      "cast.use_x, cast.use_y, cast.use_z (only their Blender default true is exercised)",
+      "cast.use_transform, cast.object, cast.vertex_group, cast.invert_vertex_group",
+      "corrective_smooth.*", "curve.*", "displace.*", "hook.*",
+      "laplacian_deform.*", "laplacian_smooth.*", "lattice.*", "mesh_deform.*",
+      "simple_deform.*", "skin.*", "smooth.*", "surface_deform.*", "warp.*", "wave.*"
+    ],
+    "H": ["remesh.*"],
+    "I": [
+      "data_transfer.*", "mask.*", "normal_edit.*", "uv_project.*", "uv_warp.*",
+      "vertex_weight_edit.*", "vertex_weight_mix.*", "vertex_weight_proximity.*",
+      "weighted_normal.*"
+    ],
+    "J": ["explode.*", "particle_instance.*", "particle_system.*"],
+    "K": ["ocean.*"],
+    "L": ["use_pin_to_last across modifier types (stack ordering is not tested here)"],
+    "M": [
+      "multires.* except quality/use_creases", "subdivision.* except quality/use_creases"
+    ],
+    "N": ["nodes.*"],
+    "O": [
+      "cloth.*", "collision.*", "dynamic_paint.*", "fluid.*", "mesh_to_volume.*",
+      "soft_body.*", "volume_displace.*", "volume_to_mesh.*"
+    ],
+    "P": [
+      "array.* except fit_length at FIXED_COUNT and use_apply_on_spline on a mesh",
+      "build.*",
+      "screw.* except the default angle 2π",
+      "weld.*", "wireframe.*"
+    ],
+    "Q": ["mesh_cache.*", "mesh_sequence_cache.*"],
+    "PR14": ["bevel.*"],
+    "PR15": ["decimate.* except ratio"],
+    "PR16": [
+      "multires.quality", "multires.use_creases", "subdivision.quality", "subdivision.use_creases"
+    ],
+    "PR17": ["boolean.*"]
+  },
+  "interpretation": "Runtime-default and schema acceptance checks do not count as parameter-behavior coverage. Properties outside the named scenarios remain unexercised, not silently supported, inert, or divergent. Their owners remain the audit implementation slices listed above."
+}

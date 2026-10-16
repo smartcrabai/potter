@@ -42,8 +42,8 @@ pub(crate) fn evaluate(
 ) -> Result<()> {
     let resource = string_param(modifier, "resource")?;
     let object_path = string_param(modifier, "object_path")?;
-    let frame_offset = number_param(modifier, "frame_offset", 0.0)?;
-    let velocity_scale = number_param(modifier, "velocity_scale", 0.0)?;
+    let frame_offset = number_param(modifier, "frame_offset")?;
+    let velocity_scale = number_param(modifier, "velocity_scale")?;
     let override_frame = match modifier.params.get("override_frame") {
         None | Some(Value::Null) => None,
         Some(value) => Some(
@@ -55,7 +55,7 @@ pub(crate) fn evaluate(
                 })?,
         ),
     };
-    let interpolate = bool_param(modifier, "use_vertex_interpolation", false)?;
+    let interpolate = bool_param(modifier, "use_vertex_interpolation")?;
     let read = read_params(modifier)?;
     let rate = f64::from(fps) / fps_base;
     if !rate.is_finite() || rate <= 0.0 {
@@ -467,13 +467,13 @@ fn string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
         .ok_or_else(|| invalid_parameter(modifier, name, "a non-empty string"))
 }
 
-fn number_param(modifier: &Modifier, name: &str, default: f64) -> Result<f64> {
-    super::modifiers::number_param(modifier, name, default)
+fn number_param(modifier: &Modifier, name: &str) -> Result<f64> {
+    super::modifiers::number_param(modifier, name)
         .map_err(|_| invalid_parameter(modifier, name, "a finite number"))
 }
 
-fn bool_param(modifier: &Modifier, name: &str, default: bool) -> Result<bool> {
-    super::modifiers::bool_param(modifier, name, default)
+fn bool_param(modifier: &Modifier, name: &str) -> Result<bool> {
+    super::modifiers::bool_param(modifier, name)
         .map_err(|_| invalid_parameter(modifier, name, "a boolean"))
 }
 

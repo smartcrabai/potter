@@ -513,6 +513,9 @@ fn upgrade_mesh_v2(mesh: &mut Value) -> Result<()> {
         let Some(name) = crate::geom::attribute_keys::user_name(&key).map(str::to_owned) else {
             continue;
         };
+        if layers.iter().any(|layer| layer == &name) {
+            continue;
+        }
         let Some(attribute) = attributes.remove(&key) else {
             continue;
         };

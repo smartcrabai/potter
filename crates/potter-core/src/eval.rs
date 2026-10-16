@@ -13,7 +13,18 @@ use crate::{
     geom::{Aabb, CylinderParams, IcosphereParams, Mesh, normals::SHADING_ATTRIBUTES},
     hash,
     model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
+    params::{self, ParameterFamily},
 };
+
+/// Blender's default for a `mesh_to_volume` parameter, read from the schema table.
+fn mesh_to_volume_default(parameter: &str) -> Result<&'static Value> {
+    params::default_value(ParameterFamily::Modifier, "mesh_to_volume", parameter).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            format!("mesh_to_volume has no schema default for `{parameter}`"),
+        )
+    })
+}
 
 pub mod animation;
 mod ik_solver;
@@ -1033,22 +1044,37 @@ impl Snapshot {
                         for vertex in &mut transformed.vertices {
                             vertex.co = operand_to_owner.transform_point3(vertex.co);
                         }
-                        let number = |parameter: &str, default: f64| {
-                            modifier
-                                .params
-                                .get(parameter)
-                                .and_then(serde_json::Value::as_f64)
-                                .unwrap_or(default)
+                        // A parameter the modifier does not store takes its Blender default from the schema table.
+                        let number = |parameter: &str| -> Result<f64> {
+                            match modifier.params.get(parameter).and_then(Value::as_f64) {
+                                Some(value) => Ok(value),
+                                None => mesh_to_volume_default(parameter)?.as_f64().ok_or_else(|| {
+                                    PotError::new(
+                                        ErrorCode::InternalError,
+                                        format!("mesh_to_volume default `{parameter}` is not a number"),
+                                    )
+                                }),
+                            }
                         };
-                        let resolution_mode = modifier
+                        let resolution_mode = match modifier
                             .params
                             .get("resolution_mode")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("VOXEL_AMOUNT");
+                            .and_then(Value::as_str)
+                        {
+                            Some(mode) => mode,
+                            None => mesh_to_volume_default("resolution_mode")?
+                                .as_str()
+                                .ok_or_else(|| {
+                                    PotError::new(
+                                        ErrorCode::InternalError,
+                                        "mesh_to_volume default `resolution_mode` is not a string",
+                                    )
+                                })?,
+                        };
                         let voxel_size = match resolution_mode {
-                            "VOXEL_SIZE" => number("voxel_size", 0.1),
+                            "VOXEL_SIZE" => number("voxel_size")?,
                             "VOXEL_AMOUNT" => {
-                                let amount = number("voxel_amount", 32.0);
+                                let amount = number("voxel_amount")?;
                                 let bounds = transformed.bounds().ok_or_else(|| {
                                     PotError::with_details(
                                         ErrorCode::InvalidArgument,
@@ -1076,8 +1102,8 @@ impl Snapshot {
                         generated = Some(crate::geom::volume::mesh_to_fog_volume(
                             &transformed,
                             voxel_size as f32 as f64,
-                            number("interior_band_width", 0.2),
-                            number("density", 1.0),
+                            number("interior_band_width")?,
+                            number("density")?,
                             true,
                         )?);
                     }

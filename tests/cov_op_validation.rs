@@ -398,6 +398,90 @@ fn attribute_modifier_boundary_parameters_are_accepted() {
 }
 
 #[test]
+fn null_required_references_are_refused_with_pointers() {
+    let setup = json!([
+        {"op":"node.create","id":"body","kind":"box","params":{"size":1.0}},
+        {"op":"node.create","id":"guard","kind":"box","params":{"size":1.0}}
+    ]);
+    let cases = [
+        invalid_case(
+            "vertex-weight proximity target null",
+            setup.clone(),
+            json!({"op":"modifier.create","target":{"id":"body"},"id":"proximity","type":"vertex_weight_proximity","params":{"target":null,"vertex_group":"weights"}}),
+            "INVALID_OPERATION",
+            Some("/operations/0/params/target"),
+            Some("modifier.vertex_weight_proximity"),
+        ),
+        invalid_case(
+            "normal edit target null",
+            setup.clone(),
+            json!({"op":"modifier.create","target":{"id":"body"},"id":"normal","type":"normal_edit","params":{"target":null}}),
+            "INVALID_OPERATION",
+            Some("/operations/0/params/target"),
+            Some("modifier.normal_edit"),
+        ),
+        invalid_case(
+            "data transfer object null",
+            setup,
+            json!({"op":"modifier.create","target":{"id":"body"},"id":"transfer","type":"data_transfer","params":{"object":null}}),
+            "INVALID_OPERATION",
+            Some("/operations/0/params/object"),
+            Some("modifier.data_transfer"),
+        ),
+    ];
+    run_invalid_cases(&cases);
+}
+
+#[test]
+fn null_required_reference_batches_leave_the_scene_and_revision_unchanged() {
+    let (_directory, scene) =
+        setup_scene(&json!([{"op":"node.create","id":"body","kind":"box","params":{"size":1.0}}]));
+    let before = fs::read(scene.join("scene.json")).unwrap();
+    let output = apply(
+        &scene,
+        1,
+        &json!([
+            {"op":"node.create","id":"extra","kind":"box","params":{"size":1.0}},
+            {"op":"modifier.create","target":{"id":"body"},"id":"transfer","type":"data_transfer","params":{"object":null}}
+        ]),
+    );
+    assert!(
+        !output.status.success(),
+        "null required object was accepted"
+    );
+    assert_eq!(
+        fs::read(scene.join("scene.json")).unwrap(),
+        before,
+        "a rejected batch changed the stored scene or its revision"
+    );
+}
+
+#[test]
+fn optional_null_references_remain_accepted() {
+    let (_directory, scene) = setup_scene(&json!([
+        {"op":"node.create","id":"body","kind":"box","params":{"size":1.0}},
+        {"op":"node.create","id":"guard","kind":"box","params":{"size":1.0}},
+        {"op":"vertex_group.create","target":{"id":"body"},"id":"weights","name":"weights"}
+    ]));
+    let output = apply(
+        &scene,
+        1,
+        &json!([{"op":"modifier.create","target":{"id":"body"},"id":"proximity","type":"vertex_weight_proximity","params":{"target":"guard","vertex_group":"weights","mask_texture":null,"mask_tex_map_object":null}}]),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document: SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let modifier = &document.nodes[&Id::new("body").unwrap()].modifiers[0];
+    assert_eq!(modifier.params["target"], "guard");
+    assert!(modifier.params["mask_texture"].is_null());
+    assert!(modifier.params["mask_tex_map_object"].is_null());
+}
+
+#[test]
 fn physics_reference_errors_report_exact_codes_and_pointers() {
     let cases = [
         invalid_case(
