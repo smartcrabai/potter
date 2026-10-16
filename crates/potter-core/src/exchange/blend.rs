@@ -445,10 +445,6 @@ fn prepare_blend_export_resources(
             let mut wrote_frame = false;
             for (frame, frame_record) in sequence_frames {
                 let mut frame_record = frame_record.clone();
-                if frame_record.get("status").and_then(Value::as_str) == Some("missing") {
-                    output_frames.insert(frame.clone(), frame_record);
-                    continue;
-                }
                 let frame_resource_id = format!("{id}:{frame}");
                 let (bytes, digest) = match crate::cache_sequence::read_cache_resource_record(
                     &frame_record,
@@ -460,27 +456,18 @@ fn prepare_blend_export_resources(
                         if error.code == ErrorCode::DependencyMissing
                             && error.message.starts_with("Alembic cache file is missing:") =>
                     {
-                        if let Some(object) = frame_record.as_object_mut() {
-                            object.insert("status".to_owned(), json!("missing"));
-                        }
                         output_frames.insert(frame.clone(), frame_record);
                         continue;
                     }
                     Err(error) => return Err(error),
                 };
                 let filename = frame_record
-                    .get("filename")
+                    .get("uri")
                     .and_then(Value::as_str)
-                    .or_else(|| {
-                        frame_record
-                            .get("uri")
-                            .and_then(Value::as_str)
-                            .and_then(|uri| Path::new(uri).file_name())
-                            .and_then(|name| name.to_str())
-                    })
-                    .filter(|name| {
-                        Path::new(name).file_name().and_then(|part| part.to_str()) == Some(*name)
-                    })
+                    .and_then(|uri| Path::new(uri).file_name())
+                    .and_then(|name| name.to_str())
+                    .filter(|name| Path::new(name).file_name().and_then(|part| part.to_str()) == Some(*name))
+                    .map(str::to_owned)
                     .ok_or_else(|| {
                         PotError::with_details(
                             ErrorCode::SceneInvalid,
