@@ -5,8 +5,6 @@
 
 //! Parameter adapter for Blender's voxel and octree-style Remesh modifier modes.
 
-use std::collections::{BTreeSet, HashMap};
-
 use serde_json::json;
 
 use crate::{
@@ -52,18 +50,6 @@ fn voxel_remesh(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a number in [0, 1]",
         ));
     }
-    if adaptivity > 0.0 {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "Blender VOXEL adaptivity is not supported",
-            json!({
-                "feature_id":"modifier.remesh.voxel_adaptivity",
-                "modifier_id":modifier.id,
-                "mode":"VOXEL",
-                "adaptivity":adaptivity
-            }),
-        ));
-    }
     let voxel_size = voxel_size as f32;
     if !voxel_size.is_finite() || voxel_size <= 0.0 {
         return Err(invalid_parameter(
@@ -73,7 +59,7 @@ fn voxel_remesh(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ));
     }
     let smooth_shade = bool_param(modifier, "use_smooth_shade")?;
-    voxel::remesh(mesh, voxel_size, smooth_shade)
+    voxel::remesh(mesh, voxel_size, adaptivity as f32, smooth_shade)
 }
 
 fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
@@ -85,20 +71,23 @@ fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
             "an integer from 1 to 24",
         ));
     }
-    if depth > 6 {
-        return Err(PotError::new(
-            crate::error::ErrorCode::LimitExceeded,
-            format!(
-                "dual-contouring grid at octree_depth {depth} exceeds the configured voxel budget (maximum depth 6)"
-            ),
-        ));
-    }
     let scale = number_param(modifier, "scale")?;
     if !scale.is_finite() || !(0.0..=0.99).contains(&scale) || scale <= 0.0 {
         return Err(invalid_parameter(
             modifier,
             "scale",
             "a finite number in (0, 0.99]",
+        ));
+    }
+    if depth > 20 {
+        return Err(PotError::with_details(
+            ErrorCode::LimitExceeded,
+            format!("dual-contour depth {depth} has zero cell resolution on Blender's 2^20 grid"),
+            json!({
+                "modifier_id":modifier.id,
+                "mode":mode,
+                "octree_depth":depth
+            }),
         ));
     }
     let sharpness = number_param(modifier, "sharpness")?;
@@ -117,88 +106,28 @@ fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
     }
     let depth = u32::try_from(depth).map_err(|_| {
         PotError::new(
-            crate::error::ErrorCode::LimitExceeded,
+            ErrorCode::LimitExceeded,
             "dual-contour depth exceeds integer limits",
         )
     })?;
-    let mut result = dual_contour::remesh(mesh, depth, scale, mode, sharpness, &modifier.id)?;
-    finish_remesh(&mut result, smooth_shade, remove_disconnected, threshold)?;
+    let settings = dual_contour::DualConSettings {
+        mode,
+        depth,
+        scale: scale as f32,
+        sharpness: sharpness as f32,
+        threshold: threshold as f32,
+        flood_fill: remove_disconnected,
+    };
+    let mut result = dual_contour::remesh(mesh, &settings)?;
+    finish_remesh(&mut result, smooth_shade)?;
     Ok(result)
 }
 
-fn finish_remesh(
-    mesh: &mut Mesh,
-    smooth_shade: bool,
-    remove_disconnected: bool,
-    threshold: f64,
-) -> Result<()> {
-    if remove_disconnected {
-        remove_disconnected_components(mesh, threshold);
-    }
+fn finish_remesh(mesh: &mut Mesh, smooth_shade: bool) -> Result<()> {
     if smooth_shade {
         crate::geom::normals::shade_faces_smooth(mesh);
     }
     validated(mesh)
-}
-
-fn remove_disconnected_components(mesh: &mut Mesh, threshold: f64) {
-    if mesh.faces.len() < 2 || threshold <= 0.0 {
-        return;
-    }
-    let mut vertex_faces = HashMap::<u32, Vec<usize>>::new();
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        for vertex_id in &face.vertices {
-            vertex_faces.entry(*vertex_id).or_default().push(face_index);
-        }
-    }
-    let mut unseen = (0..mesh.faces.len()).collect::<BTreeSet<_>>();
-    let mut components = Vec::new();
-    while let Some(first) = unseen.iter().next().copied() {
-        unseen.remove(&first);
-        let mut stack = vec![first];
-        let mut component = Vec::new();
-        while let Some(face_index) = stack.pop() {
-            component.push(face_index);
-            for vertex_id in &mesh.faces[face_index].vertices {
-                if let Some(adjacent) = vertex_faces.get(vertex_id) {
-                    for adjacent_face in adjacent {
-                        if unseen.remove(adjacent_face) {
-                            stack.push(*adjacent_face);
-                        }
-                    }
-                }
-            }
-        }
-        components.push(component);
-    }
-    let largest = components.iter().map(Vec::len).max().unwrap_or(0);
-    let minimum_size = (largest as f32 * threshold as f32) as usize;
-    let retained = components
-        .iter()
-        .filter(|component| component.len() >= minimum_size)
-        .flatten()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let retained_face_ids = mesh
-        .faces
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| retained.contains(index))
-        .map(|(_, face)| face.id)
-        .collect::<BTreeSet<_>>();
-    mesh.faces
-        .retain(|face| retained_face_ids.contains(&face.id));
-    let retained_vertices = mesh
-        .faces
-        .iter()
-        .flat_map(|face| face.vertices.iter().copied())
-        .collect::<BTreeSet<_>>();
-    mesh.vertices
-        .retain(|vertex| retained_vertices.contains(&vertex.id));
-    mesh.edges.retain(|edge| {
-        retained_vertices.contains(&edge.vertices[0])
-            && retained_vertices.contains(&edge.vertices[1])
-    });
 }
 
 #[cfg(test)]

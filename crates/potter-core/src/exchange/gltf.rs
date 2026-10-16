@@ -4036,9 +4036,31 @@ fn export_with_root_inner(
     if !animations.is_empty() {
         root["animations"] = json!(animations);
     }
+    omit_empty_containers(&mut root, binary.is_empty());
     let json_bytes = serde_json::to_vec(&root)
         .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
     Ok((json_bytes, binary))
+}
+
+/// Removes top-level containers that would be empty. glTF requires `accessors`, `bufferViews`,
+/// `materials`, and `meshes` to hold at least one entry when present, and a buffer to hold at
+/// least one byte, so empty geometry omits them instead of serializing empty containers.
+fn omit_empty_containers(root: &mut Value, binary_is_empty: bool) {
+    let Some(object) = root.as_object_mut() else {
+        return;
+    };
+    for key in ["accessors", "bufferViews", "materials", "meshes"] {
+        if object
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            object.remove(key);
+        }
+    }
+    if binary_is_empty {
+        object.remove("buffers");
+    }
 }
 
 fn camera_definitions(doc: &SceneDoc) -> (Vec<Value>, BTreeMap<Id, usize>) {
@@ -4369,6 +4391,8 @@ fn to_f32(value: f64) -> Result<f32> {
     Ok(value)
 }
 
+/// Packs the JSON chunk and, when there are buffer bytes, the BIN chunk into one GLB container.
+/// glTF forbids zero-length buffers, so an export without buffer bytes has no BIN chunk.
 pub(crate) fn to_glb(json_bytes: &[u8], binary: &[u8]) -> Result<Vec<u8>> {
     let json_length = json_bytes
         .len()
@@ -4378,11 +4402,17 @@ pub(crate) fn to_glb(json_bytes: &[u8], binary: &[u8]) -> Result<Vec<u8>> {
         .len()
         .checked_add((4 - binary.len() % 4) % 4)
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "GLB binary chunk is too large"))?;
+    let binary_chunk_length = if binary.is_empty() {
+        0
+    } else {
+        binary_length.checked_add(8).ok_or_else(|| {
+            PotError::new(ErrorCode::LimitExceeded, "GLB binary chunk is too large")
+        })?
+    };
     let total_length = 12_usize
         .checked_add(8)
         .and_then(|value| value.checked_add(json_length))
-        .and_then(|value| value.checked_add(8))
-        .and_then(|value| value.checked_add(binary_length))
+        .and_then(|value| value.checked_add(binary_chunk_length))
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "GLB file is too large"))?;
     let total_length = u32::try_from(total_length)
         .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "GLB file exceeds u32 length"))?;
@@ -4403,19 +4433,21 @@ pub(crate) fn to_glb(json_bytes: &[u8], binary: &[u8]) -> Result<Vec<u8>> {
     output.extend_from_slice(&0x4E4F_534A_u32.to_le_bytes());
     output.extend_from_slice(json_bytes);
     output.resize(output.len() + json_length - json_bytes.len(), b' ');
-    output.extend_from_slice(
-        &u32::try_from(binary_length)
-            .map_err(|_| {
-                PotError::new(
-                    ErrorCode::LimitExceeded,
-                    "GLB binary chunk exceeds u32 length",
-                )
-            })?
-            .to_le_bytes(),
-    );
-    output.extend_from_slice(&0x004E_4942_u32.to_le_bytes());
-    output.extend_from_slice(binary);
-    output.resize(output.len() + binary_length - binary.len(), 0);
+    if !binary.is_empty() {
+        output.extend_from_slice(
+            &u32::try_from(binary_length)
+                .map_err(|_| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "GLB binary chunk exceeds u32 length",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        output.extend_from_slice(&0x004E_4942_u32.to_le_bytes());
+        output.extend_from_slice(binary);
+        output.resize(output.len() + binary_length - binary.len(), 0);
+    }
     Ok(output)
 }
 
