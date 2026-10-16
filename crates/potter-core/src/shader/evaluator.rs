@@ -593,14 +593,14 @@ pub(crate) fn displacement_uses_view_direction(
     let Some(output) = active_output.or(fallback_output) else {
         return false;
     };
-    if !group
+    let Some(displacement_link) = group
         .links
         .iter()
-        .any(|link| link.to_node == output && link.to_socket == "Displacement")
-    {
+        .find(|link| link.to_node == output && link.to_socket == "Displacement")
+    else {
         return false;
-    }
-    let mut pending = vec![output];
+    };
+    let mut pending = vec![displacement_link.from_node.clone()];
     let mut visited = BTreeSet::new();
     while let Some(node_id) = pending.pop() {
         if !visited.insert(node_id.clone()) {
@@ -2304,6 +2304,7 @@ mod tests {
         insert_node(&mut graph, "math", "ShaderNodeMath", json!({}));
         insert_node(&mut graph, "fresnel", "ShaderNodeFresnel", json!({}));
         link(&mut graph, "math", "Value", "output", "Displacement");
+        link(&mut graph, "fresnel", "Fac", "output", "Surface");
         let graph_id = Id::new("view_dependency_shader".to_owned()).unwrap();
         let mut groups = Registry::new();
         groups.insert(graph_id.clone(), graph);

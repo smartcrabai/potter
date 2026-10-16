@@ -149,6 +149,7 @@ pub(super) fn preview_geometry_parameters(
     let visible_nodes = visible_scene_node_ids(doc, snapshot)?;
     let mut bounds: Option<(DVec3, DVec3)> = None;
     let mut view_dependent = false;
+    let mut checked_materials = HashSet::new();
     for node_id in visible_nodes {
         let Some(node) = doc.nodes.get(&node_id) else {
             continue;
@@ -157,15 +158,31 @@ pub(super) fn preview_geometry_parameters(
             continue;
         }
         if !view_dependent {
-            view_dependent = node.materials.iter().any(|material_id| {
-                doc.materials.get(material_id).is_some_and(|material| {
-                    material.displacement_method == "displacement"
+            if let Some(mesh) = snapshot.meshes.get(&node_id) {
+                for face in &mesh.faces {
+                    let Ok(slot) = usize::try_from(face.material_index) else {
+                        continue;
+                    };
+                    let Some(material_id) = snapshot.slot_material(&node_id, node, slot) else {
+                        continue;
+                    };
+                    if !checked_materials.insert(material_id.clone()) {
+                        continue;
+                    }
+                    let Some(material) = doc.materials.get(material_id) else {
+                        continue;
+                    };
+                    if material.displacement_method == "displacement"
                         && crate::shader::displacement_uses_view_direction(
                             material,
                             &doc.node_groups,
                         )
-                })
-            });
+                    {
+                        view_dependent = true;
+                        break;
+                    }
+                }
+            }
         }
         if let Some(node_bounds) = snapshot.nodes.get(&node_id).and_then(|node| node.bounds) {
             bounds = Some(match bounds {
@@ -2169,7 +2186,6 @@ mod shading_normal_tests {
             Mesh,
             color_layers::{ColorDomain, ColorLayer},
             uv_layers::{UvLayer, UvStore},
-            Mesh,
         },
         model::Id,
         render::raster::{AlphaMode, Triangle},
