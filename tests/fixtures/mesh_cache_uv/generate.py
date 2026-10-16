@@ -1,6 +1,7 @@
 # Blender fixtures for tests/mesh_cache_uv_layers.rs. Writes `two_layers.abc` and a second
 # animated archive whose `UVMap` has asymmetric loop values while a same-size face winding flips.
 # Run: Blender -b --factory-startup -P generate.py -- <output directory>
+import json
 import bpy
 import sys
 
