@@ -2303,8 +2303,10 @@ mod tests {
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(&mut graph, "math", "ShaderNodeMath", json!({}));
         insert_node(&mut graph, "fresnel", "ShaderNodeFresnel", json!({}));
+        insert_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", json!({}));
         link(&mut graph, "math", "Value", "output", "Displacement");
-        link(&mut graph, "fresnel", "Fac", "output", "Surface");
+        link(&mut graph, "fresnel", "Fac", "principled", "Metallic");
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
         let graph_id = Id::new("view_dependency_shader".to_owned()).unwrap();
         let mut groups = Registry::new();
         groups.insert(graph_id.clone(), graph);
