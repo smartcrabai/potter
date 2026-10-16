@@ -61,6 +61,7 @@ struct Piece {
     vertex_base: usize,
     vertices: usize,
     edges: usize,
+    face_base: usize,
     faces: usize,
     corners: usize,
 }
@@ -88,6 +89,7 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
             vertex_base: output.vertices.len(),
             vertices: mesh.vertices.len(),
             edges: mesh.edges.len(),
+            face_base: output.faces.len(),
             faces: mesh.faces.len(),
             corners: mesh.faces.iter().map(|face| face.vertices.len()).sum(),
         });
@@ -96,7 +98,7 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
         output.edges.append(&mut mesh.edges);
         output.faces.append(&mut mesh.faces);
     }
-    output.attributes = merge_attributes(&pieces)?;
+    output.attributes = merge_attributes(&pieces, &output)?;
     let layers = join_uv_layers(&mut pieces);
     if !layers.is_empty() {
         let stores: Vec<Value> = layers
@@ -455,7 +457,7 @@ type Member<'a> = (Option<&'a Value>, &'a Piece);
 
 /// Merges every member's mesh-level attributes. An attribute present on some members only is
 /// filled with defaults for the others, so positional data stays aligned.
-fn merge_attributes(pieces: &[Piece]) -> Result<Map<String, Value>> {
+fn merge_attributes(pieces: &[Piece], mesh: &Mesh) -> Result<Map<String, Value>> {
     let mut names: Vec<&str> = Vec::new();
     for piece in pieces {
         for name in piece.attributes.keys() {
@@ -470,14 +472,15 @@ fn merge_attributes(pieces: &[Piece]) -> Result<Map<String, Value>> {
             .iter()
             .map(|piece| (piece.attributes.get(name), piece))
             .collect();
-        merged.insert(name.to_owned(), merge_attribute(name, &members)?);
+        merged.insert(name.to_owned(), merge_attribute(name, &members, mesh)?);
     }
     Ok(merged)
 }
 
-fn merge_attribute(name: &str, members: &[Member<'_>]) -> Result<Value> {
+fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Value> {
     match name {
         "blender_attributes" => merge_blender_attributes(name, members),
+        "color_layers" => merge_color_layers(name, members),
         "blender_edge_flags" => merge_positional(
             name,
             members,
@@ -493,6 +496,12 @@ fn merge_attribute(name: &str, members: &[Member<'_>]) -> Result<Value> {
         "blender_metadata" => merge_metadata(name, members),
         "skin_radii" | "skin_roots" => merge_vertex_objects(name, members),
         "vertex_groups" => merge_vertex_groups(name, members),
+        _ if members.iter().any(|(value, _)| {
+            value.is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("color"))
+        }) =>
+        {
+            merge_color_attribute(name, members, mesh)
+        }
         _ if members
             .iter()
             .any(|(value, _)| value.is_some_and(|value| value.get("values").is_some())) =>
@@ -755,6 +764,138 @@ fn merge_named(name: &str, members: &[Member<'_>]) -> Result<Value> {
     merged.insert("values".to_owned(), Value::Object(values));
     Ok(Value::Object(merged))
 }
+/// Joins canonical color layers in first-seen order. The first valid active/render designation is
+/// retained; when none survives, the first joined layer is used.
+fn merge_color_layers(name: &str, members: &[Member<'_>]) -> Result<Value> {
+    let mut layers = Vec::<String>::new();
+    let mut active = None;
+    let mut render = None;
+    for (value, _) in members {
+        let Some(value) = value else { continue };
+        let object = value.as_object().ok_or_else(|| shape_error(name))?;
+        let names = object
+            .get("layers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| shape_error(name))?;
+        for layer in names {
+            let layer = layer.as_str().ok_or_else(|| shape_error(name))?;
+            if !layers.iter().any(|known| known == layer) {
+                layers.push(layer.to_owned());
+            }
+        }
+        if active.is_none() {
+            active = object
+                .get("active")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+        if render.is_none() {
+            render = object
+                .get("render")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+    let fallback = layers.first().cloned();
+    let designation = |name: Option<String>| {
+        name.filter(|name| layers.contains(name))
+            .or_else(|| fallback.clone())
+    };
+    Ok(json!({
+        "layers": layers,
+        "active": designation(active),
+        "render": designation(render)
+    }))
+}
+
+/// Joins canonical named color attributes, filling absent layers with opaque black. When point and
+/// corner members share a layer name, the joined layer becomes corner-domain without losing point
+/// colors: each source vertex value is expanded to every face corner that references it.
+fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Value> {
+    const DEFAULT: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+    let mut corner_domain = false;
+    for (value, _) in members {
+        let Some(value) = value else { continue };
+        if text(value, "type") != "color" {
+            return Err(conflict_error(name));
+        }
+        match text(value, "domain") {
+            "point" => {}
+            "corner" => corner_domain = true,
+            _ => return Err(conflict_error(name)),
+        }
+    }
+    let mut values = Map::new();
+    if corner_domain {
+        for (attribute, piece) in members {
+            let fields = attribute
+                .and_then(|attribute| attribute.get("values"))
+                .and_then(Value::as_object);
+            if attribute.is_some() && fields.is_none() {
+                return Err(shape_error(name));
+            }
+            for face in &mesh.faces[piece.face_base..piece.face_base + piece.faces] {
+                let row = match (attribute, fields) {
+                    (Some(attribute), Some(fields)) if text(attribute, "domain") == "corner" => {
+                        let row = fields
+                            .get(&format!("f{}", face.id))
+                            .and_then(Value::as_array)
+                            .filter(|row| row.len() == face.vertices.len())
+                            .ok_or_else(|| shape_error(name))?;
+                        row.iter()
+                            .map(|value| color_value(value, name))
+                            .collect::<Result<Vec<_>>>()?
+                    }
+                    (Some(_), Some(fields)) => face
+                        .vertices
+                        .iter()
+                        .map(|vertex| {
+                            fields
+                                .get(&format!("v{vertex}"))
+                                .map_or(Ok(json!(DEFAULT)), |value| color_value(value, name))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    (None, None) => vec![json!(DEFAULT); face.vertices.len()],
+                    _ => return Err(shape_error(name)),
+                };
+                values.insert(format!("f{}", face.id), Value::Array(row));
+            }
+        }
+    } else {
+        for (attribute, piece) in members {
+            let fields = attribute
+                .and_then(|attribute| attribute.get("values"))
+                .and_then(Value::as_object);
+            if attribute.is_some() && fields.is_none() {
+                return Err(shape_error(name));
+            }
+            for vertex in &mesh.vertices[piece.vertex_base..piece.vertex_base + piece.vertices] {
+                let color = fields
+                    .and_then(|fields| fields.get(&format!("v{}", vertex.id)))
+                    .map_or(Ok(json!(DEFAULT)), |value| color_value(value, name))?;
+                values.insert(format!("v{}", vertex.id), color);
+            }
+        }
+    }
+    Ok(json!({
+        "domain": if corner_domain { "corner" } else { "point" },
+        "type": "color",
+        "values": values
+    }))
+}
+
+fn color_value(value: &Value, name: &str) -> Result<Value> {
+    value
+        .as_array()
+        .filter(|values| values.len() == 4)
+        .and_then(|values| {
+            values
+                .iter()
+                .all(|component| component.as_f64().is_some_and(f64::is_finite))
+                .then(|| value.clone())
+        })
+        .ok_or_else(|| shape_error(name))
+}
 
 /// `blender_metadata` describes each member's data-block. The joined mesh keeps every member's custom
 /// properties; a key set to different values on two members is refused. `potter.*` keys are bridge
@@ -762,25 +903,49 @@ fn merge_named(name: &str, members: &[Member<'_>]) -> Result<Value> {
 /// flags belong to no single joined mesh and are not carried either.
 fn merge_metadata(name: &str, members: &[Member<'_>]) -> Result<Value> {
     let mut custom = Map::new();
+    let mut color_types = Map::new();
     for (value, _) in members {
         let Some(value) = *value else { continue };
-        let Some(properties) = value.get("custom_properties").and_then(Value::as_object) else {
-            continue;
-        };
-        for (key, property) in properties {
-            if key.starts_with("potter.") {
-                continue;
+        if let Some(properties) = value.get("custom_properties").and_then(Value::as_object) {
+            for (key, property) in properties {
+                if key.starts_with("potter.") {
+                    continue;
+                }
+                match custom.get(key) {
+                    Some(known) if known != property => return Err(conflict_error(name)),
+                    Some(_) => {}
+                    None => {
+                        custom.insert(key.clone(), property.clone());
+                    }
+                }
             }
-            match custom.get(key) {
-                Some(known) if known != property => return Err(conflict_error(name)),
-                Some(_) => {}
-                None => {
-                    custom.insert(key.clone(), property.clone());
+        }
+        if let Some(types) = value.get("color_data_types").and_then(Value::as_object) {
+            for (layer, data_type) in types {
+                let data_type = data_type.as_str().ok_or_else(|| shape_error(name))?;
+                match color_types.get(layer).and_then(Value::as_str) {
+                    None => {
+                        color_types.insert(layer.clone(), json!(data_type));
+                    }
+                    Some(known @ ("BYTE_COLOR" | "FLOAT_COLOR")) => {
+                        if !matches!(data_type, "BYTE_COLOR" | "FLOAT_COLOR") {
+                            return Err(conflict_error(layer));
+                        }
+                        if known == "FLOAT_COLOR" || data_type == "FLOAT_COLOR" {
+                            color_types.insert(layer.clone(), json!("FLOAT_COLOR"));
+                        }
+                    }
+                    Some(known) if known == data_type => {}
+                    Some(_) => return Err(conflict_error(layer)),
                 }
             }
         }
     }
-    Ok(json!({ "custom_properties": custom }))
+    let mut metadata = json!({ "custom_properties": custom });
+    if !color_types.is_empty() {
+        metadata["color_data_types"] = Value::Object(color_types);
+    }
+    Ok(metadata)
 }
 
 /// Mesh-level data with no element keys must agree across members.
@@ -1054,6 +1219,99 @@ mod tests {
         assert_eq!(corner_colors.len(), 48);
         assert_eq!(corner_colors[0], json!([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(corner_colors[24], json!([0.0, 0.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn native_color_layers_union_and_promote_point_to_corner() {
+        let mut point = cube();
+        let point_values: Map<String, Value> = point
+            .vertices
+            .iter()
+            .map(|vertex| {
+                (
+                    format!("v{}", vertex.id),
+                    json!([f64::from(vertex.id), 0.0, 0.0, 1.0]),
+                )
+            })
+            .collect();
+        let first_color = point_values[&format!("v{}", point.faces[0].vertices[0])].clone();
+        point.attributes.insert(
+            "Body".to_owned(),
+            json!({"domain":"point","type":"color","values":point_values}),
+        );
+        point.attributes.insert(
+            "color_layers".to_owned(),
+            json!({"layers":["Body"],"active":"Body","render":null}),
+        );
+        point.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types":{"Body":"BYTE_COLOR"}}),
+        );
+
+        let mut corner = cube();
+        let body_values: Map<String, Value> = corner
+            .faces
+            .iter()
+            .map(|face| {
+                (
+                    format!("f{}", face.id),
+                    json!(vec![[0.0, 0.0, 1.0, 1.0]; face.vertices.len()]),
+                )
+            })
+            .collect();
+        let atlas_values: Map<String, Value> = corner
+            .faces
+            .iter()
+            .map(|face| {
+                (
+                    format!("f{}", face.id),
+                    json!(vec![[0.25, 0.5, 0.75, 1.0]; face.vertices.len()]),
+                )
+            })
+            .collect();
+        corner.attributes.insert(
+            "Body".to_owned(),
+            json!({"domain":"corner","type":"color","values":body_values}),
+        );
+        corner.attributes.insert(
+            "Atlas".to_owned(),
+            json!({"domain":"corner","type":"color","values":atlas_values}),
+        );
+        corner.attributes.insert(
+            "color_layers".to_owned(),
+            json!({"layers":["Body","Atlas"],"active":null,"render":"Atlas"}),
+        );
+        corner.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types":{"Body":"FLOAT_COLOR","Atlas":"FLOAT_COLOR"}}),
+        );
+
+        let joined = concatenate(vec![
+            member(&point, DMat4::IDENTITY, 0, 1),
+            member(&corner, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        let layers = &joined.attributes["color_layers"];
+        assert_eq!(layers["layers"], json!(["Body", "Atlas"]));
+        assert_eq!(layers["active"], json!("Body"));
+        assert_eq!(layers["render"], json!("Atlas"));
+        assert_eq!(joined.attributes["Body"]["domain"], json!("corner"));
+        assert_eq!(
+            joined.attributes["Body"]["values"][format!("f{}", joined.faces[0].id)][0],
+            first_color
+        );
+        assert_eq!(
+            joined.attributes["Body"]["values"][format!("f{}", joined.faces[6].id)][0],
+            json!([0.0, 0.0, 1.0, 1.0])
+        );
+        assert_eq!(
+            joined.attributes["Atlas"]["values"][format!("f{}", joined.faces[0].id)],
+            json!(vec![[0.0, 0.0, 0.0, 1.0]; 4])
+        );
+        assert_eq!(
+            joined.attributes["blender_metadata"]["color_data_types"]["Body"],
+            json!("FLOAT_COLOR")
+        );
     }
 
     #[test]
