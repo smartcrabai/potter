@@ -58,6 +58,7 @@ pub(crate) enum AlphaMode {
 pub(crate) struct Triangle {
     pub(crate) positions: [DVec3; 3],
     pub(crate) object_index: u32,
+    /// Source element index; face records carry per-slot UV bindings through subdivision copies.
     pub(crate) element_index: u32,
     pub(crate) color: [f64; 4],
     pub(crate) alpha_mode: AlphaMode,

@@ -208,6 +208,8 @@ pub struct HitUvLayers<'a> {
     pub barycentric: [f64; 3],
     /// Index of the render layer; `None` when the object has no UV layer.
     pub render: Option<usize>,
+    /// Source-member layers actually available; `None` preserves ordinary-mesh name resolution.
+    pub available_mask: Option<u8>,
 }
 
 impl HitUvLayers<'_> {
@@ -1662,15 +1664,20 @@ fn tangent_basis(normal: DVec3) -> (DVec3, DVec3) {
     (tangent_u, tangent_v)
 }
 
-/// Index of the layer that a reference names. `None` and the empty name are the render layer,
-/// which is `None` for an object without layers. A name the object lacks falls back to the render
-/// layer and records `uv.layer_missing`.
+/// Index of the layer that a reference names. `None` and the empty name select the render layer.
+/// A name absent from the source member (including a layer contributed by another joined member)
+/// falls back to the render layer and records `uv.layer_missing`.
 fn layer_index(hit_ctx: &HitContext<'_>, layer: Option<&str>) -> Option<usize> {
     let render = hit_ctx.uv_layers.and_then(|layers| layers.render);
     let Some(name) = layer.filter(|name| !name.is_empty()) else {
         return render;
     };
-    if let Some(index) = hit_ctx.uv_layers.and_then(|layers| layers.index_of(name)) {
+    if let Some(index) = hit_ctx.uv_layers.and_then(|layers| layers.index_of(name))
+        && hit_ctx
+            .uv_layers
+            .and_then(|layers| layers.available_mask)
+            .is_none_or(|mask| index < 8 && mask & (1_u8 << index) != 0)
+    {
         return Some(index);
     }
     if let Some(warnings) = hit_ctx.warnings {
@@ -1908,7 +1915,10 @@ mod tests {
         model::{Id, Material, Registry},
     };
 
-    use super::{HitContext, HitUvLayers, color_lerp, evaluate_displacement, evaluate_surface};
+    use super::{
+        HitContext, HitUvLayers, color_lerp, evaluate_displacement, evaluate_surface, layer_index,
+        layer_uv,
+    };
 
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
         let Value::Object(properties) = properties else {
@@ -1972,6 +1982,7 @@ mod tests {
             positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
             barycentric: [1.0 / 3.0; 3],
             render: Some(0),
+            available_mask: None,
         });
         let mut pixels = Vec::with_capacity(64);
         for y in 0..8 {
@@ -2015,6 +2026,43 @@ mod tests {
             to_node: Id::new(to.to_owned()).unwrap(),
             to_socket: input.to_owned(),
         });
+    }
+
+    #[test]
+    fn unavailable_joined_uv_layer_warns_and_falls_back_to_member_render() {
+        use std::cell::RefCell;
+
+        let groups = Registry::new();
+        let names = vec!["JoinedOnly".to_owned(), "MemberRender".to_owned()];
+        let corners = vec![[[0.8, 0.2]; 3], [[0.25, 0.75]; 3]];
+        let warnings = RefCell::new(Vec::new());
+        let context = HitContext::new(&groups)
+            .with_uv_layers(HitUvLayers {
+                names: &names,
+                corners: &corners,
+                positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+                barycentric: [1.0 / 3.0; 3],
+                render: Some(1),
+                available_mask: Some(0b10),
+            })
+            .with_warnings(&warnings);
+
+        let selected = layer_index(&context, Some("JoinedOnly"));
+        assert_eq!(selected, Some(1));
+        assert_eq!(layer_uv(&context, selected), [0.25, 0.75]);
+        assert_eq!(layer_index(&context, None), Some(1));
+        assert_eq!(warnings.borrow().len(), 1);
+        assert_eq!(warnings.borrow()[0]["code"], "uv.layer_missing");
+
+        let ordinary = HitContext::new(&groups).with_uv_layers(HitUvLayers {
+            names: &names,
+            corners: &corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [1.0 / 3.0; 3],
+            render: Some(1),
+            available_mask: None,
+        });
+        assert_eq!(layer_index(&ordinary, Some("JoinedOnly")), Some(0));
     }
 
     #[test]

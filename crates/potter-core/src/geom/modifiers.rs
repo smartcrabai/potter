@@ -4546,51 +4546,18 @@ fn decimate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
 }
 
-fn decimate_merge_faces(
-    first: &[usize],
-    second: &[usize],
-    edge: (usize, usize),
-) -> Option<Vec<usize>> {
-    let orientation =
-        [(edge.0, edge.1), (edge.1, edge.0)]
-            .into_iter()
-            .find_map(|(start, end)| {
-                let start_a = first.iter().position(|vertex| *vertex == start)?;
-                let end_a = (start_a + 1) % first.len();
-                if first[end_a] != end {
-                    return None;
-                }
-                let start_b = second.iter().position(|vertex| *vertex == start)?;
-                let end_b = second.iter().position(|vertex| *vertex == end)?;
-                ((end_b + 1) % second.len() == start_b)
-                    .then_some((start, start_a, end_a, start_b, end_b))
-            })?;
-    let (_, start_a, end_a, start_b, end_b) = orientation;
-    let mut merged = Vec::with_capacity(first.len() + second.len() - 2);
-    let mut index = end_a;
-    loop {
-        merged.push(first[index]);
-        if index == start_a {
-            break;
-        }
-        index = (index + 1) % first.len();
-    }
-    index = (start_b + 1) % second.len();
-    while index != end_b {
-        merged.push(second[index]);
-        index = (index + 1) % second.len();
-    }
-    clean_polygon(merged)
-}
-
 fn decimate_compact(
     points: Vec<DVec3>,
     mut polygons: Vec<Polygon>,
     mut loose: Vec<[usize; 2]>,
     origin: Origin,
     source: &Mesh,
+    keep_vertices: &[bool],
 ) -> Result<Mesh> {
-    let mut used = vec![false; points.len()];
+    // Blender's BMesh keeps the live vertices no face or edge uses; `keep_vertices` marks them.
+    let mut used: Vec<bool> = (0..points.len())
+        .map(|index| keep_vertices.get(index).copied().unwrap_or(false))
+        .collect();
     for (face, _) in &polygons {
         for vertex in face {
             used[*vertex] = true;
@@ -4945,13 +4912,6 @@ pub(super) fn unique_tagged_polygons<T>(polygons: Vec<(T, Polygon)>) -> Vec<(T, 
             key.sort_unstable();
             seen.insert(key)
         })
-        .collect()
-}
-
-fn unique_polygons(polygons: Vec<Polygon>) -> Vec<Polygon> {
-    unique_tagged_polygons(polygons.into_iter().map(|polygon| ((), polygon)).collect())
-        .into_iter()
-        .map(|((), polygon)| polygon)
         .collect()
 }
 

@@ -1166,12 +1166,18 @@ fn make_surface(
     } else {
         point
     };
+    let element = triangle
+        .element_index
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| geometry.elements.get(index));
     let layers = HitUvLayers {
         names: &object.uv_layers,
         corners: &triangle.layer_uvs,
         positions: triangle.positions,
         barycentric: hit.barycentric,
-        render: object.uv_render,
+        render: element.map_or(object.uv_render, |element| element.uv_render),
+        available_mask: element.and_then(|element| element.uv_available_mask),
     };
     let mut context = HitContext::new(&doc.node_groups)
         .with_images(images)

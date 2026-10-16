@@ -50,6 +50,8 @@ for case in cases:
     }
     if case["edges"]:
         input_doc["edges"] = case["edges"]
+    if "blender_edge_order" in blender:
+        input_doc["blender_edge_order"] = blender["blender_edge_order"]
     text = (
         "{\n"
         f'"variant": {json.dumps(name)},\n'

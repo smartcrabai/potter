@@ -1239,6 +1239,8 @@ def mesh_dump(mesh):
     uv_active = _uv_layer_index(mesh.uv_layers, "active_index")
     uv_render = _uv_layer_index(mesh.uv_layers, "active_render_index")
     attrs = []
+    custom_normals = any(attr.name == "custom_normal" for attr in mesh.attributes)
+    corner_normals = [plain(normal.vector) for normal in mesh.corner_normals] if custom_normals else None
     try:
         for attr in mesh.attributes:
             vals = []
@@ -1264,6 +1266,7 @@ def mesh_dump(mesh):
             "library": library_reference(mesh), "vertices": vertices,
             "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "uv_active": uv_active,
             "uv_render": uv_render, "attributes": attrs,
+            "corner_normals": corner_normals,
             "skin_vertices": skin_vertices,
             "shape_keys": _mesh_shape_keys(mesh),
             "descriptor": json.loads(mesh.get("potter.descriptor_json", "null")),
@@ -2558,6 +2561,32 @@ def _bind_blender_modifiers(doc, object_map, preserved_native_binds):
                 view_layer.update()
                 obj.select_set(was_selected)
                 view_layer.objects.active = previous_active
+
+
+def _native_values(attributes, name):
+    """Potter's native values for a mesh attribute keyed by element ID ('f3', 'e7'), or None when
+    the attribute is absent. An empty mapping is still the current state and wins over raw data."""
+    attribute = attributes.get(name)
+    if not isinstance(attribute, dict) or not isinstance(attribute.get("values"), dict):
+        return None
+    return attribute["values"]
+
+
+def _set_native_custom_normals(mesh, values, face_ids):
+    """Writes native per-corner custom normals; faces without an entry keep Blender's normals."""
+    mesh.update()
+    normals = [tuple(normal.vector) for normal in mesh.corner_normals]
+    for polygon, face_id in zip(mesh.polygons, face_ids):
+        corners = values.get("f%d" % face_id)
+        if corners is None:
+            continue
+        if len(corners) != polygon.loop_total:
+            raise ValueError("custom_normal for face f%d needs one vector per corner" % face_id)
+        for offset, corner in enumerate(corners):
+            normals[polygon.loop_start + offset] = tuple(corner)
+    mesh.normals_split_custom_set(normals)
+
+
 def mesh_create(name, raw, block_id):
     mesh = bpy.data.meshes.new(name)
     attributes = raw.get("attributes", {})
@@ -2568,6 +2597,19 @@ def mesh_create(name, raw, block_id):
     faces = [[vertex_indexes[value] for value in item["v"]] for item in raw.get("faces", [])]
     mesh.from_pydata(vertices, edges, faces)
     mesh.update()
+    native_sharp = _native_values(attributes, "sharp")
+    native_smooth = _native_values(attributes, "shade_smooth")
+    native_custom = _native_values(attributes, "custom_normal")
+    edge_ids = [item.get("id") for item in raw.get("edges", [])]
+    face_ids = [item.get("id") for item in raw.get("faces", [])]
+    # Native shading is the current state, so the raw Blender entries it replaces are not written.
+    superseded = set()
+    if native_smooth is not None:
+        superseded.add("sharp_face")
+    if native_sharp is not None:
+        superseded.add("sharp_edge")
+    if native_custom is not None:
+        superseded.add("custom_normal")
     edge_flags = attributes.get("blender_edge_flags", [])
     for index, edge in enumerate(mesh.edges):
         if index < len(edge_flags):
@@ -2579,13 +2621,17 @@ def mesh_create(name, raw, block_id):
                     edge.use_seam = True
             except Exception:
                 pass
+        if native_sharp is not None and index < len(edge_ids):
+            edge.use_edge_sharp = bool(native_sharp.get("e%d" % edge_ids[index], False))
     polygon_smooth = attributes.get("blender_polygon_smooth", [])
     for index, polygon in enumerate(mesh.polygons):
         if index < len(raw.get("faces", [])):
             material_index = int(raw["faces"][index].get("material_index", 0))
             if material_index:
                 polygon.material_index = material_index
-        if index < len(polygon_smooth) and polygon_smooth[index]:
+        if native_smooth is not None and index < len(face_ids):
+            polygon.use_smooth = bool(native_smooth.get("f%d" % face_ids[index], False))
+        elif index < len(polygon_smooth) and polygon_smooth[index]:
             polygon.use_smooth = True
     uv_layers = raw.get("uv_layers", [])
     if len(uv_layers) > 8:
@@ -2614,6 +2660,8 @@ def mesh_create(name, raw, block_id):
             continue
         if source.get("data_type") == "FLOAT2" and source.get("domain") == "CORNER" and name in layer_names:
             continue
+        if name in superseded:
+            continue
         try:
             attribute = mesh.attributes.get(name)
             if attribute is None:
@@ -2634,6 +2682,8 @@ def mesh_create(name, raw, block_id):
                     data.value = value
         except Exception:
             continue
+    if native_custom is not None:
+        _set_native_custom_normals(mesh, native_custom, face_ids)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
     if metadata.get("fake_user"):

@@ -368,7 +368,7 @@ fn apply_colorspace(mut pixels: Vec<[f64; 4]>, colorspace: ImageColorspace) -> V
     if colorspace == ImageColorspace::Srgb {
         for pixel in &mut pixels {
             for component in &mut pixel[..3] {
-                *component = srgb_to_linear(*component);
+                *component = crate::color::srgb_to_linear(*component);
             }
         }
     }
@@ -904,12 +904,4 @@ fn decode_png(bytes: &[u8], colorspace: ImageColorspace) -> Result<(u32, u32, Ve
     let pixels = apply_colorspace(pixels, colorspace);
     validate_pixels(width, height, &pixels)?;
     Ok((width, height, pixels))
-}
-
-fn srgb_to_linear(value: f64) -> f64 {
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
 }

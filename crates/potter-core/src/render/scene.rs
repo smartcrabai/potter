@@ -43,6 +43,12 @@ pub(super) struct ElementRecord {
     pub node_id: Id,
     pub domain: String,
     pub element_id: String,
+    /// Per-face UV binding metadata read by triangles through their retained `element_index`.
+    #[serde(skip)]
+    pub uv_render: Option<usize>,
+    /// Source-member layers available to this face; `None` for ordinary meshes.
+    #[serde(skip)]
+    pub uv_available_mask: Option<u8>,
 }
 
 pub(super) struct Geometry {
@@ -235,8 +241,7 @@ pub(super) fn extract_geometry(
             .iter()
             .map(|layer| layer.name.clone())
             .collect();
-        let render_layer = uv_store.render_index().unwrap_or(0);
-        let uv_render = (!uv_names.is_empty()).then_some(render_layer);
+        let uv_render = (!uv_names.is_empty()).then_some(uv_store.render_index().unwrap_or(0));
         objects.push(ObjectRecord {
             index: object_index,
             node_id: node_id.clone(),
@@ -280,6 +285,13 @@ pub(super) fn extract_geometry(
             let face_normals = world_face_normals(mesh, matrix, node_id, &mut warnings);
             let mut triangle_offset = 0_usize;
             for (face_index, face) in mesh.faces.iter().enumerate() {
+                let material_slot = usize::try_from(face.material_index).ok();
+                let binding = material_slot
+                    .and_then(|slot| snapshot.slot_binding(node_id, node, slot));
+                let render_layer = binding.map_or(uv_render, |binding| {
+                    binding.uv.render_index.map(usize::from)
+                });
+                let uv_available_mask = binding.map(|binding| binding.uv.available_mask);
                 let face_corner_normals = face_normals[face_index].as_deref();
                 let element_index = u32::try_from(elements.len() + 1).map_err(|_| {
                     PotError::new(
@@ -292,10 +304,11 @@ pub(super) fn extract_geometry(
                     node_id: node_id.clone(),
                     domain: "face".to_owned(),
                     element_id: format!("f{}", face.id),
+                    uv_render: render_layer,
+                    uv_available_mask,
                 });
-                let material_id = usize::try_from(face.material_index)
-                    .ok()
-                    .and_then(|index| node.materials.get(index));
+                let material_id = material_slot
+                    .and_then(|slot| snapshot.slot_material(node_id, node, slot));
                 let material_index = material_id.map_or(0, |id| {
                     if let Some(index) = material_indices.get(id).copied() {
                         index
@@ -344,11 +357,9 @@ pub(super) fn extract_geometry(
                         })?;
                         positions[index] = matrix.transform_point3(local);
                     }
-                    let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
-                    let uv = layer_uvs
-                        .get(render_layer)
-                        .copied()
-                        .unwrap_or([[0.0; 2]; 3]);
+                    let uv = render_layer
+                        .and_then(|index| layer_uvs.get(index).copied())
+                        .unwrap_or([[0.0, 1.0]; 3]);
                     let raw_normal =
                         (positions[1] - positions[0]).cross(positions[2] - positions[0]);
                     if raw_normal.length_squared() <= f64::EPSILON || !raw_normal.is_finite() {
@@ -407,7 +418,8 @@ pub(super) fn extract_geometry(
                             corners: &triangle.layer_uvs,
                             positions: triangle.positions,
                             barycentric: [1.0, 0.0, 0.0],
-                            render: uv_render,
+                            render: render_layer,
+                            available_mask: uv_available_mask,
                         };
                         triangles.extend(subdivide_displaced_triangle(
                             doc,
@@ -1280,7 +1292,7 @@ fn triangle_corners(face: &crate::geom::Face, triangle: &[u32; 3]) -> [Option<us
 }
 
 /// Corner UVs of every UV layer for a triangle whose vertices sit at face corners `corners`, in
-/// layer order. A layer with no entry for the face samples `[0, 0]` at each corner.
+/// layer order. A layer with no entry for the face samples canonical UV `[0, 1]` at each corner.
 fn triangle_layer_uvs(
     store: &UvStore,
     face_index: usize,
@@ -1298,7 +1310,7 @@ fn triangle_layer_uvs(
                 corner
                     .and_then(|corner| values.and_then(|values| values.get(corner)))
                     .copied()
-                    .unwrap_or([0.0; 2])
+                    .unwrap_or([0.0, 1.0])
             })
         })
         .collect()
@@ -1762,9 +1774,15 @@ mod shading_normal_tests {
     use glam::{DMat4, DVec3};
     use serde_json::json;
 
-    use super::{corner_values, subdivide_displaced, triangle_corners, world_face_normals};
+    use super::{
+        corner_values, subdivide_displaced, triangle_corners, triangle_layer_uvs,
+        world_face_normals,
+    };
     use crate::{
-        geom::Mesh,
+        geom::{
+            uv_layers::{UvLayer, UvStore},
+            Mesh,
+        },
         model::Id,
         render::raster::{AlphaMode, Triangle},
     };
@@ -1781,6 +1799,18 @@ mod shading_normal_tests {
             json!({"domain": "face", "type": "bool", "values": {"f0": smooth}}),
         );
         mesh
+    }
+
+    #[test]
+    fn absent_uv_rows_use_the_canonical_storage_default() {
+        let store = UvStore {
+            layers: vec![UvLayer::new("UVMap", vec![None])],
+            ..UvStore::default()
+        };
+        assert_eq!(
+            triangle_layer_uvs(&store, 0, [Some(0), Some(1), Some(2)]),
+            vec![[[0.0, 1.0]; 3]],
+        );
     }
 
     #[test]

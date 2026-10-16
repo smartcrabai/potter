@@ -495,13 +495,6 @@ pub fn feature_catalog() -> Value {
             &["modifier.create"],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
-            "modifier.decimate.collapse_vertex_group_invert",
-            "Decimate COLLAPSE inverted vertex-group weights",
-            "DECIMATE",
-            &["modifier.create"],
-            "Blender 5.2.2 COLLAPSE evaluation with an inverted vertex group is not parity-compatible for any ratio below 1.0; the grid ratio-0.7 probe differed by one face/edge and 1.554746e-1 in vertex position.",
-        ),
         supported(
             "modifier.weld",
             "Weld modifier",

@@ -106,6 +106,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         })
     } else {
         let snapshot = Snapshot::evaluate_with_cache(&doc, &context, Some(project.path()))?;
+        let mut warnings = snapshot.warnings.clone();
         let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
         let mut losses = export_losses(&doc, format);
         losses.extend(exchange::shading::shading_losses(format, &meshes));
@@ -116,7 +117,10 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             _ => None,
         };
         if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
-            losses.extend(exchange::gltf::uv_layer_losses(&doc, &snapshot, vrm)?);
+            let (uv_losses, uv_warnings) =
+                exchange::gltf::uv_layer_diagnostics(&doc, &snapshot, vrm)?;
+            losses.extend(uv_losses);
+            warnings.extend(uv_warnings);
         }
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
@@ -246,7 +250,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             .filter(|path| *path != &args.out)
             .collect::<Vec<_>>();
         let conversions = export_conversions(&doc, &meshes, format);
-        let warnings = with_load_warnings(&snapshot.warnings, &project)?;
+        let warnings = with_load_warnings(&warnings, &project)?;
         json!({
             "format": format,
             "path": args.out,

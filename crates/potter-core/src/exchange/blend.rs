@@ -4365,6 +4365,24 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         next_id,
     };
     uv_layers::write(&mut mesh, &uv);
+    if let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null()) {
+        let normals = raw
+            .as_array()
+            .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
+            .iter()
+            .map(|normal| {
+                parse_vec3_value(normal)
+                    .map(glam::DVec3::from_array)
+                    .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Blender's polygon smooth flags are exact; the corner normals decide only custom normals.
+        let exact = super::shading::ExactShading {
+            smooth,
+            sharp: Vec::new(),
+        };
+        super::shading::import_shading_flags(&mut mesh, &normals, Some(&exact))?;
+    }
     mesh.validate()
         .map_err(|error| invalid_intermediate(&format!("invalid mesh data: {error}")))?;
     Ok(mesh)
@@ -5780,6 +5798,9 @@ fn has_verbatim_native_movie_clip(doc: &SceneDoc, clip: &MovieClip) -> bool {
             .all(|(key, value)| source_tracking.get(key) == Some(value))
 }
 
+/// Lists features the Blender adapter cannot write back. Native `custom_normal` and `shade_smooth`
+/// are written from Potter's current values by the bridge (a malformed value fails the export), so
+/// they are never a loss. Any other mesh attribute is a loss.
 pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
     for (clip_id, clip) in &doc.movie_clips {
@@ -5891,7 +5912,11 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ));
         }
         if let Some(mesh) = &data.mesh {
-            for attribute in mesh.attributes.keys() {
+            for attribute in mesh
+                .attributes
+                .keys()
+                .filter(|name| !matches!(name.as_str(), "custom_normal" | "shade_smooth"))
+            {
                 if !matches!(
                     attribute.as_str(),
                     "uv_layers"
@@ -7182,6 +7207,206 @@ mod tests {
             force_field: None,
             ..Node::default()
         })
+    }
+
+    fn raw_custom_normal_entry(corners: usize) -> Value {
+        json!({
+            "name": "custom_normal",
+            "domain": "CORNER",
+            "data_type": "INT16_2D",
+            "values": Value::Array(vec![json!([0, 0]); corners]),
+        })
+    }
+
+    fn box_with_attributes(attributes: Vec<(&str, Value)>) -> Result<Mesh> {
+        let mut mesh = crate::geom::primitive("box", &json!({"size": 2.0}))
+            .map_err(|error| PotError::invalid_argument(error.to_string()))?;
+        for (name, value) in attributes {
+            mesh.attributes.insert(name.to_owned(), value);
+        }
+        Ok(mesh)
+    }
+
+    fn mesh_attribute_losses(mesh: Mesh) -> Result<Vec<Loss>> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.data_blocks.insert(
+            Id::new("mesh_box")?,
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        Ok(export_losses(&doc)
+            .into_iter()
+            .filter(|loss| loss.feature_id == "blender.mesh.attribute")
+            .collect())
+    }
+
+    #[test]
+    fn custom_normal_and_shade_smooth_export_without_loss() -> Result<()> {
+        let shading = vec![
+            (
+                "custom_normal",
+                json!({"domain": "corner", "type": "float3", "values": {}}),
+            ),
+            (
+                "shade_smooth",
+                json!({"domain": "face", "type": "bool", "values": {}}),
+            ),
+        ];
+        assert!(
+            mesh_attribute_losses(box_with_attributes(shading.clone())?)?.is_empty(),
+            "native custom normals and smooth flags are written by the bridge"
+        );
+        let mut with_raw = shading;
+        with_raw.push(("blender_attributes", json!([raw_custom_normal_entry(24)])));
+        assert!(mesh_attribute_losses(box_with_attributes(with_raw)?)?.is_empty());
+        let unknown = vec![
+            (
+                "scratch",
+                json!({"domain": "point", "type": "float", "values": {}}),
+            ),
+            ("blender_attributes", json!([raw_custom_normal_entry(24)])),
+        ];
+        assert_eq!(
+            mesh_attribute_losses(box_with_attributes(unknown)?)?.len(),
+            1,
+            "unknown attributes stay a loss"
+        );
+        Ok(())
+    }
+
+    fn quad_import_item(corner_normals: &Value) -> Value {
+        json!({
+            "name": "Quad",
+            "potter_id": null,
+            "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}, {"co": [1.0, 1.0, 0.0]}, {"co": [0.0, 1.0, 0.0]}],
+            "edges": [{"v": [0, 1], "sharp": false, "seam": false}, {"v": [1, 2], "sharp": false, "seam": false},
+                      {"v": [2, 3], "sharp": false, "seam": false}, {"v": [3, 0], "sharp": false, "seam": false}],
+            "polygons": [{"v": [0, 1, 2, 3], "material_index": 0, "smooth": true}],
+            "uv_layers": [],
+            "attributes": [raw_custom_normal_entry(4)],
+            "corner_normals": corner_normals,
+            "custom_properties": {},
+            "fake_user": false,
+            "users": 1,
+            "rna_properties": {}
+        })
+    }
+
+    #[test]
+    fn imported_custom_normals_decode_loop_normals_with_polygon_smooth() -> Result<()> {
+        let tilted = json!([
+            [0.0, 0.6, 0.8],
+            [0.0, 0.6, 0.8],
+            [0.0, 0.6, 0.8],
+            [0.0, 0.6, 0.8]
+        ]);
+        let mesh = convert_mesh(&quad_import_item(&tilted))?;
+        // Element IDs are 1-based (`checked_element_id`), so the first face is `f1`.
+        let key = format!("f{}", mesh.faces[0].id);
+        let native = |name: &str| {
+            mesh.attributes
+                .get(name)
+                .and_then(|attribute| attribute.get("values"))
+                .and_then(|values| values.get(&key))
+                .cloned()
+        };
+        let custom = native("custom_normal")
+            .and_then(|corners| corners.as_array().cloned())
+            .ok_or_else(|| invalid_intermediate("imported custom normals are missing"))?;
+        assert_eq!(custom.len(), 4);
+        for corner in &custom {
+            let components = corner
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_f64)
+                .collect::<Vec<_>>();
+            assert!(
+                components.len() == 3
+                    && components[0].abs() < 1e-9
+                    && (components[1] - 0.6).abs() < 1e-9
+                    && (components[2] - 0.8).abs() < 1e-9,
+                "{corner}"
+            );
+        }
+        assert_eq!(
+            native("shade_smooth").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(mesh_attribute_losses(mesh)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn blender_native_custom_normals_override_stale_raw_entry() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let mut mesh = box_with_attributes(Vec::new())?;
+        let corner_count = mesh
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
+        // The raw entry holds zero codes, which decode to a normal other than the +X native ones.
+        let native = mesh
+            .faces
+            .iter()
+            .map(|face| {
+                (
+                    format!("f{}", face.id),
+                    Value::Array(vec![json!([1.0, 0.0, 0.0]); face.vertices.len()]),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        mesh.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([raw_custom_normal_entry(corner_count)]),
+        );
+        mesh.attributes.insert(
+            "custom_normal".to_owned(),
+            json!({"domain": "corner", "type": "float3", "values": native}),
+        );
+        let mut doc = roundtrip_scene()?;
+        doc.data_blocks
+            .get_mut(&Id::new("mesh_box")?)
+            .ok_or_else(|| invalid_intermediate("fixture mesh is missing"))?
+            .mesh = Some(mesh);
+        let output = directory.path().join("normals.blend");
+        let context = crate::eval::EvaluationContext::default();
+        let options = ExportOptions {
+            allow_lossy: false,
+            pack: false,
+            blender: Some(&blender),
+            context: &context,
+        };
+        export_blend(&doc, &project, &output, &options)?;
+        let imported = import_blend(&output, Some(&blender))?;
+        let imported_mesh = imported
+            .doc
+            .data_blocks
+            .values()
+            .filter_map(|data| data.mesh.as_ref())
+            .find(|mesh| mesh.attributes.contains_key("custom_normal"))
+            .ok_or_else(|| invalid_intermediate("imported custom normals are missing"))?;
+        // Import omits an entry on faces whose flat normal already is +X, so judge the effective
+        // corner normals instead: the native +X must win over the raw entry on every corner.
+        let points = imported_mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let effective = crate::geom::normals::corner_normals(imported_mesh, &points)?;
+        assert_eq!(effective.len(), corner_count);
+        for normal in effective {
+            assert!(normal.abs_diff_eq(glam::DVec3::X, 1e-3), "{normal:?}");
+        }
+        Ok(())
     }
 
     fn roundtrip_scene() -> Result<SceneDoc> {
