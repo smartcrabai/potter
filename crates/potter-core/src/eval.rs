@@ -1532,6 +1532,7 @@ impl Snapshot {
                 suppressed_instances,
                 &mut BTreeSet::new(),
             )?;
+            let bounds = mesh_bounds(&mesh, matrix)?;
             if !mesh.vertices.is_empty() {
                 instance_bindings.insert(id.clone(), bindings);
                 meshes.insert(id.clone(), mesh);

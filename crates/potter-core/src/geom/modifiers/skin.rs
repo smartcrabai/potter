@@ -3,6 +3,8 @@
 // Portions derived from Blender (https://www.blender.org):
 //   source/blender/modifiers/intern/MOD_skin.cc, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
 
+use glam::DQuat;
+
 use super::*;
 
 use std::ptr::NonNull;
@@ -419,6 +421,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             frame_vertex_ids[frame_index][corner] = target;
         }
     }
+    let mut faces = Vec::<Polygon>::new();
     let mut branch_faces = Vec::new();
     let mut branch_frame_states = vec![(false, [false; 4]); frames.len()];
     for ring_frames in &branch_rings {
@@ -516,7 +519,6 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         vertices: origins,
         faces: vec![None; faces.len()],
         corners: None,
-        raw_normals: false,
     };
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
     result.attributes.remove("blender_skin_vertices");
