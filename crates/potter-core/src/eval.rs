@@ -3575,6 +3575,7 @@ struct JoinedMemberBindings {
     color_names: Vec<String>,
     slot_base: usize,
 }
+type ColorMaskRemapCache = HashMap<*const [u64], (Arc<[u64]>, Arc<[u64]>)>;
 
 /// A plain member's slot table: its material list, or one empty slot when it has none.
 fn member_slots(node: &Node) -> Vec<Option<Id>> {
@@ -3613,7 +3614,7 @@ fn color_layer_names(mesh: &Mesh) -> Vec<String> {
 
 fn all_color_layers_mask(layer_count: usize) -> Arc<[u64]> {
     let mut mask = vec![u64::MAX; layer_count.div_ceil(64)];
-    if layer_count % 64 != 0
+    if !layer_count.is_multiple_of(64)
         && let Some(last) = mask.last_mut()
     {
         *last = (1_u64 << (layer_count % 64)) - 1;
@@ -3719,7 +3720,7 @@ fn remap_slot_binding(
     uv_map: &[Option<usize>],
     color_map: &[Option<usize>],
     color_count: usize,
-    color_masks: &mut HashMap<*const [u64], (Arc<[u64]>, Arc<[u64]>)>,
+    color_masks: &mut ColorMaskRemapCache,
 ) -> SlotBinding {
     binding.uv.render_index = binding
         .uv
@@ -3844,7 +3845,7 @@ fn evaluate_collection_instance(
         ));
     }
     let slot_coverage = fold_slot_coverage(&mesh, &uv_coverage, slot_base);
-    let mut color_masks = HashMap::<*const [u64], (Arc<[u64]>, Arc<[u64]>)>::new();
+    let mut color_masks = ColorMaskRemapCache::new();
     let mut bindings = Vec::with_capacity(slot_base);
     for ((member, uv_map), color_map) in member_bindings.into_iter().zip(&uv_maps).zip(&color_maps)
     {

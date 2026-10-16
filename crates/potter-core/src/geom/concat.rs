@@ -924,7 +924,9 @@ mod tests {
         }
     }
 
-    fn set_uv_layers(mesh: &mut Mesh, layers: &[(&str, [f64; 2], Option<[bool; 4]>)]) {
+    type UvLayerFixture<'a> = (&'a str, [f64; 2], Option<[bool; 4]>);
+
+    fn set_uv_layers(mesh: &mut Mesh, layers: &[UvLayerFixture<'_>]) {
         let layers = layers
             .iter()
             .map(|(name, uv, pins)| {
