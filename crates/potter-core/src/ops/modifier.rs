@@ -1851,10 +1851,19 @@ fn validate_attribute_modifier_params_inner(
         _ => &[],
     };
     for (field, values) in enum_fields {
+        let allows_dynamic_layer_name = modifier_type == "data_transfer"
+            && matches!(
+                *field,
+                "layers_vgroup_select_src"
+                    | "layers_uv_select_src"
+                    | "layers_vgroup_select_dst"
+                    | "layers_uv_select_dst"
+            );
         if params.get(*field).is_some_and(|value| {
-            !value
-                .as_str()
-                .is_some_and(|identifier| values.contains(&identifier))
+            !value.as_str().is_some_and(|identifier| {
+                !identifier.is_empty()
+                    && (allows_dynamic_layer_name || values.contains(&identifier))
+            })
         }) {
             return Err(unsupported_attribute_modifier_value(modifier_type, field));
         }
@@ -2392,4 +2401,74 @@ fn unsupported(_engine: &Engine<'_>, modifier_type: &str) -> PotError {
         format!("modifier `{modifier_type}` is not supported"),
         json!({"feature_id":format!("modifier.{modifier_type}")}),
     )
+}
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "operation-validation regression")]
+
+    use crate::ops::apply_batch;
+    use crate::{error::ErrorCode, model::SceneDoc};
+    use serde_json::json;
+
+    #[test]
+    fn data_transfer_dynamic_layer_names_pass_modifier_operation_validation() {
+        let doc = SceneDoc::new("scene-test".to_owned());
+        let operations = json!([
+            {"op":"node.create","id":"target","kind":"box","params":{"size":2.0}},
+            {
+                "op":"modifier.create",
+                "target":{"id":"target"},
+                "id":"transfer",
+                "type":"data_transfer",
+                "params":{
+                    "layers_vgroup_select_src":"Group / hand.L",
+                    "layers_uv_select_src":"UV set.with punctuation / 02",
+                    "layers_vgroup_select_dst":"Target Group (copy)",
+                    "layers_uv_select_dst":"UV/target layer [new]"
+                }
+            }
+        ]);
+        let outcome = apply_batch(
+            &doc,
+            &json!({"schema_version":1,"base_revision":0,"operations":operations}),
+        )
+        .unwrap();
+        let target = &outcome.doc.nodes[&crate::model::Id::new("target").unwrap()];
+        let params = &target.modifiers[0].params;
+        assert_eq!(
+            params["layers_uv_select_src"],
+            json!("UV set.with punctuation / 02")
+        );
+        assert_eq!(
+            params["layers_uv_select_dst"],
+            json!("UV/target layer [new]")
+        );
+
+        let invalid_type = json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[
+                {"op":"node.create","id":"target","kind":"box","params":{"size":2.0}},
+                {
+                    "op":"modifier.create",
+                    "target":{"id":"target"},
+                    "id":"transfer",
+                    "type":"data_transfer",
+                    "params":{"layers_uv_select_src":7}
+                }
+            ]
+        });
+        let error = apply_batch(&doc, &invalid_type).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        assert_eq!(
+            error.details["pointer"],
+            json!("/operations/1/params/layers_uv_select_src")
+        );
+        let mut empty_name = invalid_type;
+        empty_name["operations"][1]["params"]["layers_uv_select_src"] = json!("");
+        assert_eq!(
+            apply_batch(&doc, &empty_name).unwrap_err().code,
+            ErrorCode::InvalidOperation
+        );
+    }
 }

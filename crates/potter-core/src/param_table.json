@@ -171,11 +171,27 @@
           "maximum": 1.0
         },
         "layers_vgroup_select_src": {
-          "enum": [
-            "ACTIVE",
-            "ALL",
-            "BONE_SELECT",
-            "BONE_DEFORM"
+          "oneOf": [
+            {
+              "enum": [
+                "ACTIVE",
+                "ALL",
+                "BONE_SELECT",
+                "BONE_DEFORM"
+              ]
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "enum": [
+                  "ACTIVE",
+                  "ALL",
+                  "BONE_SELECT",
+                  "BONE_DEFORM"
+                ]
+              }
+            }
           ],
           "default": "ALL"
         },
@@ -198,19 +214,50 @@
           "default": "ALL"
         },
         "layers_uv_select_src": {
-          "enum": [
-            "ACTIVE",
-            "ALL",
-            "BONE_SELECT",
-            "BONE_DEFORM"
+          "oneOf": [
+            {
+              "enum": [
+                "ACTIVE",
+                "ALL",
+                "BONE_SELECT",
+                "BONE_DEFORM"
+              ]
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "enum": [
+                  "ACTIVE",
+                  "ALL",
+                  "BONE_SELECT",
+                  "BONE_DEFORM"
+                ]
+              }
+            }
           ],
           "default": "ALL"
         },
         "layers_vgroup_select_dst": {
-          "enum": [
-            "ACTIVE",
-            "NAME",
-            "INDEX"
+          "oneOf": [
+            {
+              "enum": [
+                "ACTIVE",
+                "NAME",
+                "INDEX"
+              ]
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "enum": [
+                  "ACTIVE",
+                  "NAME",
+                  "INDEX"
+                ]
+              }
+            }
           ],
           "default": "NAME"
         },
@@ -231,10 +278,25 @@
           "default": "NAME"
         },
         "layers_uv_select_dst": {
-          "enum": [
-            "ACTIVE",
-            "NAME",
-            "INDEX"
+          "oneOf": [
+            {
+              "enum": [
+                "ACTIVE",
+                "NAME",
+                "INDEX"
+              ]
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "enum": [
+                  "ACTIVE",
+                  "NAME",
+                  "INDEX"
+                ]
+              }
+            }
           ],
           "default": "NAME"
         },

@@ -997,7 +997,8 @@ impl Snapshot {
                             | "normal_edit"
                             | "uv_project"
                             | "uv_warp"
-                            | "data_transfer" => apply_scene_attribute_modifier(
+                            | "data_transfer"
+                            | "mask" => apply_scene_attribute_modifier(
                                 mesh,
                                 modifier,
                                 id,

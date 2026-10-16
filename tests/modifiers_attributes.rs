@@ -201,18 +201,14 @@ fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
             json!({"mode":"FACE_AREA","weight":50}),
         )?],
     )?;
-    let normals = result.attributes["custom_normal"]["values"]["f0"]
-        .as_array()
-        .ok_or("custom corner normals missing")?;
+    if let Some(custom) = result.attributes.get("custom_normal") {
+        assert_eq!(custom["type"], "normal_code");
+    }
+    let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
     assert_eq!(normals.len(), 3);
     for normal in normals {
-        let values = normal.as_array().ok_or("normal must be a vector")?;
-        let length = values
-            .iter()
-            .map(|value| value.as_f64().unwrap_or_default().powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!((length - 1.0).abs() < 1.0e-12);
+        assert!((normal.length() - 1.0).abs() < 1.0e-12);
     }
     Ok(())
 }
@@ -401,11 +397,11 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
         }),
     )?;
     let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
-    let normal = result.attributes["custom_normal"]["values"]["f0"][0]
-        .as_array()
-        .ok_or("custom normal missing")?;
-    assert!((normal[0].as_f64().ok_or("normal x missing")? + 1.0).abs() < 1.0e-12);
-    assert!(normal[1].as_f64().ok_or("normal y missing")?.abs() < 1.0e-12);
+    let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
+    let normal = normals.first().ok_or("custom normal missing")?;
+    assert!((normal.x + 1.0).abs() < 1.0e-12);
+    assert!(normal.y.abs() < 1.0e-12);
     Ok(())
 }
 
@@ -1627,14 +1623,19 @@ fn blender_quantize_loop_normals(
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let sharp_values = mesh
+        .attributes
+        .get("sharp")
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(Value::as_object);
     let sharp_edges = mesh
         .edges
         .iter()
         .filter(|edge| {
-            mesh.attributes
-                .get("sharp_edges")
-                .and_then(Value::as_array)
-                .is_some_and(|ids| ids.iter().any(|id| id.as_u64() == Some(u64::from(edge.id))))
+            sharp_values
+                .and_then(|values| values.get(&format!("e{}", edge.id)))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         })
         .map(|edge| {
             edge.vertices
@@ -2088,7 +2089,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_normal_parity(
         "normal_edit RADIAL/COPY",
-        &normals.attributes["custom_normal"]["values"]["f0"],
+        &corner_normals(&normals)?,
         &expected["normal_edit"],
         1.0e-4,
     )?;
@@ -2118,7 +2119,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_normal_parity(
         "normal_edit DIRECTIONAL/ADD",
-        &directional_result.attributes["custom_normal"]["values"]["f0"],
+        &corner_normals(&directional_result)?,
         &expected["normal_edit_directional"],
         1.0e-4,
     )?;
@@ -2438,21 +2439,22 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "uv":flip_v(&json!([[0.25,0.25],[1.25,0.25],[1.25,1.25],[0.25,1.25]]))
         }])),
     );
-    domain_source
-        .attributes
-        .insert("sharp_edges".to_owned(), json!([2]));
-    domain_source.attributes.insert(
-        "uv_seam".to_owned(),
-        json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":true,"e2":false,"e3":false}}),
-    );
+    let sharp = edge_boolean_attribute(&domain_source, &[2]);
+    domain_source.attributes.insert("sharp".to_owned(), sharp);
+    let seam = edge_boolean_attribute(&domain_source, &[1]);
+    domain_source.attributes.insert("seam".to_owned(), seam);
     domain_source.attributes.insert(
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.75,"e1":0.0,"e2":0.0,"e3":0.0}}),
     );
-    domain_source.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}}),
-    );
+    potter_core::geom::edit::apply(
+        &mut domain_source,
+        "mesh.set_custom_normals",
+        &json!({
+            "elements":{"domain":"face","ids":["f0"]},
+            "normals":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}
+        }),
+    )?;
     domain_source.attributes.insert(
         "color".to_owned(),
         json!({"domain":"corner","type":"color","values":{"f0":[[0.2,0.3,0.4,1.0],[0.3,0.3,0.4,1.0],[0.4,0.3,0.4,1.0],[0.5,0.3,0.4,1.0]]}}),
@@ -2462,7 +2464,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         json!({"layers":["color"],"active":"color","render":"color"}),
     );
     domain_source.attributes.insert(
-        "smooth".to_owned(),
+        "shade_smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":true}}),
     );
     domain_source.attributes.insert(
@@ -2807,16 +2809,17 @@ fn weighted_normal_mesh(sharp_edge: bool) -> Result<Mesh, Box<dyn Error>> {
     )?;
     mesh.faces[2].material_index = 1;
     if sharp_edge {
-        let edge = mesh
+        let edge_id = mesh
             .edges
             .iter()
             .find(|edge| {
                 (edge.vertices[0] == 0 && edge.vertices[1] == 2)
                     || (edge.vertices[0] == 2 && edge.vertices[1] == 0)
             })
+            .map(|edge| edge.id)
             .ok_or("weighted-normal sharp edge missing")?;
-        mesh.attributes
-            .insert("sharp_edges".to_owned(), json!([edge.id]));
+        let sharp = edge_boolean_attribute(&mesh, &[edge_id]);
+        mesh.attributes.insert("sharp".to_owned(), sharp);
     }
     Ok(mesh)
 }
@@ -2868,21 +2871,28 @@ fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
 }
 
 fn corner_normals(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
+    let positions = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let normals = potter_core::geom::normals::corner_normals(mesh, &positions)?;
+    Ok(Value::Array(
+        normals
+            .into_iter()
+            .map(|normal| json!(normal.to_array()))
+            .collect(),
+    ))
+}
+
+fn edge_boolean_attribute(mesh: &Mesh, selected_ids: &[u32]) -> Value {
     let values = mesh
-        .attributes
-        .get("custom_normal")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object)
-        .ok_or("custom corner normals missing")?;
-    let mut result = Vec::new();
-    for face in &mesh.faces {
-        let corners = values
-            .get(&format!("f{}", face.id))
-            .and_then(Value::as_array)
-            .ok_or("custom face corner normals missing")?;
-        result.extend(corners.iter().cloned());
-    }
-    Ok(Value::Array(result))
+        .edges
+        .iter()
+        .map(|edge| {
+            (
+                format!("e{}", edge.id),
+                Value::Bool(selected_ids.contains(&edge.id)),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({"domain":"edge","type":"bool","values":values})
 }
 
 fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
@@ -2902,24 +2912,27 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
             {"face_id":1,"uv":[[0,1],[1,0],[0,0]]}
         ])),
     );
-    mesh.attributes.insert("sharp_edges".to_owned(), json!([]));
-    mesh.attributes.insert(
-        "uv_seam".to_owned(),
-        json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":false,"e2":false,"e3":false,"e4":false}}),
-    );
+    let sharp = edge_boolean_attribute(&mesh, &[]);
+    let seam = edge_boolean_attribute(&mesh, &[]);
+    mesh.attributes.insert("sharp".to_owned(), sharp);
+    mesh.attributes.insert("seam".to_owned(), seam);
     mesh.attributes.insert(
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.0,"e1":0.0,"e2":0.0,"e3":0.0,"e4":0.0}}),
     );
+    potter_core::geom::edit::apply(
+        &mut mesh,
+        "mesh.set_custom_normals",
+        &json!({
+            "elements":{"domain":"face","ids":["f0","f1"]},
+            "normals":{
+                "f0":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]],
+                "f1":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]]
+            }
+        }),
+    )?;
     mesh.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":{
-            "f0":[[1,0,0],[1,0,0],[1,0,0]],
-            "f1":[[1,0,0],[1,0,0],[1,0,0]]
-        }}),
-    );
-    mesh.attributes.insert(
-        "smooth".to_owned(),
+        "shade_smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),
     );
     mesh.attributes.insert(
@@ -2930,22 +2943,14 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
 }
 
 fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
-    let sharp_ids = mesh
-        .attributes
-        .get("sharp_edges")
-        .and_then(Value::as_array)
-        .ok_or("sharp edge attribute missing")?
-        .iter()
-        .filter_map(Value::as_u64)
-        .filter_map(|id| u32::try_from(id).ok())
-        .collect::<std::collections::BTreeSet<_>>();
     let edge_attributes = |name: &str| {
         mesh.attributes
             .get(name)
             .and_then(|attribute| attribute.get("values"))
             .and_then(Value::as_object)
     };
-    let seam_values = edge_attributes("uv_seam").ok_or("seam edge values missing")?;
+    let sharp_values = edge_attributes("sharp").ok_or("sharp edge values missing")?;
+    let seam_values = edge_attributes("seam").ok_or("seam edge values missing")?;
     let crease_values = edge_attributes("crease_edge").ok_or("crease edge values missing")?;
     let mut sharp = serde_json::Map::new();
     let mut seam = serde_json::Map::new();
@@ -2954,7 +2959,15 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         let first = edge.vertices[0].min(edge.vertices[1]);
         let second = edge.vertices[0].max(edge.vertices[1]);
         let key = format!("{first}-{second}");
-        sharp.insert(key.clone(), Value::Bool(sharp_ids.contains(&edge.id)));
+        sharp.insert(
+            key.clone(),
+            Value::Bool(
+                sharp_values
+                    .get(&format!("e{}", edge.id))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+        );
         seam.insert(
             key.clone(),
             Value::Bool(
@@ -3031,7 +3044,7 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         "uv":uv,
         "color":corner_values("color")?,
         "normal":corner_normals(mesh)?,
-        "smooth":face_values("smooth")?,
+        "smooth":face_values("shade_smooth")?,
         "freestyle":face_values("freestyle_face")?
     }))
 }
