@@ -2557,6 +2557,8 @@ pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
+    /// Whether face counts or indices have multiple Alembic samples.
+    pub connectivity_is_animated: bool,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
     /// Canonical `.geom/uv` layer; Blender leaves it unchanged for UV-only reads without POLY.
@@ -2860,7 +2862,7 @@ pub(crate) fn read_mesh_cache(
             &archive.time_samplings,
         )?;
         result.push(MeshCacheSample {
-            time_seconds: sample_time,
+            connectivity_is_animated: counts.sample_count > 1 || indices.sample_count > 1,
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,

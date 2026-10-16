@@ -149,7 +149,9 @@ pub(crate) fn evaluate(
                 json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
             )
         })?;
-        !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces)
+        !topology_dimensions_match(mesh, sample.sample.positions.len(), &sample.sample.faces)
+            || (requires_connectivity_check(sequence, sample.sample.connectivity_is_animated)
+                && !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces))
     };
     if topology_changed {
         // Blender's file-sequence reader rereads all supported streams for changed connectivity.
@@ -224,17 +226,28 @@ pub(crate) fn evaluate(
     Ok(warnings)
 }
 
+fn topology_dimensions_match(
+    mesh: &Mesh,
+    cache_vertex_count: usize,
+    cache_faces: &[Vec<usize>],
+) -> bool {
+    !mesh.vertices.is_empty()
+        && mesh.vertices.len() == cache_vertex_count
+        && mesh.faces.len() == cache_faces.len()
+        && mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>()
+            == cache_faces.iter().map(Vec::len).sum::<usize>()
+}
+
+fn requires_connectivity_check(is_sequence: bool, connectivity_is_animated: bool) -> bool {
+    is_sequence || connectivity_is_animated
+}
+
 fn topology_matches(
     mesh: &Mesh,
     cache_vertex_count: usize,
     cache_faces: &[Vec<usize>],
 ) -> bool {
-    let corner_count = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
-    if mesh.vertices.is_empty()
-        || mesh.vertices.len() != cache_vertex_count
-        || mesh.faces.len() != cache_faces.len()
-        || corner_count != cache_faces.iter().map(Vec::len).sum::<usize>()
-    {
+    if !topology_dimensions_match(mesh, cache_vertex_count, cache_faces) {
         return false;
     }
     let indices = mesh
@@ -853,6 +866,13 @@ mod tests {
         assert!(!topology_matches(&mesh, 4, &[vec![3, 2, 1, 0]]));
         assert!(!topology_matches(&mesh, 5, &[vec![0, 1, 2, 3]]));
         Ok(())
+    }
+
+    #[test]
+    fn connectivity_check_matches_blender_cache_modes() {
+        assert!(!super::requires_connectivity_check(false, false));
+        assert!(super::requires_connectivity_check(false, true));
+        assert!(super::requires_connectivity_check(true, false));
     }
 
     #[test]
