@@ -1,14 +1,12 @@
-//! Blender parity for collection instances. Each case in `fixtures/blend_collection_instances.py` is
-//! one `.blend` scene, written in full and as a geometry-only variant whose members have no color
-//! attributes, vertex groups, or seams. Potter imports the geometry-only variant and exports GLB,
-//! and Blender exports the same variant itself. glTF export refuses `blender_attributes`, so only
-//! geometry is compared there: every primitive is reduced to its triangles' world-space corners, each
-//! corner a (position, normal, TEXCOORD values) tuple. Triangles sharing an edge form a patch, and
-//! patches must match with tolerance by triangle count and unique corner set, and each primitive's
-//! total corner count (with multiplicity) must agree. Per-corner multiplicity inside a patch is not
-//! compared, since diagonal choice inside a quad changes it. Cases that
-//! carry attributes also round-trip the full scene through Potter's `.blend` export, and Blender's
-//! reading of both files must agree on each member's color attributes, vertex groups, and seams.
+//! Blender parity for collection instances. Each case saves original quad members in `<case>.blend`,
+//! then compares every depsgraph-evaluated instance face against Potter's `.blend` round trip:
+//! material slot and name, UV layer names, loop count, and ordered world-space (position, normal,
+//! UV) tuples match one-to-one with tolerance. Face order and cyclic starting corner may differ;
+//! winding and every corner remain significant. For GLB parity, the fixture makes a geometry-only
+//! copy, triangulates that copy in Blender, and compares every triangle's corner tuples one-to-one
+//! with multiplicity. Triangle orientation is adjusted only when the world matrix determinant parity
+//! differs between Blender's object transform and Potter's baked collection member. The source-face
+//! oracle retains original quads. Attribute cases also compare color layers, groups, and seams.
 //! Blender-gated: `POTTER_REQUIRE_BLENDER` turns a missing Blender into a failure.
 
 use std::{collections::BTreeSet, error::Error, fs, path::Path, process::Command};
@@ -92,6 +90,7 @@ struct Primitive {
     material: Option<String>,
     texcoord_sets: usize,
     corners: Vec<Corner>,
+    mirrored: bool,
 }
 
 fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
@@ -340,12 +339,16 @@ fn transform_point(m: &[f64; 16], p: [f64; 3]) -> [f64; 3] {
 /// Normals transform by the inverse transpose of the upper 3x3. The cofactor matrix equals
 /// `det(M) * M^-T`, so a mirrored matrix (negative determinant) needs its sign flipped back; without
 /// that, mirrored members get inward normals and fail against the outward ones Potter writes.
+fn determinant3(m: &[f64; 16]) -> f64 {
+    let a = |row: usize, column: usize| m[column * 4 + row];
+    a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1))
+        - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
+        + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0))
+}
+
 fn transform_normal(m: &[f64; 16], n: [f64; 3]) -> [f64; 3] {
     let a = |row: usize, column: usize| m[column * 4 + row];
-    let determinant = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1))
-        - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
-        + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
-    let sign = if determinant < 0.0 { -1.0 } else { 1.0 };
+    let sign = if determinant3(m) < 0.0 { -1.0 } else { 1.0 };
     let mut out = [0.0; 3];
     for (i, value) in out.iter_mut().enumerate() {
         *value = sign
@@ -422,6 +425,7 @@ fn read_primitive(
             .and_then(|slot| materials.get(slot as usize).cloned()),
         texcoord_sets,
         corners,
+        mirrored: determinant3(world) < 0.0,
     })
 }
 
@@ -483,114 +487,141 @@ fn corner_matches(expected: &Corner, actual: &Corner) -> bool {
             .zip(&actual.uvs)
             .all(|(e, a)| close(e, a, UV_TOLERANCE))
 }
-
-/// A polygon-level piece of a primitive: the triangles of one edge-connected run, their count, and
-/// the run's unique corners. What is checked, with tolerance: each primitive's total corner count
-/// (with multiplicity), and for every patch its triangle count and its unique (position, normal,
-/// TEXCOORD) corner set, matched one-to-one. Per-corner multiplicity inside a patch is not checked:
-/// Blender and Potter may split one quad along different diagonals, which changes how many times
-/// each corner appears without changing the polygon, so no multiplicity is invariant across them.
-struct Patch<'a> {
-    triangles: usize,
-    corners: Vec<&'a Corner>,
-}
-
-/// Union-find root with path halving.
-fn root(parent: &mut [usize], mut index: usize) -> usize {
-    while parent[index] != index {
-        parent[index] = parent[parent[index]];
-        index = parent[index];
-    }
-    index
-}
-
-fn patches(primitive: &Primitive) -> Vec<Patch<'_>> {
-    let triangles: Vec<&[Corner]> = primitive.corners.chunks(3).collect();
-    let mut parent: Vec<usize> = (0..triangles.len()).collect();
-    for first in 0..triangles.len() {
-        for second in first + 1..triangles.len() {
-            let shared = triangles[first]
-                .iter()
-                .filter(|corner| {
-                    triangles[second]
-                        .iter()
-                        .any(|other| corner_matches(corner, other))
-                })
-                .count();
-            if shared >= 2 {
-                let (a, b) = (root(&mut parent, first), root(&mut parent, second));
-                parent[a] = b;
-            }
-        }
-    }
-    let mut grouped: Vec<Option<Patch<'_>>> = (0..triangles.len()).map(|_| None).collect();
-    for (index, &triangle) in triangles.iter().enumerate() {
-        let patch = grouped[root(&mut parent, index)].get_or_insert_with(|| Patch {
-            triangles: 0,
-            corners: Vec::new(),
-        });
-        patch.triangles += 1;
-        for corner in triangle {
-            if !patch
-                .corners
-                .iter()
-                .any(|known| corner_matches(known, corner))
-            {
-                patch.corners.push(corner);
-            }
-        }
-    }
-    grouped.into_iter().flatten().collect()
-}
-
-fn patch_matches(expected: &Patch<'_>, actual: &Patch<'_>) -> bool {
-    expected.triangles == actual.triangles
-        && expected.corners.len() == actual.corners.len()
-        && expected.corners.iter().all(|corner| {
-            actual
-                .corners
-                .iter()
-                .any(|other| corner_matches(corner, other))
+/// A mirrored node matrix can reverse Blender's world-space triangles; Potter's joined mesh bakes
+/// that transform and reverses its face. Require the corresponding orientation change, not either
+/// winding indiscriminately.
+fn triangle_matches(expected: &[Corner; 3], actual: &[Corner; 3], reverse: bool) -> bool {
+    (0..3).any(|start| {
+        (0..3).all(|corner| {
+            let index = if reverse {
+                (start + 3 - corner) % 3
+            } else {
+                (corner + start) % 3
+            };
+            corner_matches(&expected[corner], &actual[index])
         })
-        && actual.corners.iter().all(|corner| {
-            expected
-                .corners
-                .iter()
-                .any(|other| corner_matches(other, corner))
-        })
-}
-
-/// One-to-one matching of patches: every expected patch takes an unused actual patch with the same
-/// triangle count and corner set.
-fn patches_match(expected: &Primitive, actual: &Primitive) -> bool {
-    let expected = patches(expected);
-    let actual = patches(actual);
-    if expected.len() != actual.len() {
-        return false;
-    }
-    let mut used = vec![false; actual.len()];
-    expected.iter().all(|patch| {
-        let found = actual
-            .iter()
-            .enumerate()
-            .position(|(index, candidate)| !used[index] && patch_matches(patch, candidate));
-        match found {
-            Some(index) => {
-                used[index] = true;
-                true
-            }
-            None => false,
-        }
     })
 }
 
+/// Every triangle corner is matched once; fixture copies are source-triangulated before export so
+/// Blender and Potter see the same original triangles, not competing quad diagonal choices.
+fn triangles_match(expected: &Primitive, actual: &Primitive) -> bool {
+    let (expected_triangles, expected_remainder) = expected.corners.as_chunks::<3>();
+    let (actual_triangles, actual_remainder) = actual.corners.as_chunks::<3>();
+    if !expected_remainder.is_empty()
+        || !actual_remainder.is_empty()
+        || expected_triangles.len() != actual_triangles.len()
+    {
+        return false;
+    }
+    let reverse = expected.mirrored != actual.mirrored;
+    let mut used = vec![false; actual_triangles.len()];
+    for triangle in expected_triangles {
+        let Some(index) = actual_triangles
+            .iter()
+            .enumerate()
+            .position(|(index, other)| !used[index] && triangle_matches(triangle, other, reverse))
+        else {
+            return false;
+        };
+        used[index] = true;
+    }
+    true
+}
+
 fn primitive_matches(expected: &Primitive, actual: &Primitive) -> bool {
-    // Potter shares one attribute layout per instance mesh, so a primitive may carry more TEXCOORD
-    // sets than its Blender member; the extra sets are not compared.
+    // Potter shares one attribute layout per instance mesh, so extra TEXCOORD sets are not compared.
     expected.material == actual.material
-        && expected.corners.len() == actual.corners.len()
         && actual.texcoord_sets >= expected.texcoord_sets
-        && patches_match(expected, actual)
+        && triangles_match(expected, actual)
+}
+fn close_json_arrays(expected: &Value, actual: &Value, tolerance: f64) -> bool {
+    let (Some(expected), Some(actual)) = (expected.as_array(), actual.as_array()) else {
+        return false;
+    };
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(left, right)| {
+            left.as_f64()
+                .zip(right.as_f64())
+                .is_some_and(|(left, right)| (left - right).abs() <= tolerance)
+        })
+}
+
+fn evaluated_corner_matches(expected: &Value, actual: &Value) -> bool {
+    close_json_arrays(
+        &expected["position"],
+        &actual["position"],
+        POSITION_TOLERANCE,
+    ) && close_json_arrays(&expected["normal"], &actual["normal"], NORMAL_TOLERANCE)
+        && expected["uvs"]
+            .as_array()
+            .zip(actual["uvs"].as_array())
+            .is_some_and(|(expected, actual)| {
+                expected.len() == actual.len()
+                    && expected
+                        .iter()
+                        .zip(actual)
+                        .all(|(left, right)| close_json_arrays(left, right, UV_TOLERANCE))
+            })
+}
+
+/// Compares one evaluated Blender polygon's material, UV layers, loop count, and ordered corner
+/// tuples. Cyclic starts may differ, but winding and every corner remain significant.
+fn evaluated_face_matches(expected: &Value, actual: &Value) -> bool {
+    if expected["material"] != actual["material"]
+        || expected["slot"] != actual["slot"]
+        || expected["uv_layers"] != actual["uv_layers"]
+    {
+        return false;
+    }
+    let (Some(expected), Some(actual)) =
+        (expected["corners"].as_array(), actual["corners"].as_array())
+    else {
+        return false;
+    };
+    expected.len() == actual.len()
+        && (0..expected.len()).any(|start| {
+            expected.iter().enumerate().all(|(corner, expected)| {
+                evaluated_corner_matches(expected, &actual[(corner + start) % actual.len()])
+            })
+        })
+}
+
+fn assert_evaluated_face_records_match(expected: &Value, actual: &Value, case: &str) -> TestResult {
+    let expected = expected["instance_faces"]
+        .as_array()
+        .ok_or("Blender dump has no evaluated instance faces")?;
+    let actual = actual["instance_faces"]
+        .as_array()
+        .ok_or("Potter .blend dump has no evaluated instance faces")?;
+    ensure(
+        expected.len() == actual.len(),
+        format!(
+            "{case}: evaluated face count differs: Blender {}, Potter {}",
+            expected.len(),
+            actual.len()
+        ),
+    )?;
+    let mut used = vec![false; actual.len()];
+    for face in expected {
+        let found = actual
+            .iter()
+            .enumerate()
+            .position(|(index, candidate)| !used[index] && evaluated_face_matches(face, candidate));
+        match found {
+            Some(index) => used[index] = true,
+            None => {
+                return Err(format!(
+                    "{case}: evaluated Blender face has no one-to-one Potter match (material {:?}, slot {:?}, loops {}): {face}",
+                    face["material"],
+                    face["slot"],
+                    face["corners"].as_array().map_or(0, Vec::len)
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn summarize(primitives: &[Primitive]) -> Vec<(Option<String>, usize)> {
@@ -911,8 +942,8 @@ fn run_case(
     check: Check,
 ) -> TestResult {
     run_blender(blender, builder, &[path_str(case_root)?, case])?;
-    let oracle = case_root.join(format!("{case}.blend"));
-    let oracle_text = path_str(&oracle)?;
+    let face_oracle = case_root.join(format!("{case}-faces.blend"));
+    let face_oracle_text = path_str(&face_oracle)?;
     let geometry = case_root.join(format!("{case}-geometry.blend"));
     let geometry_text = path_str(&geometry)?;
     let blender_glb = case_root.join(format!("{case}-geometry.blender.glb"));
@@ -941,6 +972,57 @@ fn run_case(
     let revision = imported["scene"]["revision"]
         .as_u64()
         .ok_or("import reports no scene revision")?;
+    let face_project = case_root.join("face-project");
+    let face_project_text = path_str(&face_project)?;
+    run_pot_json(&["init", face_project_text, "--json"])?;
+    run_pot_json(&[
+        "import",
+        face_project_text,
+        "--file",
+        face_oracle_text,
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender_text,
+        "--json",
+    ])?;
+    let potter_blend = case_root.join("potter.blend");
+    let potter_blend_text = path_str(&potter_blend)?;
+    run_pot_json(&[
+        "export",
+        face_project_text,
+        "--format",
+        "blend",
+        "--out",
+        potter_blend_text,
+        "--allow-lossy",
+        "--overwrite",
+        "--blender",
+        blender_text,
+        "--json",
+    ])?;
+    let expected_dump = case_root.join("oracle.json");
+    let actual_dump = case_root.join("potter.json");
+    run_blender(
+        blender,
+        dumper,
+        &[face_oracle_text, path_str(&expected_dump)?],
+    )?;
+    run_blender(
+        blender,
+        dumper,
+        &[potter_blend_text, path_str(&actual_dump)?],
+    )?;
+    let expected_dump = read_json(&expected_dump)?;
+    let actual_dump = read_json(&actual_dump)?;
+    assert_evaluated_face_records_match(&expected_dump, &actual_dump, case)?;
+    if check == Check::GeometryAndAttributes {
+        assert_attribute_records_match(&expected_dump, &actual_dump, case)?;
+    }
 
     match check {
         Check::TexturedWithoutUv => {
@@ -1055,56 +1137,6 @@ fn run_case(
         )?;
     }
 
-    if check == Check::GeometryAndAttributes {
-        // The attribute round trip keeps the full scene. The glTF comparison above used the
-        // geometry-only variant, because glTF export refuses `blender_attributes`.
-        let attribute_project = case_root.join("attribute-project");
-        let attribute_project_text = path_str(&attribute_project)?;
-        let potter_blend = case_root.join("potter.blend");
-        let potter_blend_text = path_str(&potter_blend)?;
-        run_pot_json(&["init", attribute_project_text, "--json"])?;
-        run_pot_json(&[
-            "import",
-            attribute_project_text,
-            "--file",
-            oracle_text,
-            "--format",
-            "blend",
-            "--mode",
-            "replace",
-            "--base-revision",
-            "0",
-            "--blender",
-            blender_text,
-            "--json",
-        ])?;
-        run_pot_json(&[
-            "export",
-            attribute_project_text,
-            "--format",
-            "blend",
-            "--out",
-            potter_blend_text,
-            "--allow-lossy",
-            "--overwrite",
-            "--blender",
-            blender_text,
-            "--json",
-        ])?;
-        let expected_dump = case_root.join("oracle.json");
-        let actual_dump = case_root.join("potter.json");
-        run_blender(blender, dumper, &[oracle_text, path_str(&expected_dump)?])?;
-        run_blender(
-            blender,
-            dumper,
-            &[potter_blend_text, path_str(&actual_dump)?],
-        )?;
-        assert_attribute_records_match(
-            &read_json(&expected_dump)?,
-            &read_json(&actual_dump)?,
-            case,
-        )?;
-    }
     Ok(())
 }
 

@@ -808,11 +808,11 @@ fn merge_color_layers(name: &str, members: &[Member<'_>]) -> Result<Value> {
     }))
 }
 
-/// Joins canonical named color attributes, filling absent layers with opaque black. When point and
+/// Joins canonical named color attributes, filling absent layers with transparent black. When point and
 /// corner members share a layer name, the joined layer becomes corner-domain without losing point
 /// colors: each source vertex value is expanded to every face corner that references it.
 fn merge_color_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Value> {
-    const DEFAULT: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+    const DEFAULT: [f64; 4] = [0.0, 0.0, 0.0, 0.0];
     let mut corner_domain = false;
     for (value, _) in members {
         let Some(value) = value else { continue };
@@ -1306,7 +1306,7 @@ mod tests {
         );
         assert_eq!(
             joined.attributes["Atlas"]["values"][format!("f{}", joined.faces[0].id)],
-            json!(vec![[0.0, 0.0, 0.0, 1.0]; 4])
+            json!(vec![[0.0, 0.0, 0.0, 0.0]; 4])
         );
         assert_eq!(
             joined.attributes["blender_metadata"]["color_data_types"]["Body"],

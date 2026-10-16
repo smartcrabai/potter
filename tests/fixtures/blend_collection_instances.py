@@ -2,17 +2,18 @@
 
 Run as: blender --background --factory-startup --python blend_collection_instances.py -- <root> <case>
 
-Writes <root>/<case>.blend (the full scene, for the attribute round trip), <root>/<case>-geometry.blend
-(the same scene with every member's color attributes, vertex groups, and seams removed, which Potter
-imports for the glTF comparison), and <root>/<case>-geometry.blender.glb, Blender's own glTF export of
-that geometry-only scene. Member collections stay unlinked from the scene, so only instances draw them,
-as in the Potter scenes.
+Writes the original quad scene as `<case>.blend`, plus `<case>-faces.blend` for Blender face-loop
+checks. Only the latter drops the missing-UV material's image node, since Potter's blend bridge
+cannot export that external image reference; its source GLB still covers the textured refusal. A
+geometry-only copy strips colors, groups, and seams, triangulates a copy of each mesh, and feeds the
+GLB triangle-corner multiset comparison.
 """
 
 import math
 import os
 import sys
 
+import bmesh
 import bpy
 
 ARGUMENTS = sys.argv[sys.argv.index("--") + 1:]
@@ -304,10 +305,36 @@ def strip_attributes():
             edge.use_seam = False
 
 
+def triangulate_geometry():
+    for mesh in bpy.data.meshes:
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bmesh.ops.triangulate(bm, faces=list(bm.faces))
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 CASES[CASE](scene)
-bpy.ops.wm.save_as_mainfile(filepath=os.path.join(ROOT, CASE + ".blend"), check_existing=False)
+full_scene = os.path.join(ROOT, CASE + ".blend")
+bpy.ops.wm.save_as_mainfile(filepath=full_scene, check_existing=False)
+if CASE == "missing_uv_textured":
+    for material in bpy.data.materials:
+        if material.use_nodes:
+            for node in list(material.node_tree.nodes):
+                if node.type == "TEX_IMAGE":
+                    material.node_tree.nodes.remove(node)
+bpy.ops.wm.save_as_mainfile(
+    filepath=os.path.join(ROOT, CASE + "-faces.blend"),
+    check_existing=False,
+)
+bpy.ops.wm.open_mainfile(filepath=full_scene)
 strip_attributes()
+triangulate_geometry()
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(ROOT, CASE + "-geometry.blend"), check_existing=False)
-bpy.ops.export_scene.gltf(filepath=os.path.join(ROOT, CASE + "-geometry.blender.glb"), export_format="GLB")
+bpy.ops.export_scene.gltf(
+    filepath=os.path.join(ROOT, CASE + "-geometry.blender.glb"),
+    export_format="GLB",
+)
