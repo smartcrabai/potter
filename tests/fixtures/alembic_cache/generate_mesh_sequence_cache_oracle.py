@@ -14,6 +14,8 @@ The script writes, next to itself:
 - `uv_only.abc`: static `/UvOnly` PolyMesh with one asymmetric face-corner UV layer for the
   independent UV-only MeshSequenceCache case.
 - `seq.000<k>.abc`: one single-frame file per frame of `/Animated` for `is_sequence` cases.
+- `reordered.000<k>.abc`: same-size file-sequence samples with reversed face-corner connectivity and
+  asymmetric UVs, exercising the cache topology-change reread.
 - `oracle.json`: per case, the CacheFile settings, the modifier settings, and the evaluated mesh of
   each frame (local positions, faces in Blender loop order, corner normals, custom-normal flag and
   every non-internal attribute with full values).
@@ -46,6 +48,8 @@ REST = [
     (1.5, 2.5, -0.5),
 ]
 FACES = [(0, 1, 2, 3), (0, 3, 4), (3, 2, 5, 4)]
+REORDERED_PATH = "/Reordered/Reordered"
+REORDERED_FACES = [tuple(reversed(FACES[0])), *FACES[1:]]
 DELTA = [
     (0.10, 0.00, 0.20),
     (0.00, 0.30, 0.00),
@@ -217,6 +221,23 @@ def build_uv_only():
     return obj
 
 
+def build_reordered_source(faces):
+    obj = new_object("Reordered", REST, faces)
+    layer = obj.data.uv_layers.new(name="UVMap")
+    rows = [
+        [(0.137, 0.223), (0.619, 0.357), (0.283, 0.881), (0.947, 0.569)],
+        [(0.731, 0.163), (0.194, 0.907), (0.853, 0.421)],
+        [(0.367, 0.689), (0.521, 0.241), (0.063, 0.773), (0.917, 0.487)],
+    ]
+    loop = 0
+    for face_index, face in enumerate(faces):
+        uv_by_vertex = dict(zip(FACES[face_index], rows[face_index]))
+        for vertex in face:
+            layer.data[loop].uv = uv_by_vertex[vertex]
+            loop += 1
+    return obj
+
+
 def export_selected(obj, path, start, end, *, uvs=False):
     # The exporter samples the current frame for single-frame ranges, so start there explicitly.
     bpy.context.scene.frame_set(start)
@@ -365,6 +386,18 @@ def main():
         FRAMES[-1],
         uvs=True,
     )
+    for frame, faces in [(1, FACES), (2, REORDERED_FACES)]:
+        reordered = build_reordered_source(faces)
+        mesh = reordered.data
+        export_selected(
+            reordered,
+            os.path.join(OUT, f"reordered.{frame:04d}.abc"),
+            frame,
+            frame,
+            uvs=True,
+        )
+        bpy.data.objects.remove(reordered, do_unlink=True)
+        bpy.data.meshes.remove(mesh)
 
     # Remove the source objects; receivers are created below from fresh meshes.
     for obj in list(bpy.data.objects):
@@ -374,12 +407,20 @@ def main():
     topo_path = os.path.join(OUT, "topo.abc")
     seq_path = os.path.join(OUT, "seq.0001.abc")
     uv_only_path = os.path.join(OUT, "uv_only.abc")
+    reordered_path = os.path.join(OUT, "reordered.0001.abc")
 
     def receiver(name, verts, faces):
         return new_object(name, verts, faces)
 
     same_topology = lambda: receiver("RecvSame", REST, FACES)
     cube_topology = lambda: receiver("RecvCube", CUBE_VERTS, CUBE_FACES)
+
+    def same_topology_with_uv():
+        obj = same_topology()
+        layer = obj.data.uv_layers.new(name="UVMap")
+        for index, item in enumerate(layer.data):
+            item.uv = (20.0 + index, -10.0 - index)
+        return obj
 
     cases = []
     cases.append(run_case(
@@ -461,6 +502,11 @@ def main():
     cases.append(run_case(
         "topology_face_change_vert_only", cube_topology(), topo_path, TOPO_PATH,
         {}, {"read_data": ["VERT"]}, [1, 3],
+    ))
+    cases.append(run_case(
+        "sequence_same_size_reordered_connectivity", same_topology_with_uv(),
+        reordered_path, REORDERED_PATH, {"is_sequence": True},
+        {"read_data": ["VERT"]}, [1, 2],
     ))
     cases.append(run_case(
         "is_sequence_per_frame_files", same_topology(), seq_path, ANIMATED_PATH,

@@ -149,16 +149,11 @@ pub(crate) fn evaluate(
                 json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
             )
         })?;
-        mesh.vertices.len() != sample.sample.positions.len()
-            || !topology_matches(mesh, &sample.sample.faces)
+        !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces)
     };
     if topology_changed {
-        read = ReadAttributes {
-            vertices: true,
-            polygons: true,
-            uv: true,
-            color: true,
-        };
+        // Blender's file-sequence reader rereads all supported streams for changed connectivity.
+        read = ReadAttributes::ALL;
         samples = cached_mesh_cache_samples(
             archive_bytes,
             resource_hash,
@@ -200,7 +195,6 @@ pub(crate) fn evaluate(
                     json!({"modifier_id":modifier.id,"reason":error.to_string()}),
                 )
             })?;
-        carry_uv_store(mesh, &mut evaluated);
         apply_cache_attributes(
             &mut evaluated,
             sample.sample,
@@ -230,9 +224,14 @@ pub(crate) fn evaluate(
     Ok(warnings)
 }
 
-fn topology_matches(mesh: &Mesh, cache_faces: &[Vec<usize>]) -> bool {
+fn topology_matches(
+    mesh: &Mesh,
+    cache_vertex_count: usize,
+    cache_faces: &[Vec<usize>],
+) -> bool {
     let corner_count = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
-    if mesh.vertices.len() == 0
+    if mesh.vertices.is_empty()
+        || mesh.vertices.len() != cache_vertex_count
         || mesh.faces.len() != cache_faces.len()
         || corner_count != cache_faces.iter().map(Vec::len).sum::<usize>()
     {
@@ -424,23 +423,6 @@ fn set_cache_color_data_type(mesh: &mut Mesh, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Carries UV layers to a topology replacement, clearing rows only when the face layout differs.
-fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
-    let mut store = uv_layers::read(input);
-    let same_layout = input.faces.len() == replacement.faces.len()
-        && input
-            .faces
-            .iter()
-            .zip(&replacement.faces)
-            .all(|(old, new)| old.vertices.len() == new.vertices.len());
-    if !same_layout {
-        for layer in &mut store.layers {
-            layer.faces = vec![None; replacement.faces.len()];
-            layer.pinned = vec![None; replacement.faces.len()];
-        }
-    }
-    uv_layers::write(replacement, &store);
-}
 
 /// Writes named cache UV layers through the canonical store, reversing each file-corner row once.
 fn write_cache_uvs(
@@ -691,6 +673,14 @@ struct ReadAttributes {
     uv: bool,
     color: bool,
 }
+impl ReadAttributes {
+    const ALL: Self = Self {
+        vertices: true,
+        polygons: true,
+        uv: true,
+        color: true,
+    };
+}
 
 fn read_params(modifier: &Modifier) -> Result<ReadAttributes> {
     let Some(value) = modifier.params.get("read_data").or_else(|| {
@@ -700,12 +690,7 @@ fn read_params(modifier: &Modifier) -> Result<ReadAttributes> {
             "read_data",
         )
     }) else {
-        return Ok(ReadAttributes {
-            vertices: true,
-            polygons: true,
-            uv: true,
-            color: true,
-        });
+        return Ok(ReadAttributes::ALL);
     };
     let values = value.as_array().ok_or_else(|| {
         invalid_parameter(modifier, "read_data", "an array of Blender read-data flags")
@@ -855,7 +840,20 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::lerp_position;
+    use super::{lerp_position, topology_matches};
+    use crate::geom::Mesh;
+
+    #[test]
+    fn topology_identity_detects_same_size_corner_reorder() -> Result<(), Box<dyn std::error::Error>> {
+        let mesh = Mesh::from_positions_and_faces(
+            vec![glam::DVec3::ZERO, glam::DVec3::X, glam::DVec3::ONE, glam::DVec3::Y],
+            vec![vec![0, 1, 2, 3]],
+        )?;
+        assert!(topology_matches(&mesh, 4, &[vec![0, 1, 2, 3]]));
+        assert!(!topology_matches(&mesh, 4, &[vec![3, 2, 1, 0]]));
+        assert!(!topology_matches(&mesh, 5, &[vec![0, 1, 2, 3]]));
+        Ok(())
+    }
 
     #[test]
     fn cache_color_scopes_use_named_linear_corner_store() -> Result<(), Box<dyn std::error::Error>>

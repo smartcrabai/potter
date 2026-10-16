@@ -313,6 +313,7 @@ fn set_receiver_mesh(
     scene: &Path,
     positions: &[[f64; 3]],
     faces: &[Vec<usize>],
+    seeded_uv: bool,
 ) -> Result<(), Box<dyn Error>> {
     let scene_path = scene.join("scene.json");
     let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
@@ -348,6 +349,27 @@ fn set_receiver_mesh(
         mesh.attributes.insert(
             name.to_owned(),
             json!({"domain":domain,"type":"bool","values":values}),
+        );
+    }
+    if seeded_uv {
+        let rows = mesh
+            .faces
+            .iter()
+            .enumerate()
+            .map(|(face_index, face)| {
+                let uv = (0..face.vertices.len())
+                    .map(|corner| json!([20 + face_index, 10 + corner]))
+                    .collect::<Vec<_>>();
+                json!({"face_id":face.id,"uv":uv})
+            })
+            .collect::<Vec<_>>();
+        mesh.attributes.insert(
+            "uv_layers".to_owned(),
+            json!({
+                "layers":[{"name":"UVMap","faces":rows}],
+                "active":"UVMap",
+                "render":"UVMap",
+            }),
         );
     }
     document["data_blocks"][data_id.as_str()]["descriptor"] = Value::Null;
@@ -404,10 +426,37 @@ fn add_sequence_resource(
     fixture_dir: &Path,
     cache_file: &Value,
 ) -> Result<(), Box<dyn Error>> {
-    let sequence_pattern = fixture_dir.join("seq.####.abc");
+    let filename = Path::new(
+        cache_file["filepath"]
+            .as_str()
+            .ok_or("Blender oracle sequence filepath is missing")?,
+    )
+    .file_name()
+    .and_then(|name| name.to_str())
+    .ok_or("Blender oracle sequence filename is missing")?;
+    let extension_start = filename.rfind('.').unwrap_or(filename.len());
+    let stem = &filename[..extension_start];
+    let frame_start = stem
+        .as_bytes()
+        .iter()
+        .rposition(|byte| !byte.is_ascii_digit())
+        .map_or(0, |index| index + 1);
+    if frame_start == stem.len() {
+        return Err("Blender oracle sequence path must end in a numbered filename".into());
+    }
+    let frame_width = extension_start - frame_start;
+    let first_frame = stem[frame_start..].parse::<i32>()?;
+    let prefix = &filename[..frame_start];
+    let suffix = &filename[extension_start..];
+    let pattern_name = format!("{prefix}{}{suffix}", "#".repeat(frame_width));
+    let sequence_pattern = fixture_dir.join(pattern_name);
     let mut sequence_frames = serde_json::Map::new();
-    for frame in 1..=4 {
-        let source = fixture_dir.join(format!("seq.{frame:04}.abc"));
+    let mut frame = first_frame;
+    loop {
+        let source = fixture_dir.join(format!("{prefix}{frame:0width$}{suffix}", width = frame_width));
+        if !source.is_file() {
+            break;
+        }
         let digest = potter_core::hash::sha256(&fs::read(&source)?);
         sequence_frames.insert(
             frame.to_string(),
@@ -418,6 +467,11 @@ fn add_sequence_resource(
                 "packed":false,
             }),
         );
+        frame += 1;
+    }
+    let end = frame - 1;
+    if sequence_frames.is_empty() {
+        return Err("Blender oracle sequence has no numbered frame files".into());
     }
     let scene_path = scene.join("scene.json");
     let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
@@ -426,8 +480,8 @@ fn add_sequence_resource(
         "kind":"alembic",
         "packed":false,
         "cache_file":cache_file,
-        "sequence_start":1,
-        "sequence_end":4,
+        "sequence_start":first_frame,
+        "sequence_end":end,
         "sequence_frames":sequence_frames
     });
     fs::write(&scene_path, serde_json::to_vec_pretty(&document)?)?;
@@ -1282,6 +1336,7 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
         "is_sequence_per_frame_files",
         "override_frame_fractional_interpolated",
         "override_frame_fractional_no_interpolation",
+        "sequence_same_size_reordered_connectivity",
         "read_attributes_only",
         "read_no_color",
         "read_poly_only",
@@ -1314,7 +1369,12 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
             &json!([{"op":"node.create","id":"body","name":"OracleReceiver","kind":"box","params":{}}]),
         )?;
         let (positions, faces) = oracle_receiver_geometry(case_id);
-        set_receiver_mesh(&target, &positions, &faces)?;
+        set_receiver_mesh(
+            &target,
+            &positions,
+            &faces,
+            case_id == "sequence_same_size_reordered_connectivity",
+        )?;
         add_oracle_cache(&target, &fixture_dir, oracle_case)?;
         let frames = oracle_case["frames"]
             .as_array()
