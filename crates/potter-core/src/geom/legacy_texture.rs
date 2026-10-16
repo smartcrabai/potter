@@ -20,9 +20,38 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    image::{ImageData, ImageInterpolation, load_image_data},
-    model::{Id, ImageAlphaMode, ImageColorspace, SceneDoc, migrate},
+    image::{
+        ImageData, ImageInterpolation, load_image_data,
+        storage::{ImageUserSelection, load_image_data_for_legacy_texture},
+    },
+    model::{migrate, Id, ImageAlphaMode, ImageColorspace, SceneDoc},
 };
+
+fn image_user_index(id: &str, settings: &Map<String, Value>, key: &str) -> Result<u16> {
+    match settings.get(key) {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .and_then(|index| u16::try_from(index).ok())
+            .ok_or_else(|| {
+                record_error(
+                    id,
+                    format!("`image_user.{key}` must be a non-negative 16-bit index"),
+                )
+            }),
+    }
+}
+
+fn parse_image_user_selection(
+    id: &str,
+    settings: &Map<String, Value>,
+) -> Result<ImageUserSelection> {
+    Ok(ImageUserSelection {
+        layer: image_user_index(id, settings, "multilayer_layer")?,
+        pass: image_user_index(id, settings, "multilayer_pass")?,
+        view: image_user_index(id, settings, "multilayer_view")?,
+    })
+}
 
 /// Record kind of a Blender legacy texture.
 pub(crate) const LEGACY_TEXTURE_KIND: &str = "legacy_texture";
@@ -212,6 +241,7 @@ pub(crate) struct ImageSamplerSettings {
     pub(crate) factor_green: f32,
     pub(crate) factor_blue: f32,
     pub(crate) use_clamp: bool,
+    source_channels: usize,
     source_srgb_encoded: bool,
     use_color_ramp: bool,
     color_ramp: ColorRamp,
@@ -243,6 +273,7 @@ pub(crate) const DEFAULT_IMAGE_SETTINGS: ImageSamplerSettings = ImageSamplerSett
     factor_green: 1.0,
     factor_blue: 1.0,
     use_clamp: false,
+    source_channels: 4,
     source_srgb_encoded: false,
     use_color_ramp: false,
     color_ramp: DEFAULT_COLOR_RAMP,
@@ -602,6 +633,9 @@ fn validate_image_settings(id: &str, settings: &Map<String, Value>) -> Result<()
                 format!("`{key}` is not a valid Blender IMAGE setting"),
             ));
         }
+    }
+    if let Some(Value::Object(image_user)) = settings.get("image_user") {
+        parse_image_user_selection(id, image_user)?;
     }
     if let Some(value) = settings.get("color_ramp") {
         let ramp = value
@@ -1218,8 +1252,15 @@ pub fn resolve_texture(
         })?;
         let mut settings = DEFAULT_IMAGE_SETTINGS;
         settings.use_alpha &= image.alpha_mode != ImageAlphaMode::None;
-        settings.source_srgb_encoded = image.colorspace == ImageColorspace::Srgb;
-        let data = load_image_data(image, root, ImageInterpolation::Linear)?;
+        let (data, color_pass, source_channels) = load_image_data_for_legacy_texture(
+            image,
+            root,
+            ImageInterpolation::Linear,
+            ImageUserSelection::default(),
+        )?;
+        settings.source_channels = source_channels;
+        settings.source_srgb_encoded =
+            color_pass && image.colorspace == ImageColorspace::Srgb;
         let resolved = if settings == DEFAULT_IMAGE_SETTINGS {
             ResolvedTextureKind::Image(data)
         } else {
@@ -1247,7 +1288,7 @@ pub fn resolve_texture(
     let resolved = match parse_record(&texture_id.to_string(), record)? {
         LegacyTexture::ImageRecord {
             image,
-            settings: _,
+            settings,
             mut sampler,
         } => {
             let Some(image_id) = image else {
@@ -1277,9 +1318,22 @@ pub fn resolve_texture(
                     json!({"texture": texture_id}),
                 )
             })?;
+            let image_user = settings
+                .get("image_user")
+                .and_then(Value::as_object)
+                .map(|settings| parse_image_user_selection(&texture_id.to_string(), settings))
+                .transpose()?
+                .unwrap_or_default();
             sampler.use_alpha &= image.alpha_mode != ImageAlphaMode::None;
-            sampler.source_srgb_encoded = image.colorspace == ImageColorspace::Srgb;
-            let data = load_image_data(image, root, ImageInterpolation::Linear)?;
+            let (data, color_pass, source_channels) = load_image_data_for_legacy_texture(
+                image,
+                root,
+                ImageInterpolation::Linear,
+                image_user,
+            )?;
+            sampler.source_channels = source_channels;
+            sampler.source_srgb_encoded =
+                color_pass && image.colorspace == ImageColorspace::Srgb;
             ResolvedTextureKind::ImageWithSettings {
                 image: data,
                 settings: sampler,
@@ -1518,6 +1572,12 @@ fn image_pixel(
         .copied()
         .ok_or_else(|| invalid_image_sample("image texture texel index is invalid"))?;
     let mut texel = pixel.map(|value| value as f32);
+    if !matches!(settings.source_channels, 3 | 4)
+        && settings.use_alpha
+        && !settings.calculate_alpha
+    {
+        texel[..3].fill(1.0);
+    }
     if settings.source_srgb_encoded {
         texel[0] = srgb_encoded_channel(texel[0]);
         texel[1] = srgb_encoded_channel(texel[1]);
@@ -1901,6 +1961,33 @@ fn sample_image(
     }
     fx = (fx + 1.0) / 2.0;
     fy = (fy + 1.0) / 2.0;
+    let mut width_px = image.width;
+    let mut height_px = image.height;
+    let mut pixels = image.pixels.as_slice();
+    // Blender selects a tiled image's buffer from the input UV before applying extension modes.
+    if !image.tiles.is_empty() {
+        let u = floor_to_texture_i64(fx)
+            .ok_or_else(|| invalid_image_sample("UDIM U coordinate is out of range"))?;
+        let v = floor_to_texture_i64(fy)
+            .ok_or_else(|| invalid_image_sample("UDIM V coordinate is out of range"))?;
+        if fx >= 0.0 && fy >= 0.0 && fx < 10.0 {
+            let tile_number = i64::from(1001_u32)
+                .checked_add(v.checked_mul(10).ok_or_else(|| {
+                    invalid_image_sample("UDIM tile number overflows")
+                })?)
+                .and_then(|number| number.checked_add(u))
+                .and_then(|number| u32::try_from(number).ok());
+            if let Some(tile_number) = tile_number {
+                if let Some(tile) = image.tiles.get(&tile_number) {
+                    width_px = tile.width;
+                    height_px = tile.height;
+                    pixels = tile.pixels.as_slice();
+                    fx -= u as f32;
+                    fy -= v as f32;
+                }
+            }
+        }
+    }
     if settings.extension == ImageExtension::Repeat {
         fx = repeated_coordinate(fx, settings.repeat_x, settings.mirror_x)
             .ok_or_else(|| invalid_image_sample("image repeat X coordinate is out of range"))?;
@@ -1909,34 +1996,7 @@ fn sample_image(
     }
     fx = settings.crop_min_x + fx * (settings.crop_max_x - settings.crop_min_x);
     fy = settings.crop_min_y + fy * (settings.crop_max_y - settings.crop_min_y);
-    let mut width_px = image.width;
-    let mut height_px = image.height;
-    let mut pixels = image.pixels.as_slice();
-    if !image.tiles.is_empty() {
-        let u = floor_to_texture_i64(fx)
-            .ok_or_else(|| invalid_image_sample("UDIM U coordinate is out of range"))?;
-        let v = floor_to_texture_i64(fy)
-            .ok_or_else(|| invalid_image_sample("UDIM V coordinate is out of range"))?;
-        let tile_number = i64::from(1001_u32)
-            .checked_add(
-                v.checked_mul(10)
-                    .ok_or_else(|| invalid_image_sample("UDIM tile number overflows"))?,
-            )
-            .and_then(|number| number.checked_add(u))
-            .and_then(|number| u32::try_from(number).ok());
-        let Some(tile_number) = tile_number else {
-            return Ok(empty_image_sample(settings));
-        };
-        if let Some(tile) = image.tiles.get(&tile_number) {
-            width_px = tile.width;
-            height_px = tile.height;
-            pixels = tile.pixels.as_slice();
-        } else if tile_number != 1001 {
-            return Ok(empty_image_sample(settings));
-        }
-        fx = fx.rem_euclid(1.0);
-        fy = fy.rem_euclid(1.0);
-    }
+
     if settings.flip_axis {
         std::mem::swap(&mut fx, &mut fy);
     }
@@ -3574,8 +3634,19 @@ fn musgrave_ridged(
 }
 #[cfg(test)]
 mod tests {
+    use std::{error::Error, fs, path::Path};
+
     use glam::DVec3;
     use serde_json::{Value, json};
+
+    use crate::{
+        hash,
+        image::ImageTileData,
+        model::{
+            Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Modifier, ModifierRuntime,
+            SceneDoc,
+        },
+    };
 
     use super::{
         BlenderRng, DEFAULT_IMAGE_SETTINGS, ImageData, ImageInterpolation, LegacyTexture,
@@ -3606,6 +3677,375 @@ mod tests {
         for (actual, expected) in actual.into_iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
+    }
+
+    fn add_linked_image(
+        doc: &mut SceneDoc,
+        id: &str,
+        root: &Path,
+        path: &str,
+        width: u32,
+        height: u32,
+        alpha_mode: ImageAlphaMode,
+    ) -> Result<(), Box<dyn Error>> {
+        let bytes = fs::read(root.join(path))?;
+        doc.images.insert(
+            Id::new(id.to_owned())?,
+            Image {
+                name: id.to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::Linear,
+                width,
+                height,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(path.to_owned()),
+                source_hash: Some(hash::sha256(&bytes)),
+                alpha_mode,
+            },
+        );
+        Ok(())
+    }
+
+    fn sample_scene_image_record(
+        doc: &mut SceneDoc,
+        texture_id: &Id,
+        image_id: &str,
+        root: &Path,
+        settings: Value,
+        coords: DVec3,
+    ) -> Result<super::TextureResult, Box<dyn Error>> {
+        let mut record = image_record(settings);
+        record["image"] = json!(image_id);
+        doc.resources.insert(texture_id.clone(), record);
+        let modifier = Modifier {
+            id: Id::new("texture_consumer".to_owned())?,
+            modifier_type: "DISPLACE".to_owned(),
+            name: "Texture consumer".to_owned(),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params: json!({"texture": texture_id.to_string()})
+                .as_object()
+                .expect("texture parameters are an object")
+                .clone(),
+            binding_data: None,
+            runtime: ModifierRuntime::default(),
+        };
+        let resolved = crate::geom::modifiers::load_modifier_texture(
+            &modifier,
+            "texture",
+            doc,
+            Some(root),
+        )?
+        .ok_or_else(|| std::io::Error::other("image texture was not resolved"))?;
+        let mut rng = BlenderRng::seed(0);
+        Ok(sample(resolved.source(), coords, &mut rng)?)
+    }
+
+    #[test]
+    fn legacy_image_user_selects_multilayer_exr_layer_pass_and_view() -> Result<(), Box<dyn Error>> {
+        use exr::prelude::{
+            Encoding, Image as ExrImage, ImageAttributes, IntegerBounds, Layer, LayerAttributes,
+            SpecificChannels, Vec2, WritableImage,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let source = root.join("multilayer.exr");
+        let size = Vec2(1_usize, 2_usize);
+        let mut depth_attributes = LayerAttributes::named("LayerA.Depth-left");
+        depth_attributes.view_name = Some("left".into());
+        let depth = Layer::new(
+            size,
+            depth_attributes,
+            Encoding::FAST_LOSSLESS,
+            SpecificChannels::build()
+                .with_channel::<f32>("Z")
+                .with_pixels(|position| {
+                    if position.1 == 0 {
+                        0.75_f32
+                    } else {
+                        0.25_f32
+                    }
+                }),
+        );
+        let rgba_layer = |name: &str, view: &str, top: [f32; 4], bottom: [f32; 4]| {
+            let mut attributes = LayerAttributes::named(name);
+            attributes.view_name = Some(view.into());
+            Layer::new(
+                size,
+                attributes,
+                Encoding::FAST_LOSSLESS,
+                SpecificChannels::rgba(move |position| {
+                    let rgba = if position.1 == 0 { top } else { bottom };
+                    (rgba[0], rgba[1], rgba[2], rgba[3])
+                }),
+            )
+        };
+        ExrImage::empty(ImageAttributes::new(IntegerBounds::from_dimensions(size)))
+            .with_layer(depth)
+            .with_layer(rgba_layer(
+                "LayerA.Combined-left",
+                "left",
+                [0.1, 0.05, 0.2, 0.25],
+                [0.2, 0.3, 0.1, 0.5],
+            ))
+            .with_layer(rgba_layer(
+                "LayerA.Combined-right",
+                "right",
+                [0.1, 0.2, 0.05, 0.5],
+                [0.3, 0.1, 0.05, 0.5],
+            ))
+            .with_layer(rgba_layer(
+                "LayerB.Combined-left",
+                "left",
+                [0.15, 0.1, 0.05, 0.5],
+                [0.05, 0.15, 0.2, 0.5],
+            ))
+            .write()
+            .to_file(&source)?;
+
+        let mut doc = SceneDoc::default();
+        add_linked_image(
+            &mut doc,
+            "shared_image",
+            root,
+            "multilayer.exr",
+            1,
+            2,
+            ImageAlphaMode::Premultiplied,
+        )?;
+        let texture_id = Id::new("selected_texture".to_owned())?;
+        let coords = DVec3::new(-0.5, 0.5, 0.0);
+        let right = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "shared_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "image_user": {
+                    "frame_offset": 7,
+                    "multilayer_layer": 0,
+                    "multilayer_pass": 0,
+                    "multilayer_view": 1
+                }
+            }),
+            coords,
+        )?;
+        assert_rgb_close(right.rgb, [0.2, 0.4, 0.1]);
+        assert!((right.alpha - 0.5).abs() < 1e-6);
+
+        let bottom_row = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "shared_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "image_user": {
+                    "multilayer_layer": 0,
+                    "multilayer_pass": 0,
+                    "multilayer_view": 1
+                }
+            }),
+            DVec3::new(-0.5, -0.5, 0.0),
+        )?;
+        assert_rgb_close(bottom_row.rgb, [0.6, 0.2, 0.1]);
+        assert!((bottom_row.alpha - 0.5).abs() < 1e-6);
+
+        let other_frame = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "shared_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "image_user": {
+                    "frame_offset": 99,
+                    "multilayer_layer": 0,
+                    "multilayer_pass": 0,
+                    "multilayer_view": 1
+                }
+            }),
+            coords,
+        )?;
+        assert_eq!(other_frame.rgb, right.rgb);
+        assert_eq!(other_frame.alpha, right.alpha);
+
+        let other_layer = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "shared_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "image_user": {
+                    "multilayer_layer": 1,
+                    "multilayer_pass": 0,
+                    "multilayer_view": 0
+                }
+            }),
+            coords,
+        )?;
+        assert_rgb_close(other_layer.rgb, [0.3, 0.2, 0.1]);
+        assert!((other_layer.alpha - 0.5).abs() < 1e-6);
+
+        let depth = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "shared_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "image_user": {
+                    "multilayer_layer": 0,
+                    "multilayer_pass": 2,
+                    "multilayer_view": 0
+                }
+            }),
+            coords,
+        )?;
+        assert_rgb_close(depth.rgb, [1.0; 3]);
+        assert!((depth.alpha - 0.75).abs() < 1e-6);
+
+        let depth_without_alpha = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "shared_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "use_alpha": false,
+                "image_user": {
+                    "multilayer_layer": 0,
+                    "multilayer_pass": 2,
+                    "multilayer_view": 0
+                }
+            }),
+            coords,
+        )?;
+        assert_rgb_close(depth_without_alpha.rgb, [0.75; 3]);
+        assert_eq!(depth_without_alpha.alpha, 1.0);
+
+        let missing_pass = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "shared_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "image_user": {
+                    "multilayer_layer": 0,
+                    "multilayer_pass": 99,
+                    "multilayer_view": 99
+                }
+            }),
+            coords,
+        )?;
+        assert_rgb_close(missing_pass.rgb, [0.4, 0.2, 0.8]);
+        assert!((missing_pass.alpha - 0.25).abs() < 1e-6);
+
+        let missing_layer = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "shared_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "image_user": {
+                    "multilayer_layer": 8,
+                    "multilayer_pass": 0,
+                    "multilayer_view": 0
+                }
+            }),
+            coords,
+        )?;
+        assert_rgb_close(missing_layer.rgb, [0.0; 3]);
+        assert_eq!(missing_layer.alpha, 0.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn still_image_user_selectors_are_noops_and_udim_tile_comes_from_coordinates()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let still = root.join("still.exr");
+        exr::prelude::write_rgba_file(&still, 1, 1, |_, _| (0.2, 0.4, 0.6, 1.0))?;
+        let mut doc = SceneDoc::default();
+        add_linked_image(
+            &mut doc,
+            "still_image",
+            root,
+            "still.exr",
+            1,
+            1,
+            ImageAlphaMode::Straight,
+        )?;
+        let texture_id = Id::new("still_texture".to_owned())?;
+        let still_sample = sample_scene_image_record(
+            &mut doc,
+            &texture_id,
+            "still_image",
+            root,
+            json!({
+                "use_interpolation": false,
+                "image_user": {
+                    "frame_current": 33,
+                    "frame_offset": 11,
+                    "multilayer_layer": 9,
+                    "multilayer_pass": 12,
+                    "multilayer_view": 5,
+                    "tile": 1002
+                }
+            }),
+            DVec3::ZERO,
+        )?;
+        assert_rgb_close(still_sample.rgb, [0.2, 0.4, 0.6]);
+
+        let direct_image_id = Id::new("still_image".to_owned())?;
+        let direct = super::resolve_texture(&doc, &direct_image_id, Some(root))?;
+        let mut rng = BlenderRng::seed(0);
+        let direct_sample = sample(direct.source(), DVec3::ZERO, &mut rng)?;
+        assert_rgb_close(direct_sample.rgb, [0.2, 0.4, 0.6]);
+
+        let image = ImageData {
+            width: 1,
+            height: 1,
+            pixels: vec![[0.1, 0.2, 0.3, 1.0]],
+            tiles: std::collections::BTreeMap::from([(
+                1002,
+                ImageTileData {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![[0.7, 0.2, 0.1, 1.0]],
+                },
+            )]),
+            interpolation: ImageInterpolation::Linear,
+        };
+        for tile in [1001, 1002] {
+            let texture = parse_record(
+                "tiled_texture",
+                &image_record(json!({
+                    "use_interpolation": false,
+                    "image_user": {"tile": tile}
+                })),
+            )?;
+            let LegacyTexture::ImageRecord { sampler, .. } = texture else {
+                panic!("IMAGE record");
+            };
+            let mut rng = BlenderRng::seed(0);
+            let result = sample(
+                TextureSource::ImageWithSettings(&image, &sampler),
+                DVec3::new(1.5, 0.0, 0.0),
+                &mut rng,
+            )?;
+            assert_rgb_close(result.rgb, [0.7, 0.2, 0.1]);
+        }
+        Ok(())
     }
 
     #[test]
