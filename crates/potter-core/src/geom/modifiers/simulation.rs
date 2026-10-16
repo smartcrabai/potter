@@ -9,7 +9,6 @@ use crate::{
         Edge, Face, Mesh, Vertex, edge_key,
         volume::{VolumeData, VolumeGeneratedSource, VolumeGrid, VolumeSource},
     },
-    image::ImageData,
     sim::ParticleState,
 };
 
@@ -524,25 +523,17 @@ fn quad_cut_fragments(
 pub fn displace_volume(
     volume: &VolumeData,
     params: &Map<String, Value>,
-    texture_type: &str,
-    image: Option<&ImageData>,
+    texture: Option<crate::geom::legacy_texture::TextureSource<'_>>,
     volume_world: DMat4,
     texture_map_object_world: Option<DMat4>,
 ) -> Result<VolumeData> {
     let strength = number_param("volume_displace", params, "strength")?;
-    if !matches!(texture_type, "NONE" | "NOISE" | "IMAGE") {
-        return Err(unsupported(
-            "modifier.volume_displace.texture_type",
-            "only deterministic noise and image textures are supported",
-        ));
-    }
-    if texture_type == "NONE" || strength == 0.0 {
+    let Some(texture) = texture.filter(|_| strength != 0.0) else {
         return Ok(volume.clone());
-    }
+    };
     let texture = VolumeDisplacement::new(
         params,
-        texture_type,
-        image,
+        texture,
         strength,
         volume_world,
         texture_map_object_world,
@@ -574,8 +565,7 @@ pub fn displace_volume(
 }
 
 struct VolumeDisplacement<'a> {
-    texture_type: &'a str,
-    image: Option<&'a ImageData>,
+    texture: crate::geom::legacy_texture::TextureSource<'a>,
     mapping: DMat4,
     strength: f64,
     mid_level: [f64; 3],
@@ -585,18 +575,11 @@ struct VolumeDisplacement<'a> {
 impl<'a> VolumeDisplacement<'a> {
     fn new(
         params: &Map<String, Value>,
-        texture_type: &'a str,
-        image: Option<&'a ImageData>,
+        texture: crate::geom::legacy_texture::TextureSource<'a>,
         strength: f64,
         volume_world: DMat4,
         texture_map_object_world: Option<DMat4>,
     ) -> Result<Self> {
-        if texture_type == "IMAGE" && image.is_none() {
-            return Err(unsupported(
-                "modifier.volume_displace.image_texture",
-                "image texture source is unavailable",
-            ));
-        }
         let sample_radius = number_param("volume_displace", params, "texture_sample_radius")?;
         if sample_radius < 0.0 {
             return Err(invalid("texture_sample_radius must be non-negative"));
@@ -610,16 +593,10 @@ impl<'a> VolumeDisplacement<'a> {
         let mapping = match mode {
             "LOCAL" => DMat4::IDENTITY,
             "GLOBAL" => volume_world,
-            "OBJECT" => {
-                let object_world = texture_map_object_world.ok_or_else(|| {
-                    PotError::with_details(
-                        ErrorCode::InvalidOperation,
-                        "OBJECT texture mapping requires texture_map_object",
-                        json!({"feature_id":"modifier.volume_displace.texture_map_object"}),
-                    )
-                })?;
-                invert_transform(object_world)? * volume_world
-            }
+            "OBJECT" => match texture_map_object_world {
+                Some(object_world) => invert_transform(object_world)? * volume_world,
+                None => DMat4::IDENTITY,
+            },
             _ => {
                 return Err(invalid("texture_map_mode must be LOCAL, GLOBAL, or OBJECT"));
             }
@@ -630,8 +607,7 @@ impl<'a> VolumeDisplacement<'a> {
             ));
         }
         Ok(Self {
-            texture_type,
-            image,
+            texture,
             mapping,
             strength,
             mid_level: vector_param("volume_displace", params, "texture_mid_level")?,
@@ -644,107 +620,9 @@ impl<'a> VolumeDisplacement<'a> {
         if !texture_position.is_finite() {
             return Err(invalid("volume texture coordinates are not finite"));
         }
-        let color = match self.texture_type {
-            "NOISE" => value_noise_color(texture_position),
-            "IMAGE" => {
-                let image = self
-                    .image
-                    .ok_or_else(|| invalid("image texture source disappeared"))?;
-                // Blender's flat Image Texture projection maps object coordinates from
-                // [-1, 1] to UVs and repeats outside the unit square.
-                let uv = [
-                    (texture_position.x * 0.5 + 0.5).rem_euclid(1.0),
-                    (texture_position.y * 0.5 + 0.5).rem_euclid(1.0),
-                ];
-                let rgba = sample_repeated_image(image, uv)?;
-                [rgba[0], rgba[1], rgba[2]]
-            }
-            _ => {
-                return Err(unsupported(
-                    "modifier.volume_displace.texture_type",
-                    "unsupported volume displacement texture source",
-                ));
-            }
-        };
-        Ok(DVec3::new(
-            color[0] - self.mid_level[0],
-            color[1] - self.mid_level[1],
-            color[2] - self.mid_level[2],
-        ) * self.strength)
+        let sample = crate::geom::legacy_texture::sample(self.texture, texture_position)?;
+        Ok((DVec3::from_array(sample.rgb) - DVec3::from_array(self.mid_level)) * self.strength)
     }
-}
-fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
-    let width = usize::try_from(image.width)
-        .map_err(|_| limit("image texture width exceeds addressable memory"))?;
-    let height = usize::try_from(image.height)
-        .map_err(|_| limit("image texture height exceeds addressable memory"))?;
-    let pixel_count = width
-        .checked_mul(height)
-        .ok_or_else(|| limit("image texture pixel count overflows"))?;
-    if width == 0 || height == 0 || image.pixels.len() != pixel_count {
-        return Err(invalid("image texture dimensions do not match its pixels"));
-    }
-    if uv.iter().any(|coordinate| !coordinate.is_finite()) {
-        return Err(invalid("image texture coordinates must be finite"));
-    }
-    let width_f64 = f64::from(image.width);
-    let height_f64 = f64::from(image.height);
-    let width_i64 = i64::from(image.width);
-    let height_i64 = i64::from(image.height);
-    if image.interpolation == crate::image::ImageInterpolation::Closest {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "wrapped coordinates are bounded by the u32 image dimensions"
-        )]
-        let x = (uv[0].rem_euclid(1.0) * width_f64).floor() as i64;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "wrapped coordinates are bounded by the u32 image dimensions"
-        )]
-        let y = (uv[1].rem_euclid(1.0) * height_f64).floor() as i64;
-        let x = usize::try_from(x.rem_euclid(width_i64))
-            .map_err(|_| invalid("image texture x coordinate is invalid"))?;
-        let y = usize::try_from(y.rem_euclid(height_i64))
-            .map_err(|_| invalid("image texture y coordinate is invalid"))?;
-        return Ok(image.pixels[y * width + x]);
-    }
-    let x = uv[0].rem_euclid(1.0) * width_f64 - 0.5;
-    let y = uv[1].rem_euclid(1.0) * height_f64 - 0.5;
-    let x_floor = x.floor();
-    let y_floor = y.floor();
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "wrapped coordinates are bounded by the u32 image dimensions"
-    )]
-    let x0 = x_floor as i64;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "wrapped coordinates are bounded by the u32 image dimensions"
-    )]
-    let y0 = y_floor as i64;
-    let x1 = (x0 + 1).rem_euclid(width_i64);
-    let y1 = (y0 + 1).rem_euclid(height_i64);
-    let x0 = usize::try_from(x0.rem_euclid(width_i64))
-        .map_err(|_| invalid("image texture x coordinate is invalid"))?;
-    let y0 = usize::try_from(y0.rem_euclid(height_i64))
-        .map_err(|_| invalid("image texture y coordinate is invalid"))?;
-    let x1 = usize::try_from(x1).map_err(|_| invalid("image texture x coordinate is invalid"))?;
-    let y1 = usize::try_from(y1).map_err(|_| invalid("image texture y coordinate is invalid"))?;
-    let fraction_x = x - x_floor;
-    let fraction_y = y - y_floor;
-    let top: [f64; 4] = std::array::from_fn(|channel| {
-        let first = image.pixels[y0 * width + x0][channel];
-        let second = image.pixels[y0 * width + x1][channel];
-        first + (second - first) * fraction_x
-    });
-    let bottom: [f64; 4] = std::array::from_fn(|channel| {
-        let first = image.pixels[y1 * width + x0][channel];
-        let second = image.pixels[y1 * width + x1][channel];
-        first + (second - first) * fraction_x
-    });
-    Ok(std::array::from_fn(|channel| {
-        top[channel] + (bottom[channel] - top[channel]) * fraction_y
-    }))
 }
 
 fn displace_inline_grid(grid: &mut VolumeGrid, texture: &VolumeDisplacement<'_>) -> Result<()> {
@@ -1050,32 +928,6 @@ fn append_instances(mesh: &Mesh, transforms: &[(DMat4, DVec3)]) -> Result<Mesh> 
     Ok(output)
 }
 
-fn value_noise_color(point: DVec3) -> [f64; 3] {
-    if !point.is_finite() || point.abs().max_element() > 9.0e18 {
-        return [0.5; 3];
-    }
-    let floor = point.floor();
-    let base = floor.to_array().map(|value| value as i64);
-    let mut fade = (point - floor).to_array();
-    for component in &mut fade {
-        *component = *component * *component * (3.0 - 2.0 * *component);
-    }
-    std::array::from_fn(|channel| {
-        let mut value = 0.0;
-        for z in 0..=1 {
-            for y in 0..=1 {
-                for x in 0..=1 {
-                    let cell = [base[0] + x, base[1] + y, base[2] + z];
-                    let weight = (if x == 0 { 1.0 - fade[0] } else { fade[0] })
-                        * (if y == 0 { 1.0 - fade[1] } else { fade[1] })
-                        * (if z == 0 { 1.0 - fade[2] } else { fade[2] });
-                    value += hash_value_noise(cell, channel) * weight;
-                }
-            }
-        }
-        value
-    })
-}
 
 fn sample_volume_grid(samples: &[f32], dims: [usize; 3], coordinate: [f64; 3]) -> f64 {
     if coordinate.iter().any(|value| !value.is_finite())
@@ -1151,18 +1003,6 @@ fn sample_volume_grid(samples: &[f32], dims: [usize; 3], coordinate: [f64; 3]) -
     )
 }
 
-fn hash_value_noise(point: [i64; 3], channel: usize) -> f64 {
-    let mut value = (point[0] as u64).wrapping_mul(0x9e37_79b9)
-        ^ (point[1] as u64).wrapping_mul(0x85eb_ca6b)
-        ^ (point[2] as u64).wrapping_mul(0xc2b2_ae35)
-        ^ (channel as u64).wrapping_mul(0x27d4_eb2d);
-    value ^= value >> 16;
-    value = value.wrapping_mul(0x7feb_352d);
-    value ^= value >> 15;
-    value = value.wrapping_mul(0x846c_a68b);
-    value ^= value >> 16;
-    (value as f64) / (u64::MAX as f64)
-}
 
 fn vertex_group_weight(mesh: &Mesh, face: &Face, params: &Map<String, Value>) -> f64 {
     let Some(group_name) = params.get("vertex_group").and_then(Value::as_str) else {
@@ -1432,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn volume_displace_resamples_and_rejects_unknown_textures() -> crate::error::Result<()> {
+    fn volume_displace_resamples_with_shared_texture() -> crate::error::Result<()> {
         let volume = VolumeData {
             grids: vec![VolumeGrid {
                 dims: [3, 1, 1],
@@ -1441,7 +1281,7 @@ mod tests {
             }],
             ..VolumeData::default()
         };
-        let unchanged = displace_volume(&volume, &Map::new(), "NONE", None, DMat4::IDENTITY, None)?;
+        let unchanged = displace_volume(&volume, &Map::new(), None, DMat4::IDENTITY, None)?;
         assert_eq!(
             unchanged.grids[0].values.as_deref(),
             Some(&[0.0_f32, 1.0, 0.0][..])
@@ -1462,8 +1302,7 @@ mod tests {
                 ("texture_mid_level".into(), json!([0.5, 0.5, 0.5])),
                 ("texture_sample_radius".into(), json!(0.0)),
             ]),
-            "IMAGE",
-            Some(&image),
+            Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
             DMat4::IDENTITY,
             None,
         )?;
@@ -1471,15 +1310,49 @@ mod tests {
             displaced.grids[0].values.as_deref(),
             Some(&[0.0_f32, 0.5, 0.5][..])
         );
-        let Err(error) =
-            displace_volume(&volume, &Map::new(), "VORONOI", None, DMat4::IDENTITY, None)
-        else {
-            return Err(crate::error::PotError::new(
-                crate::error::ErrorCode::InternalError,
-                "unsupported texture type unexpectedly succeeded",
-            ));
+        Ok(())
+    }
+    #[test]
+    fn volume_displace_object_mapping_without_object_uses_local_coordinates()
+    -> crate::error::Result<()> {
+        let volume = VolumeData {
+            grids: vec![VolumeGrid {
+                dims: [3, 1, 1],
+                values: Some(vec![0.0, 1.0, 0.0]),
+                ..VolumeGrid::default()
+            }],
+            ..VolumeData::default()
         };
-        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+        let image = crate::image::ImageData {
+            width: 1,
+            height: 1,
+            pixels: vec![[1.0, 0.5, 0.5, 1.0]],
+            tiles: std::collections::BTreeMap::new(),
+            interpolation: crate::image::ImageInterpolation::Linear,
+        };
+        let settings = |mode| {
+            Map::from_iter([
+                ("texture_map_mode".into(), json!(mode)),
+                ("strength".into(), json!(1.0)),
+                ("texture_mid_level".into(), json!([0.5, 0.5, 0.5])),
+                ("texture_sample_radius".into(), json!(0.0)),
+            ])
+        };
+        let local = displace_volume(
+            &volume,
+            &settings("LOCAL"),
+            Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
+            DMat4::from_translation(DVec3::new(2.0, 3.0, 4.0)),
+            None,
+        )?;
+        let object_without_target = displace_volume(
+            &volume,
+            &settings("OBJECT"),
+            Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
+            DMat4::from_translation(DVec3::new(2.0, 3.0, 4.0)),
+            None,
+        )?;
+        assert_eq!(object_without_target, local);
         Ok(())
     }
 }
