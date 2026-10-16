@@ -109,6 +109,8 @@ fn mesh_volume_round_trip_stays_within_one_voxel_of_source_bounds() {
         modifier_type: "mesh_to_volume".to_owned(),
         name: "Mesh to Volume".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::Map::from_iter([
             ("voxel_size".to_owned(), json!(voxel_size)),
             ("padding".to_owned(), json!(1)),

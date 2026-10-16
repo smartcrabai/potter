@@ -1732,17 +1732,58 @@ with open(os.path.join(root, 'subdivision_expected.json'), 'w', encoding='utf-8'
     let expected: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
     for (name, mesh, use_render_levels, params) in cases {
         let params: Map<String, Value> = serde_json::from_value(params)?;
-        let mut modifier = potter_core::model::Modifier {
+        let node_id = potter_core::model::Id::new(name.to_owned())?;
+        let data_id = potter_core::model::Id::new(format!("subdivision_{name}"))?;
+        let modifier = potter_core::model::Modifier {
             id: potter_core::model::Id::new("subdivision".to_owned())?,
             modifier_type: "subdivision".to_owned(),
             name: "Subdivision".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params,
             binding_data: None,
             runtime: potter_core::model::ModifierRuntime::default(),
         };
-        modifier.runtime.use_render_levels = use_render_levels;
-        let evaluated = potter_core::geom::modifiers::evaluate_modifiers(&mesh, &[modifier])?;
+        let mut doc =
+            potter_core::model::SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            potter_core::model::DataBlock {
+                mesh: Some(mesh.clone()),
+                ..potter_core::model::DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            potter_core::model::Node {
+                name: name.to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                modifiers: vec![modifier],
+                ..potter_core::model::Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&potter_core::model::Id::new("collection_root".to_owned())?)
+            .ok_or("root collection is missing")?
+            .objects
+            .push(node_id.clone());
+        let snapshot = potter_core::eval::Snapshot::evaluate(
+            &doc,
+            &potter_core::eval::EvaluationContext {
+                purpose: if use_render_levels {
+                    potter_core::eval::EvaluationPurpose::Render
+                } else {
+                    potter_core::eval::EvaluationPurpose::Preview
+                },
+                ..potter_core::eval::EvaluationContext::default()
+            },
+        )?;
+        let evaluated = snapshot
+            .meshes
+            .get(&node_id)
+            .ok_or("evaluated subdivision mesh is missing")?;
         let blender_positions = blender_points(&expected[name]["points"])?;
         assert_eq!(
             evaluated.vertices.len(),
@@ -2197,6 +2238,7 @@ fn volume_displace_resamples_inline_density_with_object_texture_mapping()
         &document,
         &potter_core::eval::EvaluationContext::default(),
         Some(&scene),
+        Some(&scene.join(".potter/cache")),
     )?;
     let values = snapshot
         .volume_data

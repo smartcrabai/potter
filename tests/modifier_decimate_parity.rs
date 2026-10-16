@@ -212,6 +212,8 @@ fn modifier(params: &Value) -> TestResult<Modifier> {
         modifier_type: "decimate".to_owned(),
         name: "decimate".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("modifier params must be an object")?

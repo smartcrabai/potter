@@ -140,6 +140,7 @@ fn mesh_positions(scene: &Path, frame: f64) -> Result<Vec<[f64; 3]>, Box<dyn Err
             ..potter_core::eval::EvaluationContext::default()
         },
         Some(project.path()),
+        Some(project.cache_directory()),
     )?;
     let mesh = snapshot
         .meshes

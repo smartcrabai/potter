@@ -7,7 +7,7 @@ use tempfile::tempdir;
 
 use super::{frame_output_names, render_camera_frame, render_vse_frame};
 use crate::{
-    eval::EvaluationContext,
+    eval::{EvaluationContext, EvaluationPurpose},
     model::{Scene, SceneDoc},
     ops::apply_batch,
     sequencer::{EffectType, Strip, StripType, TransitionType},
@@ -40,6 +40,7 @@ fn render(
     width: u32,
     height: u32,
 ) -> crate::error::Result<crate::sequencer::RgbaFrame> {
+    let cache_directory = root.join(".potter/cache");
     let mut warnings = Vec::new();
     render_vse_frame(
         doc,
@@ -48,6 +49,7 @@ fn render(
         width,
         height,
         root,
+        &cache_directory,
         "realtime",
         1,
         0,
@@ -171,18 +173,19 @@ fn scene_strips_match_their_source_camera_render() -> Result<(), Box<dyn Error>>
     let context = EvaluationContext {
         scene_id: Some(scene_id),
         frame: Some(1.0),
+        purpose: EvaluationPurpose::Render,
         ..EvaluationContext::default()
     };
     let (_, raster, _) = render_camera_frame(
         &doc,
         &context,
         directory.path(),
+        directory.path().join(".potter/cache").as_path(),
         "camera_main",
         1,
         1,
         "beauty",
         "realtime",
-        true,
         false,
         1,
         0,

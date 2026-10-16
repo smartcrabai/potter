@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     hash,
     model::{CameraProjection, Id, SceneDoc},
 };
@@ -35,7 +35,6 @@ pub struct PreviewRequest<'a> {
     pub out: Option<&'a Path>,
     pub overwrite: bool,
     pub context: &'a EvaluationContext,
-    pub render_visibility: bool,
     pub staged_assets: Option<&'a BTreeMap<String, Vec<u8>>>,
 }
 
@@ -76,7 +75,8 @@ impl Drop for StagedView {
 
 pub fn render_previews(
     doc: &SceneDoc,
-    scene_root: &Path,
+    project_root: &Path,
+    cache_directory: &Path,
     request: &PreviewRequest<'_>,
 ) -> Result<Vec<Value>> {
     if !(MIN_SIZE..=MAX_SIZE).contains(&request.size) {
@@ -88,21 +88,19 @@ pub fn render_previews(
     }
     let mode = parse_mode(request.mode)?;
     let labels = resolve_views(request.views, request.camera_id)?;
-    let (snapshot, node_errors) =
-        Snapshot::evaluate_available_with_cache(doc, request.context, Some(scene_root))?;
+    let (snapshot, node_errors) = Snapshot::evaluate_available_with_cache(
+        doc,
+        request.context,
+        Some(project_root),
+        Some(cache_directory),
+    )?;
     let images = if matches!(mode, Mode::Beauty) {
-        super::path::load_images(doc, scene_root, request.staged_assets)?
+        super::path::load_images(doc, project_root, request.staged_assets)?
     } else {
         BTreeMap::new()
     };
-    let mut geometry = extract_geometry(
-        doc,
-        &snapshot,
-        mode,
-        request.render_visibility,
-        matches!(mode, Mode::Beauty),
-        &images,
-    )?;
+    let mut geometry =
+        extract_geometry(doc, &snapshot, mode, matches!(mode, Mode::Beauty), &images)?;
     for (node_id, error) in &node_errors {
         geometry.warnings.push(json!({
             "code": "UNSUPPORTED_FEATURE",
@@ -171,7 +169,6 @@ pub fn render_previews(
             &prepared,
             &label,
             mode,
-            request.render_visibility,
             request.size,
             background,
             &raster,
@@ -186,7 +183,7 @@ pub fn render_previews(
             let key = render_key.strip_prefix("sha256:").ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "render key has an invalid prefix")
             })?;
-            scene_root
+            project_root
                 .join(".potter/previews")
                 .join(format!("r{}", snapshot.revision))
                 .join(key)
@@ -217,13 +214,13 @@ pub fn render_previews(
 pub(crate) fn render_camera_frame(
     doc: &SceneDoc,
     context: &EvaluationContext,
+    project_root: &Path,
     cache_directory: &Path,
     camera_id: &str,
     width: u32,
     height: u32,
     mode_name: &str,
     engine: &str,
-    render_visibility: bool,
     film_transparent: bool,
     samples: u32,
     seed: u32,
@@ -234,13 +231,13 @@ pub(crate) fn render_camera_frame(
         ));
     }
     let mode = parse_mode(mode_name)?;
-    let snapshot = Snapshot::evaluate_with_cache(doc, context, Some(cache_directory))?;
-    let images = super::path::load_images(doc, cache_directory, None)?;
+    let snapshot =
+        Snapshot::evaluate_with_cache(doc, context, Some(project_root), Some(cache_directory))?;
+    let images = super::path::load_images(doc, project_root, None)?;
     let geometry = extract_geometry(
         doc,
         &snapshot,
         mode,
-        render_visibility,
         engine == "path" && matches!(mode, Mode::Beauty),
         &images,
     )?;
@@ -551,6 +548,14 @@ fn linear_to_byte(value: f64) -> u8 {
     (srgb * 255.0).round() as u8
 }
 
+/// Manifest `visibility` naming the modifier stack a render or preview evaluated.
+pub(crate) fn visibility_name(purpose: EvaluationPurpose) -> &'static str {
+    match purpose {
+        EvaluationPurpose::Preview => "viewport",
+        EvaluationPurpose::Render => "render",
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "manifest construction includes every value in the render-key contract"
@@ -562,7 +567,6 @@ fn manifest_value(
     prepared: &PreparedCamera,
     view: &str,
     mode: Mode,
-    render_visibility: bool,
     size: u32,
     background: [u8; 4],
     raster: &RasterOutput,
@@ -625,7 +629,7 @@ fn manifest_value(
         "seed": 0,
         "mode": mode_name,
         "background": background,
-        "visibility": if render_visibility { "render" } else { "viewport" },
+        "visibility": visibility_name(snapshot.purpose),
         "transparent": false,
         "ambient": if ambient { json!({ "color": [0.08, 0.08, 0.08], "source": "default_no_lights_or_world" }) } else { Value::Null },
         "engine": "cpu",

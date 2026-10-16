@@ -1400,11 +1400,11 @@ def object_dump(obj):
     materials = []
     for slot in obj.material_slots:
         materials.append(slot.material.name_full if slot.material else None)
-    modifiers = []
     try:
         modifier_ids = json.loads(obj.get("potter.modifier_ids_json", "{}"))
     except Exception:
         modifier_ids = {}
+    modifiers = []
     for modifier in obj.modifiers:
         properties = modifier_params(modifier)
         if modifier.type == "NODES":
@@ -1428,9 +1428,17 @@ def object_dump(obj):
                 }
             finally:
                 evaluated_target.to_mesh_clear()
-        modifiers.append({"name": modifier.name, "type": modifier.type,
-                          "potter_id": modifier_ids.get(modifier.name),
-                          "enabled": bool(modifier.show_viewport and modifier.show_render),
+        metadata = modifier_ids.get(modifier.name, {})
+        if isinstance(metadata, str):
+            metadata = {"id": metadata, "name": modifier.name}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        modifiers.append({"name": metadata.get("name", modifier.name),
+                          "blender_name": modifier.name, "type": modifier.type,
+                          "potter_id": metadata.get("id"),
+                          "enabled": True,  # Blender has no global switch; always on.
+                          "show_viewport": bool(modifier.show_viewport),
+                          "show_render": bool(modifier.show_render),
                           "properties": properties,
                           "native_target_mesh": native_target_mesh,
                           "physics_settings": _physics_modifier_settings(obj, modifier),
@@ -2155,6 +2163,296 @@ def _create_modifier(obj, name, modifier_type):
         if temporarily_linked:
             scene.collection.objects.unlink(obj)
 
+
+# Blender's modifier-stack insertion and move constraints. Keep these in sync with Blender's
+# ModifierTypeType::OnlyDeform and ModifierTypeFlag::RequiresOriginalData rules.
+_ONLY_DEFORM_MODIFIER_TYPES = frozenset((
+    "ARMATURE", "CAST", "CLOTH", "COLLISION", "CORRECTIVE_SMOOTH", "CURVE", "DISPLACE", "HOOK",
+    "LAPLACIANDEFORM", "LAPLACIANSMOOTH", "LATTICE", "MESH_CACHE", "MESH_DEFORM",
+    "PARTICLE_SYSTEM", "SHRINKWRAP", "SIMPLE_DEFORM", "SMOOTH", "SOFT_BODY", "SURFACE_DEFORM",
+    "WARP", "WAVE",
+))
+_ORIGINAL_DATA_MODIFIER_TYPES = frozenset(("MULTIRES", "SOFT_BODY"))
+
+
+def _modifier_stack_state(obj, ids_by_blender_name):
+    return [(ids_by_blender_name[modifier.name], modifier.type, bool(modifier.use_pin_to_last))
+            for modifier in obj.modifiers]
+
+
+def _stack_mismatch_message(obj_name, expected, actual, actual_names):
+    expected_states = [(identifier, modifier_type, pinned)
+                       for identifier, _, modifier_type, pinned in expected]
+    for index, (want, have) in enumerate(zip(expected_states, actual)):
+        if want[0] != have[0]:
+            name = expected[index][1]
+            return ("cannot reproduce modifier order on %s: expected %s at position %d, "
+                    "Blender has %s there"
+                    % (obj_name, name, index, actual_names.get(have[0], have[0])))
+        if want[1] != have[1]:
+            return ("cannot reproduce modifier type on %s: %s must be %s"
+                    % (obj_name, expected[index][1], want[1]))
+        if want[2] != have[2]:
+            return ("cannot reproduce modifier pin on %s: %s must be %s"
+                    % (obj_name, expected[index][1],
+                       "pinned to last" if want[2] else "unpinned"))
+    if len(expected) > len(actual):
+        name = expected[len(actual)][1]
+        return ("cannot reproduce modifier order on %s: expected %s at position %d, "
+                "Blender has no modifier there" % (obj_name, name, len(actual)))
+    if len(actual) > len(expected):
+        identifier = actual[len(expected)][0]
+        name = actual_names.get(identifier, identifier)
+        return ("cannot reproduce modifier order on %s: unexpected modifier %s at position %d"
+                % (obj_name, name, len(expected)))
+    return "cannot reproduce modifier order on %s" % obj_name
+
+
+def _insertion_index(stack, modifier_type):
+    if modifier_type == "HOOK" or modifier_type in _ORIGINAL_DATA_MODIFIER_TYPES:
+        index = 0
+        while index < len(stack) and stack[index][1] in _ONLY_DEFORM_MODIFIER_TYPES:
+            if index + 1 < len(stack) and stack[index + 1][2]:
+                break
+            index += 1
+        return index
+    index = len(stack)
+    while index > 0 and stack[index - 1][2]:
+        index -= 1
+    return index
+
+
+def _may_move_before(modifier, previous):
+    unpins_past_pinned = modifier[2] and not previous[2]
+    past_original_data = (
+        previous[1] in _ORIGINAL_DATA_MODIFIER_TYPES
+        and modifier[1] not in _ONLY_DEFORM_MODIFIER_TYPES
+    )
+    return not (unpins_past_pinned or past_original_data)
+
+
+def _may_move_after(modifier, following):
+    unpins_before_pinned = following[2] and not modifier[2]
+    past_non_deform = (
+        modifier[1] in _ORIGINAL_DATA_MODIFIER_TYPES
+        and following[1] not in _ONLY_DEFORM_MODIFIER_TYPES
+    )
+    return not (unpins_before_pinned or past_non_deform)
+
+
+def _move_stack_modifier(stack, source, destination, allow_partial=False):
+    modifier = stack[source]
+    current = source
+    if source < destination:
+        while current < destination and _may_move_after(modifier, stack[current + 1]):
+            current += 1
+    else:
+        while current > destination and _may_move_before(modifier, stack[current - 1]):
+            current -= 1
+    if current != destination and not allow_partial:
+        return
+    if current != source:
+        stack.insert(current, stack.pop(source))
+
+
+def _set_stack_pin(stack, index, pinned):
+    identifier, modifier_type, _ = stack[index]
+    stack[index] = (identifier, modifier_type, pinned)
+    destination = index
+    if pinned:
+        while destination + 1 < len(stack) and not stack[destination + 1][2]:
+            destination += 1
+    else:
+        while destination > 0 and stack[destination - 1][2]:
+            destination -= 1
+    _move_stack_modifier(stack, index, destination, allow_partial=True)
+
+
+
+def _apply_stack_operation(state, operation):
+    stack = list(state)
+    kind = operation[0]
+    if kind == "create":
+        _, identifier, _, modifier_type = operation
+        stack.insert(_insertion_index(stack, modifier_type), (identifier, modifier_type, False))
+    elif kind == "pin":
+        _, identifier, pinned = operation
+        index = next(index for index, modifier in enumerate(stack)
+                     if modifier[0] == identifier)
+        _set_stack_pin(stack, index, pinned)
+    else:
+        _, identifier, destination = operation
+        source = next(index for index, modifier in enumerate(stack)
+                      if modifier[0] == identifier)
+        _move_stack_modifier(stack, source, destination)
+    return tuple(stack)
+
+
+def _search_operations(state, target):
+    present = {modifier[0] for modifier in state}
+    operations = [("create", identifier, name, modifier_type)
+                  for identifier, name, modifier_type, _ in target
+                  if identifier not in present]
+    operations.extend(("pin", identifier, not pinned)
+                      for identifier, _, pinned in state)
+    count = len(state)
+    operations.extend(("move", state[source][0], destination)
+                      for source in range(count) for destination in range(count)
+                      if source != destination)
+    return operations
+
+
+def _matched_prefix(state, expected):
+    length = 0
+    for have, want in zip(state, expected):
+        if have != want:
+            break
+        length += 1
+    return length
+
+
+def _plan_modifier_stack(obj, target, ids_by_blender_name):
+    """Search Blender's finite modifier-operation state space for Potter's exact stack.
+
+    Modifier IDs define identity throughout the search; Blender RNA names are only used when
+    replaying a creation and are allowed to remain unique independently of Potter display names.
+    """
+    expected = tuple((identifier, modifier_type, pinned)
+                     for identifier, _, modifier_type, pinned in target)
+    start = tuple(_modifier_stack_state(obj, ids_by_blender_name))
+    if start == expected:
+        return []
+    parents = {start: None}
+    best = _matched_prefix(start, expected)
+    pending = [start]
+    found = None
+    while pending:
+        state = pending.pop()
+        operations = _search_operations(state, target)
+        for operation in reversed(operations):
+            next_state = _apply_stack_operation(state, operation)
+            if next_state == state or next_state in parents:
+                continue
+            parents[next_state] = (state, operation)
+            best = max(best, _matched_prefix(next_state, expected))
+            if next_state == expected:
+                found = next_state
+                break
+            pending.append(next_state)
+        if found is not None:
+            break
+    if found is None:
+        raise ValueError(
+            "cannot reproduce modifier order on %s: the order is not reachable with Blender operations; "
+            "first target position %d (%s, pinned to last=%s) is never reached"
+            % (obj.name, best, target[best][1], target[best][3]))
+    result = []
+    while parents[found] is not None:
+        previous, operation = parents[found]
+        result.append(operation)
+        found = previous
+    result.reverse()
+    return result
+
+
+def _execute_stack_op(obj, operation, modifiers_by_id):
+    kind = operation[0]
+    if kind == "move":
+        # Blender may refuse or silently skip a constrained move; final state verification is
+        # authoritative and never relies on the move call reporting success.
+        try:
+            target = modifiers_by_id[operation[1]]
+            source = next(index for index, modifier in enumerate(obj.modifiers)
+                          if modifier.name == target.name)
+            obj.modifiers.move(source, operation[2])
+        except RuntimeError:
+            pass
+        return
+    identifier = operation[1]
+    try:
+        if kind == "create":
+            _, _, name, modifier_type = operation
+            modifiers_by_id[identifier] = _create_modifier(obj, name, modifier_type)
+        else:
+            modifiers_by_id[identifier].use_pin_to_last = operation[2]
+    except Exception as error:
+        raise RuntimeError("cannot reconstruct modifier %s" % identifier) from error
+
+
+def _restore_modifier_stack(obj, modifier_items):
+    """Make Blender's stack equal Potter's order and pin flags, or raise a precise ValueError.
+
+    Potter IDs drive planning and replay. Existing unannotated Blender modifiers are matched by
+    their unique RNA names only to preserve legacy native modifier settings.
+    """
+    target = [
+        (item.get("id") or "legacy_modifier_%d" % index,
+         item["name"], blender_modifier_type(item["type"]),
+         bool(item.get("params", {}).get("use_pin_to_last", False)))
+        for index, item in enumerate(modifier_items)
+    ]
+    target_ids = [item[0] for item in target]
+    if len(set(target_ids)) != len(target_ids):
+        raise ValueError("modifier IDs must be unique on %s" % obj.name)
+    target_types = {identifier: modifier_type for identifier, _, modifier_type, _ in target}
+    try:
+        annotations = json.loads(obj.get("potter.modifier_ids_json", "{}"))
+    except Exception:
+        annotations = {}
+    if not isinstance(annotations, dict):
+        annotations = {}
+    modifiers_by_id = {}
+    ids_by_blender_name = {}
+    for modifier in obj.modifiers:
+        annotation = annotations.get(modifier.name)
+        identifier = (annotation.get("id") if isinstance(annotation, dict)
+                      else annotation if isinstance(annotation, str) else None)
+        if isinstance(identifier, str) and identifier:
+            if identifier in modifiers_by_id:
+                raise ValueError("duplicate Potter modifier ID %s on %s"
+                                 % (identifier, obj.name))
+            modifiers_by_id[identifier] = modifier
+            ids_by_blender_name[modifier.name] = identifier
+    for identifier, name, modifier_type, _ in target:
+        if identifier in modifiers_by_id:
+            continue
+        for modifier in obj.modifiers:
+            if (modifier.name in ids_by_blender_name or modifier.type != modifier_type):
+                continue
+            rna_name_matches = (
+                modifier.name == name
+                or (modifier.name.startswith(name + ".")
+                    and modifier.name[len(name) + 1:].isdigit())
+            )
+            if rna_name_matches:
+                modifiers_by_id[identifier] = modifier
+                ids_by_blender_name[modifier.name] = identifier
+                break
+    for modifier in list(obj.modifiers):
+        blender_name = modifier.name
+        identifier = ids_by_blender_name.get(blender_name)
+        if target_types.get(identifier) != modifier.type:
+            obj.modifiers.remove(modifier)
+            if identifier is not None:
+                modifiers_by_id.pop(identifier, None)
+            ids_by_blender_name.pop(blender_name, None)
+    for operation in _plan_modifier_stack(obj, target, ids_by_blender_name):
+        _execute_stack_op(obj, operation, modifiers_by_id)
+        if operation[0] == "create":
+            ids_by_blender_name[modifiers_by_id[operation[1]].name] = operation[1]
+    actual = tuple(_modifier_stack_state(obj, ids_by_blender_name))
+    expected = tuple((identifier, modifier_type, pinned)
+                     for identifier, _, modifier_type, pinned in target)
+    actual_names = {identifier: modifier.name
+                    for identifier, modifier in modifiers_by_id.items()}
+    if actual != expected:
+        raise ValueError(_stack_mismatch_message(obj.name, target, actual, actual_names))
+    obj["potter.modifier_ids_json"] = json.dumps(
+        {modifiers_by_id[identifier].name: {"id": identifier, "name": name}
+         for identifier, name, _, _ in target},
+        sort_keys=True,
+    )
+    return modifiers_by_id
 
 
 
@@ -5184,11 +5482,6 @@ def export_doc(doc, target, pack, scene_hash, context):
         set_rna(obj, visibility_rna)
         if item.get("tags"):
             obj["potter.tags"] = item["tags"]
-        if item.get("modifiers"):
-            obj["potter.modifier_ids_json"] = json.dumps(
-                {modifier["name"]: modifier["id"] for modifier in item["modifiers"]},
-                sort_keys=True,
-            )
         for material_id in item.get("materials", []):
             material = material_map.get(material_id)
             if material and obj.type in ("MESH", "CURVE", "SURFACE", "FONT", "GREASEPENCIL"):
@@ -5302,29 +5595,38 @@ def export_doc(doc, target, pack, scene_hash, context):
             continue
         obj = object_map[node_id]
         source_object = compatibility_block(doc, "objects", "Object", node_id)
-        source_modifiers = {modifier.get("name"): modifier
-                            for modifier in source_object.get("modifiers", [])}
-        for modifier_item in item.get("modifiers", []):
+        source_modifiers = {
+            modifier.get("potter_id"): modifier
+            for modifier in source_object.get("modifiers", [])
+            if isinstance(modifier.get("potter_id"), str)
+        }
+        source_modifiers_by_rna_name = {
+            modifier.get("blender_name", modifier.get("name")): modifier
+            for modifier in source_object.get("modifiers", [])
+        }
+        modifier_items = item.get("modifiers", [])
+        modifiers_by_id = _restore_modifier_stack(obj, modifier_items)
+        for modifier_item in modifier_items:
             try:
                 params = modifier_item.get("params", {})
-                modifier_type = blender_modifier_type(modifier_item["type"])
-                modifier = obj.modifiers.get(modifier_item["name"])
-                if modifier is not None and modifier.type != modifier_type:
-                    obj.modifiers.remove(modifier)
-                    modifier = None
-                if modifier is None:
-                    modifier = _create_modifier(
-                        obj, modifier_item["name"], modifier_type)
-                modifier.show_viewport = modifier_item.get("enabled", True)
-                modifier.show_render = modifier_item.get("enabled", True)
+                modifier = modifiers_by_id[modifier_item["id"]]
+                enabled = modifier_item.get("enabled", True)
+                modifier.show_viewport = bool(enabled and modifier_item.get("show_viewport", True))
+                modifier.show_render = bool(enabled and modifier_item.get("show_render", True))
+                rna_item = dict(modifier_item, params={
+                    key: value for key, value in params.items() if key != "use_pin_to_last"})
                 set_modifier_params(
-                    modifier, modifier_item, id_lookup, doc, target, node_id, obj)
+                    modifier, rna_item, id_lookup, doc, target, node_id, obj)
                 if modifier_item.get("type") == "mesh_sequence_cache":
                     cache_file = _cache_file_for_resource(
                         doc, params["resource"], target, params)
                     modifier.cache_file = cache_file
                     modifier.object_path = params["object_path"]
-                source_modifier = source_modifiers.get(modifier_item.get("name"), {})
+                source_modifier = (
+                    source_modifiers.get(modifier_item.get("id"))
+                    or source_modifiers_by_rna_name.get(modifier_item.get("name"))
+                    or {}
+                )
                 source_properties = source_modifier.get("properties", {})
                 if modifier.type == "NODES":
                     model_params = modifier_item.get("params", {})
@@ -5353,12 +5655,6 @@ def export_doc(doc, target, pack, scene_hash, context):
                 raise RuntimeError(
                     "cannot reconstruct modifier %s (%s)" % (modifier_item.get("name"), modifier_item.get("type"))
                 ) from error
-        desired_modifier_names = {
-            modifier.get("name") for modifier in item.get("modifiers", [])
-        }
-        for modifier in list(obj.modifiers):
-            if modifier.name not in desired_modifier_names:
-                obj.modifiers.remove(modifier)
     for node_id, item in doc.get("nodes", {}).items():
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]

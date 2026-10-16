@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::ModifierEvaluationContext,
     graph::{self, NodeGroup},
     model::{Id, Modifier, Registry},
     params::{self, ParameterFamily},
@@ -136,6 +137,8 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
+        ModifierEvaluationContext::default(),
+        |_, modifier| modifier.enabled,
         custom_modifier,
     )
 }
@@ -150,6 +153,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     object_meshes: &BTreeMap<Id, &Mesh>,
     evaluated_object_meshes: &BTreeMap<Id, Mesh>,
     curve_path_lengths: &BTreeMap<Id, f64>,
+    context: ModifierEvaluationContext<'_>,
+    is_active: impl Fn(usize, &Modifier) -> bool,
     mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     if !frame.is_finite() {
@@ -162,9 +167,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     for (modifier_index, modifier) in modifiers
         .iter()
         .enumerate()
-        .filter(|(_, modifier)| modifier.enabled)
+        .filter(|&(modifier_index, modifier)| is_active(modifier_index, modifier))
     {
-        validate_boolean_topology_suffix(modifiers, modifier_index)?;
+        validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
         let scene_operand_modifier = (matches!(
             modifier.modifier_type.as_str(),
             "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform"
@@ -289,7 +294,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 evaluated_object_meshes,
                 curve_path_lengths,
             )?,
-            "subdivision" | "multires" => subdivision(&evaluated, modifier)?,
+            "subdivision" | "multires" => subdivision(&evaluated, modifier, context)?,
             "solidify" => solidify(&evaluated, modifier)?,
             "triangulate" => triangulate(&evaluated, modifier)?,
             "bevel" => bevel(&evaluated, modifier)?,
@@ -298,7 +303,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "displace" => displace(&evaluated, modifier, owner_world_matrix)?,
             "smooth" => smooth(&evaluated, modifier)?,
             "simple_deform" => advanced::simple_deform(&evaluated, modifier)?,
-            "screw" => advanced::screw(&evaluated, modifier)?,
+            "screw" => advanced::screw(&evaluated, modifier, context)?,
             "shrinkwrap" => advanced::shrinkwrap(&evaluated, modifier)?,
             "curve" => advanced::curve(&evaluated, modifier)?,
             "hook" => advanced::hook(&evaluated, modifier)?,
@@ -324,7 +329,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,
             "remesh" => remesh_modes::remesh_modifier(&evaluated, modifier)?,
-            "ocean" => ocean::ocean(&evaluated, modifier, frame)?,
+            "ocean" => ocean::ocean(&evaluated, modifier, frame, context)?,
             _ => return Err(unsupported_modifier(modifier)),
         };
         let dropped: Vec<String> = attributes_before
@@ -466,17 +471,22 @@ fn modifier_depends_on_topology(modifier: &Modifier) -> bool {
 pub(crate) fn validate_boolean_topology_suffix(
     modifiers: &[Modifier],
     modifier_index: usize,
+    is_active: &impl Fn(usize, &Modifier) -> bool,
 ) -> Result<()> {
     let Some(boolean_modifier) = modifiers.get(modifier_index) else {
         return Ok(());
     };
-    if !boolean_modifier.enabled || boolean_modifier.modifier_type != "boolean" {
+    if !is_active(modifier_index, boolean_modifier) || boolean_modifier.modifier_type != "boolean" {
         return Ok(());
     }
     let Some(downstream) = modifiers
         .iter()
+        .enumerate()
         .skip(modifier_index + 1)
-        .find(|candidate| candidate.enabled && modifier_depends_on_topology(candidate))
+        .find(|(index, candidate)| {
+            is_active(*index, candidate) && modifier_depends_on_topology(candidate)
+        })
+        .map(|(_, modifier)| modifier)
     else {
         return Ok(());
     };
@@ -2128,9 +2138,13 @@ struct SubdivisionOptions {
     raw_normals: bool,
 }
 
-fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+fn subdivision(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    context: ModifierEvaluationContext<'_>,
+) -> Result<Mesh> {
     validated(mesh)?;
-    let level_name = if modifier.runtime.use_render_levels {
+    let level_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
         "render_levels"
     } else {
         "levels"
@@ -5197,6 +5211,8 @@ mod tests {
             modifier_type: modifier_type.to_owned(),
             name: "Modifier".to_owned(),
             enabled,
+            show_viewport: true,
+            show_render: true,
             params: serde_json::Map::new(),
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),

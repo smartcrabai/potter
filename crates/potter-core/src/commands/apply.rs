@@ -6,7 +6,7 @@ use crate::{
     cli::ApplyArgs,
     commands::util::check_base_revision,
     error::{ErrorCode, PotError, Result},
-    eval::EvaluationContext,
+    eval::{EvaluationContext, EvaluationPurpose},
     model::Id,
     ops,
     render::{PreviewRequest, render_previews},
@@ -44,7 +44,12 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
     let mut project = Project::open_exclusive(args.scene)?;
     check_base_revision(project.doc(), base_revision)?;
     let before = project.doc().clone();
-    let outcome = ops::apply_batch_with_asset_root(&before, &batch, project.path())?;
+    let outcome = ops::apply_batch_with_project_context(
+        &before,
+        &batch,
+        project.path(),
+        Some(project.cache_directory()),
+    )?;
     let warnings = serde_json::to_value(&outcome.warnings).map_err(PotError::internal_json)?;
     let candidate_revision = if outcome.changed {
         base_revision
@@ -66,6 +71,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
         render_candidate_preview(
             &candidate,
             project.path(),
+            project.cache_directory(),
             &batch,
             &outcome.asset_blobs,
             views_csv,
@@ -112,6 +118,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
 fn render_candidate_preview(
     candidate: &crate::model::SceneDoc,
     scene_root: &Path,
+    cache_directory: &Path,
     batch: &Value,
     staged_assets: &std::collections::BTreeMap<String, Vec<u8>>,
     views_csv: &str,
@@ -155,10 +162,12 @@ fn render_candidate_preview(
         scene_id,
         view_layer,
         frame,
+        purpose: EvaluationPurpose::Preview,
     };
     render_previews(
         candidate,
         scene_root,
+        cache_directory,
         &PreviewRequest {
             views: &views,
             camera_id: camera_id.as_deref(),
@@ -167,7 +176,6 @@ fn render_candidate_preview(
             out: None,
             overwrite: false,
             context: &context,
-            render_visibility: false,
             staged_assets: Some(staged_assets),
         },
     )
