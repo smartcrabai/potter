@@ -111,6 +111,26 @@ fn bullet_hull_faces(points: &[DVec3], input: &[usize]) -> Result<Vec<Vec<usize>
     clippy::manual_midpoint,
     reason = "matches Blender's float evaluation order for parity"
 )]
+pub(super) fn skin_with_warnings(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    warnings: &mut Vec<PotError>,
+) -> Result<Mesh> {
+    match skin(mesh, modifier) {
+        Err(error)
+            if error
+                .details
+                .get("modifier_warning")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            warnings.push(error);
+            Ok(mesh.clone())
+        }
+        result => result,
+    }
+}
+
 pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let source_positions = positions(mesh);
     let source_indices = id_indices(mesh);
@@ -1314,7 +1334,11 @@ fn edge_matrices(
     mats.into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
-            invalid_parameter(modifier, "mesh", "a root vertex in every connected skeleton")
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "No valid root vertex found (you need one per mesh island you want to skin)",
+                serde_json::json!({"modifier_id":modifier.id,"modifier_warning":true}),
+            )
         })
 }
 

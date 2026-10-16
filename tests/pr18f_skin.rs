@@ -800,10 +800,13 @@ fn zero_average_edge_radius_is_accepted_without_subdivision() {
     assert_eq!(result.faces.len(), 6);
 }
 #[test]
-fn skeleton_without_root_is_invalid() {
+fn skeleton_without_root_reports_blender_modifier_warning_and_keeps_input() {
     let mesh = skeleton(&LINE_INPUT_VERTICES, &LINE_EDGES, Some(&LINE_NO_ROOT_SKIN));
-    let error = evaluate_modifiers(&mesh, &[skin_modifier(json!({}))]).unwrap_err();
-    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    let result = evaluate_modifiers(&mesh, &[skin_modifier(json!({}))]).unwrap();
+    assert_eq!(result.mesh, mesh);
+    assert_eq!(result.warnings.len(), 1);
+    assert_eq!(result.warnings[0].details["modifier_warning"], true);
+    assert!(result.warnings[0].message.contains("No valid root vertex"));
 }
 
 const MIDDLE_ROOT_VERTICES: [[f64; 3]; 24] = [
