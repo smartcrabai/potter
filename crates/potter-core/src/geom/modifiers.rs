@@ -138,6 +138,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         ModifierEvaluationContext::default(),
+        |_, modifier| modifier.enabled,
         custom_modifier,
     )
 }
@@ -153,6 +154,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     evaluated_object_meshes: &BTreeMap<Id, Mesh>,
     curve_path_lengths: &BTreeMap<Id, f64>,
     context: ModifierEvaluationContext<'_>,
+    is_active: impl Fn(usize, &Modifier) -> bool,
     mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     if !frame.is_finite() {
@@ -165,9 +167,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     for (modifier_index, modifier) in modifiers
         .iter()
         .enumerate()
-        .filter(|(_, modifier)| modifier.enabled)
+        .filter(|&(modifier_index, modifier)| is_active(modifier_index, modifier))
     {
-        validate_boolean_topology_suffix(modifiers, modifier_index)?;
+        validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
         let scene_operand_modifier = (matches!(
             modifier.modifier_type.as_str(),
             "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform"
@@ -469,20 +471,25 @@ fn modifier_depends_on_topology(modifier: &Modifier) -> bool {
 pub(crate) fn validate_boolean_topology_suffix(
     modifiers: &[Modifier],
     modifier_index: usize,
+    is_active: &impl Fn(usize, &Modifier) -> bool,
 ) -> Result<()> {
     let Some(boolean_modifier) = modifiers.get(modifier_index) else {
         return Ok(());
     };
-    if !boolean_modifier.enabled || boolean_modifier.modifier_type != "boolean" {
+    if !is_active(modifier_index, boolean_modifier) || boolean_modifier.modifier_type != "boolean" {
         return Ok(());
     }
     let Some(downstream) = modifiers
         .iter()
+        .enumerate()
         .skip(modifier_index + 1)
-        .find(|candidate| candidate.enabled && modifier_depends_on_topology(candidate))
+        .find(|(index, candidate)| {
+            is_active(*index, candidate) && modifier_depends_on_topology(candidate)
+        })
+        .map(|(_, modifier)| modifier)
     else {
         return Ok(());
-    };
+    }
     Err(PotError::with_details(
         ErrorCode::UnsupportedFeature,
         "Boolean output topology is not Blender-compatible for a downstream topology-dependent modifier",
