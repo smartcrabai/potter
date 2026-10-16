@@ -93,6 +93,49 @@ fn edge_key(a: usize, b: usize) -> (usize, usize) {
     (a.min(b), a.max(b))
 }
 
+/// Fixture UV rows are Blender V-up values in face/corner order; modifier evaluation uses Potter's
+/// canonical face-keyed store with V down.
+fn fixture_uv_layers(layers: &[Value], mesh: &Mesh) -> TestResult<Value> {
+    let corner_count: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+    let mut converted = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let name = layer["name"].as_str().ok_or("UV layer name missing")?;
+        let values = layer["values"]
+            .as_array()
+            .ok_or("UV layer values missing")?;
+        if values.len() != corner_count {
+            return Err("UV layer corner count differs from input mesh".into());
+        }
+        let mut corner = 0;
+        let faces = mesh
+            .faces
+            .iter()
+            .map(|face| {
+                let end = corner + face.vertices.len();
+                let row: Vec<[f64; 2]> = values[corner..end]
+                    .iter()
+                    .map(|value| {
+                        let [u, v] = uv_pair(value);
+                        [u, 1.0 - v]
+                    })
+                    .collect();
+                corner = end;
+                json!({"face_id": face.id, "uv": row})
+            })
+            .collect::<Vec<_>>();
+        converted.push(json!({"name": name, "faces": faces}));
+    }
+    let first = converted
+        .first()
+        .and_then(|layer| layer["name"].as_str())
+        .map(str::to_owned);
+    Ok(json!({
+        "layers": converted,
+        "active": first.clone(),
+        "render": first,
+    }))
+}
+
 /// Rebuilds the Blender input in Potter: same vertex and edge order, face material indices, UV corner
 /// values, vertex-group weights, edge flags (native `seam`/`sharp` or `blender_edge_flags`) and
 /// point/edge attributes.
@@ -165,8 +208,12 @@ fn input_mesh(input: &Value) -> TestResult<Mesh> {
     ) {
         face.material_index = u32::try_from(material.as_u64().ok_or("material index")?)?;
     }
-    mesh.attributes
-        .insert("blender_uv_layers".to_owned(), input["uv_layers"].clone());
+    if let Some(layers) = input.get("uv_layers").and_then(Value::as_array)
+        && !layers.is_empty()
+    {
+        mesh.attributes
+            .insert("uv_layers".to_owned(), fixture_uv_layers(layers, &mesh)?);
+    }
     let mut groups = Map::new();
     for (name, members) in input["vertex_groups"].as_object().ok_or("groups missing")? {
         let mut weights = Map::new();
@@ -418,18 +465,26 @@ fn compare(case: &Value) -> TestResult<Report> {
     }
     let potter_layers: Vec<(String, Vec<[f64; 2]>)> = output
         .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
+        .get("uv_layers")
+        .and_then(|store| store["layers"].as_array())
         .into_iter()
         .flatten()
         .map(|layer| {
             let name = layer["name"].as_str().unwrap_or_default().to_owned();
-            let values = layer["values"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(uv_pair)
-                .collect();
+            let mut values = Vec::new();
+            if let Some(rows) = layer["faces"].as_array() {
+                for face in &output.faces {
+                    if let Some(row) = rows
+                        .iter()
+                        .find(|row| row["face_id"].as_u64() == Some(u64::from(face.id)))
+                    {
+                        values.extend(row["uv"].as_array().into_iter().flatten().map(|value| {
+                            let [u, v] = uv_pair(value);
+                            [u, 1.0 - v]
+                        }));
+                    }
+                }
+            }
             (name, values)
         })
         .collect();
@@ -493,6 +548,13 @@ fn compare(case: &Value) -> TestResult<Report> {
                 } else {
                     report.max_uv_error.max(error)
                 };
+                if (error.is_nan() || error > TOLERANCE) && report.problems.len() < 10 {
+                    report.problems.push(format!(
+                        "UV layer {layer_name} output face {} corner {corner} at Blender vertex {}: Potter {p:?}, Blender {b:?}",
+                        output.faces[face_index].id,
+                        ring[(potter_shift + corner) % ring.len()]
+                    ));
+                }
             }
         }
     }

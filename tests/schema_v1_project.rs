@@ -202,6 +202,96 @@ fn schema_v1_project_keeps_revisions_uv_state_and_hashes_through_edit_history_an
 }
 
 #[test]
+fn schema_v1_active_blender_layer_survives_migration_and_omitted_selector_uv_transform()
+-> TestResult {
+    let directory = TempDir::new()?;
+    let scene = copy_fixture(directory.path())?;
+    let scene_file = scene.join("scene.json");
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&scene_file)?)?;
+    legacy["data_blocks"]["cube_mesh"]["mesh"]["attributes"]["blender_uv_layers"] = json!([
+        {
+            "name": "Light",
+            "active": true,
+            "values": vec![json!([0.25, 0.5]); 24]
+        }
+    ]);
+    fs::write(&scene_file, serde_json::to_vec_pretty(&legacy)?)?;
+    let original = fs::read(&scene_file)?;
+    let expected = read_only_digests(&scene)?;
+    let head = document(&scene)?["history"]["head"]
+        .as_str()
+        .ok_or("the fixture has no history head")?
+        .to_owned();
+    let head_blob = scene.join(blob_path("history", "blob.json", &head));
+    let head_bytes = fs::read(&head_blob)?;
+
+    let inspected =
+        envelope(
+            pot()
+                .arg("inspect")
+                .arg(&scene)
+                .args(["--id", "cube_mesh", "--json"]),
+        )?;
+    assert_eq!(inspected["ok"], true, "{inspected}");
+    let uv_layers = inspected["result"]["items"][0]["uv_layers"]
+        .as_array()
+        .ok_or("mesh inspect omitted UV layers")?;
+    assert!(
+        uv_layers
+            .iter()
+            .any(|layer| layer["name"] == "Light" && layer["active"] == true),
+        "{inspected}"
+    );
+    assert!(
+        uv_layers.iter().any(|layer| {
+            layer["name"] == "UVMap" && layer["render"] == true && layer["active"] == false
+        }),
+        "{inspected}"
+    );
+    assert_eq!(
+        fs::read(&scene_file)?,
+        original,
+        "inspect rewrote the v1 project"
+    );
+    assert_eq!(
+        read_only_digests(&scene)?,
+        expected,
+        "inspect rewrote project files"
+    );
+    assert_eq!(
+        fs::read(&head_blob)?,
+        head_bytes,
+        "inspect rewrote the history head bytes"
+    );
+
+    let applied = apply(
+        &scene,
+        2,
+        &json!([{
+            "op": "uv.transform",
+            "target": {"id": "cube"},
+            "translation": [0.25, 0.0]
+        }]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["scene"]["revision"], 3);
+    assert_eq!(document(&scene)?["schema_version"], 2);
+    let attributes = mesh_attributes(&scene)?;
+    assert_eq!(attributes["uv_layers"]["active"], "Light");
+    assert_eq!(attributes["uv_layers"]["render"], "UVMap");
+    assert_corner_close(stored_corner(&scene, "Light", 0)?, [0.5, 0.5]);
+    assert_corner_close(stored_corner(&scene, "UVMap", 0)?, [-0.9, -0.8]);
+    assert_original_kept(&scene, &original)?;
+    assert_history_kept(&scene, &expected)?;
+    assert_eq!(
+        fs::read(&head_blob)?,
+        head_bytes,
+        "apply rewrote the history head bytes"
+    );
+    Ok(())
+}
+
+#[test]
 fn schema_v1_history_is_verified_before_it_is_upgraded() -> TestResult {
     let directory = TempDir::new()?;
     let scene = copy_fixture(directory.path())?;

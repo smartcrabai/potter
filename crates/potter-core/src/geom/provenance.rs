@@ -797,12 +797,11 @@ impl Sources<'_> {
     }
 
     /// One UV layer rebuilt for the output faces. Each output corner blends the UVs of its source
-    /// corners by weight. A source corner whose face has no entry reads as `[0, 0]` and keeps its
-    /// weight (no renormalisation: Blender layers are complete, so no oracle covers partial layers).
-    /// An output face gets an entry when any of its corners has a source with an entry, so a
-    /// modifier that leaves face sources empty (screw) keeps its UVs. A corner's pin is the pin of
-    /// its heaviest source corner (see [`heaviest_source`]); `pinned` is omitted when no
-    /// contributing source corner has pins.
+    /// corners by weight. A source corner whose face has no entry reads as `[0, 1]` and keeps its
+    /// weight (no renormalisation). An output face gets an entry when any of its corners has a source
+    /// with an entry, so a modifier that leaves face sources empty (screw) keeps its UVs. A corner's
+    /// pin is the pin of its heaviest source corner (see [`heaviest_source`]); `pinned` is omitted
+    /// when no contributing source corner has pins.
     fn uv_layer(&self, layer: &UvLayer) -> UvLayer {
         let source_offsets =
             corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
@@ -814,7 +813,7 @@ impl Sources<'_> {
             .iter()
             .map(|face| face.vertices.len())
             .sum();
-        let mut flat = vec![[0.0, 0.0]; source_corners];
+        let mut flat = vec![[0.0, 1.0]; source_corners];
         // Pin per source corner; `None` where the source face has no `pinned` array.
         let mut flat_pinned: Vec<Option<bool>> = vec![None; source_corners];
         // Source corners whose face has an entry for this layer.
@@ -1039,16 +1038,18 @@ fn blend_indexed(values: &[Value], sources: &[(usize, f64)], data_type: &str) ->
 }
 
 /// The weighted sum of the UVs at `sources`. Indices past the end of `uvs` are skipped, so a corner
-/// with no usable source is `[0, 0]`.
+/// with no usable source is `[0, 1]`.
 fn blend_uv(uvs: &[[f64; 2]], sources: &[(usize, f64)]) -> [f64; 2] {
     let mut uv = [0.0; 2];
+    let mut found = false;
     for (index, weight) in sources {
         if let Some([u, v]) = uvs.get(*index) {
+            found = true;
             uv[0] += weight * u;
             uv[1] += weight * v;
         }
     }
-    uv
+    if found { uv } else { [0.0, 1.0] }
 }
 
 /// Blender data types stored as integers; blended results round to the nearest integer.
@@ -1319,5 +1320,64 @@ mod tests {
         let layers = uv_layers::read_layers(&output);
         assert_eq!(layers[0].faces[0].as_ref().map(Vec::len), Some(3));
         assert_eq!(layers[0].pinned[0], Some(vec![false, true, false]));
+    }
+
+    /// Screw can create a face with no source face while carrying corner provenance from a partial
+    /// UV layer; missing and source-less corners take `[0, 1]` without changing populated sums.
+    #[test]
+    fn screw_partial_uv_provenance_defaults_missing_corners_to_canonical_uv() {
+        let mut source = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::ZERO,
+                DVec3::X,
+                DVec3::Y,
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
+                DVec3::new(2.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2], vec![3, 4, 5]],
+        )
+        .expect("two source faces");
+        uv_layers::write_layers(
+            &mut source,
+            &[UvLayer {
+                name: "UVMap".to_owned(),
+                faces: vec![Some(vec![[2.0, 4.0], [4.0, 6.0], [6.0, 8.0]]), None],
+                pinned: vec![None, None],
+            }],
+        );
+        let mut output = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(0.0, 0.0, 1.0),
+                DVec3::new(1.0, 0.0, 1.0),
+                DVec3::new(1.0, 1.0, 1.0),
+                DVec3::new(0.0, 1.0, 1.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )
+        .expect("generated face");
+        let origin = Origin {
+            vertices: vec![
+                vec![(0, 1.0)],
+                vec![(3, 1.0)],
+                vec![(1, 0.5), (3, 0.5)],
+                Vec::new(),
+            ],
+            faces: vec![None],
+            corners: Some(vec![
+                vec![(0, 1.0)],
+                vec![(3, 1.0)],
+                vec![(1, 0.5), (3, 0.5)],
+                Vec::new(),
+            ]),
+            raw_normals: false,
+        };
+
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+
+        assert_eq!(
+            uv_layers::read_layers(&output)[0].faces[0],
+            Some(vec![[2.0, 4.0], [0.0, 1.0], [2.0, 3.5], [0.0, 1.0]])
+        );
     }
 }

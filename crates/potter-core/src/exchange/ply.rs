@@ -115,7 +115,7 @@ fn split_mesh(mesh: &ExchangeMesh) -> Result<Split> {
     for (face, face_uvs) in faces.iter().zip(&uvs) {
         let mut indices = Vec::with_capacity(face.len());
         for (position, uv) in face.iter().zip(face_uvs) {
-            let st = blender_st(*uv);
+            let st = blender_st(*uv)?;
             let key = (*position, st.map(f32::to_bits));
             let index = *lookup.entry(key).or_insert_with(|| {
                 vertices.push((*position, st));
@@ -137,8 +137,15 @@ fn split_mesh(mesh: &ExchangeMesh) -> Result<Split> {
     clippy::cast_possible_truncation,
     reason = "PLY texture coordinates use float32 by specification"
 )]
-fn blender_st(uv: [f64; 2]) -> [f32; 2] {
-    [uv[0] as f32, (1.0 - uv[1]) as f32]
+fn blender_st(uv: [f64; 2]) -> Result<[f32; 2]> {
+    let st = [uv[0] as f32, (1.0 - uv[1]) as f32];
+    if st.iter().any(|component| !component.is_finite()) {
+        return Err(PotError::new(
+            ErrorCode::ExportFailed,
+            "PLY texture coordinate exceeds float32 range",
+        ));
+    }
+    Ok(st)
 }
 
 pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
@@ -585,7 +592,7 @@ pub(crate) fn imported_graph(
 
 #[cfg(test)]
 mod tests {
-    use super::{export, import};
+    use super::{blender_st, export, import};
     use crate::{
         error::{ErrorCode, PotError, Result},
         exchange::{ExchangeMesh, ExchangeUvLayer},
@@ -651,6 +658,21 @@ mod tests {
         assert_eq!(read_f32(&bytes, vertex + 8)?, 0.0);
         assert_eq!(read_f32(&bytes, vertex + 16)?, 0.5);
         assert_eq!(read_f32(&bytes, vertex + 20)?, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_uv_overflow_after_float32_conversion() -> Result<()> {
+        assert_eq!(blender_st([0.25, 0.75])?, [0.25, 0.25]);
+
+        let mut mesh = quad_with_seam_uvs();
+        mesh.uv_layers[0].corners[0][0][0] = f64::MAX;
+        let error = export(&[mesh]).expect_err("out-of-range UV should fail PLY export");
+        assert_eq!(error.code, ErrorCode::ExportFailed);
+        assert_eq!(
+            error.message,
+            "PLY texture coordinate exceeds float32 range"
+        );
         Ok(())
     }
 

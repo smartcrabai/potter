@@ -329,8 +329,9 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
 ///   version-1 behaviour and is not reported.
 /// - Pins are kept when they are one boolean per corner. Otherwise the row keeps its UVs, its pins
 ///   are dropped, and a `uv.legacy_pins_dropped` warning is reported.
-/// - The first layer that `uv_map` names is the render and active layer. Without `uv_map`, the first
-///   layer is.
+/// - The first layer that `uv_map` names is the render layer; without `uv_map`, the first layer is.
+/// - A valid `blender_uv_layers[].active` flag selects the active layer independently; when none
+///   survives, the render layer is active.
 /// - At most [`MAX_LAYERS`] layers are kept. Priority: the render layer, then the layers
 ///   `referenced` names, then the rest in order. Kept layers keep their original order. Each dropped
 ///   layer is reported with a `uv.legacy_layer_dropped` warning.
@@ -397,6 +398,7 @@ pub(crate) fn upgrade_mesh_v1(
     // duplicates are removed below.
     let mut names = BTreeSet::new();
     let mut layers: Vec<UvLayer> = Vec::new();
+    let mut legacy_active = None;
     for (index, layer) in blender_layers.iter().enumerate() {
         let Some(name) = layer
             .get("name")
@@ -461,7 +463,12 @@ pub(crate) fn upgrade_mesh_v1(
             .iter()
             .map(|(_, count)| Some(flipped.by_ref().take(*count).collect()))
             .collect();
+        let is_active = layer.get("active").and_then(Value::as_bool) == Some(true);
+        let layer_index = layers.len();
         layers.push(UvLayer::new(name, rows));
+        if is_active && legacy_active.is_none() {
+            legacy_active = Some(layer_index);
+        }
     }
 
     let mut render: Option<String> = None;
@@ -603,8 +610,7 @@ pub(crate) fn upgrade_mesh_v1(
     }
 
     if !layers.is_empty() {
-        // Version 1 had no active-layer notion. The render layer, the one `uv_map` named, is the
-        // edit target; without `uv_map` the first layer is.
+        // The first `uv_map` layer is render; a surviving legacy active flag selects active.
         let render_index = render
             .as_deref()
             .and_then(|name| layers.iter().position(|layer| layer.name == name))
@@ -627,9 +633,13 @@ pub(crate) fn upgrade_mesh_v1(
             .map(|&index| layer_json(&layers[index], &faces))
             .collect();
         let render_name = layers[render_index].name.clone();
+        let active_name = legacy_active
+            .filter(|index| kept.contains(index))
+            .map(|index| layers[index].name.clone())
+            .unwrap_or_else(|| render_name.clone());
         attributes.insert(
             ATTRIBUTE.to_owned(),
-            json!({"layers": stored, "active": render_name, "render": render_name}),
+            json!({"layers": stored, "active": active_name, "render": render_name}),
         );
     }
     if let Some(entries) = attributes
@@ -742,7 +752,7 @@ mod tests {
         let face_zero = mesh.faces[0].id;
         let mut value = serde_json::to_value(&mesh).expect("mesh json");
         value["attributes"] = json!({
-            "blender_uv_layers": [{"name": "Light", "values": [
+            "blender_uv_layers": [{"name": "Light", "active": true, "values": [
                 [0.0, 0.25], [1.0, 0.25], [1.0, 0.75],
                 [0.0, 0.75], [0.5, 0.0], [0.5, 1.0]
             ]}],
@@ -777,7 +787,7 @@ mod tests {
             .collect();
         assert_eq!(names, ["Light", "UVMap"]);
         assert_eq!(store.render.as_deref(), Some("UVMap"));
-        assert_eq!(store.active.as_deref(), Some("UVMap"));
+        assert_eq!(store.active.as_deref(), Some("Light"));
         // Blender rows are flipped into storage convention; `uv_map` rows are not.
         assert_eq!(
             store.layers[0].faces,
@@ -819,7 +829,7 @@ mod tests {
         let (first, second) = (mesh.faces[0].id, mesh.faces[1].id);
         let mut value = serde_json::to_value(&mesh).expect("mesh json");
         value["attributes"] = json!({
-            "blender_uv_layers": [{"name": "Light", "values": [
+            "blender_uv_layers": [{"name": "Light", "active": true, "values": [
                 [0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]
             ]}],
             "uv_map": [
@@ -852,6 +862,7 @@ mod tests {
             .map(|layer| layer.name.as_str())
             .collect();
         assert_eq!(names, ["UVMap"]);
+        assert_eq!(store.active.as_deref(), Some("UVMap"));
         assert_eq!(
             store.layers[0].faces,
             vec![None, Some(vec![[0.5, 0.5], [0.6, 0.6], [0.7, 0.7]]),]

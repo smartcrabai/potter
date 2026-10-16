@@ -1782,6 +1782,175 @@ fn vrm1_preserves_capsules_per_joint_settings_and_texture_transform_expressions(
 }
 
 #[test]
+fn vrm_expressions_target_every_material_uv_variant() -> TestResult<()> {
+    let options = FixtureOptions {
+        expression_texture_transform: true,
+        ..FixtureOptions::default()
+    };
+    let (directory, project) = new_fixture(options)?;
+    apply_success(
+        &project,
+        revision(&project)?,
+        &[
+            json!({
+                "op": "node.create",
+                "id": "uv_variant",
+                "kind": "box",
+                "params": {"size": 0.5},
+                "material": "skin_material"
+            }),
+            json!({"op": "uv.layer_create", "target": {"id": "uv_variant"}, "name": "BaseUV"}),
+            json!({"op": "uv.layer_create", "target": {"id": "uv_variant"}, "name": "VariantUV"}),
+            json!({"op": "uv.layer_set_render", "target": {"id": "uv_variant"}, "name": "VariantUV"}),
+        ],
+    )?;
+    let material_for_node = |root: &Value, id: &str| -> TestResult<usize> {
+        let node = gltf_node_index(root, id);
+        let mesh = usize_field(&root["nodes"][node]["mesh"]);
+        Ok(usize_field(
+            &root["meshes"][mesh]["primitives"][0]["material"],
+        ))
+    };
+
+    let v1_path = directory.path().join("material-variants.vrm");
+    export(&project, "vrm", &v1_path)?;
+    let v1 = parse_glb(&v1_path)?;
+    let v1_base = material_for_node(&v1.json, "body")?;
+    let v1_variant = material_for_node(&v1.json, "uv_variant")?;
+    assert_ne!(v1_base, v1_variant);
+    assert_eq!(
+        v1.json["materials"][v1_variant]["extensions"]["VRMC_materials_mtoon"]["shadeMultiplyTexture"]
+            ["texCoord"],
+        1
+    );
+    let happy = &v1.json["extensions"]["VRMC_vrm"]["expressions"]["preset"]["happy"];
+    let material_indices = [v1_base, v1_variant];
+    let color_binds = happy["materialColorBinds"]
+        .as_array()
+        .ok_or("VRM 1 material color binds are missing")?;
+    assert_eq!(color_binds.len(), 2);
+    for (bind, index) in color_binds.iter().zip(material_indices) {
+        assert_eq!(usize_field(&bind["material"]), index);
+        assert_eq!(bind["targetValue"], json!([0.2, 0.4, 0.6, 0.8]));
+    }
+    let transform_binds = happy["textureTransformBinds"]
+        .as_array()
+        .ok_or("VRM 1 texture transform binds are missing")?;
+    assert_eq!(transform_binds.len(), 2);
+    for (bind, index) in transform_binds.iter().zip(material_indices) {
+        assert_eq!(usize_field(&bind["material"]), index);
+        assert_eq!(bind["scale"], json!([1.25, 0.75]));
+        assert_eq!(bind["offset"], json!([0.1, 0.2]));
+    }
+
+    let v0_path = directory.path().join("material-variants-v0.vrm");
+    let v0_output = pot()
+        .arg("export")
+        .arg(&project)
+        .args(["--format", "vrm0", "--out"])
+        .arg(&v0_path)
+        .args(["--allow-lossy", "--overwrite", "--json"])
+        .output()?;
+    assert!(
+        v0_output.status.success(),
+        "lossy VRM0 UV variant export failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&v0_output.stdout),
+        String::from_utf8_lossy(&v0_output.stderr)
+    );
+    let v0 = parse_glb(&v0_path)?;
+    let v0_base = material_for_node(&v0.json, "body")?;
+    let v0_variant = material_for_node(&v0.json, "uv_variant")?;
+    assert_ne!(v0_base, v0_variant);
+    let source_name = v0.json["materials"][v0_base]["name"]
+        .as_str()
+        .ok_or("VRM 0 source material name is missing")?;
+    let variant_name = v0.json["materials"][v0_variant]["name"]
+        .as_str()
+        .ok_or("VRM 0 variant material name is missing")?;
+    assert_ne!(source_name, variant_name);
+    let properties = &v0.json["extensions"]["VRM"]["materialProperties"];
+    assert_eq!(properties[v0_base]["name"].as_str(), Some(source_name));
+    assert_eq!(properties[v0_variant]["name"].as_str(), Some(variant_name));
+    let mut variant_properties = properties[v0_variant].clone();
+    variant_properties["name"] = json!(source_name);
+    assert_eq!(properties[v0_base], variant_properties);
+    let groups = v0.json["extensions"]["VRM"]["blendShapeMaster"]["blendShapeGroups"]
+        .as_array()
+        .ok_or("VRM 0 expressions are missing")?;
+    let happy = groups
+        .iter()
+        .find(|group| group["presetName"] == "joy")
+        .ok_or("VRM 0 joy expression is missing")?;
+    let material_values = happy["materialValues"]
+        .as_array()
+        .ok_or("VRM 0 material values are missing")?;
+    assert_eq!(material_values.len(), 4);
+    let source_values = material_values
+        .iter()
+        .filter(|value| value["materialName"].as_str() == Some(source_name))
+        .collect::<Vec<_>>();
+    let variant_values = material_values
+        .iter()
+        .filter(|value| value["materialName"].as_str() == Some(variant_name))
+        .collect::<Vec<_>>();
+    assert_eq!(source_values.len(), 2);
+    assert_eq!(variant_values.len(), 2);
+    for (source, variant) in source_values.into_iter().zip(variant_values) {
+        assert_eq!(source["propertyName"], variant["propertyName"]);
+        assert_eq!(source["targetValue"], variant["targetValue"]);
+    }
+    let (_roundtrip_directory, imported_project) = init_project()?;
+    let imported = pot()
+        .arg("import")
+        .arg(&imported_project)
+        .arg("--file")
+        .arg(&v0_path)
+        .args([
+            "--format",
+            "vrm0",
+            "--base-revision",
+            "0",
+            "--mode",
+            "replace",
+            "--json",
+        ])
+        .output()?;
+    assert!(
+        imported.status.success(),
+        "VRM0 variant round-trip import failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&imported.stdout),
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let imported_avatar = scene_avatar(&imported_project)?;
+    let imported_happy = &imported_avatar["expressions"]["happy"];
+    let imported_color_binds = imported_happy["material_color_binds"]
+        .as_array()
+        .ok_or("VRM0 round-trip material color binds are missing")?;
+    assert_eq!(imported_color_binds.len(), 2);
+    assert_ne!(
+        imported_color_binds[0]["material"],
+        imported_color_binds[1]["material"]
+    );
+    assert!(
+        imported_color_binds
+            .iter()
+            .all(|bind| bind["target_value"] == json!([0.2, 0.4, 0.6, 0.8]))
+    );
+    let imported_transform_binds = imported_happy["texture_transform_binds"]
+        .as_array()
+        .ok_or("VRM0 round-trip texture transform binds are missing")?;
+    assert_eq!(imported_transform_binds.len(), 2);
+    assert_ne!(
+        imported_transform_binds[0]["material"],
+        imported_transform_binds[1]["material"]
+    );
+    assert!(imported_transform_binds
+        .iter()
+        .all(|bind| bind["scale"] == json!([1.25, 0.75]) && bind["offset"] == json!([0.1, 0.2])));
+    Ok(())
+}
+
+#[test]
 fn avatar_updates_preserve_omitted_components_and_clear_all_settings() -> TestResult {
     let (_directory, project) = new_fixture(FixtureOptions::default())?;
     assert_eq!(revision(&project)?, 1);
@@ -2578,7 +2747,7 @@ fn ordinary_textured_relative_shape_key_exports_in_both_vrm_versions() -> TestRe
 
 #[test]
 fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() -> TestResult<()> {
-    let (_directory, project) = new_fixture(FixtureOptions::default())?;
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
         &project,
         1,
@@ -2599,6 +2768,31 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
         ],
     )?;
     assert_format_loss_both_versions(&project, "uv.layer_missing")?;
+
+    let lossy_path = directory.path().join("uvless-ordinary.vrm");
+    let lossy_output = pot()
+        .arg("export")
+        .arg(&project)
+        .args(["--format", "vrm", "--out"])
+        .arg(&lossy_path)
+        .args(["--allow-lossy", "--overwrite", "--json"])
+        .output()?;
+    assert!(
+        lossy_output.status.success(),
+        "lossy UV-less VRM export failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&lossy_output.stdout),
+        String::from_utf8_lossy(&lossy_output.stderr)
+    );
+    let lossy_glb = parse_glb(&lossy_path)?;
+    let uvless_node = gltf_node_index(&lossy_glb.json, "uvless_ordinary_surface");
+    let uvless_mesh = usize_field(&lossy_glb.json["nodes"][uvless_node]["mesh"]);
+    let attributes = &lossy_glb.json["meshes"][uvless_mesh]["primitives"][0]["attributes"];
+    assert!(attributes["TEXCOORD_0"].is_null());
+    assert!(
+        attributes
+            .as_object()
+            .is_some_and(|attributes| !attributes.keys().any(|name| name.starts_with("TEXCOORD_")))
+    );
 
     let (_directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(

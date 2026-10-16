@@ -52,8 +52,7 @@ enum Check {
     GeometryAndAttributes,
     /// Blender-authored members joined with a Potter `uv.unwrap` member. Blender's members match
     /// Blender's export; the Potter member matches its own standalone export.
-    MixedWithPotterUnwrap,
-    /// A textured member without UVs is refused, and Blender exports it without `TEXCOORD_0`.
+    /// A textured member without UVs is refused strictly and emits no TEXCOORD sets when lossy.
     TexturedWithoutUv,
     /// A user metadata conflict fails only the instance that owns it.
     ConflictIsolated,
@@ -1038,7 +1037,7 @@ fn run_case(
             ])?;
             ensure(
                 refusal["error"]["code"] == "UNSUPPORTED_FEATURE"
-                    && refusal["error"]["details"]["feature_id"] == "material.texture_uv_map",
+                    && refusal["error"]["details"]["feature_id"] == "uv.layer_missing",
                 format!("a textured member without UVs must be refused: {refusal}"),
             )?;
             ensure(
@@ -1052,6 +1051,25 @@ fn run_case(
                         && primitive.texcoord_sets == 0
                 }),
                 "Blender must export the textured member without TEXCOORD_0",
+            )?;
+            run_pot_json(&[
+                "export",
+                project_text,
+                "--format",
+                "glb",
+                "--out",
+                potter_glb_text,
+                "--allow-lossy",
+                "--overwrite",
+                "--json",
+            ])?;
+            let exported = primitives(&potter_glb)?;
+            ensure(
+                exported.iter().any(|primitive| {
+                    primitive.material.as_deref() == Some("textured")
+                        && primitive.texcoord_sets == 0
+                }),
+                "lossy export must preserve UV absence on the textured primitive",
             )?;
             return Ok(());
         }

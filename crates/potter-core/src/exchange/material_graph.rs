@@ -269,6 +269,9 @@ fn build_graph(
         normal_map
             .properties
             .insert("space".to_owned(), json!("TANGENT"));
+        normal_map
+            .properties
+            .insert("potter_gltf_imported_normal_map".to_owned(), json!(true));
         // The node reads the normal texture's layer, as Blender's importer sets it; the render
         // layer (no name, or an empty one) is the node default.
         if let Some(layer) = slot
@@ -491,7 +494,7 @@ mod tests {
         assert_eq!(graph.nodes.len(), 1);
     }
 
-    fn normal_map_uv_map(uv_layer: Option<&str>) -> Result<Option<Value>> {
+    fn normal_map_properties(uv_layer: Option<&str>) -> Result<(Option<Value>, Option<Value>)> {
         let textures = GraphTextures {
             base_color: None,
             metallic_roughness: None,
@@ -508,21 +511,25 @@ mod tests {
             occlusion: None,
         };
         let graph = build_graph(&Material::default(), &textures, false)?;
-        Ok(graph
+        let properties = &graph
             .nodes
             .get(&Id::new("normal_strength")?)
-            .and_then(|node| node.properties.get("uv_map"))
-            .cloned())
+            .ok_or_else(|| graph_error("normal map node is missing"))?
+            .properties;
+        Ok((
+            properties.get("uv_map").cloned(),
+            properties.get("potter_gltf_imported_normal_map").cloned(),
+        ))
     }
 
     #[test]
-    fn normal_map_node_reads_the_normal_texture_layer() -> Result<()> {
+    fn importer_generated_normal_map_is_marked_without_changing_uv_selection() -> Result<()> {
         assert_eq!(
-            normal_map_uv_map(Some("UVMap.001"))?,
-            Some(json!("UVMap.001"))
+            normal_map_properties(Some("UVMap.001"))?,
+            (Some(json!("UVMap.001")), Some(json!(true)))
         );
-        assert_eq!(normal_map_uv_map(None)?, None);
-        assert_eq!(normal_map_uv_map(Some(""))?, None);
+        assert_eq!(normal_map_properties(None)?, (None, Some(json!(true))));
+        assert_eq!(normal_map_properties(Some(""))?, (None, Some(json!(true))));
         Ok(())
     }
 }

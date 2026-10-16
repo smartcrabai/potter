@@ -2564,6 +2564,7 @@ fn material_value(
     material: &Material,
     surface: &ResolvedSurface,
     tex_coords: &TexCoords,
+    omitted: &BTreeSet<Option<String>>,
     doc: &SceneDoc,
     root_path: &Path,
     texture_export: &mut TextureExport,
@@ -2591,7 +2592,9 @@ fn material_value(
         "metallicFactor": surface.metallic,
         "roughnessFactor": surface.roughness
     });
-    if let Some(texture) = &surface.base_color.texture {
+    if let Some(texture) = &surface.base_color.texture
+        && !omitted.contains(&texture.uv_layer)
+    {
         pbr["baseColorTexture"] = texture_export.sampled_info(
             texture,
             base_reads(surface),
@@ -2602,7 +2605,9 @@ fn material_value(
             views,
         )?;
     }
-    if let Some(texture) = &surface.metallic_roughness_texture {
+    if let Some(texture) = &surface.metallic_roughness_texture
+        && !omitted.contains(&texture.uv_layer)
+    {
         pbr["metallicRoughnessTexture"] = texture_export.sampled_info(
             texture,
             reads::MR,
@@ -2631,7 +2636,9 @@ fn material_value(
         value["extras"]["potter"]["transmission"] = json!(material.transmission);
         value["extras"]["potter"]["ior"] = json!(material.ior);
     }
-    if let Some(texture) = &surface.emissive.texture {
+    if let Some(texture) = &surface.emissive.texture
+        && !omitted.contains(&texture.uv_layer)
+    {
         value["emissiveTexture"] = texture_export.sampled_info(
             texture,
             reads::RGB,
@@ -2642,7 +2649,9 @@ fn material_value(
             views,
         )?;
     }
-    if let Some(normal) = &surface.normal {
+    if let Some(normal) = &surface.normal
+        && !omitted.contains(&normal.texture.uv_layer)
+    {
         value["normalTexture"] = textured_normal_info(
             normal,
             tex_coords,
@@ -2653,7 +2662,9 @@ fn material_value(
             views,
         )?;
     }
-    if let Some(occlusion) = &surface.occlusion {
+    if let Some(occlusion) = &surface.occlusion
+        && !omitted.contains(&occlusion.texture.uv_layer)
+    {
         let mut info = texture_export.sampled_info(
             &occlusion.texture,
             reads::R,
@@ -2689,7 +2700,9 @@ fn material_value(
         if !crate::float::equal_f64(transmission.factor, 0.0) {
             extension.insert("transmissionFactor".to_owned(), json!(transmission.factor));
         }
-        if let Some(texture) = &transmission.texture {
+        if let Some(texture) = &transmission.texture
+            && !omitted.contains(&texture.uv_layer)
+        {
             extension.insert(
                 "transmissionTexture".to_owned(),
                 texture_export.sampled_info(
@@ -2726,7 +2739,9 @@ fn material_value(
         if !crate::float::equal_f64(clearcoat.factor, 0.0) {
             extension.insert("clearcoatFactor".to_owned(), json!(clearcoat.factor));
         }
-        if let Some(texture) = &clearcoat.texture {
+        if let Some(texture) = &clearcoat.texture
+            && !omitted.contains(&texture.uv_layer)
+        {
             extension.insert(
                 "clearcoatTexture".to_owned(),
                 texture_export.sampled_info(
@@ -2746,7 +2761,9 @@ fn material_value(
                 json!(clearcoat.roughness_factor),
             );
         }
-        if let Some(texture) = &clearcoat.roughness_texture {
+        if let Some(texture) = &clearcoat.roughness_texture
+            && !omitted.contains(&texture.uv_layer)
+        {
             extension.insert(
                 "clearcoatRoughnessTexture".to_owned(),
                 texture_export.sampled_info(
@@ -2760,7 +2777,9 @@ fn material_value(
                 )?,
             );
         }
-        if let Some(normal) = &clearcoat.normal {
+        if let Some(normal) = &clearcoat.normal
+            && !omitted.contains(&normal.texture.uv_layer)
+        {
             extension.insert(
                 "clearcoatNormalTexture".to_owned(),
                 textured_normal_info(
@@ -2786,7 +2805,9 @@ fn material_value(
         if !crate::float::equal_f64_array(&sheen.color_factor, &[0.0; 3]) {
             extension.insert("sheenColorFactor".to_owned(), json!(sheen.color_factor));
         }
-        if let Some(texture) = &sheen.color_texture {
+        if let Some(texture) = &sheen.color_texture
+            && !omitted.contains(&texture.uv_layer)
+        {
             extension.insert(
                 "sheenColorTexture".to_owned(),
                 texture_export.sampled_info(
@@ -2806,7 +2827,9 @@ fn material_value(
                 json!(sheen.roughness_factor),
             );
         }
-        if let Some(texture) = &sheen.roughness_texture {
+        if let Some(texture) = &sheen.roughness_texture
+            && !omitted.contains(&texture.uv_layer)
+        {
             extension.insert(
                 "sheenRoughnessTexture".to_owned(),
                 texture_export.sampled_info(
@@ -2832,7 +2855,9 @@ fn material_value(
         if !crate::float::equal_f64(specular.factor, 1.0) {
             extension.insert("specularFactor".to_owned(), json!(specular.factor));
         }
-        if let Some(texture) = &specular.texture {
+        if let Some(texture) = &specular.texture
+            && !omitted.contains(&texture.uv_layer)
+        {
             extension.insert(
                 "specularTexture".to_owned(),
                 texture_export.sampled_info(
@@ -2852,7 +2877,9 @@ fn material_value(
                 json!(specular.color_factor),
             );
         }
-        if let Some(texture) = &specular.color_texture {
+        if let Some(texture) = &specular.color_texture
+            && !omitted.contains(&texture.uv_layer)
+        {
             extension.insert(
                 "specularColorTexture".to_owned(),
                 texture_export.sampled_info(
@@ -2932,13 +2959,25 @@ fn textured_normal_info(
 /// `texCoord` map from each UV layer reference to its glTF TEXCOORD index.
 pub(crate) type TexCoords = BTreeMap<Option<String>, usize>;
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TexCoordVariant {
+    coords: TexCoords,
+    omitted: BTreeSet<Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct SlotTexCoord {
+    variant: TexCoordVariant,
+    has_uv_layers: bool,
+}
+
 /// Empty `texCoord` map for a material no mesh uses: its references read `TEXCOORD_0`.
 static NO_TEX_COORDS: TexCoords = BTreeMap::new();
 
 /// One material's per-face-slot UV map; `coords` remains its first-used base variant for VRM.
 pub(crate) struct TexCoordPlan {
     coords: BTreeMap<Id, TexCoords>,
-    slot_coords: BTreeMap<Id, BTreeMap<usize, (Id, TexCoords)>>,
+    slot_coords: BTreeMap<Id, BTreeMap<usize, (Id, SlotTexCoord)>>,
     losses: Vec<Loss>,
     warnings: Vec<PotError>,
 }
@@ -2948,12 +2987,17 @@ impl TexCoordPlan {
     pub(crate) fn for_material(&self, material: &Id) -> &TexCoords {
         self.coords.get(material).unwrap_or(&NO_TEX_COORDS)
     }
-    /// The `texCoord` map for one used face slot.
-    fn for_slot(&self, node_id: &Id, slot: usize) -> Option<&TexCoords> {
+    fn for_slot(&self, node_id: &Id, slot: usize) -> Option<&TexCoordVariant> {
         self.slot_coords
             .get(node_id)
             .and_then(|slots| slots.get(&slot))
-            .map(|(_, coords)| coords)
+            .map(|(_, slot_coords)| &slot_coords.variant)
+    }
+    fn slot_has_uv_layers(&self, node_id: &Id, slot: usize) -> Option<bool> {
+        self.slot_coords
+            .get(node_id)
+            .and_then(|slots| slots.get(&slot))
+            .map(|(_, slot_coords)| slot_coords.has_uv_layers)
     }
 }
 
@@ -2990,8 +3034,13 @@ fn set_mtoon_texture_coord(
     field: &str,
     texture: &TextureRef,
     coords: &TexCoords,
+    omitted: &BTreeSet<Option<String>>,
 ) {
-    if extension[field].is_object() {
+    if omitted.contains(&texture.uv_layer) {
+        if let Some(fields) = extension.as_object_mut() {
+            fields.remove(field);
+        }
+    } else if extension[field].is_object() {
         extension[field]["texCoord"] = json!(coords.get(&texture.uv_layer).copied().unwrap_or(0));
     }
 }
@@ -3000,12 +3049,19 @@ fn set_mtoon_variant_uvs(
     extension: &mut Value,
     mtoon: &crate::model::AvatarMtoon,
     coords: &TexCoords,
+    omitted: &BTreeSet<Option<String>>,
 ) {
     if let Some(texture) = &mtoon.shade_multiply_texture {
-        set_mtoon_texture_coord(extension, "shadeMultiplyTexture", texture, coords);
+        set_mtoon_texture_coord(extension, "shadeMultiplyTexture", texture, coords, omitted);
     }
     if let Some(shift) = &mtoon.shading_shift_texture {
-        set_mtoon_texture_coord(extension, "shadingShiftTexture", &shift.texture, coords);
+        set_mtoon_texture_coord(
+            extension,
+            "shadingShiftTexture",
+            &shift.texture,
+            coords,
+            omitted,
+        );
     }
     for (field, texture) in [
         ("rimMultiplyTexture", mtoon.rim_multiply_texture.as_ref()),
@@ -3019,7 +3075,7 @@ fn set_mtoon_variant_uvs(
         ),
     ] {
         if let Some(texture) = texture {
-            set_mtoon_texture_coord(extension, field, texture, coords);
+            set_mtoon_texture_coord(extension, field, texture, coords, omitted);
         }
     }
 }
@@ -3056,7 +3112,7 @@ pub(crate) fn tex_coord_plan(
         losses: Vec::new(),
         warnings: Vec::new(),
     };
-    let mut reported = BTreeSet::<(Id, Option<String>, Id, &'static str)>::new();
+    let mut reported = BTreeSet::<(Id, Option<String>, Id, usize, &'static str)>::new();
     for (node_id, node) in &doc.nodes {
         if !node.visible || !node.render_visible || !visible.contains(node_id) {
             continue;
@@ -3091,15 +3147,19 @@ pub(crate) fn tex_coord_plan(
                 )
             })?;
             let binding = snapshot.slot_binding(node_id, node, slot);
+            let has_uv_layers = binding.map_or(!layers.layers.is_empty(), |binding| {
+                binding.uv.available_mask != 0
+            });
             let mut coords = TexCoords::new();
+            let mut omitted = BTreeSet::new();
             for reference in texture_refs {
                 let (index, missing) = binding_tex_coord(&layers, reference.as_deref(), binding);
-                let index = index.unwrap_or(0);
                 if missing
                     && reported.insert((
                         material_id.clone(),
                         reference.clone(),
                         node_id.clone(),
+                        slot,
                         feature_id::UV_LAYER_MISSING,
                     ))
                 {
@@ -3107,27 +3167,53 @@ pub(crate) fn tex_coord_plan(
                         .as_deref()
                         .filter(|name| !name.is_empty())
                         .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
-                    plan.warnings.push(PotError::with_details(
-                        ErrorCode::UnrepresentableFeature,
-                        format!(
-                            "material `{material_id}` samples UV layer {layer}, which is unavailable to mesh `{node_id}` for this slot; the texture falls back to TEXCOORD_{index}"
-                        ),
-                        json!({
-                            "feature_id": feature_id::UV_LAYER_MISSING,
-                            "status": "fallback",
-                            "material_id": material_id,
-                            "node_id": node_id,
-                            "uv_layer": reference,
-                            "texcoord": index
-                        }),
-                    ));
+                    if let Some(index) = index {
+                        plan.warnings.push(PotError::with_details(
+                            ErrorCode::UnrepresentableFeature,
+                            format!(
+                                "material `{material_id}` samples UV layer {layer}, which is unavailable to mesh `{node_id}` for this slot; the texture falls back to TEXCOORD_{index}"
+                            ),
+                            json!({
+                                "feature_id": feature_id::UV_LAYER_MISSING,
+                                "status": "fallback",
+                                "material_id": material_id,
+                                "node_id": node_id,
+                                "uv_layer": reference,
+                                "texcoord": index
+                            }),
+                        ));
+                    } else {
+                        plan.losses.push(Loss {
+                            feature_id: feature_id::UV_LAYER_MISSING.to_owned(),
+                            data_id: Some(material_id.to_string()),
+                            reason: format!(
+                                "material `{material_id}` samples UV layer {layer}, but mesh `{node_id}` has no UV layer available to this texture for the slot"
+                            ),
+                            suggestion: Some(
+                                "create a UV layer for the textured mesh or choose a material texture layer that exists".to_owned(),
+                            ),
+                        });
+                    }
                 }
-                coords.insert(reference.clone(), index);
+                if let Some(index) = index {
+                    coords.insert(reference.clone(), index);
+                } else {
+                    omitted.insert(reference.clone());
+                }
             }
             if !plan.coords.contains_key(material_id) {
                 plan.coords.insert(material_id.clone(), coords.clone());
             }
-            node_coords.insert(slot, (material_id.clone(), coords));
+            node_coords.insert(
+                slot,
+                (
+                    material_id.clone(),
+                    SlotTexCoord {
+                        variant: TexCoordVariant { coords, omitted },
+                        has_uv_layers,
+                    },
+                ),
+            );
         }
         if !node_coords.is_empty() {
             plan.slot_coords.insert(node_id.clone(), node_coords);
@@ -3152,7 +3238,7 @@ pub(crate) fn tex_coord_plan(
                     .values()
                     .flat_map(|slots| slots.values())
                     .filter(|(bound_material, _)| bound_material == material_id)
-                    .filter_map(|(_, coordinates)| coordinates.get(&layer).copied())
+                    .filter_map(|(_, slot_coords)| slot_coords.variant.coords.get(&layer).copied())
                     .find(|index| *index != 0)
                     .or_else(|| coords.get(&layer).copied())
                     .unwrap_or(0);
@@ -3189,11 +3275,128 @@ pub(crate) fn uv_layer_diagnostics(
     Ok((plan.losses, plan.warnings))
 }
 
+fn remove_vrm0_texture_property(
+    property: &mut Value,
+    field: &str,
+    uv_layer: Option<&Option<String>>,
+    omitted: &BTreeSet<Option<String>>,
+) {
+    if uv_layer.is_some_and(|uv_layer| omitted.contains(uv_layer))
+        && let Some(textures) = property["textureProperties"].as_object_mut()
+    {
+        textures.remove(field);
+    }
+}
+
+fn remove_vrm0_variant_textures(
+    property: &mut Value,
+    surface: &ResolvedSurface,
+    mtoon: Option<&crate::model::AvatarMtoon>,
+    omitted: &BTreeSet<Option<String>>,
+) {
+    for (field, uv_layer) in [
+        (
+            "_MainTex",
+            surface
+                .base_color
+                .texture
+                .as_ref()
+                .map(|texture| &texture.uv_layer),
+        ),
+        (
+            "_BumpMap",
+            surface
+                .normal
+                .as_ref()
+                .map(|normal| &normal.texture.uv_layer),
+        ),
+        (
+            "_EmissionMap",
+            surface
+                .emissive
+                .texture
+                .as_ref()
+                .map(|texture| &texture.uv_layer),
+        ),
+    ] {
+        remove_vrm0_texture_property(property, field, uv_layer, omitted);
+    }
+    if let Some(mtoon) = mtoon {
+        for (field, uv_layer) in [
+            (
+                "_ShadeTexture",
+                mtoon
+                    .shade_multiply_texture
+                    .as_ref()
+                    .map(|texture| &texture.uv_layer),
+            ),
+            (
+                "_RimTexture",
+                mtoon
+                    .rim_multiply_texture
+                    .as_ref()
+                    .map(|texture| &texture.uv_layer),
+            ),
+            (
+                "_OutlineWidthTexture",
+                mtoon
+                    .outline_width_multiply_texture
+                    .as_ref()
+                    .map(|texture| &texture.uv_layer),
+            ),
+            (
+                "_UvAnimMaskTexture",
+                mtoon
+                    .uv_animation_mask_texture
+                    .as_ref()
+                    .map(|texture| &texture.uv_layer),
+            ),
+        ] {
+            remove_vrm0_texture_property(property, field, uv_layer, omitted);
+        }
+    }
+}
+
+fn preserve_vrm0_expression_variants(
+    root: &mut Value,
+    variant_names: &BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    let groups = root["extensions"]["VRM"]["blendShapeMaster"]["blendShapeGroups"]
+        .as_array_mut()
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "VRM 0 expression groups are missing",
+            )
+        })?;
+    for group in groups {
+        let Some(values) = group["materialValues"].as_array_mut() else {
+            continue;
+        };
+        let original = values.clone();
+        for value in original {
+            let Some(name) = value["materialName"].as_str() else {
+                continue;
+            };
+            let Some(names) = variant_names.get(name) else {
+                continue;
+            };
+            for name in names {
+                let mut variant_value = value.clone();
+                variant_value["materialName"] = json!(name);
+                values.push(variant_value);
+            }
+        }
+    }
+    Ok(())
+}
 fn preserve_vrm_material_variants(
     version: AvatarVersion,
+    doc: &SceneDoc,
+    surfaces: &BTreeMap<Id, ResolvedSurface>,
     avatar: &AvatarSettings,
     material_indices: &BTreeMap<Id, usize>,
-    material_variant_indices: &BTreeMap<Id, BTreeMap<TexCoords, usize>>,
+    material_variant_indices: &BTreeMap<Id, BTreeMap<TexCoordVariant, usize>>,
     root: &mut Value,
     base_material_count: usize,
 ) -> Result<()> {
@@ -3212,35 +3415,71 @@ fn preserve_vrm_material_variants(
     }
     match version {
         AvatarVersion::V0 => {
-            let properties = root["extensions"]["VRM"]["materialProperties"]
-                .as_array_mut()
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::InternalError,
-                        "VRM 0 material properties are missing",
-                    )
-                })?;
-            for (index, material_id, _) in variants {
+            let mut used_names = root["materials"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|material| material["name"].as_str().map(str::to_owned))
+                .collect::<BTreeSet<_>>();
+            let mut variant_names = BTreeMap::<String, Vec<String>>::new();
+            for (index, material_id, variant) in variants {
                 let base_index = material_indices.get(material_id).copied().ok_or_else(|| {
                     PotError::new(
                         ErrorCode::InternalError,
                         "VRM base material index is missing",
                     )
                 })?;
-                let property = properties.get(base_index).cloned().ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::InternalError,
-                        "VRM base material properties are missing",
-                    )
-                })?;
-                if properties.len() != *index {
-                    return Err(PotError::new(
-                        ErrorCode::InternalError,
-                        "VRM variant material properties are not contiguous",
-                    ));
+                let base_name = root["materials"][base_index]["name"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| material_id.to_string());
+                let mut variant_name = format!("{base_name}__potter_uv_variant_{index}");
+                while !used_names.insert(variant_name.clone()) {
+                    variant_name.push('_');
                 }
-                properties.push(property);
+                let surface = surfaces.get(material_id).ok_or_else(|| {
+                    PotError::new(ErrorCode::SceneInvalid, "node material surface is missing")
+                })?;
+                let mut property = root["extensions"]["VRM"]["materialProperties"]
+                    .get(base_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "VRM base material properties are missing",
+                        )
+                    })?;
+                remove_vrm0_variant_textures(
+                    &mut property,
+                    surface,
+                    avatar.mtoon.get(material_id),
+                    &variant.omitted,
+                );
+                property["name"] = json!(variant_name.clone());
+                {
+                    let properties = root["extensions"]["VRM"]["materialProperties"]
+                        .as_array_mut()
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::InternalError,
+                                "VRM 0 material properties are missing",
+                            )
+                        })?;
+                    if properties.len() != *index {
+                        return Err(PotError::new(
+                            ErrorCode::InternalError,
+                            "VRM variant material properties are not contiguous",
+                        ));
+                    }
+                    properties.push(property);
+                }
+                root["materials"][*index]["name"] = json!(variant_name.clone());
+                variant_names
+                    .entry(base_name)
+                    .or_default()
+                    .push(variant_name);
             }
+            preserve_vrm0_expression_variants(root, &variant_names)?;
         }
         AvatarVersion::V1 => {
             for (material_id, mtoon) in &avatar.mtoon {
@@ -3260,13 +3499,68 @@ fn preserve_vrm_material_variants(
                         continue;
                     }
                     let mut extension = base_extension.clone();
-                    set_mtoon_variant_uvs(&mut extension, mtoon, coords);
+                    set_mtoon_variant_uvs(&mut extension, mtoon, &coords.coords, &coords.omitted);
                     root["materials"][**index]["extensions"]["VRMC_materials_mtoon"] = extension;
                 }
             }
         }
     }
+    if matches!(version, AvatarVersion::V1) {
+        preserve_vrm_v1_expression_variants(root, material_indices, material_variant_indices);
+    }
+
     Ok(())
+}
+
+fn preserve_vrm_v1_expression_variants(
+    root: &mut Value,
+    material_indices: &BTreeMap<Id, usize>,
+    material_variant_indices: &BTreeMap<Id, BTreeMap<TexCoordVariant, usize>>,
+) {
+    for expression_group in ["preset", "custom"] {
+        let Some(expressions) =
+            root["extensions"]["VRMC_vrm"]["expressions"][expression_group].as_object_mut()
+        else {
+            continue;
+        };
+        for expression in expressions.values_mut() {
+            for field in ["materialColorBinds", "textureTransformBinds"] {
+                let Some(binds) = expression[field].as_array_mut() else {
+                    continue;
+                };
+                let original = binds.clone();
+                for bind in original {
+                    let Some(source_index) = bind["material"]
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                    else {
+                        continue;
+                    };
+                    let Some((material_id, _)) = material_indices
+                        .iter()
+                        .find(|(_, index)| **index == source_index)
+                    else {
+                        continue;
+                    };
+                    let Some(variants) = material_variant_indices.get(material_id) else {
+                        continue;
+                    };
+                    let mut indexes = variants
+                        .values()
+                        .copied()
+                        .filter(|index| *index != source_index)
+                        .collect::<Vec<_>>();
+                    indexes.sort_unstable();
+                    indexes.dedup();
+                    for index in indexes {
+                        let mut variant_bind = bind.clone();
+                        variant_bind["material"] = json!(index);
+                        binds.push(variant_bind);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn validate_shape_key_export(shape_keys: &ShapeKeyData) -> Result<()> {
@@ -3488,6 +3782,7 @@ fn export_with_root_inner(
     let mut texture_export = TextureExport::new();
     let surfaces = resolve_material_surfaces(doc)?;
     let tex_coords = tex_coord_plan(doc, snapshot, &surfaces, vrm)?;
+    let no_omitted_texture_layers = BTreeSet::new();
     for (id, material) in &doc.materials {
         material_indices.insert(id.clone(), materials.len());
         let surface = surfaces.get(id).ok_or_else(|| {
@@ -3498,6 +3793,7 @@ fn export_with_root_inner(
             material,
             surface,
             tex_coords.for_material(id),
+            &no_omitted_texture_layers,
             doc,
             root_path,
             &mut texture_export,
@@ -3507,7 +3803,7 @@ fn export_with_root_inner(
         )?;
         materials.push(value);
     }
-    let mut material_variant_indices = BTreeMap::<Id, BTreeMap<TexCoords, usize>>::new();
+    let mut material_variant_indices = BTreeMap::<Id, BTreeMap<TexCoordVariant, usize>>::new();
     for id in doc.materials.keys() {
         let index = material_indices.get(id).copied().ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "base material index is missing")
@@ -3515,13 +3811,20 @@ fn export_with_root_inner(
         material_variant_indices
             .entry(id.clone())
             .or_default()
-            .insert(tex_coords.for_material(id).clone(), index);
+            .insert(
+                TexCoordVariant {
+                    coords: tex_coords.for_material(id).clone(),
+                    omitted: BTreeSet::new(),
+                },
+                index,
+            );
     }
     for slots in tex_coords.slot_coords.values() {
-        for (material_id, coords) in slots.values() {
+        for (material_id, slot_coords) in slots.values() {
+            let variant = &slot_coords.variant;
             if material_variant_indices
                 .get(material_id)
-                .is_some_and(|variants| variants.contains_key(coords))
+                .is_some_and(|variants| variants.contains_key(variant))
             {
                 continue;
             }
@@ -3538,7 +3841,8 @@ fn export_with_root_inner(
                 material_id,
                 material,
                 surface,
-                coords,
+                &variant.coords,
+                &variant.omitted,
                 doc,
                 root_path,
                 &mut texture_export,
@@ -3551,7 +3855,7 @@ fn export_with_root_inner(
             material_variant_indices
                 .entry(material_id.clone())
                 .or_default()
-                .insert(coords.clone(), index);
+                .insert(variant.clone(), index);
         }
     }
     let visible_node_ids = super::render_visible_nodes(doc, snapshot)?;
@@ -3886,20 +4190,31 @@ fn export_with_root_inner(
                     "mesh material slot exceeds platform range",
                 )
             })?;
-            if let Some(material_id) = snapshot.slot_material(node_id, node, slot) {
-                let coords = tex_coords
-                    .for_slot(node_id, slot)
-                    .unwrap_or_else(|| tex_coords.for_material(material_id));
-                let material_index = material_variant_indices
-                    .get(material_id)
-                    .and_then(|variants| variants.get(coords))
-                    .copied()
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::SceneInvalid,
-                            "node material UV variant is missing",
-                        )
+            let has_uv_layers = tex_coords
+                .slot_has_uv_layers(node_id, slot)
+                .unwrap_or(!uv_sets.is_empty());
+            if !has_uv_layers {
+                let primitive_attributes =
+                    primitive["attributes"].as_object_mut().ok_or_else(|| {
+                        PotError::new(ErrorCode::InternalError, "primitive attributes are missing")
                     })?;
+                primitive_attributes.retain(|name, _| !name.starts_with("TEXCOORD_"));
+            }
+            if let Some(material_id) = snapshot.slot_material(node_id, node, slot) {
+                let material_index = if let Some(variant) = tex_coords.for_slot(node_id, slot) {
+                    material_variant_indices
+                        .get(material_id)
+                        .and_then(|variants| variants.get(variant))
+                        .copied()
+                } else {
+                    material_indices.get(material_id).copied()
+                }
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "node material UV variant is missing",
+                    )
+                })?;
                 primitive["material"] = json!(material_index);
             }
             primitives.push(primitive);
@@ -4308,6 +4623,8 @@ fn export_with_root_inner(
         )?;
         preserve_vrm_material_variants(
             version,
+            doc,
+            &surfaces,
             avatar,
             &material_indices,
             &material_variant_indices,
@@ -7487,6 +7804,307 @@ fn import_animations(
     Ok(losses)
 }
 
+fn gltf_byte_offset(value: &Value) -> Result<usize> {
+    match value.get("byteOffset") {
+        None => Ok(0),
+        Some(offset) => usize::try_from(
+            offset
+                .as_u64()
+                .ok_or_else(|| import_error("glTF byteOffset is invalid"))?,
+        )
+        .map_err(|_| import_error("glTF byteOffset exceeds platform range")),
+    }
+}
+
+fn buffer_view_data<'a>(
+    root: &'a Value,
+    buffers: &'a [Vec<u8>],
+    view_index: usize,
+) -> Result<(&'a Value, &'a [u8])> {
+    let view = root["bufferViews"]
+        .get(view_index)
+        .ok_or_else(|| import_error("glTF accessor bufferView is missing"))?;
+    let buffer_index = usize::try_from(
+        view["buffer"]
+            .as_u64()
+            .ok_or_else(|| import_error("glTF accessor buffer index is missing"))?,
+    )
+    .map_err(|_| import_error("glTF accessor buffer index exceeds platform range"))?;
+    let buffer = buffers
+        .get(buffer_index)
+        .ok_or_else(|| import_error("glTF accessor buffer is missing"))?;
+    let start = gltf_byte_offset(view)?;
+    let length = usize::try_from(
+        view["byteLength"]
+            .as_u64()
+            .ok_or_else(|| import_error("glTF accessor bufferView byteLength is missing"))?,
+    )
+    .map_err(|_| import_error("glTF accessor bufferView length exceeds platform range"))?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| import_error("glTF accessor bufferView range overflows"))?;
+    let data = buffer
+        .get(start..end)
+        .ok_or_else(|| import_error("glTF accessor bufferView data is truncated"))?;
+    Ok((view, data))
+}
+
+fn read_accessor_component(bytes: &[u8], component_type: u64, normalized: bool) -> Result<f64> {
+    match component_type {
+        5126 => Ok(f64::from(f32::from_le_bytes(bytes.try_into().map_err(
+            |_| import_error("glTF accessor component is truncated"),
+        )?))),
+        5121 if normalized => Ok(f64::from(bytes[0]) / f64::from(u8::MAX)),
+        5123 if normalized => Ok(f64::from(u16::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| import_error("glTF accessor component is truncated"))?,
+        )) / f64::from(u16::MAX)),
+        _ => Err(import_error("glTF accessor component type is unsupported")),
+    }
+}
+
+fn read_sparse_index(bytes: &[u8], component_type: u64) -> Result<usize> {
+    match component_type {
+        5121 => Ok(usize::from(bytes[0])),
+        5123 => {
+            Ok(usize::from(u16::from_le_bytes(bytes.try_into().map_err(
+                |_| import_error("glTF sparse index is truncated"),
+            )?)))
+        }
+        5125 => usize::try_from(u32::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| import_error("glTF sparse index is truncated"))?,
+        ))
+        .map_err(|_| import_error("glTF sparse index exceeds platform range")),
+        _ => Err(import_error(
+            "glTF sparse index component type is unsupported",
+        )),
+    }
+}
+
+fn read_accessor_values(
+    root: &Value,
+    buffers: &[Vec<u8>],
+    index: usize,
+    allow_normalized_unsigned: bool,
+) -> Result<(Vec<f64>, usize)> {
+    let accessor = root["accessors"]
+        .get(index)
+        .ok_or_else(|| import_error("glTF accessor is missing"))?;
+    let component_type = accessor["componentType"]
+        .as_u64()
+        .ok_or_else(|| import_error("glTF accessor component type is missing"))?;
+    let normalized = match accessor.get("normalized") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| import_error("glTF accessor normalized flag is invalid"))?,
+    };
+    let component_size = match component_type {
+        5126 if !normalized => 4,
+        5121 | 5123 if allow_normalized_unsigned && normalized => {
+            if component_type == 5121 {
+                1
+            } else {
+                2
+            }
+        }
+        _ => return Err(import_error("glTF accessor component type is unsupported")),
+    };
+    let dimensions: usize = match accessor["type"].as_str() {
+        Some("SCALAR") => 1,
+        Some("VEC2") => 2,
+        Some("VEC3") => 3,
+        Some("VEC4") => 4,
+        Some("MAT4") => 16,
+        _ => return Err(import_error("glTF accessor type is unsupported")),
+    };
+    let count = usize::try_from(
+        accessor["count"]
+            .as_u64()
+            .ok_or_else(|| import_error("glTF accessor count is missing"))?,
+    )
+    .map_err(|_| import_error("glTF accessor count exceeds platform range"))?;
+    let capacity = count
+        .checked_mul(dimensions)
+        .ok_or_else(|| import_error("glTF accessor value count overflows"))?;
+    let element_size = dimensions
+        .checked_mul(component_size)
+        .ok_or_else(|| import_error("glTF accessor element size overflows"))?;
+    let mut values = vec![0.0; capacity];
+
+    let sparse = accessor
+        .get("sparse")
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(|| import_error("glTF sparse accessor is invalid"))
+        })
+        .transpose()?;
+    let buffer_view_index = accessor
+        .get("bufferView")
+        .map(|value| {
+            usize::try_from(
+                value
+                    .as_u64()
+                    .ok_or_else(|| import_error("glTF accessor bufferView is invalid"))?,
+            )
+            .map_err(|_| import_error("glTF accessor bufferView exceeds platform range"))
+        })
+        .transpose()?;
+    if let Some(view_index) = buffer_view_index {
+        let (view, data) = buffer_view_data(root, buffers, view_index)?;
+        let byte_offset = gltf_byte_offset(accessor)?;
+        if !byte_offset.is_multiple_of(component_size) {
+            return Err(import_error("glTF accessor offset is misaligned"));
+        }
+        let stride = match view.get("byteStride") {
+            None => element_size,
+            Some(value) => usize::try_from(
+                value
+                    .as_u64()
+                    .ok_or_else(|| import_error("glTF accessor byteStride is invalid"))?,
+            )
+            .map_err(|_| import_error("glTF accessor stride exceeds platform range"))?,
+        };
+        if stride < element_size || !stride.is_multiple_of(component_size) {
+            return Err(import_error(
+                "glTF accessor byteStride is too small or misaligned",
+            ));
+        }
+        for element in 0..count {
+            let start = byte_offset
+                .checked_add(
+                    element
+                        .checked_mul(stride)
+                        .ok_or_else(|| import_error("glTF accessor stride overflows"))?,
+                )
+                .ok_or_else(|| import_error("glTF accessor offset overflows"))?;
+            for component in 0..dimensions {
+                let offset = start
+                    .checked_add(component * component_size)
+                    .ok_or_else(|| import_error("glTF accessor offset overflows"))?;
+                let end = offset
+                    .checked_add(component_size)
+                    .ok_or_else(|| import_error("glTF accessor offset overflows"))?;
+                let raw = data
+                    .get(offset..end)
+                    .ok_or_else(|| import_error("glTF accessor data is truncated"))?;
+                values[element * dimensions + component] =
+                    read_accessor_component(raw, component_type, normalized)?;
+            }
+        }
+    } else if sparse.is_none() {
+        return Err(import_error(
+            "glTF accessor needs a bufferView or sparse values",
+        ));
+    }
+
+    if let Some(sparse) = sparse {
+        let sparse_count = usize::try_from(
+            sparse["count"]
+                .as_u64()
+                .ok_or_else(|| import_error("glTF sparse accessor count is missing"))?,
+        )
+        .map_err(|_| import_error("glTF sparse accessor count exceeds platform range"))?;
+        if sparse_count == 0 || sparse_count > count {
+            return Err(import_error(
+                "glTF sparse accessor count is outside accessor count",
+            ));
+        }
+        let indices = &sparse["indices"];
+        let index_type = indices["componentType"]
+            .as_u64()
+            .ok_or_else(|| import_error("glTF sparse index component type is missing"))?;
+        let index_size = match index_type {
+            5121 => 1,
+            5123 => 2,
+            5125 => 4,
+            _ => {
+                return Err(import_error(
+                    "glTF sparse index component type is unsupported",
+                ));
+            }
+        };
+        let index_view = usize::try_from(
+            indices["bufferView"]
+                .as_u64()
+                .ok_or_else(|| import_error("glTF sparse indices bufferView is missing"))?,
+        )
+        .map_err(|_| import_error("glTF sparse indices bufferView exceeds platform range"))?;
+        let (_, index_data) = buffer_view_data(root, buffers, index_view)?;
+        let index_offset = gltf_byte_offset(indices)?;
+        if !index_offset.is_multiple_of(index_size) {
+            return Err(import_error("glTF sparse indices offset is misaligned"));
+        }
+        let values_info = &sparse["values"];
+        let value_view = usize::try_from(
+            values_info["bufferView"]
+                .as_u64()
+                .ok_or_else(|| import_error("glTF sparse values bufferView is missing"))?,
+        )
+        .map_err(|_| import_error("glTF sparse values bufferView exceeds platform range"))?;
+        let (_, value_data) = buffer_view_data(root, buffers, value_view)?;
+        let value_offset = gltf_byte_offset(values_info)?;
+        if !value_offset.is_multiple_of(component_size) {
+            return Err(import_error("glTF sparse values offset is misaligned"));
+        }
+        let mut previous_index = None;
+        for sparse_element in 0..sparse_count {
+            let index_start = index_offset
+                .checked_add(
+                    sparse_element
+                        .checked_mul(index_size)
+                        .ok_or_else(|| import_error("glTF sparse index offset overflows"))?,
+                )
+                .ok_or_else(|| import_error("glTF sparse index offset overflows"))?;
+            let index_end = index_start
+                .checked_add(index_size)
+                .ok_or_else(|| import_error("glTF sparse index offset overflows"))?;
+            let source_index = read_sparse_index(
+                index_data
+                    .get(index_start..index_end)
+                    .ok_or_else(|| import_error("glTF sparse indices are truncated"))?,
+                index_type,
+            )?;
+            if source_index >= count
+                || previous_index.is_some_and(|previous| source_index <= previous)
+            {
+                return Err(import_error(
+                    "glTF sparse indices must be unique, increasing, and in range",
+                ));
+            }
+            previous_index = Some(source_index);
+            let value_start = value_offset
+                .checked_add(
+                    sparse_element
+                        .checked_mul(element_size)
+                        .ok_or_else(|| import_error("glTF sparse value offset overflows"))?,
+                )
+                .ok_or_else(|| import_error("glTF sparse value offset overflows"))?;
+            for component in 0..dimensions {
+                let offset = value_start
+                    .checked_add(component * component_size)
+                    .ok_or_else(|| import_error("glTF sparse value offset overflows"))?;
+                let end = offset
+                    .checked_add(component_size)
+                    .ok_or_else(|| import_error("glTF sparse value offset overflows"))?;
+                let raw = value_data
+                    .get(offset..end)
+                    .ok_or_else(|| import_error("glTF sparse values are truncated"))?;
+                values[source_index * dimensions + component] =
+                    read_accessor_component(raw, component_type, normalized)?;
+            }
+        }
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(import_error("glTF accessor contains non-finite values"));
+    }
+    Ok((values, dimensions))
+}
+
 fn read_float_accessor(
     root: &Value,
     buffers: &[Vec<u8>],
@@ -7500,86 +8118,7 @@ fn read_float_accessor(
             "glTF animation accessors must use float components",
         ));
     }
-    let dimensions: usize = match accessor["type"].as_str() {
-        Some("SCALAR") => 1,
-        Some("VEC2") => 2,
-        Some("VEC3") => 3,
-        Some("VEC4") => 4,
-        Some("MAT4") => 16,
-        _ => return Err(import_error("glTF animation accessor type is unsupported")),
-    };
-    let count = usize::try_from(
-        accessor["count"]
-            .as_u64()
-            .ok_or_else(|| import_error("glTF animation accessor count is missing"))?,
-    )
-    .map_err(|_| import_error("glTF animation accessor count exceeds platform range"))?;
-    let view_index = usize::try_from(
-        accessor["bufferView"]
-            .as_u64()
-            .ok_or_else(|| import_error("glTF animation accessor bufferView is missing"))?,
-    )
-    .map_err(|_| import_error("glTF animation bufferView exceeds platform range"))?;
-    let view = root["bufferViews"]
-        .get(view_index)
-        .ok_or_else(|| import_error("glTF animation bufferView is missing"))?;
-    let buffer_index = usize::try_from(view["buffer"].as_u64().unwrap_or(0))
-        .map_err(|_| import_error("glTF animation buffer index exceeds platform range"))?;
-    let buffer = buffers
-        .get(buffer_index)
-        .ok_or_else(|| import_error("glTF animation buffer is missing"))?;
-    let base = usize::try_from(view["byteOffset"].as_u64().unwrap_or(0))
-        .map_err(|_| import_error("glTF animation buffer offset exceeds platform range"))?
-        .checked_add(
-            usize::try_from(accessor["byteOffset"].as_u64().unwrap_or(0)).map_err(|_| {
-                import_error("glTF animation accessor offset exceeds platform range")
-            })?,
-        )
-        .ok_or_else(|| import_error("glTF animation buffer offset overflow"))?;
-    let element_size = dimensions
-        .checked_mul(4)
-        .ok_or_else(|| import_error("glTF animation element size overflow"))?;
-    let stride = view["byteStride"]
-        .as_u64()
-        .map(|value| {
-            usize::try_from(value)
-                .map_err(|_| import_error("glTF animation stride exceeds platform range"))
-        })
-        .transpose()?
-        .unwrap_or(element_size);
-    if stride < element_size {
-        return Err(import_error("glTF animation byteStride is too small"));
-    }
-    let capacity = count
-        .checked_mul(dimensions)
-        .ok_or_else(|| import_error("glTF animation value count overflow"))?;
-    let mut values = Vec::with_capacity(capacity);
-    for element in 0..count {
-        let start = base
-            .checked_add(
-                element
-                    .checked_mul(stride)
-                    .ok_or_else(|| import_error("glTF animation offset overflow"))?,
-            )
-            .ok_or_else(|| import_error("glTF animation offset overflow"))?;
-        for component in 0..dimensions {
-            let offset = start
-                .checked_add(component * 4)
-                .ok_or_else(|| import_error("glTF animation offset overflow"))?;
-            let raw = buffer
-                .get(offset..offset + 4)
-                .ok_or_else(|| import_error("glTF animation data is truncated"))?;
-            let value = f64::from(f32::from_le_bytes(
-                raw.try_into()
-                    .map_err(|_| import_error("glTF animation data is truncated"))?,
-            ));
-            if !value.is_finite() {
-                return Err(import_error("glTF animation contains non-finite values"));
-            }
-            values.push(value);
-        }
-    }
-    Ok((values, dimensions))
+    read_accessor_values(root, buffers, index, false)
 }
 
 /// Whether a glTF attribute name is a `TEXCOORD_n` set past the stored UV layer limit.
@@ -7873,9 +8412,11 @@ fn read_vec3(root: &Value, buffers: &[Vec<u8>], accessor_index: usize) -> Result
 }
 
 fn read_vec2(root: &Value, buffers: &[Vec<u8>], accessor_index: usize) -> Result<Vec<[f64; 2]>> {
-    let (values, dimensions) = read_float_accessor(root, buffers, accessor_index)?;
+    let (values, dimensions) = read_accessor_values(root, buffers, accessor_index, true)?;
     if dimensions != 2 {
-        return Err(import_error("glTF TEXCOORD accessor must be float VEC2"));
+        return Err(import_error(
+            "glTF TEXCOORD accessor must be VEC2 with float or normalized unsigned components",
+        ));
     }
     Ok(values
         .as_chunks::<2>()
@@ -8276,7 +8817,7 @@ mod tests {
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
     /// Rewrites an exported glTF document and its binary buffer.
-    type Edit = fn(&mut Value, &mut [u8]) -> TestResult<()>;
+    type Edit = fn(&mut Value, &mut Vec<u8>) -> TestResult<()>;
 
     fn scene(operations: &Value) -> TestResult<SceneDoc> {
         let initial = SceneDoc::new(uuid::Uuid::new_v4().to_string());
@@ -10009,7 +10550,7 @@ mod tests {
     /// Exports `doc`, lets `edit` rewrite the glTF JSON and binary buffer, and imports the result.
     fn import_edited(
         doc: &SceneDoc,
-        edit: impl FnOnce(&mut Value, &mut [u8]) -> TestResult<()>,
+        edit: impl FnOnce(&mut Value, &mut Vec<u8>) -> TestResult<()>,
     ) -> TestResult<crate::error::Result<ImportedGraph>> {
         let directory = tempfile::tempdir()?;
         let snapshot = Snapshot::evaluate(doc, &EvaluationContext::default())?;
@@ -10021,6 +10562,29 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&root)?)?;
         std::fs::write(directory.path().join("scene.bin"), binary)?;
         Ok(import(&path, uuid::Uuid::new_v4().to_string()))
+    }
+
+    fn append_test_buffer_view(
+        root: &mut Value,
+        binary: &mut Vec<u8>,
+        bytes: &[u8],
+        alignment: usize,
+    ) -> TestResult<usize> {
+        while !binary.len().is_multiple_of(alignment) {
+            binary.push(0);
+        }
+        let offset = binary.len();
+        binary.extend_from_slice(bytes);
+        let views = root["bufferViews"]
+            .as_array_mut()
+            .ok_or("bufferViews are missing")?;
+        let index = views.len();
+        views.push(json!({
+            "buffer": 0,
+            "byteOffset": offset,
+            "byteLength": bytes.len()
+        }));
+        Ok(index)
     }
 
     /// Byte offset in the binary buffer of the bufferView that holds one `extras.potter.polygons` field.
@@ -10847,6 +11411,281 @@ mod tests {
             document["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["texCoord"]
                 .as_u64(),
             Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uvless_texture_reports_a_loss_without_fabricating_texcoord_attributes() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
+                {"op":"material.create","id":"paint_mat","base_color_texture":{"image":"paint"}},
+                {"op":"node.create","id":"quad","kind":"plane","params":{"size":2.0},"material":"paint_mat"}
+            ]),
+        )?;
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let (losses, warnings) = uv_layer_diagnostics(&doc, &snapshot, None)?;
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "uv.layer_missing")
+        );
+        assert!(
+            warnings.is_empty(),
+            "an absent UV layer is a loss, not fallback: {warnings:?}"
+        );
+
+        let (document, _) = export_root_and_binary_at_root(&doc, root.path())?;
+        let node = document["nodes"]
+            .as_array()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|node| node["extras"]["potter"]["id"] == "quad")
+            })
+            .ok_or("textured mesh node is missing")?;
+        let mesh_index = usize::try_from(node["mesh"].as_u64().ok_or("mesh index is missing")?)?;
+        let attributes = document["meshes"][mesh_index]["primitives"][0]["attributes"]
+            .as_object()
+            .ok_or("primitive attributes are missing")?;
+        assert!(!attributes.keys().any(|name| name.starts_with("TEXCOORD_")));
+        Ok(())
+    }
+
+    #[test]
+    fn higher_texcoord_sets_import_sparse_and_normalized_integer_accessors() -> TestResult {
+        let doc = scene(&json!([
+            {"op":"node.create","id":"plane","kind":"plane","params":{"size":2.0}},
+            {"op":"uv.unwrap","target":{"id":"plane"},"method":"smart"}
+        ]))?;
+        let imported = import_edited(&doc, |root, binary| {
+            let position_accessor = usize::try_from(
+                root["meshes"][0]["primitives"][0]["attributes"]["POSITION"]
+                    .as_u64()
+                    .ok_or("POSITION accessor is missing")?,
+            )?;
+            let count = usize::try_from(
+                root["accessors"][position_accessor]["count"]
+                    .as_u64()
+                    .ok_or("POSITION count is missing")?,
+            )?;
+            assert!(count >= 2, "fixture plane needs at least two vertices");
+            let last_index = u8::try_from(count - 1)?;
+            let indices_view = append_test_buffer_view(root, binary, &[0, last_index], 4)?;
+            let sparse_values = [255_u8, 0, 128, 255];
+            let sparse_values_view = append_test_buffer_view(root, binary, &sparse_values, 4)?;
+            let sparse_accessor = {
+                let accessors = root["accessors"]
+                    .as_array_mut()
+                    .ok_or("accessors are missing")?;
+                let index = accessors.len();
+                accessors.push(json!({
+                    "componentType": 5121,
+                    "count": count,
+                    "type": "VEC2",
+                    "normalized": true,
+                    "sparse": {
+                        "count": 2,
+                        "indices": {"bufferView": indices_view, "componentType": 5121},
+                        "values": {"bufferView": sparse_values_view}
+                    }
+                }));
+                index
+            };
+
+            let mut unsigned_short_values = Vec::with_capacity(count * 4);
+            for _ in 0..count {
+                for value in [0_u16, u16::MAX] {
+                    unsigned_short_values.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            let unsigned_short_view =
+                append_test_buffer_view(root, binary, &unsigned_short_values, 4)?;
+            let unsigned_short_sparse_indices = append_test_buffer_view(root, binary, &[1_u8], 4)?;
+            let mut unsigned_short_sparse_values = Vec::with_capacity(4);
+            for value in [32_768_u16, 16_384_u16] {
+                unsigned_short_sparse_values.extend_from_slice(&value.to_le_bytes());
+            }
+            let unsigned_short_sparse_values_view =
+                append_test_buffer_view(root, binary, &unsigned_short_sparse_values, 4)?;
+            let unsigned_short_accessor = {
+                let accessors = root["accessors"]
+                    .as_array_mut()
+                    .ok_or("accessors are missing")?;
+                let index = accessors.len();
+                accessors.push(json!({
+                    "bufferView": unsigned_short_view,
+                    "componentType": 5123,
+                    "count": count,
+                    "type": "VEC2",
+                    "normalized": true,
+                    "sparse": {
+                        "count": 1,
+                        "indices": {"bufferView": unsigned_short_sparse_indices, "componentType": 5121},
+                        "values": {"bufferView": unsigned_short_sparse_values_view}
+                    }
+                }));
+                index
+            };
+            root["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_1"] = json!(sparse_accessor);
+            root["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_2"] =
+                json!(unsigned_short_accessor);
+            root["buffers"][0]["byteLength"] = json!(binary.len());
+            Ok(())
+        })??;
+
+        let layers = uv_layers::read_layers(first_mesh(&imported.doc)?);
+        assert_eq!(
+            layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
+            ["UVMap", "UVMap.001", "UVMap.002"]
+        );
+        let values = |set: usize| {
+            layers[set]
+                .faces
+                .iter()
+                .flatten()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let sparse_uvs = values(1);
+        assert!(sparse_uvs.contains(&[1.0, 0.0]));
+        assert!(sparse_uvs.contains(&[f64::from(128_u8) / 255.0, 1.0]));
+        assert!(sparse_uvs.contains(&[0.0, 0.0]));
+        let normalized_uvs = values(2);
+        assert!(normalized_uvs.contains(&[0.0, 1.0]));
+        assert!(normalized_uvs.contains(&[32_768.0 / 65_535.0, 16_384.0 / 65_535.0]));
+        Ok(())
+    }
+
+    #[test]
+    fn gltf_import_tags_normal_map_only_when_other_textures_force_a_graph() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"normal","width":1,"height":1,"colorspace":"linear","fill_color":[0.5,0.5,1.0,1.0]},
+                {"op":"material.create","id":"normal_mat","normal_texture":{"image":"normal"}},
+                {"op":"node.create","id":"surface","kind":"plane","params":{"size":1.0},"material":"normal_mat"}
+            ]),
+        )?;
+        let (mut document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        std::fs::write(root.path().join("scene.bin"), &binary)?;
+        let direct_path = root.path().join("direct.gltf");
+        std::fs::write(&direct_path, serde_json::to_vec(&document)?)?;
+        let direct = import(&direct_path, uuid::Uuid::new_v4().to_string())?;
+        let material_id = crate::model::Id::new("normal_mat")?;
+        let direct_material = direct
+            .doc
+            .materials
+            .get(&material_id)
+            .ok_or("direct normal material is missing")?;
+        assert!(direct_material.normal_texture.is_some());
+        assert!(direct_material.node_tree.is_none());
+
+        let texture_index = document["materials"][0]["normalTexture"]["index"].clone();
+        document["materials"][0]["emissiveTexture"] = json!({"index": texture_index});
+        document["materials"][0]["emissiveFactor"] = json!([1.0, 1.0, 1.0]);
+        let graph_path = root.path().join("graph.gltf");
+        std::fs::write(&graph_path, serde_json::to_vec(&document)?)?;
+        let graph_import = import(&graph_path, uuid::Uuid::new_v4().to_string())?;
+        let graph_material = graph_import
+            .doc
+            .materials
+            .get(&material_id)
+            .ok_or("graph-converted normal material is missing")?;
+        let graph_id = graph_material
+            .node_tree
+            .as_ref()
+            .ok_or("normal graph is missing")?;
+        let graph = graph_import
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or("normal graph group is missing")?;
+        let normal_map = graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeNormalMap")
+            .ok_or("imported NormalMap node is missing")?;
+        assert_eq!(
+            normal_map.properties["potter_gltf_imported_normal_map"],
+            json!(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uvless_collection_slot_omits_union_uv_attrs_and_unsupported_textures() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let mut doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
+                {"op":"material.create","id":"shared","base_color_texture":{"image":"paint"}},
+                {"op":"collection.create","id":"source"},
+                {"op":"node.create","id":"a_member","kind":"plane","collection":"source","params":{"size":2.0}},
+                {"op":"node.update","target":{"id":"a_member"},"set":{"materials":["shared"]}},
+                {"op":"node.create","id":"b_member","kind":"plane","collection":"source","params":{"size":2.0}},
+                {"op":"node.update","target":{"id":"b_member"},"set":{"materials":["shared"]}},
+                {"op":"collection.instance_create","id":"instance","collection":"source"}
+            ]),
+        )?;
+        store_single_uv_layer(&mut doc, "b_member", "MemberUV", true)?;
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let (losses, warnings) = uv_layer_diagnostics(&doc, &snapshot, None)?;
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "uv.layer_missing")
+        );
+        assert!(warnings.is_empty());
+
+        let (document, _) = export_root_and_binary_at_root(&doc, root.path())?;
+        let mesh = document["meshes"]
+            .as_array()
+            .and_then(|meshes| meshes.iter().find(|mesh| mesh["name"] == "instance_source"))
+            .ok_or("collection instance mesh is missing")?;
+        let primitives = mesh["primitives"]
+            .as_array()
+            .ok_or("collection instance primitives are missing")?;
+        assert_eq!(primitives.len(), 2);
+        let missing_attributes = primitives[0]["attributes"]
+            .as_object()
+            .ok_or("UV-less member attributes are missing")?;
+        assert!(
+            !missing_attributes
+                .keys()
+                .any(|name| name.starts_with("TEXCOORD_"))
+        );
+        let missing_material = usize::try_from(
+            primitives[0]["material"]
+                .as_u64()
+                .ok_or("UV-less material variant is missing")?,
+        )?;
+        let missing_pbr = &document["materials"][missing_material]["pbrMetallicRoughness"];
+        assert!(missing_pbr["baseColorTexture"].is_null());
+        assert!(missing_pbr["baseColorFactor"].is_array());
+
+        let mapped_attributes = primitives[1]["attributes"]
+            .as_object()
+            .ok_or("UV-mapped member attributes are missing")?;
+        assert!(mapped_attributes["TEXCOORD_0"].is_number());
+        assert!(mapped_attributes["TEXCOORD_1"].is_null());
+        let mapped_material = usize::try_from(
+            primitives[1]["material"]
+                .as_u64()
+                .ok_or("UV-mapped material variant is missing")?,
+        )?;
+        assert!(
+            document["materials"][mapped_material]["pbrMetallicRoughness"]["baseColorTexture"]
+                .is_object()
         );
         Ok(())
     }

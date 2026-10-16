@@ -220,12 +220,12 @@ pub(crate) fn evaluate(
     Ok(warnings)
 }
 
-fn topology_matches(
-    mesh: &Mesh,
-    cache_vertex_count: usize,
-    cache_faces: &[Vec<usize>],
-) -> bool {
-    let corner_count = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+fn topology_matches(mesh: &Mesh, cache_vertex_count: usize, cache_faces: &[Vec<usize>]) -> bool {
+    let corner_count = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .sum::<usize>();
     if mesh.vertices.is_empty()
         || mesh.vertices.len() != cache_vertex_count
         || mesh.faces.len() != cache_faces.len()
@@ -239,12 +239,17 @@ fn topology_matches(
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect::<HashMap<_, _>>();
-    mesh.faces.iter().zip(cache_faces).all(|(face, cache_face)| {
-        face.vertices.len() == cache_face.len()
-            && face.vertices.iter().zip(cache_face).all(|(id, index)| {
-                indices.get(id).is_some_and(|mesh_index| mesh_index == index)
-            })
-    })
+    mesh.faces
+        .iter()
+        .zip(cache_faces)
+        .all(|(face, cache_face)| {
+            face.vertices.len() == cache_face.len()
+                && face.vertices.iter().zip(cache_face).all(|(id, index)| {
+                    indices
+                        .get(id)
+                        .is_some_and(|mesh_index| mesh_index == index)
+                })
+        })
 }
 
 fn cached_mesh_cache_samples(
@@ -260,10 +265,7 @@ fn cached_mesh_cache_samples(
     let velocity_parameter = if read_velocity { velocity_name } else { "" };
     let key = format!(
         "{resource_hash}\0{object_path}\0{}\0{}\0{}\0{}",
-        read.uv,
-        read.color,
-        read.polygons,
-        velocity_parameter
+        read.uv, read.color, read.polygons, velocity_parameter
     );
     let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
         PotError::new(
@@ -762,9 +764,15 @@ mod tests {
     use crate::geom::Mesh;
 
     #[test]
-    fn topology_identity_detects_same_size_corner_reorder() -> Result<(), Box<dyn std::error::Error>> {
+    fn topology_identity_detects_same_size_corner_reorder() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mesh = Mesh::from_positions_and_faces(
-            vec![glam::DVec3::ZERO, glam::DVec3::X, glam::DVec3::ONE, glam::DVec3::Y],
+            vec![
+                glam::DVec3::ZERO,
+                glam::DVec3::X,
+                glam::DVec3::ONE,
+                glam::DVec3::Y,
+            ],
             vec![vec![0, 1, 2, 3]],
         )?;
         assert!(topology_matches(&mesh, 4, &[vec![0, 1, 2, 3]]));

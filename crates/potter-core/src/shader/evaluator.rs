@@ -955,8 +955,14 @@ impl Evaluator<'_, '_, '_, '_> {
                 ));
             }
         };
+        let routing_uv = [uv.x, uv.y];
+        let pixel_uv = if tile == 0 {
+            [uv.x, 1.0 - uv.y]
+        } else {
+            [uv.x.rem_euclid(1.0), 1.0 - uv.y.rem_euclid(1.0)]
+        };
         let pixel =
-            sample_with_extension(image, [uv.x, 1.0 - uv.y], tile, interpolation, extension);
+            sample_with_extension(image, routing_uv, pixel_uv, tile, interpolation, extension);
         if pixel.iter().any(|component| !component.is_finite()) {
             return Err(eval_error(format!(
                 "Image Texture node `{id}` sampled non-finite pixels"
@@ -1401,6 +1407,12 @@ impl Evaluator<'_, '_, '_, '_> {
         if !matches!(space, "TANGENT_SPACE" | "TANGENT") {
             return Err(unsupported_node(id, &format!("NormalMap:{space}")));
         }
+        let imported_normal_map = self
+            .node(id)?
+            .properties
+            .get("potter_gltf_imported_normal_map")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
         let color = self.color_input(id, &["Color"], [0.5, 0.5, 1.0, 1.0])?;
         let tangent_normal = DVec3::new(
             color[0] * 2.0 - 1.0,
@@ -1414,7 +1426,11 @@ impl Evaluator<'_, '_, '_, '_> {
             .get("uv_map")
             .and_then(JsonValue::as_str);
         let layer = layer_index(self.hit_ctx, uv_map);
-        let (tangent_u, tangent_v) = blender_layer_frame(self.hit_ctx, layer, base_normal);
+        let (tangent_u, tangent_v) = if imported_normal_map {
+            layer_frame(self.hit_ctx, layer, base_normal)
+        } else {
+            blender_layer_frame(self.hit_ctx, layer, base_normal)
+        };
         let mapped_normal = normalize_or(
             tangent_u * tangent_normal.x
                 + tangent_v * tangent_normal.y

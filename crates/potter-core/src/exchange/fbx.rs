@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::Snapshot,
+    eval::{SlotBinding, Snapshot},
     geom::{Mesh, normals::corner_normals, uv_layers},
     model::{
         Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode,
@@ -72,12 +72,20 @@ struct MorphExport {
 }
 
 #[derive(Clone, Debug)]
+struct MaterialExport {
+    id: i64,
+    material_id: Id,
+    uv_layers: [Option<String>; 4],
+}
+
+#[derive(Clone, Debug)]
 struct TextureExport {
     id: i64,
     material_id: Id,
+    material_object_id: i64,
     property: &'static str,
     path: String,
-    uv_layer: String,
+    uv_layer: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -188,11 +196,10 @@ pub(crate) fn export_with_root_allow_lossy(
     let (bone_models, bone_model_ids) = build_bone_models(doc, &ids, &mut next_id)?;
     let (skin_exports, morph_exports) =
         build_deformers(doc, snapshot, &ids, &bone_model_ids, &mut next_id)?;
-    let mut material_ids = BTreeMap::<Id, i64>::new();
-    for material_id in doc.materials.keys() {
-        material_ids.insert(material_id.clone(), take_object_id(&mut next_id)?);
-    }
-    let texture_exports = build_texture_exports(doc, project_root, &mut next_id)?;
+    let (material_exports, material_bindings) =
+        build_material_exports(doc, snapshot, &mut next_id)?;
+    let texture_exports =
+        build_texture_exports(doc, project_root, &material_exports, &mut next_id)?;
 
     let mut stacks = BTreeMap::<Id, (i64, i64)>::new();
     let mut curve_exports = Vec::<CurveExport>::new();
@@ -297,7 +304,7 @@ pub(crate) fn export_with_root_allow_lossy(
         + bone_models.len()
         + ids.values().filter(|ids| ids.geometry.is_some()).count()
         + morph_exports.len()
-        + material_ids.len()
+        + material_exports.len()
         + texture_exports.len()
         + deformer_count
         + stacks.len() * 2
@@ -308,7 +315,7 @@ pub(crate) fn export_with_root_allow_lossy(
         "Definitions:  {{\n\tVersion: 100\n\tCount: {object_count}\n\tObjectType: \"Model\" {{\n\t\tCount: {}\n\t}}\n\tObjectType: \"Geometry\" {{\n\t\tCount: {}\n\t}}\n\tObjectType: \"Material\" {{\n\t\tCount: {}\n\t}}\n\tObjectType: \"Texture\" {{\n\t\tCount: {}\n\t}}\n\tObjectType: \"Deformer\" {{\n\t\tCount: {deformer_count}\n\t}}\n\tObjectType: \"AnimationStack\" {{\n\t\tCount: {}\n\t}}\n\tObjectType: \"AnimationLayer\" {{\n\t\tCount: {}\n\t}}\n\tObjectType: \"AnimationCurveNode\" {{\n\t\tCount: {}\n\t}}\n\tObjectType: \"AnimationCurve\" {{\n\t\tCount: {}\n\t}}\n}}\n",
         ids.len() + bone_models.len(),
         ids.values().filter(|ids| ids.geometry.is_some()).count() + morph_exports.len(),
-        material_ids.len(),
+        material_exports.len(),
         texture_exports.len(),
         stacks.len(),
         stacks.len(),
@@ -357,6 +364,7 @@ pub(crate) fn export_with_root_allow_lossy(
                 node,
                 mesh,
                 data_block,
+                snapshot.slot_count(node_id, node),
                 allow_lossy,
             )?;
         }
@@ -428,23 +436,21 @@ pub(crate) fn export_with_root_allow_lossy(
         write_morph_export(&mut output, morph)?;
     }
 
-    for (material_id, material) in &doc.materials {
-        let object_id = material_ids.get(material_id).ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "FBX material ID was not allocated",
-            )
-        })?;
+    for material_export in &material_exports {
+        let material = doc
+            .materials
+            .get(&material_export.material_id)
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "FBX material is missing"))?;
         writeln!(
             output,
-            "\tMaterial: {}, \"{}\", \"\" {{\n\t\tVersion: 102\n\t\tShadingModel: \"phong\"\n\t\tMultiLayer: 0\n\t\tProperties70:  {{\n\t\t\tP: \"DiffuseColor\", \"Color\", \"\",\"A\",{},{},{}\n\t\t\tP: \"DiffuseFactor\", \"Number\", \"\",\"A\",1\n\t\t\tP: \"Opacity\", \"Number\", \"\",\"A\",{}\n\t\t\tP: \"potter:id\", \"KString\", \"\", \"\", \"{}\"\n\t\t\tP: \"potter:metallic\", \"Number\", \"\",\"A\",{}\n\t\t\tP: \"potter:roughness\", \"Number\", \"\",\"A\",{}\n\t\t\tP: \"potter:emission_color\", \"Color\", \"\",\"A\",{},{},{}\n\t\t\tP: \"potter:emission_strength\", \"Number\", \"\",\"A\",{}\n\t\t\tP: \"potter:transmission\", \"Number\", \"\",\"A\",{}\n\t\t\tP: \"potter:ior\", \"Number\", \"\",\"A\",{}\n\t\t\tP: \"potter:double_sided\", \"bool\", \"Boolean\", \"\",{}\n\t\t}}\n\t}}",
-            object_id,
+            "\tMaterial: {}, \"{}\", \"\" {{\n\t\tVersion: 102\n\t\tShadingModel: \"phong\"\n\t\tMultiLayer: 0\n\t\tProperties70:  {{\n\t\t\tP: \"DiffuseColor\", \"Color\",\"\",\"A\",{},{},{}\n\t\t\tP: \"DiffuseFactor\", \"Number\",\"\",\"A\",1\n\t\t\tP: \"Opacity\", \"Number\",\"\",\"A\",{}\n\t\t\tP: \"potter:id\", \"KString\", \"\", \"\", \"{}\"\n\t\t\tP: \"potter:metallic\", \"Number\",\"\",\"A\",{}\n\t\t\tP: \"potter:roughness\", \"Number\",\"\",\"A\",{}\n\t\t\tP: \"potter:emission_color\", \"Color\",\"\",\"A\",{},{},{}\n\t\t\tP: \"potter:emission_strength\", \"Number\",\"\",\"A\",{}\n\t\t\tP: \"potter:transmission\", \"Number\",\"\",\"A\",{}\n\t\t\tP: \"potter:ior\", \"Number\",\"\",\"A\",{}\n\t\t\tP: \"potter:double_sided\", \"bool\", \"Boolean\", \"\",{}\n\t\t}}\n\t}}",
+            material_export.id,
             quote(&format!("Material::{}", material.name)),
             fmt_num(material.base_color[0]),
             fmt_num(material.base_color[1]),
             fmt_num(material.base_color[2]),
             fmt_num(material.base_color[3]),
-            quote(material_id.as_str()),
+            quote(material_export.material_id.as_str()),
             fmt_num(material.metallic),
             fmt_num(material.roughness),
             fmt_num(material.emission_color[0]),
@@ -462,13 +468,32 @@ pub(crate) fn export_with_root_allow_lossy(
         let material = doc.materials.get(&texture.material_id).ok_or_else(|| {
             PotError::new(ErrorCode::SceneInvalid, "FBX texture material is missing")
         })?;
+        let uv_set_property = texture
+            .uv_layer
+            .as_deref()
+            .map_or_else(String::new, |layer| {
+                format!(
+                    "\t\t\tP: \"UVSet\", \"KString\", \"\", \"\", \"{}\"\n",
+                    quote(layer)
+                )
+            });
+        let default_name_property = texture
+            .uv_layer
+            .as_deref()
+            .filter(|layer| *layer == "default")
+            .map_or_else(String::new, |layer| {
+                format!(
+                    "\t\t\tP: \"potter:uv_layer_name\", \"KString\", \"\", \"\", \"{}\"\n",
+                    quote(layer)
+                )
+            });
         writeln!(
             output,
-            "\tTexture: {}, \"Texture::{}\", \"TextureVideoClip\" {{\n\t\tType: \"TextureVideoClip\"\n\t\tVersion: 202\n\t\tTextureName: \"Texture::{}\"\n\t\tProperties70:  {{\n\t\t\tP: \"UVSet\", \"KString\", \"\", \"\", \"{}\"\n\t\t\tP: \"potter:property\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}\n\t\tFileName: \"{}\"\n\t\tRelativeFilename: \"{}\"\n\t\tModelUVTranslation: 0,0\n\t\tModelUVScaling: 1,1\n\t\tTexture_Alpha_Source: \"None\"\n\t\tCropping: 0,0,0,0\n\t}}",
+            "\tTexture: {}, \"Texture::{}\", \"TextureVideoClip\" {{\n\t\tType: \"TextureVideoClip\"\n\t\tVersion: 202\n\t\tTextureName: \"Texture::{}\"\n\t\tProperties70:  {{\n{}{default_name_property}\t\t\tP: \"potter:property\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}\n\t\tFileName: \"{}\"\n\t\tRelativeFilename: \"{}\"\n\t\tModelUVTranslation: 0,0\n\t\tModelUVScaling: 1,1\n\t\tTexture_Alpha_Source: \"None\"\n\t\tCropping: 0,0,0,0\n\t}}",
             texture.id,
             quote(&material.name),
             quote(&material.name),
-            quote(&texture.uv_layer),
+            uv_set_property,
             texture.property,
             quote(&texture.path),
             quote(&texture.path),
@@ -547,15 +572,26 @@ pub(crate) fn export_with_root_allow_lossy(
         } else {
             writeln!(output, "\tC: \"OO\",{},0", object_ids.model).map_err(write_error)?;
         }
-        for material_id in &node.materials {
-            let material = material_ids.get(material_id).ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "node references a material absent from the FBX export",
-                    json!({ "node_id": node_id, "material_id": material_id }),
-                )
-            })?;
-            writeln!(output, "\tC: \"OO\",{material},{}", object_ids.model).map_err(write_error)?;
+        for slot in 0..snapshot.slot_count(node_id, node) {
+            let Some(material_id) = snapshot.slot_material(node_id, node, slot) else {
+                continue;
+            };
+            let material_object_id =
+                material_bindings
+                    .get(&(node_id.clone(), slot))
+                    .ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "node material UV variant is missing",
+                            json!({ "node_id": node_id, "slot": slot, "material_id": material_id }),
+                        )
+                    })?;
+            writeln!(
+                output,
+                "\tC: \"OO\",{material_object_id},{}",
+                object_ids.model
+            )
+            .map_err(write_error)?;
         }
     }
     for bone in &bone_models {
@@ -591,16 +627,10 @@ pub(crate) fn export_with_root_allow_lossy(
         .map_err(write_error)?;
     }
     for texture in &texture_exports {
-        let material_id = material_ids.get(&texture.material_id).ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "FBX texture material ID is missing",
-            )
-        })?;
         writeln!(
             output,
             "\tC: \"OP\",{}, {},\"{}\"",
-            texture.id, material_id, texture.property
+            texture.id, texture.material_object_id, texture.property
         )
         .map_err(write_error)?;
     }
@@ -634,12 +664,166 @@ pub(crate) fn export_with_root_allow_lossy(
     Ok(output.into_bytes())
 }
 
+fn material_texture_refs(material: &Material) -> [Option<&TextureRef>; 4] {
+    [
+        material.base_color_texture.as_ref(),
+        material.roughness_texture.as_ref(),
+        material.metallic_texture.as_ref(),
+        material.normal_texture.as_ref(),
+    ]
+}
+
+const TEXTURE_PROPERTIES: [&str; 4] = ["DiffuseColor", "Shininess", "ReflectionColor", "NormalMap"];
+
+#[derive(Clone, Debug)]
+struct TextureUvSelection {
+    uv_layer: Option<String>,
+    missing: Option<String>,
+}
+
+fn resolve_texture_uv_selection(
+    store: Option<&uv_layers::UvStore>,
+    binding: Option<&SlotBinding>,
+    reference: Option<&str>,
+) -> TextureUvSelection {
+    let reference = reference.filter(|name| !name.is_empty());
+    let Some(store) = store else {
+        return TextureUvSelection {
+            uv_layer: reference.map(str::to_owned),
+            missing: None,
+        };
+    };
+    let render_index = match binding {
+        Some(binding) => binding.uv.render_index.map(usize::from),
+        None => store.render_index(),
+    }
+    .filter(|index| store.layers.get(*index).is_some());
+    let (index, missing) = match reference {
+        Some(name) => match store.index_of(name) {
+            Some(index)
+                if binding.is_none_or(|binding| {
+                    index < 8 && binding.uv.available_mask & (1_u8 << index) != 0
+                }) =>
+            {
+                (Some(index), None)
+            }
+            _ => (render_index, Some(name.to_owned())),
+        },
+        None => (render_index, None),
+    };
+    TextureUvSelection {
+        uv_layer: index
+            .and_then(|index| store.layers.get(index))
+            .map(|layer| layer.name.clone()),
+        missing,
+    }
+}
+
+fn material_uv_layers(
+    material: &Material,
+    store: Option<&uv_layers::UvStore>,
+    binding: Option<&SlotBinding>,
+) -> [Option<String>; 4] {
+    let textures = material_texture_refs(material);
+    std::array::from_fn(|index| {
+        textures[index].and_then(|texture| {
+            resolve_texture_uv_selection(store, binding, texture.uv_layer.as_deref()).uv_layer
+        })
+    })
+}
+
+fn export_mesh_for_node<'a>(
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    node_id: &Id,
+    node: &'a Node,
+) -> Option<&'a Mesh> {
+    let data_block = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
+    let has_deformations = data_block.is_some_and(|data| {
+        data.shape_keys
+            .as_ref()
+            .is_some_and(|keys| !keys.keys.is_empty())
+            || !data.vertex_groups.is_empty()
+            || !data.vertex_weights.is_empty()
+    });
+    if has_deformations {
+        data_block.and_then(|data| data.mesh.as_ref())
+    } else {
+        snapshot.meshes.get(node_id)
+    }
+}
+
+fn add_material_export(
+    material_id: &Id,
+    uv_layers: [Option<String>; 4],
+    variants: &mut BTreeMap<(Id, [Option<String>; 4]), i64>,
+    output: &mut Vec<MaterialExport>,
+    next_id: &mut i64,
+) -> Result<i64> {
+    let key = (material_id.clone(), uv_layers.clone());
+    if let Some(id) = variants.get(&key) {
+        return Ok(*id);
+    }
+    let id = take_object_id(next_id)?;
+    variants.insert(key, id);
+    output.push(MaterialExport {
+        id,
+        material_id: material_id.clone(),
+        uv_layers,
+    });
+    Ok(id)
+}
+
+fn build_material_exports(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    next_id: &mut i64,
+) -> Result<(Vec<MaterialExport>, BTreeMap<(Id, usize), i64>)> {
+    let mut output = Vec::new();
+    let mut variants = BTreeMap::<(Id, [Option<String>; 4]), i64>::new();
+    let mut bindings = BTreeMap::new();
+    let mut used_materials = BTreeSet::new();
+    for (node_id, node) in &doc.nodes {
+        let store = export_mesh_for_node(doc, snapshot, node_id, node).map(uv_layers::read);
+        for slot in 0..snapshot.slot_count(node_id, node) {
+            let Some(material_id) = snapshot.slot_material(node_id, node, slot) else {
+                continue;
+            };
+            let material = doc.materials.get(material_id).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "node references a material absent from the FBX export",
+                    json!({"node_id":node_id,"material_id":material_id}),
+                )
+            })?;
+            let binding = snapshot.slot_binding(node_id, node, slot);
+            let uv_layers = material_uv_layers(material, store.as_ref(), binding);
+            let object_id =
+                add_material_export(material_id, uv_layers, &mut variants, &mut output, next_id)?;
+            bindings.insert((node_id.clone(), slot), object_id);
+            used_materials.insert(material_id.clone());
+        }
+    }
+    for (material_id, material) in &doc.materials {
+        if !used_materials.contains(material_id) {
+            let uv_layers = material_texture_refs(material)
+                .map(|texture| texture.and_then(|texture| texture.uv_layer.clone()));
+            add_material_export(material_id, uv_layers, &mut variants, &mut output, next_id)?;
+        }
+    }
+    Ok((output, bindings))
+}
+
 fn build_texture_exports(
     doc: &SceneDoc,
     root: &Path,
+    materials: &[MaterialExport],
     next_id: &mut i64,
 ) -> Result<Vec<TextureExport>> {
-    let mut output = Vec::new();
+    let mut paths = BTreeMap::<(Id, &'static str), String>::new();
     for (material_id, material) in &doc.materials {
         if material
             .node_tree
@@ -652,12 +836,10 @@ fn build_texture_exports(
                 json!({"feature_id":"format.fbx.material_node_tree","material_id":material_id}),
             ));
         }
-        for (texture, property) in [
-            (&material.base_color_texture, "DiffuseColor"),
-            (&material.roughness_texture, "Shininess"),
-            (&material.metallic_texture, "ReflectionColor"),
-            (&material.normal_texture, "NormalMap"),
-        ] {
+        for (texture, property) in material_texture_refs(material)
+            .into_iter()
+            .zip(TEXTURE_PROPERTIES)
+        {
             let Some(texture) = texture else {
                 continue;
             };
@@ -720,89 +902,126 @@ fn build_texture_exports(
                 }
             };
             let path = fs::canonicalize(path).map_err(|error| PotError::io(&error))?;
+            paths.insert(
+                (material_id.clone(), property),
+                path.to_string_lossy().into_owned(),
+            );
+        }
+    }
+
+    let mut output = Vec::new();
+    for material_export in materials {
+        let material = doc
+            .materials
+            .get(&material_export.material_id)
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "FBX material is missing"))?;
+        for (index, (texture, property)) in material_texture_refs(material)
+            .into_iter()
+            .zip(TEXTURE_PROPERTIES)
+            .enumerate()
+        {
+            if texture.is_none() {
+                continue;
+            }
+            let path = paths
+                .get(&(material_export.material_id.clone(), property))
+                .ok_or_else(|| {
+                    PotError::new(ErrorCode::InternalError, "FBX texture path is missing")
+                })?;
             output.push(TextureExport {
                 id: take_object_id(next_id)?,
-                material_id: material_id.clone(),
+                material_id: material_export.material_id.clone(),
+                material_object_id: material_export.id,
                 property,
-                path: path.to_string_lossy().into_owned(),
-                uv_layer: texture_uv_set(doc, material_id, texture.uv_layer.as_deref()),
+                path: path.clone(),
+                uv_layer: material_export.uv_layers[index].clone(),
             });
         }
     }
     Ok(output)
 }
 
-/// The layer a material texture samples, as FBX's `UVSet`. The first mesh that uses the material
-/// resolves the reference. A layer name that mesh lacks falls back to its render layer, which
-/// `uv_texture_losses` reports.
-fn texture_uv_set(doc: &SceneDoc, material_id: &Id, uv_layer: Option<&str>) -> String {
-    let Some(store) = doc
-        .nodes
-        .values()
-        .find(|node| node.materials.contains(material_id))
-        .and_then(|node| node.data.as_ref())
-        .and_then(|data_id| doc.data_blocks.get(data_id))
-        .and_then(|data| data.mesh.as_ref())
-        .map(uv_layers::read)
-    else {
-        return uv_layer.unwrap_or_default().to_owned();
-    };
-    let (index, _) = store.resolve(uv_layer);
-    index
-        .and_then(|index| store.layers.get(index))
-        .map(|layer| layer.name.clone())
-        .unwrap_or_default()
-}
-
-/// Losses for material textures that name a UV layer which a mesh using the material lacks. FBX
-/// writes the render layer for those textures instead.
-pub(crate) fn uv_texture_losses(doc: &SceneDoc) -> Vec<Loss> {
-    let mut missing = BTreeSet::<(String, String, String)>::new();
-    for (material_id, material) in &doc.materials {
-        let textures = [
-            &material.base_color_texture,
-            &material.roughness_texture,
-            &material.metallic_texture,
-            &material.normal_texture,
-        ];
-        for texture in textures.into_iter().flatten() {
-            let Some(name) = texture.uv_layer.as_deref() else {
+fn missing_texture_uv_layers(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+) -> BTreeMap<(Id, Option<String>, Id, usize), Option<String>> {
+    let mut missing = BTreeMap::new();
+    for (node_id, node) in &doc.nodes {
+        let Some(mesh) = export_mesh_for_node(doc, snapshot, node_id, node) else {
+            continue;
+        };
+        let store = uv_layers::read(mesh);
+        for slot in 0..snapshot.slot_count(node_id, node) {
+            let Some(material_id) = snapshot.slot_material(node_id, node, slot) else {
                 continue;
             };
-            for (node_id, node) in doc
-                .nodes
-                .iter()
-                .filter(|(_, node)| node.materials.contains(material_id))
-            {
-                let Some(mesh) = node
-                    .data
-                    .as_ref()
-                    .and_then(|data_id| doc.data_blocks.get(data_id))
-                    .and_then(|data| data.mesh.as_ref())
-                else {
-                    continue;
-                };
-                if uv_layers::read(mesh).resolve(Some(name)).1.is_some() {
-                    missing.insert((
-                        material_id.to_string(),
-                        name.to_owned(),
-                        node_id.to_string(),
-                    ));
+            let Some(material) = doc.materials.get(material_id) else {
+                continue;
+            };
+            let binding = snapshot.slot_binding(node_id, node, slot);
+            for texture in material_texture_refs(material).into_iter().flatten() {
+                let requested = texture.uv_layer.as_deref().filter(|name| !name.is_empty());
+                let selection = resolve_texture_uv_selection(Some(&store), binding, requested);
+                if selection.missing.is_some() || selection.uv_layer.is_none() {
+                    let missing_layer = selection.missing.or_else(|| requested.map(str::to_owned));
+                    missing.insert(
+                        (material_id.clone(), missing_layer, node_id.clone(), slot),
+                        selection.uv_layer,
+                    );
                 }
             }
         }
     }
     missing
+}
+
+/// Textures whose requested or default render UV layer is unavailable on an evaluated mesh.
+pub(crate) fn uv_texture_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss> {
+    missing_texture_uv_layers(doc, snapshot)
         .into_iter()
-        .map(|(material, layer, node)| Loss {
-            feature_id: "uv.layer_missing".to_owned(),
-            data_id: Some(material.clone()),
-            reason: format!(
-                "material `{material}` samples UV layer `{layer}`, which node `{node}` does not have; FBX samples the render layer instead"
-            ),
-            suggestion: Some(
-                "add the UV layer to the mesh, or point the texture at the render layer".to_owned(),
-            ),
+        .filter_map(|((material, layer, node, slot), render_layer)| {
+            render_layer.is_none().then_some(Loss {
+                feature_id: "uv.layer_missing".to_owned(),
+                data_id: Some(material.clone()),
+                reason: match layer {
+                    Some(layer) => format!(
+                        "material `{material}` samples UV layer `{layer}`, which node `{node}` does not have for slot {slot} and has no render layer to fall back to"
+                    ),
+                    None => format!(
+                        "material `{material}` uses the render UV layer, but node `{node}` has no render layer for slot {slot}"
+                    ),
+                },
+                suggestion: Some(
+                    "add the requested UV layer or a render UV layer to the mesh".to_owned(),
+                ),
+            })
+        })
+        .collect()
+}
+
+/// Warnings for explicit texture UV names that fall back to an evaluated mesh's render layer.
+pub(crate) fn uv_texture_warnings(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PotError> {
+    missing_texture_uv_layers(doc, snapshot)
+        .into_iter()
+        .filter_map(|((material, layer, node, slot), render_layer)| {
+            Some((material, layer?, node, slot, render_layer?))
+        })
+        .map(|(material, layer, node, slot, render_layer)| {
+            PotError::with_details(
+                ErrorCode::UnrepresentableFeature,
+                format!(
+                    "material `{material}` samples UV layer `{layer}`, which node `{node}` does not have for slot {slot}; render layer `{render_layer}` is used instead"
+                ),
+                json!({
+                    "feature_id": "uv.layer_missing",
+                    "status": "fallback",
+                    "material_id": material,
+                    "node_id": node,
+                    "slot": slot,
+                    "uv_layer": layer,
+                    "render_uv_layer": render_layer,
+                }),
+            )
         })
         .collect()
 }
@@ -1267,6 +1486,7 @@ fn write_geometry(
     node: &Node,
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
+    material_slot_count: usize,
     allow_lossy: bool,
 ) -> Result<()> {
     // Shading attributes and UV layers have their own FBX layers. Unsupported attributes are
@@ -1425,16 +1645,15 @@ fn write_geometry(
     output.push_str("\n\t\t}\n");
     write_normal_layer(output, mesh)?;
     write_uv_layers(output, mesh)?;
-    if !node.materials.is_empty() {
+    if material_slot_count > 0 {
         write!(output, "\t\tLayerElementMaterial: 0 {{\n\t\t\tVersion: 101\n\t\t\tName: \"\"\n\t\t\tMappingInformationType: \"ByPolygon\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tMaterials: *{} {{\n\t\t\t\ta: ", mesh.faces.len()).map_err(write_error)?;
         for (index, face) in mesh.faces.iter().enumerate() {
-            if usize::try_from(face.material_index)
-                .map_or(true, |slot| slot >= node.materials.len())
+            if usize::try_from(face.material_index).map_or(true, |slot| slot >= material_slot_count)
             {
                 return Err(PotError::with_details(
                     ErrorCode::SceneInvalid,
-                    "mesh face material slot is outside the node material list",
-                    json!({"face_id":face.id,"slot":face.material_index,"material_count":node.materials.len()}),
+                    "mesh face material slot is outside the evaluated material slot list",
+                    json!({"face_id":face.id,"slot":face.material_index,"material_count":material_slot_count}),
                 ));
             }
             if index != 0 {
@@ -1445,7 +1664,7 @@ fn write_geometry(
         output.push_str("\n\t\t\t}\n\t\t}\n");
     }
     output.push_str("\t\tLayer: 0 {\n\t\t\tVersion: 100\n\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementNormal\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
-    if !node.materials.is_empty() {
+    if material_slot_count > 0 {
         output.push_str("\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementMaterial\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
     }
     // Blender keeps the first UV layer in layer 0 and gives each further layer its own layer.
@@ -2677,7 +2896,10 @@ fn parse_texture(node: &FbxNode, numeric_id: i64) -> Result<ImportedTexture> {
         .ok_or_else(|| import_error("FBX texture has no file path"))?
         .to_owned();
     let properties = node.child("Properties70");
-    let uv_layer = read_string_property(properties, "UVSet").filter(|value| !value.is_empty());
+    let uv_layer = read_string_property(properties, "potter:uv_layer_name").or_else(|| {
+        read_string_property(properties, "UVSet")
+            .filter(|value| !value.is_empty() && value != "default")
+    });
     Ok(ImportedTexture {
         numeric_id,
         file_name,
@@ -3377,16 +3599,28 @@ fn write_error(_: std::fmt::Error) -> PotError {
 
 #[cfg(test)]
 mod tests {
-    use super::{lex, parse_nodes, parse_uv_layers, write_uv_layers};
+    use super::{
+        export_with_root, import_bytes, lex, parse_nodes, parse_uv_layers, uv_texture_losses,
+        uv_texture_warnings, write_uv_layers,
+    };
     use crate::{
         error::{ErrorCode, PotError, Result},
+        eval::{EvaluationContext, Snapshot},
         exchange::Loss,
         geom::{
             Mesh,
             uv_layers::{self, UvLayer, UvStore},
         },
+        image::ImageInterpolation,
+        model::{
+            DataBlock, Id, Image, ImageColorspace, ImageSource, Material, Node, SceneDoc,
+            TextureRef,
+        },
     };
     use glam::DVec3;
+    use std::{fs, path::Path};
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
     fn triangle() -> Result<Mesh> {
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
@@ -3438,6 +3672,320 @@ mod tests {
             &[[0.1, 0.25], [0.5, 0.75], [0.9, 0.0]],
         );
         assert_close(&layers[1].corners[0], &[[0.2, 0.1], [0.6, 0.3], [0.4, 0.0]]);
+        Ok(())
+    }
+
+    fn add_member_mesh(
+        doc: &mut SceneDoc,
+        node_name: &str,
+        first_layer: &str,
+        render_layer: &str,
+        first_uv: [f64; 2],
+        detail_uv: [f64; 2],
+        render_uv: [f64; 2],
+        material_id: &Id,
+    ) -> TestResult<()> {
+        let node_id = Id::new(node_name)?;
+        let data_id = Id::new(format!("{node_name}_data"))?;
+        let mut mesh = triangle()?;
+        let corners = |uv| vec![Some(vec![uv; 3])];
+        uv_layers::write(
+            &mut mesh,
+            &UvStore {
+                layers: vec![
+                    UvLayer::new(first_layer, corners(first_uv)),
+                    UvLayer::new("Detail", corners(detail_uv)),
+                    UvLayer::new(render_layer, corners(render_uv)),
+                ],
+                active: Some(render_layer.to_owned()),
+                render: Some(render_layer.to_owned()),
+            },
+        );
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: node_name.to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                materials: vec![material_id.clone()],
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("FBX test root collection is missing")?
+            .objects
+            .push(node_id);
+        Ok(())
+    }
+
+    fn texture_on_node<'a>(doc: &'a SceneDoc, node_name: &str) -> TestResult<&'a TextureRef> {
+        let node = doc
+            .nodes
+            .values()
+            .find(|node| node.name == node_name)
+            .ok_or("FBX test mesh is missing")?;
+        let material_id = node
+            .materials
+            .first()
+            .ok_or("FBX test mesh has no material")?;
+        doc.materials
+            .get(material_id)
+            .and_then(|material| material.base_color_texture.as_ref())
+            .ok_or_else(|| "FBX test material texture is missing".into())
+    }
+
+    fn sample_node_texture(doc: &SceneDoc, node_name: &str, root: &Path) -> TestResult<[f64; 4]> {
+        let node = doc
+            .nodes
+            .values()
+            .find(|node| node.name == node_name)
+            .ok_or("FBX test mesh is missing")?;
+        let data_id = node.data.as_ref().ok_or("FBX test mesh has no data")?;
+        let mesh = doc
+            .data_blocks
+            .get(data_id)
+            .and_then(|data| data.mesh.as_ref())
+            .ok_or("FBX test mesh data is missing")?;
+        let material_id = node
+            .materials
+            .first()
+            .ok_or("FBX test mesh has no material")?;
+        let material = doc
+            .materials
+            .get(material_id)
+            .ok_or("FBX test material is missing")?;
+        let texture = material
+            .base_color_texture
+            .as_ref()
+            .ok_or("FBX test material texture is missing")?;
+        let image = doc
+            .images
+            .get(&texture.image)
+            .ok_or("FBX test image is missing")?;
+        let mut images = std::collections::BTreeMap::new();
+        images.insert(
+            texture.image.to_string(),
+            crate::image::load_image_data(image, root, texture.interpolation)?,
+        );
+
+        let store = uv_layers::read(mesh);
+        let names = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.clone())
+            .collect::<Vec<_>>();
+        let corners = store
+            .layers
+            .iter()
+            .map(|layer| -> TestResult<[[f64; 2]; 3]> {
+                layer
+                    .faces
+                    .first()
+                    .and_then(Option::as_ref)
+                    .ok_or("FBX test UV face is missing")?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "FBX test UV face is not a triangle".into())
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let hit_uvs = crate::shader::HitUvLayers {
+            names: &names,
+            corners: &corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [1.0, 0.0, 0.0],
+            render: store.render_index(),
+            available_mask: None,
+        };
+        let hit = crate::shader::HitContext::new(&doc.node_groups)
+            .with_images(&images)
+            .with_uv_layers(hit_uvs);
+        Ok(crate::shader::evaluate_surface(material, &hit)?.base_color)
+    }
+
+    fn assert_pixel(actual: [f64; 4], expected: [f64; 4]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_material_uv_variants_round_trip_and_sample_member_uvs() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let image_path = root.path().join("texture.pixels");
+        let pixels = crate::image::encode_pixels(
+            4,
+            1,
+            &[
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+            ],
+        )?;
+        fs::write(&image_path, &pixels)?;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let image_id = Id::new("image")?;
+        doc.images.insert(
+            image_id.clone(),
+            Image {
+                name: "Image".to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::Srgb,
+                width: 4,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(image_path.to_string_lossy().into_owned()),
+                source_hash: Some(crate::hash::sha256(&pixels)),
+                alpha_mode: Default::default(),
+            },
+        );
+        let material_id = Id::new("shared")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Shared".to_owned(),
+                base_color: [1.0; 4],
+                base_color_texture: Some(TextureRef {
+                    image: image_id,
+                    uv_layer: None,
+                    interpolation: ImageInterpolation::Linear,
+                }),
+                ..Material::default()
+            },
+        );
+        add_member_mesh(
+            &mut doc,
+            "left",
+            "LeftFirst",
+            "LeftRender",
+            [0.875, 0.5],
+            [0.375, 0.5],
+            [0.125, 0.5],
+            &material_id,
+        )?;
+        add_member_mesh(
+            &mut doc,
+            "right",
+            "RightFirst",
+            "RightRender",
+            [0.125, 0.5],
+            [0.625, 0.5],
+            [0.875, 0.5],
+            &material_id,
+        )?;
+
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        assert!(uv_texture_losses(&doc, &snapshot).is_empty());
+        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000001".to_owned())?;
+        let left_node = imported
+            .doc
+            .nodes
+            .values()
+            .find(|node| node.name == "left")
+            .ok_or("FBX reader lost the left mesh")?;
+        let right_node = imported
+            .doc
+            .nodes
+            .values()
+            .find(|node| node.name == "right")
+            .ok_or("FBX reader lost the right mesh")?;
+        assert_ne!(left_node.materials.first(), right_node.materials.first());
+        assert_eq!(
+            texture_on_node(&imported.doc, "left")?.uv_layer.as_deref(),
+            Some("LeftRender")
+        );
+        assert_eq!(
+            texture_on_node(&imported.doc, "right")?.uv_layer.as_deref(),
+            Some("RightRender")
+        );
+        assert_pixel(
+            sample_node_texture(&imported.doc, "left", root.path())?,
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        assert_pixel(
+            sample_node_texture(&imported.doc, "right", root.path())?,
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        doc.materials
+            .get_mut(&material_id)
+            .and_then(|material| material.base_color_texture.as_mut())
+            .ok_or("FBX test shared texture disappeared")?
+            .uv_layer = Some("Detail".to_owned());
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        assert!(uv_texture_losses(&doc, &snapshot).is_empty());
+        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000002".to_owned())?;
+        assert_eq!(
+            texture_on_node(&imported.doc, "left")?.uv_layer.as_deref(),
+            Some("Detail")
+        );
+        assert_eq!(
+            texture_on_node(&imported.doc, "right")?.uv_layer.as_deref(),
+            Some("Detail")
+        );
+        assert_pixel(
+            sample_node_texture(&imported.doc, "left", root.path())?,
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        assert_pixel(
+            sample_node_texture(&imported.doc, "right", root.path())?,
+            [0.0, 1.0, 1.0, 1.0],
+        );
+
+        let right_id = Id::new("right")?;
+        let right_data_id = doc
+            .nodes
+            .get(&right_id)
+            .and_then(|node| node.data.clone())
+            .ok_or("FBX test right mesh data is missing")?;
+        let right_mesh = doc
+            .data_blocks
+            .get_mut(&right_data_id)
+            .and_then(|data| data.mesh.as_mut())
+            .ok_or("FBX test right mesh is missing")?;
+        let mut right_uv = uv_layers::read(right_mesh);
+        right_uv.layers.retain(|layer| layer.name != "Detail");
+        uv_layers::write(right_mesh, &right_uv);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        assert!(uv_texture_losses(&doc, &snapshot).is_empty());
+        let warnings = uv_texture_warnings(&doc, &snapshot);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].details["feature_id"], "uv.layer_missing");
+        assert_eq!(warnings[0].details["status"], "fallback");
+        assert_eq!(warnings[0].details["node_id"], "right");
+        assert_eq!(warnings[0].details["render_uv_layer"], "RightRender");
+        let bytes = export_with_root(&doc, &snapshot, root.path())?;
+        let imported = import_bytes(&bytes, "00000000-0000-4000-8000-000000000003".to_owned())?;
+        assert_eq!(
+            texture_on_node(&imported.doc, "left")?.uv_layer.as_deref(),
+            Some("Detail")
+        );
+        assert_eq!(
+            texture_on_node(&imported.doc, "right")?.uv_layer.as_deref(),
+            Some("RightRender")
+        );
+        assert_pixel(
+            sample_node_texture(&imported.doc, "left", root.path())?,
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        assert_pixel(
+            sample_node_texture(&imported.doc, "right", root.path())?,
+            [0.0, 0.0, 1.0, 1.0],
+        );
         Ok(())
     }
 }

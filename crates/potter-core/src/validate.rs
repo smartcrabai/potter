@@ -646,6 +646,34 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
                                     ),
                                 }
                             }
+                            if matches!(format, "fbx" | "fbx-binary") {
+                                losses
+                                    .extend(crate::exchange::fbx::uv_texture_losses(doc, snapshot));
+                                for warning in
+                                    crate::exchange::fbx::uv_texture_warnings(doc, snapshot)
+                                {
+                                    let code = warning
+                                        .details
+                                        .get("feature_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("uv.layer_missing")
+                                        .to_owned();
+                                    let data_id = warning
+                                        .details
+                                        .get("material_id")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned);
+                                    issue(
+                                        &mut issues,
+                                        "warning",
+                                        &code,
+                                        &warning.message,
+                                        data_id,
+                                        None,
+                                        warning.details,
+                                    );
+                                }
+                            }
                         }
                         Err(error) => issue(
                             &mut issues,

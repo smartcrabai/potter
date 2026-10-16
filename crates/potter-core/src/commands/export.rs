@@ -122,6 +122,10 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             losses.extend(uv_losses);
             warnings.extend(uv_warnings);
         }
+        if matches!(format, "fbx" | "fbx-binary") {
+            losses.extend(exchange::fbx::uv_texture_losses(&doc, &snapshot));
+            warnings.extend(exchange::fbx::uv_texture_warnings(&doc, &snapshot));
+        }
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
         }
@@ -544,9 +548,6 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
         losses.extend(material_losses(doc));
         losses.extend(mesh_color_losses(doc));
-    }
-    if matches!(format, "fbx" | "fbx-binary") {
-        losses.extend(exchange::fbx::uv_texture_losses(doc));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);

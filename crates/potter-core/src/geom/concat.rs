@@ -253,9 +253,9 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
     Ok(())
 }
 
-/// Reverses a mirrored member's faces, with every corner-keyed value of each face: the corner order
-/// of each face, `custom_normal` and named `corner` rows, `CORNER` `blender_attributes` segments, and
-/// UV rows. A corner keeps its vertex, UV, and normal together.
+/// Reverses a mirrored member's faces with every corner-keyed value: the corner order, `custom_normal`
+/// and named `corner` rows, `CORNER` `blender_attributes` segments, and UV rows and pin flags. A
+/// corner keeps its vertex, UV, pin flag, and normal together.
 fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
     let sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
     for (key, attribute) in &mut mesh.attributes {
@@ -289,6 +289,9 @@ fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
     }
     for layer in layers.iter_mut() {
         for row in layer.faces.iter_mut().flatten() {
+            row.reverse();
+        }
+        for row in layer.pinned.iter_mut().flatten() {
             row.reverse();
         }
     }
@@ -430,6 +433,19 @@ fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Va
         "vertex_groups" => merge_vertex_groups(name, members),
         _ if members.iter().any(|(value, _)| {
             value.is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("color"))
+        }) && members.iter().all(|(value, piece)| {
+            let Some(value) = value else { return true };
+            value.get("type").and_then(Value::as_str) == Some("color")
+                && matches!(
+                    value.get("domain").and_then(Value::as_str),
+                    Some("point" | "corner")
+                )
+                && piece
+                    .attributes
+                    .get("color_layers")
+                    .and_then(|layers| layers.get("layers"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|layers| layers.iter().any(|layer| layer.as_str() == Some(name)))
         }) =>
         {
             merge_color_attribute(name, members, mesh)
@@ -1140,7 +1156,18 @@ mod tests {
                 )
             })
             .collect();
-        let uv_layer = crate::geom::uv_layers::UvLayer::new("UVMap", uv_faces);
+        let source_pins = source
+            .faces
+            .iter()
+            .enumerate()
+            .map(|(index, face)| {
+                let mut pins = vec![false; face.vertices.len()];
+                pins[index % face.vertices.len()] = true;
+                pins
+            })
+            .collect::<Vec<_>>();
+        let mut uv_layer = crate::geom::uv_layers::UvLayer::new("UVMap", uv_faces);
+        uv_layer.pinned = source_pins.iter().cloned().map(Some).collect();
         crate::geom::uv_layers::write(
             &mut source,
             &crate::geom::uv_layers::UvStore {
@@ -1178,6 +1205,7 @@ mod tests {
         for (index, face) in joined.faces.iter().enumerate() {
             let source_face = &source.faces[index];
             let uv_row = uv.faces[index].as_ref().unwrap();
+            let pin_row = uv.pinned[index].as_ref().unwrap();
             let rows = &custom[&format!("f{}", face.id)];
             for (corner, vertex) in face.vertices.iter().enumerate() {
                 let original = source_face.vertices.len() - 1 - corner;
@@ -1188,6 +1216,7 @@ mod tests {
                     (uv_row[corner][0] - index as f64).abs() <= 1.0e-12
                         && (uv_row[corner][1] - original as f64).abs() <= 1.0e-12
                 );
+                assert_eq!(pin_row[corner], source_pins[index][original]);
                 let normal = if original == 0 {
                     json!([-1.0, 0.0, 0.0])
                 } else {
@@ -1251,6 +1280,111 @@ mod tests {
         assert_eq!(corner_colors.len(), 48);
         assert_eq!(corner_colors[0], json!([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(corner_colors[24], json!([0.0, 0.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn generic_face_edge_and_sparse_corner_colors_use_named_merge() {
+        let mut first = cube();
+        let mut second = cube();
+        let first_face = first.faces[0].id;
+        let second_face = second.faces[0].id;
+        let first_edge = first.edges[0].id;
+        let second_edge = second.edges[0].id;
+        let first_face_color = json!([1.0, 0.0, 0.0, 1.0]);
+        let second_face_color = json!([0.0, 0.0, 1.0, 1.0]);
+        let first_edge_color = json!([0.0, 1.0, 0.0, 1.0]);
+        let second_edge_color = json!([1.0, 1.0, 0.0, 1.0]);
+        let first_corner_color = json!([0.25, 0.5, 0.75, 1.0]);
+        let second_corner_color = json!([0.75, 0.5, 0.25, 1.0]);
+
+        first.attributes.insert(
+            "generic_face_color".to_owned(),
+            json!({"domain":"face","type":"color","values":{format!("f{first_face}"):first_face_color}}),
+        );
+        second.attributes.insert(
+            "generic_face_color".to_owned(),
+            json!({"domain":"face","type":"color","values":{format!("f{second_face}"):second_face_color}}),
+        );
+        first.attributes.insert(
+            "generic_edge_color".to_owned(),
+            json!({"domain":"edge","type":"color","values":{format!("e{first_edge}"):first_edge_color}}),
+        );
+        second.attributes.insert(
+            "generic_edge_color".to_owned(),
+            json!({"domain":"edge","type":"color","values":{format!("e{second_edge}"):second_edge_color}}),
+        );
+        first.attributes.insert(
+            "sparse_corner_color".to_owned(),
+            json!({"domain":"corner","type":"color","values":{format!("f{first_face}"):vec![first_corner_color.clone(); first.faces[0].vertices.len()]}}),
+        );
+        second.attributes.insert(
+            "sparse_corner_color".to_owned(),
+            json!({"domain":"corner","type":"color","values":{format!("f{second_face}"):vec![second_corner_color.clone(); second.faces[0].vertices.len()]}}),
+        );
+
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        let face_values = joined.attributes["generic_face_color"]["values"]
+            .as_object()
+            .unwrap();
+        assert_eq!(face_values.len(), 2);
+        assert!(face_values.values().any(|value| value == &first_face_color));
+        assert!(
+            face_values
+                .values()
+                .any(|value| value == &second_face_color)
+        );
+
+        let edge_values = joined.attributes["generic_edge_color"]["values"]
+            .as_object()
+            .unwrap();
+        assert_eq!(edge_values.len(), 2);
+        assert!(edge_values.values().any(|value| value == &first_edge_color));
+        assert!(
+            edge_values
+                .values()
+                .any(|value| value == &second_edge_color)
+        );
+
+        let corner_values = joined.attributes["sparse_corner_color"]["values"]
+            .as_object()
+            .unwrap();
+        assert_eq!(corner_values.len(), 2);
+        assert!(
+            corner_values
+                .values()
+                .any(|value| { value == &json!(vec![first_corner_color.clone(); 4]) })
+        );
+        assert!(
+            corner_values
+                .values()
+                .any(|value| { value == &json!(vec![second_corner_color.clone(); 4]) })
+        );
+    }
+
+    #[test]
+    fn generic_color_attributes_keep_named_conflict_errors() {
+        let mut first = cube();
+        let mut second = cube();
+        first.attributes.insert(
+            "generic_color".to_owned(),
+            json!({"domain":"face","type":"color","values":{}}),
+        );
+        second.attributes.insert(
+            "generic_color".to_owned(),
+            json!({"domain":"edge","type":"color","values":{}}),
+        );
+
+        let error = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+        assert_eq!(error.details["attribute"], json!("generic_color"));
     }
 
     #[test]
