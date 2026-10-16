@@ -59,6 +59,19 @@ impl BlenderRng {
     pub(crate) fn get_float(&mut self) -> f32 {
         self.get_int32() as f32 / 2_147_483_648.0_f32
     }
+
+    /// Blender's scalar `gaussRand`: accepted polar x, with y discarded each call.
+    pub(crate) fn gaussian(&mut self) -> f32 {
+        loop {
+            let x = 1.0 - 2.0 * self.get_float();
+            let y = 1.0 - 2.0 * self.get_float();
+            let length_squared = x * x + y * y;
+            if length_squared > 0.0 && length_squared < 1.0 {
+                return x * (-2.0 * length_squared.ln() / length_squared).sqrt();
+            }
+        }
+    }
+
 }
 
 /// `BLI_hash_frand`: a float hash of one integer.
@@ -114,6 +127,13 @@ mod tests {
         let mut rng = BlenderRng::seed(1);
         assert_eq!(rng.get_float(), 0.041_630_343);
         assert_eq!(rng.get_float(), 0.454_492_45);
+    }
+
+    #[test]
+    fn gaussian_matches_blender_gauss_rand_sequence() {
+        let mut rng = BlenderRng::seed(1);
+        assert!((rng.gaussian() - 0.570_007_74).abs() < 1.0e-6);
+        assert!((rng.gaussian() + 0.973_007_74).abs() < 1.0e-6);
     }
 
     #[test]
