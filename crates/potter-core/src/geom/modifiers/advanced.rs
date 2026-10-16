@@ -18,7 +18,12 @@ use super::{
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Mesh, provenance::Origin},
+    geom::{
+        Mesh,
+        clnor::transfer_custom_normals,
+        normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags},
+        provenance::Origin,
+    },
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -260,11 +265,13 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "at least one profile edge",
         ));
     }
-    // Blender closes a full turn only from three steps up, and only when the screw offset is within
-    // FLT_EPSILON * 100 of zero; a closed screw then ignores the offset.
+    // Blender closes a full turn only from three steps up, and only when the screw offset and the
+    // turn's excess over 2π are within FLT_EPSILON * 100 (float32, MOD_screw.cc); a closed screw
+    // then ignores the offset. The angle is a float32 parameter, so 2π is compared in float32 too.
+    let tolerance = f32::EPSILON * 100.0;
     let closed = steps >= 3
-        && height.abs() <= f64::from(f32::EPSILON) * 100.0
-        && (angle.abs() - std::f64::consts::TAU).abs() <= 1.0e-10;
+        && (height as f32).abs() <= tolerance
+        && ((angle as f32).abs() - std::f32::consts::TAU).abs() <= tolerance;
     let height = if closed { 0.0 } else { height };
     let ring_count = if closed { steps } else { steps + 1 };
     let mut points = Vec::with_capacity(source_positions.len() * ring_count);
@@ -278,20 +285,23 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let segments = if closed { ring_count } else { ring_count - 1 };
     let mut faces = Vec::with_capacity(segments * source_edges.len());
+    let flip = bool_param(modifier, "use_normal_flip", false)?;
     for step in 0..segments {
         let next_step = (step + 1) % ring_count;
         for [first, second] in &source_edges {
-            // Same cycle as the profile edge's own winding, started at its second vertex: for copies of
-            // an on-axis vertex the later corner lands on the next ring, as Blender's loops do.
-            faces.push((
-                vec![
-                    step * source_positions.len() + second,
-                    step * source_positions.len() + first,
-                    next_step * source_positions.len() + first,
-                    next_step * source_positions.len() + second,
-                ],
-                0,
-            ));
+            // Blender's screw loops run against the profile edge's winding, so each face's cycle runs
+            // back from the next ring to this one. `use_normal_flip` reverses every quad (quad_ord in
+            // MOD_screw.cc).
+            let mut quad = vec![
+                next_step * source_positions.len() + second,
+                next_step * source_positions.len() + first,
+                step * source_positions.len() + first,
+                step * source_positions.len() + second,
+            ];
+            if flip {
+                quad.reverse();
+            }
+            faces.push((quad, 0));
         }
     }
     let vertex_count = source_positions.len();
@@ -384,6 +394,9 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         })
         .collect();
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
+    if bool_param(modifier, "use_smooth_shade", false)? {
+        crate::geom::normals::shade_faces_smooth(&mut result);
+    }
     super::map_uv_values(&mut result, |face, corner, [u, v]| {
         let (turns, loose_value) = corner_uv[face][corner];
         [u + turn * usize_as_f64(turns), loose_value.unwrap_or(v)]
@@ -1276,147 +1289,164 @@ fn randomize_build_order(indices: &mut [usize], seed: u64) {
 }
 
 pub(super) fn edge_split(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let angle = number_param(modifier, "split_angle", std::f64::consts::FRAC_PI_4)?;
+    // Blender's defaults: 30 degrees, angle and sharp-edge splitting both on (DNA defaults).
+    let angle = number_param(modifier, "split_angle", std::f64::consts::FRAC_PI_6)?;
+    let use_edge_angle = bool_param(modifier, "use_edge_angle", true)?;
     let split_sharp = bool_param(modifier, "use_edge_sharp", true)?;
     let face_polygons = polygons(mesh)?;
     let source_positions = positions(mesh);
-    let face_normals: Vec<DVec3> = face_polygons
-        .iter()
-        .map(|(vertices, _)| {
-            if vertices.len() < 3 {
-                DVec3::ZERO
+    let vertex_indices = id_indices(mesh);
+
+    let mut offsets = Vec::with_capacity(face_polygons.len());
+    let mut face_normals = Vec::with_capacity(face_polygons.len());
+    let mut corner_count = 0;
+    for (indices, _) in &face_polygons {
+        offsets.push(corner_count);
+        corner_count += indices.len();
+        let points: Vec<DVec3> = indices
+            .iter()
+            .map(|index| source_positions[*index])
+            .collect();
+        face_normals.push(face_normal(&points));
+    }
+
+    // Each edge's uses, with the corner of each face at the edge's lower and higher vertex.
+    let mut edge_uses: HashMap<(usize, usize), Vec<_>> = HashMap::new();
+    for (face_index, (indices, _)) in face_polygons.iter().enumerate() {
+        for position in 0..indices.len() {
+            let next = (position + 1) % indices.len();
+            let (first, second) = (indices[position], indices[next]);
+            let (corner_a, corner_b) = (offsets[face_index] + position, offsets[face_index] + next);
+            let (key, low, high) = if first < second {
+                ((first, second), corner_a, corner_b)
             } else {
-                (source_positions[vertices[1]] - source_positions[vertices[0]])
-                    .cross(source_positions[vertices[2]] - source_positions[vertices[0]])
-                    .normalize_or_zero()
-            }
-        })
-        .collect();
-    let mut edge_faces: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        for index in 0..face.vertices.len() {
-            let first = face.vertices[index];
-            let second = face.vertices[(index + 1) % face.vertices.len()];
-            edge_faces
-                .entry((first.min(second), first.max(second)))
+                ((second, first), corner_b, corner_a)
+            };
+            edge_uses
+                .entry(key)
                 .or_default()
-                .push(face_index);
+                .push((face_index, low, high));
         }
     }
-    let sharp: HashSet<(u32, u32)> = if split_sharp {
-        mesh.attributes
-            .get("sharp_edges")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|value| {
-                let pair = value.as_array()?;
-                let first = u32::try_from(pair.first()?.as_u64()?).ok()?;
-                let second = u32::try_from(pair.get(1)?.as_u64()?).ok()?;
-                Some((first.min(second), first.max(second)))
+    let sharp: HashSet<(usize, usize)> = if split_sharp {
+        mesh.edges
+            .iter()
+            .zip(sharp_edge_flags(mesh)?)
+            .filter(|(_, sharp)| *sharp)
+            .map(|(edge, _)| {
+                let first = vertex_indices[&edge.vertices[0]];
+                let second = vertex_indices[&edge.vertices[1]];
+                (first.min(second), first.max(second))
             })
             .collect()
     } else {
         HashSet::new()
     };
-    // Vertex i copies source vertex i; split corners append copies of their source vertex.
-    let mut points: Vec<usize> = (0..mesh.vertices.len()).collect();
-    let mut out_faces = Vec::new();
-    let mut any_split = false;
-    for (face_index, (indices, material)) in face_polygons.into_iter().enumerate() {
-        let face = &mesh.faces[face_index];
-        let should_split = (0..face.vertices.len()).any(|index| {
-            let first = face.vertices[index];
-            let second = face.vertices[(index + 1) % face.vertices.len()];
-            let adjacent_faces = edge_faces.get(&(first.min(second), first.max(second)));
-            let angle_split = adjacent_faces.is_some_and(|adjacent| {
-                adjacent.iter().any(|other| {
-                    *other != face_index
-                        && face_normals[face_index]
-                            .dot(face_normals[*other])
-                            .clamp(-1.0, 1.0)
-                            .acos()
-                            > angle
-                })
-            });
-            angle_split || sharp.contains(&(first.min(second), first.max(second)))
-        });
-        any_split |= should_split;
-        let mut output = Vec::with_capacity(indices.len());
-        for index in indices {
-            if should_split {
-                output.push(points.len());
-                points.push(index);
-            } else {
-                output.push(index);
-            }
-        }
-        out_faces.push((output, material));
-    }
-    if !any_split {
+
+    // BM_mesh_edgesplit (bmesh_edgesplit.cc) with MOD_edgesplit.cc's tags. An edge with three or
+    // more faces always splits; a two-face edge splits when its faces meet at more than the angle.
+    let angle_split_enabled = use_edge_angle && angle < std::f64::consts::PI;
+    let split_every_edge = use_edge_angle && angle < f64::from(f32::EPSILON);
+    let threshold = (angle + 0.000_000_175).cos();
+    let tagged: HashSet<(usize, usize)> = edge_uses
+        .iter()
+        .filter(|(key, uses)| {
+            let angle_split = angle_split_enabled
+                && (uses.len() > 2
+                    || (uses.len() == 2
+                        && (split_every_edge
+                            || face_normals[uses[0].0].dot(face_normals[uses[1].0]) < threshold)));
+            angle_split || sharp.contains(key)
+        })
+        .map(|(key, _)| *key)
+        .collect();
+    if tagged.is_empty() {
         return Ok(mesh.clone());
     }
-    let loose_edges = loose_edges(mesh)?;
-    let source_indices = id_indices(mesh);
-    let mut source_connected = vec![false; mesh.vertices.len()];
-    for face in &mesh.faces {
-        for id in &face.vertices {
-            source_connected[source_indices[id]] = true;
+
+    // A vertex splits into one copy per fan: corners joined through an untagged edge share a fan.
+    let mut parent: Vec<usize> = (0..corner_count).collect();
+    for (key, uses) in &edge_uses {
+        if tagged.contains(key) {
+            continue;
+        }
+        for other in uses.iter().skip(1) {
+            union_corners(&mut parent, uses[0].1, other.1);
+            union_corners(&mut parent, uses[0].2, other.2);
         }
     }
-    for edge in &mesh.edges {
-        source_connected[source_indices[&edge.vertices[0]]] = true;
-        source_connected[source_indices[&edge.vertices[1]]] = true;
+    let mut touched = vec![false; mesh.vertices.len()];
+    for (first, second) in &tagged {
+        touched[*first] = true;
+        touched[*second] = true;
     }
-    let mut used = HashSet::new();
-    for (face, _) in &out_faces {
-        used.extend(face.iter().copied());
-    }
-    for [first, second] in &loose_edges {
-        used.insert(*first);
-        used.insert(*second);
-    }
-    for (index, connected) in source_connected.iter().enumerate() {
-        if !connected {
-            used.insert(index);
+    let mut corners_at = vec![Vec::new(); mesh.vertices.len()];
+    for (face_index, (indices, _)) in face_polygons.iter().enumerate() {
+        for (position, index) in indices.iter().enumerate() {
+            corners_at[*index].push(offsets[face_index] + position);
         }
     }
-    let mut remap = vec![usize::MAX; points.len()];
-    let mut sources = Vec::with_capacity(used.len());
-    for (index, source) in points.into_iter().enumerate() {
-        if used.contains(&index) {
-            remap[index] = sources.len();
-            sources.push(source);
+    // Point i copies source vertex i; each extra fan appends a copy of its vertex.
+    let mut sources: Vec<usize> = (0..mesh.vertices.len()).collect();
+    let mut corner_point = vec![0; corner_count];
+    for (vertex, corners) in corners_at.iter().enumerate() {
+        let mut fans: Vec<(usize, usize)> = Vec::new();
+        for &corner in corners {
+            let point = if touched[vertex] {
+                let root = find_corner(&mut parent, corner);
+                if let Some(&(_, point)) = fans.iter().find(|(fan, _)| *fan == root) {
+                    point
+                } else {
+                    let point = if fans.is_empty() {
+                        vertex
+                    } else {
+                        sources.push(vertex);
+                        sources.len() - 1
+                    };
+                    fans.push((root, point));
+                    point
+                }
+            } else {
+                vertex
+            };
+            corner_point[corner] = point;
         }
     }
-    let compact_points: Vec<DVec3> = sources
-        .iter()
-        .map(|&index| source_positions[index])
-        .collect();
-    let compact_faces = out_faces
+    let out_faces: Vec<_> = face_polygons
         .into_iter()
-        .map(|(face, material)| {
-            (
-                face.into_iter().map(|index| remap[index]).collect(),
-                material,
-            )
+        .enumerate()
+        .map(|(face_index, (indices, material))| {
+            let output = (0..indices.len())
+                .map(|position| corner_point[offsets[face_index] + position])
+                .collect();
+            (output, material)
         })
         .collect();
-    let compact_loose_edges = loose_edges
-        .into_iter()
-        .map(|[first, second]| [remap[first], remap[second]])
+    let points: Vec<DVec3> = sources
+        .iter()
+        .map(|&index| source_positions[index])
         .collect();
     let origin = Origin::copies(
         sources.into_iter().map(Some),
         (0..mesh.faces.len()).map(Some).collect(),
     );
-    build_mesh(
-        compact_points,
-        compact_faces,
-        compact_loose_edges,
-        &origin,
-        mesh,
-    )
+    build_mesh(points, out_faces, loose_edges(mesh)?, &origin, mesh)
+}
+
+fn union_corners(parent: &mut [usize], first: usize, second: usize) {
+    let first = find_corner(parent, first);
+    let second = find_corner(parent, second);
+    if first != second {
+        parent[second] = first;
+    }
+}
+
+fn find_corner(parent: &mut [usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        parent[index] = parent[parent[index]];
+        index = parent[index];
+    }
+    index
 }
 
 fn smooth_positions(mesh: &Mesh, iterations: usize, factor: f64) -> Result<Mesh> {
@@ -1678,6 +1708,14 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let mut face_normals = Vec::with_capacity(mesh.faces.len());
     let mut normals = vec![DVec3::ZERO; mesh.vertices.len()];
     let mut face_indices = Vec::with_capacity(mesh.faces.len());
+    // Blender's vertex normals (Mesh::vert_normals) weight each corner's normal by its angle; with
+    // custom normals the corner normals themselves are mixed.
+    let custom_corners = mesh
+        .attributes
+        .contains_key("custom_normal")
+        .then(|| corner_normals(mesh, &source_positions))
+        .transpose()?;
+    let mut corner_offset = 0;
     for face in &mesh.faces {
         let indices = face
             .vertices
@@ -1699,9 +1737,17 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             );
         }
         normal = normal.normalize_or_zero();
-        for index in &indices {
-            normals[*index] += normal;
+        let face_points: Vec<DVec3> = indices
+            .iter()
+            .map(|index| source_positions[*index])
+            .collect();
+        for (position, index) in indices.iter().enumerate() {
+            let value = custom_corners
+                .as_ref()
+                .map_or(normal, |values| values[corner_offset + position]);
+            normals[*index] += value * corner_angle(&face_points, position);
         }
+        corner_offset += indices.len();
         face_normals.push(normal);
         face_indices.push(indices);
     }
@@ -1928,7 +1974,13 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .max()
         .unwrap_or(0);
     let mut faces = Vec::new();
-    let mut face_sources: Vec<Option<usize>> = Vec::new();
+    let mut face_sources: Vec<usize> = Vec::new();
+    if !use_replace {
+        for (face_index, source_face) in mesh.faces.iter().enumerate() {
+            faces.push((face_indices[face_index].clone(), source_face.material_index));
+            face_sources.push(face_index);
+        }
+    }
     let mut crease_edges = HashSet::new();
     for (face_index, indices) in face_indices.iter().enumerate() {
         let source_face = &mesh.faces[face_index];
@@ -2008,13 +2060,89 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             }
         }
         face_sources.extend(std::iter::repeat_n(
-            Some(face_index),
+            face_index,
             faces.len() - emitted_before,
         ));
     }
     let (sources, coords): (Vec<usize>, Vec<DVec3>) = points.into_iter().unzip();
-    let origin = Origin::copies(sources.into_iter().map(Some), face_sources);
+    // Each output corner copies the loop of its source face at the same vertex, so raw custom data
+    // follows that corner (BM_elem_attrs_copy in bmesh_wireframe.cc).
+    let mut corner_offset = 0;
+    let mut input_corner_offsets = Vec::with_capacity(face_indices.len());
+    for indices in &face_indices {
+        input_corner_offsets.push(corner_offset);
+        corner_offset += indices.len();
+    }
+    let mut source_corners = Vec::new();
+    for ((corner_points, _), face_index) in faces.iter().zip(&face_sources) {
+        for point in corner_points {
+            let vertex = sources[*point];
+            let position = face_indices[*face_index]
+                .iter()
+                .position(|index| *index == vertex)
+                .ok_or_else(|| {
+                    invalid_parameter(modifier, "mesh", "wireframe corners on their source face")
+                })?;
+            source_corners.push(input_corner_offsets[*face_index] + position);
+        }
+    }
+    let origin = Origin::copies(
+        sources.into_iter().map(Some),
+        face_sources.into_iter().map(Some).collect(),
+    );
     let mut result = build_mesh(coords, faces, Vec::new(), &origin, mesh)?;
+    // BMesh gives new edges the SMOOTH flag (bmesh_core.cc), so only source edges between kept
+    // original vertices (use_replace off) stay sharp.
+    let source_sharp: HashSet<(usize, usize)> = mesh
+        .edges
+        .iter()
+        .zip(sharp_edge_flags(mesh)?)
+        .filter(|(_, sharp)| *sharp)
+        .map(|(edge, _)| {
+            let first = vertex_indices[&edge.vertices[0]];
+            let second = vertex_indices[&edge.vertices[1]];
+            (first.min(second), first.max(second))
+        })
+        .collect();
+    let result_indices = id_indices(&result);
+    let original_count = if use_replace { 0 } else { mesh.vertices.len() };
+    let edge_keys: Vec<(usize, usize)> = result
+        .edges
+        .iter()
+        .map(|edge| {
+            let first = result_indices[&edge.vertices[0]];
+            let second = result_indices[&edge.vertices[1]];
+            (first.min(second), first.max(second))
+        })
+        .collect();
+    let output_sharp: HashSet<(usize, usize)> = edge_keys
+        .iter()
+        .copied()
+        .filter(|(first, second)| {
+            *second < original_count && source_sharp.contains(&(*first, *second))
+        })
+        .collect();
+    if mesh.attributes.contains_key("sharp") {
+        let values: serde_json::Map<String, Value> = result
+            .edges
+            .iter()
+            .zip(&edge_keys)
+            .map(|(edge, key)| {
+                (
+                    format!("e{}", edge.id),
+                    Value::Bool(output_sharp.contains(key)),
+                )
+            })
+            .collect();
+        result.attributes.insert(
+            "sharp".to_owned(),
+            serde_json::json!({"domain": "edge", "type": "bool", "values": values}),
+        );
+    }
+    // Each output corner copies the raw custom data of its source corner, which its new fan decodes
+    // (BM_elem_attrs_copy in bmesh_wireframe.cc, read back through the output fans).
+    let sources: Vec<Option<usize>> = source_corners.iter().map(|corner| Some(*corner)).collect();
+    transfer_custom_normals(mesh, &mut result, &sources)?;
     result.attributes.remove("wireframe_use_crease");
     result.attributes.remove("wireframe_crease_weight");
     if use_crease {
@@ -2067,7 +2195,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ));
     }
     let _branch_smoothing = number_param(modifier, "branch_smoothing", 0.0)?;
-    let smooth_shade = bool_param(modifier, "use_smooth_shade", true)?;
+    let smooth_shade = bool_param(modifier, "use_smooth_shade", false)?;
     let _symmetry = [
         bool_param(modifier, "use_x_symmetry", false)?,
         bool_param(modifier, "use_y_symmetry", false)?,
@@ -2293,12 +2421,32 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             else {
                 continue;
             };
-            for side in 0..4 {
-                let next = (side + 1) % 4;
-                faces.push((
-                    vec![first[side], first[next], second[next], second[side]],
-                    0,
-                ));
+            // Blender's connect_frames: each side quad runs from the second frame back to the first, and
+            // the whole connection is reversed when its quads face the connection's centre (MOD_skin.cc).
+            let quads: Vec<[usize; 4]> = (0..4)
+                .map(|side| {
+                    let next = (side + 1) % 4;
+                    [second[side], second[next], first[next], first[side]]
+                })
+                .collect();
+            let centre_of =
+                |quad: &[usize; 4]| quad.iter().map(|index| points[*index]).sum::<DVec3>() * 0.25;
+            let centre = quads.iter().map(centre_of).sum::<DVec3>() * 0.25;
+            let facing: f64 = quads
+                .iter()
+                .map(|quad| {
+                    let normal = (points[quad[2]] - points[quad[0]])
+                        .cross(points[quad[3]] - points[quad[1]])
+                        .normalize_or_zero();
+                    normal.dot(centre - centre_of(quad))
+                })
+                .sum();
+            for quad in quads {
+                if facing > 0.0 {
+                    faces.push((vec![quad[3], quad[2], quad[1], quad[0]], 0));
+                } else {
+                    faces.push((quad.to_vec(), 0));
+                }
             }
         }
     }
@@ -2311,9 +2459,13 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             if degrees[vertex] != 1 || !capped.insert(vertex) {
                 continue;
             }
+            // Blender's cap frame has its normal opposite the edge direction, which points into the tube
+            // (MOD_skin.cc, FLIP_NORMAL), so the cap faces away from the tube.
+            let other = if vertex == first { second } else { first };
+            let into_tube = source_positions[other] - source_positions[vertex];
             let cap_normal =
                 (points[base[1]] - points[base[0]]).cross(points[base[2]] - points[base[0]]);
-            let flipped = point_frames[vertex][0].dot(cap_normal) < 0.0;
+            let flipped = into_tube.dot(cap_normal) < 0.0;
             let cap = if flipped {
                 vec![base[0], base[1], base[2], base[3]]
             } else {
@@ -2326,11 +2478,15 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         vertices: origins,
         faces: vec![None; faces.len()],
         corners: None,
+        raw_normals: false,
     };
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
     result.attributes.remove("blender_skin_vertices");
     result.attributes.remove("skin_radii");
     result.attributes.remove("skin_roots");
+    if smooth_shade {
+        crate::geom::normals::shade_faces_smooth(&mut result);
+    }
     // Blender's Skin output has no UV layers, so UV data is dropped (reported as attribute loss).
     let uv_names: Vec<String> = result
         .attributes

@@ -10,8 +10,7 @@
 //! normal, a corner whose fan cancels gets the zero vector, and a zero-length edge contributes a
 //! right angle to its corner.
 
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
-use std::f64::consts::FRAC_PI_2;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use glam::{DMat3, DMat4, DVec3};
 use serde_json::{Map, Value, json};
@@ -117,12 +116,7 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Shading> {
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
-    let mut sharp_edges = HashSet::new();
-    for (edge, sharp) in mesh.edges.iter().zip(sharp_edge_flags(mesh)?) {
-        if sharp {
-            sharp_edges.insert(edge_key(edge.vertices[0], edge.vertices[1]));
-        }
-    }
+    let sharp_edges = sharp_edge_keys(mesh)?;
     let smooth = smooth_face_flags(mesh)?;
 
     let mut offsets = Vec::with_capacity(mesh.faces.len());
@@ -182,26 +176,7 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Shading> {
             }
         }
     } else {
-        let mut incidence: HashMap<(u32, u32), Vec<(usize, usize)>> = HashMap::new();
-        for (face_index, face) in mesh.faces.iter().enumerate() {
-            for corner in 0..face.vertices.len() {
-                let next = (corner + 1) % face.vertices.len();
-                incidence
-                    .entry(edge_key(face.vertices[corner], face.vertices[next]))
-                    .or_default()
-                    .push((face_index, corner));
-            }
-        }
-        for (key, uses) in &incidence {
-            // Sharp edges, boundary edges (one use) and non-manifold edges (3+ uses) end fans.
-            if sharp_edges.contains(key) || uses.len() != 2 {
-                continue;
-            }
-            let (first, second) = (uses[0], uses[1]);
-            if smooth[first.0] && smooth[second.0] {
-                join_shared_edge(&mut parent, mesh, &offsets, first, second);
-            }
-        }
+        join_smooth_fans(mesh, &offsets, &sharp_edges, &smooth, &mut parent);
     }
 
     let roots: Vec<usize> = (0..corner_total)
@@ -318,6 +293,114 @@ fn join_shared_edge(
     );
 }
 
+/// Edges flagged `sharp`, as [`edge_key`] pairs of vertex IDs.
+fn sharp_edge_keys(mesh: &Mesh) -> Result<HashSet<(u32, u32)>> {
+    Ok(mesh
+        .edges
+        .iter()
+        .zip(sharp_edge_flags(mesh)?)
+        .filter(|(_, sharp)| *sharp)
+        .map(|(edge, _)| edge_key(edge.vertices[0], edge.vertices[1]))
+        .collect())
+}
+
+/// Joins the corners of every smooth fan in `parent`: smooth faces that share a non-sharp manifold
+/// edge join the corners at its two ends. Sharp, boundary and non-manifold edges end fans.
+fn join_smooth_fans(
+    mesh: &Mesh,
+    offsets: &[usize],
+    sharp_edges: &HashSet<(u32, u32)>,
+    smooth: &[bool],
+    parent: &mut [usize],
+) {
+    let mut incidence: HashMap<(u32, u32), Vec<(usize, usize)>> = HashMap::new();
+    for (face_index, face) in mesh.faces.iter().enumerate() {
+        for corner in 0..face.vertices.len() {
+            let next = (corner + 1) % face.vertices.len();
+            incidence
+                .entry(edge_key(face.vertices[corner], face.vertices[next]))
+                .or_default()
+                .push((face_index, corner));
+        }
+    }
+    for (key, uses) in &incidence {
+        // Sharp edges, boundary edges (one use) and non-manifold edges (3+ uses) end fans.
+        if sharp_edges.contains(key) || uses.len() != 2 {
+            continue;
+        }
+        let (first, second) = (uses[0], uses[1]);
+        if smooth[first.0] && smooth[second.0] {
+            join_shared_edge(parent, mesh, offsets, first, second);
+        }
+    }
+}
+
+/// Blender's custom-normal fan average (`normals_calc_corners`): each corner with an authored normal
+/// in a smooth fan of more than one authored corner takes the normalised mean of those normals.
+/// Corners without an authored normal are left out of the mean and keep none; a fan with a single
+/// authored corner keeps its value.
+///
+/// # Errors
+///
+/// Returns the errors of [`sharp_edge_flags`], [`smooth_face_flags`], and [`custom_corner_normals`].
+pub(crate) fn average_custom_normals_by_fan(mesh: &mut Mesh) -> Result<()> {
+    let authored: Vec<Option<Vec<DVec3>>> = {
+        let custom = attribute_values(mesh, "custom_normal", "corner", "float3")?;
+        if custom.is_none() {
+            return Ok(());
+        }
+        mesh.faces
+            .iter()
+            .map(|face| custom_corner_normals(custom, face))
+            .collect::<Result<_>>()?
+    };
+    let smooth = smooth_face_flags(mesh)?;
+    let sharp_edges = sharp_edge_keys(mesh)?;
+    let mut offsets = Vec::with_capacity(mesh.faces.len());
+    let mut corner_total = 0_usize;
+    for face in &mesh.faces {
+        offsets.push(corner_total);
+        corner_total += face.vertices.len();
+    }
+    let mut parent: Vec<usize> = (0..corner_total).collect();
+    join_smooth_fans(mesh, &offsets, &sharp_edges, &smooth, &mut parent);
+    let roots: Vec<usize> = (0..corner_total)
+        .map(|corner| find(&mut parent, corner))
+        .collect();
+    let mut sums = vec![DVec3::ZERO; corner_total];
+    let mut counts = vec![0.0_f64; corner_total];
+    for (face_index, normals) in authored.iter().enumerate() {
+        for (corner, normal) in normals.iter().flatten().enumerate() {
+            let root = roots[offsets[face_index] + corner];
+            sums[root] += *normal;
+            counts[root] += 1.0;
+        }
+    }
+    let Some(values) = mesh
+        .attributes
+        .get_mut("custom_normal")
+        .and_then(|attribute| attribute.get_mut("values"))
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    for (face_index, face) in mesh.faces.iter().enumerate() {
+        let Some(rows) = values
+            .get_mut(&format!("f{}", face.id))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (corner, row) in rows.iter_mut().enumerate().take(face.vertices.len()) {
+            let root = roots[offsets[face_index] + corner];
+            if counts[root] > 1.0 {
+                *row = json!((sums[root] / counts[root]).normalize_or_zero().to_array());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Newell normal of a polygon, normalized. A polygon with no area has no direction; Blender gives
 /// it the unit Z normal, so every face has a normal and no export fails on one.
 pub(crate) fn face_normal(points: &[DVec3]) -> DVec3 {
@@ -343,17 +426,34 @@ pub(crate) fn face_normal(points: &[DVec3]) -> DVec3 {
     }
 }
 
-/// Angle at `points[corner]` between its two edges. A zero-length edge has no direction, so the
-/// angle is a right angle, as Blender's `acos` of a zero dot product gives.
+/// Blender's `safe_acos_approx` (max error 4.5e-5 rad). Blender weights fan and vertex normals by
+/// this approximation, not by the exact arc cosine, so the corner weights use it too.
+pub(crate) fn safe_acos_approx(x: f64) -> f64 {
+    let magnitude = x.abs();
+    let m = if magnitude < 1.0 {
+        1.0 - (1.0 - magnitude)
+    } else {
+        1.0
+    };
+    let acos = (1.0 - m).sqrt()
+        * (std::f64::consts::FRAC_PI_2
+            + m * (-0.213_300_989 + m * (0.077_980_478 + m * -0.021_640_95)));
+    if x < 0.0 {
+        std::f64::consts::PI - acos
+    } else {
+        acos
+    }
+}
+
+/// Angle at `points[corner]` between its two edges, weighted as Blender weights a fan face: the
+/// approximate arc cosine of the normalized edge dot product. A zero-length edge has no direction,
+/// so its dot product is zero and the angle is a right angle, as Blender's `acos` of zero gives.
 pub(crate) fn corner_angle(points: &[DVec3], corner: usize) -> f64 {
     let count = points.len();
     let current = points[corner];
-    let previous = (points[(corner + count - 1) % count] - current).try_normalize();
-    let next = (points[(corner + 1) % count] - current).try_normalize();
-    match (previous, next) {
-        (Some(previous), Some(next)) => previous.cross(next).length().atan2(previous.dot(next)),
-        _ => FRAC_PI_2,
-    }
+    let previous = (points[(corner + count - 1) % count] - current).normalize_or_zero();
+    let next = (points[(corner + 1) % count] - current).normalize_or_zero();
+    safe_acos_approx(previous.dot(next))
 }
 
 fn custom_corner_normals(
@@ -385,7 +485,7 @@ fn custom_corner_normals(
         .map(Some)
 }
 
-fn vector3(value: &Value) -> Option<DVec3> {
+pub(crate) fn vector3(value: &Value) -> Option<DVec3> {
     let [x, y, z] = value.as_array()?.as_slice() else {
         return None;
     };
@@ -503,28 +603,21 @@ fn mesh_error(error: &MeshError) -> PotError {
     )
 }
 
-/// Attributes keyed by face or edge ID. Topology changes leave them stale; instances remap them.
+/// Attributes keyed by face or edge ID. Modifiers remap them through provenance, and instances
+/// remap them by element.
 pub(crate) const SHADING_ATTRIBUTES: [&str; 3] = ["shade_smooth", "sharp", "custom_normal"];
 
-/// Whether a topology change leaves shading keys stale: unless `evaluated` keeps each face's vertex
-/// sequence and each edge's endpoints, the face- and edge-keyed `SHADING_ATTRIBUTES` name other elements.
-pub(crate) fn shading_keys_stale(source: &Mesh, evaluated: &Mesh) -> bool {
-    let shaded = SHADING_ATTRIBUTES
+/// Marks every face smooth, as a generator's `use_smooth_shade` does for the faces it creates.
+pub(crate) fn shade_faces_smooth(mesh: &mut Mesh) {
+    let values: Map<String, Value> = mesh
+        .faces
         .iter()
-        .any(|name| source.attributes.contains_key(*name));
-    let faces = |mesh: &Mesh| {
-        mesh.faces
-            .iter()
-            .map(|face| (face.id, face.vertices.clone()))
-            .collect::<BTreeMap<_, _>>()
-    };
-    let edges = |mesh: &Mesh| {
-        mesh.edges
-            .iter()
-            .map(|edge| (edge.id, edge_key(edge.vertices[0], edge.vertices[1])))
-            .collect::<BTreeMap<_, _>>()
-    };
-    shaded && (faces(source) != faces(evaluated) || edges(source) != edges(evaluated))
+        .map(|face| (format!("f{}", face.id), json!(true)))
+        .collect();
+    mesh.attributes.insert(
+        "shade_smooth".to_owned(),
+        json!({"domain":"face","type":"bool","values":values}),
+    );
 }
 
 #[cfg(test)]
@@ -890,31 +983,5 @@ mod tests {
         let faces = render_corner_normals(&mesh, &points).expect("fold is valid");
         assert_eq!(faces[0].as_ref().map(Vec::len), Some(4));
         assert!(faces[1].is_none());
-    }
-
-    #[test]
-    fn weld_that_keeps_face_ids_and_corner_counts_marks_shading_stale() {
-        // Welding copies of vertices 3 and 4 onto 1 and 0 keeps face IDs and corner counts, but e3 now joins other vertices.
-        let mut source = Mesh::from_positions_and_faces(
-            vec![
-                DVec3::ZERO,
-                DVec3::X,
-                DVec3::Y,
-                DVec3::X,
-                DVec3::ZERO,
-                DVec3::NEG_Y,
-            ],
-            vec![vec![0, 1, 2], vec![3, 4, 5]],
-        )
-        .expect("source mesh");
-        set_faces_attribute(&mut source, "shade_smooth", &[(0, true), (1, true)]);
-        set_edge_sharp(&mut source, 3, 4);
-        let welded = Mesh::from_positions_and_faces(
-            vec![DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::NEG_Y],
-            vec![vec![0, 1, 2], vec![1, 0, 3]],
-        )
-        .expect("welded mesh");
-        assert!(shading_keys_stale(&source, &welded));
-        assert!(!shading_keys_stale(&source, &source.clone()));
     }
 }

@@ -18,7 +18,8 @@ use glam::{DVec2, DVec3};
 use serde_json::{Map, json};
 
 use super::{
-    Polygon, build_mesh, edge_crease_weights, loose_edges, polygons, positions, usize_as_f64,
+    NonManifold, Polygon, build_mesh, edge_crease_weights, loose_edges, polygons, positions,
+    usize_as_f64,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -230,6 +231,9 @@ impl Position {
         vertex_count: usize,
         with_fans: bool,
     ) -> Self {
+        // OpenSubdiv makes non-manifold edges infinitely sharp in the face-varying topology too.
+        let creases =
+            NonManifold::new(vertex_count, polys.iter().map(Vec::as_slice)).sharpened(creases);
         let total: usize = polys.iter().map(Vec::len).sum();
         let mut starts = Vec::with_capacity(polys.len() + 1);
         let mut face_of = Vec::with_capacity(total);
@@ -985,7 +989,11 @@ impl UvSubdivision {
 
 /// One level of bilinear (`SIMPLE`) subdivision: original points stay, each edge gets its midpoint,
 /// and each face its centroid. Every corner becomes one quad, as in `subdivide_once`.
-pub(super) fn subdivide_simple_once(mesh: &Mesh, use_creases: bool) -> Result<Mesh> {
+pub(super) fn subdivide_simple_once(
+    mesh: &Mesh,
+    use_creases: bool,
+    raw_normals: bool,
+) -> Result<Mesh> {
     let source_points = positions(mesh);
     let source_polygons = polygons(mesh)?;
     let source_edges = loose_edges(mesh)?;
@@ -1022,6 +1030,7 @@ pub(super) fn subdivide_simple_once(mesh: &Mesh, use_creases: bool) -> Result<Me
         &edge_point_indices,
         &edge_creases,
         use_creases,
+        raw_normals,
     )
 }
 
@@ -1038,6 +1047,7 @@ pub(super) fn subdivided_mesh(
     edge_points: &BTreeMap<(usize, usize), usize>,
     edge_creases: &BTreeMap<(usize, usize), f64>,
     use_creases: bool,
+    raw_normals: bool,
 ) -> Result<Mesh> {
     let face_point_base = points.len() - source_polygons.len();
     let mut output_polygons =
@@ -1085,6 +1095,7 @@ pub(super) fn subdivided_mesh(
             .flat_map(|(index, (face, _))| std::iter::repeat_n(Some(index), face.len()))
             .collect(),
         corners: None,
+        raw_normals,
     };
     let mut output = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
     if use_creases && mesh.attributes.contains_key("crease_edge") {
