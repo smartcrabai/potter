@@ -695,7 +695,7 @@ fn loose_skin_branch_skips_edge_subdivision() {
                 .iter()
                 .enumerate()
                 .map(|(index, (radius, root))| {
-                    json!({"radius": radius, "root": root, "loose": index == 0})
+                    json!({"radius": radius, "root": root, "loose": index == 1})
                 })
                 .collect(),
         ),
