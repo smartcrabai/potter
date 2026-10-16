@@ -203,8 +203,12 @@ fn simple_deform_bend(coordinates: [f64; 3], cut: [f64; 3], axis: usize, factor:
     }
 }
 
-pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let steps_name = if modifier.runtime.use_render_settings {
+pub(super) fn screw(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    context: crate::eval::ModifierEvaluationContext<'_>,
+) -> Result<Mesh> {
+    let steps_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
         "render_steps"
     } else {
         "steps"

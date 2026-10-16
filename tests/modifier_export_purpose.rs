@@ -186,7 +186,14 @@ impl Projects {
                 "armature",
                 &[
                     json!({"op": "node.create", "id": "arm", "kind": "armature"}),
-                    json!({"op": "rig.generate_basic_human", "target": {"id": "arm"}, "scale": 1.0}),
+                    json!({
+                        "op": "bone.create",
+                        "target": {"id": "arm"},
+                        "id": "root",
+                        "name": "Root",
+                        "head": [0.0, 0.0, 0.0],
+                        "tail": [0.0, 1.0, 0.0],
+                    }),
                 ],
             )?,
             avatar: new_project(root, "avatar", &avatar)?,

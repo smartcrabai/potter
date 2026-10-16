@@ -287,7 +287,7 @@ fn stack_doc(steps: &[Step]) -> TestResult<SceneDoc> {
             Create { name, kind, pinned } => json!({
                 "op": "modifier.create",
                 "target": {"id": OBJECT},
-                "id": name,
+                "id": name.to_ascii_lowercase(),
                 "name": name,
                 "type": kind,
                 "params": {"use_pin_to_last": pinned},
@@ -295,7 +295,7 @@ fn stack_doc(steps: &[Step]) -> TestResult<SceneDoc> {
             Pin { name, pinned } => json!({
                 "op": "modifier.update",
                 "target": {"id": OBJECT},
-                "id": name,
+                "id": name.to_ascii_lowercase(),
                 "set": {"params": {"use_pin_to_last": pinned}},
             }),
         };
@@ -306,9 +306,13 @@ fn stack_doc(steps: &[Step]) -> TestResult<SceneDoc> {
 
 /// Potter's stack for `OBJECT`, bottom to top, as (name, `use_pin_to_last`).
 fn potter_stack(doc: &SceneDoc) -> TestResult<Vec<(String, bool)>> {
+    potter_stack_for(doc, OBJECT)
+}
+
+fn potter_stack_for(doc: &SceneDoc, object_id: &str) -> TestResult<Vec<(String, bool)>> {
     let node = doc
         .nodes
-        .get(&Id::new(OBJECT)?)
+        .get(&Id::new(object_id.to_owned())?)
         .ok_or("stack node is missing")?;
     Ok(node
         .modifiers
@@ -471,7 +475,12 @@ fn imported_blender_stack_order_survives_reexport() -> TestResult<()> {
     )?;
     let source = root.join("source.blend");
     let imported = import_blend(&source, Some(blender.as_path()))?;
-    let imported_stack = potter_stack(&imported.doc)?;
+    let imported_id = imported
+        .id_mappings
+        .get("Object:stack")
+        .and_then(Value::as_str)
+        .ok_or("Blender stack object ID mapping is missing")?;
+    let imported_stack = potter_stack_for(&imported.doc, imported_id)?;
     assert_eq!(
         imported_stack,
         vec![("Array".to_owned(), false), ("Softbody".to_owned(), true)],

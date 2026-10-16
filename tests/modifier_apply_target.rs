@@ -491,7 +491,7 @@ fn array_fit_curve_apply_uses_curve_data_and_world_transform() -> TestResult<()>
         "op": "curve.create",
         "id": "path",
         "dimensions": "three_d",
-        "transform": {"scale": [2.0, 1.0, 1.0]},
+        "transform": {"scale": [2.0, 2.0, 2.0]},
         "splines": [{
             "type": "poly",
             "points": [{"co": [0.0, 0.0, 0.0]}, {"co": [2.0, 0.0, 0.0]}],
@@ -613,6 +613,93 @@ fn array_geometry_operand_uses_source_viewport_stack_visibility() -> TestResult<
     ensure_eq(&max_z(&visible_source)?, &2.0, "visible source stack max Z")
 }
 
+#[test]
+fn boolean_apply_uses_simulated_geometry_operand_world_transform() -> TestResult<()> {
+    let scene = |target_visible| -> TestResult<SceneDoc> {
+        let operand = json!({
+            "op": "node.create",
+            "id": OPERAND,
+            "kind": "box",
+            "params": {"size": 1.0},
+            "transform": {"translation": [0.0, 0.0, 5.0]},
+        });
+        let physics_world = json!({
+            "op": "physics.world.update",
+            "target": {"id": "scene_main"},
+            "set": {
+                "enabled": true,
+                "gravity": [0.0, 0.0, -9.81],
+                "substeps": 4,
+                "solver_iterations": 8,
+                "frame_start": 1,
+                "frame_end": 120,
+                "seed": 23,
+            },
+        });
+        let active_operand = json!({
+            "op": "physics.rigid_body.create",
+            "target": {"id": OPERAND},
+            "type": "active",
+            "mass": 1.0,
+            "shape": "box",
+            "friction": 0.5,
+            "restitution": 0.0,
+            "linear_damping": 0.0,
+            "angular_damping": 0.0,
+        });
+        let boolean = modifier(
+            "boolean",
+            "boolean",
+            json!({"object": OPERAND, "operation": "DIFFERENCE", "solver": "EXACT"}),
+            target_visible,
+            true,
+        );
+        build(&[operand, physics_world, active_operand, boolean])
+    };
+    let visible_target = scene(true)?;
+    let hidden_target = scene(false)?;
+    let subject_id = Id::new(SUBJECT)?;
+    let frame_context = potter_core::eval::EvaluationContext {
+        frame: Some(24.0),
+        ..potter_core::eval::EvaluationContext::default()
+    };
+    let expected_snapshot = potter_core::eval::Snapshot::evaluate(&visible_target, &frame_context)?;
+    let expected_mesh = expected_snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("evaluated target mesh is missing")?;
+    let initial_snapshot = potter_core::eval::Snapshot::evaluate(
+        &visible_target,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let initial_mesh = initial_snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("initial target mesh is missing")?;
+    if expected_mesh == initial_mesh {
+        return Err("rigid-body operand did not move through the Boolean surface".into());
+    }
+
+    let batch = json!({
+        "schema_version": 1,
+        "base_revision": hidden_target.revision,
+        "evaluation": {"frame": 24.0},
+        "operations": [apply_op("boolean")],
+    });
+    let applied = ops::apply_batch(&hidden_target, &batch)?.doc;
+    let actual_mesh = data_block(&applied)?
+        .mesh
+        .as_ref()
+        .ok_or("applied target mesh is missing")?;
+    ensure_eq(
+        actual_mesh,
+        expected_mesh,
+        "applied Boolean uses the simulated operand world transform",
+    )
+}
 #[test]
 fn array_geometry_operand_propagates_unsupported_source_stack_errors() -> TestResult<()> {
     let mut extra = unsupported_bevel_source(&json!({"translation": [3.0, 0.0, 0.0]}))

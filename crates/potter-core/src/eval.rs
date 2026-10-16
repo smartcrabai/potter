@@ -115,6 +115,9 @@ pub struct Snapshot {
     #[serde(default)]
     pub warnings: Vec<PotError>,
     pub nodes: BTreeMap<Id, EvaluatedNode>,
+    /// World transforms captured for apply-only evaluations, including simulation results.
+    #[serde(skip)]
+    pub(crate) transform_world_matrices: BTreeMap<Id, DMat4>,
     /// Local-space geometry after the node's enabled modifier stack.
     #[serde(skip)]
     pub meshes: BTreeMap<Id, Mesh>,
@@ -234,7 +237,7 @@ impl Snapshot {
         Self::evaluate_internal(doc, context, project_root, cache_directory, Some(node_ids))
     }
 
-    /// Evaluate only a modifier's classified geometry operands and their dependencies.
+    /// Evaluate only a modifier's classified geometry operands and target world transform.
     pub(crate) fn evaluate_modifier_operands_with_cache(
         doc: &SceneDoc,
         context: &EvaluationContext,
@@ -242,13 +245,14 @@ impl Snapshot {
         cache_directory: Option<&Path>,
         target_id: &Id,
         modifier_id: &Id,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Self> {
         let modifier_context = ModifierEvaluationContext {
             purpose: context.purpose,
             project_root,
             cache_directory,
         };
         let suppressed = BTreeSet::new();
+        let world_matrix_ids = BTreeSet::from([target_id.clone()]);
         let mesh_dependencies = object_mesh_dependencies(
             doc,
             ModifierGate {
@@ -264,13 +268,10 @@ impl Snapshot {
         if let Some(dependencies) = mesh_dependencies.other.get(target_id) {
             selected_nodes.extend(dependencies.iter().cloned());
         }
-        if selected_nodes.is_empty() {
-            return Ok(None);
-        }
         doc.validate()?;
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
-        Ok(Some(Self::evaluate_gated(
+        Self::evaluate_gated(
             doc,
             &scene_hash,
             context,
@@ -278,7 +279,8 @@ impl Snapshot {
             Some(&selected_nodes),
             &suppressed,
             &mesh_dependencies,
-        )?))
+            Some(&world_matrix_ids),
+        )
     }
 
     /// Evaluate every supported node, recording modifier-feature failures per owner.
@@ -315,6 +317,7 @@ impl Snapshot {
                 None,
                 &suppressed,
                 &mesh_dependencies,
+                None,
             );
             match evaluation {
                 Ok(snapshot) if node_errors.is_empty() => {
@@ -444,6 +447,7 @@ impl Snapshot {
             selected_nodes,
             &suppressed,
             &mesh_dependencies,
+            None,
         )
     }
 
@@ -457,6 +461,7 @@ impl Snapshot {
         selected_nodes: Option<&BTreeSet<Id>>,
         suppressed: &BTreeSet<Id>,
         mesh_dependencies: &ObjectMeshDependencies,
+        world_matrix_ids: Option<&BTreeSet<Id>>,
     ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
@@ -638,7 +643,11 @@ impl Snapshot {
             "simulation_cache_key": simulation_cache_key,
         });
         let evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
-        let mut volume_data = load_vdb_volume_data(doc, modifier_context.project_root)?;
+        let mut volume_data = if mesh_evaluation_order.is_empty() {
+            BTreeMap::new()
+        } else {
+            load_vdb_volume_data(doc, modifier_context.project_root)?
+        };
 
         let mut nodes = BTreeMap::new();
         let mut meshes = BTreeMap::new();
@@ -1340,7 +1349,8 @@ impl Snapshot {
             );
         }
         let has_mesh_dependent_constraints = doc.nodes.iter().any(|(id, node)| {
-            evaluated_node_ids.contains(id)
+            (evaluated_node_ids.contains(id)
+                || world_matrix_ids.is_some_and(|ids| ids.contains(id)))
                 && node.constraints.iter().any(|constraint| {
                     constraint.enabled
                         && constraint.influence != 0.0
@@ -1446,6 +1456,12 @@ impl Snapshot {
             evaluated_node.bounds = bounds;
             evaluated_node.dimensions = bounds.map(|value| value.size().to_array());
         }
+        let transform_world_matrices: BTreeMap<Id, DMat4> =
+            world_matrix_ids.map_or_else(BTreeMap::new, |ids| {
+                ids.iter()
+                    .filter_map(|id| matrices.get(id).copied().map(|matrix| (id.clone(), matrix)))
+                    .collect()
+            });
         Ok(Self {
             scene_id,
             view_layer,
@@ -1455,6 +1471,7 @@ impl Snapshot {
             scene_hash: scene_hash.to_owned(),
             evaluation_hash,
             nodes,
+            transform_world_matrices,
             instance_paths,
             instance_bindings,
             meshes,
@@ -1538,14 +1555,10 @@ impl ModifierGate<'_> {
     pub(crate) fn is_active(&self, node_id: &Id, modifier: &Modifier) -> bool {
         !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
     }
-    /// `node_id`'s modifier list with this evaluation's enabled flags and render settings applied.
-    /// Borrowed when the stored state already matches; otherwise only this node's list is copied.
+
+    /// Borrow the stack when all modifiers remain active; otherwise copy only for visibility.
     pub(crate) fn stack<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> Cow<'m, [Modifier]> {
-        let matches = |modifier: &Modifier| {
-            modifier.enabled == self.is_active(node_id, modifier)
-                && modifier.runtime.use_render_settings
-                    == uses_render_settings(modifier, self.context.purpose)
-        };
+        let matches = |modifier: &Modifier| modifier.enabled == self.is_active(node_id, modifier);
         if modifiers.iter().all(matches) {
             return Cow::Borrowed(modifiers);
         }
@@ -1555,21 +1568,11 @@ impl ModifierGate<'_> {
                 .map(|modifier| {
                     let mut applied = modifier.clone();
                     applied.enabled = self.is_active(node_id, modifier);
-                    applied.runtime.use_render_settings =
-                        uses_render_settings(modifier, self.context.purpose);
                     applied
                 })
                 .collect(),
         )
     }
-}
-
-fn uses_render_settings(modifier: &Modifier, purpose: EvaluationPurpose) -> bool {
-    purpose == EvaluationPurpose::Render
-        && matches!(
-            modifier.modifier_type.as_str(),
-            "subdivision" | "multires" | "screw" | "ocean"
-        )
 }
 
 /// Read and verify a cache resource from the scene's asset registry.
@@ -4336,17 +4339,70 @@ pub(crate) fn mesh_vertex_weights(
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
 
+    use std::{borrow::Cow, collections::BTreeSet};
+
     use glam::DVec3;
 
     use crate::{
         geom::{BoxParams, Mesh},
         model::{
             DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
-            GreasePencilStroke, Id, Node, SceneDoc, Transform,
+            GreasePencilStroke, Id, Modifier, ModifierRuntime, Node, SceneDoc, Transform,
         },
     };
 
-    use super::{EvaluationContext, Snapshot};
+    use super::{
+        EvaluationContext, EvaluationPurpose, ModifierEvaluationContext, ModifierGate, Snapshot,
+    };
+
+    #[test]
+    fn render_gate_borrows_large_binding_payload() {
+        let owner = Id::new("owner").unwrap();
+        let binding_data = serde_json::json!({"binds": vec![vec![0.25; 64]; 4096]});
+        let modifiers = vec![
+            Modifier {
+                id: Id::new("bound").unwrap(),
+                modifier_type: "mesh_deform".to_owned(),
+                name: "Bound".to_owned(),
+                enabled: true,
+                show_viewport: true,
+                show_render: true,
+                params: serde_json::Map::new(),
+                binding_data: Some(binding_data),
+                runtime: ModifierRuntime::default(),
+            },
+            Modifier {
+                id: Id::new("subdivision").unwrap(),
+                modifier_type: "subdivision".to_owned(),
+                name: "Subdivision".to_owned(),
+                enabled: true,
+                show_viewport: true,
+                show_render: true,
+                params: serde_json::Map::new(),
+                binding_data: None,
+                runtime: ModifierRuntime::default(),
+            },
+        ];
+        let suppressed = BTreeSet::new();
+        let gate = ModifierGate {
+            context: ModifierEvaluationContext {
+                purpose: EvaluationPurpose::Render,
+                project_root: None,
+                cache_directory: None,
+            },
+            suppressed: &suppressed,
+        };
+
+        let stack = gate.stack(&owner, &modifiers);
+        let Cow::Borrowed(stack) = stack else {
+            panic!("render-settings selection must borrow a fully active stack");
+        };
+        assert!(std::ptr::eq(stack.as_ptr(), modifiers.as_ptr()));
+        assert!(std::ptr::eq(
+            stack[0].binding_data.as_ref().unwrap(),
+            modifiers[0].binding_data.as_ref().unwrap()
+        ));
+    }
 
     fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {
         let data_id = Id::new("grease_pencil_data").unwrap();
