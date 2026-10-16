@@ -49,7 +49,7 @@ pub(super) fn surface_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "one polygon-binding set per source vertex",
         ));
     }
-    let strength = number_param(modifier, "strength", 1.0)?;
+    let strength = number_param(modifier, "strength")?;
     if !(-100.0..=100.0).contains(&strength) {
         return Err(invalid_parameter(
             modifier,
@@ -57,7 +57,7 @@ pub(super) fn surface_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a number in [-100, 100]",
         ));
     }
-    let falloff = number_param(modifier, "falloff", 4.0)?;
+    let falloff = number_param(modifier, "falloff")?;
     if !(2.0..=16.0).contains(&falloff) {
         return Err(invalid_parameter(
             modifier,
@@ -65,9 +65,9 @@ pub(super) fn surface_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a number in [2, 16]",
         ));
     }
-    let _sparse = bool_param(modifier, "use_sparse_bind", false)?;
+    let _sparse = bool_param(modifier, "use_sparse_bind")?;
     let group = group_weights(mesh, modifier)?;
-    let invert = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
     let mut result = mesh.clone();
     for (index, (vertex, record)) in result.vertices.iter_mut().zip(bind_data).enumerate() {
         let polygons = record
@@ -323,7 +323,7 @@ fn native_surface_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) ->
             invalid_parameter(modifier, "binding_data", "native Surface Deform binds")
         })?;
     let strength = bind_object.get("strength").map_or_else(
-        || number_param(modifier, "strength", 1.0),
+        || number_param(modifier, "strength"),
         |value| finite_number(value, modifier, "binding_data"),
     )?;
     if bind_object
@@ -345,7 +345,7 @@ fn native_surface_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) ->
         ));
     }
     let group = group_weights(mesh, modifier)?;
-    let invert = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
     let mut result = mesh.clone();
     for binding in bindings {
         let vertex_index = binding
@@ -537,7 +537,7 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             })?,
         )
         .map_err(|_| invalid_parameter(modifier, "object", "a mesh cage object operand"))?;
-    let precision = uint_param(modifier, "precision", 5)?;
+    let precision = uint_param(modifier, "precision")?;
     if !(2..=10).contains(&precision) {
         return Err(invalid_parameter(
             modifier,
@@ -547,9 +547,9 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let precision = u32::try_from(precision)
         .map_err(|_| invalid_parameter(modifier, "precision", "an integer from 2 to 10"))?;
-    let dynamic = bool_param(modifier, "use_dynamic_bind", false)?;
+    let dynamic = bool_param(modifier, "use_dynamic_bind")?;
     let group = group_weights(mesh, modifier)?;
-    let invert = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
     if bind_weights.len() != mesh.vertices.len() || !same_mesh_topology(&bound_cage, &cage) {
         return Err(invalid_parameter(
             modifier,
@@ -680,7 +680,7 @@ fn native_mesh_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) -> Re
     }
     let group = group_weights(mesh, modifier)?;
     let flags = data.get("flag").and_then(Value::as_i64).unwrap_or_default();
-    let invert = flags & 1 != 0 || bool_param(modifier, "invert_vertex_group", false)?;
+    let invert = flags & 1 != 0 || bool_param(modifier, "invert_vertex_group")?;
     let dynamic = data
         .get("dynamic_bind")
         .and_then(Value::as_bool)
@@ -1117,12 +1117,12 @@ pub(super) fn laplacian_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh>
             })
             .collect::<Result<Vec<_>>>()?
     };
-    let iterations = usize::try_from(uint_param(modifier, "iterations", 1)?)
+    let iterations = usize::try_from(uint_param(modifier, "iterations")?)
         .map_err(|_| invalid_parameter(modifier, "iterations", "a non-negative integer"))?;
     let group = group_weights(mesh, modifier)?.ok_or_else(|| {
         invalid_parameter(modifier, "vertex_group", "an anchor vertex-group name")
     })?;
-    let invert = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
     let mut anchors = vec![false; mesh.vertices.len()];
     let mut anchor_positions = vec![DVec3::ZERO; mesh.vertices.len()];
     for (index, vertex) in mesh.vertices.iter().enumerate() {
@@ -1508,9 +1508,9 @@ pub(crate) fn bind_surface(mesh: &Mesh, target: &Mesh, modifier: &Modifier) -> R
             "surface deform binding requires target polygons",
         ));
     }
-    let sparse = bool_param(modifier, "use_sparse_bind", false)?;
+    let sparse = bool_param(modifier, "use_sparse_bind")?;
     let group = group_weights(mesh, modifier)?;
-    let invert = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
     let mut records = Vec::with_capacity(mesh.vertices.len());
     for (source_index, vertex) in mesh.vertices.iter().enumerate() {
         let bind_weight = group.as_ref().map_or(0.0, |weights| {
@@ -1622,7 +1622,7 @@ pub(crate) fn bind_mesh(mesh: &Mesh, cage: &Mesh, modifier: &Modifier) -> Result
             "mesh deform binding requires at least four cage vertices",
         ));
     }
-    let precision = uint_param(modifier, "precision", 5)?;
+    let precision = uint_param(modifier, "precision")?;
     if !(2..=10).contains(&precision) {
         return Err(invalid_parameter(
             modifier,
@@ -2293,12 +2293,8 @@ fn finite_number(value: &Value, modifier: &Modifier, name: &str) -> Result<f64> 
 }
 
 fn group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
-    let Some(group_name) = modifier.params.get("vertex_group") else {
-        return Ok(None);
-    };
-    let group_name = group_name
-        .as_str()
-        .ok_or_else(|| invalid_parameter(modifier, "vertex_group", "a vertex-group name"))?;
+    let group_name =
+        super::string_param_with_expected(modifier, "vertex_group", "a vertex-group name")?;
     if group_name.is_empty() {
         return Ok(None);
     }

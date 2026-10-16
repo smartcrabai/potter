@@ -3,6 +3,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     model::{ForceField, Id, Modifier, Node, RigidBody, RigidBodyWorld},
+    params::{self, ParameterFamily},
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer};
@@ -659,6 +660,30 @@ fn physics_property(system: &str) -> &'static str {
     }
 }
 
+/// Modifier-level properties (the base flags plus the type selectors) are not physics settings: they
+/// move out of `settings` and stay on the modifier. The keys are the modifier schema's own
+/// properties minus `settings_id`, so this split cannot drift from the operation-layer validation.
+fn split_modifier_flags(
+    modifier_type: &str,
+    settings: &mut Map<String, Value>,
+) -> Map<String, Value> {
+    let schema_keys: Vec<String> = params::type_spec(ParameterFamily::Modifier, modifier_type)
+        .and_then(|spec| spec.get("properties"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|properties| properties.keys())
+        .filter(|key| key.as_str() != "settings_id")
+        .cloned()
+        .collect();
+    let mut flags = Map::new();
+    for flag in schema_keys {
+        if let Some(value) = settings.remove(&flag) {
+            flags.insert(flag, value);
+        }
+    }
+    flags
+}
+
 pub(super) fn create_linked_modifier_settings(
     engine: &mut Engine<'_>,
     target: &Id,
@@ -679,6 +704,7 @@ pub(super) fn create_linked_modifier_settings(
             "/params/settings_id",
         ));
     }
+    let mut modifier_flags = split_modifier_flags(modifier_type, &mut settings);
     let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     validate_system_target(engine, target, &node)?;
     validate_physics_settings(engine, system, &settings)?;
@@ -728,10 +754,11 @@ pub(super) fn create_linked_modifier_settings(
         }
     }
     engine.mark("nodes", target, ChangeKind::Updated);
-    Ok(Map::from_iter([(
+    modifier_flags.insert(
         "settings_id".to_owned(),
         Value::String(modifier_id.to_string()),
-    )]))
+    );
+    Ok(modifier_flags)
 }
 
 pub(super) fn update_linked_modifier_settings(
@@ -756,6 +783,7 @@ pub(super) fn update_linked_modifier_settings(
     }
     let mut settings = params.clone();
     settings.remove("settings_id");
+    let mut modifier_flags = split_modifier_flags(modifier_type, &mut settings);
     let property = physics_property(system);
     let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     let is_particle_registry_entry = system == "particle_emitter"
@@ -784,33 +812,37 @@ pub(super) fn update_linked_modifier_settings(
             "modifier physics target disappeared",
         )
     })?;
-    if is_particle_registry_entry {
-        let registry = node
-            .properties
-            .get_mut("physics_particle_systems")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "particle settings registry is invalid",
-                )
-            })?;
-        registry.insert(modifier_id.to_string(), Value::Object(settings));
-    } else {
-        node.properties
-            .insert(property.to_owned(), Value::Object(settings));
-        if system == "particle_emitter" {
-            node.properties.insert(
-                "physics_particle_emitter_modifier_id".to_owned(),
-                Value::String(modifier_id.to_string()),
-            );
+    // A flag-only update has no physics settings to write; the stored settings stay as they are.
+    if !settings.is_empty() {
+        if is_particle_registry_entry {
+            let registry = node
+                .properties
+                .get_mut("physics_particle_systems")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "particle settings registry is invalid",
+                    )
+                })?;
+            registry.insert(modifier_id.to_string(), Value::Object(settings));
+        } else {
+            node.properties
+                .insert(property.to_owned(), Value::Object(settings));
+            if system == "particle_emitter" {
+                node.properties.insert(
+                    "physics_particle_emitter_modifier_id".to_owned(),
+                    Value::String(modifier_id.to_string()),
+                );
+            }
         }
+        engine.mark("nodes", target, ChangeKind::Updated);
     }
-    engine.mark("nodes", target, ChangeKind::Updated);
-    Ok(Map::from_iter([(
+    modifier_flags.insert(
         "settings_id".to_owned(),
         Value::String(modifier_id.to_string()),
-    )]))
+    );
+    Ok(modifier_flags)
 }
 
 pub(super) fn delete_linked_modifier_settings(

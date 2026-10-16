@@ -1,0 +1,178 @@
+{
+  "description": "Explicit Blender 5.2.2 behavior scenarios only. Known gaps require an activating Blender input and are checked against Blender at test time; inert cases are confirmed no-ops under their recorded condition. Cast scenarios use a factor 0 baseline (Blender and Potter both leave the box unchanged). cast_default sends the schema defaults only; on a size-2 box every vertex is equidistant from the origin, so the default auto-sized sphere is a Blender no-op there and the scenario checks that Potter's default evaluates to the same no-op. The default's active effect is covered by cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry.",
+  "scenarios": [
+    {
+      "id": "edge_split_no_angle",
+      "primitive": "box",
+      "modifier": "edge_split",
+      "baseline_params": {},
+      "case_params": {
+        "use_edge_angle": false
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "triangulate_min_vertices5",
+      "primitive": "box",
+      "modifier": "triangulate",
+      "baseline_params": {},
+      "case_params": {
+        "min_vertices": 5
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "solidify_nonmanifold",
+      "primitive": "box",
+      "modifier": "solidify",
+      "baseline_params": {
+        "thickness": 0.2
+      },
+      "case_params": {
+        "thickness": 0.2,
+        "solidify_mode": "NON_MANIFOLD"
+      },
+      "expectation": "known_gap",
+      "owner": "D",
+      "potter_changes": false
+    },
+    {
+      "id": "decimate_half",
+      "primitive": "box",
+      "modifier": "decimate",
+      "baseline_params": {},
+      "case_params": {
+        "ratio": 0.5
+      },
+      "expectation": "known_gap",
+      "owner": "PR15",
+      "potter_changes": true
+    },
+    {
+      "id": "screw_default_angle",
+      "primitive": "box",
+      "modifier": "screw",
+      "baseline_params": {
+        "angle": 6.283185307179586
+      },
+      "case_params": {},
+      "expectation": "inert"
+    },
+    {
+      "id": "array_fit_length_fixed_count",
+      "primitive": "box",
+      "modifier": "array",
+      "baseline_params": {
+        "count": 2,
+        "fit_type": "FIXED_COUNT",
+        "fit_length": 0.0
+      },
+      "case_params": {
+        "count": 2,
+        "fit_type": "FIXED_COUNT",
+        "fit_length": 5.0
+      },
+      "expectation": "inert"
+    },
+    {
+      "id": "apply_on_spline_mesh",
+      "primitive": "box",
+      "modifier": "array",
+      "baseline_params": {
+        "count": 2
+      },
+      "case_params": {
+        "count": 2,
+        "use_apply_on_spline": true
+      },
+      "expectation": "inert"
+    },
+    {
+      "id": "cast_default",
+      "primitive": "box",
+      "modifier": "cast",
+      "baseline_params": {
+        "factor": 0.0
+      },
+      "case_params": {},
+      "expectation": "inert"
+    },
+    {
+      "id": "cast_cuboid_auto_bounds",
+      "primitive": "box",
+      "modifier": "cast",
+      "baseline_params": {
+        "factor": 0.0
+      },
+      "case_params": {
+        "cast_type": "CUBOID"
+      },
+      "expectation": "inert"
+    },
+    {
+      "id": "cast_cylinder",
+      "primitive": "box",
+      "modifier": "cast",
+      "baseline_params": {
+        "factor": 0.0
+      },
+      "case_params": {
+        "cast_type": "CYLINDER"
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "cast_cuboid_size",
+      "primitive": "box",
+      "modifier": "cast",
+      "baseline_params": {
+        "factor": 0.0
+      },
+      "case_params": {
+        "cast_type": "CUBOID",
+        "use_radius_as_size": false,
+        "size": 2.0
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "cast_radius_sets_length",
+      "primitive": "box",
+      "modifier": "cast",
+      "baseline_params": {
+        "factor": 0.0
+      },
+      "case_params": {
+        "radius": 2.0
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "cast_size_sets_length",
+      "primitive": "box",
+      "modifier": "cast",
+      "baseline_params": {
+        "factor": 0.0
+      },
+      "case_params": {
+        "use_radius_as_size": false,
+        "size": 2.0
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "cast_radius_excludes_all",
+      "primitive": "box",
+      "modifier": "cast",
+      "baseline_params": {
+        "factor": 0.0
+      },
+      "case_params": {
+        "use_radius_as_size": false,
+        "size": 2.0,
+        "radius": 1.5
+      },
+      "expectation": "inert"
+    }
+  ]
+}

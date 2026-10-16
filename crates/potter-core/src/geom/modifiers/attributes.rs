@@ -7,13 +7,16 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Edge, Face, Mesh, Vertex, uv_layers::uv_map_entry_layer},
+    geom::{
+        Edge, Face, Mesh, Vertex,
+        uv_layers::{selected_layer_name, uv_map_entry_layer},
+    },
     model::{CameraData, Modifier},
 };
 
 use super::{
     bool_param as boolean, closest_point_triangle, invalid_parameter as invalid,
-    string_param as string,
+    number_param as number, schema_value, string_param as string,
 };
 #[derive(Clone, Debug)]
 /// A resolved scene-object operand for native modifier evaluation.
@@ -96,9 +99,24 @@ fn texture_mask_weights(
             json!({"feature_id":format!("modifier.{}.texture_type",modifier.modifier_type),"modifier_id":modifier.id}),
         )
     })?;
-    let mapping = string(modifier, "mask_tex_mapping", "LOCAL")?;
-    let channel = string(modifier, "mask_tex_use_channel", "INT")?;
-    let uv_layer = string(modifier, "mask_tex_uv_layer", "UVMap")?;
+    // `mask_tex_*` exist only in the vertex-weight schemas. The other attribute types cannot
+    // carry a mask texture (validation rejects it), so their former literals are kept locally.
+    let has_mask_schema = crate::params::default_value(
+        crate::params::ParameterFamily::Modifier,
+        &modifier.modifier_type,
+        "mask_tex_mapping",
+    )
+    .is_some();
+    let (mapping, channel, uv_layer) = if has_mask_schema {
+        (
+            string(modifier, "mask_tex_mapping")?,
+            string(modifier, "mask_tex_use_channel")?,
+            string(modifier, "mask_tex_uv_layer")?,
+        )
+    } else {
+        ("LOCAL", "INT", "UVMap")
+    };
+    let uv_layer = selected_layer_name(mesh, uv_layer);
     let uv_coordinates = if mapping == "UV" {
         Some(vertex_uv_coordinates(mesh, modifier, uv_layer)?)
     } else {
@@ -260,7 +278,7 @@ pub fn evaluate_mesh_cache(
             "a finite scene frame and positive frame rate",
         ));
     }
-    let format = string(modifier, "cache_format", "MDD")?;
+    let format = string(modifier, "cache_format")?;
     let samples = match format {
         "PC2" => read_pc2(bytes, modifier)?,
         "MDD" => read_mdd(bytes, modifier)?,
@@ -273,18 +291,18 @@ pub fn evaluate_mesh_cache(
             "a cache with matching vertex count",
         ));
     }
-    let frame_start = number(modifier, "frame_start", 0.0)?;
-    let frame_scale = number(modifier, "frame_scale", 1.0)?;
-    let play_mode = string(modifier, "play_mode", "SCENE")?;
+    let frame_start = number(modifier, "frame_start")?;
+    let frame_scale = number(modifier, "frame_scale")?;
+    let play_mode = string(modifier, "play_mode")?;
     if !matches!(play_mode, "SCENE" | "CUSTOM") {
         return Err(invalid(modifier, "play_mode", "SCENE or CUSTOM"));
     }
-    let time_mode = string(modifier, "time_mode", "FRAME")?;
+    let time_mode = string(modifier, "time_mode")?;
     if !matches!(time_mode, "FRAME" | "TIME" | "FACTOR") {
         return Err(invalid(modifier, "time_mode", "FRAME, TIME, or FACTOR"));
     }
     let custom = play_mode == "CUSTOM";
-    let interpolation = string(modifier, "interpolation", "LINEAR")?;
+    let interpolation = string(modifier, "interpolation")?;
     if !matches!(interpolation, "NONE" | "LINEAR") {
         return Err(invalid(modifier, "interpolation", "NONE or LINEAR"));
     }
@@ -292,7 +310,7 @@ pub fn evaluate_mesh_cache(
     let (first, second, factor) = match time_mode {
         "FRAME" => {
             let evaluation_frame = if custom {
-                number(modifier, "eval_frame", 0.0)?
+                number(modifier, "eval_frame")?
             } else {
                 frame
             };
@@ -306,7 +324,7 @@ pub fn evaluate_mesh_cache(
         }
         "TIME" => {
             let evaluation_time = if custom {
-                number(modifier, "eval_time", 0.0)?
+                number(modifier, "eval_time")?
             } else {
                 frame * fps_base / f64::from(fps) * frame_scale - frame_start
             };
@@ -325,7 +343,7 @@ pub fn evaluate_mesh_cache(
         }
         _ => {
             let evaluation_factor = if custom {
-                number(modifier, "eval_factor", 0.0)?
+                number(modifier, "eval_factor")?
             } else {
                 frame * fps_base / f64::from(fps) * frame_scale - frame_start
             };
@@ -337,24 +355,24 @@ pub fn evaluate_mesh_cache(
             )
         }
     };
-    let forward = string(modifier, "forward_axis", "POS_Y")?;
-    let up = string(modifier, "up_axis", "POS_Z")?;
+    let forward = string(modifier, "forward_axis")?;
+    let up = string(modifier, "up_axis")?;
     let flip = modifier
         .params
         .get("flip_axis")
         .map(|value| axis_flip_set(value, modifier))
         .transpose()?
         .unwrap_or([false; 3]);
-    let deform_mode = string(modifier, "deform_mode", "OVERWRITE")?;
+    let deform_mode = string(modifier, "deform_mode")?;
     if !matches!(deform_mode, "OVERWRITE" | "INTEGRATE") {
         return Err(invalid(modifier, "deform_mode", "OVERWRITE or INTEGRATE"));
     }
-    let amount = number(modifier, "factor", 1.0)?.clamp(0.0, 1.0);
+    let amount = number(modifier, "factor")?.clamp(0.0, 1.0);
     let group = optional_string(modifier, "vertex_group")?;
     let weights = group
         .map(|name| get_group_weights(mesh, name))
         .transpose()?;
-    let invert_group = boolean(modifier, "invert_vertex_group", false)?;
+    let invert_group = boolean(modifier, "invert_vertex_group")?;
     let basis = mesh
         .vertices
         .iter()
@@ -683,21 +701,21 @@ fn vertex_weight_edit(
     modifier: &Modifier,
     texture_weights: Option<&BTreeMap<u32, f64>>,
 ) -> Result<Mesh> {
-    let group = string(modifier, "vertex_group", "")?;
+    let group = string(modifier, "vertex_group")?;
     if group.is_empty() {
         return Err(invalid(modifier, "vertex_group", "a vertex-group name"));
     }
     let falloff = falloff_type(modifier)?;
-    let invert_falloff = boolean(modifier, "invert_falloff", false)?;
-    let use_add = boolean(modifier, "use_add", false)?;
-    let use_remove = boolean(modifier, "use_remove", false)?;
-    let add_threshold = number(modifier, "add_threshold", 0.01)?;
-    let remove_threshold = number(modifier, "remove_threshold", 0.01)?;
-    let default = number(modifier, "default_weight", 0.0)?.clamp(0.0, 1.0);
-    let normalize = boolean(modifier, "normalize", false)?;
-    let mask_constant = number(modifier, "mask_constant", 1.0)?.clamp(0.0, 1.0);
+    let invert_falloff = boolean(modifier, "invert_falloff")?;
+    let use_add = boolean(modifier, "use_add")?;
+    let use_remove = boolean(modifier, "use_remove")?;
+    let add_threshold = number(modifier, "add_threshold")?;
+    let remove_threshold = number(modifier, "remove_threshold")?;
+    let default = number(modifier, "default_weight")?.clamp(0.0, 1.0);
+    let normalize = boolean(modifier, "normalize")?;
+    let mask_constant = number(modifier, "mask_constant")?.clamp(0.0, 1.0);
     let mask_group = optional_string(modifier, "mask_vertex_group")?;
-    let mask_invert = boolean(modifier, "invert_mask_vertex_group", false)?;
+    let mask_invert = boolean(modifier, "invert_mask_vertex_group")?;
     let curve = curve_points(modifier)?;
     let mut result = mesh.clone();
     let existing = get_group_weights(&result, group)?;
@@ -746,8 +764,8 @@ fn vertex_weight_mix(
     modifier: &Modifier,
     texture_weights: Option<&BTreeMap<u32, f64>>,
 ) -> Result<Mesh> {
-    let group_a = string(modifier, "vertex_group_a", "")?;
-    let group_b = string(modifier, "vertex_group_b", "")?;
+    let group_a = string(modifier, "vertex_group_a")?;
+    let group_b = string(modifier, "vertex_group_b")?;
     if group_a.is_empty() || group_b.is_empty() {
         return Err(invalid(
             modifier,
@@ -755,16 +773,16 @@ fn vertex_weight_mix(
             "two vertex-group names",
         ));
     }
-    let mode = string(modifier, "mix_mode", "SET")?;
-    let mix_set = string(modifier, "mix_set", "AND")?;
-    let default_a = number(modifier, "default_weight_a", 0.0)?.clamp(0.0, 1.0);
-    let default_b = number(modifier, "default_weight_b", 0.0)?.clamp(0.0, 1.0);
-    let invert_a = boolean(modifier, "invert_vertex_group_a", false)?;
-    let invert_b = boolean(modifier, "invert_vertex_group_b", false)?;
-    let normalize = boolean(modifier, "normalize", false)?;
-    let mask_constant = number(modifier, "mask_constant", 1.0)?.clamp(0.0, 1.0);
+    let mode = string(modifier, "mix_mode")?;
+    let mix_set = string(modifier, "mix_set")?;
+    let default_a = number(modifier, "default_weight_a")?.clamp(0.0, 1.0);
+    let default_b = number(modifier, "default_weight_b")?.clamp(0.0, 1.0);
+    let invert_a = boolean(modifier, "invert_vertex_group_a")?;
+    let invert_b = boolean(modifier, "invert_vertex_group_b")?;
+    let normalize = boolean(modifier, "normalize")?;
+    let mask_constant = number(modifier, "mask_constant")?.clamp(0.0, 1.0);
     let mask_group = optional_string(modifier, "mask_vertex_group")?;
-    let mask_invert = boolean(modifier, "invert_mask_vertex_group", false)?;
+    let mask_invert = boolean(modifier, "invert_mask_vertex_group")?;
     let mut result = mesh.clone();
     let weights_a = get_group_weights(&result, group_a)?;
     let weights_b = get_group_weights_if_present(&result, group_b)?;
@@ -835,11 +853,11 @@ fn vertex_weight_proximity(
     subject_world: DMat4,
 ) -> Result<Mesh> {
     let target = one_operand(operands, "target", modifier)?;
-    let group = string(modifier, "vertex_group", "")?;
+    let group = string(modifier, "vertex_group")?;
     if group.is_empty() {
         return Err(invalid(modifier, "vertex_group", "a vertex-group name"));
     }
-    let mode = string(modifier, "proximity_mode", "GEOMETRY")?;
+    let mode = string(modifier, "proximity_mode")?;
     let mut geometry = string_set(modifier, "proximity_geometry")?;
     if geometry.is_empty() {
         geometry.push("FACE".to_owned());
@@ -857,8 +875,8 @@ fn vertex_weight_proximity(
             "a set containing VERTEX, EDGE, or FACE",
         ));
     }
-    let minimum = number(modifier, "min_dist", 0.0)?;
-    let maximum = number(modifier, "max_dist", 1.0)?;
+    let minimum = number(modifier, "min_dist")?;
+    let maximum = number(modifier, "max_dist")?;
     if minimum < 0.0 || maximum < minimum {
         return Err(invalid(
             modifier,
@@ -867,11 +885,11 @@ fn vertex_weight_proximity(
         ));
     }
     let falloff = falloff_type(modifier)?;
-    let invert_falloff = boolean(modifier, "invert_falloff", false)?;
+    let invert_falloff = boolean(modifier, "invert_falloff")?;
     let curve = curve_points(modifier)?;
-    let mask_constant = number(modifier, "mask_constant", 1.0)?.clamp(0.0, 1.0);
+    let mask_constant = number(modifier, "mask_constant")?.clamp(0.0, 1.0);
     let mask_group = optional_string(modifier, "mask_vertex_group")?;
-    let mask_invert = boolean(modifier, "invert_mask_vertex_group", false)?;
+    let mask_invert = boolean(modifier, "invert_mask_vertex_group")?;
     let mask_weights = mask_group
         .map(|name| get_group_weights(mesh, name))
         .transpose()?;
@@ -960,7 +978,7 @@ fn vertex_weight_proximity(
         );
     }
     write_group_weights(&mut result, group, &updated)?;
-    if boolean(modifier, "normalize", false)? {
+    if boolean(modifier, "normalize")? {
         normalize_group(&mut result, group)?;
     }
     Ok(result)
@@ -1020,7 +1038,7 @@ fn point_segment_distance(point: DVec3, first: DVec3, second: DVec3) -> f64 {
 }
 
 fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let mode = string(modifier, "mode", "FACE_AREA")?;
+    let mode = string(modifier, "mode")?;
     if !matches!(mode, "FACE_AREA" | "CORNER_ANGLE" | "FACE_AREA_WITH_ANGLE") {
         return Err(invalid(
             modifier,
@@ -1028,15 +1046,15 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "FACE_AREA, CORNER_ANGLE, or FACE_AREA_WITH_ANGLE",
         ));
     }
-    let power = number(modifier, "weight", 50.0)?.clamp(1.0, 100.0) / 50.0;
-    let threshold = number(modifier, "thresh", 0.01)?.max(0.0);
+    let power = number(modifier, "weight")?.clamp(1.0, 100.0) / 50.0;
+    let threshold = number(modifier, "thresh")?.max(0.0);
     let group = optional_string(modifier, "vertex_group")?;
     let group_weights = group
         .map(|name| get_group_weights(mesh, name))
         .transpose()?;
-    let invert_group = boolean(modifier, "invert_vertex_group", false)?;
-    let keep_sharp = boolean(modifier, "keep_sharp", false)?;
-    let use_face_influence = boolean(modifier, "use_face_influence", false)?;
+    let invert_group = boolean(modifier, "invert_vertex_group")?;
+    let keep_sharp = boolean(modifier, "keep_sharp")?;
+    let use_face_influence = boolean(modifier, "use_face_influence")?;
     let sharp_edges = mesh
         .attributes
         .get("sharp_edges")
@@ -1224,20 +1242,20 @@ fn normal_edit(
     operands: &BTreeMap<String, Vec<SceneOperand>>,
 ) -> Result<Mesh> {
     let target = one_operand(operands, "target", modifier)?;
-    let mode = string(modifier, "mode", "RADIAL")?;
+    let mode = string(modifier, "mode")?;
     if !matches!(mode, "RADIAL" | "DIRECTIONAL") {
         return Err(invalid(modifier, "mode", "RADIAL or DIRECTIONAL"));
     }
-    let offset = vector3(modifier, "offset", DVec3::ZERO)?;
-    let mix_mode = string(modifier, "mix_mode", "COPY")?;
-    let factor = number(modifier, "mix_factor", 1.0)?.clamp(0.0, 1.0);
-    let limit = number(modifier, "mix_limit", std::f64::consts::PI)?;
-    let parallel = boolean(modifier, "use_direction_parallel", false)?;
+    let offset = vector3(modifier, "offset")?;
+    let mix_mode = string(modifier, "mix_mode")?;
+    let factor = number(modifier, "mix_factor")?.clamp(0.0, 1.0);
+    let limit = number(modifier, "mix_limit")?;
+    let parallel = boolean(modifier, "use_direction_parallel")?;
     let group = optional_string(modifier, "vertex_group")?;
     let group_weights = group
         .map(|name| get_group_weights(mesh, name))
         .transpose()?;
-    let invert_group = boolean(modifier, "invert_vertex_group", false)?;
+    let invert_group = boolean(modifier, "invert_vertex_group")?;
     let target_origin = target.local_to_subject.transform_point3(DVec3::ZERO);
     let target_direction = (target_origin - offset).normalize_or_zero();
     let mut values = Map::new();
@@ -1304,14 +1322,14 @@ fn uv_project(
         ));
     }
     // Blender clamps these RNA properties to a hard minimum of 1.0.
-    let aspect_x = number(modifier, "aspect_x", 1.0)?.max(1.0);
-    let aspect_y = number(modifier, "aspect_y", 1.0)?.max(1.0);
-    let scale_x = number(modifier, "scale_x", 1.0)?;
-    let scale_y = number(modifier, "scale_y", 1.0)?;
+    let aspect_x = number(modifier, "aspect_x")?.max(1.0);
+    let aspect_y = number(modifier, "aspect_y")?.max(1.0);
+    let scale_x = number(modifier, "scale_x")?;
+    let scale_y = number(modifier, "scale_y")?;
     if scale_x <= 0.0 || scale_y <= 0.0 {
         return Err(invalid(modifier, "scale_x", "positive projection scales"));
     }
-    let layer = string(modifier, "uv_layer", "UVMap")?;
+    let layer = selected_layer_name(mesh, string(modifier, "uv_layer")?);
     let mut entries = uv_entries(mesh, modifier)?;
     for face in &mesh.faces {
         let normal = face_normal(mesh, face)?;
@@ -1445,20 +1463,20 @@ fn uv_warp(
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
 ) -> Result<Mesh> {
-    let center = vector2(modifier, "center", DVec2::splat(0.5))?;
-    let axis_u = string(modifier, "axis_u", "X")?;
-    let axis_v = string(modifier, "axis_v", "Y")?;
+    let center = vector2(modifier, "center")?;
+    let axis_u = string(modifier, "axis_u")?;
+    let axis_v = string(modifier, "axis_v")?;
     let axis_u = selected_axis(axis_u, modifier, "axis_u")?;
     let axis_v = selected_axis(axis_v, modifier, "axis_v")?;
-    let offset = vector2(modifier, "offset", DVec2::ZERO)?;
-    let scale = vector2(modifier, "scale", DVec2::ONE)?;
-    let rotation = number(modifier, "rotation", 0.0)?;
-    let layer = string(modifier, "uv_layer", "UVMap")?;
+    let offset = vector2(modifier, "offset")?;
+    let scale = vector2(modifier, "scale")?;
+    let rotation = number(modifier, "rotation")?;
+    let layer = selected_layer_name(mesh, string(modifier, "uv_layer")?);
     let group = optional_string(modifier, "vertex_group")?;
     let weights = group
         .map(|name| get_group_weights(mesh, name))
         .transpose()?;
-    let invert_group = boolean(modifier, "invert_vertex_group", false)?;
+    let invert_group = boolean(modifier, "invert_vertex_group")?;
     let from = operands.get("object_from").and_then(|items| items.first());
     let to = operands.get("object_to").and_then(|items| items.first());
     check_uv_warp_bone_binding(modifier, operands, "bone_from", "object_from")?;
@@ -1553,31 +1571,31 @@ fn data_transfer(
     operands: &BTreeMap<String, Vec<SceneOperand>>,
 ) -> Result<Mesh> {
     let source = one_operand(operands, "object", modifier)?;
-    let use_transform = boolean(modifier, "use_object_transform", true)?;
+    let use_transform = boolean(modifier, "use_object_transform")?;
     let source_transform = if use_transform {
         source.local_to_subject
     } else {
         DMat4::IDENTITY
     };
-    let use_vertices = boolean(modifier, "use_vert_data", false)?;
-    let use_edges = boolean(modifier, "use_edge_data", false)?;
-    let use_loops = boolean(modifier, "use_loop_data", false)?;
-    let use_polygons = boolean(modifier, "use_poly_data", false)?;
-    let vertex_mapping = string(modifier, "vert_mapping", "NEAREST")?;
-    let edge_mapping = string(modifier, "edge_mapping", "NEAREST")?;
-    let loop_mapping = string(modifier, "loop_mapping", "NEAREST_POLYNOR")?;
-    let polygon_mapping = string(modifier, "poly_mapping", "NEAREST")?;
+    let use_vertices = boolean(modifier, "use_vert_data")?;
+    let use_edges = boolean(modifier, "use_edge_data")?;
+    let use_loops = boolean(modifier, "use_loop_data")?;
+    let use_polygons = boolean(modifier, "use_poly_data")?;
+    let vertex_mapping = string(modifier, "vert_mapping")?;
+    let edge_mapping = string(modifier, "edge_mapping")?;
+    let loop_mapping = string(modifier, "loop_mapping")?;
+    let polygon_mapping = string(modifier, "poly_mapping")?;
     validate_transfer_mapping(modifier, "vert_mapping", vertex_mapping)?;
     validate_transfer_mapping(modifier, "edge_mapping", edge_mapping)?;
     validate_transfer_mapping(modifier, "loop_mapping", loop_mapping)?;
     validate_transfer_mapping(modifier, "poly_mapping", polygon_mapping)?;
-    let factor = number(modifier, "mix_factor", 1.0)?.clamp(0.0, 1.0);
-    let mix_mode = string(modifier, "mix_mode", "REPLACE")?;
+    let factor = number(modifier, "mix_factor")?.clamp(0.0, 1.0);
+    let mix_mode = string(modifier, "mix_mode")?;
     let mask_group = optional_string(modifier, "vertex_group")?.filter(|name| !name.is_empty());
     let mask_weights = mask_group
         .map(|name| get_group_weights(mesh, name))
         .transpose()?;
-    let invert_mask = boolean(modifier, "invert_vertex_group", false)?;
+    let invert_mask = boolean(modifier, "invert_vertex_group")?;
     let mut result = mesh.clone();
     let data_types_verts = string_set(modifier, "data_types_verts")?;
     let data_types_edges = string_set(modifier, "data_types_edges")?;
@@ -2270,8 +2288,8 @@ fn transfer_uv(
     if source_entries.is_empty() {
         return Ok(());
     }
-    let source_selection = string(modifier, "layers_uv_select_src", "ALL")?;
-    let destination_selection = string(modifier, "layers_uv_select_dst", "NAME")?;
+    let source_selection = string(modifier, "layers_uv_select_src")?;
+    let destination_selection = string(modifier, "layers_uv_select_dst")?;
     if !matches!(source_selection, "ACTIVE" | "ALL") {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -2977,7 +2995,7 @@ fn write_group_weights(mesh: &mut Mesh, group: &str, weights: &BTreeMap<u32, f64
 }
 
 fn falloff_type(modifier: &Modifier) -> Result<&str> {
-    let falloff = string(modifier, "falloff_type", "LINEAR")?;
+    let falloff = string(modifier, "falloff_type")?;
     if matches!(
         falloff,
         "LINEAR" | "CURVE" | "SHARP" | "SMOOTH" | "ROOT" | "ICON_SPHERECURVE" | "RANDOM" | "STEP"
@@ -3096,32 +3114,16 @@ fn optional_string<'a>(modifier: &'a Modifier, name: &str) -> Result<Option<&'a 
     }
 }
 
-fn number(modifier: &Modifier, name: &str, default: f64) -> Result<f64> {
-    match modifier.params.get(name) {
-        None => Ok(default),
-        Some(value) => value
-            .as_f64()
-            .filter(|number| number.is_finite())
-            .ok_or_else(|| invalid(modifier, name, "a finite number")),
-    }
+fn vector2(modifier: &Modifier, name: &str) -> Result<DVec2> {
+    value2(schema_value(modifier, name)?)
+        .filter(|point| point.is_finite())
+        .ok_or_else(|| invalid(modifier, name, "two finite numbers"))
 }
 
-fn vector2(modifier: &Modifier, name: &str, default: DVec2) -> Result<DVec2> {
-    match modifier.params.get(name) {
-        None => Ok(default),
-        Some(value) => value2(value)
-            .filter(|point| point.is_finite())
-            .ok_or_else(|| invalid(modifier, name, "two finite numbers")),
-    }
-}
-
-fn vector3(modifier: &Modifier, name: &str, default: DVec3) -> Result<DVec3> {
-    match modifier.params.get(name) {
-        None => Ok(default),
-        Some(value) => value3(value)
-            .filter(|vector| vector.is_finite())
-            .ok_or_else(|| invalid(modifier, name, "three finite numbers")),
-    }
+fn vector3(modifier: &Modifier, name: &str) -> Result<DVec3> {
+    value3(schema_value(modifier, name)?)
+        .filter(|vector| vector.is_finite())
+        .ok_or_else(|| invalid(modifier, name, "three finite numbers"))
 }
 
 fn value2(value: &Value) -> Option<DVec2> {

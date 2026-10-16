@@ -18,7 +18,7 @@ use crate::{
 use super::{
     Mesh, Polygon, blend_weights, bool_param, clean_polygon, cyclic_pairs, decimate_compact,
     edge_key, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
-    unique_polygons, unique_tagged_polygons,
+    schema_value, unique_polygons, unique_tagged_polygons,
 };
 #[derive(Clone, Copy, Default)]
 struct DecimateQuadric([f64; 10]);
@@ -1310,7 +1310,7 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
         return Ok(mesh.clone());
     }
     let weights = decimate_group_weights(mesh, modifier)?;
-    let weight_factor = number_param(modifier, "vertex_group_factor", 1.0)?;
+    let weight_factor = number_param(modifier, "vertex_group_factor")?;
     if !(0.0..=1.0).contains(&weight_factor) {
         return Err(invalid_parameter(
             modifier,
@@ -1318,13 +1318,13 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
             "a number from 0 through 1",
         ));
     }
-    let use_triangulate = bool_param(modifier, "use_collapse_triangulate", false)?;
-    let symmetry_axis = if bool_param(modifier, "use_symmetry", false)? {
+    let use_triangulate = bool_param(modifier, "use_collapse_triangulate")?;
+    let symmetry_axis = if bool_param(modifier, "use_symmetry")? {
         Some(decimate_symmetry_axis(modifier)?)
     } else {
         None
     };
-    let invert_weights = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert_weights = bool_param(modifier, "invert_vertex_group")?;
     if ratio < 1.0 && invert_weights && weights.is_some() && weight_factor > 0.0 {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -1655,28 +1655,26 @@ fn decimate_merged_corners(
 }
 
 fn decimate_symmetry_axis(modifier: &Modifier) -> Result<usize> {
-    match modifier.params.get("symmetry_axis") {
-        None => Ok(0),
-        Some(Value::String(axis)) => match axis.to_ascii_uppercase().as_str() {
+    match schema_value(modifier, "symmetry_axis")? {
+        Value::String(axis) => match axis.to_ascii_uppercase().as_str() {
             "X" => Ok(0),
             "Y" => Ok(1),
             "Z" => Ok(2),
             _ => Err(invalid_parameter(modifier, "symmetry_axis", "X, Y, or Z")),
         },
-        Some(Value::Number(axis)) => axis
+        Value::Number(axis) => axis
             .as_u64()
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value < 3)
             .ok_or_else(|| invalid_parameter(modifier, "symmetry_axis", "X, Y, or Z")),
-        Some(_) => Err(invalid_parameter(modifier, "symmetry_axis", "X, Y, or Z")),
+        _ => Err(invalid_parameter(modifier, "symmetry_axis", "X, Y, or Z")),
     }
 }
 
 fn decimate_group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
-    let group_name = match modifier.params.get("vertex_group") {
-        None => "",
-        Some(Value::String(name)) => name.as_str(),
-        Some(_) => {
+    let group_name = match schema_value(modifier, "vertex_group")? {
+        Value::String(name) => name.as_str(),
+        _ => {
             return Err(invalid_parameter(
                 modifier,
                 "vertex_group",
@@ -1696,7 +1694,7 @@ fn decimate_group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec
         .ok_or_else(|| {
             invalid_parameter(modifier, "vertex_group", "a group present on the mesh")
         })?;
-    let invert = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert = bool_param(modifier, "invert_vertex_group")?;
     mesh.vertices
         .iter()
         .map(|vertex| {
@@ -2642,7 +2640,7 @@ pub(super) fn decimate_dissolve(
     angle_limit: f64,
     modifier: &Modifier,
 ) -> Result<Mesh> {
-    let dissolve_boundaries = bool_param(modifier, "use_dissolve_boundaries", false)?;
+    let dissolve_boundaries = bool_param(modifier, "use_dissolve_boundaries")?;
     if angle_limit == 0.0 || mesh.faces.len() <= 3 {
         return Ok(mesh.clone());
     }

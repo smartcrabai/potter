@@ -19,7 +19,8 @@ use crate::{
 };
 
 use super::{
-    bool_param, invalid_parameter, number_param, string_param_with_expected, uint_param, validated,
+    bool_param, invalid_parameter, number_param, schema_value, string_param_with_expected,
+    uint_param, validated,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,12 +67,8 @@ impl std::ops::Mul for Complex {
 
 /// Evaluate either the generated periodic grid or an input mesh displaced by the spectrum.
 pub(super) fn ocean(mesh: &Mesh, modifier: &Modifier, _frame: f64) -> Result<Mesh> {
-    let geometry_mode = string_param_with_expected(
-        modifier,
-        "geometry_mode",
-        "GENERATE",
-        "a Blender enum or string",
-    )?;
+    let geometry_mode =
+        string_param_with_expected(modifier, "geometry_mode", "a Blender enum or string")?;
     if !["GENERATE", "DISPLACE"].contains(&geometry_mode) {
         return Err(invalid_parameter(
             modifier,
@@ -79,8 +76,8 @@ pub(super) fn ocean(mesh: &Mesh, modifier: &Modifier, _frame: f64) -> Result<Mes
             "GENERATE or DISPLACE",
         ));
     }
-    let _render_resolution = resolution_param(modifier, "resolution", 7)?;
-    let viewport_resolution = resolution_param(modifier, "viewport_resolution", 7)?;
+    let _render_resolution = resolution_param(modifier, "resolution")?;
+    let viewport_resolution = resolution_param(modifier, "viewport_resolution")?;
     let geometry_resolution = usize::try_from(viewport_resolution)
         .map_err(|_| {
             PotError::new(
@@ -101,19 +98,19 @@ pub(super) fn ocean(mesh: &Mesh, modifier: &Modifier, _frame: f64) -> Result<Mes
             )
         })?;
     let n = geometry_resolution;
-    let spatial_size = number_param(modifier, "spatial_size", 50.0)?;
-    let size = number_param(modifier, "size", 1.0)?;
-    let depth = number_param(modifier, "depth", 200.0)?;
-    let wave_scale = number_param(modifier, "wave_scale", 1.0)?;
-    let wave_scale_min = number_param(modifier, "wave_scale_min", 0.01)?;
-    let choppiness = number_param(modifier, "choppiness", 1.0)?;
-    let wind_velocity = number_param(modifier, "wind_velocity", 30.0)?;
-    let wave_alignment = number_param(modifier, "wave_alignment", 0.0)?;
-    let wave_direction = number_param(modifier, "wave_direction", 0.0)?;
-    let damping = number_param(modifier, "damping", 0.5)?;
-    let frame_time = number_param(modifier, "time", 1.0)?;
-    let repeat_x = repeat_param(modifier, "repeat_x", 1)?;
-    let repeat_y = repeat_param(modifier, "repeat_y", 1)?;
+    let spatial_size = number_param(modifier, "spatial_size")?;
+    let size = number_param(modifier, "size")?;
+    let depth = number_param(modifier, "depth")?;
+    let wave_scale = number_param(modifier, "wave_scale")?;
+    let wave_scale_min = number_param(modifier, "wave_scale_min")?;
+    let choppiness = number_param(modifier, "choppiness")?;
+    let wind_velocity = number_param(modifier, "wind_velocity")?;
+    let wave_alignment = number_param(modifier, "wave_alignment")?;
+    let wave_direction = number_param(modifier, "wave_direction")?;
+    let damping = number_param(modifier, "damping")?;
+    let frame_time = number_param(modifier, "time")?;
+    let repeat_x = repeat_param(modifier, "repeat_x")?;
+    let repeat_y = repeat_param(modifier, "repeat_y")?;
     if !spatial_size.is_finite() || spatial_size <= 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -159,8 +156,7 @@ pub(super) fn ocean(mesh: &Mesh, modifier: &Modifier, _frame: f64) -> Result<Mes
             "a finite time in seconds",
         ));
     }
-    let spectrum =
-        string_param_with_expected(modifier, "spectrum", "PHILLIPS", "a Blender enum or string")?;
+    let spectrum = string_param_with_expected(modifier, "spectrum", "a Blender enum or string")?;
     if ![
         "PHILLIPS",
         "PIERSON_MOSKOWITZ",
@@ -175,8 +171,8 @@ pub(super) fn ocean(mesh: &Mesh, modifier: &Modifier, _frame: f64) -> Result<Mes
             "PHILLIPS, PIERSON_MOSKOWITZ, JONSWAP, or TEXEL_MARSEN_ARSLOE",
         ));
     }
-    let sharpen_peak = number_param(modifier, "sharpen_peak_jonswap", 0.0)?;
-    let fetch = number_param(modifier, "fetch_jonswap", 120.0)?;
+    let sharpen_peak = number_param(modifier, "sharpen_peak_jonswap")?;
+    let fetch = number_param(modifier, "fetch_jonswap")?;
     if !(0.0..=1.0).contains(&sharpen_peak) || !fetch.is_finite() || fetch < 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -184,12 +180,12 @@ pub(super) fn ocean(mesh: &Mesh, modifier: &Modifier, _frame: f64) -> Result<Mes
             "sharpen_peak_jonswap in [0, 1] and non-negative fetch_jonswap",
         ));
     }
-    let use_normals = bool_param(modifier, "use_normals", false)?;
-    let use_foam = bool_param(modifier, "use_foam", false)?;
+    let use_normals = bool_param(modifier, "use_normals")?;
+    let use_foam = bool_param(modifier, "use_foam")?;
     let foam_layer_name =
-        string_param_with_expected(modifier, "foam_layer_name", "", "a Blender enum or string")?;
-    let foam_coverage = number_param(modifier, "foam_coverage", 0.0)?;
-    let random_seed = seed_param(modifier, "random_seed", 0)?;
+        string_param_with_expected(modifier, "foam_layer_name", "a Blender enum or string")?;
+    let foam_coverage = number_param(modifier, "foam_coverage")?;
+    let random_seed = seed_param(modifier, "random_seed")?;
     let (spectrum_values, displacement_x, displacement_y) = height_spectrum(
         n,
         spatial_size,
@@ -614,8 +610,8 @@ fn sample_grid(values: &[f64], n: usize, x: f64, y: f64) -> f64 {
     first * (1.0 - fx) + second * fx
 }
 
-fn resolution_param(modifier: &Modifier, name: &str, default: u64) -> Result<u32> {
-    let value = uint_param(modifier, name, default)?;
+fn resolution_param(modifier: &Modifier, name: &str) -> Result<u32> {
+    let value = uint_param(modifier, name)?;
     if value == 0 {
         return Err(invalid_parameter(
             modifier,
@@ -640,8 +636,8 @@ fn resolution_param(modifier: &Modifier, name: &str, default: u64) -> Result<u32
     })
 }
 
-fn repeat_param(modifier: &Modifier, name: &str, default: u64) -> Result<u32> {
-    let value = uint_param(modifier, name, default)?;
+fn repeat_param(modifier: &Modifier, name: &str) -> Result<u32> {
+    let value = uint_param(modifier, name)?;
     if !(1..=1024).contains(&value) {
         return Err(invalid_parameter(
             modifier,
@@ -652,14 +648,11 @@ fn repeat_param(modifier: &Modifier, name: &str, default: u64) -> Result<u32> {
     u32::try_from(value).map_err(|_| invalid_parameter(modifier, name, "an integer from 1 to 1024"))
 }
 
-fn seed_param(modifier: &Modifier, name: &str, default: u64) -> Result<u64> {
-    match modifier.params.get(name) {
-        None => Ok(default),
-        Some(value) => value
-            .as_u64()
-            .filter(|seed| *seed <= 2_147_483_647)
-            .ok_or_else(|| invalid_parameter(modifier, name, "an integer from 0 to 2147483647")),
-    }
+fn seed_param(modifier: &Modifier, name: &str) -> Result<u64> {
+    schema_value(modifier, name)?
+        .as_u64()
+        .filter(|seed| *seed <= 2_147_483_647)
+        .ok_or_else(|| invalid_parameter(modifier, name, "an integer from 0 to 2147483647"))
 }
 
 fn blender_hash_int_2d(x: u32, y: u32) -> u32 {

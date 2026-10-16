@@ -127,7 +127,7 @@ pub(crate) fn validate_params(
     }
     if let Some(required) = type_spec.get("required").and_then(Value::as_array) {
         for name in required.iter().filter_map(Value::as_str) {
-            if !params.contains_key(name) {
+            if params.get(name).is_none_or(Value::is_null) {
                 return Err(ParameterError {
                     pointer: format!("{base_pointer}/{}", escape_pointer(name)),
                     message: format!(

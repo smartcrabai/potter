@@ -1226,8 +1226,9 @@ def mesh_dump(mesh):
     polygons = [{"v": list(poly.vertices), "material_index": int(poly.material_index),
                  "smooth": bool(poly.use_smooth)} for poly in mesh.polygons]
     uv_layers = []
-    for layer in mesh.uv_layers:
-        uv_layers.append({"name": layer.name, "values": [plain(item.uv) for item in layer.data]})
+    for index, layer in enumerate(mesh.uv_layers):
+        uv_layers.append({"name": layer.name, "active": index == mesh.uv_layers.active_index,
+                          "values": [plain(item.uv) for item in layer.data]})
     attrs = []
     try:
         for attr in mesh.attributes:
@@ -2577,11 +2578,13 @@ def mesh_create(name, raw, block_id):
         if index < len(polygon_smooth) and polygon_smooth[index]:
             polygon.use_smooth = True
     uv_layers = attributes.get("blender_uv_layers", raw.get("uv_layers", []))
-    for layer in uv_layers:
+    for index, layer in enumerate(uv_layers):
         uv = mesh.uv_layers.new(name=layer["name"])
-        for index, item in enumerate(layer.get("values", [])):
-            if index < len(uv.data):
-                uv.data[index].uv = item
+        for item_index, item in enumerate(layer.get("values", [])):
+            if item_index < len(uv.data):
+                uv.data[item_index].uv = item
+        if layer.get("active"):
+            mesh.uv_layers.active_index = index
     for source in attributes.get("blender_attributes", []):
         name = source.get("name")
         if not name or name in ("position", ".corner_vert", ".corner_edge", ".edge_verts"):

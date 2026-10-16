@@ -238,10 +238,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                     json!({"modifier_id":modifier.id,"node_group":group_id}),
                 )
             })?;
-            let overrides = match modifier.params.get("inputs") {
-                None => Map::new(),
-                Some(Value::Object(overrides)) => overrides.clone(),
-                Some(_) => {
+            let overrides = match schema_value(modifier, "inputs")? {
+                Value::Object(overrides) => overrides.clone(),
+                _ => {
                     return Err(invalid_parameter(
                         modifier,
                         "inputs",
@@ -521,12 +520,8 @@ fn boolean_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh object operand"))?;
     let operand: Mesh = serde_json::from_value(operand)
         .map_err(|_| invalid_parameter(modifier, "object", "a mesh object operand"))?;
-    let operation = match modifier.params.get("operation") {
-        None => "DIFFERENCE",
-        Some(value) => value.as_str().ok_or_else(|| {
-            invalid_parameter(modifier, "operation", "UNION, DIFFERENCE, or INTERSECT")
-        })?,
-    };
+    let operation =
+        string_param_with_expected(modifier, "operation", "UNION, DIFFERENCE, or INTERSECT")?;
     super::boolean::boolean_mesh(mesh, &operand, operation)
 }
 
@@ -549,55 +544,70 @@ fn parameter_value<'a>(modifier: &'a Modifier, name: &str) -> Option<&'a Value> 
         .or_else(|| params::default_value(ParameterFamily::Modifier, &modifier.modifier_type, name))
 }
 
-fn string_param<'a>(modifier: &'a Modifier, name: &str, default: &'a str) -> Result<&'a str> {
-    string_param_with_expected(modifier, name, default, "a string")
+/// The modifier's value for `name`, else its Blender default from `param_table.json`.
+fn schema_value<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a Value> {
+    parameter_value(modifier, name).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InternalError,
+            format!(
+                "modifier type `{}` has no value or schema default for parameter `{name}`",
+                modifier.modifier_type
+            ),
+            json!({
+                "modifier_id": modifier.id,
+                "modifier_type": modifier.modifier_type,
+                "parameter": name
+            }),
+        )
+    })
+}
+
+fn string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
+    string_param_with_expected(modifier, name, "a string")
 }
 
 fn string_param_with_expected<'a>(
     modifier: &'a Modifier,
     name: &str,
-    default: &'a str,
     expected: &str,
 ) -> Result<&'a str> {
-    modifier.params.get(name).map_or(Ok(default), |value| {
-        value
+    schema_value(modifier, name)?
+        .as_str()
+        .ok_or_else(|| invalid_parameter(modifier, name, expected))
+}
+
+/// Object-reference parameter: `None` when the value is null or absent.
+fn optional_string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<Option<&'a str>> {
+    match parameter_value(modifier, name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
             .as_str()
-            .ok_or_else(|| invalid_parameter(modifier, name, expected))
-    })
-}
-
-pub(super) fn number_param(modifier: &Modifier, name: &str, default: f64) -> Result<f64> {
-    match parameter_value(modifier, name) {
-        None => Ok(default),
-        Some(value) => value
-            .as_f64()
-            .filter(|number| number.is_finite())
-            .ok_or_else(|| invalid_parameter(modifier, name, "a finite number")),
+            .map(Some)
+            .ok_or_else(|| invalid_parameter(modifier, name, "a string or null")),
     }
 }
 
-pub(super) fn bool_param(modifier: &Modifier, name: &str, default: bool) -> Result<bool> {
-    match parameter_value(modifier, name) {
-        None => Ok(default),
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| invalid_parameter(modifier, name, "a boolean")),
-    }
+pub(super) fn number_param(modifier: &Modifier, name: &str) -> Result<f64> {
+    schema_value(modifier, name)?
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| invalid_parameter(modifier, name, "a finite number"))
 }
 
-fn uint_param(modifier: &Modifier, name: &str, default: u64) -> Result<u64> {
-    match parameter_value(modifier, name) {
-        None => Ok(default),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| invalid_parameter(modifier, name, "a non-negative integer")),
-    }
+pub(super) fn bool_param(modifier: &Modifier, name: &str) -> Result<bool> {
+    schema_value(modifier, name)?
+        .as_bool()
+        .ok_or_else(|| invalid_parameter(modifier, name, "a boolean"))
 }
 
-fn vec3_param(modifier: &Modifier, name: &str, default: DVec3) -> Result<DVec3> {
-    let Some(value) = parameter_value(modifier, name) else {
-        return Ok(default);
-    };
+fn uint_param(modifier: &Modifier, name: &str) -> Result<u64> {
+    schema_value(modifier, name)?
+        .as_u64()
+        .ok_or_else(|| invalid_parameter(modifier, name, "a non-negative integer"))
+}
+
+fn vec3_param(modifier: &Modifier, name: &str) -> Result<DVec3> {
+    let value = schema_value(modifier, name)?;
     let components = if let Some(array) = value.as_array() {
         if array.len() != 3 {
             return Err(invalid_parameter(modifier, name, "three finite numbers"));
@@ -1071,8 +1081,8 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     if selected.is_empty() {
         return Ok(mesh.clone());
     }
-    let merge = bool_param(modifier, "use_mirror_merge", true)?;
-    let threshold = number_param(modifier, "merge_threshold", 0.001)?;
+    let merge = bool_param(modifier, "use_mirror_merge")?;
+    let threshold = number_param(modifier, "merge_threshold")?;
     if threshold < 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -1177,22 +1187,22 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // Blender averages the custom normals of each merged fan when it reads them back; a seam's copies
     // join one fan, so their mirrored values meet here.
     average_custom_normals_by_fan(&mut result)?;
-    if bool_param(modifier, "use_mirror_vertex_groups", true)? {
+    if bool_param(modifier, "use_mirror_vertex_groups")? {
         mirror_vertex_groups(mesh, &mut result, &merged.point_members, vertex_count);
     }
     let flip = [
-        bool_param(modifier, "use_mirror_u", false)?,
-        bool_param(modifier, "use_mirror_v", false)?,
+        bool_param(modifier, "use_mirror_u")?,
+        bool_param(modifier, "use_mirror_v")?,
     ];
     let mirror_offset = [
-        number_param(modifier, "mirror_offset_u", 0.0)?,
-        number_param(modifier, "mirror_offset_v", 0.0)?,
+        number_param(modifier, "mirror_offset_u")?,
+        number_param(modifier, "mirror_offset_v")?,
     ];
     let offset = [
-        number_param(modifier, "offset_u", 0.0)?,
-        number_param(modifier, "offset_v", 0.0)?,
+        number_param(modifier, "offset_u")?,
+        number_param(modifier, "offset_v")?,
     ];
-    let udim = bool_param(modifier, "use_mirror_udim", false)?;
+    let udim = bool_param(modifier, "use_mirror_udim")?;
     map_uv_values(&mut result, |face, _, uv| {
         (0..passes[face]).fold(uv, |uv, _| {
             mirror_uv_pass(uv, flip, mirror_offset, offset, udim)
@@ -1211,7 +1221,7 @@ fn array(
     curve_path_lengths: &BTreeMap<Id, f64>,
 ) -> Result<Mesh> {
     validated(mesh)?;
-    let mut count = uint_param(modifier, "count", 2)?;
+    let mut count = uint_param(modifier, "count")?;
     if count == 0 || count > 10_000 {
         return Err(invalid_parameter(
             modifier,
@@ -1226,10 +1236,10 @@ fn array(
         evaluated_object_meshes,
     )?;
     let end_cap = array_cap_mesh(modifier, "end_cap", object_meshes, evaluated_object_meshes)?;
-    let use_relative = bool_param(modifier, "use_relative_offset", true)?;
-    let use_constant = bool_param(modifier, "use_constant_offset", false)?;
-    let relative = vec3_param(modifier, "relative_offset_displace", DVec3::X)?;
-    let constant = vec3_param(modifier, "constant_offset_displace", DVec3::ZERO)?;
+    let use_relative = bool_param(modifier, "use_relative_offset")?;
+    let use_constant = bool_param(modifier, "use_constant_offset")?;
+    let relative = vec3_param(modifier, "relative_offset_displace")?;
+    let constant = vec3_param(modifier, "constant_offset_displace")?;
     let dimensions = mesh.bounds().map_or(DVec3::ZERO, super::Aabb::size);
     let increment = (if use_relative {
         dimensions * relative
@@ -1244,15 +1254,10 @@ fn array(
         ));
     }
     let mut step = DMat4::from_translation(increment);
-    if bool_param(modifier, "use_object_offset", false)?
-        && let Some(value) = modifier
-            .params
-            .get("offset_object")
-            .filter(|value| !value.is_null())
+    if bool_param(modifier, "use_object_offset")?
+        && let Some(target) = optional_string_param(modifier, "offset_object")
+            .map_err(|_| invalid_parameter(modifier, "offset_object", "an object ID or null"))?
     {
-        let target = value
-            .as_str()
-            .ok_or_else(|| invalid_parameter(modifier, "offset_object", "an object ID or null"))?;
         let target_id = Id::new(target)
             .map_err(|_| invalid_parameter(modifier, "offset_object", "a valid object ID"))?;
         let target_world = object_world_matrices.get(&target_id).ok_or_else(|| {
@@ -1275,12 +1280,7 @@ fn array(
             "an object offset that produces a finite transform",
         ));
     }
-    let fit_type = match modifier.params.get("fit_type") {
-        None => "FIXED_COUNT",
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| invalid_parameter(modifier, "fit_type", "a Blender array fit type"))?,
-    };
+    let fit_type = string_param_with_expected(modifier, "fit_type", "a Blender array fit type")?;
     if !matches!(fit_type, "FIXED_COUNT" | "FIT_LENGTH" | "FIT_CURVE") {
         return Err(invalid_parameter(
             modifier,
@@ -1289,7 +1289,7 @@ fn array(
         ));
     }
     let fit_length = match fit_type {
-        "FIT_LENGTH" => number_param(modifier, "fit_length", 0.0)?,
+        "FIT_LENGTH" => number_param(modifier, "fit_length")?,
         "FIT_CURVE" => array_curve_length(modifier, curve_path_lengths)?,
         _ => 0.0,
     };
@@ -1325,9 +1325,9 @@ fn array(
             fitted as u64
         };
     }
-    let use_merge = bool_param(modifier, "use_merge_vertices", false)?;
-    let merge_final = bool_param(modifier, "use_merge_vertices_cap", false)?;
-    let merge_threshold = number_param(modifier, "merge_threshold", 0.01)?;
+    let use_merge = bool_param(modifier, "use_merge_vertices")?;
+    let merge_final = bool_param(modifier, "use_merge_vertices_cap")?;
+    let merge_threshold = number_param(modifier, "merge_threshold")?;
     if merge_threshold < 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -1335,8 +1335,8 @@ fn array(
             "a non-negative finite number",
         ));
     }
-    let offset_u = number_param(modifier, "offset_u", 0.0)?;
-    let offset_v = number_param(modifier, "offset_v", 0.0)?;
+    let offset_u = number_param(modifier, "offset_u")?;
+    let offset_v = number_param(modifier, "offset_v")?;
     let source_points = positions(mesh);
     let source_polygons = polygons(mesh)?;
     let source_loose_edges = loose_edges(mesh)?;
@@ -1587,12 +1587,11 @@ fn array_cap_mesh<'a>(
     object_meshes: &'a BTreeMap<Id, &'a Mesh>,
     evaluated_object_meshes: &'a BTreeMap<Id, Mesh>,
 ) -> Result<Option<&'a Mesh>> {
-    let Some(value) = modifier.params.get(name).filter(|value| !value.is_null()) else {
+    let Some(target) = optional_string_param(modifier, name)
+        .map_err(|_| invalid_parameter(modifier, name, "a mesh object ID or null"))?
+    else {
         return Ok(None);
     };
-    let target = value
-        .as_str()
-        .ok_or_else(|| invalid_parameter(modifier, name, "a mesh object ID or null"))?;
     let target_id =
         Id::new(target).map_err(|_| invalid_parameter(modifier, name, "a valid object ID"))?;
     evaluated_object_meshes
@@ -1609,16 +1608,11 @@ fn array_cap_mesh<'a>(
 }
 
 fn array_curve_length(modifier: &Modifier, curve_path_lengths: &BTreeMap<Id, f64>) -> Result<f64> {
-    let Some(value) = modifier
-        .params
-        .get("curve")
-        .filter(|value| !value.is_null())
+    let Some(target) = optional_string_param(modifier, "curve")
+        .map_err(|_| invalid_parameter(modifier, "curve", "a curve object ID or null"))?
     else {
         return Ok(0.0);
     };
-    let target = value
-        .as_str()
-        .ok_or_else(|| invalid_parameter(modifier, "curve", "a curve object ID or null"))?;
     let target_id =
         Id::new(target).map_err(|_| invalid_parameter(modifier, "curve", "a valid object ID"))?;
     curve_path_lengths.get(&target_id).copied().ok_or_else(|| {
@@ -2141,7 +2135,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     } else {
         "levels"
     };
-    let levels = uint_param(modifier, level_name, 1)?;
+    let levels = uint_param(modifier, level_name)?;
     if levels > 5 {
         return Err(invalid_parameter(
             modifier,
@@ -2149,12 +2143,8 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "an integer between 0 and 5",
         ));
     }
-    let boundary_smooth = match modifier.params.get("boundary_smooth") {
-        None => "ALL",
-        Some(value) => value.as_str().ok_or_else(|| {
-            invalid_parameter(modifier, "boundary_smooth", "ALL or PRESERVE_CORNERS")
-        })?,
-    };
+    let boundary_smooth =
+        string_param_with_expected(modifier, "boundary_smooth", "ALL or PRESERVE_CORNERS")?;
     if !matches!(boundary_smooth, "ALL" | "PRESERVE_CORNERS") {
         return Err(invalid_parameter(
             modifier,
@@ -2162,12 +2152,8 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "ALL or PRESERVE_CORNERS",
         ));
     }
-    let uv_smooth = match modifier.params.get("uv_smooth") {
-        None => "PRESERVE_BOUNDARIES",
-        Some(value) => value.as_str().ok_or_else(|| {
-            invalid_parameter(modifier, "uv_smooth", "a Blender UV smoothing mode")
-        })?,
-    };
+    let uv_smooth =
+        string_param_with_expected(modifier, "uv_smooth", "a Blender UV smoothing mode")?;
     if !matches!(
         uv_smooth,
         "NONE"
@@ -2183,7 +2169,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a Blender UV smoothing mode",
         ));
     }
-    let quality = uint_param(modifier, "quality", 3)?;
+    let quality = uint_param(modifier, "quality")?;
     if !(1..=10).contains(&quality) {
         return Err(invalid_parameter(
             modifier,
@@ -2204,7 +2190,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     };
     let options = SubdivisionOptions {
         preserve_corners: boundary_smooth == "PRESERVE_CORNERS",
-        use_creases: bool_param(modifier, "use_creases", true)?,
+        use_creases: bool_param(modifier, "use_creases")?,
         raw_normals: true,
     };
     let uv_options = subdivision_uv::UvOptions {
@@ -2213,8 +2199,11 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         use_creases: options.use_creases,
     };
     // Bilinear subdivision has no limit surface: its positions are already the limit.
+    // `use_limit_surface` is not in the multires schema; multires uses `true` when it is unset.
+    let multires_unset =
+        modifier.modifier_type == "multires" && !modifier.params.contains_key("use_limit_surface");
     let use_limit_surface =
-        levels > 0 && !simple && bool_param(modifier, "use_limit_surface", true)?;
+        levels > 0 && !simple && (multires_unset || bool_param(modifier, "use_limit_surface")?);
     if levels > 0 {
         let first_level_faces = mesh
             .faces
@@ -2236,7 +2225,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let mut result = mesh.clone();
     // Blender's subdivision keeps custom normals only with Use Custom Normals; without it they drop.
-    if !bool_param(modifier, "use_custom_normals", false)? {
+    if !bool_param(modifier, "use_custom_normals")? {
         result.attributes.remove("custom_normal");
     }
     let mut uv = if levels > 0 {
@@ -2929,7 +2918,7 @@ fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
 fn triangulate_quad_method(modifier: &Modifier) -> Result<QuadMethod> {
     const EXPECTED: &str = "BEAUTY, FIXED, FIXED_ALTERNATE, SHORTEST_DIAGONAL, or LONGEST_DIAGONAL";
     Ok(
-        match string_param_with_expected(modifier, "quad_method", "SHORTEST_DIAGONAL", EXPECTED)? {
+        match string_param_with_expected(modifier, "quad_method", EXPECTED)? {
             "BEAUTY" => QuadMethod::Beauty,
             "FIXED" => QuadMethod::Fixed,
             "FIXED_ALTERNATE" => QuadMethod::FixedAlternate,
@@ -2943,7 +2932,7 @@ fn triangulate_quad_method(modifier: &Modifier) -> Result<QuadMethod> {
 fn triangulate_ngon_method(modifier: &Modifier) -> Result<NgonMethod> {
     const EXPECTED: &str = "BEAUTY or CLIP";
     Ok(
-        match string_param_with_expected(modifier, "ngon_method", "BEAUTY", EXPECTED)? {
+        match string_param_with_expected(modifier, "ngon_method", EXPECTED)? {
             "BEAUTY" => NgonMethod::Beauty,
             "CLIP" => NgonMethod::Clip,
             _ => return Err(invalid_parameter(modifier, "ngon_method", EXPECTED)),
@@ -2953,10 +2942,10 @@ fn triangulate_ngon_method(modifier: &Modifier) -> Result<NgonMethod> {
 
 fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     validated(mesh)?;
-    let keep_custom_normals = bool_param(modifier, "keep_custom_normals", false)?;
+    let keep_custom_normals = bool_param(modifier, "keep_custom_normals")?;
     let quad_method = triangulate_quad_method(modifier)?;
     let ngon_method = triangulate_ngon_method(modifier)?;
-    let min_vertices = usize::try_from(uint_param(modifier, "min_vertices", 4)?)
+    let min_vertices = usize::try_from(uint_param(modifier, "min_vertices")?)
         .ok()
         .filter(|count| *count >= 4)
         .ok_or_else(|| invalid_parameter(modifier, "min_vertices", "an integer of at least 4"))?;
@@ -3053,7 +3042,7 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 )]
 fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     validated(mesh)?;
-    let thickness = number_param(modifier, "thickness", 0.01)?;
+    let thickness = number_param(modifier, "thickness")?;
     if thickness < 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -3061,7 +3050,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a non-negative finite number",
         ));
     }
-    let offset = number_param(modifier, "offset", -1.0)?;
+    let offset = number_param(modifier, "offset")?;
     if !(-1.0..=1.0).contains(&offset) {
         return Err(invalid_parameter(
             modifier,
@@ -3069,11 +3058,11 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a number from -1 through 1",
         ));
     }
-    let use_even_offset = bool_param(modifier, "use_even_offset", false)?;
-    let use_quality_normals = bool_param(modifier, "use_quality_normals", false)?;
-    let use_rim = bool_param(modifier, "use_rim", true)?;
-    let use_rim_only = bool_param(modifier, "use_rim_only", false)?;
-    let flip = bool_param(modifier, "use_flip_normals", false)?;
+    let use_even_offset = bool_param(modifier, "use_even_offset")?;
+    let use_quality_normals = bool_param(modifier, "use_quality_normals")?;
+    let use_rim = bool_param(modifier, "use_rim")?;
+    let use_rim_only = bool_param(modifier, "use_rim_only")?;
+    let flip = bool_param(modifier, "use_flip_normals")?;
     if mesh.faces.is_empty() {
         return Ok(mesh.clone());
     }
@@ -3539,7 +3528,7 @@ fn bevel_profile_middle(start: DVec3, end: DVec3, edge_start: DVec3, edge_end: D
 )]
 fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     validated(mesh)?;
-    let width = number_param(modifier, "width", 0.1)?;
+    let width = number_param(modifier, "width")?;
     if width < 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -3551,16 +3540,11 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         return Ok(mesh.clone());
     }
 
-    let segments = usize::try_from(uint_param(modifier, "segments", 1)?)
+    let segments = usize::try_from(uint_param(modifier, "segments")?)
         .ok()
         .filter(|value| (1..=64).contains(value))
         .ok_or_else(|| invalid_parameter(modifier, "segments", "an integer from 1 through 64"))?;
-    let limit_method = modifier
-        .params
-        .get("limit_method")
-        .and_then(Value::as_str)
-        .unwrap_or("NONE")
-        .to_ascii_uppercase();
+    let limit_method = string_param(modifier, "limit_method")?.to_ascii_uppercase();
     if !matches!(
         limit_method.as_str(),
         "NONE" | "ANGLE" | "WEIGHT" | "VGROUP"
@@ -3571,16 +3555,11 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "NONE, ANGLE, WEIGHT, or VGROUP",
         ));
     }
-    let affect = modifier
-        .params
-        .get("affect")
-        .and_then(Value::as_str)
-        .unwrap_or("EDGES")
-        .to_ascii_uppercase();
+    let affect = string_param(modifier, "affect")?.to_ascii_uppercase();
     if !matches!(affect.as_str(), "EDGES" | "VERTICES") {
         return Err(invalid_parameter(modifier, "affect", "EDGES or VERTICES"));
     }
-    let profile = number_param(modifier, "profile", 0.5)?;
+    let profile = number_param(modifier, "profile")?;
     if !(0.0..=1.0).contains(&profile) {
         return Err(invalid_parameter(
             modifier,
@@ -3588,10 +3567,10 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a number from 0 through 1",
         ));
     }
-    let clamp_overlap = bool_param(modifier, "use_clamp_overlap", true)?;
-    let loop_slide = bool_param(modifier, "loop_slide", true)?;
-    let harden_normals = bool_param(modifier, "harden_normals", false)?;
-    let mark_sharp = bool_param(modifier, "mark_sharp", false)?;
+    let clamp_overlap = bool_param(modifier, "use_clamp_overlap")?;
+    let loop_slide = bool_param(modifier, "loop_slide")?;
+    let harden_normals = bool_param(modifier, "harden_normals")?;
+    let mark_sharp = bool_param(modifier, "mark_sharp")?;
     // Blender's mark_seam copies the input's seams onto the new rungs (check_edge_data_seam_sharp_edges),
     // so it changes nothing on a mesh without seams.
     let input_seam = mesh
@@ -3603,7 +3582,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .iter()
                 .any(|entry| entry.get("seam").and_then(Value::as_bool) == Some(true))
         });
-    if bool_param(modifier, "mark_seam", false)? && input_seam {
+    if bool_param(modifier, "mark_seam")? && input_seam {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
             "bevel mark_seam on a mesh with seam edges is not supported",
@@ -3613,12 +3592,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             }),
         ));
     }
-    let offset_type = modifier
-        .params
-        .get("offset_type")
-        .and_then(Value::as_str)
-        .unwrap_or("OFFSET")
-        .to_ascii_uppercase();
+    let offset_type = string_param(modifier, "offset_type")?.to_ascii_uppercase();
     if !matches!(
         offset_type.as_str(),
         "OFFSET" | "WIDTH" | "DEPTH" | "PERCENT"
@@ -3664,7 +3638,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
 
     let mut selected_edges = HashSet::new();
-    let angle_limit = number_param(modifier, "angle_limit", std::f64::consts::FRAC_PI_6)?;
+    let angle_limit = number_param(modifier, "angle_limit")?;
     if !(0.0..=std::f64::consts::PI).contains(&angle_limit) {
         return Err(invalid_parameter(
             modifier,
@@ -4603,13 +4577,10 @@ fn decimate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     if mesh.faces.is_empty() {
         return Ok(mesh.clone());
     }
-    let mode = parameter_value(modifier, "decimate_type")
-        .and_then(Value::as_str)
-        .unwrap_or("COLLAPSE")
-        .to_ascii_uppercase();
+    let mode = string_param(modifier, "decimate_type")?.to_ascii_uppercase();
     match mode.as_str() {
         "COLLAPSE" => {
-            let ratio = number_param(modifier, "ratio", 1.0)?;
+            let ratio = number_param(modifier, "ratio")?;
             if !(0.0..=1.0).contains(&ratio) {
                 return Err(invalid_parameter(
                     modifier,
@@ -4623,7 +4594,7 @@ fn decimate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             decimate::decimate_collapse(mesh, ratio, modifier)
         }
         "UNSUBDIV" => {
-            let iterations = usize::try_from(uint_param(modifier, "iterations", 2)?)
+            let iterations = usize::try_from(uint_param(modifier, "iterations")?)
                 .ok()
                 .filter(|value| *value <= 64)
                 .ok_or_else(|| {
@@ -4632,7 +4603,7 @@ fn decimate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             decimate::decimate_unsubdivide(mesh, iterations)
         }
         "DISSOLVE" => {
-            let angle = number_param(modifier, "angle_limit", 0.0)?;
+            let angle = number_param(modifier, "angle_limit")?;
             if !(0.0..=std::f64::consts::PI).contains(&angle) {
                 return Err(invalid_parameter(
                     modifier,
@@ -4735,7 +4706,7 @@ fn decimate_compact(
 fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     validated(mesh)?;
     let threshold_name = "merge_threshold";
-    let threshold = number_param(modifier, threshold_name, 0.001)?;
+    let threshold = number_param(modifier, threshold_name)?;
     if threshold < 0.0 {
         return Err(invalid_parameter(
             modifier,
@@ -4743,15 +4714,12 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a non-negative finite number",
         ));
     }
-    let connected = match modifier.params.get("mode") {
-        None => false,
-        Some(value) => match value.as_str() {
-            Some("ALL") => false,
-            Some("CONNECTED") => true,
-            _ => return Err(invalid_parameter(modifier, "mode", "ALL or CONNECTED")),
-        },
+    let connected = match schema_value(modifier, "mode")?.as_str() {
+        Some("ALL") => false,
+        Some("CONNECTED") => true,
+        _ => return Err(invalid_parameter(modifier, "mode", "ALL or CONNECTED")),
     };
-    let only_loose_edges = bool_param(modifier, "loose_edges", false)?;
+    let only_loose_edges = bool_param(modifier, "loose_edges")?;
     if mesh.vertices.len() < 2 {
         return Ok(mesh.clone());
     }
@@ -4808,18 +4776,13 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 
 fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Result<Mesh> {
     validated(mesh)?;
-    let strength = number_param(modifier, "strength", 1.0)?;
-    let mid_level = number_param(modifier, "mid_level", 0.5)?;
-    let direction = match modifier.params.get("direction") {
-        None => "NORMAL",
-        Some(value) => value.as_str().ok_or_else(|| {
-            invalid_parameter(
-                modifier,
-                "direction",
-                "NORMAL, X, Y, Z, RGB_TO_XYZ, or CUSTOM_NORMAL",
-            )
-        })?,
-    };
+    let strength = number_param(modifier, "strength")?;
+    let mid_level = number_param(modifier, "mid_level")?;
+    let direction = string_param_with_expected(
+        modifier,
+        "direction",
+        "NORMAL, X, Y, Z, RGB_TO_XYZ, or CUSTOM_NORMAL",
+    )?;
     if !matches!(
         direction,
         "NORMAL" | "NOR" | "X" | "Y" | "Z" | "RGB_TO_XYZ" | "CUSTOM_NORMAL" | "CLNOR"
@@ -4830,12 +4793,7 @@ fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Resu
             "NORMAL, X, Y, Z, RGB_TO_XYZ, or CUSTOM_NORMAL",
         ));
     }
-    let space = match modifier.params.get("space") {
-        None => "LOCAL",
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| invalid_parameter(modifier, "space", "LOCAL or GLOBAL"))?,
-    };
+    let space = string_param_with_expected(modifier, "space", "LOCAL or GLOBAL")?;
     if !matches!(space, "LOCAL" | "GLOBAL") {
         return Err(invalid_parameter(modifier, "space", "LOCAL or GLOBAL"));
     }
@@ -4853,15 +4811,8 @@ fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Resu
         ));
     }
 
-    let group_name = match modifier.params.get("vertex_group") {
-        None => None,
-        Some(value) => {
-            let name = value.as_str().ok_or_else(|| {
-                invalid_parameter(modifier, "vertex_group", "a vertex-group name")
-            })?;
-            (!name.is_empty()).then_some(name)
-        }
-    };
+    let group_name = string_param_with_expected(modifier, "vertex_group", "a vertex-group name")?;
+    let group_name = (!group_name.is_empty()).then_some(group_name);
     let group_weights = if let Some(group_name) = group_name {
         let group = mesh
             .attributes
@@ -4899,7 +4850,7 @@ fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Resu
     } else {
         None
     };
-    let invert_group = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert_group = bool_param(modifier, "invert_vertex_group")?;
     let points = positions(mesh);
     let indices = id_indices(mesh);
     let mut normals = vec![DVec3::ZERO; points.len()];
@@ -4947,7 +4898,7 @@ fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Resu
 
 fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     validated(mesh)?;
-    let factor = number_param(modifier, "factor", 0.5)?;
+    let factor = number_param(modifier, "factor")?;
     if !(0.0..=1.0).contains(&factor) {
         return Err(invalid_parameter(
             modifier,
@@ -4955,7 +4906,7 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "a number from 0 through 1",
         ));
     }
-    let iterations = uint_param(modifier, "iterations", 1)?;
+    let iterations = uint_param(modifier, "iterations")?;
     if iterations > 100 {
         return Err(invalid_parameter(
             modifier,
@@ -4964,22 +4915,15 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ));
     }
     let axes = [
-        bool_param(modifier, "use_x", true)?,
-        bool_param(modifier, "use_y", true)?,
-        bool_param(modifier, "use_z", true)?,
+        bool_param(modifier, "use_x")?,
+        bool_param(modifier, "use_y")?,
+        bool_param(modifier, "use_z")?,
     ];
     if factor == 0.0 || iterations == 0 || !axes.into_iter().any(|enabled| enabled) {
         return Ok(mesh.clone());
     }
-    let group_name = match modifier.params.get("vertex_group") {
-        None => None,
-        Some(value) => {
-            let name = value.as_str().ok_or_else(|| {
-                invalid_parameter(modifier, "vertex_group", "a vertex-group name")
-            })?;
-            (!name.is_empty()).then_some(name)
-        }
-    };
+    let group_name = string_param_with_expected(modifier, "vertex_group", "a vertex-group name")?;
+    let group_name = (!group_name.is_empty()).then_some(group_name);
     let group_weights = if let Some(group_name) = group_name {
         let group = mesh
             .attributes
@@ -5017,7 +4961,7 @@ fn smooth(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     } else {
         None
     };
-    let invert_group = bool_param(modifier, "invert_vertex_group", false)?;
+    let invert_group = bool_param(modifier, "invert_vertex_group")?;
     let index_by_id = id_indices(mesh);
     let mut neighbors = vec![BTreeSet::new(); mesh.vertices.len()];
     for edge in &mesh.edges {
