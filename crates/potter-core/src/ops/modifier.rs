@@ -93,8 +93,7 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 "modifier binding requires a source mesh",
             ));
         }
-        let mut bind_doc = engine.doc.clone();
-        let bind_node = bind_doc.nodes.get_mut(&subject_id).ok_or_else(|| {
+        let bind_node = engine.doc.nodes.get(&subject_id).ok_or_else(|| {
             PotError::new(
                 ErrorCode::TargetNotFound,
                 "modifier binding subject disappeared",
@@ -110,20 +109,22 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
         } else {
             bind_index + 1
         };
-        bind_node.modifiers.truncate(keep);
         let bind_nodes = BTreeSet::from([subject_id.clone()]);
-        let bind_snapshot = crate::eval::Snapshot::evaluate_nodes_with_cache(
-            &bind_doc,
-            &crate::eval::EvaluationContext {
-                scene_id: None,
-                view_layer: None,
-                frame: Some(engine.evaluation_frame),
-                purpose: EvaluationPurpose::Preview,
-            },
-            engine.asset_root,
-            None,
-            &bind_nodes,
-        )?;
+        let bind_snapshot =
+            crate::eval::Snapshot::evaluate_nodes_with_modifier_prefix_with_cache(
+                engine.doc,
+                &crate::eval::EvaluationContext {
+                    scene_id: None,
+                    view_layer: None,
+                    frame: Some(engine.evaluation_frame),
+                    purpose: EvaluationPurpose::Preview,
+                },
+                engine.asset_root,
+                None,
+                &bind_nodes,
+                &subject_id,
+                keep,
+            )?;
         let source_bind_mesh = bind_snapshot
             .meshes
             .get(&subject_id)
