@@ -438,6 +438,105 @@ fn prepare_blend_export_resources(
             .and_then(Value::as_object)
             .and_then(|resources| resources.get(&id))
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "resource disappeared"))?;
+        if let Some(sequence_frames) = resource
+            .get("sequence_frames")
+            .and_then(Value::as_object)
+        {
+            let mut output_frames = Map::new();
+            let sequence_dir = sidecar.join(format!("sequence_{id}"));
+            let mut wrote_frame = false;
+            for (frame, frame_record) in sequence_frames {
+                let mut frame_record = frame_record.clone();
+                if frame_record.get("status").and_then(Value::as_str) == Some("missing") {
+                    output_frames.insert(frame.clone(), frame_record);
+                    continue;
+                }
+                let frame_resource_id = format!("{id}:{frame}");
+                let (bytes, digest) = match crate::cache_sequence::read_cache_resource_record(
+                    &frame_record,
+                    &frame_resource_id,
+                    Some(project),
+                ) {
+                    Ok(value) => value,
+                    Err(error)
+                        if error.code == ErrorCode::DependencyMissing
+                            && error.message.starts_with("Alembic cache file is missing:") =>
+                    {
+                        if let Some(object) = frame_record.as_object_mut() {
+                            object.insert("status".to_owned(), json!("missing"));
+                        }
+                        output_frames.insert(frame.clone(), frame_record);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let filename = frame_record
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        frame_record
+                            .get("uri")
+                            .and_then(Value::as_str)
+                            .and_then(|uri| Path::new(uri).file_name())
+                            .and_then(|name| name.to_str())
+                    })
+                    .filter(|name| {
+                        Path::new(name).file_name().and_then(|part| part.to_str()) == Some(*name)
+                    })
+                    .ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "Alembic sequence frame has no safe filename",
+                            json!({"resource_id":id,"frame":frame}),
+                        )
+                    })?;
+                let destination = sequence_dir.join(filename);
+                if destination.exists() {
+                    let existing = fs::read(&destination).map_err(|error| PotError::io(&error))?;
+                    if crate::hash::sha256(&existing) != digest {
+                        return Err(PotError::with_details(
+                            ErrorCode::ExportFailed,
+                            "Alembic sequence sidecar filename collides with different content",
+                            json!({"resource_id":id,"frame":frame,"path":destination}),
+                        ));
+                    }
+                } else {
+                    write_asset_sidecar(&destination, &bytes)?;
+                }
+                if let Some(object) = frame_record.as_object_mut() {
+                    object.insert(
+                        "export_path".to_owned(),
+                        json!(fs::canonicalize(&destination)
+                            .map_err(|error| PotError::io(&error))?),
+                    );
+                }
+                if !files.contains(&destination) {
+                    files.push(destination);
+                }
+                wrote_frame = true;
+                output_frames.insert(frame.clone(), frame_record);
+            }
+            if wrote_frame && !sidecar_created {
+                sidecar_created = true;
+            }
+            let pattern_name = resource
+                .get("filename")
+                .and_then(Value::as_str)
+                .filter(|name| {
+                    Path::new(name).file_name().and_then(|part| part.to_str()) == Some(*name)
+                })
+                .or_else(|| {
+                    resource
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| Path::new(uri).file_name())
+                        .and_then(|name| name.to_str())
+                })
+                .unwrap_or("sequence.####.abc");
+            let pattern_path = sequence_dir.join(pattern_name);
+            sequence_updates.push((id.clone(), pattern_path, output_frames));
+            continue;
+        }
         let uri = resource
             .get("uri")
             .and_then(Value::as_str)
@@ -4005,6 +4104,20 @@ fn import_blender_resources(
             .and_then(Value::as_str)
             .filter(|data| !data.is_empty());
         let resolved_path = source_path.map(|path| resolve_blend_resource_path(path, blend_file));
+        let is_sequence = source
+            .get("cache_file")
+            .and_then(|settings| settings.get("is_sequence"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let sequence_manifest = if is_sequence {
+            resolved_path
+                .as_deref()
+                .map(|path| crate::cache_sequence::cache_sequence_manifest(path, None))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            crate::cache_sequence::CacheSequenceManifest::default()
+        };
         let packed_bytes = packed_data.map(decode_resource_base64).transpose()?;
         let bytes = if let Some(bytes) = packed_bytes {
             Some(bytes)
@@ -4053,24 +4166,70 @@ fn import_blender_resources(
             .as_ref()
             .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
         let original_path = (!uri.is_empty()).then(|| uri.clone());
-        let status = if bytes.is_some() {
+        let mut sequence_frames = Map::new();
+        if is_sequence {
+            for (frame, path) in &sequence_manifest.files {
+                let frame_key = frame.to_string();
+                let expected = sequence_manifest
+                    .hashes
+                    .get(&frame_key)
+                    .ok_or_else(|| invalid_intermediate("cache sequence manifest is inconsistent"))?;
+                let bytes = match fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(PotError::io(&error)),
+                };
+                let actual = crate::hash::sha256(&bytes);
+                if &actual != expected {
+                    return Err(PotError::with_details(
+                        ErrorCode::AssetChanged,
+                        "Alembic sequence frame changed while importing the Blender asset",
+                        json!({"frame":frame,"expected_hash":expected,"actual_hash":actual}),
+                    ));
+                }
+                assets.push((actual.clone(), bytes));
+                let path_uri = path.to_string_lossy();
+                sequence_frames.insert(
+                    frame_key,
+                    crate::cache_sequence::cache_sequence_resource_record(
+                        &path_uri,
+                        kind,
+                        &actual,
+                        None,
+                    ),
+                );
+            }
+        }
+        let status = if bytes.is_some() || !sequence_frames.is_empty() {
             "available"
         } else {
             "missing"
         };
-        let hash = digest.as_deref().map_or(Value::Null, |value| json!(value));
-        let mut resource = json!({
-            "uri": uri,
-            "original_path": original_path,
-            "hash": hash.clone(),
-            "expected_hash": hash,
-            "kind": kind,
-            "owner": owner,
-            "filename": filename,
-            "packed": false,
-            "source_packed": source_packed,
-            "status": status,
-        });
+        let mut resource = if is_sequence {
+            json!({
+                "uri":uri,
+                "original_path":original_path,
+                "kind":kind,
+                "owner":owner,
+                "filename":filename,
+                "packed":false,
+                "status":status,
+            })
+        } else {
+            let hash = digest.as_deref().map_or(Value::Null, |value| json!(value));
+            json!({
+                "uri":uri,
+                "original_path":original_path,
+                "hash":hash.clone(),
+                "expected_hash":hash,
+                "kind":kind,
+                "owner":owner,
+                "filename":filename,
+                "packed":false,
+                "source_packed":source_packed,
+                "status":status,
+            })
+        };
         if let Some(cache_file) = source.get("cache_file") {
             resource["cache_file"] = cache_file.clone();
         }

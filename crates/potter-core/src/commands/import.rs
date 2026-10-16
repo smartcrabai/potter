@@ -558,11 +558,16 @@ fn configure_blender_sequence(
             }));
         }
         reference_uris.insert(uri.clone(), destination.clone());
-        let leaf_record = leaf.as_object_mut().ok_or_else(invalid)?;
-        leaf_record.insert("uri".to_owned(), json!(destination));
-        leaf_record.insert("packed".to_owned(), Value::Bool(false));
-        leaf_record.remove("bytes");
-        leaf_record.remove("export_path");
+        let mut leaf_record = crate::cache_sequence::cache_sequence_resource_record(
+            &destination,
+            &kind,
+            &digest,
+            None,
+        );
+        let leaf_object = leaf_record.as_object_mut().ok_or_else(invalid)?;
+        leaf_object.insert("original_path".to_owned(), json!(uri));
+        leaf_object.insert("status".to_owned(), json!(status));
+        *leaf = leaf_record;
         result.push(json!({
             "id": id,
             "sequence_frame": frame,

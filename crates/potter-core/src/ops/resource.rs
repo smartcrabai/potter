@@ -142,7 +142,7 @@ fn pack_sequence(
     end: i32,
 ) -> Result<bool> {
     let pattern = resolve_path(uri);
-    let manifest = crate::eval::cache_sequence_manifest(&pattern, Some((start, end)))?;
+    let manifest = crate::cache_sequence::cache_sequence_manifest(&pattern, Some((start, end)))?;
     let mut frames = Map::new();
     for (frame, path) in &manifest.files {
         let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
@@ -157,7 +157,7 @@ fn pack_sequence(
         let path_uri = path.to_string_lossy();
         frames.insert(
             frame.to_string(),
-            crate::eval::cache_sequence_resource_record(
+            crate::cache_sequence::cache_sequence_resource_record(
                 &path_uri,
                 kind,
                 &digest,
@@ -370,7 +370,7 @@ fn unpack_sequence(
         ));
     }
     let frame_count = i64::from(end) - i64::from(start) + 1;
-    if frame_count > crate::eval::MAX_CACHE_SEQUENCE_FRAMES {
+    if frame_count > crate::cache_sequence::MAX_CACHE_SEQUENCE_FRAMES {
         return Err(engine.error(
             ErrorCode::SceneInvalid,
             "packed Alembic sequence frame range exceeds the supported limit",
@@ -438,13 +438,13 @@ fn unpack_sequence(
             ));
         }
         let resource_label = format!("{id}:{frame}");
-        let (bytes, digest) = crate::eval::read_cache_resource_record(
+        let (bytes, digest) = crate::cache_sequence::read_cache_resource_record(
             frame_record,
             &resource_label,
             engine.asset_root,
         )?;
         let frame_path =
-            crate::eval::cache_sequence_output_path(&pattern, frame)?.ok_or_else(|| {
+            crate::cache_sequence::cache_sequence_output_path(&pattern, frame)?.ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::InvalidArgument,
                     "sequence unpack path must include a frame-number pattern",
@@ -473,7 +473,7 @@ fn unpack_sequence(
         let uri = frame_path.to_string_lossy();
         output_frames.insert(
             frame_key,
-            crate::eval::cache_sequence_resource_record(&uri, &kind, &digest, None),
+            crate::cache_sequence::cache_sequence_resource_record(&uri, &kind, &digest, None),
         );
         output_files.push((frame_path, bytes));
     }
