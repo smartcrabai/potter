@@ -163,18 +163,15 @@ pub(crate) fn remap_attributes_skipping(
         raw_normals: origin.raw_normals,
     };
     // The store's layers are rebuilt per corner; their names and active/render choices carry over.
-    let uv_store = source
-        .attributes
-        .contains_key(uv_layers::ATTRIBUTE)
-        .then(|| {
-            let mut store = uv_layers::read(source);
-            store.layers = store
-                .layers
-                .iter()
-                .map(|layer| sources.uv_layer(layer))
-                .collect();
-            store
-        });
+    let uv_store = has(uv_layers::ATTRIBUTE).then(|| {
+        let mut store = uv_layers::read(source);
+        store.layers = store
+            .layers
+            .iter()
+            .map(|layer| sources.uv_layer(layer))
+            .collect();
+        store
+    });
     let mut attributes = Map::new();
     for (key, value) in &source.attributes {
         if !kept(key.as_str()) {
