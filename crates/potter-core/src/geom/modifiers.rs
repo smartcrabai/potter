@@ -553,7 +553,7 @@ pub(crate) fn validate_boolean_topology_suffix(
         .map(|(_, modifier)| modifier)
     else {
         return Ok(());
-    }
+    };
     Err(PotError::with_details(
         ErrorCode::UnsupportedFeature,
         "Boolean output topology is not Blender-compatible for a downstream topology-dependent modifier",
