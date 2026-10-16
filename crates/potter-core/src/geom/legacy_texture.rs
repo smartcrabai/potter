@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     image::{
-        ImageData, ImageInterpolation, load_image_data,
+        ImageData, ImageInterpolation,
         storage::{ImageUserSelection, load_image_data_for_legacy_texture},
     },
     model::{migrate, Id, ImageAlphaMode, ImageColorspace, SceneDoc},
@@ -3647,7 +3647,6 @@ mod tests {
             SceneDoc,
         },
     };
-
     use super::{
         BlenderRng, DEFAULT_IMAGE_SETTINGS, ImageData, ImageInterpolation, LegacyTexture,
         ResolvedTexture, TextureSource, cell_noise_v3, parse_record, record_value, sample,
@@ -4065,7 +4064,6 @@ mod tests {
             [0.982_098, 0.161_631, 0.193_576]
         );
     }
-
     #[test]
     fn image_records_share_pixels_but_keep_independent_sampler_settings() {
         let first = parse_record(

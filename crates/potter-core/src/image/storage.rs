@@ -1180,7 +1180,6 @@ fn is_exr_color_pass(channel_count: usize, ids: &[char; 4]) -> bool {
     let channel_ids = ids.iter().take(channel_count).copied().collect::<String>();
     matches!(channel_ids.as_str(), "RGB" | "RGBA" | "R" | "G" | "B" | "A")
 }
-
 fn image_blob_bytes<'a>(
     blob: Option<&str>,
     image: &Image,
