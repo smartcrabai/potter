@@ -43,19 +43,8 @@ pub struct SceneOperand {
 ///
 /// Returns an invalid-parameter or evaluation error when a requested group, UV layer,
 /// or attribute is missing or malformed.
-pub(super) fn evaluate(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    rng: &mut BlenderRng,
-) -> Result<Mesh> {
-    evaluate_with_texture_context(
-        mesh,
-        modifier,
-        &BTreeMap::new(),
-        None,
-        DMat4::IDENTITY,
-        rng,
-    )
+pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier, rng: &mut BlenderRng) -> Result<Mesh> {
+    evaluate_with_texture_context(mesh, modifier, &BTreeMap::new(), None, DMat4::IDENTITY, rng)
 }
 
 /// Evaluate an attribute modifier with its resolved scene operands and optional resolved texture.
@@ -152,7 +141,6 @@ fn texture_mask_weights(
         )
     } else {
         ("LOCAL", "INT")
-
     };
     if !matches!(mapping, "LOCAL" | "GLOBAL" | "OBJECT" | "UV") {
         return Err(invalid(
@@ -298,7 +286,6 @@ fn texture_channel(color: [f64; 4], channel: &str) -> f64 {
         _ => 0.2126_f64.mul_add(red, 0.7152_f64.mul_add(green, 0.0722 * blue)),
     }
 }
-
 
 /// Evaluate a PC2 or MDD Mesh Cache resource at one scene frame.
 ///
@@ -1527,8 +1514,7 @@ fn uv_warp(
     let to = operands.get("object_to").and_then(|items| items.first());
     let has_from_bone =
         optional_string(modifier, "bone_from")?.is_some_and(|bone| !bone.is_empty());
-    let has_to_bone =
-        optional_string(modifier, "bone_to")?.is_some_and(|bone| !bone.is_empty());
+    let has_to_bone = optional_string(modifier, "bone_to")?.is_some_and(|bone| !bone.is_empty());
     let from_matrix = modifier
         .runtime
         .warp_from_matrix
@@ -2178,9 +2164,7 @@ fn transfer_vertex_attribute(
             .attributes
             .insert(key.clone(), Value::Object(fields));
     } else {
-        destination
-            .attributes
-            .insert(key, Value::Object(output));
+        destination.attributes.insert(key, Value::Object(output));
     }
     Ok(())
 }
@@ -2478,7 +2462,11 @@ fn transfer_custom_normals(
     factor: f64,
 ) -> Result<()> {
     if clnor::corner_codes(source)?.is_none() {
-        return Err(invalid(modifier, "data_types_loops", "source custom normals"));
+        return Err(invalid(
+            modifier,
+            "data_types_loops",
+            "source custom normals",
+        ));
     }
     // Blender transfers the final loop normals: authored vectors, and computed normals where automatic.
     let source_final = corner_normals(source, &mesh_points(source))?;
@@ -2693,7 +2681,11 @@ fn transfer_color_layer(
             let name = free_attribute_name(destination, &source_name);
             let count = match domain {
                 ColorDomain::Point => destination.vertices.len(),
-                ColorDomain::Corner => destination.faces.iter().map(|face| face.vertices.len()).sum(),
+                ColorDomain::Corner => destination
+                    .faces
+                    .iter()
+                    .map(|face| face.vertices.len())
+                    .sum(),
             };
             store.layers.push(ColorLayer {
                 name: name.clone(),

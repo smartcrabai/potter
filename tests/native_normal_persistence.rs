@@ -13,14 +13,14 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -38,7 +38,8 @@ use serde_json::{Map, Value, json};
 use tempfile::tempdir;
 
 /// Blender's no-layer authoring reference (see `fixtures/native_oracle/authoring_reference.py`).
-const AUTHORING_REFERENCE_SCRIPT: &str = include_str!("fixtures/native_oracle/authoring_reference.py");
+const AUTHORING_REFERENCE_SCRIPT: &str =
+    include_str!("fixtures/native_oracle/authoring_reference.py");
 
 /// Attaches UV layers, two color layers, and generic corner/face attributes to `Regress`, keeping its
 /// custom normals. Values are written to the file and read back by Blender, never by Potter.
@@ -187,8 +188,12 @@ fn corner_distance(left: [f64; 3], right: [f64; 3]) -> f64 {
 }
 
 fn blender_loops(object: &Value) -> TestResult<BlenderLoops> {
-    let vertices = object["vertices"].as_array().ok_or("dumped vertices are missing")?;
-    let loops = object["loops"].as_array().ok_or("dumped loops are missing")?;
+    let vertices = object["vertices"]
+        .as_array()
+        .ok_or("dumped vertices are missing")?;
+    let loops = object["loops"]
+        .as_array()
+        .ok_or("dumped loops are missing")?;
     let normals = object["corner_normals"]
         .as_array()
         .ok_or("dumped corner normals are missing")?;
@@ -199,7 +204,12 @@ fn blender_loops(object: &Value) -> TestResult<BlenderLoops> {
             if codes.len() != count {
                 return Err(format!("{} codes for {count} loops", codes.len()).into());
             }
-            Some(codes.iter().map(code_pair).collect::<TestResult<Vec<_>>>()?)
+            Some(
+                codes
+                    .iter()
+                    .map(code_pair)
+                    .collect::<TestResult<Vec<_>>>()?,
+            )
         }
         other => return Err(format!("dumped codes are malformed: {other}").into()),
     };
@@ -210,7 +220,10 @@ fn blender_loops(object: &Value) -> TestResult<BlenderLoops> {
         code,
     };
     let mut covered = vec![false; count];
-    for face in object["faces"].as_array().ok_or("dumped faces are missing")? {
+    for face in object["faces"]
+        .as_array()
+        .ok_or("dumped faces are missing")?
+    {
         let center = vec3(&face["center"])?;
         let start = face["loop_start"].as_u64().ok_or("loop start is missing")? as usize;
         let total = face["loop_total"].as_u64().ok_or("loop total is missing")? as usize;
@@ -232,7 +245,12 @@ fn blender_loops(object: &Value) -> TestResult<BlenderLoops> {
 }
 
 fn loop_keys(blender: &BlenderLoops) -> Vec<([f64; 3], [f64; 3])> {
-    blender.co.iter().copied().zip(blender.center.iter().copied()).collect()
+    blender
+        .co
+        .iter()
+        .copied()
+        .zip(blender.center.iter().copied())
+        .collect()
 }
 
 /// The `(co, center)` key of each corner of a Blender reference list.
@@ -254,7 +272,10 @@ struct PotterFace {
 
 fn potter_faces(mesh: &Value) -> TestResult<Vec<PotterFace>> {
     let mut positions = BTreeMap::new();
-    for vertex in mesh["vertices"].as_array().ok_or("mesh vertices are missing")? {
+    for vertex in mesh["vertices"]
+        .as_array()
+        .ok_or("mesh vertices are missing")?
+    {
         let id = vertex["id"].as_u64().ok_or("vertex id is missing")?;
         positions.insert(id, vec3(&vertex["co"])?);
     }
@@ -287,7 +308,10 @@ fn loop_ordinals(mesh: &Value) -> TestResult<Vec<Vec<usize>>> {
     let mut rows = Vec::new();
     for face in mesh["faces"].as_array().ok_or("mesh faces are missing")? {
         let id = face["id"].as_u64().ok_or("face id is missing")?;
-        let corners = face["v"].as_array().ok_or("face vertices are missing")?.len();
+        let corners = face["v"]
+            .as_array()
+            .ok_or("face vertices are missing")?
+            .len();
         let row: Vec<usize> = match order {
             Some(order) => order
                 .get(&format!("f{id}"))
@@ -382,25 +406,39 @@ fn check_codes_against_blender(mesh: &Value, dumped: &Value, label: &str) -> Tes
 
 /// The loop whose `(co, center)` key is nearest to `(co, center)`, which must lie within `1e-4`
 /// (the bound the existing Subdivision test uses).
-fn nearest_corner(keys: &[([f64; 3], [f64; 3])], co: [f64; 3], center: [f64; 3]) -> TestResult<usize> {
+fn nearest_corner(
+    keys: &[([f64; 3], [f64; 3])],
+    co: [f64; 3],
+    center: [f64; 3],
+) -> TestResult<usize> {
     let (index, distance) = keys
         .iter()
         .enumerate()
         .map(|(index, (key_co, key_center))| {
-            (index, corner_distance(*key_co, co) + corner_distance(*key_center, center))
+            (
+                index,
+                corner_distance(*key_co, co) + corner_distance(*key_center, center),
+            )
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .ok_or("no corners to match")?;
     if distance < 1.0e-4 {
         Ok(index)
     } else {
-        Err(format!("no corner at {co:?} with center {center:?}; nearest distance {distance}").into())
+        Err(
+            format!("no corner at {co:?} with center {center:?}; nearest distance {distance}")
+                .into(),
+        )
     }
 }
 
 /// Matches each Blender reference corner (`co`, `center`) to exactly one loop of `actual`. Returns
 /// the loop of each reference corner, in reference order.
-fn match_reference_loops(actual: &BlenderLoops, reference: &[Value], label: &str) -> TestResult<Vec<usize>> {
+fn match_reference_loops(
+    actual: &BlenderLoops,
+    reference: &[Value],
+    label: &str,
+) -> TestResult<Vec<usize>> {
     if reference.len() != actual.co.len() {
         return Err(format!(
             "{label}: Blender has {} corners, the reference has {}",
@@ -417,7 +455,10 @@ fn match_reference_loops(actual: &BlenderLoops, reference: &[Value], label: &str
         let center = vec3(&wanted["center"])?;
         let loop_index = nearest_corner(&keys, co, center)
             .map_err(|error| format!("{label} corner {index}: {error}"))?;
-        assert!(claimed.insert(loop_index), "{label} corner {index} matches loop {loop_index} twice");
+        assert!(
+            claimed.insert(loop_index),
+            "{label} corner {index} matches loop {loop_index} twice"
+        );
         loops.push(loop_index);
     }
     Ok(loops)
@@ -425,7 +466,11 @@ fn match_reference_loops(actual: &BlenderLoops, reference: &[Value], label: &str
 
 /// Matches each Blender reference corner (`co`, `center`, `normal`) to one loop of `actual` and
 /// checks that loop's normal within `NORMAL_TOLERANCE`. Returns the loop of each reference corner.
-fn match_reference_normals(actual: &BlenderLoops, reference: &[Value], label: &str) -> TestResult<Vec<usize>> {
+fn match_reference_normals(
+    actual: &BlenderLoops,
+    reference: &[Value],
+    label: &str,
+) -> TestResult<Vec<usize>> {
     let loops = match_reference_loops(actual, reference, label)?;
     for (index, (wanted, &loop_index)) in reference.iter().zip(&loops).enumerate() {
         let co = vec3(&wanted["co"])?;
@@ -452,14 +497,26 @@ fn named<'a>(layers: &'a [Value], name: &str) -> TestResult<&'a Value> {
 /// attribute at its face center. Each dumped value must match within the same tolerance as the
 /// stored form (byte color uses one byte step).
 fn check_subdivision_data(object: &Value, reference: &Value, label: &str) -> TestResult {
-    let reference_loops = reference["loops"].as_array().ok_or("reference loops are missing")?;
-    let reference_faces = reference["faces"].as_array().ok_or("reference faces are missing")?;
+    let reference_loops = reference["loops"]
+        .as_array()
+        .ok_or("reference loops are missing")?;
+    let reference_faces = reference["faces"]
+        .as_array()
+        .ok_or("reference faces are missing")?;
     let actual = blender_loops(object)?;
     let loops = match_reference_loops(&actual, reference_loops, label)?;
-    let uv_layers = object["uv_layers"].as_array().ok_or("dumped UV layers are missing")?;
-    let color_layers = object["color_layers"].as_array().ok_or("dumped color layers are missing")?;
-    let attributes = object["attributes"].as_array().ok_or("dumped attributes are missing")?;
-    let dumped_faces = object["faces"].as_array().ok_or("dumped faces are missing")?;
+    let uv_layers = object["uv_layers"]
+        .as_array()
+        .ok_or("dumped UV layers are missing")?;
+    let color_layers = object["color_layers"]
+        .as_array()
+        .ok_or("dumped color layers are missing")?;
+    let attributes = object["attributes"]
+        .as_array()
+        .ok_or("dumped attributes are missing")?;
+    let dumped_faces = object["faces"]
+        .as_array()
+        .ok_or("dumped faces are missing")?;
 
     for (corner, wanted) in reference_loops.iter().enumerate() {
         let loop_index = loops[corner];
@@ -472,7 +529,10 @@ fn check_subdivision_data(object: &Value, reference: &Value, label: &str) -> Tes
                 &format!("{label} UV {name} corner {corner}"),
             );
         }
-        for (name, expected) in wanted["color"].as_object().ok_or("reference color is missing")? {
+        for (name, expected) in wanted["color"]
+            .as_object()
+            .ok_or("reference color is missing")?
+        {
             let layer = named(color_layers, name)?;
             let tolerance = if layer["data_type"] == "BYTE_COLOR" {
                 BYTE_TOLERANCE
@@ -486,7 +546,10 @@ fn check_subdivision_data(object: &Value, reference: &Value, label: &str) -> Tes
                 &format!("{label} color {name} corner {corner}"),
             );
         }
-        for (name, expected) in wanted["corner"].as_object().ok_or("reference corner data is missing")? {
+        for (name, expected) in wanted["corner"]
+            .as_object()
+            .ok_or("reference corner data is missing")?
+        {
             let layer_value = named(attributes, name)?;
             assert_close(
                 number(&layer_value["values"][loop_index])?,
@@ -507,7 +570,10 @@ fn check_subdivision_data(object: &Value, reference: &Value, label: &str) -> Tes
             .iter()
             .position(|candidate| corner_distance(*candidate, center) < 1.0e-4)
             .ok_or_else(|| format!("{label} face {index} has no dumped face at {center:?}"))?;
-        for (name, expected) in wanted["face"].as_object().ok_or("reference face data is missing")? {
+        for (name, expected) in wanted["face"]
+            .as_object()
+            .ok_or("reference face data is missing")?
+        {
             let layer_value = named(attributes, name)?;
             assert_close(
                 number(&layer_value["values"][face])?,
@@ -530,7 +596,11 @@ fn attach_native_layers(blender: &Path, root: &Path, blend: &Path) -> TestResult
 
 /// Blender's evaluated Subdivision corner and face data of `blend` (see the script above).
 fn subdivision_data_reference(blender: &Path, root: &Path, blend: &Path) -> TestResult<Value> {
-    let script = write_script(root, "subdivision_data_reference.py", SUBDIVISION_DATA_REFERENCE_SCRIPT)?;
+    let script = write_script(
+        root,
+        "subdivision_data_reference.py",
+        SUBDIVISION_DATA_REFERENCE_SCRIPT,
+    )?;
     let out = root.join("subdivision_data_reference.json");
     run_blender(blender, &script, Some(blend), &out)?;
     Ok(serde_json::from_slice(&fs::read(out)?)?)
@@ -573,7 +643,10 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
         "the Subdivision result must store a nonidentity corner_order"
     );
     let (authored, automatic) = stored_counts(subdivided_mesh)?;
-    assert!(authored > 0 && automatic > 0, "the Subdivision result must mix authored and automatic corners");
+    assert!(
+        authored > 0 && automatic > 0,
+        "the Subdivision result must mix authored and automatic corners"
+    );
 
     // Export and reopen in Blender: raw codes map through the stored basis, and every UV, color,
     // and generic value sits at the same corner identity as Blender's own evaluation.
@@ -602,7 +675,11 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
         reimported_object,
         "re-exported Subdivision",
     )?;
-    check_subdivision_data(reimported_object, &data_reference, "re-exported Subdivision")?;
+    check_subdivision_data(
+        reimported_object,
+        &data_reference,
+        "re-exported Subdivision",
+    )?;
 
     // A geometry-only modifier continues the chain: codes survive and decode on displaced fans.
     let applied = apply_operations(
@@ -616,7 +693,10 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
     assert_eq!(applied["ok"], true, "{applied}");
     let displaced = read_scene(&reimported)?;
     let (authored, automatic) = stored_counts(mesh_of_node(&displaced, "Regress")?)?;
-    assert!(authored > 0 && automatic > 0, "Displace must keep both authored and automatic corners");
+    assert!(
+        authored > 0 && automatic > 0,
+        "Displace must keep both authored and automatic corners"
+    );
 
     let displaced_blend = root.path().join("displaced.blend");
     export(&blender, &reimported, "blend", &displaced_blend)?;
@@ -630,7 +710,8 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
 }
 
 #[test]
-fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_allocates_the_layer() -> TestResult {
+fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_allocates_the_layer()
+-> TestResult {
     let Some(blender) = blender() else {
         return Ok(());
     };
@@ -663,9 +744,9 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
         "Subdivision without use_custom_normals must not allocate a value layer"
     );
     assert!(
-        layer
-            .as_object()
-            .is_some_and(|fields| fields.keys().all(|key| matches!(key.as_str(), "domain" | "type" | "corner_order"))),
+        layer.as_object().is_some_and(|fields| fields
+            .keys()
+            .all(|key| matches!(key.as_str(), "domain" | "type" | "corner_order"))),
         "basis-only state holds only domain, type and corner_order"
     );
     let basis = loop_ordinals(saved_mesh)?;
@@ -680,7 +761,9 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
     let mut normals = Map::new();
     let mut face_ids = Vec::new();
     let faces = potter_faces(saved_mesh)?;
-    let face_json = saved_mesh["faces"].as_array().ok_or("mesh faces are missing")?;
+    let face_json = saved_mesh["faces"]
+        .as_array()
+        .ok_or("mesh faces are missing")?;
     for (face, face_json) in faces.iter().zip(face_json) {
         let id = face_json["id"].as_u64().ok_or("face id is missing")?;
         let row = face
@@ -705,13 +788,21 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
 
     let authored_state = read_scene(&project)?;
     let authored_mesh = mesh_of_node(&authored_state, "Regress")?;
-    assert_eq!(loop_ordinals(authored_mesh)?, basis, "authoring must keep the stored loop basis");
+    assert_eq!(
+        loop_ordinals(authored_mesh)?,
+        basis,
+        "authoring must keep the stored loop basis"
+    );
     let (authored, automatic) = stored_counts(authored_mesh)?;
     assert_eq!(
         (authored as u64, automatic as u64),
         (
-            reference["authored"].as_u64().ok_or("reference authored count is missing")?,
-            reference["automatic"].as_u64().ok_or("reference automatic count is missing")?
+            reference["authored"]
+                .as_u64()
+                .ok_or("reference authored count is missing")?,
+            reference["automatic"]
+                .as_u64()
+                .ok_or("reference automatic count is missing")?
         ),
         "stored authored and automatic corners must match Blender's reference"
     );

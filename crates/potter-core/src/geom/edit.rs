@@ -6,10 +6,11 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{PotError, Result},
     geom::{
-        Face, Mesh, MeshError, edge_key,
+        Face, Mesh, MeshError,
         attribute_keys::storage_key,
         clnor::{self, NormalCodeOptions, SetterInput},
         color_layers::{self, ColorDomain, ColorLayer},
+        edge_key,
         uv_layers::{self, UvLayer, UvStore},
     },
 };
@@ -4684,8 +4685,8 @@ mod tests {
     use serde_json::json;
 
     use super::apply;
-    use crate::geom::{BoxParams, Mesh, PlaneParams};
     use crate::geom::color_layers::{self, ColorDomain};
+    use crate::geom::{BoxParams, Mesh, PlaneParams};
 
     #[test]
     fn triangulate_replaces_selected_ngon_with_winding_preserving_triangles() {
@@ -5194,7 +5195,11 @@ mod tests {
         create_color(&mut mesh, "Second", "corner", json!([0.0, 1.0, 0.0, 1.0]));
 
         let store = color_layers::read(&mesh);
-        let names: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(names, ["First", "Second"]);
         assert_eq!(store.active.as_deref(), Some("First"));
         assert_eq!(store.render.as_deref(), Some("First"));
@@ -5218,7 +5223,11 @@ mod tests {
     #[test]
     fn attribute_create_color_rejects_edge_and_face_domains_and_byte_color() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        for (domain, kind) in [("edge", "color"), ("face", "color"), ("point", "byte_color")] {
+        for (domain, kind) in [
+            ("edge", "color"),
+            ("face", "color"),
+            ("point", "byte_color"),
+        ] {
             let result = apply(
                 &mut mesh,
                 "attribute_create",
@@ -5318,7 +5327,11 @@ mod tests {
 
         apply(&mut mesh, "attribute_delete", &json!({ "name": "First" })).unwrap();
         let store = color_layers::read(&mesh);
-        let names: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(names, ["Second"]);
         assert_eq!(store.active.as_deref(), Some("Second"));
         assert_eq!(store.render.as_deref(), Some("Second"));

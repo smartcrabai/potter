@@ -4,11 +4,12 @@ use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh, ResolvedTexture, resolve_texture,
+        Mesh, ResolvedTexture,
         modifiers::{
             attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
             evaluate_modifiers,
         },
+        resolve_texture,
     },
     image::{ImageData, ImageInterpolation, encode_pixels},
     model::{
@@ -80,14 +81,20 @@ fn resolved_mask_texture(
     let directory = tempdir()?;
     let bytes = encode_pixels(image_data.width, image_data.height, &image_data.pixels)?;
     let blob = potter_core::hash::sha256(&bytes);
-    let hash = blob.strip_prefix("sha256:").ok_or("image blob hash prefix missing")?;
+    let hash = blob
+        .strip_prefix("sha256:")
+        .ok_or("image blob hash prefix missing")?;
     let blob_path = directory
         .path()
         .join("assets")
         .join("sha256")
         .join(hash)
         .join("blob");
-    fs::create_dir_all(blob_path.parent().ok_or("image blob has no parent directory")?)?;
+    fs::create_dir_all(
+        blob_path
+            .parent()
+            .ok_or("image blob has no parent directory")?,
+    )?;
     fs::write(&blob_path, &bytes)?;
 
     let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());

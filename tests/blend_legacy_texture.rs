@@ -1,4 +1,7 @@
-#![expect(clippy::unwrap_used, reason = "Blender integration fixtures use fixed valid data")]
+#![expect(
+    clippy::unwrap_used,
+    reason = "Blender integration fixtures use fixed valid data"
+)]
 
 use std::{
     error::Error,
@@ -289,7 +292,15 @@ fn import_blend(project: &Path, blend: &Path, blender: &Path) -> Result<(), Box<
         .arg(project)
         .args(["--file"])
         .arg(blend)
-        .args(["--format", "blend", "--mode", "replace", "--base-revision", "0", "--blender"])
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
         .arg(blender)
         .arg("--json");
     run_ok(command, "Blender import")?;
@@ -333,7 +344,11 @@ fn assert_scene_textures(document: &Value, expected: &Value) {
             assert_eq!(texture["kind"], "legacy_texture");
             assert_eq!(texture["texture_type"], "IMAGE");
             let image_id = texture["image"].as_str().unwrap();
-            let image = document["images"].as_object().unwrap().get(image_id).unwrap();
+            let image = document["images"]
+                .as_object()
+                .unwrap()
+                .get(image_id)
+                .unwrap();
             assert_eq!(image["name"], state["image_name"]);
             assert_value_subset(&texture["settings"], &state["settings"]);
             assert_eq!(names[texture_id], state["texture_name"]);
@@ -345,7 +360,11 @@ fn assert_scene_textures(document: &Value, expected: &Value) {
             shared_texture_ids.push(texture_id);
             shared_image_ids.push(image_id);
         } else if state["texture_type"] == "IMAGE" {
-            let image = document["images"].as_object().unwrap().get(texture_id).unwrap();
+            let image = document["images"]
+                .as_object()
+                .unwrap()
+                .get(texture_id)
+                .unwrap();
             assert_eq!(image["name"], state["image_name"]);
             assert!(!resources.contains_key(texture_id));
         } else {
@@ -366,9 +385,13 @@ fn assert_scene_textures(document: &Value, expected: &Value) {
     assert_ne!(shared_texture_ids[0], shared_texture_ids[1]);
     assert_eq!(shared_image_ids[0], shared_image_ids[1]);
     let raw = &document["compatibility"]["blender_adapter"]["intermediate"];
-    assert!(!raw["other_datablocks"].as_array().unwrap().iter().any(|block| {
-        block["type"] == "textures"
-    }));
+    assert!(
+        !raw["other_datablocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| { block["type"] == "textures" })
+    );
 }
 
 #[test]
@@ -456,8 +479,8 @@ fn blender_legacy_texture_round_trip_and_native_value_noise_loss() -> Result<(),
         .iter()
         .position(|modifier| modifier["name"] == "Clouds Displace")
         .unwrap();
-    let cloud_modifier = &native_noise_document["nodes"][carrier_id.as_str()]
-        ["modifiers"][cloud_index];
+    let cloud_modifier =
+        &native_noise_document["nodes"][carrier_id.as_str()]["modifiers"][cloud_index];
     let cloud_modifier_id = cloud_modifier["id"].as_str().unwrap().to_owned();
     let old_texture_id = cloud_modifier["params"]["texture"]
         .as_str()
@@ -473,8 +496,8 @@ fn blender_legacy_texture_round_trip_and_native_value_noise_loss() -> Result<(),
         "texture_type": "NATIVE_VALUE_NOISE",
         "settings": {}
     });
-    native_noise_document["nodes"][carrier_id.as_str()]["modifiers"][cloud_index]
-        ["params"]["texture"] = json!("native_value_noise");
+    native_noise_document["nodes"][carrier_id.as_str()]["modifiers"][cloud_index]["params"]["texture"] =
+        json!("native_value_noise");
     fs::write(
         second_project.join("scene.json"),
         serde_json::to_vec_pretty(&native_noise_document)?,
@@ -491,8 +514,14 @@ fn blender_legacy_texture_round_trip_and_native_value_noise_loss() -> Result<(),
         .arg(&blender)
         .arg("--json");
     let rejected = process::run_guarded(strict_export)?;
-    assert!(!strict_output.exists(), "refused export wrote a Blender file");
-    assert!(!rejected.status.success(), "native Value Noise export unexpectedly succeeded");
+    assert!(
+        !strict_output.exists(),
+        "refused export wrote a Blender file"
+    );
+    assert!(
+        !rejected.status.success(),
+        "native Value Noise export unexpectedly succeeded"
+    );
     let rejection: Value = serde_json::from_slice(&rejected.stdout)?;
     assert_eq!(rejection["error"]["code"], "UNREPRESENTABLE_FEATURE");
     let texture_loss = rejection["error"]["details"]["losses"]
@@ -501,19 +530,28 @@ fn blender_legacy_texture_round_trip_and_native_value_noise_loss() -> Result<(),
         .iter()
         .find(|loss| loss["feature_id"] == "blender.texture.native_value_noise")
         .unwrap();
-    assert_eq!(texture_loss["data_id"].as_str(), Some(cloud_modifier_id.as_str()));
-    assert!(texture_loss["reason"]
-        .as_str()
-        .unwrap()
-        .contains("native_value_noise"));
-    assert!(texture_loss["reason"]
-        .as_str()
-        .unwrap()
-        .contains("has no Blender legacy Texture type"));
-    assert!(texture_loss["suggestion"]
-        .as_str()
-        .unwrap()
-        .contains("--allow-lossy"));
+    assert_eq!(
+        texture_loss["data_id"].as_str(),
+        Some(cloud_modifier_id.as_str())
+    );
+    assert!(
+        texture_loss["reason"]
+            .as_str()
+            .unwrap()
+            .contains("native_value_noise")
+    );
+    assert!(
+        texture_loss["reason"]
+            .as_str()
+            .unwrap()
+            .contains("has no Blender legacy Texture type")
+    );
+    assert!(
+        texture_loss["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("--allow-lossy")
+    );
 
     let lossy_output = root.join("native-value-noise-lossy.blend");
     let mut lossy_export = Command::new(env!("CARGO_BIN_EXE_pot"));
@@ -527,9 +565,13 @@ fn blender_legacy_texture_round_trip_and_native_value_noise_loss() -> Result<(),
         .arg("--json");
     let lossy = run_ok(lossy_export, "lossy native Value Noise export")?;
     let report: Value = serde_json::from_slice(&lossy.stdout)?;
-    assert!(report["result"]["losses"].as_array().unwrap().iter().any(|loss| {
-        loss["feature_id"] == "blender.texture.native_value_noise"
-    }));
+    assert!(
+        report["result"]["losses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|loss| { loss["feature_id"] == "blender.texture.native_value_noise" })
+    );
     run_blender_script(
         &blender,
         &root.join("inspect_native_noise.py"),
@@ -537,8 +579,7 @@ fn blender_legacy_texture_round_trip_and_native_value_noise_loss() -> Result<(),
         Some(&lossy_output),
         &[root],
     )?;
-    let native_state: Value =
-        serde_json::from_slice(&fs::read(root.join("native_noise.json"))?)?;
+    let native_state: Value = serde_json::from_slice(&fs::read(root.join("native_noise.json"))?)?;
     assert_eq!(native_state["texture_type"], Value::Null);
     assert_eq!(native_state["texture_name"], Value::Null);
     assert_eq!(native_state["native_id_texture"], Value::Null);

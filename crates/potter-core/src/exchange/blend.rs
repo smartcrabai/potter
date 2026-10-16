@@ -313,9 +313,7 @@ fn add_blender_mesh_fields(doc: &SceneDoc, document: &mut Value) -> Result<()> {
             .attributes
             .keys()
             .filter(|key| !withdrawn.contains(key.as_str()))
-            .filter_map(|key| {
-                attribute_keys::user_name(key).map(|name| (key.clone(), json!(name)))
-            })
+            .filter_map(|key| attribute_keys::user_name(key).map(|name| (key.clone(), json!(name))))
             .collect();
         let vectors = match clnor::corner_codes(mesh)? {
             Some(codes) => {
@@ -350,7 +348,10 @@ fn add_blender_mesh_fields(doc: &SceneDoc, document: &mut Value) -> Result<()> {
         else {
             continue;
         };
-        if let Some(attributes) = mesh_value.get_mut("attributes").and_then(Value::as_object_mut) {
+        if let Some(attributes) = mesh_value
+            .get_mut("attributes")
+            .and_then(Value::as_object_mut)
+        {
             for key in &withdrawn {
                 attributes.remove(*key);
             }
@@ -438,10 +439,7 @@ fn prepare_blend_export_resources(
             .and_then(Value::as_object)
             .and_then(|resources| resources.get(&id))
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "resource disappeared"))?;
-        if let Some(sequence_frames) = resource
-            .get("sequence_frames")
-            .and_then(Value::as_object)
-        {
+        if let Some(sequence_frames) = resource.get("sequence_frames").and_then(Value::as_object) {
             let mut output_frames = Map::new();
             let sequence_dir = sidecar.join(format!("sequence_{id}"));
             let mut wrote_frame = false;
@@ -506,8 +504,9 @@ fn prepare_blend_export_resources(
                 if let Some(object) = frame_record.as_object_mut() {
                     object.insert(
                         "export_path".to_owned(),
-                        json!(fs::canonicalize(&destination)
-                            .map_err(|error| PotError::io(&error))?),
+                        json!(
+                            fs::canonicalize(&destination).map_err(|error| PotError::io(&error))?
+                        ),
                     );
                 }
                 if !files.contains(&destination) {
@@ -1600,7 +1599,10 @@ fn build_imported_graph(
             .cloned()
             .unwrap_or_default();
         for key in ["custom_properties", "fake_user", "users", "rna_properties"] {
-            metadata.insert(key.to_owned(), item.get(key).cloned().unwrap_or(Value::Null));
+            metadata.insert(
+                key.to_owned(),
+                item.get(key).cloned().unwrap_or(Value::Null),
+            );
         }
         let mut attributes = mesh.attributes.clone();
         attributes.insert("blender_metadata".to_owned(), Value::Object(metadata));
@@ -1737,7 +1739,11 @@ fn build_imported_graph(
             "Material",
         )?;
         let color = vec4_field(item, "base_color", [0.6, 0.6, 0.6, 1.0]);
-        let alpha_mode = match item.get("alpha_mode").and_then(Value::as_str).unwrap_or("opaque") {
+        let alpha_mode = match item
+            .get("alpha_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("opaque")
+        {
             mode @ ("opaque" | "clip" | "blend") => mode.to_owned(),
             other => {
                 return Err(invalid_intermediate(&format!(
@@ -1817,7 +1823,9 @@ fn build_imported_graph(
                 reference
                     .get("name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| invalid_intermediate("legacy Image Texture has an invalid image reference"))?
+                    .ok_or_else(|| {
+                        invalid_intermediate("legacy Image Texture has an invalid image reference")
+                    })?
             }
             _ => {
                 return Err(invalid_intermediate(
@@ -2196,8 +2204,9 @@ fn build_imported_graph(
                                 let resource_id = Id::new(reference.clone())?;
                                 match doc.resources.get(&resource_id) {
                                     Some(resource)
-                                        if crate::model::migrate::inline_resource_kind(resource)?
-                                            == Some("legacy_texture") =>
+                                        if crate::model::migrate::inline_resource_kind(
+                                            resource,
+                                        )? == Some("legacy_texture") =>
                                     {
                                         Some(reference.as_str())
                                     }
@@ -4113,7 +4122,6 @@ fn import_blend_library_overrides(
     Ok(())
 }
 
-
 fn import_blender_resources(
     raw: &Value,
     blend_file: &Path,
@@ -4125,10 +4133,7 @@ fn import_blender_resources(
     for source in optional_array(raw, "resources")? {
         let inline_kind = crate::model::migrate::inline_resource_kind(source)?;
         if let Some(kind) = inline_kind {
-            let owner = source
-                .get("owner")
-                .and_then(Value::as_str)
-                .unwrap_or(kind);
+            let owner = source.get("owner").and_then(Value::as_str).unwrap_or(kind);
             let seed = format!(
                 "resource_{}",
                 &crate::hash::sha256(format!("{kind}:{owner}").as_bytes())[7..19]
@@ -4217,10 +4222,9 @@ fn import_blender_resources(
         if is_sequence {
             for (frame, path) in &sequence_manifest.files {
                 let frame_key = frame.to_string();
-                let expected = sequence_manifest
-                    .hashes
-                    .get(&frame_key)
-                    .ok_or_else(|| invalid_intermediate("cache sequence manifest is inconsistent"))?;
+                let expected = sequence_manifest.hashes.get(&frame_key).ok_or_else(|| {
+                    invalid_intermediate("cache sequence manifest is inconsistent")
+                })?;
                 let bytes = match fs::read(path) {
                     Ok(bytes) => bytes,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -4239,10 +4243,7 @@ fn import_blender_resources(
                 sequence_frames.insert(
                     frame_key,
                     crate::cache_sequence::cache_sequence_resource_record(
-                        &path_uri,
-                        kind,
-                        &actual,
-                        None,
+                        &path_uri, kind, &actual, None,
                     ),
                 );
             }
@@ -4725,6 +4726,7 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         });
         smooth.push(flag_field(polygon, "smooth"));
     }
+    let blender_polygon_smooth = Value::Array(smooth.iter().copied().map(Value::Bool).collect());
     let uv = convert_uv_layers(item, &faces)?;
     let uv_layer_names = uv
         .layers
@@ -4749,14 +4751,30 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         .iter()
         .map(|face| format!("f{}", face.id))
         .collect();
-    insert_flag_attribute(&mut mesh.attributes, "shade_smooth", "face", face_keys, &smooth);
+    insert_flag_attribute(
+        &mut mesh.attributes,
+        "shade_smooth",
+        "face",
+        face_keys,
+        &smooth,
+    );
     let edge_keys: Vec<String> = mesh
         .edges
         .iter()
         .map(|edge| format!("e{}", edge.id))
         .collect();
-    insert_flag_attribute(&mut mesh.attributes, "sharp", "edge", edge_keys.clone(), &sharp);
+    insert_flag_attribute(
+        &mut mesh.attributes,
+        "sharp",
+        "edge",
+        edge_keys.clone(),
+        &sharp,
+    );
     insert_flag_attribute(&mut mesh.attributes, "seam", "edge", edge_keys, &seam);
+    mesh.attributes
+        .insert("blender_edge_flags".to_owned(), json!(edge_metadata));
+    mesh.attributes
+        .insert("blender_polygon_smooth".to_owned(), blender_polygon_smooth);
     let raw_attributes = optional_array(item, "attributes")?;
     let mut blender_attributes = Vec::new();
     let mut color_list = Vec::new();
@@ -4775,13 +4793,15 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             blender_attributes.push(entry.clone());
             continue;
         }
-        let domain = entry.get("domain").and_then(Value::as_str).unwrap_or_default();
+        let domain = entry
+            .get("domain")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let data_type = entry
             .get("data_type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR")
-            && matches!(domain, "POINT" | "CORNER")
+        if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR") && matches!(domain, "POINT" | "CORNER")
         {
             let color_domain = if domain == "POINT" {
                 ColorDomain::Point
@@ -4867,29 +4887,6 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             Value::Array(blender_attributes),
         );
     }
-    let uv = convert_uv_layers(item, &faces)?;
-    let uv_layer_names = uv
-        .layers
-        .iter()
-        .map(|layer| layer.name.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut attributes = Map::new();
-    attributes.insert("blender_edge_flags".to_owned(), json!(edge_metadata));
-    attributes.insert("blender_polygon_smooth".to_owned(), json!(smooth));
-    let blender_attributes = item
-        .get("attributes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|entry| !is_uv_layer_attribute(entry, &uv_layer_names))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !blender_attributes.is_empty() {
-        attributes.insert(
-            "blender_attributes".to_owned(),
-            Value::Array(blender_attributes),
-        );
-    }
     if let Some(skin_vertices) = item
         .get("skin_vertices")
         .and_then(Value::as_array)
@@ -4917,37 +4914,7 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             Value::Array(skin_vertices.clone()),
         );
     }
-    let next_id = IdCounters {
-        vertex: next_counter(vertices.len())?,
-        edge: next_counter(edges.len())?,
-        face: next_counter(faces.len())?,
-    };
-    let mut mesh = Mesh {
-        vertices,
-        edges,
-        faces,
-        attributes,
-        next_id,
-    };
     uv_layers::write(&mut mesh, &uv);
-    if let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null()) {
-        let normals = raw
-            .as_array()
-            .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
-            .iter()
-            .map(|normal| {
-                parse_vec3_value(normal)
-                    .map(glam::DVec3::from_array)
-                    .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Blender's polygon smooth flags are exact; the corner normals decide only custom normals.
-        let exact = super::shading::ExactShading {
-            smooth,
-            sharp: Vec::new(),
-        };
-        super::shading::import_shading_flags(&mut mesh, &normals, Some(&exact))?;
-    }
     mesh.validate()
         .map_err(|error| invalid_intermediate(&format!("invalid mesh data: {error}")))?;
     Ok(mesh)
@@ -5023,7 +4990,12 @@ fn finite_components<const N: usize>(value: &Value) -> Option<[f64; N]> {
 fn native_attribute_value(data_type: &str, value: &Value) -> Result<Value> {
     let invalid_value = || invalid_intermediate("mesh attribute value is invalid");
     Ok(match data_type {
-        "float" => json!(value.as_f64().filter(|number| number.is_finite()).ok_or_else(invalid_value)?),
+        "float" => json!(
+            value
+                .as_f64()
+                .filter(|number| number.is_finite())
+                .ok_or_else(invalid_value)?
+        ),
         "int" => json!(
             value
                 .as_i64()
@@ -5054,11 +5026,27 @@ fn native_attribute_entries(
     };
     let mut entries = Map::new();
     let keys: Vec<String> = match domain {
-        "point" => mesh.vertices.iter().map(|vertex| format!("v{}", vertex.id)).collect(),
-        "edge" => mesh.edges.iter().map(|edge| format!("e{}", edge.id)).collect(),
-        "face" => mesh.faces.iter().map(|face| format!("f{}", face.id)).collect(),
+        "point" => mesh
+            .vertices
+            .iter()
+            .map(|vertex| format!("v{}", vertex.id))
+            .collect(),
+        "edge" => mesh
+            .edges
+            .iter()
+            .map(|edge| format!("e{}", edge.id))
+            .collect(),
+        "face" => mesh
+            .faces
+            .iter()
+            .map(|face| format!("f{}", face.id))
+            .collect(),
         "corner" => {
-            let loops = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+            let loops = mesh
+                .faces
+                .iter()
+                .map(|face| face.vertices.len())
+                .sum::<usize>();
             if values.len() != loops {
                 return Err(mismatch());
             }
@@ -5226,18 +5214,29 @@ fn blend_attribute_refusal(
             "alembic_velocity" => "Alembic mesh velocity data are not written to Blender",
             "alembic_normals" => "Alembic imported mesh normals are not written to Blender",
             _ if BLENDER_HANDLED_MESH_KEYS.contains(&key) => return None,
-            _ => return Some((
-                "mesh.attribute",
-                format!("blend does not write Potter mesh store `{key}`"),
-            )),
+            _ => {
+                return Some((
+                    "mesh.attribute",
+                    format!("blend does not write Potter mesh store `{key}`"),
+                ));
+            }
         };
-        return Some(("mesh.attribute", format!("blend does not write `{key}`: {reason}")));
+        return Some((
+            "mesh.attribute",
+            format!("blend does not write `{key}`: {reason}"),
+        ));
     };
     if color_names.contains(name) {
         return None;
     }
-    let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
-    let domain = value.get("domain").and_then(Value::as_str).unwrap_or_default();
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let domain = value
+        .get("domain")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let feature = if kind == "color" {
         "mesh.color_attribute"
     } else {
@@ -5250,7 +5249,10 @@ fn blend_attribute_refusal(
     } else if kind == "color" {
         "it is not a registered color layer".to_owned()
     } else if !matches!(domain, "point" | "edge" | "face" | "corner")
-        || !matches!(kind, "float" | "int" | "float2" | "float3" | "bool" | "quaternion")
+        || !matches!(
+            kind,
+            "float" | "int" | "float2" | "float3" | "bool" | "quaternion"
+        )
     {
         format!("Blender has no {domain} attribute of type {kind}")
     } else {
@@ -7674,7 +7676,11 @@ mod tests {
         assert_eq!(mesh.attributes["user:skin_tone"]["type"], "float");
         assert!(!mesh.attributes.contains_key("blender_attributes"));
         let store = color_layers::read(&mesh);
-        let layers: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let layers: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(layers, ["color_layers"]);
         assert_eq!(store.active.as_deref(), Some("color_layers"));
         assert_eq!(store.render.as_deref(), Some("color_layers"));

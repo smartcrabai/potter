@@ -154,7 +154,8 @@ pub(super) fn preview_geometry_parameters(
         let Some(node) = doc.nodes.get(&node_id) else {
             continue;
         };
-        if !node.visible || (snapshot.purpose == EvaluationPurpose::Render && !node.render_visible) {
+        if !node.visible || (snapshot.purpose == EvaluationPurpose::Render && !node.render_visible)
+        {
             continue;
         }
         if !view_dependent {
@@ -402,8 +403,8 @@ pub(super) fn extract_geometry(
             };
             for (face_index, face) in mesh.faces.iter().enumerate() {
                 let material_slot = usize::try_from(face.material_index).ok();
-                let binding = material_slot
-                    .and_then(|slot| snapshot.slot_binding(node_id, node, slot));
+                let binding =
+                    material_slot.and_then(|slot| snapshot.slot_binding(node_id, node, slot));
                 let render_layer = binding.map_or(uv_render, |binding| {
                     binding.uv.render_index.map(usize::from)
                 });
@@ -431,8 +432,8 @@ pub(super) fn extract_geometry(
                     uv_render: render_layer,
                     uv_available_mask,
                 });
-                let material_id = material_slot
-                    .and_then(|slot| snapshot.slot_material(node_id, node, slot));
+                let material_id =
+                    material_slot.and_then(|slot| snapshot.slot_material(node_id, node, slot));
                 let material_index = material_id.map_or(0, |id| {
                     if let Some(index) = material_indices.get(id).copied() {
                         index
@@ -1491,14 +1492,13 @@ impl SceneShader<'_> {
         material: &Material,
         hit: &SurfaceHit,
     ) -> Result<BsdfParams> {
-        let object = object_for_index(&self.geometry.objects, triangle.object_index).ok_or_else(
-            || {
+        let object =
+            object_for_index(&self.geometry.objects, triangle.object_index).ok_or_else(|| {
                 PotError::new(
                     ErrorCode::EvaluationFailed,
                     "triangle references an unmapped object",
                 )
-            },
-        )?;
+            })?;
         let element = triangle
             .element_index
             .checked_sub(1)
@@ -1642,7 +1642,9 @@ fn carried_color_layers(
         None
     };
     let color_render = render.map(|index| {
-        let position = carried.iter().position(|&carried_index| carried_index == index);
+        let position = carried
+            .iter()
+            .position(|&carried_index| carried_index == index);
         match position {
             Some(position) => position,
             None => {

@@ -244,9 +244,9 @@ pub(crate) fn blend_export_document(doc: &SceneDoc) -> Result<(Cow<'_, SceneDoc>
             ("normal", &material.normal_texture),
         ]
         .map(|(role, field)| {
-            field
-                .as_ref()
-                .map(|reference| export_reference(&users, material_id, role, reference, &mut losses))
+            field.as_ref().map(|reference| {
+                export_reference(&users, material_id, role, reference, &mut losses)
+            })
         });
         color_images.extend(base.iter().map(|texture| texture.image.clone()));
         data_images.extend(
@@ -330,7 +330,11 @@ fn material_users<'a>(doc: &'a SceneDoc, material_id: &Id) -> Vec<&'a Mesh> {
     doc.nodes
         .values()
         .filter(|node| node.materials.contains(material_id))
-        .filter_map(|node| node.data.as_ref().and_then(|data| doc.data_blocks.get(data)))
+        .filter_map(|node| {
+            node.data
+                .as_ref()
+                .and_then(|data| doc.data_blocks.get(data))
+        })
         .filter_map(|data| data.mesh.as_ref())
         .collect()
 }
@@ -692,7 +696,15 @@ fn channel_texture(
     let split = format!("{name}_split");
     insert(graph, &split, GraphNode::new("ShaderNodeSeparateColor"))?;
     connect(graph, &color, "Color", &split, "Color")?;
-    multiply_channel(graph, &split, channel, name, factor, "principled", to_socket)
+    multiply_channel(
+        graph,
+        &split,
+        channel,
+        name,
+        factor,
+        "principled",
+        to_socket,
+    )
 }
 
 /// Links `color` (a Color output of `node`) into `to_socket`, multiplied by the RGB `factor`.
@@ -738,7 +750,9 @@ fn multiply_value(
     math_node
         .properties
         .insert("operation".to_owned(), json!("MULTIPLY"));
-    math_node.inputs.insert("Value_001".to_owned(), json!(factor));
+    math_node
+        .inputs
+        .insert("Value_001".to_owned(), json!(factor));
     insert(graph, &math, math_node)?;
     connect(graph, from_node, from_socket, &math, "Value")?;
     connect(graph, &math, "Value", to, to_socket)

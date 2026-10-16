@@ -63,8 +63,13 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         None
     };
     let settings = settings_field(engine, operation)?;
-    let record =
-        legacy_texture::merged_record(&id.to_string(), texture_type, image.as_ref(), None, &settings)?;
+    let record = legacy_texture::merged_record(
+        &id.to_string(),
+        texture_type,
+        image.as_ref(),
+        None,
+        &settings,
+    )?;
     engine.doc.resources.insert(id.clone(), record);
     engine.mark("resources", &id, ChangeKind::Created);
     Ok(true)
@@ -98,12 +103,8 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     let existing_texture = legacy_texture::parse_record(&id.to_string(), &existing)?;
     let (texture_type, existing_image) = match existing_texture {
         legacy_texture::LegacyTexture::Blend(_) => ("BLEND".to_owned(), None),
-        legacy_texture::LegacyTexture::ImageRecord { image, .. } => {
-            ("IMAGE".to_owned(), image)
-        }
-        legacy_texture::LegacyTexture::NativeValueNoise => {
-            ("NATIVE_VALUE_NOISE".to_owned(), None)
-        }
+        legacy_texture::LegacyTexture::ImageRecord { image, .. } => ("IMAGE".to_owned(), image),
+        legacy_texture::LegacyTexture::NativeValueNoise => ("NATIVE_VALUE_NOISE".to_owned(), None),
         legacy_texture::LegacyTexture::Procedural { texture_type, .. } => (texture_type, None),
     };
     let image = if texture_type == "IMAGE" {
@@ -166,8 +167,10 @@ fn image_id_field(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result
     Ok(image)
 }
 
-
-fn settings_field(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result<Map<String, Value>> {
+fn settings_field(
+    engine: &Engine<'_>,
+    operation: &Map<String, Value>,
+) -> Result<Map<String, Value>> {
     match operation.get("settings") {
         None => Ok(Map::new()),
         Some(Value::Object(settings)) => Ok(settings.clone()),

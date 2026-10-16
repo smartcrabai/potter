@@ -22,7 +22,11 @@ fn init(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn apply(scene: &Path, revision: u64, operations: &Value) -> Result<std::process::Output, Box<dyn Error>> {
+fn apply(
+    scene: &Path,
+    revision: u64,
+    operations: &Value,
+) -> Result<std::process::Output, Box<dyn Error>> {
     let directory = tempdir()?;
     let batch = directory.path().join("operations.json");
     fs::write(
@@ -41,7 +45,9 @@ fn apply(scene: &Path, revision: u64, operations: &Value) -> Result<std::process
 }
 
 fn read_scene(scene: &Path) -> Result<Value, Box<dyn Error>> {
-    Ok(serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?)
+    Ok(serde_json::from_slice(&fs::read(
+        scene.join("scene.json"),
+    )?)?)
 }
 
 #[expect(
@@ -113,7 +119,11 @@ fn inline_texture_coexists_with_binary_resources_and_library_copy() -> Result<()
     let listing: Value = serde_json::from_slice(&listing.stdout)?;
     let assets = listing["result"]["assets"].as_array().unwrap();
     assert!(assets.iter().any(|asset| asset["owner"] == "packed_binary"));
-    assert!(!assets.iter().any(|asset| asset["owner"] == "inline_texture"));
+    assert!(
+        !assets
+            .iter()
+            .any(|asset| asset["owner"] == "inline_texture")
+    );
     assert!(assets.iter().any(|asset| {
         asset["owner"] == "linked_cache"
             && asset["sequence_frame"] == 4
@@ -163,7 +173,10 @@ fn inline_texture_coexists_with_binary_resources_and_library_copy() -> Result<()
         String::from_utf8_lossy(&linked.stdout)
     );
     let target_document = read_scene(&target)?;
-    assert_eq!(target_document["resources"]["source_library__inline_texture"], inline);
+    assert_eq!(
+        target_document["resources"]["source_library__inline_texture"],
+        inline
+    );
     assert_eq!(
         target_document["resources"]["source_library__linked_cache"],
         source_document["resources"]["linked_cache"]
@@ -271,23 +284,19 @@ fn asset_report_checks_each_sequence_leaf_and_rejects_missing_packed_frames()
         .filter(|asset| asset["owner"] == "cache_sequence")
         .collect::<Vec<_>>();
     assert_eq!(sequence_assets.len(), 3);
-    assert!(sequence_assets
-        .iter()
-        .all(|asset| asset["uri"].as_str() != Some(master_uri.as_str())));
+    assert!(
+        sequence_assets
+            .iter()
+            .all(|asset| asset["uri"].as_str() != Some(master_uri.as_str()))
+    );
     assert!(sequence_assets.iter().any(|asset| {
-        asset["sequence_frame"] == 1
-            && asset["kind"] == "alembic"
-            && asset["changed"] == false
+        asset["sequence_frame"] == 1 && asset["kind"] == "alembic" && asset["changed"] == false
     }));
     assert!(sequence_assets.iter().any(|asset| {
-        asset["sequence_frame"] == 2
-            && asset["kind"] == "alembic_cache"
-            && asset["changed"] == true
+        asset["sequence_frame"] == 2 && asset["kind"] == "alembic_cache" && asset["changed"] == true
     }));
     assert!(sequence_assets.iter().any(|asset| {
-        asset["sequence_frame"] == 3
-            && asset["kind"] == "alembic_cache"
-            && asset["missing"] == true
+        asset["sequence_frame"] == 3 && asset["kind"] == "alembic_cache" && asset["missing"] == true
     }));
     assert_eq!(
         assets
@@ -320,8 +329,8 @@ fn asset_report_checks_each_sequence_leaf_and_rejects_missing_packed_frames()
 }
 
 #[test]
-fn image_delete_uses_only_explicit_image_texture_resource_references()
--> Result<(), Box<dyn Error>> {
+fn image_delete_uses_only_explicit_image_texture_resource_references() -> Result<(), Box<dyn Error>>
+{
     let directory = tempdir()?;
     let scene = directory.path().join("image-refs");
     init(&scene)?;

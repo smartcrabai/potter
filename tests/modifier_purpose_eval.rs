@@ -219,8 +219,10 @@ fn hidden_physics_sources_respect_purpose_and_legacy_properties() -> TestResult 
         .and_then(Value::as_object_mut)
         .ok_or("linked particle settings are missing")?
         .insert("render_type".to_owned(), json!("UNSUPPORTED"));
-    let hidden_unsupported_preview =
-        Snapshot::evaluate(&unsupported_render_type_doc, &context(EvaluationPurpose::Preview))?;
+    let hidden_unsupported_preview = Snapshot::evaluate(
+        &unsupported_render_type_doc,
+        &context(EvaluationPurpose::Preview),
+    )?;
     ensure_eq(
         &hidden_unsupported_preview
             .simulated_particles
@@ -228,10 +230,12 @@ fn hidden_physics_sources_respect_purpose_and_legacy_properties() -> TestResult 
         &false,
         "viewport-hidden unsupported particle render type is not simulated",
     )?;
-    let active_render_error =
-        Snapshot::evaluate(&unsupported_render_type_doc, &context(EvaluationPurpose::Render))
-            .err()
-            .ok_or("active unsupported particle render type unexpectedly evaluated")?;
+    let active_render_error = Snapshot::evaluate(
+        &unsupported_render_type_doc,
+        &context(EvaluationPurpose::Render),
+    )
+    .err()
+    .ok_or("active unsupported particle render type unexpectedly evaluated")?;
     ensure_eq(
         &active_render_error.code,
         &ErrorCode::UnsupportedFeature,
@@ -246,17 +250,23 @@ fn hidden_physics_sources_respect_purpose_and_legacy_properties() -> TestResult 
     let preview = Snapshot::evaluate(&doc, &context(EvaluationPurpose::Preview))?;
     let render = Snapshot::evaluate(&doc, &context(EvaluationPurpose::Render))?;
     ensure_eq(
-        &preview.simulated_particles.contains_key(&Id::new("emitter_hidden")?),
+        &preview
+            .simulated_particles
+            .contains_key(&Id::new("emitter_hidden")?),
         &false,
         "viewport-hidden linked particle emitter is not simulated",
     )?;
     ensure_eq(
-        &render.simulated_particles.contains_key(&Id::new("emitter_hidden")?),
+        &render
+            .simulated_particles
+            .contains_key(&Id::new("emitter_hidden")?),
         &true,
         "render-visible linked particle emitter is simulated",
     )?;
     ensure_eq(
-        &preview.simulated_particles.contains_key(&Id::new("emitter_legacy")?),
+        &preview
+            .simulated_particles
+            .contains_key(&Id::new("emitter_legacy")?),
         &true,
         "legacy property-only particle emitter remains simulated",
     )?;

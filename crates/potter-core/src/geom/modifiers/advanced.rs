@@ -109,15 +109,8 @@ pub(super) fn simple_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         if weight == 0.0 {
             continue;
         }
-        let deformed = simple_deform_point(
-            origin_point,
-            method,
-            axis,
-            limit_axis,
-            lock,
-            factor,
-            limits,
-        );
+        let deformed =
+            simple_deform_point(origin_point, method, axis, limit_axis, lock, factor, limits);
         let blended = origin_point.lerp(deformed, weight);
         vertex.co = object.map_or(blended, |matrix| matrix.transform_point3(blended));
     }
@@ -137,7 +130,10 @@ fn simple_deform_axis(modifier: &Modifier) -> Result<usize> {
 /// Blender's limit fractions: both clamp to [0, 1] and the lower one never exceeds the upper one.
 fn simple_deform_limits(modifier: &Modifier) -> Result<[f64; 2]> {
     let invalid = || invalid_parameter(modifier, "limits", "two normalized values");
-    let fractions = match schema_value(modifier, "limits")?.as_array().map(Vec::as_slice) {
+    let fractions = match schema_value(modifier, "limits")?
+        .as_array()
+        .map(Vec::as_slice)
+    {
         Some([first, second]) => [first.as_f64(), second.as_f64()],
         _ => return Err(invalid()),
     };
@@ -195,11 +191,10 @@ fn simple_deform_point(
             return DVec3::from_array(simple_deform_bend(coordinates, cut, axis, factor));
         }
     };
-    for (value, offset) in deformed.iter_mut().zip([
-        cut[map[0]],
-        cut[map[1]],
-        cut[map[2]],
-    ]) {
+    for (value, offset) in deformed
+        .iter_mut()
+        .zip([cut[map[0]], cut[map[1]], cut[map[2]]])
+    {
         *value += offset;
     }
     let mut result = [0.0; 3];
@@ -617,7 +612,10 @@ pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // Blender works in the reference object's space with `use_transform`, else shifted to its centre.
     let (forward, backward) = match object {
         Some(matrix) if use_transform => (matrix.inverse(), matrix),
-        Some(_) => (DMat4::from_translation(-center), DMat4::from_translation(center)),
+        Some(_) => (
+            DMat4::from_translation(-center),
+            DMat4::from_translation(center),
+        ),
         None => (DMat4::IDENTITY, DMat4::IDENTITY),
     };
     let weights = deform_group_weights(mesh, modifier)?;

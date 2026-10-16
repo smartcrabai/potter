@@ -99,8 +99,7 @@ pub fn render_previews(
     } else {
         BTreeMap::new()
     };
-    let (base_bounds, view_dependent) =
-        super::scene::preview_geometry_parameters(doc, &snapshot)?;
+    let (base_bounds, view_dependent) = super::scene::preview_geometry_parameters(doc, &snapshot)?;
     let prepared_views = if let Some(camera_id) = request.camera_id {
         let camera = stored_camera(doc, &snapshot, camera_id)?;
         labels
@@ -172,7 +171,9 @@ pub fn render_previews(
         let geometry = view_geometry
             .as_ref()
             .or(shared_geometry.as_ref())
-            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "preview geometry is missing"))?;
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "preview geometry is missing")
+            })?;
         let view_shader = if view_dependent {
             surface_shader(doc, &snapshot, &images, geometry, mode)
         } else {

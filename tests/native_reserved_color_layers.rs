@@ -4,16 +4,19 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use native_oracle::{
     FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats, assert_rgba,
@@ -47,7 +50,6 @@ fn build_reserved_oracle(blender: &Path, root: &Path) -> TestResult<(PathBuf, Va
     let expected = serde_json::from_slice(&fs::read(output.join("expected.json"))?)?;
     Ok((output.join("reserved_color_oracle.blend"), expected))
 }
-
 
 fn forbid_color_losses(report: &Value, label: &str) {
     for feature in loss_features(report) {
@@ -85,10 +87,18 @@ fn check_imported_colors(mesh: &Value, expected: &Value) -> TestResult {
         .as_array()
         .ok_or("expected color layer values are missing")?;
     let active = layers
-        .get(expected["color_active_index"].as_u64().ok_or("active index missing")? as usize)
+        .get(
+            expected["color_active_index"]
+                .as_u64()
+                .ok_or("active index missing")? as usize,
+        )
         .ok_or("active color layer index is out of range")?;
     let render = layers
-        .get(expected["color_render_index"].as_u64().ok_or("render index missing")? as usize)
+        .get(
+            expected["color_render_index"]
+                .as_u64()
+                .ok_or("render index missing")? as usize,
+        )
         .ok_or("render color layer index is out of range")?;
     assert_eq!(store["active"], active["name"]);
     assert_eq!(store["render"], render["name"]);
@@ -98,7 +108,10 @@ fn check_imported_colors(mesh: &Value, expected: &Value) -> TestResult {
             .iter()
             .find(|layer| layer["name"].as_str() == Some(name))
         else {
-            assert_eq!(name, "color_layers", "only the registry-name collision is optional");
+            assert_eq!(
+                name, "color_layers",
+                "only the registry-name collision is optional"
+            );
             continue;
         };
         let attribute = mesh["attributes"]
@@ -154,8 +167,14 @@ fn check_imported_colors(mesh: &Value, expected: &Value) -> TestResult {
 
     let raw_vertex_groups = &mesh["attributes"]["vertex_groups"];
     if !raw_vertex_groups.is_null() {
-        assert!(raw_vertex_groups.is_object(), "native vertex weights must be stored separately");
-        assert_ne!(raw_vertex_groups["type"], "color", "raw vertex_groups holds weights, not colors");
+        assert!(
+            raw_vertex_groups.is_object(),
+            "native vertex weights must be stored separately"
+        );
+        assert_ne!(
+            raw_vertex_groups["type"], "color",
+            "raw vertex_groups holds weights, not colors"
+        );
     }
     assert!(
         mesh["attributes"]["user:vertex_groups"]["values"].is_object(),
@@ -177,9 +196,9 @@ fn has_named_layer(value: &Value, names: &[&str]) -> bool {
                 .get("name")
                 .and_then(Value::as_str)
                 .is_some_and(|name| names.contains(&name))
-                || fields
-                    .iter()
-                    .any(|(key, item)| names.contains(&key.as_str()) || has_named_layer(item, names))
+                || fields.iter().any(|(key, item)| {
+                    names.contains(&key.as_str()) || has_named_layer(item, names)
+                })
         }
         _ => false,
     }
@@ -231,15 +250,24 @@ fn check_imported_material(scene: &Value, expected: &Value) -> TestResult<String
     let names = expected["material"]["shared_by"]
         .as_array()
         .ok_or("expected shared material users are missing")?;
-    let left = node_id(scene, names[0].as_str().ok_or("left object name is missing")?)?;
-    let right = node_id(scene, names[1].as_str().ok_or("right object name is missing")?)?;
+    let left = node_id(
+        scene,
+        names[0].as_str().ok_or("left object name is missing")?,
+    )?;
+    let right = node_id(
+        scene,
+        names[1].as_str().ok_or("right object name is missing")?,
+    )?;
     let left_material = scene["nodes"][&left]["materials"][0]
         .as_str()
         .ok_or("left material assignment is missing")?;
     let right_material = scene["nodes"][&right]["materials"][0]
         .as_str()
         .ok_or("right material assignment is missing")?;
-    assert_eq!(left_material, right_material, "objects must share one material");
+    assert_eq!(
+        left_material, right_material,
+        "objects must share one material"
+    );
 
     let material = &scene["materials"][left_material];
     assert_eq!(material["name"], expected["material"]["name"]);
@@ -255,8 +283,7 @@ fn check_imported_material(scene: &Value, expected: &Value) -> TestResult<String
         .find(|node| node["type"] == "ShaderNodeVertexColor")
         .ok_or("material has no Vertex Color node")?;
     assert_eq!(
-        vertex_node["properties"]["layer_name"],
-        expected["material"]["vertex_color_layer"],
+        vertex_node["properties"]["layer_name"], expected["material"]["vertex_color_layer"],
         "material layer selector is the raw user-facing name"
     );
     let multiply = graph_nodes
@@ -309,13 +336,11 @@ fn check_blend_colors(object: &Value, expected: &Value) -> TestResult {
         .collect();
     assert_eq!(names, expected_names, "Blender color layer order");
     assert_eq!(
-        object["color_active"],
-        expected["color_active_index"],
+        object["color_active"], expected["color_active_index"],
         "active color index"
     );
     assert_eq!(
-        object["color_render"],
-        expected["color_render_index"],
+        object["color_render"], expected["color_render_index"],
         "render color index"
     );
     for (actual, expected_layer) in actual_layers.iter().zip(expected_layers) {
@@ -450,7 +475,9 @@ fn check_glb_colors(glb: &Glb, expected: &Value) -> TestResult {
         .ok_or("expected color layers are missing")?;
     assert_eq!(layers[0]["name"], "vertex_groups");
     for (semantic_index, expected_layer) in layers.iter().enumerate() {
-        let name = expected_layer["name"].as_str().ok_or("color layer name is missing")?;
+        let name = expected_layer["name"]
+            .as_str()
+            .ok_or("color layer name is missing")?;
         let actual = &colors_by_semantic[semantic_index];
         assert!(!actual.is_empty(), "GLB {name} color accessor is missing");
         for mesh in expected_meshes {
@@ -511,8 +538,13 @@ fn reserved_color_layer_names_coexist_with_weights_material_render_and_exports()
     forbid_color_losses(&import_report, "Blender import");
 
     let scene = read_scene(&project)?;
-    for expected_mesh in expected["meshes"].as_array().ok_or("expected meshes are missing")? {
-        let name = expected_mesh["name"].as_str().ok_or("mesh name is missing")?;
+    for expected_mesh in expected["meshes"]
+        .as_array()
+        .ok_or("expected meshes are missing")?
+    {
+        let name = expected_mesh["name"]
+            .as_str()
+            .ok_or("mesh name is missing")?;
         let mesh = mesh_of_node(&scene, name)?;
         check_imported_colors(mesh, expected_mesh)?;
         if expected_mesh["vertex_groups"]["Hip"].is_object() {
@@ -533,7 +565,10 @@ fn reserved_color_layer_names_coexist_with_weights_material_render_and_exports()
     let render_report: Value = serde_json::from_slice(&render_output.stdout)?;
     assert_eq!(render_report["ok"], true, "{render_report}");
     let rendered_exr = frames.join("frame_0001.exr");
-    assert!(fs::metadata(&rendered_exr)?.len() > 0, "rendered EXR is empty");
+    assert!(
+        fs::metadata(&rendered_exr)?.len() > 0,
+        "rendered EXR is empty"
+    );
     let loaded = apply_operations(
         &project,
         root.path(),
@@ -551,20 +586,36 @@ fn reserved_color_layer_names_coexist_with_weights_material_render_and_exports()
             .try_into()
             .map_err(|_| "render probe UV is not a pair")?;
         let actual = pixel_at(&project, "reserved_render", uv)?;
-        assert!(actual[..3].iter().any(|channel| *channel > 0.01), "{name} pixel is black");
-        assert!(actual[..3].iter().any(|channel| *channel < 0.95), "{name} pixel is white");
-        assert_rgba(actual, wanted, RENDER_TOLERANCE, &format!("{name} rendered pixel"));
+        assert!(
+            actual[..3].iter().any(|channel| *channel > 0.01),
+            "{name} pixel is black"
+        );
+        assert!(
+            actual[..3].iter().any(|channel| *channel < 0.95),
+            "{name} pixel is white"
+        );
+        assert_rgba(
+            actual,
+            wanted,
+            RENDER_TOLERANCE,
+            &format!("{name} rendered pixel"),
+        );
     }
 
     let exported_blend = root.path().join("reserved_roundtrip.blend");
     let blend_report = export(&blender, &project, "blend", &exported_blend)?;
-    assert!(losses(&blend_report).is_empty(), "blend export reported losses: {blend_report}");
+    assert!(
+        losses(&blend_report).is_empty(),
+        "blend export reported losses: {blend_report}"
+    );
     let dump = dump_blend(&blender, root.path(), &exported_blend, "reserved-roundtrip")?;
     let expected_objects = expected["meshes"]
         .as_array()
         .ok_or("expected meshes are missing")?;
     for expected_mesh in expected_objects {
-        let name = expected_mesh["name"].as_str().ok_or("mesh name is missing")?;
+        let name = expected_mesh["name"]
+            .as_str()
+            .ok_or("mesh name is missing")?;
         let object = dumped_object(&dump, name)?;
         check_blend_colors(object, expected_mesh)?;
         if expected_mesh["vertex_groups"]["Hip"].is_object() {

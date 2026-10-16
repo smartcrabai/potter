@@ -248,22 +248,12 @@ impl WorldEvaluator<'_> {
                     .get("blend_type")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("MIX");
-                let factor = as_scalar(self.input(
-                    id,
-                    "Factor_Float",
-                    WorldValue::Scalar(0.5),
-                )?)
-                .clamp(0.0, 1.0);
-                let first = as_color(self.input(
-                    id,
-                    "A_Color",
-                    WorldValue::Color([0.5, 0.5, 0.5, 1.0]),
-                )?);
-                let second = as_color(self.input(
-                    id,
-                    "B_Color",
-                    WorldValue::Color([0.5, 0.5, 0.5, 1.0]),
-                )?);
+                let factor = as_scalar(self.input(id, "Factor_Float", WorldValue::Scalar(0.5))?)
+                    .clamp(0.0, 1.0);
+                let first =
+                    as_color(self.input(id, "A_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
+                let second =
+                    as_color(self.input(id, "B_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
                 let blended = match blend_type {
                     "MIX" => second,
                     "ADD" => std::array::from_fn(|index| first[index] + second[index]),
@@ -279,7 +269,9 @@ impl WorldEvaluator<'_> {
                     unsupported => {
                         return Err(PotError::with_details(
                             ErrorCode::UnsupportedFeature,
-                            format!("world ShaderNodeMix blend type `{unsupported}` is not supported"),
+                            format!(
+                                "world ShaderNodeMix blend type `{unsupported}` is not supported"
+                            ),
                             json!({
                                 "feature_id": format!("world.node.ShaderNodeMix.blend_type.{unsupported}"),
                                 "node_id": id,
@@ -433,10 +425,9 @@ mod tests {
             background_id.clone(),
             GraphNode::new("ShaderNodeBackground"),
         );
-        group.nodes.insert(
-            output_id.clone(),
-            GraphNode::new("ShaderNodeOutputWorld"),
-        );
+        group
+            .nodes
+            .insert(output_id.clone(), GraphNode::new("ShaderNodeOutputWorld"));
         group.links.extend([
             GraphLink {
                 from_node: mix_id,
@@ -455,15 +446,19 @@ mod tests {
         groups.insert(world_id.clone(), group);
         let mut world = World::default();
         world.node_tree = Some(world_id);
-        evaluate_world(&world, &groups, &std::collections::BTreeMap::new(), DVec3::Z)
+        evaluate_world(
+            &world,
+            &groups,
+            &std::collections::BTreeMap::new(),
+            DVec3::Z,
+        )
     }
 
     #[test]
     fn evaluates_rgba_generic_mix_sockets() {
         let mut mix = GraphNode::new("ShaderNodeMix");
         mix.properties.insert("data_type".to_owned(), json!("RGBA"));
-        mix.inputs
-            .insert("Factor_Float".to_owned(), json!(0.25));
+        mix.inputs.insert("Factor_Float".to_owned(), json!(0.25));
         mix.inputs
             .insert("A_Color".to_owned(), json!([1.0, 0.0, 0.0, 1.0]));
         mix.inputs

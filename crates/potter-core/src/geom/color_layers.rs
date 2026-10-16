@@ -144,7 +144,10 @@ pub(crate) fn read(mesh: &Mesh) -> ColorStore {
 }
 
 fn read_layer(mesh: &Mesh, name: &str) -> Option<ColorLayer> {
-    let attribute = mesh.attributes.get(attribute_keys::storage_key(name).as_ref())?.as_object()?;
+    let attribute = mesh
+        .attributes
+        .get(attribute_keys::storage_key(name).as_ref())?
+        .as_object()?;
     if attribute.get("type").and_then(Value::as_str) != Some(COLOR_TYPE) {
         return None;
     }
@@ -201,7 +204,8 @@ pub(crate) fn write(mesh: &mut Mesh, store: &ColorStore) {
         .collect();
     for name in previous {
         if store.index_of(&name).is_none() {
-            mesh.attributes.remove(attribute_keys::storage_key(&name).as_ref());
+            mesh.attributes
+                .remove(attribute_keys::storage_key(&name).as_ref());
         }
     }
     let fallback = [0.0, 0.0, 0.0, 1.0];
@@ -246,11 +250,7 @@ pub(crate) fn write(mesh: &mut Mesh, store: &ColorStore) {
             .or(store.layers.first().map(|layer| &layer.name))
             .cloned()
     };
-    let layers: Vec<Value> = store
-        .layers
-        .iter()
-        .map(|layer| json!(layer.name))
-        .collect();
+    let layers: Vec<Value> = store.layers.iter().map(|layer| json!(layer.name)).collect();
     mesh.attributes.insert(
         ATTRIBUTE.to_owned(),
         json!({
@@ -294,7 +294,11 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
             .get("domain")
             .and_then(Value::as_str)
             .and_then(ColorDomain::parse)
-            .ok_or_else(|| invalid(format!("color layer `{name}` domain must be point or corner")))?;
+            .ok_or_else(|| {
+                invalid(format!(
+                    "color layer `{name}` domain must be point or corner"
+                ))
+            })?;
         if attribute.get("type").and_then(Value::as_str) != Some(COLOR_TYPE) {
             return Err(invalid(format!("color layer `{name}` type must be color")));
         }
@@ -348,7 +352,9 @@ pub(crate) fn validate(mesh: &Mesh) -> Result<()> {
             _ => false,
         };
         if !valid {
-            return Err(invalid(format!("color_layers.{key} must name a color layer")));
+            return Err(invalid(format!(
+                "color_layers.{key} must name a color layer"
+            )));
         }
     }
     Ok(())

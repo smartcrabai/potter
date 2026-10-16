@@ -14,19 +14,18 @@
 
 use std::{f64::consts::PI, path::Path};
 
+use crate::blender_rng::BlenderRng;
 use glam::DVec3;
 use serde_json::{Map, Value, json};
-use crate::blender_rng::BlenderRng;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     image::{ImageData, ImageInterpolation, load_image_data},
-    model::{migrate, Id, ImageAlphaMode, ImageColorspace, SceneDoc},
+    model::{Id, ImageAlphaMode, ImageColorspace, SceneDoc, migrate},
 };
 
 /// Record kind of a Blender legacy texture.
 pub(crate) const LEGACY_TEXTURE_KIND: &str = "legacy_texture";
-
 
 /// Blender's `Blend` texture progression (`Tex::stype` with the RNA `progression` identifiers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,7 +301,6 @@ pub(crate) struct TextureResult {
     pub(crate) is_rgb: bool,
 }
 
-
 fn record_error(id: &str, message: impl Into<String>) -> PotError {
     PotError::with_details(
         ErrorCode::SceneInvalid,
@@ -310,7 +308,6 @@ fn record_error(id: &str, message: impl Into<String>) -> PotError {
         json!({"resource": id, "kind": LEGACY_TEXTURE_KIND}),
     )
 }
-
 
 /// Rejects settings keys that the texture type does not define.
 fn known_keys(id: &str, settings: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
@@ -336,7 +333,12 @@ fn parse_blend(id: &str, settings: &Map<String, Value>) -> Result<BlendTexture> 
         None => false,
         Some(Value::String(value)) if value == "HORIZONTAL" => false,
         Some(Value::String(value)) if value == "VERTICAL" => true,
-        _ => return Err(record_error(id, "`use_flip_axis` must be HORIZONTAL or VERTICAL")),
+        _ => {
+            return Err(record_error(
+                id,
+                "`use_flip_axis` must be HORIZONTAL or VERTICAL",
+            ));
+        }
     };
     Ok(BlendTexture {
         progression,
@@ -361,35 +363,98 @@ const LEGACY_TEXTURE_TYPES: [&str; 12] = [
 
 fn texture_settings_keys(texture_type: &str) -> &'static [&'static str] {
     match texture_type {
-        "CLOUDS" => &["noise_scale", "noise_depth", "noise_basis", "noise_type", "cloud_type"],
+        "CLOUDS" => &[
+            "noise_scale",
+            "noise_depth",
+            "noise_basis",
+            "noise_type",
+            "cloud_type",
+        ],
         "MARBLE" => &[
-            "noise_scale", "turbulence", "noise_depth", "noise_type", "marble_type",
-            "noise_basis", "noise_basis_2",
+            "noise_scale",
+            "turbulence",
+            "noise_depth",
+            "noise_type",
+            "marble_type",
+            "noise_basis",
+            "noise_basis_2",
         ],
         "WOOD" => &[
-            "noise_scale", "turbulence", "noise_basis", "noise_type", "wood_type", "noise_basis_2",
+            "noise_scale",
+            "turbulence",
+            "noise_basis",
+            "noise_type",
+            "wood_type",
+            "noise_basis_2",
         ],
         "MAGIC" => &["turbulence", "noise_depth"],
         "BLEND" => &["progression", "use_flip_axis"],
-        "STUCCI" => &["turbulence", "noise_basis", "noise_scale", "noise_type", "stucci_type"],
+        "STUCCI" => &[
+            "turbulence",
+            "noise_basis",
+            "noise_scale",
+            "noise_type",
+            "stucci_type",
+        ],
         "NOISE" => &[],
-        "DISTORTED_NOISE" => &["distortion", "noise_scale", "noise_basis", "noise_distortion"],
+        "DISTORTED_NOISE" => &[
+            "distortion",
+            "noise_scale",
+            "noise_basis",
+            "noise_distortion",
+        ],
         "VORONOI" => &[
-            "weight_1", "weight_2", "weight_3", "weight_4", "minkovsky_exponent",
-            "distance_metric", "color_mode", "noise_intensity", "noise_scale",
+            "weight_1",
+            "weight_2",
+            "weight_3",
+            "weight_4",
+            "minkovsky_exponent",
+            "distance_metric",
+            "color_mode",
+            "noise_intensity",
+            "noise_scale",
         ],
         "MUSGRAVE" => &[
-            "musgrave_type", "dimension_max", "lacunarity", "octaves", "offset", "gain",
-            "noise_intensity", "noise_scale", "noise_basis",
+            "musgrave_type",
+            "dimension_max",
+            "lacunarity",
+            "octaves",
+            "offset",
+            "gain",
+            "noise_intensity",
+            "noise_scale",
+            "noise_basis",
         ],
         "NATIVE_VALUE_NOISE" => &[],
         "IMAGE" => &[
-            "use_interpolation", "filter_size", "use_flip_axis", "use_alpha",
-            "use_calculate_alpha", "invert_alpha", "extension", "repeat_x", "repeat_y",
-            "use_mirror_x", "use_mirror_y", "use_checker_odd", "use_checker_even",
-            "checker_distance", "crop_min_x", "crop_min_y", "crop_max_x", "crop_max_y",
-            "brightness", "contrast", "saturation", "factor_red", "factor_green",
-            "factor_blue", "use_clamp", "use_color_ramp", "color_ramp", "image_user",
+            "use_interpolation",
+            "filter_size",
+            "use_flip_axis",
+            "use_alpha",
+            "use_calculate_alpha",
+            "invert_alpha",
+            "extension",
+            "repeat_x",
+            "repeat_y",
+            "use_mirror_x",
+            "use_mirror_y",
+            "use_checker_odd",
+            "use_checker_even",
+            "checker_distance",
+            "crop_min_x",
+            "crop_min_y",
+            "crop_max_x",
+            "crop_max_y",
+            "brightness",
+            "contrast",
+            "saturation",
+            "factor_red",
+            "factor_green",
+            "factor_blue",
+            "use_clamp",
+            "use_color_ramp",
+            "color_ramp",
+            "image_user",
         ],
         _ => &[],
     }
@@ -398,9 +463,16 @@ fn texture_settings_keys(texture_type: &str) -> &'static [&'static str] {
 fn enum_values(key: &str) -> Option<&'static [&'static str]> {
     match key {
         "noise_basis" | "noise_distortion" => Some(&[
-            "BLENDER_ORIGINAL", "ORIGINAL_PERLIN", "IMPROVED_PERLIN", "VORONOI_F1",
-            "VORONOI_F2", "VORONOI_F3", "VORONOI_F4", "VORONOI_F2_F1",
-            "VORONOI_CRACKLE", "CELL_NOISE",
+            "BLENDER_ORIGINAL",
+            "ORIGINAL_PERLIN",
+            "IMPROVED_PERLIN",
+            "VORONOI_F1",
+            "VORONOI_F2",
+            "VORONOI_F3",
+            "VORONOI_F4",
+            "VORONOI_F2_F1",
+            "VORONOI_CRACKLE",
+            "CELL_NOISE",
         ]),
         "noise_basis_2" => Some(&["SIN", "SAW", "TRI"]),
         "noise_type" => Some(&["SOFT_NOISE", "HARD_NOISE"]),
@@ -408,17 +480,35 @@ fn enum_values(key: &str) -> Option<&'static [&'static str]> {
         "wood_type" => Some(&["BANDS", "RINGS", "BANDNOISE", "RINGNOISE"]),
         "marble_type" => Some(&["SOFT", "SHARP", "SHARPER"]),
         "musgrave_type" => Some(&[
-            "MULTIFRACTAL", "RIDGED_MULTIFRACTAL", "HYBRID_MULTIFRACTAL", "FBM",
+            "MULTIFRACTAL",
+            "RIDGED_MULTIFRACTAL",
+            "HYBRID_MULTIFRACTAL",
+            "FBM",
             "HETERO_TERRAIN",
         ]),
         "distance_metric" => Some(&[
-            "DISTANCE", "DISTANCE_SQUARED", "MANHATTAN", "CHEBYCHEV", "MINKOVSKY_HALF",
-            "MINKOVSKY_FOUR", "MINKOVSKY",
+            "DISTANCE",
+            "DISTANCE_SQUARED",
+            "MANHATTAN",
+            "CHEBYCHEV",
+            "MINKOVSKY_HALF",
+            "MINKOVSKY_FOUR",
+            "MINKOVSKY",
         ]),
-        "color_mode" => Some(&["INTENSITY", "POSITION", "POSITION_OUTLINE", "POSITION_OUTLINE_INTENSITY"]),
+        "color_mode" => Some(&[
+            "INTENSITY",
+            "POSITION",
+            "POSITION_OUTLINE",
+            "POSITION_OUTLINE_INTENSITY",
+        ]),
         "progression" => Some(&[
-            "LINEAR", "QUADRATIC", "EASING", "DIAGONAL", "SPHERICAL",
-            "QUADRATIC_SPHERE", "RADIAL",
+            "LINEAR",
+            "QUADRATIC",
+            "EASING",
+            "DIAGONAL",
+            "SPHERICAL",
+            "QUADRATIC_SPHERE",
+            "RADIAL",
         ]),
         "use_flip_axis" => Some(&["HORIZONTAL", "VERTICAL"]),
         "stucci_type" => Some(&["PLASTIC", "WALL_IN", "WALL_OUT"]),
@@ -439,15 +529,24 @@ fn validate_legacy_settings(
     for (key, value) in settings {
         if let Some(values) = enum_values(key) {
             if !value.as_str().is_some_and(|value| values.contains(&value)) {
-                return Err(record_error(id, format!("`{key}` is not a valid Blender enum value")));
+                return Err(record_error(
+                    id,
+                    format!("`{key}` is not a valid Blender enum value"),
+                ));
             }
         } else if key == "noise_depth" {
             if !value.as_u64().is_some_and(|depth| depth <= 30) {
-                return Err(record_error(id, "`noise_depth` must be an integer from 0 through 30"));
+                return Err(record_error(
+                    id,
+                    "`noise_depth` must be an integer from 0 through 30",
+                ));
             }
         } else if let Some(number) = value.as_f64().filter(|number| number.is_finite()) {
             if number.abs() > f64::from(f32::MAX) {
-                return Err(record_error(id, format!("`{key}` exceeds Blender's float range")));
+                return Err(record_error(
+                    id,
+                    format!("`{key}` exceeds Blender's float range"),
+                ));
             }
             if key == "noise_scale" && number < 0.0001 {
                 return Err(record_error(id, "`noise_scale` must be at least 0.0001"));
@@ -468,13 +567,22 @@ fn validate_legacy_settings(
 fn validate_image_settings(id: &str, settings: &Map<String, Value>) -> Result<()> {
     for (key, value) in settings {
         let valid = match key.as_str() {
-            "use_interpolation" | "use_flip_axis" | "use_alpha" | "use_calculate_alpha"
-            | "invert_alpha" | "use_mirror_x" | "use_mirror_y" | "use_checker_odd"
-            | "use_checker_even" | "use_clamp" | "use_color_ramp" => value.is_boolean(),
-            "extension" => enum_values(key).is_some_and(|values| {
-                value.as_str().is_some_and(|value| values.contains(&value))
-            }),
-            "repeat_x" | "repeat_y" => value.as_u64().is_some_and(|repeat| (1..=512).contains(&repeat)),
+            "use_interpolation"
+            | "use_flip_axis"
+            | "use_alpha"
+            | "use_calculate_alpha"
+            | "invert_alpha"
+            | "use_mirror_x"
+            | "use_mirror_y"
+            | "use_checker_odd"
+            | "use_checker_even"
+            | "use_clamp"
+            | "use_color_ramp" => value.is_boolean(),
+            "extension" => enum_values(key)
+                .is_some_and(|values| value.as_str().is_some_and(|value| values.contains(&value))),
+            "repeat_x" | "repeat_y" => value
+                .as_u64()
+                .is_some_and(|repeat| (1..=512).contains(&repeat)),
             "filter_size" => image_number_in_range(value, 0.1, 50.0),
             "checker_distance" => image_number_in_range(value, 0.0, 0.99),
             "crop_min_x" | "crop_min_y" | "crop_max_x" | "crop_max_y" => {
@@ -489,7 +597,10 @@ fn validate_image_settings(id: &str, settings: &Map<String, Value>) -> Result<()
             _ => false,
         };
         if !valid {
-            return Err(record_error(id, format!("`{key}` is not a valid Blender IMAGE setting")));
+            return Err(record_error(
+                id,
+                format!("`{key}` is not a valid Blender IMAGE setting"),
+            ));
         }
     }
     if let Some(value) = settings.get("color_ramp") {
@@ -519,14 +630,21 @@ fn parse_color_ramp(id: &str, object: &Map<String, Value>) -> Result<ColorRamp> 
             "elements" | "interpolation" | "color_mode" | "hue_interpolation"
         )
     }) {
-        return Err(record_error(id, format!("color_ramp field `{key}` is not defined")));
+        return Err(record_error(
+            id,
+            format!("color_ramp field `{key}` is not defined"),
+        ));
     }
     let elements = object
         .get("elements")
         .and_then(Value::as_array)
         .filter(|elements| (1..=32).contains(&elements.len()))
         .ok_or_else(|| record_error(id, "`color_ramp.elements` must contain 1 through 32 stops"))?;
-    let interpolation = match object.get("interpolation").and_then(Value::as_str).unwrap_or("LINEAR") {
+    let interpolation = match object
+        .get("interpolation")
+        .and_then(Value::as_str)
+        .unwrap_or("LINEAR")
+    {
         "LINEAR" => RampInterpolation::Linear,
         "EASE" => RampInterpolation::Ease,
         "B_SPLINE" => RampInterpolation::BSpline,
@@ -534,7 +652,11 @@ fn parse_color_ramp(id: &str, object: &Map<String, Value>) -> Result<ColorRamp> 
         "CONSTANT" => RampInterpolation::Constant,
         _ => return Err(record_error(id, "color_ramp interpolation is invalid")),
     };
-    let color_mode = match object.get("color_mode").and_then(Value::as_str).unwrap_or("RGB") {
+    let color_mode = match object
+        .get("color_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("RGB")
+    {
         "RGB" => RampColorMode::Rgb,
         "HSV" => RampColorMode::Hsv,
         "HSL" => RampColorMode::Hsl,
@@ -562,10 +684,14 @@ fn parse_color_ramp(id: &str, object: &Map<String, Value>) -> Result<ColorRamp> 
         let element = element
             .as_object()
             .ok_or_else(|| record_error(id, "color_ramp elements must be objects"))?;
-        if let Some(key) = element.keys().find(|key| {
-            !matches!(key.as_str(), "position" | "pos" | "color")
-        }) {
-            return Err(record_error(id, format!("color_ramp element field `{key}` is not defined")));
+        if let Some(key) = element
+            .keys()
+            .find(|key| !matches!(key.as_str(), "position" | "pos" | "color"))
+        {
+            return Err(record_error(
+                id,
+                format!("color_ramp element field `{key}` is not defined"),
+            ));
         }
         let position = element
             .get("position")
@@ -575,7 +701,10 @@ fn parse_color_ramp(id: &str, object: &Map<String, Value>) -> Result<ColorRamp> 
             .map(|position| position as f32)
             .ok_or_else(|| record_error(id, "color_ramp stop position must be in [0, 1]"))?;
         if position < previous_position {
-            return Err(record_error(id, "color_ramp stop positions must be ordered"));
+            return Err(record_error(
+                id,
+                "color_ramp stop positions must be ordered",
+            ));
         }
         previous_position = position;
         let color = element
@@ -591,7 +720,10 @@ fn parse_color_ramp(id: &str, object: &Map<String, Value>) -> Result<ColorRamp> 
                 .map(|value| value as f32)
                 .ok_or_else(|| record_error(id, "color_ramp stop channels must be finite"))?;
         }
-        ramp.stops[index] = RampStop { position, color: rgba };
+        ramp.stops[index] = RampStop {
+            position,
+            color: rgba,
+        };
     }
     Ok(ramp)
 }
@@ -605,31 +737,72 @@ fn parse_image_settings(settings: &Map<String, Value>) -> Result<ImageSamplerSet
         "CHECKER" => ImageExtension::Checker,
         _ => ImageExtension::Repeat,
     };
-    parsed.interpolation = settings.get("use_interpolation").and_then(Value::as_bool).unwrap_or(true);
+    parsed.interpolation = settings
+        .get("use_interpolation")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     parsed.filter_size = setting_f32(settings, "filter_size", 1.0);
-    parsed.flip_axis = settings.get("use_flip_axis").and_then(Value::as_bool).unwrap_or(false);
-    parsed.repeat_x = settings.get("repeat_x").and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()).unwrap_or(1);
-    parsed.repeat_y = settings.get("repeat_y").and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()).unwrap_or(1);
-    parsed.mirror_x = settings.get("use_mirror_x").and_then(Value::as_bool).unwrap_or(false);
-    parsed.mirror_y = settings.get("use_mirror_y").and_then(Value::as_bool).unwrap_or(false);
-    parsed.checker_odd = settings.get("use_checker_odd").and_then(Value::as_bool).unwrap_or(true);
-    parsed.checker_even = settings.get("use_checker_even").and_then(Value::as_bool).unwrap_or(false);
+    parsed.flip_axis = settings
+        .get("use_flip_axis")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    parsed.repeat_x = settings
+        .get("repeat_x")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(1);
+    parsed.repeat_y = settings
+        .get("repeat_y")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(1);
+    parsed.mirror_x = settings
+        .get("use_mirror_x")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    parsed.mirror_y = settings
+        .get("use_mirror_y")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    parsed.checker_odd = settings
+        .get("use_checker_odd")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    parsed.checker_even = settings
+        .get("use_checker_even")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     parsed.checker_distance = setting_f32(settings, "checker_distance", 0.0);
     parsed.crop_min_x = setting_f32(settings, "crop_min_x", 0.0);
     parsed.crop_min_y = setting_f32(settings, "crop_min_y", 0.0);
     parsed.crop_max_x = setting_f32(settings, "crop_max_x", 1.0);
     parsed.crop_max_y = setting_f32(settings, "crop_max_y", 1.0);
-    parsed.use_alpha = settings.get("use_alpha").and_then(Value::as_bool).unwrap_or(true);
-    parsed.calculate_alpha = settings.get("use_calculate_alpha").and_then(Value::as_bool).unwrap_or(false);
-    parsed.invert_alpha = settings.get("invert_alpha").and_then(Value::as_bool).unwrap_or(false);
+    parsed.use_alpha = settings
+        .get("use_alpha")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    parsed.calculate_alpha = settings
+        .get("use_calculate_alpha")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    parsed.invert_alpha = settings
+        .get("invert_alpha")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     parsed.brightness = setting_f32(settings, "brightness", 1.0);
     parsed.contrast = setting_f32(settings, "contrast", 1.0);
     parsed.saturation = setting_f32(settings, "saturation", 1.0);
     parsed.factor_red = setting_f32(settings, "factor_red", 1.0);
     parsed.factor_green = setting_f32(settings, "factor_green", 1.0);
     parsed.factor_blue = setting_f32(settings, "factor_blue", 1.0);
-    parsed.use_clamp = settings.get("use_clamp").and_then(Value::as_bool).unwrap_or(false);
-    parsed.use_color_ramp = settings.get("use_color_ramp").and_then(Value::as_bool).unwrap_or(false);
+    parsed.use_clamp = settings
+        .get("use_clamp")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    parsed.use_color_ramp = settings
+        .get("use_color_ramp")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if let Some(ramp) = settings.get("color_ramp").and_then(Value::as_object) {
         parsed.color_ramp = parse_color_ramp("texture", ramp)?;
     }
@@ -750,7 +923,10 @@ pub(crate) fn parse_record(id: &str, value: &Value) -> Result<LegacyTexture> {
             "storage" | "kind" | "texture_type" | "image" | "settings"
         )
     }) {
-        return Err(record_error(id, format!("record field `{key}` is not defined")));
+        return Err(record_error(
+            id,
+            format!("record field `{key}` is not defined"),
+        ));
     }
     let texture_type = object
         .get("texture_type")
@@ -764,7 +940,12 @@ pub(crate) fn parse_record(id: &str, value: &Value) -> Result<LegacyTexture> {
         ("IMAGE", Some(Value::Null)) => None,
         ("IMAGE", Some(_)) => return Err(record_error(id, "`image` must be an image ID or null")),
         ("IMAGE", None) => return Err(record_error(id, "IMAGE texture requires an `image` field")),
-        (_, Some(_)) => return Err(record_error(id, "only IMAGE textures may have an image field")),
+        (_, Some(_)) => {
+            return Err(record_error(
+                id,
+                "only IMAGE textures may have an image field",
+            ));
+        }
         (_, None) => None,
     };
     let settings = match object.get("settings") {
@@ -773,7 +954,10 @@ pub(crate) fn parse_record(id: &str, value: &Value) -> Result<LegacyTexture> {
         Some(_) => return Err(record_error(id, "settings must be an object")),
     };
     if !LEGACY_TEXTURE_TYPES.contains(&texture_type) {
-        return Err(record_error(id, format!("unknown legacy texture type `{texture_type}`")));
+        return Err(record_error(
+            id,
+            format!("unknown legacy texture type `{texture_type}`"),
+        ));
     }
     validate_legacy_settings(id, texture_type, &settings)?;
     match texture_type {
@@ -807,8 +991,7 @@ pub(crate) fn validate_record(id: &Id, value: &Value) -> Result<()> {
 /// Validates a record and its image reference without loading the image pixels.
 pub(crate) fn validate_record_in_scene(doc: &SceneDoc, id: &Id, value: &Value) -> Result<()> {
     if let LegacyTexture::ImageRecord {
-        image: Some(image),
-        ..
+        image: Some(image), ..
     } = parse_record(&id.to_string(), value)?
     {
         if !doc.images.contains_key(&image) {
@@ -863,15 +1046,29 @@ pub(crate) fn record_value(texture: &LegacyTexture) -> Value {
 
 fn default_settings(texture_type: &str) -> Map<String, Value> {
     let defaults = match texture_type {
-        "CLOUDS" => json!({"noise_scale":0.25,"noise_depth":2,"noise_basis":"BLENDER_ORIGINAL","noise_type":"SOFT_NOISE","cloud_type":"GRAYSCALE"}),
-        "MARBLE" => json!({"noise_scale":0.25,"turbulence":5.0,"noise_depth":2,"noise_type":"SOFT_NOISE","marble_type":"SOFT","noise_basis":"BLENDER_ORIGINAL","noise_basis_2":"SIN"}),
-        "WOOD" => json!({"noise_scale":0.25,"turbulence":5.0,"noise_basis":"BLENDER_ORIGINAL","noise_type":"SOFT_NOISE","wood_type":"BANDS","noise_basis_2":"SIN"}),
+        "CLOUDS" => {
+            json!({"noise_scale":0.25,"noise_depth":2,"noise_basis":"BLENDER_ORIGINAL","noise_type":"SOFT_NOISE","cloud_type":"GRAYSCALE"})
+        }
+        "MARBLE" => {
+            json!({"noise_scale":0.25,"turbulence":5.0,"noise_depth":2,"noise_type":"SOFT_NOISE","marble_type":"SOFT","noise_basis":"BLENDER_ORIGINAL","noise_basis_2":"SIN"})
+        }
+        "WOOD" => {
+            json!({"noise_scale":0.25,"turbulence":5.0,"noise_basis":"BLENDER_ORIGINAL","noise_type":"SOFT_NOISE","wood_type":"BANDS","noise_basis_2":"SIN"})
+        }
         "MAGIC" => json!({"turbulence":5.0,"noise_depth":2}),
         "BLEND" => json!({"progression":"LINEAR","use_flip_axis":"HORIZONTAL"}),
-        "STUCCI" => json!({"turbulence":5.0,"noise_basis":"BLENDER_ORIGINAL","noise_scale":0.25,"noise_type":"SOFT_NOISE","stucci_type":"PLASTIC"}),
-        "DISTORTED_NOISE" => json!({"distortion":1.0,"noise_scale":0.25,"noise_basis":"BLENDER_ORIGINAL","noise_distortion":"BLENDER_ORIGINAL"}),
-        "VORONOI" => json!({"weight_1":1.0,"weight_2":0.0,"weight_3":0.0,"weight_4":0.0,"minkovsky_exponent":2.5,"distance_metric":"DISTANCE","color_mode":"INTENSITY","noise_intensity":1.0,"noise_scale":0.25}),
-        "MUSGRAVE" => json!({"musgrave_type":"MULTIFRACTAL","dimension_max":1.0,"lacunarity":2.0,"octaves":2.0,"offset":1.0,"gain":1.0,"noise_intensity":1.0,"noise_scale":0.25,"noise_basis":"BLENDER_ORIGINAL"}),
+        "STUCCI" => {
+            json!({"turbulence":5.0,"noise_basis":"BLENDER_ORIGINAL","noise_scale":0.25,"noise_type":"SOFT_NOISE","stucci_type":"PLASTIC"})
+        }
+        "DISTORTED_NOISE" => {
+            json!({"distortion":1.0,"noise_scale":0.25,"noise_basis":"BLENDER_ORIGINAL","noise_distortion":"BLENDER_ORIGINAL"})
+        }
+        "VORONOI" => {
+            json!({"weight_1":1.0,"weight_2":0.0,"weight_3":0.0,"weight_4":0.0,"minkovsky_exponent":2.5,"distance_metric":"DISTANCE","color_mode":"INTENSITY","noise_intensity":1.0,"noise_scale":0.25})
+        }
+        "MUSGRAVE" => {
+            json!({"musgrave_type":"MULTIFRACTAL","dimension_max":1.0,"lacunarity":2.0,"octaves":2.0,"offset":1.0,"gain":1.0,"noise_intensity":1.0,"noise_scale":0.25,"noise_basis":"BLENDER_ORIGINAL"})
+        }
         "IMAGE" => json!({
             "use_interpolation":true,"filter_size":1.0,"use_flip_axis":false,"use_alpha":true,
             "use_calculate_alpha":false,"invert_alpha":false,"extension":"REPEAT","repeat_x":1,
@@ -910,12 +1107,13 @@ pub(crate) fn migrate_legacy_volume_noise_sentinel(doc: &mut SceneDoc) -> Result
     if !has_sentinel {
         return Ok(false);
     }
-    let existing = doc.resources.iter().find_map(|(id, value)| {
-        match parse_record(&id.to_string(), value) {
-            Ok(LegacyTexture::NativeValueNoise) => Some(id.clone()),
-            _ => None,
-        }
-    });
+    let existing =
+        doc.resources
+            .iter()
+            .find_map(|(id, value)| match parse_record(&id.to_string(), value) {
+                Ok(LegacyTexture::NativeValueNoise) => Some(id.clone()),
+                _ => None,
+            });
     let (resource_id, insert_record) = if let Some(id) = existing {
         (id, false)
     } else {
@@ -939,8 +1137,10 @@ pub(crate) fn migrate_legacy_volume_noise_sentinel(doc: &mut SceneDoc) -> Result
         }
     };
     if insert_record {
-        doc.resources
-            .insert(resource_id.clone(), record_value(&LegacyTexture::NativeValueNoise));
+        doc.resources.insert(
+            resource_id.clone(),
+            record_value(&LegacyTexture::NativeValueNoise),
+        );
     }
     let texture_id = Value::String(resource_id.to_string());
     for node in doc.nodes.values_mut() {
@@ -948,14 +1148,14 @@ pub(crate) fn migrate_legacy_volume_noise_sentinel(doc: &mut SceneDoc) -> Result
             if modifier.modifier_type == "volume_displace"
                 && modifier.params.get("texture").and_then(Value::as_str) == Some("noise")
             {
-                modifier.params.insert("texture".to_owned(), texture_id.clone());
+                modifier
+                    .params
+                    .insert("texture".to_owned(), texture_id.clone());
             }
         }
     }
     Ok(true)
 }
-
-
 
 /// The canonical record for `texture_type` with `settings` merged over `base` (when present).
 ///
@@ -985,7 +1185,9 @@ pub(crate) fn merged_record(
         "settings": merged,
     });
     if texture_type == "IMAGE" {
-        record["image"] = image.map(|image| json!(image.to_string())).unwrap_or(Value::Null);
+        record["image"] = image
+            .map(|image| json!(image.to_string()))
+            .unwrap_or(Value::Null);
     }
     let texture = parse_record(id, &record)?;
     Ok(record_value(&texture))
@@ -1299,7 +1501,8 @@ fn image_pixel(
     column: i64,
     settings: &ImageSamplerSettings,
 ) -> Result<[f32; 4]> {
-    let row = usize::try_from(row).map_err(|_| invalid_image_sample("image texture row is invalid"))?;
+    let row =
+        usize::try_from(row).map_err(|_| invalid_image_sample("image texture row is invalid"))?;
     let column = usize::try_from(column)
         .map_err(|_| invalid_image_sample("image texture column is invalid"))?;
     let index = row
@@ -1678,19 +1881,19 @@ fn sample_image(
     coords: DVec3,
     settings: &ImageSamplerSettings,
 ) -> Result<TextureResult> {
-    if image.width == 0
-        && image.height == 0
-        && image.pixels.is_empty()
-        && image.tiles.is_empty()
-    {
+    if image.width == 0 && image.height == 0 && image.pixels.is_empty() && image.tiles.is_empty() {
         return Ok(empty_image_sample(settings));
     }
     if !coords.is_finite() {
-        return Err(invalid_image_sample("image texture coordinates must be finite"));
+        return Err(invalid_image_sample(
+            "image texture coordinates must be finite",
+        ));
     }
     let (mut fx, mut fy, fz) = (coords.x as f32, coords.y as f32, coords.z as f32);
     if !fx.is_finite() || !fy.is_finite() || !fz.is_finite() {
-        return Err(invalid_image_sample("image texture coordinates exceed Blender's float range"));
+        return Err(invalid_image_sample(
+            "image texture coordinates exceed Blender's float range",
+        ));
     }
     fx = (fx + 1.0) / 2.0;
     fy = (fy + 1.0) / 2.0;
@@ -1711,7 +1914,10 @@ fn sample_image(
         let v = floor_to_texture_i64(fy)
             .ok_or_else(|| invalid_image_sample("UDIM V coordinate is out of range"))?;
         let tile_number = i64::from(1001_u32)
-            .checked_add(v.checked_mul(10).ok_or_else(|| invalid_image_sample("UDIM tile number overflows"))?)
+            .checked_add(
+                v.checked_mul(10)
+                    .ok_or_else(|| invalid_image_sample("UDIM tile number overflows"))?,
+            )
             .and_then(|number| number.checked_add(u))
             .and_then(|number| u32::try_from(number).ok());
         let Some(tile_number) = tile_number else {
@@ -1735,7 +1941,9 @@ fn sample_image(
     let height = usize::try_from(height_px)
         .map_err(|_| invalid_image_sample("image texture height exceeds addressable memory"))?;
     if width == 0 || height == 0 || width.checked_mul(height) != Some(pixels.len()) {
-        return Err(invalid_image_sample("image texture dimensions do not match its pixels"));
+        return Err(invalid_image_sample(
+            "image texture dimensions do not match its pixels",
+        ));
     }
     if settings.extension == ImageExtension::Checker {
         let tile_x = floor_to_texture_i64(fx)
@@ -1787,18 +1995,16 @@ fn sample_image(
         let adjusted_x = fx - (raw_x - x) as f32 / width_float;
         let adjusted_y = fy - (raw_y - y) as f32 / height_float;
         filtered_image_pixels(
-            pixels,
-            width,
-            width_px,
-            height_px,
-            adjusted_x,
-            adjusted_y,
-            settings,
+            pixels, width, width_px, height_px, adjusted_x, adjusted_y, settings,
         )?
     } else {
         let texel = image_pixel(pixels, width, y, x, settings)?;
         let rgb = if alpha_active {
-            [texel[0] * texel[3], texel[1] * texel[3], texel[2] * texel[3]]
+            [
+                texel[0] * texel[3],
+                texel[1] * texel[3],
+                texel[2] * texel[3],
+            ]
         } else {
             [texel[0], texel[1], texel[2]]
         };
@@ -1812,16 +2018,19 @@ fn sample_image(
     } else {
         1.0
     };
-    let mut alpha = if settings.invert_alpha { 1.0 - tint } else { tint };
+    let mut alpha = if settings.invert_alpha {
+        1.0 - tint
+    } else {
+        tint
+    };
     if alpha_active && alpha != 1.0 && alpha > 1e-4 {
         rgb = rgb.map(|value| value / alpha);
     }
-    rgb[0] = settings.factor_red
-        * ((rgb[0] - 0.5) * settings.contrast + settings.brightness - 0.5);
-    rgb[1] = settings.factor_green
-        * ((rgb[1] - 0.5) * settings.contrast + settings.brightness - 0.5);
-    rgb[2] = settings.factor_blue
-        * ((rgb[2] - 0.5) * settings.contrast + settings.brightness - 0.5);
+    rgb[0] = settings.factor_red * ((rgb[0] - 0.5) * settings.contrast + settings.brightness - 0.5);
+    rgb[1] =
+        settings.factor_green * ((rgb[1] - 0.5) * settings.contrast + settings.brightness - 0.5);
+    rgb[2] =
+        settings.factor_blue * ((rgb[2] - 0.5) * settings.contrast + settings.brightness - 0.5);
     if settings.use_clamp {
         rgb = rgb.map(|value| value.max(0.0));
     }
@@ -1989,12 +2198,7 @@ fn lerp_rgba(first: [f32; 4], second: [f32; 4], factor: f32) -> [f32; 4] {
     std::array::from_fn(|index| first[index] + (second[index] - first[index]) * factor)
 }
 
-fn interpolate_hue(
-    first: f32,
-    second: f32,
-    factor: f32,
-    mode: RampHueInterpolation,
-) -> f32 {
+fn interpolate_hue(first: f32, second: f32, factor: f32, mode: RampHueInterpolation) -> f32 {
     let first = first.rem_euclid(1.0);
     let second = second.rem_euclid(1.0);
     let mut from = first;
@@ -2114,7 +2318,8 @@ const fn decode_u8_table<const N: usize>(hex: &str) -> [u8; N] {
     let mut output = [0_u8; N];
     let mut index = 0;
     while index < N {
-        output[index] = ((hex_digit(bytes[index * 2]) << 4) | hex_digit(bytes[index * 2 + 1])) as u8;
+        output[index] =
+            ((hex_digit(bytes[index * 2]) << 4) | hex_digit(bytes[index * 2 + 1])) as u8;
         index += 1;
     }
     output
@@ -2433,10 +2638,13 @@ fn noise_hash(x: i32, y: i32, z: i32) -> usize {
     (hash_value(yi).wrapping_add(x as usize)) & 255
 }
 
-
 fn hash_point(x: i32, y: i32, z: i32) -> [f32; 3] {
     let index = noise_hash(x, y, z) * 3;
-    [table_float(&HASHPOINT, index), table_float(&HASHPOINT, index + 1), table_float(&HASHPOINT, index + 2)]
+    [
+        table_float(&HASHPOINT, index),
+        table_float(&HASHPOINT, index + 1),
+        table_float(&HASHPOINT, index + 2),
+    ]
 }
 
 fn org_blender_noise(x: f32, y: f32, z: f32) -> f32 {
@@ -2456,7 +2664,8 @@ fn org_blender_noise(x: f32, y: f32, z: f32) -> f32 {
     let b00 = hash_value(hash_value((ix & 255) as usize).wrapping_add((iy & 255) as usize));
     let b10 = hash_value(hash_value(((ix + 1) & 255) as usize).wrapping_add((iy & 255) as usize));
     let b01 = hash_value(hash_value((ix & 255) as usize).wrapping_add(((iy + 1) & 255) as usize));
-    let b11 = hash_value(hash_value(((ix + 1) & 255) as usize).wrapping_add(((iy + 1) & 255) as usize));
+    let b11 =
+        hash_value(hash_value(((ix + 1) & 255) as usize).wrapping_add(((iy + 1) & 255) as usize));
     let b20 = (iz & 255) as usize;
     let b21 = ((iz + 1) & 255) as usize;
     let mut value = 0.5_f32;
@@ -2491,14 +2700,24 @@ fn noise_fade(t: f32) -> f32 {
 fn noise_gradient(hash: usize, x: f32, y: f32, z: f32) -> f32 {
     let h = (hash & 15) as i32;
     let u = if h < 8 { x } else { y };
-    let v = if h < 4 { y } else if h == 12 || h == 14 { x } else { z };
+    let v = if h < 4 {
+        y
+    } else if h == 12 || h == 14 {
+        x
+    } else {
+        z
+    };
     (if h & 1 == 0 { u } else { -u }) + (if h & 2 == 0 { v } else { -v })
 }
 
 fn improved_perlin(x: f32, y: f32, z: f32) -> f32 {
     let floor = [x.floor(), y.floor(), z.floor()];
     let frac = [x - floor[0], y - floor[1], z - floor[2]];
-    let xyz = [(floor[0] as i32 & 255) as usize, (floor[1] as i32 & 255) as usize, (floor[2] as i32 & 255) as usize];
+    let xyz = [
+        (floor[0] as i32 & 255) as usize,
+        (floor[1] as i32 & 255) as usize,
+        (floor[2] as i32 & 255) as usize,
+    ];
     let (x, y, z) = (frac[0], frac[1], frac[2]);
     let (u, v, w) = (noise_fade(x), noise_fade(y), noise_fade(z));
     let a = hash_value(xyz[0]) + xyz[1];
@@ -2507,13 +2726,35 @@ fn improved_perlin(x: f32, y: f32, z: f32) -> f32 {
     let b = hash_value(xyz[0] + 1) + xyz[1];
     let ba = hash_value(b) + xyz[2];
     let bb = hash_value(b + 1) + xyz[2];
-    lerp_noise(w,
-        lerp_noise(v,
-            lerp_noise(u, noise_gradient(hash_value(aa),x,y,z), noise_gradient(hash_value(ba),x-1.0,y,z)),
-            lerp_noise(u, noise_gradient(hash_value(ab),x,y-1.0,z), noise_gradient(hash_value(bb),x-1.0,y-1.0,z))),
-        lerp_noise(v,
-            lerp_noise(u, noise_gradient(hash_value(aa+1),x,y,z-1.0), noise_gradient(hash_value(ba+1),x-1.0,y,z-1.0)),
-            lerp_noise(u, noise_gradient(hash_value(ab+1),x,y-1.0,z-1.0), noise_gradient(hash_value(bb+1),x-1.0,y-1.0,z-1.0))))
+    lerp_noise(
+        w,
+        lerp_noise(
+            v,
+            lerp_noise(
+                u,
+                noise_gradient(hash_value(aa), x, y, z),
+                noise_gradient(hash_value(ba), x - 1.0, y, z),
+            ),
+            lerp_noise(
+                u,
+                noise_gradient(hash_value(ab), x, y - 1.0, z),
+                noise_gradient(hash_value(bb), x - 1.0, y - 1.0, z),
+            ),
+        ),
+        lerp_noise(
+            v,
+            lerp_noise(
+                u,
+                noise_gradient(hash_value(aa + 1), x, y, z - 1.0),
+                noise_gradient(hash_value(ba + 1), x - 1.0, y, z - 1.0),
+            ),
+            lerp_noise(
+                u,
+                noise_gradient(hash_value(ab + 1), x, y - 1.0, z - 1.0),
+                noise_gradient(hash_value(bb + 1), x - 1.0, y - 1.0, z - 1.0),
+            ),
+        ),
+    )
 }
 
 fn original_perlin(x: f32, y: f32, z: f32) -> f32 {
@@ -2529,60 +2770,128 @@ fn original_perlin(x: f32, y: f32, z: f32) -> f32 {
         relative0[axis] = t - t.floor();
         relative1[axis] = relative0[axis] - 1.0;
     }
-    let mut bx0 = [0_usize;3];
-    let mut bx1 = [0_usize;3];
-    for axis in 0..3 { bx0[axis]=base[axis] as usize; bx1[axis]=next[axis] as usize; }
+    let mut bx0 = [0_usize; 3];
+    let mut bx1 = [0_usize; 3];
+    for axis in 0..3 {
+        bx0[axis] = base[axis] as usize;
+        bx1[axis] = next[axis] as usize;
+    }
     let p = &PERLIN_PERM;
-    let i=usize::from(p.get(bx0[0]).copied().unwrap_or(0));
-    let j=usize::from(p.get(bx1[0]).copied().unwrap_or(0));
-    let b00=usize::from(p.get(i+bx0[1]).copied().unwrap_or(0));
-    let b10=usize::from(p.get(j+bx0[1]).copied().unwrap_or(0));
-    let b01=usize::from(p.get(i+bx1[1]).copied().unwrap_or(0));
-    let b11=usize::from(p.get(j+bx1[1]).copied().unwrap_or(0));
-    let rx0=relative0[0]; let rx1=relative1[0]; let ry0=relative0[1]; let ry1=relative1[1]; let rz0=relative0[2]; let rz1=relative1[2];
-    let gdot=|index:usize,rx:f32,ry:f32,rz:f32| -> f32 {
-        table_float(&PERLIN_GRAD,index*3)*rx+table_float(&PERLIN_GRAD,index*3+1)*ry+table_float(&PERLIN_GRAD,index*3+2)*rz
+    let i = usize::from(p.get(bx0[0]).copied().unwrap_or(0));
+    let j = usize::from(p.get(bx1[0]).copied().unwrap_or(0));
+    let b00 = usize::from(p.get(i + bx0[1]).copied().unwrap_or(0));
+    let b10 = usize::from(p.get(j + bx0[1]).copied().unwrap_or(0));
+    let b01 = usize::from(p.get(i + bx1[1]).copied().unwrap_or(0));
+    let b11 = usize::from(p.get(j + bx1[1]).copied().unwrap_or(0));
+    let rx0 = relative0[0];
+    let rx1 = relative1[0];
+    let ry0 = relative0[1];
+    let ry1 = relative1[1];
+    let rz0 = relative0[2];
+    let rz1 = relative1[2];
+    let gdot = |index: usize, rx: f32, ry: f32, rz: f32| -> f32 {
+        table_float(&PERLIN_GRAD, index * 3) * rx
+            + table_float(&PERLIN_GRAD, index * 3 + 1) * ry
+            + table_float(&PERLIN_GRAD, index * 3 + 2) * rz
     };
-    let surf=|t:f32| t*t*(3.0-2.0*t);
-    let sx=surf(rx0); let sy=surf(ry0); let sz=surf(rz0);
-    let a=lerp_noise(sx,gdot(b00+bx0[2],rx0,ry0,rz0),gdot(b10+bx0[2],rx1,ry0,rz0));
-    let b=lerp_noise(sx,gdot(b01+bx0[2],rx0,ry1,rz0),gdot(b11+bx0[2],rx1,ry1,rz0));
-    let c=lerp_noise(sy,a,b);
-    let a=lerp_noise(sx,gdot(b00+bx1[2],rx0,ry0,rz1),gdot(b10+bx1[2],rx1,ry0,rz1));
-    let b=lerp_noise(sx,gdot(b01+bx1[2],rx0,ry1,rz1),gdot(b11+bx1[2],rx1,ry1,rz1));
-    1.5*lerp_noise(sz,c,lerp_noise(sy,a,b))
+    let surf = |t: f32| t * t * (3.0 - 2.0 * t);
+    let sx = surf(rx0);
+    let sy = surf(ry0);
+    let sz = surf(rz0);
+    let a = lerp_noise(
+        sx,
+        gdot(b00 + bx0[2], rx0, ry0, rz0),
+        gdot(b10 + bx0[2], rx1, ry0, rz0),
+    );
+    let b = lerp_noise(
+        sx,
+        gdot(b01 + bx0[2], rx0, ry1, rz0),
+        gdot(b11 + bx0[2], rx1, ry1, rz0),
+    );
+    let c = lerp_noise(sy, a, b);
+    let a = lerp_noise(
+        sx,
+        gdot(b00 + bx1[2], rx0, ry0, rz1),
+        gdot(b10 + bx1[2], rx1, ry0, rz1),
+    );
+    let b = lerp_noise(
+        sx,
+        gdot(b01 + bx1[2], rx0, ry1, rz1),
+        gdot(b11 + bx1[2], rx1, ry1, rz1),
+    );
+    1.5 * lerp_noise(sz, c, lerp_noise(sy, a, b))
 }
 
-fn voronoi_distance(dx:f32,dy:f32,dz:f32,metric:u8,exponent:f32)->f32 {
+fn voronoi_distance(dx: f32, dy: f32, dz: f32, metric: u8, exponent: f32) -> f32 {
     match metric {
-        1 => dx*dx+dy*dy+dz*dz,
-        2 => dx.abs()+dy.abs()+dz.abs(),
+        1 => dx * dx + dy * dy + dz * dz,
+        2 => dx.abs() + dy.abs() + dz.abs(),
         3 => dx.abs().max(dy.abs()).max(dz.abs()),
-        4 => { let d=dx.abs().sqrt()+dy.abs().sqrt()+dz.abs().sqrt(); d*d },
-        5 => { let x=dx*dx; let y=dy*dy; let z=dz*dz; (x*x+y*y+z*z).sqrt().sqrt() },
-        6 => (dx.abs().powf(exponent)+dy.abs().powf(exponent)+dz.abs().powf(exponent)).powf(1.0/exponent),
-        _ => (dx*dx+dy*dy+dz*dz).sqrt(),
+        4 => {
+            let d = dx.abs().sqrt() + dy.abs().sqrt() + dz.abs().sqrt();
+            d * d
+        }
+        5 => {
+            let x = dx * dx;
+            let y = dy * dy;
+            let z = dz * dz;
+            (x * x + y * y + z * z).sqrt().sqrt()
+        }
+        6 => (dx.abs().powf(exponent) + dy.abs().powf(exponent) + dz.abs().powf(exponent))
+            .powf(1.0 / exponent),
+        _ => (dx * dx + dy * dy + dz * dz).sqrt(),
     }
 }
 
-fn voronoi4(x:f32,y:f32,z:f32,metric:u8,exponent:f32)->([f32;4],[[f32;3];4]) {
-    let origin=[x.floor() as i32,y.floor() as i32,z.floor() as i32];
-    let mut distances=[1.0e10_f32;4]; let mut points=[[0.0_f32;3];4];
-    for xx in origin[0].saturating_sub(1)..=origin[0].saturating_add(1) { for yy in origin[1].saturating_sub(1)..=origin[1].saturating_add(1) { for zz in origin[2].saturating_sub(1)..=origin[2].saturating_add(1) {
-        let random=hash_point(xx,yy,zz); let point=[random[0]+xx as f32,random[1]+yy as f32,random[2]+zz as f32];
-        let distance=voronoi_distance(x-point[0],y-point[1],z-point[2],metric,exponent);
-        let mut slot=0_usize; while slot<4 && distance>=distances[slot] { slot+=1; }
-        if slot<4 { let mut shift=3; while shift>slot { distances[shift]=distances[shift-1]; points[shift]=points[shift-1]; shift-=1; } distances[slot]=distance; points[slot]=point; }
-    }}} (distances,points)
+fn voronoi4(x: f32, y: f32, z: f32, metric: u8, exponent: f32) -> ([f32; 4], [[f32; 3]; 4]) {
+    let origin = [x.floor() as i32, y.floor() as i32, z.floor() as i32];
+    let mut distances = [1.0e10_f32; 4];
+    let mut points = [[0.0_f32; 3]; 4];
+    for xx in origin[0].saturating_sub(1)..=origin[0].saturating_add(1) {
+        for yy in origin[1].saturating_sub(1)..=origin[1].saturating_add(1) {
+            for zz in origin[2].saturating_sub(1)..=origin[2].saturating_add(1) {
+                let random = hash_point(xx, yy, zz);
+                let point = [
+                    random[0] + xx as f32,
+                    random[1] + yy as f32,
+                    random[2] + zz as f32,
+                ];
+                let distance =
+                    voronoi_distance(x - point[0], y - point[1], z - point[2], metric, exponent);
+                let mut slot = 0_usize;
+                while slot < 4 && distance >= distances[slot] {
+                    slot += 1;
+                }
+                if slot < 4 {
+                    let mut shift = 3;
+                    while shift > slot {
+                        distances[shift] = distances[shift - 1];
+                        points[shift] = points[shift - 1];
+                        shift -= 1;
+                    }
+                    distances[slot] = distance;
+                    points[slot] = point;
+                }
+            }
+        }
+    }
+    (distances, points)
 }
 
-fn cell_noise_u(x:f32,y:f32,z:f32)->f32 {
-    let x=((x+0.000001)*1.00001).floor() as i32;
-    let y=((y+0.000001)*1.00001).floor() as i32;
-    let z=((z+0.000001)*1.00001).floor() as i32;
-    let mut n=(x as u32).wrapping_add((y as u32).wrapping_mul(1301)).wrapping_add((z as u32).wrapping_mul(314159));
+fn cell_noise_u(x: f32, y: f32, z: f32) -> f32 {
+    let x = ((x + 0.000001) * 1.00001).floor() as i32;
+    let y = ((y + 0.000001) * 1.00001).floor() as i32;
+    let z = ((z + 0.000001) * 1.00001).floor() as i32;
+    let mut n = (x as u32)
+        .wrapping_add((y as u32).wrapping_mul(1301))
+        .wrapping_add((z as u32).wrapping_mul(314159));
     n ^= n.wrapping_shl(13);
-    let inner=n.wrapping_mul(n).wrapping_mul(n).wrapping_mul(15731).wrapping_add(n.wrapping_mul(789221)).wrapping_add(1376312589);
+    let inner = n
+        .wrapping_mul(n)
+        .wrapping_mul(n)
+        .wrapping_mul(15731)
+        .wrapping_add(n.wrapping_mul(789221))
+        .wrapping_add(1376312589);
     inner as f32 / 4_294_967_296.0
 }
 
@@ -2641,7 +2950,11 @@ fn generic_noise(noise_size: f32, x: f32, y: f32, z: f32, hard: bool, basis: u8)
         z *= scale;
     }
     let value = noise_basis_unsigned(basis, x, y, z);
-    if hard { (2.0 * value - 1.0).abs() } else { value }
+    if hard {
+        (2.0 * value - 1.0).abs()
+    } else {
+        value
+    }
 }
 
 fn generic_turbulence(
@@ -2683,7 +2996,11 @@ fn generic_turbulence(
     sum * power / denominator
 }
 fn setting_f32(settings: &Map<String, Value>, key: &str, default: f32) -> f32 {
-    settings.get(key).and_then(Value::as_f64).map(|value| value as f32).unwrap_or(default)
+    settings
+        .get(key)
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or(default)
 }
 
 fn setting_text<'a>(settings: &'a Map<String, Value>, key: &str, default: &'a str) -> &'a str {
@@ -2710,7 +3027,11 @@ fn hard_noise(settings: &Map<String, Value>) -> bool {
 }
 
 fn noise_depth(settings: &Map<String, Value>) -> i32 {
-    settings.get("noise_depth").and_then(Value::as_i64).unwrap_or(2).clamp(0, 30) as i32
+    settings
+        .get("noise_depth")
+        .and_then(Value::as_i64)
+        .unwrap_or(2)
+        .clamp(0, 30) as i32
 }
 
 fn scalar_result(intensity: f32) -> TextureResult {
@@ -2733,14 +3054,15 @@ fn rgb_result(rgb: [f32; 3]) -> TextureResult {
     }
 }
 
-
 fn texture_waveform(kind: u8, value: f32) -> f32 {
     match kind {
         1 => {
             let period = 2.0 * std::f32::consts::PI;
             let turns = (value / period) as i32;
             let mut wrapped = value - turns as f32 * period;
-            if wrapped < 0.0 { wrapped += period; }
+            if wrapped < 0.0 {
+                wrapped += period;
+            }
             wrapped / period
         }
         2 => {
@@ -2767,86 +3089,221 @@ fn sample_procedural(
     let (x, y, z) = (point[0], point[1], point[2]);
     match settings.kind {
         0 => {
-            let red = generic_turbulence(settings.noise_size,x,y,z,settings.depth,settings.hard_noise,settings.basis);
+            let red = generic_turbulence(
+                settings.noise_size,
+                x,
+                y,
+                z,
+                settings.depth,
+                settings.hard_noise,
+                settings.basis,
+            );
             if settings.cloud_color {
                 Ok(rgb_result([
                     red,
-                    generic_turbulence(settings.noise_size,y,x,z,settings.depth,settings.hard_noise,settings.basis),
-                    generic_turbulence(settings.noise_size,y,z,x,settings.depth,settings.hard_noise,settings.basis),
+                    generic_turbulence(
+                        settings.noise_size,
+                        y,
+                        x,
+                        z,
+                        settings.depth,
+                        settings.hard_noise,
+                        settings.basis,
+                    ),
+                    generic_turbulence(
+                        settings.noise_size,
+                        y,
+                        z,
+                        x,
+                        settings.depth,
+                        settings.hard_noise,
+                        settings.basis,
+                    ),
                 ]))
-            } else { Ok(scalar_result(red)) }
+            } else {
+                Ok(scalar_result(red))
+            }
         }
         1 => {
-            let value=match settings.wood_type {
+            let value = match settings.wood_type {
                 1 | 3 => {
-                    let noise=if settings.wood_type==3 { settings.turbulence*generic_noise(settings.noise_size,x,y,z,settings.hard_noise,settings.basis) } else {0.0};
-                    texture_waveform(settings.basis_2,(x*x+y*y+z*z).sqrt()*20.0+noise)
+                    let noise = if settings.wood_type == 3 {
+                        settings.turbulence
+                            * generic_noise(
+                                settings.noise_size,
+                                x,
+                                y,
+                                z,
+                                settings.hard_noise,
+                                settings.basis,
+                            )
+                    } else {
+                        0.0
+                    };
+                    texture_waveform(
+                        settings.basis_2,
+                        (x * x + y * y + z * z).sqrt() * 20.0 + noise,
+                    )
                 }
                 2 => {
-                    let noise=settings.turbulence*generic_noise(settings.noise_size,x,y,z,settings.hard_noise,settings.basis);
-                    texture_waveform(settings.basis_2,(x+y+z)*10.0+noise)
+                    let noise = settings.turbulence
+                        * generic_noise(
+                            settings.noise_size,
+                            x,
+                            y,
+                            z,
+                            settings.hard_noise,
+                            settings.basis,
+                        );
+                    texture_waveform(settings.basis_2, (x + y + z) * 10.0 + noise)
                 }
-                _ => texture_waveform(settings.basis_2,(x+y+z)*10.0),
+                _ => texture_waveform(settings.basis_2, (x + y + z) * 10.0),
             };
             Ok(scalar_result(value))
         }
         2 => {
-            let noise=5.0*(x+y+z)+settings.turbulence*generic_turbulence(settings.noise_size,x,y,z,settings.depth,settings.hard_noise,settings.basis);
-            let mut value=texture_waveform(settings.basis_2,noise);
-            if settings.marble_type==1 {value=value.sqrt();}
-            else if settings.marble_type==2 {value=value.sqrt().sqrt();}
+            let noise = 5.0 * (x + y + z)
+                + settings.turbulence
+                    * generic_turbulence(
+                        settings.noise_size,
+                        x,
+                        y,
+                        z,
+                        settings.depth,
+                        settings.hard_noise,
+                        settings.basis,
+                    );
+            let mut value = texture_waveform(settings.basis_2, noise);
+            if settings.marble_type == 1 {
+                value = value.sqrt();
+            } else if settings.marble_type == 2 {
+                value = value.sqrt().sqrt();
+            }
             Ok(scalar_result(value))
         }
         3 => {
-            let mut depth=settings.depth;
-            let turbulence=settings.turbulence/5.0;
-            let mut px=((x+y+z)*5.0).sin();
-            let mut py=((-x+y-z)*5.0).cos();
-            let mut pz=-((-x-y+z)*5.0).cos();
-            if depth>0 {
-                px*=turbulence; py*=turbulence; pz*=turbulence;
-                py=-(px-py+pz).cos(); py*=turbulence; depth-=1;
-                if depth>0 {px=(px-py-pz).cos()*turbulence;depth-=1;}
-                if depth>0 {pz=(-px-py-pz).sin()*turbulence;depth-=1;}
-                if depth>0 {px=-(-px+py-pz).cos()*turbulence;depth-=1;}
-                if depth>0 {py=-(-px+py+pz).sin()*turbulence;depth-=1;}
-                if depth>0 {py=-(-px+py+pz).cos()*turbulence;depth-=1;}
-                if depth>0 {px=(px+py+pz).cos()*turbulence;depth-=1;}
-                if depth>0 {pz=(px+py-pz).sin()*turbulence;depth-=1;}
-                if depth>0 {px=-(-px-py+pz).cos()*turbulence;depth-=1;}
-                if depth>0 {py=(px-py+pz).sin()*-turbulence;}
+            let mut depth = settings.depth;
+            let turbulence = settings.turbulence / 5.0;
+            let mut px = ((x + y + z) * 5.0).sin();
+            let mut py = ((-x + y - z) * 5.0).cos();
+            let mut pz = -((-x - y + z) * 5.0).cos();
+            if depth > 0 {
+                px *= turbulence;
+                py *= turbulence;
+                pz *= turbulence;
+                py = -(px - py + pz).cos();
+                py *= turbulence;
+                depth -= 1;
+                if depth > 0 {
+                    px = (px - py - pz).cos() * turbulence;
+                    depth -= 1;
+                }
+                if depth > 0 {
+                    pz = (-px - py - pz).sin() * turbulence;
+                    depth -= 1;
+                }
+                if depth > 0 {
+                    px = -(-px + py - pz).cos() * turbulence;
+                    depth -= 1;
+                }
+                if depth > 0 {
+                    py = -(-px + py + pz).sin() * turbulence;
+                    depth -= 1;
+                }
+                if depth > 0 {
+                    py = -(-px + py + pz).cos() * turbulence;
+                    depth -= 1;
+                }
+                if depth > 0 {
+                    px = (px + py + pz).cos() * turbulence;
+                    depth -= 1;
+                }
+                if depth > 0 {
+                    pz = (px + py - pz).sin() * turbulence;
+                    depth -= 1;
+                }
+                if depth > 0 {
+                    px = -(-px - py + pz).cos() * turbulence;
+                    depth -= 1;
+                }
+                if depth > 0 {
+                    py = (px - py + pz).sin() * -turbulence;
+                }
             }
-            let divisor=if turbulence==0.0 {1.0} else {turbulence*2.0};
-            Ok(rgb_result([0.5-px/divisor,0.5-py/divisor,0.5-pz/divisor]))
+            let divisor = if turbulence == 0.0 {
+                1.0
+            } else {
+                turbulence * 2.0
+            };
+            Ok(rgb_result([
+                0.5 - px / divisor,
+                0.5 - py / divisor,
+                0.5 - pz / divisor,
+            ]))
         }
         4 => {
-            let first=generic_noise(settings.noise_size,x,y,z,settings.hard_noise,settings.basis);
-            let mut offset=settings.turbulence/200.0;
-            if settings.stucci_type!=0 {offset*=first*first;}
-            let mut value=generic_noise(settings.noise_size,x,y,z+offset,settings.hard_noise,settings.basis);
-            if settings.stucci_type==2 {value=1.0-value;}
+            let first = generic_noise(
+                settings.noise_size,
+                x,
+                y,
+                z,
+                settings.hard_noise,
+                settings.basis,
+            );
+            let mut offset = settings.turbulence / 200.0;
+            if settings.stucci_type != 0 {
+                offset *= first * first;
+            }
+            let mut value = generic_noise(
+                settings.noise_size,
+                x,
+                y,
+                z + offset,
+                settings.hard_noise,
+                settings.basis,
+            );
+            if settings.stucci_type == 2 {
+                value = 1.0 - value;
+            }
             Ok(scalar_result(value.max(0.0)))
         }
-        5 => sample_voronoi(settings,point),
+        5 => sample_voronoi(settings, point),
         6 => {
-            if settings.noise_size==0.0 {return Err(PotError::invalid_argument("distorted noise_scale must be nonzero"));}
-            let p=[x/settings.noise_size,y/settings.noise_size,z/settings.noise_size];
-            let amount=settings.distortion;
-            let rv=[
-                noise_basis_signed(settings.basis,p[0]+13.5,p[1]+13.5,p[2]+13.5)*amount,
-                noise_basis_signed(settings.basis,p[0],p[1],p[2])*amount,
-                noise_basis_signed(settings.basis,p[0]-13.5,p[1]-13.5,p[2]-13.5)*amount,
+            if settings.noise_size == 0.0 {
+                return Err(PotError::invalid_argument(
+                    "distorted noise_scale must be nonzero",
+                ));
+            }
+            let p = [
+                x / settings.noise_size,
+                y / settings.noise_size,
+                z / settings.noise_size,
             ];
-            Ok(scalar_result(noise_basis_signed(settings.basis_2,p[0]+rv[0],p[1]+rv[1],p[2]+rv[2])))
+            let amount = settings.distortion;
+            let rv = [
+                noise_basis_signed(settings.basis, p[0] + 13.5, p[1] + 13.5, p[2] + 13.5) * amount,
+                noise_basis_signed(settings.basis, p[0], p[1], p[2]) * amount,
+                noise_basis_signed(settings.basis, p[0] - 13.5, p[1] - 13.5, p[2] - 13.5) * amount,
+            ];
+            Ok(scalar_result(noise_basis_signed(
+                settings.basis_2,
+                p[0] + rv[0],
+                p[1] + rv[1],
+                p[2] + rv[2],
+            )))
         }
-        7 => sample_musgrave(settings,point),
+        7 => sample_musgrave(settings, point),
         8 => {
-            let random=rng.get_int32() as u32;
-            let mut value=(random>>29)&3;
-            let mut shift=29_i32;
-            let mut divisor=3.0_f32;
-            for _ in 0..settings.depth { shift-=2; value=value.wrapping_mul((random>>(shift as u32))&3); divisor*=3.0; }
-            Ok(scalar_result(value as f32/divisor))
+            let random = rng.get_int32() as u32;
+            let mut value = (random >> 29) & 3;
+            let mut shift = 29_i32;
+            let mut divisor = 3.0_f32;
+            for _ in 0..settings.depth {
+                shift -= 2;
+                value = value.wrapping_mul((random >> (shift as u32)) & 3);
+                divisor *= 3.0;
+            }
+            Ok(scalar_result(value as f32 / divisor))
         }
         _ => Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -2857,60 +3314,247 @@ fn sample_procedural(
 }
 
 fn sample_voronoi(settings: &ProceduralSamplerSettings, p: [f32; 3]) -> Result<TextureResult> {
-    if settings.noise_size==0.0 {return Err(PotError::invalid_argument("Voronoi noise_scale must be nonzero"));}
-    let p=[p[0]/settings.noise_size,p[1]/settings.noise_size,p[2]/settings.noise_size];
-    let (distances,points)=voronoi4(p[0],p[1],p[2],settings.distance_metric,settings.minkovsky_exponent);
-    let weights=settings.voronoi_weights;
-    let absolute=weights.map(f32::abs);
-    let total=absolute.iter().sum::<f32>();
-    let intensity_scale=if total!=0.0 {settings.noise_intensity/total} else {0.0};
-    let intensity=intensity_scale*(weights[0]*distances[0]+weights[1]*distances[1]+weights[2]*distances[2]+weights[3]*distances[3]).abs();
+    if settings.noise_size == 0.0 {
+        return Err(PotError::invalid_argument(
+            "Voronoi noise_scale must be nonzero",
+        ));
+    }
+    let p = [
+        p[0] / settings.noise_size,
+        p[1] / settings.noise_size,
+        p[2] / settings.noise_size,
+    ];
+    let (distances, points) = voronoi4(
+        p[0],
+        p[1],
+        p[2],
+        settings.distance_metric,
+        settings.minkovsky_exponent,
+    );
+    let weights = settings.voronoi_weights;
+    let absolute = weights.map(f32::abs);
+    let total = absolute.iter().sum::<f32>();
+    let intensity_scale = if total != 0.0 {
+        settings.noise_intensity / total
+    } else {
+        0.0
+    };
+    let intensity = intensity_scale
+        * (weights[0] * distances[0]
+            + weights[1] * distances[1]
+            + weights[2] * distances[2]
+            + weights[3] * distances[3])
+            .abs();
     match settings.color_mode {
-        0=>Ok(scalar_result(intensity)),
-        mode=>{
-            let mut color=[0.0_f32;3];
-            for cell in 0..4 {let point=points.get(cell).copied().unwrap_or([0.0;3]);let c=cell_noise_v3(point[0],point[1],point[2]);for ch in 0..3 {color[ch]+=absolute[cell]*c[ch];}}
-            let outline=((distances[1]-distances[0])*10.0).min(1.0);
-            let factor=match mode {2=>outline*intensity_scale,3=>outline*intensity,_=>intensity_scale};
-            Ok(rgb_result(color.map(|value|value*factor)))
+        0 => Ok(scalar_result(intensity)),
+        mode => {
+            let mut color = [0.0_f32; 3];
+            for cell in 0..4 {
+                let point = points.get(cell).copied().unwrap_or([0.0; 3]);
+                let c = cell_noise_v3(point[0], point[1], point[2]);
+                for ch in 0..3 {
+                    color[ch] += absolute[cell] * c[ch];
+                }
+            }
+            let outline = ((distances[1] - distances[0]) * 10.0).min(1.0);
+            let factor = match mode {
+                2 => outline * intensity_scale,
+                3 => outline * intensity,
+                _ => intensity_scale,
+            };
+            Ok(rgb_result(color.map(|value| value * factor)))
         }
     }
 }
 
-fn sample_musgrave(settings:&ProceduralSamplerSettings,p:[f32;3])->Result<TextureResult> {
-    if settings.noise_size==0.0 {return Err(PotError::invalid_argument("Musgrave noise_scale must be nonzero"));}
-    let (x,y,z)=(p[0]/settings.noise_size,p[1]/settings.noise_size,p[2]/settings.noise_size);
-    let value=match settings.musgrave_type {
-        3=>musgrave_fbm(x,y,z,settings.dimension_max,settings.lacunarity,settings.octaves,settings.basis),
-        4=>musgrave_hetero(x,y,z,settings.dimension_max,settings.lacunarity,settings.octaves,settings.offset,settings.basis),
-        2=>musgrave_hybrid(x,y,z,settings.dimension_max,settings.lacunarity,settings.octaves,settings.offset,settings.gain,settings.basis),
-        1=>musgrave_ridged(x,y,z,settings.dimension_max,settings.lacunarity,settings.octaves,settings.offset,settings.gain,settings.basis),
-        _=>musgrave_multi(x,y,z,settings.dimension_max,settings.lacunarity,settings.octaves,settings.basis),
-    }*settings.noise_intensity;
+fn sample_musgrave(settings: &ProceduralSamplerSettings, p: [f32; 3]) -> Result<TextureResult> {
+    if settings.noise_size == 0.0 {
+        return Err(PotError::invalid_argument(
+            "Musgrave noise_scale must be nonzero",
+        ));
+    }
+    let (x, y, z) = (
+        p[0] / settings.noise_size,
+        p[1] / settings.noise_size,
+        p[2] / settings.noise_size,
+    );
+    let value = match settings.musgrave_type {
+        3 => musgrave_fbm(
+            x,
+            y,
+            z,
+            settings.dimension_max,
+            settings.lacunarity,
+            settings.octaves,
+            settings.basis,
+        ),
+        4 => musgrave_hetero(
+            x,
+            y,
+            z,
+            settings.dimension_max,
+            settings.lacunarity,
+            settings.octaves,
+            settings.offset,
+            settings.basis,
+        ),
+        2 => musgrave_hybrid(
+            x,
+            y,
+            z,
+            settings.dimension_max,
+            settings.lacunarity,
+            settings.octaves,
+            settings.offset,
+            settings.gain,
+            settings.basis,
+        ),
+        1 => musgrave_ridged(
+            x,
+            y,
+            z,
+            settings.dimension_max,
+            settings.lacunarity,
+            settings.octaves,
+            settings.offset,
+            settings.gain,
+            settings.basis,
+        ),
+        _ => musgrave_multi(
+            x,
+            y,
+            z,
+            settings.dimension_max,
+            settings.lacunarity,
+            settings.octaves,
+            settings.basis,
+        ),
+    } * settings.noise_intensity;
     Ok(scalar_result(value))
 }
-fn musgrave_fbm(mut x:f32,mut y:f32,mut z:f32,h:f32,lac:f32,oct:f32,basis:u8)->f32 {
-    let mut value=0.0; let mut power=1.0; let octave_power=lac.powf(-h);
-    for _ in 0..oct.floor().max(0.0) as usize {value+=noise_basis_signed(basis,x,y,z)*power; power*=octave_power; x*=lac;y*=lac;z*=lac;}
-    let remainder=oct-oct.floor(); if remainder!=0.0 {value+=remainder*noise_basis_signed(basis,x,y,z)*power;} value
+fn musgrave_fbm(mut x: f32, mut y: f32, mut z: f32, h: f32, lac: f32, oct: f32, basis: u8) -> f32 {
+    let mut value = 0.0;
+    let mut power = 1.0;
+    let octave_power = lac.powf(-h);
+    for _ in 0..oct.floor().max(0.0) as usize {
+        value += noise_basis_signed(basis, x, y, z) * power;
+        power *= octave_power;
+        x *= lac;
+        y *= lac;
+        z *= lac;
+    }
+    let remainder = oct - oct.floor();
+    if remainder != 0.0 {
+        value += remainder * noise_basis_signed(basis, x, y, z) * power;
+    }
+    value
 }
-fn musgrave_multi(mut x:f32,mut y:f32,mut z:f32,h:f32,lac:f32,oct:f32,basis:u8)->f32 {
-    let mut value=1.0; let mut power=1.0; let octave_power=lac.powf(-h);
-    for _ in 0..oct.floor().max(0.0) as usize {value*=power*noise_basis_signed(basis,x,y,z)+1.0;power*=octave_power;x*=lac;y*=lac;z*=lac;}
-    let remainder=oct-oct.floor(); if remainder!=0.0 {value*=remainder*noise_basis_signed(basis,x,y,z)*power+1.0;} value
+fn musgrave_multi(
+    mut x: f32,
+    mut y: f32,
+    mut z: f32,
+    h: f32,
+    lac: f32,
+    oct: f32,
+    basis: u8,
+) -> f32 {
+    let mut value = 1.0;
+    let mut power = 1.0;
+    let octave_power = lac.powf(-h);
+    for _ in 0..oct.floor().max(0.0) as usize {
+        value *= power * noise_basis_signed(basis, x, y, z) + 1.0;
+        power *= octave_power;
+        x *= lac;
+        y *= lac;
+        z *= lac;
+    }
+    let remainder = oct - oct.floor();
+    if remainder != 0.0 {
+        value *= remainder * noise_basis_signed(basis, x, y, z) * power + 1.0;
+    }
+    value
 }
-fn musgrave_hetero(mut x:f32,mut y:f32,mut z:f32,h:f32,lac:f32,oct:f32,offset:f32,basis:u8)->f32 {
-    let mut value=offset+noise_basis_signed(basis,x,y,z);x*=lac;y*=lac;z*=lac;let octave_power=lac.powf(-h);let mut power=octave_power;
-    for _ in 1..oct.floor().max(1.0) as usize {value+=(noise_basis_signed(basis,x,y,z)+offset)*power*value;power*=octave_power;x*=lac;y*=lac;z*=lac;}
-    let remainder=oct-oct.floor();if remainder!=0.0 {value+=remainder*(noise_basis_signed(basis,x,y,z)+offset)*power*value;}value
+fn musgrave_hetero(
+    mut x: f32,
+    mut y: f32,
+    mut z: f32,
+    h: f32,
+    lac: f32,
+    oct: f32,
+    offset: f32,
+    basis: u8,
+) -> f32 {
+    let mut value = offset + noise_basis_signed(basis, x, y, z);
+    x *= lac;
+    y *= lac;
+    z *= lac;
+    let octave_power = lac.powf(-h);
+    let mut power = octave_power;
+    for _ in 1..oct.floor().max(1.0) as usize {
+        value += (noise_basis_signed(basis, x, y, z) + offset) * power * value;
+        power *= octave_power;
+        x *= lac;
+        y *= lac;
+        z *= lac;
+    }
+    let remainder = oct - oct.floor();
+    if remainder != 0.0 {
+        value += remainder * (noise_basis_signed(basis, x, y, z) + offset) * power * value;
+    }
+    value
 }
-fn musgrave_hybrid(mut x:f32,mut y:f32,mut z:f32,h:f32,lac:f32,oct:f32,offset:f32,gain:f32,basis:u8)->f32 {
-    let mut result=noise_basis_signed(basis,x,y,z)+offset;let mut weight=gain*result;x*=lac;y*=lac;z*=lac;let octave_power=lac.powf(-h);let mut power=octave_power;
-    for _ in 1..oct.floor().max(1.0) as usize {if weight<=0.001 {break;}weight=weight.min(1.0);let signal=(noise_basis_signed(basis,x,y,z)+offset)*power;power*=octave_power;result+=weight*signal;weight*=gain*signal;x*=lac;y*=lac;z*=lac;}
-    let remainder=oct-oct.floor();if remainder!=0.0 {result+=remainder*(noise_basis_signed(basis,x,y,z)+offset)*power;}result
+fn musgrave_hybrid(
+    mut x: f32,
+    mut y: f32,
+    mut z: f32,
+    h: f32,
+    lac: f32,
+    oct: f32,
+    offset: f32,
+    gain: f32,
+    basis: u8,
+) -> f32 {
+    let mut result = noise_basis_signed(basis, x, y, z) + offset;
+    let mut weight = gain * result;
+    x *= lac;
+    y *= lac;
+    z *= lac;
+    let octave_power = lac.powf(-h);
+    let mut power = octave_power;
+    for _ in 1..oct.floor().max(1.0) as usize {
+        if weight <= 0.001 {
+            break;
+        }
+        weight = weight.min(1.0);
+        let signal = (noise_basis_signed(basis, x, y, z) + offset) * power;
+        power *= octave_power;
+        result += weight * signal;
+        weight *= gain * signal;
+        x *= lac;
+        y *= lac;
+        z *= lac;
+    }
+    let remainder = oct - oct.floor();
+    if remainder != 0.0 {
+        result += remainder * (noise_basis_signed(basis, x, y, z) + offset) * power;
+    }
+    result
 }
-fn musgrave_ridged(mut x:f32,mut y:f32,mut z:f32,h:f32,lac:f32,oct:f32,offset:f32,gain:f32,basis:u8)->f32 {
-    let mut signal=(offset-noise_basis_signed(basis,x,y,z).abs()).powi(2);let mut result=signal;let octave_power=lac.powf(-h);let mut power=octave_power;
+fn musgrave_ridged(
+    mut x: f32,
+    mut y: f32,
+    mut z: f32,
+    h: f32,
+    lac: f32,
+    oct: f32,
+    offset: f32,
+    gain: f32,
+    basis: u8,
+) -> f32 {
+    let mut signal = (offset - noise_basis_signed(basis, x, y, z).abs()).powi(2);
+    let mut result = signal;
+    let octave_power = lac.powf(-h);
+    let mut power = octave_power;
     for _ in 1..oct.floor().max(1.0) as usize {
         x *= lac;
         y *= lac;
@@ -2931,8 +3575,7 @@ mod tests {
 
     use super::{
         BlenderRng, DEFAULT_IMAGE_SETTINGS, ImageData, ImageInterpolation, LegacyTexture,
-        ResolvedTexture, TextureSource, parse_record, record_value, sample,
-        cell_noise_v3,
+        ResolvedTexture, TextureSource, cell_noise_v3, parse_record, record_value, sample,
     };
 
     fn image_record(settings: Value) -> Value {
@@ -2964,7 +3607,10 @@ mod tests {
     #[test]
     fn blender_522_cell_noise_v3_matches_hash_point_color() {
         // Blender 5.2.2 BLI_noise_cell_v3(0, 0, 0), using its HASHPNT tables.
-        assert_eq!(cell_noise_v3(0.0, 0.0, 0.0), [0.982_098, 0.161_631, 0.193_576]);
+        assert_eq!(
+            cell_noise_v3(0.0, 0.0, 0.0),
+            [0.982_098, 0.161_631, 0.193_576]
+        );
     }
 
     #[test]
@@ -3101,12 +3747,7 @@ mod tests {
         .expect("valid NOISE resource");
         let mut actual = BlenderRng::seed(47);
         let mut expected = BlenderRng::seed(47);
-        sample(
-            TextureSource::Legacy(&noise),
-            DVec3::ZERO,
-            &mut actual,
-        )
-        .expect("noise sample");
+        sample(TextureSource::Legacy(&noise), DVec3::ZERO, &mut actual).expect("noise sample");
         let _ = expected.get_int32();
         assert_eq!(actual.get_int32(), expected.get_int32());
     }
@@ -3118,12 +3759,8 @@ mod tests {
             resolved: super::ResolvedTextureKind::Image(image),
         };
         let mut rng = BlenderRng::seed(0);
-        let result = sample(
-            resolved.source(),
-            DVec3::new(-0.5, 0.0, 0.0),
-            &mut rng,
-        )
-        .expect("default direct image sample");
+        let result = sample(resolved.source(), DVec3::new(-0.5, 0.0, 0.0), &mut rng)
+            .expect("default direct image sample");
         assert_rgb_close(result.rgb, [0.2, 0.4, 0.6]);
     }
 
@@ -3190,5 +3827,4 @@ mod tests {
         .expect("large repeated image filter");
         assert!((result.intensity - BLENDER_FILTER_ORACLE).abs() < 1e-6);
     }
-
 }

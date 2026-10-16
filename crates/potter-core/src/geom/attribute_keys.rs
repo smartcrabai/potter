@@ -84,7 +84,10 @@ mod tests {
             let key = storage_key(name);
             assert_eq!(user_name(&key), Some(name), "round trip of {name}");
         }
-        assert_eq!(storage_key("color_layers"), format!("{ESCAPE_PREFIX}color_layers"));
+        assert_eq!(
+            storage_key("color_layers"),
+            format!("{ESCAPE_PREFIX}color_layers")
+        );
         assert_eq!(storage_key("skin_tone"), "skin_tone");
         assert_eq!(storage_key("user:x"), "user:user:x");
     }

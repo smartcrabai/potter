@@ -146,7 +146,11 @@ fn evaluated_body(doc: &SceneDoc) -> TestResult<Vec<[f64; 3]>> {
         .meshes
         .get(&Id::new("body".to_owned())?)
         .ok_or("evaluated body mesh is missing")?;
-    Ok(mesh.vertices.iter().map(|vertex| vertex.co.to_array()).collect())
+    Ok(mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.to_array())
+        .collect())
 }
 
 fn assert_matches_blender(actual: &[[f64; 3]], expected: &[[f64; 3]], case: &str) {
@@ -467,8 +471,18 @@ const BLENDER_CHAIN_LINEAR_DQ: [[f64; 3]; 16] = [
     [1.0, -0.1, 2.45],
 ];
 
-const ROOT_ROTATION_XYZW: [f64; 4] = [0.069034992623, 0.20710497787, 0.046023328416, 0.974794107069];
-const UPPER_ROTATION_XYZW: [f64; 4] = [0.355488683981, 0.071097736796, -0.142195473592, 0.921060994003];
+const ROOT_ROTATION_XYZW: [f64; 4] = [
+    0.069034992623,
+    0.20710497787,
+    0.046023328416,
+    0.974794107069,
+];
+const UPPER_ROTATION_XYZW: [f64; 4] = [
+    0.355488683981,
+    0.071097736796,
+    -0.142195473592,
+    0.921060994003,
+];
 const LOWER_ROTATION_XYZW: [f64; 4] = [-0.0, -0.295520206661, -0.0, 0.955336489126];
 
 // ---- Regressions ----
@@ -483,7 +497,11 @@ fn armature_with_no_deform_source_leaves_the_mesh_unchanged() -> TestResult {
 #[test]
 fn linear_vertex_group_skinning_matches_blender() -> TestResult {
     let doc = armature_doc(&[json!({"object":"arm","use_vertex_groups":true})])?;
-    assert_matches_blender(&evaluated_body(&doc)?, &BLENDER_LINEAR_GROUPS, "linear groups");
+    assert_matches_blender(
+        &evaluated_body(&doc)?,
+        &BLENDER_LINEAR_GROUPS,
+        "linear groups",
+    );
     Ok(())
 }
 
@@ -520,13 +538,21 @@ fn preserve_volume_blends_dual_quaternions_with_pose_scale() -> TestResult {
     let plain = armature_doc(&[json!({
         "object":"arm","use_vertex_groups":true,"use_deform_preserve_volume":true
     })])?;
-    assert_matches_blender(&evaluated_body(&plain)?, &BLENDER_DQ_GROUPS, "dual quaternion");
+    assert_matches_blender(
+        &evaluated_body(&plain)?,
+        &BLENDER_DQ_GROUPS,
+        "dual quaternion",
+    );
 
     let masked = armature_doc(&[json!({
         "object":"arm","use_vertex_groups":true,"use_deform_preserve_volume":true,
         "vertex_group":"Mask"
     })])?;
-    assert_matches_blender(&evaluated_body(&masked)?, &BLENDER_DQ_MASK, "dual quaternion mask");
+    assert_matches_blender(
+        &evaluated_body(&masked)?,
+        &BLENDER_DQ_MASK,
+        "dual quaternion mask",
+    );
     Ok(())
 }
 
@@ -576,7 +602,11 @@ fn multi_modifier_mixes_its_deformed_input_by_the_mask() -> TestResult {
             "use_multi_modifier":true,"vertex_group":"Mask"
         }),
     ])?;
-    assert_matches_blender(&evaluated_body(&masked)?, &BLENDER_MULTI_MASKED, "multi masked");
+    assert_matches_blender(
+        &evaluated_body(&masked)?,
+        &BLENDER_MULTI_MASKED,
+        "multi masked",
+    );
 
     let inverted = armature_doc(&[
         first.clone(),
@@ -598,7 +628,11 @@ fn multi_modifier_mixes_its_deformed_input_by_the_mask() -> TestResult {
             "use_multi_modifier":true
         }),
     ])?;
-    assert_matches_blender(&evaluated_body(&unmasked)?, &BLENDER_MULTI_UNMASKED, "multi unmasked");
+    assert_matches_blender(
+        &evaluated_body(&unmasked)?,
+        &BLENDER_MULTI_UNMASKED,
+        "multi unmasked",
+    );
 
     let missing = armature_doc(&[
         first,

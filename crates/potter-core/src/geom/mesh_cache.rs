@@ -714,7 +714,10 @@ mod tests {
         assert_eq!(domain, super::ColorDomain::Corner);
         super::write_cache_colors(&mut mesh, domain, values);
         let corner = super::color_layers::read(&mesh);
-        let corner_layer = corner.layers.first().ok_or("corner color layer is missing")?;
+        let corner_layer = corner
+            .layers
+            .first()
+            .ok_or("corner color layer is missing")?;
         assert_eq!(corner_layer.name, "color");
         assert_eq!(corner_layer.domain, super::ColorDomain::Corner);
         assert_eq!(

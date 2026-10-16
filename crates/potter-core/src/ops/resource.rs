@@ -110,7 +110,10 @@ fn sequence_range(engine: &Engine<'_>, value: &Value) -> Result<(i32, i32)> {
             &operation_pointer(engine.operation_index, "sequence"),
         )
     })?;
-    if object.keys().any(|key| !matches!(key.as_str(), "start" | "end")) {
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "start" | "end"))
+    {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "resource sequence accepts only start and end frame fields",
@@ -406,9 +409,9 @@ fn unpack_sequence(
     }
     for key in frames.keys() {
         let frame = key.parse::<i32>().ok();
-        if frame.is_none_or(|frame| {
-            frame.to_string() != key.as_str() || frame < start || frame > end
-        }) {
+        if frame
+            .is_none_or(|frame| frame.to_string() != key.as_str() || frame < start || frame > end)
+        {
             return Err(engine.error(
                 ErrorCode::SceneInvalid,
                 "Alembic sequence frame key is not a canonical in-range int32",
@@ -436,11 +439,14 @@ fn unpack_sequence(
             return Err(engine.error(
                 ErrorCode::SceneInvalid,
                 "packed Alembic sequence frame is not a matching standard resource record",
-                &operation_pointer(engine.operation_index, &format!("id/sequence_frames/{frame}")),
+                &operation_pointer(
+                    engine.operation_index,
+                    &format!("id/sequence_frames/{frame}"),
+                ),
             ));
         }
-        let frame_path =
-            crate::cache_sequence::cache_sequence_output_path(&pattern, frame)?.ok_or_else(|| {
+        let frame_path = crate::cache_sequence::cache_sequence_output_path(&pattern, frame)?
+            .ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::InvalidArgument,
                     "sequence unpack path must include a frame-number pattern",
@@ -482,7 +488,10 @@ fn unpack_sequence(
         let mut output_frame =
             crate::cache_sequence::cache_sequence_resource_record(&uri, &kind, &digest, None);
         let output_fields = output_frame.as_object_mut().ok_or_else(|| {
-            PotError::new(ErrorCode::InternalError, "cache frame record is not an object")
+            PotError::new(
+                ErrorCode::InternalError,
+                "cache frame record is not an object",
+            )
         })?;
         if let Some(source_fields) = frame_record.as_object() {
             for (key, value) in source_fields {

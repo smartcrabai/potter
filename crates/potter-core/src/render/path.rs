@@ -1215,7 +1215,6 @@ fn make_surface(
     })
 }
 
-
 pub(super) fn object_for_index(
     objects: &[ObjectRecord],
     object_index: u32,

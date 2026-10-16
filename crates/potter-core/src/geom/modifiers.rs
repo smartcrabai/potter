@@ -11,6 +11,7 @@ use std::rc::Rc;
 use glam::{DMat4, DVec3};
 use serde_json::{Map, Value, json};
 
+use crate::blender_rng::BlenderRng;
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::ModifierEvaluationContext,
@@ -18,17 +19,13 @@ use crate::{
     model::{Id, Modifier, Registry},
     params::{self, ParameterFamily},
 };
-use crate::blender_rng::BlenderRng;
 
 use super::attribute_keys;
 use super::clnor::{self, CornerNormalCode, NormalCodeOptions, settle_custom_normals};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
-    normals::{
-        corner_normals, face_normal, safe_acos_approx,
-        sharp_edge_flags,
-    },
+    normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
     provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
     uv_layers,
 };
@@ -40,7 +37,9 @@ mod bevel_vmesh;
 mod decimate;
 pub(crate) mod deform;
 pub(crate) mod displacement;
-pub(crate) use displacement::{displace_textured, load_modifier_texture, warp_textured, wave_textured};
+pub(crate) use displacement::{
+    displace_textured, load_modifier_texture, warp_textured, wave_textured,
+};
 mod ocean;
 mod remesh_modes;
 pub mod simulation;
@@ -77,10 +76,7 @@ const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
 /// Build Blender's shrinkwrap space pair with its f32 matrix operation order.
-pub(crate) fn blender_space_transform_f32(
-    local: DMat4,
-    target: DMat4,
-) -> ([f32; 16], [f32; 16]) {
+pub(crate) fn blender_space_transform_f32(local: DMat4, target: DMat4) -> ([f32; 16], [f32; 16]) {
     let local = local.to_cols_array().map(|value| value as f32);
     let target = target.to_cols_array().map(|value| value as f32);
     let inverse_target = blender_inverse_m4(target);
@@ -97,7 +93,6 @@ pub(crate) fn blender_transform_point_f32(matrix: &[f32; 16], point: glam::Vec3)
         point.x * matrix[2] + point.y * matrix[6] + matrix[10] * point.z + matrix[14],
     )
 }
-
 
 /// Blender `mul_m4_m4m4` grouping: SIMD on x86_64/ARM64, scalar on other targets.
 pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
@@ -164,7 +159,13 @@ pub fn evaluate_modifiers_with_groups_and_custom(
     evaluated: Mesh,
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
-    custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>, Option<&[DVec3]>, &mut BlenderRng) -> Result<()>,
+    custom_modifier: impl FnMut(
+        &mut Mesh,
+        &Modifier,
+        &mut Vec<PotError>,
+        Option<&[DVec3]>,
+        &mut BlenderRng,
+    ) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_groups_and_custom_at_frame(
         evaluated,
@@ -186,7 +187,13 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
-    custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>, Option<&[DVec3]>, &mut BlenderRng) -> Result<()>,
+    custom_modifier: impl FnMut(
+        &mut Mesh,
+        &Modifier,
+        &mut Vec<PotError>,
+        Option<&[DVec3]>,
+        &mut BlenderRng,
+    ) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     let mut texture_rng = BlenderRng::seed_random(0);
     evaluate_modifiers_with_scene_context(
@@ -297,15 +304,24 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)))
             || (modifier.modifier_type == "displace"
-                && modifier.params.get("texture").is_some_and(|value| !value.is_null()))
+                && modifier
+                    .params
+                    .get("texture")
+                    .is_some_and(|value| !value.is_null()))
             || (modifier.modifier_type == "wave"
-                && ["texture", "start_position_object"]
-                    .iter()
-                    .any(|key| modifier.params.get(*key).is_some_and(|value| !value.is_null())))
+                && ["texture", "start_position_object"].iter().any(|key| {
+                    modifier
+                        .params
+                        .get(*key)
+                        .is_some_and(|value| !value.is_null())
+                }))
             || (modifier.modifier_type == "warp"
-                && ["object_from", "object_to", "texture"]
-                    .iter()
-                    .any(|key| modifier.params.get(*key).is_some_and(|value| !value.is_null())))
+                && ["object_from", "object_to", "texture"].iter().any(|key| {
+                    modifier
+                        .params
+                        .get(*key)
+                        .is_some_and(|value| !value.is_null())
+                }))
             || (matches!(
                 modifier.modifier_type.as_str(),
                 "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity"
@@ -413,7 +429,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "bevel" => bevel(&evaluated, modifier)?,
             "decimate" => without_custom_normals(decimate(&evaluated, modifier)?),
             "weld" => weld(&evaluated, modifier)?,
-            "displace" => displace_textured(&evaluated, modifier, owner_world_matrix, None, texture_rng)?,
+            "displace" => {
+                displace_textured(&evaluated, modifier, owner_world_matrix, None, texture_rng)?
+            }
             "smooth" => smooth(&evaluated, modifier)?,
             "simple_deform" => advanced::simple_deform(&evaluated, modifier)?,
             "screw" => advanced::screw(&evaluated, modifier, context)?,
@@ -2410,7 +2428,10 @@ fn subdivision(
         result.attributes.remove("custom_normal");
     }
     let mut normals = if levels > 0 {
-        Some(subdivision_uv::NormalSubdivision::new(mesh, use_custom_normals)?)
+        Some(subdivision_uv::NormalSubdivision::new(
+            mesh,
+            use_custom_normals,
+        )?)
     } else {
         None
     };
@@ -2421,10 +2442,7 @@ fn subdivision(
     };
     for _ in 0..levels {
         let next = if simple {
-            subdivision_uv::subdivide_simple_once(
-                &result,
-                options.use_creases,
-            )?
+            subdivision_uv::subdivide_simple_once(&result, options.use_creases)?
         } else {
             subdivide_once(&result, options)?
         };

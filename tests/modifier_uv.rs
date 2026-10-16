@@ -682,11 +682,7 @@ fn screw_keeps_each_uv_layer_complete_against_blender_oracle() -> TestResult {
     expected.sort();
     assert_eq!(stored, expected, "UV layer names");
     for layer in &layers {
-        assert_eq!(
-            layer_uvs(mesh, layer)?.len(),
-            144,
-            "`{layer}` corner count"
-        );
+        assert_eq!(layer_uvs(mesh, layer)?.len(), 144, "`{layer}` corner count");
     }
     assert_eq!(matched_oracle_corners(mesh, &fixture, false)?, 144);
     Ok(())

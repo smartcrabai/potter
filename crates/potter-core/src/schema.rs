@@ -177,8 +177,20 @@ fn complete_scene_schema(root: &mut Value) {
     root["properties"]["movie_clips"] = registry_schema("movie_clip");
     root["properties"]["masks"] = registry_schema("mask");
     let defs = &mut root["$defs"];
-    defs["legacy_texture_resource"]["properties"]["texture_type"]["enum"] =
-        json!(["CLOUDS","MARBLE","WOOD","MAGIC","BLEND","STUCCI","NOISE","DISTORTED_NOISE","VORONOI","MUSGRAVE","NATIVE_VALUE_NOISE","IMAGE"]);
+    defs["legacy_texture_resource"]["properties"]["texture_type"]["enum"] = json!([
+        "CLOUDS",
+        "MARBLE",
+        "WOOD",
+        "MAGIC",
+        "BLEND",
+        "STUCCI",
+        "NOISE",
+        "DISTORTED_NOISE",
+        "VORONOI",
+        "MUSGRAVE",
+        "NATIVE_VALUE_NOISE",
+        "IMAGE"
+    ]);
     defs["legacy_texture_resource"]["properties"]["settings"]["properties"]["octaves"] =
         json!({"type":"number"});
     defs["legacy_texture_resource"]["properties"]["settings"]["properties"]["color_mode"] =
@@ -1360,20 +1372,20 @@ fn operation_contract(name: &str) -> OperationContract {
             "shared|single_user for shared data",
             json!({}),
         ),
-"texture.create" => (
-    vec!["id", "texture_type", "image", "settings"],
-    vec!["op", "id", "texture_type"],
-    "legacy texture",
-    "none",
-    json!({"image":"required for IMAGE; references a shared doc.images entry","settings":"Blender defaults"}),
-),
-"texture.update" => (
-    vec!["id", "image", "settings"],
-    vec!["op", "id"],
-    "legacy texture",
-    "none",
-    json!({"image":"unchanged unless supplied","settings":"merged over existing settings"}),
-),
+        "texture.create" => (
+            vec!["id", "texture_type", "image", "settings"],
+            vec!["op", "id", "texture_type"],
+            "legacy texture",
+            "none",
+            json!({"image":"required for IMAGE; references a shared doc.images entry","settings":"Blender defaults"}),
+        ),
+        "texture.update" => (
+            vec!["id", "image", "settings"],
+            vec!["op", "id"],
+            "legacy texture",
+            "none",
+            json!({"image":"unchanged unless supplied","settings":"merged over existing settings"}),
+        ),
         "paint.texture" => (
             vec![
                 "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "seed",
@@ -2733,7 +2745,11 @@ mod tests {
     fn attribute_create_type_accepts_color_and_rejects_byte_color() -> crate::error::Result<()> {
         let create = schema("operations", Some("mesh.attribute_create"))?;
         let types = &create["properties"]["type"]["enum"];
-        assert!(types.as_array().is_some_and(|types| types.iter().any(|value| value == "color")));
+        assert!(
+            types
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "color"))
+        );
         assert!(
             types
                 .as_array()

@@ -401,16 +401,18 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .ok_or_else(|| invalid_parameter(modifier, "binding_data", "cage-coordinate rows"))?;
     let bound_cage: Mesh =
         serde_json::from_value(bind_data.get("cage_mesh").cloned().ok_or_else(|| {
-            invalid_parameter(modifier, "binding_data", "the bind-time owner-space cage mesh")
+            invalid_parameter(
+                modifier,
+                "binding_data",
+                "the bind-time owner-space cage mesh",
+            )
         })?)
         .map_err(|_| invalid_parameter(modifier, "binding_data", "a valid bind-time cage mesh"))?;
-    let bound_cage_local: Mesh = serde_json::from_value(
-        bind_data
-            .get("cage_local_mesh")
-            .cloned()
-            .ok_or_else(|| invalid_parameter(modifier, "binding_data", "the bind-time cage mesh"))?,
-    )
-    .map_err(|_| invalid_parameter(modifier, "binding_data", "a valid bind-time cage mesh"))?;
+    let bound_cage_local: Mesh =
+        serde_json::from_value(bind_data.get("cage_local_mesh").cloned().ok_or_else(|| {
+            invalid_parameter(modifier, "binding_data", "the bind-time cage mesh")
+        })?)
+        .map_err(|_| invalid_parameter(modifier, "binding_data", "a valid bind-time cage mesh"))?;
     let bind_matrix = native_matrix(bind_data, modifier)?;
     let cage_owner = modifier
         .runtime
@@ -529,8 +531,8 @@ pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         if total_weight <= 0.0 {
             continue;
         }
-        vertex.co += inverse_deform_matrix.transform_vector3(deformation / total_weight)
-            * group_weight;
+        vertex.co +=
+            inverse_deform_matrix.transform_vector3(deformation / total_weight) * group_weight;
     }
     validated(&result)?;
     Ok(result)
@@ -1033,7 +1035,11 @@ pub(super) fn laplacian_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh>
                 if point.is_finite() {
                     Ok(point)
                 } else {
-                    Err(invalid_parameter(modifier, "bind_data", "finite bind positions"))
+                    Err(invalid_parameter(
+                        modifier,
+                        "bind_data",
+                        "finite bind positions",
+                    ))
                 }
             })
             .collect::<Result<Vec<_>>>()?
@@ -1243,7 +1249,6 @@ fn laplacian_unit_vertices(
         })
         .collect()
 }
-
 
 fn rotate_differentials(
     rest: &[DVec3],
@@ -1658,8 +1663,11 @@ impl SurfaceBindTarget {
                 "surface deform target vertex has no polygons",
             ));
         }
-        let average_distance =
-            polygons.iter().map(|polygon| polygon.weight_dist).sum::<f64>() / polygons.len() as f64;
+        let average_distance = polygons
+            .iter()
+            .map(|polygon| polygon.weight_dist)
+            .sum::<f64>()
+            / polygons.len() as f64;
         if !infinite.any() {
             for &edge in &self.vertex_edges[nearest] {
                 let members = (0..polygons.len())
@@ -1696,8 +1704,7 @@ impl SurfaceBindTarget {
                 let other = 1 - dominant;
                 let edge_angle_a = polygon.point_edgemid_angles[dominant];
                 let edge_angle_b = polygon.point_edgemid_angles[other];
-                let mut scale_weight = edge_angle_a
-                    / edge_angle_a.max(polygon.edgemid_angle);
+                let mut scale_weight = edge_angle_a / edge_angle_a.max(polygon.edgemid_angle);
                 scale_weight /=
                     scale_weight + edge_angle_b / edge_angle_b.max(polygon.edgemid_angle);
                 let squared = scale_weight * scale_weight;
@@ -1706,8 +1713,8 @@ impl SurfaceBindTarget {
                 let edge_scale = scale_weight * polygon.scales[other]
                     + (1.0 - scale_weight) * polygon.scales[dominant];
                 let dominant_weight = polygon.dominant_angle_weight;
-                polygon.scales[0] = dominant_weight * polygon.scale_mid
-                    + (1.0 - dominant_weight) * edge_scale;
+                polygon.scales[0] =
+                    dominant_weight * polygon.scale_mid + (1.0 - dominant_weight) * edge_scale;
                 polygon.weight_dist_proj =
                     (polygon.weight_dist_proj / polygon.scales[0]).powf(falloff);
                 polygon.weight_dist = (polygon.weight_dist / average_distance).powf(falloff);
@@ -1799,14 +1806,20 @@ impl SurfaceBindTarget {
                     "surface deform target polygon does not contain its nearest vertex",
                 )
             })?;
-        let edge_vertex_indices = [(corner_index + count - 1) % count, (corner_index + 1) % count];
+        let edge_vertex_indices = [
+            (corner_index + count - 1) % count,
+            (corner_index + 1) % count,
+        ];
         let edge_indices = [
             corner_edges[edge_vertex_indices[0]],
             corner_edges[corner_index],
         ];
         let centroid = coords.iter().copied().sum::<DVec3>() / count as f64;
         let normal = polygon_normal(&coords).ok_or_else(invalid_polygons)?;
-        let axis = normal.cross(DVec3::Z).try_normalize().unwrap_or(DVec3::ZERO);
+        let axis = normal
+            .cross(DVec3::Z)
+            .try_normalize()
+            .unwrap_or(DVec3::ZERO);
         let angle = angle_normalized_3d(normal, DVec3::Z);
         let coords_v2 = coords
             .iter()
@@ -1821,8 +1834,8 @@ impl SurfaceBindTarget {
         let vert0 = coords_v2[edge_vertex_indices[0]];
         let vert1 = coords_v2[edge_vertex_indices[1]];
         let corner = coords_v2[corner_index];
-        let cent_edgemid_vectors =
-            [vert0, vert1].map(|vertex| ((vertex + corner) * 0.5 - centroid_v2).normalize_or_zero());
+        let cent_edgemid_vectors = [vert0, vert1]
+            .map(|vertex| ((vertex + corner) * 0.5 - centroid_v2).normalize_or_zero());
         let scales = [
             distance_to_line_2d(centroid_v2, vert0, corner),
             distance_to_line_2d(centroid_v2, vert1, corner),
@@ -1980,7 +1993,11 @@ pub(crate) fn bind_surface(
 ) -> Result<Value> {
     let falloff = number_param(modifier, "falloff")?;
     if !(2.0..=16.0).contains(&falloff) {
-        return Err(invalid_parameter(modifier, "falloff", "a number in [2, 16]"));
+        return Err(invalid_parameter(
+            modifier,
+            "falloff",
+            "a number in [2, 16]",
+        ));
     }
     let sparse = bool_param(modifier, "use_sparse_bind")?;
     let invert = bool_param(modifier, "invert_vertex_group")?;
@@ -2085,7 +2102,8 @@ fn point_inside_polygon(point: DVec2, polygon: &[DVec2]) -> bool {
         let first = polygon[index];
         let second = polygon[(index + 1) % polygon.len()];
         if (first.y > point.y) != (second.y > point.y) {
-            let crossing = first.x + (point.y - first.y) * (second.x - first.x) / (second.y - first.y);
+            let crossing =
+                first.x + (point.y - first.y) * (second.x - first.x) / (second.y - first.y);
             if point.x < crossing {
                 inside = !inside;
             }
@@ -2208,7 +2226,11 @@ fn triangle_barycentric(triangle: [DVec3; 3], point: DVec3) -> [f64; 3] {
 }
 
 /// Blender's `sortPolyVertsEdge`: loop vertices starting at the edge's first corner.
-fn sort_polygon_from_edge(corners: &[usize], corner_edges: &[usize], edge: usize) -> Result<Vec<usize>> {
+fn sort_polygon_from_edge(
+    corners: &[usize],
+    corner_edges: &[usize],
+    edge: usize,
+) -> Result<Vec<usize>> {
     let start = corner_edges
         .iter()
         .position(|&candidate| candidate == edge)

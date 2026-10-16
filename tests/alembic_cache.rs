@@ -600,8 +600,7 @@ fn assert_oracle_uv_layers(
     assert_eq!(actual_names, expected_names, "canonical UV layer names");
 
     let actual_layers: &[Value] = actual_layers.map(Vec::as_slice).unwrap_or(&[]);
-    let expected_positions: Vec<[f64; 3]> =
-        serde_json::from_value(expected["positions"].clone())?;
+    let expected_positions: Vec<[f64; 3]> = serde_json::from_value(expected["positions"].clone())?;
     let actual_positions = mesh
         .vertices
         .iter()
@@ -629,23 +628,21 @@ fn assert_oracle_uv_layers(
                 .iter()
                 .map(|index| expected_positions[*index])
                 .collect::<Vec<_>>();
-            let actual_face = mesh
-                .faces
-                .iter()
-                .find(|face| {
-                    face.vertices.len() == corner_count
-                        && face.vertices.iter().all(|id| {
-                            let actual = actual_positions[id];
-                            expected_face_positions.iter().any(|expected| {
-                                actual
-                                    .to_array()
-                                    .iter()
-                                    .zip(expected)
-                                    .all(|(actual, expected)| (actual - expected).abs() <= 1.0e-6)
+            let actual_face =
+                mesh.faces
+                    .iter()
+                    .find(|face| {
+                        face.vertices.len() == corner_count
+                            && face.vertices.iter().all(|id| {
+                                let actual = actual_positions[id];
+                                expected_face_positions.iter().any(|expected| {
+                                    actual.to_array().iter().zip(expected).all(
+                                        |(actual, expected)| (actual - expected).abs() <= 1.0e-6,
+                                    )
+                                })
                             })
-                        })
-                })
-                .ok_or_else(|| format!("evaluated face for UV layer {name} is missing"))?;
+                    })
+                    .ok_or_else(|| format!("evaluated face for UV layer {name} is missing"))?;
             let actual_row = stored_faces
                 .iter()
                 .find(|entry| entry["face_id"].as_u64() == Some(u64::from(actual_face.id)))
@@ -674,11 +671,7 @@ fn assert_oracle_uv_layers(
                 let v = oracle_uv[1]
                     .as_f64()
                     .ok_or_else(|| format!("oracle UV layer {name} V is not numeric"))?;
-                assert_numeric_json_close(
-                    &actual_row[actual_corner],
-                    &json!([u, 1.0 - v]),
-                    1.0e-6,
-                );
+                assert_numeric_json_close(&actual_row[actual_corner], &json!([u, 1.0 - v]), 1.0e-6);
             }
             corner_offset += corner_count;
         }
@@ -742,8 +735,7 @@ fn assert_oracle_builtin_attribute(
                         .unwrap_or(false)
                 })
                 .collect::<Vec<_>>();
-            let expected_values: Vec<bool> =
-                serde_json::from_value(expected["values"].clone())?;
+            let expected_values: Vec<bool> = serde_json::from_value(expected["values"].clone())?;
             assert_eq!(actual, expected_values, "canonical edge sharp flags");
         }
         "sharp_face" => {
@@ -764,8 +756,7 @@ fn assert_oracle_builtin_attribute(
                         .unwrap_or(false)
                 })
                 .collect::<Vec<_>>();
-            let expected_values: Vec<bool> =
-                serde_json::from_value(expected["values"].clone())?;
+            let expected_values: Vec<bool> = serde_json::from_value(expected["values"].clone())?;
             assert_eq!(actual, expected_values, "canonical sharp_face semantics");
         }
         "material_index" => {
@@ -776,8 +767,7 @@ fn assert_oracle_builtin_attribute(
                 .iter()
                 .map(|face| face.material_index)
                 .collect::<Vec<_>>();
-            let expected_values: Vec<u32> =
-                serde_json::from_value(expected["values"].clone())?;
+            let expected_values: Vec<u32> = serde_json::from_value(expected["values"].clone())?;
             assert_eq!(actual, expected_values, "canonical face material indices");
         }
         _ => return Err(format!("oracle built-in attribute {name} is unsupported").into()),
@@ -842,7 +832,10 @@ fn assert_oracle_mesh(
     let has_custom_normals = expected["has_custom_normals"]
         .as_bool()
         .ok_or("Blender oracle custom-normal flag is missing")?;
-    assert_eq!(mesh.attributes.contains_key("custom_normal"), has_custom_normals);
+    assert_eq!(
+        mesh.attributes.contains_key("custom_normal"),
+        has_custom_normals
+    );
 
     let expected_attributes = expected["attributes"]
         .as_object()
@@ -866,7 +859,10 @@ fn assert_oracle_mesh(
         .iter()
         .filter(|(name, attribute)| {
             !is_oracle_uv_attribute(attribute)
-                && !matches!(name.as_str(), "material_index" | "sharp_edge" | "sharp_face")
+                && !matches!(
+                    name.as_str(),
+                    "material_index" | "sharp_edge" | "sharp_face"
+                )
         })
         .map(|(name, _)| name.to_string())
         .collect::<Vec<_>>();
@@ -877,7 +873,10 @@ fn assert_oracle_mesh(
         if is_oracle_uv_attribute(attribute) {
             continue;
         }
-        if matches!(name.as_str(), "material_index" | "sharp_edge" | "sharp_face") {
+        if matches!(
+            name.as_str(),
+            "material_index" | "sharp_edge" | "sharp_face"
+        ) {
             assert_oracle_builtin_attribute(mesh, name, attribute)?;
         } else {
             assert_oracle_attribute(mesh, name, attribute)?;
@@ -933,8 +932,7 @@ fn add_oracle_cache(
     )?;
     let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     assert_eq!(
-        document["resources"]["oracle_cache"]["cache_file"],
-        *cache_file,
+        document["resources"]["oracle_cache"]["cache_file"], *cache_file,
         "CacheFile settings were not persisted for {}",
         oracle_case["id"]
     );
@@ -1164,7 +1162,10 @@ fn round_trip_sequence_cache_blend(
         "forward_axis",
         "up_axis",
     ] {
-        assert_eq!(modifier.params[field], expected_params[field], "reopened {field}");
+        assert_eq!(
+            modifier.params[field], expected_params[field],
+            "reopened {field}"
+        );
     }
     let resource_id = modifier.params["resource"]
         .as_str()
@@ -1190,8 +1191,7 @@ fn round_trip_sequence_cache_blend(
         "velocity_unit",
     ] {
         assert_eq!(
-            reopened_settings[field],
-            oracle_case["cache_file"][field],
+            reopened_settings[field], oracle_case["cache_file"][field],
             "reopened CacheFile {field}"
         );
     }
@@ -1228,7 +1228,10 @@ fn round_trip_sequence_cache_blend(
                 .and_then(|name| name.to_str()),
             Some(expected_filename.as_str())
         );
-        assert!(Path::new(frame_path).is_file(), "reopened sequence frame is missing");
+        assert!(
+            Path::new(frame_path).is_file(),
+            "reopened sequence frame is missing"
+        );
     }
     drop(project);
 
@@ -1257,23 +1260,17 @@ fn round_trip_sequence_cache_blend(
     Ok(())
 }
 #[test]
-fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes()
--> Result<(), Box<dyn Error>> {
+fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Result<(), Box<dyn Error>>
+{
     let temporary = tempdir()?;
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alembic_cache");
-    let oracle: Value = serde_json::from_str(include_str!(
-        "fixtures/alembic_cache/oracle.json"
-    ))?;
+    let oracle: Value = serde_json::from_str(include_str!("fixtures/alembic_cache/oracle.json"))?;
     let cases = oracle["cases"]
         .as_array()
         .ok_or("Blender Alembic oracle cases are missing")?;
     let mut case_ids = cases
         .iter()
-        .map(|case| {
-            case["id"]
-                .as_str()
-                .ok_or("Blender oracle case has no id")
-        })
+        .map(|case| case["id"].as_str().ok_or("Blender oracle case has no id"))
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     case_ids.sort_unstable();
     let mut expected_case_ids = [
@@ -1338,12 +1335,7 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes()
         if case_id == "is_sequence_per_frame_files"
             && let Some(blender) = blender_executable()
         {
-            round_trip_sequence_cache_blend(
-                &target,
-                temporary.path(),
-                &blender,
-                oracle_case,
-            )?;
+            round_trip_sequence_cache_blend(&target, temporary.path(), &blender, oracle_case)?;
         }
         if case_id == "default_same_topology" {
             let exported = temporary.path().join("evaluated_cache.abc");
@@ -1367,7 +1359,9 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes()
                 pot()
                     .args(["preview"])
                     .arg(&target)
-                    .args(["--views", "iso", "--size", "64", "--mode", "normal", "--out"])
+                    .args([
+                        "--views", "iso", "--size", "64", "--mode", "normal", "--out",
+                    ])
                     .arg(&preview_dir)
                     .args(["--overwrite", "--json"]),
             )?;
@@ -1386,8 +1380,7 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes()
 fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<(), Box<dyn Error>> {
     let temporary = tempdir()?;
     let target = temporary.path().join("sequence.pot");
-    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/alembic_cache");
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alembic_cache");
     let source_archive = fixture_dir.join("animated.abc");
     init(&target)?;
     run_ok(
@@ -1462,12 +1455,14 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
             }
         }]),
     )?;
-    let oracle: Value = serde_json::from_str(include_str!(
-        "fixtures/alembic_cache/oracle.json"
-    ))?;
+    let oracle: Value = serde_json::from_str(include_str!("fixtures/alembic_cache/oracle.json"))?;
     let sequence_case = oracle["cases"]
         .as_array()
-        .and_then(|cases| cases.iter().find(|case| case["id"] == "is_sequence_per_frame_files"))
+        .and_then(|cases| {
+            cases
+                .iter()
+                .find(|case| case["id"] == "is_sequence_per_frame_files")
+        })
         .ok_or("Blender sequence oracle case is missing")?;
     for frame in 1.0..=4.0 {
         let expected = sequence_case["frames"]
@@ -1486,23 +1481,32 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
     }
     let missing_case = oracle["cases"]
         .as_array()
-        .and_then(|cases| cases.iter().find(|case| case["id"] == "is_sequence_missing_file"))
+        .and_then(|cases| {
+            cases
+                .iter()
+                .find(|case| case["id"] == "is_sequence_missing_file")
+        })
         .ok_or("Blender missing-frame oracle case is missing")?;
     let missing_frame = missing_case["frames"]
         .as_array()
-        .and_then(|frames| frames.iter().find(|sample| sample["frame"].as_i64() == Some(5)))
+        .and_then(|frames| {
+            frames
+                .iter()
+                .find(|sample| sample["frame"].as_i64() == Some(5))
+        })
         .ok_or("Blender missing sequence frame is missing")?;
     assert_positions_close(
         &mesh_positions(&target, 5.0)?,
         &serde_json::from_value(missing_frame["positions"].clone())?,
         1.0e-6,
     );
-    let output = run_ok(
-        pot()
-            .args(["inspect"])
-            .arg(&target)
-            .args(["--id", target_id.as_str(), "--frame", "5", "--json"]),
-    )?;
+    let output = run_ok(pot().args(["inspect"]).arg(&target).args([
+        "--id",
+        target_id.as_str(),
+        "--frame",
+        "5",
+        "--json",
+    ]))?;
     let response: Value = serde_json::from_slice(&output.stdout)?;
     assert!(
         response["result"]["warnings"]
@@ -1537,8 +1541,7 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
 fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn Error>> {
     let temporary = tempdir()?;
     let target = temporary.path().join("packed_sequence.pot");
-    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/alembic_cache");
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alembic_cache");
     let source_archive = fixture_dir.join("animated.abc");
     init(&target)?;
     run_ok(
@@ -1590,11 +1593,14 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
             }
         ]),
     )?;
-    let oracle: Value =
-        serde_json::from_str(include_str!("fixtures/alembic_cache/oracle.json"))?;
+    let oracle: Value = serde_json::from_str(include_str!("fixtures/alembic_cache/oracle.json"))?;
     let sequence_case = oracle["cases"]
         .as_array()
-        .and_then(|cases| cases.iter().find(|case| case["id"] == "is_sequence_per_frame_files"))
+        .and_then(|cases| {
+            cases
+                .iter()
+                .find(|case| case["id"] == "is_sequence_per_frame_files")
+        })
         .ok_or("Blender sequence oracle case is missing")?;
     for frame in 1.0..=4.0 {
         let expected = sequence_case["frames"]
@@ -1702,7 +1708,12 @@ fn resource_pack_sequence_is_self_contained_after_reopen() -> Result<(), Box<dyn
         &json!([{"op":"resource.unpack","id":"packed_sequence","path":unpack_pattern}]),
     )?;
     for frame in 1..=4 {
-        assert!(temporary.path().join(format!("unpacked.{frame:04}.abc")).is_file());
+        assert!(
+            temporary
+                .path()
+                .join(format!("unpacked.{frame:04}.abc"))
+                .is_file()
+        );
     }
     for frame in 1.0..=4.0 {
         let expected = sequence_case["frames"]
@@ -1730,8 +1741,7 @@ fn resource_pack_sequence_rejects_out_of_directory_symlink_without_commit()
     let target = temporary.path().join("symlink_sequence.pot");
     init(&target)?;
 
-    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/alembic_cache");
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alembic_cache");
     let sequence_root = temporary.path().join("sequence");
     let outside_root = temporary.path().join("outside");
     fs::create_dir_all(&sequence_root)?;
@@ -1742,10 +1752,7 @@ fn resource_pack_sequence_rejects_out_of_directory_symlink_without_commit()
     )?;
     let outside_frame = outside_root.join("seq.0002.abc");
     fs::copy(fixture_dir.join("seq.0002.abc"), &outside_frame)?;
-    std::os::unix::fs::symlink(
-        &outside_frame,
-        sequence_root.join("seq.0002.abc"),
-    )?;
+    std::os::unix::fs::symlink(&outside_frame, sequence_root.join("seq.0002.abc"))?;
 
     let scene_path = target.join("scene.json");
     let before: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
@@ -1792,8 +1799,8 @@ fn blender_topology_change_forces_full_cache_read_with_vertex_only_flag()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempdir()?;
     let target = temporary.path().join("topology.pot");
-    let archive = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/alembic_cache/topo.abc");
+    let archive =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alembic_cache/topo.abc");
     init(&target)?;
     run_ok(
         pot()
@@ -1966,14 +1973,15 @@ fn mesh_sequence_cache_and_resource_schema_describe_parameters() -> Result<(), B
         .as_array()
         .ok_or("resource.pack schema is missing required fields")?;
     for optional in ["kind", "sequence"] {
-        assert!(!pack_required.iter().any(|field| field.as_str() == Some(optional)));
+        assert!(
+            !pack_required
+                .iter()
+                .any(|field| field.as_str() == Some(optional))
+        );
     }
     assert_eq!(pack_schema["properties"]["kind"]["type"], "string");
     assert_eq!(pack_schema["properties"]["kind"]["default"], "binary");
-    assert_eq!(
-        pack_schema["properties"]["sequence"]["type"],
-        "object"
-    );
+    assert_eq!(pack_schema["properties"]["sequence"]["type"], "object");
     assert_eq!(
         pack_schema["properties"]["sequence"]["required"],
         json!(["start", "end"])
@@ -2000,10 +2008,7 @@ fn mesh_sequence_cache_and_resource_schema_describe_parameters() -> Result<(), B
         pack_schema["allOf"][0]["if"]["required"],
         json!(["sequence"])
     );
-    assert_eq!(
-        pack_schema["allOf"][0]["then"]["required"],
-        json!(["kind"])
-    );
+    assert_eq!(pack_schema["allOf"][0]["then"]["required"], json!(["kind"]));
     assert_eq!(
         pack_schema["allOf"][0]["then"]["properties"]["kind"]["const"],
         "alembic"
@@ -2013,7 +2018,11 @@ fn mesh_sequence_cache_and_resource_schema_describe_parameters() -> Result<(), B
     let unpack_required = unpack_schema["required"]
         .as_array()
         .ok_or("resource.unpack schema is missing required fields")?;
-    assert!(!unpack_required.iter().any(|field| field.as_str() == Some("path")));
+    assert!(
+        !unpack_required
+            .iter()
+            .any(|field| field.as_str() == Some("path"))
+    );
     assert_eq!(unpack_schema["properties"]["path"]["type"], "string");
     Ok(())
 }

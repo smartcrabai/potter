@@ -110,7 +110,11 @@ fn expected(oracle: &Value, case: &str) -> Vec<DVec3> {
 }
 
 fn assert_points(label: &str, actual: &Mesh, expected: &[DVec3]) {
-    assert_eq!(actual.vertices.len(), expected.len(), "{label}: vertex count");
+    assert_eq!(
+        actual.vertices.len(),
+        expected.len(),
+        "{label}: vertex count"
+    );
     for (index, (vertex, want)) in actual.vertices.iter().zip(expected).enumerate() {
         let error = (vertex.co - *want).abs().max_element();
         assert!(
@@ -152,7 +156,11 @@ fn laplacian_smooth_matches_blender_closed_torus() {
     let params = oracle["cases"]["lap_t_closed_torus"]["params"].clone();
     let mesh = tube(&oracle, &oracle["bent"], true);
     let result = evaluate(&mesh, &[modifier("laplacian_smooth", params)]);
-    assert_points("lap_t_closed_torus", &result, &expected(&oracle, "lap_t_closed_torus"));
+    assert_points(
+        "lap_t_closed_torus",
+        &result,
+        &expected(&oracle, "lap_t_closed_torus"),
+    );
 }
 
 #[test]
@@ -164,7 +172,9 @@ fn laplacian_smooth_zero_weight_vertices_stay_put() {
     let bent = points(&oracle["bent"]);
     // Vertices absent from group G have weight 0: their row is the identity.
     for index in (3..24).step_by(4) {
-        let error = (result.vertices[index].co - bent[index]).abs().max_element();
+        let error = (result.vertices[index].co - bent[index])
+            .abs()
+            .max_element();
         assert!(error < 1.0e-9, "vertex {index} moved by {error}");
     }
 }
@@ -201,7 +211,9 @@ fn corrective_smooth_pins_boundary_rings() {
     let bent = points(&oracle["bent"]);
     // Rings 0 and 3 are the open ends (one face per edge): pinned, so they keep the input.
     for index in (0..6).chain(18..24) {
-        let error = (result.vertices[index].co - bent[index]).abs().max_element();
+        let error = (result.vertices[index].co - bent[index])
+            .abs()
+            .max_element();
         assert!(error < 1.0e-6, "pinned vertex {index} moved by {error}");
     }
 }
@@ -216,7 +228,9 @@ fn corrective_smooth_zero_weight_vertices_stay_put() {
     let result = evaluate(&mesh, &[bind]);
     let bent = points(&oracle["bent"]);
     for index in (3..24).step_by(4) {
-        let error = (result.vertices[index].co - bent[index]).abs().max_element();
+        let error = (result.vertices[index].co - bent[index])
+            .abs()
+            .max_element();
         assert!(error < 1.0e-9, "vertex {index} moved by {error}");
     }
 }

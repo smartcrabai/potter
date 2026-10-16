@@ -14,8 +14,9 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot, mesh_vertex_weights},
     geom::{
-        Mesh, MeshError, attribute_keys, clnor, edge_key,
+        Mesh, MeshError, attribute_keys, clnor,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+        edge_key,
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
         uv_layers::{self, UvLayer, UvStore},
     },
@@ -1055,10 +1056,10 @@ fn color_losses(
         let Some(material_id) = material_for_slot(*slot) else {
             continue;
         };
-        let layer = layer.as_deref().filter(|name| !name.is_empty()).map_or_else(
-            || "the render layer".to_owned(),
-            |name| format!("`{name}`"),
-        );
+        let layer = layer
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
         losses.push(Loss {
             feature_id: feature_id::VERTEX_COLOR.to_owned(),
             data_id: Some(material_id.to_string()),
@@ -1194,9 +1195,8 @@ fn unwritten_attribute_losses(mesh: &Mesh, mesh_id: &str) -> Vec<Loss> {
 }
 
 fn explicit_zero_normal_loss(mesh: &Mesh, mesh_id: &str) -> Result<Option<Loss>> {
-    let explicit_zero = clnor::corner_codes(mesh)?.is_some_and(|codes| {
-        codes.contains(&clnor::CornerNormalCode::ExplicitZero)
-    });
+    let explicit_zero = clnor::corner_codes(mesh)?
+        .is_some_and(|codes| codes.contains(&clnor::CornerNormalCode::ExplicitZero));
     Ok(explicit_zero.then(|| Loss {
         feature_id: "mesh.normals".to_owned(),
         data_id: Some(mesh_id.to_owned()),
@@ -1244,9 +1244,7 @@ pub(crate) fn mesh_export_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<
         }
         let bindings = used_material_bindings(node_id, node, snapshot, mesh)?;
         let colors = color_plan(mesh, &bindings, &surfaces)?;
-        losses.extend(color_losses(
-            &mesh_id, mesh, &bindings, &surfaces, &colors,
-        ));
+        losses.extend(color_losses(&mesh_id, mesh, &bindings, &surfaces, &colors));
     }
     Ok(losses)
 }
@@ -1265,7 +1263,10 @@ fn color_plan(
     for (slot, material_id) in bindings {
         let surface = match *material_id {
             Some(id) => Some(surfaces.get(id).ok_or_else(|| {
-                PotError::new(ErrorCode::SceneInvalid, "node material reference is missing")
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "node material reference is missing",
+                )
             })?),
             None => None,
         };
@@ -1282,8 +1283,7 @@ fn color_plan(
         match store.resolve(reference.as_deref()) {
             (Some(index), _) => {
                 plan.slot_layers.insert(*slot, index);
-                if surface.is_some_and(|surface| !matches!(surface.alpha_mode, AlphaMode::Opaque))
-                {
+                if surface.is_some_and(|surface| !matches!(surface.alpha_mode, AlphaMode::Opaque)) {
                     plan.translucent.insert(*slot);
                 }
             }
@@ -1328,7 +1328,9 @@ fn export_vertex_layout(
         .map(|face| face.vertices.len())
         .sum::<usize>();
     if layers.iter().any(|layer| layer.len() != corner_count)
-        || colors.iter().any(|color| color.corners.len() != corner_count)
+        || colors
+            .iter()
+            .any(|color| color.corners.len() != corner_count)
     {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -3462,7 +3464,10 @@ pub(crate) fn tex_coord_plan(
                 continue;
             };
             let slot = usize::try_from(slot).map_err(|_| {
-                PotError::new(ErrorCode::SceneInvalid, "mesh material slot exceeds platform range")
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "mesh material slot exceeds platform range",
+                )
             })?;
             let texture_refs = references.get(material_id).ok_or_else(|| {
                 PotError::new(
@@ -3483,10 +3488,10 @@ pub(crate) fn tex_coord_plan(
                         feature_id::UV_LAYER_MISSING,
                     ))
                 {
-                    let layer = reference.as_deref().filter(|name| !name.is_empty()).map_or_else(
-                        || "the render layer".to_owned(),
-                        |name| format!("`{name}`"),
-                    );
+                    let layer = reference
+                        .as_deref()
+                        .filter(|name| !name.is_empty())
+                        .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
                     plan.warnings.push(PotError::with_details(
                         ErrorCode::UnrepresentableFeature,
                         format!(
@@ -3602,7 +3607,10 @@ fn preserve_vrm_material_variants(
                 })?;
             for (index, material_id, _) in variants {
                 let base_index = material_indices.get(material_id).copied().ok_or_else(|| {
-                    PotError::new(ErrorCode::InternalError, "VRM base material index is missing")
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "VRM base material index is missing",
+                    )
                 })?;
                 let property = properties.get(base_index).cloned().ok_or_else(|| {
                     PotError::new(
@@ -3622,11 +3630,13 @@ fn preserve_vrm_material_variants(
         AvatarVersion::V1 => {
             for (material_id, mtoon) in &avatar.mtoon {
                 let base_index = material_indices.get(material_id).copied().ok_or_else(|| {
-                    PotError::new(ErrorCode::InternalError, "VRM base material index is missing")
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "VRM base material index is missing",
+                    )
                 })?;
-                let base_extension = root["materials"][base_index]["extensions"]
-                    ["VRMC_materials_mtoon"]
-                    .clone();
+                let base_extension =
+                    root["materials"][base_index]["extensions"]["VRMC_materials_mtoon"].clone();
                 if !base_extension.is_object() {
                     continue;
                 }
@@ -3902,7 +3912,10 @@ fn export_with_root_inner(
                 continue;
             }
             let material = doc.materials.get(material_id).ok_or_else(|| {
-                PotError::new(ErrorCode::SceneInvalid, "node material reference is missing")
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "node material reference is missing",
+                )
             })?;
             let surface = surfaces.get(material_id).ok_or_else(|| {
                 PotError::new(ErrorCode::SceneInvalid, "node material surface is missing")
@@ -4283,7 +4296,10 @@ fn export_with_root_inner(
                 primitive["attributes"][format!("COLOR_{set}")] = json!(accessor);
             }
             let slot = usize::try_from(*slot).map_err(|_| {
-                PotError::new(ErrorCode::SceneInvalid, "mesh material slot exceeds platform range")
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "mesh material slot exceeds platform range",
+                )
             })?;
             if let Some(material_id) = snapshot.slot_material(node_id, node, slot) {
                 let coords = tex_coords
@@ -7295,9 +7311,7 @@ fn import_color_layers(
                 .iter()
                 .zip(&welded_values)
                 .map(|(copy, value)| {
-                    value.unwrap_or_else(|| {
-                        values.get(*copy).copied().flatten().unwrap_or(DEFAULT)
-                    })
+                    value.unwrap_or_else(|| values.get(*copy).copied().flatten().unwrap_or(DEFAULT))
                 })
                 .collect::<Vec<_>>();
             (ColorDomain::Point, per_vertex)
@@ -9663,7 +9677,10 @@ mod tests {
 
         set_codes(
             &mut mesh,
-            [json!([null, "explicit_zero", null]), json!(["explicit_zero", null, null])],
+            [
+                json!([null, "explicit_zero", null]),
+                json!(["explicit_zero", null, null]),
+            ],
         );
         let loss = super::explicit_zero_normal_loss(&mesh, "mesh")?
             .ok_or("explicit zero must be reported as a loss")?;
@@ -9677,12 +9694,18 @@ mod tests {
             "{loss:?}"
         );
 
-        set_codes(&mut mesh, [json!([null, null, null]), json!([null, null, null])]);
+        set_codes(
+            &mut mesh,
+            [json!([null, null, null]), json!([null, null, null])],
+        );
         assert!(super::explicit_zero_normal_loss(&mesh, "mesh")?.is_none());
 
         set_codes(
             &mut mesh,
-            [json!([[12000, 7000], null, [-3, 4]]), json!([null, [0, 9], null])],
+            [
+                json!([[12000, 7000], null, [-3, 4]]),
+                json!([null, [0, 9], null]),
+            ],
         );
         assert!(super::explicit_zero_normal_loss(&mesh, "mesh")?.is_none());
 
@@ -9717,12 +9740,11 @@ mod tests {
         vertex
             .properties
             .insert("layer_name".to_owned(), json!(layer));
-        group
-            .nodes
-            .insert(crate::model::Id::new("out")?, output);
-        group
-            .nodes
-            .insert(crate::model::Id::new("bsdf")?, GraphNode::new("ShaderNodeBsdfPrincipled"));
+        group.nodes.insert(crate::model::Id::new("out")?, output);
+        group.nodes.insert(
+            crate::model::Id::new("bsdf")?,
+            GraphNode::new("ShaderNodeBsdfPrincipled"),
+        );
         group.nodes.insert(crate::model::Id::new("paint")?, vertex);
         group.links.push(GraphLink {
             from_node: crate::model::Id::new("bsdf")?,
@@ -9819,11 +9841,8 @@ mod tests {
         let accessor = primitives[0]["attributes"]["COLOR_0"]
             .as_u64()
             .ok_or("COLOR_0 is missing")?;
-        let (colors, dimensions) = super::read_float_accessor(
-            &document,
-            &buffers,
-            usize::try_from(accessor)?,
-        )?;
+        let (colors, dimensions) =
+            super::read_float_accessor(&document, &buffers, usize::try_from(accessor)?)?;
         assert_eq!(dimensions, 4);
         let vertex_ids = mesh_value["extras"]["potter"]["vertex_ids"]
             .as_array()
@@ -9831,12 +9850,7 @@ mod tests {
         let exported = vertex_ids
             .iter()
             .zip(colors.as_chunks::<4>().0)
-            .map(|(id, color)| {
-                (
-                    id.as_u64().unwrap_or(u64::MAX),
-                    color.map(f64::to_bits),
-                )
-            })
+            .map(|(id, color)| (id.as_u64().unwrap_or(u64::MAX), color.map(f64::to_bits)))
             .collect::<BTreeSet<_>>();
         // Each corner's vertex with its corner value. Corners that share a value and a vertex
         // share an output vertex, so the sets compare exactly.
@@ -9860,11 +9874,8 @@ mod tests {
         let point_accessor = primitives[0]["attributes"]["COLOR_1"]
             .as_u64()
             .ok_or("COLOR_1 is missing")?;
-        let (point_colors, _) = super::read_float_accessor(
-            &document,
-            &buffers,
-            usize::try_from(point_accessor)?,
-        )?;
+        let (point_colors, _) =
+            super::read_float_accessor(&document, &buffers, usize::try_from(point_accessor)?)?;
         let exported_points = vertex_ids
             .iter()
             .zip(point_colors.as_chunks::<4>().0)
@@ -11927,11 +11938,8 @@ mod tests {
         assert!(attributes["TEXCOORD_2"].is_null());
         let buffers = vec![binary];
         let read_set = |set: &str| -> TestResult<Vec<[f64; 2]>> {
-            let accessor = usize::try_from(
-                attributes[set]
-                    .as_u64()
-                    .ok_or("UV accessor is missing")?,
-            )?;
+            let accessor =
+                usize::try_from(attributes[set].as_u64().ok_or("UV accessor is missing")?)?;
             Ok(super::read_vec2(&document, &buffers, accessor)?)
         };
         assert!(read_set("TEXCOORD_0")?.iter().all(|uv| *uv == [0.0, 1.0]));

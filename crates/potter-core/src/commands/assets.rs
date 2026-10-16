@@ -68,7 +68,10 @@ pub fn run(args: AssetsArgs) -> Result<(Option<SceneInfo>, Value)> {
                 bool_field(resource.as_object(), &["packed", "is_packed"]).unwrap_or(false);
             let status = if is_sequence_resource(resource) {
                 let resource_id = library.resource.as_ref().ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "library sequence resource is missing")
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "library sequence resource is missing",
+                    )
                 })?;
                 let mut found = false;
                 let mut missing = false;
@@ -246,9 +249,18 @@ fn append_sequence_assets(
             .get("packed")
             .and_then(Value::as_bool)
             .ok_or_else(invalid)?;
-        if leaf.get("uri").and_then(Value::as_str).is_none_or(str::is_empty)
-            || leaf.get("kind").and_then(Value::as_str).is_none_or(str::is_empty)
-            || leaf.get("hash").and_then(Value::as_str).is_none_or(str::is_empty)
+        if leaf
+            .get("uri")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            || leaf
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || leaf
+                .get("hash")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
             || (leaf_packed && leaf.get("bytes").and_then(Value::as_array).is_none())
             || (packed && !leaf_packed)
         {
@@ -294,7 +306,6 @@ fn collect_resource_hash<'a>(resource: &'a Value, hashes: &mut BTreeSet<&'a str>
         hashes.insert(digest);
     }
 }
-
 
 fn string_field(object: Option<&Map<String, Value>>, names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
@@ -400,7 +411,11 @@ fn sequence_resource_status(
             Some((start, end, count))
         }
         (None, None) if !packed => None,
-        _ => return Err(invalid("Alembic sequence has an invalid inclusive frame range")),
+        _ => {
+            return Err(invalid(
+                "Alembic sequence has an invalid inclusive frame range",
+            ));
+        }
     };
     let frame_count = i64::try_from(frames.len())
         .map_err(|_| invalid("Alembic sequence has too many frame records"))?;
@@ -419,12 +434,16 @@ fn sequence_resource_status(
             .filter(|frame| frame.to_string() == frame_key.as_str())
             .ok_or_else(|| invalid("Alembic sequence frame key is not a canonical int32"))?;
         if range.is_some_and(|(start, end, _)| frame < start || frame > end) {
-            return Err(invalid("Alembic sequence frame is outside its inclusive range"));
+            return Err(invalid(
+                "Alembic sequence frame is outside its inclusive range",
+            ));
         }
     }
     if let Some((_, _, expected_count)) = range {
         if packed && frame_count != expected_count {
-            return Err(invalid("packed Alembic sequence does not contain every frame in its range"));
+            return Err(invalid(
+                "packed Alembic sequence does not contain every frame in its range",
+            ));
         }
         if !packed && frame_count < expected_count {
             missing = true;

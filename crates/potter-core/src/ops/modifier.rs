@@ -110,21 +110,20 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             bind_index + 1
         };
         let bind_nodes = BTreeSet::from([subject_id.clone()]);
-        let bind_snapshot =
-            crate::eval::Snapshot::evaluate_nodes_with_modifier_prefix_with_cache(
-                engine.doc,
-                &crate::eval::EvaluationContext {
-                    scene_id: None,
-                    view_layer: None,
-                    frame: Some(engine.evaluation_frame),
-                    purpose: EvaluationPurpose::Preview,
-                },
-                engine.asset_root,
-                None,
-                &bind_nodes,
-                &subject_id,
-                keep,
-            )?;
+        let bind_snapshot = crate::eval::Snapshot::evaluate_nodes_with_modifier_prefix_with_cache(
+            engine.doc,
+            &crate::eval::EvaluationContext {
+                scene_id: None,
+                view_layer: None,
+                frame: Some(engine.evaluation_frame),
+                purpose: EvaluationPurpose::Preview,
+            },
+            engine.asset_root,
+            None,
+            &bind_nodes,
+            &subject_id,
+            keep,
+        )?;
         let source_bind_mesh = bind_snapshot
             .meshes
             .get(&subject_id)
@@ -202,14 +201,13 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                     json!({"modifier_id":modifier_id,"target":target_id}),
                 ));
             }
-            let target_mesh =
-                bind_snapshot
-                    .meshes
-                    .get(&target_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        PotError::invalid_operation("evaluated target mesh is unavailable")
-                    })?;
+            let target_mesh = bind_snapshot
+                .meshes
+                .get(&target_id)
+                .cloned()
+                .ok_or_else(|| {
+                    PotError::invalid_operation("evaluated target mesh is unavailable")
+                })?;
             let driver_values =
                 crate::eval::rig::evaluate_drivers(engine.doc, engine.evaluation_frame)?;
             let world_matrices = crate::eval::rig::evaluate_world_matrices_with_drivers(
@@ -1268,95 +1266,93 @@ fn evaluate_modifier_output(
                 },
                 |_, modifier| modifier.enabled,
                 &mut texture_rng,
-                |mesh, modifier, modifier_warnings, multi_input, texture_rng| {
-                    match modifier.modifier_type.as_str() {
-                        "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
-                            mesh,
-                            data_block,
-                            modifier,
-                            object_world,
-                            engine.doc,
-                            frame,
-                            &world_matrices,
-                            &driver_values,
-                            engine.asset_root,
-                            engine
-                                .doc
-                                .scenes
-                                .get(&engine.doc.active_scene)
-                                .map_or(24, |scene| scene.fps),
-                            engine
-                                .doc
-                                .scenes
-                                .get(&engine.doc.active_scene)
-                                .map_or(1.0, |scene| scene.fps_base),
-                            evaluated_operand_meshes,
-                            multi_input,
-                        ),
-                        "lattice" => crate::eval::apply_lattice_modifier(
-                            mesh,
-                            modifier,
-                            target,
-                            data_block,
-                            engine.doc,
-                            &world_matrices,
-                        ),
-                        "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
-                            mesh,
-                            modifier,
-                            target,
-                            engine.doc,
-                            &world_matrices,
-                            &volume_data,
-                        ),
-                        "surface_deform" | "mesh_deform" => {
-                            crate::eval::apply_scene_deform_modifier(
-                                mesh,
-                                modifier,
-                                target,
-                                engine.doc,
-                                &references,
-                                modifier_warnings,
-                            )
-                        }
-                        "boolean" | "shrinkwrap" | "curve" | "hook" | "cast"
-                        | "simple_deform" => crate::eval::apply_scene_operand_modifier(
-                            mesh,
-                            modifier,
-                            target,
-                            engine.doc,
-                            &references,
-                        ),
-                        "displace" | "wave" | "warp" => {
-                            crate::eval::apply_scene_displacement_modifier(
-                                mesh,
-                                modifier,
-                                target,
-                                engine.doc,
-                                &references,
-                                frame,
-                                texture_rng,
-                            )
-                        }
-                        "vertex_weight_edit"
-                        | "vertex_weight_mix"
-                        | "vertex_weight_proximity"
-                        | "normal_edit"
-                        | "uv_project"
-                        | "uv_warp"
-                        | "data_transfer" => crate::eval::apply_scene_attribute_modifier(
+                |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier
+                    .modifier_type
+                    .as_str()
+                {
+                    "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
+                        mesh,
+                        data_block,
+                        modifier,
+                        object_world,
+                        engine.doc,
+                        frame,
+                        &world_matrices,
+                        &driver_values,
+                        engine.asset_root,
+                        engine
+                            .doc
+                            .scenes
+                            .get(&engine.doc.active_scene)
+                            .map_or(24, |scene| scene.fps),
+                        engine
+                            .doc
+                            .scenes
+                            .get(&engine.doc.active_scene)
+                            .map_or(1.0, |scene| scene.fps_base),
+                        evaluated_operand_meshes,
+                        multi_input,
+                    ),
+                    "lattice" => crate::eval::apply_lattice_modifier(
+                        mesh,
+                        modifier,
+                        target,
+                        data_block,
+                        engine.doc,
+                        &world_matrices,
+                    ),
+                    "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
+                        mesh,
+                        modifier,
+                        target,
+                        engine.doc,
+                        &world_matrices,
+                        &volume_data,
+                    ),
+                    "surface_deform" | "mesh_deform" => crate::eval::apply_scene_deform_modifier(
+                        mesh,
+                        modifier,
+                        target,
+                        engine.doc,
+                        &references,
+                        modifier_warnings,
+                    ),
+                    "boolean" | "shrinkwrap" | "curve" | "hook" | "cast" | "simple_deform" => {
+                        crate::eval::apply_scene_operand_modifier(
                             mesh,
                             modifier,
                             target,
                             engine.doc,
                             &references,
-                            texture_rng,
-                        ),
-                        _ => Err(PotError::new(
-                            ErrorCode::InternalError,
-                            "custom modifier callback received an unexpected type",
-                        )),
+                        )
                     }
+                    "displace" | "wave" | "warp" => crate::eval::apply_scene_displacement_modifier(
+                        mesh,
+                        modifier,
+                        target,
+                        engine.doc,
+                        &references,
+                        frame,
+                        texture_rng,
+                    ),
+                    "vertex_weight_edit"
+                    | "vertex_weight_mix"
+                    | "vertex_weight_proximity"
+                    | "normal_edit"
+                    | "uv_project"
+                    | "uv_warp"
+                    | "data_transfer" => crate::eval::apply_scene_attribute_modifier(
+                        mesh,
+                        modifier,
+                        target,
+                        engine.doc,
+                        &references,
+                        texture_rng,
+                    ),
+                    _ => Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "custom modifier callback received an unexpected type",
+                    )),
                 },
             )?;
             let (dropped, blocking): (Vec<PotError>, Vec<PotError>) = evaluation

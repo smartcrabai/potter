@@ -9,14 +9,14 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
 
 use native_oracle::{
     NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations, blender, build_oracle, code_pair,
@@ -41,19 +41,39 @@ fn check_stored_codes(
     let mut automatic = 0;
     for (face, ((row, raw_row), status_row)) in rows.iter().zip(codes).zip(statuses).enumerate() {
         let raw_row = raw_row.as_array().ok_or("oracle code row is missing")?;
-        let status_row = status_row.as_array().ok_or("oracle status row is missing")?;
+        let status_row = status_row
+            .as_array()
+            .ok_or("oracle status row is missing")?;
         assert_eq!(row.len(), raw_row.len(), "{label} face {face} corner count");
-        assert_eq!(row.len(), status_row.len(), "{label} face {face} status count");
+        assert_eq!(
+            row.len(),
+            status_row.len(),
+            "{label} face {face} status count"
+        );
         for (corner, stored) in row.iter().enumerate() {
             let raw = code_pair(&raw_row[corner])?;
             let oracle_authored = !status_row[corner].is_null();
             if raw == [0, 0] {
-                assert_eq!(*stored, StoredCorner::Auto, "{label} face {face} corner {corner} is automatic in Blender");
-                assert!(!oracle_authored, "{label} face {face} corner {corner}: status says authored, code says automatic");
+                assert_eq!(
+                    *stored,
+                    StoredCorner::Auto,
+                    "{label} face {face} corner {corner} is automatic in Blender"
+                );
+                assert!(
+                    !oracle_authored,
+                    "{label} face {face} corner {corner}: status says authored, code says automatic"
+                );
                 automatic += 1;
             } else {
-                assert_eq!(*stored, StoredCorner::Code(raw), "{label} face {face} corner {corner}");
-                assert!(oracle_authored, "{label} face {face} corner {corner}: code says authored, status says automatic");
+                assert_eq!(
+                    *stored,
+                    StoredCorner::Code(raw),
+                    "{label} face {face} corner {corner}"
+                );
+                assert!(
+                    oracle_authored,
+                    "{label} face {face} corner {corner}: code says authored, status says automatic"
+                );
                 authored += 1;
             }
         }
@@ -78,9 +98,16 @@ fn import_stores_raw_blender_code_pairs_as_normal_code_state() -> TestResult {
     let oracle_statuses = expected["oracle"]["custom_normal"]
         .as_array()
         .ok_or("oracle custom normal statuses are missing")?;
-    let (authored, automatic) =
-        check_stored_codes(mesh_of_node(&scene, "Oracle")?, oracle_codes, oracle_statuses, "Oracle")?;
-    assert!(authored > 0 && automatic > 0, "the oracle must mix both statuses");
+    let (authored, automatic) = check_stored_codes(
+        mesh_of_node(&scene, "Oracle")?,
+        oracle_codes,
+        oracle_statuses,
+        "Oracle",
+    )?;
+    assert!(
+        authored > 0 && automatic > 0,
+        "the oracle must mix both statuses"
+    );
 
     let regress_codes = expected["regress"]["custom_normal_codes"]
         .as_array()
@@ -88,9 +115,16 @@ fn import_stores_raw_blender_code_pairs_as_normal_code_state() -> TestResult {
     let regress_statuses = expected["regress"]["custom_normal"]
         .as_array()
         .ok_or("regress custom normal statuses are missing")?;
-    let (authored, automatic) =
-        check_stored_codes(mesh_of_node(&scene, "Regress")?, regress_codes, regress_statuses, "Regress")?;
-    assert!(authored > 0 && automatic > 0, "the regress object must mix both statuses");
+    let (authored, automatic) = check_stored_codes(
+        mesh_of_node(&scene, "Regress")?,
+        regress_codes,
+        regress_statuses,
+        "Regress",
+    )?;
+    assert!(
+        authored > 0 && automatic > 0,
+        "the regress object must mix both statuses"
+    );
     Ok(())
 }
 
@@ -112,12 +146,17 @@ fn dumped_corners(object: &Value) -> TestResult<Vec<DumpedCorner>> {
     let vertices = object["vertices"]
         .as_array()
         .ok_or("dumped vertices are missing")?;
-    let loops = object["loops"].as_array().ok_or("dumped loops are missing")?;
+    let loops = object["loops"]
+        .as_array()
+        .ok_or("dumped loops are missing")?;
     let normals = object["corner_normals"]
         .as_array()
         .ok_or("dumped corner normals are missing")?;
     let mut corners = Vec::new();
-    for face in object["faces"].as_array().ok_or("dumped faces are missing")? {
+    for face in object["faces"]
+        .as_array()
+        .ok_or("dumped faces are missing")?
+    {
         let center = vec3(&face["center"])?;
         let start = face["loop_start"].as_u64().ok_or("loop start is missing")? as usize;
         let total = face["loop_total"].as_u64().ok_or("loop total is missing")? as usize;
@@ -165,7 +204,9 @@ fn subdivision_then_displace_keeps_every_corner_normal_as_blender_computes_it() 
             match stored {
                 StoredCorner::Auto => nulls += 1,
                 StoredCorner::Code(_) => codes += 1,
-                StoredCorner::ExplicitZero => panic!("a Blender import has no literal zero vectors"),
+                StoredCorner::ExplicitZero => {
+                    panic!("a Blender import has no literal zero vectors")
+                }
             }
         }
     }
@@ -264,9 +305,17 @@ fn subdivision_without_use_custom_normals_drops_the_custom_normal_layer() -> Tes
     // Blender's own evaluation is the reference for what Potter must do.
     let probe_script = write_script(root.path(), "subsurf_probe.py", SUBSURF_CUSTOM_NORMAL_PROBE)?;
     let probe_json = root.path().join("subsurf_probe.json");
-    run_blender_arguments(&blender, &probe_script, Some(blend.as_path()), &[&probe_json])?;
+    run_blender_arguments(
+        &blender,
+        &probe_script,
+        Some(blend.as_path()),
+        &[&probe_json],
+    )?;
     let probe: Value = serde_json::from_slice(&std::fs::read(&probe_json)?)?;
-    assert_eq!(probe["base"], true, "the oracle's Regress must start with custom normals");
+    assert_eq!(
+        probe["base"], true,
+        "the oracle's Regress must start with custom normals"
+    );
     assert_eq!(
         probe["default"], false,
         "Blender drops custom normals from a Subdivision without use_custom_normals"
@@ -282,7 +331,10 @@ fn subdivision_without_use_custom_normals_drops_the_custom_normal_layer() -> Tes
 
     let cases = [
         ("default", json!({"levels": 1})),
-        ("explicit_false", json!({"levels": 1, "use_custom_normals": false})),
+        (
+            "explicit_false",
+            json!({"levels": 1, "use_custom_normals": false}),
+        ),
     ];
     for (name, params) in cases {
         let (project, _) = import_blend(&blender, root.path(), name, &blend)?;

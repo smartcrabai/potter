@@ -3454,12 +3454,28 @@ mod tests {
             ..crate::model::Node::default()
         };
         let mut output = String::new();
-        write_geometry(&mut output, 1, &node, &mesh, None, EvaluationPurpose::Render, true)?;
+        write_geometry(
+            &mut output,
+            1,
+            &node,
+            &mesh,
+            None,
+            EvaluationPurpose::Render,
+            true,
+        )?;
         assert!(output.contains("Geometry: 1, \"Geometry::Triangle\", \"Mesh\""));
         // The losses for these attributes come from `exchange::attribute_losses`.
         let losses = crate::exchange::mesh_attribute_losses("fbx", "triangle", &mesh);
-        assert!(losses.iter().any(|loss| loss.feature_id == "mesh.color_attribute"));
-        assert!(losses.iter().any(|loss| loss.feature_id == "mesh.attribute"));
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "mesh.color_attribute")
+        );
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "mesh.attribute")
+        );
         Ok(())
     }
 }

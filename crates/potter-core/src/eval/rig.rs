@@ -2550,22 +2550,19 @@ pub(crate) fn apply_armature_skinning(
         }
 
         let total: f64 = contributions.iter().map(|(_, weight)| *weight).sum();
-        let mixed = (total > ARMATURE_CONTRIBUTION_THRESHOLD).then(|| {
-            mix_armature_point(source_armature, &contributions, total, preserve_volume)
-        });
+        let mixed = (total > ARMATURE_CONTRIBUTION_THRESHOLD)
+            .then(|| mix_armature_point(source_armature, &contributions, total, preserve_volume));
         if multi_input.is_some() {
-            let previous_weight = mask_weight(vertex.id).map_or(0.0, |mask| {
-                if invert_mask { mask } else { 1.0 - mask }
-            });
+            let previous_weight = mask_weight(vertex.id)
+                .map_or(0.0, |mask| if invert_mask { mask } else { 1.0 - mask });
             if previous_weight == 1.0 {
                 continue;
             }
             let base = mixed.map_or(source, |point| to_object.transform_point3(point));
             vertex.co = base.lerp(vertex.co, previous_weight);
         } else {
-            let weight = mask_weight(vertex.id).map_or(1.0, |mask| {
-                if invert_mask { 1.0 - mask } else { mask }
-            });
+            let weight = mask_weight(vertex.id)
+                .map_or(1.0, |mask| if invert_mask { 1.0 - mask } else { mask });
             if weight == 0.0 {
                 continue;
             }
@@ -2685,8 +2682,7 @@ fn envelope_falloff(distance_squared: f64, closest_radius: f64, falloff_distance
     if distance_squared < closest_radius * closest_radius {
         return 1.0;
     }
-    if falloff_distance <= 0.0 || distance_squared >= (closest_radius + falloff_distance).powi(2)
-    {
+    if falloff_distance <= 0.0 || distance_squared >= (closest_radius + falloff_distance).powi(2) {
         return 0.0;
     }
     let outside = distance_squared.sqrt() - closest_radius;
@@ -2759,7 +2755,10 @@ impl BoneDualQuat {
                 ..DMat4::from_quat(matrix_rotation_quat(DMat3::from_cols(x, y, z)))
             };
             let shear = base_rotation.inverse() * posed;
-            (base_rotation * rest_inverse, Some(rest * shear * rest_inverse))
+            (
+                base_rotation * rest_inverse,
+                Some(rest * shear * rest_inverse),
+            )
         } else {
             (skin, None)
         };

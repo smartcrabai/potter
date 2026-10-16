@@ -2241,4 +2241,3 @@ fn kani_revision_bound_is_exact() {
         "revision range must include exactly the interoperable integer range",
     );
 }
-

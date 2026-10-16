@@ -1821,8 +1821,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
 "#,
     )?;
     assert_ne!(
-        expected["bind_corner_tris"],
-        expected["hook_corner_tris"],
+        expected["bind_corner_tris"], expected["hook_corner_tris"],
         "Blender Hook deformation did not change the evaluated corner triangulation"
     );
 

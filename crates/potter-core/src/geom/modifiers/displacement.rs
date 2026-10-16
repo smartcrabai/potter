@@ -47,7 +47,11 @@ pub(super) fn vertex_group(mesh: &Mesh, modifier: &Modifier) -> Result<VertexGro
     if name.is_empty() {
         return Ok(VertexGroup::Absent);
     }
-    let Some(groups) = mesh.attributes.get("vertex_groups").and_then(Value::as_object) else {
+    let Some(groups) = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+    else {
         return Ok(VertexGroup::Absent);
     };
     let Some(group) = groups.get(name) else {
@@ -333,13 +337,15 @@ pub(crate) fn displace_textured(
             continue;
         }
         let sample = match (texture, &coords) {
-            (Some(texture), Some(coords)) => Some(legacy_texture::sample(texture.source(), coords[index], rng)?),
+            (Some(texture), Some(coords)) => Some(legacy_texture::sample(
+                texture.source(),
+                coords[index],
+                rng,
+            )?),
             _ => None,
         };
         let scaled = strength * weight;
-        let delta = sample
-            .map_or(1.0 - mid_level, |sample| sample.intensity - mid_level)
-            * scaled;
+        let delta = sample.map_or(1.0 - mid_level, |sample| sample.intensity - mid_level) * scaled;
         let delta = delta.clamp(-10000.0, 10000.0);
         let offset = match direction {
             "X" => axis_offset(0, delta, global, owner_world_matrix),
@@ -349,7 +355,11 @@ pub(crate) fn displace_textured(
                 let Some(sample) = sample else {
                     return Err(dependency_missing(modifier, "texture"));
                 };
-                let rgb = if sample.is_rgb { sample.rgb } else { [sample.intensity; 3] };
+                let rgb = if sample.is_rgb {
+                    sample.rgb
+                } else {
+                    [sample.intensity; 3]
+                };
                 let mut local = DVec3::from_array(rgb) - DVec3::splat(mid_level);
                 if global {
                     local = transpose_mul(owner_world_matrix, local);
@@ -728,7 +738,8 @@ fn blend_with_identity(matrix: DMat4, weight: f64) -> DMat4 {
     } else {
         (1.0 - weight, weight)
     };
-    let blended = std::array::from_fn::<f64, 4, _>(|i| start_weight * start[i] + end_weight * quat[i]);
+    let blended =
+        std::array::from_fn::<f64, 4, _>(|i| start_weight * start[i] + end_weight * quat[i]);
     let rotation_matrix = DMat3::from_quat(DQuat::from_xyzw(
         blended[1], blended[2], blended[3], blended[0],
     ));
@@ -852,10 +863,7 @@ mod tests {
             size: DVec3::splat(2.0),
         })
         .unwrap();
-        let mut detail = UvLayer::new(
-            "Detail",
-            vec![Some(vec![[0.3, 0.4]; 4]); mesh.faces.len()],
-        );
+        let mut detail = UvLayer::new("Detail", vec![Some(vec![[0.3, 0.4]; 4]); mesh.faces.len()]);
         detail.pinned = vec![Some(vec![true; 4]); mesh.faces.len()];
         uv_layers::write(
             &mut mesh,

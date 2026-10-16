@@ -1233,7 +1233,10 @@ impl NormalSubdivision {
     /// the basis when it differs from storage order. Without a custom layer only that basis remains.
     pub(super) fn write_back(&self, result: &mut Mesh) -> Result<()> {
         let order = self.loop_order();
-        let identity = order.iter().enumerate().all(|(index, &ordinal)| index == ordinal);
+        let identity = order
+            .iter()
+            .enumerate()
+            .all(|(index, &ordinal)| index == ordinal);
         let options = NormalCodeOptions {
             corner_order: (!identity).then_some(order.as_slice()),
             setter_input: SetterInput::AlreadyNormalized,
@@ -1254,12 +1257,7 @@ impl NormalSubdivision {
                     let (dx, dy) = SLOT_OFFSETS[loop_slot];
                     let u = usize_as_f32(sample.x + dx) / side;
                     let v = usize_as_f32(sample.y + dy) / side;
-                    let weights = [
-                        (1.0 - u) * (1.0 - v),
-                        u * (1.0 - v),
-                        u * v,
-                        (1.0 - u) * v,
-                    ];
+                    let weights = [(1.0 - u) * (1.0 - v), u * (1.0 - v), u * v, (1.0 - u) * v];
                     let mut value = Vec3::ZERO;
                     for (&point, weight) in patch.iter().zip(weights) {
                         value += point.as_vec3() * weight;
@@ -1334,11 +1332,9 @@ fn corner_patches(vectors: &[DVec3], faces: &[NormalFace], locals: &[usize]) -> 
                 let previous = corners[(index + face.count - 1) % face.count];
                 patches[face.start + index] = [
                     current,
-                    clnor::normalize(current.as_vec3() * 0.5 + next.as_vec3() * 0.5)
-                        .as_dvec3(),
+                    clnor::normalize(current.as_vec3() * 0.5 + next.as_vec3() * 0.5).as_dvec3(),
                     mean,
-                    clnor::normalize(previous.as_vec3() * 0.5 + current.as_vec3() * 0.5)
-                        .as_dvec3(),
+                    clnor::normalize(previous.as_vec3() * 0.5 + current.as_vec3() * 0.5).as_dvec3(),
                 ];
             }
         }
@@ -1381,10 +1377,7 @@ fn ngon_square_order(
     let centre_faces = corners * centre_per_corner;
 
     if side >= 2 && (1..side).contains(&x) && (1..side - 1).contains(&y) {
-        return (
-            corner * inner_per_corner + (y - 1) * inner + (x - 1),
-            0,
-        );
+        return (corner * inner_per_corner + (y - 1) * inner + (x - 1), 0);
     }
     if side >= 3 && y == side - 1 && (1..side - 1).contains(&x) {
         return (inner_faces + corner * boundary + x - 1, 1);

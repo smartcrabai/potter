@@ -52,9 +52,8 @@ fn bullet_hull_faces(points: &[DVec3], input: &[usize]) -> Result<Vec<Vec<usize>
     }
 
     let mut raw_hull = std::ptr::null_mut();
-    let status = unsafe {
-        potter_skin_hull_compute(coordinates.as_ptr(), input.len(), &mut raw_hull)
-    };
+    let status =
+        unsafe { potter_skin_hull_compute(coordinates.as_ptr(), input.len(), &mut raw_hull) };
     if status != 0 {
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
@@ -214,8 +213,8 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             (first_radius[0] + first_radius[1] + second_radius[0] + second_radius[1]) * 0.5;
         let first_is_branch = degrees[first] > 2;
         let second_is_branch = degrees[second] > 2;
-        let loose_branch = (first_is_branch && node_loose[first])
-            || (second_is_branch && node_loose[second]);
+        let loose_branch =
+            (first_is_branch && node_loose[first]) || (second_is_branch && node_loose[second]);
         let mut subdivisions = if loose_branch {
             if first_is_branch && second_is_branch {
                 2
@@ -309,13 +308,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             [(edge_index, _)] => {
                 let [_, y_axis, z_axis] = edge_mats[*edge_index].1;
                 node_frame[vertex] = frames.len();
-                frames.push(frame_corners(
-                    center,
-                    radius,
-                    y_axis,
-                    z_axis,
-                    DVec3::ZERO,
-                ));
+                frames.push(frame_corners(center, radius, y_axis, z_axis, DVec3::ZERO));
                 frame_nodes.push(vertex);
             }
             [(first_edge, _), (second_edge, _)] => {
@@ -345,13 +338,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                     let [y_axis, z_axis] =
                         bisector_yz(edge_mats[incoming].1, edge_mats[outgoing].1[0]);
                     node_frame[vertex] = frames.len();
-                    frames.push(frame_corners(
-                        center,
-                        radius,
-                        y_axis,
-                        z_axis,
-                        DVec3::ZERO,
-                    ));
+                    frames.push(frame_corners(center, radius, y_axis, z_axis, DVec3::ZERO));
                     frame_nodes.push(vertex);
                 }
             }
@@ -407,7 +394,10 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             }
             .copied()
             .ok_or_else(|| {
-                PotError::new(ErrorCode::InternalError, "skin branch has no neighboring frame")
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "skin branch has no neighboring frame",
+                )
             })?;
             rings.push(frame_at(neighbor, edge_index));
         }
@@ -436,7 +426,10 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .and_then(|ids| ids.get(target_corner))
                 .copied()
                 .ok_or_else(|| {
-                    PotError::new(ErrorCode::InternalError, "skin frame merge target is missing")
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "skin frame merge target is missing",
+                    )
                 })?;
             frame_vertex_ids[frame_index][corner] = target;
         }
@@ -470,15 +463,16 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &mut branch_faces,
         &detached_frames,
     );
-    smooth_branch_hull_points(&mut points, &branch_faces, &frame_vertex_ids, branch_smoothing);
+    smooth_branch_hull_points(
+        &mut points,
+        &branch_faces,
+        &frame_vertex_ids,
+        branch_smoothing,
+    );
     faces.extend(branch_faces.into_iter().map(|face| (face, 0)));
     for ids in seam_frames.iter().flatten() {
         let [first, second] = *ids;
-        let second_ids = bridge_order(
-            &points,
-            frame_vertex_ids[first],
-            frame_vertex_ids[second],
-        );
+        let second_ids = bridge_order(&points, frame_vertex_ids[first], frame_vertex_ids[second]);
         connect_frames(&points, frame_vertex_ids[first], second_ids, &mut faces);
     }
     for ids in box_frames.iter().flatten() {
@@ -486,7 +480,10 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         let first_ids = frame_vertex_ids[first];
         let second_ids = frame_vertex_ids[second];
         connect_frames(&points, first_ids, second_ids, &mut faces);
-        faces.push((vec![first_ids[3], first_ids[2], first_ids[1], first_ids[0]], 0));
+        faces.push((
+            vec![first_ids[3], first_ids[2], first_ids[1], first_ids[0]],
+            0,
+        ));
         faces.push((second_ids.to_vec(), 0));
     }
     for (edge_index, chain) in edge_chains.iter().enumerate() {
@@ -578,7 +575,6 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-
 /// Blender's `skin_merge_close_frame_verts`: merge near corners of frames surrounding each branch.
 fn merge_branch_frame_corners(
     frames: &mut [[DVec3; 4]],
@@ -611,8 +607,7 @@ fn merge_branch_frame_corners(
                                 * 0.5;
                             frames[first_frame][first_corner] = midpoint;
                             frames[second_frame][second_corner] = midpoint;
-                            merges[second_frame][second_corner] =
-                                Some((first_frame, first_corner));
+                            merges[second_frame][second_corner] = Some((first_frame, first_corner));
                             targets[first_frame][first_corner] = true;
                             break;
                         }
@@ -726,9 +721,8 @@ fn branch_hull_faces(
 }
 
 fn face_has_edge(face: &[usize], edge: (usize, usize)) -> bool {
-    (0..face.len()).any(|corner| {
-        ordered_edge(face[corner], face[(corner + 1) % face.len()]) == edge
-    })
+    (0..face.len())
+        .any(|corner| ordered_edge(face[corner], face[(corner + 1) % face.len()]) == edge)
 }
 
 fn ordered_edge(first: usize, second: usize) -> (usize, usize) {
@@ -1082,7 +1076,6 @@ fn skin_float_normalize(vector: [f32; 3]) -> [f32; 3] {
     }
 }
 
-
 fn triangle_normal(points: &[DVec3], triangle: [usize; 3]) -> DVec3 {
     (points[triangle[1]] - points[triangle[0]])
         .cross(points[triangle[2]] - points[triangle[0]])
@@ -1169,7 +1162,10 @@ fn quad_from_triangles(
     second: [usize; 3],
     shared: [usize; 2],
 ) -> Option<[usize; 4]> {
-    let opposite = second.iter().copied().find(|vertex| !first.contains(vertex))?;
+    let opposite = second
+        .iter()
+        .copied()
+        .find(|vertex| !first.contains(vertex))?;
     let mut quad = Vec::with_capacity(4);
     for index in 0..3 {
         let vertex = first[index];
@@ -1331,15 +1327,13 @@ fn edge_matrices(
             stack.push((child, next_edge, mat));
         }
     }
-    mats.into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "No valid root vertex found (you need one per mesh island you want to skin)",
-                serde_json::json!({"modifier_id":modifier.id,"modifier_warning":true}),
-            )
-        })
+    mats.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "No valid root vertex found (you need one per mesh island you want to skin)",
+            serde_json::json!({"modifier_id":modifier.id,"modifier_warning":true}),
+        )
+    })
 }
 
 /// Blender's calc_edge_mat: a root's frame, with world Z as the up reference; an edge along Z uses
@@ -1348,11 +1342,7 @@ fn calc_edge_mat(x_axis: DVec3) -> [DVec3; 3] {
     let dot = x_axis.dot(DVec3::Z);
     if (-1.0 + f64::EPSILON..1.0 - f64::EPSILON).contains(&dot) {
         let y_axis = DVec3::Z.cross(x_axis).normalize_or_zero();
-        [
-            x_axis,
-            y_axis,
-            x_axis.cross(y_axis).normalize_or_zero(),
-        ]
+        [x_axis, y_axis, x_axis.cross(y_axis).normalize_or_zero()]
     } else {
         [x_axis, DVec3::X, DVec3::Y]
     }
@@ -1520,12 +1510,14 @@ fn skin_radius(
             "two finite radii per vertex",
         ));
     }
-    let first = values.first().and_then(Value::as_f64).ok_or_else(|| {
-        invalid_parameter(modifier, "skin_radii", "two finite radii per vertex")
-    })?;
-    let second = values.get(1).and_then(Value::as_f64).ok_or_else(|| {
-        invalid_parameter(modifier, "skin_radii", "two finite radii per vertex")
-    })?;
+    let first = values
+        .first()
+        .and_then(Value::as_f64)
+        .ok_or_else(|| invalid_parameter(modifier, "skin_radii", "two finite radii per vertex"))?;
+    let second = values
+        .get(1)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| invalid_parameter(modifier, "skin_radii", "two finite radii per vertex"))?;
     if !first.is_finite() || !second.is_finite() {
         return Err(invalid_parameter(
             modifier,

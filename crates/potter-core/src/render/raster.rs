@@ -92,7 +92,6 @@ pub(crate) struct Triangle {
 impl Triangle {
     /// This triangle's shading attributes over new corner geometry.
     pub(crate) fn with_corners(
-
         &self,
         positions: [DVec3; 3],
         uv: [[f64; 2]; 3],
@@ -1593,9 +1592,11 @@ mod tests {
             lens_mm: 50.0,
             sensor_width_mm: 36.0,
         });
-        assert!(perspective
-            .view_direction_from(point)
-            .abs_diff_eq(DVec3::new(1.0, 2.0, 3.0).normalize(), f64::EPSILON));
+        assert!(
+            perspective
+                .view_direction_from(point)
+                .abs_diff_eq(DVec3::new(1.0, 2.0, 3.0).normalize(), f64::EPSILON)
+        );
     }
 
     #[test]
@@ -1803,7 +1804,9 @@ mod smooth_shading_tests {
 
     impl SurfaceShader for RecordingShader {
         fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 3]> {
-            self.calls.borrow_mut().push((hit.point, hit.normal, hit.geometric));
+            self.calls
+                .borrow_mut()
+                .push((hit.point, hit.normal, hit.geometric));
             Ok([0.25, 0.5, 0.75])
         }
     }

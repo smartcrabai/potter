@@ -257,11 +257,7 @@ fn cycle_from_lowest(face: &[usize]) -> Vec<usize> {
 
 /// Every expected Blender vertex must have an evaluated vertex at the same position, and the faces
 /// must match as vertex cycles over those vertices (winding included).
-fn assert_blender_geometry<F: AsRef<[usize]>>(
-    result: &Mesh,
-    vertices: &[[f64; 3]],
-    faces: &[F],
-) {
+fn assert_blender_geometry<F: AsRef<[usize]>>(result: &Mesh, vertices: &[[f64; 3]], faces: &[F]) {
     assert_eq!(result.vertices.len(), vertices.len());
     assert_eq!(result.faces.len(), faces.len());
     let mut matched = vec![false; result.vertices.len()];
@@ -273,8 +269,7 @@ fn assert_blender_geometry<F: AsRef<[usize]>>(
             .iter()
             .enumerate()
             .find_map(|(storage, vertex)| {
-                (!matched[storage] && vertex.co.distance(position) < 1.0e-6)
-                    .then_some(storage)
+                (!matched[storage] && vertex.co.distance(position) < 1.0e-6).then_some(storage)
             })
             .expect("Blender Skin vertex is present");
         matched[storage] = true;
@@ -353,7 +348,6 @@ fn assert_skin_oracle(result: &Mesh, oracle: &str) {
         smooth.iter().filter(|value| **value).count()
     );
 }
-
 
 #[test]
 fn line_skin_matches_blender() {
@@ -452,21 +446,15 @@ fn branch_x_symmetry_changes_hull_triangle_merging() {
         &SYMMETRY_EDGES,
         Some(&SYMMETRY_SKIN),
     );
-    let symmetric = evaluate_modifiers(
-        &mesh,
-        &[skin_modifier(json!({"use_x_symmetry": true}))],
-    )
-    .unwrap();
+    let symmetric =
+        evaluate_modifiers(&mesh, &[skin_modifier(json!({"use_x_symmetry": true}))]).unwrap();
     assert_blender_geometry(
         &symmetric,
         &SYMMETRY_BRANCH_VERTICES,
         &SYMMETRY_BRANCH_ON_FACES,
     );
-    let asymmetric = evaluate_modifiers(
-        &mesh,
-        &[skin_modifier(json!({"use_x_symmetry": false}))],
-    )
-    .unwrap();
+    let asymmetric =
+        evaluate_modifiers(&mesh, &[skin_modifier(json!({"use_x_symmetry": false}))]).unwrap();
     assert_blender_geometry(
         &asymmetric,
         &SYMMETRY_BRANCH_VERTICES,
@@ -540,11 +528,8 @@ fn branch_z_symmetry_changes_hull_triangle_merging() {
 #[test]
 fn y_branch_smoothing_matches_blender_coordinates() {
     let mesh = skeleton(&Y_INPUT_VERTICES, &Y_EDGES, Some(&Y_SKIN));
-    let result = evaluate_modifiers(
-        &mesh,
-        &[skin_modifier(json!({"branch_smoothing": 1.0}))],
-    )
-    .unwrap();
+    let result =
+        evaluate_modifiers(&mesh, &[skin_modifier(json!({"branch_smoothing": 1.0}))]).unwrap();
     assert_blender_geometry(&result, &Y_BRANCH_SMOOTH_VERTICES, &Y_BRANCH_FACES);
 }
 
@@ -665,7 +650,11 @@ fn detached_skin_repair_preserves_point_colors_and_vertex_groups() {
         .as_array()
         .unwrap();
     assert_eq!(point_values.len(), result.vertices.len());
-    assert!(point_values.iter().all(|value| value.as_f64() == Some(1.75)));
+    assert!(
+        point_values
+            .iter()
+            .all(|value| value.as_f64() == Some(1.75))
+    );
     let color_values = attributes
         .iter()
         .find(|attribute| attribute["name"] == "SkinColor")
@@ -722,11 +711,8 @@ fn middle_root_seam_frames_match_blender() {
 #[test]
 fn isolated_skin_vertex_builds_blender_box() {
     let verts = [[0.0, 0.0, 0.0]];
-    let result = evaluate_modifiers(
-        &skeleton(&verts, &[], None),
-        &[skin_modifier(json!({}))],
-    )
-    .unwrap();
+    let result =
+        evaluate_modifiers(&skeleton(&verts, &[], None), &[skin_modifier(json!({}))]).unwrap();
     assert_blender_geometry(&result, &ISOLATED_VERTICES, &ISOLATED_FACES);
 }
 
@@ -784,7 +770,6 @@ fn mixed_sign_skin_radii_match_blender_bounds() {
     assert!((bounds.min.z - 0.0).abs() < 1.0e-6);
     assert!((bounds.max.z - 1.0).abs() < 1.0e-6);
 }
-
 
 #[test]
 fn zero_average_edge_radius_is_accepted_without_subdivision() {

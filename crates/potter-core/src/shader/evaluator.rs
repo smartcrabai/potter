@@ -337,7 +337,6 @@ impl<'a> HitContext<'a> {
         self
     }
 
-
     /// Collect `uv.layer_missing` warnings raised while evaluating this hit. Without a sink, the
     /// render UV is still used but the warning is not recorded.
     #[must_use]
@@ -369,7 +368,6 @@ impl<'a> HitContext<'a> {
         shifted
     }
 }
-
 
 /// Writes `(layer name, color)` pairs into `table` in layer order, ready for
 /// [`HitContext::with_color_layers`]. Nothing is allocated.
@@ -609,7 +607,10 @@ pub(crate) fn displacement_uses_view_direction(
         let Some(node) = group.nodes.get(&node_id) else {
             continue;
         };
-        if matches!(node.node_type.as_str(), "ShaderNodeFresnel" | "ShaderNodeLayerWeight") {
+        if matches!(
+            node.node_type.as_str(),
+            "ShaderNodeFresnel" | "ShaderNodeLayerWeight"
+        ) {
             return true;
         }
         pending.extend(
@@ -1328,7 +1329,9 @@ impl Evaluator<'_, '_, '_, '_> {
         } else {
             ("Fac", "Color1", "Color2", "Color", "MixRGB")
         };
-        let factor = self.scalar_input(id, &[factor_socket], 0.5)?.clamp(0.0, 1.0);
+        let factor = self
+            .scalar_input(id, &[factor_socket], 0.5)?
+            .clamp(0.0, 1.0);
         let first = self.color_input(id, &[first_socket], [0.5, 0.5, 0.5, 1.0])?;
         let second = self.color_input(id, &[second_socket], [0.5, 0.5, 0.5, 1.0])?;
         let blended = match blend.as_str() {
@@ -2020,7 +2023,6 @@ fn eval_error(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, message)
 }
 
-
 /// Color of layer `name` at this hit; the empty name is the render layer. A layer the mesh does not
 /// carry reads as opaque black and records a `mesh.color_layer_missing` warning.
 fn layer_color(hit_ctx: &HitContext<'_>, name: &str) -> [f64; 4] {
@@ -2303,7 +2305,12 @@ mod tests {
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(&mut graph, "math", "ShaderNodeMath", json!({}));
         insert_node(&mut graph, "fresnel", "ShaderNodeFresnel", json!({}));
-        insert_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({}),
+        );
         link(&mut graph, "math", "Value", "output", "Displacement");
         link(&mut graph, "fresnel", "Fac", "principled", "Metallic");
         link(&mut graph, "principled", "BSDF", "output", "Surface");
@@ -2371,7 +2378,11 @@ mod tests {
         )
         .unwrap();
         for (actual, expected) in params.base_color.iter().zip([0.2, 0.3, 0.5, 0.75]) {
-            assert!((actual - expected).abs() < 1e-12, "base color {:?}", params.base_color);
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "base color {:?}",
+                params.base_color
+            );
         }
 
         // A layer the mesh does not carry reads opaque black and records a warning.

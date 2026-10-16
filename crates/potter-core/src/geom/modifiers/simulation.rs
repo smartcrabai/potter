@@ -933,7 +933,6 @@ fn append_instances(mesh: &Mesh, transforms: &[(DMat4, DVec3)]) -> Result<Mesh> 
     Ok(output)
 }
 
-
 fn sample_volume_grid(samples: &[f32], dims: [usize; 3], coordinate: [f64; 3]) -> f64 {
     if coordinate.iter().any(|value| !value.is_finite())
         || (0..3).any(|axis| {
@@ -1007,7 +1006,6 @@ fn sample_volume_grid(samples: &[f32], dims: [usize; 3], coordinate: [f64; 3]) -
         fraction[2],
     )
 }
-
 
 fn vertex_group_weight(mesh: &Mesh, face: &Face, params: &Map<String, Value>) -> f64 {
     let Some(group_name) = params.get("vertex_group").and_then(Value::as_str) else {
@@ -1287,7 +1285,8 @@ mod tests {
             ..VolumeData::default()
         };
         let mut rng = crate::blender_rng::BlenderRng::seed(0);
-        let unchanged = displace_volume(&volume, &Map::new(), None, &mut rng, DMat4::IDENTITY, None)?;
+        let unchanged =
+            displace_volume(&volume, &Map::new(), None, &mut rng, DMat4::IDENTITY, None)?;
         assert_eq!(
             unchanged.grids[0].values.as_deref(),
             Some(&[0.0_f32, 1.0, 0.0][..])

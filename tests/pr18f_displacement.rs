@@ -217,17 +217,11 @@ fn input(grouped: bool) -> Mesh {
     let faces = FACES.iter().map(|face| face.to_vec()).collect();
     let mut mesh = Mesh::from_positions_and_faces(positions, faces).unwrap();
     if grouped {
-        let weights: Map<String, Value> = [
-            (0, 0.0),
-            (1, 1.0),
-            (2, 0.5),
-            (3, 0.25),
-            (4, 0.75),
-            (5, 1.0),
-        ]
-        .into_iter()
-        .map(|(vertex, weight)| (format!("v{vertex}"), json!(weight)))
-        .collect();
+        let weights: Map<String, Value> =
+            [(0, 0.0), (1, 1.0), (2, 0.5), (3, 0.25), (4, 0.75), (5, 1.0)]
+                .into_iter()
+                .map(|(vertex, weight)| (format!("v{vertex}"), json!(weight)))
+                .collect();
         mesh.attributes
             .insert("vertex_groups".to_owned(), json!({ "G": weights }));
     }
@@ -247,7 +241,11 @@ fn modifier(modifier_type: &str, params: Value) -> Modifier {
 }
 
 fn assert_points(label: &str, actual: &Mesh, expected: &[[f64; 3]; 7]) {
-    assert_eq!(actual.vertices.len(), expected.len(), "{label}: vertex count");
+    assert_eq!(
+        actual.vertices.len(),
+        expected.len(),
+        "{label}: vertex count"
+    );
     for (index, (vertex, want)) in actual.vertices.iter().zip(expected).enumerate() {
         let error = (vertex.co - DVec3::from_array(*want)).abs().max_element();
         assert!(
@@ -534,7 +532,10 @@ fn texture_ops() -> Vec<Value> {
 }
 
 /// Evaluates the scene built by `operations` and returns the evaluated mesh of node `subject`.
-fn scene_subject(operations: &[Value], frame: Option<f64>) -> Result<Mesh, Box<dyn std::error::Error>> {
+fn scene_subject(
+    operations: &[Value],
+    frame: Option<f64>,
+) -> Result<Mesh, Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let scene = directory.path().join("displacement");
     let batch = directory.path().join("operations.json");
@@ -606,12 +607,42 @@ fn assert_plane(label: &str, mesh: &Mesh, expected: &[[f64; 3]; 4]) {
     }
 }
 
-const SCENE_TEX_LOCAL_X: [[f64; 3]; 4] = [[-1.255555511, -1.0, 0.0], [0.744444489, -1.0, 0.0], [0.744444489, 1.0, 0.0], [-1.255555511, 1.0, 0.0]];
-const SCENE_TEX_LOCAL_RGB: [[f64; 3]; 4] = [[-1.119607806, -1.034313679, -0.229411781], [0.880392194, -1.034313679, -0.229411781], [0.880392194, 0.965686321, -0.229411781], [-1.119607806, 0.965686321, -0.229411781]];
-const SCENE_TEX_GLOBAL_X_TRANSFORM: [[f64; 3]; 4] = [[-1.372565031, -0.946224868, 0.0], [0.729355395, -0.960935831, 0.0], [0.487294734, 1.074002624, 0.0], [-1.614625692, 1.088713646, 0.0]];
-const SCENE_TEX_OBJECT_X_TRANSFORM: [[f64; 3]; 4] = [[-1.286264300, -1.0, 0.0], [0.726361394, -1.0, 0.0], [0.875387669, 1.0, 0.0], [-1.307304144, 1.0, 0.0]];
-const SCENE_WARP_TEX_LOCAL: [[f64; 3]; 4] = [[-1.170758367, -0.647514105, 0.0], [0.975437999, -0.769736409, 0.0], [1.342104673, 0.953069687, 0.0], [-0.804091692, 1.075292110, 0.0]];
-const SCENE_WAVE_TEX_LOCAL: [[f64; 3]; 4] = [[-1.0, -1.0, 0.062329289], [1.0, -1.0, 0.062329289], [1.0, 1.0, 0.062329289], [-1.0, 1.0, 0.062329289]];
+const SCENE_TEX_LOCAL_X: [[f64; 3]; 4] = [
+    [-1.255555511, -1.0, 0.0],
+    [0.744444489, -1.0, 0.0],
+    [0.744444489, 1.0, 0.0],
+    [-1.255555511, 1.0, 0.0],
+];
+const SCENE_TEX_LOCAL_RGB: [[f64; 3]; 4] = [
+    [-1.119607806, -1.034313679, -0.229411781],
+    [0.880392194, -1.034313679, -0.229411781],
+    [0.880392194, 0.965686321, -0.229411781],
+    [-1.119607806, 0.965686321, -0.229411781],
+];
+const SCENE_TEX_GLOBAL_X_TRANSFORM: [[f64; 3]; 4] = [
+    [-1.372565031, -0.946224868, 0.0],
+    [0.729355395, -0.960935831, 0.0],
+    [0.487294734, 1.074002624, 0.0],
+    [-1.614625692, 1.088713646, 0.0],
+];
+const SCENE_TEX_OBJECT_X_TRANSFORM: [[f64; 3]; 4] = [
+    [-1.286264300, -1.0, 0.0],
+    [0.726361394, -1.0, 0.0],
+    [0.875387669, 1.0, 0.0],
+    [-1.307304144, 1.0, 0.0],
+];
+const SCENE_WARP_TEX_LOCAL: [[f64; 3]; 4] = [
+    [-1.170758367, -0.647514105, 0.0],
+    [0.975437999, -0.769736409, 0.0],
+    [1.342104673, 0.953069687, 0.0],
+    [-0.804091692, 1.075292110, 0.0],
+];
+const SCENE_WAVE_TEX_LOCAL: [[f64; 3]; 4] = [
+    [-1.0, -1.0, 0.062329289],
+    [1.0, -1.0, 0.062329289],
+    [1.0, 1.0, 0.062329289],
+    [-1.0, 1.0, 0.062329289],
+];
 
 /// The subject transform of the transformed-texture cases (translation, Euler Z 30 degrees, scale).
 fn subject_transform() -> Value {
@@ -645,7 +676,8 @@ fn displace_rgb_to_xyz_texture_matches_blender() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn displace_texture_global_coordinates_use_subject_transform() -> Result<(), Box<dyn std::error::Error>> {
+fn displace_texture_global_coordinates_use_subject_transform()
+-> Result<(), Box<dyn std::error::Error>> {
     let mesh = scene_subject(
         &plane_ops(
             subject_transform(),
@@ -653,18 +685,27 @@ fn displace_texture_global_coordinates_use_subject_transform() -> Result<(), Box
         ),
         None,
     )?;
-    assert_plane("displace texture global", &mesh, &SCENE_TEX_GLOBAL_X_TRANSFORM);
+    assert_plane(
+        "displace texture global",
+        &mesh,
+        &SCENE_TEX_GLOBAL_X_TRANSFORM,
+    );
     Ok(())
 }
 
 #[test]
-fn displace_texture_object_coordinates_use_map_object_transform() -> Result<(), Box<dyn std::error::Error>> {
+fn displace_texture_object_coordinates_use_map_object_transform()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut ops = texture_ops();
     ops.push(json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0},"transform":subject_transform()}));
     ops.push(json!({"op":"node.create","id":"map","kind":"empty","transform":{"translation":[0.3,-0.2,0.5],"rotation_deg":[0.0,0.0,20.0],"scale":[1.5,1.0,0.8]}}));
     ops.push(json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"X","strength":1.0,"mid_level":0.5,"texture":"tex","texture_coords":"OBJECT","texture_coords_object":"map"}}));
     let mesh = scene_subject(&ops, None)?;
-    assert_plane("displace texture object", &mesh, &SCENE_TEX_OBJECT_X_TRANSFORM);
+    assert_plane(
+        "displace texture object",
+        &mesh,
+        &SCENE_TEX_OBJECT_X_TRANSFORM,
+    );
     Ok(())
 }
 
@@ -759,43 +800,78 @@ fn legacy_procedural_texture_types_match_blender() -> Result<(), Box<dyn std::er
             "wood",
             "WOOD",
             json!({"noise_scale":0.7,"turbulence":1.3,"wood_type":"BANDNOISE","noise_basis":"IMPROVED_PERLIN","noise_type":"SOFT_NOISE","noise_basis_2":"TRI"}),
-            [[-0.786335468,-1.0,0.0],[1.388136148,-1.0,0.0],[0.876659393,1.0,0.0],[-0.723966121,1.0,0.0]],
+            [
+                [-0.786335468, -1.0, 0.0],
+                [1.388136148, -1.0, 0.0],
+                [0.876659393, 1.0, 0.0],
+                [-0.723966121, 1.0, 0.0],
+            ],
         ),
         (
             "marble",
             "MARBLE",
             json!({"noise_scale":0.7,"turbulence":1.7,"noise_depth":3,"noise_type":"HARD_NOISE","marble_type":"SHARP","noise_basis":"ORIGINAL_PERLIN","noise_basis_2":"SAW"}),
-            [[-0.826449752,-1.0,0.0],[0.694319665,-1.0,0.0],[1.307487249,1.0,0.0],[-1.291079879,1.0,0.0]],
+            [
+                [-0.826449752, -1.0, 0.0],
+                [0.694319665, -1.0, 0.0],
+                [1.307487249, 1.0, 0.0],
+                [-1.291079879, 1.0, 0.0],
+            ],
         ),
         (
             "magic",
             "MAGIC",
             json!({"turbulence":4.0,"noise_depth":3}),
-            [[-0.891056001,-1.0,0.0],[1.002521873,-1.0,0.0],[1.099560261,1.0,0.0],[-0.997478127,1.0,0.0]],
+            [
+                [-0.891056001, -1.0, 0.0],
+                [1.002521873, -1.0, 0.0],
+                [1.099560261, 1.0, 0.0],
+                [-0.997478127, 1.0, 0.0],
+            ],
         ),
         (
             "stucci",
             "STUCCI",
             json!({"noise_scale":0.7,"turbulence":6.0,"noise_basis":"IMPROVED_PERLIN","noise_type":"HARD_NOISE","stucci_type":"WALL_IN"}),
-            [[-0.890909791,-1.0,0.0],[0.956595302,-1.0,0.0],[0.742240787,1.0,0.0],[-1.417513132,1.0,0.0]],
+            [
+                [-0.890909791, -1.0, 0.0],
+                [0.956595302, -1.0, 0.0],
+                [0.742240787, 1.0, 0.0],
+                [-1.417513132, 1.0, 0.0],
+            ],
         ),
         (
             "voronoi",
             "VORONOI",
             json!({"noise_scale":0.7,"weight_1":0.7,"weight_2":0.3,"weight_3":0.1,"weight_4":0.0,"distance_metric":"MANHATTAN","color_mode":"INTENSITY"}),
-            [[-0.914880514,-1.0,0.0],[1.328364611,-1.0,0.0],[1.523912549,1.0,0.0],[-0.446137071,1.0,0.0]],
+            [
+                [-0.914880514, -1.0, 0.0],
+                [1.328364611, -1.0, 0.0],
+                [1.523912549, 1.0, 0.0],
+                [-0.446137071, 1.0, 0.0],
+            ],
         ),
         (
             "distorted noise",
             "DISTORTED_NOISE",
             json!({"noise_scale":0.7,"distortion":1.2,"noise_basis":"IMPROVED_PERLIN","noise_distortion":"ORIGINAL_PERLIN"}),
-            [[-2.025891304,-1.0,0.0],[0.319869339,-1.0,0.0],[0.645129561,1.0,0.0],[-1.473574638,1.0,0.0]],
+            [
+                [-2.025891304, -1.0, 0.0],
+                [0.319869339, -1.0, 0.0],
+                [0.645129561, 1.0, 0.0],
+                [-1.473574638, 1.0, 0.0],
+            ],
         ),
         (
             "musgrave",
             "MUSGRAVE",
             json!({"noise_scale":0.7,"musgrave_type":"HYBRID_MULTIFRACTAL","dimension_max":1.2,"lacunarity":2.0,"octaves":3.0,"offset":1.0,"gain":2.0,"noise_intensity":0.75,"noise_basis":"ORIGINAL_PERLIN"}),
-            [[-0.465015054,-1.0,0.0],[1.687701941,-1.0,0.0],[1.442296505,1.0,0.0],[-0.498639464,1.0,0.0]],
+            [
+                [-0.465015054, -1.0, 0.0],
+                [1.687701941, -1.0, 0.0],
+                [1.442296505, 1.0, 0.0],
+                [-0.498639464, 1.0, 0.0],
+            ],
         ),
     ];
     for (id, texture_type, settings, expected) in cases {
@@ -817,19 +893,34 @@ fn procedural_rgb_textures_feed_blender_rgb_to_xyz() -> Result<(), Box<dyn std::
             "clouds color",
             "CLOUDS",
             json!({"noise_scale":0.7,"noise_depth":2,"noise_basis":"IMPROVED_PERLIN","noise_type":"HARD_NOISE","cloud_type":"COLOR"}),
-            [[-1.020454764,-1.020454764,-0.234896079],[0.887225568,-1.247156024,-0.070604682],[0.826765239,0.826765239,-0.218865976],[-1.247156024,0.887225568,-0.214647397]],
+            [
+                [-1.020454764, -1.020454764, -0.234896079],
+                [0.887225568, -1.247156024, -0.070604682],
+                [0.826765239, 0.826765239, -0.218865976],
+                [-1.247156024, 0.887225568, -0.214647397],
+            ],
         ),
         (
             "magic",
             "MAGIC",
             json!({"turbulence":4.0,"noise_depth":3}),
-            [[-1.259343863,-0.713979006,0.169422061],[1.006774307,-0.702482820,-0.299752236],[0.727355063,1.253543615,0.198309809],[-0.993225694,1.297517180,-0.299752236]],
+            [
+                [-1.259343863, -0.713979006, 0.169422061],
+                [1.006774307, -0.702482820, -0.299752236],
+                [0.727355063, 1.253543615, 0.198309809],
+                [-0.993225694, 1.297517180, -0.299752236],
+            ],
         ),
         (
             "voronoi color",
             "VORONOI",
             json!({"noise_scale":0.7,"weight_1":0.7,"weight_2":0.3,"weight_3":0.1,"weight_4":0.0,"distance_metric":"MANHATTAN","color_mode":"POSITION_OUTLINE_INTENSITY"}),
-            [[-1.157602906,-1.126606226,0.032202959],[0.890928745,-1.047678709,0.170679048],[0.871754527,1.027703524,-0.112273268],[-0.654694438,0.936932743,0.195293725]],
+            [
+                [-1.157602906, -1.126606226, 0.032202959],
+                [0.890928745, -1.047678709, 0.170679048],
+                [0.871754527, 1.027703524, -0.112273268],
+                [-0.654694438, 0.936932743, 0.195293725],
+            ],
         ),
     ];
     for (id, texture_type, settings, expected) in cases {
@@ -845,7 +936,8 @@ fn procedural_rgb_textures_feed_blender_rgb_to_xyz() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn native_value_noise_record_preserves_old_volume_noise_color() -> Result<(), Box<dyn std::error::Error>> {
+fn native_value_noise_record_preserves_old_volume_noise_color()
+-> Result<(), Box<dyn std::error::Error>> {
     let operations = [
         json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
         json!({"op":"texture.create","id":"native_noise","texture_type":"NATIVE_VALUE_NOISE"}),
@@ -863,7 +955,8 @@ fn native_value_noise_record_preserves_old_volume_noise_color() -> Result<(), Bo
 }
 
 #[test]
-fn legacy_noise_texture_consumes_one_seeded_rng_value_per_vertex() -> Result<(), Box<dyn std::error::Error>> {
+fn legacy_noise_texture_consumes_one_seeded_rng_value_per_vertex()
+-> Result<(), Box<dyn std::error::Error>> {
     let operations = [
         json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
         json!({"op":"texture.create","id":"noise_tex","texture_type":"NOISE"}),
@@ -895,11 +988,7 @@ fn snapshot_noise_doc(render_seed: u32) -> SceneDoc {
     )
     .unwrap()
     .doc;
-    doc.scenes
-        .get_mut(&doc.active_scene)
-        .unwrap()
-        .render
-        .seed = render_seed;
+    doc.scenes.get_mut(&doc.active_scene).unwrap().render.seed = render_seed;
     let subject_id = Id::new("b_subject").unwrap();
     let data_id = doc.nodes[&subject_id].data.as_ref().unwrap().clone();
     let data = doc.data_blocks.get_mut(&data_id).unwrap();
@@ -929,11 +1018,7 @@ fn snapshot_noise_doc(render_seed: u32) -> SceneDoc {
     doc
 }
 
-fn snapshot_positions(
-    doc: &SceneDoc,
-    purpose: EvaluationPurpose,
-    node: &str,
-) -> Vec<DVec3> {
+fn snapshot_positions(doc: &SceneDoc, purpose: EvaluationPurpose, node: &str) -> Vec<DVec3> {
     let snapshot = Snapshot::evaluate(
         doc,
         &EvaluationContext {
@@ -955,11 +1040,7 @@ fn snapshot_noise_rng_uses_purpose_seed_and_one_shared_stream() {
     let render_seed_nonzero = snapshot_noise_doc(73);
 
     assert_eq!(
-        snapshot_positions(
-            &render_seed_zero,
-            EvaluationPurpose::Preview,
-            "b_subject"
-        ),
+        snapshot_positions(&render_seed_zero, EvaluationPurpose::Preview, "b_subject"),
         snapshot_positions(
             &render_seed_nonzero,
             EvaluationPurpose::Preview,
@@ -967,27 +1048,16 @@ fn snapshot_noise_rng_uses_purpose_seed_and_one_shared_stream() {
         ),
         "Preview must use seed 0 instead of the scene render seed",
     );
-    let render_positions = snapshot_positions(
-        &render_seed_nonzero,
-        EvaluationPurpose::Render,
-        "b_subject",
-    );
+    let render_positions =
+        snapshot_positions(&render_seed_nonzero, EvaluationPurpose::Render, "b_subject");
     assert_ne!(
-        snapshot_positions(
-            &render_seed_zero,
-            EvaluationPurpose::Render,
-            "b_subject"
-        ),
+        snapshot_positions(&render_seed_zero, EvaluationPurpose::Render, "b_subject"),
         render_positions,
         "Render must use the scene render seed",
     );
     assert_eq!(
         render_positions,
-        snapshot_positions(
-            &render_seed_nonzero,
-            EvaluationPurpose::Render,
-            "b_subject"
-        ),
+        snapshot_positions(&render_seed_nonzero, EvaluationPurpose::Render, "b_subject"),
         "same-context Snapshot evaluation must be deterministic",
     );
 

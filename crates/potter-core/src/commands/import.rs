@@ -580,7 +580,10 @@ fn configure_blender_sequence(
         }));
     }
     frame_numbers.sort_unstable();
-    if frame_numbers.windows(2).any(|window| window[0] == window[1]) {
+    if frame_numbers
+        .windows(2)
+        .any(|window| window[0] == window[1])
+    {
         return Err(invalid());
     }
     source["packed"] = json!(false);
@@ -1029,12 +1032,8 @@ mod tests {
             }
         });
         doc.resources.insert(id.clone(), record.clone());
-        let error = configure_blender_resources(
-            &mut doc,
-            &BTreeMap::new(),
-            AssetPolicy::Copy,
-        )
-        .expect_err("incomplete packed sequences must fail");
+        let error = configure_blender_resources(&mut doc, &BTreeMap::new(), AssetPolicy::Copy)
+            .expect_err("incomplete packed sequences must fail");
         assert_eq!(error.code, ErrorCode::SceneInvalid);
         assert_eq!(doc.resources[&id], record);
         Ok(())

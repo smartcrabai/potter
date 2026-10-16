@@ -168,8 +168,12 @@ pub(crate) fn remap_attributes_skipping(
     // Each output corner takes the code of its heaviest source corner: codes are never interpolated.
     // The shared clnor rebuild then applies the output fan rules.
     let code_sources: Option<Vec<Option<usize>>> = if has("custom_normal") {
-        clnor::corner_codes(source)?
-            .map(|_| corner_origin.iter().map(|sources| heaviest_source(sources)).collect())
+        clnor::corner_codes(source)?.map(|_| {
+            corner_origin
+                .iter()
+                .map(|sources| heaviest_source(sources))
+                .collect()
+        })
     } else {
         None
     };
@@ -237,7 +241,6 @@ fn corner_offsets(face_sizes: impl Iterator<Item = usize>) -> Vec<usize> {
 fn text<'a>(entry: &'a Value, key: &str) -> &'a str {
     entry.get(key).and_then(Value::as_str).unwrap_or_default()
 }
-
 
 /// `entry` with its `values` replaced; the old values array is not cloned.
 fn with_values(entry: &Value, values: Value) -> Value {
@@ -554,7 +557,6 @@ impl Sources<'_> {
             .collect()
     }
 
-
     /// Edge values blended over each output edge's source edges (see [`blend`]).
     fn edge_values(
         &self,
@@ -616,7 +618,8 @@ impl Sources<'_> {
                     .iter()
                     .zip(&self.origin.vertices)
                     .map(|(vertex, sources)| {
-                        let value = blend_sources(&stored, sources, data_type).unwrap_or_else(default);
+                        let value =
+                            blend_sources(&stored, sources, data_type).unwrap_or_else(default);
                         (format!("v{}", vertex.id), value)
                     })
                     .collect()
@@ -633,7 +636,8 @@ impl Sources<'_> {
                     .iter()
                     .zip(self.edge_origin)
                     .map(|(edge, sources)| {
-                        let value = blend_sources(&stored, sources, data_type).unwrap_or_else(default);
+                        let value =
+                            blend_sources(&stored, sources, data_type).unwrap_or_else(default);
                         (format!("e{}", edge.id), value)
                     })
                     .collect()
@@ -653,11 +657,19 @@ impl Sources<'_> {
                 })
                 .collect(),
             "corner" => {
-                let corner_count: usize = self.source.faces.iter().map(|face| face.vertices.len()).sum();
+                let corner_count: usize = self
+                    .source
+                    .faces
+                    .iter()
+                    .map(|face| face.vertices.len())
+                    .sum();
                 let mut stored: Vec<Option<&Value>> = vec![None; corner_count];
-                let offsets = corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
+                let offsets =
+                    corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
                 for (face, offset) in self.source.faces.iter().zip(offsets) {
-                    let Some(row) = values.get(&format!("f{}", face.id)).and_then(Value::as_array)
+                    let Some(row) = values
+                        .get(&format!("f{}", face.id))
+                        .and_then(Value::as_array)
                     else {
                         continue;
                     };
@@ -665,7 +677,8 @@ impl Sources<'_> {
                         stored[offset + corner] = Some(value);
                     }
                 }
-                let offsets = corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
+                let offsets =
+                    corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
                 self.output
                     .faces
                     .iter()
@@ -673,7 +686,9 @@ impl Sources<'_> {
                     .map(|(face, offset)| {
                         let row: Vec<Value> = self.corner_origin[offset..][..face.vertices.len()]
                             .iter()
-                            .map(|sources| blend_sources(&stored, sources, data_type).unwrap_or_else(default))
+                            .map(|sources| {
+                                blend_sources(&stored, sources, data_type).unwrap_or_else(default)
+                            })
                             .collect();
                         (format!("f{}", face.id), Value::Array(row))
                     })
@@ -1193,7 +1208,11 @@ mod tests {
         );
         assert_eq!(
             output.attributes["Paint"]["values"][out_face.as_str()],
-            json!([[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.5, 0.5, 0.0, 1.0]])
+            json!([
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.5, 0.5, 0.0, 1.0]
+            ])
         );
         assert_eq!(
             output.attributes["weight"]["values"][out_face.as_str()],

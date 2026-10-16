@@ -183,9 +183,9 @@ impl Snapshot {
         _node: &Node,
         slot: usize,
     ) -> Option<&'a SlotBinding> {
-        self.slot_bindings.get(node_id).and_then(|table| {
-            table.get(slot.min(table.len().checked_sub(1)?))
-        })
+        self.slot_bindings
+            .get(node_id)
+            .and_then(|table| table.get(slot.min(table.len().checked_sub(1)?)))
     }
 
     /// Material for a face slot; out-of-range indices clamp to the last available slot.
@@ -251,7 +251,14 @@ impl Snapshot {
                 ));
             }
         }
-        Self::evaluate_internal(doc, context, project_root, cache_directory, Some(node_ids), None)
+        Self::evaluate_internal(
+            doc,
+            context,
+            project_root,
+            cache_directory,
+            Some(node_ids),
+            None,
+        )
     }
 
     /// Evaluate selected nodes with one node's modifier stack limited to a prefix.
@@ -327,11 +334,11 @@ impl Snapshot {
         if let Some(dependencies) = mesh_dependencies.other.get(target_id) {
             selected_nodes.extend(dependencies.iter().cloned());
         }
-        if let Some(modifier) = doc
-            .nodes
-            .get(target_id)
-            .and_then(|node| node.modifiers.iter().find(|modifier| &modifier.id == modifier_id))
-        {
+        if let Some(modifier) = doc.nodes.get(target_id).and_then(|node| {
+            node.modifiers
+                .iter()
+                .find(|modifier| &modifier.id == modifier_id)
+        }) {
             let transform_references = modifier_transform_references(modifier);
             world_matrix_ids.extend(transform_references.iter().cloned());
             for reference_id in transform_references {
@@ -542,7 +549,7 @@ impl Snapshot {
                     "node_id": prefix.node_id,
                     "keep": prefix.keep,
                 },
-            })))?
+            }))?)
         } else {
             scene_hash.clone()
         };
@@ -652,8 +659,11 @@ impl Snapshot {
             let Some(owner) = doc.nodes.get(owner_id) else {
                 continue;
             };
-            for modifier in owner.modifiers.iter().enumerate().filter_map(
-                |(index, modifier)| {
+            for modifier in owner
+                .modifiers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, modifier)| {
                     (gate.is_active_at(owner_id, index, modifier)
                         && modifier.modifier_type == "array"
                         && modifier
@@ -662,8 +672,8 @@ impl Snapshot {
                             .and_then(serde_json::Value::as_str)
                             == Some("FIT_CURVE"))
                     .then_some(modifier)
-                },
-            ) {
+                })
+            {
                 let Some(curve_reference) = modifier
                     .params
                     .get("curve")
@@ -924,7 +934,10 @@ impl Snapshot {
                         gate.context,
                         |index, modifier| gate.is_active_at(id, index, modifier),
                         &mut texture_rng,
-                        |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier.modifier_type.as_str() {
+                        |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier
+                            .modifier_type
+                            .as_str()
+                        {
                             "armature" => rig::apply_armature_modifier_with_drivers(
                                 mesh,
                                 data_block,
@@ -952,11 +965,17 @@ impl Snapshot {
                                 &volume_data,
                             ),
                             "boolean" | "shrinkwrap" | "curve" | "hook" | "cast"
-                            | "simple_deform" => apply_scene_operand_modifier(
-                                mesh, modifier, id, doc, &references,
-                            ),
+                            | "simple_deform" => {
+                                apply_scene_operand_modifier(mesh, modifier, id, doc, &references)
+                            }
                             "displace" | "wave" | "warp" => apply_scene_displacement_modifier(
-                                mesh, modifier, id, doc, &references, frame, texture_rng,
+                                mesh,
+                                modifier,
+                                id,
+                                doc,
+                                &references,
+                                frame,
+                                texture_rng,
                             ),
                             "vertex_weight_edit"
                             | "vertex_weight_mix"
@@ -1209,7 +1228,10 @@ impl Snapshot {
                         gate.context,
                         |index, modifier| gate.is_active_at(id, index, modifier),
                         &mut texture_rng,
-                        |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier.modifier_type.as_str() {
+                        |mesh, modifier, modifier_warnings, multi_input, texture_rng| match modifier
+                            .modifier_type
+                            .as_str()
+                        {
                             "armature" => rig::apply_armature_modifier_with_drivers(
                                 mesh,
                                 data_block,
@@ -1237,11 +1259,17 @@ impl Snapshot {
                                 &volume_data,
                             ),
                             "boolean" | "shrinkwrap" | "curve" | "hook" | "cast"
-                            | "simple_deform" => apply_scene_operand_modifier(
-                                mesh, modifier, id, doc, &references,
-                            ),
+                            | "simple_deform" => {
+                                apply_scene_operand_modifier(mesh, modifier, id, doc, &references)
+                            }
                             "displace" | "wave" | "warp" => apply_scene_displacement_modifier(
-                                mesh, modifier, id, doc, &references, frame, texture_rng,
+                                mesh,
+                                modifier,
+                                id,
+                                doc,
+                                &references,
+                                frame,
+                                texture_rng,
                             ),
                             "vertex_weight_edit"
                             | "vertex_weight_mix"
@@ -1347,13 +1375,16 @@ impl Snapshot {
                         )
                     })?;
                     let mut generated = None;
-                    for modifier in node.modifiers.iter().enumerate().filter_map(
-                        |(index, modifier)| {
-                            (gate.is_active_at(id, index, modifier)
-                                && modifier.modifier_type == "mesh_to_volume")
-                            .then_some(modifier)
-                        },
-                    ) {
+                    for modifier in
+                        node.modifiers
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, modifier)| {
+                                (gate.is_active_at(id, index, modifier)
+                                    && modifier.modifier_type == "mesh_to_volume")
+                                    .then_some(modifier)
+                            })
+                    {
                         let object_text = modifier
                             .params
                             .get("object")
@@ -1471,13 +1502,16 @@ impl Snapshot {
                     }
                     let base_volume = volume_data.get(data_id).unwrap_or(volume);
                     let mut displaced = None;
-                    for modifier in node.modifiers.iter().enumerate().filter_map(
-                        |(index, modifier)| {
-                            (gate.is_active_at(id, index, modifier)
-                                && modifier.modifier_type == "volume_displace")
-                            .then_some(modifier)
-                        },
-                    ) {
+                    for modifier in
+                        node.modifiers
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, modifier)| {
+                                (gate.is_active_at(id, index, modifier)
+                                    && modifier.modifier_type == "volume_displace")
+                                    .then_some(modifier)
+                            })
+                    {
                         let current = displaced.take().unwrap_or_else(|| base_volume.clone());
                         displaced = Some(apply_volume_displace_modifier(
                             &current,
@@ -1714,12 +1748,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         }
     }
     if modifier.modifier_type == "array" {
-        if modifier
-            .params
-            .get("fit_type")
-            .and_then(Value::as_str)
-            == Some("FIT_CURVE")
-        {
+        if modifier.params.get("fit_type").and_then(Value::as_str) == Some("FIT_CURVE") {
             add_reference(&mut references, modifier.params.get("curve"));
         }
         if modifier
@@ -1790,7 +1819,8 @@ pub(crate) fn evaluated_array_curve_path_length(
     let Some(curve_world_matrix) = world_matrices.get(&curve_id).copied() else {
         return Ok(None);
     };
-    let length = crate::geom::modifiers::evaluated_curve_path_length(curve_data, curve_world_matrix)?;
+    let length =
+        crate::geom::modifiers::evaluated_curve_path_length(curve_data, curve_world_matrix)?;
     Ok(Some((curve_id, length)))
 }
 
@@ -1880,8 +1910,6 @@ impl ModifierGate<'_> {
         };
         linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
     }
-
-
 }
 /// Read and verify a cache resource from the scene's asset registry.
 ///
@@ -1902,9 +1930,6 @@ pub(crate) fn read_cache_resource(
     })?;
     crate::cache_sequence::read_cache_resource_record(resource, resource_id.as_str(), project_root)
 }
-
-
-
 
 pub(crate) fn load_vdb_volume_data(
     doc: &SceneDoc,
@@ -2256,14 +2281,10 @@ fn object_mesh_evaluation_order(
                     "physics_particle_emitter",
                     "particle_system",
                 ))
-                || node
-                    .modifiers
-                    .iter()
-                    .enumerate()
-                    .any(|(index, modifier)| {
-                        gate.is_active_at(id, index, modifier)
-                            && modifier.modifier_type == "particle_system"
-                    });
+                || node.modifiers.iter().enumerate().any(|(index, modifier)| {
+                    gate.is_active_at(id, index, modifier)
+                        && modifier.modifier_type == "particle_system"
+                });
             if has_particle_system == particle_system_first {
                 visit(
                     id,
@@ -2308,7 +2329,13 @@ fn reference_object_id(modifier: &Modifier, parameter: &str, doc: &SceneDoc) -> 
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(text)) if text.is_empty() => return Ok(None),
         Some(Value::String(text)) => text.as_str(),
-        Some(_) => return Err(invalid_reference(modifier, parameter, "an object ID or null")),
+        Some(_) => {
+            return Err(invalid_reference(
+                modifier,
+                parameter,
+                "an object ID or null",
+            ));
+        }
     };
     let object_id = Id::new(text).map_err(|error| {
         PotError::with_details(
@@ -2588,23 +2615,12 @@ fn warp_reference_matrices(
         return Ok(None);
     };
     let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
-    let from_matrix = reference_world_matrix_with_bone_fallback(
-        modifier,
-        &from,
-        "bone_from",
-        doc,
-        references,
-    )?;
-    let to_matrix = reference_world_matrix_with_bone_fallback(
-        modifier,
-        &to,
-        "bone_to",
-        doc,
-        references,
-    )?;
+    let from_matrix =
+        reference_world_matrix_with_bone_fallback(modifier, &from, "bone_from", doc, references)?;
+    let to_matrix =
+        reference_world_matrix_with_bone_fallback(modifier, &to, "bone_to", doc, references)?;
     Ok(Some((inverse * from_matrix, inverse * to_matrix)))
 }
-
 
 pub(crate) fn apply_scene_attribute_modifier(
     mesh: &mut Mesh,
@@ -2973,9 +2989,7 @@ fn read_cache_sequence_resource(
         ));
     }
     if !packed_sequence {
-        let frame_path_text = frame_uri
-            .strip_prefix("file://")
-            .unwrap_or(frame_uri);
+        let frame_path_text = frame_uri.strip_prefix("file://").unwrap_or(frame_uri);
         let frame_path = Path::new(frame_path_text);
         let asset_prefix = Path::new("assets/sha256");
         let is_content_addressed = frame_path.starts_with(asset_prefix)
@@ -3063,7 +3077,6 @@ fn read_cache_sequence_resource(
     }
 }
 
-
 const MAX_RENDERED_PARTICLES: usize = 100_000;
 
 fn render_simulated_particles(
@@ -3103,25 +3116,20 @@ fn render_simulated_particles(
             .iter()
             .filter(|state| state.life_state == crate::sim::ParticleLifeState::Alive)
         {
-            let system_modifier = usize::try_from(state.system_index)
-                .ok()
-                .and_then(|index| {
-                    node.modifiers
-                        .iter()
-                        .filter(|modifier| modifier.modifier_type == "particle_system")
-                        .nth(index)
-                });
+            let system_modifier = usize::try_from(state.system_index).ok().and_then(|index| {
+                node.modifiers
+                    .iter()
+                    .filter(|modifier| modifier.modifier_type == "particle_system")
+                    .nth(index)
+            });
             let active = match (system_modifier, primary_modifier_id) {
-                (Some(modifier), Some(primary_id))
-                    if modifier.id.as_str() == primary_id =>
-                {
-                    gate.is_property_active(
+                (Some(modifier), Some(primary_id)) if modifier.id.as_str() == primary_id => gate
+                    .is_property_active(
                         emitter_id,
                         node,
                         "physics_particle_emitter",
                         "particle_system",
-                    )
-                }
+                    ),
                 (Some(_), None) if state.system_index == 0 => gate.is_property_active(
                     emitter_id,
                     node,
@@ -3182,190 +3190,196 @@ fn render_simulated_particles(
                     json!({"node_id":emitter_id}),
                 )
             })?;
-        let render_type = settings
-            .get("render_type")
-            .and_then(serde_json::Value::as_str);
-        let mode = match render_type {
-            Some("HALO") => "points",
-            Some("PATH") => "hair_curves",
-            Some("OBJECT") => "object",
-            Some("COLLECTION") => "collection",
-            Some(_) => {
-                return Err(PotError::with_details(
-                    ErrorCode::UnsupportedFeature,
-                    "particle render_type is not supported",
-                    json!({"feature_id":"physics.particle_emitter.render_type","node_id":emitter_id,"render_type":render_type}),
-                ));
-            }
-            None => settings
-                .get("render_as")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("points"),
-        };
-        let emitter_world = matrices.get(emitter_id).copied().ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "particle emitter transform is missing",
-                json!({"node_id":emitter_id}),
-            )
-        })?;
-        let emitter_inverse = emitter_world.inverse();
-        if !emitter_inverse.is_finite() {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "particle emitter transform cannot be inverted",
-                json!({"node_id":emitter_id}),
-            ));
-        }
-        let (template, object_world) = match mode {
-            "points" => (
-                Mesh::icosphere(IcosphereParams {
-                    subdivisions: 1,
-                    radius: 1.0,
-                })
-                .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?,
-                None,
-            ),
-            "hair_curves" => (
-                Mesh::cylinder(CylinderParams {
-                    vertices: 6,
-                    radius: 1.0,
-                    depth: 2.0,
-                    ..CylinderParams::default()
-                })
-                .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?,
-                None,
-            ),
-            "object" => {
-                let object_id = settings
-                    .get("instance_object")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::InvalidOperation,
-                            "object particle rendering requires instance_object",
-                            json!({"node_id":emitter_id}),
-                        )
-                    })?;
-                let object_id = Id::new(object_id.to_owned())
-                    .map_err(|error| PotError::new(ErrorCode::InvalidOperation, error.message))?;
-                if object_id == *emitter_id {
+            let render_type = settings
+                .get("render_type")
+                .and_then(serde_json::Value::as_str);
+            let mode = match render_type {
+                Some("HALO") => "points",
+                Some("PATH") => "hair_curves",
+                Some("OBJECT") => "object",
+                Some("COLLECTION") => "collection",
+                Some(_) => {
                     return Err(PotError::with_details(
-                        ErrorCode::InvalidOperation,
-                        "particle instances cannot reference their own emitter",
-                        json!({"node_id":emitter_id}),
+                        ErrorCode::UnsupportedFeature,
+                        "particle render_type is not supported",
+                        json!({"feature_id":"physics.particle_emitter.render_type","node_id":emitter_id,"render_type":render_type}),
                     ));
                 }
-                let template = meshes.get(&object_id).cloned().ok_or_else(|| {
-                    PotError::with_details(
-                        ErrorCode::TargetNotFound,
-                        "particle instance mesh was not evaluated",
-                        json!({"node_id":emitter_id,"instance_object":object_id}),
-                    )
-                })?;
-                let mut matrix = matrices.get(&object_id).copied().ok_or_else(|| {
-                    PotError::with_details(
-                        ErrorCode::EvaluationFailed,
-                        "particle instance transform is missing",
-                        json!({"instance_object":object_id}),
-                    )
-                })?;
-                matrix.w_axis = DVec3::ZERO.extend(1.0);
-                (template, Some(matrix))
-            }
-            "collection" => {
-                let collection_text = settings
-                    .get("instance_collection")
+                None => settings
+                    .get("render_as")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::InvalidOperation,
-                            "collection particle rendering requires instance_collection",
-                            json!({"node_id":emitter_id}),
-                        )
-                    })?;
-                let collection_id = Id::new(collection_text.to_owned())
-                    .map_err(|error| PotError::new(ErrorCode::InvalidOperation, error.message))?;
-                let mut object_ids = BTreeSet::new();
-                collect_modifier_collection_objects(
-                    doc,
-                    &collection_id,
-                    &mut BTreeSet::new(),
-                    &mut object_ids,
-                )?;
-                let mut template = Mesh::new();
-                for object_id in object_ids {
-                    if &object_id == emitter_id {
-                        continue;
-                    }
-                    let Some(source) = meshes.get(&object_id) else {
-                        continue;
-                    };
-                    let object_world = matrices.get(&object_id).copied().ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::EvaluationFailed,
-                            "particle collection object transform is missing",
-                            json!({"object":object_id}),
-                        )
-                    })?;
-                    append_transformed_mesh(&mut template, source, emitter_inverse * object_world)?;
-                }
-                (template, None)
-            }
-            _ => {
+                    .unwrap_or("points"),
+            };
+            let emitter_world = matrices.get(emitter_id).copied().ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "particle emitter transform is missing",
+                    json!({"node_id":emitter_id}),
+                )
+            })?;
+            let emitter_inverse = emitter_world.inverse();
+            if !emitter_inverse.is_finite() {
                 return Err(PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "particle render_as setting is invalid",
-                    json!({"node_id":emitter_id,"render_as":mode}),
+                    ErrorCode::EvaluationFailed,
+                    "particle emitter transform cannot be inverted",
+                    json!({"node_id":emitter_id}),
                 ));
             }
-        };
-        let output = meshes.get_mut(emitter_id).ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "particle emitter mesh was not evaluated",
-                json!({"node_id":emitter_id}),
-            )
-        })?;
-        let size = settings
-            .get("hair_length")
-            .and_then(serde_json::Value::as_f64)
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(0.1);
-        for particle in visible_states {
-            let position = DVec3::from_array(particle.position);
-            let world_transform = if let Some(object_world) = object_world {
-                DMat4::from_translation(position)
-                    * DMat4::from_scale(DVec3::splat(particle.size))
-                    * object_world
-            } else if mode == "hair_curves" {
-                let velocity = DVec3::from_array(particle.velocity);
-                let direction = if velocity.length_squared() > 1.0e-24 {
-                    velocity.normalize()
-                } else {
-                    DVec3::Z
-                };
-                DMat4::from_scale_rotation_translation(
-                    DVec3::new(
-                        0.004 * particle.size,
-                        0.004 * particle.size,
-                        size * 0.5 * particle.size,
-                    ),
-                    DQuat::from_rotation_arc(DVec3::Z, direction),
-                    position + direction * (size * 0.5 * particle.size),
-                )
-            } else {
-                DMat4::from_translation(position)
-                    * DMat4::from_scale(DVec3::splat(0.02 * particle.size))
+            let (template, object_world) = match mode {
+                "points" => (
+                    Mesh::icosphere(IcosphereParams {
+                        subdivisions: 1,
+                        radius: 1.0,
+                    })
+                    .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?,
+                    None,
+                ),
+                "hair_curves" => (
+                    Mesh::cylinder(CylinderParams {
+                        vertices: 6,
+                        radius: 1.0,
+                        depth: 2.0,
+                        ..CylinderParams::default()
+                    })
+                    .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?,
+                    None,
+                ),
+                "object" => {
+                    let object_id = settings
+                        .get("instance_object")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            PotError::with_details(
+                                ErrorCode::InvalidOperation,
+                                "object particle rendering requires instance_object",
+                                json!({"node_id":emitter_id}),
+                            )
+                        })?;
+                    let object_id = Id::new(object_id.to_owned()).map_err(|error| {
+                        PotError::new(ErrorCode::InvalidOperation, error.message)
+                    })?;
+                    if object_id == *emitter_id {
+                        return Err(PotError::with_details(
+                            ErrorCode::InvalidOperation,
+                            "particle instances cannot reference their own emitter",
+                            json!({"node_id":emitter_id}),
+                        ));
+                    }
+                    let template = meshes.get(&object_id).cloned().ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::TargetNotFound,
+                            "particle instance mesh was not evaluated",
+                            json!({"node_id":emitter_id,"instance_object":object_id}),
+                        )
+                    })?;
+                    let mut matrix = matrices.get(&object_id).copied().ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::EvaluationFailed,
+                            "particle instance transform is missing",
+                            json!({"instance_object":object_id}),
+                        )
+                    })?;
+                    matrix.w_axis = DVec3::ZERO.extend(1.0);
+                    (template, Some(matrix))
+                }
+                "collection" => {
+                    let collection_text = settings
+                        .get("instance_collection")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            PotError::with_details(
+                                ErrorCode::InvalidOperation,
+                                "collection particle rendering requires instance_collection",
+                                json!({"node_id":emitter_id}),
+                            )
+                        })?;
+                    let collection_id = Id::new(collection_text.to_owned()).map_err(|error| {
+                        PotError::new(ErrorCode::InvalidOperation, error.message)
+                    })?;
+                    let mut object_ids = BTreeSet::new();
+                    collect_modifier_collection_objects(
+                        doc,
+                        &collection_id,
+                        &mut BTreeSet::new(),
+                        &mut object_ids,
+                    )?;
+                    let mut template = Mesh::new();
+                    for object_id in object_ids {
+                        if &object_id == emitter_id {
+                            continue;
+                        }
+                        let Some(source) = meshes.get(&object_id) else {
+                            continue;
+                        };
+                        let object_world = matrices.get(&object_id).copied().ok_or_else(|| {
+                            PotError::with_details(
+                                ErrorCode::EvaluationFailed,
+                                "particle collection object transform is missing",
+                                json!({"object":object_id}),
+                            )
+                        })?;
+                        append_transformed_mesh(
+                            &mut template,
+                            source,
+                            emitter_inverse * object_world,
+                        )?;
+                    }
+                    (template, None)
+                }
+                _ => {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "particle render_as setting is invalid",
+                        json!({"node_id":emitter_id,"render_as":mode}),
+                    ));
+                }
             };
-            append_transformed_mesh(output, &template, emitter_inverse * world_transform)?;
-        }
-        let bounds = mesh_bounds(output, emitter_world)?;
-        let evaluated = nodes.get_mut(emitter_id).ok_or_else(|| {
-            PotError::new(ErrorCode::InternalError, "particle emitter node is missing")
-        })?;
-        evaluated.bounds = bounds;
-        evaluated.dimensions = bounds.map(|value| value.size().to_array());
+            let output = meshes.get_mut(emitter_id).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "particle emitter mesh was not evaluated",
+                    json!({"node_id":emitter_id}),
+                )
+            })?;
+            let size = settings
+                .get("hair_length")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(0.1);
+            for particle in visible_states {
+                let position = DVec3::from_array(particle.position);
+                let world_transform = if let Some(object_world) = object_world {
+                    DMat4::from_translation(position)
+                        * DMat4::from_scale(DVec3::splat(particle.size))
+                        * object_world
+                } else if mode == "hair_curves" {
+                    let velocity = DVec3::from_array(particle.velocity);
+                    let direction = if velocity.length_squared() > 1.0e-24 {
+                        velocity.normalize()
+                    } else {
+                        DVec3::Z
+                    };
+                    DMat4::from_scale_rotation_translation(
+                        DVec3::new(
+                            0.004 * particle.size,
+                            0.004 * particle.size,
+                            size * 0.5 * particle.size,
+                        ),
+                        DQuat::from_rotation_arc(DVec3::Z, direction),
+                        position + direction * (size * 0.5 * particle.size),
+                    )
+                } else {
+                    DMat4::from_translation(position)
+                        * DMat4::from_scale(DVec3::splat(0.02 * particle.size))
+                };
+                append_transformed_mesh(output, &template, emitter_inverse * world_transform)?;
+            }
+            let bounds = mesh_bounds(output, emitter_world)?;
+            let evaluated = nodes.get_mut(emitter_id).ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "particle emitter node is missing")
+            })?;
+            evaluated.bounds = bounds;
+            evaluated.dimensions = bounds.map(|value| value.size().to_array());
         }
     }
     Ok(())
@@ -3672,7 +3686,6 @@ fn apply_volume_displace_modifier(
     )
 }
 
-
 fn apply_generic_scene_mesh_operand_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -3744,24 +3757,12 @@ pub(crate) fn apply_scene_operand_modifier(
         "hook" => return apply_scene_hook_modifier(mesh, modifier, subject_id, doc, references),
         "cast" => {
             return apply_scene_single_reference_modifier(
-                mesh,
-                modifier,
-                subject_id,
-                doc,
-                references,
-                "object",
-                None,
+                mesh, modifier, subject_id, doc, references, "object", None,
             );
         }
         "simple_deform" => {
             return apply_scene_single_reference_modifier(
-                mesh,
-                modifier,
-                subject_id,
-                doc,
-                references,
-                "origin",
-                None,
+                mesh, modifier, subject_id, doc, references, "origin", None,
             );
         }
         _ => {}
@@ -4096,15 +4097,14 @@ pub(crate) fn texture_coordinate_matrix_with_parameters(
             let Some(object_id) = reference_object_id(modifier, object_parameter, doc)? else {
                 return Ok(Some(DMat4::IDENTITY));
             };
-            let mapping =
-                reference_world_matrix_with_bone_fallback(
-                    modifier,
-                    &object_id,
-                    bone_parameter,
-                    doc,
-                    references,
-                )?
-                .inverse();
+            let mapping = reference_world_matrix_with_bone_fallback(
+                modifier,
+                &object_id,
+                bone_parameter,
+                doc,
+                references,
+            )?
+            .inverse();
             if !mapping.is_finite() {
                 return Err(PotError::invalid_argument(
                     "texture coordinate mapping transform must be invertible",
@@ -4862,8 +4862,7 @@ fn remap_slot_binding(
             .entry(pointer)
             .or_insert_with(|| {
                 let source_mask = Arc::clone(&binding.color_available_mask);
-                let mapped =
-                    remap_color_mask(&source_mask, color_map, color_count);
+                let mapped = remap_color_mask(&source_mask, color_map, color_count);
                 (source_mask, mapped)
             })
             .1,
@@ -4972,13 +4971,9 @@ fn evaluate_collection_instance(
         ));
     }
     let slot_coverage = fold_slot_coverage(&mesh, &uv_coverage, slot_base);
-    let mut color_masks =
-        HashMap::<*const [u64], (Arc<[u64]>, Arc<[u64]>)>::new();
+    let mut color_masks = HashMap::<*const [u64], (Arc<[u64]>, Arc<[u64]>)>::new();
     let mut bindings = Vec::with_capacity(slot_base);
-    for ((member, uv_map), color_map) in member_bindings
-        .into_iter()
-        .zip(&uv_maps)
-        .zip(&color_maps)
+    for ((member, uv_map), color_map) in member_bindings.into_iter().zip(&uv_maps).zip(&color_maps)
     {
         for (local_slot, binding) in member.slots.into_iter().enumerate() {
             let mut binding = remap_slot_binding(
@@ -5021,7 +5016,6 @@ fn is_isolated_failure(error: &PotError) -> bool {
     error.code == ErrorCode::UnsupportedFeature
         || error.details.get(INSTANCE_JOIN_FAILURE).is_some()
 }
-
 
 #[expect(
     clippy::too_many_arguments,
@@ -5103,8 +5097,7 @@ fn append_collection_geometry<'a>(
                     .collect();
                 let uv_coverage = uv_face_coverage(&uv_store.layers, source_mesh.faces.len());
                 let color_names = color_layer_names(source_mesh);
-                let slots =
-                    member_slot_bindings(source_node, source_mesh, &uv_store, &color_names);
+                let slots = member_slot_bindings(source_node, source_mesh, &uv_store, &color_names);
                 (
                     Cow::Borrowed(source_mesh),
                     vec![vec![object_id.clone()]],
@@ -5115,14 +5108,7 @@ fn append_collection_geometry<'a>(
                 )
             })
         };
-        let Some((
-            nested_mesh,
-            nested_paths,
-            slots,
-            uv_names,
-            uv_coverage,
-            color_names,
-        )) = member
+        let Some((nested_mesh, nested_paths, slots, uv_names, uv_coverage, color_names)) = member
         else {
             continue;
         };
@@ -5499,7 +5485,6 @@ mod tests {
     use super::{
         EvaluationContext, SlotBinding, Snapshot, UvBinding, evaluate_collection_instance,
     };
-
 
     #[test]
     fn particle_render_limit_counts_all_systems_for_each_emitter() {
@@ -5934,15 +5919,14 @@ mod tests {
         let layer = &store.layers[store.index_of("color").unwrap()];
         assert_eq!(layer.domain, ColorDomain::Point);
         assert_eq!(layer.values, colors);
-        assert_eq!(mesh.attributes["color"]["domain"], serde_json::json!("point"));
+        assert_eq!(
+            mesh.attributes["color"]["domain"],
+            serde_json::json!("point")
+        );
         assert!(color_layers::validate(&mesh).is_ok());
     }
 
-    fn member_mesh(
-        layers: &[(&str, [f64; 2], Option<usize>)],
-        render: &str,
-        color: &str,
-    ) -> Mesh {
+    fn member_mesh(layers: &[(&str, [f64; 2], Option<usize>)], render: &str, color: &str) -> Mesh {
         let mut mesh = Mesh::box_mesh(BoxParams {
             size: DVec3::splat(2.0),
         })
@@ -5956,8 +5940,7 @@ mod tests {
                         .iter()
                         .enumerate()
                         .map(|(index, face)| {
-                            (*missing_face != Some(index))
-                                .then(|| vec![*uv; face.vertices.len()])
+                            (*missing_face != Some(index)).then(|| vec![*uv; face.vertices.len()])
                         })
                         .collect(),
                 )
@@ -6068,18 +6051,12 @@ mod tests {
         );
         let prefix = member_mesh(&[("Other", [0.1, 0.2], None)], "Other", "Tint");
         let mut first = member_mesh(
-            &[
-                ("Base", [0.3, 0.4], Some(0)),
-                ("Detail", [0.5, 0.6], None),
-            ],
+            &[("Base", [0.3, 0.4], Some(0)), ("Detail", [0.5, 0.6], None)],
             "Detail",
             "Skin",
         );
         let second = member_mesh(
-            &[
-                ("Detail", [0.7, 0.8], None),
-                ("Base", [0.9, 0.25], None),
-            ],
+            &[("Detail", [0.7, 0.8], None), ("Base", [0.9, 0.25], None)],
             "Base",
             "Skin",
         );
@@ -6143,34 +6120,13 @@ mod tests {
             [0.0, 1.0],
             "an originally absent row stays uncovered after its default is materialized"
         );
-        assert_eq!(
-            uv.layers[1].faces[7].as_ref().unwrap()[0],
-            [0.3, 0.4]
-        );
-        assert_eq!(
-            uv.layers[2].faces[6].as_ref().unwrap()[0],
-            [0.5, 0.6]
-        );
-        assert_eq!(
-            uv.layers[1].faces[12].as_ref().unwrap()[0],
-            [0.9, 0.25]
-        );
-        assert_eq!(
-            uv.layers[2].faces[12].as_ref().unwrap()[0],
-            [0.7, 0.8]
-        );
-        assert_eq!(
-            &evaluation.uv_coverage[..6],
-            &[1, 1, 1, 1, 1, 1]
-        );
-        assert_eq!(
-            &evaluation.uv_coverage[6..12],
-            &[4, 6, 6, 6, 6, 6]
-        );
-        assert_eq!(
-            &evaluation.uv_coverage[12..],
-            &[6, 6, 6, 6, 6, 6]
-        );
+        assert_eq!(uv.layers[1].faces[7].as_ref().unwrap()[0], [0.3, 0.4]);
+        assert_eq!(uv.layers[2].faces[6].as_ref().unwrap()[0], [0.5, 0.6]);
+        assert_eq!(uv.layers[1].faces[12].as_ref().unwrap()[0], [0.9, 0.25]);
+        assert_eq!(uv.layers[2].faces[12].as_ref().unwrap()[0], [0.7, 0.8]);
+        assert_eq!(&evaluation.uv_coverage[..6], &[1, 1, 1, 1, 1, 1]);
+        assert_eq!(&evaluation.uv_coverage[6..12], &[4, 6, 6, 6, 6, 6]);
+        assert_eq!(&evaluation.uv_coverage[12..], &[6, 6, 6, 6, 6, 6]);
 
         assert_eq!(evaluation.bindings.len(), 4);
         assert_eq!(evaluation.bindings[0].uv.render_index, Some(0));
@@ -6183,7 +6139,10 @@ mod tests {
         assert_eq!(evaluation.bindings[3].uv.render_index, Some(1));
         assert_eq!(evaluation.bindings[3].uv.available_mask, 6);
         assert!(!evaluation.bindings[3].uv.texcoord0_covered);
-        assert_eq!(evaluation.bindings[1].material, evaluation.bindings[2].material);
+        assert_eq!(
+            evaluation.bindings[1].material,
+            evaluation.bindings[2].material
+        );
         assert_eq!(evaluation.bindings[1].color_render_layer, Some(1));
         assert_eq!(&*evaluation.bindings[1].color_available_mask, &[2]);
         assert!(std::sync::Arc::ptr_eq(
@@ -6202,8 +6161,7 @@ mod tests {
             .iter()
             .map(|vertex| vertex.co)
             .collect::<Vec<_>>();
-        let normals =
-            crate::geom::normals::corner_normals(&evaluation.mesh, &positions).unwrap();
+        let normals = crate::geom::normals::corner_normals(&evaluation.mesh, &positions).unwrap();
         assert_eq!(normals.len(), corner_count);
         let mut corner_base = 0;
         for face in &evaluation.mesh.faces {
@@ -6240,7 +6198,11 @@ mod tests {
             snapshot.slot_material(&ordinary_id, &ordinary, usize::MAX),
             Some(&last)
         );
-        assert!(snapshot.slot_material(&ordinary_id, &Node::default(), 0).is_none());
+        assert!(
+            snapshot
+                .slot_material(&ordinary_id, &Node::default(), 0)
+                .is_none()
+        );
 
         let instance_id = Id::new("instance").unwrap();
         let instance = Node::default();
@@ -6288,6 +6250,10 @@ mod tests {
                 .slot_binding(&empty_id, &instance, usize::MAX)
                 .is_none()
         );
-        assert!(snapshot.slot_material(&empty_id, &instance, usize::MAX).is_none());
+        assert!(
+            snapshot
+                .slot_material(&empty_id, &instance, usize::MAX)
+                .is_none()
+        );
     }
 }

@@ -25,7 +25,11 @@ impl Topology {
         let index_by_id = id_indices(mesh);
         let index = |id: u32| -> Result<usize> {
             index_by_id.get(&id).copied().ok_or_else(|| {
-                invalid_parameter(modifier, "mesh", "edges and faces referencing existing vertices")
+                invalid_parameter(
+                    modifier,
+                    "mesh",
+                    "edges and faces referencing existing vertices",
+                )
             })
         };
         let edges = mesh
@@ -659,21 +663,18 @@ pub(super) fn corrective_smooth(
     rest_mesh: &Mesh,
     modifier: &Modifier,
 ) -> Result<Mesh> {
-    let length_weighted = match string_param_with_expected(
-        modifier,
-        "smooth_type",
-        "SIMPLE or LENGTH_WEIGHTED",
-    )? {
-        "SIMPLE" => false,
-        "LENGTH_WEIGHTED" => true,
-        _ => {
-            return Err(invalid_parameter(
-                modifier,
-                "smooth_type",
-                "SIMPLE or LENGTH_WEIGHTED",
-            ));
-        }
-    };
+    let length_weighted =
+        match string_param_with_expected(modifier, "smooth_type", "SIMPLE or LENGTH_WEIGHTED")? {
+            "SIMPLE" => false,
+            "LENGTH_WEIGHTED" => true,
+            _ => {
+                return Err(invalid_parameter(
+                    modifier,
+                    "smooth_type",
+                    "SIMPLE or LENGTH_WEIGHTED",
+                ));
+            }
+        };
     let smoothing = Smoothing {
         iterations: iteration_count(modifier)?,
         factor: number_param(modifier, "factor")?,

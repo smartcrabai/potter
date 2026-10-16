@@ -10,20 +10,20 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
 
 use native_oracle::{
-    BYTE_TOLERANCE, FLOAT_TOLERANCE, TestResult, assert_close, assert_floats, assert_rgba, attribute,
-    blender, build_oracle, dump_blend, dumped_object, export, face_loop_starts, floats, import_blend,
-    loss_features, losses, mesh_of_node, node_id, number, oracle_section, read_scene, value_at,
-    vec3, vec4,
+    BYTE_TOLERANCE, FLOAT_TOLERANCE, TestResult, assert_close, assert_floats, assert_rgba,
+    attribute, blender, build_oracle, dump_blend, dumped_object, export, face_loop_starts, floats,
+    import_blend, loss_features, losses, mesh_of_node, node_id, number, oracle_section, read_scene,
+    value_at, vec3, vec4,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -139,7 +139,9 @@ fn check_internals(mesh: &Value) -> TestResult {
             .as_str()
             .ok_or("blender attribute has no name")?;
         assert!(
-            INTERNAL_PREFIXES.iter().any(|prefix| name.starts_with(prefix)),
+            INTERNAL_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix)),
             "{name} must be native or dropped, not kept as a Blender-only attribute"
         );
     }
@@ -221,12 +223,7 @@ fn check_value(actual: &Value, expected: &Value, kind: &str, label: &str) -> Tes
     match kind {
         "bool" => assert_eq!(actual.as_bool(), expected.as_bool(), "{label}"),
         "int" => assert_eq!(actual.as_i64(), expected.as_i64(), "{label}"),
-        "float3" => assert_floats(
-            &vec3(actual)?,
-            &vec3(expected)?,
-            FLOAT_TOLERANCE,
-            label,
-        ),
+        "float3" => assert_floats(&vec3(actual)?, &vec3(expected)?, FLOAT_TOLERANCE, label),
         _ => assert_close(number(actual)?, number(expected)?, FLOAT_TOLERANCE, label),
     }
     Ok(())
@@ -314,7 +311,9 @@ fn check_uv(mesh: &Value, oracle: &Value) -> TestResult {
                 .iter()
                 .find(|entry| entry["face_id"].as_u64() == Some(face as u64))
                 .ok_or_else(|| format!("UV layer {name} has no face {face}"))?;
-            let corners = entry["uv"].as_array().ok_or("stored UV corners are missing")?;
+            let corners = entry["uv"]
+                .as_array()
+                .ok_or("stored UV corners are missing")?;
             for (corner, stored) in corners.iter().enumerate() {
                 let expected_uv = floats(&expected[start + corner])?;
                 let stored = floats(stored)?;
@@ -376,8 +375,14 @@ fn check_flags_dumped(object: &Value, oracle: &Value) -> TestResult {
         .iter()
         .enumerate()
     {
-        assert_eq!(object["faces"][index]["smooth"], face["smooth"], "face {index}");
-        assert_eq!(object["faces"][index]["v"], face["v"], "face {index} corners");
+        assert_eq!(
+            object["faces"][index]["smooth"], face["smooth"],
+            "face {index}"
+        );
+        assert_eq!(
+            object["faces"][index]["v"], face["v"],
+            "face {index} corners"
+        );
     }
     for (index, edge) in oracle["edges"]
         .as_array()
@@ -385,8 +390,14 @@ fn check_flags_dumped(object: &Value, oracle: &Value) -> TestResult {
         .iter()
         .enumerate()
     {
-        assert_eq!(object["edges"][index]["sharp"], edge["sharp"], "edge {index} sharp");
-        assert_eq!(object["edges"][index]["seam"], edge["seam"], "edge {index} seam");
+        assert_eq!(
+            object["edges"][index]["sharp"], edge["sharp"],
+            "edge {index} sharp"
+        );
+        assert_eq!(
+            object["edges"][index]["seam"], edge["seam"],
+            "edge {index} seam"
+        );
     }
     for (index, vertex) in oracle["vertices"]
         .as_array()
@@ -429,7 +440,9 @@ fn check_colors_dumped(object: &Value, oracle: &Value) -> TestResult {
         let values = expected["values"]
             .as_array()
             .ok_or("expected color values are missing")?;
-        let actual = layer["values"].as_array().ok_or("Blender values are missing")?;
+        let actual = layer["values"]
+            .as_array()
+            .ok_or("Blender values are missing")?;
         assert_eq!(actual.len(), values.len(), "{name} element count");
         for (index, value) in values.iter().enumerate() {
             assert_rgba(
@@ -458,12 +471,23 @@ fn check_generics_dumped(object: &Value, oracle: &Value) -> TestResult {
         let domain = spec["domain"].as_str().unwrap_or_default().to_uppercase();
         let kind = spec["type"].as_str().unwrap_or_default();
         assert_eq!(attr["domain"], domain.as_str(), "{name} Blender domain");
-        assert_eq!(attr["data_type"], blender_data_type(kind), "{name} Blender type");
+        assert_eq!(
+            attr["data_type"],
+            blender_data_type(kind),
+            "{name} Blender type"
+        );
         let values = spec["values"].as_array().ok_or("values are missing")?;
-        let actual = attr["values"].as_array().ok_or("Blender values are missing")?;
+        let actual = attr["values"]
+            .as_array()
+            .ok_or("Blender values are missing")?;
         assert_eq!(actual.len(), values.len(), "{name} element count");
         for (index, expected) in values.iter().enumerate() {
-            check_value(&actual[index], expected, kind, &format!("Blender {name}[{index}]"))?;
+            check_value(
+                &actual[index],
+                expected,
+                kind,
+                &format!("Blender {name}[{index}]"),
+            )?;
         }
     }
     Ok(())
@@ -473,7 +497,9 @@ fn check_uv_dumped(object: &Value, oracle: &Value) -> TestResult {
     let uv = &oracle["uv_layers"];
     assert_eq!(object["uv_active"], 2, "Blender active UV index");
     assert_eq!(object["uv_render"], 1, "Blender render UV index");
-    let layers = object["uv_layers"].as_array().ok_or("Blender UV layers are missing")?;
+    let layers = object["uv_layers"]
+        .as_array()
+        .ok_or("Blender UV layers are missing")?;
     let names: Vec<String> = layers
         .iter()
         .map(|layer| layer["name"].as_str().unwrap_or_default().to_owned())
@@ -481,8 +507,12 @@ fn check_uv_dumped(object: &Value, oracle: &Value) -> TestResult {
     assert_eq!(names, string_list(&uv["names"])?, "Blender UV order");
     for layer in layers {
         let name = layer["name"].as_str().unwrap_or_default();
-        let expected = uv["values"][name].as_array().ok_or("expected UV values are missing")?;
-        let actual = layer["values"].as_array().ok_or("Blender UV values are missing")?;
+        let expected = uv["values"][name]
+            .as_array()
+            .ok_or("expected UV values are missing")?;
+        let actual = layer["values"]
+            .as_array()
+            .ok_or("Blender UV values are missing")?;
         for (loop_index, value) in expected.iter().enumerate() {
             assert_floats(
                 &floats(&actual[loop_index])?,

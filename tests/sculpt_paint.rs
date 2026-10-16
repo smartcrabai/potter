@@ -141,7 +141,9 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
             .unwrap()
             .iter()
             .enumerate()
-            .any(|(corner, vertex)| *vertex == json!(6) && row[corner] == json!([0.1, 0.2, 0.3, 1.0]))
+            .any(|(corner, vertex)| {
+                *vertex == json!(6) && row[corner] == json!([0.1, 0.2, 0.3, 1.0])
+            })
     });
     assert!(painted_at_v6);
     assert_eq!(

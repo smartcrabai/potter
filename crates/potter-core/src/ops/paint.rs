@@ -1178,6 +1178,10 @@ mod tests {
         let layer = &store.layers[store.index_of("color").unwrap()];
         assert_eq!(layer.domain, ColorDomain::Point);
         assert_eq!(layer.values[0], [0.5, 0.5, 0.5, 1.0]);
-        assert!(layer.values[1..].iter().all(|value| *value == DEFAULT_COLOR));
+        assert!(
+            layer.values[1..]
+                .iter()
+                .all(|value| *value == DEFAULT_COLOR)
+        );
     }
 }

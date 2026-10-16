@@ -98,7 +98,6 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
     output.attributes = merge_attributes(&pieces, &output)?;
     let layers = join_uv_layers(&mut pieces, &output.faces)?;
     if !layers.is_empty() {
-
         write_layers(&mut output, &layers);
     }
     output.validate().map_err(|error| join_error(&error))?;
@@ -269,8 +268,6 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 /// Reverses a mirrored member's faces, with every corner-keyed value of each face: the corner order
 /// of each face, `custom_normal` and named `corner` rows, `CORNER` `blender_attributes` segments, UV
@@ -1041,7 +1038,11 @@ mod tests {
         assert!(!joined.attributes.contains_key("uv_map"));
         assert!(!joined.attributes.contains_key("blender_uv_layers"));
         let store = crate::geom::uv_layers::read(&joined);
-        let names: Vec<_> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let names: Vec<_> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(names, ["A", "Extra"]);
         assert_eq!(store.active.as_deref(), Some("A"));
         assert_eq!(store.render.as_deref(), Some("A"));
@@ -1177,7 +1178,11 @@ mod tests {
         let joined = concatenate(parts).unwrap();
         let store = uv_layers::read(&joined);
         assert_eq!(
-            store.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
+            store
+                .layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
             ["Map", "UVMap"]
         );
         assert_eq!(store.layers[0].faces[0].as_ref().unwrap()[0], [0.1, 0.2]);
@@ -1188,7 +1193,12 @@ mod tests {
             store.layers[1].pinned[6].as_deref().unwrap(),
             &[true, false, true, false]
         );
-        assert!(store.layers.iter().all(|layer| layer.faces[12..].iter().all(Option::is_some)));
+        assert!(
+            store
+                .layers
+                .iter()
+                .all(|layer| layer.faces[12..].iter().all(Option::is_some))
+        );
     }
 
     #[test]
@@ -1212,7 +1222,13 @@ mod tests {
         layer.pinned = source
             .faces
             .iter()
-            .map(|face| Some((0..face.vertices.len()).map(|corner| corner % 2 == 0).collect()))
+            .map(|face| {
+                Some(
+                    (0..face.vertices.len())
+                        .map(|corner| corner % 2 == 0)
+                        .collect(),
+                )
+            })
             .collect();
         let mut normals = Map::new();
         for face in &source.faces {

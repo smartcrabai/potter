@@ -11,10 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{
-        provenance::Origin,
-        uv_layers,
-    },
+    geom::{provenance::Origin, uv_layers},
     model::Modifier,
 };
 
@@ -66,7 +63,6 @@ fn collapse_uv_layers(mesh: &Mesh) -> (Vec<String>, Vec<Vec<[f64; 2]>>) {
     }
     (names, values)
 }
-
 
 /// Rewrites the UV layers of `mesh`, rebuilt by a collapse, from the per-corner values of `corner_uv`
 /// (output face order, then corner order). `names[l]` is the layer of `corner_uv[c][l]`.

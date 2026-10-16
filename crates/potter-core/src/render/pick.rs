@@ -249,7 +249,14 @@ pub fn pick(
         ));
     }
     let camera = camera_from_manifest(&manifest.camera)?;
-    let geometry = extract_geometry(doc, &snapshot, Mode::Solid, false, &BTreeMap::new(), &camera)?;
+    let geometry = extract_geometry(
+        doc,
+        &snapshot,
+        Mode::Solid,
+        false,
+        &BTreeMap::new(),
+        &camera,
+    )?;
     verify_mapping_matches_geometry(&manifest, &geometry)?;
     let (ray_origin, ray_direction) =
         ray_for_pixel(&camera, buffers.width, buffers.height, pixel.0, pixel.1)?;

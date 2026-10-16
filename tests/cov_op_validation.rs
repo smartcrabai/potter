@@ -851,20 +851,18 @@ fn solve_object_accepts_the_four_track_boundary_and_persists_a_valid_solve() {
 
 #[test]
 fn modifier_apply_reports_shape_key_failures() {
-    let cases = [
-        invalid_case(
-            "shape keys guard modifier application",
-            json!([
-                {"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}},
-                {"op":"shape_key.create","target":{"id":"subject"},"id":"smile","name":"Smile","positions":{"0":[1.0,-1.0,0.25]}},
-                {"op":"modifier.create","target":{"id":"subject"},"id":"wave","type":"wave","params":{"height":0.5}}
-            ]),
-            json!({"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"wave"}),
-            "UNSUPPORTED_FEATURE",
-            None,
-            Some("modifier.apply.shape_key_guard"),
-        ),
-    ];
+    let cases = [invalid_case(
+        "shape keys guard modifier application",
+        json!([
+            {"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}},
+            {"op":"shape_key.create","target":{"id":"subject"},"id":"smile","name":"Smile","positions":{"0":[1.0,-1.0,0.25]}},
+            {"op":"modifier.create","target":{"id":"subject"},"id":"wave","type":"wave","params":{"height":0.5}}
+        ]),
+        json!({"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"wave"}),
+        "UNSUPPORTED_FEATURE",
+        None,
+        Some("modifier.apply.shape_key_guard"),
+    )];
     run_invalid_cases(&cases);
 }
 

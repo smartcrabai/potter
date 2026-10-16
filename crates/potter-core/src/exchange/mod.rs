@@ -819,7 +819,15 @@ mod tests {
     fn every_non_gltf_format_reports_color_and_generic_attributes() -> crate::error::Result<()> {
         let mesh = triangle_with_attributes()?;
         let formats = [
-            "fbx", "fbx-binary", "alembic", "obj", "ply", "stl", "usda", "usdc", "usdz",
+            "fbx",
+            "fbx-binary",
+            "alembic",
+            "obj",
+            "ply",
+            "stl",
+            "usda",
+            "usdc",
+            "usdz",
         ];
         for format in formats {
             let losses = mesh_attribute_losses(format, "triangle", &mesh);
@@ -839,11 +847,25 @@ mod tests {
             assert_eq!(generic.len(), 2, "{format}: {generic:?}");
             assert!(colors[0].contains(&format!("{format} does not write color layer `Col`")));
             assert!(colors[1].contains("color layer `Corner`"), "{format}");
-            assert!(colors[2].contains("Blender color attribute `Blender Col`"), "{format}");
+            assert!(
+                colors[2].contains("Blender color attribute `Blender Col`"),
+                "{format}"
+            );
             assert!(generic[0].contains("mesh attribute `weight`"), "{format}");
-            assert!(generic[1].contains("Blender attribute `Pinned`"), "{format}");
-            assert!(losses.iter().all(|loss| loss.data_id.as_deref() == Some("triangle")));
-            assert!(losses.iter().all(|loss| !loss.reason.contains("select_vert")));
+            assert!(
+                generic[1].contains("Blender attribute `Pinned`"),
+                "{format}"
+            );
+            assert!(
+                losses
+                    .iter()
+                    .all(|loss| loss.data_id.as_deref() == Some("triangle"))
+            );
+            assert!(
+                losses
+                    .iter()
+                    .all(|loss| !loss.reason.contains("select_vert"))
+            );
         }
         Ok(())
     }
@@ -860,10 +882,22 @@ mod tests {
             serde_json::json!({"domain": "edge", "type": "bool", "values": {}}),
         );
         let losses = mesh_attribute_losses("obj", "triangle", &mesh);
-        assert!(losses.iter().all(|loss| !loss.reason.contains("`shade_smooth`")));
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("`shade_smooth`"))
+        );
         assert!(losses.iter().all(|loss| !loss.reason.contains("`sharp`")));
-        assert!(losses.iter().all(|loss| !loss.reason.contains("`uv_layers`")));
-        assert!(losses.iter().all(|loss| !loss.reason.contains("`color_layers`")));
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("`uv_layers`"))
+        );
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("`color_layers`"))
+        );
         Ok(())
     }
 
@@ -875,7 +909,11 @@ mod tests {
             serde_json::json!({"domain": "point", "type": "float", "values": {}}),
         );
         let losses = mesh_attribute_losses("obj", "triangle", &mesh);
-        assert!(losses.iter().any(|loss| loss.reason.ends_with("mesh attribute `sharp`")));
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.reason.ends_with("mesh attribute `sharp`"))
+        );
         Ok(())
     }
 }

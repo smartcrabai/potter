@@ -352,7 +352,8 @@ fn lattice_scene(strength: f64, grouped: bool, invert: bool, missing_group: bool
     ];
     let mut params = json!({"object":"lat","strength":strength});
     if grouped {
-        operations.push(json!({"op":"vertex_group.create","target":{"id":"subj"},"id":"g","name":"G"}));
+        operations
+            .push(json!({"op":"vertex_group.create","target":{"id":"subj"},"id":"g","name":"G"}));
         params["vertex_group"] = json!("g");
         params["invert_vertex_group"] = json!(invert);
     } else if missing_group {
@@ -361,11 +362,15 @@ fn lattice_scene(strength: f64, grouped: bool, invert: bool, missing_group: bool
     let staged = apply(&base_scene(), &json!(operations));
     let mut second = Vec::new();
     if grouped {
-        second.push(json!({"op":"vertex_group.assign","target":{"id":"subj"},"group_id":"g",
-                           "weights":group_assignments(source_mesh(&staged, "subj"))}));
+        second.push(
+            json!({"op":"vertex_group.assign","target":{"id":"subj"},"group_id":"g",
+                           "weights":group_assignments(source_mesh(&staged, "subj"))}),
+        );
     }
-    second.push(json!({"op":"modifier.create","target":{"id":"subj"},"id":"lattice","type":"lattice",
-                       "params":params}));
+    second.push(
+        json!({"op":"modifier.create","target":{"id":"subj"},"id":"lattice","type":"lattice",
+                       "params":params}),
+    );
     apply(&staged, &json!(second))
 }
 
@@ -465,11 +470,7 @@ const BSPLINE_EXTREME: [[f64; 3]; 8] = [
     [0.518550336, 0.501709282, 0.484999865],
 ];
 
-fn outside_cage_lattice_scene(
-    interpolation: &str,
-    scale: f64,
-    translation: [f64; 3],
-) -> SceneDoc {
+fn outside_cage_lattice_scene(interpolation: &str, scale: f64, translation: [f64; 3]) -> SceneDoc {
     apply(
         &base_scene(),
         &json!([
@@ -580,8 +581,10 @@ fn blend_texture_scene(texture_coords: &str) -> SceneDoc {
     if texture_coords == "OBJECT" {
         params["texture_coords_object"] = json!("map");
     }
-    operations.push(json!({"op":"modifier.create","target":{"id":"subj"},"id":"displace","type":"displace",
-                           "params":params}));
+    operations.push(
+        json!({"op":"modifier.create","target":{"id":"subj"},"id":"displace","type":"displace",
+                           "params":params}),
+    );
     apply(&base_scene(), &json!(operations))
 }
 
@@ -631,4 +634,3 @@ fn displace_blend_texture_uses_mapping_object_coordinates() {
         &BLEND_TEXTURE_OBJECT,
     );
 }
-

@@ -1336,7 +1336,12 @@ fn assert_skin_branch_round_trip(
         evaluated["positions"].as_array().unwrap(),
         before_geometry["positions"].as_array().unwrap(),
     )
-    .ok_or_else(|| format!("{}: inspected vertex count differs from Blender", case["name"]))?;
+    .ok_or_else(|| {
+        format!(
+            "{}: inspected vertex count differs from Blender",
+            case["name"]
+        )
+    })?;
     assert!(
         position_error <= 1.0e-5,
         "{}: inspected branch geometry differs from Blender by {position_error}",

@@ -6,7 +6,10 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
     image::{ImageInterpolation, encode_pixels},
-    model::{Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, migrate::inline_resource_kind},
+    model::{
+        Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
+        migrate::inline_resource_kind,
+    },
 };
 
 use super::{
@@ -565,7 +568,10 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     for (resource_id, resource) in &engine.doc.resources {
         if inline_resource_kind(resource)? != Some("legacy_texture")
             || resource.get("texture_type").and_then(Value::as_str) != Some("IMAGE")
-            || resource.get("settings").and_then(Value::as_object).is_none()
+            || resource
+                .get("settings")
+                .and_then(Value::as_object)
+                .is_none()
         {
             continue;
         }
