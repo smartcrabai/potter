@@ -600,6 +600,7 @@ impl Evaluator<'_, '_, '_, '_> {
             "ShaderNodeMath" => self.math(node_id, socket),
             "ShaderNodeVectorMath" => self.vector_math(node_id, socket),
             "ShaderNodeMapping" => self.mapping(node_id, socket),
+            "ShaderNodeSeparateColor" => self.separate_color(node_id, socket),
             "ShaderNodeTexCoord" => self.tex_coord(socket),
             "ShaderNodeNormalMap" => self.normal_map(node_id, socket),
             "ShaderNodeFresnel" => self.fresnel(node_id, socket),
@@ -1203,6 +1204,17 @@ impl Evaluator<'_, '_, '_, '_> {
             "Vector" => Ok(Value::Vector(mapped)),
             _ => Err(invalid(format!("unknown Mapping output `{socket}`"))),
         }
+    }
+    /// `ShaderNodeSeparateColor`: one channel of its color input as a scalar.
+    fn separate_color(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        let color = self.color_input(id, &["Color"], [0.0; 4])?;
+        let channel = match socket {
+            "Red" => color[0],
+            "Green" => color[1],
+            "Blue" => color[2],
+            _ => return Err(invalid(format!("unknown Separate Color output `{socket}`"))),
+        };
+        Ok(Value::Scalar(channel))
     }
 
     fn tex_coord(&self, socket: &str) -> Result<Value> {

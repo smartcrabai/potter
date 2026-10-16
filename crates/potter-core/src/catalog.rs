@@ -2274,7 +2274,7 @@ pub fn formats_catalog() -> Value {
 fn vrm_format_row(format: &str) -> Value {
     let mut row = format_row(
         format,
-        [false, true],
+        [true, true],
         &[
             "GLB 2.0 container",
             "avatar metadata and humanoid",
@@ -2286,8 +2286,10 @@ fn vrm_format_row(format: &str) -> Value {
         false,
         &[],
         &[
-            "Settings not representable by this VRM version are rejected during validation and export.",
+            "Export: settings not representable by this VRM version are rejected during validation and export.",
             "Custom shader graphs export their supported subset to glTF materials; unsupported graph parts are reported as losses (material.shader_graph.*), and texture samples on a non-default UV layer are reported as losses (material.texture_uv_set).",
+            "Import: the file must carry the matching extension (VRMC_vrm for vrm, VRM for vrm0); a glTF extension Potter does not decode and a VRM feature Potter cannot hold are reported as losses (vrm.extension.*, vrm.meta.*, vrm.humanoid.*, vrm.expression.*, vrm.first_person.*, vrm.look_at, vrm.spring.*, vrm.mtoon.*).",
+            "Import append: the avatar is not attached when the scene already has an avatar or an imported node, data, material or image ID already exists (vrm.avatar).",
         ],
     );
     let mut features = row["features"].as_array().cloned().unwrap_or_default();

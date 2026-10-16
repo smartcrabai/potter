@@ -8,7 +8,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     exchange::{self, ImportedGraph, Loss},
     hash,
-    model::{Id, SceneDoc},
+    model::{AvatarVersion, Id, SceneDoc},
     response::SceneInfo,
     store::Project,
 };
@@ -33,6 +33,8 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
             | "ply"
             | "stl"
             | "svg"
+            | "vrm"
+            | "vrm0"
     ) {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -48,7 +50,23 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
     }
     let mut project = Project::open_exclusive(&args.scene)?;
     check_base_revision(project.doc(), args.base_revision)?;
-    let imported = load_graph(format, &args.file, args.blender.as_deref())?;
+    let mut imported = load_graph(format, &args.file, args.blender.as_deref())?;
+    // Append keeps the scene's avatar; an imported avatar attaches only when the scene has none and no
+    // node, data, material or image ID would be renamed (the avatar refers to those IDs unchanged).
+    let attach_avatar = args.mode == ImportMode::Replace
+        || (project.doc().avatar.is_none() && !avatar_ids_collide(&imported.doc, project.doc()));
+    if imported.doc.avatar.is_some() && !attach_avatar {
+        imported.losses.push(Loss {
+            feature_id: "vrm.avatar".to_owned(),
+            data_id: None,
+            reason: if project.doc().avatar.is_some() {
+                "append keeps the scene's existing avatar settings; the imported avatar is not attached".to_owned()
+            } else {
+                "the imported avatar refers to IDs that append renames; the avatar is not attached".to_owned()
+            },
+            suggestion: Some("use --mode replace to import the avatar, or --allow-lossy to append without it".to_owned()),
+        });
+    }
     if !imported.losses.is_empty() && !args.allow_lossy {
         return Err(lossy_error(format, &imported.losses));
     }
@@ -96,7 +114,7 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
             imported.id_mappings.clone()
         }
         ImportMode::Append => {
-            let append_mappings = append_graph(&mut candidate, &before, &args.file)?;
+            let append_mappings = append_graph(&mut candidate, &before, &args.file, attach_avatar)?;
             if imported
                 .id_mappings
                 .as_object()
@@ -202,6 +220,8 @@ fn load_graph(format: &str, path: &Path, blender: Option<&Path>) -> Result<Impor
         "svg" => exchange::svg::import(path, scene_id),
         "stl" => exchange::stl::imported_graph(path, scene_id),
         "ply" => exchange::ply::imported_graph(path, scene_id),
+        "vrm" => exchange::vrm::import::import(path, scene_id, AvatarVersion::V1),
+        "vrm0" => exchange::vrm::import::import(path, scene_id, AvatarVersion::V0),
         _ => Err(PotError::new(
             ErrorCode::UnsupportedFeature,
             format!("{format} import is not implemented"),
@@ -347,7 +367,12 @@ fn configure_blender_resources(
     (result, warnings)
 }
 
-fn append_graph(imported: &mut SceneDoc, base: &SceneDoc, source_path: &Path) -> Result<Value> {
+fn append_graph(
+    imported: &mut SceneDoc,
+    base: &SceneDoc,
+    source_path: &Path,
+    attach_avatar: bool,
+) -> Result<Value> {
     let namespace = safe_namespace(
         source_path
             .file_stem()
@@ -555,7 +580,9 @@ fn append_graph(imported: &mut SceneDoc, base: &SceneDoc, source_path: &Path) ->
     }
     imported.active_scene = base.active_scene.clone();
     imported.scenes = base.scenes.clone();
-    imported.avatar.clone_from(&base.avatar);
+    if !attach_avatar {
+        imported.avatar.clone_from(&base.avatar);
+    }
     imported.collections = merged_collections;
     imported.nodes = merged_nodes;
     imported.data_blocks = merged_data;
@@ -580,6 +607,23 @@ fn append_graph(imported: &mut SceneDoc, base: &SceneDoc, source_path: &Path) ->
     mappings.insert("resources".to_owned(), mapping_value(&resource_map));
     mappings.insert("libraries".to_owned(), mapping_value(&library_map));
     Ok(Value::Object(mappings))
+}
+
+/// Whether an imported node, data block, material or image shares an ID with the scene, so append renames it.
+fn avatar_ids_collide(imported: &SceneDoc, base: &SceneDoc) -> bool {
+    imported.nodes.keys().any(|id| base.nodes.contains_key(id))
+        || imported
+            .data_blocks
+            .keys()
+            .any(|id| base.data_blocks.contains_key(id))
+        || imported
+            .materials
+            .keys()
+            .any(|id| base.materials.contains_key(id))
+        || imported
+            .images
+            .keys()
+            .any(|id| base.images.contains_key(id))
 }
 
 fn registry_mapping<'a>(

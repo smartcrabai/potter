@@ -3,7 +3,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::{
-    error::Result,
+    error::{ErrorCode, PotError, Result},
     float::equal_f64,
     model::{AvatarMtoon, AvatarOutlineWidthMode, SceneDoc, TextureRef},
 };
@@ -150,6 +150,25 @@ pub(super) fn v1(
                 views,
             )?;
         }
+    }
+    for (key, transform) in &mtoon.texture_transforms {
+        let info = value
+            .get_mut(key.as_str())
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "MToon texture transform has no texture in its slot",
+                )
+            })?;
+        info.insert(
+            "extensions".to_owned(),
+            json!({ "KHR_texture_transform": {
+                "offset": transform.offset,
+                "rotation": transform.rotation,
+                "scale": transform.scale,
+            } }),
+        );
     }
     Ok(value)
 }
@@ -351,6 +370,16 @@ pub(super) fn validate_v0(surface: &ResolvedSurface, mtoon: &AvatarMtoon) -> Res
         return Err(unsupported_export(
             "vrm.v0.mtoon_shading_shift_texture",
             "VRM 0.x MToon shading-grade textures cannot preserve VRM 1.0 shadingShiftTexture; remove the map or export VRM 1.0.",
+        ));
+    }
+    if mtoon
+        .texture_transforms
+        .values()
+        .any(|transform| !transform.is_identity())
+    {
+        return Err(unsupported_export(
+            "vrm.v0.mtoon_texture_transform",
+            "VRM 0.x MToon has no per-texture transform for these slots; remove texture_transforms or export VRM 1.0.",
         ));
     }
     if mtoon.matcap_texture.is_some()

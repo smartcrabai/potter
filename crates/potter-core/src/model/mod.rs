@@ -10,6 +10,7 @@ pub use crate::geom::{
     pointcloud::{PointCloudAttribute, PointCloudData, PointCloudPoint},
     volume::{VolumeData, VolumeFileSource, VolumeGeneratedSource, VolumeGrid, VolumeSource},
 };
+pub(crate) use avatar::validate_spring;
 pub use avatar::{
     AVATAR_FEATURE_DESCRIPTORS, AvatarCommercialUsage, AvatarCreditNotation, AvatarExpression,
     AvatarExpressionOverride, AvatarFeatureDescriptor, AvatarFirstPerson, AvatarLegacyAllowedUser,
@@ -19,7 +20,8 @@ pub use avatar::{
     AvatarMtoonShadingShiftTexture, AvatarNodeRef, AvatarOutlineWidthMode, AvatarPermission,
     AvatarRangeMap, AvatarSettings, AvatarSpring, AvatarSpringBone, AvatarSpringCollider,
     AvatarSpringColliderGroup, AvatarSpringColliderShape, AvatarSpringJoint,
-    AvatarTextureTransformBind, AvatarVersion, validate_avatar_settings,
+    AvatarTextureTransform, AvatarTextureTransformBind, AvatarVersion, is_humanoid_role,
+    validate_avatar_settings,
 };
 pub use id::{Id, is_valid as is_valid_id};
 pub use rig::{
