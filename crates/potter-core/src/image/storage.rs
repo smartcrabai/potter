@@ -549,7 +549,7 @@ fn decode_exr_with_image_user(
     }
 
     let views = exr_views(&image);
-    let layers = exr_render_layers(&image, &views)?;
+    let layers = exr_render_layers(&image, &views);
     let first_layer = image.layer_data.first().ok_or_else(|| {
         encoding_error(
             ErrorCode::UnsupportedFeature,
@@ -876,7 +876,7 @@ fn push_exr_view(views: &mut Vec<String>, view: &str) {
 fn exr_render_layers<'a>(
     image: &'a ExrImageData,
     views: &[String],
-) -> Result<Vec<ExrSelectionLayer<'a>>> {
+) -> Vec<ExrSelectionLayer<'a>> {
     let mut raw_channels = Vec::new();
     for layer in &image.layer_data {
         let layer_views = layer
@@ -983,7 +983,7 @@ fn exr_render_layers<'a>(
     for layer in &mut layers {
         layer.passes.sort_by(compare_exr_passes);
     }
-    Ok(layers)
+    layers
 }
 
 fn remove_exr_view_name(name: &str, views: &[String]) -> (String, String) {

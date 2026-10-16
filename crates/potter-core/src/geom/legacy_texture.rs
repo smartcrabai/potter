@@ -3818,6 +3818,13 @@ mod tests {
         )?;
         let texture_id = Id::new("selected_texture".to_owned())?;
         let coords = DVec3::new(-0.5, 0.5, 0.0);
+
+        let direct_image_id = Id::new("shared_image".to_owned())?;
+        let direct = super::resolve_texture(&doc, &direct_image_id, Some(root))?;
+        let mut direct_rng = BlenderRng::seed(0);
+        let default_result = sample(direct.source(), coords, &mut direct_rng)?;
+        assert_rgb_close(default_result.rgb, [0.4, 0.2, 0.8]);
+        assert!((default_result.alpha - 0.25).abs() < 1e-6);
         let right = sample_scene_image_record(
             &mut doc,
             &texture_id,
@@ -3909,6 +3916,7 @@ mod tests {
         )?;
         assert_rgb_close(depth.rgb, [1.0; 3]);
         assert!((depth.alpha - 0.75).abs() < 1e-6);
+        assert_eq!(depth.intensity, 1.0);
 
         let depth_without_alpha = sample_scene_image_record(
             &mut doc,
@@ -3928,6 +3936,7 @@ mod tests {
         )?;
         assert_rgb_close(depth_without_alpha.rgb, [0.75; 3]);
         assert_eq!(depth_without_alpha.alpha, 1.0);
+        assert_eq!(depth_without_alpha.intensity, 0.75);
 
         let missing_pass = sample_scene_image_record(
             &mut doc,
