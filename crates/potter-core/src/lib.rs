@@ -7,6 +7,7 @@
     )
 )]
 
+mod blender_rng;
 pub mod catalog;
 pub mod cli;
 pub mod color;
