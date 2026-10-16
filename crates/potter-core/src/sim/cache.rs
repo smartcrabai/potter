@@ -13,6 +13,7 @@ use super::{SOLVER_VERSION, SimulationResult};
 use crate::geom::Mesh;
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::ModifierGate,
     hash,
     model::{Id, SceneDoc},
 };
@@ -24,6 +25,14 @@ struct ModifierSimulationCache {
     mesh: Mesh,
     #[serde(default)]
     particles: Option<Vec<super::ParticleState>>,
+}
+
+/// Borrowed write-side form of `ModifierSimulationCache`, so storing an entry does not copy its mesh.
+#[derive(serde::Serialize)]
+struct ModifierSimulationCacheRef<'a> {
+    cache_key: &'a str,
+    mesh: &'a Mesh,
+    particles: Option<&'a [super::ParticleState]>,
 }
 
 pub(super) fn load_modifier_simulation(
@@ -75,10 +84,10 @@ pub(super) fn store_modifier_simulation(
     let cache_directory = directory.join(".potter").join("cache");
     fs::create_dir_all(&cache_directory).map_err(|error| PotError::io(&error))?;
     let destination = cache_path(directory, key);
-    let bytes = serde_json::to_vec(&ModifierSimulationCache {
-        cache_key: key.to_owned(),
-        mesh: mesh.clone(),
-        particles: particles.map(<[super::ParticleState]>::to_vec),
+    let bytes = serde_json::to_vec(&ModifierSimulationCacheRef {
+        cache_key: key,
+        mesh,
+        particles,
     })
     .map_err(|error| {
         PotError::with_details(
@@ -107,23 +116,17 @@ pub(super) fn store_modifier_simulation(
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn cache_key(
-    doc: &SceneDoc,
+    scene_hash: &str,
     scene_id: &Id,
     frame: f64,
     base_world_matrices: &BTreeMap<Id, DMat4>,
+    gate: ModifierGate<'_>,
 ) -> Result<String> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "simulation frame must be finite",
         ));
     }
-    if !doc.scenes.contains_key(scene_id) {
-        return Err(PotError::new(
-            ErrorCode::SceneNotFound,
-            format!("scene `{scene_id}` was not found"),
-        ));
-    }
-
     let mut matrices = BTreeMap::new();
     for (id, matrix) in base_world_matrices {
         if !matrix.is_finite() {
@@ -133,18 +136,14 @@ pub(super) fn cache_key(
         }
         matrices.insert(id.to_string(), matrix.to_cols_array());
     }
-    let snapshot = serde_json::to_value(doc).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "could not serialize the simulation input snapshot",
-            json!({"cause": error.to_string()}),
-        )
-    })?;
+
     let input = json!({
         "solver_version": SOLVER_VERSION,
         "scene_id": scene_id.as_str(),
         "frame": frame,
-        "scene_snapshot": snapshot,
+        "purpose": gate.purpose,
+        "suppressed_nodes": gate.suppressed,
+        "scene_hash": scene_hash,
         "base_world_matrices": matrices,
     });
     let canonical = hash::canonicalize(&input)?;

@@ -75,6 +75,7 @@ def build_expected(raw, blender_log):
         "render_method": raw["render_method"],
         "kinds": raw["kinds"],
         "cases": raw["cases"],
+        "insertion_cases": raw["insertion_cases"],
         "checks": raw["checks"],
         "apply_viewport_disabled": apply_results,
         "notes": raw["notes"],

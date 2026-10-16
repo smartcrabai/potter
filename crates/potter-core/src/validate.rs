@@ -522,7 +522,13 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
         },
         None => checks.push(check("avatar_settings", "supported", Value::Null)),
     }
-    let context = crate::eval::EvaluationContext::default();
+    let purpose = format
+        .map(crate::commands::export::export_purpose)
+        .unwrap_or_default();
+    let context = crate::eval::EvaluationContext {
+        purpose,
+        ..crate::eval::EvaluationContext::default()
+    };
     let evaluation = crate::eval::Snapshot::evaluate(doc, &context);
     match &evaluation {
         Ok(snapshot) => {
