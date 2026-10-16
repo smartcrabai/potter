@@ -4,7 +4,24 @@
 //! do: a member's mesh is placed under fresh element IDs, its ID-keyed attributes are rewritten onto
 //! those IDs by [`remap_attributes`] (the same provenance rule modifiers use), and positional
 //! attributes concatenate in storage order. Members that lack an attribute contribute its default.
+//!
+//! UV layers join by position. Joined layer `k` is every member's `k`-th [`read_layers`] layer, in
+//! member order, in Blender's V-up convention. Potter's `uv_map` entries without a `layer` key hold
+//! glTF V (the exporter writes them unflipped) and flip to Blender's; entries with a `layer` key and
+//! `blender_uv_layers` already hold Blender's V. The joined layer keeps the name of the first member
+//! with that layer at that position, and a Potter default reads as `UVMap`, so references to the
+//! default layer still resolve. A corner with no value joins as `[0, 0]`; [`uv_covered_faces`] reports
+//! which faces really have one. The joined mesh stores UVs only in `blender_uv_layers`.
+//!
+//! A member whose transform mirrors (negative determinant) reverses each face's corner order together
+//! with every corner-keyed value of that face. Its normals rotate with its normal matrix. A face's
+//! material index clamps to the member's last slot, as Blender clamps at export, so no slot table is
+//! padded.
+//!
+//! Smooth and sharp flags are written to each member's native `shade_smooth` and `sharp` keys before
+//! the join, so one member's native key never hides another member's flags.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use glam::{DMat3, DMat4, DVec3};
@@ -12,23 +29,35 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{ErrorCode, PotError, Result};
 
-use super::normals::normal_matrix;
-use super::provenance::{Origin, default_value, remap_attributes};
-use super::uv_layers::uv_default;
-use super::{IdCounters, Mesh};
+use super::normals::{normal_matrix, sharp_edge_flags, smooth_face_flags};
+use super::provenance::{Origin, default_value, remap_attributes_skipping};
+use super::uv_layers::{UvLayer, read_layers, uv_map_entry_layer, write_layers};
+use super::{Edge, IdCounters, Mesh, MeshError, Vertex};
 
-/// One collection member: its evaluated mesh, its world matrix, and the material slots its faces
-/// index.
+/// One collection member: its evaluated mesh (borrowed for plain members, owned for nested joins),
+/// its world matrix, and the material slots its faces index.
 pub(crate) struct Part<'a> {
-    pub mesh: &'a Mesh,
+    pub mesh: Cow<'a, Mesh>,
+    /// Member world matrix.
     pub matrix: DMat4,
-    /// Where this member's slot 0 sits in the combined slot table.
+    /// Where the member's slot 0 sits in the combined slot table.
     pub material_offset: u32,
+    /// Length of the member's slot table: at least one, since an empty material list is one empty slot.
+    pub slot_count: usize,
 }
 
-/// A placed member's attributes and element counts, the inputs of [`merge_attributes`].
+/// A member placed under the joined IDs: its element tables, its attributes remapped, and its UV
+/// layers read in Blender's convention. The `uv_map` and `blender_uv_layers` stores are not kept.
+struct Placed {
+    mesh: Mesh,
+    uv_layers: Vec<UvLayer>,
+}
+
+/// A placed member's attributes and element counts, the inputs of [`merge_attributes`] and
+/// [`join_uv_layers`].
 struct Piece {
     attributes: Map<String, Value>,
+    uv_layers: Vec<UvLayer>,
     vertex_base: usize,
     vertices: usize,
     edges: usize,
@@ -37,49 +66,88 @@ struct Piece {
 }
 
 /// Joins `parts` in order. Element IDs are allocated in part order, so IDs never collide between
-/// members, and every ID-keyed attribute is rewritten onto the combined IDs.
+/// members, and every ID-keyed attribute is rewritten onto the combined IDs. The joined mesh is
+/// validated once, after every member is placed.
 ///
 /// # Errors
 ///
-/// Returns `UNSUPPORTED_FEATURE` when members disagree on a mesh-level attribute that cannot be
-/// merged, and `SCENE_INVALID` for a member whose attribute shape is malformed.
-pub(crate) fn concatenate(parts: &[Part<'_>]) -> Result<Mesh> {
+/// Returns `UNSUPPORTED_FEATURE` when members disagree on an attribute that cannot be combined (its
+/// details name the attribute), and `SCENE_INVALID` for a malformed member. Returns
+/// `EVALUATION_FAILED` when the joined mesh is not valid.
+pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
     let mut output = Mesh::new();
     let mut pieces = Vec::with_capacity(parts.len());
     for part in parts {
-        let mut placed = place(part, output.next_id)?;
+        let Placed {
+            mut mesh,
+            uv_layers,
+        } = place(&part, output.next_id)?;
         pieces.push(Piece {
-            attributes: std::mem::take(&mut placed.attributes),
+            attributes: std::mem::take(&mut mesh.attributes),
+            uv_layers,
             vertex_base: output.vertices.len(),
-            vertices: placed.vertices.len(),
-            edges: placed.edges.len(),
-            faces: placed.faces.len(),
-            corners: placed.faces.iter().map(|face| face.vertices.len()).sum(),
+            vertices: mesh.vertices.len(),
+            edges: mesh.edges.len(),
+            faces: mesh.faces.len(),
+            corners: mesh.faces.iter().map(|face| face.vertices.len()).sum(),
         });
-        output.next_id = placed.next_id;
-        output.vertices.append(&mut placed.vertices);
-        output.edges.append(&mut placed.edges);
-        output.faces.append(&mut placed.faces);
+        output.next_id = mesh.next_id;
+        output.vertices.append(&mut mesh.vertices);
+        output.edges.append(&mut mesh.edges);
+        output.faces.append(&mut mesh.faces);
     }
     output.attributes = merge_attributes(&pieces)?;
+    let layers = join_uv_layers(&mut pieces);
+    if !layers.is_empty() {
+        let stores: Vec<Value> = layers
+            .iter()
+            .map(|layer| json!({"name": layer.name, "values": []}))
+            .collect();
+        output
+            .attributes
+            .insert("blender_uv_layers".to_owned(), Value::Array(stores));
+        // Fills the layer stores and the UV-named `blender_attributes` mirrors with the joined values.
+        write_layers(&mut output, &layers);
+    }
+    output.validate().map_err(|error| join_error(&error))?;
     Ok(output)
 }
 
-/// Places one member's mesh under IDs counted from `first_ids`, with its attributes remapped and its
-/// vertices moved to the instance space. Custom normals rotate with the member's normal matrix.
-fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Mesh> {
-    let source = part.mesh;
+/// Per joined face, whether the face's member has a value on every corner of its first UV layer,
+/// which is the joined `TEXCOORD_0`. The joined mesh cannot say this: a corner without a value joins
+/// as `[0, 0]`, which reads as a real UV.
+pub(crate) fn uv_covered_faces(parts: &[Part<'_>]) -> Vec<bool> {
+    parts
+        .iter()
+        .flat_map(|part| {
+            let first = read_layers(&part.mesh).into_iter().next();
+            (0..part.mesh.faces.len()).map(move |face| {
+                first
+                    .as_ref()
+                    .is_some_and(|layer| layer.faces[face].is_some())
+            })
+        })
+        .collect()
+}
+
+/// Places one member's mesh under IDs counted from `first_ids`. Elements are built in one pass over
+/// the source, attributes are remapped and shading canonicalised, and UVs are read. A mirrored member
+/// reverses its corners. Vertices move to the instance space last, and custom normals rotate with
+/// the member's normal matrix.
+fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Placed> {
+    let source: &Mesh = &part.mesh;
     let mut mesh = Mesh {
         next_id: first_ids,
         ..Mesh::new()
     };
     let mut vertex_ids = HashMap::with_capacity(source.vertices.len());
+    mesh.vertices.reserve_exact(source.vertices.len());
     for vertex in &source.vertices {
-        let id = mesh
-            .insert_vertex(vertex.co)
-            .map_err(|error| join_error(&error))?;
+        let id = take_id(&mut mesh.next_id.vertex)?;
         vertex_ids.insert(vertex.id, id);
+        mesh.vertices.push(Vertex { id, co: vertex.co });
     }
+    mesh.edges.reserve_exact(source.edges.len());
     for edge in &source.edges {
         let [first, second] = edge.vertices.map(|id| vertex_ids.get(&id).copied());
         let (Some(first), Some(second)) = (first, second) else {
@@ -88,40 +156,56 @@ fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Mesh> {
                 "instance edge references a missing vertex",
             ));
         };
-        mesh.insert_edge([first, second])
-            .map_err(|error| join_error(&error))?;
+        let id = take_id(&mut mesh.next_id.edge)?;
+        mesh.edges.push(Edge {
+            id,
+            vertices: [first, second],
+        });
     }
-    for face in &source.faces {
-        let vertices = face
-            .vertices
-            .iter()
-            .map(|id| {
-                vertex_ids.get(id).copied().ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "instance face references a missing vertex",
-                    )
+    let last_slot = u32::try_from(part.slot_count.saturating_sub(1)).unwrap_or(u32::MAX);
+    let faces = source
+        .faces
+        .iter()
+        .map(|face| -> Result<(Vec<u32>, u32)> {
+            let vertices = face
+                .vertices
+                .iter()
+                .map(|id| {
+                    vertex_ids.get(id).copied().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "instance face references a missing vertex",
+                        )
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let material_index = face
-            .material_index
-            .checked_add(part.material_offset)
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::LimitExceeded,
-                    "instance material slot table exceeds the u32 range",
-                )
-            })?;
-        mesh.insert_face(vertices, material_index)
-            .map_err(|error| join_error(&error))?;
-    }
+                .collect::<Result<Vec<_>>>()?;
+            let material_index = face
+                .material_index
+                .min(last_slot)
+                .checked_add(part.material_offset)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "instance material slot table exceeds the u32 range",
+                    )
+                })?;
+            Ok((vertices, material_index))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    mesh.insert_faces(faces.into_iter().map(Ok))
+        .map_err(|error| join_error(&error))?;
     // Flat fallbacks are measured in member space; the transform below carries them with the mesh.
     let origin = Origin::copies(
         (0..source.vertices.len()).map(Some),
         (0..source.faces.len()).map(Some).collect(),
     );
-    remap_attributes(source, &mut mesh, &origin)?;
+    // `uv_map` is rebuilt in Blender's convention by `take_uv_layers`, so the remap never runs on it.
+    remap_attributes_skipping(source, &mut mesh, &origin, &["uv_map"])?;
+    canonical_shading(source, &mut mesh)?;
+    let mut uv_layers = take_uv_layers(source, &mut mesh);
+    if part.matrix.determinant() < 0.0 {
+        mirror_corners(&mut mesh, &mut uv_layers);
+    }
     let normals = normal_matrix(part.matrix);
     for vertex in &mut mesh.vertices {
         vertex.co = part.matrix.transform_point3(vertex.co);
@@ -136,11 +220,187 @@ fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Mesh> {
             *corners = rotate_corner_normals(corners, normals);
         }
     }
-    Ok(mesh)
+    Ok(Placed { mesh, uv_layers })
 }
 
-fn join_error(error: &crate::geom::MeshError) -> PotError {
+/// Takes the next element ID from `counter`.
+fn take_id(counter: &mut u32) -> Result<u32> {
+    let id = *counter;
+    *counter = id
+        .checked_add(1)
+        .ok_or_else(|| join_error(&MeshError::IdExhausted))?;
+    Ok(id)
+}
+
+fn join_error(error: &MeshError) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, error.to_string())
+}
+
+/// Writes the member's flags as native `shade_smooth` (per face) and `sharp` (per edge) keys, which
+/// the joined mesh reads. An imported `.blend` member keeps its flags only in `blender_*` keys.
+fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
+    if ["shade_smooth", "blender_polygon_smooth"]
+        .iter()
+        .any(|key| source.attributes.contains_key(*key))
+    {
+        let flags = smooth_face_flags(source)?;
+        let values: Map<String, Value> = mesh
+            .faces
+            .iter()
+            .zip(flags)
+            .map(|(face, flag)| (format!("f{}", face.id), json!(flag)))
+            .collect();
+        mesh.attributes.insert(
+            "shade_smooth".to_owned(),
+            json!({"domain": "face", "type": "bool", "values": values}),
+        );
+    }
+    if ["sharp", "blender_edge_flags"]
+        .iter()
+        .any(|key| source.attributes.contains_key(*key))
+    {
+        let flags = sharp_edge_flags(source)?;
+        let values: Map<String, Value> = mesh
+            .edges
+            .iter()
+            .zip(flags)
+            .map(|(edge, flag)| (format!("e{}", edge.id), json!(flag)))
+            .collect();
+        mesh.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": values}),
+        );
+    }
+    Ok(())
+}
+
+/// Reads `mesh`'s UV layers in Blender's V-up convention, then removes the `uv_map` and
+/// `blender_uv_layers` stores, which the joined mesh rebuilds from the layers.
+fn take_uv_layers(source: &Mesh, mesh: &mut Mesh) -> Vec<UvLayer> {
+    if source.attributes.contains_key("uv_map") {
+        let entries = blender_uv_map(source, mesh);
+        mesh.attributes
+            .insert("uv_map".to_owned(), Value::Array(entries));
+    }
+    let layers = read_layers(mesh);
+    mesh.attributes.remove("uv_map");
+    mesh.attributes.remove("blender_uv_layers");
+    layers
+}
+
+/// The member's `uv_map` entries on the placed faces, in Blender's V-up convention. Placement keeps
+/// face order, so each source face maps to the placed face at the same index. The source entries are
+/// the only copy converted here: the remap skips `uv_map`, so no discarded remapped copy is made.
+/// Entries without a `layer` key are glTF V (Potter's default) and flip; the rest already hold
+/// Blender's V.
+fn blender_uv_map(source: &Mesh, placed: &Mesh) -> Vec<Value> {
+    let placed_faces: HashMap<u32, u32> = source
+        .faces
+        .iter()
+        .zip(&placed.faces)
+        .map(|(from, to)| (from.id, to.id))
+        .collect();
+    let entries = source
+        .attributes
+        .get("uv_map")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let face = entry
+                .get("face_id")
+                .and_then(Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+                .and_then(|id| placed_faces.get(&id))?;
+            // Entries without a `layer` key are Potter's glTF-space default; the rest are Blender's.
+            let flip = entry.get("layer").is_none();
+            let uv: Vec<Value> = entry
+                .get("uv")
+                .and_then(Value::as_array)?
+                .iter()
+                .map(|corner| {
+                    if flip {
+                        flip_v(corner)
+                    } else {
+                        corner.clone()
+                    }
+                })
+                .collect();
+            Some(json!({
+                "face_id": *face,
+                "layer": uv_map_entry_layer(entry),
+                "uv": uv,
+            }))
+        })
+        .collect()
+}
+
+/// `[u, 1 - v]` for a `[u, v]` corner. A malformed corner passes through for [`read_layers`] to skip.
+fn flip_v(corner: &Value) -> Value {
+    match corner.as_array().map(Vec::as_slice) {
+        Some([u, v]) => match (u.as_f64(), v.as_f64()) {
+            (Some(u), Some(v)) => json!([u, 1.0 - v]),
+            _ => corner.clone(),
+        },
+        _ => corner.clone(),
+    }
+}
+
+/// Reverses a mirrored member's faces, with every corner-keyed value of each face: the corner order
+/// of each face, `custom_normal` and named `corner` rows, `CORNER` `blender_attributes` segments, and
+/// UV rows. A corner keeps its vertex, UV, and normal together.
+fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
+    let sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
+    for (key, attribute) in &mut mesh.attributes {
+        let corner_keyed = key.as_str() == "custom_normal"
+            || attribute
+                .get("domain")
+                .and_then(Value::as_str)
+                .is_some_and(|domain| domain.eq_ignore_ascii_case("corner"));
+        if !corner_keyed {
+            continue;
+        }
+        if let Some(rows) = attribute.get_mut("values").and_then(Value::as_object_mut) {
+            for row in rows.values_mut().filter_map(Value::as_array_mut) {
+                row.reverse();
+            }
+        }
+    }
+    if let Some(entries) = mesh
+        .attributes
+        .get_mut("blender_attributes")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in entries
+            .iter_mut()
+            .filter(|entry| entry.get("domain").and_then(Value::as_str) == Some("CORNER"))
+        {
+            if let Some(values) = entry.get_mut("values").and_then(Value::as_array_mut) {
+                reverse_face_segments(values, &sizes);
+            }
+        }
+    }
+    for layer in layers.iter_mut() {
+        for row in layer.faces.iter_mut().flatten() {
+            row.reverse();
+        }
+    }
+    for face in &mut mesh.faces {
+        face.vertices.reverse();
+    }
+}
+
+/// Reverses each face's run of `values`, where face `f` owns `sizes[f]` consecutive entries.
+fn reverse_face_segments(values: &mut [Value], sizes: &[usize]) {
+    let mut start = 0;
+    for size in sizes {
+        let end = start + size;
+        if let Some(segment) = values.get_mut(start..end) {
+            segment.reverse();
+        }
+        start = end;
+    }
 }
 
 /// Rotates `custom_normal` corner vectors into instance space. Malformed entries pass through
@@ -166,6 +426,34 @@ pub(crate) fn rotate_corner_normals(value: &Value, normal_matrix: DMat3) -> Valu
             })
             .collect(),
     )
+}
+
+/// Joins the members' UV layers by position: joined layer `k` is every member's layer `k`, in member
+/// order. The name comes from the first member with that layer. A member without it contributes
+/// faces with no value.
+fn join_uv_layers(pieces: &mut [Piece]) -> Vec<UvLayer> {
+    let count = pieces
+        .iter()
+        .map(|piece| piece.uv_layers.len())
+        .max()
+        .unwrap_or(0);
+    (0..count)
+        .map(|index| {
+            let name = pieces
+                .iter()
+                .find_map(|piece| piece.uv_layers.get(index))
+                .map(|layer| layer.name.clone())
+                .unwrap_or_default();
+            let mut faces = Vec::new();
+            for piece in pieces.iter_mut() {
+                match piece.uv_layers.get_mut(index) {
+                    Some(layer) => faces.append(&mut layer.faces),
+                    None => faces.extend(std::iter::repeat_n(None, piece.faces)),
+                }
+            }
+            UvLayer { name, faces }
+        })
+        .collect()
 }
 
 /// One member's value of an attribute, if it has one, with the member's piece.
@@ -195,27 +483,7 @@ fn merge_attributes(pieces: &[Piece]) -> Result<Map<String, Value>> {
 
 fn merge_attribute(name: &str, members: &[Member<'_>]) -> Result<Value> {
     match name {
-        "uv_map" => concat_arrays(name, members),
-        "blender_uv_layers" => merge_entries(
-            name,
-            members,
-            |entry| text(entry, "name").to_owned(),
-            |piece, _| Some(piece.corners),
-            |_| uv_default(),
-        ),
-        "blender_attributes" => merge_entries(
-            name,
-            members,
-            |entry| format!("{}\u{0}{}", text(entry, "domain"), text(entry, "name")),
-            |piece, entry| match text(entry, "domain") {
-                "POINT" => Some(piece.vertices),
-                "EDGE" => Some(piece.edges),
-                "FACE" => Some(piece.faces),
-                "CORNER" => Some(piece.corners),
-                _ => None,
-            },
-            |entry| default_value(text(entry, "data_type")),
-        ),
+        "blender_attributes" => merge_blender_attributes(name, members),
         "blender_edge_flags" => merge_positional(
             name,
             members,
@@ -269,23 +537,6 @@ fn text<'a>(entry: &'a Value, key: &str) -> &'a str {
     entry.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
-/// Arrays of entries, each member's entries in member order (`uv_map`).
-fn concat_arrays(name: &str, members: &[Member<'_>]) -> Result<Value> {
-    let mut output = Vec::new();
-    for (value, _) in members {
-        if let Some(value) = value {
-            output.extend(
-                value
-                    .as_array()
-                    .ok_or_else(|| shape_error(name))?
-                    .iter()
-                    .cloned(),
-            );
-        }
-    }
-    Ok(Value::Array(output))
-}
-
 /// Positional values, one per element of the member's domain (`length`); a member without the
 /// attribute contributes `default` for each of its elements.
 fn merge_positional(
@@ -311,55 +562,57 @@ fn merge_positional(
     Ok(Value::Array(output))
 }
 
-/// Named entries (`blender_uv_layers` by `name`, `blender_attributes` by domain and name) keep the
-/// first member's header. Each member's values concatenate under its own entry, and a member
-/// without the entry contributes the entry's default values.
-fn merge_entries(
-    name: &str,
-    members: &[Member<'_>],
-    key: impl Fn(&Value) -> String,
-    length: impl Fn(&Piece, &Value) -> Option<usize>,
-    default: impl Fn(&Value) -> Value,
-) -> Result<Value> {
-    // First-seen order, with each key's header entry.
-    let mut order: Vec<(String, &Value)> = Vec::new();
+/// `blender_attributes` entries, keyed by domain and name. Each member's values concatenate in
+/// member order, and a member without the entry contributes the default of the joined data type.
+fn merge_blender_attributes(name: &str, members: &[Member<'_>]) -> Result<Value> {
+    // First-seen order, each key's header (every field but `values`) with its joined data type.
+    let mut headers: Vec<(String, Value)> = Vec::new();
     for (value, _) in members {
         for entry in value.and_then(Value::as_array).into_iter().flatten() {
-            let entry_key = key(entry);
-            if !order.iter().any(|(known, _)| *known == entry_key) {
-                order.push((entry_key, entry));
+            let key = attribute_key(entry);
+            match headers.iter().position(|(known, _)| *known == key) {
+                Some(index) => {
+                    let header = &mut headers[index].1;
+                    let known = text(header, "data_type");
+                    let next = text(entry, "data_type");
+                    if known != next {
+                        let joined = promoted_data_type(name, known, next)?;
+                        header["data_type"] = json!(joined);
+                    }
+                }
+                None => headers.push((key, header_of(entry))),
             }
         }
     }
-    let mut output = Vec::with_capacity(order.len());
-    for (entry_key, header) in order {
+    let mut output = Vec::with_capacity(headers.len());
+    for (key, header) in headers {
         let mut values = Vec::new();
         for (value, piece) in members {
-            let found = value
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|entry| key(entry) == entry_key);
-            let count = length(piece, header).ok_or_else(|| {
+            let count = entry_length(&header, piece).ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::UnsupportedFeature,
                     format!("instance attribute `{name}` uses a domain that cannot be combined"),
                     json!({ "attribute": name }),
                 )
             })?;
-            if let Some(entry) = found {
-                if entry.get("data_type") != header.get("data_type") {
-                    return Err(conflict_error(name));
+            let found = value
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|entry| attribute_key(entry) == key);
+            match found {
+                Some(entry) => {
+                    let entry_values = entry
+                        .get("values")
+                        .and_then(Value::as_array)
+                        .filter(|entry_values| entry_values.len() == count)
+                        .ok_or_else(|| shape_error(name))?;
+                    values.extend(entry_values.iter().cloned());
                 }
-                let entry_values = entry
-                    .get("values")
-                    .and_then(Value::as_array)
-                    .filter(|entry_values| entry_values.len() == count)
-                    .ok_or_else(|| shape_error(name))?;
-                values.extend(entry_values.iter().cloned());
-            } else {
-                let fill = default(header);
-                values.extend(std::iter::repeat_n(fill, count));
+                None => values.extend(std::iter::repeat_n(
+                    default_value(text(&header, "data_type")),
+                    count,
+                )),
             }
         }
         let mut merged = header.as_object().cloned().unwrap_or_default();
@@ -367,6 +620,49 @@ fn merge_entries(
         output.push(Value::Object(merged));
     }
     Ok(Value::Array(output))
+}
+
+/// The join key of a `blender_attributes` entry: its domain and name.
+fn attribute_key(entry: &Value) -> String {
+    format!("{}\u{0}{}", text(entry, "domain"), text(entry, "name"))
+}
+
+/// An entry's fields except its `values`.
+fn header_of(entry: &Value) -> Value {
+    Value::Object(
+        entry
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| key.as_str() != "values")
+            .map(|(key, field)| (key.clone(), field.clone()))
+            .collect(),
+    )
+}
+
+/// Element count of a `blender_attributes` entry's domain in `piece`; `None` for an unknown domain.
+fn entry_length(entry: &Value, piece: &Piece) -> Option<usize> {
+    match text(entry, "domain") {
+        "POINT" => Some(piece.vertices),
+        "EDGE" => Some(piece.edges),
+        "FACE" => Some(piece.faces),
+        "CORNER" => Some(piece.corners),
+        _ => None,
+    }
+}
+
+/// The data type two same-named `blender_attributes` entries join as. Byte colors are float colors at
+/// lower precision, so they join as `FLOAT_COLOR` with each value kept as it is. Any other pair of
+/// types cannot be combined, and the error names them.
+fn promoted_data_type(name: &str, known: &str, next: &str) -> Result<&'static str> {
+    match (known, next) {
+        ("BYTE_COLOR" | "FLOAT_COLOR", "BYTE_COLOR" | "FLOAT_COLOR") => Ok("FLOAT_COLOR"),
+        _ => Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!("collection members store `{name}` as {known} and {next}, which cannot be combined"),
+            json!({ "attribute": name, "types": [known, next] }),
+        )),
+    }
 }
 
 /// Vertex-indexed objects keyed by storage index (`skin_radii`, `skin_roots`). Each member's keys
@@ -444,8 +740,9 @@ fn merge_named(name: &str, members: &[Member<'_>]) -> Result<Value> {
 }
 
 /// `blender_metadata` describes each member's data-block. The joined mesh keeps every member's custom
-/// properties (a key set to different values on two members is refused); the data-block's users and
-/// fake-user flags belong to no single joined mesh and are not carried.
+/// properties; a key set to different values on two members is refused. `potter.*` keys are bridge
+/// bookkeeping that differs per member, so they are not carried. The data-block's users and fake-user
+/// flags belong to no single joined mesh and are not carried either.
 fn merge_metadata(name: &str, members: &[Member<'_>]) -> Result<Value> {
     let mut custom = Map::new();
     for (value, _) in members {
@@ -454,6 +751,9 @@ fn merge_metadata(name: &str, members: &[Member<'_>]) -> Result<Value> {
             continue;
         };
         for (key, property) in properties {
+            if key.starts_with("potter.") {
+                continue;
+            }
             match custom.get(key) {
                 Some(known) if known != property => return Err(conflict_error(name)),
                 Some(_) => {}
@@ -484,10 +784,13 @@ fn merge_equal(name: &str, members: &[Member<'_>]) -> Result<Value> {
 mod tests {
     #![expect(clippy::unwrap_used, reason = "small mesh fixtures")]
 
-    use glam::{DMat4, DVec3};
-    use serde_json::{Value, json};
+    use std::borrow::Cow;
 
-    use super::{Part, concatenate};
+    use glam::{DMat4, DVec3};
+    use serde_json::{Map, Value, json};
+
+    use super::{Part, concatenate, uv_covered_faces};
+    use crate::geom::normals::smooth_face_flags;
     use crate::geom::{BoxParams, Mesh};
 
     fn cube() -> Mesh {
@@ -497,15 +800,20 @@ mod tests {
         .unwrap()
     }
 
+    /// A member borrowed from `mesh` with `slot_count` material slots.
+    fn member(mesh: &Mesh, matrix: DMat4, material_offset: u32, slot_count: usize) -> Part<'_> {
+        Part {
+            mesh: Cow::Borrowed(mesh),
+            matrix,
+            material_offset,
+            slot_count,
+        }
+    }
+
     #[test]
-    fn members_keep_their_own_ids_uvs_and_positional_flags() {
+    fn members_keep_their_own_ids_and_positional_flags() {
         let mut first = cube();
-        let first_face = first.faces[0].id;
         let first_edge = first.edges[0].id;
-        first.attributes.insert(
-            "uv_map".to_owned(),
-            json!([{"face_id": first_face, "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]}]),
-        );
         first.attributes.insert(
             "seam".to_owned(),
             json!({"domain": "edge", "values": {format!("e{first_edge}"): true}}),
@@ -514,34 +822,16 @@ mod tests {
             "blender_polygon_smooth".to_owned(),
             json!([true, false, false, false, false, false]),
         );
-        let mut second = cube();
-        let second_face = second.faces[5].id;
-        second.attributes.insert(
-            "uv_map".to_owned(),
-            json!([{"face_id": second_face, "uv": [[0.5, 0.5], [0.5, 0.5], [0.5, 0.5], [0.5, 0.5]]}]),
-        );
-        let parts = [
-            Part {
-                mesh: &first,
-                matrix: DMat4::IDENTITY,
-                material_offset: 0,
-            },
-            Part {
-                mesh: &second,
-                matrix: DMat4::from_translation(DVec3::X * 4.0),
-                material_offset: 1,
-            },
-        ];
-        let joined = concatenate(&parts).unwrap();
+        let second = cube();
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::from_translation(DVec3::X * 4.0), 1, 1),
+        ])
+        .unwrap();
         assert_eq!(joined.vertices.len(), 16);
         assert_eq!(joined.faces.len(), 12);
         assert_eq!(joined.faces[6].material_index, 1);
-
-        // The second member's UV entry follows its faces to their combined IDs.
-        let uv = joined.attributes["uv_map"].as_array().unwrap();
-        assert_eq!(uv.len(), 2);
-        assert_eq!(uv[0]["face_id"], json!(first_face));
-        assert_eq!(uv[1]["face_id"], json!(joined.faces[11].id));
+        joined.validate().unwrap();
 
         // The first member's seam keeps its combined edge ID; the second member has none.
         let seam = joined.attributes["seam"]["values"].as_object().unwrap();
@@ -558,6 +848,138 @@ mod tests {
 
         // Each member's vertices move with its matrix.
         assert!(joined.vertices[8..].iter().all(|vertex| vertex.co.x > 2.9));
+    }
+
+    #[test]
+    fn each_members_smooth_flags_survive_the_join() {
+        let mut first = cube();
+        let first_face = first.faces[0].id;
+        first.attributes.insert(
+            "shade_smooth".to_owned(),
+            json!({"domain": "face", "type": "bool", "values": {format!("f{first_face}"): true}}),
+        );
+        let mut second = cube();
+        second.attributes.insert(
+            "blender_polygon_smooth".to_owned(),
+            json!([false, true, false, false, false, false]),
+        );
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap();
+        assert_eq!(
+            smooth_face_flags(&joined).unwrap(),
+            [true, false, false, false, false, false, false, true, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn uv_layers_join_by_position_and_convert_potter_v() {
+        // First member: one Blender layer, named "Map", in V-up space.
+        let mut first = cube();
+        first.attributes.insert(
+            "blender_uv_layers".to_owned(),
+            json!([{"name": "Map", "values": vec![json!([0.1, 0.2]); 24]}]),
+        );
+        // Second member: Potter's default `uv_map` (no `layer` key, glTF V) on every face.
+        let mut second = cube();
+        let entries: Vec<Value> = second
+            .faces
+            .iter()
+            .map(|face| {
+                json!({"face_id": face.id, "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]})
+            })
+            .collect();
+        second
+            .attributes
+            .insert("uv_map".to_owned(), Value::Array(entries));
+        // Third member: no UVs at all.
+        let third = cube();
+
+        let parts = vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+            member(&third, DMat4::IDENTITY, 0, 1),
+        ];
+        let covered = uv_covered_faces(&parts);
+        assert_eq!(covered, [vec![true; 12], vec![false; 6]].concat());
+
+        let joined = concatenate(parts).unwrap();
+        assert!(!joined.attributes.contains_key("uv_map"));
+        let layers = joined.attributes["blender_uv_layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0]["name"], json!("Map"));
+        let values = layers[0]["values"].as_array().unwrap();
+        assert_eq!(values.len(), 72);
+        assert_eq!(values[0], json!([0.1, 0.2]));
+        // Potter's glTF-space corners become Blender's: [0, 0] -> [0, 1], [1, 0] -> [1, 1], ...
+        assert_eq!(values[24], json!([0.0, 1.0]));
+        assert_eq!(values[25], json!([1.0, 1.0]));
+        assert_eq!(values[26], json!([1.0, 0.0]));
+        assert_eq!(values[27], json!([0.0, 0.0]));
+        // The member without UVs joins as zeros, which `uv_covered_faces` reports as uncovered.
+        assert!(values[48..].iter().all(|value| *value == json!([0.0, 0.0])));
+    }
+
+    #[test]
+    fn mirrored_members_reverse_each_face_with_its_corner_values() {
+        let mut source = cube();
+        let mut uvs = Vec::new();
+        let mut normals = Map::new();
+        for (index, face) in source.faces.iter().enumerate() {
+            for corner in 0..face.vertices.len() {
+                uvs.push(json!([index as f64, corner as f64]));
+            }
+            let face_normals: Vec<Value> = (0..face.vertices.len())
+                .map(|corner| {
+                    if corner == 0 {
+                        json!([1.0, 0.0, 0.0])
+                    } else {
+                        json!([0.0, 0.0, 1.0])
+                    }
+                })
+                .collect();
+            normals.insert(format!("f{}", face.id), Value::Array(face_normals));
+        }
+        source.attributes.insert(
+            "blender_uv_layers".to_owned(),
+            json!([{"name": "UVMap", "values": uvs}]),
+        );
+        source.attributes.insert(
+            "custom_normal".to_owned(),
+            json!({"domain": "corner", "type": "FLOAT_VECTOR", "values": normals}),
+        );
+        let mirror = DMat4::from_scale(DVec3::new(-1.0, 1.0, 1.0));
+        let joined = concatenate(vec![member(&source, mirror, 0, 1)]).unwrap();
+        joined.validate().unwrap();
+
+        let uv = joined.attributes["blender_uv_layers"][0]["values"]
+            .as_array()
+            .unwrap();
+        let custom = joined.attributes["custom_normal"]["values"]
+            .as_object()
+            .unwrap();
+        for (index, face) in joined.faces.iter().enumerate() {
+            let source_face = &source.faces[index];
+            let rows = &custom[&format!("f{}", face.id)];
+            for (corner, vertex) in face.vertices.iter().enumerate() {
+                let original = source_face.vertices.len() - 1 - corner;
+                let expected = mirror
+                    .transform_point3(source.vertex(source_face.vertices[original]).unwrap().co);
+                assert!((joined.vertex(*vertex).unwrap().co - expected).length() < 1e-9);
+                assert_eq!(
+                    uv[index * 4 + corner],
+                    json!([index as f64, original as f64])
+                );
+                let normal = if original == 0 {
+                    json!([-1.0, 0.0, 0.0])
+                } else {
+                    json!([0.0, 0.0, 1.0])
+                };
+                assert_eq!(rows[corner], normal);
+            }
+        }
     }
 
     #[test]
@@ -596,17 +1018,9 @@ mod tests {
                 "values":std::iter::repeat_n(json!([0.0,0.0,1.0,1.0]), 24).collect::<Vec<_>>()
             }]),
         );
-        let joined = concatenate(&[
-            Part {
-                mesh: &first,
-                matrix: DMat4::IDENTITY,
-                material_offset: 0,
-            },
-            Part {
-                mesh: &second,
-                matrix: DMat4::IDENTITY,
-                material_offset: 1,
-            },
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 1, 1),
         ])
         .unwrap();
         let point_colors = joined.attributes["color"]["values"].as_object().unwrap();
@@ -624,29 +1038,81 @@ mod tests {
     }
 
     #[test]
+    fn byte_and_float_colors_join_as_float_colors() {
+        let mut first = cube();
+        first.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([{
+                "name": "Col", "domain": "CORNER", "data_type": "BYTE_COLOR",
+                "values": std::iter::repeat_n(json!([1.0, 0.0, 0.0, 1.0]), 24).collect::<Vec<_>>()
+            }]),
+        );
+        let mut second = cube();
+        second.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([{
+                "name": "Col", "domain": "CORNER", "data_type": "FLOAT_COLOR",
+                "values": std::iter::repeat_n(json!([0.0, 0.0, 1.0, 1.0]), 24).collect::<Vec<_>>()
+            }]),
+        );
+        let joined = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 1, 1),
+        ])
+        .unwrap();
+        let entry = &joined.attributes["blender_attributes"][0];
+        assert_eq!(entry["data_type"], json!("FLOAT_COLOR"));
+        let values = entry["values"].as_array().unwrap();
+        assert_eq!(values.len(), 48);
+        assert_eq!(values[0], json!([1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(values[24], json!([0.0, 0.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn unpromotable_data_types_are_refused_with_their_names() {
+        let mut first = cube();
+        first.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([{
+                "name": "Col", "domain": "CORNER", "data_type": "FLOAT_COLOR",
+                "values": std::iter::repeat_n(json!([1.0, 0.0, 0.0, 1.0]), 24).collect::<Vec<_>>()
+            }]),
+        );
+        let mut second = cube();
+        second.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([{
+                "name": "Col", "domain": "CORNER", "data_type": "FLOAT_VECTOR",
+                "values": std::iter::repeat_n(json!([0.0, 0.0, 1.0]), 24).collect::<Vec<_>>()
+            }]),
+        );
+        let error = concatenate(vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 0, 1),
+        ])
+        .unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+        assert_eq!(error.details["attribute"], json!("Col"));
+        assert_eq!(error.details["types"], json!(["FLOAT_COLOR", "FLOAT_VECTOR"]));
+    }
+
+    #[test]
     fn members_join_custom_properties_and_refuse_conflicts() {
         let metadata = |custom: Value| json!({"custom_properties": custom, "users": 1});
         let mut first = cube();
-        first
-            .attributes
-            .insert("blender_metadata".to_owned(), metadata(json!({"tag": 1})));
+        first.attributes.insert(
+            "blender_metadata".to_owned(),
+            metadata(json!({"tag": 1, "potter.id": 1})),
+        );
         let mut second = cube();
         second.attributes.insert(
             "blender_metadata".to_owned(),
-            metadata(json!({"part": "hat"})),
+            metadata(json!({"part": "hat", "potter.id": 2})),
         );
         let join = |first: &Mesh, second: &Mesh| {
-            concatenate(&[
-                Part {
-                    mesh: first,
-                    matrix: DMat4::IDENTITY,
-                    material_offset: 0,
-                },
-                Part {
-                    mesh: second,
-                    matrix: DMat4::IDENTITY,
-                    material_offset: 1,
-                },
+            concatenate(vec![
+                member(first, DMat4::IDENTITY, 0, 1),
+                member(second, DMat4::IDENTITY, 1, 1),
             ])
         };
         let joined = join(&first, &second).unwrap();
@@ -660,5 +1126,15 @@ mod tests {
             .insert("blender_metadata".to_owned(), metadata(json!({"tag": 2})));
         let error = join(&first, &second).unwrap_err();
         assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+    }
+
+    #[test]
+    fn out_of_range_material_indices_clamp_to_the_last_slot() {
+        let mut first = cube();
+        first.faces[0].material_index = 5;
+        let joined = concatenate(vec![member(&first, DMat4::IDENTITY, 3, 2)]).unwrap();
+        // Slot 5 clamps to the member's last slot (1), then joins at the member's offset (3).
+        assert_eq!(joined.faces[0].material_index, 4);
+        assert_eq!(joined.faces[1].material_index, 3);
     }
 }

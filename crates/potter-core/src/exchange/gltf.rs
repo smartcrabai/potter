@@ -1482,13 +1482,14 @@ fn mesh_export_layout(
     Ok(MeshExportLayout { layout, key_deltas })
 }
 
-/// Material slots actually bound by faces, validated against a node's evaluated slot table.
+/// Material slots bound by faces, each with whether its faces have UVs, validated against a node's
+/// evaluated slot table.
 fn used_material_bindings<'a>(
     node_id: &Id,
     node: &'a Node,
     snapshot: &'a Snapshot,
     mesh: &Mesh,
-) -> Result<Vec<(usize, &'a Id)>> {
+) -> Result<Vec<(&'a Id, bool)>> {
     let slot_count = snapshot.slot_count(node_id, node);
     let mut used = BTreeSet::new();
     for face in &mesh.faces {
@@ -1504,12 +1505,13 @@ fn used_material_bindings<'a>(
             })?;
         used.insert(slot);
     }
+    let uv = snapshot.slot_uv_table(node_id, node, mesh);
     Ok(used
         .into_iter()
         .filter_map(|slot| {
             snapshot
                 .slot_material(node_id, node, slot)
-                .map(|material| (slot, material))
+                .map(|material| (material, uv.get(slot).copied().unwrap_or(false)))
         })
         .collect())
 }
@@ -3193,13 +3195,7 @@ pub(crate) fn validate_vrm_mesh_references(
                 true,
             )?;
         }
-        for (slot, material_id) in used_material_bindings(node_id, node, snapshot, mesh)? {
-            let has_uv = snapshot
-                .instance_material_uvs
-                .get(node_id)
-                .and_then(|uvs| uvs.get(slot))
-                .copied()
-                .unwrap_or(!export.layout.uvs.is_empty());
+        for (material_id, has_uv) in used_material_bindings(node_id, node, snapshot, mesh)? {
             validate_mesh_material_uv(material_id, &surfaces, Some(avatar), mesh, has_uv)?;
         }
         exported_mesh_nodes.insert(node_id.clone());
@@ -3382,13 +3378,7 @@ fn export_with_root_inner(
         let MeshExportLayout { layout, key_deltas } =
             mesh_export_layout(mesh, data_block, geometry_scale, geometry_basis)?;
         let uv_sets = &layout.uvs;
-        for (slot, material_id) in used_material_bindings(node_id, node, snapshot, mesh)? {
-            let has_uv = snapshot
-                .instance_material_uvs
-                .get(node_id)
-                .and_then(|uvs| uvs.get(slot))
-                .copied()
-                .unwrap_or(!uv_sets.is_empty());
+        for (material_id, has_uv) in used_material_bindings(node_id, node, snapshot, mesh)? {
             validate_mesh_material_uv(
                 material_id,
                 &surfaces,

@@ -232,12 +232,16 @@ fn collection_instance_keeps_each_members_material_slots() {
     let jacket = Id::new("jacket").unwrap();
     let skin = Id::new("skin").unwrap();
     // Each member's slots follow it: box_a's jacket and skin, then box_b's skin.
+    let bindings = &snapshot.instance_bindings[&instance];
     assert_eq!(
-        snapshot.instance_materials[&instance],
+        bindings
+            .iter()
+            .map(|slot| slot.material.clone())
+            .collect::<Vec<_>>(),
         vec![Some(jacket), Some(skin.clone()), Some(skin)]
     );
     assert_eq!(
-        snapshot.instance_material_uvs[&instance],
+        bindings.iter().map(|slot| slot.uv).collect::<Vec<_>>(),
         vec![true, true, false]
     );
     let slots: Vec<u32> = snapshot.meshes[&instance]
@@ -267,25 +271,17 @@ fn collection_instance_keeps_each_members_uvs_after_face_gaps() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let mesh = &snapshot.meshes[&Id::new("instance").unwrap()];
-    let entries = mesh.attributes["uv_map"].as_array().unwrap();
-    // Both members keep a UV entry for every face, and each entry names a face of the joined mesh.
-    let mut face_ids: Vec<u64> = entries
-        .iter()
-        .map(|entry| entry["face_id"].as_u64().unwrap())
-        .collect();
-    face_ids.sort_unstable();
-    face_ids.dedup();
-    let mut mesh_face_ids: Vec<u64> = mesh.faces.iter().map(|face| u64::from(face.id)).collect();
-    mesh_face_ids.sort_unstable();
+    // The joined UVs live in one `blender_uv_layers` store with one value per corner.
+    assert!(!mesh.attributes.contains_key("uv_map"));
     assert_eq!(mesh.faces.len(), 11);
-    assert_eq!(face_ids, mesh_face_ids);
-    for face in &mesh.faces {
-        let entry = entries
-            .iter()
-            .find(|entry| entry["face_id"] == json!(face.id))
-            .unwrap();
-        assert_eq!(entry["uv"].as_array().unwrap().len(), face.vertices.len());
-    }
+    let layers = mesh.attributes["blender_uv_layers"].as_array().unwrap();
+    assert_eq!(layers.len(), 1);
+    let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+    assert_eq!(layers[0]["values"].as_array().unwrap().len(), corners);
+    // Both members have a UV value on every face, so both slots are covered.
+    let bindings = &snapshot.instance_bindings[&Id::new("instance").unwrap()];
+    assert_eq!(bindings.len(), 2);
+    assert!(bindings.iter().all(|slot| slot.uv));
 }
 
 #[test]
@@ -307,7 +303,10 @@ fn nested_collection_instances_carry_member_materials_upward() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let outer = Id::new("outer").unwrap();
-    let table = &snapshot.instance_materials[&outer];
+    let table: Vec<Option<Id>> = snapshot.instance_bindings[&outer]
+        .iter()
+        .map(|slot| slot.material.clone())
+        .collect();
     let jacket = Id::new("jacket").unwrap();
     let skin = Id::new("skin").unwrap();
     assert_eq!(table.len(), 2);

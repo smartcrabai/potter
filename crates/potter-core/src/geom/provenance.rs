@@ -72,6 +72,22 @@ impl Origin {
 ///
 /// Returns `INTERNAL_ERROR` when `origin` does not describe `output`'s vertices and polygons.
 pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin) -> Result<()> {
+    remap_attributes_skipping(source, output, origin, &[])
+}
+
+/// [`remap_attributes`] without the attributes named in `skipped`, which `output` does not receive.
+/// A caller that rebuilds one of them from `source` skips it here, so no work runs on it and it does
+/// not make corners need sources.
+///
+/// # Errors
+///
+/// Returns `INTERNAL_ERROR` when `origin` does not describe `output`'s vertices and polygons.
+pub(crate) fn remap_attributes_skipping(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    skipped: &[&str],
+) -> Result<()> {
     if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -82,51 +98,54 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
         output.attributes.clear();
         return Ok(());
     }
-    let entries = source
-        .attributes
-        .get("blender_attributes")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let needs_edges = source.attributes.contains_key("crease_edge")
-        || source.attributes.contains_key("blender_edge_flags")
-        || source.attributes.contains_key("sharp")
+    let kept = |key: &str| !skipped.iter().any(|name| *name == key);
+    let has = |key: &str| kept(key) && source.attributes.contains_key(key);
+    let entries = if kept("blender_attributes") {
+        source
+            .attributes
+            .get("blender_attributes")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+    } else {
+        &[][..]
+    };
+    let needs_edges = has("crease_edge")
+        || has("blender_edge_flags")
+        || has("sharp")
         || entries.iter().any(|entry| text(entry, "domain") == "EDGE")
         || source
             .attributes
-            .values()
-            .any(|value| named_domain(value).as_deref() == Some("edge"));
-    let needs_corners = source.attributes.contains_key("blender_uv_layers")
-        || source.attributes.contains_key("uv_map")
-        || source.attributes.contains_key("custom_normal")
-        || entries
             .iter()
-            .any(|entry| text(entry, "domain") == "CORNER")
+            .filter(|(key, _)| kept(key.as_str()))
+            .any(|(_, value)| named_domain(value).as_deref() == Some("edge"));
+    let needs_corners = has("blender_uv_layers")
+        || has("uv_map")
+        || has("custom_normal")
+        || entries.iter().any(|entry| text(entry, "domain") == "CORNER")
         || source
             .attributes
-            .values()
-            .any(|value| named_domain(value).as_deref() == Some("corner"));
-    let mut edge_origin = Vec::new();
-    if needs_edges || needs_corners {
-        let output_vertex_index: HashMap<u32, usize> = output
+            .iter()
+            .filter(|(key, _)| kept(key.as_str()))
+            .any(|(_, value)| named_domain(value).as_deref() == Some("corner"));
+    let output_vertex_index: HashMap<u32, usize> = if needs_edges || needs_corners {
+        output
             .vertices
             .iter()
             .enumerate()
             .map(|(index, vertex)| (vertex.id, index))
-            .collect();
-        if needs_edges {
-            edge_origin = edge_sources(source, output, origin, &output_vertex_index);
-        }
-    }
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let edge_origin = if needs_edges {
+        edge_sources(source, output, origin, &output_vertex_index)
+    } else {
+        Vec::new()
+    };
     let derived_corners;
     let corner_origin: &[Vec<(usize, f64)>] = match &origin.corners {
         Some(corners) => corners,
         None if needs_corners => {
-            let output_vertex_index: HashMap<u32, usize> = output
-                .vertices
-                .iter()
-                .enumerate()
-                .map(|(index, vertex)| (vertex.id, index))
-                .collect();
             derived_corners = corner_sources(source, origin, output, &output_vertex_index);
             &derived_corners
         }
@@ -142,6 +161,9 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
     };
     let mut attributes = Map::new();
     for (key, value) in &source.attributes {
+        if !kept(key.as_str()) {
+            continue;
+        }
         if key == "custom_normal" {
             // Dropped when no output corner has an authored normal, which reports attribute_dropped.
             if let Some(remapped) = sources.custom_normal(value) {
@@ -309,26 +331,30 @@ fn corner_sources(
     output_vertex_index: &HashMap<u32, usize>,
 ) -> Vec<Vec<(usize, f64)>> {
     let offsets = corner_offsets(source.faces.iter().map(|face| face.vertices.len()));
+    // Every source corner keyed by its face and vertex, built once per member, so an output corner
+    // finds its source corner by lookup instead of scanning its source face.
+    let mut source_corners: HashMap<(usize, u32), usize> = HashMap::new();
+    for (index, face) in source.faces.iter().enumerate() {
+        for (position, id) in face.vertices.iter().enumerate() {
+            source_corners
+                .entry((index, *id))
+                .or_insert(offsets[index] + position);
+        }
+    }
     let mut corners = Vec::new();
     for (face, source_face) in output.faces.iter().zip(&origin.faces) {
-        let source_face =
-            source_face.and_then(|index| source.faces.get(index).map(|face| (index, face)));
         for vertex_id in &face.vertices {
             let vertex_sources = output_vertex_index
                 .get(vertex_id)
                 .and_then(|index| origin.vertices.get(*index));
             let mut kept = Vec::new();
-            if let (Some((index, source_face)), Some(vertex_sources)) =
-                (source_face, vertex_sources)
-            {
+            if let (Some(index), Some(vertex_sources)) = (*source_face, vertex_sources) {
                 for (vertex, weight) in vertex_sources {
                     let Some(id) = source.vertices.get(*vertex).map(|vertex| vertex.id) else {
                         continue;
                     };
-                    if let Some(position) =
-                        source_face.vertices.iter().position(|corner| *corner == id)
-                    {
-                        kept.push((offsets[index] + position, *weight));
+                    if let Some(&corner) = source_corners.get(&(index, id)) {
+                        kept.push((corner, *weight));
                     }
                 }
             }
