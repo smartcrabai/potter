@@ -524,6 +524,7 @@ pub fn displace_volume(
     volume: &VolumeData,
     params: &Map<String, Value>,
     texture: Option<crate::geom::legacy_texture::TextureSource<'_>>,
+    rng: &mut crate::blender_rng::BlenderRng,
     volume_world: DMat4,
     texture_map_object_world: Option<DMat4>,
 ) -> Result<VolumeData> {
@@ -534,6 +535,7 @@ pub fn displace_volume(
     let texture = VolumeDisplacement::new(
         params,
         texture,
+        rng,
         strength,
         volume_world,
         texture_map_object_world,
@@ -547,12 +549,12 @@ pub fn displace_volume(
                 ));
             }
             for grid in &mut displaced.grids {
-                displace_inline_grid(grid, &texture)?;
+                displace_inline_grid(grid, &mut texture)?;
             }
             Ok(displaced)
         }
         VolumeSource::File(source) if source.format == "vdb" => {
-            displace_vdb_volume(volume, &texture)
+            displace_vdb_volume(volume, &mut texture)
         }
         VolumeSource::File(source) => Err(unsupported(
             "modifier.volume_displace.file_format",
@@ -566,6 +568,7 @@ pub fn displace_volume(
 
 struct VolumeDisplacement<'a> {
     texture: crate::geom::legacy_texture::TextureSource<'a>,
+    rng: &'a mut crate::blender_rng::BlenderRng,
     mapping: DMat4,
     strength: f64,
     mid_level: [f64; 3],
@@ -576,6 +579,7 @@ impl<'a> VolumeDisplacement<'a> {
     fn new(
         params: &Map<String, Value>,
         texture: crate::geom::legacy_texture::TextureSource<'a>,
+        rng: &'a mut crate::blender_rng::BlenderRng,
         strength: f64,
         volume_world: DMat4,
         texture_map_object_world: Option<DMat4>,
@@ -608,6 +612,7 @@ impl<'a> VolumeDisplacement<'a> {
         }
         Ok(Self {
             texture,
+            rng,
             mapping,
             strength,
             mid_level: vector_param("volume_displace", params, "texture_mid_level")?,
@@ -615,17 +620,17 @@ impl<'a> VolumeDisplacement<'a> {
         })
     }
 
-    fn displacement_at(&self, local_position: DVec3) -> Result<DVec3> {
+    fn displacement_at(&mut self, local_position: DVec3) -> Result<DVec3> {
         let texture_position = self.mapping.transform_point3(local_position);
         if !texture_position.is_finite() {
             return Err(invalid("volume texture coordinates are not finite"));
         }
-        let sample = crate::geom::legacy_texture::sample(self.texture, texture_position)?;
+        let sample = crate::geom::legacy_texture::sample(self.texture, texture_position, self.rng)?;
         Ok((DVec3::from_array(sample.rgb) - DVec3::from_array(self.mid_level)) * self.strength)
     }
 }
 
-fn displace_inline_grid(grid: &mut VolumeGrid, texture: &VolumeDisplacement<'_>) -> Result<()> {
+fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<'_>) -> Result<()> {
     if let Some(blob) = &grid.blob_f32 {
         if grid.values.is_some() {
             return Err(invalid(
@@ -733,7 +738,7 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &VolumeDisplacement<'_>)
 
 fn displace_vdb_volume(
     volume: &VolumeData,
-    texture: &VolumeDisplacement<'_>,
+    texture: &mut VolumeDisplacement<'_>,
 ) -> Result<VolumeData> {
     let decoded = volume.decoded_vdb.as_ref().ok_or_else(|| {
         PotError::with_details(
@@ -1281,7 +1286,8 @@ mod tests {
             }],
             ..VolumeData::default()
         };
-        let unchanged = displace_volume(&volume, &Map::new(), None, DMat4::IDENTITY, None)?;
+        let mut rng = crate::blender_rng::BlenderRng::seed(0);
+        let unchanged = displace_volume(&volume, &Map::new(), None, &mut rng, DMat4::IDENTITY, None)?;
         assert_eq!(
             unchanged.grids[0].values.as_deref(),
             Some(&[0.0_f32, 1.0, 0.0][..])
@@ -1303,6 +1309,7 @@ mod tests {
                 ("texture_sample_radius".into(), json!(0.0)),
             ]),
             Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
+            &mut rng,
             DMat4::IDENTITY,
             None,
         )?;
@@ -1330,6 +1337,7 @@ mod tests {
             tiles: std::collections::BTreeMap::new(),
             interpolation: crate::image::ImageInterpolation::Linear,
         };
+        let mut rng = crate::blender_rng::BlenderRng::seed(0);
         let settings = |mode| {
             Map::from_iter([
                 ("texture_map_mode".into(), json!(mode)),
@@ -1342,6 +1350,7 @@ mod tests {
             &volume,
             &settings("LOCAL"),
             Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
+            &mut rng,
             DMat4::from_translation(DVec3::new(2.0, 3.0, 4.0)),
             None,
         )?;
@@ -1349,6 +1358,7 @@ mod tests {
             &volume,
             &settings("OBJECT"),
             Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
+            &mut rng,
             DMat4::from_translation(DVec3::new(2.0, 3.0, 4.0)),
             None,
         )?;
