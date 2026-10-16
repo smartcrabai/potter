@@ -2557,7 +2557,7 @@ pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
-    /// Whether face counts or indices have multiple Alembic samples.
+    /// Whether face counts or indices have multiple nonconstant Alembic samples.
     pub connectivity_is_animated: bool,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
@@ -2577,6 +2577,12 @@ pub(crate) struct MeshCacheSample {
 /// # Errors
 ///
 /// Returns import errors for malformed archives or paths without a `PolyMesh`.
+fn cache_connectivity_is_animated(counts: &ParsedProperty, indices: &ParsedProperty) -> bool {
+    [counts, indices]
+        .into_iter()
+        .any(|property| property.sample_count > 1 && !property.constant)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "decoding one cache sample set needs coordinated topology, geom-parameter, and time-sampling validation"
@@ -2625,6 +2631,7 @@ pub(crate) fn read_mesh_cache(
         .ok_or_else(|| import_error("Alembic PolyMesh .faceCounts array is missing"))?;
     let indices = property(&geom.children, ".faceIndices")
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
+    let connectivity_is_animated = cache_connectivity_is_animated(counts, indices);
     let uv = if read_uv {
         uv_geom_parameters(geom)
     } else {
@@ -2862,7 +2869,7 @@ pub(crate) fn read_mesh_cache(
             &archive.time_samplings,
         )?;
         result.push(MeshCacheSample {
-            connectivity_is_animated: counts.sample_count > 1 || indices.sample_count > 1,
+            connectivity_is_animated,
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,
@@ -4508,5 +4515,46 @@ mod tests {
                 .all(|loss| !loss.reason.contains("alembic_normals"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn constant_topology_properties_keep_the_static_reader_shortcut() {
+        let property = |name: &str, sample_count, constant| ParsedProperty {
+            name: name.to_owned(),
+            property_type: 2,
+            pod: 6,
+            extent: 1,
+            sample_count,
+            first_changed: if constant { 0 } else { 1 },
+            last_changed: if constant { 0 } else { sample_count.saturating_sub(1) },
+            constant,
+            time_sampling_index: 0,
+            metadata: BTreeMap::new(),
+            children: Vec::new(),
+            samples: Vec::new(),
+        };
+        let constant_counts = property(".faceCounts", 4, true);
+        let constant_indices = property(".faceIndices", 4, true);
+        assert!(!cache_connectivity_is_animated(
+            &constant_counts,
+            &constant_indices
+        ));
+
+        let changing_indices = property(".faceIndices", 4, false);
+        assert!(cache_connectivity_is_animated(
+            &constant_counts,
+            &changing_indices
+        ));
+        let changing_counts = property(".faceCounts", 4, false);
+        assert!(cache_connectivity_is_animated(
+            &changing_counts,
+            &constant_indices
+        ));
+
+        let single_sample_indices = property(".faceIndices", 1, true);
+        assert!(!cache_connectivity_is_animated(
+            &constant_counts,
+            &single_sample_indices
+        ));
     }
 }
