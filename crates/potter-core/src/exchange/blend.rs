@@ -1981,6 +1981,14 @@ fn build_imported_graph(
                         .get("enabled")
                         .and_then(Value::as_bool)
                         .unwrap_or(true),
+                    show_viewport: modifier
+                        .get("show_viewport")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    show_render: modifier
+                        .get("show_render")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
                     params,
                     binding_data: native_bindings
                         .get(&(name.to_owned(), modifier_name.to_owned()))
@@ -6835,6 +6843,13 @@ mod tests {
             .get(&Id::new(id)?)
             .ok_or_else(|| invalid_intermediate("test action was not imported"))
     }
+    fn export_context() -> crate::eval::EvaluationContext {
+        crate::eval::EvaluationContext {
+            purpose: crate::eval::EvaluationPurpose::Render,
+            ..crate::eval::EvaluationContext::default()
+        }
+    }
+
     fn optional_blender() -> Option<PathBuf> {
         match resolve_blender(None) {
             Ok(blender) => Some(blender),
@@ -7068,7 +7083,7 @@ mod tests {
         let project = Project::init(directory.path().join("project"))?;
         let doc = shader_roundtrip_scene()?;
         let output = directory.path().join("shader-roundtrip.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -7171,7 +7186,7 @@ mod tests {
         let project = Project::init(directory.path().join("project"))?;
         let doc = roundtrip_scene()?;
         let output = directory.path().join("roundtrip.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         let options = ExportOptions {
             allow_lossy: false,
             pack: false,
@@ -7381,7 +7396,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
 
         let project = Project::init(directory.path().join("project"))?;
         let output = directory.path().join("table-roundtrip.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &imported.doc,
             &project,
@@ -7769,7 +7784,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             Some(true)
         );
         let project = Project::init(directory.path().join("project"))?;
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         let output_path = directory.path().join("returned.blend");
         let options = ExportOptions {
             allow_lossy: true,
@@ -7996,7 +8011,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         let project = Project::init(directory.path().join("project"))?;
         let doc = primitive_scene()?;
         let output = directory.path().join("primitives.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -8222,7 +8237,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         assert!(approximately(tip_bone.roll, -0.4));
         let project = Project::init(directory.path().join("project"))?;
         let roundtrip = directory.path().join("rig-roundtrip.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &imported.doc,
             &project,
@@ -8459,7 +8474,7 @@ print("RIGPROBE " + json.dumps({"groups": groups, "shapes": shape_names,
         let project = Project::init(directory.path().join("project"))?;
         let doc = rig_graph_scene()?;
         let output = directory.path().join("rig-ids.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -8596,7 +8611,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         }
         let project = Project::init(directory.path().join("project"))?;
         let output = directory.path().join("edited.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -8699,7 +8714,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "root collection missing"))?;
         root.objects = vec![Id::new("animated")?, Id::new("plain")?];
         let output = directory.path().join("transforms.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -8903,7 +8918,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         .doc;
         let project = Project::init(directory.path().join("project"))?;
         let output = directory.path().join("overlay.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -9041,7 +9056,7 @@ print("OVERLAY " + json.dumps({"bevel": round(bevel.width, 3) if bevel else None
             .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "root collection missing"))?
             .objects = vec![node_id];
         let output = directory.path().join("root-shear.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         let report = export_blend(
             &doc,
             &project,
@@ -9454,7 +9469,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 allow_lossy: true,
                 pack: false,
                 blender: Some(&blender),
-                context: &crate::eval::EvaluationContext::default(),
+                context: &export_context(),
             },
         )?;
         assert!(report.losses.iter().any(|loss| {
@@ -9624,7 +9639,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert!(active_scene.active_clip.is_none());
 
         let project = Project::init(directory.path().join("project"))?;
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         let strict_output = directory.path().join("strict.blend");
         let Err(strict_error) = export_blend(
             &doc,

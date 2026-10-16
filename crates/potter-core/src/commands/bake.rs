@@ -13,7 +13,7 @@ use super::util::parse_id;
 use crate::{
     cli::{BakeArgs, BakeKind},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     geom::Mesh,
     model::Id,
     response::SceneInfo,
@@ -69,6 +69,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             .map(parse_id)
             .transpose()?,
         frame: None,
+        purpose: EvaluationPurpose::Render,
     };
     let cache_directory = project.path().to_path_buf();
     let mut stage = BakeStage::create(&args.out)?;

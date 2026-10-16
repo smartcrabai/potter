@@ -4,6 +4,7 @@ use crate::{
     cli::{RenderArgs, RenderDevice, RenderEngine, RenderFormat},
     commands::util::evaluation_context,
     error::{ErrorCode, PotError, Result},
+    eval::EvaluationPurpose,
     model::Id,
     render::render_sequence,
     response::SceneInfo,
@@ -35,6 +36,7 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         args.context.scene_id.as_deref(),
         args.context.view_layer.as_deref(),
         args.context.frame,
+        EvaluationPurpose::Render,
     )?;
     let scene_id = context.scene_id.as_ref().unwrap_or(&doc.active_scene);
     let scene = doc.scenes.get(scene_id).ok_or_else(|| {

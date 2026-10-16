@@ -219,6 +219,8 @@ mod tests {
             modifier_type: "remesh".to_owned(),
             name: "Remesh".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params: serde_json::from_value::<Map<String, serde_json::Value>>(json!({
                 "mode":"BLOCKS", "octree_depth":3, "scale":0.9
             }))?,

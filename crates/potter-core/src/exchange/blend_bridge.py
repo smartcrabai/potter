@@ -1427,7 +1427,9 @@ def object_dump(obj):
                 evaluated_target.to_mesh_clear()
         modifiers.append({"name": modifier.name, "type": modifier.type,
                           "potter_id": modifier_ids.get(modifier.name),
-                          "enabled": bool(modifier.show_viewport and modifier.show_render),
+                          "enabled": True,  # Blender has no global switch; always on.
+                          "show_viewport": bool(modifier.show_viewport),
+                          "show_render": bool(modifier.show_render),
                           "properties": properties,
                           "native_target_mesh": native_target_mesh,
                           "physics_settings": _physics_modifier_settings(obj, modifier),
@@ -2153,6 +2155,31 @@ def _create_modifier(obj, name, modifier_type):
             scene.collection.objects.unlink(obj)
 
 
+def _restore_modifier_stack(obj, modifier_items):
+    """Make Blender's stack match Potter's order and pin-to-last flags.
+
+    Setting use_pin_to_last moves the modifier at once, so pins are cleared, the stack is
+    sorted into Potter order, pins are set, and the stack is sorted again: the pin setter
+    moves modifiers, while ``modifiers.move`` places them exactly.
+    """
+    names = [modifier_item["name"] for modifier_item in modifier_items]
+    for name in names:
+        modifier = obj.modifiers[name]
+        if getattr(modifier, "use_pin_to_last", False):
+            modifier.use_pin_to_last = False
+
+    def sort_to_potter_order():
+        for target_index, name in enumerate(names):
+            current_index = next(index for index, modifier in enumerate(obj.modifiers)
+                                 if modifier.name == name)
+            if current_index != target_index:
+                obj.modifiers.move(current_index, target_index)
+
+    sort_to_potter_order()
+    for modifier_item in modifier_items:
+        if modifier_item.get("params", {}).get("use_pin_to_last"):
+            obj.modifiers[modifier_item["name"]].use_pin_to_last = True
+    sort_to_potter_order()
 
 
 def _ensure_dynamic_paint_role(modifier, obj, role):
@@ -5265,10 +5292,13 @@ def export_doc(doc, target, pack, scene_hash, context):
                 if modifier is None:
                     modifier = _create_modifier(
                         obj, modifier_item["name"], modifier_type)
-                modifier.show_viewport = modifier_item.get("enabled", True)
-                modifier.show_render = modifier_item.get("enabled", True)
+                enabled = modifier_item.get("enabled", True)
+                modifier.show_viewport = bool(enabled and modifier_item.get("show_viewport", True))
+                modifier.show_render = bool(enabled and modifier_item.get("show_render", True))
+                rna_item = dict(modifier_item, params={
+                    key: value for key, value in params.items() if key != "use_pin_to_last"})
                 set_modifier_params(
-                    modifier, modifier_item, id_lookup, doc, target, node_id, obj)
+                    modifier, rna_item, id_lookup, doc, target, node_id, obj)
                 if modifier_item.get("type") == "mesh_sequence_cache":
                     cache_file = _cache_file_for_resource(
                         doc, params["resource"], target, params)
@@ -5309,6 +5339,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         for modifier in list(obj.modifiers):
             if modifier.name not in desired_modifier_names:
                 obj.modifiers.remove(modifier)
+        _restore_modifier_stack(obj, item.get("modifiers", []))
     for node_id, item in doc.get("nodes", {}).items():
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]

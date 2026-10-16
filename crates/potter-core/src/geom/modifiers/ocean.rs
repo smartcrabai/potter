@@ -730,6 +730,8 @@ mod tests {
                 modifier_type: "ocean".to_owned(),
                 name: "Ocean".to_owned(),
                 enabled: true,
+                show_viewport: true,
+                show_render: true,
                 params: serde_json::from_value::<Map<String, serde_json::Value>>(json!({
                     "geometry_mode":"DISPLACE", "resolution":4, "spatial_size":8.0,
                     "random_seed":12, "choppiness":choppiness, "time":2.0

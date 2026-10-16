@@ -880,10 +880,10 @@ fn modifier_cases() -> Value {
         {"name":"CaseBuild","type":"BUILD","props":{"frame_start":2.0,"frame_duration":20.0,"use_random_order":true,"seed":17,"use_reverse":true},"expected":{"frame_start":2.0,"frame_duration":20.0,"use_random_order":true,"seed":17,"use_reverse":true}},
         {"name":"CaseMask","type":"MASK","group":"MaskWeights","props":{"mode":"VERTEX_GROUP","vertex_group":"MaskWeights","threshold":0.3,"invert_vertex_group":true},"expected":{"mode":"VERTEX_GROUP","vertex_group":"MaskWeights","threshold":0.3,"invert_vertex_group":true}},
         {"name":"CaseVertexWeightEdit","type":"VERTEX_WEIGHT_EDIT","group":"CurveWeights","props":{"vertex_group":"CurveWeights","falloff_type":"CURVE","map_curve":[[0.0,0.0],[0.5,0.2],[1.0,1.0]],"use_add":false,"use_remove":false,"default_weight":0.0,"normalize":false},"expected":{"vertex_group":"CurveWeights","falloff_type":"CURVE","map_curve":[[0.0,0.0],[0.5,0.2],[1.0,1.0]],"use_add":false,"use_remove":false,"default_weight":0.0,"normalize":false}},
-        {"name":"CaseLattice","type":"LATTICE","group":"LatticeWeights","props":{"object":null,"vertex_group":"LatticeWeights","show_viewport":false},"expected_enabled":false,"expected":{"object":null,"vertex_group":"LatticeWeights"}},
+        {"name":"CaseLattice","type":"LATTICE","group":"LatticeWeights","props":{"object":null,"vertex_group":"LatticeWeights","show_viewport":false},"expected_show_viewport":false,"expected":{"object":null,"vertex_group":"LatticeWeights"}},
         {"name":"CaseArmature","type":"ARMATURE","props":{"object":"@object:ArmatureTarget","use_deform_preserve_volume":true},"expected":{"object":"@object:ArmatureTarget","use_deform_preserve_volume":true}},
         {"name":"CaseNodes","type":"NODES","props":{"node_group":"@group:TransformGroup"},"expected":{"node_group":"@group:TransformGroup"}},
-        {"name":"VolumeOwner","type":"VOLUME_TO_MESH","props":{"threshold":0.2,"adaptivity":0.1,"show_viewport":false},"expected_enabled":false,"expected":{"threshold":0.2,"adaptivity":0.1}},
+        {"name":"VolumeOwner","type":"VOLUME_TO_MESH","props":{"threshold":0.2,"adaptivity":0.1,"show_viewport":false},"expected_show_viewport":false,"expected":{"threshold":0.2,"adaptivity":0.1}},
         {"name":"MeshToVolumeOwner","type":"MESH_TO_VOLUME","props":{"object":"@object:MeshToVolumeOperand","resolution_mode":"VOXEL_SIZE","voxel_size":0.25,"interior_band_width":0.2,"density":1.0},"expected":{"object":"@object:MeshToVolumeOperand","resolution_mode":"VOXEL_SIZE","voxel_size":0.25,"interior_band_width":0.2,"density":1.0}},
         {"name":"MeshToVolumeOwnerAmount","type":"MESH_TO_VOLUME","props":{"object":"@object:MeshToVolumeOperand","resolution_mode":"VOXEL_AMOUNT","voxel_amount":16,"interior_band_width":0.35,"density":0.65},"expected":{"object":"@object:MeshToVolumeOperand","resolution_mode":"VOXEL_AMOUNT","voxel_amount":16,"interior_band_width":0.35,"density":0.65}}
     ])
@@ -1542,8 +1542,12 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
         _ => kind.to_ascii_lowercase(),
     };
     assert_eq!(modifier["type"], expected_type, "{case_name}");
-    if let Some(expected_enabled) = case["expected_enabled"].as_bool() {
-        assert_eq!(modifier["enabled"], expected_enabled, "{case_name}.enabled");
+    if let Some(expected_show_viewport) = case["expected_show_viewport"].as_bool() {
+        assert_eq!(modifier["enabled"], true, "{case_name}.enabled");
+        assert_eq!(
+            modifier["show_viewport"], expected_show_viewport,
+            "{case_name}.show_viewport"
+        );
     }
     for (key, value) in case["expected"].as_object().unwrap() {
         assert_json_value(

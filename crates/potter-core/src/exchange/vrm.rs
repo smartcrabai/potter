@@ -11,6 +11,7 @@ use std::{
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::EvaluationPurpose,
     float::equal_f64,
     image::ImageInterpolation,
     model::{
@@ -1127,9 +1128,10 @@ fn spring_terminal_has_skin_weights(
     if !bone.deform {
         return false;
     }
+    // VRM settings validation runs before evaluation and describes the exported (render) stack.
     doc.nodes.values().any(|node| {
         node.modifiers.iter().any(|modifier| {
-            modifier.enabled
+            modifier.is_active(EvaluationPurpose::Render)
                 && modifier.modifier_type == "armature"
                 && modifier.params.get("object").and_then(Value::as_str)
                     == Some(armature_node_id.as_str())

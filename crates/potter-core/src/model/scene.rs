@@ -1422,6 +1422,12 @@ pub struct Modifier {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Blender `show_viewport`: active in viewport previews (`EvaluationPurpose::Preview`).
+    #[serde(default = "default_true")]
+    pub show_viewport: bool,
+    /// Blender `show_render`: active in saved renders and exports (`EvaluationPurpose::Render`).
+    #[serde(default = "default_true")]
+    pub show_render: bool,
     #[serde(default)]
     pub params: Map<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1430,6 +1436,28 @@ pub struct Modifier {
     #[serde(skip)]
     #[doc(hidden)]
     pub runtime: ModifierRuntime,
+}
+
+impl Modifier {
+    /// Whether the modifier takes part in an evaluation for `purpose`. `enabled` is the global
+    /// switch; the purpose's `show_*` flag selects the viewport or render stack.
+    #[must_use]
+    pub fn is_active(&self, purpose: crate::eval::EvaluationPurpose) -> bool {
+        self.enabled
+            && match purpose {
+                crate::eval::EvaluationPurpose::Preview => self.show_viewport,
+                crate::eval::EvaluationPurpose::Render => self.show_render,
+            }
+    }
+
+    /// Copy whose `enabled` means "active for `purpose`", so evaluators that read only `enabled`
+    /// see that purpose's stack.
+    #[must_use]
+    pub fn for_purpose(&self, purpose: crate::eval::EvaluationPurpose) -> Self {
+        let mut modifier = self.clone();
+        modifier.enabled = self.is_active(purpose);
+        modifier
+    }
 }
 
 #[doc(hidden)]
