@@ -542,7 +542,7 @@ impl Snapshot {
                     "node_id": prefix.node_id,
                     "keep": prefix.keep,
                 },
-            }))?)?
+            })))?
         } else {
             scene_hash.clone()
         };
@@ -647,7 +647,7 @@ impl Snapshot {
                     .flatten()
             })
             .collect();
-        let mut curve_path_lengths = BTreeMap::new();
+        let curve_path_lengths = BTreeMap::new();
         for owner_id in &mesh_evaluation_order {
             let Some(owner) = doc.nodes.get(owner_id) else {
                 continue;
@@ -3162,7 +3162,7 @@ fn render_simulated_particles(
                     .is_some()
             });
             let settings = (if has_stack_system {
-                particle_system_for_index(doc, emitter_id, system_index)?.1
+                particle_system_for_index(doc, emitter_id, system_index, gate)?.1
             } else {
                 node.properties
                     .get("physics_particle_emitter")

@@ -560,6 +560,69 @@ pub fn evaluate_displacement(material: &Material, hit_ctx: &HitContext<'_>) -> R
     }
 }
 
+/// Whether the connected material displacement graph reads its camera view direction.
+pub(crate) fn displacement_uses_view_direction(
+    material: &Material,
+    node_groups: &Registry<NodeGroup>,
+) -> bool {
+    let Some(graph_id) = &material.node_tree else {
+        return false;
+    };
+    let Some(group) = node_groups.get(graph_id) else {
+        return false;
+    };
+    let mut fallback_output = None;
+    let mut active_output = None;
+    for (id, node) in &group.nodes {
+        if matches!(
+            node.node_type.as_str(),
+            "OutputMaterial" | "ShaderNodeOutputMaterial"
+        ) {
+            if node
+                .properties
+                .get("is_active_output")
+                .and_then(JsonValue::as_bool)
+                == Some(true)
+            {
+                active_output = Some(id.clone());
+                break;
+            }
+            fallback_output.get_or_insert_with(|| id.clone());
+        }
+    }
+    let Some(output) = active_output.or(fallback_output) else {
+        return false;
+    };
+    if !group
+        .links
+        .iter()
+        .any(|link| link.to_node == output && link.to_socket == "Displacement")
+    {
+        return false;
+    }
+    let mut pending = vec![output];
+    let mut visited = BTreeSet::new();
+    while let Some(node_id) = pending.pop() {
+        if !visited.insert(node_id.clone()) {
+            continue;
+        }
+        let Some(node) = group.nodes.get(&node_id) else {
+            continue;
+        };
+        if matches!(node.node_type.as_str(), "ShaderNodeFresnel" | "ShaderNodeLayerWeight") {
+            return true;
+        }
+        pending.extend(
+            group
+                .links
+                .iter()
+                .filter(|link| link.to_node == node_id)
+                .map(|link| link.from_node.clone()),
+        );
+    }
+    false
+}
+
 fn apply_material_textures(
     material: &Material,
     hit_ctx: &HitContext<'_>,
@@ -2232,6 +2295,33 @@ mod tests {
         let params = evaluate_surface(&material, &context).unwrap();
         assert!((params.displacement_height - 0.5).abs() < f64::EPSILON);
         assert!((evaluate_displacement(&material, &context).unwrap() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn displacement_view_dependency_follows_connected_input_nodes() {
+        let mut graph = NodeGroup::new("ViewDependency", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut graph, "math", "ShaderNodeMath", json!({}));
+        insert_node(&mut graph, "fresnel", "ShaderNodeFresnel", json!({}));
+        link(&mut graph, "math", "Value", "output", "Displacement");
+        let graph_id = Id::new("view_dependency_shader".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id.clone()),
+            ..Material::default()
+        };
+
+        assert!(!super::displacement_uses_view_direction(&material, &groups));
+
+        link(
+            groups.get_mut(&graph_id).expect("shader group"),
+            "fresnel",
+            "Fac",
+            "math",
+            "Value",
+        );
+        assert!(super::displacement_uses_view_direction(&material, &groups));
     }
 
     #[test]

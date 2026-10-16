@@ -26,7 +26,7 @@ use super::{
     bvh::Bvh,
     path::object_for_index,
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
+        AlphaMode, Camera, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,
     },
 };
@@ -117,13 +117,8 @@ struct PointShadowMap {
 }
 
 type ShadowContext<'a> = Option<(&'a Bvh, &'a [Triangle], &'a BTreeMap<Id, PointShadowMap>)>;
-pub(super) fn extract_geometry(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    mode: Mode,
-    path_traced: bool,
-    images: &BTreeMap<String, ImageData>,
-) -> Result<Geometry> {
+
+fn visible_scene_node_ids(doc: &SceneDoc, snapshot: &Snapshot) -> Result<HashSet<Id>> {
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
@@ -144,7 +139,52 @@ pub(super) fn extract_geometry(
         &mut visited,
         &mut visible_nodes,
     );
+    Ok(visible_nodes)
+}
 
+pub(super) fn preview_geometry_parameters(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+) -> Result<(Option<(DVec3, DVec3)>, bool)> {
+    let visible_nodes = visible_scene_node_ids(doc, snapshot)?;
+    let mut bounds: Option<(DVec3, DVec3)> = None;
+    let mut view_dependent = false;
+    for node_id in visible_nodes {
+        let Some(node) = doc.nodes.get(&node_id) else {
+            continue;
+        };
+        if !node.visible || (snapshot.purpose == EvaluationPurpose::Render && !node.render_visible) {
+            continue;
+        }
+        if !view_dependent {
+            view_dependent = node.materials.iter().any(|material_id| {
+                doc.materials.get(material_id).is_some_and(|material| {
+                    material.displacement_method == "displacement"
+                        && crate::shader::displacement_uses_view_direction(
+                            material,
+                            &doc.node_groups,
+                        )
+                })
+            });
+        }
+        if let Some(node_bounds) = snapshot.nodes.get(&node_id).and_then(|node| node.bounds) {
+            bounds = Some(match bounds {
+                Some((min, max)) => (min.min(node_bounds.min), max.max(node_bounds.max)),
+                None => (node_bounds.min, node_bounds.max),
+            });
+        }
+    }
+    Ok((bounds, view_dependent))
+}
+pub(super) fn extract_geometry(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    mode: Mode,
+    path_traced: bool,
+    images: &BTreeMap<String, ImageData>,
+    camera: &Camera,
+) -> Result<Geometry> {
+    let visible_nodes = visible_scene_node_ids(doc, snapshot)?;
     let mut materials = vec![Material::default()];
     let mut material_indices = std::collections::BTreeMap::<Id, usize>::new();
     let mut triangles = Vec::new();
@@ -512,6 +552,7 @@ pub(super) fn extract_geometry(
                             object,
                             layers,
                             &shader_warnings,
+                            camera,
                         )?);
                     } else {
                         triangles.push(triangle);
@@ -1140,10 +1181,11 @@ fn subdivide_displaced_triangle(
     object: &ObjectRecord,
     layers: HitUvLayers<'_>,
     warnings: &RefCell<Vec<serde_json::Value>>,
+    camera: &Camera,
 ) -> Result<[Triangle; 4]> {
     subdivide_displaced(triangle, object_to_world, |sample| {
         let mut tables = LayerTables::new();
-        let mut context = layered_context(
+        let context = layered_context(
             doc,
             images,
             warnings,
@@ -1152,6 +1194,8 @@ fn subdivide_displaced_triangle(
             HitPose {
                 point: sample.point,
                 object: sample.object,
+                normal: sample.normal,
+                view: camera.view_direction_from(sample.point),
                 barycentric: sample.barycentric,
             },
             HitUvLayers {
@@ -1160,7 +1204,6 @@ fn subdivide_displaced_triangle(
             },
             &mut tables,
         )?;
-        context.uv = sample.uv;
         evaluate_displacement(material, &context)
     })
 }

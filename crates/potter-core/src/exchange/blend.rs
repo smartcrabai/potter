@@ -4683,6 +4683,7 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
     let mut edges = Vec::with_capacity(edges_raw.len());
     let mut sharp = Vec::with_capacity(edges_raw.len());
     let mut seam = Vec::with_capacity(edges_raw.len());
+    let mut edge_metadata = Vec::with_capacity(edges_raw.len());
     for (index, edge) in edges_raw.iter().enumerate() {
         let vertices_array = edge
             .get("v")
@@ -4695,8 +4696,11 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             id: checked_element_id(index)?,
             vertices: [a, b],
         });
-        sharp.push(flag_field(edge, "sharp"));
-        seam.push(flag_field(edge, "seam"));
+        let sharp_flag = flag_field(edge, "sharp");
+        let seam_flag = flag_field(edge, "seam");
+        sharp.push(sharp_flag);
+        seam.push(seam_flag);
+        edge_metadata.push(json!({"sharp": sharp_flag, "seam": seam_flag}));
     }
     let polygons_raw = item
         .get("polygons")

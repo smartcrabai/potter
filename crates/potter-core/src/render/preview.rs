@@ -99,27 +99,86 @@ pub fn render_previews(
     } else {
         BTreeMap::new()
     };
-    let mut geometry =
-        extract_geometry(doc, &snapshot, mode, matches!(mode, Mode::Beauty), &images)?;
-    for (node_id, error) in &node_errors {
-        geometry.warnings.push(json!({
-            "code": "UNSUPPORTED_FEATURE",
-            "feature_id": error.details.get("feature_id"),
-            "node_id": node_id,
-            "message": error.message,
-        }));
-    }
-    geometry
-        .warnings
-        .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
-    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
-    let mut pending = Vec::with_capacity(labels.len());
-    for label in labels {
-        let prepared = if let Some(camera_id) = request.camera_id {
-            stored_camera(doc, &snapshot, camera_id)?
+    let (base_bounds, view_dependent) =
+        super::scene::preview_geometry_parameters(doc, &snapshot)?;
+    let prepared_views = if let Some(camera_id) = request.camera_id {
+        let camera = stored_camera(doc, &snapshot, camera_id)?;
+        labels
+            .into_iter()
+            .map(|label| (label, camera.clone()))
+            .collect()
+    } else {
+        labels
+            .into_iter()
+            .map(|label| Ok((label.clone(), preset_camera(base_bounds, &label)?)))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let shared_geometry = if view_dependent {
+        None
+    } else {
+        let (_, prepared) = prepared_views.first().ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "preview has no camera views")
+        })?;
+        let mut geometry = extract_geometry(
+            doc,
+            &snapshot,
+            mode,
+            matches!(mode, Mode::Beauty),
+            &images,
+            &prepared.camera,
+        )?;
+        for (node_id, error) in &node_errors {
+            geometry.warnings.push(json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": error.details.get("feature_id"),
+                "node_id": node_id,
+                "message": error.message,
+            }));
+        }
+        geometry
+            .warnings
+            .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
+        Some(geometry)
+    };
+    let shared_shader = shared_geometry
+        .as_ref()
+        .and_then(|geometry| surface_shader(doc, &snapshot, &images, geometry, mode));
+    let mut pending = Vec::with_capacity(prepared_views.len());
+    for (label, prepared) in prepared_views {
+        let view_geometry = if view_dependent {
+            let mut geometry = extract_geometry(
+                doc,
+                &snapshot,
+                mode,
+                matches!(mode, Mode::Beauty),
+                &images,
+                &prepared.camera,
+            )?;
+            for (node_id, error) in &node_errors {
+                geometry.warnings.push(json!({
+                    "code": "UNSUPPORTED_FEATURE",
+                    "feature_id": error.details.get("feature_id"),
+                    "node_id": node_id,
+                    "message": error.message,
+                }));
+            }
+            geometry
+                .warnings
+                .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
+            Some(geometry)
         } else {
-            preset_camera(&geometry, &label)?
+            None
         };
+        let geometry = view_geometry
+            .as_ref()
+            .or(shared_geometry.as_ref())
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "preview geometry is missing"))?;
+        let view_shader = if view_dependent {
+            surface_shader(doc, &snapshot, &images, geometry, mode)
+        } else {
+            None
+        };
+        let shader = view_shader.as_deref().or(shared_shader.as_deref());
         let background = background_color(doc, &snapshot, mode, false);
         let scene = doc.scenes.get(&snapshot.scene_id).ok_or_else(|| {
             PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist")
@@ -128,7 +187,7 @@ pub fn render_previews(
             super::path::render(
                 doc,
                 &snapshot,
-                &geometry,
+                geometry,
                 &prepared.camera,
                 request.size,
                 request.size,
@@ -149,7 +208,7 @@ pub fn render_previews(
                 background,
                 1,
                 0,
-                shader.as_deref(),
+                shader,
             )?
         };
         if matches!(mode, Mode::Beauty) {
@@ -165,7 +224,7 @@ pub fn render_previews(
         let (manifest, files) = manifest_value(
             doc,
             &snapshot,
-            &geometry,
+            geometry,
             &prepared,
             &label,
             mode,
@@ -234,15 +293,16 @@ pub(crate) fn render_camera_frame(
     let snapshot =
         Snapshot::evaluate_with_cache(doc, context, Some(project_root), Some(cache_directory))?;
     let images = super::path::load_images(doc, project_root, None)?;
+    let camera = stored_camera(doc, &snapshot, camera_id)?;
     let geometry = extract_geometry(
         doc,
         &snapshot,
         mode,
         engine == "path" && matches!(mode, Mode::Beauty),
         &images,
+        &camera.camera,
     )?;
     let shader = surface_shader(doc, &snapshot, &images, &geometry, mode);
-    let camera = stored_camera(doc, &snapshot, camera_id)?;
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
@@ -342,10 +402,8 @@ fn resolve_views(views: &[String], camera_id: Option<&str>) -> Result<Vec<String
     Ok(views.to_vec())
 }
 
-fn preset_camera(geometry: &Geometry, view: &str) -> Result<PreparedCamera> {
-    let target = geometry
-        .bounds
-        .map_or(DVec3::ZERO, |(min, max)| (min + max) * 0.5);
+fn preset_camera(bounds: Option<(DVec3, DVec3)>, view: &str) -> Result<PreparedCamera> {
+    let target = bounds.map_or(DVec3::ZERO, |(min, max)| (min + max) * 0.5);
     let direction = match view {
         "front" => DVec3::new(0.0, -1.0, 0.0),
         "back" => DVec3::new(0.0, 1.0, 0.0),
@@ -364,7 +422,7 @@ fn preset_camera(geometry: &Geometry, view: &str) -> Result<PreparedCamera> {
     let forward = -direction;
     let right = forward.cross(up_hint).normalize_or_zero();
     let up = right.cross(forward).normalize_or_zero();
-    let projected_height = if let Some((min, max)) = geometry.bounds {
+    let projected_height = if let Some((min, max)) = bounds {
         let mut projected_min = DVec3::splat(f64::INFINITY);
         let mut projected_max = DVec3::splat(f64::NEG_INFINITY);
         for x in [min.x, max.x] {

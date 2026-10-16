@@ -14,7 +14,7 @@ use crate::{
 use super::{
     bvh::{Bvh, BvhHit},
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, blend_uv, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
@@ -1161,7 +1161,7 @@ fn make_surface(
         available_mask: element.and_then(|element| element.uv_available_mask),
     };
     let mut tables = LayerTables::new();
-    let mut context = layered_context(
+    let context = layered_context(
         doc,
         images,
         &geometry.shader_warnings,

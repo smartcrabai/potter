@@ -1021,6 +1021,234 @@ impl ColorPlan {
         );
         attributes
     }
+    /// The `COLOR_n` set a layer occupies in a primitive for `slot`.
+    fn set_index(&self, slot: u32, layer: usize) -> Option<usize> {
+        let selected = *self.slot_layers.get(&slot)?;
+        if layer >= self.layer_count {
+            return None;
+        }
+        Some(if layer == selected {
+            0
+        } else if layer < selected {
+            layer + 1
+        } else {
+            layer
+        })
+    }
+}
+
+fn color_losses(
+    mesh_id: &str,
+    mesh: &Mesh,
+    bindings: &[(u32, Option<&Id>)],
+    surfaces: &BTreeMap<Id, ResolvedSurface>,
+    plan: &ColorPlan,
+) -> Vec<Loss> {
+    let store = color_layers::read(mesh);
+    let material_for_slot = |slot| {
+        bindings.iter().find_map(|(bound_slot, material_id)| {
+            (*bound_slot == slot).then_some(*material_id).flatten()
+        })
+    };
+    let mut losses = Vec::new();
+    for (slot, layer) in &plan.missing {
+        let Some(material_id) = material_for_slot(*slot) else {
+            continue;
+        };
+        let layer = layer.as_deref().filter(|name| !name.is_empty()).map_or_else(
+            || "the render layer".to_owned(),
+            |name| format!("`{name}`"),
+        );
+        losses.push(Loss {
+            feature_id: feature_id::VERTEX_COLOR.to_owned(),
+            data_id: Some(material_id.to_string()),
+            reason: format!(
+                "material `{material_id}` reads color layer {layer}, which mesh `{mesh_id}` does not contain; glTF uses white for the missing COLOR_0 input in slot {slot}"
+            ),
+            suggestion: Some("add the requested color layer or export as blend".to_owned()),
+        });
+    }
+    for slot in &plan.translucent {
+        let Some(material_id) = material_for_slot(*slot) else {
+            continue;
+        };
+        let layer = plan
+            .slot_layers
+            .get(slot)
+            .and_then(|index| store.layers.get(*index))
+            .map_or("the render layer", |layer| layer.name.as_str());
+        let alpha_mode = surfaces
+            .get(material_id)
+            .map_or("translucent", |surface| match &surface.alpha_mode {
+                AlphaMode::Opaque => "opaque",
+                AlphaMode::Mask { .. } => "masked",
+                AlphaMode::Blend => "blended",
+            });
+        losses.push(Loss {
+            feature_id: feature_id::VERTEX_COLOR.to_owned(),
+            data_id: Some(material_id.to_string()),
+            reason: format!(
+                "material `{material_id}` reads color layer `{layer}` in {alpha_mode} slot {slot}; glTF multiplies COLOR_0 alpha into base alpha, while Blender ignores vertex-color alpha"
+            ),
+            suggestion: Some("use opaque vertex colors or export as blend".to_owned()),
+        });
+    }
+    for (layer_index, layer) in store.layers.iter().enumerate() {
+        let mut seen_slot = false;
+        let mut first_set = None;
+        let mut mixed_sets = false;
+        for slot in &plan.used_slots {
+            let set = plan.set_index(*slot, layer_index);
+            if seen_slot && first_set != set {
+                mixed_sets = true;
+                break;
+            }
+            seen_slot = true;
+            first_set = set;
+        }
+        if !mixed_sets && seen_slot && first_set.is_some() {
+            continue;
+        }
+        let reason = if mixed_sets {
+            format!(
+                "glTF material slots read different color layers as COLOR_n, so color layer `{}` has no stable set index",
+                layer.name
+            )
+        } else {
+            format!(
+                "glTF does not write color layer `{}` on any material slot",
+                layer.name
+            )
+        };
+        losses.push(Loss {
+            feature_id: "mesh.color_attribute".to_owned(),
+            data_id: Some(mesh_id.to_owned()),
+            reason,
+            suggestion: Some(
+                "use the same color-layer selection across material slots or export as blend"
+                    .to_owned(),
+            ),
+        });
+    }
+    losses
+}
+
+fn unwritten_attribute_losses(mesh: &Mesh, mesh_id: &str) -> Vec<Loss> {
+    let colors = color_layers::read(mesh);
+    let mut losses = Vec::new();
+    for key in mesh.attributes.keys() {
+        if matches!(
+            key.as_str(),
+            uv_layers::ATTRIBUTE
+                | color_layers::ATTRIBUTE
+                | "blender_attributes"
+                | "blender_edge_flags"
+                | "blender_polygon_smooth"
+                | "custom_normal"
+                | "shade_smooth"
+                | "sharp"
+                | "vertex_groups"
+        ) {
+            continue;
+        }
+        let name = attribute_keys::user_name(key).unwrap_or(key);
+        if colors.layers.iter().any(|layer| layer.name == name) {
+            continue;
+        }
+        losses.push(Loss {
+            feature_id: "mesh.attribute".to_owned(),
+            data_id: Some(mesh_id.to_owned()),
+            reason: format!("glTF does not write mesh attribute `{name}`"),
+            suggestion: Some("export as blend to keep mesh attributes".to_owned()),
+        });
+    }
+    for entry in mesh
+        .attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if name.starts_with('.')
+            || BLENDER_BOOKKEEPING_ATTRIBUTES.contains(&name)
+            || colors.layers.iter().any(|layer| layer.name == name)
+        {
+            continue;
+        }
+        let (feature, kind) = if is_color_attribute(entry) {
+            ("mesh.color_attribute", "color attribute")
+        } else {
+            ("mesh.attribute", "attribute")
+        };
+        losses.push(Loss {
+            feature_id: feature.to_owned(),
+            data_id: Some(mesh_id.to_owned()),
+            reason: format!("glTF does not write Blender {kind} `{name}`"),
+            suggestion: Some("export as blend to keep mesh attributes".to_owned()),
+        });
+    }
+    losses
+}
+
+fn explicit_zero_normal_loss(mesh: &Mesh, mesh_id: &str) -> Result<Option<Loss>> {
+    let explicit_zero = clnor::corner_codes(mesh)?.is_some_and(|codes| {
+        codes.contains(&clnor::CornerNormalCode::ExplicitZero)
+    });
+    Ok(explicit_zero.then(|| Loss {
+        feature_id: "mesh.normals".to_owned(),
+        data_id: Some(mesh_id.to_owned()),
+        reason: "glTF cannot represent Blender's explicit zero custom normal; export uses the up-vector fallback".to_owned(),
+        suggestion: Some("use a nonzero custom normal or pass --allow-lossy to accept the up-vector fallback".to_owned()),
+    }))
+}
+
+pub(crate) fn mesh_export_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<Loss>> {
+    let mut losses = Vec::new();
+    let surfaces = resolve_material_surfaces_with_losses(doc, Some(&mut losses))?;
+    let visible = super::render_visible_nodes(doc, snapshot)?;
+    for (node_id, node) in &doc.nodes {
+        if !node.visible || !node.render_visible || !visible.contains(node_id) {
+            continue;
+        }
+        let Some(evaluated) = snapshot.meshes.get(node_id) else {
+            continue;
+        };
+        if evaluated.vertices.is_empty() {
+            continue;
+        }
+        let (mesh, data_block) = if let Some(data_id) = &node.data {
+            let Some(data_block) = doc
+                .data_blocks
+                .get(data_id)
+                .filter(|data| data.data_type == "mesh")
+            else {
+                continue;
+            };
+            (
+                source_mesh_for_export(node, data_block, evaluated, snapshot.purpose)?,
+                Some(data_block),
+            )
+        } else if instance_collection_target(node)?.is_some() {
+            (evaluated, None)
+        } else {
+            continue;
+        };
+        validate_mesh_export_attributes(mesh, data_block)?;
+        let mesh_id = node_id.to_string();
+        losses.extend(unwritten_attribute_losses(mesh, &mesh_id));
+        if let Some(loss) = explicit_zero_normal_loss(mesh, &mesh_id)? {
+            losses.push(loss);
+        }
+        let bindings = used_material_bindings(node_id, node, snapshot, mesh)?;
+        let colors = color_plan(mesh, &bindings, &surfaces)?;
+        losses.extend(color_losses(
+            &mesh_id, mesh, &bindings, &surfaces, &colors,
+        ));
+    }
+    Ok(losses)
 }
 
 fn color_plan(
@@ -2637,10 +2865,21 @@ pub(crate) fn export_vrm_with_frames(
 /// Every material resolved to its glTF surface once: used materials must resolve, unused ones fall
 /// back to their fields so an invalid graph on an unused material never blocks export.
 pub(crate) fn resolve_material_surfaces(doc: &SceneDoc) -> Result<BTreeMap<Id, ResolvedSurface>> {
+    resolve_material_surfaces_with_losses(doc, None)
+}
+
+fn resolve_material_surfaces_with_losses(
+    doc: &SceneDoc,
+    mut losses: Option<&mut Vec<Loss>>,
+) -> Result<BTreeMap<Id, ResolvedSurface>> {
     let mut surfaces = BTreeMap::new();
     for id in doc.materials.keys() {
         let surface = if material_is_used(doc, id) {
-            resolve_surface(doc, id)?.0
+            let (surface, material_losses) = resolve_surface(doc, id)?;
+            if let Some(output) = losses.as_mut() {
+                output.extend(material_losses);
+            }
+            surface
         } else {
             match resolve_surface(doc, id) {
                 Ok((surface, _)) => surface,

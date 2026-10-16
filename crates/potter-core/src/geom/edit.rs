@@ -7,11 +7,9 @@ use crate::{
     error::{PotError, Result},
     geom::{
         Face, Mesh, MeshError, edge_key,
-        Face, Mesh, MeshError, edge_key,
         attribute_keys::storage_key,
         clnor::{self, NormalCodeOptions, SetterInput},
         color_layers::{self, ColorDomain, ColorLayer},
-        uv_layers::{self, UvLayer, UvStore},
         uv_layers::{self, UvLayer, UvStore},
     },
 };

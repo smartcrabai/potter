@@ -107,7 +107,8 @@ pub(crate) fn remap_attributes_skipping(
     } else {
         &[][..]
     };
-    let needs_edges = entries.iter().any(|entry| text(entry, "domain") == "EDGE")
+    let needs_edges = has("blender_edge_flags")
+        || entries.iter().any(|entry| text(entry, "domain") == "EDGE")
         || source
             .attributes
             .iter()
@@ -189,7 +190,7 @@ pub(crate) fn remap_attributes_skipping(
             "vertex_groups" => value
                 .as_object()
                 .map(|groups| Value::Object(sources.vertex_groups(groups))),
-            "crease_edge" => Some(sources.keyed_edge_attribute(value)),
+            "crease_edge" => Some(sources.native_attribute(value)),
             "blender_edge_flags" => value
                 .as_array()
                 .map(|flags| Value::Array(sources.edge_flags(flags))),
@@ -564,6 +565,31 @@ impl Sources<'_> {
         self.edge_origin
             .iter()
             .map(|sources| blend_indexed(values, sources, data_type).unwrap_or_else(&default))
+            .collect()
+    }
+
+    /// Boolean Blender edge flags follow the same positive-weight source edges as native flags.
+    fn edge_flags(&self, flags: &[Value]) -> Vec<Value> {
+        self.edge_origin
+            .iter()
+            .map(|sources| {
+                let mut sharp = false;
+                let mut seam = false;
+                for (source, weight) in sources {
+                    if *weight <= 0.0 {
+                        continue;
+                    }
+                    let Some(source_flags) = flags.get(*source) else {
+                        continue;
+                    };
+                    sharp |= source_flags.get("sharp").and_then(Value::as_bool) == Some(true);
+                    seam |= source_flags.get("seam").and_then(Value::as_bool) == Some(true);
+                    if sharp && seam {
+                        break;
+                    }
+                }
+                json!({"sharp": sharp, "seam": seam})
+            })
             .collect()
     }
 

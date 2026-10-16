@@ -254,7 +254,7 @@ pub(super) fn screw(
         "steps"
     };
     let steps = usize::try_from(uint_param(modifier, steps_name)?)
-        .map_err(|_| invalid_parameter(modifier, steps_name, "an integer from 1 to 4096"))?
+        .map_err(|_| invalid_parameter(modifier, steps_name, "an integer from 1 to 4096"))?;
     if !(1..=4096).contains(&steps) {
         return Err(invalid_parameter(
             modifier,

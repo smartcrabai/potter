@@ -45,6 +45,7 @@ pub struct Project {
     load_warnings: Vec<Value>,
     /// Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
     /// schema-3 write replaces them.
+    legacy_digest: Option<String>,
 }
 
 impl Project {
@@ -498,7 +499,7 @@ impl Project {
     pub fn history_records(&self) -> Result<HistoryRecordsAndWarnings> {
         let mut records = Vec::new();
         let mut warnings = Vec::new();
-        let mut next = self.doc.history.head.clone();
+        let mut next: Option<String> = self.doc.history.head.clone();
         while let Some(record_hash) = next.take() {
             let (record, record_warnings) = read_history_blob(&self.path, &record_hash)?;
             warnings.extend(record_warnings);

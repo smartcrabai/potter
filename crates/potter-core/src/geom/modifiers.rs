@@ -26,11 +26,10 @@ use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
     normals::{
-        average_custom_normals_by_fan, corner_normals, face_normal, safe_acos_approx,
-        sharp_edge_flags, vector3,
+        corner_normals, face_normal, safe_acos_approx,
+        sharp_edge_flags,
     },
-    provenance::{Origin, edge_flags, mean_value_corners, normalize_custom_normals, remap_attributes},
-    uv_layers,
+    provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
     uv_layers,
 };
 

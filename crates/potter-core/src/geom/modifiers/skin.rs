@@ -531,7 +531,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
     let polygons: Vec<Vec<usize>> = faces.into_iter().map(|(face, _)| face).collect();
-    let mut faces: Vec<Polygon> = merge_triangle_faces(&points, polygons, symmetry_axes)
+    let faces: Vec<Polygon> = merge_triangle_faces(&points, polygons, symmetry_axes)
         .into_iter()
         .map(|face| (face, 0))
         .collect();

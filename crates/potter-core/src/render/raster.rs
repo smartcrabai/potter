@@ -38,6 +38,17 @@ pub(crate) struct Camera {
     pub(crate) interocular_distance: f64,
 }
 
+impl Camera {
+    pub(crate) fn view_direction_from(&self, point: DVec3) -> DVec3 {
+        match self.projection {
+            Projection::Orthographic { .. } => (self.position - self.target).normalize_or_zero(),
+            Projection::Perspective { .. } | Projection::Panorama { .. } => {
+                (self.position - point).normalize_or_zero()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Mode {
     Solid,
@@ -1570,6 +1581,21 @@ mod tests {
             stereo_mode: StereoMode::None,
             interocular_distance: 0.065,
         }
+    }
+
+    #[test]
+    fn view_direction_is_parallel_for_orthographic_camera() {
+        let point = DVec3::ZERO;
+        let orthographic = camera(Projection::Orthographic { height: 4.0 });
+        assert_eq!(orthographic.view_direction_from(point), DVec3::Z);
+
+        let perspective = camera(Projection::Perspective {
+            lens_mm: 50.0,
+            sensor_width_mm: 36.0,
+        });
+        assert!(perspective
+            .view_direction_from(point)
+            .abs_diff_eq(DVec3::new(1.0, 2.0, 3.0).normalize(), f64::EPSILON));
     }
 
     #[test]
