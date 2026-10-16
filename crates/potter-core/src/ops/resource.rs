@@ -416,8 +416,7 @@ fn unpack_sequence(
 
     let pattern = resolve_path(&raw_path);
     let mut output_paths = BTreeSet::new();
-    let mut output_files = Vec::with_capacity(frames.len());
-    let mut output_frames = Map::new();
+    let mut sequence_outputs = Vec::with_capacity(frames.len());
     for frame in start..=end {
         let frame_key = frame.to_string();
         let frame_record = frames.get(&frame_key).ok_or_else(|| {
@@ -437,12 +436,6 @@ fn unpack_sequence(
                 &operation_pointer(engine.operation_index, &format!("id/sequence_frames/{frame}")),
             ));
         }
-        let resource_label = format!("{id}:{frame}");
-        let (bytes, digest) = crate::cache_sequence::read_cache_resource_record(
-            frame_record,
-            &resource_label,
-            engine.asset_root,
-        )?;
         let frame_path =
             crate::cache_sequence::cache_sequence_output_path(&pattern, frame)?.ok_or_else(|| {
                 PotError::with_details(
@@ -470,6 +463,18 @@ fn unpack_sequence(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(PotError::io(&error)),
         }
+        sequence_outputs.push((frame, frame_key, frame_record, frame_path));
+    }
+
+    let mut output_files = Vec::with_capacity(sequence_outputs.len());
+    let mut output_frames = Map::new();
+    for (frame, frame_key, frame_record, frame_path) in sequence_outputs {
+        let resource_label = format!("{id}:{frame}");
+        let (bytes, digest) = crate::cache_sequence::read_cache_resource_record(
+            frame_record,
+            &resource_label,
+            engine.asset_root,
+        )?;
         let uri = frame_path.to_string_lossy();
         output_frames.insert(
             frame_key,
