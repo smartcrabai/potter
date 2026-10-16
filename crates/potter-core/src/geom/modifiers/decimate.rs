@@ -63,6 +63,7 @@ fn collapse_uv_layers(mesh: &Mesh) -> (Vec<String>, Vec<Vec<[f64; 2]>>) {
     (names, values)
 }
 
+
 /// Rewrites the UV layers of `mesh`, rebuilt by a collapse, from the per-corner values of `corner_uv`
 /// (output face order, then corner order). `names[l]` is the layer of `corner_uv[c][l]`.
 fn collapse_write_uv(mesh: &mut Mesh, names: &[String], corner_uv: &[CornerUv]) -> Result<()> {

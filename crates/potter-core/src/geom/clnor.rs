@@ -14,61 +14,128 @@
 //! `corner_space_custom_normal_to_data`, and `corner_space_custom_data_to_normal`.
 
 use std::collections::{HashMap, HashSet};
-use std::f64::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use serde_json::{Map, Value, json};
 
-use super::normals::{
-    corner_normals, face_normal, safe_acos_approx, sharp_edge_flags, smooth_face_flags, vector3,
-};
+use super::normals::{corner_normals, sharp_edge_flags, smooth_face_flags, vector3};
 use super::{Mesh, edge_key};
 use crate::error::{ErrorCode, PotError, Result};
 
-/// Cosine above which an angle counts as zero (`LNOR_SPACE_TRIGO_THRESHOLD`).
-const TRIGO_THRESHOLD: f64 = 1.0 - 1.0e-4;
+/// Cosine above which an angle counts as zero (`LNOR_SPACE_TRIGO_THRESHOLD`, single precision).
+const TRIGO_THRESHOLD: f32 = 1.0 - 1.0e-4;
 /// Codes are 16-bit values scaled by `SHRT_MAX`.
-const CODE_SCALE: f64 = 32767.0;
+const CODE_SCALE: f32 = 32767.0;
 /// A custom normal this close to the fan normal per component encodes as the zero code.
-const SAME_TOLERANCE: f64 = 1.0e-4;
+const SAME_TOLERANCE: f32 = 1.0e-4;
 
 /// The space of one fan (`CornerNormalSpace`). The default is the invalid space: it decodes to the
 /// zero vector.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Space {
-    lnor: DVec3,
-    vec_ref: DVec3,
-    vec_ortho: DVec3,
-    ref_alpha: f64,
-    ref_beta: f64,
+    lnor: Vec3,
+    vec_ref: Vec3,
+    vec_ortho: Vec3,
+    ref_alpha: f32,
+    ref_beta: f32,
 }
 
-/// The angle of a cosine, clamped as Blender's `safe_acos_approx`.
-fn angle(cosine: f64) -> f64 {
-    safe_acos_approx(cosine)
+/// `dot_v3v3` and `math::dot`: the products summed in component order.
+fn dot(a: Vec3, b: Vec3) -> f32 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+/// `math::cross`.
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3::new(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+}
+
+/// `math::normalize`: divides by the length. A vector too short to have a direction is zero.
+pub(crate) fn normalize(v: Vec3) -> Vec3 {
+    let length_squared = dot(v, v);
+    if length_squared > 1.0e-35 {
+        let length = length_squared.sqrt();
+        Vec3::new(v.x / length, v.y / length, v.z / length)
+    } else {
+        Vec3::ZERO
+    }
+}
+
+/// `normalize_v3`: multiplies by the reciprocal of the length, as Blender's C vector helpers do.
+fn normalize_reciprocal(v: Vec3) -> Vec3 {
+    let length_squared = dot(v, v);
+    if length_squared > 1.0e-35 {
+        let scale = 1.0 / length_squared.sqrt();
+        Vec3::new(v.x * scale, v.y * scale, v.z * scale)
+    } else {
+        Vec3::ZERO
+    }
+}
+
+/// Blender's single-precision `safe_acos_approx`.
+fn safe_acos(x: f32) -> f32 {
+    let magnitude = x.abs();
+    let m = if magnitude < 1.0 {
+        1.0 - (1.0 - magnitude)
+    } else {
+        1.0
+    };
+    let acos = (1.0 - m).sqrt()
+        * (1.5707963267 + m * (-0.213300989 + m * (0.077980478 + m * -0.02164095)));
+    if x < 0.0 { PI - acos } else { acos }
+}
+
+/// `face_normal_calc`: the unit normal of a face's corners, computed in single precision as Blender
+/// does. Quads cross their diagonals, triangles cross two edges, and n-gons use Newell's method from
+/// the last corner. A degenerate face points along +Z.
+fn face_normal(points: &[Vec3], face: &[usize]) -> Vec3 {
+    let normal = match face {
+        [i0, i1, i2, i3] => {
+            normalize_reciprocal(cross(points[*i0] - points[*i2], points[*i1] - points[*i3]))
+        }
+        [i0, i1, i2] => normalize(cross(points[*i0] - points[*i1], points[*i1] - points[*i2])),
+        _ => {
+            let mut normal = Vec3::ZERO;
+            let mut previous = points[face[face.len() - 1]];
+            for &index in face {
+                let current = points[index];
+                normal.x += (previous.y - current.y) * (previous.z + current.z);
+                normal.y += (previous.z - current.z) * (previous.x + current.x);
+                normal.z += (previous.x - current.x) * (previous.y + current.y);
+                previous = current;
+            }
+            normalize_reciprocal(normal)
+        }
+    };
+    if normal == Vec3::ZERO { Vec3::Z } else { normal }
 }
 
 impl Space {
     /// The space of a fan: its normal, the directions of its two boundary edges, and the direction
     /// of every edge of the fan when it has more than one corner (`corner_fan_space_define`).
-    fn define(lnor: DVec3, vec_ref: DVec3, vec_other: DVec3, edges: &[DVec3]) -> Self {
-        let dtp_ref = vec_ref.dot(lnor);
-        let dtp_other = vec_other.dot(lnor);
+    fn define(lnor: Vec3, vec_ref: Vec3, vec_other: Vec3, edges: &[Vec3]) -> Self {
+        let dtp_ref = dot(vec_ref, lnor);
+        let dtp_other = dot(vec_other, lnor);
         if dtp_ref.abs() >= TRIGO_THRESHOLD || dtp_other.abs() >= TRIGO_THRESHOLD {
             return Self::default();
         }
         let ref_alpha = if edges.is_empty() {
-            f64::midpoint(angle(dtp_ref), angle(dtp_other))
+            (safe_acos(dtp_ref) + safe_acos(dtp_other)) / 2.0
         } else {
-            edges.iter().map(|edge| angle(edge.dot(lnor))).sum::<f64>() / edges.len() as f64
+            let mut alpha = 0.0;
+            for &edge in edges {
+                alpha += safe_acos(dot(edge, lnor));
+            }
+            alpha / edges.len() as f32
         };
-        let vec_ref = (vec_ref - lnor * dtp_ref).normalize_or_zero();
-        let vec_ortho = lnor.cross(vec_ref).normalize_or_zero();
-        let other = (vec_other - lnor * dtp_other).normalize_or_zero();
-        let dtp = vec_ref.dot(other);
+        let vec_ref = normalize(vec_ref - lnor * dtp_ref);
+        let vec_ortho = normalize(cross(lnor, vec_ref));
+        let other = normalize(vec_other - lnor * dtp_other);
+        let dtp = dot(vec_ref, other);
         let ref_beta = if dtp < TRIGO_THRESHOLD {
-            let beta = angle(dtp);
-            if vec_ortho.dot(other) < 0.0 {
+            let beta = safe_acos(dtp);
+            if dot(vec_ortho, other) < 0.0 {
                 TAU - beta
             } else {
                 beta
@@ -90,21 +157,23 @@ impl Space {
     }
 
     /// The custom normal a code pair stands for (`corner_space_custom_data_to_normal`).
-    pub(crate) fn decode(&self, codes: [i32; 2]) -> DVec3 {
+    pub(crate) fn decode(&self, codes: [i32; 2]) -> Vec3 {
         if codes[0] == 0 || !self.is_valid() {
             return self.lnor;
         }
-        let alpha_factor = f64::from(codes[0]) / CODE_SCALE;
+        let alpha_factor = codes[0] as f32 / CODE_SCALE;
         let alpha_range = if alpha_factor > 0.0 {
             self.ref_alpha
         } else {
             TAU - self.ref_alpha
         };
         let alpha = alpha_range * alpha_factor;
-        let (sin_alpha, cos_alpha) = alpha.sin_cos();
-        let beta_factor = f64::from(codes[1]) / CODE_SCALE;
+        let sin_alpha = alpha.sin();
+        let mut custom = self.lnor * alpha.cos();
+        let beta_factor = codes[1] as f32 / CODE_SCALE;
         if beta_factor == 0.0 {
-            return self.lnor * cos_alpha + self.vec_ref * sin_alpha;
+            custom += self.vec_ref * sin_alpha;
+            return custom;
         }
         let beta_range = if beta_factor > 0.0 {
             self.ref_beta
@@ -112,30 +181,32 @@ impl Space {
             TAU - self.ref_beta
         };
         let beta = beta_range * beta_factor;
-        self.lnor * cos_alpha
-            + self.vec_ref * (sin_alpha * beta.cos())
-            + self.vec_ortho * (sin_alpha * beta.sin())
+        custom += self.vec_ref * (sin_alpha * beta.cos());
+        custom += self.vec_ortho * (sin_alpha * beta.sin());
+        custom
     }
 
     /// The code pair of a custom normal (`corner_space_custom_normal_to_data`). The zero pair
     /// stands for "no custom normal" and decodes to the fan normal.
-    pub(crate) fn encode(&self, custom: DVec3) -> [i32; 2] {
-        let same = (self.lnor - custom).abs().max_element() <= SAME_TOLERANCE;
-        if custom == DVec3::ZERO || same || !self.is_valid() {
+    pub(crate) fn encode(&self, custom: Vec3) -> [i32; 2] {
+        let same = (self.lnor.x - custom.x).abs() <= SAME_TOLERANCE
+            && (self.lnor.y - custom.y).abs() <= SAME_TOLERANCE
+            && (self.lnor.z - custom.z).abs() <= SAME_TOLERANCE;
+        if custom == Vec3::ZERO || same || !self.is_valid() {
             return [0, 0];
         }
-        let cos_alpha = self.lnor.dot(custom);
-        let alpha = angle(cos_alpha);
+        let cos_alpha = dot(self.lnor, custom);
+        let alpha = safe_acos(cos_alpha);
         let alpha_code = if alpha > self.ref_alpha {
             code(-(TAU - alpha) / (TAU - self.ref_alpha))
         } else {
             code(alpha / self.ref_alpha)
         };
-        let projected = (self.lnor * -cos_alpha + custom).normalize_or_zero();
-        let cos_beta = self.vec_ref.dot(projected);
+        let projected = normalize(self.lnor * -cos_alpha + custom);
+        let cos_beta = dot(self.vec_ref, projected);
         let beta_code = if cos_beta < TRIGO_THRESHOLD {
-            let mut beta = angle(cos_beta);
-            if self.vec_ortho.dot(projected) < 0.0 {
+            let mut beta = safe_acos(cos_beta);
+            if dot(self.vec_ortho, projected) < 0.0 {
                 beta = TAU - beta;
             }
             if beta > self.ref_beta {
@@ -155,7 +226,7 @@ impl Space {
     clippy::cast_possible_truncation,
     reason = "unit values scale into the 16-bit code range"
 )]
-fn code(value: f64) -> i32 {
+fn code(value: f32) -> i32 {
     (value * CODE_SCALE + 0.5).floor() as i32
 }
 
@@ -188,12 +259,14 @@ struct FanCorner {
 
 /// Fans and spaces of a mesh given by vertex positions, faces (vertex indices), smooth flags, and
 /// sharp edges (vertex-index pairs). Corners join a fan through an edge that is not sharp, whose
-/// faces are both smooth, and whose faces wind the same way.
+/// faces are both smooth, and whose faces wind the same way. `numbering[c]` is the number Blender
+/// gives global corner `c`; a closed fan begins with its lowest-numbered corner.
 pub(crate) fn fans(
     points: &[DVec3],
     faces: &[Vec<usize>],
     smooth: &[bool],
     sharp: &HashSet<(usize, usize)>,
+    numbering: &[usize],
 ) -> Fans {
     let mut offsets = Vec::with_capacity(faces.len());
     let mut total = 0;
@@ -201,12 +274,10 @@ pub(crate) fn fans(
         offsets.push(total);
         total += face.len();
     }
-    let face_normals: Vec<DVec3> = faces
+    let points: Vec<Vec3> = points.iter().map(|point| point.as_vec3()).collect();
+    let face_normals: Vec<Vec3> = faces
         .iter()
-        .map(|face| {
-            let corners: Vec<DVec3> = face.iter().map(|&vertex| points[vertex]).collect();
-            face_normal(&corners)
-        })
+        .map(|face| face_normal(&points, face))
         .collect();
     let mut around: Vec<Vec<(usize, usize)>> = vec![Vec::new(); points.len()];
     for (face_index, face) in faces.iter().enumerate() {
@@ -242,9 +313,9 @@ pub(crate) fn fans(
             })
             .collect();
         let origin = points[vertex];
-        let directions: Vec<DVec3> = local_vertices
+        let directions: Vec<Vec3> = local_vertices
             .iter()
-            .map(|&other| (points[other] - origin).normalize_or_zero())
+            .map(|&other| normalize(points[other] - origin))
             .collect();
         let links = edge_links(&corners, local_vertices.len(), vertex, smooth, sharp);
         let mut visited = vec![false; corners.len()];
@@ -252,7 +323,7 @@ pub(crate) fn fans(
             if visited[start] {
                 continue;
             }
-            let fan = traverse(&corners, &links, start);
+            let fan = traverse(&corners, &links, start, numbering);
             for &local in &fan {
                 visited[local] = true;
             }
@@ -339,8 +410,8 @@ fn connect(links: &mut [Link], edge: usize, corner: usize, towards: bool, sharp:
 
 /// The corners around one vertex that form a fan with `start`, in Blender's order: forward along
 /// next edges, reversed, then backward along previous edges. A closed fan is rotated to begin with
-/// its lowest global corner.
-fn traverse(corners: &[FanCorner], links: &[Link], start: usize) -> Vec<usize> {
+/// its lowest-numbered corner.
+fn traverse(corners: &[FanCorner], links: &[Link], start: usize, numbering: &[usize]) -> Vec<usize> {
     let mut fan = vec![start];
     let mut current = start;
     let mut cyclic = false;
@@ -356,7 +427,7 @@ fn traverse(corners: &[FanCorner], links: &[Link], start: usize) -> Vec<usize> {
     fan.reverse();
     if cyclic {
         let lowest = (0..fan.len())
-            .min_by_key(|&index| corners[fan[index]].corner)
+            .min_by_key(|&index| numbering[corners[fan[index]].corner])
             .unwrap_or(0);
         fan.rotate_left(lowest);
         return fan;
@@ -374,21 +445,19 @@ fn traverse(corners: &[FanCorner], links: &[Link], start: usize) -> Vec<usize> {
 fn fan_normal(
     fan: &[usize],
     corners: &[FanCorner],
-    directions: &[DVec3],
-    face_normals: &[DVec3],
-) -> DVec3 {
+    directions: &[Vec3],
+    face_normals: &[Vec3],
+) -> Vec3 {
     if let [only] = fan {
         return face_normals[corners[*only].face];
     }
-    let sum: DVec3 = fan
-        .iter()
-        .map(|&local| {
-            let corner = &corners[local];
-            let weight = angle(directions[corner.edge_prev].dot(directions[corner.edge_next]));
-            face_normals[corner.face] * weight
-        })
-        .sum();
-    sum.normalize_or_zero()
+    let mut sum = Vec3::ZERO;
+    for &local in fan {
+        let corner = &corners[local];
+        let factor = safe_acos(dot(directions[corner.edge_prev], directions[corner.edge_next]));
+        sum += face_normals[corner.face] * factor;
+    }
+    normalize(sum)
 }
 
 type Topology = (Vec<DVec3>, HashMap<u32, usize>, HashSet<(usize, usize)>);
@@ -413,8 +482,8 @@ fn topology(mesh: &Mesh) -> Result<Topology> {
     Ok((points, index_by_id, sharp))
 }
 
-/// Fans of `mesh`, with its faces' vertex indices and smooth flags.
-fn mesh_fans(mesh: &Mesh) -> Result<Fans> {
+/// Fans of `mesh`, with its faces' vertex indices and smooth flags. `numbering` is as in [`fans`].
+fn mesh_fans(mesh: &Mesh, numbering: &[usize]) -> Result<Fans> {
     let (points, index_by_id, sharp) = topology(mesh)?;
     let faces = mesh
         .faces
@@ -433,7 +502,12 @@ fn mesh_fans(mesh: &Mesh) -> Result<Fans> {
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(fans(&points, &faces, &smooth_face_flags(mesh)?, &sharp))
+    Ok(fans(&points, &faces, &smooth_face_flags(mesh)?, &sharp, numbering))
+}
+
+/// The corner numbering of `mesh` as it is stored: global corner `c` is numbered `c`.
+pub(crate) fn stored_corner_order(mesh: &Mesh) -> Vec<usize> {
+    (0..mesh.faces.iter().map(|face| face.vertices.len()).sum()).collect()
 }
 
 /// The authored custom normal of every corner of `mesh`, in `mesh.faces` order. A corner without
@@ -455,15 +529,20 @@ fn authored_vectors(mesh: &Mesh) -> Option<Vec<DVec3>> {
                     authored
                         .and_then(|corners| corners.get(corner))
                         .and_then(vector3)
-                        .map_or(DVec3::ZERO, DVec3::normalize_or_zero)
+                        .map_or(DVec3::ZERO, |vector| vector.as_vec3().as_dvec3())
                 })
             })
             .collect(),
     )
 }
 
-/// The faces using one vertex-index edge, each with the global corners at its two ends.
-type EdgeUses = HashMap<(usize, usize), Vec<(usize, [(usize, usize); 2])>>;
+/// Normalizes caller-supplied custom normals with Blender's single-precision math path.
+fn normalize_authored(vectors: &[DVec3]) -> Vec<DVec3> {
+    vectors
+        .iter()
+        .map(|vector| normalize(vector.as_vec3()).as_dvec3())
+        .collect()
+}
 
 /// The corner normals of `mesh` without its custom normals, at `positions`.
 fn plain_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
@@ -505,9 +584,22 @@ fn with_custom_normals(mesh: &Mesh, vectors: &[DVec3]) -> Mesh {
 /// # Errors
 ///
 /// Returns the errors of [`corner_normals`] when the mesh is invalid.
-pub(crate) fn settle_custom_normals(mesh: &Mesh) -> Result<Option<Mesh>> {
+pub(crate) fn settle_custom_normals(mesh: &Mesh, numbering: &[usize]) -> Result<Option<Mesh>> {
+    settle_custom_normals_inner(mesh, numbering, true)
+}
+
+fn settle_custom_normals_inner(
+    mesh: &Mesh,
+    numbering: &[usize],
+    normalize_input: bool,
+) -> Result<Option<Mesh>> {
     let Some(authored) = authored_vectors(mesh) else {
         return Ok(None);
+    };
+    let authored = if normalize_input {
+        normalize_authored(&authored)
+    } else {
+        authored
     };
     let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
     let filled = fill_custom(&authored, &plain_corner_normals(mesh, &positions)?);
@@ -518,27 +610,8 @@ pub(crate) fn settle_custom_normals(mesh: &Mesh) -> Result<Option<Mesh>> {
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
-    let smooth = smooth_face_flags(mesh)?;
-    let fans = mesh_fans(mesh)?;
+    let fans = mesh_fans(mesh, numbering)?;
     let mut sharp = sharp_edge_flags(mesh)?;
-    // Per vertex-index edge: each face using it, with the global corner at each end.
-    let mut uses: EdgeUses = HashMap::new();
-    let mut offset = 0;
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        let count = face.vertices.len();
-        for corner in 0..count {
-            let ends = [corner, (corner + 1) % count];
-            let vertices = ends.map(|end| index_of[&face.vertices[end]]);
-            let corners = ends.map(|end| offset + end);
-            uses.entry(edge_key(vertices[0], vertices[1]))
-                .or_default()
-                .push((
-                    face_index,
-                    [(vertices[0], corners[0]), (vertices[1], corners[1])],
-                ));
-        }
-        offset += count;
-    }
     let edge_index: HashMap<(usize, usize), usize> = mesh
         .edges
         .iter()
@@ -550,27 +623,49 @@ pub(crate) fn settle_custom_normals(mesh: &Mesh) -> Result<Option<Mesh>> {
             )
         })
         .collect();
-    let mut marked = false;
-    for (key, faces) in &uses {
-        let [(first, first_ends), (second, second_ends)] = faces.as_slice() else {
-            continue;
-        };
-        if !smooth[*first] || !smooth[*second] {
-            continue;
+    // Each corner's outgoing and incoming edge, as vertex-index pairs.
+    let mut outgoing = Vec::with_capacity(filled.len());
+    let mut incoming = Vec::with_capacity(filled.len());
+    for face in &mesh.faces {
+        let count = face.vertices.len();
+        let vertices: Vec<usize> = face.vertices.iter().map(|id| index_of[id]).collect();
+        for corner in 0..count {
+            outgoing.push(edge_key(vertices[corner], vertices[(corner + 1) % count]));
+            incoming.push(edge_key(vertices[(corner + count - 1) % count], vertices[corner]));
         }
-        // Only corners of one fan can disagree: that fan is cut at the edge between them.
-        let differs = first_ends.iter().any(|&(vertex, corner)| {
-            second_ends.iter().any(|&(other, other_corner)| {
-                other == vertex
-                    && fans.fan_of[corner] == fans.fan_of[other_corner]
-                    && filled[corner].dot(filled[other_corner]) < 1.0 - 1.0e-4
-            })
-        });
-        if let Some(&index) = edge_index.get(key)
-            && differs
-        {
+    }
+    // Blender's `mesh_normals_corner_custom_set` walks each fan from its last corner to its first. A
+    // corner whose normal differs from the fan's reference (the normal of the last corner that
+    // differed) sharpens the edge it shares with the corner before it and becomes the reference. The
+    // pair closing the fan is checked last. Sharpening never clears an edge.
+    let mut marked = false;
+    let mut sharpen = |previous: usize, corner: usize| {
+        let shared = if outgoing[previous] == incoming[corner] {
+            outgoing[previous]
+        } else {
+            outgoing[corner]
+        };
+        if let Some(&index) = edge_index.get(&shared) {
             sharp[index] = true;
             marked = true;
+        }
+    };
+    for corners in &fans.corners {
+        let mut reversed = corners.iter().rev();
+        let Some(&first) = reversed.next() else {
+            continue;
+        };
+        let mut reference = filled[first].as_vec3();
+        let mut previous = first;
+        for &corner in reversed {
+            if dot(reference, filled[corner].as_vec3()) < TRIGO_THRESHOLD {
+                sharpen(previous, corner);
+                reference = filled[corner].as_vec3();
+            }
+            previous = corner;
+        }
+        if corners.len() > 1 && dot(reference, filled[first].as_vec3()) < TRIGO_THRESHOLD {
+            sharpen(previous, first);
         }
     }
     if !marked {
@@ -638,6 +733,7 @@ pub(crate) fn rebuild_custom_normals(
     let Some(authored) = authored_vectors(source) else {
         return Ok(None);
     };
+    let authored = normalize_authored(&authored);
     let output_corners: usize = output.faces.iter().map(|face| face.vertices.len()).sum();
     if sources.len() != output_corners || sources.iter().flatten().any(|&c| c >= authored.len()) {
         return Err(PotError::new(
@@ -646,14 +742,16 @@ pub(crate) fn rebuild_custom_normals(
         ));
     }
 
-    let source_fans = mesh_fans(source)?;
+    let source_fans = mesh_fans(source, &stored_corner_order(source))?;
     let codes: Vec<[i32; 2]> = authored
         .iter()
         .enumerate()
-        .map(|(corner, &vector)| source_fans.spaces[source_fans.fan_of[corner]].encode(vector))
+        .map(|(corner, &vector)| {
+            source_fans.spaces[source_fans.fan_of[corner]].encode(vector.as_vec3())
+        })
         .collect();
 
-    let output_fans = mesh_fans(output)?;
+    let output_fans = mesh_fans(output, &stored_corner_order(output))?;
     let mut vectors = vec![DVec3::ZERO; output_corners];
     let mut fan_keeps = vec![false; output_fans.corners.len()];
     for (fan, corners) in output_fans.corners.iter().enumerate() {
@@ -667,7 +765,7 @@ pub(crate) fn rebuild_custom_normals(
         let count = i32::try_from(corners.len()).unwrap_or(i32::MAX);
         let average = [sum[0] / count, sum[1] / count];
         fan_keeps[fan] = average != [0, 0];
-        let normal = output_fans.spaces[fan].decode(average);
+        let normal = output_fans.spaces[fan].decode(average).as_dvec3();
         for &corner in corners {
             vectors[corner] = normal;
         }
@@ -698,5 +796,75 @@ pub(crate) fn transfer_custom_normals(
     if let Some(value) = rebuild_custom_normals(source, output, sources)? {
         output.attributes.insert("custom_normal".to_owned(), value);
     }
+    Ok(())
+}
+
+/// Stores `vectors`, one per corner in face order, as `mesh`'s `custom_normal` layer.
+pub(crate) fn store_custom_normals(mesh: &mut Mesh, vectors: &[DVec3]) {
+    let keep = vec![true; mesh.faces.len()];
+    match corner_normal_attribute(mesh, vectors, &keep) {
+        Some(value) => {
+            mesh.attributes.insert("custom_normal".to_owned(), value);
+        }
+        None => {
+            mesh.attributes.remove("custom_normal");
+        }
+    }
+}
+
+/// The normals Blender reads back when every fan of `mesh` stores the code of its mean vector. The
+/// code is encoded in the fan's space and decoded again, so every corner of a fan reads the same
+/// vector (`mesh_normals_corner_custom_set`, then `Mesh::corner_normals`).
+fn fan_custom_normals(mesh: &Mesh, vectors: &[DVec3], numbering: &[usize]) -> Result<Vec<DVec3>> {
+    let fans = mesh_fans(mesh, numbering)?;
+    let mut read = vec![DVec3::ZERO; vectors.len()];
+    for (fan, corners) in fans.corners.iter().enumerate() {
+        let space = &fans.spaces[fan];
+        let mut sum = Vec3::ZERO;
+        for &corner in corners {
+            sum += vectors[corner].as_vec3();
+        }
+        // Blender scales the sum by the reciprocal of the count (`mul_v3_fl`).
+        let average = sum * (1.0 / corners.len() as f32);
+        let normal = space.decode(space.encode(average)).as_dvec3();
+        for &corner in corners {
+            read[corner] = normal;
+        }
+    }
+    Ok(read)
+}
+
+/// The custom normals `mesh` reads back from its own `custom_normal` layer. `None` without one.
+///
+/// # Errors
+///
+/// Returns the errors of [`mesh_fans`] when the mesh is invalid.
+pub(crate) fn read_custom_normals(mesh: &Mesh) -> Result<Option<Vec<DVec3>>> {
+    let Some(authored) = authored_vectors(mesh) else {
+        return Ok(None);
+    };
+    let authored = normalize_authored(&authored);
+    fan_custom_normals(mesh, &authored, &stored_corner_order(mesh)).map(Some)
+}
+
+/// Blender's `mesh_set_custom_normals_normalized`: stores `vectors` as the corners' custom normals.
+/// Fans whose vectors diverge get their smooth edges sharpened (`settle_custom_normals`), and every
+/// corner then holds the normal its fan reads back. `numbering` gives the corners' Blender numbers,
+/// which decide where a closed fan begins.
+///
+/// # Errors
+///
+/// Returns the errors of [`settle_custom_normals`] and [`fan_custom_normals`].
+pub(crate) fn set_custom_normals(
+    mesh: &mut Mesh,
+    vectors: &[DVec3],
+    numbering: &[usize],
+) -> Result<()> {
+    store_custom_normals(mesh, vectors);
+    if let Some(settled) = settle_custom_normals_inner(mesh, numbering, false)? {
+        *mesh = settled;
+    }
+    let read = fan_custom_normals(mesh, vectors, numbering)?;
+    store_custom_normals(mesh, &read);
     Ok(())
 }

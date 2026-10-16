@@ -478,7 +478,8 @@ pub(super) fn shade_output(
         .filter(|(_, flag)| *flag)
         .map(|(edge, _)| edge_key(index_of[&edge.vertices[0]], index_of[&edge.vertices[1]]))
         .collect();
-    let fans = crate::geom::clnor::fans(&points, &polygons, &smooth, &sharp_pairs);
+    let numbering: Vec<usize> = (0..polygons.iter().map(Vec::len).sum()).collect();
+    let fans = crate::geom::clnor::fans(&points, &polygons, &smooth, &sharp_pairs, &numbering);
     let computed = corner_normals(mesh, &points)?;
     // Each hardened corner's code in its fan's frame; unhardened corners of a fan contribute zero.
     let mut codes = vec![[0_i32; 2]; computed.len()];
@@ -495,7 +496,7 @@ pub(super) fn shade_output(
             if let Some(normal) = rule {
                 let global = start + corner;
                 let fan = fans.fan_of[global];
-                codes[global] = fans.spaces[fan].encode(*normal);
+                codes[global] = fans.spaces[fan].encode(normal.as_vec3());
                 affected[fan] = true;
             }
         }
@@ -512,7 +513,7 @@ pub(super) fn shade_output(
         }
         let count = members.len() as i32;
         let average = [sum[0] / count, sum[1] / count];
-        let normal = fans.spaces[fan].decode(average);
+        let normal = fans.spaces[fan].decode(average).as_dvec3();
         for member in members {
             values[*member] = normal;
         }

@@ -2529,7 +2529,6 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         vertices: origins,
         faces: vec![None; faces.len()],
         corners: None,
-        raw_normals: false,
     };
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
     result.attributes.remove("blender_skin_vertices");

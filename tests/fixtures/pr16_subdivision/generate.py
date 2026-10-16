@@ -6,6 +6,12 @@ import sys
 
 
 ROUND_DIGITS = 7
+DEFAULTS = {"levels": 2, "quality": 2, "boundary_smooth": "ALL", "uv_smooth": "PRESERVE_BOUNDARIES",
+            "use_creases": False, "use_custom_normals": False, "use_limit_surface": True,
+            "subdivision_type": "CATMULL_CLARK"}
+UV_MODES = ["NONE", "PRESERVE_CORNERS", "PRESERVE_CORNERS_AND_JUNCTIONS",
+            "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE", "PRESERVE_BOUNDARIES", "SMOOTH_ALL"]
+BOUNDARY_MODES = ["ALL", "PRESERVE_CORNERS"]
 
 
 def rounded(value):
@@ -24,6 +30,8 @@ def rounded(value):
     if hasattr(value, "__iter__"):
         return [rounded(item) for item in value]
     raise TypeError(type(value).__name__)
+
+
 def max_rounding_error(value):
     if isinstance(value, dict):
         return max((max_rounding_error(item) for item in value.values()), default=0.0)
@@ -42,7 +50,7 @@ def edge_key(a, b):
     return tuple(sorted((int(a), int(b))))
 
 
-def make_mesh(vertices, faces, seams=(), creases=()):
+def make_mesh(vertices, faces, seams=(), creases=(), loose_edges=(), smooth=None):
     uv_layers = [{"name": "UVMap", "values": []}, {"name": "Secondary", "values": []}]
     custom_normals = []
     for face_index, face in enumerate(faces):
@@ -59,15 +67,16 @@ def make_mesh(vertices, faces, seams=(), creases=()):
     return {
         "vertices": vertices,
         "faces": faces,
+        "loose_edges": [list(edge) for edge in loose_edges],
         "uv_layers": uv_layers,
-        "smooth": [True for _ in faces],
+        "smooth": [True for _ in faces] if smooth is None else list(smooth),
         "seams": [list(edge) for edge in sorted({edge_key(*edge) for edge in seams})],
         "creases": [[int(a), int(b), float(value)] for a, b, value in creases],
         "custom_normals": custom_normals,
     }
 
 
-def fixture_set():
+def grid_meshes():
     grid_vertices = []
     for y in range(3):
         for x in range(4):
@@ -86,17 +95,23 @@ def fixture_set():
     for x in range(4):
         if (x + 1) % 2 == 0:
             seams.append((4 + x, 8 + x))
-    grid = make_mesh(grid_vertices, grid_faces, seams)
+    return grid_vertices, grid_faces, seams
 
+
+def fixture_set():
+    grid_vertices, grid_faces, grid_seams = grid_meshes()
+    grid = make_mesh(grid_vertices, grid_faces, grid_seams)
     quad = make_mesh([[-1.0, -0.8, 0.12], [1.1, -0.8, -0.07],
                       [1.0, 0.9, 0.21], [-0.9, 0.8, -0.16]],
                      [[0, 1, 2, 3]], [(0, 1), (2, 3)])
-    cube = make_mesh([[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
-                      [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]],
-                     [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
-                      [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]],
-                     [(0, 1), (2, 3), (4, 5), (6, 7), (0, 3), (1, 2)],
-                     [(0, 1, 0.25), (2, 3, 0.75)])
+    cube_vertices = [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+                     [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]]
+    cube_faces = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
+                  [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+    cube_seams = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 3), (1, 2)]
+    cube = make_mesh(cube_vertices, cube_faces, cube_seams, [(0, 1, 0.25), (2, 3, 0.75)])
+    cube_flat = make_mesh(cube_vertices, cube_faces, cube_seams, [(0, 1, 0.25), (2, 3, 0.75)],
+                          smooth=[False, True, False, True, True, False])
     ngon_vertices = []
     for i in range(7):
         angle = 2.0 * math.pi * i / 7.0
@@ -107,55 +122,177 @@ def fixture_set():
                              [-1, 0, 0], [-1, -1, 0], [0, 1, 0], [0, 2, 1]],
                             [[0, 1, 2, 3], [1, 0, 4, 5], [0, 1, 6, 7]],
                             [(0, 1), (2, 3), (4, 5), (6, 7)])
-    meshes = {"curved_grid": grid, "quad": quad, "cube": cube,
-              "ngon": ngon, "nonmanifold": nonmanifold}
-    cases = []
-    for level, quality in zip(range(1, 6), range(1, 6)):
-        cases.append({"name": f"level_{level}_quality_{quality}", "mesh": "quad",
-                      "params": {"levels": level, "quality": quality, "boundary_smooth": "ALL",
-                                 "uv_smooth": "SMOOTH_ALL", "use_creases": False,
-                                 "use_custom_normals": False, "use_limit_surface": True}})
-    cases.append({"name": "quality_6", "mesh": "quad",
-                  "params": {"levels": 3, "quality": 6, "boundary_smooth": "PRESERVE_CORNERS",
-                             "uv_smooth": "SMOOTH_ALL", "use_creases": False,
-                             "use_custom_normals": False, "use_limit_surface": True}})
-    uv_modes = ["NONE", "PRESERVE_CORNERS", "PRESERVE_CORNERS_AND_JUNCTIONS",
-                "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE", "PRESERVE_BOUNDARIES", "SMOOTH_ALL"]
-    for quality, uv_mode in enumerate(uv_modes, 1):
-        cases.append({"name": f"uv_{uv_mode.lower()}", "mesh": "cube",
-                      "params": {"levels": 2, "quality": quality, "boundary_smooth": "ALL",
-                                 "uv_smooth": uv_mode, "use_creases": False,
-                                 "use_custom_normals": False, "use_limit_surface": True}})
-    for value in (0.0, 0.25, 0.5, 1.0):
-        name = f"crease_{str(value).replace('.', '_')}"
-        meshes[name] = make_mesh(grid_vertices, grid_faces, seams,
+    mixed = make_mesh([[0.0, 0.0, 0.0], [1.0, 0.0, 0.1], [1.0, 1.0, 0.2], [0.0, 1.0, 0.0],
+                       [2.0, 0.5, 0.3], [-0.9, -0.6, 0.1], [-1.4, 0.5, 0.2], [-0.7, 1.5, 0.0]],
+                      [[0, 1, 2, 3], [1, 4, 2], [0, 5, 6, 7, 3]],
+                      [(0, 1), (3, 0), (6, 7)], [(1, 2, 0.5)])
+    loose = make_mesh([[-1.0, -0.8, 0.12], [1.1, -0.8, -0.07], [1.0, 0.9, 0.21],
+                       [-0.9, 0.8, -0.16], [2.0, 0.0, 0.3], [3.0, 1.0, 0.1], [-2.0, -2.0, 0.5]],
+                      [[0, 1, 2, 3]], [(0, 1)], loose_edges=[(4, 5)])
+    # The corpus "mixed" pentagon traverses edge 3-0 in the quad's direction (non-manifold winding);
+    # "mixed_consistent" reverses it so every shared edge is traversed once each way.
+    mixed_consistent = make_mesh(mixed["vertices"], [[0, 1, 2, 3], [1, 4, 2], [3, 7, 6, 5, 0]],
+                                 [(0, 1), (3, 0), (6, 7)], [(1, 2, 0.5)])
+    meshes = {"curved_grid": grid, "quad": quad, "cube": cube, "cube_flat": cube_flat,
+              "ngon": ngon, "nonmanifold": nonmanifold, "mixed": mixed,
+              "mixed_consistent": mixed_consistent, "loose": loose}
+    for value in (0.1, 0.25, 0.5, 0.9, 1.0):
+        name = f"grid_crease_{str(value).replace('.', '_')}"
+        meshes[name] = make_mesh(grid_vertices, grid_faces, grid_seams,
                                  [(5, 6, value), (1, 2, value), (5, 9, value)])
-        cases.append({"name": name, "mesh": name,
-                      "params": {"levels": 2, "quality": 4, "boundary_smooth": "ALL",
-                                 "uv_smooth": "PRESERVE_BOUNDARIES", "use_creases": True,
-                                 "use_custom_normals": False, "use_limit_surface": True}})
-    for boundary in ("ALL", "PRESERVE_CORNERS"):
-        cases.append({"name": f"boundary_{boundary.lower()}", "mesh": "curved_grid",
-                      "params": {"levels": 2, "quality": 5, "boundary_smooth": boundary,
-                                 "uv_smooth": "PRESERVE_BOUNDARIES", "use_creases": False,
-                                 "use_custom_normals": False, "use_limit_surface": True}})
-    for name, quality in (("cube", 2), ("ngon", 3), ("nonmanifold", 6)):
-        cases.append({"name": f"topology_{name}", "mesh": name,
-                      "params": {"levels": 2, "quality": quality, "boundary_smooth": "PRESERVE_CORNERS",
-                                 "uv_smooth": "PRESERVE_CORNERS_AND_JUNCTIONS", "use_creases": True,
-                                 "use_custom_normals": False, "use_limit_surface": True}})
+    meshes["cube_crease_mix"] = make_mesh(cube_vertices, cube_faces, cube_seams,
+                                          [(0, 1, 0.3), (2, 3, 1.0), (4, 5, 0.6), (1, 2, 0.5)])
+    meshes["ngon_crease"] = make_mesh(ngon_vertices, [list(range(7))], [(0, 1), (2, 3), (4, 5)],
+                                      [(0, 1, 0.5), (3, 4, 1.0)])
+    meshes["nonmanifold_crease"] = make_mesh(meshes["nonmanifold"]["vertices"],
+                                             meshes["nonmanifold"]["faces"],
+                                             [(0, 1), (2, 3), (4, 5), (6, 7)],
+                                             [(0, 1, 0.5), (2, 3, 1.0)])
+    meshes["mixed_crease"] = make_mesh(mixed["vertices"], mixed["faces"],
+                                       [(0, 1), (3, 0), (6, 7)], [(1, 2, 0.5), (0, 3, 0.8)])
+    dependent_plus1 = make_mesh(
+        [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [-1, 1, 0],
+         [-1, 0, 0], [-1, -1, 0], [0, -1, 0], [1, -1, 0]],
+        [[0, 1, 2, 3], [0, 3, 4, 5], [0, 5, 6, 7], [0, 7, 8, 1]],
+        creases=[(0, 3, 0.5)])
+    dependent_plus1["uv_layers"] = [{
+        "name": "UVMap",
+        "values": [[0.2, 0.4], [0.37, 0.4], [0.37, 0.53], [0.2, 0.53],
+                   [0.2, 0.4], [0.2, 0.53], [0.03, 0.53], [0.03, 0.4],
+                   [2.2, 0.4], [2.03, 0.4], [2.03, 0.27], [2.2, 0.27],
+                   [2.2, 0.4], [2.2, 0.27], [2.37, 0.27], [2.37, 0.4]],
+    }]
+    meshes["dependent_uv_plus1"] = dependent_plus1
+    dependent_plus2 = make_mesh(
+        [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [-1, 1, 0],
+         [-1, 0, 0], [0, -1, 0]],
+        [[0, 1, 2, 3], [0, 3, 4, 5], [0, 5, 6, 1]],
+        creases=[(0, 3, 0.5)])
+    dependent_plus2["uv_layers"] = [{
+        "name": "UVMap",
+        "values": [[0.2, 0.4], [0.37, 0.4], [0.37, 0.53], [0.2, 0.53],
+                   [0.2, 0.4], [0.2, 0.53], [0.03, 0.53], [0.03, 0.4],
+                   [2.2, 0.4], [2.03, 0.4], [2.2, 0.27], [2.37, 0.4]],
+    }]
+    meshes["dependent_uv_plus2"] = dependent_plus2
+    return meshes
+
+
+def build_cases():
+    cases = []
+
+    def add(name, mesh, **overrides):
+        params = dict(DEFAULTS)
+        params.update(overrides)
+        cases.append({"name": name, "mesh": mesh, "params": params})
+
+    # Quadrilateral limit surface: every level and quality pairing, plus L>Q and L<Q.
+    for level in range(1, 6):
+        add(f"level_{level}_quality_{level}", "quad", levels=level, quality=level,
+            boundary_smooth="ALL", uv_smooth="SMOOTH_ALL", use_custom_normals=False)
+    add("quality_6", "quad", levels=3, quality=6, boundary_smooth="PRESERVE_CORNERS",
+        uv_smooth="SMOOTH_ALL")
+    add("quad_l3_quality_1", "quad", levels=3, quality=1, uv_smooth="SMOOTH_ALL")
+    add("quad_l1_quality_6", "quad", levels=1, quality=6, uv_smooth="SMOOTH_ALL")
+    add("quad_l4_quality_2", "quad", levels=4, quality=2, uv_smooth="SMOOTH_ALL")
+    add("quad_l5_quality_10", "quad", levels=2, quality=10, uv_smooth="SMOOTH_ALL")
+
+    # Levels zero is the identity and quality does not matter.
+    add("levels_0_cube", "cube", levels=0, quality=3)
+    add("levels_0_grid", "curved_grid", levels=0, quality=3, boundary_smooth="PRESERVE_CORNERS")
+
+    # Every uv_smooth mode on the cube (interior extraordinary vertices) and on other topology.
+    for quality, uv_mode in enumerate(UV_MODES, 1):
+        add(f"uv_{uv_mode.lower()}", "cube", levels=2, quality=quality, uv_smooth=uv_mode)
+    for mesh, quality in (("curved_grid", 2), ("ngon", 3), ("nonmanifold", 3), ("mixed", 2)):
+        for uv_mode in UV_MODES:
+            add(f"{mesh}_uv_{uv_mode.lower()}", mesh, levels=2, quality=quality, uv_smooth=uv_mode,
+                boundary_smooth="PRESERVE_CORNERS")
+
+    # Boundary rules across levels and qualities on boundary-rich topology.
+    for mesh in ("curved_grid", "mixed", "nonmanifold"):
+        for boundary in BOUNDARY_MODES:
+            for level, quality in ((1, 1), (1, 6), (3, 1), (3, 3)):
+                add(f"{mesh}_{boundary.lower()}_l{level}_q{quality}", mesh, levels=level,
+                    quality=quality, boundary_smooth=boundary, uv_smooth="PRESERVE_BOUNDARIES")
+
+    # Semi-sharp and infinite creases, crease rules across boundary modes.
+    for value in (0.1, 0.25, 0.5, 0.9, 1.0):
+        name = f"grid_crease_{str(value).replace('.', '_')}"
+        for level, quality in ((2, 4), (3, 1)):
+            add(f"{name}_l{level}_q{quality}", name, levels=level, quality=quality,
+                use_creases=True, uv_smooth="PRESERVE_BOUNDARIES")
+    add("grid_crease_preserve_corners", "grid_crease_0_5", levels=2, quality=4,
+        use_creases=True, boundary_smooth="PRESERVE_CORNERS")
+    add("cube_crease_mix_l1_q1", "cube_crease_mix", levels=1, quality=1, use_creases=True)
+    add("cube_crease_mix_l3_q2", "cube_crease_mix", levels=3, quality=2, use_creases=True)
+    add("cube_crease_mix_l2_q6", "cube_crease_mix", levels=2, quality=6, use_creases=True,
+        boundary_smooth="PRESERVE_CORNERS", uv_smooth="PRESERVE_CORNERS")
+    add("cube_crease_disabled", "cube_crease_mix", levels=2, quality=2, use_creases=False)
+
+    # Quad n-gons and triangles at several levels.
+    for level, quality in ((1, 1), (2, 3), (3, 6), (2, 1)):
+        add(f"ngon_l{level}_q{quality}", "ngon", levels=level, quality=quality)
+    add("ngon_crease_l2_q3", "ngon_crease", levels=2, quality=3, use_creases=True)
+    add("mixed_crease_l2_q2", "mixed_crease", levels=2, quality=2, use_creases=True,
+        uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")
+    add("dependent_uv_plus1_crease", "dependent_uv_plus1", levels=3, quality=3,
+        use_creases=True, uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS")
+    add("dependent_uv_plus2_crease", "dependent_uv_plus2", levels=3, quality=3,
+        use_creases=True, uv_smooth="PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE")
+    for level, quality, boundary in ((1, 1, "ALL"), (3, 2, "PRESERVE_CORNERS"), (2, 6, "ALL")):
+        add(f"mixed_consistent_l{level}_q{quality}_{boundary.lower()}", "mixed_consistent",
+            levels=level, quality=quality, boundary_smooth=boundary, uv_smooth="SMOOTH_ALL",
+            use_creases=True)
+    add("custom_normals_mixed_consistent", "mixed_consistent", levels=2, quality=2,
+        use_custom_normals=True)
+    add("nolimit_mixed_consistent_l2", "mixed_consistent", levels=2, use_limit_surface=False)
+
+    # Non-manifold fans, with and without creases.
+    for level, quality in ((1, 2), (2, 6), (3, 1)):
+        add(f"topology_nonmanifold_l{level}_q{quality}", "nonmanifold", levels=level,
+            quality=quality, boundary_smooth="PRESERVE_CORNERS",
+            uv_smooth="PRESERVE_CORNERS_AND_JUNCTIONS", use_creases=True)
+    add("nonmanifold_crease_l2_q3", "nonmanifold_crease", levels=2, quality=3, use_creases=True,
+        uv_smooth="PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE")
+
+    # Limit surface disabled: uniform refinement, quality ignored.
+    for mesh, level in (("quad", 1), ("quad", 3), ("cube", 1), ("cube", 3), ("curved_grid", 2),
+                        ("ngon", 2), ("nonmanifold", 2), ("mixed", 2)):
+        add(f"nolimit_{mesh}_l{level}", mesh, levels=level, quality=4, use_limit_surface=False,
+            uv_smooth="SMOOTH_ALL", use_creases=True)
+
+    # Custom normals with and without limit surface, on every topology class.
     for enabled in (False, True):
-        cases.append({"name": f"custom_normals_{'enabled' if enabled else 'disabled'}",
-                      "mesh": "curved_grid",
-                      "params": {"levels": 2, "quality": 4, "boundary_smooth": "ALL",
-                                 "uv_smooth": "PRESERVE_BOUNDARIES", "use_creases": False,
-                                 "use_custom_normals": enabled, "use_limit_surface": True}})
-    return meshes, cases
+        add(f"custom_normals_{'enabled' if enabled else 'disabled'}", "curved_grid", levels=2,
+            quality=4, use_custom_normals=enabled)
+    add("custom_normals_cube_l2_q2", "cube", levels=2, quality=2, use_custom_normals=True)
+    add("custom_normals_cube_nolimit", "cube", levels=2, quality=2, use_custom_normals=True,
+        use_limit_surface=False)
+    add("custom_normals_ngon", "ngon", levels=2, quality=3, use_custom_normals=True)
+    add("custom_normals_nonmanifold", "nonmanifold", levels=2, quality=3, use_custom_normals=True,
+        use_creases=True)
+    add("custom_normals_mixed", "mixed", levels=2, quality=2, use_custom_normals=True)
+    add("custom_normals_flat_faces", "cube_flat", levels=2, quality=2, use_custom_normals=True)
+
+    # Bilinear subdivision keeps linear positions and UVs.
+    for mesh, level in (("cube", 1), ("cube", 3), ("curved_grid", 2), ("ngon", 2),
+                        ("nonmanifold", 2), ("mixed", 2)):
+        add(f"simple_{mesh}_l{level}", mesh, levels=level, subdivision_type="SIMPLE",
+            uv_smooth="PRESERVE_BOUNDARIES", use_creases=True)
+    add("simple_cube_custom", "cube", levels=2, subdivision_type="SIMPLE",
+        use_custom_normals=True)
+
+    # Loose edges and vertices are carried through and split at their midpoints.
+    add("loose_l2_q2", "loose", levels=2, quality=2, use_creases=True)
+    add("loose_l1_q4", "loose", levels=1, quality=4, use_limit_surface=True)
+    add("flat_cube_l2_q3", "cube_flat", levels=2, quality=3)
+    return cases
 
 
 def output_mesh(obj, params):
     modifier = obj.modifiers.new("OracleSubdivision", "SUBSURF")
-    modifier.subdivision_type = "CATMULL_CLARK"
+    modifier.subdivision_type = params["subdivision_type"]
     modifier.levels = params["levels"]
     modifier.render_levels = params["levels"]
     modifier.quality = params["quality"]
@@ -180,7 +317,7 @@ def output_mesh(obj, params):
             face = {"v": [int(mesh.loops[index].vertex_index) for index in loops],
                     "uvs": {name: [uv[name][index] for index in loops] for name in uv},
                     "smooth": bool(polygon.use_smooth)}
-            if params["use_custom_normals"]:
+            if mesh.has_custom_normals:
                 face["normals"] = [list(mesh.corner_normals[index].vector) for index in loops]
             faces.append(face)
         return {"vertices": [list(vertex.co) for vertex in mesh.vertices], "edges": edges,
@@ -192,7 +329,7 @@ def output_mesh(obj, params):
 
 def make_object(name, spec):
     mesh = bpy.data.meshes.new(name + "Mesh")
-    mesh.from_pydata(spec["vertices"], [], spec["faces"])
+    mesh.from_pydata(spec["vertices"], [tuple(edge) for edge in spec["loose_edges"]], spec["faces"])
     mesh.update()
     seam_set = {edge_key(*edge) for edge in spec["seams"]}
     crease_values = {edge_key(*edge[:2]): float(edge[2]) for edge in spec["creases"]}
@@ -220,7 +357,8 @@ def main():
     if len(args) != 1:
         raise RuntimeError("usage: generate.py -- <oracle.json>")
     output_path = os.path.abspath(args[0])
-    meshes, cases = fixture_set()
+    meshes = fixture_set()
+    cases = build_cases()
     results = []
     for case in cases:
         obj = make_object(case["name"], meshes[case["mesh"]])
@@ -230,10 +368,12 @@ def main():
         bpy.data.objects.remove(obj, do_unlink=True)
     oracle = {"generator": "tests/fixtures/pr16_subdivision/generate.py",
               "blender_version": bpy.app.version_string, "round_digits": ROUND_DIGITS,
-              "meshes": meshes, "cases": results}
-    oracle["max_serialization_rounding_error"] = f"{max_rounding_error(oracle):.12g}"
+              "meshes": meshes, "cases": rounded(results)}
+    expected_results = [result["expected"] for result in results]
+    oracle["max_serialization_rounding_error"] = (
+        f"{max_rounding_error(expected_results):.12g}")
     with open(output_path, "w", encoding="utf-8", newline="\n") as output:
-        json.dump(rounded(oracle), output, sort_keys=True, separators=(",", ":"))
+        json.dump(oracle, output, sort_keys=True, separators=(",", ":"))
         output.write("\n")
     print(f"wrote {len(results)} subdivision cases to {output_path}")
 

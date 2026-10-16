@@ -1,4 +1,7 @@
-use std::{collections::{BTreeMap, BTreeSet}, error::Error};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    error::Error,
+};
 
 use glam::DVec3;
 use potter_core::{
@@ -16,6 +19,9 @@ const POSITION_TOLERANCE: f64 = 3.0e-6;
 const UV_TOLERANCE: f64 = 2.0e-6;
 const NORMAL_TOLERANCE: f64 = 2.0e-6;
 const CREASE_TOLERANCE: f64 = 1.0e-6;
+// Non-manifold splits put several Blender vertices at one position; vertices closer than this
+// are one position, and each position must have the same multiplicity on both sides.
+const CLUSTER_TOLERANCE: f64 = 1.0e-4;
 
 fn number(value: &Value) -> TestResult<f64> {
     value.as_f64().ok_or_else(|| "expected a number".into())
@@ -53,28 +59,246 @@ fn uv(value: &Value) -> TestResult<[f64; 2]> {
     Ok([number(&values[0])?, number(&values[1])?])
 }
 
-fn canonical_cycle(vertices: &[usize]) -> (Vec<usize>, usize) {
-    let start = (0..vertices.len())
-        .min_by_key(|offset| {
-            (0..vertices.len())
-                .map(|index| vertices[(*offset + index) % vertices.len()])
-                .collect::<Vec<_>>()
-        })
-        .expect("face cycle is non-empty");
-    let cycle = (0..vertices.len())
-        .map(|index| vertices[(start + index) % vertices.len()])
-        .collect();
-    (cycle, start)
-}
-
 fn rotated<T: Clone>(values: &[T], start: usize) -> Vec<T> {
     (0..values.len())
         .map(|index| values[(start + index) % values.len()].clone())
         .collect()
 }
 
+/// Rotates a cycle to its lexicographically smallest form. Returns the rotated cycle and the
+/// rotation applied, so per-corner data can be rotated the same way.
+fn canonical_cycle(keys: &[usize]) -> (Vec<usize>, usize) {
+    let len = keys.len();
+    let start = (0..len)
+        .min_by(|first, second| {
+            (0..len)
+                .map(|offset| keys[(first + offset) % len])
+                .cmp((0..len).map(|offset| keys[(second + offset) % len]))
+        })
+        .unwrap_or(0);
+    (rotated(keys, start), start)
+}
+
 fn edge_key(first: usize, second: usize) -> (usize, usize) {
     if first <= second { (first, second) } else { (second, first) }
+}
+
+/// One output or oracle face, with vertices as indices into its shape's point list.
+#[derive(Clone)]
+struct FaceRecord {
+    vertices: Vec<usize>,
+    smooth: bool,
+    uv: BTreeMap<String, Vec<[f64; 2]>>,
+    normals: Option<Vec<DVec3>>,
+}
+
+struct EdgeRecord {
+    vertices: [usize; 2],
+    seam: bool,
+    crease: f64,
+}
+
+/// A mesh compared by position: only point coordinates and index relations are read.
+struct Shape {
+    points: Vec<DVec3>,
+    faces: Vec<FaceRecord>,
+    edges: Vec<EdgeRecord>,
+    has_custom_normals: bool,
+}
+
+fn oracle_shape(expected: &Value) -> TestResult<Shape> {
+    let points = expected["vertices"]
+        .as_array()
+        .ok_or("oracle positions missing")?
+        .iter()
+        .map(point)
+        .collect::<TestResult<Vec<_>>>()?;
+    let faces = expected["faces"]
+        .as_array()
+        .ok_or("oracle faces missing")?
+        .iter()
+        .map(|face| -> TestResult<FaceRecord> {
+            let mut uv_layers = BTreeMap::new();
+            for (layer, corners) in face["uvs"].as_object().ok_or("oracle UV map missing")? {
+                let values = corners
+                    .as_array()
+                    .ok_or("oracle UV corners missing")?
+                    .iter()
+                    .map(uv)
+                    .collect::<TestResult<Vec<_>>>()?;
+                uv_layers.insert(layer.clone(), values);
+            }
+            let normals = match face.get("normals") {
+                Some(values) => Some(
+                    values
+                        .as_array()
+                        .ok_or("oracle custom normals missing")?
+                        .iter()
+                        .map(point)
+                        .collect::<TestResult<Vec<_>>>()?,
+                ),
+                None => None,
+            };
+            Ok(FaceRecord {
+                vertices: indices(&face["v"])?,
+                smooth: face["smooth"].as_bool().ok_or("oracle smooth flag missing")?,
+                uv: uv_layers,
+                normals,
+            })
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    let edges = expected["edges"]
+        .as_array()
+        .ok_or("oracle edges missing")?
+        .iter()
+        .map(|edge| -> TestResult<EdgeRecord> {
+            let pair = indices(&edge["v"])?;
+            if pair.len() != 2 {
+                return Err("oracle edge must reference two vertices".into());
+            }
+            Ok(EdgeRecord {
+                vertices: [pair[0], pair[1]],
+                seam: edge["seam"].as_bool().ok_or("oracle seam flag missing")?,
+                crease: number(&edge["crease"])?,
+            })
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    Ok(Shape {
+        points,
+        faces,
+        edges,
+        has_custom_normals: expected["has_custom_normals"]
+            .as_bool()
+            .ok_or("oracle custom-normal flag missing")?,
+    })
+}
+
+fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
+    let vertex_index: BTreeMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let points = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let uv_layers = mesh
+        .attributes
+        .get("blender_uv_layers")
+        .and_then(Value::as_array)
+        .ok_or("output UV layers missing")?
+        .iter()
+        .map(|layer| -> TestResult<(String, Vec<[f64; 2]>)> {
+            let name = layer["name"].as_str().ok_or("output UV layer name missing")?;
+            let values = layer["values"]
+                .as_array()
+                .ok_or("output UV values missing")?
+                .iter()
+                .map(uv)
+                .collect::<TestResult<Vec<_>>>()?;
+            Ok((name.to_owned(), values))
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    let smooth = mesh
+        .attributes
+        .get("blender_polygon_smooth")
+        .and_then(Value::as_array)
+        .ok_or("output polygon smooth flags missing")?;
+    if smooth.len() != mesh.faces.len() {
+        return Err("output smooth flag count differs from face count".into());
+    }
+    let custom = mesh
+        .attributes
+        .get("custom_normal")
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(Value::as_object);
+    let mut loop_offset = 0;
+    let mut faces = Vec::with_capacity(mesh.faces.len());
+    for (face_index, face) in mesh.faces.iter().enumerate() {
+        let vertices = face
+            .vertices
+            .iter()
+            .map(|id| {
+                vertex_index
+                    .get(id)
+                    .copied()
+                    .ok_or("output face references a missing vertex")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let end = loop_offset + vertices.len();
+        let mut uv_map = BTreeMap::new();
+        for (name, values) in &uv_layers {
+            if end > values.len() {
+                return Err(format!("UV layer {name} is shorter than face loops").into());
+            }
+            uv_map.insert(name.clone(), values[loop_offset..end].to_vec());
+        }
+        let normals = match custom {
+            Some(values) => Some(
+                values
+                    .get(&format!("f{}", face.id))
+                    .and_then(Value::as_array)
+                    .ok_or("custom normals missing for output face")?
+                    .iter()
+                    .map(point)
+                    .collect::<TestResult<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        faces.push(FaceRecord {
+            vertices,
+            smooth: smooth[face_index]
+                .as_bool()
+                .ok_or("output smooth flag is not boolean")?,
+            uv: uv_map,
+            normals,
+        });
+        loop_offset = end;
+    }
+    for (name, values) in &uv_layers {
+        if loop_offset != values.len() {
+            return Err(format!("UV layer {name} has {} loops, faces have {loop_offset}", values.len()).into());
+        }
+    }
+    let flags = mesh
+        .attributes
+        .get("blender_edge_flags")
+        .and_then(Value::as_array)
+        .ok_or("output edge flags missing")?;
+    if flags.len() != mesh.edges.len() {
+        return Err("output edge flag count differs from edge count".into());
+    }
+    let crease_values = mesh
+        .attributes
+        .get("crease_edge")
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(Value::as_object);
+    let mut edges = Vec::with_capacity(mesh.edges.len());
+    for (edge_index, edge) in mesh.edges.iter().enumerate() {
+        let mut endpoints = [0; 2];
+        for (slot, id) in edge.vertices.iter().enumerate() {
+            endpoints[slot] = *vertex_index
+                .get(id)
+                .ok_or("output edge references a missing vertex")?;
+        }
+        let crease = crease_values
+            .and_then(|values| values.get(&format!("e{}", edge.id)))
+            .map(number)
+            .transpose()?
+            .unwrap_or(0.0);
+        edges.push(EdgeRecord {
+            vertices: endpoints,
+            seam: flags[edge_index]["seam"]
+                .as_bool()
+                .ok_or("output seam flag is not boolean")?,
+            crease,
+        });
+    }
+    Ok(Shape {
+        points,
+        faces,
+        edges,
+        has_custom_normals: custom.is_some(),
+    })
 }
 
 fn input_mesh(spec: &Value) -> TestResult<Mesh> {
@@ -91,6 +315,13 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         .map(indices)
         .collect::<TestResult<Vec<_>>>()?;
     let mut mesh = Mesh::from_positions_and_faces(vertices, faces)?;
+    for loose in spec["loose_edges"].as_array().ok_or("mesh loose edges missing")? {
+        let pair = indices(loose)?;
+        if pair.len() != 2 {
+            return Err("loose edge must reference two vertices".into());
+        }
+        mesh.insert_edge([u32::try_from(pair[0])?, u32::try_from(pair[1])?])?;
+    }
 
     let seams = spec["seams"]
         .as_array()
@@ -123,7 +354,7 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
     let mut crease_values = Map::new();
     for edge in &mesh.edges {
         let endpoints = edge_key(edge.vertices[0] as usize, edge.vertices[1] as usize);
-        flags.push(json!({"sharp":false, "seam":seams.contains(&endpoints)}));
+        flags.push(json!({"sharp": false, "seam": seams.contains(&endpoints)}));
         if let Some(value) = crease_pairs.get(&endpoints) {
             crease_values.insert(format!("e{}", edge.id), json!(value));
         }
@@ -136,7 +367,7 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         .insert("blender_uv_layers".to_owned(), spec["uv_layers"].clone());
     mesh.attributes.insert(
         "crease_edge".to_owned(),
-        json!({"domain":"edge", "type":"float", "values":crease_values}),
+        json!({"domain": "edge", "type": "float", "values": crease_values}),
     );
 
     let source_normals = spec["custom_normals"]
@@ -160,17 +391,256 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
     }
     mesh.attributes.insert(
         "custom_normal".to_owned(),
-        json!({"domain":"corner", "type":"float3", "values":normal_values}),
+        json!({"domain": "corner", "type": "float3", "values": normal_values}),
     );
     Ok(mesh)
 }
 
-fn compare_case(case: &Value, spec: &Value) -> TestResult {
+/// Groups vertices whose positions coincide. Returns each vertex's cluster, each cluster's
+/// representative position, and each cluster's multiplicity.
+fn cluster_positions(points: &[DVec3]) -> (Vec<usize>, Vec<DVec3>, Vec<usize>) {
+    let cell = |point: DVec3| {
+        (
+            (point.x / CLUSTER_TOLERANCE).floor() as i64,
+            (point.y / CLUSTER_TOLERANCE).floor() as i64,
+            (point.z / CLUSTER_TOLERANCE).floor() as i64,
+        )
+    };
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    let mut representatives: Vec<DVec3> = Vec::new();
+    let mut multiplicities: Vec<usize> = Vec::new();
+    let mut assignment = Vec::with_capacity(points.len());
+    for point in points {
+        let (x, y, z) = cell(*point);
+        let mut found = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(clusters) = grid.get(&(x + dx, y + dy, z + dz)) {
+                        for &cluster in clusters {
+                            if representatives[cluster].distance(*point) <= CLUSTER_TOLERANCE {
+                                found = Some(cluster);
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let cluster = match found {
+            Some(cluster) => {
+                multiplicities[cluster] += 1;
+                cluster
+            }
+            None => {
+                representatives.push(*point);
+                multiplicities.push(1);
+                let cluster = representatives.len() - 1;
+                grid.entry((x, y, z)).or_default().push(cluster);
+                cluster
+            }
+        };
+        assignment.push(cluster);
+    }
+    (assignment, representatives, multiplicities)
+}
+
+#[derive(Default)]
+struct Errors {
+    position: f64,
+    uv: f64,
+    normal: f64,
+    crease: f64,
+}
+
+/// Compares two shapes by position. Faces match by their canonical position-cluster cycle, edges
+/// by their endpoint clusters, so the comparison does not depend on output vertex order.
+fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
+    if actual.points.len() != expected.points.len() {
+        return Err(format!(
+            "vertex count {} != {}",
+            actual.points.len(),
+            expected.points.len()
+        ));
+    }
+    if actual.faces.len() != expected.faces.len() {
+        return Err(format!("face count {} != {}", actual.faces.len(), expected.faces.len()));
+    }
+    if actual.edges.len() != expected.edges.len() {
+        return Err(format!("edge count {} != {}", actual.edges.len(), expected.edges.len()));
+    }
+    if actual.has_custom_normals != expected.has_custom_normals {
+        return Err("custom-normal layer presence differs".to_owned());
+    }
+    let (actual_clusters, actual_reps, actual_counts) = cluster_positions(&actual.points);
+    let (expected_clusters, expected_reps, expected_counts) = cluster_positions(&expected.points);
+    if actual_reps.len() != expected_reps.len() {
+        return Err(format!(
+            "distinct positions {} != {}",
+            actual_reps.len(),
+            expected_reps.len()
+        ));
+    }
+    let mut used = vec![false; expected_reps.len()];
+    let mut to_expected = vec![0; actual_reps.len()];
+    for (cluster, representative) in actual_reps.iter().enumerate() {
+        let (target, error) = expected_reps
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !used[*index])
+            .map(|(index, other)| (index, other.distance(*representative)))
+            .min_by(|first, second| first.1.total_cmp(&second.1))
+            .ok_or("no Blender position left to match")?;
+        if error > POSITION_TOLERANCE {
+            return Err(format!(
+                "output position {representative:?} has no Blender position within {POSITION_TOLERANCE:.1e} (nearest {error:.9e})"
+            ));
+        }
+        if actual_counts[cluster] != expected_counts[target] {
+            return Err(format!(
+                "position {representative:?} occurs {} times, Blender {} times",
+                actual_counts[cluster], expected_counts[target]
+            ));
+        }
+        used[target] = true;
+        to_expected[cluster] = target;
+    }
+    let mut errors = Errors::default();
+    for (index, point) in actual.points.iter().enumerate() {
+        let target = expected_reps[to_expected[actual_clusters[index]]];
+        errors.position = errors.position.max(point.distance(target));
+    }
+    if errors.position > POSITION_TOLERANCE {
+        return Err(format!(
+            "max position error {:.9e} exceeds {POSITION_TOLERANCE:.9e}",
+            errors.position
+        ));
+    }
+
+    let mut actual_faces: BTreeMap<Vec<usize>, Vec<(&FaceRecord, usize)>> = BTreeMap::new();
+    for face in &actual.faces {
+        let keys: Vec<usize> = face
+            .vertices
+            .iter()
+            .map(|vertex| to_expected[actual_clusters[*vertex]])
+            .collect();
+        let (cycle, rotation) = canonical_cycle(&keys);
+        actual_faces.entry(cycle).or_default().push((face, rotation));
+    }
+    let mut expected_faces: BTreeMap<Vec<usize>, Vec<(&FaceRecord, usize)>> = BTreeMap::new();
+    for face in &expected.faces {
+        let keys: Vec<usize> = face
+            .vertices
+            .iter()
+            .map(|vertex| expected_clusters[*vertex])
+            .collect();
+        let (cycle, rotation) = canonical_cycle(&keys);
+        expected_faces.entry(cycle).or_default().push((face, rotation));
+    }
+    if actual_faces.keys().collect::<Vec<_>>() != expected_faces.keys().collect::<Vec<_>>() {
+        return Err("canonical oriented face topology differs".to_owned());
+    }
+    for (cycle, expected_list) in &expected_faces {
+        let actual_list = &actual_faces[cycle];
+        if actual_list.len() != expected_list.len() {
+            return Err(format!("face {cycle:?} occurs {} times, Blender {}", actual_list.len(), expected_list.len()));
+        }
+        for ((actual_face, actual_rotation), (expected_face, expected_rotation)) in
+            actual_list.iter().zip(expected_list)
+        {
+            if actual_face.smooth != expected_face.smooth {
+                return Err(format!("face {cycle:?} polygon interpolation flag differs"));
+            }
+            if actual_face.uv.keys().collect::<Vec<_>>() != expected_face.uv.keys().collect::<Vec<_>>() {
+                return Err(format!("face {cycle:?} UV layer set differs"));
+            }
+            for (layer, expected_values) in &expected_face.uv {
+                let actual_values = rotated(&actual_face.uv[layer], *actual_rotation);
+                let expected_values = rotated(expected_values, *expected_rotation);
+                for (actual_uv, expected_uv) in actual_values.iter().zip(&expected_values) {
+                    errors.uv = errors
+                        .uv
+                        .max((actual_uv[0] - expected_uv[0]).abs())
+                        .max((actual_uv[1] - expected_uv[1]).abs());
+                }
+            }
+            match (&actual_face.normals, &expected_face.normals) {
+                (Some(actual_normals), Some(expected_normals)) => {
+                    let actual_normals = rotated(actual_normals, *actual_rotation);
+                    let expected_normals = rotated(expected_normals, *expected_rotation);
+                    for (actual_normal, expected_normal) in actual_normals.iter().zip(&expected_normals) {
+                        errors.normal = errors.normal.max(actual_normal.distance(*expected_normal));
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(format!("face {cycle:?} custom-normal presence differs")),
+            }
+        }
+    }
+    if errors.uv > UV_TOLERANCE {
+        return Err(format!("max corner UV error {:.9e} exceeds {UV_TOLERANCE:.9e}", errors.uv));
+    }
+    if errors.normal > NORMAL_TOLERANCE {
+        return Err(format!(
+            "max custom-normal error {:.9e} exceeds {NORMAL_TOLERANCE:.9e}",
+            errors.normal
+        ));
+    }
+
+    let mut actual_edges: BTreeMap<(usize, usize), Vec<(bool, f64)>> = BTreeMap::new();
+    for edge in &actual.edges {
+        let first = to_expected[actual_clusters[edge.vertices[0]]];
+        let second = to_expected[actual_clusters[edge.vertices[1]]];
+        actual_edges
+            .entry(edge_key(first, second))
+            .or_default()
+            .push((edge.seam, edge.crease));
+    }
+    let mut expected_edges: BTreeMap<(usize, usize), Vec<(bool, f64)>> = BTreeMap::new();
+    for edge in &expected.edges {
+        expected_edges
+            .entry(edge_key(
+                expected_clusters[edge.vertices[0]],
+                expected_clusters[edge.vertices[1]],
+            ))
+            .or_default()
+            .push((edge.seam, edge.crease));
+    }
+    if actual_edges.keys().collect::<Vec<_>>() != expected_edges.keys().collect::<Vec<_>>() {
+        return Err("canonical edge topology differs".to_owned());
+    }
+    for (key, expected_list) in &expected_edges {
+        let mut actual_list = actual_edges[key].clone();
+        let mut expected_list = expected_list.clone();
+        actual_list.sort_by(|first, second| first.partial_cmp(second).unwrap_or(std::cmp::Ordering::Equal));
+        expected_list.sort_by(|first, second| first.partial_cmp(second).unwrap_or(std::cmp::Ordering::Equal));
+        if actual_list.len() != expected_list.len() {
+            return Err(format!("edge {key:?} occurs {} times, Blender {}", actual_list.len(), expected_list.len()));
+        }
+        for ((actual_seam, actual_crease), (expected_seam, expected_crease)) in
+            actual_list.iter().zip(&expected_list)
+        {
+            if actual_seam != expected_seam {
+                return Err(format!("seam flag differs on edge {key:?}"));
+            }
+            errors.crease = errors.crease.max((actual_crease - expected_crease).abs());
+        }
+    }
+    if errors.crease > CREASE_TOLERANCE {
+        return Err(format!(
+            "max propagated crease error {:.9e} exceeds {CREASE_TOLERANCE:.9e}",
+            errors.crease
+        ));
+    }
+    Ok(errors)
+}
+
+fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
     let name = case["name"].as_str().ok_or("case name missing")?;
     let params: Map<String, Value> = serde_json::from_value(case["params"].clone())?;
     let mesh = input_mesh(spec)?;
     let modifier = Modifier {
-        id: Id::new(format!("subdivision_{name}"))?,
+        id: Id::new("subdivision_oracle")?,
         modifier_type: "subdivision".to_owned(),
         name: "Subdivision oracle".to_owned(),
         enabled: true,
@@ -179,338 +649,13 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult {
         runtime: ModifierRuntime::default(),
     };
     let actual = evaluate_modifiers(&mesh, &[modifier])?;
-    let expected = &case["expected"];
-    let expected_positions = expected["vertices"]
-        .as_array()
-        .ok_or("oracle positions missing")?
-        .iter()
-        .map(point)
-        .collect::<TestResult<Vec<_>>>()?;
-    assert_eq!(
-        actual.vertices.len(),
-        expected_positions.len(),
-        "{name}: vertex count"
-    );
-    assert_eq!(
-        actual.edges.len(),
-        expected["edges"].as_array().ok_or("oracle edges missing")?.len(),
-        "{name}: edge count"
-    );
-    assert_eq!(
-        actual.faces.len(),
-        expected["faces"].as_array().ok_or("oracle faces missing")?.len(),
-        "{name}: face count"
-    );
-
-    let mut seen_positions = vec![false; expected_positions.len()];
-    let mut actual_to_expected = Vec::with_capacity(actual.vertices.len());
-    let mut max_position_error: f64 = 0.0;
-    for vertex in &actual.vertices {
-        let (expected_index, error) = expected_positions
-            .iter()
-            .enumerate()
-            .map(|(index, position)| (index, vertex.co.distance(*position)))
-            .min_by(|first, second| first.1.total_cmp(&second.1))
-            .ok_or("oracle has no vertices")?;
-        max_position_error = max_position_error.max(error);
-        assert!(
-            !seen_positions[expected_index],
-            "{name}: two Potter vertices map to Blender vertex {expected_index}"
-        );
-        seen_positions[expected_index] = true;
-        actual_to_expected.push(expected_index);
-    }
-    assert!(seen_positions.iter().all(|seen| *seen), "{name}: missing Blender vertex");
-    assert!(
-        max_position_error <= POSITION_TOLERANCE,
-        "{name}: max position error {max_position_error:.9e} exceeds {POSITION_TOLERANCE:.9e}"
-    );
-
-    let actual_vertex_indices = actual
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect::<BTreeMap<_, _>>();
-    let expected_faces = expected["faces"].as_array().ok_or("oracle faces missing")?;
-    let mut expected_cycles = Vec::with_capacity(expected_faces.len());
-    let mut expected_smooth = BTreeMap::new();
-    let mut expected_uv = BTreeMap::new();
-    let mut expected_normals = BTreeMap::new();
-    for face in expected_faces {
-        let vertices = indices(&face["v"])?;
-        let (cycle, rotation) = canonical_cycle(&vertices);
-        expected_cycles.push(cycle.clone());
-        expected_smooth.insert(
-            cycle.clone(),
-            face["smooth"].as_bool().ok_or("oracle smooth flag missing")?,
-        );
-        let mut face_uv = BTreeMap::new();
-        for (layer, corners) in face["uvs"].as_object().ok_or("oracle UV map missing")? {
-            let values = corners
-                .as_array()
-                .ok_or("oracle UV corners missing")?
-                .iter()
-                .map(uv)
-                .collect::<TestResult<Vec<_>>>()?;
-            face_uv.insert(layer.clone(), rotated(&values, rotation));
-        }
-        expected_uv.insert(cycle.clone(), face_uv);
-        if expected["has_custom_normals"].as_bool() == Some(true) {
-            let values = face["normals"]
-                .as_array()
-                .ok_or("oracle custom normals missing")?
-                .iter()
-                .map(point)
-                .collect::<TestResult<Vec<_>>>()?;
-            expected_normals.insert(cycle, rotated(&values, rotation));
-        }
-    }
-
-    let mut actual_cycles = Vec::with_capacity(actual.faces.len());
-    let mut actual_uv = BTreeMap::new();
-    let uv_layers = actual
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("{name}: output UV layers missing"))?;
-    let mut flattened_uv = BTreeMap::new();
-    for layer in uv_layers {
-        let layer_name = layer["name"].as_str().ok_or("output UV layer name missing")?;
-        let values = layer["values"].as_array().ok_or("output UV values missing")?;
-        flattened_uv.insert(
-            layer_name.to_owned(),
-            values.iter().map(uv).collect::<TestResult<Vec<_>>>()?,
-        );
-    }
-    let mut loop_offset = 0;
-    for face in &actual.faces {
-        let vertices = face
-            .vertices
-            .iter()
-            .map(|id| {
-                let index = actual_vertex_indices
-                    .get(id)
-                    .ok_or("output face references a missing vertex")?;
-                Ok(actual_to_expected[*index])
-            })
-            .collect::<TestResult<Vec<_>>>()?;
-        let (cycle, rotation) = canonical_cycle(&vertices);
-        actual_cycles.push(cycle.clone());
-        let mut face_uv = BTreeMap::new();
-        for (layer_name, values) in &flattened_uv {
-            let end = loop_offset + face.vertices.len();
-            if end > values.len() {
-                return Err(format!("{name}: UV layer {layer_name} is shorter than face loops").into());
-            }
-            face_uv.insert(layer_name.clone(), rotated(&values[loop_offset..end], rotation));
-        }
-        actual_uv.insert(cycle, face_uv);
-        loop_offset += face.vertices.len();
-    }
-    for values in flattened_uv.values() {
-        assert_eq!(loop_offset, values.len(), "{name}: UV layer loop count");
-    }
-    expected_cycles.sort();
-    actual_cycles.sort();
-    assert_eq!(
-        actual_cycles, expected_cycles,
-        "{name}: canonical oriented face topology"
-    );
-    assert_eq!(
-        actual_uv.keys().collect::<Vec<_>>(),
-        expected_uv.keys().collect::<Vec<_>>(),
-        "{name}: UV face coverage"
-    );
-    let input_uv_names = spec["uv_layers"]
-        .as_array()
-        .ok_or("input UV layers missing")?
-        .iter()
-        .map(|layer| {
-            layer["name"]
-                .as_str()
-                .map(str::to_owned)
-                .ok_or("input UV layer name missing")
-        })
-        .collect::<TestResult<BTreeSet<_>>>()?;
-    assert_eq!(
-        flattened_uv.keys().cloned().collect::<BTreeSet<_>>(),
-        input_uv_names,
-        "{name}: UV layer names"
-    );
-
-    let mut max_uv_error: f64 = 0.0;
-    for (cycle, expected_layers) in &expected_uv {
-        let actual_layers = &actual_uv[cycle];
-        assert_eq!(actual_layers.keys().collect::<Vec<_>>(), expected_layers.keys().collect::<Vec<_>>(),
-                   "{name}: UV layers on face {cycle:?}");
-        for (layer, expected_values) in expected_layers {
-            let actual_values = &actual_layers[layer];
-            assert_eq!(actual_values.len(), expected_values.len(), "{name}: UV corner count");
-            for (actual_uv, expected_uv) in actual_values.iter().zip(expected_values) {
-                max_uv_error = max_uv_error
-                    .max((actual_uv[0] - expected_uv[0]).abs())
-                    .max((actual_uv[1] - expected_uv[1]).abs());
-            }
-        }
-    }
-    assert!(
-        max_uv_error <= UV_TOLERANCE,
-        "{name}: max corner UV error {max_uv_error:.9e} exceeds {UV_TOLERANCE:.9e}"
-    );
-
-    let actual_smooth = actual
-        .attributes
-        .get("blender_polygon_smooth")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("{name}: output polygon smooth flags missing"))?;
-    assert_eq!(actual_smooth.len(), actual.faces.len(), "{name}: smooth flag count");
-    let mut actual_smooth_by_face = BTreeMap::new();
-    for (face, smooth) in actual.faces.iter().zip(actual_smooth) {
-        let vertices = face
-            .vertices
-            .iter()
-            .map(|id| {
-                let index = actual_vertex_indices
-                    .get(id)
-                    .ok_or("output face references a missing vertex")?;
-                Ok(actual_to_expected[*index])
-            })
-            .collect::<TestResult<Vec<_>>>()?;
-        let smooth = smooth.as_bool().ok_or("output smooth flag is not boolean")?;
-        actual_smooth_by_face.insert(canonical_cycle(&vertices).0, smooth);
-    }
-    assert_eq!(
-        actual_smooth_by_face, expected_smooth,
-        "{name}: polygon interpolation flags"
-    );
-
-    let expected_edges = expected["edges"].as_array().ok_or("oracle edges missing")?;
-    let mut expected_edge_flags = BTreeMap::new();
-    for edge in expected_edges {
-        let pair = indices(&edge["v"])?;
-        if pair.len() != 2 {
-            return Err("oracle edge must reference two vertices".into());
-        }
-        expected_edge_flags.insert(
-            edge_key(pair[0], pair[1]),
-            (
-                edge["seam"].as_bool().ok_or("oracle seam flag missing")?,
-                number(&edge["crease"])?,
-            ),
-        );
-    }
-    let actual_flags = actual
-        .attributes
-        .get("blender_edge_flags")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("{name}: output edge flags missing"))?;
-    assert_eq!(actual_flags.len(), actual.edges.len(), "{name}: edge flag count");
-    let crease_values = actual
-        .attributes
-        .get("crease_edge")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object);
-    let mut actual_edge_flags = BTreeMap::new();
-    let mut max_crease_error: f64 = 0.0;
-    for (edge_index, edge) in actual.edges.iter().enumerate() {
-        let endpoints = edge.vertices.map(|id| {
-            let index = actual_vertex_indices[&id];
-            actual_to_expected[index]
-        });
-        let flags = &actual_flags[edge_index];
-        let seam = flags["seam"].as_bool().ok_or("output seam flag is not boolean")?;
-        let crease = crease_values
-            .and_then(|values| values.get(&format!("e{}", edge.id)))
-            .map(number)
-            .transpose()?
-            .unwrap_or(0.0);
-        actual_edge_flags.insert(edge_key(endpoints[0], endpoints[1]), (seam, crease));
-    }
-    assert_eq!(
-        actual_edge_flags.keys().collect::<Vec<_>>(),
-        expected_edge_flags.keys().collect::<Vec<_>>(),
-        "{name}: canonical edge topology"
-    );
-    for (edge, expected_flags) in &expected_edge_flags {
-        let actual_flags = actual_edge_flags[edge];
-        assert_eq!(actual_flags.0, expected_flags.0, "{name}: seam flag on {edge:?}");
-        max_crease_error = max_crease_error.max((actual_flags.1 - expected_flags.1).abs());
-    }
-    assert!(
-        max_crease_error <= CREASE_TOLERANCE,
-        "{name}: max propagated crease error {max_crease_error:.9e} exceeds {CREASE_TOLERANCE:.9e}"
-    );
-
-    let expected_has_custom = expected["has_custom_normals"]
-        .as_bool()
-        .ok_or("oracle custom-normal flag missing")?;
-    let actual_custom = actual
-        .attributes
-        .get("custom_normal")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object);
-    assert_eq!(
-        actual_custom.is_some(),
-        expected_has_custom,
-        "{name}: custom-normal interpolation flag"
-    );
-    if expected_has_custom {
-        let custom_values = actual_custom.ok_or("custom normals missing")?;
-        let mut actual_normals = BTreeMap::new();
-        for face in &actual.faces {
-            let vertices = face
-                .vertices
-                .iter()
-                .map(|id| {
-                    let index = actual_vertex_indices
-                        .get(id)
-                        .ok_or("output face references a missing vertex")?;
-                    Ok(actual_to_expected[*index])
-                })
-                .collect::<TestResult<Vec<_>>>()?;
-            let (cycle, rotation) = canonical_cycle(&vertices);
-            let values = custom_values
-                .get(&format!("f{}", face.id))
-                .and_then(Value::as_array)
-                .ok_or("custom normals missing for output face")?
-                .iter()
-                .map(point)
-                .collect::<TestResult<Vec<_>>>()?;
-            actual_normals.insert(cycle, rotated(&values, rotation));
-        }
-        assert_eq!(
-            actual_normals.keys().collect::<Vec<_>>(),
-            expected_normals.keys().collect::<Vec<_>>(),
-            "{name}: custom-normal face coverage"
-        );
-        let mut max_normal_error: f64 = 0.0;
-        for (cycle, expected_values) in &expected_normals {
-            let actual_values = actual_normals
-                .get(cycle)
-                .ok_or("custom-normal face missing")?;
-            assert_eq!(
-                actual_values.len(),
-                expected_values.len(),
-                "{name}: normal corner count"
-            );
-            for (actual_normal, expected_normal) in actual_values.iter().zip(expected_values) {
-                max_normal_error = max_normal_error
-                    .max((actual_normal.x - expected_normal.x).abs())
-                    .max((actual_normal.y - expected_normal.y).abs())
-                    .max((actual_normal.z - expected_normal.z).abs());
-            }
-        }
-        assert!(
-            max_normal_error <= NORMAL_TOLERANCE,
-            "{name}: max custom-normal error {max_normal_error:.9e} exceeds {NORMAL_TOLERANCE:.9e}"
-        );
-    }
-    Ok(())
+    let actual = potter_shape(&actual)?;
+    let expected = oracle_shape(&case["expected"])?;
+    compare_shapes(&actual, &expected).map_err(|message| format!("{name}: {message}").into())
 }
 
 #[test]
-fn subdivision_surface_matches_blender_522_topology_attributes_and_settings() -> TestResult {
+fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestResult {
     let oracle: Value = serde_json::from_str(ORACLE)?;
     assert_eq!(oracle["blender_version"], "5.2.2 LTS");
     assert_eq!(oracle["round_digits"], 7);
@@ -524,133 +669,204 @@ fn subdivision_surface_matches_blender_522_topology_attributes_and_settings() ->
     );
     let meshes = oracle["meshes"].as_object().ok_or("oracle mesh inputs missing")?;
     let cases = oracle["cases"].as_array().ok_or("oracle cases missing")?;
-    let levels = cases
-        .iter()
-        .map(|case| -> TestResult<u64> {
-            Ok(case["params"]["levels"].as_u64().ok_or("level missing")?)
-        })
-        .collect::<TestResult<BTreeSet<_>>>()?;
-    assert_eq!(levels, BTreeSet::from([1, 2, 3, 4, 5]));
-    let qualities = cases
-        .iter()
-        .map(|case| -> TestResult<u64> {
-            Ok(case["params"]["quality"].as_u64().ok_or("quality missing")?)
-        })
-        .collect::<TestResult<BTreeSet<_>>>()?;
-    assert_eq!(qualities, BTreeSet::from([1, 2, 3, 4, 5, 6]));
-    let uv_cases = cases
-        .iter()
-        .filter(|case| case["name"].as_str().is_some_and(|name| name.starts_with("uv_")))
-        .collect::<Vec<_>>();
-    let uv_modes = uv_cases
-        .iter()
-        .map(|case| {
-            case["name"]
-                .as_str()
-                .and_then(|name| name.strip_prefix("uv_"))
-                .unwrap_or_default()
-                .to_ascii_uppercase()
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        uv_modes,
-        BTreeSet::from([
-            "NONE".to_owned(),
-            "PRESERVE_CORNERS".to_owned(),
-            "PRESERVE_CORNERS_AND_JUNCTIONS".to_owned(),
-            "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE".to_owned(),
-            "PRESERVE_BOUNDARIES".to_owned(),
-            "SMOOTH_ALL".to_owned(),
-        ])
-    );
-    for case in &uv_cases {
-        let mode = case["name"]
-            .as_str()
-            .and_then(|name| name.strip_prefix("uv_"))
-            .ok_or("UV mode case name is malformed")?
-            .to_ascii_uppercase();
-        assert_eq!(case["params"]["uv_smooth"].as_str(), Some(mode.as_str()));
-    }
-    assert!(uv_cases.iter().all(|case| case["mesh"].as_str() == Some("cube")));
-    let boundaries = cases
-        .iter()
-        .map(|case| -> TestResult<String> {
-            Ok(case["params"]["boundary_smooth"]
-                .as_str()
-                .ok_or("boundary rule missing")?
-                .to_owned())
-        })
-        .collect::<TestResult<BTreeSet<_>>>()?;
-    assert_eq!(
-        boundaries,
-        BTreeSet::from(["ALL".to_owned(), "PRESERVE_CORNERS".to_owned()])
-    );
-    let boundary_cases = cases
-        .iter()
-        .filter(|case| case["name"].as_str().is_some_and(|name| name.starts_with("boundary_")))
-        .collect::<Vec<_>>();
-    assert_eq!(boundary_cases.len(), 2);
-    assert!(
-        boundary_cases
-            .iter()
-            .all(|case| case["mesh"].as_str() == Some("curved_grid"))
-    );
-    let topology_cases = cases
-        .iter()
-        .filter_map(|case| case["name"].as_str().filter(|name| name.starts_with("topology_")))
-        .map(|name| name.strip_prefix("topology_").expect("prefix"))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(topology_cases, BTreeSet::from(["cube", "ngon", "nonmanifold"]));
-    let custom_modes = cases
-        .iter()
-        .filter(|case| case["name"].as_str().is_some_and(|name| name.starts_with("custom_normals_")))
-        .map(|case| -> TestResult<bool> {
-            Ok(case["params"]["use_custom_normals"]
-                .as_bool()
-                .ok_or("custom-normal mode missing")?)
-        })
-        .collect::<TestResult<BTreeSet<_>>>()?;
-    assert_eq!(custom_modes, BTreeSet::from([false, true]));
-    let crease_cases = cases
-        .iter()
-        .filter(|case| case["name"].as_str().is_some_and(|name| name.starts_with("crease_")))
-        .collect::<Vec<_>>();
-    let crease_values = crease_cases
-        .iter()
-        .map(|case| -> TestResult<i64> {
-            assert_eq!(case["params"]["levels"].as_u64(), Some(2));
-            assert_eq!(case["params"]["use_creases"].as_bool(), Some(true));
-            let mesh_name = case["mesh"].as_str().ok_or("crease mesh missing")?;
-            let crease = meshes[mesh_name]["creases"]
-                .as_array()
-                .ok_or("crease inputs missing")?
-                .first()
-                .ok_or("crease input missing")?;
-            Ok((number(&crease[2])? * 100.0).round() as i64)
-        })
-        .collect::<TestResult<BTreeSet<_>>>()?;
-    assert_eq!(crease_values, BTreeSet::from([0, 25, 50, 100]));
-    let curved_grid = meshes.get("curved_grid").ok_or("curved grid missing")?;
-    let grid_positions = curved_grid["vertices"]
-        .as_array()
-        .ok_or("curved grid vertices missing")?
-        .iter()
-        .map(point)
-        .collect::<TestResult<Vec<_>>>()?;
-    let z_min = grid_positions.iter().map(|point| point.z).fold(f64::INFINITY, f64::min);
-    let z_max = grid_positions.iter().map(|point| point.z).fold(f64::NEG_INFINITY, f64::max);
-    assert!(z_max - z_min > 0.1, "curved grid must exercise non-planar geometry");
-    for name in ["curved_grid", "cube", "ngon", "nonmanifold"] {
-        assert!(
-            !meshes[name]["seams"].as_array().ok_or("seam input missing")?.is_empty(),
-            "{name} must carry seam edges"
-        );
-    }
+    assert_matrix_coverage(cases, meshes)?;
 
+    let mut failures = Vec::new();
+    let mut worst = Errors::default();
     for case in cases {
+        let case_name = case["name"].as_str().ok_or("case name missing")?;
         let mesh_name = case["mesh"].as_str().ok_or("case mesh missing")?;
         let spec = meshes.get(mesh_name).ok_or("case mesh not present in oracle")?;
-        compare_case(case, spec)?;
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compare_case(case, spec)));
+        match outcome {
+            Ok(Ok(errors)) => {
+                worst.position = worst.position.max(errors.position);
+                worst.uv = worst.uv.max(errors.uv);
+                worst.normal = worst.normal.max(errors.normal);
+                worst.crease = worst.crease.max(errors.crease);
+            }
+            Ok(Err(error)) => failures.push(format!("{case_name}: {error}")),
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                    .unwrap_or_default();
+                failures.push(format!("{case_name}: {message}"));
+            }
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "{} of {} oracle cases failed:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+    eprintln!(
+        "subdivision corpus: {} cases; worst position {:.3e}, UV {:.3e}, normal {:.3e}, crease {:.3e}",
+        cases.len(),
+        worst.position,
+        worst.uv,
+        worst.normal,
+        worst.crease
+    );
+    Ok(())
+}
+
+/// Measures which settings, mesh classes, and crease inputs the corpus exercises. A missing
+/// combination fails the test, so the corpus cannot silently narrow.
+fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestResult {
+    let mut levels = BTreeSet::new();
+    let mut qualities = BTreeSet::new();
+    let mut uv_modes = BTreeSet::new();
+    let mut boundary_modes = BTreeSet::new();
+    let mut uv_boundary_pairs = BTreeSet::new();
+    let mut limit_settings = BTreeSet::new();
+    let mut subdivision_types = BTreeSet::new();
+    let mut crease_settings = BTreeSet::new();
+    let mut crease_dependent_uv_modes = BTreeSet::new();
+    let mut custom_normal_settings = BTreeSet::new();
+    let mut used_meshes = BTreeSet::new();
+    let mut crease_values = BTreeSet::new();
+    let mut cube_above_quality = false;
+    for case in cases {
+        let params = &case["params"];
+        let level = params["levels"].as_u64().ok_or("levels missing")?;
+        let quality = params["quality"].as_u64().ok_or("quality missing")?;
+        let uv = params["uv_smooth"].as_str().ok_or("uv_smooth missing")?.to_owned();
+        let boundary = params["boundary_smooth"]
+            .as_str()
+            .ok_or("boundary rule missing")?
+            .to_owned();
+        let mesh = case["mesh"].as_str().ok_or("case mesh missing")?;
+        let limit = params["use_limit_surface"]
+            .as_bool()
+            .ok_or("limit flag missing")?;
+        levels.insert(level);
+        qualities.insert(quality);
+        uv_boundary_pairs.insert((uv.clone(), boundary.clone()));
+        if uv == "PRESERVE_CORNERS_AND_JUNCTIONS"
+            || uv == "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE"
+        {
+            if params["use_creases"].as_bool() == Some(true) {
+                crease_dependent_uv_modes.insert(uv.clone());
+            }
+        }
+        uv_modes.insert(uv);
+        boundary_modes.insert(boundary);
+        limit_settings.insert(limit);
+        subdivision_types.insert(
+            params["subdivision_type"]
+                .as_str()
+                .ok_or("type missing")?
+                .to_owned(),
+        );
+        crease_settings.insert(params["use_creases"].as_bool().ok_or("crease flag missing")?);
+        custom_normal_settings.insert(
+            params["use_custom_normals"]
+                .as_bool()
+                .ok_or("custom-normal flag missing")?,
+        );
+        cube_above_quality |= mesh == "cube" && limit && level > quality;
+        used_meshes.insert(mesh.to_owned());
+        let mesh_spec = meshes.get(mesh).ok_or("case mesh not present in oracle")?;
+        for crease in mesh_spec["creases"]
+            .as_array()
+            .ok_or("crease inputs missing")?
+        {
+            crease_values.insert((number(&crease[2])? * 100.0).round() as i64);
+        }
+    }
+    assert_eq!(levels, BTreeSet::from([0, 1, 2, 3, 4, 5]), "levels");
+    assert_eq!(qualities, BTreeSet::from([1, 2, 3, 4, 5, 6, 10]), "qualities");
+    let all_uv_modes = [
+        "NONE",
+        "PRESERVE_CORNERS",
+        "PRESERVE_CORNERS_AND_JUNCTIONS",
+        "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE",
+        "PRESERVE_BOUNDARIES",
+        "SMOOTH_ALL",
+    ];
+    assert_eq!(
+        uv_modes,
+        all_uv_modes
+            .iter()
+            .map(|mode| (*mode).to_owned())
+            .collect(),
+        "uv_smooth modes"
+    );
+    assert_eq!(
+        boundary_modes,
+        BTreeSet::from(["ALL".to_owned(), "PRESERVE_CORNERS".to_owned()]),
+        "boundary_smooth modes"
+    );
+    assert_eq!(
+        uv_boundary_pairs.len(),
+        all_uv_modes.len() * 2,
+        "uv_smooth x boundary_smooth pairs"
+    );
+    assert_eq!(limit_settings, BTreeSet::from([false, true]), "use_limit_surface");
+    assert_eq!(
+        subdivision_types,
+        BTreeSet::from(["CATMULL_CLARK".to_owned(), "SIMPLE".to_owned()]),
+        "subdivision types"
+    );
+    assert_eq!(crease_settings, BTreeSet::from([false, true]), "use_creases");
+    assert_eq!(
+        custom_normal_settings,
+        BTreeSet::from([false, true]),
+        "use_custom_normals"
+    );
+    assert_eq!(
+        crease_values,
+        BTreeSet::from([10, 25, 30, 50, 60, 75, 80, 90, 100]),
+        "crease input values"
+    );
+    assert_eq!(
+        crease_dependent_uv_modes,
+        BTreeSet::from([
+            "PRESERVE_CORNERS_AND_JUNCTIONS".to_owned(),
+            "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE".to_owned(),
+        ]),
+        "dependent UV corner-sharpness modes with creases"
+    );
+    assert!(
+        cube_above_quality,
+        "a limit-surface cube must run with levels above quality"
+    );
+    for mesh in [
+        "quad",
+        "cube",
+        "cube_flat",
+        "ngon",
+        "nonmanifold",
+        "mixed",
+        "mixed_consistent",
+        "dependent_uv_plus1",
+        "dependent_uv_plus2",
+        "loose",
+        "curved_grid",
+    ] {
+        assert!(used_meshes.contains(mesh), "{mesh} must be in the corpus");
+    }
+    for mesh in ["curved_grid", "cube", "ngon", "nonmanifold", "mixed"] {
+        let seams = meshes[mesh]["seams"]
+            .as_array()
+            .ok_or("seam input missing")?;
+        assert!(!seams.is_empty(), "{mesh} must carry seam edges");
+    }
+    let loose_edges = meshes["loose"]["loose_edges"]
+        .as_array()
+        .ok_or("loose edges missing")?;
+    assert!(!loose_edges.is_empty(), "loose mesh must carry a loose edge");
+    let flat = meshes["cube_flat"]["smooth"]
+        .as_array()
+        .ok_or("smooth flags missing")?;
+    assert!(
+        flat.iter().any(|flag| flag.as_bool() == Some(false)),
+        "flat faces must be in the corpus"
+    );
     Ok(())
 }
