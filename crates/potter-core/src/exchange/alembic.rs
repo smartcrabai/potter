@@ -2561,7 +2561,9 @@ pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
-    /// Every UV layer of the sample, in file order, named as Blender names it.
+    /// Whether face counts or indices have multiple nonconstant Alembic samples.
+    pub connectivity_is_animated: bool,
+    /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
     pub colors: Option<(String, Vec<Vec<f64>>)>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
@@ -2576,6 +2578,12 @@ pub(crate) struct MeshCacheSample {
 /// # Errors
 ///
 /// Returns import errors for malformed archives or paths without a `PolyMesh`.
+fn cache_connectivity_is_animated(counts: &ParsedProperty, indices: &ParsedProperty) -> bool {
+    [counts, indices]
+        .into_iter()
+        .any(|property| property.sample_count > 1 && !property.constant)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "decoding one cache sample set needs coordinated topology, geom-parameter, and time-sampling validation"
@@ -2623,6 +2631,7 @@ pub(crate) fn read_mesh_cache(
         .ok_or_else(|| import_error("Alembic PolyMesh .faceCounts array is missing"))?;
     let indices = property(&geom.children, ".faceIndices")
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
+    let connectivity_is_animated = cache_connectivity_is_animated(counts, indices);
     let uv = if read_uv {
         uv_geom_parameters(geom)
     } else {
@@ -2769,6 +2778,7 @@ pub(crate) fn read_mesh_cache(
         )?;
         result.push(MeshCacheSample {
             time_seconds: sample_time,
+            connectivity_is_animated,
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,
@@ -4365,5 +4375,63 @@ mod tests {
         assert_eq!(child.parent.as_ref(), Some(&parent_id));
         assert_eq!(child.transform.translation, [0.0, 3.0, 0.0]);
         Ok(())
+    }
+
+    #[test]
+    fn color_and_generic_attributes_are_losses_not_refusals() -> Result<()> {
+        let mut mesh = crate::exchange::test_support::triangle_with_attributes()?;
+        mesh.attributes.insert(
+            "seam".to_owned(),
+            serde_json::json!({"domain": "edge", "type": "bool", "values": {}}),
+        );
+        // Sampling never refuses; strict export refuses on the losses from `attribute_losses`.
+        assert!(mesh_sample(&mesh).is_ok());
+        let losses = crate::exchange::mesh_attribute_losses("alembic", "triangle", &mesh);
+        assert!(losses.iter().any(|loss| loss.feature_id == "mesh.color_attribute"));
+        assert!(losses.iter().any(|loss| loss.reason.contains("mesh attribute `weight`")));
+        assert!(losses.iter().any(|loss| loss.reason.contains("mesh attribute `seam`")));
+        assert!(losses.iter().all(|loss| !loss.reason.contains("alembic_normals")));
+        Ok(())
+    }
+
+    #[test]
+    fn constant_topology_properties_keep_the_static_reader_shortcut() {
+        let property = |name: &str, sample_count, constant| ParsedProperty {
+            name: name.to_owned(),
+            property_type: 2,
+            pod: 6,
+            extent: 1,
+            sample_count,
+            first_changed: if constant { 0 } else { 1 },
+            last_changed: if constant { 0 } else { sample_count.saturating_sub(1) },
+            constant,
+            time_sampling_index: 0,
+            metadata: BTreeMap::new(),
+            children: Vec::new(),
+            samples: Vec::new(),
+        };
+        let constant_counts = property(".faceCounts", 4, true);
+        let constant_indices = property(".faceIndices", 4, true);
+        assert!(!cache_connectivity_is_animated(
+            &constant_counts,
+            &constant_indices
+        ));
+
+        let changing_indices = property(".faceIndices", 4, false);
+        assert!(cache_connectivity_is_animated(
+            &constant_counts,
+            &changing_indices
+        ));
+        let changing_counts = property(".faceCounts", 4, false);
+        assert!(cache_connectivity_is_animated(
+            &changing_counts,
+            &constant_indices
+        ));
+
+        let single_sample_indices = property(".faceIndices", 1, true);
+        assert!(!cache_connectivity_is_animated(
+            &constant_counts,
+            &single_sample_indices
+        ));
     }
 }
