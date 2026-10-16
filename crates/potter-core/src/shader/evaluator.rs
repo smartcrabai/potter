@@ -9,7 +9,10 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     graph::{GraphKind, GraphNode, NodeGroup},
-    image::{ImageData, ImageInterpolation, sample_with_interpolation},
+    image::{
+        ImageData, ImageExtension, ImageInterpolation, sample_with_extension,
+        sample_with_interpolation,
+    },
     model::{Id, Material, Registry, TextureRef},
 };
 
@@ -187,17 +190,93 @@ impl BsdfParams {
     }
 }
 
+/// The UV layers of the triangle a hit lies on, borrowed from the render geometry.
+///
+/// Layer `index` is `names[index]`, with corner values `corners[index]`. A layer's UV at the hit
+/// blends those corners by `barycentric`, so every layer shares the hit's position on the triangle.
+/// Moving the hit therefore moves each layer by its own UV derivative: the per-layer change is the
+/// affine map between the layer's corner values and the triangle.
+#[derive(Clone, Copy, Debug)]
+pub struct HitUvLayers<'a> {
+    /// Layer names in mesh order. A name resolves to its index by a search of this slice.
+    pub names: &'a [String],
+    /// Corner `[u, v]` values of the triangle for each layer, in `names` order.
+    pub corners: &'a [[[f64; 2]; 3]],
+    /// Corner positions of the triangle.
+    pub positions: [DVec3; 3],
+    /// Barycentric weights of the hit over `positions`.
+    pub barycentric: [f64; 3],
+    /// Index of the render layer; `None` when the object has no UV layer.
+    pub render: Option<usize>,
+    /// Source-member layers actually available; `None` preserves ordinary-mesh name resolution.
+    pub available_mask: Option<u8>,
+}
+
+impl HitUvLayers<'_> {
+    /// The UV of layer `index` at the hit; `None` when the layer has no corner values.
+    #[must_use]
+    pub fn uv(&self, index: usize) -> Option<[f64; 2]> {
+        let corners = self.corners.get(index)?;
+        let weights = self.barycentric;
+        Some([
+            corners[0][0] * weights[0] + corners[1][0] * weights[1] + corners[2][0] * weights[2],
+            corners[0][1] * weights[0] + corners[1][1] * weights[1] + corners[2][1] * weights[2],
+        ])
+    }
+
+    /// `dP/du` and `dP/dv` of layer `index` on the hit triangle, or `None` when its corner UVs are
+    /// degenerate.
+    fn derivatives(&self, index: usize) -> Option<(DVec3, DVec3)> {
+        let corners = self.corners.get(index)?;
+        let [origin, second, third] = self.positions;
+        let (edge1, edge2) = (second - origin, third - origin);
+        let uv1 = [corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]];
+        let uv2 = [corners[2][0] - corners[0][0], corners[2][1] - corners[0][1]];
+        let determinant = uv1[0] * uv2[1] - uv1[1] * uv2[0];
+        if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+            return None;
+        }
+        let du = (edge1 * uv2[1] - edge2 * uv1[1]) / determinant;
+        let dv = (edge2 * uv1[0] - edge1 * uv2[0]) / determinant;
+        (du.is_finite() && dv.is_finite()).then_some((du, dv))
+    }
+
+    /// The barycentric weights of the point `offset` away from the hit, moved within the triangle's
+    /// plane. A degenerate triangle keeps the hit's weights, so its UVs do not move.
+    fn shifted_barycentric(&self, offset: DVec3) -> [f64; 3] {
+        let [origin, second, third] = self.positions;
+        let (edge1, edge2) = (second - origin, third - origin);
+        let (a11, a12, a22) = (edge1.dot(edge1), edge1.dot(edge2), edge2.dot(edge2));
+        let determinant = a11 * a22 - a12 * a12;
+        if !determinant.is_finite() || determinant <= f64::EPSILON * a11 * a22 {
+            return self.barycentric;
+        }
+        let (r1, r2) = (offset.dot(edge1), offset.dot(edge2));
+        let s1 = (a22 * r1 - a12 * r2) / determinant;
+        let s2 = (a11 * r2 - a12 * r1) / determinant;
+        let [b0, b1, b2] = self.barycentric;
+        [b0 - s1 - s2, b1 + s1, b2 + s2]
+    }
+
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.names
+            .iter()
+            .position(|candidate| candidate.as_str() == name)
+    }
+}
+
 /// Per-hit coordinates and graph context used by procedural shader nodes.
 #[derive(Clone, Copy, Debug)]
 pub struct HitContext<'a> {
     pub node_groups: &'a Registry<NodeGroup>,
     /// Resolved linear image buffers keyed by their persistent image ID.
     pub image_data: Option<&'a BTreeMap<String, ImageData>>,
+    /// The render-layer UV at the hit. Without `uv_layers` it is the only UV.
     pub uv: [f64; 2],
-    pub uv_maps: Option<&'a [(&'a str, [f64; 2])]>,
+    /// The UV layers of the hit triangle; `None` when only `uv` is known.
+    pub uv_layers: Option<HitUvLayers<'a>>,
     /// Sink for `uv.layer_missing` warnings; see [`HitContext::with_warnings`].
     pub warnings: Option<&'a RefCell<Vec<JsonValue>>>,
-    pub tangent_frame: Option<(DVec3, DVec3)>,
     pub generated: DVec3,
     pub position: DVec3,
     pub object: DVec3,
@@ -218,9 +297,8 @@ impl<'a> HitContext<'a> {
             image_data: None,
             node_groups,
             uv: [0.0; 2],
-            uv_maps: None,
+            uv_layers: None,
             warnings: None,
-            tangent_frame: None,
             generated: DVec3::ZERO,
             position: DVec3::ZERO,
             object: DVec3::ZERO,
@@ -238,23 +316,16 @@ impl<'a> HitContext<'a> {
         self
     }
 
-    /// Provide per-hit UV coordinates by authored layer name without copying the map.
+    /// Attach the UV layers of the hit triangle. Named layers resolve against them, and normal maps
+    /// take their frames from them.
     #[must_use]
-    pub const fn with_uv_maps(mut self, uv_maps: &'a [(&'a str, [f64; 2])]) -> Self {
-        self.uv_maps = Some(uv_maps);
+    pub const fn with_uv_layers(mut self, layers: HitUvLayers<'a>) -> Self {
+        self.uv_layers = Some(layers);
         self
     }
 
-    /// Collect `uv.layer_missing` warnings raised while evaluating this hit. Without a sink the
-    /// render UV is still used, but the warning is not recorded.
-    #[must_use]
-    pub const fn with_warnings(mut self, warnings: &'a RefCell<Vec<JsonValue>>) -> Self {
-        self.warnings = Some(warnings);
-        self
-    }
-
-    /// Provide the per-hit color of each color layer by name, plus the render layer's color. A
-    /// layer that is not listed reads as opaque black, with a `mesh.color_layer_missing` warning.
+    /// Provide the per-hit color of each color layer by name, plus the render layer's color.
+    /// Missing layers read opaque black and record a `mesh.color_layer_missing` warning.
     #[must_use]
     pub const fn with_color_layers(
         mut self,
@@ -266,26 +337,39 @@ impl<'a> HitContext<'a> {
         self
     }
 
-    /// Provide the per-hit tangent and bitangent for tangent-space normal mapping.
+
+    /// Collect `uv.layer_missing` warnings raised while evaluating this hit. Without a sink, the
+    /// render UV is still used but the warning is not recorded.
     #[must_use]
-    pub const fn with_tangent_frame(mut self, tangent: DVec3, bitangent: DVec3) -> Self {
-        self.tangent_frame = Some((tangent, bitangent));
+    pub const fn with_warnings(mut self, warnings: &'a RefCell<Vec<JsonValue>>) -> Self {
+        self.warnings = Some(warnings);
         self
+    }
+
+    /// This hit moved by one finite-difference step. With UV layers every layer is re-blended at
+    /// the moved position; without them only `uv` moves, by the step's UV change.
+    fn shifted(&self, step: SurfaceStep) -> Self {
+        let mut shifted = *self;
+        shifted.generated += step.world;
+        shifted.position += step.world;
+        shifted.object += step.world;
+        if let Some(layers) = self.uv_layers {
+            let moved = HitUvLayers {
+                barycentric: layers.shifted_barycentric(step.world),
+                ..layers
+            };
+            shifted.uv_layers = Some(moved);
+            if let Some(uv) = moved.render.and_then(|index| moved.uv(index)) {
+                shifted.uv = uv;
+            }
+        } else {
+            shifted.uv[0] += step.uv[0];
+            shifted.uv[1] += step.uv[1];
+        }
+        shifted
     }
 }
 
-/// Writes `(layer name, UV)` pairs into `table` in layer order and returns the filled prefix, ready
-/// for [`HitContext::with_uv_maps`]. Nothing is allocated.
-///
-/// # Errors
-///
-/// Returns `LIMIT_EXCEEDED` when there are more layers than `table` holds.
-pub fn fill_uv_maps<'a, 'n>(
-    table: &'a mut [(&'n str, [f64; 2])],
-    maps: impl IntoIterator<Item = (&'n str, [f64; 2])>,
-) -> Result<&'a [(&'n str, [f64; 2])]> {
-    fill_named(table, maps)
-}
 
 /// Writes `(layer name, color)` pairs into `table` in layer order, ready for
 /// [`HitContext::with_color_layers`]. Nothing is allocated.
@@ -489,20 +573,23 @@ fn apply_material_textures(
         return Ok(());
     }
     if let Some(texture) = &material.base_color_texture {
-        let pixel = sample_material_texture(texture, hit_ctx)?;
+        let pixel = sample_material_texture(texture, hit_ctx, texture_layer(hit_ctx, texture))?;
         for (channel, texel) in params.base_color[..3].iter_mut().zip(pixel) {
             *channel *= texel;
         }
         params.alpha *= pixel[3];
     }
     if let Some(texture) = &material.roughness_texture {
-        params.roughness *= sample_material_texture(texture, hit_ctx)?[0];
+        let layer = texture_layer(hit_ctx, texture);
+        params.roughness *= sample_material_texture(texture, hit_ctx, layer)?[0];
     }
     if let Some(texture) = &material.metallic_texture {
-        params.metallic *= sample_material_texture(texture, hit_ctx)?[0];
+        let layer = texture_layer(hit_ctx, texture);
+        params.metallic *= sample_material_texture(texture, hit_ctx, layer)?[0];
     }
     if let Some(texture) = &material.normal_texture {
-        let pixel = sample_material_texture(texture, hit_ctx)?;
+        let layer = texture_layer(hit_ctx, texture);
+        let pixel = sample_material_texture(texture, hit_ctx, layer)?;
         let tangent_normal = normalize_or(
             DVec3::new(
                 pixel[0] * 2.0 - 1.0,
@@ -512,7 +599,7 @@ fn apply_material_textures(
             DVec3::Z,
         );
         let normal = normalize_or(params.normal, hit_ctx.normal);
-        let (tangent, bitangent) = tangent_basis_for_hit(hit_ctx, normal);
+        let (tangent, bitangent) = layer_frame(hit_ctx, layer, normal);
         params.normal = normalize_or(
             tangent * tangent_normal.x + bitangent * tangent_normal.y + normal * tangent_normal.z,
             normal,
@@ -525,7 +612,11 @@ fn apply_material_textures(
     Ok(())
 }
 
-fn sample_material_texture(texture: &TextureRef, hit_ctx: &HitContext<'_>) -> Result<[f64; 4]> {
+fn sample_material_texture(
+    texture: &TextureRef,
+    hit_ctx: &HitContext<'_>,
+    layer: Option<usize>,
+) -> Result<[f64; 4]> {
     let image_id = texture.image.as_str();
     let images = hit_ctx.image_data.ok_or_else(|| {
         PotError::with_details(
@@ -541,10 +632,7 @@ fn sample_material_texture(texture: &TextureRef, hit_ctx: &HitContext<'_>) -> Re
             json!({"image_id":image_id}),
         )
     })?;
-    let uv = texture
-        .uv_layer
-        .as_deref()
-        .map_or(hit_ctx.uv, |layer| named_uv(hit_ctx, layer));
+    let uv = layer_uv(hit_ctx, layer);
     let tile = if image.tiles.is_empty() { 0 } else { 1001 };
     let pixel = sample_with_interpolation(image, uv, tile, texture.interpolation);
     if pixel.iter().any(|component| !component.is_finite()) {
@@ -859,7 +947,7 @@ impl Evaluator<'_, '_, '_, '_> {
         let uv = self.vector_input(
             id,
             &["Vector"],
-            DVec3::new(self.hit_ctx.uv[0], self.hit_ctx.uv[1], 0.0),
+            DVec3::new(self.hit_ctx.uv[0], 1.0 - self.hit_ctx.uv[1], 0.0),
         )?;
         let node = self.node(id)?;
         let image_id = node
@@ -908,7 +996,21 @@ impl Evaluator<'_, '_, '_, '_> {
             }
             None => image.interpolation,
         };
-        let pixel = sample_with_interpolation(image, [uv.x, uv.y], tile, interpolation);
+        let extension = match node.properties.get("extension").and_then(JsonValue::as_str) {
+            None | Some("REPEAT") => ImageExtension::Repeat,
+            Some("EXTEND") => ImageExtension::Extend,
+            Some("CLIP") => ImageExtension::Clip,
+            Some("MIRROR") => ImageExtension::Mirror,
+            Some(extension) => {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    format!("Image Texture extension `{extension}` is not supported"),
+                    json!({"feature_id":"shader.node.ShaderNodeTexImage.extension","node_id":id,"extension":extension}),
+                ));
+            }
+        };
+        let pixel =
+            sample_with_extension(image, [uv.x, 1.0 - uv.y], tile, interpolation, extension);
         if pixel.iter().any(|component| !component.is_finite()) {
             return Err(eval_error(format!(
                 "Image Texture node `{id}` sampled non-finite pixels"
@@ -934,20 +1036,8 @@ impl Evaluator<'_, '_, '_, '_> {
         if strength.abs() <= f64::EPSILON || distance.abs() <= f64::EPSILON {
             return Ok(Value::Vector(normal));
         }
-        let (tangent_u, tangent_v) = tangent_basis_for_hit(self.hit_ctx, normal);
-        let epsilon = 1.0e-3;
-        let mut plus_u = *self.hit_ctx;
-        let mut minus_u = *self.hit_ctx;
-        let mut plus_v = *self.hit_ctx;
-        let mut minus_v = *self.hit_ctx;
-        offset_context(&mut plus_u, 0, tangent_u, epsilon);
-        offset_context(&mut minus_u, 0, tangent_u, -epsilon);
-        offset_context(&mut plus_v, 1, tangent_v, epsilon);
-        offset_context(&mut minus_v, 1, tangent_v, -epsilon);
-        let derivative_u =
-            (self.height_at(id, &plus_u)? - self.height_at(id, &minus_u)?) / (2.0 * epsilon);
-        let derivative_v =
-            (self.height_at(id, &plus_v)? - self.height_at(id, &minus_v)?) / (2.0 * epsilon);
+        let gradient =
+            height_gradient(self.hit_ctx, normal, |context| self.height_at(id, context))?;
         let invert = self
             .node(id)?
             .properties
@@ -955,8 +1045,7 @@ impl Evaluator<'_, '_, '_, '_> {
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
         let sign = if invert { -1.0 } else { 1.0 };
-        let perturbed = normal
-            - (tangent_u * derivative_u + tangent_v * derivative_v) * (strength * distance * sign);
+        let perturbed = normal - gradient * (strength * distance * sign);
         Ok(Value::Vector(normalize_or(perturbed, normal)))
     }
 
@@ -1296,9 +1385,31 @@ impl Evaluator<'_, '_, '_, '_> {
         let location = self.vector_input(id, &["Location"], DVec3::ZERO)?;
         let rotation = self.vector_input(id, &["Rotation"], DVec3::ZERO)?;
         let scale = self.vector_input(id, &["Scale"], DVec3::ONE)?;
-        let mapped = location
-            + DQuat::from_euler(EulerRot::XYZ, rotation.x, rotation.y, rotation.z)
-                * (vector * scale);
+        let rotation = DQuat::from_euler(EulerRot::XYZ, rotation.x, rotation.y, rotation.z);
+        let vector_type = self
+            .node(id)?
+            .properties
+            .get("vector_type")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("POINT");
+        let mapped = match vector_type {
+            "POINT" => location + rotation * (vector * scale),
+            "VECTOR" => rotation * (vector * scale),
+            "TEXTURE" | "NORMAL" => {
+                if scale.x == 0.0 || scale.y == 0.0 || scale.z == 0.0 {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("Mapping:{vector_type}:zero_scale"),
+                    ));
+                }
+                if vector_type == "TEXTURE" {
+                    rotation.conjugate() * (vector - location) / scale
+                } else {
+                    (rotation * (vector / scale)).normalize_or_zero()
+                }
+            }
+            other => return Err(unsupported_node(id, &format!("Mapping:{other}"))),
+        };
         match socket {
             "Vector" => Ok(Value::Vector(mapped)),
             _ => Err(invalid(format!("unknown Mapping output `{socket}`"))),
@@ -1319,7 +1430,10 @@ impl Evaluator<'_, '_, '_, '_> {
     fn tex_coord(&self, socket: &str) -> Result<Value> {
         let value = match socket {
             "Generated" => self.hit_ctx.generated,
-            "UV" => DVec3::new(self.hit_ctx.uv[0], self.hit_ctx.uv[1], 0.0),
+            "UV" => {
+                let uv = storage_to_blender_uv(self.hit_ctx.uv);
+                DVec3::new(uv[0], uv[1], 0.0)
+            }
             "Object" => self.hit_ctx.object,
             "Normal" => self.hit_ctx.normal,
             "Position" => self.hit_ctx.position,
@@ -1340,12 +1454,11 @@ impl Evaluator<'_, '_, '_, '_> {
         if socket != "UV" {
             return Err(invalid(format!("unknown UV Map output `{socket}`")));
         }
-        let uv = node
-            .properties
-            .get("uv_map")
-            .and_then(JsonValue::as_str)
-            .filter(|layer| !layer.is_empty())
-            .map_or(self.hit_ctx.uv, |layer| named_uv(self.hit_ctx, layer));
+        let layer = layer_index(
+            self.hit_ctx,
+            node.properties.get("uv_map").and_then(JsonValue::as_str),
+        );
+        let uv = storage_to_blender_uv(layer_uv(self.hit_ctx, layer));
         Ok(Value::Vector(DVec3::new(uv[0], uv[1], 0.0)))
     }
 
@@ -1369,7 +1482,13 @@ impl Evaluator<'_, '_, '_, '_> {
             color[2] * 2.0 - 1.0,
         );
         let base_normal = normalize_or(self.hit_ctx.normal, DVec3::Z);
-        let (tangent_u, tangent_v) = tangent_basis_for_hit(self.hit_ctx, base_normal);
+        let uv_map = self
+            .node(id)?
+            .properties
+            .get("uv_map")
+            .and_then(JsonValue::as_str);
+        let layer = layer_index(self.hit_ctx, uv_map);
+        let (tangent_u, tangent_v) = blender_layer_frame(self.hit_ctx, layer, base_normal);
         let mapped_normal = normalize_or(
             tangent_u * tangent_normal.x
                 + tangent_v * tangent_normal.y
@@ -1478,13 +1597,6 @@ impl Evaluator<'_, '_, '_, '_> {
             }
         })
     }
-}
-
-fn offset_context(context: &mut HitContext<'_>, axis: usize, direction: DVec3, distance: f64) {
-    context.uv[axis] += distance;
-    context.generated += direction * distance;
-    context.position += direction * distance;
-    context.object += direction * distance;
 }
 
 fn socket_default(node: &GraphNode, socket: &str) -> JsonValue {
@@ -1626,17 +1738,171 @@ fn tangent_basis(normal: DVec3) -> (DVec3, DVec3) {
     (tangent_u, tangent_v)
 }
 
-fn tangent_basis_for_hit(hit_ctx: &HitContext<'_>, normal: DVec3) -> (DVec3, DVec3) {
+/// Index of the layer that a reference names. `None` and the empty name select the render layer.
+/// A name absent from the source member (including a layer contributed by another joined member)
+/// falls back to the render layer and records `uv.layer_missing`.
+fn layer_index(hit_ctx: &HitContext<'_>, layer: Option<&str>) -> Option<usize> {
+    let render = hit_ctx.uv_layers.and_then(|layers| layers.render);
+    let Some(name) = layer.filter(|name| !name.is_empty()) else {
+        return render;
+    };
+    if let Some(index) = hit_ctx.uv_layers.and_then(|layers| layers.index_of(name))
+        && hit_ctx
+            .uv_layers
+            .and_then(|layers| layers.available_mask)
+            .is_none_or(|mask| index < 8 && mask & (1_u8 << index) != 0)
+    {
+        return Some(index);
+    }
+    if let Some(warnings) = hit_ctx.warnings {
+        let warning = json!({
+            "code": "uv.layer_missing",
+            "message": format!("UV layer `{name}` is not on this mesh; the render layer was used"),
+            "layer": name,
+        });
+        let mut recorded = warnings.borrow_mut();
+        if !recorded.contains(&warning) {
+            recorded.push(warning);
+        }
+    }
+    render
+}
+
+/// The UV at the hit of layer `index`, or the render `uv` when there is no such layer.
+fn layer_uv(hit_ctx: &HitContext<'_>, index: Option<usize>) -> [f64; 2] {
+    index
+        .and_then(|index| hit_ctx.uv_layers.and_then(|layers| layers.uv(index)))
+        .unwrap_or(hit_ctx.uv)
+}
+/// Converts the canonical V-down coordinates to the V-up coordinates used by Blender shader
+/// graph UV sources.
+fn storage_to_blender_uv(uv: [f64; 2]) -> [f64; 2] {
+    [uv[0], 1.0 - uv[1]]
+}
+
+/// The layer of a material texture reference, resolved by [`layer_index`].
+fn texture_layer(hit_ctx: &HitContext<'_>, texture: &TextureRef) -> Option<usize> {
+    layer_index(hit_ctx, texture.uv_layer.as_deref())
+}
+
+/// Tangent and bitangent of layer `index` at the hit, orthogonal to `normal`. The tangent follows
+/// the layer's `dP/du` and the bitangent its `dP/dv`, so a mirrored layer gets the bitangent its
+/// UVs define. Without a usable layer, the frame of `normal` is used.
+fn layer_frame(hit_ctx: &HitContext<'_>, index: Option<usize>, normal: DVec3) -> (DVec3, DVec3) {
+    layer_frame_with_v_direction(hit_ctx, index, normal, 1.0)
+}
+
+/// Blender shader graphs use V-up coordinates. Blender's Normal Map node follows the selected
+/// layer's V derivative, so its bitangent is the inverse of the canonical V-down derivative.
+fn blender_layer_frame(
+    hit_ctx: &HitContext<'_>,
+    index: Option<usize>,
+    normal: DVec3,
+) -> (DVec3, DVec3) {
+    layer_frame_with_v_direction(hit_ctx, index, normal, -1.0)
+}
+
+fn layer_frame_with_v_direction(
+    hit_ctx: &HitContext<'_>,
+    index: Option<usize>,
+    normal: DVec3,
+    v_direction: f64,
+) -> (DVec3, DVec3) {
     let fallback = tangent_basis(normal);
-    let Some((tangent, bitangent)) = hit_ctx.tangent_frame else {
+    let derivatives = index.and_then(|index| {
+        hit_ctx
+            .uv_layers
+            .and_then(|layers| layers.derivatives(index))
+    });
+    let Some((du, dv)) = derivatives else {
         return fallback;
     };
-    let tangent = normalize_or(tangent - normal * tangent.dot(normal), fallback.0);
+    let tangent = normalize_or(du - normal * du.dot(normal), fallback.0);
+    let dv = dv * v_direction;
     let bitangent = normalize_or(
-        bitangent - normal * bitangent.dot(normal) - tangent * bitangent.dot(tangent),
+        dv - normal * dv.dot(normal) - tangent * dv.dot(tangent),
         fallback.1,
     );
     (tangent, bitangent)
+}
+
+/// Finite-difference step across the surface, in render-UV units.
+const HEIGHT_STEP: f64 = 1.0e-3;
+
+/// One finite-difference step: the surface displacement, and the UV change it implies when the hit
+/// has no UV layers.
+#[derive(Clone, Copy)]
+struct SurfaceStep {
+    world: DVec3,
+    uv: [f64; 2],
+}
+
+impl SurfaceStep {
+    fn reversed(self) -> Self {
+        Self {
+            world: -self.world,
+            uv: [-self.uv[0], -self.uv[1]],
+        }
+    }
+}
+
+/// The step that moves the render UV by `HEIGHT_STEP` along `axis` (0 for U, 1 for V). It follows
+/// the render layer's surface derivative, projected into the tangent plane of `normal`. Without one
+/// it follows the tangent frame of `normal`.
+fn surface_step(hit_ctx: &HitContext<'_>, normal: DVec3, axis: usize) -> SurfaceStep {
+    let (tangent, bitangent) = tangent_basis(normal);
+    let derivatives = hit_ctx
+        .uv_layers
+        .and_then(|layers| layers.render.and_then(|index| layers.derivatives(index)));
+    let (direction, uv) = match (axis, derivatives) {
+        (0, Some((du, _))) => (du, [HEIGHT_STEP, 0.0]),
+        (_, Some((_, dv))) => (dv, [0.0, HEIGHT_STEP]),
+        (0, None) => (tangent, [HEIGHT_STEP, 0.0]),
+        (_, None) => (bitangent, [0.0, HEIGHT_STEP]),
+    };
+    let in_plane = direction - normal * direction.dot(normal);
+    SurfaceStep {
+        world: in_plane * HEIGHT_STEP,
+        uv,
+    }
+}
+
+/// Gradient across the surface at the hit of the height field that `height` samples. A surface
+/// displaced by the field has the normal `normal - gradient`, before it is normalised.
+///
+/// Bump nodes and displacement both use it. The steps follow the render layer's surface
+/// derivatives, so the render UV moves by `HEIGHT_STEP` per step and every other layer moves by its
+/// own derivative. A degenerate render UV leaves UV-driven heights flat, while procedural heights
+/// still vary along the tangent frame.
+///
+/// # Errors
+///
+/// Returns the error of `height` at any sample.
+pub fn height_gradient<'a>(
+    context: &HitContext<'a>,
+    normal: DVec3,
+    mut height: impl FnMut(&HitContext<'a>) -> Result<f64>,
+) -> Result<DVec3> {
+    let step_u = surface_step(context, normal, 0);
+    let step_v = surface_step(context, normal, 1);
+    let slope_u =
+        (height(&context.shifted(step_u))? - height(&context.shifted(step_u.reversed()))?) / 2.0;
+    let slope_v =
+        (height(&context.shifted(step_v))? - height(&context.shifted(step_v.reversed()))?) / 2.0;
+    // Solve for the gradient in the span of the two steps: `gradient · step = slope` for both.
+    let (world_u, world_v) = (step_u.world, step_v.world);
+    let (a, b, c) = (
+        world_u.dot(world_u),
+        world_u.dot(world_v),
+        world_v.dot(world_v),
+    );
+    let determinant = a * c - b * b;
+    if !determinant.is_finite() || determinant <= f64::EPSILON * a * c {
+        return Ok(DVec3::ZERO);
+    }
+    let along_u = (c * slope_u - b * slope_v) / determinant;
+    let along_v = (a * slope_v - b * slope_u) / determinant;
+    Ok(world_u * along_u + world_v * along_v)
 }
 
 fn perlin(point: DVec3) -> f64 {
@@ -1691,28 +1957,6 @@ fn eval_error(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, message)
 }
 
-/// UV of layer `layer` at this hit. A layer the mesh does not carry falls back to the render UV and
-/// records a `uv.layer_missing` warning.
-fn named_uv(hit_ctx: &HitContext<'_>, layer: &str) -> [f64; 2] {
-    if let Some((_, uv)) = hit_ctx
-        .uv_maps
-        .and_then(|maps| maps.iter().find(|(name, _)| *name == layer))
-    {
-        return *uv;
-    }
-    if let Some(warnings) = hit_ctx.warnings {
-        let warning = json!({
-            "code": "uv.layer_missing",
-            "message": format!("UV layer `{layer}` is not on this mesh; the render layer was used"),
-            "layer": layer,
-        });
-        let mut recorded = warnings.borrow_mut();
-        if !recorded.contains(&warning) {
-            recorded.push(warning);
-        }
-    }
-    hit_ctx.uv
-}
 
 /// Color of layer `name` at this hit; the empty name is the render layer. A layer the mesh does not
 /// carry reads as opaque black and records a `mesh.color_layer_missing` warning.
@@ -1780,10 +2024,104 @@ mod tests {
 
     use crate::{
         graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
+        image::{ImageData, ImageInterpolation},
         model::{Id, Material, Registry},
     };
 
-    use super::{HitContext, color_lerp, evaluate_displacement, evaluate_surface};
+    use super::{
+        HitContext, HitUvLayers, color_lerp, evaluate_displacement, evaluate_surface, layer_index,
+        layer_uv,
+    };
+
+    fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
+        let Value::Object(properties) = properties else {
+            unreachable!("shader test properties must be an object")
+        };
+        group
+            .nodes
+            .get_mut(&Id::new(id.to_owned()).unwrap())
+            .unwrap()
+            .properties = properties;
+    }
+
+    fn mapped_image_color(
+        vector_type: &str,
+        location: [f64; 3],
+        rotation: [f64; 3],
+        scale: [f64; 3],
+        extension: Option<&str>,
+    ) -> [f64; 4] {
+        let mut graph = NodeGroup::new("Mapping", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Base Color":[1.0,1.0,1.0,1.0]}),
+        );
+        insert_node(&mut graph, "uv", "ShaderNodeUVMap", json!({}));
+        insert_node(
+            &mut graph,
+            "mapping",
+            "ShaderNodeMapping",
+            json!({"Location":location,"Rotation":rotation,"Scale":scale}),
+        );
+        insert_node(&mut graph, "image", "ShaderNodeTexImage", json!({}));
+        set_properties(&mut graph, "uv", json!({"uv_map":"UVMap"}));
+        set_properties(&mut graph, "mapping", json!({"vector_type":vector_type}));
+        let mut image_properties = json!({"image":"image","interpolation":"CLOSEST"});
+        if let Some(extension) = extension {
+            image_properties["extension"] = json!(extension);
+        }
+        set_properties(&mut graph, "image", image_properties);
+        link(&mut graph, "uv", "UV", "mapping", "Vector");
+        link(&mut graph, "mapping", "Vector", "image", "Vector");
+        link(&mut graph, "image", "Color", "principled", "Base Color");
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+
+        let graph_id = Id::new("mapping_shader".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            base_color: [1.0; 4],
+            ..Material::default()
+        };
+        let names = vec!["UVMap".to_owned()];
+        let corners = vec![[[0.2, 0.3]; 3]];
+        let mut context = HitContext::new(&groups).with_uv_layers(HitUvLayers {
+            names: &names,
+            corners: &corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [1.0 / 3.0; 3],
+            render: Some(0),
+            available_mask: None,
+        });
+        let mut pixels = Vec::with_capacity(64);
+        for y in 0..8 {
+            for x in 0..8 {
+                let blender_y = 7 - y;
+                pixels.push([
+                    f64::from(x) / 7.0,
+                    f64::from(blender_y) / 7.0,
+                    f64::from(x + 2 * blender_y) / 21.0,
+                    1.0,
+                ]);
+            }
+        }
+        let images = BTreeMap::from([(
+            "image".to_owned(),
+            ImageData {
+                width: 8,
+                height: 8,
+                pixels,
+                tiles: BTreeMap::new(),
+                interpolation: ImageInterpolation::Closest,
+            },
+        )]);
+        context = context.with_images(&images);
+        evaluate_surface(&material, &context).unwrap().base_color
+    }
 
     fn insert_node(group: &mut NodeGroup, id: &str, node_type: &str, inputs: Value) {
         let mut node = GraphNode::new(node_type);
@@ -1801,6 +2139,43 @@ mod tests {
             to_node: Id::new(to.to_owned()).unwrap(),
             to_socket: input.to_owned(),
         });
+    }
+
+    #[test]
+    fn unavailable_joined_uv_layer_warns_and_falls_back_to_member_render() {
+        use std::cell::RefCell;
+
+        let groups = Registry::new();
+        let names = vec!["JoinedOnly".to_owned(), "MemberRender".to_owned()];
+        let corners = vec![[[0.8, 0.2]; 3], [[0.25, 0.75]; 3]];
+        let warnings = RefCell::new(Vec::new());
+        let context = HitContext::new(&groups)
+            .with_uv_layers(HitUvLayers {
+                names: &names,
+                corners: &corners,
+                positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+                barycentric: [1.0 / 3.0; 3],
+                render: Some(1),
+                available_mask: Some(0b10),
+            })
+            .with_warnings(&warnings);
+
+        let selected = layer_index(&context, Some("JoinedOnly"));
+        assert_eq!(selected, Some(1));
+        assert_eq!(layer_uv(&context, selected), [0.25, 0.75]);
+        assert_eq!(layer_index(&context, None), Some(1));
+        assert_eq!(warnings.borrow().len(), 1);
+        assert_eq!(warnings.borrow()[0]["code"], "uv.layer_missing");
+
+        let ordinary = HitContext::new(&groups).with_uv_layers(HitUvLayers {
+            names: &names,
+            corners: &corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [1.0 / 3.0; 3],
+            render: Some(1),
+            available_mask: None,
+        });
+        assert_eq!(layer_index(&ordinary, Some("JoinedOnly")), Some(0));
     }
 
     #[test]
@@ -2016,6 +2391,70 @@ mod tests {
         context.normal = DVec3::Z;
         let error = evaluate_displacement(&material, &context).unwrap_err();
         assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+    }
+
+    #[test]
+    fn mapping_vector_types_match_blender_sampled_texels_in_v_up_space() {
+        let cases = [
+            (
+                "POINT",
+                [0.1, 0.2, 0.0],
+                [0.0, 0.0, std::f64::consts::FRAC_PI_2],
+                [1.0, 1.0, 1.0],
+                [3.0 / 7.0, 3.0 / 7.0, 9.0 / 21.0, 1.0],
+            ),
+            (
+                "TEXTURE",
+                [0.1, 0.2, 0.0],
+                [0.0, 0.0, std::f64::consts::PI / 6.0],
+                [2.0, 1.0, 1.0],
+                [1.0 / 7.0, 3.0 / 7.0, 7.0 / 21.0, 1.0],
+            ),
+            (
+                "VECTOR",
+                [0.1, 0.2, 0.0],
+                [0.0, 0.0, std::f64::consts::PI / 6.0],
+                [2.0, 1.0, 1.0],
+                [1.0, 6.0 / 7.0, 19.0 / 21.0, 1.0],
+            ),
+            (
+                "NORMAL",
+                [0.1, 0.2, 0.0],
+                [0.0, 0.0, std::f64::consts::PI / 6.0],
+                [2.0, 1.0, 1.0],
+                [5.0 / 7.0, 1.0, 19.0 / 21.0, 1.0],
+            ),
+        ];
+        for (vector_type, location, rotation, scale, expected) in cases {
+            let actual = mapped_image_color(vector_type, location, rotation, scale, Some("REPEAT"));
+            for (component, reference) in actual.into_iter().zip(expected) {
+                assert!(
+                    (component - reference).abs() < 1.0e-12,
+                    "{vector_type}: expected {expected:?}, got {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_texture_extensions_match_blender_edges_and_default_repeat() {
+        let cases = [
+            (None, [1.0 / 7.0, 5.0 / 7.0, 11.0 / 21.0, 1.0]),
+            (Some("REPEAT"), [1.0 / 7.0, 5.0 / 7.0, 11.0 / 21.0, 1.0]),
+            (Some("EXTEND"), [1.0 / 7.0, 1.0, 15.0 / 21.0, 1.0]),
+            (Some("CLIP"), [0.0; 4]),
+            (Some("MIRROR"), [1.0 / 7.0, 2.0 / 7.0, 5.0 / 21.0, 1.0]),
+        ];
+        for (extension, expected) in cases {
+            let actual =
+                mapped_image_color("POINT", [0.0, 1.0, 0.0], [0.0; 3], [1.0; 3], extension);
+            for (component, reference) in actual.into_iter().zip(expected) {
+                assert!(
+                    (component - reference).abs() < 1.0e-12,
+                    "extension {extension:?}: expected {expected:?}, got {actual:?}"
+                );
+            }
+        }
     }
 
     proptest! {

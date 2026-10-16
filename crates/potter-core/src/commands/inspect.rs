@@ -13,7 +13,7 @@ use crate::{
     store::Project,
 };
 
-use super::util::parse_id;
+use super::util::{parse_id, with_load_warnings};
 pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
     let project = Project::open(args.scene)?;
     let doc = project.doc();
@@ -103,6 +103,7 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
                 .is_some_and(|node_id| item_ids.contains(node_id))
         });
     }
+    let warnings = with_load_warnings(&warnings, &project)?;
     let scene = project.info()?;
     Ok((
         Some(scene),

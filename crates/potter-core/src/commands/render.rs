@@ -109,7 +109,7 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
     } else {
         settings.seed
     };
-    let result = render_sequence(
+    let mut result = render_sequence(
         doc,
         &context,
         project.path(),
@@ -126,6 +126,9 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         seed,
         settings.film_transparent,
     )?;
+    if let Some(warnings) = result["warnings"].as_array_mut() {
+        warnings.extend(project.warnings().iter().cloned());
+    }
     Ok((Some(project.info()?), result))
 }
 

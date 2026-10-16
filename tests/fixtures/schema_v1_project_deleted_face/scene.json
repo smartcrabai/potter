@@ -1,0 +1,501 @@
+{
+  "schema_version": 1,
+  "scene_id": "445be24a-3dc4-4699-940c-56e1eec212ab",
+  "revision": 2,
+  "active_scene": "scene_main",
+  "profile": {
+    "blender": "5.2.2"
+  },
+  "scenes": {
+    "scene_main": {
+      "name": "Scene",
+      "root_collection": "collection_root",
+      "view_layers": {
+        "view_main": {
+          "name": "View Layer",
+          "excluded_collections": []
+        }
+      },
+      "frame_current": 1.0,
+      "frame_start": 1,
+      "frame_end": 250,
+      "fps": 24,
+      "fps_base": 1.0,
+      "camera": null,
+      "world": null,
+      "active_clip": null,
+      "unit": {
+        "system": "metric",
+        "scale_length": 1.0
+      },
+      "render": {
+        "resolution_x": 1920,
+        "resolution_y": 1080,
+        "resolution_percentage": 100,
+        "samples": 64,
+        "seed": 0,
+        "max_bounces": 4,
+        "film_transparent": false,
+        "engine": "path",
+        "use_sequencer": false,
+        "audio_codec": "wav",
+        "passes": [
+          "combined"
+        ],
+        "motion_blur": false,
+        "shutter": 0.5,
+        "motion_blur_samples": 8
+      },
+      "use_compositing": false,
+      "compositor": null,
+      "color_management": {
+        "display_device": "sRGB",
+        "view_transform": "standard",
+        "look": "none",
+        "exposure": 0.0,
+        "gamma": 1.0,
+        "curve": []
+      },
+      "markers": [],
+      "rigid_body_world": null,
+      "sequencer": {
+        "channels": 32,
+        "strips": []
+      }
+    }
+  },
+  "collections": {
+    "collection_root": {
+      "name": "Collection",
+      "children": [],
+      "objects": [
+        "body"
+      ]
+    }
+  },
+  "nodes": {
+    "body": {
+      "name": "body",
+      "kind": "mesh",
+      "primitive": null,
+      "tags": [],
+      "parent": null,
+      "parent_inverse": null,
+      "transform": {
+        "translation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "rotation_mode": "quaternion"
+      },
+      "data": "body_mesh",
+      "materials": [],
+      "modifiers": [],
+      "visible": true,
+      "render_visible": true,
+      "selectable": true,
+      "action": null,
+      "nla_tracks": [],
+      "properties": {},
+      "rigid_body": null,
+      "force_field": null,
+      "parent_type": "object",
+      "parent_bone": null,
+      "pose": {},
+      "constraints": [],
+      "drivers": []
+    }
+  },
+  "data_blocks": {
+    "body_mesh": {
+      "type": "mesh",
+      "descriptor": null,
+      "mesh": {
+        "vertices": [
+          {
+            "id": 0,
+            "co": [
+              -1.0,
+              -1.0,
+              -1.0
+            ]
+          },
+          {
+            "id": 1,
+            "co": [
+              1.0,
+              -1.0,
+              -1.0
+            ]
+          },
+          {
+            "id": 2,
+            "co": [
+              1.0,
+              1.0,
+              -1.0
+            ]
+          },
+          {
+            "id": 3,
+            "co": [
+              -1.0,
+              1.0,
+              -1.0
+            ]
+          },
+          {
+            "id": 4,
+            "co": [
+              -1.0,
+              -1.0,
+              1.0
+            ]
+          },
+          {
+            "id": 5,
+            "co": [
+              1.0,
+              -1.0,
+              1.0
+            ]
+          },
+          {
+            "id": 6,
+            "co": [
+              1.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "id": 7,
+            "co": [
+              -1.0,
+              1.0,
+              1.0
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "id": 0,
+            "v": [
+              0,
+              3
+            ]
+          },
+          {
+            "id": 1,
+            "v": [
+              3,
+              2
+            ]
+          },
+          {
+            "id": 2,
+            "v": [
+              2,
+              1
+            ]
+          },
+          {
+            "id": 3,
+            "v": [
+              1,
+              0
+            ]
+          },
+          {
+            "id": 4,
+            "v": [
+              4,
+              5
+            ]
+          },
+          {
+            "id": 5,
+            "v": [
+              5,
+              6
+            ]
+          },
+          {
+            "id": 6,
+            "v": [
+              6,
+              7
+            ]
+          },
+          {
+            "id": 7,
+            "v": [
+              7,
+              4
+            ]
+          },
+          {
+            "id": 8,
+            "v": [
+              1,
+              5
+            ]
+          },
+          {
+            "id": 9,
+            "v": [
+              4,
+              0
+            ]
+          },
+          {
+            "id": 10,
+            "v": [
+              2,
+              6
+            ]
+          },
+          {
+            "id": 11,
+            "v": [
+              3,
+              7
+            ]
+          }
+        ],
+        "faces": [
+          {
+            "id": 1,
+            "v": [
+              4,
+              5,
+              6,
+              7
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 2,
+            "v": [
+              0,
+              1,
+              5,
+              4
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 3,
+            "v": [
+              1,
+              2,
+              6,
+              5
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 4,
+            "v": [
+              2,
+              3,
+              7,
+              6
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 5,
+            "v": [
+              3,
+              0,
+              4,
+              7
+            ],
+            "material_index": 0
+          }
+        ],
+        "attributes": {
+          "uv_map": [
+            {
+              "face_id": 0,
+              "uv": [
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  -1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 1,
+              "uv": [
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 2,
+              "uv": [
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 3,
+              "uv": [
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 4,
+              "uv": [
+                [
+                  1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 5,
+              "uv": [
+                [
+                  1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ]
+              ]
+            }
+          ]
+        },
+        "next_id": {
+          "vertex": 8,
+          "edge": 12,
+          "face": 6
+        }
+      },
+      "camera": null,
+      "light": null,
+      "grease_pencil": null,
+      "armature": null,
+      "shape_keys": null,
+      "vertex_groups": [],
+      "vertex_weights": {},
+      "curve": null,
+      "surface": null,
+      "text": null,
+      "hair_curves": null,
+      "metaball": null,
+      "lattice": null,
+      "pointcloud": null,
+      "volume": null
+    }
+  },
+  "materials": {},
+  "images": {},
+  "movie_clips": {},
+  "masks": {},
+  "worlds": {},
+  "node_groups": {},
+  "actions": {},
+  "resources": {},
+  "libraries": {},
+  "compatibility": {},
+  "history": {
+    "head": "sha256:f9f5323161e536185f325de6e325fea07974b7e57695ddebbdd7297bcb7e9e87",
+    "undo": [
+      "sha256:51371d9ddf4e855c30fb20ec36e092f9cfae1c91732e773532b56fe6fea89ad2",
+      "sha256:2de0f0a972e72fc9fae15def3848e2abc2bd22c4b98ae8c7f9183ffda13230c3"
+    ],
+    "redo": []
+  }
+}

@@ -172,8 +172,8 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
         let mut uv = [0.0_f64; 2];
         for property in &parsed.vertex_properties {
             let raw = take(&bytes, &mut cursor, scalar_size(&property.scalar_type)?)?;
-            if matches!(property.name.as_str(), "s" | "t") {
-                uv[usize::from(property.name == "t")] = read_scalar(raw, &property.scalar_type)?;
+            if let Some(axis) = uv_axis(&property.name) {
+                uv[axis] = read_scalar(raw, &property.scalar_type)?;
                 continue;
             }
             let (target, axis) = match property.name.as_str() {
@@ -372,10 +372,10 @@ fn parse_header(header: &str) -> Result<Header> {
     }
     let has_coordinates = has_vertex_properties(&vertex_properties, ["x", "y", "z"]);
     let has_normals = has_vertex_properties(&vertex_properties, ["nx", "ny", "nz"]);
-    let has_uv = ["s", "t"].iter().all(|name| {
+    let has_uv = [0, 1].iter().all(|axis| {
         vertex_properties
             .iter()
-            .any(|property| property.name == *name)
+            .any(|property| uv_axis(&property.name) == Some(*axis))
     });
     let has_indices = face_properties.iter().any(|property| matches!(property, FaceProperty::List(_, _, name) if name == "vertex_indices" || name == "vertex_index"));
     if !has_coordinates || !has_indices {
@@ -398,6 +398,16 @@ fn has_vertex_properties(properties: &[ScalarProperty], names: [&str; 3]) -> boo
     names
         .iter()
         .all(|name| properties.iter().any(|property| property.name == *name))
+}
+
+/// The UV axis a vertex property names: `s`, `u`, or `texture_u` for U; `t`, `v`, or `texture_v`
+/// for V.
+fn uv_axis(name: &str) -> Option<usize> {
+    match name {
+        "s" | "u" | "texture_u" => Some(0),
+        "t" | "v" | "texture_v" => Some(1),
+        _ => None,
+    }
 }
 
 /// Blender's per-vertex normals (`mesh.vertex_normals`) in float32. A vertex whose faces cancel

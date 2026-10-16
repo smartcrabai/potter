@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use glam::DVec3;
 use serde_json::{Map, Value, json};
 
@@ -7,7 +9,8 @@ use crate::{
         Face, Mesh,
         uv_layers::{self, UvLayer, UvStore},
     },
-    model::{AvatarMtoon, Id, Material, SceneDoc, TextureRef},
+    graph::GraphNode,
+    model::{AvatarMtoon, Id, Material, Modifier, SceneDoc, TextureRef},
 };
 
 use super::{ChangeKind, Engine, check_fields, resolve_node_targets};
@@ -16,14 +19,9 @@ use super::{ChangeKind, Engine, check_fields, resolve_node_targets};
 const DEFAULT_PACK_MARGIN: f64 = 0.001;
 /// Blender's name for a new UV map. Unnamed layers take `.001`-style suffixes from it.
 const DEFAULT_LAYER_NAME: &str = "UVMap";
-/// Modifier params that name a UV layer.
-const MODIFIER_LAYER_PARAMS: [&str; 4] = [
-    "uv_layer",
-    "mask_tex_uv_layer",
-    "layers_uv_select_src",
-    "layers_uv_select_dst",
-];
-
+/// Modifier params that name a UV layer. The layer-select params of the Blender modifiers are fixed
+/// enums (`ALL`, `ACTIVE`, `NAME`, `INDEX`), not layer names, so they are not listed.
+const MODIFIER_LAYER_PARAMS: [&str; 2] = ["uv_layer", "mask_tex_uv_layer"];
 pub(super) fn apply(
     engine: &mut Engine<'_>,
     name: &str,
@@ -285,7 +283,16 @@ fn layer_delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
     let (targets, elements) = selected_targets(engine, operation)?;
     reject_elements(engine, elements.as_ref())?;
     let name = layer_name(engine, operation, "name")?;
-    let referrers = layer_referrers(engine.doc, &name);
+    let scope = super::parse_scope(
+        engine,
+        operation.get("scope"),
+        "/scope",
+        "scope must be a string",
+        "scope must be shared or single_user",
+        false,
+    )?;
+    let edited = edited_users(engine.doc, &targets, scope);
+    let referrers = layer_referrers(engine.doc, &edited, &name);
     if !referrers.is_empty() {
         let mut error = engine.error(
             ErrorCode::InvalidOperation,
@@ -328,6 +335,28 @@ fn layer_rename(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
     reject_elements(engine, elements.as_ref())?;
     let name = layer_name(engine, operation, "name")?;
     let to = layer_name(engine, operation, "to")?;
+    let scope = super::parse_scope(
+        engine,
+        operation.get("scope"),
+        "/scope",
+        "scope must be a string",
+        "scope must be shared or single_user",
+        false,
+    )?;
+    let edited = edited_users(engine.doc, &targets, scope);
+    let conflicts = shared_reference_conflicts(engine.doc, &edited, &name);
+    if !conflicts.is_empty() {
+        let mut error = engine.error(
+            ErrorCode::InvalidOperation,
+            format!(
+                "UV layer `{name}` cannot be renamed: nodes outside the target also use it: {}",
+                conflicts.join(", ")
+            ),
+            "/name",
+        );
+        error.details["referrers"] = json!(conflicts);
+        return Err(feature(error, "uv.layer_in_use"));
+    }
     let changed = edit_targets(engine, targets, operation.get("scope"), |mesh| {
         let mut store = uv_layers::read(mesh);
         let index = store
@@ -351,7 +380,7 @@ fn layer_rename(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         uv_layers::write(mesh, &store);
         Ok(())
     })?;
-    let references = rename_layer_references(engine.doc, &name, &to);
+    let references = rename_layer_references(engine.doc, &edited, &name, &to);
     for id in &references.materials {
         engine.mark("materials", id, ChangeKind::Updated);
     }
@@ -500,10 +529,16 @@ fn reject_elements(engine: &Engine<'_>, elements: Option<&Value>) -> Result<()> 
     Ok(())
 }
 
-/// The optional `uv_layer` name of a UV operation. Absent means the active layer.
+/// The optional `uv_layer` name of a UV operation. Absent means the active layer. An empty name is
+/// rejected: the active layer is selected by omitting the field.
 fn uv_layer_field(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result<Option<String>> {
     match operation.get("uv_layer") {
         None => Ok(None),
+        Some(Value::String(name)) if name.is_empty() => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "uv_layer must not be empty; omit it to use the active layer",
+            "/uv_layer",
+        )),
         Some(Value::String(name)) => Ok(Some(name.clone())),
         Some(_) => Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -512,7 +547,6 @@ fn uv_layer_field(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result
         )),
     }
 }
-
 fn selected_targets(
     engine: &Engine<'_>,
     operation: &Map<String, Value>,
@@ -656,27 +690,146 @@ fn mtoon_textures_mut(mtoon: &mut AvatarMtoon) -> [(&'static str, Option<&mut Te
     ]
 }
 
-/// Describes every stored reference to the UV layer `name`: material and `MToon` textures, graph
-/// `ShaderNodeUVMap` nodes, and modifier params. References are name-based and matched scene-wide.
-fn layer_referrers(doc: &SceneDoc, name: &str) -> Vec<String> {
-    let mut referrers = Vec::new();
-    for (material_id, material) in &doc.materials {
+/// The nodes whose mesh a UV edit of `targets` changes. A `shared` edit changes the mesh every
+/// user of the target shares; any other edit changes only the targets (`single_user` copies the
+/// mesh for them first).
+fn edited_users(doc: &SceneDoc, targets: &[Id], scope: Option<&str>) -> BTreeSet<Id> {
+    let mut edited: BTreeSet<Id> = targets.iter().cloned().collect();
+    if scope == Some("shared") {
+        let data: BTreeSet<&Id> = targets
+            .iter()
+            .filter_map(|target| doc.nodes.get(target)?.data.as_ref())
+            .collect();
+        edited.extend(
+            doc.nodes
+                .iter()
+                .filter(|(_, node)| node.data.as_ref().is_some_and(|id| data.contains(id)))
+                .map(|(node_id, _)| node_id.clone()),
+        );
+    }
+    edited
+}
+
+/// What a set of nodes reaches: the materials in their slots, the node groups their geometry
+/// modifiers instance, and the shader graphs those materials use, including node groups instanced
+/// by group nodes, transitively.
+#[derive(Default)]
+struct Reach {
+    materials: BTreeSet<Id>,
+    graphs: BTreeSet<Id>,
+}
+
+fn reach<'a>(doc: &SceneDoc, nodes: impl IntoIterator<Item = &'a Id>) -> Reach {
+    let mut reached = Reach::default();
+    let mut pending: Vec<Id> = Vec::new();
+    for node_id in nodes {
+        if let Some(node) = doc.nodes.get(node_id) {
+            reached.materials.extend(node.materials.iter().cloned());
+            pending.extend(node.modifiers.iter().filter_map(modifier_node_group));
+        }
+    }
+    pending.extend(
+        reached
+            .materials
+            .iter()
+            .filter_map(|material_id| doc.materials.get(material_id)?.node_tree.clone()),
+    );
+    while let Some(graph_id) = pending.pop() {
+        let Some(graph) = doc.node_groups.get(&graph_id) else {
+            continue;
+        };
+        if !reached.graphs.insert(graph_id) {
+            continue;
+        }
+        for node in graph.nodes.values() {
+            if node.node_type != "ShaderNodeGroup" {
+                continue;
+            }
+            let Some(tree) = group_tree_name(node) else {
+                continue;
+            };
+            pending.extend(
+                doc.node_groups
+                    .iter()
+                    .filter(|(_, group)| group.name == tree)
+                    .map(|(id, _)| id.clone()),
+            );
+        }
+    }
+    reached
+}
+
+/// The node group a `ShaderNodeGroup` node instances. Its `node_tree` property names the group, as
+/// `{"name": ...}` or as a bare name.
+fn group_tree_name(node: &GraphNode) -> Option<&str> {
+    let value = node.properties.get("node_tree")?;
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_str())
+}
+
+/// The node group a geometry modifier instances: its `node_group` param, a graph ID.
+fn modifier_node_group(modifier: &Modifier) -> Option<Id> {
+    Id::new(modifier.params.get("node_group")?.as_str()?).ok()
+}
+
+/// The texture and `MToon` slots of material `material_id` that name layer `name`.
+fn material_refs(doc: &SceneDoc, material_id: &Id, name: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(material) = doc.materials.get(material_id) {
         for (field, texture) in material_textures(material) {
             if texture.and_then(|texture| texture.uv_layer.as_deref()) == Some(name) {
-                referrers.push(format!("material `{material_id}` {field}"));
+                refs.push(format!("material `{material_id}` {field}"));
             }
         }
     }
-    if let Some(avatar) = &doc.avatar {
-        for (material_id, mtoon) in &avatar.mtoon {
-            for (field, texture) in mtoon_textures(mtoon) {
-                if texture.and_then(|texture| texture.uv_layer.as_deref()) == Some(name) {
-                    referrers.push(format!("avatar MToon `{material_id}` {field}"));
-                }
+    if let Some(mtoon) = doc
+        .avatar
+        .as_ref()
+        .and_then(|avatar| avatar.mtoon.get(material_id))
+    {
+        for (field, texture) in mtoon_textures(mtoon) {
+            if texture.and_then(|texture| texture.uv_layer.as_deref()) == Some(name) {
+                refs.push(format!("avatar MToon `{material_id}` {field}"));
             }
         }
     }
-    for (node_id, node) in &doc.nodes {
+    refs
+}
+
+/// The `ShaderNodeUVMap` nodes of node group `graph_id` that name layer `name`.
+fn graph_refs(doc: &SceneDoc, graph_id: &Id, name: &str) -> Vec<String> {
+    let Some(graph) = doc.node_groups.get(graph_id) else {
+        return Vec::new();
+    };
+    graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| {
+            node.node_type == "ShaderNodeUVMap"
+                && node.properties.get("uv_map").and_then(Value::as_str) == Some(name)
+        })
+        .map(|(node_id, _)| {
+            format!("ShaderNodeUVMap node `{node_id}` in node group `{graph_id}` property `uv_map`")
+        })
+        .collect()
+}
+
+/// Describes every reference to the UV layer `name` that the nodes in `edited` reach: material and
+/// `MToon` texture slots, modifier params of those nodes, and `ShaderNodeUVMap` nodes of the graphs
+/// they reach. Unreached references are not reported.
+fn layer_referrers(doc: &SceneDoc, edited: &BTreeSet<Id>, name: &str) -> Vec<String> {
+    let reached = reach(doc, edited);
+    let mut referrers: Vec<String> = reached
+        .materials
+        .iter()
+        .flat_map(|material_id| material_refs(doc, material_id, name))
+        .collect();
+    for node_id in edited {
+        let Some(node) = doc.nodes.get(node_id) else {
+            continue;
+        };
         for modifier in &node.modifiers {
             for key in MODIFIER_LAYER_PARAMS {
                 if modifier.params.get(key).and_then(Value::as_str) == Some(name) {
@@ -688,18 +841,40 @@ fn layer_referrers(doc: &SceneDoc, name: &str) -> Vec<String> {
             }
         }
     }
-    for (group_id, group) in &doc.node_groups {
-        for (node_id, node) in &group.nodes {
-            if node.node_type == "ShaderNodeUVMap"
-                && node.properties.get("uv_map").and_then(Value::as_str) == Some(name)
-            {
-                referrers.push(format!(
-                    "ShaderNodeUVMap node `{node_id}` in node group `{group_id}` property `uv_map`"
+    for graph_id in &reached.graphs {
+        referrers.extend(graph_refs(doc, graph_id, name));
+    }
+    referrers
+}
+
+/// Rename conflicts: the items a rename of layer `name` would rewrite for the nodes in `edited`
+/// that a node outside `edited` also reaches. Rewriting such an item would change that node too,
+/// so the rename is refused rather than applied.
+fn shared_reference_conflicts(doc: &SceneDoc, edited: &BTreeSet<Id>, name: &str) -> Vec<String> {
+    let reached = reach(doc, edited);
+    let mut conflicts = Vec::new();
+    for other in doc
+        .nodes
+        .keys()
+        .filter(|node_id| !edited.contains(*node_id))
+    {
+        let shared = reach(doc, [other]);
+        for material_id in shared.materials.intersection(&reached.materials) {
+            if !material_refs(doc, material_id, name).is_empty() {
+                conflicts.push(format!(
+                    "material `{material_id}` is also used by node `{other}`"
+                ));
+            }
+        }
+        for graph_id in shared.graphs.intersection(&reached.graphs) {
+            if !graph_refs(doc, graph_id, name).is_empty() {
+                conflicts.push(format!(
+                    "node group `{graph_id}` is also used by node `{other}`"
                 ));
             }
         }
     }
-    referrers
+    conflicts
 }
 
 /// Objects whose stored layer references a rename changed.
@@ -720,39 +895,23 @@ impl ReferenceChanges {
     }
 }
 
-/// Renames every stored reference to the layer `from` so that it names `to`.
-fn rename_layer_references(doc: &mut SceneDoc, from: &str, to: &str) -> ReferenceChanges {
+/// Renames every reference to the layer `from` that the nodes in `edited` reach, so that it names
+/// `to`. Items the edited nodes do not reach are left alone.
+fn rename_layer_references(
+    doc: &mut SceneDoc,
+    edited: &BTreeSet<Id>,
+    from: &str,
+    to: &str,
+) -> ReferenceChanges {
     let mut changes = ReferenceChanges::default();
     if from == to {
         return changes;
     }
-    for (material_id, material) in &mut doc.materials {
-        let mut changed = false;
-        for (_, texture) in material_textures_mut(material) {
-            if let Some(texture) = texture
-                && texture.uv_layer.as_deref() == Some(from)
-            {
-                texture.uv_layer = Some(to.to_owned());
-                changed = true;
-            }
-        }
-        if changed {
-            changes.materials.push(material_id.clone());
-        }
-    }
-    if let Some(avatar) = &mut doc.avatar {
-        for mtoon in avatar.mtoon.values_mut() {
-            for (_, texture) in mtoon_textures_mut(mtoon) {
-                if let Some(texture) = texture
-                    && texture.uv_layer.as_deref() == Some(from)
-                {
-                    texture.uv_layer = Some(to.to_owned());
-                    changes.avatar = true;
-                }
-            }
-        }
-    }
-    for (node_id, node) in &mut doc.nodes {
+    let reached = reach(&*doc, edited);
+    for node_id in edited {
+        let Some(node) = doc.nodes.get_mut(node_id) else {
+            continue;
+        };
         let mut changed = false;
         for modifier in &mut node.modifiers {
             for key in MODIFIER_LAYER_PARAMS {
@@ -768,9 +927,42 @@ fn rename_layer_references(doc: &mut SceneDoc, from: &str, to: &str) -> Referenc
             changes.nodes.push(node_id.clone());
         }
     }
-    for (group_id, group) in &mut doc.node_groups {
+    for material_id in &reached.materials {
+        if let Some(material) = doc.materials.get_mut(material_id) {
+            let mut changed = false;
+            for (_, texture) in material_textures_mut(material) {
+                if let Some(texture) = texture
+                    && texture.uv_layer.as_deref() == Some(from)
+                {
+                    texture.uv_layer = Some(to.to_owned());
+                    changed = true;
+                }
+            }
+            if changed {
+                changes.materials.push(material_id.clone());
+            }
+        }
+        if let Some(mtoon) = doc
+            .avatar
+            .as_mut()
+            .and_then(|avatar| avatar.mtoon.get_mut(material_id))
+        {
+            for (_, texture) in mtoon_textures_mut(mtoon) {
+                if let Some(texture) = texture
+                    && texture.uv_layer.as_deref() == Some(from)
+                {
+                    texture.uv_layer = Some(to.to_owned());
+                    changes.avatar = true;
+                }
+            }
+        }
+    }
+    for graph_id in &reached.graphs {
+        let Some(graph) = doc.node_groups.get_mut(graph_id) else {
+            continue;
+        };
         let mut changed = false;
-        for node in group.nodes.values_mut() {
+        for node in graph.nodes.values_mut() {
             if node.node_type == "ShaderNodeUVMap"
                 && node.properties.get("uv_map").and_then(Value::as_str) == Some(from)
             {
@@ -779,12 +971,11 @@ fn rename_layer_references(doc: &mut SceneDoc, from: &str, to: &str) -> Referenc
             }
         }
         if changed {
-            changes.node_groups.push(group_id.clone());
+            changes.node_groups.push(graph_id.clone());
         }
     }
     changes
 }
-
 fn edit_targets(
     engine: &mut Engine<'_>,
     targets: Vec<Id>,
@@ -2600,6 +2791,11 @@ mod tests {
             json!({"op":"uv.unwrap","target":{"id":"body"},"method":"box"}),
         )
         .unwrap();
+        doc.nodes
+            .get_mut(&Id::new("body").unwrap())
+            .unwrap()
+            .materials
+            .push(surface.clone());
         create_layer(&mut doc, Some("Mid")).unwrap();
         create_layer(&mut doc, Some("Top")).unwrap();
         doc.nodes

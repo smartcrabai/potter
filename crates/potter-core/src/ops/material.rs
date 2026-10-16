@@ -739,6 +739,13 @@ fn parse_texture_ref(
     }
     let uv_layer = match object.get("uv_layer") {
         None | Some(Value::Null) => None,
+        Some(Value::String(uv_layer)) if uv_layer.is_empty() => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "uv_layer must not be empty; use null for the render layer",
+                &operation_pointer(engine.operation_index, &format!("{pointer}/uv_layer")),
+            ));
+        }
         Some(Value::String(uv_layer)) => Some(uv_layer.clone()),
         Some(_) => {
             return Err(engine.error(

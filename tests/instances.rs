@@ -232,7 +232,7 @@ fn collection_instance_keeps_each_members_material_slots() {
     let jacket = Id::new("jacket").unwrap();
     let skin = Id::new("skin").unwrap();
     // Each member's slots follow it: box_a's jacket and skin, then box_b's skin.
-    let bindings = &snapshot.instance_bindings[&instance];
+    let bindings = &snapshot.slot_bindings[&instance];
     assert_eq!(
         bindings
             .iter()
@@ -241,7 +241,10 @@ fn collection_instance_keeps_each_members_material_slots() {
         vec![Some(jacket), Some(skin.clone()), Some(skin)]
     );
     assert_eq!(
-        bindings.iter().map(|slot| slot.uv).collect::<Vec<_>>(),
+        bindings
+            .iter()
+            .map(|slot| slot.uv.texcoord0_covered)
+            .collect::<Vec<_>>(),
         vec![true, true, false]
     );
     let slots: Vec<u32> = snapshot.meshes[&instance]
@@ -271,17 +274,28 @@ fn collection_instance_keeps_each_members_uvs_after_face_gaps() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let mesh = &snapshot.meshes[&Id::new("instance").unwrap()];
-    // The joined UVs live in one `blender_uv_layers` store with one value per corner.
+    // The joined canonical store has one real row per surviving face and corner.
     assert!(!mesh.attributes.contains_key("uv_map"));
     assert_eq!(mesh.faces.len(), 11);
-    let layers = mesh.attributes["blender_uv_layers"].as_array().unwrap();
+    let layers = mesh.attributes["uv_layers"]["layers"].as_array().unwrap();
     assert_eq!(layers.len(), 1);
+    let rows = layers[0]["faces"].as_array().unwrap();
+    assert_eq!(rows.len(), mesh.faces.len());
     let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
-    assert_eq!(layers[0]["values"].as_array().unwrap().len(), corners);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["uv"].as_array().unwrap().len())
+            .sum::<usize>(),
+        corners
+    );
+    for (face, row) in mesh.faces.iter().zip(rows) {
+        assert_eq!(row["face_id"], json!(face.id));
+        assert_eq!(row["uv"].as_array().unwrap().len(), face.vertices.len());
+    }
     // Both members have a UV value on every face, so both slots are covered.
-    let bindings = &snapshot.instance_bindings[&Id::new("instance").unwrap()];
+    let bindings = &snapshot.slot_bindings[&Id::new("instance").unwrap()];
     assert_eq!(bindings.len(), 2);
-    assert!(bindings.iter().all(|slot| slot.uv));
+    assert!(bindings.iter().all(|slot| slot.uv.texcoord0_covered));
 }
 
 #[test]
@@ -303,7 +317,7 @@ fn nested_collection_instances_carry_member_materials_upward() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let outer = Id::new("outer").unwrap();
-    let table: Vec<Option<Id>> = snapshot.instance_bindings[&outer]
+    let table: Vec<Option<Id>> = snapshot.slot_bindings[&outer]
         .iter()
         .map(|slot| slot.material.clone())
         .collect();

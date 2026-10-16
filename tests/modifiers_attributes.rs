@@ -2532,11 +2532,12 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     for mapping in ["LOCAL", "GLOBAL", "OBJECT", "UV"] {
         let mut mask_mesh = quad.clone();
         if mapping == "UV" {
+            // Blender's V-up values, stored V-down.
             mask_mesh.attributes.insert(
                 "uv_layers".to_owned(),
                 uv_layers_attribute(&json!([{
                     "face_id":0,
-                    "uv":[[0.13,0.17],[0.73,0.24],[0.84,0.81],[0.2,0.69]]
+                    "uv":flip_v(&json!([[0.13,0.17],[0.73,0.24],[0.84,0.81],[0.2,0.69]]))
                 }])),
             );
         }
@@ -3063,5 +3064,198 @@ fn assert_normal_parity(
         max_angle <= tolerance,
         "{label} normal angle {max_angle}; actual={worst_actual:?}, expected={worst_expected:?}"
     );
+    Ok(())
+}
+
+/// Blender's UV values of the UV Data Transfer probe, per corner in V-up.
+const TRANSFER_SOURCE: [[f64; 2]; 4] = [[0.3, 0.7], [0.6, 0.2], [0.9, 0.4], [0.1, 0.8]];
+const TRANSFER_DESTINATION: [[f64; 2]; 4] = [[0.2, 0.2], [0.4, 0.6], [0.7, 0.1], [0.5, 0.9]];
+/// Blender's factor 0.5 result over `TRANSFER_DESTINATION`: the midpoint of destination and source.
+const TRANSFER_HALF: [[f64; 2]; 4] = [[0.25, 0.45], [0.5, 0.4], [0.8, 0.25], [0.3, 0.85]];
+/// Blender's factor 0.5 result into a layer the destination lacks, which starts at zero in V-up.
+const TRANSFER_GENERATED_HALF: [[f64; 2]; 4] = [[0.15, 0.35], [0.3, 0.1], [0.45, 0.2], [0.05, 0.4]];
+
+/// A `uv_layers` attribute with one layer `name` on face 0, holding Blender V-up `values`, stored V-down.
+fn named_uv_layers(name: &str, values: [[f64; 2]; 4]) -> Value {
+    json!({
+        "layers": [{"name": name, "faces": [{"face_id": 0, "uv": flip_v(&json!(values))}]}],
+        "active": name,
+        "render": name
+    })
+}
+
+/// A quad carrying one UV layer `name` with Blender V-up `values`.
+fn uv_layer_quad(name: &str, values: [[f64; 2]; 4]) -> Result<Mesh, Box<dyn Error>> {
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    mesh.attributes
+        .insert("uv_layers".to_owned(), named_uv_layers(name, values));
+    Ok(mesh)
+}
+
+/// Blender V-up corner values of layer `name` on face 0 of `mesh`.
+fn transferred_uv(mesh: &Mesh, name: &str) -> Result<Vec<[f64; 2]>, Box<dyn Error>> {
+    let store = mesh
+        .attributes
+        .get("uv_layers")
+        .ok_or("uv_layers missing")?;
+    let layer = store["layers"]
+        .as_array()
+        .ok_or("uv_layers layers missing")?
+        .iter()
+        .find(|layer| layer["name"] == name)
+        .ok_or_else(|| format!("no `{name}` layer"))?;
+    layer["faces"][0]["uv"]
+        .as_array()
+        .ok_or("uv row missing")?
+        .iter()
+        .map(|corner| -> Result<[f64; 2], Box<dyn Error>> {
+            Ok([
+                corner[0].as_f64().ok_or("U must be a number")?,
+                1.0 - corner[1].as_f64().ok_or("V must be a number")?,
+            ])
+        })
+        .collect()
+}
+
+fn assert_uv_close(actual: &[[f64; 2]], expected: &[[f64; 2]]) {
+    assert_eq!(actual.len(), expected.len(), "corner count");
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual[0] - expected[0]).abs() < 1.0e-9 && (actual[1] - expected[1]).abs() < 1.0e-9,
+            "UV {actual:?} differs from Blender {expected:?}"
+        );
+    }
+}
+
+/// Runs a TOPOLOGY UV Data Transfer of `source` onto `destination`.
+fn run_uv_transfer(
+    destination: &Mesh,
+    source: &Mesh,
+    mix_mode: &str,
+    factor: f64,
+) -> Result<Mesh, Box<dyn Error>> {
+    let transfer = modifier(
+        "data_transfer",
+        json!({
+            "object": "source",
+            "use_loop_data": true,
+            "data_types_loops": ["UV"],
+            "loop_mapping": "TOPOLOGY",
+            "layers_uv_select_src": "ALL",
+            "layers_uv_select_dst": "NAME",
+            "mix_mode": mix_mode,
+            "mix_factor": factor
+        }),
+    )?;
+    let mut operands = BTreeMap::new();
+    operands.insert(
+        "object".to_owned(),
+        vec![scene_operand(source.clone(), DMat4::IDENTITY, None)],
+    );
+    Ok(evaluate_with_context(
+        destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+    )?)
+}
+
+#[test]
+fn data_transfer_uv_mixes_by_factor_and_ignores_add_sub_mul_like_blender()
+-> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a UV transfer gives the REPLACE result for ADD, SUB, and MUL alike, lerped
+    // from destination to source by factor. Blender's RNA offers only REPLACE for UV alone; the probe
+    // selected a color loop type too, and the UV result was the same.
+    let source = uv_layer_quad("Src", TRANSFER_SOURCE)?;
+    let destination = uv_layer_quad("Src", TRANSFER_DESTINATION)?;
+    for (mode, factor, expected) in [
+        ("ADD", 1.0, TRANSFER_SOURCE),
+        ("SUB", 1.0, TRANSFER_SOURCE),
+        ("MUL", 1.0, TRANSFER_SOURCE),
+        ("ADD", 0.5, TRANSFER_HALF),
+        ("SUB", 0.5, TRANSFER_HALF),
+        ("MUL", 0.5, TRANSFER_HALF),
+    ] {
+        let result = run_uv_transfer(&destination, &source, mode, factor)?;
+        assert_uv_close(&transferred_uv(&result, "Src")?, &expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn data_transfer_uv_into_missing_layer_starts_at_blender_zero() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a layer generated for the transfer is zero in V-up, so a factor 0.5 transfer
+    // gives half the source, and a factor 1 transfer gives the source.
+    let source = uv_layer_quad("Src", TRANSFER_SOURCE)?;
+    let destination = uv_layer_quad("UVMap", TRANSFER_DESTINATION)?;
+    let half = run_uv_transfer(&destination, &source, "REPLACE", 0.5)?;
+    assert_uv_close(&transferred_uv(&half, "Src")?, &TRANSFER_GENERATED_HALF);
+    let full = run_uv_transfer(&destination, &source, "ADD", 1.0)?;
+    assert_uv_close(&transferred_uv(&full, "Src")?, &TRANSFER_SOURCE);
+    Ok(())
+}
+
+#[test]
+fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a 1x4 Non-Color image, rows 0.1, 0.3, 0.6, 0.9 from bottom to top, with
+    // Closest sampling. UV mapping at V-up (0.13, 0.12), (0.73, 0.38), (0.84, 0.62), (0.2, 0.88) gives
+    // mask weights 0.1, 0.3, 0.6, 0.9. Each row is picked by its V-up coordinate, not its stored one.
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        named_uv_layers(
+            "UVMap",
+            [[0.13, 0.12], [0.73, 0.38], [0.84, 0.62], [0.2, 0.88]],
+        ),
+    );
+    mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({
+            "A": {"v0": 0.0, "v1": 0.0, "v2": 0.0, "v3": 0.0},
+            "B": {"v0": 1.0, "v1": 1.0, "v2": 1.0, "v3": 1.0}
+        }),
+    );
+    let image = ImageData {
+        width: 1,
+        height: 4,
+        pixels: vec![
+            [0.1, 0.1, 0.1, 1.0],
+            [0.3, 0.3, 0.3, 1.0],
+            [0.6, 0.6, 0.6, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+        ],
+        tiles: BTreeMap::new(),
+        interpolation: ImageInterpolation::Closest,
+    };
+    let mix = modifier(
+        "vertex_weight_mix",
+        json!({
+            "vertex_group_a": "A",
+            "vertex_group_b": "B",
+            "mix_mode": "SET",
+            "mix_set": "ALL",
+            "mask_texture": "image_mask",
+            "mask_tex_use_channel": "RED",
+            "mask_tex_mapping": "UV",
+            "mask_tex_uv_layer": "UVMap"
+        }),
+    )?;
+    let result =
+        evaluate_with_context(&mesh, &mix, &BTreeMap::new(), Some(&image), DMat4::IDENTITY)?;
+    let weights = vertex_weights(&result, "A")?;
+    assert_eq!(weights.len(), 4);
+    for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {
+        assert!(
+            (weight - expected).abs() < 1.0e-9,
+            "mask weight {weight} differs from Blender {expected}"
+        );
+    }
     Ok(())
 }

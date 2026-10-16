@@ -626,8 +626,34 @@ pub fn validate_with_context(
                                     }
                                     _ => None,
                                 };
-                                match crate::exchange::gltf::uv_layer_losses(doc, snapshot, vrm) {
-                                    Ok(uv_losses) => losses.extend(uv_losses),
+                                match crate::exchange::gltf::uv_layer_diagnostics(
+                                    doc, snapshot, vrm,
+                                ) {
+                                    Ok((uv_losses, uv_warnings)) => {
+                                        losses.extend(uv_losses);
+                                        for warning in uv_warnings {
+                                            let code = warning
+                                                .details
+                                                .get("feature_id")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("uv.layer_missing")
+                                                .to_owned();
+                                            let data_id = warning
+                                                .details
+                                                .get("material_id")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_owned);
+                                            issue(
+                                                &mut issues,
+                                                "warning",
+                                                &code,
+                                                &warning.message,
+                                                data_id,
+                                                None,
+                                                warning.details,
+                                            );
+                                        }
+                                    }
                                     Err(error) => issue(
                                         &mut issues,
                                         "error",

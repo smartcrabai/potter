@@ -17,14 +17,14 @@ use crate::{
     image::ImageData,
     model::{Id, Material, SceneDoc},
     shader::{
-        BsdfParams, HitContext, evaluate_displacement, evaluate_surface, fill_color_layers,
-        fill_uv_maps,
+        BsdfParams, HitContext, HitUvLayers, evaluate_displacement, evaluate_surface,
+        fill_color_layers,
     },
 };
 
 use super::{
     bvh::Bvh,
-    path::{object_for_index, triangle_tangent_frame},
+    path::object_for_index,
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, blend_color,
         blend_corner_normals, blend_uv,
@@ -46,10 +46,12 @@ pub(super) struct ObjectRecord {
     /// Color layer names in layer order, matching `Triangle::layer_colors`. Not part of the output.
     #[serde(skip)]
     pub color_layers: Vec<String>,
-    /// Position in `color_layers` of the render color layer, when a material reads it by empty
-    /// name.
+    /// Position in `color_layers` of the render color layer, when a material reads it by empty name.
     #[serde(skip)]
     pub color_render: Option<usize>,
+    /// Index of the render layer in `uv_layers`; `None` without layers. Not part of the output.
+    #[serde(skip)]
+    pub uv_render: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -58,6 +60,12 @@ pub(super) struct ElementRecord {
     pub node_id: Id,
     pub domain: String,
     pub element_id: String,
+    /// Per-face UV binding metadata read by triangles through their retained `element_index`.
+    #[serde(skip)]
+    pub uv_render: Option<usize>,
+    /// Source-member layers available to this face; `None` for ordinary meshes.
+    #[serde(skip)]
+    pub uv_available_mask: Option<u8>,
 }
 
 pub(super) struct Geometry {
@@ -250,6 +258,7 @@ pub(super) fn extract_geometry(
             .map(|layer| layer.name.clone())
             .collect();
         let render_layer = uv_store.render_index().unwrap_or(0);
+        let uv_render = (!uv_names.is_empty()).then_some(render_layer);
         let color_store = mesh.map_or_else(ColorStore::default, color_layers::read);
         let material_color_names: Vec<BTreeSet<String>> = node
             .materials
@@ -284,12 +293,13 @@ pub(super) fn extract_geometry(
                 .and_then(|paths| paths.first())
                 .cloned()
                 .unwrap_or_default(),
-            uv_layers: uv_names,
+            uv_layers: uv_names.clone(),
             color_layers: carried_layers
                 .iter()
                 .map(|layer| layer.name.clone())
                 .collect(),
             color_render,
+            uv_render,
         });
         let object = objects.last().ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "object record was not stored")
@@ -334,6 +344,13 @@ pub(super) fn extract_geometry(
                     .collect()
             };
             for (face_index, face) in mesh.faces.iter().enumerate() {
+                let material_slot = usize::try_from(face.material_index).ok();
+                let binding = material_slot
+                    .and_then(|slot| snapshot.slot_binding(node_id, node, slot));
+                let render_layer = binding.map_or(uv_render, |binding| {
+                    binding.uv.render_index.map(usize::from)
+                });
+                let uv_available_mask = binding.map(|binding| binding.uv.available_mask);
                 let face_corner_normals = face_normals[face_index].as_deref();
                 // Corners are numbered across faces in order, as `color_layers::read` lays them
                 // out.
@@ -354,9 +371,10 @@ pub(super) fn extract_geometry(
                     node_id: node_id.clone(),
                     domain: "face".to_owned(),
                     element_id: format!("f{}", face.id),
+                    uv_render: render_layer,
+                    uv_available_mask,
                 });
-                let material_id = usize::try_from(face.material_index)
-                    .ok()
+                let material_id = material_slot
                     .and_then(|slot| snapshot.slot_material(node_id, node, slot));
                 let material_index = material_id.map_or(0, |id| {
                     if let Some(index) = material_indices.get(id).copied() {
@@ -397,7 +415,6 @@ pub(super) fn extract_geometry(
                 for triangle in face_triangles {
                     let mut positions = [DVec3::ZERO; 3];
                     let corners = triangle_corners(face, triangle);
-                    let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
                     for (index, vertex_id) in triangle.iter().enumerate() {
                         let local = vertex_positions.get(vertex_id).copied().ok_or_else(|| {
                             PotError::new(
@@ -408,10 +425,9 @@ pub(super) fn extract_geometry(
                         positions[index] = matrix.transform_point3(local);
                     }
                     let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
-                    let uv = layer_uvs
-                        .get(render_layer)
-                        .copied()
-                        .unwrap_or([[0.0; 2]; 3]);
+                    let uv = render_layer
+                        .and_then(|index| layer_uvs.get(index).copied())
+                        .unwrap_or([[0.0, 1.0]; 3]);
                     let layer_colors = triangle_layer_colors(
                         &carried_layers,
                         face_corner_base,
@@ -479,6 +495,14 @@ pub(super) fn extract_geometry(
                         material.displacement_method == "displacement"
                             && material.node_tree.is_some()
                     }) {
+                        let layers = HitUvLayers {
+                            names: &uv_names,
+                            corners: &triangle.layer_uvs,
+                            positions: triangle.positions,
+                            barycentric: [1.0, 0.0, 0.0],
+                            render: render_layer,
+                            available_mask: uv_available_mask,
+                        };
                         triangles.extend(subdivide_displaced_triangle(
                             doc,
                             material,
@@ -486,6 +510,7 @@ pub(super) fn extract_geometry(
                             &triangle,
                             images,
                             object,
+                            layers,
                             &shader_warnings,
                         )?);
                     } else {
@@ -768,8 +793,8 @@ pub(super) fn extract_geometry(
         let bvh = Bvh::build(&geometry.triangles)?;
         for index in 0..geometry.triangles.len() {
             let triangle = &geometry.triangles[index];
-            if triangle.normals.is_some() || triangle.lit_per_pixel {
-                // Smooth and per-pixel lit triangles are shaded at each visible hit.
+            if triangle.normals.is_some() {
+                // Smooth triangles are shaded per pixel from their corner normals.
                 continue;
             }
             let material = geometry
@@ -1113,11 +1138,12 @@ fn subdivide_displaced_triangle(
     triangle: &Triangle,
     images: &BTreeMap<String, ImageData>,
     object: &ObjectRecord,
+    layers: HitUvLayers<'_>,
     warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<[Triangle; 4]> {
     subdivide_displaced(triangle, object_to_world, |sample| {
         let mut tables = LayerTables::new();
-        let context = layered_context(
+        let mut context = layered_context(
             doc,
             images,
             warnings,
@@ -1126,13 +1152,15 @@ fn subdivide_displaced_triangle(
             HitPose {
                 point: sample.point,
                 object: sample.object,
-                normal: sample.normal,
-                view: DVec3::Z,
                 barycentric: sample.barycentric,
             },
+            HitUvLayers {
+                barycentric: sample.barycentric,
+                ..layers
+            },
             &mut tables,
-        )?
-        .with_tangent_frame(sample.tangent, sample.bitangent);
+        )?;
+        context.uv = sample.uv;
         evaluate_displacement(material, &context)
     })
 }
@@ -1149,8 +1177,6 @@ struct DisplacementSample {
     layer_colors: Vec<[f64; 4]>,
     /// Blended corner normal the sample moves along, or the face normal on flat triangles.
     normal: DVec3,
-    tangent: DVec3,
-    bitangent: DVec3,
 }
 
 /// Splits a triangle into four and moves its six sample points by `displacement`.
@@ -1167,34 +1193,6 @@ fn subdivide_displaced(
     let normal = (triangle.positions[1] - triangle.positions[0])
         .cross(triangle.positions[2] - triangle.positions[0])
         .normalize_or_zero();
-    let uv1 = [
-        triangle.uv[1][0] - triangle.uv[0][0],
-        triangle.uv[1][1] - triangle.uv[0][1],
-    ];
-    let uv2 = [
-        triangle.uv[2][0] - triangle.uv[0][0],
-        triangle.uv[2][1] - triangle.uv[0][1],
-    ];
-    let determinant = uv1[0] * uv2[1] - uv1[1] * uv2[0];
-    let (tangent, bitangent) = if determinant.abs() > f64::EPSILON {
-        (
-            ((triangle.positions[1] - triangle.positions[0]) * uv2[1]
-                - (triangle.positions[2] - triangle.positions[0]) * uv1[1])
-                / determinant,
-            ((triangle.positions[2] - triangle.positions[0]) * uv1[0]
-                - (triangle.positions[1] - triangle.positions[0]) * uv2[0])
-                / determinant,
-        )
-    } else {
-        let tangent = if normal.z.abs() < 0.999 {
-            normal.cross(DVec3::Z)
-        } else {
-            normal.cross(DVec3::Y)
-        };
-        (tangent, normal.cross(tangent))
-    };
-    let tangent = tangent.normalize_or_zero();
-    let bitangent = bitangent.normalize_or_zero();
     let barycentric = [
         [1.0, 0.0, 0.0],
         [0.5, 0.5, 0.0],
@@ -1242,8 +1240,6 @@ fn subdivide_displaced(
                 .map(|corners| blend_color(corners, weights))
                 .collect(),
             normal: sample_normal,
-            tangent,
-            bitangent,
         };
         let displacement = displacement(&sample)?;
         positions[index] = point + sample_normal * displacement;
@@ -1443,6 +1439,19 @@ impl SceneShader<'_> {
                 )
             },
         )?;
+        let element = triangle
+            .element_index
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.geometry.elements.get(index));
+        let layers = HitUvLayers {
+            names: &object.uv_layers,
+            corners: &triangle.layer_uvs,
+            positions: triangle.positions,
+            barycentric: hit.barycentric,
+            render: element.map_or(object.uv_render, |element| element.uv_render),
+            available_mask: element.and_then(|element| element.uv_available_mask),
+        };
         let mut tables = LayerTables::new();
         let context = layered_context(
             self.doc,
@@ -1457,12 +1466,12 @@ impl SceneShader<'_> {
                 view: hit.view,
                 barycentric: hit.barycentric,
             },
+            layers,
             &mut tables,
         )?;
         evaluate_surface(material, &context)
     }
 }
-
 /// Face-corner index of each triangle vertex; the UV and shading-normal lookups share it.
 fn triangle_corners(face: &crate::geom::Face, triangle: &[u32; 3]) -> [Option<usize>; 3] {
     triangle.map(|vertex_id| {
@@ -1473,7 +1482,7 @@ fn triangle_corners(face: &crate::geom::Face, triangle: &[u32; 3]) -> [Option<us
 }
 
 /// Corner UVs of every UV layer for a triangle whose vertices sit at face corners `corners`, in
-/// layer order. A layer with no entry for the face samples `[0, 0]` at each corner.
+/// layer order. A layer with no entry for the face samples canonical UV `[0, 1]` at each corner.
 fn triangle_layer_uvs(
     store: &UvStore,
     face_index: usize,
@@ -1491,7 +1500,7 @@ fn triangle_layer_uvs(
                 corner
                     .and_then(|corner| values.and_then(|values| values.get(corner)))
                     .copied()
-                    .unwrap_or([0.0; 2])
+                    .unwrap_or([0.0, 1.0])
             })
         })
         .collect()
@@ -1585,17 +1594,14 @@ fn carried_color_layers(
     (carried, color_render)
 }
 
-/// Layer tables of one hit: UV and color values by layer name, filled in place per hit so that no
-/// memory is allocated per ray.
+/// The color values of one hit, filled in place so ray shading does not allocate a table.
 pub(super) struct LayerTables<'a> {
-    uv: [(&'a str, [f64; 2]); uv_layers::MAX_LAYERS],
     color: [(&'a str, [f64; 4]); MAX_COLOR_LAYERS],
 }
 
 impl LayerTables<'_> {
     pub(super) fn new() -> Self {
         Self {
-            uv: [("", [0.0; 2]); uv_layers::MAX_LAYERS],
             color: [("", [0.0; 4]); MAX_COLOR_LAYERS],
         }
     }
@@ -1621,17 +1627,9 @@ pub(super) fn layered_context<'a>(
     object: &'a ObjectRecord,
     triangle: &Triangle,
     pose: HitPose,
+    layers: HitUvLayers<'a>,
     tables: &'a mut LayerTables<'a>,
 ) -> Result<HitContext<'a>> {
-    let uv_maps = fill_uv_maps(
-        &mut tables.uv,
-        object.uv_layers.iter().map(String::as_str).zip(
-            triangle
-                .layer_uvs
-                .iter()
-                .map(|corners| blend_uv(corners, pose.barycentric)),
-        ),
-    )?;
     let color_maps = fill_color_layers(
         &mut tables.color,
         object.color_layers.iter().map(String::as_str).zip(
@@ -1645,14 +1643,18 @@ pub(super) fn layered_context<'a>(
         .color_render
         .and_then(|index| triangle.layer_colors.get(index))
         .map(|corners| blend_color(corners, pose.barycentric));
-    let (tangent, bitangent) = triangle_tangent_frame(triangle, pose.normal);
-    let mut context = HitContext::new(&doc.node_groups)
-        .with_images(images)
-        .with_tangent_frame(tangent, bitangent)
-        .with_uv_maps(uv_maps)
-        .with_color_layers(color_maps, color_render)
-        .with_warnings(warnings);
-    context.uv = blend_uv(&triangle.uv, pose.barycentric);
+    let mut context = HitContext::new(&doc.node_groups).with_images(images);
+    context.uv = layers
+        .render
+        .and_then(|index| layers.uv(index))
+        .unwrap_or([0.0, 1.0]);
+    context.uv_layers = Some(HitUvLayers {
+        barycentric: pose.barycentric,
+        ..layers
+    });
+    context.color_layers = Some(color_maps);
+    context.color_render = color_render;
+    context.warnings = Some(warnings);
     context.generated = pose.object;
     context.position = pose.point;
     context.object = pose.object;
@@ -1680,7 +1682,6 @@ pub(super) fn object_space(snapshot: &Snapshot, object: &ObjectRecord, point: DV
         point
     }
 }
-
 /// Per-corner values for a triangle, or `None` when any corner is not on the face.
 fn corner_values<T: Copy>(values: &[T], corners: [Option<usize>; 3]) -> Option<[T; 3]> {
     Some([
@@ -2124,6 +2125,8 @@ mod shading_normal_tests {
         geom::{
             Mesh,
             color_layers::{ColorDomain, ColorLayer},
+            uv_layers::{UvLayer, UvStore},
+            Mesh,
         },
         model::Id,
         render::raster::{AlphaMode, Triangle},
@@ -2141,6 +2144,18 @@ mod shading_normal_tests {
             json!({"domain": "face", "type": "bool", "values": {"f0": smooth}}),
         );
         mesh
+    }
+
+    #[test]
+    fn absent_uv_rows_use_the_canonical_storage_default() {
+        let store = UvStore {
+            layers: vec![UvLayer::new("UVMap", vec![None])],
+            ..UvStore::default()
+        };
+        assert_eq!(
+            triangle_layer_uvs(&store, 0, [Some(0), Some(1), Some(2)]),
+            vec![[[0.0, 1.0]; 3]],
+        );
     }
 
     #[test]

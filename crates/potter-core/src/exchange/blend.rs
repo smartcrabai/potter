@@ -388,7 +388,6 @@ fn blender_uv_loops(mesh: &Mesh, layer: &UvLayer) -> (Value, Value) {
     }
     (Value::Array(values), Value::Array(pins))
 }
-
 fn prepare_blend_export_resources(
     mut document: Value,
     project: &Project,
@@ -4826,6 +4825,29 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             Value::Array(blender_attributes),
         );
     }
+    let uv = convert_uv_layers(item, &faces)?;
+    let uv_layer_names = uv
+        .layers
+        .iter()
+        .map(|layer| layer.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut attributes = Map::new();
+    attributes.insert("blender_edge_flags".to_owned(), json!(edge_metadata));
+    attributes.insert("blender_polygon_smooth".to_owned(), json!(smooth));
+    let blender_attributes = item
+        .get("attributes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !is_uv_layer_attribute(entry, &uv_layer_names))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !blender_attributes.is_empty() {
+        attributes.insert(
+            "blender_attributes".to_owned(),
+            Value::Array(blender_attributes),
+        );
+    }
     if let Some(skin_vertices) = item
         .get("skin_vertices")
         .and_then(Value::as_array)
@@ -4853,7 +4875,37 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             Value::Array(skin_vertices.clone()),
         );
     }
+    let next_id = IdCounters {
+        vertex: next_counter(vertices.len())?,
+        edge: next_counter(edges.len())?,
+        face: next_counter(faces.len())?,
+    };
+    let mut mesh = Mesh {
+        vertices,
+        edges,
+        faces,
+        attributes,
+        next_id,
+    };
     uv_layers::write(&mut mesh, &uv);
+    if let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null()) {
+        let normals = raw
+            .as_array()
+            .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
+            .iter()
+            .map(|normal| {
+                parse_vec3_value(normal)
+                    .map(glam::DVec3::from_array)
+                    .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Blender's polygon smooth flags are exact; the corner normals decide only custom normals.
+        let exact = super::shading::ExactShading {
+            smooth,
+            sharp: Vec::new(),
+        };
+        super::shading::import_shading_flags(&mut mesh, &normals, Some(&exact))?;
+    }
     mesh.validate()
         .map_err(|error| invalid_intermediate(&format!("invalid mesh data: {error}")))?;
     Ok(mesh)
@@ -5254,7 +5306,6 @@ fn is_uv_layer_attribute(attribute: &Value, layer_names: &BTreeSet<&str>) -> boo
             .is_some_and(|layer| layer_names.contains(layer));
     corner && (layer_data || pin_flags)
 }
-
 fn parse_shape_keys(
     item: &Value,
     mesh: &Mesh,

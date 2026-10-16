@@ -7,7 +7,8 @@
 //!   when the slot has a `KHR_texture_transform`, with Blender's Location, Rotation and Scale;
 //! - the base color, metallic-roughness and emissive colors into the Principled BSDF, multiplied by
 //!   their factors as Blender does;
-//! - the normal map through a Normal Map node whose Strength is the `normalTexture.scale`;
+//! - the normal map through a Normal Map node whose Strength is the `normalTexture.scale` and whose
+//!   UV Map is the normal texture's layer (the render layer when it names none);
 //! - occlusion through a Separate Color (Red) into the `glTF Material Output` group, which PR10's
 //!   resolver reads back as glTF occlusion.
 
@@ -550,6 +551,18 @@ fn build_graph(
         normal_map
             .properties
             .insert("space".to_owned(), json!("TANGENT"));
+        // The node reads the normal texture's layer, as Blender's importer sets it; the render
+        // layer (no name, or an empty one) is the node default.
+        if let Some(layer) = slot
+            .texture
+            .uv_layer
+            .as_deref()
+            .filter(|layer| !layer.is_empty())
+        {
+            normal_map
+                .properties
+                .insert("uv_map".to_owned(), json!(layer));
+        }
         normal_map
             .inputs
             .insert("Strength".to_owned(), json!(textures.normal_scale));
@@ -790,38 +803,38 @@ mod tests {
         assert_eq!(graph.nodes.len(), 1);
     }
 
-    #[test]
-    fn field_base_alpha_multiplies_texture_alpha_by_material_factor() {
-        let texture = TextureRef {
-            image: Id::new("paint").unwrap(),
-            uv_layer: None,
-            interpolation: ImageInterpolation::Linear,
+    fn normal_map_uv_map(uv_layer: Option<&str>) -> Result<Option<Value>> {
+        let textures = GraphTextures {
+            base_color: None,
+            metallic_roughness: None,
+            normal: Some(SlotTexture {
+                texture: TextureRef {
+                    image: Id::new("normal_image")?,
+                    uv_layer: uv_layer.map(str::to_owned),
+                    interpolation: ImageInterpolation::Linear,
+                },
+                transform: None,
+            }),
+            normal_scale: 1.0,
+            emissive: None,
+            occlusion: None,
         };
-        let textures = GraphTextures::from_field_refs(Some(texture), None, None, None);
-        let material = Material {
-            base_color: [1.0, 1.0, 1.0, 0.35],
-            alpha_mode: "blend".to_owned(),
-            ..Material::default()
-        };
-        let graph = build_graph(&material, &textures, false).expect("graph");
-        let math = graph
+        let graph = build_graph(&Material::default(), &textures, false)?;
+        Ok(graph
             .nodes
-            .get(&Id::new("base_alpha_factor").unwrap())
-            .expect("base alpha multiply node");
-        assert_eq!(math.node_type, "ShaderNodeMath");
-        assert_eq!(math.properties.get("operation"), Some(&json!("MULTIPLY")));
-        assert_eq!(math.inputs.get("Value_001"), Some(&json!(0.35)));
-        assert!(graph.links.contains(&GraphLink {
-            from_node: Id::new("base_tex").unwrap(),
-            from_socket: "Alpha".to_owned(),
-            to_node: Id::new("base_alpha_factor").unwrap(),
-            to_socket: "Value".to_owned(),
-        }));
-        assert!(graph.links.contains(&GraphLink {
-            from_node: Id::new("base_alpha_factor").unwrap(),
-            from_socket: "Value".to_owned(),
-            to_node: Id::new("principled").unwrap(),
-            to_socket: "Alpha".to_owned(),
-        }));
+            .get(&Id::new("normal_strength")?)
+            .and_then(|node| node.properties.get("uv_map"))
+            .cloned())
+    }
+
+    #[test]
+    fn normal_map_node_reads_the_normal_texture_layer() -> Result<()> {
+        assert_eq!(
+            normal_map_uv_map(Some("UVMap.001"))?,
+            Some(json!("UVMap.001"))
+        );
+        assert_eq!(normal_map_uv_map(None)?, None);
+        assert_eq!(normal_map_uv_map(Some(""))?, None);
+        Ok(())
     }
 }

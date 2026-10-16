@@ -4,11 +4,14 @@ use std::{
     path::Path,
 };
 
-use super::{ExchangeMesh, ImportedGraph, Loss, evaluated_meshes, import_error, shading};
+use super::{
+    ExchangeMesh, ExchangeUvLayer, ImportedGraph, Loss, evaluated_meshes, import_error,
+    import_uv_layers, shading,
+};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{Snapshot, animation::animated_transform},
-    geom::Mesh,
+    geom::{Mesh, uv_layers},
     model::{
         Action, ArmatureData, CameraData, CameraProjection, DataBlock, FCurve, Id, Interpolation,
         Keyframe, LightData, LightType, Material, Modifier, Node, PoseBone, SceneDoc, ShapeKeyData,
@@ -1847,15 +1850,10 @@ fn parse_usda(text: &str, scene_id: String) -> Result<(SceneDoc, Vec<Loss>)> {
         .get(&doc.active_scene)
         .map(|scene| scene.root_collection.clone())
         .ok_or_else(|| import_error("USD scene root collection is missing"))?;
-    let mut roots = doc
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.parent.is_none())
-        .map(|(id, _)| id.clone())
-        .collect::<Vec<_>>();
-    roots.sort();
+    let mut objects = doc.nodes.keys().cloned().collect::<Vec<_>>();
+    objects.sort();
     if let Some(collection) = doc.collections.get_mut(&collection) {
-        collection.objects = roots;
+        collection.objects = objects;
     }
     if doc.nodes.is_empty() {
         return Err(import_error("USD layer contains no supported scene prims"));
@@ -1935,7 +1933,8 @@ fn import_node_tree(
     let mut data_id = None;
     let mut node_materials = Vec::new();
     if let Some(mesh_prim) = mesh_prim {
-        let (positions, faces, normals) = import_mesh(mesh_prim, losses)?;
+        let (positions, faces, normals, (uv_layers, uv_active, uv_render)) =
+            import_mesh(mesh_prim, losses)?;
         let mut mesh = Mesh::from_positions_and_faces(
             positions.iter().copied().map(DVec3::from_array).collect(),
             faces,
@@ -1947,6 +1946,7 @@ fn import_node_tree(
                 json!({"reason": error.to_string()}),
             )
         })?;
+        import_uv_layers(&mut mesh, &uv_layers, uv_active, uv_render);
         if let Some(normals) = normals {
             shading::import_shading(&mut mesh, &normals)?;
         }
@@ -2160,7 +2160,13 @@ fn import_node_tree(
     Ok(())
 }
 
-type ImportedMesh = (Vec<[f64; 3]>, Vec<Vec<usize>>, Option<Vec<DVec3>>);
+type ImportedUvLayers = (Vec<ExchangeUvLayer>, Option<usize>, Option<usize>);
+type ImportedMesh = (
+    Vec<[f64; 3]>,
+    Vec<Vec<usize>>,
+    Option<Vec<DVec3>>,
+    ImportedUvLayers,
+);
 type UsdDeformation = (
     Option<ShapeKeyData>,
     Vec<VertexGroup>,
@@ -2218,7 +2224,8 @@ fn import_mesh(prim: &Prim, losses: &mut Vec<Loss>) -> Result<ImportedMesh> {
         offset = end;
     }
     let normals = import_normals(prim, &points, &faces, losses)?;
-    Ok((points, faces, normals))
+    let uv = import_uv_layers_of(prim, points.len(), &faces, losses);
+    Ok((points, faces, normals, uv))
 }
 
 /// Corner normals for `prim`, from `primvars:normals` or the legacy `normals` attribute.
@@ -2329,6 +2336,221 @@ fn normal_loss(reason: &str) -> Loss {
         reason: reason.to_owned(),
         suggestion: Some("use --allow-lossy to import the file with derived shading".to_owned()),
     }
+}
+
+/// A UV layer that cannot be read. The layer is dropped, so the import needs `--allow-lossy`.
+fn uv_loss(reason: String) -> Loss {
+    Loss {
+        feature_id: "mesh.uv_layer".to_owned(),
+        data_id: None,
+        reason,
+        suggestion: Some("use --allow-lossy to import the file without these UV layers".to_owned()),
+    }
+}
+
+/// Reads the UV layers of a mesh prim in Potter's convention (V down), with the active and render
+/// layer indices. Each `texCoord2f` primvar is one layer, named by its primvar: `primvars:st` is
+/// `st`. A file Potter wrote lists its layers in `potter:uv_layers`, with `potter:uv_render` and
+/// `potter:uv_active` naming the render and active layers; that metadata sets the names, order and
+/// selections. Without it, layers keep the primvar order of the file, the render layer is `st` (or
+/// the first layer without one), and the active layer is the render layer.
+fn import_uv_layers_of(
+    prim: &Prim,
+    point_count: usize,
+    faces: &[Vec<usize>],
+    losses: &mut Vec<Loss>,
+) -> ImportedUvLayers {
+    let mut declared: Vec<&Declaration> = Vec::new();
+    for declaration in &prim.declared {
+        let is_uv = declaration.name.starts_with("primvars:")
+            && declaration.type_name.starts_with("texCoord");
+        if is_uv && !declared.iter().any(|known| known.name == declaration.name) {
+            declared.push(declaration);
+        }
+    }
+    let potter_names = property_strings(prim, "potter:uv_layers");
+    let (entries, render_name, active_name): (
+        Vec<(String, String)>,
+        Option<String>,
+        Option<String>,
+    ) = if let Some(names) = &potter_names {
+        let render = property_string(prim, "potter:uv_render");
+        let entries: Vec<(String, String)> = names
+            .iter()
+            .map(|name| {
+                let identifier = if render.as_deref() == Some(name.as_str()) {
+                    "st".to_owned()
+                } else {
+                    prim_identifier(name)
+                };
+                (name.clone(), format!("primvars:{identifier}"))
+            })
+            .collect();
+        let active = property_string(prim, "potter:uv_active").or_else(|| render.clone());
+        (entries, render, active)
+    } else {
+        let entries: Vec<(String, String)> = declared
+            .iter()
+            .map(|declaration| {
+                let name = declaration.name["primvars:".len()..].to_owned();
+                (name, declaration.name.clone())
+            })
+            .collect();
+        let render = entries
+            .iter()
+            .find(|(name, _)| name == "st")
+            .or_else(|| entries.first())
+            .map(|(name, _)| name.clone());
+        (entries, render.clone(), render)
+    };
+    if potter_names.is_some() {
+        for declaration in &declared {
+            if !entries
+                .iter()
+                .any(|(_, primvar)| primvar == &declaration.name)
+            {
+                losses.push(uv_loss(format!(
+                    "USD UV primvar `{}` on `{}` is not listed in potter:uv_layers",
+                    declaration.name, prim.name
+                )));
+            }
+        }
+    }
+    let mut layers: Vec<ExchangeUvLayer> = Vec::new();
+    for (name, primvar) in entries {
+        let Some(declaration) = declared.iter().find(|known| known.name == primvar) else {
+            losses.push(uv_loss(format!(
+                "UV layer `{name}` on `{}` has no `{primvar}` texCoord primvar",
+                prim.name
+            )));
+            continue;
+        };
+        if declaration.type_name != "texCoord2f" {
+            losses.push(uv_loss(format!(
+                "USD UV primvar `{primvar}` on `{}` has type `{}`; only texCoord2f UV sets are imported",
+                prim.name, declaration.type_name
+            )));
+            continue;
+        }
+        match read_uv_primvar(prim, &primvar, point_count, faces) {
+            Ok(corners) => layers.push(ExchangeUvLayer { name, corners }),
+            Err(reason) => losses.push(uv_loss(format!(
+                "USD UV primvar `{primvar}` on `{}` {reason}",
+                prim.name
+            ))),
+        }
+    }
+    if layers.len() > uv_layers::MAX_LAYERS {
+        for layer in layers.drain(uv_layers::MAX_LAYERS..) {
+            losses.push(uv_loss(format!(
+                "`{}` has more than {} UV layers; layer `{}` is dropped",
+                prim.name,
+                uv_layers::MAX_LAYERS,
+                layer.name
+            )));
+        }
+    }
+    let position = |name: Option<&String>| {
+        name.and_then(|name| layers.iter().position(|layer| &layer.name == name))
+    };
+    let render = position(render_name.as_ref()).or((!layers.is_empty()).then_some(0));
+    let active = position(active_name.as_ref()).or(render);
+    (layers, active, render)
+}
+
+/// Corner values of one `texCoord2f` primvar, one row per face of `faces` in corner order, in
+/// Potter's convention. `faceVarying` values are per corner and `vertex` values per point, so each
+/// corner takes the value of its point. A `primvars:<name>:indices` array selects a value per
+/// element. The error completes "USD UV primvar `…` on `…` " and says why the values cannot be
+/// mapped onto the corners.
+fn read_uv_primvar(
+    prim: &Prim,
+    primvar: &str,
+    point_count: usize,
+    faces: &[Vec<usize>],
+) -> std::result::Result<Vec<Vec<[f64; 2]>>, String> {
+    let raw = prim
+        .properties
+        .get(primvar)
+        .ok_or_else(|| "has no values".to_owned())?;
+    let (value_text, interpolation) = split_interpolation(raw);
+    let interpolation = interpolation.ok_or_else(|| "has no interpolation metadata".to_owned())?;
+    let corner_total = faces.iter().map(Vec::len).sum::<usize>();
+    let element_count = match interpolation.as_str() {
+        "faceVarying" => corner_total,
+        "vertex" => point_count,
+        other => {
+            return Err(format!(
+                "uses unsupported interpolation `{other}`; only faceVarying and vertex UV sets are imported"
+            ));
+        }
+    };
+    let numbers = scan_numbers(value_text).map_err(|_| "has malformed values".to_owned())?;
+    if numbers.len() % 2 != 0 {
+        return Err("has values that are not uv pairs".to_owned());
+    }
+    let values = numbers.as_chunks::<2>().0.to_vec();
+    let element_values = if let Some(raw_indices) =
+        prim.properties.get(&format!("{primvar}:indices"))
+    {
+        let indices = scan_numbers(raw_indices).map_err(|_| "has malformed indices".to_owned())?;
+        if indices.len() != element_count {
+            return Err(format!(
+                "has {} indices for {element_count} {interpolation} elements",
+                indices.len()
+            ));
+        }
+        indices
+            .iter()
+            .map(|index| {
+                (index.fract() == 0.0 && *index >= 0.0)
+                    .then(|| values.get(*index as usize).copied())
+                    .flatten()
+                    .ok_or_else(|| "has an index outside its values".to_owned())
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?
+    } else {
+        if values.len() != element_count {
+            return Err(format!(
+                "has {} values for {element_count} {interpolation} elements and no indices",
+                values.len()
+            ));
+        }
+        values
+    };
+    let mut corners = Vec::with_capacity(faces.len());
+    let mut corner = 0_usize;
+    for face in faces {
+        let mut row = Vec::with_capacity(face.len());
+        for &vertex in face {
+            let element = if interpolation == "vertex" {
+                vertex
+            } else {
+                corner
+            };
+            let [u, v] = *element_values
+                .get(element)
+                .ok_or_else(|| "has no value for a corner".to_owned())?;
+            // USD's V points up, and Potter stores V down.
+            row.push([u, 1.0 - v]);
+            corner += 1;
+        }
+        corners.push(row);
+    }
+    Ok(corners)
+}
+
+/// The declared type of the attribute whose `=` is at `equals`: the token before the name, or the
+/// token before the `[]` of an array (`texCoord2f[] primvars:st =`, `custom string[] potter:x =`).
+fn declared_type(tokens: &[Token], equals: usize) -> String {
+    let mut position = equals.saturating_sub(2);
+    if tokens.get(position).is_some_and(|token| token.value == "]") {
+        position = position.saturating_sub(2);
+    }
+    tokens
+        .get(position)
+        .map(|token| token.value.clone())
+        .unwrap_or_default()
 }
 
 fn import_deformation(prim: &Prim, mesh: &Mesh) -> Result<UsdDeformation> {
@@ -2728,11 +2950,20 @@ struct Token {
     line: usize,
 }
 
+/// One attribute declaration in file order: `texCoord2f[] primvars:st =` declares `primvars:st`
+/// with type `texCoord2f`.
+#[derive(Clone)]
+struct Declaration {
+    name: String,
+    type_name: String,
+}
+
 #[derive(Clone)]
 struct Prim {
     kind: String,
     name: String,
     properties: BTreeMap<String, String>,
+    declared: Vec<Declaration>,
     children: Vec<Prim>,
 }
 
@@ -2784,6 +3015,7 @@ fn parse_prim(tokens: &[Token], start: usize, end: usize) -> Result<(Prim, usize
     let body_start = index + 1;
     let body_end = matching_close(tokens, index, end, "{", "}")?;
     let mut properties = BTreeMap::new();
+    let mut declared = Vec::new();
     let mut children = Vec::new();
     index = body_start;
     while index < body_end {
@@ -2805,6 +3037,10 @@ fn parse_prim(tokens: &[Token], start: usize, end: usize) -> Result<(Prim, usize
                 .map(|token| token.value.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
+            declared.push(Declaration {
+                type_name: declared_type(tokens, index),
+                name: key.clone(),
+            });
             properties.insert(key, raw);
             index = value_end.max(index + 1);
             continue;
@@ -2816,6 +3052,7 @@ fn parse_prim(tokens: &[Token], start: usize, end: usize) -> Result<(Prim, usize
             kind,
             name,
             properties,
+            declared,
             children,
         },
         body_end + 1,
@@ -3112,6 +3349,50 @@ fn write_uv_primvars(output: &mut String, exchange: &ExchangeMesh, depth: usize)
                 "{}int[] primvars:{name}:indices = [{}]",
                 spaces(depth),
                 indices.join(", ")
+            ),
+        );
+    }
+    if exchange.uv_layers.is_empty() {
+        return Ok(());
+    }
+    // A primvar name cannot carry a layer's exact name, the order, or which layer is active, so
+    // Potter records them here. Readers without this metadata fall back to the primvars alone.
+    let layer_names = exchange
+        .uv_layers
+        .iter()
+        .map(|layer| layer.name.clone())
+        .collect::<Vec<_>>();
+    line(
+        output,
+        &format!(
+            "{}custom string[] potter:uv_layers = {}",
+            spaces(depth),
+            string_array(&layer_names)?
+        ),
+    );
+    if let Some(render) = exchange
+        .uv_render
+        .and_then(|index| exchange.uv_layers.get(index))
+    {
+        line(
+            output,
+            &format!(
+                "{}custom string potter:uv_render = {}",
+                spaces(depth),
+                quote(&render.name)?
+            ),
+        );
+    }
+    if let Some(active) = exchange
+        .uv_active
+        .and_then(|index| exchange.uv_layers.get(index))
+    {
+        line(
+            output,
+            &format!(
+                "{}custom string potter:uv_active = {}",
+                spaces(depth),
+                quote(&active.name)?
             ),
         );
     }

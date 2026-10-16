@@ -2485,11 +2485,7 @@ fn import_polymesh(
                         .collect::<Vec<_>>())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let name = parameter
-                .metadata
-                .get("sourceName")
-                .cloned()
-                .unwrap_or_else(|| parameter.name.clone());
+            let name = uv_source_name(parameter);
             Ok((name, samples))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2553,7 +2549,8 @@ pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
-    pub uv_faces: Option<Vec<Vec<[f64; 2]>>>,
+    /// Every UV layer of the sample, in file order, named as Blender names it.
+    pub uv_layers: Option<Vec<ExchangeUvLayer>>,
     pub colors: Option<(String, Vec<Vec<f64>>)>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
 }
@@ -2562,6 +2559,7 @@ pub(crate) struct MeshCacheSample {
 ///
 /// The object path is an Alembic path, including the archive's virtual `root` segment.
 /// `read_uv` and `read_color` avoid decoding unrequested geometric parameters.
+/// Each UV `GeomParam` becomes one layer, named by its `sourceName` or its own name.
 ///
 /// # Errors
 ///
@@ -2613,9 +2611,12 @@ pub(crate) fn read_mesh_cache(
         .ok_or_else(|| import_error("Alembic PolyMesh .faceCounts array is missing"))?;
     let indices = property(&geom.children, ".faceIndices")
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
-    let uv = read_uv
-        .then(|| uv_geom_parameters(geom).into_iter().next())
-        .flatten();
+    let uv = if read_uv {
+        uv_geom_parameters(geom)
+    } else {
+        Vec::new()
+    };
+    let uv_names = uv_layer_names(&uv);
     let color = read_color
         .then(|| property(&geom.children, "color").or_else(|| property(&geom.children, "Cs")))
         .flatten();
@@ -2631,7 +2632,7 @@ pub(crate) fn read_mesh_cache(
         .into_iter()
         .max_by_key(|parameter| parameter.sample_count)
         .ok_or_else(|| import_error("Alembic PolyMesh has no time-sampled properties"))?;
-    for parameter in [uv, color, velocity].into_iter().flatten() {
+    for parameter in uv.iter().copied().chain(color).chain(velocity) {
         let values = geomparam_values_property(parameter)?;
         sample_count = sample_count.max(values.sample_count);
         if values.sample_count != 1 && values.sample_count != sample_count {
@@ -2667,7 +2668,7 @@ pub(crate) fn read_mesh_cache(
             .collect::<Vec<_>>();
         let face_counts = decode_i32_sample(bytes, counts, face_sample)?;
         let face_indices = decode_i32_sample(bytes, indices, index_sample)?;
-        // Per-corner values arrive in file winding, so they are indexed by file faces and reversed.
+        // Keep cache UVs in file-corner order; the cache modifier reverses them only with polygons.
         let file_faces = decode_faces(&points, &face_counts, &face_indices)?;
         let geometry_sample = MeshSample {
             positions: points.clone(),
@@ -2675,26 +2676,31 @@ pub(crate) fn read_mesh_cache(
             uv_layers: Vec::new(),
             normals: Vec::new(),
         };
-        let uv_faces = uv
-            .map(|parameter| {
-                let values = geomparam_values_property(parameter)?;
-                validate_cache_parameter_samples(values, sample_count)?;
-                let (scope, tuples) = geomparam_values(
-                    bytes,
-                    parameter,
-                    &geometry_sample,
-                    2,
-                    sample_slot(values, sample_index),
-                )?;
-                cache_uv_faces(&file_faces, &scope, &tuples).map(|faces| {
-                    faces
-                        .into_iter()
-                        .map(|mut corners| {
-                            corners.reverse();
-                            uv_to_storage(corners)
+        let uv_layers = read_uv
+            .then(|| {
+                uv.iter()
+                    .copied()
+                    .zip(&uv_names)
+                    .map(|(parameter, name)| {
+                        let values = geomparam_values_property(parameter)?;
+                        validate_cache_parameter_samples(values, sample_count)?;
+                        let (scope, tuples) = geomparam_values(
+                            bytes,
+                            parameter,
+                            &geometry_sample,
+                            2,
+                            sample_slot(values, sample_index),
+                        )?;
+                        let corners = cache_uv_faces(&file_faces, &scope, &tuples)?
+                            .into_iter()
+                            .map(uv_to_storage)
+                            .collect();
+                        Ok(ExchangeUvLayer {
+                            name: name.clone(),
+                            corners,
                         })
-                        .collect::<Vec<_>>()
-                })
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
         let colors = color
@@ -2753,7 +2759,7 @@ pub(crate) fn read_mesh_cache(
             time_seconds: sample_time,
             positions: points,
             faces: reversed_faces(&file_faces),
-            uv_faces,
+            uv_layers,
             colors,
             velocities,
         });
@@ -3122,11 +3128,32 @@ fn uv_geom_parameters(geom: &ParsedProperty) -> Vec<&ParsedProperty> {
     parameters
 }
 
+/// The name a UV parameter's layer carries: its `sourceName`, or its own name without one.
+fn uv_source_name(parameter: &ParsedProperty) -> String {
+    parameter
+        .metadata
+        .get("sourceName")
+        .cloned()
+        .unwrap_or_else(|| parameter.name.clone())
+}
+
+/// The layer names of the UV parameters, in file order, made unique as the importer makes them.
+fn uv_layer_names(parameters: &[&ParsedProperty]) -> Vec<String> {
+    let mut layers = Vec::<ExchangeUvLayer>::new();
+    for parameter in parameters {
+        let name = unique_uv_name(&uv_source_name(parameter), &layers);
+        layers.push(ExchangeUvLayer {
+            name,
+            corners: Vec::new(),
+        });
+    }
+    layers.into_iter().map(|layer| layer.name).collect()
+}
+
 /// Alembic stores V up, as Blender does; Potter stores V down, so the conversion flips V.
 fn uv_to_storage(corners: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
     corners.into_iter().map(|[u, v]| [u, 1.0 - v]).collect()
 }
-
 fn geomparam_values_property(parameter: &ParsedProperty) -> Result<&ParsedProperty> {
     let values = match parameter.property_type {
         0 => property(&parameter.children, ".vals")

@@ -5,10 +5,10 @@
 //! those IDs by [`remap_attributes`] (the same provenance rule modifiers use), and positional
 //! attributes concatenate in storage order. Members that lack an attribute contribute its default.
 //!
-//! UV layers join by position. Joined layer `k` is every member's `k`-th [`read_layers`] layer, in
-//! member order and in Potter's stored convention. The joined layer keeps the name of the first
-//! member with that layer at that position. Missing corners stay absent in the canonical store;
-//! [`uv_covered_faces`] reports which faces have values. Per-corner pins follow their UV values.
+//! UV layers form one canonical V-down store and join by name in first-seen order. A layer keeps
+//! each member's values and pins by that name; a missing layer or face row contributes Blender's
+//! default UV(0, 0), stored canonically as `[0, 1]`. The evaluator retains source-face coverage
+//! separately so synthesized defaults do not become available member data.
 //!
 //! A member whose transform mirrors (negative determinant) reverses each face's corner order together
 //! with every corner-keyed value of that face. Its normals rotate with its normal matrix. A face's
@@ -27,7 +27,7 @@ use serde_json::{Map, Value, json};
 use crate::error::{ErrorCode, PotError, Result};
 
 use super::normals::{normal_matrix, sharp_edge_flags, smooth_face_flags};
-use super::provenance::{Origin, default_value, remap_attributes};
+use super::provenance::{Origin, default_value, remap_attributes_skipping};
 use super::uv_layers::{UvLayer, read_layers, write_layers};
 use super::{Edge, IdCounters, Mesh, MeshError, Vertex};
 
@@ -43,9 +43,8 @@ pub(crate) struct Part<'a> {
     pub slot_count: usize,
 }
 
-/// A member placed under the joined IDs: its element tables, its attributes remapped, and its UV
-/// layers read in Potter's storage convention. Its canonical UV store is removed and rebuilt after
-/// the members join.
+/// A member placed under joined IDs: its attributes are remapped, and its canonical UV layers stay
+/// in Potter's V-down convention. Legacy `uv_map` and bridge-only `blender_uv_layers` are excluded.
 struct Placed {
     mesh: Mesh,
     uv_layers: Vec<UvLayer>,
@@ -97,18 +96,18 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
         output.faces.append(&mut mesh.faces);
     }
     output.attributes = merge_attributes(&pieces, &output)?;
-    let layers = join_uv_layers(&mut pieces);
+    let layers = join_uv_layers(&mut pieces, &output.faces)?;
     if !layers.is_empty() {
-        // Rebuild the canonical UV store from the joined layers.
+
         write_layers(&mut output, &layers);
     }
     output.validate().map_err(|error| join_error(&error))?;
     Ok(output)
 }
 
-/// Per joined face, whether the face's member has a value on every corner of its first UV layer,
-/// which is the joined `TEXCOORD_0`. The joined mesh cannot say this: a missing corner exports as
-/// `[0, 0]`, which reads as a real UV.
+/// Per joined face, whether the member supplied a value on every corner of its first UV layer.
+/// Joined defaults store `[0, 1]`, which exports as glTF's `[0, 0]`, so the mesh alone cannot
+/// distinguish authored coordinates from synthesized defaults.
 pub(crate) fn uv_covered_faces(parts: &[Part<'_>]) -> Vec<bool> {
     parts
         .iter()
@@ -122,7 +121,6 @@ pub(crate) fn uv_covered_faces(parts: &[Part<'_>]) -> Vec<bool> {
         })
         .collect()
 }
-
 /// Places one member's mesh under IDs counted from `first_ids`. Elements are built in one pass over
 /// the source, attributes are remapped and shading canonicalised, and UVs are read. A mirrored member
 /// reverses its corners. Vertices move to the instance space last, and custom normals rotate with
@@ -192,9 +190,15 @@ fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Placed> {
         (0..source.vertices.len()).map(Some),
         (0..source.faces.len()).map(Some).collect(),
     );
-    remap_attributes(source, &mut mesh, &origin)?;
+    // UV stores are excluded from attribute remapping and rebuilt as one named union below.
+    remap_attributes_skipping(
+        source,
+        &mut mesh,
+        &origin,
+        &["uv_map", "uv_layers", "blender_uv_layers"],
+    )?;
     canonical_shading(source, &mut mesh)?;
-    let mut uv_layers = take_uv_layers(&mut mesh);
+    let mut uv_layers = read_layers(source);
     if part.matrix.determinant() < 0.0 {
         mirror_corners(&mut mesh, &mut uv_layers);
     }
@@ -266,12 +270,6 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
     Ok(())
 }
 
-/// Reads `mesh`'s canonical UV layers, then removes the store which the joined mesh rebuilds.
-fn take_uv_layers(mesh: &mut Mesh) -> Vec<UvLayer> {
-    let layers = read_layers(mesh);
-    mesh.attributes.remove("uv_layers");
-    layers
-}
 
 
 /// Reverses a mirrored member's faces, with every corner-keyed value of each face: the corner order
@@ -358,43 +356,54 @@ pub(crate) fn rotate_corner_normals(value: &Value, normal_matrix: DMat3) -> Valu
     )
 }
 
-/// Joins the members' UV layers by position: joined layer `k` is every member's layer `k`, in member
-/// order. The name comes from the first member with that layer. A member without it contributes
-/// faces with no value.
-fn join_uv_layers(pieces: &mut [Piece]) -> Vec<UvLayer> {
-    let count = pieces
-        .iter()
-        .map(|piece| piece.uv_layers.len())
-        .max()
-        .unwrap_or(0);
-    (0..count)
-        .map(|index| {
-            let name = pieces
-                .iter()
-                .find_map(|piece| piece.uv_layers.get(index))
-                .map(|layer| layer.name.clone())
-                .unwrap_or_default();
-            let mut faces = Vec::new();
-            let mut pinned = Vec::new();
-            for piece in pieces.iter_mut() {
-                match piece.uv_layers.get_mut(index) {
-                    Some(layer) => {
-                        faces.append(&mut layer.faces);
-                        pinned.append(&mut layer.pinned);
-                    }
-                    None => {
-                        faces.extend(std::iter::repeat_n(None, piece.faces));
-                        pinned.extend(std::iter::repeat_n(None, piece.faces));
-                    }
+/// Joins canonical UV layers by first-seen name, preserving rows and pins from matching members.
+/// Missing layers and face rows receive the canonical default; unions over the mesh limit fail.
+fn join_uv_layers(pieces: &mut [Piece], faces: &[super::Face]) -> Result<Vec<UvLayer>> {
+    let mut names = Vec::new();
+    for piece in pieces.iter() {
+        for layer in &piece.uv_layers {
+            if !names.contains(&layer.name) {
+                names.push(layer.name.clone());
+            }
+        }
+    }
+    if names.len() > super::uv_layers::MAX_LAYERS {
+        return Err(PotError::with_details(
+            ErrorCode::LimitExceeded,
+            "collection instance UV layers exceed the mesh limit",
+            json!({"layer_count":names.len(),"limit":super::uv_layers::MAX_LAYERS}),
+        ));
+    }
+    let mut joined = Vec::with_capacity(names.len());
+    for name in names {
+        let mut layer_faces = Vec::new();
+        let mut pinned = Vec::new();
+        for piece in pieces.iter_mut() {
+            let member_faces = &faces[piece.face_base..piece.face_base + piece.faces];
+            if let Some(layer) = piece.uv_layers.iter_mut().find(|layer| layer.name == name) {
+                for (face_index, face) in member_faces.iter().enumerate() {
+                    let corners = layer
+                        .faces
+                        .get_mut(face_index)
+                        .and_then(Option::take)
+                        .unwrap_or_else(|| vec![[0.0, 1.0]; face.vertices.len()]);
+                    layer_faces.push(Some(corners));
+                    pinned.push(layer.pinned.get_mut(face_index).and_then(Option::take));
+                }
+            } else {
+                for face in member_faces {
+                    layer_faces.push(Some(vec![[0.0, 1.0]; face.vertices.len()]));
+                    pinned.push(None);
                 }
             }
-            UvLayer {
-                name,
-                faces,
-                pinned,
-            }
-        })
-        .collect()
+        }
+        joined.push(UvLayer {
+            name,
+            faces: layer_faces,
+            pinned,
+        });
+    }
+    Ok(joined)
 }
 
 /// One member's value of an attribute, if it has one, with the member's piece.
@@ -512,8 +521,8 @@ fn merge_positional(
 
 /// `blender_attributes` entries, keyed by domain and name. Each member's values concatenate in
 /// member order, and a member without the entry contributes the default of the joined data type.
-/// UV-named mirrors are omitted: the joined UV layers are rebuilt from the canonical store, and a
-/// mirror named after a member's layer would otherwise name a layer the joined store does not carry.
+/// UV-named mirrors are omitted because the canonical store already carries these corner values.
+/// Keeping both would create a second live UV store on the joined mesh.
 fn merge_blender_attributes(name: &str, members: &[Member<'_>]) -> Result<Value> {
     let uv_names: Vec<&str> = members
         .iter()
@@ -916,7 +925,7 @@ mod tests {
     use glam::{DMat4, DVec3};
     use serde_json::{Map, Value, json};
 
-    use super::{Part, concatenate, uv_covered_faces};
+    use super::{Part, concatenate};
     use crate::geom::normals::smooth_face_flags;
     use crate::geom::uv_layers::{self, UvLayer, UvStore};
     use crate::geom::{BoxParams, Mesh};
@@ -948,6 +957,135 @@ mod tests {
         }
     }
 
+    fn set_uv_layers(mesh: &mut Mesh, layers: &[(&str, [f64; 2], Option<[bool; 4]>)]) {
+        let layers = layers
+            .iter()
+            .map(|(name, uv, pins)| {
+                let faces = mesh
+                    .faces
+                    .iter()
+                    .map(|face| Some(vec![*uv; face.vertices.len()]))
+                    .collect();
+                let mut layer = crate::geom::uv_layers::UvLayer::new(*name, faces);
+                layer.pinned = mesh
+                    .faces
+                    .iter()
+                    .map(|_| pins.as_ref().map(|flags| flags.to_vec()))
+                    .collect();
+                layer
+            })
+            .collect::<Vec<_>>();
+        let selected = layers.first().map(|layer| layer.name.clone());
+        crate::geom::uv_layers::write(
+            mesh,
+            &crate::geom::uv_layers::UvStore {
+                layers,
+                active: selected.clone(),
+                render: selected,
+            },
+        );
+    }
+
+    fn assert_uv_rows(
+        layer: &crate::geom::uv_layers::UvLayer,
+        face_range: std::ops::Range<usize>,
+        expected: [f64; 2],
+    ) {
+        for face in &layer.faces[face_range] {
+            let corners = face.as_ref().unwrap();
+            assert_eq!(corners.len(), 4);
+            for actual in corners {
+                assert!(
+                    (actual[0] - expected[0]).abs() <= 1.0e-12
+                        && (actual[1] - expected[1]).abs() <= 1.0e-12
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uv_layers_join_by_name_with_defaults_pins_and_material_slots() {
+        let mut first = cube();
+        set_uv_layers(
+            &mut first,
+            &[
+                ("A", [0.1, 0.2], Some([true, false, true, false])),
+                ("Extra", [0.3, 0.4], Some([false, true, false, true])),
+            ],
+        );
+        let mut second = cube();
+        set_uv_layers(
+            &mut second,
+            &[("Extra", [0.5, 0.6], Some([true, true, false, false]))],
+        );
+        second.faces[0].material_index = 1;
+        let mut third = cube();
+        set_uv_layers(
+            &mut third,
+            &[
+                ("Extra", [0.7, 0.8], Some([false, false, true, true])),
+                ("A", [0.9, 0.25], Some([false, true, false, true])),
+            ],
+        );
+        let fourth = cube();
+
+        let parts = vec![
+            member(&first, DMat4::IDENTITY, 0, 1),
+            member(&second, DMat4::IDENTITY, 1, 2),
+            member(&third, DMat4::IDENTITY, 3, 1),
+            member(&fourth, DMat4::IDENTITY, 4, 1),
+        ];
+
+        let joined = concatenate(parts).unwrap();
+        assert_eq!(joined.faces[6].material_index, 2);
+        assert!(!joined.attributes.contains_key("uv_map"));
+        assert!(!joined.attributes.contains_key("blender_uv_layers"));
+        let store = crate::geom::uv_layers::read(&joined);
+        let names: Vec<_> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        assert_eq!(names, ["A", "Extra"]);
+        assert_eq!(store.active.as_deref(), Some("A"));
+        assert_eq!(store.render.as_deref(), Some("A"));
+
+        let a = &store.layers[0];
+        assert_uv_rows(a, 0..6, [0.1, 0.2]);
+        assert_uv_rows(a, 6..12, [0.0, 1.0]);
+        assert_uv_rows(a, 12..18, [0.9, 0.25]);
+        assert_uv_rows(a, 18..24, [0.0, 1.0]);
+        assert_eq!(a.pinned[0], Some(vec![true, false, true, false]));
+        assert!(a.pinned[6..12].iter().all(Option::is_none));
+        assert_eq!(a.pinned[12], Some(vec![false, true, false, true]));
+        assert!(a.pinned[18..24].iter().all(Option::is_none));
+
+        let extra = &store.layers[1];
+        assert_uv_rows(extra, 0..6, [0.3, 0.4]);
+        assert_uv_rows(extra, 6..12, [0.5, 0.6]);
+        assert_uv_rows(extra, 12..18, [0.7, 0.8]);
+        assert_uv_rows(extra, 18..24, [0.0, 1.0]);
+        assert_eq!(extra.pinned[0], Some(vec![false, true, false, true]));
+        assert_eq!(extra.pinned[6], Some(vec![true, true, false, false]));
+        assert_eq!(extra.pinned[12], Some(vec![false, false, true, true]));
+        assert!(extra.pinned[18..24].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn collection_uv_union_enforces_the_mesh_layer_limit() {
+        let mut meshes = (0..=crate::geom::uv_layers::MAX_LAYERS)
+            .map(|_| cube())
+            .collect::<Vec<_>>();
+        let mut parts = Vec::with_capacity(meshes.len());
+        for (index, mesh) in meshes.iter_mut().enumerate() {
+            let name = format!("Layer{index}");
+            set_uv_layers(mesh, &[(name.as_str(), [0.25, 0.75], None)]);
+            parts.push(member(
+                mesh,
+                DMat4::IDENTITY,
+                u32::try_from(index).unwrap(),
+                1,
+            ));
+        }
+        let error = concatenate(parts).unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
+    }
     #[test]
     fn members_keep_their_own_ids_and_positional_flags() {
         let mut first = cube();
@@ -1015,25 +1153,15 @@ mod tests {
     }
 
     #[test]
-    fn uv_layers_join_by_position_and_preserve_pins() {
+    #[test]
+    fn uv_layers_join_by_name_and_preserve_pins_and_coverage() {
         let mut first = cube();
-        write_uv_layers(
-            &mut first,
-            vec![UvLayer::new(
-                "Map",
-                vec![Some(vec![[0.1, 0.2]; 4]); first.faces.len()],
-            )],
-        );
+        set_uv_layers(&mut first, &[("Map", [0.1, 0.2], None)]);
         let mut second = cube();
-        let mut second_layer = UvLayer::new(
-            "UVMap",
-            vec![
-                Some(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
-                second.faces.len()
-            ],
+        set_uv_layers(
+            &mut second,
+            &[("UVMap", [0.0, 0.0], Some([true, false, true, false]))],
         );
-        second_layer.pinned = vec![Some(vec![true, false, true, false]); second.faces.len()];
-        write_uv_layers(&mut second, vec![second_layer]);
         let third = cube();
 
         let parts = vec![
@@ -1041,31 +1169,31 @@ mod tests {
             member(&second, DMat4::IDENTITY, 0, 1),
             member(&third, DMat4::IDENTITY, 0, 1),
         ];
-        let covered = uv_covered_faces(&parts);
-        assert_eq!(covered, [vec![true; 12], vec![false; 6]].concat());
+        assert_eq!(
+            uv_covered_faces(&parts),
+            [vec![true; 12], vec![false; 6]].concat()
+        );
 
         let joined = concatenate(parts).unwrap();
         let store = uv_layers::read(&joined);
-        assert_eq!(store.layers.len(), 1);
-        let layer = &store.layers[0];
-        assert_eq!(layer.name, "Map");
-        assert_eq!(layer.faces[0].as_ref().unwrap()[0], [0.1, 0.2]);
         assert_eq!(
-            layer.faces[6].as_deref().unwrap(),
-            &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+            store.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
+            ["Map", "UVMap"]
         );
+        assert_eq!(store.layers[0].faces[0].as_ref().unwrap()[0], [0.1, 0.2]);
+        assert_eq!(store.layers[0].faces[6].as_ref().unwrap()[0], [0.0, 1.0]);
+        assert_eq!(store.layers[1].faces[0].as_ref().unwrap()[0], [0.0, 1.0]);
+        assert_eq!(store.layers[1].faces[6].as_ref().unwrap()[0], [0.0, 0.0]);
         assert_eq!(
-            layer.pinned[6].as_deref().unwrap(),
+            store.layers[1].pinned[6].as_deref().unwrap(),
             &[true, false, true, false]
         );
-        assert!(layer.faces[12..].iter().all(Option::is_none));
-        assert!(layer.pinned[12..].iter().all(Option::is_none));
+        assert!(store.layers.iter().all(|layer| layer.faces[12..].iter().all(Option::is_some)));
     }
 
     #[test]
     fn mirrored_members_reverse_each_face_with_its_corner_values() {
         let mut source = cube();
-        let mut normals = Map::new();
         let mut layer = UvLayer::new(
             "UVMap",
             source
@@ -1086,6 +1214,7 @@ mod tests {
             .iter()
             .map(|face| Some((0..face.vertices.len()).map(|corner| corner % 2 == 0).collect()))
             .collect();
+        let mut normals = Map::new();
         for face in &source.faces {
             let face_normals: Vec<Value> = (0..face.vertices.len())
                 .map(|corner| {
@@ -1114,6 +1243,7 @@ mod tests {
             .unwrap();
         for (index, face) in joined.faces.iter().enumerate() {
             let source_face = &source.faces[index];
+            let uv_row = uv.faces[index].as_ref().unwrap();
             let rows = &custom[&format!("f{}", face.id)];
             let uv_face = uv.faces[index].as_ref().unwrap();
             let pinned = uv.pinned[index].as_ref().unwrap();
@@ -1389,13 +1519,7 @@ mod tests {
     #[test]
     fn uv_mirrors_of_member_layers_are_not_carried() {
         let mut first = cube();
-        write_uv_layers(
-            &mut first,
-            vec![UvLayer::new(
-                "Body",
-                vec![Some(vec![[0.5, 0.5]; 4]); first.faces.len()],
-            )],
-        );
+        set_uv_layers(&mut first, &[("Body", [0.5, 0.5], None)]);
         first.attributes.insert(
             "blender_attributes".to_owned(),
             json!([
@@ -1411,6 +1535,8 @@ mod tests {
             .map(|entry| entry["name"].clone())
             .collect();
         assert_eq!(names, vec![json!("LoopColor")]);
-        assert_eq!(uv_layers::read(&joined).layers[0].name, "Body");
+        let layers = crate::geom::uv_layers::read(&joined).layers;
+        assert_eq!(layers[0].name, "Body");
+        assert!(!joined.attributes.contains_key("blender_uv_layers"));
     }
 }

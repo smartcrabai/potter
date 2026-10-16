@@ -5,17 +5,16 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::uv_layers::MAX_LAYERS,
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
-    shader::{BsdfParams, HitContext, evaluate_surface, fill_uv_maps},
+    shader::{BsdfParams, HitContext, HitUvLayers, evaluate_surface, height_gradient},
 };
 
 use super::{
     bvh::{Bvh, BvhHit},
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, blend_uv, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
@@ -1148,8 +1147,21 @@ fn make_surface(
                 "triangle references an unmapped material",
             )
         })?;
+    let element = triangle
+        .element_index
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| geometry.elements.get(index));
+    let layers = HitUvLayers {
+        names: &object.uv_layers,
+        corners: &triangle.layer_uvs,
+        positions: triangle.positions,
+        barycentric: hit.barycentric,
+        render: element.map_or(object.uv_render, |element| element.uv_render),
+        available_mask: element.and_then(|element| element.uv_available_mask),
+    };
     let mut tables = LayerTables::new();
-    let context = layered_context(
+    let mut context = layered_context(
         doc,
         images,
         &geometry.shader_warnings,
@@ -1162,9 +1174,9 @@ fn make_surface(
             view: -direction,
             barycentric: hit.barycentric,
         },
+        layers,
         &mut tables,
     )?;
-    let (tangent, bitangent) = triangle_tangent_frame(triangle, normal);
     let mut params = evaluate_surface(material, &context)?;
     params.alpha = match material.alpha_mode.as_str() {
         "opaque" => 1.0,
@@ -1178,7 +1190,10 @@ fn make_surface(
         _ => params.alpha.clamp(0.0, 1.0),
     };
     if params.displacement_height != 0.0 && material.displacement_method != "displacement" {
-        params.normal = displacement_bump_normal(material, context, tangent, bitangent, normal)?;
+        let gradient = height_gradient(&context, normal, |sample| {
+            evaluate_surface(material, sample).map(|surface| surface.displacement_height)
+        })?;
+        params.normal = normal - gradient;
     }
     params.normal = if params.normal.is_finite() {
         params.normal.normalize_or_zero()
@@ -1200,47 +1215,6 @@ fn make_surface(
     })
 }
 
-fn displacement_bump_normal(
-    material: &crate::model::Material,
-    context: HitContext<'_>,
-    tangent: DVec3,
-    bitangent: DVec3,
-    normal: DVec3,
-) -> Result<DVec3> {
-    let step = 1.0e-3;
-    let positive_u = displacement_sample(material, context, [step, 0.0], tangent, bitangent)?;
-    let negative_u = displacement_sample(material, context, [-step, 0.0], tangent, bitangent)?;
-    let positive_v = displacement_sample(material, context, [0.0, step], tangent, bitangent)?;
-    let negative_v = displacement_sample(material, context, [0.0, -step], tangent, bitangent)?;
-    let gradient_u = (positive_u - negative_u) / (2.0 * step);
-    let gradient_v = (positive_v - negative_v) / (2.0 * step);
-    Ok((normal - tangent * gradient_u - bitangent * gradient_v).normalize_or_zero())
-}
-
-fn displacement_sample(
-    material: &crate::model::Material,
-    context: HitContext<'_>,
-    uv_offset: [f64; 2],
-    tangent: DVec3,
-    bitangent: DVec3,
-) -> Result<f64> {
-    let displacement = tangent * uv_offset[0] + bitangent * uv_offset[1];
-    let mut uv_table: [(&str, [f64; 2]); MAX_LAYERS] = [("", [0.0; 2]); MAX_LAYERS];
-    let mut sample_context: HitContext<'_> = context;
-    sample_context.uv[0] += uv_offset[0];
-    sample_context.uv[1] += uv_offset[1];
-    if let Some(maps) = context.uv_maps {
-        sample_context.uv_maps = Some(fill_uv_maps(
-            &mut uv_table,
-            maps.iter()
-                .map(|(name, uv)| (*name, [uv[0] + uv_offset[0], uv[1] + uv_offset[1]])),
-        )?);
-    }
-    sample_context.generated += displacement;
-    sample_context.position += displacement;
-    sample_context.object += displacement;
-    evaluate_surface(material, &sample_context).map(|params| params.displacement_height)
-}
 
 pub(super) fn object_for_index(
     objects: &[ObjectRecord],
@@ -1250,52 +1224,6 @@ pub(super) fn object_for_index(
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
         .and_then(|index| objects.get(index))
-}
-
-pub(super) fn triangle_tangent_frame(
-    triangle: &super::raster::Triangle,
-    normal: DVec3,
-) -> (DVec3, DVec3) {
-    let edge1 = triangle.positions[1] - triangle.positions[0];
-    let edge2 = triangle.positions[2] - triangle.positions[0];
-    let uv1 = [
-        triangle.uv[1][0] - triangle.uv[0][0],
-        triangle.uv[1][1] - triangle.uv[0][1],
-    ];
-    let uv2 = [
-        triangle.uv[2][0] - triangle.uv[0][0],
-        triangle.uv[2][1] - triangle.uv[0][1],
-    ];
-    let determinant = uv1[0] * uv2[1] - uv1[1] * uv2[0];
-    let (raw_tangent, raw_bitangent) =
-        if determinant.is_finite() && determinant.abs() > f64::EPSILON {
-            (
-                (edge1 * uv2[1] - edge2 * uv1[1]) / determinant,
-                (edge2 * uv1[0] - edge1 * uv2[0]) / determinant,
-            )
-        } else {
-            (edge1, normal.cross(edge1))
-        };
-    let tangent = (raw_tangent - normal * raw_tangent.dot(normal)).normalize_or_zero();
-    let fallback = if normal.z.abs() < 0.9 {
-        normal.cross(DVec3::Z).normalize_or_zero()
-    } else {
-        normal.cross(DVec3::Y).normalize_or_zero()
-    };
-    let tangent = if tangent == DVec3::ZERO {
-        fallback
-    } else {
-        tangent
-    };
-    let bitangent =
-        (raw_bitangent - normal * raw_bitangent.dot(normal) - tangent * raw_bitangent.dot(tangent))
-            .normalize_or_zero();
-    let bitangent = if bitangent == DVec3::ZERO {
-        normal.cross(tangent).normalize_or_zero()
-    } else {
-        bitangent
-    };
-    (tangent, bitangent)
 }
 
 #[expect(

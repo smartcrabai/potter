@@ -11,8 +11,8 @@ use crate::{
     graph::NodeGroup,
     hash,
     library::{
-        self, hash_matches, linked_key, load_project, namespaced_id, registry_entry,
-        remap_references,
+        self, hash_matches, legacy_warnings, linked_key, load_project, namespaced_id,
+        registry_entry, remap_references,
     },
     model::{
         Action, Collection, DataBlock, Id, Library, LibraryKind, LibraryOverride,
@@ -65,7 +65,8 @@ fn link(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
         ));
     }
     let uri = read_string(engine, operation, "uri")?;
-    let (project_path, source, source_hash) = load_project(&uri)?;
+    let (project_path, source, source_hash, legacy) = load_project(&uri)?;
+    engine.warnings.extend(legacy_warnings(&legacy));
     let items = parse_items(engine, operation)?;
     let (mappings, imported) =
         copy_items(engine, &source, &items, Some(library_id.as_str()), true)?;
@@ -370,10 +371,14 @@ fn append(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             )
         })?;
         let uri = record.uri.clone();
-        (load_project(&uri)?.1, uri)
+        let (_, source, _, legacy) = load_project(&uri)?;
+        engine.warnings.extend(legacy_warnings(&legacy));
+        (source, uri)
     } else {
         let uri = read_string(engine, operation, "uri")?;
-        (load_project(&uri)?.1, uri)
+        let (_, source, _, legacy) = load_project(&uri)?;
+        engine.warnings.extend(legacy_warnings(&legacy));
+        (source, uri)
     };
     let items = parse_items(engine, operation)?;
     let (mappings, imported) = copy_items(engine, &source, &items, None, false)?;
@@ -810,7 +815,8 @@ fn reload(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         return Ok(true);
     }
 
-    let (_path, source, digest) = load_project(&record.uri)?;
+    let (_path, source, digest, legacy) = load_project(&record.uri)?;
+    engine.warnings.extend(legacy_warnings(&legacy));
     let mut id_map = BTreeMap::new();
     let mut replacements = Vec::new();
     for (key, source_id) in &record.items {
@@ -887,7 +893,8 @@ fn relocate(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<b
         };
         (path.to_string_lossy().into_owned(), status)
     } else {
-        let (project_path, _, digest) = load_project(&uri)?;
+        let (project_path, _, digest, legacy) = load_project(&uri)?;
+        engine.warnings.extend(legacy_warnings(&legacy));
         let status = if hash_matches(&existing.hash, &digest) {
             LibraryStatus::Ok
         } else {

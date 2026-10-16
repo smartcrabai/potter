@@ -1412,7 +1412,6 @@ def _custom_normal_codes(mesh):
         raise ValueError("mesh %s has custom normals but no custom_normal layer" % mesh.name)
     return [[int(a), int(b)] for a, b in (item.value for item in layer.data)]
 
-
 def mesh_dump(mesh):
     vertices = [{"co": plain(v.co)} for v in mesh.vertices]
     edges = [{"v": list(edge.vertices), "sharp": bool(getattr(edge, "use_edge_sharp", False)),
@@ -1425,8 +1424,8 @@ def mesh_dump(mesh):
                           "pins": [bool(item.pin_uv) for item in layer.data]})
     uv_active = _uv_layer_index(mesh.uv_layers, "active_index")
     uv_render = _uv_layer_index(mesh.uv_layers, "active_render_index")
-    # Raw per-element values in Blender order (loops for CORNER). Rust decides which entries are native.
-    # Custom normals travel only as `custom_normal_codes`, never as a raw attribute.
+    custom_normals = any(attr.name == "custom_normal" for attr in mesh.attributes)
+    corner_normals = [plain(normal.vector) for normal in mesh.corner_normals] if custom_normals else None
     attrs = [{"name": attr.name, "domain": attr.domain, "data_type": attr.data_type,
               "values": [_attribute_item_value(item, attr.data_type) for item in attr.data]}
              for attr in mesh.attributes if attr.name != "custom_normal"]
@@ -1444,6 +1443,7 @@ def mesh_dump(mesh):
             "uv_render": uv_render, "attributes": attrs,
             "color_active": _color_attribute_name(mesh, color_attributes.active_color_index),
             "color_render": _color_attribute_name(mesh, color_attributes.render_color_index),
+            "corner_normals": corner_normals,
             "skin_vertices": skin_vertices,
             "shape_keys": _mesh_shape_keys(mesh),
             "descriptor": json.loads(mesh.get("potter.descriptor_json", "null")),

@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ApplyArgs,
-    commands::util::check_base_revision,
+    commands::util::{check_base_revision, with_load_warnings},
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, EvaluationPurpose},
     model::Id,
@@ -45,7 +45,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
     check_base_revision(project.doc(), base_revision)?;
     let before = project.doc().clone();
     let outcome = ops::apply_batch_with_asset_root(&before, &batch, project.path())?;
-    let warnings = serde_json::to_value(&outcome.warnings).map_err(PotError::internal_json)?;
+    let warnings = with_load_warnings(&outcome.warnings, &project)?;
     let candidate_revision = if outcome.changed {
         base_revision
             .checked_add(1)

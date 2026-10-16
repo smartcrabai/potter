@@ -56,6 +56,7 @@ pub fn run(args: PreviewArgs) -> Result<(Option<SceneInfo>, Value)> {
             warnings.push(warning.clone());
         }
     }
+    warnings.extend(project.warnings().iter().cloned());
     Ok((
         Some(project.info()?),
         json!({"previews":previews,"warnings":warnings}),

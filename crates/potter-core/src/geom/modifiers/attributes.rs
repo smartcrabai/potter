@@ -152,6 +152,7 @@ fn texture_mask_weights(
         )
     } else {
         ("LOCAL", "INT")
+
     };
     if !matches!(mapping, "LOCAL" | "GLOBAL" | "OBJECT" | "UV") {
         return Err(invalid(
@@ -241,6 +242,8 @@ fn texture_mask_weights(
     Ok(Some(weights))
 }
 
+/// Per-vertex mean of the layer's corner UVs in Blender's V-up convention. The store is V-down, so
+/// each corner is flipped before the mean; the image sampler reads V-up coordinates.
 fn vertex_uv_coordinates(mesh: &Mesh, modifier: &Modifier) -> Result<BTreeMap<u32, DVec2>> {
     let store = uv_layers::read(mesh);
     let Some(index) = uv_layer_index(&store, modifier, "mask_tex_uv_layer")? else {
@@ -254,7 +257,7 @@ fn vertex_uv_coordinates(mesh: &Mesh, modifier: &Modifier) -> Result<BTreeMap<u3
         };
         for (vertex_id, uv) in face.vertices.iter().zip(values) {
             let entry = sums.entry(*vertex_id).or_insert((DVec2::ZERO, 0));
-            entry.0 += DVec2::from_array(*uv);
+            entry.0 += DVec2::new(uv[0], 1.0 - uv[1]);
             entry.1 += 1;
         }
     }
@@ -1745,7 +1748,6 @@ fn data_transfer(
                     loop_mapping,
                     source_transform,
                     factor,
-                    mix_mode,
                     mask_weights.as_ref(),
                     invert_mask,
                 )?,
@@ -2318,6 +2320,11 @@ fn transfer_edge_attribute(
     }
     Ok(())
 }
+
+/// UV Data Transfer. Blender transfers UVs by replacement only: `mix_mode` does not apply to a UV
+/// layer, since Blender's RNA offers REPLACE alone for UV and still replaces the UVs when other types
+/// are selected. Each corner moves toward its source by `factor * mask`. A corner the destination
+/// layer lacks starts at Blender's generated `[0, 0]` (V-up), which is `[0, 1]` in the V-down store.
 fn transfer_uv(
     destination: &mut Mesh,
     source: &Mesh,
@@ -2325,7 +2332,6 @@ fn transfer_uv(
     mapping: &str,
     source_transform: DMat4,
     factor: f64,
-    mix_mode: &str,
     mask_weights: Option<&BTreeMap<u32, f64>>,
     invert_mask: bool,
 ) -> Result<()> {
@@ -2421,12 +2427,13 @@ fn transfer_uv(
                 .iter()
                 .enumerate()
                 .map(|(index, vertex_id)| {
+                    // Blender's generated layer is zero in V-up, which is (0, 1) in the store.
                     let old = existing_uv(
                         &destination_store.layers[destination_index],
                         face_index,
                         index,
                     )
-                    .unwrap_or(DVec2::ZERO);
+                    .unwrap_or(DVec2::new(0.0, 1.0));
                     let mask = mask_weights
                         .map_or(1.0, |weights| {
                             weights.get(vertex_id).copied().unwrap_or(0.0)
@@ -2451,9 +2458,7 @@ fn transfer_uv(
                             })
                             .and_then(|value| value2(&value))
                     };
-                    target.map_or(old, |target| {
-                        mix_vector(old, target, factor * mask, mix_mode).unwrap_or(target)
-                    })
+                    target.map_or(old, |target| old.lerp(target, factor * mask))
                 })
                 .map(|value| value.to_array())
                 .collect();
@@ -2934,16 +2939,6 @@ fn mix_json(
     }
 }
 
-fn mix_vector(first: DVec2, second: DVec2, factor: f64, mode: &str) -> Option<DVec2> {
-    match mode {
-        "REPLACE" => Some(first.lerp(second, factor)),
-        "ADD" => Some(first + second * factor),
-        "SUB" => Some(first - second * factor),
-        "MUL" => Some(first * second.lerp(DVec2::ONE, 1.0 - factor)),
-        _ => None,
-    }
-}
-
 /// Index of the layer that `parameter` names. An empty name is the active layer, as Blender's
 /// empty UV Map field is. `None` only for an empty name on a mesh without layers.
 fn uv_layer_index(store: &UvStore, modifier: &Modifier, parameter: &str) -> Result<Option<usize>> {
@@ -2966,7 +2961,6 @@ fn active_index(store: &UvStore) -> Option<usize> {
         .and_then(|name| store.index_of(name))
         .or((!store.layers.is_empty()).then_some(0))
 }
-
 /// Index of the layer a writing modifier updates. A mesh without layers gets `UVMap`, which is
 /// both active and render, when the parameter is empty.
 fn writer_layer_index(

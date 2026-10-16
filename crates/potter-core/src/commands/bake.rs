@@ -9,7 +9,7 @@ use std::{
 use glam::DMat4;
 use serde_json::{Value, json};
 
-use super::util::parse_id;
+use super::util::{parse_id, with_load_warnings};
 use crate::{
     cli::{BakeArgs, BakeKind},
     error::{ErrorCode, PotError, Result},
@@ -231,9 +231,10 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     files.push("manifest.json".to_owned());
     stage.publish(&args.out, args.overwrite)?;
     let scene = project.info()?;
+    let warnings = with_load_warnings(&[], &project)?;
     Ok((
         Some(scene),
-        json!({"kind":match args.kind {BakeKind::Animation=>"animation",BakeKind::Geometry=>"geometry",BakeKind::Simulation=>"simulation",BakeKind::Texture=>"texture"},"path":args.out,"files":files,"frame_count":baked_frames.len(),"cache_keys":cache_keys,"scene_modified":false}),
+        json!({"kind":match args.kind {BakeKind::Animation=>"animation",BakeKind::Geometry=>"geometry",BakeKind::Simulation=>"simulation",BakeKind::Texture=>"texture"},"path":args.out,"files":files,"frame_count":baked_frames.len(),"cache_keys":cache_keys,"scene_modified":false,"warnings":warnings}),
     ))
 }
 

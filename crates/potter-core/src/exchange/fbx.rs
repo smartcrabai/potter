@@ -92,7 +92,38 @@ struct BoneExport {
 /// Export the evaluated mesh and scene transforms as ASCII FBX 7.4. Color layers and generic
 /// attributes are not written; `exchange::attribute_losses` reports them.
 pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
-    let project_root = Path::new(".");
+    export_with_root(doc, snapshot, Path::new("."))
+}
+
+/// Export ASCII FBX with the project root available for linked and packed images.
+pub(crate) fn export_with_root(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    project_root: &Path,
+) -> Result<Vec<u8>> {
+    export_with_root_allow_lossy(doc, snapshot, project_root, false)
+}
+
+/// Export ASCII FBX, optionally dropping attributes reported by the command's lossy-export gate.
+pub(crate) fn export_allow_lossy(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    allow_lossy: bool,
+) -> Result<Vec<u8>> {
+    if allow_lossy {
+        export_with_root_allow_lossy(doc, snapshot, Path::new("."), true)
+    } else {
+        export(doc, snapshot)
+    }
+}
+
+pub(crate) fn export_with_root_allow_lossy(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    project_root: &Path,
+    allow_lossy: bool,
+) -> Result<Vec<u8>> {
+    let _ = project_root;
     doc.validate()?;
     let scene = doc
         .scenes
@@ -328,6 +359,7 @@ pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
                 mesh,
                 data_block,
                 snapshot.purpose,
+                allow_lossy,
             )?;
         }
         let mesh_model = object_ids.geometry.is_some();
@@ -1238,9 +1270,22 @@ fn write_geometry(
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
     purpose: EvaluationPurpose,
+    allow_lossy: bool,
 ) -> Result<()> {
-    // Shading and UV attributes have their own FBX layers. Color layers and generic attributes
-    // are not written here; `exchange::attribute_losses` reports them.
+    // Shading attributes and UV layers have their own FBX layers. Unsupported attributes are
+    // skipped only for lossy export and are reported by `commands::export::export_losses`.
+    if !allow_lossy
+        && mesh.attributes.keys().any(|name| {
+            name != uv_layers::ATTRIBUTE
+                && !crate::geom::normals::SHADING_ATTRIBUTES.contains(&name.as_str())
+        })
+    {
+        return Err(PotError::with_details(
+            ErrorCode::UnrepresentableFeature,
+            "FBX adapter does not represent mesh custom attributes",
+            json!({ "feature_id": "format.fbx.mesh_attributes", "node_id": node.name }),
+        ));
+    }
     let vertex_indices = mesh
         .vertices
         .iter()
@@ -1253,6 +1298,20 @@ fn write_geometry(
         quote(&format!("Geometry::{}", node.name))
     )
     .map_err(write_error)?;
+    // FBX has no active or render flag on its UV layers, so Potter records both by layer name.
+    let uv = uv_layers::read(mesh);
+    let mut properties = Vec::new();
+    for (property, name) in [
+        ("potter:uv_active", &uv.active),
+        ("potter:uv_render", &uv.render),
+    ] {
+        if let Some(name) = name {
+            properties.push(format!(
+                "\t\t\tP: \"{property}\", \"KString\", \"\", \"\", \"{}\"",
+                quote(name)
+            ));
+        }
+    }
     if let Some(data) = data_block.filter(|data| {
         data.shape_keys
             .as_ref()
@@ -1276,10 +1335,16 @@ fn write_geometry(
                 json!({"reason": error.to_string()}),
             )
         })?;
+        properties.push(format!(
+            "\t\t\tP: \"potter:deformation\", \"KString\", \"\", \"\", \"{}\"",
+            quote(&metadata)
+        ));
+    }
+    if !properties.is_empty() {
         writeln!(
             output,
-            "\t\tProperties70:  {{\n\t\t\tP: \"potter:deformation\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}",
-            quote(&metadata)
+            "\t\tProperties70:  {{\n{}\n\t\t}}",
+            properties.join("\n")
         )
         .map_err(write_error)?;
     }
@@ -1917,7 +1982,12 @@ fn import_bytes_with_base(
             if let Some(normals) = &geometry.normals {
                 shading::import_shading(&mut mesh, normals)?;
             }
-            import_uv_layers(&mut mesh, &geometry.uv_layers, Some(0), Some(0));
+            import_uv_layers(
+                &mut mesh,
+                &geometry.uv_layers,
+                geometry.uv_active,
+                geometry.uv_render,
+            );
             for (face_index, face) in mesh.faces.iter_mut().enumerate() {
                 let slot = geometry
                     .material_indices
@@ -2038,6 +2108,10 @@ struct ImportedGeometry {
     normals: Option<Vec<DVec3>>,
     /// UV layers in file order; empty when the geometry has none.
     uv_layers: Vec<ExchangeUvLayer>,
+    /// Index of the active UV layer; `None` when the geometry has no UV layer.
+    uv_active: Option<usize>,
+    /// Index of the render UV layer; `None` when the geometry has no UV layer.
+    uv_render: Option<usize>,
 }
 
 fn decode_deformation_field<T: DeserializeOwned>(
@@ -2294,6 +2368,17 @@ fn parse_geometry(
         });
     }
     let layers = parse_uv_layers(node, positions.len(), &faces, geometry_id, losses)?;
+    // A geometry without a recorded selection, or one naming no layer, selects the first layer.
+    let select = |property: &str| {
+        if layers.is_empty() {
+            return None;
+        }
+        let named = read_string_property(node.child("Properties70"), property)
+            .and_then(|name| layers.iter().position(|layer| layer.name == name));
+        Some(named.unwrap_or(0))
+    };
+    let uv_active = select("potter:uv_active");
+    let uv_render = select("potter:uv_render");
     Ok(ImportedGeometry {
         positions,
         faces,
@@ -2301,6 +2386,8 @@ fn parse_geometry(
         deformation,
         normals,
         uv_layers: layers,
+        uv_active,
+        uv_render,
     })
 }
 
@@ -3293,7 +3380,9 @@ fn write_error(_: std::fmt::Error) -> PotError {
 
 #[cfg(test)]
 mod tests {
-    use super::{lex, parse_nodes, parse_uv_layers, write_geometry, write_uv_layers};
+    use super::{
+        EvaluationPurpose, lex, parse_nodes, parse_uv_layers, write_geometry, write_uv_layers,
+    };
     use crate::{
         error::{ErrorCode, PotError, Result},
         exchange::Loss,
@@ -3365,7 +3454,7 @@ mod tests {
             ..crate::model::Node::default()
         };
         let mut output = String::new();
-        write_geometry(&mut output, 1, &node, &mesh, None)?;
+        write_geometry(&mut output, 1, &node, &mesh, None, EvaluationPurpose::Render, true)?;
         assert!(output.contains("Geometry: 1, \"Geometry::Triangle\", \"Mesh\""));
         // The losses for these attributes come from `exchange::attribute_losses`.
         let losses = crate::exchange::mesh_attribute_losses("fbx", "triangle", &mesh);

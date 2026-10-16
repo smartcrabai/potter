@@ -1025,16 +1025,16 @@ impl ColorPlan {
 
 fn color_plan(
     mesh: &Mesh,
-    bindings: &[(u32, Option<&Id>, bool)],
+    bindings: &[(u32, Option<&Id>)],
     surfaces: &BTreeMap<Id, ResolvedSurface>,
 ) -> Result<ColorPlan> {
     let store = color_layers::read(mesh);
     let mut plan = ColorPlan {
         layer_count: store.layers.len(),
-        used_slots: bindings.iter().map(|(slot, _, _)| *slot).collect(),
+        used_slots: bindings.iter().map(|(slot, _)| *slot).collect(),
         ..ColorPlan::default()
     };
-    for (slot, material_id, _) in bindings {
+    for (slot, material_id) in bindings {
         let surface = match *material_id {
             Some(id) => Some(surfaces.get(id).ok_or_else(|| {
                 PotError::new(ErrorCode::SceneInvalid, "node material reference is missing")
@@ -1081,10 +1081,6 @@ struct ExportVertexLayout {
     face_indices: BTreeMap<u32, BTreeMap<u32, u32>>,
 }
 
-/// Whether the glTF exporter writes `TEXCOORD_0` for a mesh with a native UV layer.
-pub(crate) fn exports_texcoord0(mesh: &Mesh) -> bool {
-    uv_layers::has_uv_layers(mesh)
-}
 fn export_vertex_layout(
     mesh: &Mesh,
     layers: &[Vec<DVec3>],
@@ -1132,7 +1128,7 @@ fn export_vertex_layout(
                         .and_then(Option::as_ref)
                         .and_then(|values| values.get(position))
                         .copied()
-                        .unwrap_or([0.0, 0.0])
+                        .unwrap_or([0.0, 1.0])
                 })
                 .collect();
             corners_by_vertex[source_index].push((face.id, *vertex_id, corner, uvs));
@@ -1527,14 +1523,13 @@ fn mesh_export_layout(
     Ok(MeshExportLayout { layout, key_deltas })
 }
 
-/// Material slots bound by faces, each with whether its faces have UVs, validated against a node's
-/// evaluated slot table.
+/// Material slots bound by faces, with each effective material resolved from the node snapshot.
 fn used_material_bindings<'a>(
     node_id: &Id,
     node: &'a Node,
     snapshot: &'a Snapshot,
     mesh: &Mesh,
-) -> Result<Vec<(u32, Option<&'a Id>, bool)>> {
+) -> Result<Vec<(u32, Option<&'a Id>)>> {
     let slot_count = snapshot.slot_count(node_id, node);
     let mut used = BTreeSet::new();
     for face in &mesh.faces {
@@ -1550,15 +1545,8 @@ fn used_material_bindings<'a>(
             })?;
         used.insert((face.material_index, slot));
     }
-    let uv = snapshot.slot_uv_table(node_id, node, mesh);
     used.into_iter()
-        .map(|(slot, index)| {
-            Ok((
-                slot,
-                snapshot.slot_material(node_id, node, index),
-                uv.get(index).copied().unwrap_or(false),
-            ))
-        })
+        .map(|(slot, index)| Ok((slot, snapshot.slot_material(node_id, node, index))))
         .collect()
 }
 
@@ -1615,8 +1603,6 @@ const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 18] = [
     "custom_normal",
 ];
 
-/// Hard errors for mesh data that does not match its data block. Data glTF cannot represent is a
-/// loss instead (see [`unwritten_attribute_losses`] and [`color_losses`]), which `--allow-lossy` permits.
 fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) -> Result<()> {
     match mesh.attributes.get("vertex_groups") {
         Some(value)
@@ -3078,33 +3064,102 @@ fn textured_normal_info(
     Ok(info)
 }
 
-/// `texCoord` of each UV layer reference a material samples, keyed by the reference (`None` is the
-/// render layer). The value is the TEXCOORD index the reference resolves to on the first mesh that
-/// uses the material. A reference no layer has falls back to the render layer, and reports a loss.
+/// `texCoord` map from each UV layer reference to its glTF TEXCOORD index.
 pub(crate) type TexCoords = BTreeMap<Option<String>, usize>;
 
 /// Empty `texCoord` map for a material no mesh uses: its references read `TEXCOORD_0`.
 static NO_TEX_COORDS: TexCoords = BTreeMap::new();
 
-/// The `texCoord` plan of one export: each material's [`TexCoords`] and the losses resolving them
-/// reported.
+/// One material's per-face-slot UV map; `coords` remains its first-used base variant for VRM.
 pub(crate) struct TexCoordPlan {
     coords: BTreeMap<Id, TexCoords>,
+    slot_coords: BTreeMap<Id, BTreeMap<usize, (Id, TexCoords)>>,
     losses: Vec<Loss>,
+    warnings: Vec<PotError>,
 }
 
 impl TexCoordPlan {
-    /// The `texCoord` map of `material`.
+    /// The base material's `texCoord` map, retained for VRM material-index mappings.
     pub(crate) fn for_material(&self, material: &Id) -> &TexCoords {
         self.coords.get(material).unwrap_or(&NO_TEX_COORDS)
     }
+    /// The `texCoord` map for one used face slot.
+    fn for_slot(&self, node_id: &Id, slot: usize) -> Option<&TexCoords> {
+        self.slot_coords
+            .get(node_id)
+            .and_then(|slots| slots.get(&slot))
+            .map(|(_, coords)| coords)
+    }
 }
 
-/// Resolves the UV layer references of every texture on the meshes that use its material, and the
-/// losses that resolution reports. glTF materials are written once and hold one `texCoord` per
-/// texture, so each reference takes the index from the first mesh that uses the material. A later
-/// mesh that resolves a reference differently is reported as `mesh.uv_layer`; a reference that falls
-/// back to the render layer, or a mesh without layers, is reported as `uv.layer_missing`.
+/// Resolves one texture selector using a collection member's layer availability when present.
+fn binding_tex_coord(
+    layers: &uv_layers::UvStore,
+    reference: Option<&str>,
+    binding: Option<&crate::eval::SlotBinding>,
+) -> (Option<usize>, bool) {
+    let Some(binding) = binding else {
+        let (index, missing) = layers.resolve(reference);
+        return (index, missing.is_some() || index.is_none());
+    };
+    let render_index = binding.uv.render_index.map(usize::from);
+    match reference {
+        None | Some("") => (render_index, render_index.is_none()),
+        Some(name) => {
+            let index = layers.index_of(name).filter(|index| {
+                u8::try_from(*index)
+                    .ok()
+                    .and_then(|index| 1_u8.checked_shl(u32::from(index)))
+                    .is_some_and(|bit| binding.uv.available_mask & bit != 0)
+            });
+            match index {
+                Some(index) => (Some(index), false),
+                None => (render_index, true),
+            }
+        }
+    }
+}
+
+fn set_mtoon_texture_coord(
+    extension: &mut Value,
+    field: &str,
+    texture: &TextureRef,
+    coords: &TexCoords,
+) {
+    if extension[field].is_object() {
+        extension[field]["texCoord"] = json!(coords.get(&texture.uv_layer).copied().unwrap_or(0));
+    }
+}
+
+fn set_mtoon_variant_uvs(
+    extension: &mut Value,
+    mtoon: &crate::model::AvatarMtoon,
+    coords: &TexCoords,
+) {
+    if let Some(texture) = &mtoon.shade_multiply_texture {
+        set_mtoon_texture_coord(extension, "shadeMultiplyTexture", texture, coords);
+    }
+    if let Some(shift) = &mtoon.shading_shift_texture {
+        set_mtoon_texture_coord(extension, "shadingShiftTexture", &shift.texture, coords);
+    }
+    for (field, texture) in [
+        ("rimMultiplyTexture", mtoon.rim_multiply_texture.as_ref()),
+        (
+            "outlineWidthMultiplyTexture",
+            mtoon.outline_width_multiply_texture.as_ref(),
+        ),
+        (
+            "uvAnimationMaskTexture",
+            mtoon.uv_animation_mask_texture.as_ref(),
+        ),
+    ] {
+        if let Some(texture) = texture {
+            set_mtoon_texture_coord(extension, field, texture, coords);
+        }
+    }
+}
+
+/// Resolves UV layer references per used face slot and reports only actual missing-layer fallbacks.
 pub(crate) fn tex_coord_plan(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -3132,7 +3187,9 @@ pub(crate) fn tex_coord_plan(
     let visible = super::render_visible_nodes(doc, snapshot)?;
     let mut plan = TexCoordPlan {
         coords: BTreeMap::new(),
+        slot_coords: BTreeMap::new(),
         losses: Vec::new(),
+        warnings: Vec::new(),
     };
     let mut reported = BTreeSet::<(Id, Option<String>, Id, &'static str)>::new();
     for (node_id, node) in &doc.nodes {
@@ -3160,23 +3217,26 @@ pub(crate) fn tex_coord_plan(
             continue;
         };
         let layers = uv_layers::read(mesh);
-        for (slot, material_id, has_uv) in used_material_bindings(node_id, node, snapshot, mesh)? {
+        let mut node_coords = BTreeMap::new();
+        for (slot, material_id) in used_material_bindings(node_id, node, snapshot, mesh)? {
             let Some(material_id) = material_id else {
                 continue;
             };
+            let slot = usize::try_from(slot).map_err(|_| {
+                PotError::new(ErrorCode::SceneInvalid, "mesh material slot exceeds platform range")
+            })?;
             let texture_refs = references.get(material_id).ok_or_else(|| {
                 PotError::new(
                     ErrorCode::SceneInvalid,
                     "node material reference is missing",
                 )
             })?;
+            let binding = snapshot.slot_binding(node_id, node, slot);
+            let mut coords = TexCoords::new();
             for reference in texture_refs {
-                let (index, missing) = layers.resolve(reference.as_deref());
-                let layer = reference
-                    .as_deref()
-                    .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
-                let uncovered = index == Some(0) && !has_uv;
-                if (missing.is_some() || index.is_none() || uncovered)
+                let (index, missing) = binding_tex_coord(&layers, reference.as_deref(), binding);
+                let index = index.unwrap_or(0);
+                if missing
                     && reported.insert((
                         material_id.clone(),
                         reference.clone(),
@@ -3184,56 +3244,37 @@ pub(crate) fn tex_coord_plan(
                         feature_id::UV_LAYER_MISSING,
                     ))
                 {
-                    let reason = if missing.is_some() || index.is_none() {
+                    let layer = reference.as_deref().filter(|name| !name.is_empty()).map_or_else(
+                        || "the render layer".to_owned(),
+                        |name| format!("`{name}`"),
+                    );
+                    plan.warnings.push(PotError::with_details(
+                        ErrorCode::UnrepresentableFeature,
                         format!(
-                            "material `{material_id}` samples UV layer {layer}, which mesh `{node_id}` does not have; the texture exports at TEXCOORD_0"
-                        )
-                    } else {
-                        format!(
-                            "material `{material_id}` samples TEXCOORD_0, but slot {slot} of mesh `{node_id}` has faces without UV values; those faces export with zero coordinates"
-                        )
-                    };
-                    plan.losses.push(Loss {
-                        feature_id: feature_id::UV_LAYER_MISSING.to_owned(),
-                        data_id: Some(material_id.to_string()),
-                        reason,
-                        suggestion: Some(
-                            "name the layer on the mesh, or provide UV values for every face using this material slot".to_owned(),
+                            "material `{material_id}` samples UV layer {layer}, which is unavailable to mesh `{node_id}` for this slot; the texture falls back to TEXCOORD_{index}"
                         ),
-                    });
+                        json!({
+                            "feature_id": feature_id::UV_LAYER_MISSING,
+                            "status": "fallback",
+                            "material_id": material_id,
+                            "node_id": node_id,
+                            "uv_layer": reference,
+                            "texcoord": index
+                        }),
+                    ));
                 }
-                let index = index.unwrap_or(0);
-                let coords = plan.coords.entry(material_id.clone()).or_default();
-                match coords.get(reference) {
-                    None => {
-                        coords.insert(reference.clone(), index);
-                    }
-                    Some(first) if *first != index => {
-                        if reported.insert((
-                            material_id.clone(),
-                            reference.clone(),
-                            node_id.clone(),
-                            feature_id::MESH_UV_LAYER,
-                        )) {
-                            plan.losses.push(Loss {
-                                feature_id: feature_id::MESH_UV_LAYER.to_owned(),
-                                data_id: Some(material_id.to_string()),
-                                reason: format!(
-                                    "material `{material_id}` samples UV layer {layer} at TEXCOORD_{first} on the first mesh that uses it, but TEXCOORD_{index} on mesh `{node_id}`; a glTF material holds one texCoord per texture, so `{node_id}` samples TEXCOORD_{first}"
-                                ),
-                                suggestion: Some(
-                                    "give the meshes that share this material the same layer order".to_owned(),
-                                ),
-                            });
-                        }
-                    }
-                    Some(_) => {}
-                }
+                coords.insert(reference.clone(), index);
             }
+            if !plan.coords.contains_key(material_id) {
+                plan.coords.insert(material_id.clone(), coords.clone());
+            }
+            node_coords.insert(slot, (material_id.clone(), coords));
+        }
+        if !node_coords.is_empty() {
+            plan.slot_coords.insert(node_id.clone(), node_coords);
         }
     }
-    // VRM 0.x MToon textures carry no `texCoord`, so they sample TEXCOORD_0. A texture on another
-    // layer exports from TEXCOORD_0 under this loss; without `--allow-lossy` the export is refused.
+    // VRM 0.x MToon textures carry no `texCoord`, so they sample TEXCOORD_0.
     let mut v0_losses = Vec::new();
     if let Some((avatar, AvatarVersion::V0)) = vrm {
         for (material_id, mtoon) in &avatar.mtoon {
@@ -3247,7 +3288,15 @@ pub(crate) fn tex_coord_plan(
                 .chain(super::vrm::uv_textures(mtoon).map(|texture| texture.uv_layer.clone()))
                 .collect::<BTreeSet<_>>();
             for layer in layers {
-                let index = coords.get(&layer).copied().unwrap_or(0);
+                let index = plan
+                    .slot_coords
+                    .values()
+                    .flat_map(|slots| slots.values())
+                    .filter(|(bound_material, _)| bound_material == material_id)
+                    .filter_map(|(_, coordinates)| coordinates.get(&layer).copied())
+                    .find(|index| *index != 0)
+                    .or_else(|| coords.get(&layer).copied())
+                    .unwrap_or(0);
                 if index != 0 {
                     let name = layer
                         .as_deref()
@@ -3270,257 +3319,90 @@ pub(crate) fn tex_coord_plan(
     Ok(plan)
 }
 
-/// UV layer losses of a glTF or VRM export of `doc`, as [`tex_coord_plan`] reports them. `vrm` is
-/// the avatar and version of a VRM export, whose `MToon` textures take part.
-pub(crate) fn uv_layer_losses(
+/// UV losses and fallback warnings from one resolved material/slot plan.
+pub(crate) fn uv_layer_diagnostics(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     vrm: Option<(&AvatarSettings, AvatarVersion)>,
-) -> Result<Vec<Loss>> {
+) -> Result<(Vec<Loss>, Vec<PotError>)> {
     let surfaces = resolve_material_surfaces(doc)?;
-    Ok(tex_coord_plan(doc, snapshot, &surfaces, vrm)?.losses)
+    let plan = tex_coord_plan(doc, snapshot, &surfaces, vrm)?;
+    Ok((plan.losses, plan.warnings))
 }
 
-/// Losses of a glTF or VRM export of `doc` for mesh data glTF cannot write: generic and Blender-only
-/// attributes, color layers no material selects, and vertex-color reads that name no layer.
-pub(crate) fn mesh_export_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<Loss>> {
-    let surfaces = resolve_material_surfaces(doc)?;
-    let visible = super::render_visible_nodes(doc, snapshot)?;
-    let mut losses = Vec::new();
-    let mut reported = BTreeSet::<(String, String)>::new();
-    for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible.contains(node_id) {
-            continue;
-        }
-        let Some(evaluated) = snapshot.meshes.get(node_id) else {
-            continue;
-        };
-        if evaluated.vertices.is_empty() {
-            continue;
-        }
-        let (mesh, owner) = if let Some(data_id) = &node.data {
-            let Some(data_block) = doc
-                .data_blocks
-                .get(data_id)
-                .filter(|data| data.data_type == "mesh")
-            else {
-                continue;
-            };
-            (
-                source_mesh_for_export(node, data_block, evaluated, snapshot.purpose)?,
-                data_id.to_string(),
-            )
-        } else if instance_collection_target(node)?.is_some() {
-            (evaluated, node_id.to_string())
-        } else {
-            continue;
-        };
-        let found = unwritten_attribute_losses(mesh, &owner)
-            .into_iter()
-            .chain(explicit_zero_normal_loss(mesh, &owner)?)
-            .chain(color_losses(node_id, node, mesh, &owner, snapshot, &surfaces)?);
-        for loss in found {
-            if reported.insert((owner.clone(), loss.reason.clone())) {
-                losses.push(loss);
-            }
-        }
-    }
-    Ok(losses)
-}
-
-/// One loss of a mesh's data, owned by `owner` (a mesh data-block or an instancing node).
-fn export_loss(owner: &str, feature: &str, reason: String, suggestion: &str) -> Loss {
-    Loss {
-        feature_id: feature.to_owned(),
-        data_id: Some(owner.to_owned()),
-        reason,
-        suggestion: Some(suggestion.to_owned()),
-    }
-}
-
-/// The `mesh.normals` loss of a mesh with an explicit-zero custom normal. glTF writes a zero normal
-/// as the up-vector fallback, so the authored zero is not preserved. Automatic and authored codes
-/// are written normally and are not losses.
-fn explicit_zero_normal_loss(mesh: &Mesh, owner: &str) -> Result<Option<Loss>> {
-    const SUGGESTION: &str =
-        "export with --allow-lossy, or export as blend only if its loss is accepted";
-    let codes = clnor::corner_codes(mesh)?.unwrap_or_default();
-    if !codes.contains(&clnor::CornerNormalCode::ExplicitZero) {
-        return Ok(None);
-    }
-    Ok(Some(export_loss(
-        owner,
-        "mesh.normals",
-        format!(
-            "glTF output writes a zero custom normal on `{owner}` as the up-vector fallback, so the authored explicit zero is not preserved"
-        ),
-        SUGGESTION,
-    )))
-}
-
-/// Losses for the attributes of one mesh that glTF does not write: generic element attributes,
-/// Blender custom properties, and Blender-only `blender_attributes` entries. Color data is reported
-/// by [`color_losses`].
-pub(crate) fn unwritten_attribute_losses(mesh: &Mesh, owner: &str) -> Vec<Loss> {
-    const SUGGESTION: &str = "export as blend to keep mesh attributes";
-    let store = color_layers::read(mesh);
-    let uv_names = uv_layers::read_layers(mesh)
-        .into_iter()
-        .map(|layer| layer.name)
-        .collect::<BTreeSet<_>>();
-    let mut losses = Vec::new();
-    for (key, value) in &mesh.attributes {
-        match key.as_str() {
-            "blender_metadata" => {
-                if value["custom_properties"]
-                    .as_object()
-                    .is_some_and(|properties| !properties.is_empty())
-                {
-                    losses.push(export_loss(
-                        owner,
-                        "mesh.attribute",
-                        format!("glTF export does not write Blender custom properties on mesh `{owner}`"),
-                        SUGGESTION,
-                    ));
-                }
-            }
-            "blender_attributes" => {
-                for entry in value.as_array().into_iter().flatten() {
-                    let Some(entry_name) = entry["name"].as_str() else {
-                        continue;
-                    };
-                    // Dot-prefixed entries are Blender selection and hide state. The bookkeeping
-                    // entries mirror native data, and UV layers are stored as UV layers.
-                    if entry_name.starts_with('.')
-                        || BLENDER_BOOKKEEPING_ATTRIBUTES.contains(&entry_name)
-                        || uv_names.contains(entry_name)
-                    {
-                        continue;
-                    }
-                    let (feature, kind) = if is_color_attribute(entry) {
-                        ("mesh.color_attribute", "color attribute")
-                    } else {
-                        ("mesh.attribute", "attribute")
-                    };
-                    losses.push(export_loss(
-                        owner,
-                        feature,
-                        format!("glTF export does not write Blender {kind} `{entry_name}` on mesh `{owner}`"),
-                        SUGGESTION,
-                    ));
-                }
-            }
-            _ => {
-                let Some(name) = attribute_keys::user_name(key) else {
-                    if matches!(
-                        key.as_str(),
-                        "uv_layers"
-                            | "color_layers"
-                            | "custom_normal"
-                            | "shade_smooth"
-                            | "sharp"
-                            | "vertex_groups"
-                    ) {
-                        continue;
-                    }
-                    losses.push(export_loss(
-                        owner,
-                        "mesh.attribute",
-                        format!(
-                            "glTF export does not write mesh attribute `{key}` on mesh `{owner}`"
-                        ),
-                        SUGGESTION,
-                    ));
-                    continue;
-                };
-                if store.layers.iter().any(|layer| layer.name == name) {
-                    continue;
-                }
-                losses.push(export_loss(
-                    owner,
-                    "mesh.attribute",
-                    format!("glTF export does not write mesh attribute `{name}` on mesh `{owner}`"),
-                    SUGGESTION,
-                ));
-            }
-        }
-    }
-    losses
-}
-
-/// Color losses of one exported mesh. A layer is lost when the export cannot hold it per corner: the
-/// materials read different layers, so a glTF import cannot tell their `COLOR_0` sets apart, or a
-/// primitive has no `COLOR_n` for it. Each vertex-color read that names no layer of the mesh is
-/// reported too.
-fn color_losses(
-    node_id: &Id,
-    node: &Node,
-    mesh: &Mesh,
-    owner: &str,
-    snapshot: &Snapshot,
-    surfaces: &BTreeMap<Id, ResolvedSurface>,
-) -> Result<Vec<Loss>> {
-    const SUGGESTION: &str =
-        "export with --allow-lossy, or export as blend to keep the color layers";
-    let store = color_layers::read(mesh);
-    let bindings = used_material_bindings(node_id, node, snapshot, mesh)?;
-    let plan = color_plan(mesh, &bindings, surfaces)?;
-    let mixed = plan.slot_layers.values().collect::<BTreeSet<_>>().len() > 1;
-    let mut losses = Vec::new();
-    for (index, layer) in store.layers.iter().enumerate() {
-        let unset = plan.used_slots.iter().find(|slot| {
-            !plan
-                .attributes(**slot)
+fn preserve_vrm_material_variants(
+    version: AvatarVersion,
+    avatar: &AvatarSettings,
+    material_indices: &BTreeMap<Id, usize>,
+    material_variant_indices: &BTreeMap<Id, BTreeMap<TexCoords, usize>>,
+    root: &mut Value,
+    base_material_count: usize,
+) -> Result<()> {
+    let mut variants = material_variant_indices
+        .iter()
+        .flat_map(|(material_id, uv_variants)| {
+            uv_variants
                 .iter()
-                .any(|(_, carried)| *carried == index)
-        });
-        let reason = if mixed {
-            format!(
-                "materials of `{owner}` read different color layers; a glTF import cannot tell their COLOR_0 sets apart, so `{}` is not restored",
-                layer.name
-            )
-        } else if let Some(slot) = unset {
-            format!(
-                "material slot {slot} of `{owner}` has no COLOR_n for `{}`, so the layer is unset on its corners",
-                layer.name
-            )
-        } else {
-            continue;
-        };
-        losses.push(export_loss(owner, "mesh.color_attribute", reason, SUGGESTION));
+                .map(move |(coords, index)| (index, material_id, coords))
+        })
+        .filter(|(index, _, _)| **index >= base_material_count)
+        .collect::<Vec<_>>();
+    variants.sort_by_key(|(index, _, _)| **index);
+    if variants.is_empty() {
+        return Ok(());
     }
-    for slot in &plan.translucent {
-        let Some(layer) = plan
-            .slot_layers
-            .get(slot)
-            .and_then(|&index| store.layers.get(index))
-        else {
-            continue;
-        };
-        if layer.values.iter().any(|color| !crate::float::equal_f64(color[3], 1.0)) {
-            losses.push(export_loss(
-                owner,
-                feature_id::VERTEX_COLOR,
-                format!(
-                    "glTF multiplies the alpha of `{}` into the base alpha of `{owner}` (slot {slot}); Blender ignores that alpha, so the output differs",
-                    layer.name
-                ),
-                SUGGESTION,
-            ));
+    match version {
+        AvatarVersion::V0 => {
+            let properties = root["extensions"]["VRM"]["materialProperties"]
+                .as_array_mut()
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "VRM 0 material properties are missing",
+                    )
+                })?;
+            for (index, material_id, _) in variants {
+                let base_index = material_indices.get(material_id).copied().ok_or_else(|| {
+                    PotError::new(ErrorCode::InternalError, "VRM base material index is missing")
+                })?;
+                let property = properties.get(base_index).cloned().ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "VRM base material properties are missing",
+                    )
+                })?;
+                if properties.len() != *index {
+                    return Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "VRM variant material properties are not contiguous",
+                    ));
+                }
+                properties.push(property);
+            }
+        }
+        AvatarVersion::V1 => {
+            for (material_id, mtoon) in &avatar.mtoon {
+                let base_index = material_indices.get(material_id).copied().ok_or_else(|| {
+                    PotError::new(ErrorCode::InternalError, "VRM base material index is missing")
+                })?;
+                let base_extension = root["materials"][base_index]["extensions"]
+                    ["VRMC_materials_mtoon"]
+                    .clone();
+                if !base_extension.is_object() {
+                    continue;
+                }
+                for (index, variant_material, coords) in &variants {
+                    if *variant_material != material_id || **index == base_index {
+                        continue;
+                    }
+                    let mut extension = base_extension.clone();
+                    set_mtoon_variant_uvs(&mut extension, mtoon, coords);
+                    root["materials"][**index]["extensions"]["VRMC_materials_mtoon"] = extension;
+                }
+            }
         }
     }
-    for (slot, reference) in &plan.missing {
-        let layer = reference
-            .as_deref()
-            .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
-        losses.push(export_loss(
-            owner,
-            feature_id::VERTEX_COLOR,
-            format!("a material of `{owner}` (slot {slot}) reads {layer}, which the mesh does not have; its COLOR_0 is not written"),
-            "read a color layer the mesh has, or give the mesh that layer",
-        ));
-    }
-    Ok(losses)
+    Ok(())
 }
 
 fn validate_shape_key_export(shape_keys: &ShapeKeyData) -> Result<()> {
@@ -3761,6 +3643,50 @@ fn export_with_root_inner(
             &mut extensions_used,
         )?;
         materials.push(value);
+    }
+    let mut material_variant_indices = BTreeMap::<Id, BTreeMap<TexCoords, usize>>::new();
+    for id in doc.materials.keys() {
+        let index = material_indices.get(id).copied().ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "base material index is missing")
+        })?;
+        material_variant_indices
+            .entry(id.clone())
+            .or_default()
+            .insert(tex_coords.for_material(id).clone(), index);
+    }
+    for slots in tex_coords.slot_coords.values() {
+        for (material_id, coords) in slots.values() {
+            if material_variant_indices
+                .get(material_id)
+                .is_some_and(|variants| variants.contains_key(coords))
+            {
+                continue;
+            }
+            let material = doc.materials.get(material_id).ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "node material reference is missing")
+            })?;
+            let surface = surfaces.get(material_id).ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "node material surface is missing")
+            })?;
+            let value = material_value(
+                material_id,
+                material,
+                surface,
+                coords,
+                doc,
+                root_path,
+                &mut texture_export,
+                &mut binary,
+                &mut views,
+                &mut extensions_used,
+            )?;
+            let index = materials.len();
+            materials.push(value);
+            material_variant_indices
+                .entry(material_id.clone())
+                .or_default()
+                .insert(coords.clone(), index);
+        }
     }
     let visible_node_ids = super::render_visible_nodes(doc, snapshot)?;
     let node_ids = doc.nodes.keys().cloned().collect::<Vec<_>>();
@@ -4117,15 +4043,21 @@ fn export_with_root_inner(
                 })?;
                 primitive["attributes"][format!("COLOR_{set}")] = json!(accessor);
             }
-            if let Some(material_id) = usize::try_from(*slot)
-                .ok()
-                .and_then(|slot| snapshot.slot_material(node_id, node, slot))
-            {
-                let material_index =
-                    material_indices.get(material_id).copied().ok_or_else(|| {
+            let slot = usize::try_from(*slot).map_err(|_| {
+                PotError::new(ErrorCode::SceneInvalid, "mesh material slot exceeds platform range")
+            })?;
+            if let Some(material_id) = snapshot.slot_material(node_id, node, slot) {
+                let coords = tex_coords
+                    .for_slot(node_id, slot)
+                    .unwrap_or_else(|| tex_coords.for_material(material_id));
+                let material_index = material_variant_indices
+                    .get(material_id)
+                    .and_then(|variants| variants.get(coords))
+                    .copied()
+                    .ok_or_else(|| {
                         PotError::new(
                             ErrorCode::SceneInvalid,
-                            "node material reference is missing",
+                            "node material UV variant is missing",
                         )
                     })?;
                 primitive["material"] = json!(material_index);
@@ -4533,6 +4465,14 @@ fn export_with_root_inner(
             &mut texture_export,
             &mut binary,
             &mut views,
+        )?;
+        preserve_vrm_material_variants(
+            version,
+            avatar,
+            &material_indices,
+            &material_variant_indices,
+            &mut root,
+            material_indices.len(),
         )?;
         root["bufferViews"] = json!(views);
         root["buffers"][0]["byteLength"] = json!(binary.len());
@@ -8686,7 +8626,7 @@ mod tests {
 
     use super::{
         axis_from_gltf, axis_to_gltf, export_with_root, gltf_import_losses, import, to_glb,
-        uv_layer_losses,
+        uv_layer_diagnostics,
     };
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -11416,6 +11356,45 @@ mod tests {
         }
     }
 
+    fn store_single_uv_layer(
+        doc: &mut SceneDoc,
+        node_name: &str,
+        layer_name: &str,
+        has_data: bool,
+    ) -> TestResult {
+        let node_id = crate::model::Id::new(node_name)?;
+        let data_id = doc
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.data.clone())
+            .ok_or("node mesh data is missing")?;
+        let mesh = doc
+            .data_blocks
+            .get_mut(&data_id)
+            .and_then(|data| data.mesh.as_mut())
+            .ok_or("node mesh is missing")?;
+        let faces = mesh
+            .faces
+            .iter()
+            .map(|face| {
+                has_data.then(|| {
+                    (0..face.vertices.len())
+                        .map(|corner| [corner as f64 + 1.0, corner as f64 + 2.0])
+                        .collect()
+                })
+            })
+            .collect();
+        uv_layers::write(
+            mesh,
+            &UvStore {
+                layers: vec![UvLayer::new(layer_name, faces)],
+                active: Some(layer_name.to_owned()),
+                render: Some(layer_name.to_owned()),
+            },
+        );
+        Ok(())
+    }
+
     /// Asserts two UV lists hold the same values in any order.
     fn assert_same_uvs(actual: &[[f64; 2]], expected: &[[f64; 2]]) {
         let sorted = |values: &[[f64; 2]]| {
@@ -11524,6 +11503,171 @@ mod tests {
     }
 
     #[test]
+    fn shared_material_exports_uv_index_variants_per_mesh() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let mut doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
+                {"op":"material.create","id":"shared","base_color_texture":{"image":"paint","interpolation":"linear"}},
+                {"op":"node.create","id":"left","kind":"plane","params":{"size":2.0},"material":"shared"},
+                {"op":"node.create","id":"right","kind":"plane","params":{"size":2.0},"material":"shared"}
+            ]),
+        )?;
+        store_three_uv_layers_everywhere(&mut doc, "UVMap");
+        doc.materials
+            .get_mut(&crate::model::Id::new("shared")?)
+            .and_then(|material| material.base_color_texture.as_mut())
+            .ok_or("shared material texture is missing")?
+            .uv_layer = Some("UVMap.002".to_owned());
+        let right_id = crate::model::Id::new("right")?;
+        let data_id = doc
+            .nodes
+            .get(&right_id)
+            .and_then(|node| node.data.clone())
+            .ok_or("right mesh data is missing")?;
+        let mesh = doc
+            .data_blocks
+            .get_mut(&data_id)
+            .and_then(|data| data.mesh.as_mut())
+            .ok_or("right mesh is missing")?;
+        let mut store = uv_layers::read(mesh);
+        store.layers.swap(0, 2);
+        uv_layers::write(mesh, &store);
+
+        let (document, _) = export_root_and_binary_at_root(&doc, root.path())?;
+        let mesh_index = |name: &str| -> TestResult<usize> {
+            let node = document["nodes"]
+                .as_array()
+                .ok_or("nodes are missing")?
+                .iter()
+                .find(|node| node["extras"]["potter"]["id"] == name)
+                .ok_or("mesh node is missing")?;
+            Ok(usize::try_from(
+                node["mesh"].as_u64().ok_or("node mesh index is missing")?,
+            )?)
+        };
+        let material_index = |name: &str| -> TestResult<usize> {
+            let mesh = mesh_index(name)?;
+            Ok(usize::try_from(
+                document["meshes"][mesh]["primitives"][0]["material"]
+                    .as_u64()
+                    .ok_or("primitive material index is missing")?,
+            )?)
+        };
+        let left_material = material_index("left")?;
+        let right_material = material_index("right")?;
+        assert_ne!(left_material, right_material);
+        assert_eq!(
+            document["materials"][left_material]["pbrMetallicRoughness"]["baseColorTexture"]["texCoord"]
+                .as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            document["materials"][right_material]["pbrMetallicRoughness"]["baseColorTexture"]["texCoord"]
+                .as_u64(),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collection_member_uv_bindings_emit_variants_and_contiguous_sets() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let mut doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
+                {"op":"material.create","id":"shared","base_color_texture":{"image":"paint","interpolation":"linear"}},
+                {"op":"collection.create","id":"source"},
+                {"op":"node.create","id":"a_member","kind":"plane","collection":"source","params":{"size":2.0}},
+                {"op":"node.update","target":{"id":"a_member"},"set":{"materials":["shared"]}},
+                {"op":"node.create","id":"b_member","kind":"plane","collection":"source","params":{"size":2.0},"transform":{"translation":[2.0,0.0,0.0]}},
+                {"op":"node.update","target":{"id":"b_member"},"set":{"materials":["shared"]}},
+                {"op":"collection.instance_create","id":"instance","collection":"source"}
+            ]),
+        )?;
+        store_single_uv_layer(&mut doc, "a_member", "Empty", false)?;
+        store_single_uv_layer(&mut doc, "b_member", "MemberUV", true)?;
+        doc.materials
+            .get_mut(&crate::model::Id::new("shared")?)
+            .and_then(|material| material.base_color_texture.as_mut())
+            .ok_or("shared material texture is missing")?
+            .uv_layer = Some("MemberUV".to_owned());
+
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let instance_id = crate::model::Id::new("instance")?;
+        let instance_node = doc.nodes.get(&instance_id).ok_or("instance is missing")?;
+        let first_binding = snapshot
+            .slot_binding(&instance_id, instance_node, 0)
+            .ok_or("first slot binding is missing")?;
+        assert_eq!(first_binding.uv.available_mask, 1);
+        assert_eq!(first_binding.uv.render_index, Some(0));
+        let second_binding = snapshot
+            .slot_binding(&instance_id, instance_node, 1)
+            .ok_or("second slot binding is missing")?;
+        assert_eq!(second_binding.uv.available_mask, 2);
+        assert_eq!(second_binding.uv.render_index, Some(1));
+        let (losses, warnings) = uv_layer_diagnostics(&doc, &snapshot, None)?;
+        assert!(warnings.iter().any(|warning| {
+            warning.details["feature_id"] == "uv.layer_missing"
+                && warning.details["status"] == "fallback"
+                && warning.details["node_id"] == "instance"
+                && warning.details["material_id"] == "shared"
+        }));
+        assert!(losses.is_empty());
+
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        let instance_mesh = document["meshes"]
+            .as_array()
+            .ok_or("meshes are missing")?
+            .iter()
+            .find(|mesh| mesh["name"] == "instance_source")
+            .ok_or("instance mesh is missing")?;
+        let primitives = instance_mesh["primitives"]
+            .as_array()
+            .ok_or("instance primitives are missing")?;
+        assert_eq!(primitives.len(), 2);
+        let first_material = usize::try_from(
+            primitives[0]["material"]
+                .as_u64()
+                .ok_or("first material is missing")?,
+        )?;
+        let second_material = usize::try_from(
+            primitives[1]["material"]
+                .as_u64()
+                .ok_or("second material is missing")?,
+        )?;
+        assert_ne!(first_material, second_material);
+        assert_eq!(
+            document["materials"][first_material]["pbrMetallicRoughness"]["baseColorTexture"]["texCoord"]
+                .as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            document["materials"][second_material]["pbrMetallicRoughness"]["baseColorTexture"]["texCoord"]
+                .as_u64(),
+            Some(1)
+        );
+        let attributes = &primitives[0]["attributes"];
+        assert!(attributes["TEXCOORD_0"].as_u64().is_some());
+        assert!(attributes["TEXCOORD_1"].as_u64().is_some());
+        assert!(attributes["TEXCOORD_2"].is_null());
+        let buffers = vec![binary];
+        let read_set = |set: &str| -> TestResult<Vec<[f64; 2]>> {
+            let accessor = usize::try_from(
+                attributes[set]
+                    .as_u64()
+                    .ok_or("UV accessor is missing")?,
+            )?;
+            Ok(super::read_vec2(&document, &buffers, accessor)?)
+        };
+        assert!(read_set("TEXCOORD_0")?.iter().all(|uv| *uv == [0.0, 1.0]));
+        assert!(read_set("TEXCOORD_1")?.iter().any(|uv| *uv != [0.0, 1.0]));
+        Ok(())
+    }
+
+    #[test]
     fn texture_naming_a_missing_uv_layer_reports_uv_layer_missing() -> TestResult {
         let root = tempfile::tempdir()?;
         let mut doc = scene_with_asset_root(
@@ -11546,14 +11690,16 @@ mod tests {
             .uv_layer = Some("Missing".to_owned());
 
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = uv_layer_losses(&doc, &snapshot, None)?;
+        let (losses, warnings) = uv_layer_diagnostics(&doc, &snapshot, None)?;
         assert!(
-            losses.iter().any(|loss| {
-                loss.feature_id == "uv.layer_missing"
-                    && loss.data_id.as_deref() == Some("paint_mat")
+            warnings.iter().any(|warning| {
+                warning.details["feature_id"] == "uv.layer_missing"
+                    && warning.details["material_id"] == "paint_mat"
+                    && warning.details["status"] == "fallback"
             }),
-            "{losses:?}"
+            "{warnings:?}"
         );
+        assert!(losses.is_empty());
         // The texture still exports, sampling the render layer.
         let (document, _) = export_root_and_binary_at_root(&doc, root.path())?;
         assert_eq!(

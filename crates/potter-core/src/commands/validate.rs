@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ValidateArgs,
-    commands::{export::export_purpose, util::exchange_format_name},
+    commands::{export::export_purpose, util::{exchange_format_name, with_load_warnings}},
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot},
     model::AvatarVersion,
@@ -66,6 +66,7 @@ pub fn run(args: ValidateArgs) -> Result<(Option<SceneInfo>, Value)> {
             json!({"result":report.value,"strict":true}),
         ));
     }
+    report.value["warnings"] = with_load_warnings(&[], &project)?;
     Ok((Some(scene), report.value))
 }
 

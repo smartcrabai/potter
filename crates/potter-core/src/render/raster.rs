@@ -58,6 +58,7 @@ pub(crate) enum AlphaMode {
 pub(crate) struct Triangle {
     pub(crate) positions: [DVec3; 3],
     pub(crate) object_index: u32,
+    /// Source element index; face records carry per-slot UV bindings through subdivision copies.
     pub(crate) element_index: u32,
     pub(crate) color: [f64; 4],
     pub(crate) alpha_mode: AlphaMode,
@@ -80,6 +81,7 @@ pub(crate) struct Triangle {
 impl Triangle {
     /// This triangle's shading attributes over new corner geometry.
     pub(crate) fn with_corners(
+
         &self,
         positions: [DVec3; 3],
         uv: [[f64; 2]; 3],
@@ -188,7 +190,6 @@ pub(crate) fn blend_color(corners: &[[f64; 4]; 3], weights: [f64; 3]) -> [f64; 4
             + corners[2][channel] * weights[2]
     })
 }
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Line {
     pub(crate) start: DVec3,

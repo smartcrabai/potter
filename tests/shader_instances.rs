@@ -9,7 +9,7 @@ use potter_core::{
     image::{ImageData, ImageInterpolation, ImageTileData},
     model::{Id, Material, Registry, SceneDoc, TextureRef},
     ops::apply_batch,
-    shader::{HitContext, evaluate_surface},
+    shader::{HitContext, HitUvLayers, evaluate_surface},
 };
 use serde_json::json;
 
@@ -387,11 +387,17 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     material.metallic_texture = Some(texture_ref("metallic_image", None));
     material.normal_texture = Some(texture_ref("normal_image", None));
     let image_data = material_texture_images();
-    let uv_maps = [("UVMap", [0.75, 0.5])];
+    let names = ["UVMap".to_owned()];
+    let layers = HitUvLayers {
+        names: &names,
+        corners: &[[[0.75, 0.5]; 3]],
+        positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+        barycentric: [1.0 / 3.0; 3],
+        render: Some(0),
+    };
     let mut context = HitContext::new(&groups)
         .with_images(&image_data)
-        .with_uv_maps(&uv_maps)
-        .with_tangent_frame(DVec3::X, DVec3::Y);
+        .with_uv_layers(layers);
     context.uv = [0.25, 0.5];
     let simple = evaluate_surface(&material, &context).unwrap();
     assert_eq!(simple.base_color, [0.0, 0.25, 0.0, 1.0]);
@@ -403,7 +409,7 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     material.node_tree = Some(graph_id);
     let graph_backed = evaluate_surface(&material, &context).unwrap();
     assert_eq!(graph_backed, simple);
-    let no_images = HitContext::new(&groups).with_uv_maps(&uv_maps);
+    let no_images = HitContext::new(&groups).with_uv_layers(layers);
     let error = evaluate_surface(&material, &no_images).unwrap_err();
     assert_eq!(error.code, ErrorCode::UnsupportedFeature);
     assert_eq!(
@@ -448,13 +454,20 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
         "test_image".to_owned(),
         image_data(2, 1, vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]]),
     )]);
-    let uv_maps = [("UVMap", [0.25, 0.5]), ("Detail", [0.75, 0.5])];
+    let names = ["UVMap".to_owned(), "Detail".to_owned()];
+    let layers = HitUvLayers {
+        names: &names,
+        corners: &[[[0.25, 0.5]; 3], [[0.75, 0.5]; 3]],
+        positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+        barycentric: [1.0 / 3.0; 3],
+        render: Some(0),
+    };
 
     let (named_material, named_groups) = uv_map_material("Detail");
     let warnings = RefCell::new(Vec::new());
     let mut context = HitContext::new(&named_groups)
         .with_images(&images)
-        .with_uv_maps(&uv_maps)
+        .with_uv_layers(layers)
         .with_warnings(&warnings);
     context.uv = [0.25, 0.5];
     let named = evaluate_surface(&named_material, &context).unwrap();
@@ -464,7 +477,7 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
     let (missing_material, missing_groups) = uv_map_material("Missing");
     let context = HitContext::new(&missing_groups)
         .with_images(&images)
-        .with_uv_maps(&uv_maps)
+        .with_uv_layers(layers)
         .with_warnings(&warnings);
     let fallback = evaluate_surface(&missing_material, &context).unwrap();
     assert_eq!(fallback.base_color, [1.0, 0.0, 0.0, 1.0]);

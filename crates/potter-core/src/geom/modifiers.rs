@@ -25,8 +25,12 @@ use super::clnor::{self, CornerNormalCode, NormalCodeOptions, settle_custom_norm
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
-    normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
-    provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
+    normals::{
+        average_custom_normals_by_fan, corner_normals, face_normal, safe_acos_approx,
+        sharp_edge_flags, vector3,
+    },
+    provenance::{Origin, edge_flags, mean_value_corners, normalize_custom_normals, remap_attributes},
+    uv_layers,
     uv_layers,
 };
 
@@ -1880,7 +1884,8 @@ fn copy_keyed_value(cap: &Mesh, source: &mut Mesh, name: &str, from: &str, to: S
 /// Storage order is the input, then the start cap, then the end cap, matching the source indices
 /// `array` reports. Input elements keep their IDs; cap elements get fresh IDs after them. Like
 /// Blender's array modifier, a cap contributes UV data only: each input UV layer gains the matching
-/// cap layer's corner values, face by face (default `[0, 0]` where the cap lacks the layer). Every
+/// cap layer's corner values, face by face. Where the cap lacks the layer, its corners take Blender's
+/// `[0, 0]` in V-up, stored as `[0, 1]`. Every
 /// other attribute stays input-only, so cap elements take defaults.
 fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
     let mut source = mesh.clone();
@@ -1951,7 +1956,7 @@ fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
                     .and_then(|known| known.faces.get(index))
                     .cloned()
                     .flatten()
-                    .unwrap_or_else(|| vec![[0.0, 0.0]; face.vertices.len()]);
+                    .unwrap_or_else(|| vec![[0.0, 1.0]; face.vertices.len()]);
                 layer.faces.push(Some(uv));
                 layer.pinned.push(None);
             }
@@ -2003,7 +2008,6 @@ fn array_provenance_normals(mesh: &Mesh, caps: &[&Mesh], source: &mut Mesh) -> R
         },
     )
 }
-
 /// The first element ID after `ids`, or zero when there are none.
 fn next_element_id(ids: impl Iterator<Item = u32>) -> Result<u32> {
     ids.max().map_or(Ok(0), |id| {

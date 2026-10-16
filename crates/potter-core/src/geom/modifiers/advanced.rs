@@ -1723,6 +1723,7 @@ pub(super) fn curve(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         let deformed = position + rotation * cross;
         vertex.co = object.transform_point3(local.lerp(deformed, weight));
     }
+
     validated(&result)?;
     Ok(result)
 }

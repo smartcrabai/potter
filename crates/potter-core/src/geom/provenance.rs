@@ -189,6 +189,10 @@ pub(crate) fn remap_attributes_skipping(
             "vertex_groups" => value
                 .as_object()
                 .map(|groups| Value::Object(sources.vertex_groups(groups))),
+            "crease_edge" => Some(sources.keyed_edge_attribute(value)),
+            "blender_edge_flags" => value
+                .as_array()
+                .map(|flags| Value::Array(sources.edge_flags(flags))),
             "blender_attributes" => value.as_array().map(|entries| {
                 Value::Array(
                     entries

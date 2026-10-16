@@ -7,9 +7,11 @@ use crate::{
     error::{PotError, Result},
     geom::{
         Face, Mesh, MeshError, edge_key,
+        Face, Mesh, MeshError, edge_key,
         attribute_keys::storage_key,
         clnor::{self, NormalCodeOptions, SetterInput},
         color_layers::{self, ColorDomain, ColorLayer},
+        uv_layers::{self, UvLayer, UvStore},
         uv_layers::{self, UvLayer, UvStore},
     },
 };
@@ -1722,6 +1724,7 @@ fn apply_delete(mesh: &mut Mesh, selected: &Selection) -> IdChanges {
             });
         }
     }
+    uv_layers::prune_missing_faces(mesh);
     changes
 }
 
@@ -2396,12 +2399,23 @@ fn create_color_layer(
     Ok(())
 }
 
+/// `uv_layers` is the UV layer store, not a user attribute: create, update, and delete reject it.
+fn reject_reserved_attribute(name: &str) -> Result<()> {
+    if name == uv_layers::ATTRIBUTE {
+        return Err(invalid(format!(
+            "mesh attribute `{name}` is reserved for UV layers"
+        )));
+    }
+    Ok(())
+}
+
 fn apply_attribute_create(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
     let name = args
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_create requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     if mesh.attributes.contains_key(&*storage_key(name)) {
         return Err(invalid(format!("mesh attribute `{name}` already exists")));
     }
@@ -2466,6 +2480,7 @@ fn apply_attribute_update(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_update requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     let storage = storage_key(name);
     let key: &str = &storage;
     let attribute = mesh
@@ -2524,6 +2539,7 @@ fn apply_attribute_delete(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_delete requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     let storage = storage_key(name);
     let key: &str = &storage;
     if !mesh.attributes.contains_key(key) {

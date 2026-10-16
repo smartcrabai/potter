@@ -6,6 +6,8 @@
 //! `uv_layers`, and the texture reference field `uv_map` with `uv_layer`. Version 3 converted
 //! Blender-keyed shading (including compressed custom normals), color, and generic element data to
 //! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]).
+use std::collections::BTreeSet;
+
 use serde_json::{Map, Value, json};
 
 use super::SceneDoc;
@@ -29,7 +31,6 @@ pub fn inline_resource_kind(value: &Value) -> Result<Option<&str>> {
         .ok_or_else(|| invalid("inline resource is missing its kind"))
 }
 
-
 /// Texture reference fields of a material.
 const MATERIAL_TEXTURES: [&str; 4] = [
     "base_color_texture",
@@ -47,25 +48,41 @@ const MTOON_TEXTURES: [&str; 5] = [
     "uv_animation_mask_texture",
 ];
 
-/// Parses and upgrades a scene document, then migrates its loaded-only legacy resource sentinels.
-pub fn parse_scene(bytes: &[u8]) -> Result<SceneDoc> {
-    let mut value = parse_value(bytes)?;
-    upgrade_scene(&mut value)?;
-    let mut scene = serde_json::from_value(value).map_err(|error| json_error(&error))?;
-    crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut scene)?;
-    Ok(scene)
+/// A scene document read from bytes, with what its upgrade produced.
+pub struct ParsedScene {
+    pub doc: SceneDoc,
+    /// Diagnostics for version-1 UV data skipped or dropped during migration.
+    pub warnings: Vec<Value>,
+    /// Whether the bytes were schema version 1. Their original bytes must be kept before the first
+    /// schema-version-3 write replaces them.
+    pub legacy: bool,
 }
 
-/// Parses and upgrades a history snapshot, then migrates loaded-only legacy resource sentinels.
-pub(crate) fn parse_history_record(bytes: &[u8]) -> Result<HistoryRecord> {
+/// Parses and upgrades a scene document, then migrates its loaded-only legacy resource sentinels.
+pub fn parse_scene(bytes: &[u8]) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
-    if let Some(snapshot) = value.get_mut("snapshot") {
-        upgrade_scene(snapshot)?;
-    }
+    let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1);
+    let warnings = upgrade_scene(&mut value)?;
+    let mut doc: SceneDoc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
+    crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut doc)?;
+    Ok(ParsedScene {
+        doc,
+        warnings,
+        legacy,
+    })
+}
+
+/// Parses a history record, upgrading its snapshot and migrating loaded-only texture sentinels.
+pub(crate) fn parse_history_record(bytes: &[u8]) -> Result<(HistoryRecord, Vec<Value>)> {
+    let mut value = parse_value(bytes)?;
+    let warnings = match value.get_mut("snapshot") {
+        Some(snapshot) => upgrade_scene(snapshot)?,
+        None => Vec::new(),
+    };
     let mut record: HistoryRecord =
         serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut record.snapshot)?;
-    Ok(record)
+    Ok((record, warnings))
 }
 
 fn parse_value(bytes: &[u8]) -> Result<Value> {
@@ -80,69 +97,120 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place: version 1 to 2, then version 2 to 3. Other versions are left
-/// for `SceneDoc::validate` to accept or reject.
-pub fn upgrade_scene(value: &mut Value) -> Result<()> {
+/// Upgrades a document from version 1 through 3, retaining diagnostics from legacy UV data.
+pub fn upgrade_scene(value: &mut Value) -> Result<Vec<Value>> {
+    let mut warnings = Vec::new();
     if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
-        upgrade_v1(value)?;
+        warnings = upgrade_v1(value)?;
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(2) {
         upgrade_v2(value)?;
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// Upgrades a schema-version-1 scene document to version 2.
-fn upgrade_v1(value: &mut Value) -> Result<()> {
+fn upgrade_v1(value: &mut Value) -> Result<Vec<Value>> {
+    let referenced: BTreeSet<String> = texture_refs(value)
+        .iter()
+        .filter_map(|texture| texture.get("uv_map")?.as_str())
+        .filter(|name| !name.is_empty() && *name != "uv_map")
+        .map(str::to_owned)
+        .collect();
+    let mut warnings = Vec::new();
     if let Some(blocks) = value.get_mut("data_blocks").and_then(Value::as_object_mut) {
-        for block in blocks.values_mut() {
+        for (id, block) in blocks.iter_mut() {
             if let Some(mesh) = block.get_mut("mesh").filter(|mesh| !mesh.is_null()) {
-                crate::geom::uv_layers::upgrade_mesh_v1(mesh)?;
+                warnings.extend(crate::geom::uv_layers::upgrade_mesh_v1(
+                    mesh,
+                    id,
+                    &referenced,
+                ));
             }
         }
     }
-    if let Some(materials) = value.get_mut("materials").and_then(Value::as_object_mut) {
-        for material in materials.values_mut() {
-            for key in MATERIAL_TEXTURES {
-                if let Some(texture) = material.get_mut(key) {
-                    upgrade_texture_ref(texture);
-                }
-            }
-        }
-    }
-    if let Some(mtoon) = value
-        .pointer_mut("/avatar/mtoon")
-        .and_then(Value::as_object_mut)
-    {
-        for material in mtoon.values_mut() {
-            for key in MTOON_TEXTURES {
-                if let Some(texture) = material.get_mut(key) {
-                    upgrade_texture_ref(texture);
-                }
-            }
-            if let Some(texture) = material.pointer_mut("/shading_shift_texture/texture") {
-                upgrade_texture_ref(texture);
-            }
-        }
+    for texture in texture_refs(value) {
+        upgrade_texture_ref(texture)?;
     }
     value["schema_version"] = json!(2);
-    Ok(())
+    Ok(warnings)
 }
 
-/// `uv_map: "uv_map"` named the single version-1 UV set, which is the render layer, so it becomes
-/// `uv_layer: null`. Any other name stays as a layer reference.
-fn upgrade_texture_ref(texture: &mut Value) {
-    let Some(object) = texture.as_object_mut() else {
+/// Every material and MToon texture reference, for mutation.
+fn texture_refs(value: &mut Value) -> Vec<&mut Value> {
+    let mut refs = Vec::new();
+    let Some(object) = value.as_object_mut() else {
+        return refs;
+    };
+    for (key, section) in object.iter_mut() {
+        match key.as_str() {
+            "materials" => {
+                if let Some(materials) = section.as_object_mut() {
+                    for material in materials.values_mut() {
+                        push_material_refs(material, &MATERIAL_TEXTURES, &mut refs);
+                    }
+                }
+            }
+            "avatar" => {
+                if let Some(mtoon) = section.get_mut("mtoon").and_then(Value::as_object_mut) {
+                    for material in mtoon.values_mut() {
+                        push_mtoon_refs(material, &mut refs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    refs
+}
+
+fn push_material_refs<'a>(material: &'a mut Value, keys: &[&str], refs: &mut Vec<&'a mut Value>) {
+    if let Some(fields) = material.as_object_mut() {
+        refs.extend(
+            fields
+                .iter_mut()
+                .filter(|(key, _)| keys.contains(&key.as_str()))
+                .map(|(_, texture)| texture),
+        );
+    }
+}
+
+fn push_mtoon_refs<'a>(material: &'a mut Value, refs: &mut Vec<&'a mut Value>) {
+    let Some(fields) = material.as_object_mut() else {
         return;
+    };
+    for (key, field) in fields.iter_mut() {
+        if key.as_str() == "shading_shift_texture" {
+            if let Some(texture) = field.get_mut("texture") {
+                refs.push(texture);
+            }
+        } else if MTOON_TEXTURES.contains(&key.as_str()) {
+            refs.push(field);
+        }
+    }
+}
+
+/// Converts one version-1 texture reference; empty and `uv_map` select the render layer.
+fn upgrade_texture_ref(texture: &mut Value) -> Result<()> {
+    let Some(object) = texture.as_object_mut() else {
+        return Ok(());
     };
     let Some(uv_map) = object.remove("uv_map") else {
-        return;
+        return Ok(());
     };
     let uv_layer = match uv_map {
-        Value::String(name) if name != "uv_map" => Value::String(name),
-        _ => Value::Null,
+        Value::Null => Value::Null,
+        Value::String(name) if name.is_empty() || name == "uv_map" => Value::Null,
+        Value::String(name) => Value::String(name),
+        _ => {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "version-1 texture uv_map must be a string or null",
+            ));
+        }
     };
     object.insert("uv_layer".to_owned(), uv_layer);
+    Ok(())
 }
 
 /// Upgrades a schema-version-2 scene document to version 3 on every data-block mesh.
@@ -157,6 +225,7 @@ fn upgrade_v2(value: &mut Value) -> Result<()> {
     value["schema_version"] = json!(3);
     Ok(())
 }
+
 
 /// Blender attributes that mirror a native key or topology Potter recomputes. They are dropped.
 const MIRROR_ATTRIBUTES: [&str; 5] = [
@@ -1033,8 +1102,8 @@ mod tests {
     fn parse_scene_migrates_the_legacy_volume_noise_sentinel() {
         let bytes = serde_json::to_vec(&legacy_volume_noise_scene()).expect("scene JSON");
         let scene = parse_scene(&bytes).expect("scene migration");
-        assert_native_value_noise(&scene);
-        assert_eq!(scene.resources.len(), 1);
+        assert_native_value_noise(&scene.doc);
+        assert_eq!(scene.doc.resources.len(), 1);
     }
 
     #[test]
@@ -1051,7 +1120,8 @@ mod tests {
             snapshot: legacy_volume_noise_scene(),
         };
         let bytes = serde_json::to_vec(&record).expect("history JSON");
-        let record = parse_history_record(&bytes).expect("history migration");
+        let (record, warnings) = parse_history_record(&bytes).expect("history migration");
+        assert!(warnings.is_empty());
         assert_native_value_noise(&record.snapshot);
         assert_eq!(record.snapshot.resources.len(), 1);
     }
@@ -1132,7 +1202,7 @@ mod tests {
             }]
         });
 
-        let migrated = parse_scene(&serde_json::to_vec(&source)?)?;
+        let migrated = parse_scene(&serde_json::to_vec(&source)?)?.doc;
         assert_eq!(migrated.schema_version, 3);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
@@ -1183,7 +1253,7 @@ mod tests {
     }
 
     fn migrated_mesh(source: &Value) -> TestResult<crate::geom::Mesh> {
-        let migrated = parse_scene(&serde_json::to_vec(source)?)?;
+        let migrated = parse_scene(&serde_json::to_vec(source)?)?.doc;
         let mesh = migrated.data_blocks[&crate::model::Id::new("meshdata")?]
             .mesh
             .clone()
