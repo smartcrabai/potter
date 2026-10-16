@@ -429,23 +429,103 @@ function checkNormalMap(spec) {
 // MToon samples the base texture at uv + offset * B(mask at uv), with rotation phase 0 (spec sets no rotation).
 // Prediction per pixel: changed iff nearest texel at (u0 + off0*m) differs from nearest texel at (u0 + off1*m).
 // ---------------------------------------------------------------------------
-// Pixels are classed before the mask is read. `jump`: a 4-neighbour's UV differs by more than UV_JUMP
-// (UV island edges and the u wrap). `band`: within MASK_STEP_BAND_TEXELS of the mask's u = 0.5 step.
-// Every other pixel is `rest`. Only `rest` must match exactly; `jump` and `band` are measured and
-// reported, so a regression in either shows up as a count above its recorded ceiling.
+// Pixels are classed once per view, not per frame. The camera and the geometry are the same in both
+// frames (the scroll is a shader uniform), so the body is rendered once more with each fragment's texture
+// coordinate encoded in RGBA8: fract(u) and fract(v) at 16 bits per axis (q = 1 + round(fract * 65533),
+// 1..65534). q = 0 means the pixel is not covered by the body. The encoding replaces a raycast per pixel
+// (the previous check cost five raycasts per pixel and took most of the job's time).
+// Classes: `jump` = a covered 4-neighbour's UV differs by more than UV_JUMP (UV island edges and the u
+// wrap); `band` = within MASK_STEP_BAND_TEXELS of the mask's u = 0.5 step; `rest` = everything else.
+// Only `rest` must match the nearest-texel prediction exactly. `jump` and `band` are measured and checked
+// against recorded ceilings, so a regression in either shows up as a count above its ceiling.
 const MASK_STEP_BAND_TEXELS = 4;
 const UV_JUMP = 0.1;
-function inMaskStepBand(u, width) {
-  const x = (((u % 1) + 1) % 1) * width;
-  return Math.abs(x - width / 2) <= MASK_STEP_BAND_TEXELS;
-}
-function pixelUvJump(R, meshes, i, j, u0, v0) {
-  for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-    const n = pick(R, meshes, i + di, j + dj, 'front');
-    if (n && (Math.abs(n.uv.x - u0) > UV_JUMP || Math.abs(n.uv.y - v0) > UV_JUMP)) return true;
+const UV_SCALE = 65533;
+const UV_VERTEX = `varying vec2 vUv;
+void main() {
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+const UV_FRAGMENT = `varying vec2 vUv;
+void main() {
+  float qu = 1.0 + floor(fract(vUv.x) * 65533.0 + 0.5);
+  float qv = 1.0 + floor(fract(vUv.y) * 65533.0 + 0.5);
+  gl_FragColor = vec4(floor(qu / 256.0), mod(qu, 256.0), floor(qv / 256.0), mod(qv, 256.0)) / 255.0;
+}`;
+
+// Encoded (fract(u), fract(v)) per pixel of the view, row 0 at top.
+function uvPass(R, meshes) {
+  const S = R.S;
+  const { renderer, scene } = ctx;
+  const target = new THREE.WebGLRenderTarget(S, S, { type: THREE.UnsignedByteType, depthBuffer: true });
+  const uvMaterial = (side) => new THREE.ShaderMaterial({ side, toneMapped: false, vertexShader: UV_VERTEX, fragmentShader: UV_FRAGMENT });
+  const swapped = [];
+  for (const mesh of meshes) {
+    // A multi-slot mesh keeps one UV material per slot, so its geometry groups still apply.
+    swapped.push([mesh, mesh.material]);
+    mesh.material = Array.isArray(mesh.material) ? mesh.material.map((m) => uvMaterial(m.side)) : uvMaterial(mesh.material.side);
   }
-  return false;
+  const clearColour = renderer.getClearColor(new THREE.Color());
+  const clearAlpha = renderer.getClearAlpha();
+  const previous = renderer.getRenderTarget();
+  let raw;
+  try {
+    renderer.setClearColor(0x000000, 0);
+    renderer.setRenderTarget(target);
+    renderer.clear();
+    renderer.render(scene, R.cam);
+    raw = new Uint8Array(S * S * 4);
+    renderer.readRenderTargetPixels(target, 0, 0, S, S, raw);
+  } finally {
+    renderer.setRenderTarget(previous);
+    renderer.setClearColor(clearColour, clearAlpha);
+    for (const [mesh, original] of swapped) {
+      for (const uv of [mesh.material].flat()) uv.dispose();
+      mesh.material = original;
+    }
+    target.dispose();
+  }
+  const qu = new Uint16Array(S * S);
+  const qv = new Uint16Array(S * S);
+  for (let j = 0; j < S; j++) {
+    const row = (S - 1 - j) * S; // readRenderTargetPixels is bottom-up; the checks index top-down
+    for (let i = 0; i < S; i++) {
+      const o = (row + i) * 4;
+      qu[j * S + i] = raw[o] * 256 + raw[o + 1];
+      qv[j * S + i] = raw[o + 2] * 256 + raw[o + 3];
+    }
+  }
+  return { S, qu, qv };
 }
+
+// Class per pixel: 0 uncovered, 1 rest, 2 jump, 3 band. Computed once per view.
+const CLASS = { uncovered: 0, rest: 1, jump: 2, band: 3 };
+function classifyView(pass, maskWidth) {
+  const { S, qu, qv } = pass;
+  const cls = new Uint8Array(S * S);
+  const uOf = (k) => (qu[k] - 1) / UV_SCALE;
+  const vOf = (k) => (qv[k] - 1) / UV_SCALE;
+  const inBand = (u) => {
+    const x = u * maskWidth;
+    return Math.abs(x - maskWidth / 2) <= MASK_STEP_BAND_TEXELS;
+  };
+  for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
+    const k = j * S + i;
+    if (qu[k] === 0) continue;
+    const u0 = uOf(k), v0 = vOf(k);
+    let jump = false;
+    for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const ni = i + di, nj = j + dj;
+      if (ni < 0 || nj < 0 || ni >= S || nj >= S) continue;
+      const n = nj * S + ni;
+      if (qu[n] === 0) continue;
+      if (Math.abs(uOf(n) - u0) > UV_JUMP || Math.abs(vOf(n) - v0) > UV_JUMP) { jump = true; break; }
+    }
+    cls[k] = jump ? CLASS.jump : inBand(u0) ? CLASS.band : CLASS.rest;
+  }
+  return cls;
+}
+
 function checkUvAnimation(spec) {
   const cloth = spec.MATERIALS.cloth;
   show([spec.MESHES.body]);
@@ -464,25 +544,26 @@ function checkUvAnimation(spec) {
   const A1 = render('body');
   const mask = decode(surface.uvAnimationMaskTexture);
   const map = decode(surface.map);
-  const classes = ['rest', 'jump', 'band'];
+  const pass = uvPass(A0, body);
+  const cls = classifyView(pass, mask.w);
+  const names = ['uncovered', 'rest', 'jump', 'band'];
   const r = { speed: cloth.uvAnimationScrollX, dt: DT, offsetDelta: off1 - off0, expectedOffsetDelta: cloth.uvAnimationScrollX * DT,
     determined: 0, predictedChanged: 0, predictedUnchanged: 0, observedChanged: 0, mismatch: 0, undetermined: 0, maskZeroDetermined: 0,
-    byClass: Object.fromEntries(classes.map((c) => [c, { determined: 0, mismatch: 0 }])) };
+    byClass: Object.fromEntries(names.slice(1).map((c) => [c, { determined: 0, mismatch: 0 }])) };
   const colour = (u, v) => keyRGBA(map.d, nearestOffset(map, u, v));
-  const [i0, j0, i1, j1] = boundsPx(A0, body);
-  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
-    const hit = pick(A0, body, i, j, 'front');
-    if (!hit) continue;
-    const [u0, v0] = [hit.uv.x, hit.uv.y];
-    const cls = pixelUvJump(A0, body, i, j, u0, v0) ? 'jump' : inMaskStepBand(u0, mask.w) ? 'band' : 'rest';
+  for (let k = 0; k < cls.length; k++) {
+    if (cls[k] === CLASS.uncovered) continue;
+    const i = k % pass.S, j = (k - i) / pass.S;
+    const u0 = (pass.qu[k] - 1) / UV_SCALE, v0 = (pass.qv[k] - 1) / UV_SCALE;
+    const cname = names[cls[k]];
     const m = uniformAt(mask, u0, v0, keyMaskB);
     if (m === null) { r.undetermined++; continue; }
     const observed = differs(A0, A1, i, j);
-    const bucket = r.byClass[cls];
+    const bucket = r.byClass[cname];
     bucket.determined++;
     if (m === 0) {
       r.maskZeroDetermined++;
-      if (observed) { r.mismatch += cls === 'rest' ? 1 : 0; bucket.mismatch++; }
+      if (observed) { r.mismatch += cname === 'rest' ? 1 : 0; bucket.mismatch++; }
       continue;
     }
     const c0 = colour(u0 + off0 * m, v0);
@@ -491,7 +572,7 @@ function checkUvAnimation(spec) {
     r.determined++;
     if (predicted) r.predictedChanged++; else r.predictedUnchanged++;
     if (observed) r.observedChanged++;
-    if (predicted !== observed) { r.mismatch += cls === 'rest' ? 1 : 0; bucket.mismatch++; }
+    if (predicted !== observed) { r.mismatch += cname === 'rest' ? 1 : 0; bucket.mismatch++; }
   }
   return r;
 }
