@@ -359,7 +359,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "shrinkwrap" => advanced::shrinkwrap(&evaluated, modifier)?,
             "curve" => advanced::curve(&evaluated, modifier)?,
             "hook" => advanced::hook(&evaluated, modifier)?,
-            "skin" => skin::skin(&evaluated, modifier)?,
+            "skin" => skin::skin_with_warnings(&evaluated, modifier, &mut warnings)?,
             "cast" => advanced::cast(&evaluated, modifier)?,
             "wave" => wave_textured(&evaluated, modifier, frame, None, texture_rng)?,
             "warp" => warp_textured(&evaluated, modifier, None, texture_rng)?,
