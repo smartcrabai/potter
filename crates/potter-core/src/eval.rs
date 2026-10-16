@@ -2584,14 +2584,17 @@ fn render_simulated_particles(
                     .push(state);
             }
         }
+        let particle_count = visible_states_by_system
+            .values()
+            .fold(0_usize, |count, states| count.saturating_add(states.len()));
+        if particle_count > MAX_RENDERED_PARTICLES {
+            return Err(PotError::with_details(
+                ErrorCode::LimitExceeded,
+                "particle visualization exceeds the 100000 particle limit",
+                json!({"node_id":emitter_id,"count":particle_count}),
+            ));
+        }
         for (system_index, visible_states) in visible_states_by_system {
-            if visible_states.len() > MAX_RENDERED_PARTICLES {
-                return Err(PotError::with_details(
-                    ErrorCode::LimitExceeded,
-                    "particle visualization exceeds the 100000 particle limit",
-                    json!({"node_id":emitter_id,"count":visible_states.len()}),
-                ));
-            }
             let has_stack_system = usize::try_from(system_index).ok().is_some_and(|index| {
                 node.modifiers
                     .iter()
@@ -4557,6 +4560,52 @@ mod tests {
 
     use super::{EvaluationContext, Snapshot};
 
+
+    #[test]
+    fn particle_render_limit_counts_all_systems_for_each_emitter() {
+        let emitter_id = Id::new("emitter").unwrap();
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.nodes.insert(
+            emitter_id.clone(),
+            Node {
+                name: "Emitter".to_owned(),
+                kind: "mesh".to_owned(),
+                ..Node::default()
+            },
+        );
+        let mut states = Vec::with_capacity(120_002);
+        for system_index in 0..2 {
+            for _ in 0..60_001 {
+                states.push(crate::sim::ParticleState {
+                    system_index,
+                    ..crate::sim::ParticleState::default()
+                });
+            }
+        }
+        let particles = std::collections::BTreeMap::from([(emitter_id.clone(), states)]);
+        let suppressed = std::collections::BTreeSet::new();
+        let gate = super::ModifierGate {
+            context: super::ModifierEvaluationContext {
+                purpose: super::EvaluationPurpose::Preview,
+                project_root: None,
+                cache_directory: None,
+            },
+            suppressed: &suppressed,
+        };
+        let evaluated_nodes = std::collections::BTreeSet::from([emitter_id.clone()]);
+        let error = super::render_simulated_particles(
+            &doc,
+            gate,
+            &particles,
+            &std::collections::BTreeMap::new(),
+            &mut std::collections::BTreeMap::new(),
+            &mut std::collections::BTreeMap::new(),
+            &evaluated_nodes,
+        )
+        .expect_err("combined visible systems must exceed the per-emitter limit");
+        assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
+        assert_eq!(error.details["count"], serde_json::json!(120_002));
+    }
     fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {
         let data_id = Id::new("grease_pencil_data").unwrap();
         let node_id = Id::new("grease_pencil_node").unwrap();
