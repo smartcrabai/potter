@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{provenance::Origin, uv_layers},
+    geom::{
+        provenance::{Origin, edge_flags},
+        uv_layers,
+    },
     model::Modifier,
 };
 
@@ -1520,7 +1523,6 @@ pub(super) fn decimate_collapse(mesh: &Mesh, ratio: f64, modifier: &Modifier) ->
         vertices: model.origins,
         faces: face_origins,
         corners: None,
-        raw_normals: false,
     };
     let mut out = decimate_compact(points, polygons, loose, origin, mesh)?;
     collapse_write_uv(&mut out, &layer_names, &corner_uv)?;
@@ -1966,19 +1968,11 @@ fn decimate_dissolve_edge_flags(
     mesh: &Mesh,
     indices: &HashMap<u32, usize>,
 ) -> (HashSet<DecimateEdge>, HashSet<DecimateEdge>) {
-    let Some(flags) = mesh
-        .attributes
-        .get("blender_edge_flags")
-        .and_then(Value::as_array)
-    else {
-        return (HashSet::new(), HashSet::new());
-    };
     let mut sharp = HashSet::new();
     let mut seam = HashSet::new();
-    for (index, edge) in mesh.edges.iter().enumerate() {
-        let Some(metadata) = flags.get(index) else {
-            continue;
-        };
+    let sharp_flags = edge_flags(mesh, "sharp");
+    let seam_flags = edge_flags(mesh, "seam");
+    for ((edge, sharp_flag), seam_flag) in mesh.edges.iter().zip(sharp_flags).zip(seam_flags) {
         let (Some(first), Some(second)) = (
             indices.get(&edge.vertices[0]).copied(),
             indices.get(&edge.vertices[1]).copied(),
@@ -1986,10 +1980,10 @@ fn decimate_dissolve_edge_flags(
             continue;
         };
         let edge = edge_key(first, second);
-        if metadata.get("sharp").and_then(Value::as_bool) == Some(true) {
+        if sharp_flag {
             sharp.insert(edge);
         }
-        if metadata.get("seam").and_then(Value::as_bool) == Some(true) {
+        if seam_flag {
             seam.insert(edge);
         }
     }

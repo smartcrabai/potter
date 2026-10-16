@@ -14,7 +14,8 @@ use crate::{
     color::{ColorManagement, ViewTransform},
     error::{ErrorCode, PotError, Result},
     geom::{
-        Edge, Face, IdCounters, Mesh, Vertex,
+        Edge, Face, IdCounters, Mesh, Vertex, attribute_keys, clnor,
+        color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         uv_layers::{self, UvLayer, UvStore},
     },
     graph::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
@@ -39,7 +40,7 @@ use crate::{
     store::Project,
 };
 
-use super::{ExportOptions, ExportReport, ImportedGraph, Loss};
+use super::{ExportOptions, ExportReport, ImportedGraph, Loss, material_graph};
 
 type ImportedResourceAssets = (BTreeMap<String, String>, Vec<(String, Vec<u8>)>);
 
@@ -116,6 +117,8 @@ pub fn export_blend(
     check_blender_version(&blender)?;
     let mut losses = export_losses(doc);
     losses.extend(native_bind_export_losses(doc, project));
+    let (export_doc, texture_losses) = material_graph::blend_export_document(doc)?;
+    losses.extend(texture_losses);
     if !losses.is_empty() && !opts.allow_lossy {
         return Err(PotError::with_details(
             ErrorCode::UnrepresentableFeature,
@@ -130,7 +133,11 @@ pub fn export_blend(
     fs::create_dir_all(parent).map_err(|error| PotError::io(&error))?;
     let mut document = serde_json::to_value(doc).map_err(PotError::internal_json)?;
     let scene_hash = crate::hash::sha256(&crate::hash::canonicalize(&document)?);
+    if let std::borrow::Cow::Owned(export) = &export_doc {
+        document = serde_json::to_value(export).map_err(PotError::internal_json)?;
+    }
     add_blender_uv_fields(doc, &mut document);
+    add_blender_mesh_fields(doc, &mut document)?;
     let (document, asset_files) = prepare_blend_export_resources(document, project, out)?;
     let input = temporary_path("blend-export-input.json")?;
     let script = temporary_path("blend-bridge.py")?;
@@ -270,7 +277,94 @@ fn add_blender_uv_fields(doc: &SceneDoc, document: &mut Value) {
     }
 }
 
-/// A layer's per-loop values and pin flags in Blender convention. Loops follow storage face order.
+/// Writes the mesh fields the bridge reads beyond the stored attributes. `attribute_names` maps every user
+/// attribute key that stays in `attributes` to its user-facing name. Attributes Blender cannot store are
+/// withdrawn here and reported by `export_losses`, so the bridge writes exactly the listed user attributes.
+///
+/// `custom_normal_vectors` holds the evaluated vector of every flattened corner, or `null` for an automatic
+/// corner. They are derived from the stored codes, never stored, and only initialize Blender's custom-normal
+/// layer; the bridge then writes each loop's exact raw pair from `attributes.custom_normal`. A code basis that
+/// Blender's polygon loop order cannot realize is withdrawn with its raw codes, so Blender encodes the layer from
+/// the vectors alone, and `export_losses` reports that case.
+fn add_blender_mesh_fields(doc: &SceneDoc, document: &mut Value) -> Result<()> {
+    for (data_id, data) in &doc.data_blocks {
+        let Some(mesh) = &data.mesh else {
+            continue;
+        };
+        let color_names: BTreeSet<String> = color_layers::read(mesh)
+            .layers
+            .into_iter()
+            .map(|layer| layer.name)
+            .collect();
+        let order = clnor::corner_order(mesh)?;
+        let realizable = order
+            .as_deref()
+            .is_none_or(|order| blender_loop_order_is_realizable(mesh, order));
+        let mut withdrawn: BTreeSet<&str> = mesh
+            .attributes
+            .iter()
+            .filter(|(key, value)| blend_attribute_refusal(key, value, &color_names).is_some())
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if !realizable {
+            withdrawn.insert("custom_normal");
+        }
+        let names: Map<String, Value> = mesh
+            .attributes
+            .keys()
+            .filter(|key| !withdrawn.contains(key.as_str()))
+            .filter_map(|key| {
+                attribute_keys::user_name(key).map(|name| (key.clone(), json!(name)))
+            })
+            .collect();
+        let vectors = match clnor::corner_codes(mesh)? {
+            Some(codes) => {
+                let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+                let identity: Vec<usize> = (0..codes.len()).collect();
+                let evaluated = clnor::evaluate_codes(
+                    mesh,
+                    &codes,
+                    &positions,
+                    clnor::NormalCodeOptions {
+                        corner_order: Some(&identity),
+                        setter_input: clnor::SetterInput::NormalizeInput,
+                    },
+                )?;
+                Some(Value::Array(
+                    codes
+                        .iter()
+                        .zip(&evaluated)
+                        .map(|(code, vector)| match code {
+                            clnor::CornerNormalCode::Auto => Value::Null,
+                            _ => json!(vector.to_array()),
+                        })
+                        .collect(),
+                ))
+            }
+            None => None,
+        };
+        let Some(mesh_value) = document
+            .get_mut("data_blocks")
+            .and_then(|blocks| blocks.get_mut(data_id.as_str()))
+            .and_then(|block| block.get_mut("mesh"))
+        else {
+            continue;
+        };
+        if let Some(attributes) = mesh_value.get_mut("attributes").and_then(Value::as_object_mut) {
+            for key in &withdrawn {
+                attributes.remove(*key);
+            }
+        }
+        mesh_value["attribute_names"] = Value::Object(names);
+        if let Some(rows) = vectors {
+            mesh_value["custom_normal_vectors"] = rows;
+        }
+    }
+    Ok(())
+}
+
+/// A layer's per-corner values and pin flags in Blender convention. Corners follow storage face order; the
+/// bridge maps them onto Blender loops with the same mapping it applies to every other face and corner value.
 /// A face without an entry takes the store default: `[0, 0]` in storage convention, unpinned.
 fn blender_uv_loops(mesh: &Mesh, layer: &UvLayer) -> (Value, Value) {
     let mut values = Vec::new();
@@ -1390,13 +1484,17 @@ fn build_imported_graph(
         if !key_group_names.is_empty() {
             shape_key_vertex_groups.insert(id.clone(), key_group_names);
         }
+        let mut metadata = mesh
+            .attributes
+            .get("blender_metadata")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for key in ["custom_properties", "fake_user", "users", "rna_properties"] {
+            metadata.insert(key.to_owned(), item.get(key).cloned().unwrap_or(Value::Null));
+        }
         let mut attributes = mesh.attributes.clone();
-        attributes.insert(
-            "blender_metadata".to_owned(),
-            json!({"custom_properties": item.get("custom_properties"),
-                "fake_user": item.get("fake_user"), "users": item.get("users"),
-                "rna_properties": item.get("rna_properties")}),
-        );
+        attributes.insert("blender_metadata".to_owned(), Value::Object(metadata));
         doc.data_blocks.insert(
             id,
             DataBlock {
@@ -1530,11 +1628,21 @@ fn build_imported_graph(
             "Material",
         )?;
         let color = vec4_field(item, "base_color", [0.6, 0.6, 0.6, 1.0]);
+        let alpha_mode = match item.get("alpha_mode").and_then(Value::as_str).unwrap_or("opaque") {
+            mode @ ("opaque" | "clip" | "blend") => mode.to_owned(),
+            other => {
+                return Err(invalid_intermediate(&format!(
+                    "material `{name}` has unknown alpha_mode `{other}`"
+                )));
+            }
+        };
         doc.materials.insert(
             id,
             Material {
                 name: name.to_owned(),
                 base_color: color,
+                alpha_mode,
+                alpha_threshold: number_field(item, "alpha_threshold", 0.5),
                 metallic: number_field(item, "metallic", 0.0),
                 roughness: number_field(item, "roughness", 0.8),
                 emission_color: vec3_field(item, "emission_color", [0.0; 3]),
@@ -4261,7 +4369,8 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         .and_then(Value::as_array)
         .ok_or_else(|| invalid_intermediate("mesh edges are missing"))?;
     let mut edges = Vec::with_capacity(edges_raw.len());
-    let mut edge_metadata = Vec::with_capacity(edges_raw.len());
+    let mut sharp = Vec::with_capacity(edges_raw.len());
+    let mut seam = Vec::with_capacity(edges_raw.len());
     for (index, edge) in edges_raw.iter().enumerate() {
         let vertices_array = edge
             .get("v")
@@ -4274,7 +4383,8 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             id: checked_element_id(index)?,
             vertices: [a, b],
         });
-        edge_metadata.push(json!({"sharp": edge.get("sharp"), "seam": edge.get("seam")}));
+        sharp.push(flag_field(edge, "sharp"));
+        seam.push(flag_field(edge, "seam"));
     }
     let polygons_raw = item
         .get("polygons")
@@ -4297,12 +4407,7 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             material_index: u32::try_from(integer_field(polygon, "material_index", 0))
                 .map_err(|_| invalid_intermediate("mesh material index is out of range"))?,
         });
-        smooth.push(
-            polygon
-                .get("smooth")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        );
+        smooth.push(flag_field(polygon, "smooth"));
     }
     let uv = convert_uv_layers(item, &faces)?;
     let uv_layer_names = uv
@@ -4310,19 +4415,119 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         .iter()
         .map(|layer| layer.name.as_str())
         .collect::<BTreeSet<_>>();
-    let mut attributes = Map::new();
-    attributes.insert("blender_edge_flags".to_owned(), json!(edge_metadata));
-    attributes.insert("blender_polygon_smooth".to_owned(), json!(smooth));
-    let blender_attributes = item
-        .get("attributes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|entry| !is_uv_layer_attribute(entry, &uv_layer_names))
-        .cloned()
-        .collect::<Vec<_>>();
+    let loop_count = faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+    let next_id = IdCounters {
+        vertex: next_counter(vertices.len())?,
+        edge: next_counter(edges.len())?,
+        face: next_counter(faces.len())?,
+    };
+    let mut mesh = Mesh {
+        vertices,
+        edges,
+        faces,
+        attributes: Map::new(),
+        next_id,
+    };
+    let face_keys: Vec<String> = mesh
+        .faces
+        .iter()
+        .map(|face| format!("f{}", face.id))
+        .collect();
+    insert_flag_attribute(&mut mesh.attributes, "shade_smooth", "face", face_keys, &smooth);
+    let edge_keys: Vec<String> = mesh
+        .edges
+        .iter()
+        .map(|edge| format!("e{}", edge.id))
+        .collect();
+    insert_flag_attribute(&mut mesh.attributes, "sharp", "edge", edge_keys.clone(), &sharp);
+    insert_flag_attribute(&mut mesh.attributes, "seam", "edge", edge_keys, &seam);
+    let raw_attributes = optional_array(item, "attributes")?;
+    let mut blender_attributes = Vec::new();
+    let mut color_list = Vec::new();
+    let mut color_data_types = Map::new();
+    for entry in raw_attributes {
+        if is_uv_layer_attribute(entry, &uv_layer_names) {
+            continue;
+        }
+        let name = string_field(entry, "name")?;
+        if BLENDER_MANAGED_ATTRIBUTES.contains(&name)
+            || (name.starts_with('.') && !is_blender_state_attribute(name))
+        {
+            continue;
+        }
+        if name.starts_with('.') {
+            blender_attributes.push(entry.clone());
+            continue;
+        }
+        let domain = entry.get("domain").and_then(Value::as_str).unwrap_or_default();
+        let data_type = entry
+            .get("data_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if matches!(data_type, "FLOAT_COLOR" | "BYTE_COLOR")
+            && matches!(domain, "POINT" | "CORNER")
+        {
+            let color_domain = if domain == "POINT" {
+                ColorDomain::Point
+            } else {
+                ColorDomain::Corner
+            };
+            let colors = color_layer_values(&mesh, name, color_domain, array(entry, "values")?)?;
+            color_list.push(ColorLayer {
+                name: name.to_owned(),
+                domain: color_domain,
+                values: colors,
+            });
+            color_data_types.insert(name.to_owned(), json!(data_type));
+        } else if let Some((native_domain, native_type)) = native_attribute_kind(domain, data_type)
+        {
+            let entries = native_attribute_entries(
+                &mesh,
+                name,
+                native_domain,
+                native_type,
+                array(entry, "values")?,
+            )?;
+            mesh.attributes.insert(
+                attribute_keys::storage_key(name).into_owned(),
+                json!({"domain": native_domain, "type": native_type, "values": entries}),
+            );
+        } else {
+            blender_attributes.push(entry.clone());
+        }
+    }
+    if let Some(codes) = blender_normal_codes(item, loop_count)? {
+        // Blender's loops are created in face order by `mesh_dump`, so the loop ordinal is the storage
+        // index and `corner_order` stays absent.
+        clnor::write_codes(
+            &mut mesh,
+            Some(&codes),
+            clnor::NormalCodeOptions {
+                corner_order: None,
+                setter_input: clnor::SetterInput::NormalizeInput,
+            },
+        )?;
+    }
+    let store = ColorStore {
+        layers: color_list,
+        active: item
+            .get("color_active")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        render: item
+            .get("color_render")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    };
+    color_layers::write(&mut mesh, &store);
+    if !color_data_types.is_empty() {
+        mesh.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types": color_data_types}),
+        );
+    }
     if !blender_attributes.is_empty() {
-        attributes.insert(
+        mesh.attributes.insert(
             "blender_attributes".to_owned(),
             Value::Array(blender_attributes),
         );
@@ -4345,29 +4550,327 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             );
             roots.insert(id, skin_vertex.get("root").cloned().unwrap_or(json!(false)));
         }
-        attributes.insert("skin_radii".to_owned(), Value::Object(radii));
-        attributes.insert("skin_roots".to_owned(), Value::Object(roots));
-        attributes.insert(
+        mesh.attributes
+            .insert("skin_radii".to_owned(), Value::Object(radii));
+        mesh.attributes
+            .insert("skin_roots".to_owned(), Value::Object(roots));
+        mesh.attributes.insert(
             "blender_skin_vertices".to_owned(),
             Value::Array(skin_vertices.clone()),
         );
     }
-    let next_id = IdCounters {
-        vertex: next_counter(vertices.len())?,
-        edge: next_counter(edges.len())?,
-        face: next_counter(faces.len())?,
-    };
-    let mut mesh = Mesh {
-        vertices,
-        edges,
-        faces,
-        attributes,
-        next_id,
-    };
     uv_layers::write(&mut mesh, &uv);
     mesh.validate()
         .map_err(|error| invalid_intermediate(&format!("invalid mesh data: {error}")))?;
     Ok(mesh)
+}
+
+/// Blender attributes that Potter never stores as element data. Blender mirrors the shading, seam,
+/// custom-normal, and material data in them, and `position` and the topology arrays are recomputed,
+/// so the importer drops them.
+const BLENDER_MANAGED_ATTRIBUTES: [&str; 6] = [
+    "position",
+    "sharp_face",
+    "sharp_edge",
+    "uv_seam",
+    "material_index",
+    "custom_normal",
+];
+
+/// Mesh-level keys that the `.blend` writer recreates or restores itself.
+const BLENDER_HANDLED_MESH_KEYS: [&str; 11] = [
+    "uv_layers",
+    "color_layers",
+    "shade_smooth",
+    "sharp",
+    "seam",
+    "custom_normal",
+    "blender_metadata",
+    "blender_attributes",
+    "blender_skin_vertices",
+    "skin_radii",
+    "skin_roots",
+];
+
+/// Blender selection and hide state. It is Blender-only data, kept in `blender_attributes`.
+fn is_blender_state_attribute(name: &str) -> bool {
+    [".select_", ".uv_select_", ".hide_", ".sculpt_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Potter `(domain, type)` of a generic Blender attribute, or `None` when Potter cannot store it.
+fn native_attribute_kind(domain: &str, data_type: &str) -> Option<(&'static str, &'static str)> {
+    let domain = match domain {
+        "POINT" => "point",
+        "EDGE" => "edge",
+        "FACE" => "face",
+        "CORNER" => "corner",
+        _ => return None,
+    };
+    let data_type = match data_type {
+        "FLOAT" => "float",
+        "INT" => "int",
+        "FLOAT2" => "float2",
+        "FLOAT_VECTOR" => "float3",
+        "BOOLEAN" => "bool",
+        "QUATERNION" => "quaternion",
+        _ => return None,
+    };
+    Some((domain, data_type))
+}
+
+/// The `N` finite numbers of a JSON array, or `None` when the array has another length or a non-number.
+fn finite_components<const N: usize>(value: &Value) -> Option<[f64; N]> {
+    let values = value.as_array().filter(|values| values.len() == N)?;
+    let mut components = [0.0; N];
+    for (component, value) in components.iter_mut().zip(values) {
+        *component = value.as_f64().filter(|number| number.is_finite())?;
+    }
+    Some(components)
+}
+
+/// One Blender attribute value, as the bridge dumps it, in the native encoding of `data_type`.
+fn native_attribute_value(data_type: &str, value: &Value) -> Result<Value> {
+    let invalid_value = || invalid_intermediate("mesh attribute value is invalid");
+    Ok(match data_type {
+        "float" => json!(value.as_f64().filter(|number| number.is_finite()).ok_or_else(invalid_value)?),
+        "int" => json!(
+            value
+                .as_i64()
+                .filter(|number| i32::try_from(*number).is_ok())
+                .ok_or_else(invalid_value)?
+        ),
+        "bool" => json!(value.as_bool().ok_or_else(invalid_value)?),
+        "float2" => json!(finite_components::<2>(value).ok_or_else(invalid_value)?),
+        "float3" => json!(finite_components::<3>(value).ok_or_else(invalid_value)?),
+        "quaternion" => json!(finite_components::<4>(value).ok_or_else(invalid_value)?),
+        _ => return Err(invalid_value()),
+    })
+}
+
+/// A generic Blender attribute's values as native element entries keyed by persistent ID: `v<id>`
+/// for points, `e<id>` for edges, `f<id>` for faces, and one row of per-corner values per face.
+fn native_attribute_entries(
+    mesh: &Mesh,
+    name: &str,
+    domain: &str,
+    data_type: &str,
+    values: &[Value],
+) -> Result<Map<String, Value>> {
+    let mismatch = || {
+        invalid_intermediate(&format!(
+            "mesh attribute `{name}` has the wrong number of values"
+        ))
+    };
+    let mut entries = Map::new();
+    let keys: Vec<String> = match domain {
+        "point" => mesh.vertices.iter().map(|vertex| format!("v{}", vertex.id)).collect(),
+        "edge" => mesh.edges.iter().map(|edge| format!("e{}", edge.id)).collect(),
+        "face" => mesh.faces.iter().map(|face| format!("f{}", face.id)).collect(),
+        "corner" => {
+            let loops = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+            if values.len() != loops {
+                return Err(mismatch());
+            }
+            let mut offset = 0;
+            for face in &mesh.faces {
+                let count = face.vertices.len();
+                let row = values
+                    .get(offset..offset + count)
+                    .ok_or_else(mismatch)?
+                    .iter()
+                    .map(|value| native_attribute_value(data_type, value))
+                    .collect::<Result<Vec<_>>>()?;
+                entries.insert(format!("f{}", face.id), Value::Array(row));
+                offset += count;
+            }
+            return Ok(entries);
+        }
+        _ => return Err(invalid_intermediate("mesh attribute domain is unsupported")),
+    };
+    if values.len() != keys.len() {
+        return Err(mismatch());
+    }
+    for (key, value) in keys.into_iter().zip(values) {
+        entries.insert(key, native_attribute_value(data_type, value)?);
+    }
+    Ok(entries)
+}
+
+/// One color layer's values in storage order, read as linear RGBA. A point layer has one value per
+/// vertex and a corner layer one per loop. Values are not clamped.
+fn color_layer_values(
+    mesh: &Mesh,
+    name: &str,
+    domain: ColorDomain,
+    values: &[Value],
+) -> Result<Vec<[f64; 4]>> {
+    let expected = match domain {
+        ColorDomain::Point => mesh.vertices.len(),
+        ColorDomain::Corner => mesh.faces.iter().map(|face| face.vertices.len()).sum(),
+    };
+    if values.len() != expected {
+        return Err(invalid_intermediate(&format!(
+            "mesh color layer `{name}` has the wrong number of values"
+        )));
+    }
+    values
+        .iter()
+        .map(|value| {
+            finite_components::<4>(value).ok_or_else(|| {
+                invalid_intermediate(&format!("mesh color layer `{name}` value is invalid"))
+            })
+        })
+        .collect()
+}
+
+/// A boolean field of an intermediate record. A missing or non-boolean field is false.
+fn flag_field(value: &Value, key: &str) -> bool {
+    value.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Writes a native bool element attribute (`shade_smooth`, `sharp`, `seam`). It is written only when
+/// some element is set, because an absent attribute reads as all false.
+fn insert_flag_attribute(
+    attributes: &mut Map<String, Value>,
+    name: &str,
+    domain: &str,
+    keys: Vec<String>,
+    flags: &[bool],
+) {
+    if !flags.iter().any(|&flag| flag) {
+        return;
+    }
+    let values: Map<String, Value> = keys
+        .into_iter()
+        .zip(flags)
+        .map(|(key, &flag)| (key, json!(flag)))
+        .collect();
+    attributes.insert(
+        name.to_owned(),
+        json!({"domain": domain, "type": "bool", "values": values}),
+    );
+}
+
+/// Blender's per-loop custom-normal code pairs in loop order. Loop order is the Mesh storage order because
+/// `mesh_dump` lists polygons and loops in face order. `None` when the mesh has no custom-normal layer; a `[0, 0]`
+/// pair is Auto. The status comes from the codes alone, never from comparing vectors.
+fn blender_normal_codes(
+    item: &Value,
+    loop_count: usize,
+) -> Result<Option<Vec<clnor::CornerNormalCode>>> {
+    let Some(raw) = item.get("custom_normal_codes") else {
+        return Ok(None);
+    };
+    let pairs = raw.as_array().ok_or_else(invalid_normal_code)?;
+    if pairs.len() != loop_count {
+        return Err(invalid_intermediate(
+            "mesh custom normal codes do not match the loops",
+        ));
+    }
+    pairs
+        .iter()
+        .map(|pair| {
+            let pair = pair
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(invalid_normal_code)?;
+            let component = |item: &Value| {
+                item.as_i64()
+                    .and_then(|number| i16::try_from(number).ok())
+                    .ok_or_else(invalid_normal_code)
+            };
+            Ok(clnor::CornerNormalCode::from_pair([
+                component(&pair[0])?,
+                component(&pair[1])?,
+            ]))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn invalid_normal_code() -> PotError {
+    invalid_intermediate("mesh custom normal code is invalid")
+}
+
+/// Whether Blender's polygon loop order can hold the stored corner ordinals `order` (flattened in storage
+/// corner order). Each face's loops must be one contiguous run around the face that starts at some corner,
+/// a rotation of the face's own cycle. A reversed or interleaved run is not a Blender polygon: it would change
+/// the face's winding or its loop identity, so it cannot be realized.
+fn blender_loop_order_is_realizable(mesh: &Mesh, order: &[usize]) -> bool {
+    let mut start = 0_usize;
+    for face in &mesh.faces {
+        let count = face.vertices.len();
+        let Some(ordinals) = order.get(start..start + count) else {
+            return false;
+        };
+        start += count;
+        let Some(&first) = ordinals.first() else {
+            continue;
+        };
+        let base = ordinals.iter().copied().min().unwrap_or(first);
+        let rotation = first - base;
+        if rotation >= count
+            || ordinals
+                .iter()
+                .enumerate()
+                .any(|(corner, &ordinal)| ordinal != base + (corner + rotation) % count)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Why the `.blend` writer cannot recreate the mesh attribute stored under `key`, with the loss feature it is
+/// reported under. `None` when the bridge writes it: a Potter store it restores itself, a native color layer,
+/// or a generic element attribute Blender can store.
+fn blend_attribute_refusal(
+    key: &str,
+    value: &Value,
+    color_names: &BTreeSet<String>,
+) -> Option<(&'static str, String)> {
+    let Some(name) = attribute_keys::user_name(key) else {
+        let reason = match key {
+            "alembic_time_samples" => "Alembic mesh time samples are not written to Blender",
+            "alembic_velocity" => "Alembic mesh velocity data are not written to Blender",
+            "alembic_normals" => "Alembic imported mesh normals are not written to Blender",
+            _ if BLENDER_HANDLED_MESH_KEYS.contains(&key) => return None,
+            _ => return Some((
+                "mesh.attribute",
+                format!("blend does not write Potter mesh store `{key}`"),
+            )),
+        };
+        return Some(("mesh.attribute", format!("blend does not write `{key}`: {reason}")));
+    };
+    if color_names.contains(name) {
+        return None;
+    }
+    let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+    let domain = value.get("domain").and_then(Value::as_str).unwrap_or_default();
+    let feature = if kind == "color" {
+        "mesh.color_attribute"
+    } else {
+        "mesh.attribute"
+    };
+    let reason = if name.starts_with('.') {
+        "names starting with `.` belong to Blender".to_owned()
+    } else if BLENDER_MANAGED_ATTRIBUTES.contains(&name) {
+        "Blender manages this attribute from native mesh data".to_owned()
+    } else if kind == "color" {
+        "it is not a registered color layer".to_owned()
+    } else if !matches!(domain, "point" | "edge" | "face" | "corner")
+        || !matches!(kind, "float" | "int" | "float2" | "float3" | "bool" | "quaternion")
+    {
+        format!("Blender has no {domain} attribute of type {kind}")
+    } else {
+        return None;
+    };
+    Some((
+        feature,
+        format!("blend does not write attribute `{name}`: {reason}"),
+    ))
 }
 
 /// Reads the mesh's UV layers from the intermediate `uv_layers`, whose values are Blender V-up rows
@@ -5891,24 +6394,35 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ));
         }
         if let Some(mesh) = &data.mesh {
-            for attribute in mesh.attributes.keys() {
-                if !matches!(
-                    attribute.as_str(),
-                    "uv_layers"
-                        | "blender_edge_flags"
-                        | "blender_polygon_smooth"
-                        | "blender_metadata"
-                        | "blender_attributes"
-                        | "blender_skin_vertices"
-                        | "skin_radii"
-                        | "skin_roots"
-                ) {
+            let color_names = color_layers::read(mesh)
+                .layers
+                .into_iter()
+                .map(|layer| layer.name)
+                .collect::<BTreeSet<_>>();
+            for (key, value) in &mesh.attributes {
+                if let Some((feature, reason)) = blend_attribute_refusal(key, value, &color_names) {
+                    losses.push(loss(feature, Some(data_id.as_str()), &reason));
+                }
+            }
+            if let Ok(Some(codes)) = clnor::corner_codes(mesh) {
+                if codes
+                    .iter()
+                    .any(|code| *code == clnor::CornerNormalCode::ExplicitZero)
+                {
                     losses.push(loss(
-                        "blender.mesh.attribute",
+                        "blender.mesh.custom_normal_explicit_zero",
                         Some(data_id.as_str()),
-                        "custom mesh attributes are retained in compatibility JSON but not recreated",
+                        "explicit zero custom normals cannot be represented by Blender's normalized normal codes; they are written as automatic (0, 0) codes",
                     ));
-                    break;
+                }
+                if let Ok(Some(order)) = clnor::corner_order(mesh)
+                    && !blender_loop_order_is_realizable(mesh, &order)
+                {
+                    losses.push(loss(
+                        "blender.mesh.custom_normal_corner_order",
+                        Some(data_id.as_str()),
+                        "the custom-normal code basis needs a loop order that Blender polygons cannot provide (each face's loops must be one contiguous run around the face); the normals export as Blender-encoded vectors and the stored codes are not preserved",
+                    ));
                 }
             }
         }
@@ -6667,10 +7181,10 @@ mod tests {
                 {"name": "sharp_face", "domain": "FACE", "data_type": "BOOLEAN", "values": []},
                 {"name": "sharp_edge", "domain": "EDGE", "data_type": "BOOLEAN", "values": []},
                 {"name": "uv_seam", "domain": "EDGE", "data_type": "BOOLEAN", "values": []},
-                {"name": "custom_normal", "domain": "CORNER", "data_type": "INT16_2D", "values": []},
-                {"name": "material_index", "domain": "FACE", "data_type": "INT", "values": []},
-                {"name": "crease_edge", "domain": "EDGE", "data_type": "FLOAT", "values": []},
-                {"name": "custom", "domain": "POINT", "data_type": "FLOAT", "values": []}
+                {"name": "custom_normal", "domain": "CORNER", "data_type": "INT16_2D", "values": [[0, 0], [0, 0], [0, 0], [0, 0]]},
+                {"name": "material_index", "domain": "FACE", "data_type": "INT", "values": [0]},
+                {"name": "crease_edge", "domain": "EDGE", "data_type": "FLOAT", "values": [0.0, 0.5, 1.0, 0.25]},
+                {"name": "custom", "domain": "POINT", "data_type": "FLOAT", "values": [1.0, 2.0, 3.0, 4.0]}
             ]
         });
         let mesh = convert_mesh(&item)?;
@@ -6716,7 +7230,98 @@ mod tests {
                 .all(|entry| entry["name"] != "Base" && entry["name"] != ".pn.Base"),
             "UV layer and pin attributes are held by the store"
         );
-        assert_eq!(attributes.len(), 13);
+        let names = attributes
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [".select_vert", ".uv_select_face"]);
+        assert_eq!(mesh.attributes["user:crease_edge"]["domain"], "edge");
+        assert_eq!(mesh.attributes["user:crease_edge"]["type"], "float");
+        assert_eq!(mesh.attributes["custom"]["values"]["v3"], json!(3.0));
+        assert!(!mesh.attributes.contains_key("custom_normal"));
+        assert!(!mesh.attributes.contains_key("blender_polygon_smooth"));
+        assert!(!mesh.attributes.contains_key("blender_edge_flags"));
+        Ok(())
+    }
+    #[test]
+    fn blender_names_that_collide_with_potter_keys_are_escaped_user_attributes() -> Result<()> {
+        let item = json!({
+            "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}, {"co": [0.0, 1.0, 0.0]}],
+            "edges": [{"v": [0, 1]}, {"v": [1, 2]}, {"v": [2, 0]}],
+            "polygons": [{"v": [0, 1, 2], "material_index": 0, "smooth": false}],
+            "uv_layers": [], "custom_properties": {},
+            "attributes": [
+                {"name": "vertex_groups", "domain": "POINT", "data_type": "FLOAT", "values": [1.0, 2.0, 3.0]},
+                {"name": "color_layers", "domain": "POINT", "data_type": "FLOAT_COLOR",
+                 "values": [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]]},
+                {"name": "skin_tone", "domain": "POINT", "data_type": "FLOAT", "values": [0.0, 0.5, 1.0]}
+            ],
+            "color_active": "color_layers",
+            "color_render": "color_layers",
+            "custom_normal_codes": [[0, 0], [3, 4], [0, 0]]
+        });
+        let mesh = convert_mesh(&item)?;
+        assert_eq!(mesh.attributes["user:vertex_groups"]["domain"], "point");
+        assert_eq!(mesh.attributes["user:skin_tone"]["type"], "float");
+        assert!(!mesh.attributes.contains_key("blender_attributes"));
+        let store = color_layers::read(&mesh);
+        let layers: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        assert_eq!(layers, ["color_layers"]);
+        assert_eq!(store.active.as_deref(), Some("color_layers"));
+        assert_eq!(store.render.as_deref(), Some("color_layers"));
+        assert_eq!(
+            clnor::corner_codes(&mesh)?,
+            Some(vec![
+                clnor::CornerNormalCode::Auto,
+                clnor::CornerNormalCode::Authored([3, 4]),
+                clnor::CornerNormalCode::Auto,
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blend_refuses_only_attributes_it_cannot_recreate() {
+        let colors = BTreeSet::from(["Tint".to_owned()]);
+        let generic = json!({"domain": "point", "type": "float", "values": {}});
+        let color = json!({"domain": "point", "type": "color", "values": {}});
+        assert!(blend_attribute_refusal("user:vertex_groups", &generic, &colors).is_none());
+        assert!(blend_attribute_refusal("Tint", &color, &colors).is_none());
+        for (key, reason) in [
+            ("alembic_time_samples", "time samples"),
+            ("alembic_velocity", "velocity"),
+            ("alembic_normals", "imported mesh normals"),
+        ] {
+            let (feature, detail) = blend_attribute_refusal(key, &generic, &colors)
+                .expect("the bridge has no writer for Alembic mesh data");
+            assert_eq!(feature, "mesh.attribute");
+            assert!(detail.contains(key), "{detail}");
+            assert!(detail.contains(reason), "{detail}");
+            assert_eq!(attribute_keys::user_name(key), None);
+        }
+        assert!(blend_attribute_refusal("vertex_groups", &generic, &colors).is_some());
+        let (feature, reason) = blend_attribute_refusal("position", &generic, &colors)
+            .expect("a Blender-managed name is refused");
+        assert_eq!(feature, "mesh.attribute");
+        assert!(reason.contains("`position`"), "{reason}");
+        let (feature, _) = blend_attribute_refusal("Loose", &color, &colors)
+            .expect("a color layer outside the registry is refused");
+        assert_eq!(feature, "mesh.color_attribute");
+        assert!(blend_attribute_refusal(".select_vert", &generic, &colors).is_some());
+    }
+
+    #[test]
+    fn blender_loop_order_accepts_only_rotations_of_each_face() -> Result<()> {
+        let item = json!({
+            "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}, {"co": [1.0, 1.0, 0.0]}, {"co": [0.0, 1.0, 0.0]}],
+            "edges": [{"v": [0, 1]}, {"v": [1, 2]}, {"v": [2, 3]}, {"v": [3, 0]}],
+            "polygons": [{"v": [0, 1, 2, 3], "material_index": 0, "smooth": false}],
+            "uv_layers": [], "attributes": []
+        });
+        let mesh = convert_mesh(&item)?;
+        assert!(blender_loop_order_is_realizable(&mesh, &[1, 2, 3, 0]));
+        assert!(!blender_loop_order_is_realizable(&mesh, &[3, 2, 1, 0]));
+        assert!(!blender_loop_order_is_realizable(&mesh, &[0, 2, 1, 3]));
         Ok(())
     }
     #[test]
@@ -8009,33 +8614,22 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .get(mesh_id)
             .and_then(|data| data.mesh.as_ref())
             .ok_or_else(|| invalid_intermediate("fixture mesh data was missing"))?;
-        let attributes = mesh
+        let custom_attribute = mesh
             .attributes
-            .get("blender_attributes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid_intermediate("custom mesh attributes were not imported"))?;
-        assert!(attributes.iter().any(
-            |attribute| attribute.get("name").and_then(Value::as_str) == Some("custom_weight")
-        ));
-        let custom_attribute = attributes
-            .iter()
-            .find(|attribute| {
-                attribute.get("name").and_then(Value::as_str) == Some("custom_weight")
-            })
+            .get("custom_weight")
             .ok_or_else(|| invalid_intermediate("custom float attribute is missing"))?;
         assert_eq!(
             custom_attribute.get("domain").and_then(Value::as_str),
-            Some("POINT")
+            Some("point")
         );
         assert_eq!(
-            custom_attribute.get("data_type").and_then(Value::as_str),
-            Some("FLOAT")
+            custom_attribute.get("type").and_then(Value::as_str),
+            Some("float")
         );
         assert_eq!(
             custom_attribute
                 .get("values")
-                .and_then(Value::as_array)
-                .and_then(|values| values.get(1))
+                .and_then(|values| values.get("v2"))
                 .and_then(Value::as_f64),
             Some(0.25)
         );
@@ -8130,26 +8724,18 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .and_then(|data_id| roundtrip.doc.data_blocks.get(data_id))
             .and_then(|data| data.mesh.as_ref())
             .ok_or_else(|| invalid_intermediate("round-trip cube mesh is missing"))?;
-        let roundtrip_attributes = roundtrip_mesh
+        let roundtrip_attribute = roundtrip_mesh
             .attributes
-            .get("blender_attributes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid_intermediate("round-trip custom mesh attributes are missing"))?;
-        let roundtrip_attribute = roundtrip_attributes
-            .iter()
-            .find(|attribute| {
-                attribute.get("name").and_then(Value::as_str) == Some("custom_weight")
-            })
+            .get("custom_weight")
             .ok_or_else(|| invalid_intermediate("round-trip custom float attribute is missing"))?;
         assert_eq!(
-            roundtrip_attribute.get("data_type").and_then(Value::as_str),
-            Some("FLOAT")
+            roundtrip_attribute.get("type").and_then(Value::as_str),
+            Some("float")
         );
         assert_eq!(
             roundtrip_attribute
                 .get("values")
-                .and_then(Value::as_array)
-                .and_then(|values| values.get(1))
+                .and_then(|values| values.get("v2"))
                 .and_then(Value::as_f64),
             Some(0.25)
         );

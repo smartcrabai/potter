@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{ErrorCode, PotError, Result};
 
-use super::normals::{face_normal, vector3};
+use super::clnor::{self, NormalCodeOptions};
 use super::uv_layers::{self, UvLayer};
 use super::{Mesh, edge_key};
 
@@ -34,10 +34,6 @@ pub(crate) struct Origin {
     /// with the input corner index counted as in [`corner_offsets`]. `None` derives corner sources
     /// from the vertex origins restricted to each output face's source polygon.
     pub corners: Option<Vec<Vec<(usize, f64)>>>,
-    /// Keep blended custom normals unnormalised. Subdivision sets this on every level but normalises
-    /// once at the end ([`normalize_custom_normals`]): Blender evaluates all levels from the base
-    /// corners, and blending normalised levels would compound the normalisation.
-    pub raw_normals: bool,
 }
 
 impl Origin {
@@ -53,20 +49,22 @@ impl Origin {
                 .collect(),
             faces,
             corners: None,
-            raw_normals: false,
         }
     }
 }
 
 /// Rewrite the ID-keyed attributes of `output` (rebuilt from `source`) through `origin`.
 ///
-/// `vertex_groups`, `crease_edge`, skin vertex keys, every `uv_layers` layer, and
-/// every `blender_attributes` entry on the POINT, EDGE, FACE, or CORNER domain are remapped. Corner
-/// data blends over the source corners of each output corner (see [`corner_sources`]), so UVs follow
-/// the face corner they came from. Shading follows the same origins: `shade_smooth` and
-/// `blender_polygon_smooth` copy their source face's flag, `sharp` and `blender_edge_flags.sharp` OR
-/// over the source edges, and `custom_normal` blends the custom normals of the source corners. Elements
-/// without a source take the default (false, or no custom normal), so no key refers to a stale element.
+/// `vertex_groups`, `crease_edge`, skin vertex keys, every `uv_layers` layer, and every native element
+/// attribute (any `mesh.attributes` entry whose `domain` is point, edge, face, or corner) are remapped.
+/// That covers `shade_smooth`, `sharp`, `seam`, color layers, and generic attributes. Corner data blends
+/// over the source corners of each output corner (see [`corner_sources`]), so UVs follow the face corner
+/// they came from. A face copies its source face's value, and an edge blends its positive-weight source
+/// edges (booleans OR over them, so `sharp` and `seam` keep a mark from any source). Other values blend by
+/// weight. `custom_normal` is not interpolated: its codes follow
+/// [`crate::geom::clnor::transfer_custom_normals`]. `color_layers` names the same
+/// attributes in the same order, so it carries over unchanged. Elements without a source take the type's
+/// default, so no key refers to a stale element.
 ///
 /// # Errors
 ///
@@ -87,12 +85,16 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
         .get("blender_attributes")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let needs_edges = source.attributes.contains_key("crease_edge")
-        || source.attributes.contains_key("blender_edge_flags")
-        || source.attributes.contains_key("sharp")
+    let needs_edges = source
+        .attributes
+        .values()
+        .any(|value| native_domain(value) == Some("edge"))
         || entries.iter().any(|entry| text(entry, "domain") == "EDGE");
     let needs_corners = source.attributes.contains_key(uv_layers::ATTRIBUTE)
-        || source.attributes.contains_key("custom_normal")
+        || source
+            .attributes
+            .values()
+            .any(|value| native_domain(value) == Some("corner"))
         || entries
             .iter()
             .any(|entry| text(entry, "domain") == "CORNER");
@@ -129,7 +131,6 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
         origin,
         edge_origin: &edge_origin,
         corner_origin,
-        raw_normals: origin.raw_normals,
     };
     // The store's layers are rebuilt per corner; their names and active/render choices carry over.
     let uv_store = source
@@ -144,6 +145,11 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
                 .collect();
             store
         });
+    // Each output corner takes the code of its heaviest source corner: codes are never interpolated.
+    // The shared clnor rebuild then applies the output fan rules.
+    let code_sources: Option<Vec<Option<usize>>> = clnor::corner_codes(source)?
+        .is_some()
+        .then(|| corner_origin.iter().map(|sources| heaviest_source(sources)).collect());
     let mut attributes = Map::new();
     for (key, value) in &source.attributes {
         if key == uv_layers::ATTRIBUTE {
@@ -151,10 +157,7 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
             continue;
         }
         if key == "custom_normal" {
-            // Dropped when no output corner has an authored normal, which reports attribute_dropped.
-            if let Some(remapped) = sources.custom_normal(value) {
-                attributes.insert(key.clone(), remapped);
-            }
+            // The code state is rebuilt below from source corner identity, never interpolated.
             continue;
         }
         let remapped = match key.as_str() {
@@ -162,9 +165,6 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
                 .as_object()
                 .map(|groups| Value::Object(sources.vertex_groups(groups))),
             "crease_edge" => Some(sources.keyed_edge_attribute(value)),
-            "blender_edge_flags" => value
-                .as_array()
-                .map(|flags| Value::Array(sources.edge_flags(flags))),
             "blender_attributes" => value.as_array().map(|entries| {
                 Value::Array(
                     entries
@@ -179,18 +179,16 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
             "blender_skin_vertices" => value.as_array().map(|vertices| {
                 Value::Array(sources.vertex_values(vertices, "FLOAT", || json!({})))
             }),
-            "shade_smooth" => Some(sources.shade_smooth(value)),
-            "sharp" => Some(sources.sharp(value)),
-            "blender_polygon_smooth" => value
-                .as_array()
-                .map(|flags| Value::Array(sources.polygon_smooth(flags))),
-            _ => None,
+            _ => native_domain(value).map(|_| sources.native_attribute(value)),
         };
         attributes.insert(key.clone(), remapped.unwrap_or_else(|| value.clone()));
     }
     output.attributes = attributes;
     if let Some(store) = uv_store {
         uv_layers::write(output, &store);
+    }
+    if let Some(sources) = code_sources {
+        clnor::transfer_custom_normals(source, output, &sources, NormalCodeOptions::default())?;
     }
     Ok(())
 }
@@ -482,7 +480,6 @@ where
 }
 
 struct Sources<'a> {
-    raw_normals: bool,
     source: &'a Mesh,
     output: &'a Mesh,
     origin: &'a Origin,
@@ -560,135 +557,95 @@ impl Sources<'_> {
             .collect()
     }
 
-    /// `blender_edge_flags` per output edge: `sharp` and `seam` are OR-ed over the positive-weight
-    /// source edges, so a merged edge keeps a mark from any input edge it came from. An edge with
-    /// no source has neither mark.
-    fn edge_flags(&self, flags: &[Value]) -> Vec<Value> {
-        self.edge_origin
-            .iter()
-            .map(|sources| {
-                let mut sharp = false;
-                let mut seam = false;
-                for (index, _) in sources.iter().filter(|(_, weight)| *weight > 0.0) {
-                    let Some(flag) = flags.get(*index) else {
+    /// A native element attribute (`{"domain", "type", "values"}`) moved to the output elements of its
+    /// domain. Point, edge, and corner values blend over their origins by weight, and a face value copies
+    /// its source face's value. Output elements without a source take the type's default. Booleans blend
+    /// as OR over the positive-weight sources, and colors blend channel by channel.
+    fn native_attribute(&self, attribute: &Value) -> Value {
+        let Some(values) = attribute.get("values").and_then(Value::as_object) else {
+            return attribute.clone();
+        };
+        let data_type = blend_type(text(attribute, "type"));
+        let default = || default_value(data_type);
+        let remapped: Map<String, Value> = match text(attribute, "domain") {
+            "point" => {
+                let stored: Vec<Option<&Value>> = self
+                    .source
+                    .vertices
+                    .iter()
+                    .map(|vertex| values.get(&format!("v{}", vertex.id)))
+                    .collect();
+                self.output
+                    .vertices
+                    .iter()
+                    .zip(&self.origin.vertices)
+                    .map(|(vertex, sources)| {
+                        let value = blend_sources(&stored, sources, data_type).unwrap_or_else(default);
+                        (format!("v{}", vertex.id), value)
+                    })
+                    .collect()
+            }
+            "edge" => {
+                let stored: Vec<Option<&Value>> = self
+                    .source
+                    .edges
+                    .iter()
+                    .map(|edge| values.get(&format!("e{}", edge.id)))
+                    .collect();
+                self.output
+                    .edges
+                    .iter()
+                    .zip(self.edge_origin)
+                    .map(|(edge, sources)| {
+                        let value = blend_sources(&stored, sources, data_type).unwrap_or_else(default);
+                        (format!("e{}", edge.id), value)
+                    })
+                    .collect()
+            }
+            "face" => self
+                .output
+                .faces
+                .iter()
+                .zip(&self.origin.faces)
+                .map(|(face, source)| {
+                    let value = source
+                        .and_then(|index| self.source.faces.get(index))
+                        .and_then(|source_face| values.get(&format!("f{}", source_face.id)))
+                        .cloned()
+                        .unwrap_or_else(default);
+                    (format!("f{}", face.id), value)
+                })
+                .collect(),
+            "corner" => {
+                let corner_count: usize = self.source.faces.iter().map(|face| face.vertices.len()).sum();
+                let mut stored: Vec<Option<&Value>> = vec![None; corner_count];
+                let offsets = corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
+                for (face, offset) in self.source.faces.iter().zip(offsets) {
+                    let Some(row) = values.get(&format!("f{}", face.id)).and_then(Value::as_array)
+                    else {
                         continue;
                     };
-                    sharp |= flag.get("sharp").and_then(Value::as_bool) == Some(true);
-                    seam |= flag.get("seam").and_then(Value::as_bool) == Some(true);
+                    for (corner, value) in row.iter().enumerate().take(face.vertices.len()) {
+                        stored[offset + corner] = Some(value);
+                    }
                 }
-                json!({"sharp": sharp, "seam": seam})
-            })
-            .collect()
-    }
-
-    /// `shade_smooth`: each output face copies its source face's flag, and a generated face is flat.
-    fn shade_smooth(&self, attribute: &Value) -> Value {
-        let values = attribute.get("values").and_then(Value::as_object);
-        let mut output = Map::new();
-        for (face, source) in self.output.faces.iter().zip(&self.origin.faces) {
-            let flag = source
-                .and_then(|index| self.source.faces.get(index))
-                .and_then(|source| values?.get(&format!("f{}", source.id)))
-                .and_then(Value::as_bool)
-                == Some(true);
-            output.insert(format!("f{}", face.id), json!(flag));
-        }
-        with_values(attribute, Value::Object(output))
-    }
-
-    /// `blender_polygon_smooth`, positional per face: each output face copies its source face's flag.
-    fn polygon_smooth(&self, flags: &[Value]) -> Vec<Value> {
-        self.origin
-            .faces
-            .iter()
-            .map(|source| {
-                let flag = source
-                    .and_then(|index| flags.get(index))
-                    .and_then(Value::as_bool);
-                json!(flag == Some(true))
-            })
-            .collect()
-    }
-
-    /// `sharp`: an output edge is sharp when any positive-weight source edge is.
-    fn sharp(&self, attribute: &Value) -> Value {
-        let values = attribute.get("values").and_then(Value::as_object);
-        let mut output = Map::new();
-        for (edge, sources) in self.output.edges.iter().zip(self.edge_origin) {
-            let sharp = sources
-                .iter()
-                .filter(|(_, weight)| *weight > 0.0)
-                .any(|(index, _)| {
-                    self.source
-                        .edges
-                        .get(*index)
-                        .and_then(|source| values?.get(&format!("e{}", source.id)))
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                });
-            output.insert(format!("e{}", edge.id), json!(sharp));
-        }
-        with_values(attribute, Value::Object(output))
-    }
-
-    /// `custom_normal` (`{"domain","type","values":{"f{id}": [[x, y, z]; corners]}}`) moved to output
-    /// corners. Each output corner blends the authored normals of its source corners, weights
-    /// renormalised over those that have one, and normalises the result unless `raw_normals`. A face
-    /// whose corners have no authored source keeps no entry; `None` when no face does.
-    fn custom_normal(&self, attribute: &Value) -> Option<Value> {
-        let values = attribute.get("values").and_then(Value::as_object)?;
-        let source_offsets =
-            corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
-        let source_corners: usize = self
-            .source
-            .faces
-            .iter()
-            .map(|face| face.vertices.len())
-            .sum();
-        let mut authored: Vec<Option<DVec3>> = vec![None; source_corners];
-        for (index, face) in self.source.faces.iter().enumerate() {
-            let Some(corners) = values
-                .get(&format!("f{}", face.id))
-                .and_then(Value::as_array)
-            else {
-                continue;
-            };
-            for (corner, value) in corners.iter().enumerate().take(face.vertices.len()) {
-                authored[source_offsets[index] + corner] = vector3(value);
+                let offsets = corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
+                self.output
+                    .faces
+                    .iter()
+                    .zip(offsets)
+                    .map(|(face, offset)| {
+                        let row: Vec<Value> = self.corner_origin[offset..][..face.vertices.len()]
+                            .iter()
+                            .map(|sources| blend_sources(&stored, sources, data_type).unwrap_or_else(default))
+                            .collect();
+                        (format!("f{}", face.id), Value::Array(row))
+                    })
+                    .collect()
             }
-        }
-        let output_offsets =
-            corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
-        let positions: HashMap<u32, DVec3> = self
-            .output
-            .vertices
-            .iter()
-            .map(|vertex| (vertex.id, vertex.co))
-            .collect();
-        let mut result = Map::new();
-        for (face_index, face) in self.output.faces.iter().enumerate() {
-            let corners = &self.corner_origin[output_offsets[face_index]..][..face.vertices.len()];
-            let blended: Vec<Option<DVec3>> = corners
-                .iter()
-                .map(|sources| blend_vectors(sources, &authored, self.raw_normals))
-                .collect();
-            if blended.iter().all(Option::is_none) {
-                continue;
-            }
-            // A corner whose sources have no authored normal takes the flat normal of its face.
-            let points: Vec<DVec3> = face
-                .vertices
-                .iter()
-                .filter_map(|id| positions.get(id).copied())
-                .collect();
-            let flat = face_normal(&points);
-            let rows: Vec<Value> = blended
-                .into_iter()
-                .map(|normal| json!(normal.unwrap_or(flat).to_array()))
-                .collect();
-            result.insert(format!("f{}", face.id), Value::Array(rows));
-        }
-        (!result.is_empty()).then(|| with_values(attribute, Value::Object(result)))
+            _ => return attribute.clone(),
+        };
+        with_values(attribute, Value::Object(remapped))
     }
 
     /// Positional vertex values, blended by origin weights (see [`blend`]).
@@ -832,48 +789,6 @@ impl Sources<'_> {
     }
 }
 
-/// Blend of the authored custom normals at `sources`, weights renormalised over the sources that
-/// have one. Normalised unless `raw`; `None` when no source has an authored normal.
-fn blend_vectors(sources: &[(usize, f64)], authored: &[Option<DVec3>], raw: bool) -> Option<DVec3> {
-    let mut total = 0.0;
-    let mut sum = DVec3::ZERO;
-    for (index, weight) in sources {
-        if let Some(Some(normal)) = authored.get(*index) {
-            sum += *normal * *weight;
-            total += *weight;
-        }
-    }
-    if total <= 0.0 {
-        return None;
-    }
-    let blended = sum / total;
-    Some(if raw {
-        blended
-    } else {
-        blended.normalize_or_zero()
-    })
-}
-
-/// Normalises every authored `custom_normal` vector. Subdivision blends unnormalised levels and calls
-/// this once on its final mesh.
-pub(crate) fn normalize_custom_normals(mesh: &mut Mesh) {
-    let Some(values) = mesh
-        .attributes
-        .get_mut("custom_normal")
-        .and_then(|attribute| attribute.get_mut("values"))
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    for corners in values.values_mut() {
-        for value in corners.as_array_mut().into_iter().flatten() {
-            if let Some(normal) = vector3(value) {
-                *value = json!(normal.normalize_or_zero().to_array());
-            }
-        }
-    }
-}
-
 /// Index of the heaviest `(index, weight)` source; ties go to the lowest index.
 fn heaviest_source(sources: &[(usize, f64)]) -> Option<usize> {
     sources
@@ -975,8 +890,64 @@ fn default_value(data_type: &str) -> Value {
         "FLOAT2" => json!([0.0, 0.0]),
         "FLOAT_VECTOR" => json!([0.0, 0.0, 0.0]),
         "FLOAT_COLOR" | "BYTE_COLOR" => json!([0.0, 0.0, 0.0, 1.0]),
+        "QUATERNION" => json!([0.0, 0.0, 0.0, 1.0]),
         _ => Value::Null,
     }
+}
+
+/// The Blender data type that [`blend`] and [`default_value`] use for a native attribute type.
+fn blend_type(kind: &str) -> &'static str {
+    match kind {
+        "int" => "INT",
+        "bool" => "BOOLEAN",
+        "float2" => "FLOAT2",
+        "float3" => "FLOAT_VECTOR",
+        "quaternion" => "QUATERNION",
+        "color" => "FLOAT_COLOR",
+        _ => "FLOAT",
+    }
+}
+
+/// [`blend`] over the `stored` values at the `(index, weight)` sources. Sources without a value are skipped.
+fn blend_sources(
+    stored: &[Option<&Value>],
+    sources: &[(usize, f64)],
+    data_type: &str,
+) -> Option<Value> {
+    blend(
+        sources
+            .iter()
+            .filter_map(|(index, weight)| Some(((*stored.get(*index)?)?, *weight))),
+        data_type,
+    )
+}
+
+/// The element domain of a native attribute (`point`, `edge`, `face`, or `corner`). Other mesh keys, such
+/// as `uv_layers`, `color_layers`, `vertex_groups`, and the Blender containers, have no such domain.
+fn native_domain(value: &Value) -> Option<&str> {
+    value
+        .get("domain")
+        .and_then(Value::as_str)
+        .filter(|domain| matches!(*domain, "point" | "edge" | "face" | "corner"))
+}
+
+/// Flags of the edge-domain boolean attribute `name`, one per edge in storage order. An edge without an
+/// entry, or a mesh without the attribute, is unflagged.
+pub(crate) fn edge_flags(mesh: &Mesh, name: &str) -> Vec<bool> {
+    let values = mesh
+        .attributes
+        .get(name)
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(Value::as_object);
+    mesh.edges
+        .iter()
+        .map(|edge| {
+            values
+                .and_then(|values| values.get(&format!("e{}", edge.id)))
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1013,7 +984,6 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
-            raw_normals: false,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let out_ids: Vec<u32> = output.vertices.iter().map(|vertex| vertex.id).collect();
@@ -1023,8 +993,13 @@ mod tests {
         assert_eq!(groups[format!("v{}", out_ids[2])], json!(0.5));
     }
 
+    /// A JSON object of keyed entries, for attribute fixtures.
+    fn keyed(entries: Vec<(String, Value)>) -> Value {
+        Value::Object(entries.into_iter().collect())
+    }
+
     /// Subdivision of one quad: edge midpoints take two corners, the face centre takes all four.
-    /// Boundary halves keep their source edge's flags; the inner spokes take the default.
+    /// Boundary halves keep their source edge's sharp and seam flags; the inner spokes are unflagged.
     #[test]
     fn subdivision_inner_edges_take_no_source_edge_flags() {
         let corners = vec![
@@ -1035,14 +1010,21 @@ mod tests {
         ];
         let mut source =
             Mesh::from_positions_and_faces(corners, vec![vec![0, 1, 2, 3]]).expect("quad");
-        let flags: Vec<Value> = source
-            .edges
-            .iter()
-            .map(|_| json!({"sharp": true, "seam": true}))
-            .collect();
-        source
-            .attributes
-            .insert("blender_edge_flags".to_owned(), Value::Array(flags));
+        let flags = keyed(
+            source
+                .edges
+                .iter()
+                .map(|edge| (format!("e{}", edge.id), json!(true)))
+                .collect(),
+        );
+        source.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": flags.clone()}),
+        );
+        source.attributes.insert(
+            "seam".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": flags}),
+        );
         let positions = vec![
             DVec3::new(0.0, 0.0, 0.0),
             DVec3::new(1.0, 0.0, 0.0),
@@ -1078,20 +1060,15 @@ mod tests {
             ],
             faces: vec![Some(0); 4],
             corners: None,
-            raw_normals: false,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let centre = output.vertices[8].id;
         assert_eq!(output.edges.len(), 12);
-        let flags = output.attributes["blender_edge_flags"]
-            .as_array()
-            .expect("edge flags");
-        for (edge, flag) in output.edges.iter().zip(flags) {
-            if edge.vertices.contains(&centre) {
-                assert_eq!(flag, &json!({"sharp": false, "seam": false}));
-            } else {
-                assert_eq!(flag, &json!({"sharp": true, "seam": true}));
-            }
+        let sharp = edge_flags(&output, "sharp");
+        let seam = edge_flags(&output, "seam");
+        for (edge, (sharp, seam)) in output.edges.iter().zip(sharp.into_iter().zip(seam)) {
+            let boundary = !edge.vertices.contains(&centre);
+            assert_eq!((sharp, seam), (boundary, boundary));
         }
     }
 
@@ -1106,9 +1083,20 @@ mod tests {
         let fourth = source.insert_vertex(DVec3::X).expect("vertex");
         source.insert_edge([first, second]).expect("edge");
         source.insert_edge([third, fourth]).expect("edge");
+        let (sharp_edge, seam_edge) = (source.edges[0].id, source.edges[1].id);
         source.attributes.insert(
-            "blender_edge_flags".to_owned(),
-            json!([{"sharp": true, "seam": false}, {"sharp": false, "seam": true}]),
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": keyed(vec![
+                (format!("e{sharp_edge}"), json!(true)),
+                (format!("e{seam_edge}"), json!(false)),
+            ])}),
+        );
+        source.attributes.insert(
+            "seam".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": keyed(vec![
+                (format!("e{sharp_edge}"), json!(false)),
+                (format!("e{seam_edge}"), json!(true)),
+            ])}),
         );
         let mut output = Mesh::new();
         let near = output.insert_vertex(DVec3::ZERO).expect("vertex");
@@ -1118,12 +1106,62 @@ mod tests {
             vertices: vec![vec![(0, 0.5), (2, 0.5)], vec![(1, 0.5), (3, 0.5)]],
             faces: Vec::new(),
             corners: None,
-            raw_normals: false,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
+        assert_eq!(edge_flags(&output, "sharp"), vec![true]);
+        assert_eq!(edge_flags(&output, "seam"), vec![true]);
+    }
+
+    /// Native element attributes follow their origins: a point color blends the two sources of a merged
+    /// vertex, a corner color follows the corner it came from (blended where the output corner has two
+    /// sources), and a face value copies its source face.
+    #[test]
+    fn native_color_and_generic_attributes_follow_origins() {
+        let mut source = triangle();
+        let vertices: Vec<u32> = source.vertices.iter().map(|vertex| vertex.id).collect();
+        let face = source.faces[0].id;
+        source.attributes.insert(
+            "Col".to_owned(),
+            json!({"domain": "point", "type": "color", "values": keyed(vec![
+                (format!("v{}", vertices[0]), json!([1.0, 0.0, 0.0, 1.0])),
+                (format!("v{}", vertices[1]), json!([0.0, 1.0, 0.0, 1.0])),
+                (format!("v{}", vertices[2]), json!([0.0, 0.0, 1.0, 1.0])),
+            ])}),
+        );
+        source.attributes.insert(
+            "Paint".to_owned(),
+            json!({"domain": "corner", "type": "color", "values": keyed(vec![(
+                format!("f{face}"),
+                json!([[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]]),
+            )])}),
+        );
+        source.attributes.insert(
+            "weight".to_owned(),
+            json!({"domain": "face", "type": "float", "values": keyed(vec![(
+                format!("f{face}"),
+                json!(0.75),
+            )])}),
+        );
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            faces: vec![Some(0)],
+            corners: None,
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+        let out_vertex = format!("v{}", output.vertices[2].id);
+        let out_face = format!("f{}", output.faces[0].id);
         assert_eq!(
-            output.attributes["blender_edge_flags"],
-            json!([{"sharp": true, "seam": true}])
+            output.attributes["Col"]["values"][out_vertex.as_str()],
+            json!([0.5, 0.5, 0.0, 1.0])
+        );
+        assert_eq!(
+            output.attributes["Paint"]["values"][out_face.as_str()],
+            json!([[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.5, 0.5, 0.0, 1.0]])
+        );
+        assert_eq!(
+            output.attributes["weight"]["values"][out_face.as_str()],
+            json!(0.75)
         );
     }
 
@@ -1167,7 +1205,6 @@ mod tests {
                 vec![(0, 0.5), (1, 0.5)],
                 vec![(2, 1.0)],
             ]),
-            raw_normals: false,
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let layers = uv_layers::read_layers(&output);

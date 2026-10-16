@@ -160,7 +160,7 @@ fn schema_v1_project_keeps_revisions_uv_state_and_hashes_through_edit_history_an
     )?;
     assert_eq!(edited["ok"], true, "{edited}");
     assert_eq!(edited["scene"]["revision"], 3);
-    assert_eq!(document(&scene)?["schema_version"], 2);
+    assert_eq!(document(&scene)?["schema_version"], 3);
     let store = &mesh_attributes(&scene)?["uv_layers"];
     assert_eq!(store["layers"][0]["name"], "UVMap");
     assert_eq!(store["active"], "UVMap");

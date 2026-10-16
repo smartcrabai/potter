@@ -2316,7 +2316,7 @@ mod tests {
             .insert("uv_layers".to_owned(), uv_layers_attribute(&entries));
         mesh.attributes.insert(
             "seam".to_owned(),
-            json!({"domain":"edge","values":seam_values}),
+            json!({"domain":"edge","type":"bool","values":seam_values}),
         );
         run_uv(
             &mut doc,

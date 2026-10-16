@@ -27,7 +27,10 @@ use serde_json::{Map, Value, json};
 use super::{BevelEdgeFacesWithMaterial, Mesh, Polygon, edge_key};
 use crate::{
     error::Result,
-    geom::normals::{corner_angle, corner_normals, face_normal, smooth_face_flags},
+    geom::{
+        clnor::{self, NormalCodeOptions, SetterInput},
+        normals::{corner_angle, face_normal, smooth_face_flags},
+    },
 };
 
 /// A beveled edge's side: `(face index, loop's first vertex, loop's second vertex, material)`.
@@ -471,36 +474,30 @@ pub(super) fn shade_output(
         return Ok(());
     }
     // Sharp flags are final now; the fans and their frames come from the mesh without custom data.
-    let sharp_pairs: HashSet<(usize, usize)> = mesh
-        .edges
-        .iter()
-        .zip(crate::geom::normals::sharp_edge_flags(mesh)?)
-        .filter(|(_, flag)| *flag)
-        .map(|(edge, _)| edge_key(index_of[&edge.vertices[0]], index_of[&edge.vertices[1]]))
-        .collect();
-    let fans = crate::geom::clnor::fans(&points, &polygons, &smooth, &sharp_pairs);
-    let computed = corner_normals(mesh, &points)?;
-    // Each hardened corner's code in its fan's frame; unhardened corners of a fan contribute zero.
-    let mut codes = vec![[0_i32; 2]; computed.len()];
-    let mut affected = vec![false; fans.corners.len()];
     let mut starts = Vec::with_capacity(polygons.len());
     let mut total = 0;
     for polygon in &polygons {
         starts.push(total);
         total += polygon.len();
     }
+    // Bevel output keeps Potter's storage order as its loop order.
+    let numbering: Vec<usize> = (0..total).collect();
+    let fans = clnor::mesh_fans(mesh, &points, &numbering)?;
+    // Each hardened corner's code in its fan's frame; unhardened corners of a fan contribute zero.
+    let mut codes = vec![[0_i32; 2]; total];
+    let mut affected = vec![false; fans.corners.len()];
     for (polygon, row) in rules.iter().enumerate() {
         let start = starts[polygon];
         for (corner, rule) in row.iter().enumerate() {
             if let Some(normal) = rule {
                 let global = start + corner;
                 let fan = fans.fan_of[global];
-                codes[global] = fans.spaces[fan].encode(*normal);
+                codes[global] = fans.spaces[fan].encode(normal.as_vec3());
                 affected[fan] = true;
             }
         }
     }
-    let mut values = vec![DVec3::ZERO; computed.len()];
+    let mut values = vec![DVec3::ZERO; total];
     for (fan, members) in fans.corners.iter().enumerate() {
         if !affected[fan] {
             continue;
@@ -512,34 +509,21 @@ pub(super) fn shade_output(
         }
         let count = members.len() as i32;
         let average = [sum[0] / count, sum[1] / count];
-        let normal = fans.spaces[fan].decode(average);
+        let normal = fans.spaces[fan].decode(average).as_dvec3();
         for member in members {
             values[*member] = normal;
         }
     }
-    let mut entries = Map::new();
-    let mut start = 0;
-    for face in &mesh.faces {
-        let count = face.vertices.len();
-        let touched = (start..start + count).any(|global| affected[fans.fan_of[global]]);
-        if touched {
-            let row: Vec<Value> = (start..start + count)
-                .map(|global| {
-                    let normal = if affected[fans.fan_of[global]] {
-                        values[global]
-                    } else {
-                        computed[global]
-                    };
-                    json!(normal.to_array())
-                })
-                .collect();
-            entries.insert(format!("f{}", face.id), Value::Array(row));
-        }
-        start += count;
-    }
-    mesh.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain": "corner", "type": "float3", "values": entries}),
-    );
-    Ok(())
+    // Corners of unaffected fans have no hardened normal: they stay automatic (`None`).
+    let vectors: Vec<Option<DVec3>> = (0..total)
+        .map(|global| affected[fans.fan_of[global]].then_some(values[global]))
+        .collect();
+    clnor::encode_vectors(
+        mesh,
+        Some(&vectors),
+        NormalCodeOptions {
+            corner_order: Some(&numbering),
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )
 }

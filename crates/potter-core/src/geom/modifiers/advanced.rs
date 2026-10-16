@@ -20,7 +20,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
-        clnor::transfer_custom_normals,
+        clnor::{self, NormalCodeOptions},
         normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags},
         provenance::Origin,
         uv_layers,
@@ -1721,9 +1721,8 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let mut face_indices = Vec::with_capacity(mesh.faces.len());
     // Blender's vertex normals (Mesh::vert_normals) weight each corner's normal by its angle; with
     // custom normals the corner normals themselves are mixed.
-    let custom_corners = mesh
-        .attributes
-        .contains_key("custom_normal")
+    let custom_corners = clnor::corner_codes(mesh)?
+        .is_some()
         .then(|| corner_normals(mesh, &source_positions))
         .transpose()?;
     let mut corner_offset = 0;
@@ -2153,7 +2152,7 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // Each output corner copies the raw custom data of its source corner, which its new fan decodes
     // (BM_elem_attrs_copy in bmesh_wireframe.cc, read back through the output fans).
     let sources: Vec<Option<usize>> = source_corners.iter().map(|corner| Some(*corner)).collect();
-    transfer_custom_normals(mesh, &mut result, &sources)?;
+    clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     result.attributes.remove("wireframe_use_crease");
     result.attributes.remove("wireframe_crease_weight");
     if use_crease {
@@ -2489,15 +2488,11 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         vertices: origins,
         faces: vec![None; faces.len()],
         corners: None,
-        raw_normals: false,
     };
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
     result.attributes.remove("blender_skin_vertices");
     result.attributes.remove("skin_radii");
     result.attributes.remove("skin_roots");
-    if smooth_shade {
-        crate::geom::normals::shade_faces_smooth(&mut result);
-    }
     // Blender's Skin output has no UV layers, so the store is dropped (reported as attribute loss).
     let uv_names: Vec<String> = uv_layers::read_layers(&result)
         .into_iter()
@@ -2517,9 +2512,14 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         });
     }
     drop_partial_vertex_groups(mesh, &origin, &mut result);
+    let smooth: serde_json::Map<String, serde_json::Value> = result
+        .faces
+        .iter()
+        .map(|face| (format!("f{}", face.id), serde_json::json!(smooth_shade)))
+        .collect();
     result.attributes.insert(
-        "blender_polygon_smooth".to_owned(),
-        serde_json::json!(vec![smooth_shade; result.faces.len()]),
+        "shade_smooth".to_owned(),
+        serde_json::json!({"domain": "face", "type": "bool", "values": smooth}),
     );
     validated(&result)?;
     Ok(result)

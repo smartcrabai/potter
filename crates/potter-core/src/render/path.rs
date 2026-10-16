@@ -15,10 +15,10 @@ use crate::{
 use super::{
     bvh::{Bvh, BvhHit},
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, blend_uv, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
-    scene::{Geometry, ObjectRecord},
+    scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
 };
 
 const RAY_EPSILON: f64 = 1.0e-5;
@@ -848,13 +848,11 @@ fn trace_path(
             }
             continue;
         }
-        if bounce == 0 {
-            alpha = 1.0;
-        }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
+        alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
             * surface.params.emission_strength.max(0.0);
@@ -1135,7 +1133,6 @@ fn make_surface(
             }
         }
     };
-    let uv = blend_uv(&triangle.uv, hit.barycentric);
     let object = object_for_index(&geometry.objects, triangle.object_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1151,43 +1148,23 @@ fn make_surface(
                 "triangle references an unmapped material",
             )
         })?;
-    let matrix = snapshot
-        .nodes
-        .get(&object.node_id)
-        .map_or(DMat4::IDENTITY, |node| {
-            DMat4::from_cols_array(&node.world_matrix)
-        });
-    let world_to_local = matrix.inverse();
-    let local_is_finite = world_to_local
-        .to_cols_array()
-        .iter()
-        .all(|value| value.is_finite());
-    let object_position = if local_is_finite {
-        world_to_local.transform_point3(point)
-    } else {
-        point
-    };
-    let mut uv_table: [(&str, [f64; 2]); MAX_LAYERS] = [("", [0.0; 2]); MAX_LAYERS];
-    let uv_maps = fill_uv_maps(
-        &mut uv_table,
-        object
-            .uv_layers
-            .iter()
-            .zip(&triangle.layer_uvs)
-            .map(|(name, corners)| (name.as_str(), blend_uv(corners, hit.barycentric))),
+    let mut tables = LayerTables::new();
+    let context = layered_context(
+        doc,
+        images,
+        &geometry.shader_warnings,
+        object,
+        triangle,
+        HitPose {
+            point,
+            object: object_space(snapshot, object, point),
+            normal,
+            view: -direction,
+            barycentric: hit.barycentric,
+        },
+        &mut tables,
     )?;
     let (tangent, bitangent) = triangle_tangent_frame(triangle, normal);
-    let mut context = HitContext::new(&doc.node_groups)
-        .with_images(images)
-        .with_tangent_frame(tangent, bitangent)
-        .with_uv_maps(uv_maps)
-        .with_warnings(&geometry.shader_warnings);
-    context.uv = uv;
-    context.generated = object_position;
-    context.position = point;
-    context.object = object_position;
-    context.normal = normal;
-    context.view_direction = -direction;
     let mut params = evaluate_surface(material, &context)?;
     params.alpha = match material.alpha_mode.as_str() {
         "opaque" => 1.0,
@@ -1265,14 +1242,20 @@ fn displacement_sample(
     evaluate_surface(material, &sample_context).map(|params| params.displacement_height)
 }
 
-fn object_for_index(objects: &[ObjectRecord], object_index: u32) -> Option<&ObjectRecord> {
+pub(super) fn object_for_index(
+    objects: &[ObjectRecord],
+    object_index: u32,
+) -> Option<&ObjectRecord> {
     object_index
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
         .and_then(|index| objects.get(index))
 }
 
-fn triangle_tangent_frame(triangle: &super::raster::Triangle, normal: DVec3) -> (DVec3, DVec3) {
+pub(super) fn triangle_tangent_frame(
+    triangle: &super::raster::Triangle,
+    normal: DVec3,
+) -> (DVec3, DVec3) {
     let edge1 = triangle.positions[1] - triangle.positions[0];
     let edge2 = triangle.positions[2] - triangle.positions[0];
     let uv1 = [

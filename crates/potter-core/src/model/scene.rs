@@ -118,7 +118,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 2,
+            schema_version: 3,
             scene_id,
             revision: 0,
             active_scene,
@@ -145,7 +145,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 2 {
+        if self.schema_version != 3 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -178,6 +178,8 @@ impl SceneDoc {
         for block in self.data_blocks.values() {
             if let Some(mesh) = &block.mesh {
                 crate::geom::uv_layers::validate(mesh)?;
+                crate::geom::color_layers::validate(mesh)?;
+                crate::geom::clnor::validate(mesh)?;
             }
         }
         for (scene_id, scene) in &self.scenes {

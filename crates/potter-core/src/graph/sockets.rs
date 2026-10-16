@@ -44,7 +44,8 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "ShaderNodeTexCoord"
             | "ShaderNodeMixRGB"
             | "ShaderNodeMix"
-            | "ShaderNodeMixShader"
+            | "ShaderNodeVertexColor"
+            | "ShaderNodeAttribute"
             | "ShaderNodeAddShader"
             | "ShaderNodeBsdfPrincipled"
             | "ShaderNodeVolumePrincipled"
@@ -296,8 +297,24 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
                 ("Incoming", "vector"),
             ]),
         ),
-        "ShaderNodeMixRGB" | "ShaderNodeMix" => (
+        "ShaderNodeMixRGB" => (
             sockets(&[("Fac", "float"), ("Color1", "color"), ("Color2", "color")]),
+            sockets(&[("Color", "color"), ("Alpha", "float")]),
+        ),
+        "ShaderNodeMix" => (
+            sockets(&[
+                ("Factor_Float", "float"),
+                ("A_Color", "color"),
+                ("B_Color", "color"),
+            ]),
+            sockets(&[("Result_Color", "color")]),
+        ),
+        "ShaderNodeVertexColor" => (
+            sockets(&[("Layer Name", "string")]),
+            sockets(&[("Color", "color"), ("Alpha", "float")]),
+        ),
+        "ShaderNodeAttribute" => (
+            sockets(&[("Name", "string")]),
             sockets(&[("Color", "color"), ("Alpha", "float")]),
         ),
         "ShaderNodeMixShader" => (

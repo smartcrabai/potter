@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -14,7 +13,6 @@ use crate::{
     eval::{EvaluationContext, Snapshot},
     exchange::{
         self, ExportOptions, Loss,
-        gltf::is_color_attribute,
         material_surface::{material_is_used, resolve_surface},
     },
     hash,
@@ -110,6 +108,11 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         let mut losses = export_losses(&doc, format);
         losses.extend(exchange::shading::shading_losses(format, &meshes));
         losses.extend(exchange::uv_layer_losses(format, &meshes));
+        if matches!(format, "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl")
+            || matches!(format, "usda" | "usdc" | "usd" | "usdz")
+        {
+            losses.extend(exchange::attribute_losses(format, &doc, &snapshot)?);
+        }
         let vrm = match (format, doc.avatar.as_ref()) {
             ("vrm", Some(avatar)) => Some((avatar, AvatarVersion::V1)),
             ("vrm0", Some(avatar)) => Some((avatar, AvatarVersion::V0)),
@@ -117,6 +120,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         };
         if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
             losses.extend(exchange::gltf::uv_layer_losses(&doc, &snapshot, vrm)?);
+            losses.extend(exchange::gltf::mesh_export_losses(&doc, &snapshot)?);
         }
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
@@ -178,11 +182,11 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             "bvh" => vec![(args.out.clone(), exchange::bvh::export(&doc, &snapshot)?)],
             "fbx-binary" => vec![(
                 args.out.clone(),
-                exchange::fbx_binary::export_allow_lossy(&doc, &snapshot, options.allow_lossy)?,
+                exchange::fbx_binary::export(&doc, &snapshot)?,
             )],
             "fbx" => vec![(
                 args.out.clone(),
-                exchange::fbx::export_allow_lossy(&doc, &snapshot, options.allow_lossy)?,
+                exchange::fbx::export(&doc, &snapshot)?,
             )],
             "svg" => vec![(
                 args.out.clone(),
@@ -502,31 +506,6 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
                 ),
             });
         }
-        if matches!(format, "alembic" | "fbx" | "fbx-binary")
-            && let Some(mesh) = data.mesh.as_ref()
-        {
-            for attribute in mesh.attributes.keys() {
-                let supported = if format == "alembic" {
-                    matches!(
-                        attribute.as_str(),
-                        "uv_layers" | "shade_smooth" | "sharp" | "custom_normal"
-                    )
-                } else {
-                    attribute == "uv_layers"
-                        || crate::geom::normals::SHADING_ATTRIBUTES.contains(&attribute.as_str())
-                };
-                // Alembic's existing loss below describes this imported attribute.
-                if supported || (format == "alembic" && attribute == "alembic_normals") {
-                    continue;
-                }
-                losses.push(Loss {
-                    feature_id: "mesh.attribute".to_owned(),
-                    data_id: Some(id.to_string()),
-                    reason: format!("{format} drops unsupported mesh attribute `{attribute}`"),
-                    suggestion: Some("export as blend to preserve mesh attributes".to_owned()),
-                });
-            }
-        }
         if !data_supported {
             losses.push(Loss {
                 feature_id: format!("data.{}", data.data_type),
@@ -538,58 +517,12 @@ pub(crate) fn export_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
     }
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
         losses.extend(material_losses(doc));
-        losses.extend(mesh_color_losses(doc));
     }
     if matches!(format, "fbx" | "fbx-binary") {
         losses.extend(exchange::fbx::uv_texture_losses(doc));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);
-    }
-    losses
-}
-
-/// Blender color layers on meshes that nodes use. glTF export does not write them yet (`COLOR_0` is
-/// pending), so each layer is a reported loss rather than a silent drop.
-fn mesh_color_losses(doc: &SceneDoc) -> Vec<Loss> {
-    let data_ids = doc
-        .nodes
-        .values()
-        .filter_map(|node| node.data.as_ref())
-        .collect::<BTreeSet<_>>();
-    let mut losses = Vec::new();
-    for data_id in data_ids {
-        let Some(mesh) = doc
-            .data_blocks
-            .get(data_id)
-            .and_then(|data| data.mesh.as_ref())
-        else {
-            continue;
-        };
-        let Some(entries) = mesh
-            .attributes
-            .get("blender_attributes")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for entry in entries {
-            let is_color = is_color_attribute(entry);
-            let Some(name) = entry["name"].as_str().filter(|_| is_color) else {
-                continue;
-            };
-            losses.push(Loss {
-                feature_id: "mesh.color_attribute".to_owned(),
-                data_id: Some(data_id.to_string()),
-                reason: format!(
-                    "glTF export does not write the Blender color attribute `{name}` on mesh `{data_id}` (COLOR_0 export is not implemented)"
-                ),
-                suggestion: Some(
-                    "export with --allow-lossy to omit the color layer, or remove it before export"
-                        .to_owned(),
-                ),
-            });
-        }
     }
     losses
 }

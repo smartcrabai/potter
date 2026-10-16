@@ -89,40 +89,10 @@ struct BoneExport {
     local: DMat4,
 }
 
-/// Export the evaluated mesh and scene transforms as ASCII FBX 7.4.
+/// Export the evaluated mesh and scene transforms as ASCII FBX 7.4. Color layers and generic
+/// attributes are not written; `exchange::attribute_losses` reports them.
 pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
-    export_with_root(doc, snapshot, Path::new("."))
-}
-
-/// Export ASCII FBX with the project root available for linked and packed images.
-pub(crate) fn export_with_root(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    project_root: &Path,
-) -> Result<Vec<u8>> {
-    export_with_root_allow_lossy(doc, snapshot, project_root, false)
-}
-
-/// Export ASCII FBX, optionally dropping attributes reported by the command's lossy-export gate.
-pub(crate) fn export_allow_lossy(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    allow_lossy: bool,
-) -> Result<Vec<u8>> {
-    if allow_lossy {
-        export_with_root_allow_lossy(doc, snapshot, Path::new("."), true)
-    } else {
-        export(doc, snapshot)
-    }
-}
-
-pub(crate) fn export_with_root_allow_lossy(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    project_root: &Path,
-    allow_lossy: bool,
-) -> Result<Vec<u8>> {
-    let _ = project_root;
+    let project_root = Path::new(".");
     doc.validate()?;
     let scene = doc
         .scenes
@@ -351,14 +321,7 @@ pub(crate) fn export_with_root_allow_lossy(
                     )
                 })?
             };
-            write_geometry(
-                &mut output,
-                geometry_id,
-                node,
-                mesh,
-                data_block,
-                allow_lossy,
-            )?;
+            write_geometry(&mut output, geometry_id, node, mesh, data_block)?;
         }
         let mesh_model = object_ids.geometry.is_some();
         let rotation = DQuat::from_xyzw(
@@ -1267,22 +1230,9 @@ fn write_geometry(
     node: &Node,
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
-    allow_lossy: bool,
 ) -> Result<()> {
-    // Shading attributes and UV layers have their own FBX layers. Unsupported attributes are
-    // skipped only for lossy export and are reported by `commands::export::export_losses`.
-    if !allow_lossy
-        && mesh.attributes.keys().any(|name| {
-            name != uv_layers::ATTRIBUTE
-                && !crate::geom::normals::SHADING_ATTRIBUTES.contains(&name.as_str())
-        })
-    {
-        return Err(PotError::with_details(
-            ErrorCode::UnrepresentableFeature,
-            "FBX adapter does not represent mesh custom attributes",
-            json!({ "feature_id": "format.fbx.mesh_attributes", "node_id": node.name }),
-        ));
-    }
+    // Shading and UV attributes have their own FBX layers. Color layers and generic attributes
+    // are not written here; `exchange::attribute_losses` reports them.
     let vertex_indices = mesh
         .vertices
         .iter()
@@ -3335,7 +3285,7 @@ fn write_error(_: std::fmt::Error) -> PotError {
 
 #[cfg(test)]
 mod tests {
-    use super::{lex, parse_nodes, parse_uv_layers, write_uv_layers};
+    use super::{lex, parse_nodes, parse_uv_layers, write_geometry, write_uv_layers};
     use crate::{
         error::{ErrorCode, PotError, Result},
         exchange::Loss,
@@ -3396,6 +3346,23 @@ mod tests {
             &[[0.1, 0.25], [0.5, 0.75], [0.9, 0.0]],
         );
         assert_close(&layers[1].corners[0], &[[0.2, 0.1], [0.6, 0.3], [0.4, 0.0]]);
+        Ok(())
+    }
+
+    #[test]
+    fn color_and_generic_attributes_are_not_refused_by_the_geometry_writer() -> Result<()> {
+        let mesh = crate::exchange::test_support::triangle_with_attributes()?;
+        let node = crate::model::Node {
+            name: "Triangle".to_owned(),
+            ..crate::model::Node::default()
+        };
+        let mut output = String::new();
+        write_geometry(&mut output, 1, &node, &mesh, None)?;
+        assert!(output.contains("Geometry: 1, \"Geometry::Triangle\", \"Mesh\""));
+        // The losses for these attributes come from `exchange::attribute_losses`.
+        let losses = crate::exchange::mesh_attribute_losses("fbx", "triangle", &mesh);
+        assert!(losses.iter().any(|loss| loss.feature_id == "mesh.color_attribute"));
+        assert!(losses.iter().any(|loss| loss.feature_id == "mesh.attribute"));
         Ok(())
     }
 }

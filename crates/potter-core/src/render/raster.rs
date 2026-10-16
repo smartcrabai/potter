@@ -69,6 +69,12 @@ pub(crate) struct Triangle {
     pub(crate) layer_uvs: Vec<[[f64; 2]; 3]>,
     /// World-space corner shading normals; `None` for flat faces, which keep their geometric normal.
     pub(crate) normals: Option<[DVec3; 3]>,
+    /// Corner colors of every color layer the object carries, in `ObjectRecord::color_layers`
+    /// order; empty without color layers.
+    pub(crate) layer_colors: Vec<[[f64; 4]; 3]>,
+    /// Lit per pixel by the surface shader instead of once per triangle: realtime Beauty triangles
+    /// whose material graph reads color layers. Smooth triangles are lit per pixel regardless.
+    pub(crate) lit_per_pixel: bool,
 }
 
 impl Triangle {
@@ -78,6 +84,7 @@ impl Triangle {
         positions: [DVec3; 3],
         uv: [[f64; 2]; 3],
         layer_uvs: Vec<[[f64; 2]; 3]>,
+        layer_colors: Vec<[[f64; 4]; 3]>,
     ) -> Self {
         Self {
             positions,
@@ -91,27 +98,42 @@ impl Triangle {
             uv,
             layer_uvs,
             normals: self.normals,
+            layer_colors,
+            lit_per_pixel: self.lit_per_pixel,
         }
     }
 
-    /// A copy without the per-layer UVs, for passes that only shade the triangle.
+    /// A copy without the per-layer data, for passes that only shade the triangle. Per-pixel
+    /// shading evaluates the material graph, which reads that data, so such copies keep it.
     pub(crate) fn shading_copy(&self) -> Self {
-        self.with_corners(self.positions, self.uv, Vec::new())
+        if self.lit_per_pixel {
+            self.clone()
+        } else {
+            self.with_corners(self.positions, self.uv, Vec::new(), Vec::new())
+        }
     }
 }
 
-/// Lighting for triangles with corner normals, evaluated at each visible hit.
+/// Where a visible hit lies on its triangle, for per-pixel shading.
+pub(crate) struct SurfaceHit {
+    /// Hit point in world space.
+    pub(crate) point: DVec3,
+    /// Shadow-ray origin (see [`smooth_shadow_origin`]).
+    pub(crate) shadow_point: DVec3,
+    /// Interpolated shading normal.
+    pub(crate) normal: DVec3,
+    /// Unit triangle normal.
+    pub(crate) geometric: DVec3,
+    /// Barycentric weights of the hit over the triangle's corners.
+    pub(crate) barycentric: [f64; 3],
+    /// Unit direction from the hit back toward the camera.
+    pub(crate) view: DVec3,
+}
+
+/// Lighting for triangles lit per pixel, evaluated at each visible hit.
 pub(crate) trait SurfaceShader {
-    /// Linear RGB at `point` lit with the interpolated shading `normal`. Shadow rays start at
-    /// `shadow_point` (see [`smooth_shadow_origin`]); `geometric` is the unit triangle normal.
-    fn shade(
-        &self,
-        triangle: &Triangle,
-        point: DVec3,
-        shadow_point: DVec3,
-        normal: DVec3,
-        geometric: DVec3,
-    ) -> Result<[f64; 3]>;
+    /// Linear RGB at `hit` on `triangle`.
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 3]>;
 }
 
 /// Shadow-ray origin for a hit on a smooth triangle, after Hanika's shadow-terminator offset
@@ -156,6 +178,15 @@ pub(crate) fn blend_uv(corners: &[[f64; 2]; 3], weights: [f64; 3]) -> [f64; 2] {
         corners[0][0] * weights[0] + corners[1][0] * weights[1] + corners[2][0] * weights[2],
         corners[0][1] * weights[0] + corners[1][1] * weights[1] + corners[2][1] * weights[2],
     ]
+}
+
+/// Barycentric blend of one color layer's corner values.
+pub(crate) fn blend_color(corners: &[[f64; 4]; 3], weights: [f64; 3]) -> [f64; 4] {
+    std::array::from_fn(|channel| {
+        corners[0][channel] * weights[0]
+            + corners[1][channel] * weights[1]
+            + corners[2][channel] * weights[2]
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -469,8 +500,8 @@ pub(crate) fn rasterize_with_samples(
                     } else if let Some((triangle_index, hit)) = sample_hit {
                         let triangle = &prepared[triangle_index];
                         if triangle_opacity(&triangle.source) >= 1.0 {
-                            let point = sample_ray.origin + sample_ray.direction * hit.distance;
-                            let [red, green, blue, _] = hit_color(triangle, hit, point, shader)?;
+                            let [red, green, blue, _] =
+                                hit_color(triangle, hit, sample_ray, shader)?;
                             [red, green, blue, 1.0]
                         } else {
                             composite_sample(
@@ -1152,23 +1183,25 @@ fn shading_normal(triangle: &PreparedTriangle, hit: Hit) -> DVec3 {
     })
 }
 
-/// Linear RGBA at a visible hit. Smooth triangles are lit per pixel when a shader is present.
+/// Linear RGBA at a visible hit. Triangles lit per pixel use the shader when one is present.
 fn hit_color(
     triangle: &PreparedTriangle,
     hit: Hit,
-    point: DVec3,
+    ray: Ray,
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<[f64; 4]> {
-    match (triangle.source.normals, shader) {
-        (Some(_), Some(shader)) => {
-            let shadow_point = smooth_shadow_origin(&triangle.source, point, hit.barycentric);
-            let [red, green, blue] = shader.shade(
-                &triangle.source,
+    match shader {
+        Some(shader) if triangle.source.normals.is_some() || triangle.source.lit_per_pixel => {
+            let point = ray.origin + ray.direction * hit.distance;
+            let surface = SurfaceHit {
                 point,
-                shadow_point,
-                shading_normal(triangle, hit),
-                triangle.normal,
-            )?;
+                shadow_point: smooth_shadow_origin(&triangle.source, point, hit.barycentric),
+                normal: shading_normal(triangle, hit),
+                geometric: triangle.normal,
+                barycentric: hit.barycentric,
+                view: -ray.direction,
+            };
+            let [red, green, blue] = shader.shade(&triangle.source, &surface)?;
             Ok([red, green, blue, triangle.source.color[3]])
         }
         _ => Ok(triangle.source.color),
@@ -1213,8 +1246,7 @@ fn composite_sample(
     let mut premultiplied = DVec3::ZERO;
     for (triangle_index, hit) in hits.iter().take(hit_count).flatten().copied() {
         let triangle = &triangles[triangle_index];
-        let point = ray.origin + ray.direction * hit.distance;
-        let color = hit_color(triangle, hit, point, shader)?;
+        let color = hit_color(triangle, hit, ray, shader)?;
         let opacity = triangle_opacity(&triangle.source);
         let contribution = transmittance * opacity;
         premultiplied += DVec3::new(color[0], color[1], color[2]) * contribution;
@@ -1724,8 +1756,8 @@ mod smooth_shading_tests {
     use glam::DVec3;
 
     use super::{
-        AlphaMode, Camera, Mode, Projection, RasterOutput, StereoMode, SurfaceShader, Triangle,
-        rasterize_with_samples,
+        AlphaMode, Camera, Mode, Projection, RasterOutput, StereoMode, SurfaceHit, SurfaceShader,
+        Triangle, rasterize_with_samples,
     };
     use crate::error::Result;
 
@@ -1743,15 +1775,8 @@ mod smooth_shading_tests {
     }
 
     impl SurfaceShader for RecordingShader {
-        fn shade(
-            &self,
-            _triangle: &Triangle,
-            point: DVec3,
-            _shadow_point: DVec3,
-            normal: DVec3,
-            geometric: DVec3,
-        ) -> Result<[f64; 3]> {
-            self.calls.borrow_mut().push((point, normal, geometric));
+        fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 3]> {
+            self.calls.borrow_mut().push((hit.point, hit.normal, hit.geometric));
             Ok([0.25, 0.5, 0.75])
         }
     }
@@ -1788,6 +1813,8 @@ mod smooth_shading_tests {
             uv: [[0.0; 2]; 3],
             layer_uvs: Vec::new(),
             normals,
+            layer_colors: Vec::new(),
+            lit_per_pixel: false,
         }
     }
 
