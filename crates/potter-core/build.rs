@@ -47,10 +47,24 @@ fn main() -> Result<(), io::Error> {
         .std("c++14")
         .file(manifest_dir.join("native/blender_inverse_m4.cc"))
         .include(&eigen_dir);
-    if target == "aarch64-apple-darwin" {
+    eigen.opt_level(2);
+    if target.ends_with("-apple-darwin") {
         eigen
-            .opt_level(2)
             .flag("-mdynamic-no-pic")
+            .flag("-pipe")
+            .flag("-funsigned-char")
+            .flag("-fno-strict-aliasing")
+            .flag("-ffp-contract=off");
+        if target.starts_with("x86_64-") {
+            eigen
+                .flag("-msse")
+                .flag("-msse2")
+                .flag("-msse3")
+                .flag("-mssse3");
+        }
+    } else if target.ends_with("-unknown-linux-gnu") {
+        eigen
+            .flag("-fPIC")
             .flag("-pipe")
             .flag("-funsigned-char")
             .flag("-fno-strict-aliasing")
