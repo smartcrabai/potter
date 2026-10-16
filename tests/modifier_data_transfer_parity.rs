@@ -1,8 +1,14 @@
 use std::{collections::{BTreeMap, BTreeSet}, error::Error, fs, process::Command};
 
-use glam::{DMat4, DVec3};
+use glam::{DMat4, DVec3, Mat4};
 use potter_core::{
-    geom::{Mesh, modifiers::attributes::{AttributeLayerSelection, SceneOperand, evaluate_with_transfer_context}},
+    geom::{
+        Mesh,
+        modifiers::attributes::{
+            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32,
+            evaluate_with_transfer_context,
+        },
+    },
     model::{CameraData, Modifier, ModifierRuntime},
 };
 use serde_json::{Value, json};
@@ -33,10 +39,16 @@ fn layer_selection(groups: &[&str], active_group: Option<usize>) -> AttributeLay
     }
 }
 
-fn operand(mesh: Mesh, local_to_subject: DMat4, groups: &[&str], active: Option<usize>) -> SceneOperand {
+fn operand(mesh: Mesh, _local_to_subject: DMat4, groups: &[&str], active: Option<usize>) -> SceneOperand {
+    let identity = Mat4::IDENTITY.to_cols_array();
     SceneOperand {
         mesh,
-        local_to_subject,
+        local_to_subject: None,
+        blender_matrices_f32: Some(SceneOperandMatricesF32 {
+            world: identity,
+            local_to_subject: Some(identity),
+            subject_to_local: Some(identity),
+        }),
         camera: None::<CameraData>,
         armature: false,
         object_scale: DVec3::ONE,
@@ -333,11 +345,11 @@ src = obj('Source', [(0,0,0),(2,0,0),(2,1,0),(0,1,0)], [(0,1,2,3)])
 group(src, 'A', [0.05,0.35,0.8,0.95])
 src.matrix_world = Matrix.Translation(Vector((0.2,-0.1,0.0))) @ Matrix.Diagonal((1.2,0.8,1.1,1.0))
 result = {}
-def run(key, verts, faces, mode, max_distance=10.0):
+def run(key, verts, faces, mode, max_distance=10.0, use_transform=True):
     dst = obj('Dest' + key, verts, faces); group(dst, 'A', [0.2 + 0.1*i for i in range(len(verts))])
     dst.matrix_world = Matrix.Translation(Vector((-0.1,0.15,0.0))) @ Matrix.Diagonal((0.9,1.1,1.0,1.0))
     mod = dst.modifiers.new('Transfer', 'DATA_TRANSFER'); mod.object = src
-    mod.use_object_transform = True; mod.use_vert_data = True; mod.data_types_verts = {'VGROUP_WEIGHTS'}
+    mod.use_object_transform = use_transform; mod.use_vert_data = True; mod.data_types_verts = {'VGROUP_WEIGHTS'}
     mod.vert_mapping = mode; mod.mix_mode = 'REPLACE'; mod.mix_factor = 1.0
     mod.use_max_distance = True; mod.max_distance = max_distance; mod.ray_radius = 0.01
     bpy.context.view_layer.update(); result[key] = read(dst)
@@ -346,6 +358,7 @@ for mode in ('NEAREST','EDGE_NEAREST','EDGEINTERP_NEAREST','POLY_NEAREST','POLYI
     run(mode, tri, [(0,1,2)], mode)
 run('TOPOLOGY', [(0.0,0.0,0.0),(2.0,0.0,0.0),(2.0,1.0,0.0),(0.0,1.0,0.0)], [(0,1,2,3)], 'TOPOLOGY')
 run('DISTANCE_CUTOFF',[(20,20,20),(21,20,20),(20,21,20)],[(0,1,2)],'NEAREST',0.1)
+run('NO_OBJECT_TRANSFORM',tri,[(0,1,2)],'NEAREST',10.0,False)
 with open(os.path.join(root, 'vertex-mapping-oracle.json'), 'w') as f: json.dump(result, f)
 "#;
 
@@ -376,8 +389,25 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     let destination_world = DMat4::from_scale_rotation_translation(
         DVec3::new(0.9,1.1,1.0), glam::DQuat::IDENTITY, DVec3::new(-0.1,0.15,0.0));
     let source_to_destination = destination_world.inverse() * source_world;
+    let source_world_f32 = [
+        1.2,0.0,0.0,0.0,0.0,0.8,0.0,0.0,0.0,0.0,1.1,0.0,0.2,-0.1,0.0,1.0,
+    ];
+    let local_to_subject_f32 = [
+        1.3333335,0.0,0.0,0.0,0.0,0.7272727,0.0,0.0,0.0,0.0,1.1,0.0,
+        0.33333337,-0.22727272,0.0,1.0,
+    ];
+    let subject_to_local_f32 = [
+        0.74999994,0.0,0.0,0.0,0.0,1.3750001,0.0,0.0,0.0,0.0,0.90909094,0.0,
+        -0.25,0.31250003,0.0,1.0,
+    ];
+    let mut source_operand=operand(source.clone(),source_to_destination,&["A"],Some(0));
+    source_operand.blender_matrices_f32=Some(SceneOperandMatricesF32 {
+        world:source_world_f32,
+        local_to_subject:Some(local_to_subject_f32),
+        subject_to_local:Some(subject_to_local_f32),
+    });
     let mut source_operands = BTreeMap::new();
-    source_operands.insert("object".to_owned(), vec![operand(source.clone(), source_to_destination, &["A"], Some(0))]);
+    source_operands.insert("object".to_owned(), vec![source_operand]);
     let mappings = ["NEAREST","EDGE_NEAREST","EDGEINTERP_NEAREST","POLY_NEAREST","POLYINTERP_NEAREST","POLYINTERP_VNORPROJ"];
     let destination_positions = [
         DVec3::new(0.15,0.12,0.18), DVec3::new(1.45,0.18,0.15), DVec3::new(0.85,0.86,0.21),
@@ -397,6 +427,23 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
         let error = max_error(&json!(group_weights(&actual, "A")), &expected[mapping])?;
         assert!(error < 2.0e-4, "{mapping} max error {error}");
     }
+    let mut no_transform_destination=Mesh::from_positions_and_faces(
+        destination_positions.to_vec(),vec![vec![0,1,2]])?;
+    set_group(&mut no_transform_destination,"A",&[0.2,0.3,0.4]);
+    let no_transform_modifier=modifier("data_transfer",json!({
+        "object":"source","use_object_transform":false,"use_vert_data":true,
+        "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"NEAREST",
+        "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":10.0,
+    }))?;
+    let no_transform_actual=evaluate_with_transfer_context(
+        &no_transform_destination,&no_transform_modifier,&source_operands,None,
+        DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
+    let no_transform_error=max_error(
+        &json!(group_weights(&no_transform_actual,"A")),
+        &expected["NO_OBJECT_TRANSFORM"],
+    )?;
+    assert!(no_transform_error<2.0e-4,
+        "use_object_transform=false max error {no_transform_error}");
     let mut cutoff = Mesh::from_positions_and_faces(
         vec![DVec3::new(20.0,20.0,20.0),DVec3::new(21.0,20.0,20.0),DVec3::new(20.0,21.0,20.0)],
         vec![vec![0,1,2]],
@@ -1306,7 +1353,7 @@ source=make('EdgeSource',[(0,0,0),(2,0,0),(2,2,0),(0,2,0)],[(0,1,2,3)])
 crease=source.data.attributes.get('crease_edge') or source.data.attributes.new(name='crease_edge',type='FLOAT',domain='EDGE')
 for edge in source.data.edges: crease.data[edge.index].value=0.1+0.2*edge.index
 edge_result={}
-dest_vertices=[(0.2,0.15,0.1),(1.4,0.2,0.1),(0.9,1.5,0.1)]
+dest_vertices=[(0.2,0.0,0.1),(1.4,0.0,0.1),(0.9,1.5,0.1)]
 for mapping in ('NEAREST','VERT_NEAREST','POLY_NEAREST','EDGEINTERP_VNORPROJ'):
     dest=make('Edge'+mapping,dest_vertices,[(0,1,2)])
     attr=dest.data.attributes.get('crease_edge') or dest.data.attributes.new(name='crease_edge',type='FLOAT',domain='EDGE')
@@ -1316,6 +1363,14 @@ for mapping in ('NEAREST','VERT_NEAREST','POLY_NEAREST','EDGEINTERP_VNORPROJ'):
     mod.use_max_distance=True; mod.max_distance=5.0; mod.ray_radius=0.15
     bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
     edge_result[mapping]=[me.attributes['crease_edge'].data[e.index].value for e in me.edges]; ev.to_mesh_clear()
+dest=make('EdgeRadiusZero',dest_vertices,[(0,1,2)])
+attr=dest.data.attributes.get('crease_edge') or dest.data.attributes.new(name='crease_edge',type='FLOAT',domain='EDGE')
+for edge in dest.data.edges: attr.data[edge.index].value=0.0
+mod=dest.modifiers.new('Transfer','DATA_TRANSFER'); mod.object=source; mod.use_edge_data=True
+mod.data_types_edges={'CREASE'}; mod.edge_mapping='EDGEINTERP_VNORPROJ'; mod.mix_mode='REPLACE'; mod.mix_factor=1.0
+mod.use_max_distance=True; mod.max_distance=5.0; mod.ray_radius=0.0
+bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
+edge_result['EDGEINTERP_VNORPROJ_R0']=[me.attributes['crease_edge'].data[e.index].value for e in me.edges]; ev.to_mesh_clear()
 dest=make('EdgeTOPOLOGY',[(0,0,0.1),(2,0,0.1),(2,2,0.1),(0,2,0.1)],[(0,1,2,3)])
 attr=dest.data.attributes.get('crease_edge') or dest.data.attributes.new(name='crease_edge',type='FLOAT',domain='EDGE')
 for edge in dest.data.edges: attr.data[edge.index].value=0.0
@@ -1336,6 +1391,27 @@ for mapping in ('TOPOLOGY','NEAREST','NORMAL','POLYINTERP_PNORPROJ'):
     mod.use_max_distance=True; mod.max_distance=5.0; mod.ray_radius=0.01
     bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
     face_result[mapping]=[me.attributes['freestyle_face'].data[i].value for i in range(len(me.polygons))]; ev.to_mesh_clear()
+grid_size=8
+coords=[-1.0+2.0*i/grid_size for i in range(grid_size+1)]
+oblique_source_verts=[(0.0,y,z) for z in coords for y in coords]
+oblique_source_faces=[]
+for zi in range(grid_size):
+    for yi in range(grid_size):
+        a=zi*(grid_size+1)+yi; b=a+1; d=(zi+1)*(grid_size+1)+yi; c=d+1
+        oblique_source_faces.append((a,b,c,d))
+oblique_dest_verts=[(0.1,-0.8,-0.7),(0.1,0.9,-0.6),(0.1,0.65,0.8),(0.1,-0.7,0.9)]
+for label,selected in (('PNORPROJ_OBLIQUE_HIT',19),('PNORPROJ_OBLIQUE_MISS',0)):
+    source=make('ObliqueSource'+label,oblique_source_verts,oblique_source_faces)
+    flags=source.data.attributes.new(name='freestyle_face',type='BOOLEAN',domain='FACE')
+    for index,item in enumerate(flags.data): item.value=(index==selected)
+    dest=make('ObliqueDest'+label,oblique_dest_verts,[(0,1,2,3)])
+    attr=dest.data.attributes.new(name='freestyle_face',type='BOOLEAN',domain='FACE')
+    attr.data[0].value=False
+    mod=dest.modifiers.new('Transfer','DATA_TRANSFER'); mod.object=source; mod.use_poly_data=True
+    mod.data_types_polys={'FREESTYLE_FACE'}; mod.poly_mapping='POLYINTERP_PNORPROJ'
+    mod.mix_mode='REPLACE'; mod.mix_factor=1.0; mod.use_max_distance=True; mod.max_distance=5.0; mod.ray_radius=0.5
+    bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
+    face_result[label]=[me.attributes['freestyle_face'].data[i].value for i in range(len(me.polygons))]; ev.to_mesh_clear()
 with open(os.path.join(root,'domain-mapping-oracle.json'),'w') as f: json.dump({'edge':edge_result,'face':face_result},f)
 "#;
 
@@ -1436,7 +1512,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
     set_blender_attribute(&mut source,"crease_edge","EDGE","FLOAT",json!([0.1,0.3,0.5,0.7]))?;
     let mut operands=BTreeMap::new();
     operands.insert("object".to_owned(),vec![operand(source,DMat4::IDENTITY,&[],None)]);
-    let destination_vertices=vec![DVec3::new(0.2,0.15,0.1),DVec3::new(1.4,0.2,0.1),DVec3::new(0.9,1.5,0.1)];
+    let destination_vertices=vec![DVec3::new(0.2,0.0,0.1),DVec3::new(1.4,0.0,0.1),DVec3::new(0.9,1.5,0.1)];
     for mapping in ["NEAREST","VERT_NEAREST","POLY_NEAREST","EDGEINTERP_VNORPROJ"] {
         let mut destination=Mesh::from_positions_and_faces(destination_vertices.clone(),vec![vec![0,1,2]])?;
         set_blender_attribute(&mut destination,"crease_edge","EDGE","FLOAT",json!([0.0,0.0,0.0]))?;
@@ -1450,6 +1526,21 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         let error=max_error(&values,&expected["edge"][mapping])?;
         assert!(error<3.0e-4,"edge {mapping} max error {error}");
     }
+    let mut radius_zero_destination=Mesh::from_positions_and_faces(
+        destination_vertices.clone(),vec![vec![0,1,2]])?;
+    set_blender_attribute(&mut radius_zero_destination,"crease_edge","EDGE","FLOAT",json!([0.0,0.0,0.0]))?;
+    let radius_zero_transfer=modifier("data_transfer",json!({
+        "object":"source","use_object_transform":true,"use_edge_data":true,"data_types_edges":["CREASE"],
+        "edge_mapping":"EDGEINTERP_VNORPROJ","mix_mode":"REPLACE","mix_factor":1.0,
+        "use_max_distance":true,"max_distance":5.0,"ray_radius":0.0
+    }))?;
+    let radius_zero_actual=evaluate_with_transfer_context(
+        &radius_zero_destination,&radius_zero_transfer,&operands,None,DMat4::IDENTITY,
+        "destination",&AttributeLayerSelection::default())?;
+    let radius_zero_values=radius_zero_actual.attributes["blender_attributes"][0]["values"].clone();
+    let radius_zero_error=max_error(&radius_zero_values,&expected["edge"]["EDGEINTERP_VNORPROJ_R0"])?;
+    assert!(radius_zero_error<3.0e-4,
+        "EDGEINTERP_VNORPROJ radius=0 max error {radius_zero_error}");
     let mut topology_destination=Mesh::from_positions_and_faces(
         vec![DVec3::new(0.0,0.0,0.1),DVec3::new(2.0,0.0,0.1),DVec3::new(2.0,2.0,0.1),DVec3::new(0.0,2.0,0.1)],
         vec![vec![0,1,2,3]])?;
@@ -1481,6 +1572,49 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         let actual=evaluate_with_transfer_context(&destination,&transfer,&face_operands,None,DMat4::IDENTITY,"destination",&AttributeLayerSelection::default())?;
         let values=actual.attributes["blender_attributes"][0]["values"].clone();
         assert_eq!(values, expected["face"][mapping], "face {mapping} flags");
+    }
+    let grid_size=8usize;
+    let coordinates=(0..=grid_size)
+        .map(|index|-1.0+2.0*index as f64/grid_size as f64)
+        .collect::<Vec<_>>();
+    let oblique_positions=coordinates.iter().flat_map(|z|
+        coordinates.iter().map(move |y|DVec3::new(0.0,*y,*z))).collect::<Vec<_>>();
+    let mut oblique_faces=Vec::new();
+    for z in 0..grid_size {
+        for y in 0..grid_size {
+            let a=z*(grid_size+1)+y;
+            let b=a+1;
+            let d=(z+1)*(grid_size+1)+y;
+            let c=d+1;
+            oblique_faces.push(vec![a,b,c,d]);
+        }
+    }
+    let oblique_destination_positions=vec![
+        DVec3::new(0.1,-0.8,-0.7),DVec3::new(0.1,0.9,-0.6),
+        DVec3::new(0.1,0.65,0.8),DVec3::new(0.1,-0.7,0.9),
+    ];
+    for (label,selected) in [("PNORPROJ_OBLIQUE_HIT",19usize),("PNORPROJ_OBLIQUE_MISS",0)] {
+        let mut oblique_source=Mesh::from_positions_and_faces(
+            oblique_positions.clone(),oblique_faces.clone())?;
+        let face_flags=(0..grid_size*grid_size).map(|index|index==selected).collect::<Vec<_>>();
+        set_blender_attribute(&mut oblique_source,"freestyle_face","FACE","BOOLEAN",json!(face_flags))?;
+        let mut oblique_operands=BTreeMap::new();
+        oblique_operands.insert("object".to_owned(),vec![
+            operand(oblique_source,DMat4::IDENTITY,&[],None)]);
+        let mut oblique_destination=Mesh::from_positions_and_faces(
+            oblique_destination_positions.clone(),vec![vec![0,1,2,3]])?;
+        set_blender_attribute(&mut oblique_destination,"freestyle_face","FACE","BOOLEAN",json!([false]))?;
+        let oblique_transfer=modifier("data_transfer",json!({
+            "object":"source","use_object_transform":true,"use_poly_data":true,
+            "data_types_polys":["FREESTYLE_FACE"],"poly_mapping":"POLYINTERP_PNORPROJ",
+            "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
+            "max_distance":5.0,"ray_radius":0.5
+        }))?;
+        let oblique_actual=evaluate_with_transfer_context(
+            &oblique_destination,&oblique_transfer,&oblique_operands,None,DMat4::IDENTITY,
+            "destination",&AttributeLayerSelection::default())?;
+        let values=oblique_actual.attributes["blender_attributes"][0]["values"].clone();
+        assert_eq!(values,expected["face"][label],"oblique {label} flags");
     }
     Ok(())
 }

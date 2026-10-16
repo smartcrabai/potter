@@ -1,6 +1,7 @@
 //! UV project and UV warp modifiers, including projector cameras and bone references.
 
 use super::*;
+use glam::{Vec2, Vec3};
 
 fn active_uv_layer_index(store: &crate::geom::uv_layers::UvStore) -> Option<usize> {
     store
@@ -19,11 +20,11 @@ pub(super) fn uv_project(
     let Some(projectors) = operands.get("projectors").filter(|items| !items.is_empty()) else {
         return Ok(mesh.clone());
     };
-    let aspect_x = number(modifier, "aspect_x")?.max(1.0);
-    let aspect_y = number(modifier, "aspect_y")?.max(1.0);
+    let aspect_x = (number(modifier, "aspect_x")? as f32).max(1.0);
+    let aspect_y = (number(modifier, "aspect_y")? as f32).max(1.0);
     // Blender clamps these to zero, then treats zero as the default scale of one.
-    let scale_x = number(modifier, "scale_x")?.max(0.0);
-    let scale_y = number(modifier, "scale_y")?.max(0.0);
+    let scale_x = (number(modifier, "scale_x")? as f32).max(0.0);
+    let scale_y = (number(modifier, "scale_y")? as f32).max(0.0);
     let scale_x = if scale_x == 0.0 { 1.0 } else { scale_x };
     let scale_y = if scale_y == 0.0 { 1.0 } else { scale_y };
 
@@ -51,32 +52,31 @@ pub(super) fn uv_project(
         ));
         store.layers.len() - 1
     };
-    let vertex_indices = super::super::id_indices(mesh);
-    let mut projector_normals = Vec::with_capacity(projectors.len());
-    let mut world_to_projectors = Vec::with_capacity(projectors.len());
-    for projector in projectors {
-        let projector_world = subject_world * projector.local_to_subject;
-        projector_normals.push(projector_world.transform_vector3(DVec3::Z));
-        let camera_world = if projector.camera.as_ref().is_some_and(|camera| {
-            matches!(
-                camera.projection,
-                crate::model::CameraProjection::Panorama | crate::model::CameraProjection::Fisheye
+    let subject_world_f32 = subject_world.to_cols_array().map(|value| value as f32);
+    let world_positions = mesh
+        .vertices
+        .iter()
+        .map(|vertex| {
+            crate::geom::modifiers::blender_transform_point_f32(
+                &subject_world_f32,
+                Vec3::new(vertex.co.x as f32, vertex.co.y as f32, vertex.co.z as f32),
             )
-        }) {
-            normalize_camera_transform(projector_world)
-        } else {
-            projector_world
-        };
-        let world_to_projector = camera_world.inverse();
-        if !world_to_projector.is_finite() {
-            return Err(invalid(
+        })
+        .collect::<Vec<_>>();
+    let projector_data = projectors
+        .iter()
+        .map(|projector| {
+            make_projector_f32(
+                projector,
+                aspect_x as f32,
+                aspect_y as f32,
+                scale_x as f32,
+                scale_y as f32,
                 modifier,
-                "projectors",
-                "invertible projector transforms",
-            ));
-        }
-        world_to_projectors.push(world_to_projector);
-    }
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let vertex_indices = super::super::id_indices(mesh);
     for (face_index, face) in mesh.faces.iter().enumerate() {
         let face_vertex_indices = face
             .vertices
@@ -88,34 +88,27 @@ pub(super) fn uv_project(
                     .ok_or_else(|| invalid(modifier, "projectors", "valid face vertices"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let normal = polygon_normal_from_indices(mesh, &face_vertex_indices);
-        // Blender keeps the first projector when two camera directions tie.
+        let normal = face_normal_f32(mesh, &face_vertex_indices);
+        // Blender keeps the first projector when two camera directions tie. Normals and dots
+        // stay f32 and the projector normal retains its object scale, as in MOD_uvproject.cc.
         let mut best_index = 0;
-        let mut best_dot = projector_normals[0].dot(normal);
-        for (index, projector_normal) in projector_normals.iter().enumerate().skip(1) {
-            let dot = projector_normal.dot(normal);
+        let mut best_dot = projector_data[0].normal.x * normal.x
+            + projector_data[0].normal.y * normal.y
+            + projector_data[0].normal.z * normal.z;
+        for (index, projector) in projector_data.iter().enumerate().skip(1) {
+            let dot = projector.normal.x * normal.x
+                + projector.normal.y * normal.y
+                + projector.normal.z * normal.z;
             if dot > best_dot {
                 best_index = index;
                 best_dot = dot;
             }
         }
-        let projector = &projectors[best_index];
-        let world_to_projector = world_to_projectors[best_index];
+        let projection = &projector_data[best_index].projection;
         let mut coords = Vec::with_capacity(face.vertices.len());
         for vertex_index in face_vertex_indices {
-            let uv_up = project_uv_point(
-                mesh.vertices[vertex_index].co,
-                projector,
-                world_to_projector,
-                subject_world,
-                aspect_x,
-                aspect_y,
-                scale_x,
-                scale_y,
-            )?
-            .unwrap_or(DVec2::ZERO);
-            // Canonical UV storage uses V-down; Blender's projection matrix produces V-up.
-            coords.push([uv_up.x, 1.0 - uv_up.y]);
+            let uv_up = project_world_point_f32(world_positions[vertex_index], projection);
+            coords.push([f64::from(uv_up.x), f64::from(1.0_f32 - uv_up.y)]);
         }
         store.layers[layer_index].faces[face_index] = Some(coords);
     }
@@ -123,119 +116,396 @@ pub(super) fn uv_project(
     crate::geom::uv_layers::write_layers(&mut result, &store.layers);
     Ok(result)
 }
-fn polygon_normal_from_indices(mesh: &Mesh, indices: &[usize]) -> DVec3 {
-    if indices.len() < 3 {
-        return DVec3::Z;
+fn normalize_vector_blender_f32(vector: Vec3) -> (Vec3, f32) {
+    let length_squared = vector.x * vector.x + vector.y * vector.y + vector.z * vector.z;
+    if length_squared > 1.0e-35_f32 {
+        let length = length_squared.sqrt();
+        (vector * (1.0 / length), length)
+    } else {
+        (Vec3::ZERO, 0.0)
     }
-    let mut normal = DVec3::ZERO;
-    for (index, &current_index) in indices.iter().enumerate() {
-        let current = mesh.vertices[current_index].co;
-        let next = mesh.vertices[indices[(index + 1) % indices.len()]].co;
-        normal.x += (current.y - next.y) * (current.z + next.z);
-        normal.y += (current.z - next.z) * (current.x + next.x);
-        normal.z += (current.x - next.x) * (current.y + next.y);
-    }
-    normal.normalize_or_zero()
 }
 
-fn normalize_camera_transform(transform: DMat4) -> DMat4 {
-    DMat4::from_cols(
-        transform.x_axis.truncate().normalize_or_zero().extend(transform.x_axis.w),
-        transform.y_axis.truncate().normalize_or_zero().extend(transform.y_axis.w),
-        transform.z_axis.truncate().normalize_or_zero().extend(transform.z_axis.w),
-        transform.w_axis,
-    )
-}
-#[expect(
-    clippy::manual_midpoint,
-    reason = "matches Blender's float evaluation order for parity"
-)]
-fn project_uv_point(
-    point: DVec3,
-    projector: &SceneOperand,
-    world_to_projector: DMat4,
-    subject_world: DMat4,
-    aspect_x: f64,
-    aspect_y: f64,
-    scale_x: f64,
-    scale_y: f64,
-) -> Result<Option<DVec2>> {
-    let world = subject_world.transform_point3(point);
-    let local = world_to_projector.transform_point3(world);
-    let Some(camera) = &projector.camera else {
-        return Ok(Some(DVec2::new(
-            (local.x + 1.0) * 0.5,
-            (local.y + 1.0) * 0.5,
-        )));
+fn face_normal_f32(mesh: &Mesh, indices: &[usize]) -> Vec3 {
+    let point = |index: usize| {
+        let value = mesh.vertices[index].co;
+        Vec3::new(value.x as f32, value.y as f32, value.z as f32)
     };
+    let normal = match indices {
+        [a, b, c, d] => (point(*a) - point(*c)).cross(point(*b) - point(*d)),
+        [a, b, c] => (point(*a) - point(*b)).cross(point(*b) - point(*c)),
+        values if values.len() > 4 => {
+            let mut normal = Vec3::ZERO;
+            let mut previous = point(*values.last().expect("non-empty face"));
+            for &index in values {
+                let current = point(index);
+                normal.x += (previous.y - current.y) * (previous.z + current.z);
+                normal.y += (previous.z - current.z) * (previous.x + current.x);
+                normal.z += (previous.x - current.x) * (previous.y + current.y);
+                previous = current;
+            }
+            normal
+        }
+        _ => Vec3::ZERO,
+    };
+    let (normal, length) = normalize_vector_blender_f32(normal);
+    if length == 0.0 { Vec3::Z } else { normal }
+}
+
+enum ProjectorProjection {
+    Matrix([f32; 16]),
+    Panorama {
+        world_to_camera: [f32; 16],
+        aspect_x: f32,
+        aspect_y: f32,
+        shift_x: f32,
+        shift_y: f32,
+        camera_size: f32,
+    },
+}
+
+struct ProjectorF32 {
+    normal: Vec3,
+    projection: ProjectorProjection,
+}
+
+fn make_projector_f32(
+    projector: &SceneOperand,
+    aspect_x: f32,
+    aspect_y: f32,
+    scale_x: f32,
+    scale_y: f32,
+    modifier: &Modifier,
+) -> Result<ProjectorF32> {
+    let world = projector
+        .blender_matrices_f32
+        .as_ref()
+        .map(|matrices| matrices.world)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "UV Project projector world matrix is missing from the evaluated scene context",
+                json!({"modifier_id":modifier.id}),
+            )
+        })?;
+    let normal = Vec3::new(world[8], world[9], world[10]);
+    let Some(camera) = &projector.camera else {
+        let world_to_projector = crate::geom::modifiers::blender_inverse_m4(world);
+        if matrix_is_zero(&world_to_projector) {
+            return Err(invalid(modifier, "projectors", "invertible projector transforms"));
+        }
+        let offset = uv_projection_offset_matrix();
+        return Ok(ProjectorF32 {
+            normal,
+            projection: ProjectorProjection::Matrix(
+                crate::geom::modifiers::blender_multiply_m4(offset, world_to_projector),
+            ),
+        });
+    };
+
     if matches!(
         camera.projection,
         crate::model::CameraProjection::Panorama | crate::model::CameraProjection::Fisheye
     ) {
-        let (aspect_u, aspect_v) = if aspect_x > aspect_y {
+        let normalized_world = normalize_camera_world_f32(world);
+        let world_to_camera = crate::geom::modifiers::blender_inverse_m4(normalized_world);
+        if matrix_is_zero(&world_to_camera) {
+            return Err(invalid(modifier, "projectors", "invertible projector transforms"));
+        }
+        let (base_aspect_x, base_aspect_y) = if aspect_x > aspect_y {
             (1.0, aspect_x / aspect_y)
         } else {
             (aspect_y / aspect_x, 1.0)
         };
-        return Ok(Some(DVec2::new(
-            local.x.atan2(-local.z) / (2.0 * std::f64::consts::PI) * aspect_u * scale_x + 0.5
-                - camera.shift[0] * aspect_u,
-            local.y / camera.ortho_scale * aspect_v * scale_y + 0.5
-                - camera.shift[1] * aspect_v,
-        )));
+        return Ok(ProjectorF32 {
+            normal,
+            projection: ProjectorProjection::Panorama {
+                world_to_camera,
+                aspect_x: base_aspect_x * scale_x,
+                aspect_y: base_aspect_y * scale_y,
+                shift_x: 0.5 - camera.shift[0] as f32 * base_aspect_x,
+                shift_y: 0.5 - camera.shift[1] as f32 * base_aspect_y,
+                camera_size: camera.ortho_scale as f32,
+            },
+        });
     }
 
+    let world_to_projector = crate::geom::modifiers::blender_inverse_m4(world);
+    if matrix_is_zero(&world_to_projector) {
+        return Err(invalid(modifier, "projectors", "invertible projector transforms"));
+    }
+    let win_matrix = camera_projection_matrix_f32(camera, aspect_x, aspect_y, scale_x, scale_y);
+    let temporary = crate::geom::modifiers::blender_multiply_m4(win_matrix, world_to_projector);
+    let projection = crate::geom::modifiers::blender_multiply_m4(
+        uv_projection_offset_matrix(),
+        temporary,
+    );
+    Ok(ProjectorF32 {
+        normal,
+        projection: ProjectorProjection::Matrix(projection),
+    })
+}
+
+fn camera_projection_matrix_f32(
+    camera: &crate::model::CameraData,
+    aspect_x: f32,
+    aspect_y: f32,
+    scale_x: f32,
+    scale_y: f32,
+) -> [f32; 16] {
     let ycor = aspect_y / aspect_x;
     let sensor_fit = match camera.sensor_fit.as_str() {
-        "HORIZONTAL" => "HORIZONTAL",
-        "VERTICAL" => "VERTICAL",
-        _ if ycor <= 1.0 => "HORIZONTAL",
-        _ => "VERTICAL",
+        "HORIZONTAL" => true,
+        "VERTICAL" => false,
+        _ => aspect_x >= aspect_y,
     };
-    let view_factor = if sensor_fit == "HORIZONTAL" {
-        1.0
+    let sensor_size = if camera.sensor_fit == "VERTICAL" {
+        camera.sensor_height_mm as f32
     } else {
-        ycor
+        camera.sensor_width_mm as f32
     };
-    let shift_x = camera.shift[0];
-    let shift_y = camera.shift[1];
-    let ndc = match camera.projection {
-        crate::model::CameraProjection::Orthographic => DVec2::new(
-            2.0 * local.x * view_factor / (camera.ortho_scale * scale_x)
-                - 2.0 * shift_x * view_factor,
-            2.0 * local.y * view_factor / (ycor * camera.ortho_scale * scale_y)
-                - 2.0 * shift_y * view_factor / ycor,
-        ),
-        crate::model::CameraProjection::Perspective => {
-            let depth = -local.z;
-            if depth.abs() <= f64::EPSILON {
-                return Ok(None);
+    let lens = (camera.lens_mm as f32).max(1.0e-9);
+    let ortho_scale = (camera.ortho_scale as f32).max(1.0e-9);
+    let clip_start = camera.clip_start as f32;
+    let clip_end = (camera.clip_end as f32).max(clip_start + 1.0e-3);
+    let is_ortho = camera.projection == crate::model::CameraProjection::Orthographic;
+    let mut pixel_size = if is_ortho {
+        ortho_scale
+    } else {
+        (sensor_size * clip_start) / lens
+    };
+    let view_factor = if sensor_fit { 1.0 } else { ycor };
+    pixel_size /= view_factor;
+    pixel_size *= 1.0;
+
+    let shift_x = camera.shift[0] as f32;
+    let shift_y = camera.shift[1] as f32;
+    let dx = shift_x * view_factor;
+    let dy = shift_y * view_factor;
+    let mut left = (-0.5_f32 + dx) * pixel_size;
+    let mut right = (0.5_f32 + dx) * pixel_size;
+    let mut bottom = (-0.5_f32 * ycor + dy) * pixel_size;
+    let mut top = (0.5_f32 * ycor + dy) * pixel_size;
+    left *= scale_x;
+    right *= scale_x;
+    bottom *= scale_y;
+    top *= scale_y;
+
+    let x_delta = right - left;
+    let y_delta = top - bottom;
+    let z_delta = clip_end - clip_start;
+    if is_ortho {
+        let mut matrix = [0.0_f32; 16];
+        matrix[0] = 1.0;
+        matrix[5] = 1.0;
+        matrix[10] = 1.0;
+        matrix[15] = 1.0;
+        matrix[0] = 2.0 / x_delta;
+        matrix[12] = -(right + left) / x_delta;
+        matrix[5] = 2.0 / y_delta;
+        matrix[13] = -(top + bottom) / y_delta;
+        matrix[10] = -2.0 / z_delta;
+        matrix[14] = -(clip_end + clip_start) / z_delta;
+        matrix
+    } else {
+        let mut matrix = [0.0_f32; 16];
+        matrix[0] = clip_start * 2.0 / x_delta;
+        matrix[5] = clip_start * 2.0 / y_delta;
+        matrix[8] = (right + left) / x_delta;
+        matrix[9] = (top + bottom) / y_delta;
+        matrix[10] = -(clip_end + clip_start) / z_delta;
+        matrix[11] = -1.0;
+        matrix[14] = (-2.0 * clip_start * clip_end) / z_delta;
+        matrix
+    }
+}
+
+fn uv_projection_offset_matrix() -> [f32; 16] {
+    [
+        0.5, 0.0, 0.0, 0.0,
+        0.0, 0.5, 0.0, 0.0,
+        0.0, 0.0, 0.5, 0.0,
+        0.5, 0.5, 0.5, 1.0,
+    ]
+}
+
+fn normalize_camera_world_f32(mut matrix: [f32; 16]) -> [f32; 16] {
+    for column in 0..3 {
+        let index = column * 4;
+        let (axis, length) = normalize_vector_blender_f32(Vec3::new(
+            matrix[index],
+            matrix[index + 1],
+            matrix[index + 2],
+        ));
+        matrix[index] = axis.x;
+        matrix[index + 1] = axis.y;
+        matrix[index + 2] = axis.z;
+        if length != 0.0 {
+            matrix[index + 3] /= length;
+        }
+    }
+    matrix
+}
+
+fn matrix_is_zero(matrix: &[f32; 16]) -> bool {
+    matrix.iter().all(|value| *value == 0.0)
+}
+
+fn project_world_point_f32(point: Vec3, projection: &ProjectorProjection) -> Vec2 {
+    match projection {
+        ProjectorProjection::Matrix(matrix) => {
+            let w = (point.x * matrix[3]
+                + point.y * matrix[7]
+                + matrix[11] * point.z
+                + matrix[15])
+                .abs();
+            if w == 0.0 {
+                return Vec2::ZERO;
             }
-            // CAMERA_SENSOR_FIT_AUTO selects sensor X in camera_params_from_object.
-            let sensor_size = if camera.sensor_fit == "VERTICAL" {
-                camera.sensor_height_mm
-            } else {
-                camera.sensor_width_mm
-            };
-            DVec2::new(
-                2.0 * local.x * view_factor * camera.lens_mm / (depth * sensor_size * scale_x)
-                    - 2.0 * shift_x * view_factor,
-                2.0 * local.y * view_factor * camera.lens_mm
-                    / (depth * ycor * sensor_size * scale_y)
-                    - 2.0 * shift_y * view_factor / ycor,
+            Vec2::new(
+                (point.x * matrix[0]
+                    + point.y * matrix[4]
+                    + matrix[8] * point.z
+                    + matrix[12])
+                    / w,
+                (point.x * matrix[1]
+                    + point.y * matrix[5]
+                    + matrix[9] * point.z
+                    + matrix[13])
+                    / w,
             )
         }
-        crate::model::CameraProjection::Panorama | crate::model::CameraProjection::Fisheye => {
-            unreachable!("panoramic cameras were handled above")
+        ProjectorProjection::Panorama {
+            world_to_camera,
+            aspect_x,
+            aspect_y,
+            shift_x,
+            shift_y,
+            camera_size,
+        } => {
+            let camera_point = crate::geom::modifiers::blender_transform_point_f32(
+                world_to_camera,
+                point,
+            );
+            let angle = camera_point.x.atan2(-camera_point.z)
+                / (std::f32::consts::PI * 2.0);
+            Vec2::new(
+                angle * *aspect_x + *shift_x,
+                camera_point.y / *camera_size * *aspect_y + *shift_y,
+            )
         }
+    }
+}
+
+/// Build Blender's complete UV Warp matrix from original object or pose-bone world matrices.
+pub(crate) fn build_uv_warp_matrix_f32(
+    source_world: Option<[f32; 16]>,
+    destination_world: Option<[f32; 16]>,
+    modifier: &Modifier,
+) -> Result<[f32; 16]> {
+    let axis_u = warp_axis_index(string(modifier, "axis_u")?, modifier, "axis_u")?;
+    let axis_v = warp_axis_index(string(modifier, "axis_v")?, modifier, "axis_v")?;
+    let center = vector2(modifier, "center")?;
+    let center = [center.x as f32, center.y as f32];
+    let offset = vector2(modifier, "offset")?;
+    let offset = [offset.x as f32, offset.y as f32];
+    let scale = vector2(modifier, "scale")?;
+    let scale = [scale.x as f32, scale.y as f32, 1.0_f32];
+    let rotation = number(modifier, "rotation")? as f32;
+
+    let mut warp = if let (Some(source_world), Some(destination_world)) =
+        (source_world, destination_world)
+    {
+        let inverse_destination =
+            crate::geom::modifiers::blender_inverse_m4(destination_world);
+        let mut object_warp =
+            crate::geom::modifiers::blender_multiply_m4(inverse_destination, source_world);
+
+        if center[0] != 0.0 || center[1] != 0.0 {
+            let mut center_matrix = identity_matrix_f32();
+            center_matrix[12 + axis_u] = center[0];
+            center_matrix[12 + axis_v] = center[1];
+            let inverse_center = crate::geom::modifiers::blender_inverse_m4(center_matrix);
+            object_warp = crate::geom::modifiers::blender_multiply_m4(object_warp, inverse_center);
+            object_warp = crate::geom::modifiers::blender_multiply_m4(center_matrix, object_warp);
+        }
+
+        let mut shuffle = [0.0_f32; 16];
+        shuffle[axis_u * 4] = 1.0;
+        shuffle[axis_v * 4 + 1] = 1.0;
+        shuffle[15] = 1.0;
+        let mut shuffle_transposed = [0.0_f32; 16];
+        for column in 0..4 {
+            for row in 0..4 {
+                shuffle_transposed[column * 4 + row] = shuffle[row * 4 + column];
+            }
+        }
+        object_warp = crate::geom::modifiers::blender_multiply_m4(shuffle, object_warp);
+        crate::geom::modifiers::blender_multiply_m4(object_warp, shuffle_transposed)
+    } else {
+        identity_matrix_f32()
     };
-    Ok(Some((ndc + DVec2::ONE) * 0.5))
+    blender_translate_m4(&mut warp, [center[0], center[1], 0.0]);
+    blender_rescale_m4(&mut warp, scale);
+    blender_rotate_z_m4(&mut warp, rotation);
+    blender_translate_m4(&mut warp, [offset[0], offset[1], 0.0]);
+    blender_translate_m4(&mut warp, [-center[0], -center[1], 0.0]);
+    Ok(warp)
+}
+
+fn warp_axis_index(axis: &str, modifier: &Modifier, parameter: &str) -> Result<usize> {
+    match axis {
+        "X" => Ok(0),
+        "Y" => Ok(1),
+        "Z" => Ok(2),
+        _ => Err(invalid(modifier, parameter, "X, Y, or Z")),
+    }
+}
+
+fn identity_matrix_f32() -> [f32; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+}
+
+fn blender_translate_m4(matrix: &mut [f32; 16], translation: [f32; 3]) {
+    matrix[12] += translation[0] * matrix[0]
+        + translation[1] * matrix[4]
+        + translation[2] * matrix[8];
+    matrix[13] += translation[0] * matrix[1]
+        + translation[1] * matrix[5]
+        + translation[2] * matrix[9];
+    matrix[14] += translation[0] * matrix[2]
+        + translation[1] * matrix[6]
+        + translation[2] * matrix[10];
+}
+
+fn blender_rescale_m4(matrix: &mut [f32; 16], scale: [f32; 3]) {
+    for column in 0..3 {
+        for row in 0..3 {
+            matrix[column * 4 + row] *= scale[column];
+        }
+    }
+}
+
+fn blender_rotate_z_m4(matrix: &mut [f32; 16], angle: f32) {
+    let cosine = angle.cos();
+    let sine = angle.sin();
+    for row in 0..4 {
+        let x = matrix[row];
+        let y = matrix[4 + row];
+        matrix[row] = cosine * x + sine * y;
+        matrix[4 + row] = -sine * x + cosine * y;
+    }
 }
 
 pub(super) fn uv_warp(
     mesh: &Mesh,
     modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
+    _operands: &BTreeMap<String, Vec<SceneOperand>>,
 ) -> Result<Mesh> {
     let mut store = crate::geom::uv_layers::read(mesh);
     if store.layers.is_empty() {
@@ -252,12 +522,22 @@ pub(super) fn uv_warp(
     let Some(layer_index) = layer_index else {
         return Ok(mesh.clone());
     };
-    let center = vector2(modifier, "center")?;
-    let axis_u = selected_axis(string(modifier, "axis_u")?, modifier, "axis_u")?;
-    let axis_v = selected_axis(string(modifier, "axis_v")?, modifier, "axis_v")?;
-    let offset = vector2(modifier, "offset")?;
-    let scale = vector2(modifier, "scale")?;
-    let rotation = number(modifier, "rotation")?;
+    let matrix = if let Some(columns) = modifier.runtime.uv_warp_matrix {
+        flatten_runtime_matrix(columns)
+    } else if ["object_from", "object_to"].iter().all(|parameter| {
+        modifier
+            .params
+            .get(*parameter)
+            .is_none_or(|value| value.is_null() || value.as_str().is_some_and(str::is_empty))
+    }) {
+        build_uv_warp_matrix_f32(None, None, modifier)?
+    } else {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "UV Warp matrix is missing from the evaluated scene context",
+            json!({"modifier_id":modifier.id}),
+        ));
+    };
     let group = optional_string(modifier, "vertex_group")?;
     let has_deform_weights = mesh
         .attributes
@@ -280,42 +560,6 @@ pub(super) fn uv_warp(
         .map(|name| get_group_weights(mesh, name))
         .transpose()?;
     let invert_group = boolean(modifier, "invert_vertex_group")?;
-    let from = operands.get("object_from").and_then(|items| items.first());
-    let to = operands.get("object_to").and_then(|items| items.first());
-    let from_bone = optional_string(modifier, "bone_from")?.is_some();
-    let to_bone = optional_string(modifier, "bone_to")?.is_some();
-    let object_transform = match (from, to) {
-        (Some(from), Some(to)) => {
-            let from_matrix = if from_bone {
-                warp_bone_matrix(
-                    modifier,
-                    "bone_from",
-                    modifier.runtime.warp_from_matrix,
-                )?
-            } else {
-                from.local_to_subject
-            };
-            let to_matrix = if to_bone {
-                warp_bone_matrix(
-                    modifier,
-                    "bone_to",
-                    modifier.runtime.warp_to_matrix,
-                )?
-            } else {
-                to.local_to_subject
-            };
-            let inverse = to_matrix.inverse();
-            if !inverse.is_finite() {
-                return Err(invalid(
-                    modifier,
-                    "object_to",
-                    "an invertible object transform",
-                ));
-            }
-            Some(inverse * from_matrix)
-        }
-        _ => None,
-    };
     let source_faces = &store.layers[layer_index].faces;
     let mut output_faces = Vec::with_capacity(mesh.faces.len());
     for (face_index, face) in mesh.faces.iter().enumerate() {
@@ -327,27 +571,21 @@ pub(super) fn uv_warp(
                 .map(|value| DVec2::from_array(*value))
                 .unwrap_or(DVec2::ZERO);
             // Canonical mesh UVs are V-down; Blender UV Warp works in V-up coordinates.
-            let base = DVec2::new(base_down.x, 1.0 - base_down.y);
-            let mut mask = weights
+            let base = Vec3::new(base_down.x as f32, (1.0 - base_down.y) as f32, 0.0);
+            let mut weight = weights
                 .as_ref()
-                .map_or(1.0, |values| values.get(vertex_id).copied().unwrap_or(0.0))
-                .clamp(0.0, 1.0);
+                .map_or(1.0_f32, |values| {
+                    values.get(vertex_id).copied().unwrap_or(0.0) as f32
+                });
             if invert_group && weights.is_some() {
-                mask = 1.0 - mask;
+                weight = 1.0 - weight;
             }
-            let relative = base - center + offset;
-            let rotated = DMat3::from_rotation_z(rotation)
-                .mul_vec3(DVec3::new(relative.x, relative.y, 0.0))
-                .truncate();
-            let direct = center + DVec2::new(rotated.x * scale.x, rotated.y * scale.y);
-            let transformed = object_transform.map_or(direct, |transform| {
-                let center_3d = axis_u * center.x + axis_v * center.y;
-                let direct_3d = axis_u * direct.x + axis_v * direct.y;
-                let mapped = center_3d + transform.transform_point3(direct_3d - center_3d);
-                DVec2::new(mapped.dot(axis_u), mapped.dot(axis_v))
-            });
-            let output = base.lerp(transformed, mask);
-            uv_down.push([output.x, 1.0 - output.y]);
+            let transformed = crate::geom::modifiers::blender_transform_point_f32(&matrix, base);
+            let output = Vec2::new(
+                base.x + (transformed.x - base.x) * weight,
+                base.y + (transformed.y - base.y) * weight,
+            );
+            uv_down.push([f64::from(output.x), f64::from(1.0_f32 - output.y)]);
         }
         output_faces.push(Some(uv_down));
     }
@@ -356,14 +594,8 @@ pub(super) fn uv_warp(
     crate::geom::uv_layers::write_layers(&mut result, &store.layers);
     Ok(result)
 }
-fn warp_bone_matrix(modifier: &Modifier, parameter: &str, matrix: Option<[f64; 16]>) -> Result<DMat4> {
-    let matrix = matrix.ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            format!("UV Warp `{parameter}` transform is missing from the evaluated scene context"),
-            json!({"modifier_id":modifier.id,"parameter":parameter}),
-        )
-    })?;
-    Ok(DMat4::from_cols_array(&matrix))
+
+fn flatten_runtime_matrix(columns: [[f32; 4]; 4]) -> [f32; 16] {
+    std::array::from_fn(|index| columns[index / 4][index % 4])
 }
 

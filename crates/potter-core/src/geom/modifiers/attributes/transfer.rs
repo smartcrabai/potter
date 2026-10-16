@@ -1,11 +1,12 @@
 //! Data transfer modifier: per-domain mapping, layer selection, and mixing.
 
 use super::*;
-use glam::{DMat3, DMat4, DVec2, DVec3};
+use glam::{DVec2, DVec3};
 use serde_json::{Map, Value, json};
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use crate::geom::color_layers::{self, ColorDomain};
+use crate::geom::spatial::BoundsBvh;
 use crate::geom::uv_layers::{read as read_uv_store, read_layers, write_layers, UvLayer};
 
 pub(super) fn data_transfer(
@@ -21,10 +22,20 @@ pub(super) fn data_transfer(
         return Ok(mesh.clone());
     };
     let use_transform = boolean(modifier, "use_object_transform")?;
-    let source_transform = if use_transform {
-        source.local_to_subject
+    let (source_to_destination_f32, destination_to_source_f32) = if use_transform {
+        let matrices = source.blender_matrices_f32.as_ref().ok_or_else(|| {
+            invalid(modifier, "object", "source Blender f32 transform matrices")
+        })?;
+        let local_to_subject = matrices.local_to_subject.ok_or_else(|| {
+            invalid(modifier, "object", "source local-to-subject f32 transform")
+        })?;
+        let subject_to_local = matrices.subject_to_local.ok_or_else(|| {
+            invalid(modifier, "object", "source subject-to-local f32 transform")
+        })?;
+        (local_to_subject, subject_to_local)
     } else {
-        DMat4::IDENTITY
+        let identity = glam::Mat4::IDENTITY.to_cols_array();
+        (identity, identity)
     };
     let use_vertices = boolean(modifier, "use_vert_data")?;
     let use_edges = boolean(modifier, "use_edge_data")?;
@@ -94,10 +105,23 @@ pub(super) fn data_transfer(
             || matches!(loop_mapping, "NEAREST_NORMAL" | "POLYINTERP_LNORPROJ"));
     let needs_vertex_normals = (use_vertices && vertex_mapping == "POLYINTERP_VNORPROJ")
         || (use_edges && edge_mapping == "EDGEINTERP_VNORPROJ");
+    let needs_source_face_graph =
+        (use_vertices
+            && !data_types_verts.is_empty()
+            && matches!(
+                vertex_mapping,
+                "POLY_NEAREST" | "POLYINTERP_NEAREST" | "POLYINTERP_VNORPROJ"
+            ))
+            || (use_edges
+                && !data_types_edges.is_empty()
+                && edge_mapping == "POLY_NEAREST")
+            || (use_loops && !data_types_loops.is_empty() && loop_mapping != "TOPOLOGY")
+            || (use_polygons && !data_types_polys.is_empty() && polygon_mapping != "TOPOLOGY");
     let mapping_context = TransferMapContext::new(
         &source.mesh,
         mesh,
-        source_transform,
+        source_to_destination_f32,
+        destination_to_source_f32,
         max_distance,
         ray_radius,
         islands_precision,
@@ -107,6 +131,7 @@ pub(super) fn data_transfer(
         &source.deforming_bones,
         needs_loop_normals,
         needs_vertex_normals,
+        needs_source_face_graph,
     )?;
     let mask_group = optional_string(modifier, "vertex_group")?.filter(|name| !name.is_empty());
     let mask_weights = if let Some(name) = mask_group {
@@ -131,8 +156,6 @@ pub(super) fn data_transfer(
                     vertex_mapping,
                     factor,
                     mix_mode,
-                    use_transform,
-                    source.local_to_subject,
                     mask_weights.as_ref(),
                     invert_mask,
                     &mapping_context,
@@ -143,7 +166,6 @@ pub(super) fn data_transfer(
                     modifier,
                     "bevel_weight_vert",
                     vertex_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -156,7 +178,6 @@ pub(super) fn data_transfer(
                     modifier,
                     "color",
                     vertex_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -182,7 +203,6 @@ pub(super) fn data_transfer(
                     modifier,
                     "sharp",
                     edge_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -195,7 +215,6 @@ pub(super) fn data_transfer(
                     modifier,
                     "seam",
                     edge_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -208,7 +227,6 @@ pub(super) fn data_transfer(
                     modifier,
                     "crease_edge",
                     edge_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -221,7 +239,6 @@ pub(super) fn data_transfer(
                     modifier,
                     "bevel_weight_edge",
                     edge_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -234,7 +251,6 @@ pub(super) fn data_transfer(
                     modifier,
                     "freestyle_edge",
                     edge_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -259,7 +275,6 @@ pub(super) fn data_transfer(
                     &source.mesh,
                     modifier,
                     loop_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -271,7 +286,6 @@ pub(super) fn data_transfer(
                     &source.mesh,
                     modifier,
                     loop_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     mask_weights.as_ref(),
@@ -307,10 +321,9 @@ pub(super) fn data_transfer(
                     &mut result,
                     &source.mesh,
                     modifier,
-                    "smooth",
-                    "smooth",
+                    "shade_smooth",
+                    "shade_smooth",
                     polygon_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     &mapping_context,
@@ -322,7 +335,6 @@ pub(super) fn data_transfer(
                     "freestyle_face",
                     "freestyle_face",
                     polygon_mapping,
-                    source_transform,
                     factor,
                     mix_mode,
                     &mapping_context,
@@ -388,8 +400,6 @@ fn transfer_vertex_groups(
     mapping: &str,
     factor: f64,
     mix_mode: &str,
-    _use_transform: bool,
-    _transform: DMat4,
     mask_weights: Option<&BTreeMap<u32, f64>>,
     invert_mask: bool,
     mapping_context: &TransferMapContext<'_>,
@@ -536,7 +546,6 @@ fn transfer_vertex_attribute(
     modifier: &Modifier,
     name: &str,
     mapping: &str,
-    _source_transform: DMat4,
     factor: f64,
     mix_mode: &str,
     mask_weights: Option<&BTreeMap<u32, f64>>,
@@ -686,7 +695,6 @@ fn transfer_edge_attribute(
     modifier: &Modifier,
     name: &str,
     mapping: &str,
-    _source_transform: DMat4,
     factor: f64,
     mix_mode: &str,
     mask_weights: Option<&BTreeMap<u32, f64>>,
@@ -835,7 +843,6 @@ fn transfer_uv(
     source: &Mesh,
     modifier: &Modifier,
     mapping: &str,
-    _source_transform: DMat4,
     factor: f64,
     _mix_mode: &str,
     mask_weights: Option<&BTreeMap<u32, f64>>,
@@ -946,7 +953,6 @@ fn transfer_custom_normals(
     source: &Mesh,
     _modifier: &Modifier,
     mapping: &str,
-    _source_transform: DMat4,
     factor: f64,
     mix_mode: &str,
     mask_weights: Option<&BTreeMap<u32, f64>>,
@@ -1000,12 +1006,11 @@ fn transfer_typed_attribute(
     source_name: &str,
     destination_name: &str,
     mapping: &str,
-    _source_transform: DMat4,
     _factor: f64,
     _mix_mode: &str,
     mapping_context: &TransferMapContext<'_>,
 ) -> Result<()> {
-    let domain = if source_name == "smooth" {
+    let domain = if source_name == "shade_smooth" {
         "face"
     } else {
         source
@@ -1073,7 +1078,7 @@ fn transfer_typed_attribute(
             *slot = value;
         }
     }
-    if source_name == "smooth" {
+    if source_name == "shade_smooth" {
         destination.attributes.insert(
             "shade_smooth".to_owned(),
             json!({"domain":"face","type":"bool","values":output}),
@@ -1174,7 +1179,6 @@ struct SourceTriangle {
     vertices: [usize; 3],
 }
 
-#[derive(Clone, Debug, Default)]
 struct SourceFaceGraph {
     face_islands: Vec<usize>,
     islands: Vec<SourceIsland>,
@@ -1184,6 +1188,7 @@ struct SourceFaceGraph {
     vertex_faces: Vec<Vec<usize>>,
     links: Vec<Vec<SourceFaceLink>>,
     triangles: Vec<SourceTriangle>,
+    triangle_bvh: BoundsBvh,
 }
 
 #[derive(Clone, Copy)]
@@ -1282,6 +1287,12 @@ struct PolyProjectionWorkspace {
     weights: Vec<f32>,
     touched: Vec<usize>,
 }
+
+#[derive(Default)]
+struct EdgeProjectionWorkspace {
+    weights: Vec<f32>,
+    touched: Vec<usize>,
+}
 impl BlenderRng {
     fn with_seed(seed: u32) -> Self {
         Self {
@@ -1300,8 +1311,8 @@ impl BlenderRng {
 }
 struct TransferMapContext<'a> {
     source: &'a Mesh,
-    source_to_destination: DMat4,
-    destination_to_source: DMat4,
+    source_to_destination_f32: [f32; 16],
+    destination_to_source_f32: [f32; 16],
     source_positions: Vec<DVec3>,
     source_vertex_indices: BTreeMap<u32, usize>,
     destination_vertex_indices: BTreeMap<u32, usize>,
@@ -1312,7 +1323,9 @@ struct TransferMapContext<'a> {
     source_corner_normals: Option<Vec<DVec3>>,
     destination_corner_normals: Option<Vec<DVec3>>,
     destination_vertex_normals: Option<Vec<DVec3>>,
-    source_face_graph: RefCell<Option<SourceFaceGraph>>,
+    source_vertex_bvh: BoundsBvh,
+    source_edge_bvh: BoundsBvh,
+    source_face_graph: Option<SourceFaceGraph>,
     astar_workspace: RefCell<AStarWorkspace>,
     max_distance: f64,
     ray_radius: f64,
@@ -1324,13 +1337,15 @@ struct TransferMapContext<'a> {
     poly_rng: RefCell<BlenderRng>,
     poly_face_map_cache: RefCell<BTreeMap<usize, Option<MappedSources>>>,
     poly_projection: RefCell<PolyProjectionWorkspace>,
+    edge_projection: RefCell<EdgeProjectionWorkspace>,
 }
 
 impl<'a> TransferMapContext<'a> {
     fn new(
         source: &'a Mesh,
         destination: &Mesh,
-        source_to_destination: DMat4,
+        source_to_destination_f32: [f32; 16],
+        destination_to_source_f32: [f32; 16],
         max_distance: f64,
         ray_radius: f64,
         islands_precision: f64,
@@ -1340,8 +1355,11 @@ impl<'a> TransferMapContext<'a> {
         deforming_bones: &'a std::collections::BTreeSet<String>,
         needs_loop_normals: bool,
         needs_vertex_normals: bool,
+        needs_source_face_graph: bool,
     ) -> Result<Self> {
-        let source_positions = source.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+        let source_positions = source.vertices.iter()
+            .map(|vertex| vertex.co.as_vec3().as_dvec3())
+            .collect::<Vec<_>>();
         let source_vertex_indices = source.vertices.iter().enumerate()
             .map(|(index, vertex)| (vertex.id, index))
             .collect::<BTreeMap<_, _>>();
@@ -1366,15 +1384,35 @@ impl<'a> TransferMapContext<'a> {
         }
         let source_loop_starts = face_loop_starts(source);
         let destination_loop_starts = face_loop_starts(destination);
+        let ray_radius_f32 = ray_radius as f32;
+        let max_ray_radius = f64::from(ray_radius_f32 * 25.0);
+        if !ray_radius_f32.is_finite() || !max_ray_radius.is_finite() {
+            return Err(crate::error::PotError::invalid_argument(
+                "ray_radius is outside Blender's finite f32 range",
+            ));
+        }
+        let vertex_bounds = source_positions.iter().map(|&point| (point, point)).collect::<Vec<_>>();
+        let source_vertex_bvh = BoundsBvh::new(&vertex_bounds)?;
+        let ray_padding = DVec3::splat(max_ray_radius);
+        let edge_bounds = source.edges.iter().map(|edge| {
+            let [first, second] = edge.vertices.map(|id| source_vertex_indices.get(&id).copied());
+            let [Some(first), Some(second)] = [first, second] else {
+                return Err(crate::error::PotError::invalid_argument(
+                    "source edge references a missing vertex",
+                ));
+            };
+            let first = source_positions[first];
+            let second = source_positions[second];
+            Ok((first.min(second) - ray_padding, first.max(second) + ray_padding))
+        }).collect::<Result<Vec<_>>>()?;
+        let source_edge_bvh = BoundsBvh::new(&edge_bounds)?;
         let source_corner_normals = if needs_loop_normals {
             Some(crate::geom::normals::corner_normals(source, &source_positions)?)
         } else {
             None
         };
-        let destination_positions = destination
-            .vertices
-            .iter()
-            .map(|vertex| vertex.co)
+        let destination_positions = destination.vertices.iter()
+            .map(|vertex| vertex.co.as_vec3().as_dvec3())
             .collect::<Vec<_>>();
         let destination_corner_normals = if needs_loop_normals {
             Some(crate::geom::normals::corner_normals(destination, &destination_positions)?)
@@ -1386,10 +1424,21 @@ impl<'a> TransferMapContext<'a> {
         } else {
             None
         };
+        let source_face_graph = if needs_source_face_graph {
+            Some(build_source_face_graph(
+                source,
+                &source_positions,
+                &source_vertex_indices,
+                &source_edge_indices,
+                max_ray_radius,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             source,
-            source_to_destination,
-            destination_to_source: source_to_destination.inverse(),
+            source_to_destination_f32,
+            destination_to_source_f32,
             source_positions,
             source_vertex_indices,
             destination_vertex_indices,
@@ -1400,7 +1449,9 @@ impl<'a> TransferMapContext<'a> {
             source_corner_normals,
             destination_corner_normals,
             destination_vertex_normals,
-            source_face_graph: RefCell::new(None),
+            source_vertex_bvh,
+            source_edge_bvh,
+            source_face_graph,
             astar_workspace: RefCell::new(AStarWorkspace::default()),
             max_distance,
             ray_radius,
@@ -1412,41 +1463,61 @@ impl<'a> TransferMapContext<'a> {
             poly_rng: RefCell::new(BlenderRng::with_seed(0)),
             poly_face_map_cache: RefCell::new(BTreeMap::new()),
             poly_projection: RefCell::new(PolyProjectionWorkspace::default()),
+            edge_projection: RefCell::new(EdgeProjectionWorkspace::default()),
         })
     }
 
     fn point_to_source(&self, point: DVec3) -> DVec3 {
-        self.destination_to_source.transform_point3(point)
+        crate::geom::modifiers::blender_transform_point_f32(
+            &self.destination_to_source_f32,
+            point.as_vec3(),
+        )
+        .as_dvec3()
     }
 
     fn normal_to_source(&self, normal: DVec3) -> DVec3 {
-        (DMat3::from_mat4(self.source_to_destination).transpose() * normal).normalize_or_zero()
+        Self::blender_apply_normal_f32(&self.source_to_destination_f32, normal)
     }
+
     fn normal_to_destination(&self, normal: DVec3) -> DVec3 {
-        (DMat3::from_mat4(self.source_to_destination).inverse().transpose() * normal)
-            .normalize_or_zero()
+        Self::blender_invert_normal_f32(&self.source_to_destination_f32, normal)
     }
+
     fn source_corner_normal(&self, face_index: usize, corner: usize) -> Option<DVec3> {
         let index = self.source_loop_starts.get(face_index)?.checked_add(corner)?;
         self.source_corner_normals.as_ref()?.get(index).copied()
     }
+
     fn destination_corner_normal(&self, face_index: usize, corner: usize) -> Option<DVec3> {
         let index = self.destination_loop_starts.get(face_index)?.checked_add(corner)?;
         self.destination_corner_normals.as_ref()?.get(index).copied()
     }
-    fn source_face_graph(&self) -> Option<Ref<'_, SourceFaceGraph>> {
-        if self.source_face_graph.borrow().is_none() {
-            *self.source_face_graph.borrow_mut() =
-                Some(build_source_face_graph(
-                    self.source,
-                    &self.source_positions,
-                    &self.source_vertex_indices,
-                    &self.source_edge_indices,
-                ));
-        }
-        Ref::filter_map(self.source_face_graph.borrow(), |graph| graph.as_ref()).ok()
+
+    fn source_face_graph(&self) -> Option<&SourceFaceGraph> {
+        self.source_face_graph.as_ref()
     }
 
+    fn blender_apply_normal_f32(matrix: &[f32; 16], normal: DVec3) -> DVec3 {
+        let normal = normal.as_vec3();
+        glam::Vec3::new(
+            normal.x * matrix[0] + normal.y * matrix[4] + normal.z * matrix[8],
+            normal.x * matrix[1] + normal.y * matrix[5] + normal.z * matrix[9],
+            normal.x * matrix[2] + normal.y * matrix[6] + normal.z * matrix[10],
+        )
+        .normalize_or_zero()
+        .as_dvec3()
+    }
+
+    fn blender_invert_normal_f32(matrix: &[f32; 16], normal: DVec3) -> DVec3 {
+        let normal = normal.as_vec3();
+        glam::Vec3::new(
+            normal.x * matrix[0] + normal.y * matrix[1] + normal.z * matrix[2],
+            normal.x * matrix[4] + normal.y * matrix[5] + normal.z * matrix[6],
+            normal.x * matrix[8] + normal.y * matrix[9] + normal.z * matrix[10],
+        )
+        .normalize_or_zero()
+        .as_dvec3()
+    }
     fn destination_vertex_normal(&self, index: usize) -> Option<DVec3> {
         self.destination_vertex_normals.as_ref()?.get(index).copied()
     }
@@ -1512,7 +1583,8 @@ fn build_source_face_graph(
     positions: &[DVec3],
     vertex_indices: &BTreeMap<u32, usize>,
     edge_indices: &BTreeMap<(u32, u32), usize>,
-) -> SourceFaceGraph {
+    ray_padding: f64,
+) -> Result<SourceFaceGraph> {
     let mut edge_faces = vec![Vec::new(); source.edges.len()];
     let mut vertex_faces = vec![Vec::new(); source.vertices.len()];
     for (face_index, face) in source.faces.iter().enumerate() {
@@ -1731,7 +1803,20 @@ fn build_source_face_graph(
         })
     })
     .collect();
-    SourceFaceGraph {
+    let triangle_padding = DVec3::splat(ray_padding);
+    let triangle_bounds = triangles
+        .iter()
+        .map(|triangle| {
+            let [first, second, third] =
+                triangle.vertices.map(|index| positions[index]);
+            (
+                first.min(second).min(third) - triangle_padding,
+                first.max(second).max(third) + triangle_padding,
+            )
+        })
+        .collect::<Vec<_>>();
+    let triangle_bvh = BoundsBvh::new(&triangle_bounds)?;
+    Ok(SourceFaceGraph {
         face_islands,
         islands,
         face_normals,
@@ -1740,7 +1825,8 @@ fn build_source_face_graph(
         vertex_faces,
         links,
         triangles,
-    }
+        triangle_bvh,
+    })
 }
 
 fn astar_face_path(
@@ -2344,19 +2430,21 @@ fn nearest_point_on_source_face(
     face_index: usize,
     point: DVec3,
 ) -> Option<DVec3> {
+    let point = point.as_vec3();
     graph
         .triangles
         .iter()
         .filter(|triangle| triangle.face == face_index)
         .map(|triangle| {
-            let [a, b, c] = triangle.vertices.map(|index| context.source_positions[index]);
-            closest_point_triangle(point, a, b, c)
+            let [a, b, c] =
+                triangle.vertices.map(|index| context.source_positions[index].as_vec3());
+            closest_point_triangle_blender(point, a, b, c).as_dvec3()
         })
         .min_by(|first, second| {
-            first.distance_squared(point).total_cmp(&second.distance_squared(point))
+            first.as_vec3().distance_squared(point)
+                .total_cmp(&second.as_vec3().distance_squared(point))
         })
 }
-
 fn mapped_face_sources(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
@@ -2562,37 +2650,140 @@ fn projected_polygon_sources(
     Some(MappedSources(sources))
 }
 
+fn blender_max_distance_squared(max_distance: f64) -> f64 {
+    let max_distance = max_distance.min(f64::from(f32::MAX)) as f32;
+    f64::from(max_distance * max_distance)
+}
+
+fn closest_point_triangle_blender(
+    point: glam::Vec3,
+    first: glam::Vec3,
+    second: glam::Vec3,
+    third: glam::Vec3,
+) -> glam::Vec3 {
+    let edge_ab = second - first;
+    let edge_ac = third - first;
+    let offset_a = point - first;
+    let d1 = edge_ab.dot(offset_a);
+    let d2 = edge_ac.dot(offset_a);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return first;
+    }
+    let offset_b = point - second;
+    let d3 = edge_ab.dot(offset_b);
+    let d4 = edge_ac.dot(offset_b);
+    if d3 >= 0.0 && d4 <= d3 {
+        return second;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let length_squared = d1 - d3;
+        return if length_squared == 0.0 {
+            first
+        } else {
+            first + edge_ab * (d1 / length_squared)
+        };
+    }
+    let offset_c = point - third;
+    let d5 = edge_ab.dot(offset_c);
+    let d6 = edge_ac.dot(offset_c);
+    if d6 >= 0.0 && d5 <= d6 {
+        return third;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let length_squared = d2 - d6;
+        return if length_squared == 0.0 {
+            first
+        } else {
+            first + edge_ac * (d2 / length_squared)
+        };
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        let length_squared = (d4 - d3) + (d5 - d6);
+        return if length_squared == 0.0 {
+            second
+        } else {
+            second + (third - second) * ((d4 - d3) / length_squared)
+        };
+    }
+    let denominator = 1.0 / (va + vb + vc);
+    let v = vb * denominator;
+    let w = vc * denominator;
+    first + edge_ab * v + edge_ac * w
+}
 fn nearest_vertex(context: &TransferMapContext<'_>, point: DVec3) -> Option<usize> {
+    let point = point.as_vec3();
     context
-        .source_positions
-        .iter()
-        .enumerate()
-        .map(|(index, position)| (index, position.distance_squared(point)))
-        .filter(|(_, distance)| *distance <= context.max_distance * context.max_distance)
-        .min_by(|(_, first), (_, second)| first.total_cmp(second))
-        .map(|(index, _)| index)
+        .source_vertex_bvh
+        .nearest(
+            point.as_dvec3(),
+            blender_max_distance_squared(context.max_distance),
+            |index, _| {
+                let position = context.source_positions.get(index)?.as_vec3();
+                Some((f64::from(position.distance_squared(point)), ()))
+            },
+        )
+        .map(|(index, _, ())| index)
+}
+
+fn nearest_vertex_in_island(
+    context: &TransferMapContext<'_>,
+    point: DVec3,
+    graph: &SourceFaceGraph,
+    island_index: usize,
+) -> Option<usize> {
+    let island = graph.islands.get(island_index)?;
+    let point = point.as_vec3();
+    context
+        .source_vertex_bvh
+        .nearest(
+            point.as_dvec3(),
+            blender_max_distance_squared(context.max_distance),
+            |index, _| {
+                if island.vertices.binary_search(&index).is_err() {
+                    return None;
+                }
+                let position = context.source_positions.get(index)?.as_vec3();
+                Some((f64::from(position.distance_squared(point)), ()))
+            },
+        )
+        .map(|(index, _, ())| index)
 }
 
 fn nearest_edge(
     context: &TransferMapContext<'_>,
     point: DVec3,
 ) -> Option<(usize, DVec3, f64)> {
-    context
-        .source
-        .edges
-        .iter()
-        .enumerate()
-        .filter_map(|(index, edge)| {
-            let [a, b] = edge.vertices.map(|id| context.source_vertex_indices.get(&id).copied());
-            let [Some(a), Some(b)] = [a, b] else {
-                return None;
-            };
-            let factor = segment_factor(point, context.source_positions[a], context.source_positions[b]);
-            let closest = context.source_positions[a].lerp(context.source_positions[b], factor);
-            Some((index, closest, closest.distance_squared(point)))
-        })
-        .filter(|(_, _, distance)| *distance <= context.max_distance * context.max_distance)
-        .min_by(|(_, _, first), (_, _, second)| first.total_cmp(second))
+    let point_f32 = point.as_vec3();
+    let max_distance_squared = blender_max_distance_squared(context.max_distance);
+    let (index, distance, closest) =
+        context
+            .source_edge_bvh
+            .nearest(point_f32.as_dvec3(), max_distance_squared, |index, _| {
+                let edge = context.source.edges.get(index)?;
+                let [a, b] =
+                    edge.vertices.map(|id| context.source_vertex_indices.get(&id).copied());
+                let [Some(a), Some(b)] = [a, b] else {
+                    return None;
+                };
+                let first = context.source_positions.get(a)?.as_vec3();
+                let second = context.source_positions.get(b)?.as_vec3();
+                let edge_direction = second - first;
+                let length_squared = edge_direction.length_squared();
+                let factor = if length_squared == 0.0 {
+                    0.0
+                } else {
+                    ((point_f32 - first).dot(edge_direction) / length_squared).clamp(0.0, 1.0)
+                };
+                let closest = first + edge_direction * factor;
+                Some((
+                    f64::from(closest.distance_squared(point_f32)),
+                    closest.as_dvec3(),
+                ))
+            })?;
+    Some((index, closest, distance))
 }
 
 fn nearest_surface(
@@ -2608,19 +2799,26 @@ fn nearest_surface_in_island(
     island: Option<usize>,
 ) -> Option<(usize, DVec3, f64)> {
     let graph = context.source_face_graph()?;
-    let mut best = None;
-    for triangle in &graph.triangles {
-        if island.is_some_and(|index| graph.face_islands[triangle.face] != index) {
-            continue;
-        }
-        let [first, second, third] = triangle.vertices.map(|index| context.source_positions[index]);
-        let closest = closest_point_triangle(point, first, second, third);
-        let distance = closest.distance_squared(point);
-        if best.is_none_or(|(_, _, prior): (usize, DVec3, f64)| distance < prior) {
-            best = Some((triangle.face, closest, distance));
-        }
-    }
-    best.filter(|(_, _, distance)| *distance <= context.max_distance * context.max_distance)
+    let point_f32 = point.as_vec3();
+    let (triangle_index, distance, closest) = graph.triangle_bvh.nearest(
+        point_f32.as_dvec3(),
+        blender_max_distance_squared(context.max_distance),
+        |triangle_index, _| {
+            let triangle = graph.triangles.get(triangle_index)?;
+            if island.is_some_and(|index| graph.face_islands[triangle.face] != index) {
+                return None;
+            }
+            let [first, second, third] =
+                triangle.vertices.map(|index| context.source_positions[index].as_vec3());
+            let closest = closest_point_triangle_blender(point_f32, first, second, third);
+            Some((
+                f64::from(closest.distance_squared(point_f32)),
+                closest.as_dvec3(),
+            ))
+        },
+    )?;
+    let face = graph.triangles.get(triangle_index)?.face;
+    Some((face, closest, distance))
 }
 
 fn raycast_surface(
@@ -2647,43 +2845,48 @@ fn raycast_surface_in_island(
     radius: f64,
     island: Option<usize>,
 ) -> Option<(usize, DVec3, f64)> {
-    let normal = normal.normalize_or_zero();
+    let normal = normal.as_vec3().as_dvec3();
     if normal == DVec3::ZERO {
         return None;
     }
     let graph = context.source_face_graph()?;
     let max_distance = context.max_distance.min(f64::from(f32::MAX));
-    let max_distance_f32 = max_distance as f32;
     let mut best: Option<(usize, DVec3, f64)> = None;
-    for triangle in &graph.triangles {
-        if island.is_some_and(|index| graph.face_islands[triangle.face] != index) {
-            continue;
-        }
-        let [a, b, c] = triangle.vertices.map(|index| context.source_positions[index]);
-        for direction in [normal, -normal] {
+    for direction in [normal, -normal] {
+        let hit = graph.triangle_bvh.raycast(origin, direction, 0.0, max_distance, |index, min, max| {
+            let triangle = graph.triangles.get(index)?;
+            if island.is_some_and(|value| graph.face_islands[triangle.face] != value) {
+                return None;
+            }
+            let [a, b, c] = triangle.vertices.map(|vertex| context.source_positions[vertex].as_vec3());
+            let origin_f32 = origin.as_vec3();
+            let direction_f32 = direction.as_vec3();
             let hit = if radius > 0.0 {
                 sphere_ray_triangle(
-                    origin.as_vec3(),
-                    direction.as_vec3(),
-                    max_distance_f32,
+                    origin_f32,
+                    direction_f32,
+                    max as f32,
                     radius as f32,
-                    a.as_vec3(),
-                    b.as_vec3(),
-                    c.as_vec3(),
+                    a,
+                    b,
+                    c,
                 )
                 .map(|distance| {
-                    let distance = f64::from(distance);
-                    (origin + direction * distance, distance)
+                    (
+                        (origin_f32 + direction_f32 * distance).as_dvec3(),
+                        f64::from(distance),
+                    )
                 })
             } else {
-                ray_triangle(origin, direction, a, b, c)
-                    .map(|point| (point, point.distance(origin)))
-            };
-            if let Some((point, distance)) = hit
-                && distance < max_distance
-                && best.is_none_or(|(_, _, prior)| distance < prior)
-            {
-                best = Some((triangle.face, point, distance));
+                ray_triangle(origin_f32, direction_f32, a, b, c)
+                    .map(|(distance, point)| (point.as_dvec3(), f64::from(distance)))
+            }?;
+            (hit.1 >= min && hit.1 < max).then_some((hit.1, hit.0))
+        });
+        if let Some((triangle_index, distance, point)) = hit {
+            let face = graph.triangles.get(triangle_index)?.face;
+            if best.is_none_or(|(_, _, prior)| distance < prior) {
+                best = Some((face, point, distance));
             }
         }
     }
@@ -2792,27 +2995,37 @@ fn lowest_sphere_root(a: f32, b: f32, c: f32, maximum: f32) -> Option<f32> {
     }
 }
 
-fn ray_triangle(origin: DVec3, direction: DVec3, a: DVec3, b: DVec3, c: DVec3) -> Option<DVec3> {
-    let edge1 = b - a;
-    let edge2 = c - a;
-    let cross = direction.cross(edge2);
-    let determinant = edge1.dot(cross);
-    if determinant.abs() <= 1.0e-12 {
+fn ray_triangle(
+    origin: glam::Vec3,
+    direction: glam::Vec3,
+    first: glam::Vec3,
+    second: glam::Vec3,
+    third: glam::Vec3,
+) -> Option<(f32, glam::Vec3)> {
+    let edge1 = second - first;
+    let edge2 = third - first;
+    let p = direction.cross(edge2);
+    let determinant = edge1.dot(p);
+    if determinant == 0.0 {
         return None;
     }
-    let inverse = determinant.recip();
-    let offset = origin - a;
-    let u = offset.dot(cross) * inverse;
-    if !(0.0..=1.0).contains(&u) {
+    let inverse = 1.0 / determinant;
+    let offset = origin - first;
+    let u = inverse * offset.dot(p);
+    let epsilon = f32::EPSILON;
+    if u < -epsilon || u > 1.0 + epsilon {
         return None;
     }
     let q = offset.cross(edge1);
-    let v = direction.dot(q) * inverse;
-    if v < 0.0 || u + v > 1.0 {
+    let v = inverse * direction.dot(q);
+    if v < -epsilon || u + v > 1.0 + epsilon {
         return None;
     }
-    let distance = edge2.dot(q) * inverse;
-    (distance >= 0.0).then_some(origin + direction * distance)
+    let distance = inverse * edge2.dot(q);
+    if distance < 0.0 {
+        return None;
+    }
+    Some((distance, origin + direction * distance))
 }
 
 fn polygon_vertex_weights(
@@ -2924,98 +3137,217 @@ fn projected_edge_sources(
     }) else {
         return None;
     };
-    let first_vertex = destination.vertices.get(first_index)?;
-    let second_vertex = destination.vertices.get(second_index)?;
-    let first = context.point_to_source(first_vertex.co);
-    let second = context.point_to_source(second_vertex.co);
+    let first = context.point_to_source(destination.vertices.get(first_index)?.co).as_vec3();
+    let second = context.point_to_source(destination.vertices.get(second_index)?.co).as_vec3();
     let first_normal =
-        context.normal_to_source(context.destination_vertex_normal(first_index)?);
+        context.normal_to_source(context.destination_vertex_normal(first_index)?).as_vec3();
     let second_normal =
-        context.normal_to_source(context.destination_vertex_normal(second_index)?);
-    let edge_length = first.distance(second) as f32;
+        context.normal_to_source(context.destination_vertex_normal(second_index)?).as_vec3();
     let ray_radius = context.ray_radius as f32;
     let grid_size = if ray_radius > 0.0 {
-        ((edge_length / ray_radius + 0.5) as i32).clamp(5, 100) as usize
+        ((first.distance(second) / ray_radius + 0.5) as i32).clamp(5, 100) as usize
     } else {
         5
     };
-    let grid_step = 1.0_f64 / grid_size as f64;
+    let grid_step = 1.0_f32 / grid_size as f32;
     let attempts = if ray_radius > 0.0 { 3 } else { 1 };
-    let mut weights = BTreeMap::<usize, f64>::new();
-    let mut total_weight = 0.0;
+    let mut workspace = context.edge_projection.borrow_mut();
+    workspace.weights.resize(context.source.edges.len(), 0.0);
+    workspace.touched.clear();
+    let mut total_weight = 0.0_f32;
     for sample_index in 0..grid_size {
-        let factor = grid_step * sample_index as f64;
-        let origin = first.lerp(second, factor);
-        let normal = first_normal.lerp(second_normal, factor).normalize_or_zero();
-        if normal == DVec3::ZERO {
+        let factor = grid_step * sample_index as f32;
+        let origin = (first * (1.0 - factor) + second * factor).as_dvec3();
+        let normal = blender_slerp_safe_f32(first_normal, second_normal, factor);
+        if normal == glam::Vec3::ZERO {
             continue;
         }
-        let mut approximate_weight = 1.0_f64;
+        let mut approximate_weight = 1.0_f32;
         for _ in 0..attempts {
             let radius = if ray_radius > 0.0 {
-                f64::from(ray_radius) / approximate_weight
+                ray_radius / approximate_weight
             } else {
                 0.0
             };
-            let mut best: Option<(usize, f64)> = None;
-            for (source_index, source_edge) in context.source.edges.iter().enumerate() {
-                let [Some(first_source), Some(second_source)] = source_edge.vertices.map(|id| {
-                    context.source_vertex_indices.get(&id).copied()
-                }) else {
-                    continue;
-                };
-                for direction in [normal, -normal] {
-                    let (ray_point, edge_point, hit_distance) = closest_ray_segment(
-                        origin,
-                        direction,
-                        context.source_positions[first_source],
-                        context.source_positions[second_source],
-                    );
-                    let separation = ray_point.distance(edge_point);
-                    if hit_distance <= context.max_distance
-                        && separation <= radius
-                        && best.is_none_or(|(_, prior)| hit_distance < prior)
-                    {
-                        best = Some((source_index, hit_distance));
-                    }
+            let forward = raycast_source_edge(context, origin, normal.as_dvec3(), radius);
+            let backward = raycast_source_edge(context, origin, (-normal).as_dvec3(), radius);
+            let hit = match (forward, backward) {
+                (Some(forward), Some(backward)) if backward.1 < forward.1 => Some(backward),
+                (Some(forward), _) => Some(forward),
+                (None, backward) => backward,
+            };
+            if let Some((source_edge, _)) = hit {
+                if workspace.weights[source_edge] == 0.0 {
+                    workspace.touched.push(source_edge);
                 }
-            }
-            if let Some((source_index, _)) = best {
-                *weights.entry(source_index).or_default() += approximate_weight;
+                workspace.weights[source_edge] += approximate_weight;
                 total_weight += approximate_weight;
                 break;
             }
             approximate_weight /= 5.0;
         }
     }
-    (total_weight > grid_size as f64 / 2.0).then(|| {
-        MappedSources(
-            weights
-                .into_iter()
-                .map(|(index, weight)| (index, weight / total_weight))
-                .collect(),
-        )
-    })
+    if total_weight <= grid_size as f32 / 2.0 {
+        while let Some(source_edge) = workspace.touched.pop() {
+            workspace.weights[source_edge] = 0.0;
+        }
+        return None;
+    }
+    workspace.touched.sort_unstable();
+    let mut sources = Vec::with_capacity(workspace.touched.len());
+    for &source_edge in &workspace.touched {
+        sources.push((
+            source_edge,
+            f64::from(workspace.weights[source_edge] / total_weight),
+        ));
+    }
+    while let Some(source_edge) = workspace.touched.pop() {
+        workspace.weights[source_edge] = 0.0;
+    }
+    Some(MappedSources(sources))
 }
 
-fn closest_ray_segment(
+fn raycast_source_edge(
+    context: &TransferMapContext<'_>,
     origin: DVec3,
     direction: DVec3,
-    a: DVec3,
-    b: DVec3,
-) -> (DVec3, DVec3, f64) {
-    let segment = b - a;
-    let denominator = segment.length_squared() - segment.dot(direction).powi(2);
-    let t = if denominator.abs() > f64::EPSILON {
-        ((origin - a).dot(segment) - (origin - a).dot(direction) * segment.dot(direction))
-            / denominator
+    radius: f32,
+) -> Option<(usize, f32)> {
+    let max_distance = context.max_distance.min(f64::from(f32::MAX));
+    context
+        .source_edge_bvh
+        .raycast(origin, direction, 0.0, max_distance, |index, _, max| {
+            let edge = context.source.edges.get(index)?;
+            let [Some(first), Some(second)] = edge.vertices.map(|id| {
+                context.source_vertex_indices.get(&id).copied()
+            }) else {
+                return None;
+            };
+            let first = context.source_positions.get(first)?.as_vec3();
+            let second = context.source_positions.get(second)?.as_vec3();
+            let (distance, _) = mesh_edge_spherecast(
+                origin.as_vec3(),
+                direction.as_vec3(),
+                max as f32,
+                radius,
+                first,
+                second,
+            )?;
+            Some((f64::from(distance), ()))
+        })
+        .map(|(edge, distance, ())| (edge, distance as f32))
+}
+
+fn mesh_edge_spherecast(
+    origin: glam::Vec3,
+    direction: glam::Vec3,
+    max_distance: f32,
+    radius: f32,
+    first: glam::Vec3,
+    second: glam::Vec3,
+) -> Option<(f32, glam::Vec3)> {
+    let ray_end = origin + direction;
+    if first == second {
+        let ray_segment = ray_end - origin;
+        let length_squared = ray_segment.length_squared();
+        let factor = if length_squared == 0.0 {
+            0.0
+        } else {
+            ((first - origin).dot(ray_segment) / length_squared).clamp(0.0, 1.0)
+        };
+        let hit = origin + ray_segment * factor;
+        if (hit - origin).dot(ray_segment) >= 0.0 {
+            let distance = hit.distance(origin);
+            if distance < max_distance {
+                return Some((distance, hit));
+            }
+        }
+        return None;
+    }
+
+    let edge = second - first;
+    let ray = ray_end - origin;
+    let offset = origin - first;
+    let normal = edge.cross(ray);
+    let denominator = normal.length_squared();
+    if denominator == 0.0 {
+        return None;
+    }
+    let (mut edge_point, ray_point) = if offset.dot(normal).abs() <= 1.0e-6 {
+        let cross = offset.cross(ray);
+        let point = first + edge * (cross.dot(normal) / denominator);
+        (point, point)
+    } else {
+        let shift = first - origin;
+        let shift = normal * (shift.dot(normal) / denominator);
+        let shifted_ray_start = origin + shift;
+        let shifted_ray_end = ray_end + shift;
+        let line_offset = shifted_ray_start - first;
+        let shifted_ray = shifted_ray_end - shifted_ray_start;
+        let cross = edge.cross(shifted_ray);
+        let cross_offset = line_offset.cross(shifted_ray);
+        let factor = cross_offset.dot(cross) / cross.length_squared();
+        let first_point = first + edge * factor;
+        (first_point, first_point - shift)
+    };
+    if (ray_point - origin).dot(ray) < 0.0 {
+        return None;
+    }
+    let distance = ray_point.distance(origin);
+    if distance >= max_distance {
+        return None;
+    }
+    let edge_length_squared = edge.length_squared();
+    let edge_factor = if edge_length_squared > 0.0 {
+        (edge_point - first).dot(edge) / edge_length_squared
     } else {
         0.0
+    };
+    if edge_factor < 0.0 {
+        edge_point = first;
+    } else if edge_factor > 1.0 {
+        edge_point = second;
     }
-    .clamp(0.0, 1.0);
-    let edge_point = a + segment * t;
-    let along = (edge_point - origin).dot(direction).max(0.0);
-    (origin + direction * along, edge_point, along)
+    ((edge_point - ray_point).length_squared() <= radius * radius)
+        .then_some((distance, ray_point))
+}
+
+fn blender_slerp_safe_f32(first: glam::Vec3, second: glam::Vec3, factor: f32) -> glam::Vec3 {
+    if let Some(value) = blender_slerp_f32(first, second, factor) {
+        return value;
+    }
+    let absolute = first.abs();
+    let orthogonal = if absolute.x > absolute.y && absolute.x > absolute.z {
+        glam::Vec3::new(-first.y - first.z, first.x, first.x)
+    } else if absolute.y > absolute.z {
+        glam::Vec3::new(first.y, -first.x - first.z, first.y)
+    } else {
+        glam::Vec3::new(first.z, first.z, -first.x - first.y)
+    }
+    .normalize_or_zero();
+    if factor < 0.5 {
+        blender_slerp_f32(first, orthogonal, factor * 2.0).unwrap_or(first)
+    } else {
+        blender_slerp_f32(orthogonal, second, (factor - 0.5) * 2.0).unwrap_or(second)
+    }
+}
+
+fn blender_slerp_f32(first: glam::Vec3, second: glam::Vec3, factor: f32) -> Option<glam::Vec3> {
+    let cosine = first.dot(second);
+    if cosine < -1.0 + f32::EPSILON {
+        return None;
+    }
+    let (first_weight, second_weight) = if cosine.abs() < 1.0 - 1.0e-4 {
+        let angle = cosine.acos();
+        let sine = angle.sin();
+        (
+            ((1.0 - factor) * angle).sin() / sine,
+            (factor * angle).sin() / sine,
+        )
+    } else {
+        (1.0 - factor, factor)
+    };
+    Some(first * first_weight + second * second_weight)
 }
 
 fn segment_factor(point: DVec3, first: DVec3, second: DVec3) -> f64 {
@@ -3030,12 +3362,12 @@ fn segment_factor(point: DVec3, first: DVec3, second: DVec3) -> f64 {
 
 fn polygon_normal_from_face(
     face: &Face,
-    mut position: impl FnMut(u32) -> Option<DVec3>,
+    mut position: impl FnMut(u32) -> Option<glam::Vec3>,
 ) -> DVec3 {
     if face.vertices.len() < 3 {
         return DVec3::Z;
     }
-    let mut normal = DVec3::ZERO;
+    let mut normal = glam::Vec3::ZERO;
     let mut first = None;
     let mut previous = None;
     let mut count = 0;
@@ -3061,7 +3393,7 @@ fn polygon_normal_from_face(
         normal.y += (previous.z - first.z) * (previous.x + first.x);
         normal.z += (previous.x - first.x) * (previous.y + first.y);
     }
-    normal.normalize_or_zero()
+    normal.normalize_or_zero().as_dvec3()
 }
 
 fn destination_face_normal(
@@ -3070,7 +3402,10 @@ fn destination_face_normal(
     vertex_indices: &BTreeMap<u32, usize>,
 ) -> DVec3 {
     polygon_normal_from_face(face, |id| {
-        vertex_indices.get(&id).and_then(|&index| mesh.vertices.get(index)).map(|vertex| vertex.co)
+        vertex_indices
+            .get(&id)
+            .and_then(|&index| mesh.vertices.get(index))
+            .map(|vertex| vertex.co.as_vec3())
     })
 }
 
@@ -3080,7 +3415,8 @@ fn face_normal_at(
     vertex_indices: &BTreeMap<u32, usize>,
 ) -> DVec3 {
     polygon_normal_from_face(face, |id| {
-        vertex_indices.get(&id).and_then(|&index| positions.get(index)).copied()
+        vertex_indices.get(&id).and_then(|&index| positions.get(index))
+            .map(|position| position.as_vec3())
     })
 }
 
@@ -3102,15 +3438,16 @@ fn vertex_normals(
     let face_normals = mesh
         .faces
         .iter()
-        .map(|face| destination_face_normal(mesh, face, vertex_indices))
+        .map(|face| destination_face_normal(mesh, face, vertex_indices).as_vec3())
         .collect::<Vec<_>>();
-    let mut normals = vec![DVec3::ZERO; mesh.vertices.len()];
+    let mut normals = vec![glam::Vec3::ZERO; mesh.vertices.len()];
     for (vertex_index, vertex) in mesh.vertices.iter().enumerate() {
+        let position = vertex.co.as_vec3();
         if incident[vertex_index].is_empty() {
-            normals[vertex_index] = vertex.co.normalize_or_zero();
+            normals[vertex_index] = position.normalize_or_zero();
             continue;
         }
-        let mut normal = DVec3::ZERO;
+        let mut normal = glam::Vec3::ZERO;
         for &(face_index, corner) in &incident[vertex_index] {
             let face = &mesh.faces[face_index];
             let count = face.vertices.len();
@@ -3122,20 +3459,20 @@ fn vertex_normals(
             let Some(next_index) = vertex_indices.get(&next_id).copied() else {
                 continue;
             };
-            let Some(previous) = mesh.vertices.get(previous_index).map(|vertex| vertex.co) else {
+            let Some(previous) = mesh.vertices.get(previous_index).map(|vertex| vertex.co.as_vec3()) else {
                 continue;
             };
-            let Some(next) = mesh.vertices.get(next_index).map(|vertex| vertex.co) else {
+            let Some(next) = mesh.vertices.get(next_index).map(|vertex| vertex.co.as_vec3()) else {
                 continue;
             };
-            let direction_previous = (previous - vertex.co).normalize_or_zero();
-            let direction_next = (next - vertex.co).normalize_or_zero();
+            let direction_previous = (previous - position).normalize_or_zero();
+            let direction_next = (next - position).normalize_or_zero();
             let angle = direction_previous.dot(direction_next).clamp(-1.0, 1.0).acos();
             normal += face_normals[face_index] * angle;
         }
         normals[vertex_index] = normal.normalize_or_zero();
     }
-    normals
+    normals.into_iter().map(glam::Vec3::as_dvec3).collect()
 }
 
 
@@ -3701,7 +4038,7 @@ fn union_face_islands(parents: &mut [usize], first: usize, second: usize) {
     }
 }
 fn source_face_value(source: &Mesh, name: &str, index: usize, face_id: u32) -> Option<Value> {
-    if name == "smooth" {
+    if name == "shade_smooth" {
         let value = source
             .attributes
             .get("shade_smooth")
@@ -3746,7 +4083,12 @@ mod tests {
 
     use super::data_transfer;
     use crate::{
-        geom::{Mesh, modifiers::attributes::{AttributeLayerSelection, SceneOperand}},
+        geom::{
+            Mesh,
+            modifiers::attributes::{
+                AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32,
+            },
+        },
         model::{Id, Modifier, ModifierRuntime},
     };
 
@@ -3805,9 +4147,15 @@ mod tests {
             binding_data: None,
             runtime: ModifierRuntime::default(),
         };
+        let identity = glam::Mat4::IDENTITY.to_cols_array();
         let source_operand = SceneOperand {
             mesh: source,
-            local_to_subject: DMat4::IDENTITY,
+            local_to_subject: None,
+            blender_matrices_f32: Some(SceneOperandMatricesF32 {
+                world: identity,
+                local_to_subject: Some(identity),
+                subject_to_local: Some(identity),
+            }),
             camera: None,
             armature: false,
             object_scale: DVec3::ONE,

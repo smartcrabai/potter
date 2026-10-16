@@ -1095,6 +1095,13 @@ fn evaluate_modifier_output(
                 "uv_warp" => ["object_from", "object_to"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
+                "mask" => {
+                    modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
+                        && modifier
+                            .params
+                            .get("armature")
+                            .is_some_and(Value::is_string)
+                }
                 "displace" | "wave" | "warp" => true,
                 "vertex_weight_edit" | "vertex_weight_mix" => modifier
                     .params
@@ -1213,6 +1220,7 @@ fn evaluate_modifier_output(
             let references = crate::eval::SceneReferences {
                 world_matrices: &world_matrices,
                 bone_matrices: &operand_snapshot.bone_matrices,
+                bone_pose_matrices: &operand_snapshot.bone_pose_matrices,
                 evaluated_meshes: evaluated_operand_meshes,
                 project_root: engine.asset_root,
             };

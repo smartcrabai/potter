@@ -42,6 +42,11 @@ for case in cases:
     mesh.update()
     obj = bpy.data.objects.new('ProbeSubject', mesh)
     bpy.context.collection.objects.link(obj)
+    subject_transform = case.get('subject_transform')
+    if subject_transform is not None:
+        obj.location = subject_transform['location']
+        obj.rotation_euler = subject_transform['rotation_euler']
+        obj.scale = subject_transform['scale']
     for i, polygon in enumerate(mesh.polygons):
         polygon.use_smooth = case['smooth'][i]
     for edge_pair in case['sharp_edges']:
@@ -75,7 +80,20 @@ for case in cases:
         bpy.context.collection.objects.link(target)
         target.location = case['target']['location']
         target.scale = case['target']['scale']
-    modifier = obj.modifiers.new('ProbeModifier', case['modifier_type'])
+        target.rotation_euler = case['target'].get('rotation_euler', (0.0, 0.0, 0.0))
+    bpy.context.view_layer.update()
+    if target is not None:
+        columns = lambda matrix: [[float(matrix[row][column]) for row in range(4)] for column in range(4)]
+        relative = obj.matrix_world.inverted() @ target.matrix_world
+        subject_to_target = relative.inverted()
+        if '_transform_matrices' not in results:
+            results['_transform_matrices'] = {}
+        results['_transform_matrices'][case['name']] = {
+            'local_to_subject': columns(relative),
+            'subject_to_local': columns(subject_to_target),
+            'world': columns(target.matrix_world),
+            'subject_world': columns(obj.matrix_world),
+        }
     for name, value in case['params'].items():
         if name == 'target':
             modifier.target = target
@@ -122,6 +140,7 @@ fn parameter_case(
         "sharp_edges":sharp_edges,
         "smooth":smooth,
         "custom_normals":custom_normals,
+        "subject_transform":None,
     })
 }
 
@@ -232,6 +251,28 @@ fn normal_edit_cases() -> Vec<Value> {
         smooth.clone(),
         None,
     ));
+    let mut transformed_target = target_operand([2.35, -1.65, 1.2], [2.0, 0.55, 1.35]);
+    transformed_target["rotation_euler"] = json!([0.23, -0.37, 0.41]);
+    let subject_transform = json!({
+        "location":[-1.1,0.65,0.4],
+        "rotation_euler":[0.31,-0.43,0.17],
+        "scale":[1.3,0.7,1.6]
+    });
+    for (mode, parallel) in [("RADIAL", false), ("DIRECTIONAL", false), ("DIRECTIONAL", true)] {
+        let mut case = parameter_case(
+            &format!("f32_owner_target_{mode}_{parallel}"),
+            "NORMAL_EDIT",
+            json!({"mode":mode,"mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"target":"target","offset":[0.2,-0.35,0.15],"use_direction_parallel":parallel,"no_polynors_fix":true}),
+            Some(transformed_target.clone()),
+            json!({}),
+            None,
+            vec![],
+            smooth.clone(),
+            None,
+        );
+        case["subject_transform"] = subject_transform.clone();
+        cases.push(case);
+    }
     cases.extend([
         json!({"name":"flip_fix_on","vertices":[[0,0,0],[1,0,0],[1,1,0],[0,1,0]],"faces":[[0,1,2,3]],"modifier_type":"NORMAL_EDIT","params":{"mode":"DIRECTIONAL","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"target":"target","use_direction_parallel":false,"no_polynors_fix":false},"target":{"location":[0.5,0.5,-2.0],"scale":[1,1,1]},"groups":{},"face_strength":null,"sharp_edges":[],"smooth":[true],"custom_normals":null}),
         json!({"name":"flip_fix_off","vertices":[[0,0,0],[1,0,0],[1,1,0],[0,1,0]],"faces":[[0,1,2,3]],"modifier_type":"NORMAL_EDIT","params":{"mode":"DIRECTIONAL","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"target":"target","use_direction_parallel":false,"no_polynors_fix":true},"target":{"location":[0.5,0.5,-2.0],"scale":[1,1,1]},"groups":{},"face_strength":null,"sharp_edges":[],"smooth":[true],"custom_normals":null}),
@@ -647,25 +688,29 @@ fn modifier(case: &Value) -> Result<Modifier, Box<dyn Error>> {
     })
 }
 
-fn evaluate_case(case: &Value) -> Result<Mesh, Box<dyn Error>> {
+fn evaluate_case(case: &Value, transform: Option<&Value>) -> Result<Mesh, Box<dyn Error>> {
     let mesh = pot_mesh(case)?;
     let mut operands = BTreeMap::new();
     if let Some(target) = case["target"].as_object() {
-        let [x, y, z] = target["location"].as_array().ok_or("target location missing")?.as_slice() else {
-            return Err("target location must be a vector".into());
-        };
         let [sx, sy, sz] = target["scale"].as_array().ok_or("target scale missing")?.as_slice() else {
             return Err("target scale must be a vector".into());
         };
+        let transform = transform.ok_or("Blender target transform matrix is missing")?;
+        let local_to_subject_f32 = f32_matrix(&transform["local_to_subject"])?;
+        let world_matrix_f32 = f32_matrix(&transform["world"])?;
+        let subject_to_local_f32 = f32_matrix(&transform["subject_to_local"])?;
         operands.insert(
             "target".to_owned(),
             vec![SceneOperand {
                 mesh: Mesh::default(),
-                local_to_subject: DMat4::from_translation(DVec3::new(
-                    x.as_f64().ok_or("target x is not numeric")?,
-                    y.as_f64().ok_or("target y is not numeric")?,
-                    z.as_f64().ok_or("target z is not numeric")?,
-                )),
+                local_to_subject: None,
+                blender_matrices_f32: Some(
+                    potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                        world: world_matrix_f32,
+                        local_to_subject: Some(local_to_subject_f32),
+                        subject_to_local: Some(subject_to_local_f32),
+                    },
+                ),
                 camera: None,
                 armature: false,
                 object_scale: DVec3::new(
@@ -680,6 +725,26 @@ fn evaluate_case(case: &Value) -> Result<Mesh, Box<dyn Error>> {
         );
     }
     Ok(evaluate_with_context(&mesh, &modifier(case)?, &operands, None, DMat4::IDENTITY)?)
+}
+
+fn f32_matrix(value: &Value) -> Result<[f32; 16], Box<dyn Error>> {
+    let columns = value.as_array().ok_or("transform matrix columns are missing")?;
+    if columns.len() != 4 {
+        return Err("transform matrix must have four columns".into());
+    }
+    let mut result = [0.0_f32; 16];
+    for (column, values) in columns.iter().enumerate() {
+        let values = values.as_array().ok_or("transform matrix column is malformed")?;
+        if values.len() != 4 {
+            return Err("transform matrix column must have four rows".into());
+        }
+        for (row, component) in values.iter().enumerate() {
+            result[column * 4 + row] = component
+                .as_f64()
+                .ok_or("transform matrix component is not numeric")? as f32;
+        }
+    }
+    Ok(result)
 }
 
 fn result_faces(mesh: &Mesh) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -791,13 +856,18 @@ fn normal_modifiers_match_blender_522_per_corner_cases() -> Result<(), Box<dyn E
     let root = fs::canonicalize(temp.path())?;
     let cases = blender_cases()?;
     let oracle = blender_probe(&blender, &root, &cases)?;
-    assert_eq!(oracle.as_object().map(serde_json::Map::len), Some(cases.len()));
+    assert_eq!(oracle.as_object().map(serde_json::Map::len), Some(cases.len() + 1));
+    let transform_matrices = oracle
+        .get("_transform_matrices")
+        .and_then(Value::as_object)
+        .ok_or("Blender target transform matrices are missing")?;
     for case in &cases {
-        let actual = result_faces(&evaluate_case(case)?)?;
-        let expected = oracle[case["name"].as_str().ok_or("case name missing")?]
+        let name = case["name"].as_str().ok_or("case name missing")?;
+        let actual = result_faces(&evaluate_case(case, transform_matrices.get(name))?)?;
+        let expected = oracle[name]
             .as_array()
             .ok_or("Blender oracle face rows are missing")?;
-        assert_faces_match(case["name"].as_str().unwrap_or("case"), &actual, expected)?;
+        assert_faces_match(name, &actual, expected)?;
     }
     Ok(())
 }
@@ -876,10 +946,23 @@ fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
+    let local_to_subject_f32 = DMat4::from_translation(DVec3::new(0.0, 0.0, -2.0))
+        .to_cols_array()
+        .map(|value| value as f32);
+    let subject_to_local_f32 = DMat4::from_translation(DVec3::new(0.0, 0.0, 2.0))
+        .to_cols_array()
+        .map(|value| value as f32);
     let mut operands = BTreeMap::new();
     operands.insert("target".to_owned(), vec![SceneOperand {
         mesh: Mesh::default(),
-        local_to_subject: DMat4::from_translation(DVec3::new(0.0, 0.0, -2.0)),
+        local_to_subject: None,
+        blender_matrices_f32: Some(
+            potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                world: local_to_subject_f32,
+                local_to_subject: Some(local_to_subject_f32),
+                subject_to_local: Some(subject_to_local_f32),
+            },
+        ),
         camera: None,
         armature: false,
         object_scale: DVec3::ONE,

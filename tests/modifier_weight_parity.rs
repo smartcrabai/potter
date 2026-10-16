@@ -1,9 +1,9 @@
 use std::{collections::{BTreeMap, BTreeSet}, error::Error, fs, path::Path, process::Command};
 
-use glam::{DMat4, DQuat, DVec3};
+use glam::{DMat4, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
-    geom::{Mesh, modifiers::attributes::{SceneOperand, evaluate_with_context_and_subject_name as evaluate_with_context}},
+    geom::{Mesh, modifiers::attributes::{SceneOperand, SceneOperandMatricesF32, evaluate_with_context_and_subject_name as evaluate_with_context}},
     model::{Id, Modifier, ModifierRuntime, SceneDoc},
 };
 use serde_json::{Value, json};
@@ -264,6 +264,9 @@ null_target_modifier = null_target_proximity.modifiers.new("weights", "VERTEX_WE
 null_target_modifier.vertex_group = "A"
 null_target_modifier.target = None
 result["proximity_null_target"] = read_group(null_target_proximity, "A")
+def matrix_columns(matrix):
+    return [float(matrix[row][column]) for column in range(4) for row in range(4)]
+
 def proximity_case(case_name, mode, geometry, falloff="LINEAR", invert=False, normalize=False,
                    min_dist=0.2, max_dist=5.0):
     subject = make_object(case_name, PROX_SUBJECT, location=(2, -1, 0.5), scale=(1.4, 0.75, 1.1))
@@ -282,6 +285,17 @@ def proximity_case(case_name, mode, geometry, falloff="LINEAR", invert=False, no
     modifier.normalize = normalize
     if falloff == "CURVE":
         configure_curve(modifier)
+    if case_name == "Proximity Object":
+        bpy.context.view_layer.update()
+        subject_world = subject.matrix_world.copy()
+        target_world = target.matrix_world.copy()
+        target_to_subject = subject_world.inverted() @ target_world
+        result["proximity_matrices"] = {
+            "subject_world": matrix_columns(subject_world),
+            "target_world": matrix_columns(target_world),
+            "local_to_subject": matrix_columns(target_to_subject),
+            "subject_to_local": matrix_columns(target_to_subject.inverted()),
+        }
     return read_group(subject, "A")
 
 def proximity_mask_case(case_name, invert):
@@ -554,10 +568,20 @@ fn texture_oracle(root: &Path) -> Result<Option<Value>, Box<dyn Error>> {
     Ok(Some(serde_json::from_slice(&fs::read(root.join("weight-texture-oracle.json"))?)?))
 }
 
-fn operand(mesh: Mesh, local_to_subject: DMat4) -> SceneOperand {
+fn operand(
+    mesh: Mesh,
+    world_matrix_f32: [f32; 16],
+    local_to_subject_f32: Option<[f32; 16]>,
+    subject_to_local_f32: Option<[f32; 16]>,
+) -> SceneOperand {
     SceneOperand {
         mesh,
-        local_to_subject,
+        local_to_subject: None,
+        blender_matrices_f32: Some(SceneOperandMatricesF32 {
+            world: world_matrix_f32,
+            local_to_subject: local_to_subject_f32,
+            subject_to_local: subject_to_local_f32,
+        }),
         camera: None,
         armature: false,
         object_scale: DVec3::ONE,
@@ -565,6 +589,22 @@ fn operand(mesh: Mesh, local_to_subject: DMat4) -> SceneOperand {
         deforming_bones: BTreeSet::new(),
         layer_selection: Default::default(),
     }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender matrix elements are serialized to JSON from f32"
+)]
+fn blender_matrix_f32(value: &Value) -> Result<[f32; 16], Box<dyn Error>> {
+    let values = value.as_array().ok_or("oracle matrix must be an array")?;
+    if values.len() != 16 {
+        return Err("oracle matrix must have 16 values".into());
+    }
+    let mut matrix = [0.0; 16];
+    for (slot, value) in matrix.iter_mut().zip(values) {
+        *slot = value.as_f64().ok_or("oracle matrix component must be numeric")? as f32;
+    }
+    Ok(matrix)
 }
 
 fn assert_case(
@@ -792,20 +832,22 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     let result = evaluate_with_context(&mesh, &mix_empty_b, &BTreeMap::new(), None, DMat4::IDENTITY, "Mix Empty B")?;
     assert_weights("weight mix empty B", &weights(&result, "A")?, &expected["mix_empty_group_b"]["weights"], 2.0e-5)?;
 
-    let subject_transform = DMat4::from_scale_rotation_translation(
-        DVec3::new(1.4, 0.75, 1.1),
-        DQuat::IDENTITY,
-        DVec3::new(2.0, -1.0, 0.5),
-    );
-    let target_transform = DMat4::from_scale_rotation_translation(
-        DVec3::new(0.6, 1.7, 1.1),
-        DQuat::IDENTITY,
-        DVec3::new(-1.0, 1.5, 0.0),
-    );
-    let local_to_subject = subject_transform.inverse() * target_transform;
+    let matrices = &expected["proximity_matrices"];
+    let subject_world_f32 = blender_matrix_f32(&matrices["subject_world"])?;
+    let target_world_f32 = blender_matrix_f32(&matrices["target_world"])?;
+    let subject_transform = DMat4::from_cols_array(&subject_world_f32.map(f64::from));
     let target_mesh = target_mesh()?;
-    let mut operands = BTreeMap::new();
-    operands.insert("target".to_owned(), vec![operand(target_mesh.clone(), local_to_subject)]);
+    let object_target = operand(target_mesh.clone(), target_world_f32, None, None);
+    let geometry_target = operand(
+        target_mesh,
+        target_world_f32,
+        Some(local_to_subject_f32),
+        Some(subject_to_local_f32),
+    );
+    let mut object_operands = BTreeMap::new();
+    object_operands.insert("target".to_owned(), vec![object_target]);
+    let mut geometry_operands = BTreeMap::new();
+    geometry_operands.insert("target".to_owned(), vec![geometry_target]);
     let object_proximity = modifier(
         "vertex_weight_proximity",
         json!({"vertex_group":"A","target":"target","proximity_mode":"OBJECT","proximity_geometry":["VERTEX","EDGE","FACE"],"min_dist":0.2,"max_dist":5.0}),
@@ -814,7 +856,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "weight proximity OBJECT",
         &mesh,
         &object_proximity,
-        &operands,
+        &object_operands,
         subject_transform,
         "Proximity Object",
         &expected["proximity_object"],
@@ -828,7 +870,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             &format!("weight proximity GEOMETRY/{geometry}"),
             &mesh,
             &modifier,
-            &operands,
+            &geometry_operands,
             subject_transform,
             &format!("Proximity {geometry}"),
             &expected["proximity_geometry"][geometry],
@@ -846,7 +888,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "weight proximity normalize",
         &mesh,
         &proximity_normalize,
-        &operands,
+        &geometry_operands,
         subject_transform,
         "Proximity Normalize",
         &expected["proximity_normalize"],
@@ -862,7 +904,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "weight proximity reversed range",
         &mesh,
         &reversed_range,
-        &operands,
+        &geometry_operands,
         subject_transform,
         "Proximity Reversed Range",
         &expected["proximity_reversed_range"],
@@ -879,7 +921,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "weight proximity mask",
         &mesh,
         &proximity_mask,
-        &operands,
+        &geometry_operands,
         subject_transform,
         "Proximity Mask",
         &expected["proximity_mask"],
@@ -896,7 +938,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "weight proximity inverted mask",
         &mesh,
         &proximity_mask_invert,
-        &operands,
+        &geometry_operands,
         subject_transform,
         "Proximity Mask Invert",
         &expected["proximity_mask_invert"],
@@ -908,7 +950,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     let result = evaluate_with_context(
         &mesh,
         &missing_proximity_group,
-        &operands,
+        &object_operands,
         None,
         subject_transform,
         "Proximity Missing Group",
@@ -962,7 +1004,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             &format!("weight proximity falloff {falloff}"),
             &mesh,
             &modifier,
-            &operands,
+            &geometry_operands,
             subject_transform,
             &name,
             &expected["proximity_falloffs"][falloff],
@@ -976,7 +1018,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "weight proximity inverted falloff",
         &mesh,
         &inverted_proximity,
-        &operands,
+        &geometry_operands,
         subject_transform,
         "Proximity Invert",
         &expected["proximity_invert"],

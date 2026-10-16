@@ -30,6 +30,11 @@ pub(crate) struct BoneMatrices {
     pub(crate) pose: DMat4,
     pub(crate) skin: DMat4,
 }
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EvaluatedArmatureBoneMatrices {
+    pub world: BTreeMap<Id, DMat4>,
+    pub pose: Option<BTreeMap<Id, DMat4>>,
+}
 
 #[derive(Clone, Copy)]
 struct IkGoal {
@@ -563,6 +568,32 @@ pub(crate) fn evaluate_armature_bone_world_matrices_with_resources(
     )
 }
 
+pub(crate) fn evaluate_armature_bone_world_and_pose_matrices_with_resources(
+    doc: &SceneDoc,
+    armature_node_id: &Id,
+    frame: f64,
+    armature_world: DMat4,
+    target_worlds: &BTreeMap<Id, DMat4>,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
+    project_root: Option<&Path>,
+    fps: u32,
+    fps_base: f64,
+) -> Result<EvaluatedArmatureBoneMatrices> {
+    evaluate_armature_bone_world_and_pose_matrices_with_meshes(
+        doc,
+        armature_node_id,
+        frame,
+        armature_world,
+        target_worlds,
+        driver_values,
+        project_root,
+        fps,
+        fps_base,
+        None,
+        true,
+    )
+}
+
 pub(crate) fn evaluate_armature_bone_world_matrices_with_evaluated_meshes(
     doc: &SceneDoc,
     armature_node_id: &Id,
@@ -589,7 +620,34 @@ pub(crate) fn evaluate_armature_bone_world_matrices_with_evaluated_meshes(
     )
 }
 
-fn evaluate_armature_bone_world_matrices_with_meshes(
+pub(crate) fn evaluate_armature_bone_world_and_pose_matrices_with_evaluated_meshes(
+    doc: &SceneDoc,
+    armature_node_id: &Id,
+    frame: f64,
+    armature_world: DMat4,
+    target_worlds: &BTreeMap<Id, DMat4>,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
+    project_root: Option<&Path>,
+    fps: u32,
+    fps_base: f64,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+) -> Result<EvaluatedArmatureBoneMatrices> {
+    evaluate_armature_bone_world_and_pose_matrices_with_meshes(
+        doc,
+        armature_node_id,
+        frame,
+        armature_world,
+        target_worlds,
+        driver_values,
+        project_root,
+        fps,
+        fps_base,
+        Some(evaluated_meshes),
+        true,
+    )
+}
+
+fn evaluate_armature_bone_world_and_pose_matrices_with_meshes(
     doc: &SceneDoc,
     armature_node_id: &Id,
     frame: f64,
@@ -600,7 +658,8 @@ fn evaluate_armature_bone_world_matrices_with_meshes(
     fps: u32,
     fps_base: f64,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
-) -> Result<BTreeMap<Id, DMat4>> {
+    include_pose: bool,
+) -> Result<EvaluatedArmatureBoneMatrices> {
     let node = doc.nodes.get(armature_node_id).ok_or_else(|| {
         evaluation_error_with(
             "armature node does not exist",
@@ -665,19 +724,54 @@ fn evaluate_armature_bone_world_matrices_with_meshes(
         fps_base,
         evaluated_meshes,
     )?;
-    bones
-        .into_iter()
-        .map(|(bone_id, matrices)| {
-            let world = armature_world * matrices.pose;
-            if !finite_matrix(world) {
-                return Err(evaluation_error_with(
-                    "evaluated bone world matrix is non-finite",
-                    json!({ "node": armature_node_id, "bone_id": bone_id }),
-                ));
-            }
-            Ok((bone_id, world))
-        })
-        .collect()
+    let mut pose_matrices = include_pose.then(BTreeMap::new);
+    let mut world = BTreeMap::new();
+    for (bone_id, matrices) in bones {
+        let pose_matrix = matrices.pose;
+        let world_matrix = armature_world * pose_matrix;
+        if !finite_matrix(world_matrix) {
+            return Err(evaluation_error_with(
+                "evaluated bone world matrix is non-finite",
+                json!({ "node": armature_node_id, "bone_id": bone_id }),
+            ));
+        }
+        if let Some(pose_matrices) = &mut pose_matrices {
+            pose_matrices.insert(bone_id.clone(), pose_matrix);
+        }
+        world.insert(bone_id, world_matrix);
+    }
+    Ok(EvaluatedArmatureBoneMatrices {
+        world,
+        pose: pose_matrices,
+    })
+}
+
+fn evaluate_armature_bone_world_matrices_with_meshes(
+    doc: &SceneDoc,
+    armature_node_id: &Id,
+    frame: f64,
+    armature_world: DMat4,
+    target_worlds: &BTreeMap<Id, DMat4>,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
+    project_root: Option<&Path>,
+    fps: u32,
+    fps_base: f64,
+    evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+) -> Result<BTreeMap<Id, DMat4>> {
+    let matrices = evaluate_armature_bone_world_and_pose_matrices_with_meshes(
+        doc,
+        armature_node_id,
+        frame,
+        armature_world,
+        target_worlds,
+        driver_values,
+        project_root,
+        fps,
+        fps_base,
+        evaluated_meshes,
+        false,
+    )?;
+    Ok(matrices.world)
 }
 
 #[expect(

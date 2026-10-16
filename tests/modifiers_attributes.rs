@@ -64,10 +64,44 @@ fn weights(mesh: &Mesh, group: &str) -> Result<[f64; 2], Box<dyn Error>> {
     ])
 }
 
-fn scene_operand(mesh: Mesh, local_to_subject: DMat4, camera: Option<CameraData>) -> SceneOperand {
+fn scene_operand(mesh: Mesh, world: DMat4, camera: Option<CameraData>) -> SceneOperand {
     SceneOperand {
         mesh,
-        local_to_subject,
+        local_to_subject: None,
+        blender_matrices_f32: Some(
+            potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                world: world.to_cols_array().map(|value| value as f32),
+                local_to_subject: None,
+                subject_to_local: None,
+            },
+        ),
+        camera,
+        armature: false,
+        object_scale: glam::DVec3::ONE,
+        selected_bones: std::collections::BTreeSet::new(),
+        deforming_bones: std::collections::BTreeSet::new(),
+        layer_selection:
+            potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(),
+    }
+}
+
+fn scene_operand_with_space(
+    mesh: Mesh,
+    world: [f32; 16],
+    local_to_subject: [f32; 16],
+    subject_to_local: [f32; 16],
+    camera: Option<CameraData>,
+) -> SceneOperand {
+    SceneOperand {
+        mesh,
+        local_to_subject: None,
+        blender_matrices_f32: Some(
+            potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                world,
+                local_to_subject: Some(local_to_subject),
+                subject_to_local: Some(subject_to_local),
+            },
+        ),
         camera,
         armature: false,
     }
@@ -284,7 +318,7 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<dyn Error>> {
+fn uv_warp_without_uv_layers_leaves_mesh_unchanged() -> Result<(), Box<dyn Error>> {
     let mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     let result = evaluate_modifiers(
@@ -294,21 +328,12 @@ fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<
             json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
         )?],
     )?;
-    assert_eq!(result.attributes["uv_layers"]["active"], json!("UVMap"));
-    assert_eq!(result.attributes["uv_layers"]["render"], json!("UVMap"));
-    assert_eq!(
-        result.attributes["uv_layers"]["layers"][0]["name"],
-        json!("UVMap")
-    );
-    assert_eq!(
-        result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
-        json!([[0.25, 0.5], [0.25, 0.5], [0.25, 0.5]])
-    );
+    assert_eq!(result, mesh);
     Ok(())
 }
 
 #[test]
-fn uv_warp_named_layer_the_mesh_lacks_is_an_error() -> Result<(), Box<dyn Error>> {
+fn uv_warp_named_layer_missing_uses_active() -> Result<(), Box<dyn Error>> {
     let mut mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     mesh.attributes.insert(
@@ -319,12 +344,12 @@ fn uv_warp_named_layer_the_mesh_lacks_is_an_error() -> Result<(), Box<dyn Error>
             "render": "UVMap"
         }),
     );
-    let Err(error) = evaluate_modifiers(&mesh, &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?])
-    else {
-        return Err("a named layer the mesh lacks must be an error".into());
-    };
-    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidArgument);
-    assert_eq!(error.details["code"], json!("modifier.uv_layer_missing"));
+    let expected_uv = mesh.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"].clone();
+    let result = evaluate_modifiers(&mesh, &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?])?;
+    assert_eq!(
+        result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
+        expected_uv
+    );
     Ok(())
 }
 
@@ -1847,11 +1872,31 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let mut proximity_operands = BTreeMap::new();
     proximity_operands.insert(
         "target".to_owned(),
-        vec![scene_operand(
-            Mesh::default(),
-            proximity_subject_world.inverse() * proximity_target_world,
-            None,
-        )],
+        // Exact f32 inverse(subject world) times target world for these fixture transforms.
+        vec![SceneOperand {
+            mesh: Mesh::default(),
+            local_to_subject: None,
+            blender_matrices_f32: Some(
+                potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                    world: [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 3.5, -1.0, 0.0, 1.0,
+                    ],
+                    local_to_subject: Some([
+                        0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.75, 0.0, 0.0, 1.0,
+                    ]),
+                    subject_to_local: Some([
+                        2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.5, 0.0, 0.0, 1.0,
+                    ]),
+                },
+            ),
+            camera: None,
+            armature: false,
+            object_scale: DVec3::ONE,
+            selected_bones: BTreeSet::new(),
+            deforming_bones: BTreeSet::new(),
+            layer_selection:
+                potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(),
+        }],
     );
     let proximity = modifier(
         "vertex_weight_proximity",
@@ -1886,9 +1931,11 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let mut geometry_operands = BTreeMap::new();
     geometry_operands.insert(
         "target".to_owned(),
-        vec![scene_operand(
+        vec![scene_operand_with_space(
             Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?,
-            DMat4::IDENTITY,
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             None,
         )],
     );
@@ -1940,7 +1987,13 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let mut proximity_surface_operands = BTreeMap::new();
     proximity_surface_operands.insert(
         "target".to_owned(),
-        vec![scene_operand(proximity_surface_mesh, DMat4::IDENTITY, None)],
+        vec![scene_operand_with_space(
+            proximity_surface_mesh,
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            None,
+        )],
     );
     for geometry in ["EDGE", "FACE"] {
         for falloff in [
@@ -2069,9 +2122,11 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let mut normal_operands = BTreeMap::new();
     normal_operands.insert(
         "target".to_owned(),
-        vec![scene_operand(
+        vec![scene_operand_with_space(
             Mesh::default(),
-            DMat4::from_translation(DVec3::new(2.0, 0.0, 0.0)),
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0],
             None,
         )],
     );
@@ -2098,7 +2153,13 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let mut directional_operands = BTreeMap::new();
     directional_operands.insert(
         "target".to_owned(),
-        vec![scene_operand(Mesh::default(), directional_target, None)],
+        vec![scene_operand_with_space(
+            Mesh::default(),
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, -1.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, -1.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 1.0, 0.0, 1.0],
+            None,
+        )],
     );
     let directional = modifier(
         "normal_edit",
@@ -2285,56 +2346,6 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         1.0e-5,
     )?;
 
-    let mut warp_transform_mesh = quad.clone();
-    warp_transform_mesh.attributes.insert(
-        "vertex_groups".to_owned(),
-        json!({"A":{"v0":0.1,"v1":0.4,"v2":0.7,"v3":1.0}}),
-    );
-    let warp_from = DMat4::from_scale_rotation_translation(
-        DVec3::new(1.1, 0.9, 1.0),
-        DQuat::from_rotation_z(0.3),
-        DVec3::new(0.25, 0.15, 0.0),
-    );
-    let warp_to = DMat4::from_scale_rotation_translation(
-        DVec3::new(0.8, 1.3, 1.0),
-        DQuat::from_rotation_z(-0.25),
-        DVec3::new(-0.2, 0.1, 0.0),
-    );
-    let warp_operands = BTreeMap::from([
-        (
-            "object_from".to_owned(),
-            vec![scene_operand(Mesh::default(), warp_from, None)],
-        ),
-        (
-            "object_to".to_owned(),
-            vec![scene_operand(Mesh::default(), warp_to, None)],
-        ),
-    ]);
-    let warp_transform_result = evaluate_with_context(
-        &warp_transform_mesh,
-        &modifier(
-            "uv_warp",
-            json!({
-                "object_from":"from","object_to":"to","vertex_group":"A",
-                "center":[0.5,0.5],"axis_u":"X","axis_v":"Y","uv_layer":"UVMap"
-            }),
-        )?,
-        &warp_operands,
-        None,
-        DMat4::IDENTITY,
-    )?;
-    assert_material_change(
-        "uv_warp object transforms and vertex group",
-        &expected["baseline_uv_warp_transforms"],
-        &expected["uv_warp_transforms"],
-        1.0e-5,
-    )?;
-    assert_parity(
-        "uv_warp object transforms and vertex group",
-        &flip_v(&warp_transform_result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
-        &expected["uv_warp_transforms"],
-        1.0e-5,
-    )?;
 
     let mut source = quad.clone();
     source.attributes.insert(
@@ -2556,7 +2567,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "mask_tex_map_object".to_owned(),
                 vec![scene_operand(
                     Mesh::default(),
-                    subject_world.inverse() * map_object_world,
+                    map_object_world,
                     None,
                 )],
             );

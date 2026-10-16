@@ -75,8 +75,11 @@ impl MergedGeometry {
 const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
-/// Build Blender's shrinkwrap space pair with its f32 matrix operation order.
-pub(crate) fn blender_space_transform_f32(local: DMat4, target: DMat4) -> ([f32; 16], [f32; 16]) {
+/// Build Blender's `SpaceTransform` pair from original world matrices in f32 operation order.
+pub(crate) fn blender_space_transform_f32(
+    local: DMat4,
+    target: DMat4,
+) -> ([f32; 16], [f32; 16]) {
     let local = local.to_cols_array().map(|value| value as f32);
     let target = target.to_cols_array().map(|value| value as f32);
     let inverse_target = blender_inverse_m4(target);
@@ -328,7 +331,10 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             ) && modifier
                 .params
                 .get("mask_texture")
-                .is_some_and(|value| !value.is_null()));
+                .is_some_and(|value| !value.is_null()))
+            || (modifier.modifier_type == "mask"
+                && modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
+                && modifier.params.get("armature").is_some_and(Value::is_string));
         if modifier.modifier_type == "armature"
             || modifier.modifier_type == "lattice"
             || matches!(
@@ -449,7 +455,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             | "normal_edit"
             | "uv_project"
             | "uv_warp"
-            | "data_transfer" => attributes::evaluate(&evaluated, modifier, texture_rng)?,
+            | "data_transfer"
+            | "mask" => attributes::evaluate(&evaluated, modifier, texture_rng)?,
             "laplacian_smooth" => smoothing::laplacian_smooth(&evaluated, modifier)?,
             "laplacian_deform" => deform::laplacian_deform(&evaluated, modifier)?,
             "corrective_smooth" => smoothing::corrective_smooth(
@@ -459,7 +466,6 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             )?,
             "build" => advanced::build(&evaluated, modifier, frame)?,
             "edge_split" => advanced::edge_split(&evaluated, modifier)?,
-            "mask" => advanced::mask(&evaluated, modifier)?,
             "wireframe" => advanced::wireframe(&evaluated, modifier)?,
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,

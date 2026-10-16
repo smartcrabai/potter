@@ -141,6 +141,9 @@ pub struct Snapshot {
     /// Evaluated armature bone-head matrices in world space.
     #[serde(skip)]
     pub bone_matrices: BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
+    /// Evaluated armature-local pose matrices used to build Blender world transforms.
+    #[serde(skip)]
+    pub bone_pose_matrices: BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
     /// Instance source paths recorded by geometry-node modifiers.
     #[serde(skip)]
     pub instance_paths: BTreeMap<Id, Vec<Vec<Id>>>,
@@ -383,6 +386,7 @@ impl Snapshot {
             &mesh_dependencies,
             None,
             Some(&world_matrix_ids),
+            Some((target_id, modifier_id)),
         )
     }
 
@@ -425,6 +429,7 @@ impl Snapshot {
                 &suppressed,
                 &suppressed_instances,
                 &mesh_dependencies,
+                None,
                 None,
                 None,
             );
@@ -583,6 +588,7 @@ impl Snapshot {
             &mesh_dependencies,
             modifier_prefix,
             None,
+            None,
         )
     }
 
@@ -601,6 +607,7 @@ impl Snapshot {
         mesh_dependencies: &ObjectMeshDependencies,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         world_matrix_ids: Option<&BTreeSet<Id>>,
+        target_modifier: Option<(&Id, &Id)>,
     ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
@@ -641,6 +648,8 @@ impl Snapshot {
         let mesh_evaluation_order =
             object_mesh_evaluation_order(doc, selected_nodes, gate, mesh_dependencies)?;
         let evaluated_node_ids: BTreeSet<Id> = mesh_evaluation_order.iter().cloned().collect();
+        let uv_warp_pose_armatures =
+            uv_warp_pose_armatures(doc, &evaluated_node_ids, gate, target_modifier);
 
         let computed_driver_values;
         let driver_values = if let Some(driver_values) = driver_values {
@@ -771,32 +780,63 @@ impl Snapshot {
             }
         }
         let mut bone_matrices = BTreeMap::new();
+        let mut bone_pose_matrices = BTreeMap::new();
         for (id, node) in &doc.nodes {
-            if node.kind == "armature" && evaluated_node_ids.contains(id) {
+            if node.kind == "armature"
+                && (evaluated_node_ids.contains(id) || uv_warp_pose_armatures.contains(id))
+            {
                 let armature_world = matrices.get(id).copied().ok_or_else(|| {
                     PotError::new(
                         ErrorCode::InternalError,
                         "evaluated armature world matrix is missing",
                     )
                 })?;
-                let bones = rig::evaluate_armature_bone_world_matrices_with_resources(
-                    doc,
-                    id,
-                    frame,
-                    armature_world,
-                    &matrices,
-                    driver_values,
-                    modifier_context.project_root,
-                    scene.fps,
-                    scene.fps_base,
-                )?;
+                let (world, pose) = if uv_warp_pose_armatures.contains(id) {
+                    let evaluated =
+                        rig::evaluate_armature_bone_world_and_pose_matrices_with_resources(
+                            doc,
+                            id,
+                            frame,
+                            armature_world,
+                            &matrices,
+                            driver_values,
+                            modifier_context.project_root,
+                            scene.fps,
+                            scene.fps_base,
+                        )?;
+                    (evaluated.world, evaluated.pose)
+                } else {
+                    (
+                        rig::evaluate_armature_bone_world_matrices_with_resources(
+                            doc,
+                            id,
+                            frame,
+                            armature_world,
+                            &matrices,
+                            driver_values,
+                            modifier_context.project_root,
+                            scene.fps,
+                            scene.fps_base,
+                        )?,
+                        None,
+                    )
+                };
                 bone_matrices.insert(
                     id.clone(),
-                    bones
+                    world
                         .into_iter()
                         .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
                         .collect(),
                 );
+                if let Some(pose) = pose {
+                    bone_pose_matrices.insert(
+                        id.clone(),
+                        pose
+                            .into_iter()
+                            .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
+                            .collect(),
+                    );
+                }
             }
         }
         let mut evaluation_key = json!({
@@ -933,6 +973,7 @@ impl Snapshot {
                         world_matrices: &matrices,
                         bone_matrices: &bone_matrices,
                         evaluated_meshes: &meshes,
+                        bone_pose_matrices: &bone_pose_matrices,
                         project_root: modifier_context.project_root,
                     };
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
@@ -1228,6 +1269,7 @@ impl Snapshot {
                         world_matrices: &matrices,
                         bone_matrices: &bone_matrices,
                         evaluated_meshes: &meshes,
+                        bone_pose_matrices: &bone_pose_matrices,
                         project_root: modifier_context.project_root,
                     };
                     let evaluated = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
@@ -1610,33 +1652,65 @@ impl Snapshot {
                 }
             }
             bone_matrices.clear();
+            bone_pose_matrices.clear();
             for (id, node) in &doc.nodes {
-                if node.kind == "armature" && evaluated_node_ids.contains(id) {
+                if node.kind == "armature"
+                    && (evaluated_node_ids.contains(id) || uv_warp_pose_armatures.contains(id))
+                {
                     let armature_world = matrices.get(id).copied().ok_or_else(|| {
                         PotError::new(
                             ErrorCode::InternalError,
                             "evaluated armature world matrix is missing",
                         )
                     })?;
-                    let bones = rig::evaluate_armature_bone_world_matrices_with_evaluated_meshes(
-                        doc,
-                        id,
-                        frame,
-                        armature_world,
-                        &matrices,
-                        driver_values,
-                        modifier_context.project_root,
-                        scene.fps,
-                        scene.fps_base,
-                        &meshes,
-                    )?;
+                    let (world, pose) = if uv_warp_pose_armatures.contains(id) {
+                        let evaluated =
+                            rig::evaluate_armature_bone_world_and_pose_matrices_with_evaluated_meshes(
+                                doc,
+                                id,
+                                frame,
+                                armature_world,
+                                &matrices,
+                                driver_values,
+                                modifier_context.project_root,
+                                scene.fps,
+                                scene.fps_base,
+                                &meshes,
+                            )?;
+                        (evaluated.world, evaluated.pose)
+                    } else {
+                        (
+                            rig::evaluate_armature_bone_world_matrices_with_evaluated_meshes(
+                                doc,
+                                id,
+                                frame,
+                                armature_world,
+                                &matrices,
+                                driver_values,
+                                modifier_context.project_root,
+                                scene.fps,
+                                scene.fps_base,
+                                &meshes,
+                            )?,
+                            None,
+                        )
+                    };
                     bone_matrices.insert(
                         id.clone(),
-                        bones
+                        world
                             .into_iter()
                             .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
                             .collect(),
                     );
+                    if let Some(pose) = pose {
+                        bone_pose_matrices.insert(
+                            id.clone(),
+                            pose
+                                .into_iter()
+                                .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
+                                .collect(),
+                        );
+                    }
                 }
             }
         }
@@ -1714,6 +1788,7 @@ impl Snapshot {
             strokes,
             volume_data,
             bone_matrices,
+            bone_pose_matrices,
             simulation_cache_key,
             simulated_velocities,
             simulated_particles,
@@ -1742,8 +1817,12 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         "displace" => &["texture_coords_object"],
         "wave" => &["texture_coords_object", "start_position_object"],
         "warp" => &["object_from", "object_to", "texture_coords_object"],
+        "shrinkwrap" => &["target", "auxiliary_target"],
         "vertex_weight_edit" | "vertex_weight_mix" | "vertex_weight_proximity" => {
             &["mask_tex_map_object"]
+        }
+        "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
+            &["armature"]
         }
         "volume_displace" => &["texture_map_object"],
         _ => &[],
@@ -2126,26 +2205,31 @@ fn object_mesh_dependencies(
                 "boolean" | "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => {
                     &["object"]
                 }
-                "shrinkwrap" => {
-                    if modifier
-                        .params
-                        .get("target")
-                        .is_some_and(|value| !value.is_null())
-                    {
-                        &["target"]
-                    } else {
-                        &["object"]
-                    }
-                }
+                "shrinkwrap" => &["target", "auxiliary_target"],
                 "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
                 "array" => &["start_cap", "end_cap"],
                 _ => &[],
             };
             for parameter in parameters {
+                let value = modifier.params.get(*parameter);
+                if modifier.modifier_type == "shrinkwrap"
+                    && value.and_then(Value::as_str) == Some(owner_id.as_str())
+                {
+                    continue;
+                }
                 add_mesh_operand_dependency(
                     &mut dependencies.modifiers,
                     owner_id,
-                    modifier.params.get(*parameter),
+                    value,
+                );
+            }
+            if modifier.modifier_type == "mask"
+                && modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
+            {
+                add_mesh_operand_dependency(
+                    &mut dependencies.other,
+                    owner_id,
+                    modifier.params.get("armature"),
                 );
             }
             if modifier.modifier_type == "boolean"
@@ -2322,6 +2406,8 @@ pub(crate) struct SceneReferences<'a> {
     pub(crate) world_matrices: &'a BTreeMap<Id, DMat4>,
     /// Pose-bone matrices in world space (`armature world * pose`), keyed by armature, then bone.
     pub(crate) bone_matrices: &'a BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
+    /// Armature-local pose matrices used by UV Warp, keyed by armature then bone.
+    pub(crate) bone_pose_matrices: &'a BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
     /// Meshes evaluated before the referencing modifier.
     pub(crate) evaluated_meshes: &'a BTreeMap<Id, Mesh>,
     /// Directory that image textures resolve against.
@@ -2480,10 +2566,120 @@ fn reference_world_matrix(
         })
 }
 
+fn add_uv_warp_pose_armature_references(
+    doc: &SceneDoc,
+    modifier: &Modifier,
+    result: &mut BTreeSet<Id>,
+) {
+    for (object_parameter, bone_parameter) in
+        [("object_from", "bone_from"), ("object_to", "bone_to")]
+    {
+        let Some(object_text) = modifier
+            .params
+            .get(object_parameter)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let Ok(object_id) = Id::new(object_text.to_owned()) else {
+            continue;
+        };
+        let Some(object) = doc.nodes.get(&object_id) else {
+            continue;
+        };
+        if object.kind != "armature" {
+            continue;
+        }
+        let Some(bone_name) = modifier
+            .params
+            .get(bone_parameter)
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let Some(armature) = armature_data_for_modifier_operand(object, doc) else {
+            continue;
+        };
+        if armature.bones.values().any(|bone| bone.name == bone_name) {
+            result.insert(object_id);
+        }
+    }
+}
+
+fn uv_warp_pose_armatures(
+    doc: &SceneDoc,
+    evaluated_node_ids: &BTreeSet<Id>,
+    gate: ModifierGate<'_>,
+    target_modifier: Option<(&Id, &Id)>,
+) -> BTreeSet<Id> {
+    let mut result = BTreeSet::new();
+    for owner_id in evaluated_node_ids {
+        let Some(owner) = doc.nodes.get(owner_id) else {
+            continue;
+        };
+        for (index, modifier) in owner.modifiers.iter().enumerate() {
+            if modifier.modifier_type == "uv_warp"
+                && gate.is_active_at(owner_id, index, modifier)
+            {
+                add_uv_warp_pose_armature_references(doc, modifier, &mut result);
+            }
+        }
+    }
+    if let Some((target_id, modifier_id)) = target_modifier
+        && let Some(owner) = doc.nodes.get(target_id)
+    {
+        for (index, modifier) in owner.modifiers.iter().enumerate() {
+            if &modifier.id == modifier_id {
+                if modifier.modifier_type == "uv_warp" && modifier.enabled {
+                    add_uv_warp_pose_armature_references(doc, modifier, &mut result);
+                }
+                break;
+            }
+        }
+    }
+    result
+}
+
+fn proximity_mode_is_geometry(modifier: &Modifier) -> bool {
+    modifier
+        .params
+        .get("proximity_mode")
+        .or_else(|| {
+            crate::params::default_value(
+                crate::params::ParameterFamily::Modifier,
+                "vertex_weight_proximity",
+                "proximity_mode",
+            )
+        })
+        .and_then(Value::as_str)
+        == Some("GEOMETRY")
+}
+
+fn proximity_geometry_is_empty(modifier: &Modifier) -> bool {
+    modifier
+        .params
+        .get("proximity_geometry")
+        .or_else(|| {
+            crate::params::default_value(
+                crate::params::ParameterFamily::Modifier,
+                "vertex_weight_proximity",
+                "proximity_geometry",
+            )
+        })
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+}
+
+fn proximity_uses_geometry_mesh(modifier: &Modifier) -> bool {
+    proximity_mode_is_geometry(modifier) && !proximity_geometry_is_empty(modifier)
+}
+
 /// Resolve the object-reference parameters for a scene-bound modifier through one shared path.
 ///
-/// Each operand retains its object-local mesh and carries the matrix from that object into
-/// the modifier subject's local space. Camera data is preserved for projector modifiers.
+/// Only geometry-consuming modifiers retain operand meshes; transform-only references reuse the
+/// scene's existing world-matrix context.
 pub(crate) fn resolve_modifier_object_operands(
     modifier: &Modifier,
     subject_id: &Id,
@@ -2494,26 +2690,50 @@ pub(crate) fn resolve_modifier_object_operands(
     let reference_parameters: &[&str] = match modifier.modifier_type.as_str() {
         "boolean" | "curve" | "hook" | "data_transfer" | "mesh_deform" => &["object"],
         "uv_project" => &["projectors"],
-        "uv_warp" | "warp" => &["object_from", "object_to"],
-        "shrinkwrap" => &["target", "object"],
+        "warp" => &["object_from", "object_to"],
+        "shrinkwrap" => &["target", "auxiliary_target"],
         "vertex_weight_edit" | "vertex_weight_mix" => &["mask_tex_map_object"],
         "vertex_weight_proximity" => &["target", "mask_tex_map_object"],
         "normal_edit" | "surface_deform" => &["target"],
+        "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
+            &["armature"]
+        }
         "volume_displace" => &["texture_map_object"],
         _ => &[],
     };
+    let has_references = reference_parameters.iter().any(|parameter| {
+        modifier.params.get(*parameter).is_some_and(|value| match value {
+            Value::String(text) => !text.is_empty(),
+            Value::Array(values) if *parameter == "projectors" => {
+                values.iter().any(|value| !value.is_null())
+            }
+            value => !value.is_null(),
+        })
+    });
+    if !has_references {
+        return Ok(BTreeMap::new());
+    }
     let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
         PotError::new(
             ErrorCode::InternalError,
             "modifier subject world matrix is missing",
         )
     })?;
-    let subject_inverse = subject_world.inverse();
-    if !subject_inverse.is_finite() {
-        return Err(PotError::invalid_argument(
-            "modifier subject transform must be invertible",
-        ));
-    }
+    let needs_dmat_transform = matches!(
+        modifier.modifier_type.as_str(),
+        "boolean" | "curve" | "hook" | "warp" | "shrinkwrap" | "surface_deform" | "mesh_deform"
+    );
+    let subject_inverse = if needs_dmat_transform {
+        let inverse = subject_world.inverse();
+        if !inverse.is_finite() {
+            return Err(PotError::invalid_argument(
+                "modifier subject transform must be invertible",
+            ));
+        }
+        Some(inverse)
+    } else {
+        None
+    };
     let mut resolved = BTreeMap::new();
     for parameter in reference_parameters {
         let Some(value) = modifier.params.get(*parameter) else {
@@ -2526,6 +2746,7 @@ pub(crate) fn resolve_modifier_object_operands(
             serde_json::Value::String(text) => vec![text.as_str()],
             serde_json::Value::Array(values) if *parameter == "projectors" => values
                 .iter()
+                .filter(|value| !value.is_null())
                 .map(|value| {
                     value.as_str().ok_or_else(|| {
                         PotError::invalid_argument("uv_project projectors must contain object IDs")
@@ -2555,11 +2776,28 @@ pub(crate) fn resolve_modifier_object_operands(
                     json!({"modifier_id":modifier.id,"parameter":parameter,"object":object_id}),
                 )
             })?;
+            if modifier.modifier_type == "shrinkwrap" && object_id == *subject_id {
+                continue;
+            }
             let data_block = object
                 .data
                 .as_ref()
                 .and_then(|data_id| doc.data_blocks.get(data_id));
-            let operand_mesh = if let Some(evaluated_mesh) = evaluated_meshes.get(&object_id) {
+            if modifier.modifier_type == "data_transfer"
+                && data_block.is_none_or(|data| data.data_type != "mesh")
+            {
+                operands.clear();
+                break;
+            }
+            let needs_operand_mesh = match modifier.modifier_type.as_str() {
+                "normal_edit" | "uv_project" | "vertex_weight_edit" | "vertex_weight_mix"
+                | "mask" => false,
+                "vertex_weight_proximity" => proximity_uses_geometry_mesh(modifier),
+                _ => true,
+            };
+            let operand_mesh = if !needs_operand_mesh {
+                Mesh::default()
+            } else if let Some(evaluated_mesh) = evaluated_meshes.get(&object_id) {
                 evaluated_mesh.clone()
             } else {
                 let mut base_mesh = match data_block {
@@ -2602,12 +2840,106 @@ pub(crate) fn resolve_modifier_object_operands(
                     json!({"modifier_id":modifier.id,"object":object_id}),
                 )
             })?;
+            let use_transfer_transform = modifier.modifier_type == "data_transfer"
+                && modifier
+                    .params
+                    .get("use_object_transform")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+            let is_normal_edit = modifier.modifier_type == "normal_edit";
+            let is_geometry_proximity = modifier.modifier_type == "vertex_weight_proximity"
+                && proximity_mode_is_geometry(modifier);
+            let proximity_geometry_empty =
+                is_geometry_proximity && proximity_geometry_is_empty(modifier);
+            let needs_world_matrix = modifier.modifier_type == "uv_project"
+                || (modifier.modifier_type == "vertex_weight_proximity"
+                    && (!is_geometry_proximity || proximity_geometry_empty));
+            let needs_matrix_data = use_transfer_transform
+                || is_normal_edit
+                || (is_geometry_proximity && !proximity_geometry_empty)
+                || needs_world_matrix;
+            let blender_matrices_f32 = needs_matrix_data.then(|| {
+                let world = object_world.to_cols_array().map(|value| value as f32);
+                let (local_to_subject, subject_to_local) = if use_transfer_transform {
+                    let (forward, inverse) =
+                        crate::geom::modifiers::blender_space_transform_f32(
+                            object_world,
+                            subject_world,
+                        );
+                    (Some(forward), Some(inverse))
+                } else if is_normal_edit {
+                    let subject_world_f32 =
+                        subject_world.to_cols_array().map(|value| value as f32);
+                    let inverse_subject =
+                        crate::geom::modifiers::blender_inverse_m4(subject_world_f32);
+                    let object_world_f32 =
+                        object_world.to_cols_array().map(|value| value as f32);
+                    (
+                        Some(crate::geom::modifiers::blender_multiply_m4(
+                            inverse_subject,
+                            object_world_f32,
+                        )),
+                        None,
+                    )
+                } else if is_geometry_proximity && !proximity_geometry_empty {
+                    let subject_world_f32 =
+                        subject_world.to_cols_array().map(|value| value as f32);
+                    let object_world_f32 =
+                        object_world.to_cols_array().map(|value| value as f32);
+                    let inverse_target =
+                        crate::geom::modifiers::blender_inverse_m4(object_world_f32);
+                    (
+                        None,
+                        Some(crate::geom::modifiers::blender_multiply_m4(
+                            inverse_target,
+                            subject_world_f32,
+                        )),
+                    )
+                } else {
+                    (None, None)
+                };
+                crate::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                    world,
+                    local_to_subject,
+                    subject_to_local,
+                }
+            });
+            let armature = armature_data_for_modifier_operand(object, doc);
+            let layer_selection = crate::geom::modifiers::attributes::AttributeLayerSelection {
+                vertex_group_names: data_block.map_or_else(Vec::new, |data| {
+                    data.vertex_groups
+                        .iter()
+                        .map(|group| group.name.clone())
+                        .collect()
+                }),
+                active_vertex_group_index: object.active_vertex_group_index,
+                ..Default::default()
+            };
             operands.push(crate::geom::modifiers::attributes::SceneOperand {
                 mesh: operand_mesh,
-                local_to_subject: subject_inverse * object_world,
+                local_to_subject: subject_inverse.map(|inverse| inverse * object_world),
+                blender_matrices_f32,
                 camera: data_block.and_then(|data| data.camera.clone()),
                 armature: object.kind == "armature"
                     || data_block.is_some_and(|data| data.data_type == "armature"),
+                object_scale: DVec3::from_array(object.transform.scale),
+                selected_bones: armature.map_or_else(BTreeSet::new, |armature| {
+                    armature
+                        .bones
+                        .values()
+                        .filter(|bone| bone.select)
+                        .map(|bone| bone.name.clone())
+                        .collect()
+                }),
+                deforming_bones: armature.map_or_else(BTreeSet::new, |armature| {
+                    armature
+                        .bones
+                        .values()
+                        .filter(|bone| bone.deform)
+                        .map(|bone| bone.name.clone())
+                        .collect()
+                }),
+                layer_selection,
             });
         }
         resolved.insert((*parameter).to_owned(), operands);
@@ -2615,27 +2947,96 @@ pub(crate) fn resolve_modifier_object_operands(
     Ok(resolved)
 }
 
-/// Subject-local to Warp/UV Warp source and destination matrices
-/// (`inv(subject_world) * reference_world`). A known bone uses `armature_world * pose_mat`;
-/// an empty or unknown bone name falls back to the object world matrix. `None` unless both objects are set.
-fn warp_reference_matrices(
+fn resolve_uv_warp_reference_world_f32(
     modifier: &Modifier,
-    subject_id: &Id,
+    object_parameter: &str,
+    bone_parameter: &str,
     doc: &SceneDoc,
-    references: &SceneReferences<'_>,
-) -> Result<Option<(DMat4, DMat4)>> {
-    let (Some(from), Some(to)) = (
-        reference_object_id(modifier, "object_from", doc)?,
-        reference_object_id(modifier, "object_to", doc)?,
-    ) else {
+    world_matrices: &BTreeMap<Id, DMat4>,
+    bone_pose_matrices: &BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
+) -> Result<Option<[f32; 16]>> {
+    let Some(value) = modifier.params.get(object_parameter) else {
         return Ok(None);
     };
-    let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
-    let from_matrix =
-        reference_world_matrix_with_bone_fallback(modifier, &from, "bone_from", doc, references)?;
-    let to_matrix =
-        reference_world_matrix_with_bone_fallback(modifier, &to, "bone_to", doc, references)?;
-    Ok(Some((inverse * from_matrix, inverse * to_matrix)))
+    let Some(object_text) = value.as_str().filter(|text| !text.is_empty()) else {
+        if value.is_null() || value.as_str().is_some_and(str::is_empty) {
+            return Ok(None);
+        }
+        return Err(PotError::invalid_argument(format!(
+            "UV Warp `{object_parameter}` must be an object ID or null"
+        )));
+    };
+    let object_id = Id::new(object_text.to_owned()).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            error.message,
+            json!({"modifier_id":modifier.id,"parameter":object_parameter,"object":object_text}),
+        )
+    })?;
+    let object = doc.nodes.get(&object_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("UV Warp operand object `{object_id}` was not found"),
+            json!({"modifier_id":modifier.id,"parameter":object_parameter,"object":object_id}),
+        )
+    })?;
+    let object_world = world_matrices.get(&object_id).copied().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "UV Warp operand world matrix is missing",
+            json!({"modifier_id":modifier.id,"parameter":object_parameter,"object":object_id}),
+        )
+    })?;
+    let object_world_f32 = object_world.to_cols_array().map(|value| value as f32);
+    let Some(bone_name) = modifier
+        .params
+        .get(bone_parameter)
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(Some(object_world_f32));
+    };
+    if object.kind != "armature" {
+        return Ok(Some(object_world_f32));
+    }
+    let armature = object
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .and_then(|data| data.armature.as_ref());
+    let Some(armature) = armature else {
+        return Ok(Some(object_world_f32));
+    };
+    let Some((bone_id, _)) = armature
+        .bones
+        .iter()
+        .find(|(_, bone)| bone.name == bone_name)
+    else {
+        return Ok(Some(object_world_f32));
+    };
+    let pose_matrix = bone_pose_matrices
+        .get(&object_id)
+        .and_then(|bones| bones.get(bone_id))
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "UV Warp pose-bone matrix is missing",
+                json!({"modifier_id":modifier.id,"parameter":bone_parameter,"object":object_id,"bone":bone_name}),
+            )
+        })?;
+    let pose_matrix_f32 = pose_matrix.map(|value| value as f32);
+    Ok(Some(crate::geom::modifiers::blender_multiply_m4(
+        object_world_f32,
+        pose_matrix_f32,
+    )))
+}
+
+fn matrix_f32_columns(matrix: [f32; 16]) -> [[f32; 4]; 4] {
+    let mut columns = [[0.0; 4]; 4];
+    for column in 0..4 {
+        columns[column].copy_from_slice(&matrix[column * 4..column * 4 + 4]);
+    }
+    columns
 }
 
 pub(crate) fn apply_scene_attribute_modifier(
@@ -2644,8 +3045,41 @@ pub(crate) fn apply_scene_attribute_modifier(
     subject_id: &Id,
     doc: &SceneDoc,
     references: &SceneReferences<'_>,
-    texture_rng: &mut crate::blender_rng::BlenderRng,
+    _texture_rng: &mut crate::blender_rng::BlenderRng,
 ) -> Result<()> {
+    if modifier.modifier_type == "vertex_weight_proximity"
+        && modifier.params.get("target").is_none_or(Value::is_null)
+    {
+        return Ok(());
+    }
+    let mut uv_warp_modifier = None;
+    if modifier.modifier_type == "uv_warp" {
+        let source_world = resolve_uv_warp_reference_world_f32(
+            modifier,
+            "object_from",
+            "bone_from",
+            doc,
+            references.world_matrices,
+            references.bone_pose_matrices,
+        )?;
+        let destination_world = resolve_uv_warp_reference_world_f32(
+            modifier,
+            "object_to",
+            "bone_to",
+            doc,
+            references.world_matrices,
+            references.bone_pose_matrices,
+        )?;
+        let matrix = crate::geom::modifiers::attributes::build_uv_warp_matrix_f32(
+            source_world,
+            destination_world,
+            modifier,
+        )?;
+        let mut resolved = modifier.clone();
+        resolved.runtime.uv_warp_matrix = Some(matrix_f32_columns(matrix));
+        uv_warp_modifier = Some(resolved);
+    }
+    let modifier = uv_warp_modifier.as_ref().map_or(modifier, |resolved| resolved);
     let operands = resolve_modifier_object_operands(
         modifier,
         subject_id,
@@ -2660,15 +3094,29 @@ pub(crate) fn apply_scene_attribute_modifier(
         references.project_root,
     )?;
     let subject_world = subject_world_matrix(modifier, subject_id, references)?;
+    let subject = doc.nodes.get(subject_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            "modifier subject object is missing",
+            json!({"modifier_id": modifier.id, "subject": subject_id}),
+        )
+    })?;
+    let subject_data = subject
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
+    let subject_layer_selection =
+        crate::geom::modifiers::attributes::AttributeLayerSelection {
+            vertex_group_names: subject_data.map_or_else(Vec::new, |data| {
+                data.vertex_groups
+                    .iter()
+                    .map(|group| group.name.clone())
+                    .collect()
+            }),
+            active_vertex_group_index: subject.active_vertex_group_index,
+            ..Default::default()
+        };
     let mut resolved = modifier.clone();
-    if modifier.modifier_type == "uv_warp" {
-        resolved.runtime.warp_from_matrix = None;
-        resolved.runtime.warp_to_matrix = None;
-        if let Some((from, to)) = warp_reference_matrices(modifier, subject_id, doc, references)? {
-            resolved.runtime.warp_from_matrix = Some(from.to_cols_array());
-            resolved.runtime.warp_to_matrix = Some(to.to_cols_array());
-        }
-    }
     if texture.is_some() {
         resolved.runtime.texture_matrix = texture_coordinate_matrix_with_parameters(
             modifier,
@@ -2681,13 +3129,14 @@ pub(crate) fn apply_scene_attribute_modifier(
         )?
         .map(|matrix| matrix.to_cols_array());
     }
-    *mesh = crate::geom::modifiers::attributes::evaluate_with_texture_context(
+    *mesh = crate::geom::modifiers::attributes::evaluate_with_resolved_texture_context(
         mesh,
         &resolved,
         &operands,
-        texture.as_ref().map(|texture| texture.source()),
+        texture.as_ref(),
         subject_world,
-        texture_rng,
+        &subject.name,
+        &subject_layer_selection,
     )?;
     Ok(())
 }
@@ -2721,13 +3170,19 @@ pub(crate) fn apply_scene_deform_modifier(
                 modifier.modifier_type
             ))
         })?;
+    let local_to_subject = operand.local_to_subject.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "scene deform operand DVec3 transform is missing",
+        )
+    })?;
     let mut target_mesh = operand.mesh.clone();
     for vertex in &mut target_mesh.vertices {
-        vertex.co = operand.local_to_subject.transform_point3(vertex.co);
+        vertex.co = local_to_subject.transform_point3(vertex.co);
     }
     let mut resolved = modifier.clone();
     resolved.params.remove(parameter);
-    resolved.runtime.target_to_subject = Some(operand.local_to_subject.to_cols_array());
+    resolved.runtime.target_to_subject = Some(local_to_subject.to_cols_array());
     resolved.runtime.target_mesh = Some(target_mesh);
     let evaluation = crate::geom::modifiers::evaluate_modifiers_with_groups(
         mesh,
@@ -3702,6 +4157,138 @@ fn apply_volume_displace_modifier(
     )
 }
 
+fn apply_scene_shrinkwrap_modifier(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+) -> Result<()> {
+    let Some(target_text) = modifier
+        .params
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    let target_id = Id::new(target_text.to_owned()).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            error.message,
+            json!({"modifier_id":modifier.id,"parameter":"target","object":target_text}),
+        )
+    })?;
+    if target_id == *subject_id {
+        return Ok(());
+    }
+    let is_mesh_object = |object_id: &Id| -> Result<bool> {
+        let object = doc.nodes.get(object_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                format!("modifier operand object `{object_id}` was not found"),
+                json!({"modifier_id":modifier.id,"object":object_id}),
+            )
+        })?;
+        let data_block = object
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
+        Ok(object.kind == "mesh" && data_block.is_some_and(|data| data.data_type == "mesh"))
+    };
+    if !is_mesh_object(&target_id)? {
+        return Ok(());
+    }
+    if let Some(auxiliary_text) = modifier
+        .params
+        .get("auxiliary_target")
+        .and_then(serde_json::Value::as_str)
+        && let Ok(auxiliary_id) = Id::new(auxiliary_text.to_owned())
+        && auxiliary_id != *subject_id
+        && !is_mesh_object(&auxiliary_id)?
+    {
+        return Ok(());
+    }
+
+    let mut operands = resolve_modifier_object_operands(
+        modifier,
+        subject_id,
+        doc,
+        world_matrices,
+        evaluated_meshes,
+    )?;
+    let target = operands
+        .remove("target")
+        .and_then(|mut operands| operands.pop())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "shrinkwrap target mesh was not resolved",
+                json!({"modifier_id":modifier.id,"target":target_id}),
+            )
+        })?;
+    let mut resolved = modifier.clone();
+    resolved.params.remove("target");
+    resolved.params.remove("auxiliary_target");
+    // Blender's nearest-vertex path keeps both f32 SpaceTransform directions.
+    let (target_to_subject, subject_to_target) = if modifier
+        .params
+        .get("wrap_method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method.eq_ignore_ascii_case("NEAREST_VERTEX"))
+    {
+        let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Shrinkwrap subject world matrix is missing",
+            )
+        })?;
+        let target_world = world_matrices.get(&target_id).copied().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Shrinkwrap target world matrix is missing",
+            )
+        })?;
+        let (subject_to_target, target_to_subject) =
+            crate::geom::modifiers::blender_space_transform_f32(subject_world, target_world);
+        (
+            DMat4::from_cols_array(&target_to_subject.map(f64::from)),
+            Some(subject_to_target),
+        )
+    } else {
+        (
+            target.local_to_subject.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "shrinkwrap target DVec3 transform is missing",
+                )
+            })?,
+            None,
+        )
+    };
+    resolved.runtime.target_to_subject = Some(target_to_subject.to_cols_array());
+    resolved.runtime.shrinkwrap_subject_to_target = subject_to_target;
+    resolved.runtime.shrinkwrap_target_mesh = Some(target.mesh);
+    if let Some(auxiliary) = operands
+        .remove("auxiliary_target")
+        .and_then(|mut operands| operands.pop())
+    {
+        let auxiliary_local_to_subject = auxiliary.local_to_subject.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "shrinkwrap auxiliary target DVec3 transform is missing",
+            )
+        })?;
+        resolved.runtime.auxiliary_target_to_subject =
+            Some(auxiliary_local_to_subject.to_cols_array());
+        resolved.runtime.shrinkwrap_auxiliary_target_mesh = Some(auxiliary.mesh);
+    } else {
+        resolved.runtime.auxiliary_target_to_subject = None;
+        resolved.runtime.shrinkwrap_auxiliary_target_mesh = None;
+    }
+    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    Ok(())
+}
 fn apply_generic_scene_mesh_operand_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -3717,17 +4304,18 @@ fn apply_generic_scene_mesh_operand_modifier(
         world_matrices,
         evaluated_meshes,
     )?;
-    let object_parameter =
-        if modifier.modifier_type == "shrinkwrap" && modifier.params.contains_key("target") {
-            "target"
-        } else {
-            "object"
-        };
+    let object_parameter = "object";
     let mut combined = None;
     for operand in operands.get(object_parameter).into_iter().flatten() {
+        let local_to_subject = operand.local_to_subject.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "scene mesh operand DVec3 transform is missing",
+            )
+        })?;
         let mut transformed = operand.mesh.clone();
         for vertex in &mut transformed.vertices {
-            vertex.co = operand.local_to_subject.transform_point3(vertex.co);
+            vertex.co = local_to_subject.transform_point3(vertex.co);
         }
         combined = Some(match combined {
             None => transformed,
@@ -3737,7 +4325,7 @@ fn apply_generic_scene_mesh_operand_modifier(
         });
     }
     let mut resolved = modifier.clone();
-    for parameter in ["object", "target", "collection"] {
+    for parameter in ["object", "collection"] {
         resolved.params.remove(parameter);
     }
     let operand = combined.ok_or_else(|| {
@@ -3746,7 +4334,7 @@ fn apply_generic_scene_mesh_operand_modifier(
             modifier.modifier_type
         ))
     })?;
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
+    if modifier.modifier_type == "curve" {
         resolved.runtime.target_mesh = Some(operand);
     } else {
         resolved.runtime.operand_mesh = Some(operand);
@@ -3756,7 +4344,8 @@ fn apply_generic_scene_mesh_operand_modifier(
         resolved.runtime.object_matrix = operands
             .get(object_parameter)
             .and_then(|items| items.first())
-            .map(|operand| operand.local_to_subject.to_cols_array());
+            .and_then(|operand| operand.local_to_subject)
+            .map(|matrix| matrix.to_cols_array());
     }
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
@@ -3781,14 +4370,21 @@ pub(crate) fn apply_scene_operand_modifier(
                 mesh, modifier, subject_id, doc, references, "origin", None,
             );
         }
+        "shrinkwrap" => {
+            return apply_scene_shrinkwrap_modifier(
+                mesh,
+                modifier,
+                subject_id,
+                doc,
+                references.world_matrices,
+                references.evaluated_meshes,
+            );
+        }
         _ => {}
     }
     let world_matrices = references.world_matrices;
     let evaluated_meshes = references.evaluated_meshes;
-    if matches!(
-        modifier.modifier_type.as_str(),
-        "boolean" | "shrinkwrap" | "curve"
-    ) && !modifier.params.contains_key("collection")
+    if matches!(modifier.modifier_type.as_str(), "boolean" | "curve")
     {
         return apply_generic_scene_mesh_operand_modifier(
             mesh,
@@ -3801,11 +4397,7 @@ pub(crate) fn apply_scene_operand_modifier(
     }
     let mut object_ids = BTreeSet::new();
     let mut collection_id = None;
-    let object_parameter = if modifier.modifier_type == "shrinkwrap" {
-        "target"
-    } else {
-        "object"
-    };
+    let object_parameter = "object";
     if let Some(value) = modifier.params.get(object_parameter) {
         let text = value.as_str().ok_or_else(|| {
             PotError::invalid_argument(format!(
@@ -3820,15 +4412,6 @@ pub(crate) fn apply_scene_operand_modifier(
             ))
         })?;
         object_ids.insert(object_id);
-    } else if modifier.modifier_type == "shrinkwrap"
-        && let Some(value) = modifier.params.get("object")
-    {
-        let text = value.as_str().ok_or_else(|| {
-            PotError::invalid_argument("shrinkwrap `object` must be an object ID")
-        })?;
-        object_ids.insert(Id::new(text).map_err(|_| {
-            PotError::invalid_argument("shrinkwrap `object` must be a valid object ID")
-        })?);
     }
     if let Some(value) = modifier.params.get("collection") {
         let text = value.as_str().ok_or_else(|| {

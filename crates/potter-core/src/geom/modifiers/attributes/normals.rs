@@ -631,9 +631,22 @@ pub(super) fn normal_edit(
         .transpose()?;
     let invert_group = boolean(modifier, "invert_vertex_group")?;
     let no_polynors_fix = boolean(modifier, "no_polynors_fix")?;
-    let target_origin = target.map_or(DVec3::ZERO, |target| {
-        target.local_to_subject.transform_point3(DVec3::ZERO)
-    });
+    let target_origin = if let Some(target) = target {
+        let local_to_subject = target
+            .blender_matrices_f32
+            .as_ref()
+            .and_then(|matrices| matrices.local_to_subject.as_ref())
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "Normal Edit target Blender transform is missing",
+                )
+            })?;
+        crate::geom::modifiers::blender_transform_point_f32(local_to_subject, Vec3::ZERO)
+            .as_dvec3()
+    } else {
+        DVec3::ZERO
+    };
     let use_current_normals = !(mix_mode == "COPY"
         && factor == 1.0
         && group.is_none_or(str::is_empty)

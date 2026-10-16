@@ -21,6 +21,7 @@ mod weights;
 use normals::{normal_edit, weighted_normal};
 use transfer::data_transfer;
 use uv_projection::{uv_project, uv_warp};
+pub(crate) use uv_projection::build_uv_warp_matrix_f32;
 use weights::{texture_mask_weights, vertex_weight_edit, vertex_weight_mix, vertex_weight_proximity};
 
 use super::{
@@ -34,13 +35,26 @@ pub struct AttributeLayerSelection {
     pub active_vertex_group_index: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug)]
+/// Original Blender f32 world and relative matrices for I modifier operands.
+pub struct SceneOperandMatricesF32 {
+    /// The operand's original object-to-world matrix.
+    pub world: [f32; 16],
+    /// Blender-order object-local to subject-local matrix.
+    pub local_to_subject: Option<[f32; 16]>,
+    /// Blender-order subject-local to object-local inverse matrix.
+    pub subject_to_local: Option<[f32; 16]>,
+}
+
 #[derive(Clone, Debug)]
 /// A resolved scene-object operand for native modifier evaluation.
 pub struct SceneOperand {
     /// Object-local evaluated mesh data.
     pub mesh: Mesh,
-    /// Matrix from object-local coordinates to subject-local coordinates.
-    pub local_to_subject: DMat4,
+    /// f64 object-to-subject transform for native scene modifier paths that operate on DVec3.
+    pub local_to_subject: Option<DMat4>,
+    /// Exact f32 matrices, resolved only for modifiers that consume them.
+    pub blender_matrices_f32: Option<SceneOperandMatricesF32>,
     /// Camera settings when this operand is a camera object.
     pub camera: Option<CameraData>,
     /// Whether this operand has armature data for UV Warp bone references.

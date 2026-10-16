@@ -58,42 +58,13 @@ pub(super) fn texture_mask_weights(
         .texture_matrix
         .map(|matrix| DMat4::from_cols_array(&matrix));
     let map_object = optional_string(modifier, "mask_tex_map_object")?;
-    let map_bone = optional_string(modifier, "mask_tex_map_bone")?;
-    let object_inverse = if mapping == "OBJECT" && texture_matrix.is_none() {
-        match map_object {
-            None => None,
-            Some(_) if map_bone.is_some() => {
-                return Err(PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "weight texture bone coordinates were not resolved",
-                    json!({"modifier_id":modifier.id,"parameter":"mask_tex_map_bone"}),
-                ));
-            }
-            Some(_) => {
-                let object = operands
-                    .get("mask_tex_map_object")
-                    .and_then(|objects| objects.first())
-                    .ok_or_else(|| {
-                        invalid(
-                            modifier,
-                            "mask_tex_map_object",
-                            "a resolved scene object operand",
-                        )
-                    })?;
-                let inverse = object.local_to_subject.inverse();
-                if !inverse.is_finite() {
-                    return Err(invalid(
-                        modifier,
-                        "mask_tex_map_object",
-                        "an invertible object transform",
-                    ));
-                }
-                Some(inverse)
-            }
-        }
-    } else {
-        None
-    };
+    if mapping == "OBJECT" && texture_matrix.is_none() && map_object.is_some() {
+        return Err(PotError::with_details(
+            ErrorCode::DependencyMissing,
+            "weight texture object coordinates were not resolved",
+            json!({"modifier_id":modifier.id,"parameter":"mask_tex_map_object"}),
+        ));
+    }
     let mut weights = BTreeMap::new();
     for vertex in &mesh.vertices {
         let coordinate = match mapping {
@@ -101,15 +72,8 @@ pub(super) fn texture_mask_weights(
             "GLOBAL" => texture_matrix
                 .unwrap_or(subject_world)
                 .transform_point3(vertex.co),
-            "OBJECT" => {
-                if let Some(matrix) = texture_matrix {
-                    matrix.transform_point3(vertex.co)
-                } else if let Some(inverse) = object_inverse {
-                    inverse.transform_point3(vertex.co)
-                } else {
-                    vertex.co
-                }
-            }
+            "OBJECT" => texture_matrix
+                .map_or(vertex.co, |matrix| matrix.transform_point3(vertex.co)),
             "UV" => uv_coordinates
                 .as_ref()
                 .and_then(|coordinates| coordinates.get(&vertex.id).copied())
@@ -440,16 +404,40 @@ pub(super) fn vertex_weight_proximity(
         .map(|name| existing_group_weights(mesh, name))
         .transpose()?
         .flatten();
-    let object_distance = subject_world
-        .transform_point3(DVec3::ZERO)
-        .distance(subject_world.transform_point3(target.local_to_subject.transform_point3(DVec3::ZERO)));
-    let target_inverse = target.local_to_subject.inverse();
+    let matrices = target.blender_matrices_f32.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "proximity target Blender matrices are missing",
+        )
+    })?;
+    let subject_world_f32 = weight_matrix_f32(subject_world);
+    let subject_origin = glam::Vec3::new(
+        subject_world_f32[12],
+        subject_world_f32[13],
+        subject_world_f32[14],
+    );
+    let target_origin = glam::Vec3::new(
+        matrices.world[12],
+        matrices.world[13],
+        matrices.world[14],
+    );
+    let object_distance = f64::from((subject_origin - target_origin).length());
+    let target_inverse = if mode == "GEOMETRY" {
+        Some(matrices.subject_to_local.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "proximity target subject-to-local Blender matrix is missing",
+            )
+        })?)
+    } else {
+        None
+    };
     let triangles = if mode == "GEOMETRY" && geometry.iter().any(|kind| kind == "FACE") {
         let positions = target
             .mesh
             .vertices
             .iter()
-            .map(|vertex| (vertex.id, vertex.co))
+            .map(|vertex| (vertex.id, vertex.co.as_vec3().as_dvec3()))
             .collect::<BTreeMap<_, _>>();
         target
             .mesh
@@ -473,7 +461,7 @@ pub(super) fn vertex_weight_proximity(
         .mesh
         .vertices
         .iter()
-        .map(|vertex| vertex.co)
+        .map(|vertex| vertex.co.as_vec3().as_dvec3())
         .collect::<Vec<_>>();
     let target_edges = target
         .mesh
@@ -481,13 +469,11 @@ pub(super) fn vertex_weight_proximity(
         .iter()
         .filter_map(|edge| {
             Some([
-                target.mesh.vertices.iter().find(|vertex| vertex.id == edge.vertices[0])?.co,
-                target.mesh.vertices.iter().find(|vertex| vertex.id == edge.vertices[1])?.co,
+                target.mesh.vertices.iter().find(|vertex| vertex.id == edge.vertices[0])?.co.as_vec3().as_dvec3(),
+                target.mesh.vertices.iter().find(|vertex| vertex.id == edge.vertices[1])?.co.as_vec3().as_dvec3(),
             ])
         })
         .collect::<Vec<_>>();
-    let target_origin = subject_world
-        .transform_point3(target.local_to_subject.transform_point3(DVec3::ZERO));
     let mut random = BlenderRandom::for_object(subject_name);
     let mut updated = existing.clone();
     let mut selected_ids = Vec::with_capacity(existing.len());
@@ -499,10 +485,26 @@ pub(super) fn vertex_weight_proximity(
         let distance = match mode {
             "OBJECT" => object_distance,
             "GEOMETRY" if geometry.is_empty() => {
-                subject_world.transform_point3(vertex.co).distance(target_origin)
+                f64::from(
+                    crate::geom::modifiers::blender_transform_point_f32(
+                        &subject_world_f32,
+                        vertex.co.as_vec3(),
+                    )
+                    .distance(target_origin),
+                )
             }
             "GEOMETRY" => {
-                let point = target_inverse.transform_point3(vertex.co);
+                let subject_to_local = target_inverse.ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "proximity target subject-to-local Blender matrix is missing",
+                    )
+                })?;
+                let point = crate::geom::modifiers::blender_transform_point_f32(
+                    &subject_to_local,
+                    vertex.co.as_vec3(),
+                )
+                .as_dvec3();
                 distance_to_target(
                     point,
                     &geometry,
@@ -883,6 +885,13 @@ fn curve_mapping_value(points: &[DVec2], value: f64) -> f64 {
     let lower = position.max(0.0) as usize;
     let fraction = position - lower as f64;
     (table[lower] + (table[lower + 1] - table[lower]) * fraction).clamp(0.0, 1.0)
+}
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender stores object world matrices and vertex positions in f32"
+)]
+fn weight_matrix_f32(matrix: DMat4) -> [f32; 16] {
+    matrix.to_cols_array().map(|value| value as f32)
 }
 
 

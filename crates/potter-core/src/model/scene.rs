@@ -214,6 +214,20 @@ impl SceneDoc {
             }
         }
         for (node_id, node) in &self.nodes {
+            if let Some(index) = node.active_vertex_group_index {
+                let valid = node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| self.data_blocks.get(data_id))
+                    .is_some_and(|data| index < data.vertex_groups.len());
+                if !valid {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "active vertex-group index is out of range",
+                        json!({"node_id":node_id,"active_vertex_group_index":index}),
+                    ));
+                }
+            }
             if let Some(body) = &node.rigid_body
                 && (!body.mass.is_finite()
                     || body.mass < 0.0
@@ -1494,17 +1508,26 @@ pub struct ModifierRuntime {
     /// `inv(subject_world) * reference_world` (column-major) for Hook, Cast, Simple Deform origin,
     /// Curve, and Wave's start object. A bone reference is `armature_world * pose_mat`.
     pub object_matrix: Option<[f64; 16]>,
-    /// `inv(subject_world) * source_world` for Warp or UV Warp source object or pose bone; a
-    /// named bone uses `armature_world * pose_mat`, while empty/unknown names use object world.
+    /// `inv(subject_world) * source_world` for generic Warp source object or pose bone.
     pub warp_from_matrix: Option<[f64; 16]>,
-    /// `inv(subject_world) * destination_world` for Warp or UV Warp destination object or pose bone;
-    /// a named bone uses `armature_world * pose_mat`, while empty/unknown names use object world.
+    /// `inv(subject_world) * destination_world` for generic Warp destination object or pose bone.
     pub warp_to_matrix: Option<[f64; 16]>,
     /// Subject-local to texture space: LOCAL is identity, GLOBAL is `subject_world`, OBJECT is
     /// `inv(texture_world) * subject_world` with a map object (otherwise LOCAL), and UV has no
     /// matrix. A named bone's `texture_world` is `armature_world * pose_mat`; unknown names use
     /// the map object's world matrix.
     pub texture_matrix: Option<[f64; 16]>,
+    #[doc(hidden)]
+    // Preserve Blender's original f32 local-to-target matrix instead of re-inverting its inverse.
+    pub shrinkwrap_subject_to_target: Option<[f32; 16]>,
+    pub shrinkwrap_target_mesh: Option<Mesh>,
+    #[doc(hidden)]
+    pub auxiliary_target_to_subject: Option<[f64; 16]>,
+    #[doc(hidden)]
+    pub shrinkwrap_auxiliary_target_mesh: Option<Mesh>,
+    #[doc(hidden)]
+    /// Complete Blender f32 UV Warp matrix in column-major order.
+    pub uv_warp_matrix: Option<[[f32; 4]; 4]>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1577,6 +1600,8 @@ pub struct Node {
     pub data: Option<Id>,
     #[serde(default)]
     pub materials: Vec<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_vertex_group_index: Option<usize>,
     #[serde(default)]
     pub modifiers: Vec<Modifier>,
     #[serde(default = "default_true")]
@@ -1619,6 +1644,7 @@ impl Default for Node {
             transform: Transform::default(),
             data: None,
             materials: Vec::new(),
+            active_vertex_group_index: None,
             modifiers: Vec::new(),
             visible: true,
             render_visible: true,
