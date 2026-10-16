@@ -66,6 +66,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
         render_candidate_preview(
             &candidate,
             project.path(),
+            project.cache_directory(),
             &batch,
             &outcome.asset_blobs,
             views_csv,
@@ -112,6 +113,7 @@ pub fn run(args: ApplyArgs) -> Result<(Option<SceneInfo>, Value)> {
 fn render_candidate_preview(
     candidate: &crate::model::SceneDoc,
     scene_root: &Path,
+    cache_directory: &Path,
     batch: &Value,
     staged_assets: &std::collections::BTreeMap<String, Vec<u8>>,
     views_csv: &str,
@@ -160,6 +162,7 @@ fn render_candidate_preview(
     render_previews(
         candidate,
         scene_root,
+        cache_directory,
         &PreviewRequest {
             views: &views,
             camera_id: camera_id.as_deref(),

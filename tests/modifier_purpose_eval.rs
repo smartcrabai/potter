@@ -175,7 +175,7 @@ fn failing_node_and_dependents_are_reported_for_both_purposes() -> TestResult {
 
     for purpose in [EvaluationPurpose::Preview, EvaluationPurpose::Render] {
         let (snapshot, node_errors): (Snapshot, BTreeMap<Id, PotError>) =
-            Snapshot::evaluate_available_with_cache(&doc, &purpose_context(purpose), None)?;
+            Snapshot::evaluate_available_with_cache(&doc, &purpose_context(purpose), None, None)?;
         ensure_eq(&node_errors.len(), &2, "failing and dependent node count")?;
 
         let host_error = node_errors.get(&host).ok_or("host error is missing")?;

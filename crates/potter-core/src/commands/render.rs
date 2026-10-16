@@ -113,6 +113,7 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         doc,
         &context,
         project.path(),
+        project.cache_directory(),
         camera_id.as_ref().map(Id::as_str),
         &frames,
         format,

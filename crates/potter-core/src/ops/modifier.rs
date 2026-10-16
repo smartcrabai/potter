@@ -115,6 +115,7 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 frame: Some(engine.evaluation_frame),
                 purpose: EvaluationPurpose::Preview,
             },
+            engine.asset_root,
             None,
             &bind_nodes,
         )?;
@@ -1060,6 +1061,7 @@ fn apply_modifier(
                             ..crate::eval::EvaluationContext::default()
                         },
                         engine.asset_root,
+                        None,
                     )?)
                 } else {
                     None
@@ -1118,6 +1120,7 @@ fn apply_modifier(
                     &base_object_meshes,
                     evaluated_operand_meshes,
                     &BTreeMap::new(),
+                    crate::eval::ModifierEvaluationContext::default(),
                     |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                         "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
                             mesh,
@@ -1420,7 +1423,10 @@ fn apply_modifier_as_shape_key(
         );
         if !keep_modifier
             && let Some(node) = engine.doc.nodes.get_mut(&target)
-            && node.modifiers.iter().any(|modifier| modifier.id == modifier_id)
+            && node
+                .modifiers
+                .iter()
+                .any(|modifier| modifier.id == modifier_id)
         {
             node.modifiers.retain(|modifier| modifier.id != modifier_id);
             engine.mark("nodes", &target, ChangeKind::Updated);

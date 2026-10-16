@@ -2157,6 +2157,7 @@ fn blender_mesh_cache_pc2_mdd_and_alembic_sequence_round_trip_resources()
             ..Default::default()
         },
         Some(project.as_path()),
+        Some(&project.as_path().join(".potter/cache")),
     )?;
     for (name, expected_type) in [
         ("OwnerMeshCachePC2", "mesh_cache"),

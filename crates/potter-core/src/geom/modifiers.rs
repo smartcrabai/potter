@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::ModifierEvaluationContext,
     graph::{self, NodeGroup},
     model::{Id, Modifier, Registry},
     params::{self, ParameterFamily},
@@ -136,6 +137,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
+        ModifierEvaluationContext::default(),
         custom_modifier,
     )
 }
@@ -150,6 +152,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     object_meshes: &BTreeMap<Id, &Mesh>,
     evaluated_object_meshes: &BTreeMap<Id, Mesh>,
     curve_path_lengths: &BTreeMap<Id, f64>,
+    context: ModifierEvaluationContext<'_>,
     mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
     if !frame.is_finite() {
@@ -324,7 +327,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,
             "remesh" => remesh_modes::remesh_modifier(&evaluated, modifier)?,
-            "ocean" => ocean::ocean(&evaluated, modifier, frame)?,
+            "ocean" => ocean::ocean(&evaluated, modifier, frame, context)?,
             _ => return Err(unsupported_modifier(modifier)),
         };
         let dropped: Vec<String> = attributes_before
@@ -2130,7 +2133,7 @@ struct SubdivisionOptions {
 
 fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     validated(mesh)?;
-    let level_name = if modifier.runtime.use_render_levels {
+    let level_name = if modifier.runtime.use_render_settings {
         "render_levels"
     } else {
         "levels"

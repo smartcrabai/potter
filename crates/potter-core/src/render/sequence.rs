@@ -78,6 +78,7 @@ fn frame_output_names(frames: &[f64], extension: &str) -> Result<Vec<String>> {
 pub fn render_sequence(
     doc: &SceneDoc,
     context: &EvaluationContext,
+    project_root: &Path,
     cache_directory: &Path,
     camera_id: Option<&str>,
     frames: &[f64],
@@ -167,14 +168,19 @@ pub fn render_sequence(
             })?;
             let staged_image = staging.join(filename);
             let snapshot = if uses_sequencer {
-                let snapshot =
-                    Snapshot::evaluate_with_cache(doc, &frame_context, Some(cache_directory))?;
+                let snapshot = Snapshot::evaluate_with_cache(
+                    doc,
+                    &frame_context,
+                    Some(project_root),
+                    Some(cache_directory),
+                )?;
                 let composed = render_vse_frame(
                     doc,
                     scene,
                     frame,
                     width,
                     height,
+                    project_root,
                     cache_directory,
                     engine,
                     samples,
@@ -200,6 +206,7 @@ pub fn render_sequence(
                     render_motion_blurred_frame(
                         doc,
                         &frame_context,
+                        project_root,
                         cache_directory,
                         camera_id,
                         width,
@@ -216,6 +223,7 @@ pub fn render_sequence(
                     let (snapshot, raster, frame_warnings) = render_camera_frame(
                         doc,
                         &frame_context,
+                        project_root,
                         cache_directory,
                         camera_id,
                         width,
@@ -267,7 +275,7 @@ pub fn render_sequence(
             }));
         }
         let audio_info = if let Some(filename) = &audio_filename {
-            let audio = render_vse_audio(scene, cache_directory, frames)?;
+            let audio = render_vse_audio(scene, project_root, frames)?;
             let bytes = match scene.render.audio_codec.as_str() {
                 "wav" => encode_wav(&audio)?,
                 "flac" => encode_flac(&audio)?,
@@ -386,6 +394,7 @@ pub fn render_sequence(
 fn render_motion_blurred_frame(
     doc: &SceneDoc,
     context: &EvaluationContext,
+    project_root: &Path,
     cache_directory: &Path,
     camera_id: &str,
     width: u32,
@@ -416,8 +425,12 @@ fn render_motion_blurred_frame(
     let center_frame = context.frame.unwrap_or(scene.frame_current);
     let mut center_context = context.clone();
     center_context.frame = Some(center_frame);
-    let center_snapshot =
-        Snapshot::evaluate_with_cache(doc, &center_context, Some(cache_directory))?;
+    let center_snapshot = Snapshot::evaluate_with_cache(
+        doc,
+        &center_context,
+        Some(project_root),
+        Some(cache_directory),
+    )?;
     let mut accumulated = None;
     let center_sample = shutter_samples / 2;
     for sample_index in 0..shutter_samples {
@@ -427,6 +440,7 @@ fn render_motion_blurred_frame(
         let (_, rendered, sample_warnings) = render_camera_frame(
             doc,
             &sample_context,
+            project_root,
             cache_directory,
             camera_id,
             width,
@@ -518,6 +532,7 @@ fn render_vse_frame(
     width: u32,
     height: u32,
     root: &Path,
+    cache_directory: &Path,
     engine: &str,
     samples: u32,
     seed: u32,
@@ -578,6 +593,7 @@ fn render_vse_frame(
             doc,
             scene,
             root,
+            cache_directory,
             strip,
             frame,
             width,
@@ -606,6 +622,7 @@ fn render_strip_frame(
     doc: &SceneDoc,
     scene: &Scene,
     root: &Path,
+    cache_directory: &Path,
     strip: &Strip,
     frame: f64,
     width: u32,
@@ -632,6 +649,7 @@ fn render_strip_frame(
         doc,
         scene,
         root,
+        cache_directory,
         strip,
         frame,
         width,
@@ -661,6 +679,7 @@ fn render_strip_content(
     doc: &SceneDoc,
     scene: &Scene,
     root: &Path,
+    cache_directory: &Path,
     strip: &Strip,
     frame: f64,
     width: u32,
@@ -736,6 +755,7 @@ fn render_strip_content(
                 doc,
                 &nested_context,
                 root,
+                cache_directory,
                 camera_id,
                 width,
                 height,
@@ -780,6 +800,7 @@ fn render_strip_content(
             doc,
             scene,
             root,
+            cache_directory,
             strip,
             strip.source_frame(frame),
             width,
@@ -817,6 +838,7 @@ fn render_strip_content(
                 doc,
                 scene,
                 root,
+                cache_directory,
                 first_id,
                 frame,
                 width,
@@ -832,6 +854,7 @@ fn render_strip_content(
                 doc,
                 scene,
                 root,
+                cache_directory,
                 second_id,
                 frame,
                 width,
@@ -870,6 +893,7 @@ fn render_strip_content(
                 doc,
                 scene,
                 root,
+                cache_directory,
                 first_id,
                 input_frame,
                 width,
@@ -899,6 +923,7 @@ fn render_strip_content(
                     doc,
                     scene,
                     root,
+                    cache_directory,
                     second_id,
                     input_frame,
                     width,
@@ -927,6 +952,7 @@ fn render_strip_input(
     doc: &SceneDoc,
     scene: &Scene,
     root: &Path,
+    cache_directory: &Path,
     strip_id: &str,
     frame: f64,
     width: u32,
@@ -954,6 +980,7 @@ fn render_strip_input(
         doc,
         scene,
         root,
+        cache_directory,
         strip,
         frame,
         width,
@@ -983,6 +1010,7 @@ fn compose_meta_frame(
     doc: &SceneDoc,
     scene: &Scene,
     root: &Path,
+    cache_directory: &Path,
     meta: &Strip,
     frame: f64,
     width: u32,
@@ -1032,6 +1060,7 @@ fn compose_meta_frame(
             doc,
             scene,
             root,
+            cache_directory,
             child,
             frame,
             width,

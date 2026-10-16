@@ -58,6 +58,14 @@ pub struct EvaluationContext {
     pub purpose: EvaluationPurpose,
 }
 
+/// Borrowed project resources for one modifier evaluation.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ModifierEvaluationContext<'a> {
+    pub(crate) purpose: EvaluationPurpose,
+    pub(crate) project_root: Option<&'a Path>,
+    pub(crate) cache_directory: Option<&'a Path>,
+}
+
 /// Evaluated node state for the selected scene and frame.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,22 +144,24 @@ impl Snapshot {
     ///
     /// Returns scene, evaluation, modifier, context, and serialization errors.
     pub fn evaluate(doc: &SceneDoc, context: &EvaluationContext) -> Result<Self> {
-        Self::evaluate_with_cache(doc, context, None)
+        Self::evaluate_with_cache(doc, context, None, None)
     }
 
     /// Evaluate the Scene and read/write deterministic simulation cache entries.
     pub fn evaluate_with_cache(
         doc: &SceneDoc,
         context: &EvaluationContext,
+        project_root: Option<&Path>,
         cache_directory: Option<&Path>,
     ) -> Result<Self> {
-        Self::evaluate_internal(doc, context, cache_directory, None)
+        Self::evaluate_internal(doc, context, project_root, cache_directory, None)
     }
 
     /// Evaluate only the geometry required for the selected nodes and their mesh operands.
     pub fn evaluate_nodes_with_cache(
         doc: &SceneDoc,
         context: &EvaluationContext,
+        project_root: Option<&Path>,
         cache_directory: Option<&Path>,
         node_ids: &BTreeSet<Id>,
     ) -> Result<Self> {
@@ -164,23 +174,29 @@ impl Snapshot {
                 ));
             }
         }
-        Self::evaluate_internal(doc, context, cache_directory, Some(node_ids))
+        Self::evaluate_internal(doc, context, project_root, cache_directory, Some(node_ids))
     }
 
     /// Evaluate every supported node, recording modifier-feature failures per owner.
     pub fn evaluate_available_with_cache(
         doc: &SceneDoc,
         context: &EvaluationContext,
+        project_root: Option<&Path>,
         cache_directory: Option<&Path>,
     ) -> Result<(Self, BTreeMap<Id, PotError>)> {
         doc.validate()?;
-        crate::library::validate_linked_assets(doc, cache_directory)?;
+        let modifier_context = ModifierEvaluationContext {
+            purpose: context.purpose,
+            project_root,
+            cache_directory,
+        };
+        crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(doc)?;
         let mut suppressed = BTreeSet::new();
         let mesh_dependencies = object_mesh_dependencies(
             doc,
             ModifierGate {
-                purpose: context.purpose,
+                context: modifier_context,
                 suppressed: &suppressed,
             },
         )?;
@@ -190,7 +206,7 @@ impl Snapshot {
                 doc,
                 &scene_hash,
                 context,
-                cache_directory,
+                modifier_context,
                 None,
                 &suppressed,
                 &mesh_dependencies,
@@ -253,10 +269,8 @@ impl Snapshot {
                     let dependencies = &mesh_dependencies;
                     let mut affected = vec![node_id];
                     while let Some(source_id) = affected.pop() {
-                        for (dependent_id, targets) in dependencies
-                            .modifiers
-                            .iter()
-                            .chain(&dependencies.other)
+                        for (dependent_id, targets) in
+                            dependencies.modifiers.iter().chain(&dependencies.other)
                         {
                             if dependent_id == &source_id
                                 || !targets.contains(&source_id)
@@ -293,16 +307,23 @@ impl Snapshot {
     fn evaluate_internal(
         source: &SceneDoc,
         context: &EvaluationContext,
+        project_root: Option<&Path>,
         cache_directory: Option<&Path>,
         selected_nodes: Option<&BTreeSet<Id>>,
     ) -> Result<Self> {
         source.validate()?;
-        crate::library::validate_linked_assets(source, cache_directory)?;
+        let modifier_context = ModifierEvaluationContext {
+            purpose: context.purpose,
+            project_root,
+            cache_directory,
+        };
+        crate::library::validate_linked_assets(source, modifier_context.project_root)?;
         let scene_hash = source_scene_hash(source)?;
+        let suppressed = BTreeSet::new();
         let mesh_dependencies = object_mesh_dependencies(
             source,
             ModifierGate {
-                purpose: context.purpose,
+                context: modifier_context,
                 suppressed: &suppressed,
             },
         )?;
@@ -310,7 +331,7 @@ impl Snapshot {
             source,
             &scene_hash,
             context,
-            cache_directory,
+            modifier_context,
             selected_nodes,
             &suppressed,
             &mesh_dependencies,
@@ -323,13 +344,13 @@ impl Snapshot {
         doc: &SceneDoc,
         scene_hash: &str,
         context: &EvaluationContext,
-        cache_directory: Option<&Path>,
+        modifier_context: ModifierEvaluationContext<'_>,
         selected_nodes: Option<&BTreeSet<Id>>,
         suppressed: &BTreeSet<Id>,
-        mesh_dependencies: &BTreeMap<Id, BTreeSet<Id>>,
+        mesh_dependencies: &ObjectMeshDependencies,
     ) -> Result<Self> {
         let gate = ModifierGate {
-            purpose: context.purpose,
+            context: modifier_context,
             suppressed,
         };
         let scene_id = context
@@ -372,7 +393,7 @@ impl Snapshot {
             doc,
             frame,
             &driver_values,
-            cache_directory,
+            modifier_context.project_root,
             scene.fps,
             scene.fps_base,
         )?;
@@ -438,8 +459,7 @@ impl Snapshot {
                 curve_path_lengths.insert(curve_id, length);
             }
         }
-        let simulation =
-            crate::sim::evaluate(doc, &scene_id, frame, &matrices, cache_directory, scene_hash, gate)?;
+        let simulation = crate::sim::evaluate(doc, &scene_id, frame, &matrices, scene_hash, gate)?;
         let mut simulated_velocities = BTreeMap::new();
         let mut deformed_vertices = BTreeMap::new();
         let mut fluid_surfaces = BTreeMap::new();
@@ -515,7 +535,7 @@ impl Snapshot {
                     armature_world,
                     &matrices,
                     &driver_values,
-                    cache_directory,
+                    modifier_context.project_root,
                     scene.fps,
                     scene.fps_base,
                 )?;
@@ -539,7 +559,7 @@ impl Snapshot {
             "simulation_cache_key": simulation_cache_key,
         });
         let evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
-        let mut volume_data = load_vdb_volume_data(doc, cache_directory)?;
+        let mut volume_data = load_vdb_volume_data(doc, modifier_context.project_root)?;
 
         let mut nodes = BTreeMap::new();
         let mut meshes = BTreeMap::new();
@@ -661,6 +681,7 @@ impl Snapshot {
                         &object_meshes,
                         &meshes,
                         &curve_path_lengths,
+                        gate.context,
                         |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
                                 mesh,
@@ -671,7 +692,7 @@ impl Snapshot {
                                 frame,
                                 &matrices,
                                 &driver_values,
-                                cache_directory,
+                                modifier_context.project_root,
                                 scene.fps,
                                 scene.fps_base,
                                 &meshes,
@@ -705,7 +726,7 @@ impl Snapshot {
                                 doc,
                                 &matrices,
                                 &meshes,
-                                cache_directory,
+                                modifier_context.project_root,
                             ),
                             "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
                                 mesh,
@@ -720,7 +741,7 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 doc,
-                                cache_directory,
+                                modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
@@ -729,7 +750,7 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 doc,
-                                cache_directory,
+                                modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
@@ -739,12 +760,12 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 id,
+                                doc,
                                 scene_hash,
                                 gate,
                                 &scene_id,
                                 frame,
                                 &matrices,
-                                cache_directory,
                                 &mut simulated_particles,
                             ),
                             "particle_instance" => apply_particle_instance_modifier(
@@ -934,6 +955,7 @@ impl Snapshot {
                         &object_meshes,
                         &meshes,
                         &curve_path_lengths,
+                        gate.context,
                         |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
                             "armature" => rig::apply_armature_modifier_with_drivers(
                                 mesh,
@@ -944,7 +966,7 @@ impl Snapshot {
                                 frame,
                                 &matrices,
                                 &driver_values,
-                                cache_directory,
+                                modifier_context.project_root,
                                 scene.fps,
                                 scene.fps_base,
                                 &meshes,
@@ -978,7 +1000,7 @@ impl Snapshot {
                                 doc,
                                 &matrices,
                                 &meshes,
-                                cache_directory,
+                                modifier_context.project_root,
                             ),
                             "surface_deform" | "mesh_deform" => apply_scene_deform_modifier(
                                 mesh,
@@ -993,7 +1015,7 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 doc,
-                                cache_directory,
+                                modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
@@ -1002,7 +1024,7 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 doc,
-                                cache_directory,
+                                modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
@@ -1012,12 +1034,12 @@ impl Snapshot {
                                 mesh,
                                 modifier,
                                 id,
+                                doc,
                                 scene_hash,
                                 gate,
                                 &scene_id,
                                 frame,
                                 &matrices,
-                                cache_directory,
                                 &mut simulated_particles,
                             ),
                             "particle_instance" => apply_particle_instance_modifier(
@@ -1197,7 +1219,7 @@ impl Snapshot {
                             &current,
                             modifier,
                             doc,
-                            cache_directory,
+                            modifier_context.project_root,
                             &matrices,
                             id,
                         )?);
@@ -1253,7 +1275,7 @@ impl Snapshot {
                 doc,
                 frame,
                 &driver_values,
-                cache_directory,
+                modifier_context.project_root,
                 scene.fps,
                 scene.fps_base,
                 &meshes,
@@ -1288,7 +1310,7 @@ impl Snapshot {
                         armature_world,
                         &matrices,
                         &driver_values,
-                        cache_directory,
+                        modifier_context.project_root,
                         scene.fps,
                         scene.fps_base,
                         &meshes,
@@ -1368,7 +1390,7 @@ impl Snapshot {
 /// Content address of the authored scene. Purpose resolution never changes it.
 fn source_scene_hash(doc: &SceneDoc) -> Result<String> {
     let scene_value = serde_json::to_value(doc).map_err(PotError::internal_json)?;
-    hash::sha256(&hash::canonicalize(&scene_value)?)
+    Ok(hash::sha256(&hash::canonicalize(&scene_value)?))
 }
 
 /// Modifier state for one evaluation. `purpose` selects the viewport or render stack, and
@@ -1376,26 +1398,23 @@ fn source_scene_hash(doc: &SceneDoc) -> Result<String> {
 /// this type whether a modifier is active, so Preview and Render cannot diverge.
 #[derive(Clone, Copy)]
 pub(crate) struct ModifierGate<'a> {
-    pub(crate) purpose: EvaluationPurpose,
+    pub(crate) context: ModifierEvaluationContext<'a>,
     pub(crate) suppressed: &'a BTreeSet<Id>,
 }
 
 impl ModifierGate<'_> {
     /// Whether `modifier` on `node_id` takes part in this evaluation.
     pub(crate) fn is_active(&self, node_id: &Id, modifier: &Modifier) -> bool {
-        !self.suppressed.contains(node_id) && modifier.is_active(self.purpose)
+        !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
     }
 
-    /// `node_id`'s modifier list with this evaluation's `enabled` flags and render levels applied.
+    /// `node_id`'s modifier list with this evaluation's enabled flags and render settings applied.
     /// Borrowed when the stored state already matches; otherwise only this node's list is copied.
-    pub(crate) fn stack<'m>(
-        &self,
-        node_id: &Id,
-        modifiers: &'m [Modifier],
-    ) -> Cow<'m, [Modifier]> {
+    pub(crate) fn stack<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> Cow<'m, [Modifier]> {
         let matches = |modifier: &Modifier| {
             modifier.enabled == self.is_active(node_id, modifier)
-                && modifier.runtime.use_render_levels == uses_render_levels(modifier, self.purpose)
+                && modifier.runtime.use_render_settings
+                    == uses_render_settings(modifier, self.context.purpose)
         };
         if modifiers.iter().all(matches) {
             return Cow::Borrowed(modifiers);
@@ -1406,7 +1425,8 @@ impl ModifierGate<'_> {
                 .map(|modifier| {
                     let mut applied = modifier.clone();
                     applied.enabled = self.is_active(node_id, modifier);
-                    applied.runtime.use_render_levels = uses_render_levels(modifier, self.purpose);
+                    applied.runtime.use_render_settings =
+                        uses_render_settings(modifier, self.context.purpose);
                     applied
                 })
                 .collect(),
@@ -1414,9 +1434,12 @@ impl ModifierGate<'_> {
     }
 }
 
-fn uses_render_levels(modifier: &Modifier, purpose: EvaluationPurpose) -> bool {
+fn uses_render_settings(modifier: &Modifier, purpose: EvaluationPurpose) -> bool {
     purpose == EvaluationPurpose::Render
-        && matches!(modifier.modifier_type.as_str(), "subdivision" | "multires")
+        && matches!(
+            modifier.modifier_type.as_str(),
+            "subdivision" | "multires" | "screw" | "ocean"
+        )
 }
 
 /// Read and verify a cache resource from the scene's asset registry.
@@ -1733,8 +1756,7 @@ fn object_mesh_dependencies(
                 )?;
                 for target_id in object_ids {
                     if dependencies.modifiers.contains_key(&target_id)
-                        && let Some(owner_dependencies) =
-                            dependencies.modifiers.get_mut(owner_id)
+                        && let Some(owner_dependencies) = dependencies.modifiers.get_mut(owner_id)
                     {
                         owner_dependencies.insert(target_id);
                     }
@@ -1849,7 +1871,7 @@ fn object_mesh_evaluation_order(
         .unwrap_or_else(|| doc.nodes.keys().cloned().collect());
     let mut required = BTreeSet::new();
     for id in roots {
-        include_dependencies(&id, dependencies, &gate.suppressed, &mut required);
+        include_dependencies(&id, dependencies, gate.suppressed, &mut required);
     }
     let mut order = Vec::with_capacity(required.len());
     let mut complete = BTreeSet::new();
@@ -1867,7 +1889,7 @@ fn object_mesh_evaluation_order(
                 visit(
                     id,
                     dependencies,
-                    &gate.suppressed,
+                    gate.suppressed,
                     &mut complete,
                     &mut active,
                     &mut order,
@@ -2223,11 +2245,9 @@ fn render_simulated_particles(
             continue;
         }
         if doc.nodes.get(emitter_id).is_some_and(|node| {
-            node.modifiers
-                .iter()
-                .any(|modifier| {
-                    gate.is_active(emitter_id, modifier) && modifier.modifier_type == "explode"
-                })
+            node.modifiers.iter().any(|modifier| {
+                gate.is_active(emitter_id, modifier) && modifier.modifier_type == "explode"
+            })
         }) {
             continue;
         }
@@ -2461,7 +2481,6 @@ fn apply_stack_physics_modifier(
     scene_id: &Id,
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
-    cache_directory: Option<&Path>,
     particles: &mut BTreeMap<Id, Vec<crate::sim::ParticleState>>,
 ) -> Result<()> {
     let result = crate::sim::evaluate_stack_modifier(
@@ -2472,7 +2491,6 @@ fn apply_stack_physics_modifier(
         std::mem::replace(mesh, Mesh::new()),
         frame,
         matrices,
-        cache_directory,
         scene_hash,
         gate,
     )?;

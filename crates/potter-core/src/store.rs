@@ -36,6 +36,7 @@ pub enum HistoryDirection {
 
 pub struct Project {
     path: PathBuf,
+    cache_directory: PathBuf,
     lock: Option<File>,
     doc: SceneDoc,
 }
@@ -60,8 +61,11 @@ impl Project {
         }
         let lock = Some(Self::lock_file(path)?);
         let doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let path = canonical_path(path)?;
+        let cache_directory = path.join(".potter/cache");
         let mut project = Self {
-            path: canonical_path(path)?,
+            path,
+            cache_directory,
             lock,
             doc,
         };
@@ -90,6 +94,7 @@ impl Project {
             ));
         }
         let canonical = canonical_path(path)?;
+        let cache_directory = canonical.join(".potter/cache");
         let lock = if exclusive {
             Some(Self::lock_file(&canonical)?)
         } else {
@@ -98,6 +103,7 @@ impl Project {
         let doc = Self::read_snapshot(&canonical)?;
         Ok(Self {
             path: canonical,
+            cache_directory,
             lock,
             doc,
         })
@@ -167,6 +173,10 @@ impl Project {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+    #[must_use]
+    pub fn cache_directory(&self) -> &Path {
+        &self.cache_directory
     }
 
     pub fn info(&self) -> Result<SceneInfo> {

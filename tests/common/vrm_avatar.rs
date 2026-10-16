@@ -1,4 +1,4 @@
-//! Operations that build a VRM-exportable avatar: a skinned, shape-keyed body with MToon, expressions,
+//! Operations that build a VRM-exportable avatar: a skinned, shape-keyed body with `MToon`, expressions,
 //! and spring bones. Copied from the known-good fixture in `tests/vrm_mtoon_texture_transform.rs`
 //! without its texture-transform variant, so VRM 1.0 and VRM 0.x exports both succeed.
 

@@ -8,10 +8,7 @@ pub mod particles;
 pub mod softbody;
 mod solver;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
@@ -237,10 +234,10 @@ pub(crate) fn evaluate_stack_modifier(
     input_mesh: Mesh,
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
-    cache_directory: Option<&Path>,
     scene_hash: &str,
     gate: ModifierGate<'_>,
 ) -> Result<StackModifierResult> {
+    let cache_directory = gate.context.cache_directory;
     let (property, system) = match modifier.modifier_type.as_str() {
         "cloth" => ("physics_cloth", "cloth"),
         "soft_body" => ("physics_soft_body", "soft_body"),
@@ -689,17 +686,16 @@ fn set_vertex_positions(mesh: &mut Mesh, positions: Vec<DVec3>, node_id: &Id) ->
 
 /// Evaluate deterministic physics systems for `frame` and optionally cache their result.
 ///
-/// When `cache_directory` is supplied, results are read from and atomically written to
-/// `.potter/cache` below that directory.
+/// When the gate's cache directory is supplied, results are stored directly in that directory.
 pub(crate) fn evaluate(
     doc: &SceneDoc,
     scene_id: &Id,
     frame: f64,
     base_world_matrices: &BTreeMap<Id, DMat4>,
-    cache_directory: Option<&Path>,
     scene_hash: &str,
     gate: ModifierGate<'_>,
 ) -> Result<Option<SimulationResult>> {
+    let cache_directory = gate.context.cache_directory;
     let key = cache::cache_key(scene_hash, scene_id, frame, base_world_matrices, gate)?;
     let mut result = solver::evaluate(
         doc,

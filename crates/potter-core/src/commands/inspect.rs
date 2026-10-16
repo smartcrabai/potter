@@ -21,8 +21,12 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
         args.context.view_layer.as_deref(),
         args.context.frame,
     )?;
-    let (snapshot, node_errors) =
-        Snapshot::evaluate_available_with_cache(doc, &context, Some(project.path()))?;
+    let (snapshot, node_errors) = Snapshot::evaluate_available_with_cache(
+        doc,
+        &context,
+        Some(project.path()),
+        Some(project.cache_directory()),
+    )?;
     let driver_values = crate::eval::rig::evaluate_drivers(doc, snapshot.frame)?;
     let items = if let Some(value) = args.id.as_deref() {
         let id = parse_id(value)?;
@@ -424,7 +428,11 @@ fn node_item(
     let world_transform = WorldTransform::from_matrix(evaluated.world_matrix);
     let local_matrix = animated_transform.matrix().to_cols_array();
 
-    let modifiers = node.modifiers.iter().map(modifier_item).collect::<Result<Vec<_>>>()?;
+    let modifiers = node
+        .modifiers
+        .iter()
+        .map(modifier_item)
+        .collect::<Result<Vec<_>>>()?;
     Ok(json!({
         "type": "node",
         "id": id,

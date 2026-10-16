@@ -109,6 +109,7 @@ struct Hit {
 
 pub fn pick(
     doc: &SceneDoc,
+    project_root: &Path,
     cache_directory: &Path,
     manifest_path: &Path,
     pixel: (u32, u32),
@@ -178,7 +179,8 @@ pub fn pick(
         frame: Some(manifest.frame),
         purpose,
     };
-    let snapshot = Snapshot::evaluate_with_cache(doc, &context, Some(cache_directory))?;
+    let snapshot =
+        Snapshot::evaluate_with_cache(doc, &context, Some(project_root), Some(cache_directory))?;
     if snapshot.revision != manifest.revision
         || snapshot.scene_hash != manifest.scene_hash
         || snapshot.evaluation_hash != manifest.evaluation_hash
