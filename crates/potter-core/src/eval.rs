@@ -2709,7 +2709,6 @@ pub(crate) fn resolve_modifier_object_operands(
         "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
             &["armature"]
         }
-        "volume_displace" => &["texture_map_object"],
         _ => &[],
     };
     let has_references = reference_parameters.iter().any(|parameter| {
