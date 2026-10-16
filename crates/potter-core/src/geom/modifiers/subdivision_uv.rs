@@ -977,10 +977,7 @@ impl UvSubdivision {
                     )
                 })
                 .collect();
-            layers.push(UvLayer {
-                name: layer.name.clone(),
-                faces,
-            });
+            layers.push(UvLayer::new(layer.name.clone(), faces));
         }
         uv_layers::write_layers(result, &layers);
         Ok(())

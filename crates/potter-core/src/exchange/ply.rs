@@ -1,14 +1,15 @@
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 use glam::DVec3;
 
-use super::{ExchangeMesh, shading};
+use super::{ExchangeMesh, ExchangeUvLayer, shading, single_uv_set};
 use crate::error::{ErrorCode, PotError, Result};
 
 pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
-    let vertex_count = meshes
+    let splits = meshes.iter().map(split_mesh).collect::<Result<Vec<_>>>()?;
+    let vertex_count = splits
         .iter()
-        .try_fold(0_usize, |sum, mesh| sum.checked_add(mesh.positions.len()))
+        .try_fold(0_usize, |sum, split| sum.checked_add(split.vertices.len()))
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "PLY vertex count overflow"))?;
     let face_count = meshes
         .iter()
@@ -21,34 +22,44 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
     } else {
         ""
     };
+    // Blender writes `s t` only when the mesh has a UV layer. A file where some mesh has one gives
+    // every mesh `s t`, and the meshes without a layer write zeros.
+    let with_uv = meshes.iter().any(|mesh| active_layer(mesh).is_some());
+    let uv_properties = if with_uv {
+        "property float s\nproperty float t\n"
+    } else {
+        ""
+    };
     let header = format!(
-        "ply\nformat binary_little_endian 1.0\nelement vertex {vertex_count}\nproperty float x\nproperty float y\nproperty float z\n{normal_properties}property uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar alpha\nproperty float u\nproperty float v\nelement face {face_count}\nproperty list uint uint vertex_indices\nend_header\n"
+        "ply\nformat binary_little_endian 1.0\nelement vertex {vertex_count}\nproperty float x\nproperty float y\nproperty float z\n{normal_properties}property uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar alpha\n{uv_properties}element face {face_count}\nproperty list uint uint vertex_indices\nend_header\n"
     );
     let mut output = header.into_bytes();
-    for mesh in meshes {
+    for (mesh, split) in meshes.iter().zip(&splits) {
         let normals = if with_normals {
             vertex_normals(mesh)?
         } else {
             Vec::new()
         };
-        for (index, position) in mesh.positions.iter().enumerate() {
-            for value in position {
-                push_f32(&mut output, *value)?;
+        for &(position, uv) in &split.vertices {
+            for value in mesh.positions[position] {
+                push_f32(&mut output, value)?;
             }
             if with_normals {
-                for value in normals[index] {
+                for value in normals[position] {
                     output.extend_from_slice(&value.to_le_bytes());
                 }
             }
             output.extend_from_slice(&[153, 153, 153, 255]);
-            output.extend_from_slice(&0.0_f32.to_le_bytes());
-            output.extend_from_slice(&0.0_f32.to_le_bytes());
+            if with_uv {
+                for value in uv {
+                    output.extend_from_slice(&value.to_le_bytes());
+                }
+            }
         }
     }
     let mut base = 0_usize;
-    for mesh in meshes {
-        let (faces, _) = shading::baked_faces(mesh)?;
-        for face in &faces {
+    for split in &splits {
+        for face in &split.faces {
             let count = u32::try_from(face.len())
                 .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "PLY face is too large"))?;
             output.extend_from_slice(&count.to_le_bytes());
@@ -66,10 +77,68 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<Vec<u8>> {
             }
         }
         base = base
-            .checked_add(mesh.positions.len())
+            .checked_add(split.vertices.len())
             .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "PLY vertex index overflow"))?;
     }
     Ok(output)
+}
+
+/// The active UV layer of `mesh`, the one PLY writes.
+fn active_layer(mesh: &ExchangeMesh) -> Option<&ExchangeUvLayer> {
+    mesh.uv_active.and_then(|index| mesh.uv_layers.get(index))
+}
+
+/// One mesh as PLY stores it. Without a UV layer the vertices are the positions. With the active
+/// layer they are the distinct (position, uv) pairs in first-use order, which is how Blender splits
+/// vertices: a position used with two UVs appears twice.
+struct Split {
+    /// Source position index and `s, t` of each output vertex. Without a layer, `s, t` is zero.
+    vertices: Vec<(usize, [f32; 2])>,
+    /// Faces as output vertex indices, in the world-winding order `baked_faces` gives.
+    faces: Vec<Vec<usize>>,
+}
+
+fn split_mesh(mesh: &ExchangeMesh) -> Result<Split> {
+    let (faces, _) = shading::baked_faces(mesh)?;
+    let Some(layer) = active_layer(mesh) else {
+        return Ok(Split {
+            vertices: (0..mesh.positions.len())
+                .map(|index| (index, [0.0; 2]))
+                .collect(),
+            faces,
+        });
+    };
+    let uvs = shading::baked_corners(mesh, &layer.corners);
+    let mut vertices = Vec::new();
+    let mut lookup = HashMap::<(usize, [u32; 2]), usize>::new();
+    let mut split_faces = Vec::with_capacity(faces.len());
+    for (face, face_uvs) in faces.iter().zip(&uvs) {
+        let mut indices = Vec::with_capacity(face.len());
+        for (position, uv) in face.iter().zip(face_uvs) {
+            let st = blender_st(*uv);
+            let key = (*position, st.map(f32::to_bits));
+            let index = *lookup.entry(key).or_insert_with(|| {
+                vertices.push((*position, st));
+                vertices.len() - 1
+            });
+            indices.push(index);
+        }
+        split_faces.push(indices);
+    }
+    Ok(Split {
+        vertices,
+        faces: split_faces,
+    })
+}
+
+/// Blender's `s, t` for a storage UV. Storage V points down; Blender's PLY writes raw Blender V,
+/// which points up, so `t` is flipped.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "PLY texture coordinates use float32 by specification"
+)]
+fn blender_st(uv: [f64; 2]) -> [f32; 2] {
+    [uv[0] as f32, (1.0 - uv[1]) as f32]
 }
 
 pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
@@ -96,11 +165,17 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     let mut cursor = header_end;
     let mut positions = Vec::with_capacity(parsed.vertex_count);
     let mut per_vertex_normals = Vec::with_capacity(parsed.vertex_count);
+    let mut per_vertex_uvs = Vec::with_capacity(parsed.vertex_count);
     for _ in 0..parsed.vertex_count {
         let mut position = [0.0_f64; 3];
         let mut normal = [0.0_f64; 3];
+        let mut uv = [0.0_f64; 2];
         for property in &parsed.vertex_properties {
             let raw = take(&bytes, &mut cursor, scalar_size(&property.scalar_type)?)?;
+            if matches!(property.name.as_str(), "s" | "t") {
+                uv[usize::from(property.name == "t")] = read_scalar(raw, &property.scalar_type)?;
+                continue;
+            }
             let (target, axis) = match property.name.as_str() {
                 "x" => (&mut position, 0),
                 "y" => (&mut position, 1),
@@ -115,8 +190,13 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
         if !position.iter().all(|value| value.is_finite()) {
             return Err(ply_error("PLY contains non-finite vertex coordinates"));
         }
+        if !uv.iter().all(|value| value.is_finite()) {
+            return Err(ply_error("PLY contains non-finite texture coordinates"));
+        }
         positions.push(position);
         per_vertex_normals.push(normal);
+        // Blender's PLY writes raw V, which points up; Potter stores V down.
+        per_vertex_uvs.push([uv[0], 1.0 - uv[1]]);
     }
     let mut faces = Vec::with_capacity(parsed.face_count);
     for _ in 0..parsed.face_count {
@@ -170,6 +250,20 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     } else {
         None
     };
+    let (uv_layers, uv_active, uv_render) = if parsed.has_uv {
+        single_uv_set(
+            faces
+                .iter()
+                .map(|face| {
+                    face.iter()
+                        .map(|&index| per_vertex_uvs[index])
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+        )
+    } else {
+        (Vec::<ExchangeUvLayer>::new(), None, None)
+    };
     Ok(vec![ExchangeMesh {
         id: "ply_mesh".to_owned(),
         name: "PLY Mesh".to_owned(),
@@ -180,6 +274,9 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
         singular: false,
         vertex_normals: Vec::new(),
         smooth: Vec::new(),
+        uv_layers,
+        uv_active,
+        uv_render,
     }])
 }
 
@@ -190,6 +287,7 @@ struct Header {
     vertex_properties: Vec<ScalarProperty>,
     face_properties: Vec<FaceProperty>,
     has_normals: bool,
+    has_uv: bool,
 }
 
 struct ScalarProperty {
@@ -274,6 +372,11 @@ fn parse_header(header: &str) -> Result<Header> {
     }
     let has_coordinates = has_vertex_properties(&vertex_properties, ["x", "y", "z"]);
     let has_normals = has_vertex_properties(&vertex_properties, ["nx", "ny", "nz"]);
+    let has_uv = ["s", "t"].iter().all(|name| {
+        vertex_properties
+            .iter()
+            .any(|property| property.name == *name)
+    });
     let has_indices = face_properties.iter().any(|property| matches!(property, FaceProperty::List(_, _, name) if name == "vertex_indices" || name == "vertex_index"));
     if !has_coordinates || !has_indices {
         return Err(ply_error(
@@ -287,6 +390,7 @@ fn parse_header(header: &str) -> Result<Header> {
         vertex_properties,
         face_properties,
         has_normals,
+        has_uv,
     })
 }
 
@@ -467,4 +571,94 @@ pub(crate) fn imported_graph(
 ) -> Result<crate::exchange::ImportedGraph> {
     let meshes = import(path)?;
     crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "ply", Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{export, import};
+    use crate::{
+        error::{ErrorCode, PotError, Result},
+        exchange::{ExchangeMesh, ExchangeUvLayer},
+    };
+    use std::fs;
+
+    /// Two triangles sharing positions 1 and 2, whose shared corners carry different UVs.
+    fn quad_with_seam_uvs() -> ExchangeMesh {
+        ExchangeMesh {
+            id: "quad".to_owned(),
+            name: "Quad".to_owned(),
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            faces: vec![vec![0, 1, 2], vec![2, 1, 3]],
+            normals: Some(vec![[0.0, 0.0, 1.0]; 6]),
+            mirrored: false,
+            singular: false,
+            vertex_normals: Vec::new(),
+            smooth: vec![false, false],
+            uv_layers: vec![ExchangeUvLayer {
+                name: "UVMap".to_owned(),
+                corners: vec![
+                    vec![[0.0, 0.0], [0.5, 0.0], [0.0, 0.5]],
+                    vec![[0.5, 0.0], [1.0, 0.5], [0.5, 0.5]],
+                ],
+            }],
+            uv_active: Some(0),
+            uv_render: Some(0),
+        }
+    }
+
+    fn read_f32(bytes: &[u8], offset: usize) -> Result<f32> {
+        let raw = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "PLY test read out of range"))?;
+        Ok(f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    #[test]
+    fn splits_vertices_by_position_and_uv_and_writes_flipped_st() -> Result<()> {
+        let bytes = export(&[quad_with_seam_uvs()])?;
+        let marker = b"end_header\n";
+        let header_end = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "PLY test has no header"))?
+            + marker.len();
+        let header = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
+        // Positions 1 and 2 each appear twice, once per UV: 4 + 2 vertices.
+        assert!(header.contains("element vertex 6\n"), "{header}");
+        assert!(header.contains("property float s\nproperty float t\n"));
+        assert!(!header.contains("property float u"));
+        // Vertex 3 is position 2 with the second face's UV (0.5, 0.0). Its t is the flipped storage
+        // V, 1 - 0.0. Records are 24 bytes: xyz, colour, then s and t.
+        let vertex = header_end + 3 * 24;
+        assert_eq!(read_f32(&bytes, vertex)?, 0.0);
+        assert_eq!(read_f32(&bytes, vertex + 4)?, 1.0);
+        assert_eq!(read_f32(&bytes, vertex + 8)?, 0.0);
+        assert_eq!(read_f32(&bytes, vertex + 16)?, 0.5);
+        assert_eq!(read_f32(&bytes, vertex + 20)?, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn imports_st_as_the_uv_layer_in_storage_convention() -> Result<()> {
+        let original = quad_with_seam_uvs();
+        let bytes = export(std::slice::from_ref(&original))?;
+        let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
+        fs::write(file.path(), bytes).map_err(|error| PotError::io(&error))?;
+        let imported = import(file.path())?;
+        let layer = imported[0]
+            .uv_layers
+            .first()
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "PLY import has no UV layer"))?;
+        assert_eq!(layer.name, "UVMap");
+        assert_eq!(imported[0].uv_active, Some(0));
+        assert_eq!(imported[0].uv_render, Some(0));
+        assert_eq!(layer.corners, original.uv_layers[0].corners);
+        Ok(())
+    }
 }

@@ -69,13 +69,7 @@ pub(crate) fn load_project(uri: &str) -> Result<(PathBuf, SceneDoc, String)> {
         ));
     }
     let bytes = fs::read(&scene_path).map_err(|error| PotError::io(&error))?;
-    let doc: SceneDoc = serde_json::from_slice(&bytes).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::SceneInvalid,
-            error.to_string(),
-            json!({"path":scene_path,"line":error.line(),"column":error.column()}),
-        )
-    })?;
+    let doc = crate::model::parse_scene(&bytes)?;
     doc.validate()?;
     Ok((project, doc, hash::sha256(&bytes)))
 }

@@ -335,10 +335,20 @@ fn build_graph(
 }
 
 /// An Image Texture node for `slot`, fed by a Mapping node when the slot has a transform, and returns
-/// the name of the Image Texture node. The coordinates are Texture Coordinate `UV`.
+/// the name of the Image Texture node. A named UV layer is read through a UV Map node; the render
+/// layer (no name) through Texture Coordinate `UV`.
 fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result<String> {
     let tex = format!("{name}_tex");
-    let mut source = ("coord".to_owned(), "UV".to_owned());
+    let mut source = match &slot.texture.uv_layer {
+        Some(layer) => {
+            let uv_node = format!("{name}_uv");
+            let mut node = GraphNode::new("ShaderNodeUVMap");
+            node.properties.insert("uv_map".to_owned(), json!(layer));
+            insert(graph, &uv_node, node)?;
+            (uv_node, "UV".to_owned())
+        }
+        None => ("coord".to_owned(), "UV".to_owned()),
+    };
     if let Some(transform) = &slot.transform {
         let map = format!("{name}_map");
         let (location, rotation, scale) = mapping_values(transform);

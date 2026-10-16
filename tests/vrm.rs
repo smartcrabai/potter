@@ -399,7 +399,7 @@ fn fixture_operations(options: FixtureOptions) -> Vec<Value> {
             "id": "skin_material",
             "name": "Avatar Skin",
             "base_color": [0.8, 0.65, 0.5, 1.0],
-            "base_color_texture": {"image": "tex_albedo", "uv_map": "uv_map"},
+            "base_color_texture": {"image": "tex_albedo"},
         }),
         json!({"op": "node.create", "id": "body", "kind": "box", "params": {"size": 1.0}, "material": "skin_material"}),
         json!({"op": "uv.unwrap", "target": {"id": "body"}, "elements": {"domain": "face", "ids": ["f1"]}, "method": "smart"}),
@@ -2578,7 +2578,7 @@ fn ordinary_textured_relative_shape_key_exports_in_both_vrm_versions() -> TestRe
 
 #[test]
 fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() -> TestResult<()> {
-    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    let (_directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
         &project,
         1,
@@ -2598,12 +2598,7 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
             }),
         ],
     )?;
-    assert_preflight_both_versions(
-        &directory,
-        &project,
-        "ordinary-texture-without-uv0",
-        "material.texture_uv_map",
-    )?;
+    assert_format_loss_both_versions(&project, "uv.layer_missing")?;
 
     let (_directory, project) = new_fixture(FixtureOptions::default())?;
     apply_success(
@@ -2746,8 +2741,8 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
 }
 
 #[test]
-fn vrm_preflight_rejects_mtoon_textures_without_exported_uv0() -> TestResult {
-    let (directory, project) = new_fixture(FixtureOptions::default())?;
+fn vrm_reports_mtoon_textures_without_uv_layer_as_loss() -> TestResult {
+    let (_directory, project) = new_fixture(FixtureOptions::default())?;
     let mut mtoon_settings = avatar_settings(FixtureOptions::default())["mtoon"].clone();
     mtoon_settings["uvless_mtoon_material"] = json!({
         "shade_multiply_texture": {"image": "tex_shade"},
@@ -2774,12 +2769,7 @@ fn vrm_preflight_rejects_mtoon_textures_without_exported_uv0() -> TestResult {
         ],
     )?;
     let current_revision = revision(&project)?;
-    assert_preflight_both_versions(
-        &directory,
-        &project,
-        "mtoon-without-uv0",
-        "material.texture_uv_map",
-    )?;
+    assert_format_loss_both_versions(&project, "uv.layer_missing")?;
     assert_eq!(revision(&project)?, current_revision);
     Ok(())
 }
@@ -2818,6 +2808,7 @@ fn changed_constrained_skin_pose_is_rejected_explicitly() -> TestResult {
         .arg(&project)
         .args(["--format", "vrm", "--out"])
         .arg(&output_path)
+        .arg("--allow-lossy")
         .arg("--json")
         .output()?;
     let failure = assert_failure(&output, "UNSUPPORTED_FEATURE")?;

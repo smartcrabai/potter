@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::{
     error::Result,
     exchange::{
-        gltf::GltfIndex,
+        gltf::{GltfIndex, imported_uv_layer, texture_info_set},
         material_graph::{GraphTextures, move_textures_to_graph},
         material_surface::TextureTransform,
     },
@@ -255,7 +255,7 @@ fn decode_v1_material(
             defaults.uv_animation_rotation_speed_factor,
         )?, // mtoon::v1 uvAnimationRotationSpeedFactor
         // mtoon::v1 KHR_texture_transform of each texture info (`texture_transforms`)
-        texture_transforms: v1_texture_transforms(decoder, material, value)?,
+        texture_transforms: v1_texture_transforms(value)?,
     })
 }
 
@@ -287,59 +287,40 @@ fn v1_texture_field(
     }
 }
 
-/// A VRM 1.0 texture info object as a Potter texture. A non-zero UV set cannot be represented, so it
-/// is a loss and the texture is skipped. A texture transform is read by `v1_texture_transforms`.
+/// A VRM 1.0 texture info object as a Potter texture on the layer its UV set selects (`None` is the render
+/// layer). A set past the layer limit falls back to the render layer and is reported as a loss. A texture
+/// transform is read by `v1_texture_transforms`.
 fn v1_texture(decoder: &mut Decoder<'_>, name: &str, info: &Value) -> Result<Option<TextureRef>> {
-    if info["texCoord"].as_u64().unwrap_or(0) != 0 {
+    let set = texture_info_set(info);
+    if usize::try_from(set).is_ok_and(|set| set >= crate::geom::uv_layers::MAX_LAYERS) {
         decoder.loss(
-            "vrm.mtoon.texcoord",
+            crate::exchange::material_surface::feature_id::MESH_UV_LAYER,
             format!(
-                "MToon texture `{name}` uses a non-zero UV set, which Potter does not represent"
+                "MToon texture `{name}` reads UV set {set}, past the layer limit, so it samples the render layer"
             ),
             SUGGESTION,
         );
-        return Ok(None);
     }
     let (image, interpolation) = texture_source(&decoder.index.root, index_value(&info["index"])?)?;
     Ok(Some(potter_texture(
         decoder.image_id(image)?,
         interpolation,
+        imported_uv_layer(info),
     )))
 }
 
-/// The `KHR_texture_transform` of each VRM 1.0 texture slot that Potter stores, keyed by the slot
-/// field name. The identity is not stored. The extension's own `texCoord` override cannot be
-/// represented: it is a loss, and the texture is kept without its transform. A slot whose texture
-/// is skipped for a non-zero UV set has no transform.
-fn v1_texture_transforms(
-    decoder: &mut Decoder<'_>,
-    material: &Id,
-    value: &Value,
-) -> Result<BTreeMap<String, AvatarTextureTransform>> {
+/// The `KHR_texture_transform` of each VRM 1.0 texture slot that Potter stores, keyed by the slot field
+/// name. The identity is not stored. The extension's `texCoord` selects the texture's layer, as in
+/// `v1_texture`.
+fn v1_texture_transforms(value: &Value) -> Result<BTreeMap<String, AvatarTextureTransform>> {
     let mut transforms = BTreeMap::new();
     for slot in V1_TEXTURE_SLOTS.iter().copied() {
         let Some(info) = field(value, slot) else {
             continue;
         };
-        if info["texCoord"].as_u64().unwrap_or(0) != 0 {
-            continue;
-        }
         let Some(extension) = field(&info["extensions"], "KHR_texture_transform") else {
             continue;
         };
-        if extension["texCoord"]
-            .as_u64()
-            .is_some_and(|coord| coord != 0)
-        {
-            decoder.loss(
-                "vrm.mtoon.texture_transform",
-                format!(
-                    "MToon texture `{slot}` of material `{material}` uses a KHR_texture_transform texCoord override, which Potter does not represent"
-                ),
-                SUGGESTION,
-            );
-            continue;
-        }
         let transform = AvatarTextureTransform {
             offset: vector2(extension, "offset", [0.0; 2])?,
             rotation: number(extension, "rotation", 0.0)?,
@@ -668,6 +649,7 @@ fn v0_texture(decoder: &Decoder<'_>, textures: &Value, name: &str) -> Result<Opt
     Ok(Some(potter_texture(
         decoder.image_id(image)?,
         interpolation,
+        None,
     )))
 }
 
@@ -689,6 +671,7 @@ fn v0_channel_texture(
         Ok(Some(potter_texture(
             decoder.image_id(image)?,
             interpolation,
+            None,
         )))
     } else {
         decoder.loss(
@@ -738,11 +721,16 @@ fn texture_source(root: &Value, texture_index: usize) -> Result<(usize, ImageInt
     Ok((image, interpolation))
 }
 
-/// `MToon` textures address the default UV set, which Potter stores without a name (as the exporter accepts).
-fn potter_texture(image: Id, interpolation: ImageInterpolation) -> TextureRef {
+/// A `MToon` texture on `uv_layer` (`None` is the render layer). VRM 0.x textures have no `texCoord` and pass
+/// `None`.
+fn potter_texture(
+    image: Id,
+    interpolation: ImageInterpolation,
+    uv_layer: Option<String>,
+) -> TextureRef {
     TextureRef {
         image,
-        uv_map: None,
+        uv_layer,
         interpolation,
     }
 }

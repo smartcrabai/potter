@@ -1553,10 +1553,7 @@ fn collapse_write_uv(mesh: &mut Mesh, names: &[String], corner_uv: &[CornerUv]) 
                     Some(row)
                 })
                 .collect();
-            uv_layers::UvLayer {
-                name: name.clone(),
-                faces,
-            }
+            uv_layers::UvLayer::new(name.clone(), faces)
         })
         .collect();
     uv_layers::write_layers(mesh, &layers);
@@ -1998,19 +1995,10 @@ fn decimate_dissolve_edge_flags(
 }
 
 fn decimate_dissolve_uv_seams(mesh: &Mesh, polygons: &[Polygon]) -> HashSet<DecimateEdge> {
-    let Some(layers) = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-    else {
-        return HashSet::new();
-    };
+    let (_, layers) = collapse_uv_layers(mesh);
     let mut seams = HashSet::new();
-    for layer in layers {
-        let Some(values) = layer.get("values").and_then(Value::as_array) else {
-            continue;
-        };
-        let mut edge_values: HashMap<DecimateEdge, (&Value, &Value)> = HashMap::new();
+    for values in &layers {
+        let mut edge_values: HashMap<DecimateEdge, (&[f64; 2], &[f64; 2])> = HashMap::new();
         let mut loop_index = 0;
         for (face, _) in polygons {
             if loop_index + face.len() > values.len() {
@@ -2028,7 +2016,9 @@ fn decimate_dissolve_uv_seams(mesh: &Mesh, polygons: &[Polygon]) -> HashSet<Deci
                 };
                 let edge = edge_key(first, second);
                 if let Some((expected_first, expected_second)) = edge_values.get(&edge) {
-                    if *expected_first != first_uv || *expected_second != second_uv {
+                    if !crate::float::equal_f64_array(expected_first, first_uv)
+                        || !crate::float::equal_f64_array(expected_second, second_uv)
+                    {
                         seams.insert(edge);
                     }
                 } else {

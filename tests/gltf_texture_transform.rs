@@ -462,7 +462,7 @@ fn appending_the_same_gltf_twice_keeps_each_copys_graph_and_image() -> TestResul
 }
 
 #[test]
-fn emissive_texture_on_another_uv_set_is_a_loss_not_a_failure() -> TestResult {
+fn emissive_texture_on_another_uv_set_reads_that_layer() -> TestResult {
     let directory = TempDir::new()?;
     let gltf = write_gltf(
         directory.path(),
@@ -475,31 +475,23 @@ fn emissive_texture_on_another_uv_set_is_a_loss_not_a_failure() -> TestResult {
     )?;
     let project = directory.path().join("scene");
     pot().arg("init").arg(&project).arg("--json").output()?;
-    let refused = run_import(&project, &gltf, 0, false)?;
-    assert_eq!(
-        refused["ok"], false,
-        "the loss is refused without --allow-lossy"
-    );
-    assert!(
-        refused.to_string().contains("material.texture_uv_set"),
-        "{refused}"
-    );
-    let accepted = run_import(&project, &gltf, 0, true)?;
-    assert_eq!(accepted["ok"], true, "{accepted}");
+    let outcome = run_import(&project, &gltf, 0, false)?;
+    assert_eq!(outcome["ok"], true, "{outcome}");
     let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     let material = scene["materials"]
         .as_object()
         .and_then(|materials| materials.values().next())
         .ok_or("no material")?;
-    assert!(
-        material["node_tree"].is_null(),
-        "the skipped texture needs no graph"
-    );
+    let graph = material["node_tree"]
+        .as_str()
+        .ok_or("the emissive texture needs a graph")?;
+    let (_, uv_node) = node_of(&scene["node_groups"][graph], "ShaderNodeUVMap")?;
+    assert_eq!(uv_node["properties"]["uv_map"], "UVMap.001");
     Ok(())
 }
 
 #[test]
-fn transform_on_another_uv_set_is_dropped_with_a_loss() -> TestResult {
+fn transform_on_another_uv_set_keeps_the_transform_and_layer() -> TestResult {
     let directory = TempDir::new()?;
     let gltf = write_gltf(
         directory.path(),
@@ -507,29 +499,18 @@ fn transform_on_another_uv_set_is_dropped_with_a_loss() -> TestResult {
     )?;
     let project = directory.path().join("scene");
     pot().arg("init").arg(&project).arg("--json").output()?;
-    let refused = run_import(&project, &gltf, 0, false)?;
-    assert_eq!(
-        refused["ok"], false,
-        "the loss is refused without --allow-lossy"
-    );
-    assert!(
-        refused.to_string().contains("material.texture_uv_set"),
-        "{refused}"
-    );
-    let accepted = run_import(&project, &gltf, 0, true)?;
-    assert_eq!(accepted["ok"], true, "{accepted}");
+    let outcome = run_import(&project, &gltf, 0, false)?;
+    assert_eq!(outcome["ok"], true, "{outcome}");
     let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     let material = scene["materials"]
         .as_object()
         .and_then(|materials| materials.values().next())
         .ok_or("no material")?;
-    assert!(
-        material["node_tree"].is_null(),
-        "the untransformed texture stays a field"
-    );
-    assert!(
-        !material["base_color_texture"].is_null(),
-        "the texture is kept"
-    );
+    let graph = material["node_tree"]
+        .as_str()
+        .ok_or("the transformed texture needs a graph")?;
+    let (_, uv_node) = node_of(&scene["node_groups"][graph], "ShaderNodeUVMap")?;
+    assert_eq!(uv_node["properties"]["uv_map"], "UVMap.001");
+    node_of(&scene["node_groups"][graph], "ShaderNodeMapping")?;
     Ok(())
 }

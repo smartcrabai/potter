@@ -79,6 +79,18 @@ pub(super) fn baked_faces(mesh: &ExchangeMesh) -> Result<BakedFaces> {
     Ok((faces, reversed))
 }
 
+/// Per-face corner values as a world-baked writer stores them: a mirrored node reverses each face,
+/// as `baked_faces` does for normals.
+pub(super) fn baked_corners<T: Clone>(mesh: &ExchangeMesh, corners: &[Vec<T>]) -> Vec<Vec<T>> {
+    if !mesh.mirrored {
+        return corners.to_vec();
+    }
+    corners
+        .iter()
+        .map(|face| face.iter().rev().cloned().collect())
+        .collect()
+}
+
 /// Shading a Potter writer stores exactly. `smooth` is per face in `mesh.faces` order; `sharp`
 /// holds the endpoint vertex indices (into `mesh.vertices`) of each sharp edge.
 pub(super) struct ExactShading {

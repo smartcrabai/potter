@@ -1219,6 +1219,13 @@ def _modifier_node_inputs(modifier):
     return result
 
 
+def _uv_layer_index(layers, attribute):
+    index = getattr(layers, attribute, None)
+    if index is None or not 0 <= index < len(layers):
+        return -1
+    return int(index)
+
+
 def mesh_dump(mesh):
     vertices = [{"co": plain(v.co)} for v in mesh.vertices]
     edges = [{"v": list(edge.vertices), "sharp": bool(getattr(edge, "use_edge_sharp", False)),
@@ -1226,9 +1233,11 @@ def mesh_dump(mesh):
     polygons = [{"v": list(poly.vertices), "material_index": int(poly.material_index),
                  "smooth": bool(poly.use_smooth)} for poly in mesh.polygons]
     uv_layers = []
-    for index, layer in enumerate(mesh.uv_layers):
-        uv_layers.append({"name": layer.name, "active": index == mesh.uv_layers.active_index,
-                          "values": [plain(item.uv) for item in layer.data]})
+    for layer in mesh.uv_layers:
+        uv_layers.append({"name": layer.name, "values": [plain(item.uv) for item in layer.data],
+                          "pins": [bool(item.pin_uv) for item in layer.data]})
+    uv_active = _uv_layer_index(mesh.uv_layers, "active_index")
+    uv_render = _uv_layer_index(mesh.uv_layers, "active_render_index")
     attrs = []
     try:
         for attr in mesh.attributes:
@@ -1253,7 +1262,8 @@ def mesh_dump(mesh):
                          for vertex in mesh.skin_vertices[0].data]
     return {"name": mesh.name_full, "potter_id": mesh.get("potter.id"),
             "library": library_reference(mesh), "vertices": vertices,
-            "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "attributes": attrs,
+            "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "uv_active": uv_active,
+            "uv_render": uv_render, "attributes": attrs,
             "skin_vertices": skin_vertices,
             "shape_keys": _mesh_shape_keys(mesh),
             "descriptor": json.loads(mesh.get("potter.descriptor_json", "null")),
@@ -2577,17 +2587,32 @@ def mesh_create(name, raw, block_id):
                 polygon.material_index = material_index
         if index < len(polygon_smooth) and polygon_smooth[index]:
             polygon.use_smooth = True
-    uv_layers = attributes.get("blender_uv_layers", raw.get("uv_layers", []))
-    for index, layer in enumerate(uv_layers):
+    uv_layers = raw.get("uv_layers", [])
+    if len(uv_layers) > 8:
+        raise ValueError("a Blender mesh holds at most 8 UV layers, got %d" % len(uv_layers))
+    for layer in uv_layers:
         uv = mesh.uv_layers.new(name=layer["name"])
-        for item_index, item in enumerate(layer.get("values", [])):
-            if item_index < len(uv.data):
-                uv.data[item_index].uv = item
-        if layer.get("active"):
-            mesh.uv_layers.active_index = index
+        for index, item in enumerate(layer.get("values", [])):
+            if index < len(uv.data):
+                uv.data[index].uv = item
+        pins = layer.get("pins", [])
+        # Blender creates a pin attribute as soon as any loop is written, so an all-false layer is left unpinned.
+        if any(pins):
+            for index, pinned in enumerate(pins):
+                if index < len(uv.data):
+                    uv.data[index].pin_uv = bool(pinned)
+    layer_names = {layer["name"] for layer in uv_layers}
+    uv_active = raw.get("uv_active")
+    if isinstance(uv_active, int) and 0 <= uv_active < len(mesh.uv_layers):
+        mesh.uv_layers.active_index = uv_active
+    uv_render = raw.get("uv_render")
+    if isinstance(uv_render, int) and 0 <= uv_render < len(mesh.uv_layers):
+        mesh.uv_layers.active_render_index = uv_render
     for source in attributes.get("blender_attributes", []):
         name = source.get("name")
         if not name or name in ("position", ".corner_vert", ".corner_edge", ".edge_verts"):
+            continue
+        if source.get("data_type") == "FLOAT2" and source.get("domain") == "CORNER" and name in layer_names:
             continue
         try:
             attribute = mesh.attributes.get(name)
@@ -4791,11 +4816,28 @@ def export_doc(doc, target, pack, scene_hash, context):
                     apply_exclusion(child)
             apply_exclusion(view_layer.layer_collection)
         scene["potter.view_layer_ids_json"] = json.dumps(view_layer_ids, sort_keys=True)
+    image_map = {}
     for image_id, item in doc.get("images", {}).items():
         image = bpy.data.images.new(item["name"], width=int(item["width"]),
                                     height=int(item["height"]), alpha=True)
+        colorspace = {
+            "srgb": "sRGB",
+            "linear": "Linear Rec.709",
+            "non_color": "Non-Color",
+        }.get(item.get("colorspace"))
+        if colorspace is not None:
+            image.colorspace_settings.name = colorspace
+        pixels = item.get("pixels")
+        if pixels is not None:
+            image.pixels.foreach_set(
+                [channel for pixel in pixels for channel in pixel])
+            image.update()
+        if item.get("source") == "packed":
+            image.pack()
         set_id(image, image_id)
-        image["potter.image_json"] = json.dumps(item, sort_keys=True)
+        image_metadata = {key: value for key, value in item.items() if key != "pixels"}
+        image["potter.image_json"] = json.dumps(image_metadata, sort_keys=True)
+        image_map[image_id] = image
         image.use_fake_user = True
     data_raw = doc.get("data_blocks", {})
     linked_data_blocks = linked_maps["data_blocks"]
@@ -5182,6 +5224,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                 raise ValueError("scene references missing MovieClip %s" % clip_id)
             scene_map[scene_id].active_clip = clip
     id_lookup.update({tree.name_full: tree for tree in group_map.values()})
+    id_lookup.update({image.name_full: image for image in image_map.values()})
+    id_lookup.update(image_map)
     id_lookup.update({image.name_full: image for image in linked_maps["resources"].values()})
     socket_maps = _populate_geometry_groups(group_map, group_sources, id_lookup)
     for material_id, item in doc.get("materials", {}).items():

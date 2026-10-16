@@ -23,6 +23,7 @@ use crate::{
         clnor::transfer_custom_normals,
         normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags},
         provenance::Origin,
+        uv_layers,
     },
 };
 
@@ -387,6 +388,16 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     if bool_param(modifier, "use_smooth_shade")? {
         crate::geom::normals::shade_faces_smooth(&mut result);
     }
+    let mut layers = uv_layers::read_layers(&result);
+    for layer in &mut layers {
+        for (face, values) in layer.faces.iter_mut().enumerate() {
+            let corners = &corner_uv[face];
+            if values.is_none() && corners.iter().all(|(_, value)| value.is_some()) {
+                *values = Some(vec![[0.0, 0.0]; corners.len()]);
+            }
+        }
+    }
+    uv_layers::write_layers(&mut result, &layers);
     super::map_uv_values(&mut result, |face, corner, [u, v]| {
         let (turns, loose_value) = corner_uv[face][corner];
         [u + turn * usize_as_f64(turns), loose_value.unwrap_or(v)]
@@ -2538,18 +2549,12 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     if smooth_shade {
         crate::geom::normals::shade_faces_smooth(&mut result);
     }
-    // Blender's Skin output has no UV layers, so UV data is dropped (reported as attribute loss).
-    let uv_names: Vec<String> = result
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(serde_json::Value::as_array)
+    // Blender's Skin output has no UV layers, so the store is dropped (reported as attribute loss).
+    let uv_names: Vec<String> = uv_layers::read_layers(&result)
         .into_iter()
-        .flatten()
-        .filter_map(|layer| layer.get("name").and_then(serde_json::Value::as_str))
-        .map(str::to_owned)
+        .map(|layer| layer.name)
         .collect();
-    result.attributes.remove("blender_uv_layers");
-    result.attributes.remove("uv_map");
+    result.attributes.remove(uv_layers::ATTRIBUTE);
     if let Some(entries) = result
         .attributes
         .get_mut("blender_attributes")

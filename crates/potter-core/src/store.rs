@@ -105,13 +105,7 @@ impl Project {
 
     fn read_snapshot(path: &Path) -> Result<SceneDoc> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
-        let doc: SceneDoc = serde_json::from_slice(&bytes).map_err(|error| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                error.to_string(),
-                json!({ "line": error.line(), "column": error.column() }),
-            )
-        })?;
+        let doc = crate::model::migrate::parse_scene(&bytes)?;
         doc.validate()?;
         Ok(doc)
     }
@@ -577,13 +571,14 @@ fn write_history_blob(root: &Path, record: &HistoryRecord) -> Result<String> {
 fn read_history_blob(root: &Path, digest: &str) -> Result<HistoryRecord> {
     let path = blob_path(root, "history", digest)?;
     let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::SceneInvalid,
-            error.to_string(),
-            json!({ "line": error.line(), "column": error.column() }),
-        )
-    })
+    // The digest addresses the record as written, so the stored bytes are checked before any upgrade.
+    if hash::sha256(&bytes) != digest {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "history record does not match its content hash",
+        ));
+    }
+    crate::model::migrate::parse_history_record(&bytes)
 }
 
 fn write_blob_atomic(root: &Path, destination: &Path, bytes: &[u8]) -> Result<()> {

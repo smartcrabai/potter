@@ -5,7 +5,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{PotError, Result},
-    geom::{Face, Mesh, MeshError, edge_key},
+    geom::{
+        Face, Mesh, MeshError, edge_key,
+        uv_layers::{self, UvLayer, UvStore},
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2353,12 +2356,23 @@ fn attribute_values_mut<'a>(mesh: &'a mut Mesh, name: &str) -> Result<&'a mut Ma
         .ok_or_else(|| invalid(format!("mesh attribute `{name}` has no values object")))
 }
 
+/// `uv_layers` is the UV layer store, not a user attribute: create, update, and delete reject it.
+fn reject_reserved_attribute(name: &str) -> Result<()> {
+    if name == uv_layers::ATTRIBUTE {
+        return Err(invalid(format!(
+            "mesh attribute `{name}` is reserved for UV layers"
+        )));
+    }
+    Ok(())
+}
+
 fn apply_attribute_create(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
     let name = args
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_create requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     if mesh.attributes.contains_key(name) {
         return Err(invalid(format!("mesh attribute `{name}` already exists")));
     }
@@ -2414,6 +2428,7 @@ fn apply_attribute_update(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_update requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     let attribute = mesh
         .attributes
         .get(name)
@@ -2470,6 +2485,7 @@ fn apply_attribute_delete(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_delete requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     if !mesh.attributes.contains_key(name) {
         return Err(invalid(format!("mesh attribute `{name}` does not exist")));
     }
@@ -2830,100 +2846,101 @@ fn interpolate_legacy_attribute(
     Ok(())
 }
 
-fn interpolate_uv_map(source: &Mesh, target: &mut Mesh) -> Result<()> {
-    let Some(source_entries) = source.attributes.get("uv_map") else {
+/// Interpolates every UV layer of `source` onto `target`, keeping layer order, names, and the
+/// active and render layers. A target face copies its source face's corners when both share the
+/// face ID; otherwise each corner takes the nearest source corner value. Ambiguous corners leave
+/// the face without an entry.
+fn interpolate_uv_layers(source: &Mesh, target: &mut Mesh) -> Result<()> {
+    let source_store = uv_layers::read(source);
+    if source_store.layers.is_empty() {
         return Ok(());
-    };
-    let source_entries = source_entries
-        .as_array()
-        .ok_or_else(|| invalid("uv_map must be an array"))?;
-    let entries_by_face: HashMap<u32, &Value> = source_entries
+    }
+    let source_index: HashMap<u32, usize> = source
+        .faces
         .iter()
-        .filter_map(|entry| Some((u32::try_from(entry.get("face_id")?.as_u64()?).ok()?, entry)))
+        .enumerate()
+        .map(|(index, face)| (face.id, index))
         .collect();
-    let has_pins = source_entries.iter().any(|entry| {
-        entry
-            .get("pinned")
-            .and_then(Value::as_array)
-            .is_some_and(|pinned| !pinned.is_empty())
-    });
-    let mut target_entries = Vec::with_capacity(target.faces.len());
-    for face in &target.faces {
-        if let Some(existing) = entries_by_face.get(&face.id)
-            && existing
-                .get("uv")
-                .and_then(Value::as_array)
-                .is_some_and(|uv| uv.len() == face.vertices.len())
-        {
-            target_entries.push((*existing).clone());
-            continue;
-        }
-        let mut uv = Vec::with_capacity(face.vertices.len());
-        let mut pinned = Vec::with_capacity(face.vertices.len());
-        for vertex_id in &face.vertices {
-            let position = target
-                .vertex(*vertex_id)
-                .ok_or_else(|| invalid("UV face references a missing vertex"))?
-                .co;
-            let mut candidates = Vec::new();
-            let mut nearest_pin: Option<(f64, bool)> = None;
-            for source_face in &source.faces {
-                let Some(entry) = entries_by_face.get(&source_face.id) else {
-                    continue;
-                };
-                let Some(corners) = entry
-                    .get("uv")
-                    .and_then(Value::as_array)
-                    .filter(|corners| corners.len() == source_face.vertices.len())
-                else {
-                    continue;
-                };
-                let pin_values = entry.get("pinned").and_then(Value::as_array);
-                for (index, source_vertex) in source_face.vertices.iter().enumerate() {
-                    let Some(source_vertex) = source.vertex(*source_vertex) else {
+    let mut layers = Vec::with_capacity(source_store.layers.len());
+    for source_layer in &source_store.layers {
+        let has_pins = source_layer
+            .pinned
+            .iter()
+            .any(|flags| flags.as_ref().is_some_and(|flags| !flags.is_empty()));
+        let mut layer = UvLayer::new(source_layer.name.clone(), vec![None; target.faces.len()]);
+        for (target_index, face) in target.faces.iter().enumerate() {
+            if let Some(&source_face) = source_index.get(&face.id)
+                && let Some(corners) = source_layer.faces[source_face].as_ref()
+                && corners.len() == face.vertices.len()
+            {
+                layer.faces[target_index] = Some(corners.clone());
+                layer.pinned[target_index].clone_from(&source_layer.pinned[source_face]);
+                continue;
+            }
+            let mut uv = Vec::with_capacity(face.vertices.len());
+            let mut pinned = Vec::with_capacity(face.vertices.len());
+            for vertex_id in &face.vertices {
+                let position = target
+                    .vertex(*vertex_id)
+                    .ok_or_else(|| invalid("UV face references a missing vertex"))?
+                    .co;
+                let mut candidates = Vec::new();
+                let mut nearest_pin: Option<(f64, bool)> = None;
+                for (source_face_index, source_face) in source.faces.iter().enumerate() {
+                    let Some(corners) = source_layer.faces[source_face_index]
+                        .as_ref()
+                        .filter(|corners| corners.len() == source_face.vertices.len())
+                    else {
                         continue;
                     };
-                    let Some(corner_uv) = corners.get(index) else {
-                        continue;
-                    };
-                    candidates.push((source_vertex.co, corner_uv.clone()));
-                    if let Some(is_pinned) = pin_values
-                        .and_then(|values| values.get(index))
-                        .and_then(Value::as_bool)
-                    {
-                        let distance = position.distance(source_vertex.co);
-                        if nearest_pin
-                            .is_none_or(|(nearest_distance, _)| distance < nearest_distance)
+                    let pin_values = source_layer.pinned[source_face_index].as_ref();
+                    for (index, source_vertex) in source_face.vertices.iter().enumerate() {
+                        let Some(source_vertex) = source.vertex(*source_vertex) else {
+                            continue;
+                        };
+                        let Some(corner_uv) = corners.get(index) else {
+                            continue;
+                        };
+                        candidates.push((source_vertex.co, json!(corner_uv)));
+                        if let Some(is_pinned) =
+                            pin_values.and_then(|values| values.get(index)).copied()
                         {
-                            nearest_pin = Some((distance, is_pinned));
+                            let distance = position.distance(source_vertex.co);
+                            if nearest_pin
+                                .is_none_or(|(nearest_distance, _)| distance < nearest_distance)
+                            {
+                                nearest_pin = Some((distance, is_pinned));
+                            }
                         }
                     }
                 }
+                let Some(coordinate) = nearest_untyped_attribute_value(&candidates, position)
+                else {
+                    uv.clear();
+                    break;
+                };
+                uv.push(
+                    serde_json::from_value::<[f64; 2]>(coordinate)
+                        .map_err(|_| invalid("interpolated UV corner is not a coordinate pair"))?,
+                );
+                if has_pins {
+                    pinned.push(nearest_pin.is_some_and(|(_, value)| value));
+                }
             }
-            let Some(coordinate) = nearest_untyped_attribute_value(&candidates, position) else {
-                uv.clear();
-                break;
-            };
-            uv.push(coordinate);
-            if has_pins {
-                pinned.push(Value::Bool(nearest_pin.is_some_and(|(_, value)| value)));
+            if uv.len() != face.vertices.len() {
+                continue;
             }
+            layer.faces[target_index] = Some(uv);
+            layer.pinned[target_index] = has_pins.then_some(pinned);
         }
-        if uv.len() != face.vertices.len() {
-            continue;
-        }
-        let mut entry = Map::from_iter([
-            ("face_id".to_owned(), json!(face.id)),
-            ("uv".to_owned(), Value::Array(uv)),
-        ]);
-        if has_pins {
-            entry.insert("pinned".to_owned(), Value::Array(pinned));
-        }
-        target_entries.push(Value::Object(entry));
+        layers.push(layer);
     }
-    target
-        .attributes
-        .insert("uv_map".to_owned(), Value::Array(target_entries));
+    let store = UvStore {
+        layers,
+        active: source_store.active,
+        render: source_store.render,
+    };
+    uv_layers::write(target, &store);
     Ok(())
 }
 
@@ -3121,12 +3138,12 @@ fn interpolate_attributes(source: &Mesh, target: &mut Mesh) -> Result<()> {
         };
         interpolate_legacy_attribute(source, target, name, domain, values)?;
     }
-    interpolate_uv_map(source, target)?;
+    interpolate_uv_layers(source, target)?;
     Ok(())
 }
 
 fn has_interpolatable_attributes(mesh: &Mesh) -> bool {
-    mesh.attributes.contains_key("uv_map")
+    mesh.attributes.contains_key(uv_layers::ATTRIBUTE)
         || mesh.attributes.values().any(|attribute| {
             attribute.as_object().is_some_and(|fields| {
                 fields.contains_key("domain") && fields.contains_key("values")

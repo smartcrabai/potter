@@ -1,20 +1,21 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
 use glam::{DMat4, DVec3};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
+    geom::uv_layers::MAX_LAYERS,
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
-    shader::{BsdfParams, HitContext, evaluate_surface},
+    shader::{BsdfParams, HitContext, evaluate_surface, fill_uv_maps},
 };
 
 use super::{
     bvh::{Bvh, BvhHit},
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, blend_uv, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, ObjectRecord},
@@ -350,7 +351,13 @@ pub(super) fn render(
         });
     let bvh = Bvh::build(&geometry.triangles)?;
     let lights = collect_lights(doc, snapshot);
-    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images)?;
+    let volumes = collect_volumes(
+        doc,
+        snapshot,
+        scene.unit.scale_length,
+        images,
+        &geometry.shader_warnings,
+    )?;
     let world_importance = WorldImportanceSampler::build(doc, &snapshot.scene_id, images)?;
     let mut output = RasterOutput {
         rgba: allocate(rgba_len, 0_u8, "RGBA image")?,
@@ -510,12 +517,13 @@ pub(super) fn composite_realtime_volumes(
     film_transparent: bool,
     images: &BTreeMap<String, ImageData>,
     output: &mut RasterOutput,
+    warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<()> {
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
-    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images)?;
+    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images, warnings)?;
     if volumes.is_empty() {
         return Ok(());
     }
@@ -1127,14 +1135,7 @@ fn make_surface(
             }
         }
     };
-    let uv = [
-        triangle.uv[0][0] * hit.barycentric[0]
-            + triangle.uv[1][0] * hit.barycentric[1]
-            + triangle.uv[2][0] * hit.barycentric[2],
-        triangle.uv[0][1] * hit.barycentric[0]
-            + triangle.uv[1][1] * hit.barycentric[1]
-            + triangle.uv[2][1] * hit.barycentric[2],
-    ];
+    let uv = blend_uv(&triangle.uv, hit.barycentric);
     let object = object_for_index(&geometry.objects, triangle.object_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1166,14 +1167,21 @@ fn make_surface(
     } else {
         point
     };
-    let uv_maps = [("uv_map", uv)];
+    let mut uv_table: [(&str, [f64; 2]); MAX_LAYERS] = [("", [0.0; 2]); MAX_LAYERS];
+    let uv_maps = fill_uv_maps(
+        &mut uv_table,
+        object
+            .uv_layers
+            .iter()
+            .zip(&triangle.layer_uvs)
+            .map(|(name, corners)| (name.as_str(), blend_uv(corners, hit.barycentric))),
+    )?;
     let (tangent, bitangent) = triangle_tangent_frame(triangle, normal);
     let mut context = HitContext::new(&doc.node_groups)
         .with_images(images)
-        .with_tangent_frame(tangent, bitangent);
-    if triangle.uv_available {
-        context = context.with_uv_maps(&uv_maps);
-    }
+        .with_tangent_frame(tangent, bitangent)
+        .with_uv_maps(uv_maps)
+        .with_warnings(&geometry.shader_warnings);
     context.uv = uv;
     context.generated = object_position;
     context.position = point;
@@ -1240,9 +1248,17 @@ fn displacement_sample(
     bitangent: DVec3,
 ) -> Result<f64> {
     let displacement = tangent * uv_offset[0] + bitangent * uv_offset[1];
-    let mut sample_context = context;
+    let mut uv_table: [(&str, [f64; 2]); MAX_LAYERS] = [("", [0.0; 2]); MAX_LAYERS];
+    let mut sample_context: HitContext<'_> = context;
     sample_context.uv[0] += uv_offset[0];
     sample_context.uv[1] += uv_offset[1];
+    if let Some(maps) = context.uv_maps {
+        sample_context.uv_maps = Some(fill_uv_maps(
+            &mut uv_table,
+            maps.iter()
+                .map(|(name, uv)| (*name, [uv[0] + uv_offset[0], uv[1] + uv_offset[1]])),
+        )?);
+    }
     sample_context.generated += displacement;
     sample_context.position += displacement;
     sample_context.object += displacement;
@@ -1770,6 +1786,7 @@ fn collect_volumes<'a>(
     snapshot: &'a Snapshot,
     meters_per_unit: f64,
     images: &BTreeMap<String, ImageData>,
+    warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<Vec<VolumeInstance<'a>>> {
     let mut volumes = Vec::new();
     for (node_id, node) in &doc.nodes {
@@ -1840,7 +1857,9 @@ fn collect_volumes<'a>(
             .and_then(|material_id| doc.materials.get(material_id));
         let evaluated_material = if let Some(material) = material {
             let local_center = (bounds_min + bounds_max) * 0.5;
-            let mut context = HitContext::new(&doc.node_groups).with_images(images);
+            let mut context = HitContext::new(&doc.node_groups)
+                .with_images(images)
+                .with_warnings(warnings);
             context.object = local_center;
             context.generated = local_center;
             context.position = matrix.transform_point3(local_center);

@@ -291,6 +291,7 @@ pub(crate) fn render_camera_frame(
             film_transparent,
             &images,
             &mut raster,
+            &geometry.shader_warnings,
         )?;
     }
     crate::compositor::apply(
@@ -301,7 +302,7 @@ pub(crate) fn render_camera_frame(
         height,
         context.frame.unwrap_or(scene.frame_current),
     )?;
-    Ok((snapshot, raster, geometry.warnings))
+    Ok((snapshot, raster, geometry.all_warnings()))
 }
 
 fn parse_mode(value: &str) -> Result<Mode> {
@@ -670,8 +671,9 @@ fn manifest_value(
         "width": size,
         "height": size,
     });
-    if !geometry.warnings.is_empty() {
-        core["warnings"] = json!(geometry.warnings);
+    let warnings = geometry.all_warnings();
+    if !warnings.is_empty() {
+        core["warnings"] = json!(warnings);
     }
     let render_key = hash::sha256(&hash::canonicalize(&core)?);
     let image_bytes = encode_png(&raster.rgba, size, size)?;
@@ -728,8 +730,9 @@ fn manifest_value(
         "width": size,
         "height": size,
     });
-    if !geometry.warnings.is_empty() {
-        manifest["warnings"] = json!(geometry.warnings);
+    let warnings = geometry.all_warnings();
+    if !warnings.is_empty() {
+        manifest["warnings"] = json!(warnings);
     }
     Ok((
         manifest,

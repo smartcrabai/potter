@@ -86,7 +86,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":1},
+        "schema_version":{"const":2},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -134,7 +134,7 @@ fn scene_schema() -> Value {
         "camera":{"type":"object","required":["projection","lens_mm","sensor_width_mm","ortho_scale","clip_start","clip_end","shift"],"properties":{"projection":{"enum":["perspective","orthographic"]},"lens_mm":{"type":"number"},"sensor_width_mm":{"type":"number"},"ortho_scale":{"type":"number"},"clip_start":{"type":"number"},"clip_end":{"type":"number"},"shift":{"$ref":"#/$defs/vec2"}},"additionalProperties":false},
         "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
         "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
-        "texture_ref":{"type":"object","required":["image","uv_map","interpolation"],"properties":{"image":{"$ref":"#/$defs/id"},"uv_map":{"type":["string","null"]},"interpolation":{"enum":["linear","closest"]}},"additionalProperties":false},
+        "texture_ref":{"type":"object","required":["image","interpolation"],"properties":{"image":{"$ref":"#/$defs/id"},"uv_layer":{"type":["string","null"],"default":null},"interpolation":{"enum":["linear","closest"]}},"additionalProperties":false},
         "world":{"type":"object","required":["color","strength"],"properties":{"color":{"$ref":"#/$defs/vec3"},"strength":{"type":"number","minimum":0}},"additionalProperties":false},
         "keyframe":keyframe_schema(),
         "fcurve":fcurve_schema(),
@@ -314,10 +314,25 @@ fn complete_data_block_schemas(defs: &mut Value) {
     }
 }
 
+/// A texture reference: an image, an optional UV layer name (`null` is the render layer), and the
+/// sampler interpolation.
+fn texture_ref_schema() -> Value {
+    json!({"type":"object","required":["image"],"properties":{"image":id_schema(),"uv_layer":{"type":["string","null"],"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"}},"additionalProperties":false})
+}
+
+fn nullable_texture_ref_schema() -> Value {
+    json!({"oneOf":[texture_ref_schema(),{"type":"null"}]})
+}
+
+/// A UV layer name: a non-empty string.
+fn layer_name_schema() -> Value {
+    json!({"type":"string","minLength":1})
+}
+
 fn avatar_settings_schema() -> Value {
     let id = id_schema();
     let nullable_id = json!({"oneOf":[id.clone(),{"type":"null"}]});
-    let texture_ref = json!({"type":"object","required":["image"],"properties":{"image":id.clone(),"uv_map":{"type":["string","null"],"default":null},"interpolation":{"enum":["linear","closest"],"default":"linear"}},"additionalProperties":false});
+    let texture_ref = texture_ref_schema();
     let node_ref = json!({"type":"object","required":["node"],"properties":{"node":id.clone(),"bone":nullable_id.clone()},"additionalProperties":false});
     let expression_override = json!({"enum":["none","block","blend"]});
     let expressions = json!({
@@ -565,7 +580,6 @@ fn operation_schema(name: &str) -> Value {
         "mesh.bridge",
         "mesh.split",
         "mesh.knife",
-        "uv.pin",
     ]
     .contains(&name)
     {
@@ -861,6 +875,10 @@ fn operation_contract(name: &str) -> OperationContract {
                 "emission_strength",
                 "transmission",
                 "ior",
+                "base_color_texture",
+                "roughness_texture",
+                "metallic_texture",
+                "normal_texture",
                 "displacement_method",
                 "volume_density",
                 "volume_color",
@@ -1221,7 +1239,7 @@ fn operation_contract(name: &str) -> OperationContract {
             json!({"axis":"x","direction":"positive_to_negative","origin":[0,0,0],"threshold":0.000_001}),
         ),
         "uv.unwrap" => (
-            vec!["target", "elements", "scope", "method"],
+            vec!["target", "elements", "scope", "method", "uv_layer"],
             vec!["op", "target"],
             "mesh object and faces",
             "shared|single_user for shared data",
@@ -1235,6 +1253,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "translation",
                 "scale",
                 "rotation",
+                "uv_layer",
             ],
             vec!["op", "target"],
             "mesh object and faces",
@@ -1242,18 +1261,42 @@ fn operation_contract(name: &str) -> OperationContract {
             json!({"translation":[0,0],"scale":[1,1],"rotation":0}),
         ),
         "uv.pin" => (
-            vec!["target", "elements", "scope", "pinned"],
+            vec!["target", "elements", "scope", "pinned", "uv_layer"],
             vec!["op", "target"],
             "mesh object and faces",
             "shared|single_user for shared data",
             json!({"pinned":true}),
         ),
         "uv.pack" => (
-            vec!["target", "elements", "scope", "margin"],
+            vec!["target", "elements", "scope", "margin", "uv_layer"],
             vec!["op", "target"],
             "mesh object and faces",
             "shared|single_user for shared data",
-            json!({"margin":0.04}),
+            json!({"margin":0.001}),
+        ),
+        "uv.layer_create" => (
+            vec!["target", "scope", "name"],
+            vec!["op", "target"],
+            "mesh object",
+            "shared|single_user for shared data",
+            json!({}),
+        ),
+        "uv.layer_delete" | "uv.layer_set_active" | "uv.layer_set_render" => (
+            vec!["target", "scope", "name"],
+            vec!["op", "target", "name"],
+            "mesh object",
+            "shared|single_user for shared data",
+            json!({}),
+        ),
+        "paint.texture" => (
+            vec![
+                "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "seed",
+                "color", "blend",
+            ],
+            vec!["op", "target", "image", "samples", "color"],
+            "mesh object and UV corners",
+            "shared|single_user for shared data",
+            json!({"blend":"mix"}),
         ),
         "bone.create" => (
             vec![
@@ -1909,6 +1952,9 @@ fn field_schema(operation: &str, field: &str) -> Value {
             _ => common_field_schema(field),
         };
     }
+    if field == "uv_layer" {
+        return layer_name_schema();
+    }
     if operation.starts_with("uv.") {
         return match field {
             "scope" => json!({"enum":["shared","single_user"]}),
@@ -1918,7 +1964,8 @@ fn field_schema(operation: &str, field: &str) -> Value {
             "translation" | "scale" => vec_schema(2),
             "rotation" => json!({"type":"number","description":"Rotation angle in degrees."}),
             "pinned" => json!({"type":"boolean","default":true}),
-            "margin" => json!({"type":"number","minimum":0,"maximum":0.5,"default":0.04}),
+            "margin" => json!({"type":"number","minimum":0,"maximum":0.5,"default":0.001}),
+            "name" | "to" => layer_name_schema(),
             _ => common_field_schema(field),
         };
     }
@@ -1942,6 +1989,9 @@ fn field_schema(operation: &str, field: &str) -> Value {
     }
     if ["material.create", "material.update"].contains(&operation) {
         return match field {
+            "base_color_texture" | "roughness_texture" | "metallic_texture" | "normal_texture" => {
+                nullable_texture_ref_schema()
+            }
             "alpha_mode" => json!({"enum":["opaque","blend","clip"]}),
             "alpha_threshold" | "displacement_midlevel" => {
                 json!({"type":"number","minimum":0,"maximum":1})
@@ -2389,6 +2439,10 @@ fn material_set_properties() -> Value {
         "emission_strength":{"type":"number","minimum":0},
         "transmission":{"type":"number","minimum":0,"maximum":1},
         "ior":{"type":"number","exclusiveMinimum":0},
+        "base_color_texture":nullable_texture_ref_schema(),
+        "roughness_texture":nullable_texture_ref_schema(),
+        "metallic_texture":nullable_texture_ref_schema(),
+        "normal_texture":nullable_texture_ref_schema(),
         "displacement_method":{"enum":["bump","displacement"]},
         "volume_density":{"type":"number","minimum":0},
         "volume_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},

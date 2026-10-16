@@ -179,9 +179,6 @@ const EXPECTATIONS: &[Expectation] = &[
     },
     Expectation {
         name: "P20_SecondUVLayer",
-        kind: Kind::Loss,
-        losses: &["material.texture_uv_set"],
-        ignore: &["baseColorTexture/texCoord"],
         ..BASE
     },
     Expectation {

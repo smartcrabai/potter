@@ -5,14 +5,17 @@ use std::{
 };
 
 use glam::{DMat3, DMat4, DQuat, DVec3, DVec4};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::{ImportedGraph, Loss, import_error, render_visible_nodes};
+use super::{
+    ExchangeUvLayer, ImportedGraph, Loss, import_error, import_uv_layers, render_visible_nodes,
+    unique_uv_name, uv_import_loss,
+};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, Snapshot, animation::animated_transform},
-    geom::{Mesh, normals::corner_normals},
+    geom::{Mesh, normals::corner_normals, uv_layers},
     model::{
         Action, DataBlock, FCurve, Id, Interpolation, Keyframe, Node, ParentType, SceneDoc,
         Transform,
@@ -425,9 +428,20 @@ struct FrameSample {
 struct MeshSample {
     positions: Vec<[f64; 3]>,
     faces: Vec<Vec<usize>>,
-    uvs: Vec<Vec<[f64; 2]>>,
+    uv_layers: Vec<UvSample>,
     normals: Vec<[f64; 3]>,
 }
+
+/// One UV layer of a mesh sample: corner values per face in Alembic space (V up), in the reversed
+/// corner order that `reversed_faces` gives.
+#[derive(Clone)]
+struct UvSample {
+    name: String,
+    corners: Vec<Vec<[f64; 2]>>,
+}
+
+type UvFaceSamples = Vec<Vec<[f64; 2]>>;
+type NamedUvSamples = (String, Vec<UvFaceSamples>);
 
 fn sample_frames(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<f64>> {
     let mut frames = vec![snapshot.frame];
@@ -486,10 +500,10 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
     for attribute in mesh.attributes.keys() {
         let supported_attribute = matches!(
             attribute.as_str(),
-            "uv_map" | "shade_smooth" | "sharp" | "custom_normal"
+            "uv_layers" | "shade_smooth" | "sharp" | "custom_normal"
         ) || (allow_lossy
             && matches!(attribute.as_str(), "vertex_groups" | "alembic_normals"));
-        if !supported_attribute {
+        if !supported_attribute && !allow_lossy {
             return Err(unsupported(
                 "mesh.attribute",
                 format!("Alembic export does not represent mesh attribute `{attribute}`"),
@@ -501,27 +515,7 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
         .iter()
         .map(|vertex| vertex.co)
         .collect::<Vec<_>>();
-    let uvs = if let Some(uvs) = mesh_uvs(mesh)? {
-        uvs
-    } else {
-        let point_arrays = points.iter().map(DVec3::to_array).collect::<Vec<_>>();
-        let vertex_uv = generated_uvs(&point_arrays);
-        faces
-            .iter()
-            .map(|face| {
-                face.iter()
-                    .map(|index| {
-                        vertex_uv.get(*index).copied().ok_or_else(|| {
-                            PotError::new(
-                                ErrorCode::SceneInvalid,
-                                "Alembic UV references a missing vertex",
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
+    let uv_layers = export_uv_layers(mesh);
     let normals = reverse_corner_runs(&faces, corner_normals(mesh, &points)?)?;
     Ok(MeshSample {
         positions: points
@@ -529,13 +523,7 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
             .map(|point| file_vector(point.to_array()))
             .collect(),
         faces: reversed_faces(&faces),
-        uvs: uvs
-            .into_iter()
-            .map(|mut corners| {
-                corners.reverse();
-                corners
-            })
-            .collect(),
+        uv_layers,
         normals: normals
             .iter()
             .map(|normal| file_vector(normal.to_array()))
@@ -543,91 +531,56 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
     })
 }
 
-fn mesh_uvs(mesh: &Mesh) -> Result<Option<Vec<Vec<[f64; 2]>>>> {
-    let Some(value) = mesh.attributes.get("uv_map") else {
-        return Ok(None);
-    };
-    let entries = value.as_array().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::SceneInvalid,
-            "Alembic UV map attribute is not an array",
-        )
-    })?;
-    let mut values = BTreeMap::<u32, Vec<[f64; 2]>>::new();
-    for entry in entries {
-        let face_id = entry
-            .get("face_id")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| {
-                PotError::new(ErrorCode::SceneInvalid, "Alembic UV map face ID is invalid")
-            })?;
-        let coordinates = entry.get("uv").and_then(Value::as_array).ok_or_else(|| {
-            PotError::new(
-                ErrorCode::SceneInvalid,
-                "Alembic UV map has no corner coordinates",
-            )
-        })?;
-        let coordinates = coordinates
-            .iter()
-            .map(|coordinate| {
-                let pair = coordinate
-                    .as_array()
-                    .filter(|values| values.len() == 2)
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::SceneInvalid,
-                            "Alembic UV coordinate must have two values",
-                        )
-                    })?;
-                let u = pair[0].as_f64().ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "Alembic U coordinate is not numeric",
-                    )
-                })?;
-                let v = pair[1].as_f64().ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "Alembic V coordinate is not numeric",
-                    )
-                })?;
-                if !u.is_finite() || !v.is_finite() {
-                    return Err(PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "Alembic UV coordinate is not finite",
-                    ));
-                }
-                Ok([u, v])
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if values.insert(face_id, coordinates).is_some() {
-            return Err(PotError::new(
-                ErrorCode::SceneInvalid,
-                "Alembic UV map has duplicate face IDs",
-            ));
-        }
+/// Whether Alembic reserves `name` for a `PolyMesh` property of its own (`P`, `N`, or a name starting
+/// with `.`). Such a UV layer cannot be written as a `GeomParam`.
+pub(crate) fn reserves_uv_layer_name(name: &str) -> bool {
+    matches!(name, "P" | "N") || name.starts_with('.')
+}
+
+/// The UV layers of `mesh` in Alembic space: Blender's V-up values, with each face's corners in the
+/// reversed order that `reversed_faces` gives. Layers whose names Alembic reserves are omitted;
+/// `exchange::uv_layer_losses` reports them.
+fn export_uv_layers(mesh: &Mesh) -> Vec<UvSample> {
+    let store = uv_layers::read(mesh);
+    let active = store.active.as_deref();
+    let mut layers = store
+        .layers
+        .into_iter()
+        .filter(|layer| !reserves_uv_layer_name(&layer.name))
+        .collect::<Vec<_>>();
+    // Blender writes the active Alembic GeomParam first, preserving the order of the others; the
+    // importer preserves file order.
+    if let Some(active_index) =
+        active.and_then(|name| layers.iter().position(|layer| layer.name == name))
+    {
+        let active_layer = layers.remove(active_index);
+        layers.insert(0, active_layer);
     }
-    let mut output = Vec::with_capacity(mesh.faces.len());
-    for face in &mesh.faces {
-        let coordinates = values.remove(&face.id).ok_or_else(|| {
-            PotError::new(ErrorCode::SceneInvalid, "Alembic UV map is missing a face")
-        })?;
-        if coordinates.len() != face.vertices.len() {
-            return Err(PotError::new(
-                ErrorCode::SceneInvalid,
-                "Alembic UV corner count does not match topology",
-            ));
-        }
-        output.push(coordinates);
-    }
-    if !values.is_empty() {
-        return Err(PotError::new(
-            ErrorCode::SceneInvalid,
-            "Alembic UV map contains an unknown face",
-        ));
-    }
-    Ok(Some(output))
+    layers
+        .into_iter()
+        .map(|layer| UvSample {
+            name: layer.name,
+            corners: mesh
+                .faces
+                .iter()
+                .enumerate()
+                .map(|(index, face)| {
+                    let entry = layer.faces.get(index).and_then(Option::as_ref);
+                    let mut corners = (0..face.vertices.len())
+                        .map(|corner| {
+                            let [u, v] = entry
+                                .and_then(|values| values.get(corner))
+                                .copied()
+                                .unwrap_or([0.0, 0.0]);
+                            [u, 1.0 - v]
+                        })
+                        .collect::<Vec<_>>();
+                    corners.reverse();
+                    corners
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn write_node(
@@ -744,8 +697,30 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
     let mut indices = Vec::with_capacity(samples.len());
     let mut bounds = Vec::with_capacity(samples.len());
     let mut normals = Vec::with_capacity(samples.len());
-    let mut uvs = Vec::with_capacity(samples.len());
-    let mut uv_indices = Vec::with_capacity(samples.len());
+    let layer_names = samples
+        .first()
+        .map(|sample| {
+            sample
+                .uv_layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if samples.iter().any(|sample| {
+        sample
+            .uv_layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .ne(layer_names.iter().copied())
+    }) {
+        return Err(PotError::new(
+            ErrorCode::ExportFailed,
+            "Alembic UV layers changed between samples",
+        ));
+    }
+    let mut layer_uvs = vec![Vec::with_capacity(samples.len()); layer_names.len()];
+    let mut layer_uv_indices = vec![Vec::with_capacity(samples.len()); layer_names.len()];
     for sample in samples {
         positions.push(encode_vec3_f32(&sample.positions)?);
         let mut face_counts = Vec::with_capacity(sample.faces.len());
@@ -770,20 +745,77 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
         indices.push(encode_i32s(&face_indices));
         bounds.push(encode_bounds(&sample.positions)?);
         normals.push(encode_vec3_f32(&sample.normals)?);
-        let face_uvs = sample.uvs.iter().flatten().copied().collect::<Vec<_>>();
-        uvs.push(encode_vec2_f32(&face_uvs)?);
-        let uv_index_values = (0..face_uvs.len())
-            .map(|index| {
-                u32::try_from(index).map_err(|_| {
-                    PotError::new(ErrorCode::LimitExceeded, "Alembic UV index exceeds uint32")
+        for (layer_index, layer) in sample.uv_layers.iter().enumerate() {
+            let face_uvs = layer.corners.iter().flatten().copied().collect::<Vec<_>>();
+            layer_uvs[layer_index].push(encode_vec2_f32(&face_uvs)?);
+            let uv_index_values = (0..face_uvs.len())
+                .map(|index| {
+                    u32::try_from(index).map_err(|_| {
+                        PotError::new(ErrorCode::LimitExceeded, "Alembic UV index exceeds uint32")
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        uv_indices.push(encode_u32s(&uv_index_values));
+                .collect::<Result<Vec<_>>>()?;
+            layer_uv_indices[layer_index].push(encode_u32s(&uv_index_values));
+        }
     }
     let p_meta = metadata_map(&[("geoScope", "vtx"), ("interpretation", "point")]);
     let n_meta = geomparam_metadata("facevarying", "normal", 3);
     let uv_meta = geomparam_metadata("facevarying", "vector", 2);
+    let mut geometry_properties = vec![
+        array_property("P", 10, 3, p_meta, sampling_index, positions)?,
+        array_property(
+            ".faceIndices",
+            6,
+            1,
+            BTreeMap::new(),
+            sampling_index,
+            indices,
+        )?,
+        array_property(".faceCounts", 6, 1, BTreeMap::new(), sampling_index, counts)?,
+        scalar_property(
+            ".selfBnds",
+            11,
+            6,
+            metadata_map(&[("interpretation", "box")]),
+            sampling_index,
+            bounds,
+        )?,
+        array_property("N", 10, 3, n_meta, sampling_index, normals)?,
+    ];
+    // Alembic's PolyMesh UV channel is the canonical `uv` GeomParam. Blender uses `sourceName` to
+    // restore the active layer's name; additional UV layers live under `.arbGeomParams`.
+    let mut arbitrary_uvs = Vec::with_capacity(layer_names.len().saturating_sub(1));
+    if let Some(name) = layer_names.first() {
+        let mut metadata = uv_meta.clone();
+        metadata.insert("sourceName".to_owned(), (*name).to_owned());
+        geometry_properties.push(geomparam_property(
+            "uv",
+            metadata,
+            10,
+            2,
+            sampling_index,
+            std::mem::take(&mut layer_uvs[0]),
+            std::mem::take(&mut layer_uv_indices[0]),
+        )?);
+    }
+    for (layer_index, name) in layer_names.iter().enumerate().skip(1) {
+        arbitrary_uvs.push(geomparam_property(
+            name,
+            uv_meta.clone(),
+            10,
+            2,
+            sampling_index,
+            std::mem::take(&mut layer_uvs[layer_index]),
+            std::mem::take(&mut layer_uv_indices[layer_index]),
+        )?);
+    }
+    if !arbitrary_uvs.is_empty() {
+        geometry_properties.push(compound_property(
+            ".arbGeomParams",
+            BTreeMap::new(),
+            arbitrary_uvs,
+        )?);
+    }
     let geometry = compound_property(
         ".geom",
         metadata_map(&[
@@ -791,28 +823,7 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
             ("schemaBaseType", "AbcGeom_GeomBase_v1"),
             ("schemaObjTitle", "AbcGeom_PolyMesh_v1:.geom"),
         ]),
-        vec![
-            array_property("P", 10, 3, p_meta, sampling_index, positions)?,
-            array_property(
-                ".faceIndices",
-                6,
-                1,
-                BTreeMap::new(),
-                sampling_index,
-                indices,
-            )?,
-            array_property(".faceCounts", 6, 1, BTreeMap::new(), sampling_index, counts)?,
-            scalar_property(
-                ".selfBnds",
-                11,
-                6,
-                metadata_map(&[("interpretation", "box")]),
-                sampling_index,
-                bounds,
-            )?,
-            array_property("N", 10, 3, n_meta, sampling_index, normals)?,
-            geomparam_property("uv", uv_meta, 10, 2, sampling_index, uvs, uv_indices)?,
-        ],
+        geometry_properties,
     )?;
     Ok(AbcObject {
         name: "geometry".to_owned(),
@@ -830,30 +841,6 @@ fn write_polymesh(samples: &[&MeshSample], sample_count: usize) -> Result<AbcObj
         properties: vec![geometry],
         children: Vec::new(),
     })
-}
-
-fn generated_uvs(points: &[[f64; 3]]) -> Vec<[f64; 2]> {
-    let mut min = [f64::INFINITY; 2];
-    let mut max = [f64::NEG_INFINITY; 2];
-    for point in points {
-        for axis in 0..2 {
-            min[axis] = min[axis].min(point[axis]);
-            max[axis] = max[axis].max(point[axis]);
-        }
-    }
-    points
-        .iter()
-        .map(|point| {
-            std::array::from_fn(|axis| {
-                let span = max[axis] - min[axis];
-                if span > 0.0 {
-                    (point[axis] - min[axis]) / span
-                } else {
-                    0.5
-                }
-            })
-        })
-        .collect()
 }
 
 fn encode_vec3_f32(values: &[[f64; 3]]) -> Result<Vec<u8>> {
@@ -2354,12 +2341,12 @@ fn import_polymesh(
     let indices_prop = property(&geom.children, ".faceIndices")
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
     let normals = property(&geom.children, "N");
-    let uv = property(&geom.children, "uv");
+    let uv_parameters = uv_geom_parameters(geom);
     let mut sample_count = positions_prop
         .sample_count
         .max(counts_prop.sample_count)
         .max(indices_prop.sample_count);
-    for parameter in [normals, uv].into_iter().flatten() {
+    for parameter in normals.into_iter().chain(uv_parameters.iter().copied()) {
         let values = geomparam_values_property(parameter)?;
         sample_count = sample_count.max(values.sample_count);
     }
@@ -2390,7 +2377,7 @@ fn import_polymesh(
         mesh_samples.push(MeshSample {
             positions,
             faces,
-            uvs: Vec::new(),
+            uv_layers: Vec::new(),
             normals: Vec::new(),
         });
     }
@@ -2419,7 +2406,7 @@ fn import_polymesh(
     if indices_prop.sample_count > time_property.sample_count {
         time_property = indices_prop;
     }
-    for parameter in [normals, uv].into_iter().flatten() {
+    for parameter in normals.into_iter().chain(uv_parameters.iter().copied()) {
         let values = geomparam_values_property(parameter)?;
         if values.sample_count != 1 && values.sample_count != sample_count {
             return Err(import_error(
@@ -2487,9 +2474,10 @@ fn import_polymesh(
             None
         }
     };
-    let uv_samples = uv
-        .map(|parameter| {
-            (0..sample_count)
+    let uv_samples = uv_parameters
+        .iter()
+        .map(|parameter| -> Result<NamedUvSamples> {
+            let samples = (0..sample_count)
                 .map(|sample_index| {
                     let values = geomparam_values_property(parameter)?;
                     let sample = &mesh_samples[sample_index];
@@ -2504,13 +2492,19 @@ fn import_polymesh(
                         .into_iter()
                         .map(|mut corners| {
                             corners.reverse();
-                            corners
+                            uv_to_storage(corners)
                         })
                         .collect::<Vec<_>>())
                 })
-                .collect::<Result<Vec<_>>>()
+                .collect::<Result<Vec<_>>>()?;
+            let name = parameter
+                .metadata
+                .get("sourceName")
+                .cloned()
+                .unwrap_or_else(|| parameter.name.clone());
+            Ok((name, samples))
         })
-        .transpose()?;
+        .collect::<Result<Vec<_>>>()?;
     if let Some(corners) = normal_samples.as_ref().and_then(|samples| samples.first()) {
         let corners = corners
             .iter()
@@ -2518,16 +2512,29 @@ fn import_polymesh(
             .collect::<Vec<_>>();
         super::shading::import_shading(&mut mesh, &corners)?;
     }
-    if let Some(faces_uv) = uv_samples.as_ref().and_then(|samples| samples.first()) {
-        let faces_uv = mesh
-            .faces
-            .iter()
-            .zip(faces_uv)
-            .map(|(face, coordinates)| json!({"face_id":face.id,"uv":coordinates}))
-            .collect::<Vec<_>>();
-        mesh.attributes
-            .insert("uv_map".to_owned(), Value::Array(faces_uv));
+    // Each UV layer takes its first sample's corners; the layer order is the file order.
+    let mut layers = Vec::<ExchangeUvLayer>::new();
+    for (raw_name, samples) in &uv_samples {
+        let Some(first) = samples.first() else {
+            continue;
+        };
+        if layers.len() == uv_layers::MAX_LAYERS {
+            losses.push(uv_import_loss(
+                &object.name,
+                format!(
+                    "Alembic PolyMesh has more than {} UV layers; layer `{raw_name}` is not represented",
+                    uv_layers::MAX_LAYERS
+                ),
+            ));
+            continue;
+        }
+        let name = unique_uv_name(raw_name, &layers);
+        layers.push(ExchangeUvLayer {
+            name,
+            corners: first.clone(),
+        });
     }
+    import_uv_layers(&mut mesh, &layers, Some(0), Some(0));
     if sample_count > 1 {
         mesh.attributes.insert(
             "alembic_time_samples".to_owned(),
@@ -2539,7 +2546,7 @@ fn import_polymesh(
                     .collect::<Vec<_>>(),
                 "faces": mesh_samples.iter().map(|sample| reversed_faces(&sample.faces)).collect::<Vec<_>>(),
                 "normals": normal_samples,
-                "uv": uv_samples,
+                "uv_layers": uv_samples.iter().map(|(name, samples)| json!({"name": name, "samples": samples})).collect::<Vec<_>>(),
             }),
         );
         losses.push(Loss {
@@ -2618,7 +2625,9 @@ pub(crate) fn read_mesh_cache(
         .ok_or_else(|| import_error("Alembic PolyMesh .faceCounts array is missing"))?;
     let indices = property(&geom.children, ".faceIndices")
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
-    let uv = read_uv.then(|| property(&geom.children, "uv")).flatten();
+    let uv = read_uv
+        .then(|| uv_geom_parameters(geom).into_iter().next())
+        .flatten();
     let color = read_color
         .then(|| property(&geom.children, "color").or_else(|| property(&geom.children, "Cs")))
         .flatten();
@@ -2675,7 +2684,7 @@ pub(crate) fn read_mesh_cache(
         let geometry_sample = MeshSample {
             positions: points.clone(),
             faces: file_faces.clone(),
-            uvs: Vec::new(),
+            uv_layers: Vec::new(),
             normals: Vec::new(),
         };
         let uv_faces = uv
@@ -2694,7 +2703,7 @@ pub(crate) fn read_mesh_cache(
                         .into_iter()
                         .map(|mut corners| {
                             corners.reverse();
-                            corners
+                            uv_to_storage(corners)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -3089,6 +3098,45 @@ fn sample_seconds(
         return Err(import_error("Alembic time sample is not finite"));
     }
     Ok(time)
+}
+
+/// Whether `parameter` is a two-component `facevarying` `GeomParam`, which is how Blender and Potter
+/// write a UV layer.
+fn is_uv_geomparam(parameter: &ParsedProperty) -> bool {
+    parameter
+        .metadata
+        .get("podExtent")
+        .is_some_and(|extent| extent == "2")
+        && parameter
+            .metadata
+            .get("geoScope")
+            .is_some_and(|scope| matches!(scope.as_str(), "fvr" | "facevarying"))
+}
+
+/// UV `GeomParam` properties appear either as the canonical `.geom/uv` property or as named children
+/// of `.geom/.arbGeomParams`. Preserve Blender's order: canonical active set first, then named sets.
+fn uv_geom_parameters(geom: &ParsedProperty) -> Vec<&ParsedProperty> {
+    let mut parameters = geom
+        .children
+        .iter()
+        .filter(|parameter| is_uv_geomparam(parameter))
+        .collect::<Vec<_>>();
+    if let Some(arbitrary) =
+        property(&geom.children, ".arbGeomParams").filter(|parameter| parameter.property_type == 0)
+    {
+        parameters.extend(
+            arbitrary
+                .children
+                .iter()
+                .filter(|parameter| is_uv_geomparam(parameter)),
+        );
+    }
+    parameters
+}
+
+/// Alembic stores V up, as Blender does; Potter stores V down, so the conversion flips V.
+fn uv_to_storage(corners: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    corners.into_iter().map(|[u, v]| [u, 1.0 - v]).collect()
 }
 
 fn geomparam_values_property(parameter: &ParsedProperty) -> Result<&ParsedProperty> {
@@ -4098,6 +4146,114 @@ mod tests {
             imported.doc.scenes[&imported.doc.active_scene].frame_current,
             1.0
         );
+        Ok(())
+    }
+
+    fn corners_for_faces(mesh: &Mesh, corners: [[f64; 2]; 4]) -> Vec<Option<Vec<[f64; 2]>>> {
+        mesh.faces
+            .iter()
+            .map(|face| Some(corners.iter().copied().take(face.vertices.len()).collect()))
+            .collect()
+    }
+
+    fn assert_close(actual: &[[f64; 2]], expected: &[[f64; 2]]) {
+        assert_eq!(actual.len(), expected.len());
+        for (left, right) in actual.iter().zip(expected) {
+            assert!(
+                (left[0] - right[0]).abs() < 1.0e-6 && (left[1] - right[1]).abs() < 1.0e-6,
+                "{left:?} != {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uv_layers_round_trip_in_order_with_their_storage_values() -> Result<()> {
+        let mut doc = SceneDoc::new(SOURCE_SCENE_ID.to_owned());
+        let mesh_id = Id::new("box")?;
+        let data_id = Id::new("box_mesh")?;
+        let mut mesh = Mesh::box_mesh(BoxParams::default())
+            .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.to_string()))?;
+        let first = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]];
+        let second = [[0.9, 0.1], [0.8, 0.2], [0.7, 0.3], [0.6, 0.4]];
+        let third = [[0.2, 0.2], [0.4, 0.4], [0.6, 0.6], [0.8, 0.8]];
+        let reserved = [[0.5, 0.1], [0.4, 0.2], [0.3, 0.3], [0.2, 0.4]];
+        let layers = vec![
+            uv_layers::UvLayer::new("Base", corners_for_faces(&mesh, first)),
+            uv_layers::UvLayer::new("Light", corners_for_faces(&mesh, second)),
+            uv_layers::UvLayer::new("Detail", corners_for_faces(&mesh, third)),
+            // `P` is a name Alembic reserves for its own property: the export omits this layer.
+            uv_layers::UvLayer::new("P", corners_for_faces(&mesh, reserved)),
+        ];
+        uv_layers::write(
+            &mut mesh,
+            &uv_layers::UvStore {
+                layers,
+                active: Some("Detail".to_owned()),
+                render: Some("Base".to_owned()),
+            },
+        );
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            mesh_id.clone(),
+            Node {
+                name: "UV box".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "test root collection is missing")
+            })?
+            .objects
+            .push(mesh_id.clone());
+        let snapshot = Snapshot::evaluate(
+            &doc,
+            &EvaluationContext {
+                frame: Some(1.0),
+                ..EvaluationContext::default()
+            },
+        )?;
+        let archive = export(&doc, &snapshot, false, None)?;
+        let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
+        fs::write(file.path(), archive).map_err(|error| PotError::io(&error))?;
+        let imported = import(file.path(), IMPORT_SCENE_ID.to_owned(), None)?;
+        let imported_data_id = imported
+            .doc
+            .nodes
+            .get(&mesh_id)
+            .and_then(|node| node.data.clone())
+            .ok_or_else(|| PotError::new(ErrorCode::ImportFailed, "round-trip data is missing"))?;
+        let imported_mesh = imported
+            .doc
+            .data_blocks
+            .get(&imported_data_id)
+            .and_then(|block| block.mesh.as_ref())
+            .ok_or_else(|| PotError::new(ErrorCode::ImportFailed, "round-trip mesh is missing"))?;
+        let store = uv_layers::read(imported_mesh);
+        let names = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Detail", "Base", "Light"]);
+        for (layer, expected) in store.layers.iter().zip([third, first, second]) {
+            let face = layer
+                .faces
+                .first()
+                .and_then(Option::as_ref)
+                .ok_or_else(|| PotError::new(ErrorCode::ImportFailed, "UV face is missing"))?;
+            assert_close(face, &expected);
+        }
         Ok(())
     }
 
