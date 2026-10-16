@@ -87,6 +87,14 @@ CASES = {
         loose=[False, True, False, False],
         params={},
     ),
+    # Two branch hulls share the center node's frame through a loose chain.
+    "shared_branch_frame": dict(
+        verts=[(0, 0, 0), (0, 0, 1), (0, 0, 2), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (1, 0, 2), (0, 1, 2), (0, -1, 2)],
+        edges=[(0, 1), (1, 2), (0, 3), (0, 4), (0, 5), (2, 6), (2, 7), (2, 8)],
+        skin=[((0.2, 0.2), True), ((0.2, 0.2), False), ((0.2, 0.2), False), ((0.2, 0.2), False), ((0.2, 0.2), False), ((0.2, 0.2), False), ((0.2, 0.2), False), ((0.2, 0.2), False), ((0.2, 0.2), False)],
+        loose=[True, False, True, False, False, False, False, False, False],
+        params={},
+    ),
     "y_branch_sym_off_smooth1": dict(
         verts=[(0, 0, 0), (1, 0, 0), (2, 1, 0), (2, -1, 0.5)],
         edges=[(0, 1), (1, 2), (1, 3)],

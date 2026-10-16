@@ -447,7 +447,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &mut branch_faces,
         &detached_frames,
     );
-    smooth_branch_hull_points(&mut points, &branch_faces, branch_smoothing);
+    smooth_branch_hull_points(&mut points, &branch_faces, &frame_vertex_ids, branch_smoothing);
     faces.extend(branch_faces.into_iter().map(|face| (face, 0)));
     for ids in seam_frames.iter().flatten() {
         let [first, second] = *ids;
@@ -1222,7 +1222,12 @@ fn quad_is_convex(points: &[DVec3], quad: [usize; 4]) -> bool {
     true
 }
 
-fn smooth_branch_hull_points(points: &mut [DVec3], faces: &[Vec<usize>], smoothing: f64) {
+fn smooth_branch_hull_points(
+    points: &mut [DVec3],
+    faces: &[Vec<usize>],
+    frame_vertex_ids: &[[usize; 4]],
+    smoothing: f64,
+) {
     if smoothing == 0.0 {
         return;
     }
@@ -1239,6 +1244,12 @@ fn smooth_branch_hull_points(points: &mut [DVec3], faces: &[Vec<usize>], smoothi
             }
         }
     }
+    let mut is_frame_vertex = vec![false; points.len()];
+    for frame in frame_vertex_ids {
+        for &vertex in frame {
+            is_frame_vertex[vertex] = true;
+        }
+    }
     let source = points.to_vec();
     for (index, neighbors) in adjacency.iter().enumerate() {
         if neighbors.is_empty() {
@@ -1250,7 +1261,12 @@ fn smooth_branch_hull_points(points: &mut [DVec3], faces: &[Vec<usize>], smoothi
                 .map(|neighbor| source[*neighbor])
                 .sum::<DVec3>())
             / (neighbors.len() + 1) as f64;
-        points[index] = source[index].lerp(average, smoothing * 0.5);
+        let weight = if is_frame_vertex[index] {
+            smoothing * 0.5
+        } else {
+            smoothing
+        };
+        points[index] = source[index].lerp(average, weight);
     }
 }
 /// Blender's build_edge_mats: every root's edges go onto one stack, and each edge takes the frame
