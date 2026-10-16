@@ -208,13 +208,17 @@ pub(super) fn screw(
     modifier: &Modifier,
     context: crate::eval::ModifierEvaluationContext<'_>,
 ) -> Result<Mesh> {
+    // Blender returns an empty template before reading any Screw parameters.
+    if mesh.vertices.is_empty() {
+        return Ok(mesh.clone());
+    }
     let steps_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
         "render_steps"
     } else {
         "steps"
     };
     let steps = usize::try_from(uint_param(modifier, steps_name)?)
-        .map_err(|_| invalid_parameter(modifier, steps_name, "an integer from 1 to 4096"))?;
+        .map_err(|_| invalid_parameter(modifier, steps_name, "an integer from 1 to 4096"))?
     if !(1..=4096).contains(&steps) {
         return Err(invalid_parameter(
             modifier,
@@ -412,12 +416,15 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let target: Mesh = serde_json::from_value(target.clone())
         .map_err(|_| invalid_parameter(modifier, "target", "a mesh object operand"))?;
     validated(&target)?;
-    if target.vertices.is_empty() {
-        return Err(invalid_parameter(modifier, "target", "a non-empty mesh"));
-    }
     let method = string_param(modifier, "wrap_method")?.to_ascii_uppercase();
     let offset = number_param(modifier, "offset")?;
     let wrap_mode = string_param(modifier, "wrap_mode")?.to_ascii_uppercase();
+    // shrinkwrap.cc BKE_shrinkwrap_init_tree: a target without vertices, or without faces for the
+    // surface and projection methods, builds no tree. Blender then leaves positions unchanged and
+    // reports no error; nearest-vertex lookup needs only vertices.
+    if target.vertices.is_empty() || (method != "NEAREST_VERTEX" && target.faces.is_empty()) {
+        return Ok(mesh.clone());
+    }
     let mut result = mesh.clone();
     let triangles = target_triangles(&target)?;
     for vertex in &mut result.vertices {
@@ -2238,6 +2245,28 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
+/// Skin for the modifier stack. Blender reports a skin failure as a modifier error and keeps the
+/// input (`MOD_skin.cc` `modify_mesh`); an error flagged `modifier_warning` becomes a warning here.
+pub(super) fn skin_with_warnings(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    warnings: &mut Vec<PotError>,
+) -> Result<Mesh> {
+    match skin(mesh, modifier) {
+        Err(error)
+            if error
+                .details
+                .get("modifier_warning")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            warnings.push(error);
+            Ok(mesh.clone())
+        }
+        result => result,
+    }
+}
+
 #[expect(
     clippy::manual_midpoint,
     reason = "matches Blender's float evaluation order for parity"
@@ -2247,6 +2276,24 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let source_indices = id_indices(mesh);
     let radii = mesh.attributes.get("skin_radii").and_then(Value::as_object);
     let roots = mesh.attributes.get("skin_roots").and_then(Value::as_object);
+    // MOD_skin.cc final_skin: without skin-node data the mesh passes through. With data, base_skin
+    // on zero vertices has no valid root: Blender reports that as a modifier error and keeps the
+    // empty result (see skin_with_warnings).
+    if mesh.vertices.is_empty() {
+        if mesh.attributes.get("skin_radii").is_some()
+            || mesh.attributes.get("skin_roots").is_some()
+        {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "No valid root vertex found (you need one per mesh island you want to skin)",
+                serde_json::json!({
+                    "modifier_id": modifier.id,
+                    "modifier_warning": true,
+                }),
+            ));
+        }
+        return Ok(mesh.clone());
+    }
     if mesh.edges.is_empty() {
         return Err(invalid_parameter(
             modifier,

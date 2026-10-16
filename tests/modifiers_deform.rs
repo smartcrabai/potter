@@ -554,20 +554,11 @@ fn blender_remesh_supported_modes_match_exact_geometry_and_voxel_adaptivity_is_g
         "mode":"VOXEL","voxel_size":0.3,"adaptivity":0.1,
         "use_smooth_shade":false,"use_remove_disconnected":false,"threshold":0.15
     });
-    let voxel_adaptivity_error =
-        evaluate_modifiers(&source, &[modifier("remesh", voxel_adaptivity_params)?])
-            .err()
-            .ok_or("nonzero VOXEL adaptivity unexpectedly succeeded")?;
-    assert_eq!(
-        voxel_adaptivity_error.code,
-        potter_core::error::ErrorCode::UnsupportedFeature
-    );
-    assert_eq!(
-        voxel_adaptivity_error
-            .details
-            .get("feature_id")
-            .and_then(Value::as_str),
-        Some("modifier.remesh.voxel_adaptivity")
+    let voxel_adaptive_mesh =
+        evaluate_modifiers(&source, &[modifier("remesh", voxel_adaptivity_params)?])?;
+    assert!(
+        !voxel_adaptive_mesh.faces.is_empty(),
+        "nonzero VOXEL adaptivity must produce a remeshed surface"
     );
     let catalog = potter_core::catalog::feature_catalog();
     let features = catalog["features"]
@@ -583,7 +574,7 @@ fn blender_remesh_supported_modes_match_exact_geometry_and_voxel_adaptivity_is_g
         .find(|feature| feature["feature_id"] == "modifier.remesh.voxel_adaptivity")
         .ok_or("VOXEL adaptivity is missing from the feature catalog")?;
     assert_eq!(
-        voxel_adaptivity_feature["status"], "not_supported",
+        voxel_adaptivity_feature["status"], "supported",
         "nonzero VOXEL adaptivity catalog status"
     );
     for mode in ["SMOOTH", "SHARP"] {
@@ -789,8 +780,8 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
 }
 
 #[test]
-fn blender_dual_contour_depth_and_shape_fixtures_match_exact_geometry() -> Result<(), Box<dyn Error>>
-{
+fn blender_dual_contour_remesh_depth_and_shape_fixtures_match_exact_geometry()
+-> Result<(), Box<dyn Error>> {
     struct Case {
         name: &'static str,
         depth: u32,
@@ -1041,7 +1032,7 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                 .find(|feature| feature["feature_id"] == "modifier.remesh.open_nonmanifold")
         })
         .ok_or("open/non-manifold dual-contour feature is missing from the catalog")?;
-    assert_eq!(open_surface_feature["status"], "not_supported");
+    assert_eq!(open_surface_feature["status"], "supported");
 
     for case in cases {
         let reference = &references[case.name];
@@ -1060,27 +1051,6 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
                 "threshold":case.threshold,
                 "use_smooth_shade":false
             });
-            if case.name == "suzanne" {
-                let error = evaluate_modifiers(&input, &[modifier("remesh", params)?])
-                    .err()
-                    .ok_or_else(|| format!("{context}: open Suzanne unexpectedly succeeded"))?;
-                assert_eq!(
-                    error.code,
-                    potter_core::error::ErrorCode::UnsupportedFeature
-                );
-                assert_eq!(
-                    error.details.get("feature_id").and_then(Value::as_str),
-                    Some("modifier.remesh.open_nonmanifold"),
-                    "{context}: precise open/non-manifold feature gate"
-                );
-                assert_eq!(
-                    error.details.get("mode").and_then(Value::as_str),
-                    Some(*mode),
-                    "{context}: gated mode"
-                );
-                eprintln!("{context}: gated open/non-manifold input");
-                continue;
-            }
             let native = evaluate_modifiers(&input, &[modifier("remesh", params)?])?;
             let expected = &reference["modes"][mode];
             let expected_positions = points(&expected["positions"])?;
