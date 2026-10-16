@@ -86,10 +86,7 @@ fn modifier(
 }
 
 fn node_modifiers_for(doc: &SceneDoc, node_id: &str) -> TestResult<Vec<Modifier>> {
-    let node = doc
-        .nodes
-        .get(&Id::new(node_id)?)
-        .ok_or("node is missing")?;
+    let node = doc.nodes.get(&Id::new(node_id)?).ok_or("node is missing")?;
     Ok(node.modifiers.clone())
 }
 
@@ -98,10 +95,7 @@ fn node_modifiers(doc: &SceneDoc) -> TestResult<Vec<Modifier>> {
 }
 
 fn data_block_for<'a>(doc: &'a SceneDoc, node_id: &str) -> TestResult<&'a DataBlock> {
-    let node = doc
-        .nodes
-        .get(&Id::new(node_id)?)
-        .ok_or("node is missing")?;
+    let node = doc.nodes.get(&Id::new(node_id)?).ok_or("node is missing")?;
     let data_id = node.data.as_ref().ok_or("node has no geometry data")?;
     doc.data_blocks
         .get(data_id)
@@ -112,7 +106,7 @@ fn data_block(doc: &SceneDoc) -> TestResult<&DataBlock> {
     data_block_for(doc, SUBJECT)
 }
 
-fn unsupported_bevel_source(transform: Value) -> [Value; 2] {
+fn unsupported_bevel_source(transform: &Value) -> [Value; 2] {
     [
         json!({
             "op": "node.create",
@@ -383,7 +377,7 @@ fn hidden_target_is_applied_and_its_viewport_flag_is_ignored() -> TestResult<()>
 
 #[test]
 fn array_offset_object_apply_uses_transform_without_evaluating_source_geometry() -> TestResult<()> {
-    let mut extra = unsupported_bevel_source(json!({"translation": [3.0, 0.0, 0.0]}))
+    let mut extra = unsupported_bevel_source(&json!({"translation": [3.0, 0.0, 0.0]}))
         .into_iter()
         .collect::<Vec<_>>();
     let array = modifier(
@@ -415,7 +409,10 @@ fn array_offset_object_apply_uses_transform_without_evaluating_source_geometry()
 
     let applied = run(&doc, &apply_op("array"))?;
 
-    let mesh = data_block(&applied)?.mesh.as_ref().ok_or("subject mesh is missing")?;
+    let mesh = data_block(&applied)?
+        .mesh
+        .as_ref()
+        .ok_or("subject mesh is missing")?;
     ensure_eq(&mesh.vertices.len(), &24, "array vertices")?;
     let max_x = mesh
         .vertices
@@ -437,7 +434,7 @@ fn array_offset_object_apply_uses_transform_without_evaluating_source_geometry()
 
 #[test]
 fn screw_object_apply_avoids_unrelated_source_geometry() -> TestResult<()> {
-    let mut extra = unsupported_bevel_source(json!({"translation": [0.0, 0.0, 0.5]}))
+    let mut extra = unsupported_bevel_source(&json!({"translation": [0.0, 0.0, 0.5]}))
         .into_iter()
         .collect::<Vec<_>>();
     let screw = modifier(
@@ -468,7 +465,10 @@ fn screw_object_apply_avoids_unrelated_source_geometry() -> TestResult<()> {
 
     let applied = run(&doc, &apply_op("screw"))?;
 
-    let mesh = data_block(&applied)?.mesh.as_ref().ok_or("subject mesh is missing")?;
+    let mesh = data_block(&applied)?
+        .mesh
+        .as_ref()
+        .ok_or("subject mesh is missing")?;
     ensure_eq(&mesh.vertices.len(), &24, "screw vertices")?;
     ensure_eq(
         &node_modifiers(&applied)?,
@@ -484,7 +484,7 @@ fn screw_object_apply_avoids_unrelated_source_geometry() -> TestResult<()> {
 
 #[test]
 fn array_fit_curve_apply_uses_curve_data_and_world_transform() -> TestResult<()> {
-    let mut extra = unsupported_bevel_source(json!({"translation": [9.0, 0.0, 0.0]}))
+    let mut extra = unsupported_bevel_source(&json!({"translation": [9.0, 0.0, 0.0]}))
         .into_iter()
         .collect::<Vec<_>>();
     extra.push(json!({
@@ -529,7 +529,10 @@ fn array_fit_curve_apply_uses_curve_data_and_world_transform() -> TestResult<()>
 
     let applied = run(&doc, &apply_op("array"))?;
 
-    let mesh = data_block(&applied)?.mesh.as_ref().ok_or("subject mesh is missing")?;
+    let mesh = data_block(&applied)?
+        .mesh
+        .as_ref()
+        .ok_or("subject mesh is missing")?;
     ensure_eq(&mesh.vertices.len(), &24, "fit-curve array vertices")?;
     ensure_eq(
         &node_modifiers(&applied)?,
@@ -595,7 +598,10 @@ fn array_geometry_operand_uses_source_viewport_stack_visibility() -> TestResult<
     let hidden_source = apply_with_visibility(false)?;
     let visible_source = apply_with_visibility(true)?;
     let max_z = |doc: &SceneDoc| -> TestResult<f64> {
-        let mesh = data_block(doc)?.mesh.as_ref().ok_or("subject mesh is missing")?;
+        let mesh = data_block(doc)?
+            .mesh
+            .as_ref()
+            .ok_or("subject mesh is missing")?;
         Ok(mesh
             .vertices
             .iter()
@@ -609,7 +615,7 @@ fn array_geometry_operand_uses_source_viewport_stack_visibility() -> TestResult<
 
 #[test]
 fn array_geometry_operand_propagates_unsupported_source_stack_errors() -> TestResult<()> {
-    let mut extra = unsupported_bevel_source(json!({"translation": [3.0, 0.0, 0.0]}))
+    let mut extra = unsupported_bevel_source(&json!({"translation": [3.0, 0.0, 0.0]}))
         .into_iter()
         .collect::<Vec<_>>();
     extra.push(modifier(

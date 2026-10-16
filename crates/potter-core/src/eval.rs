@@ -342,8 +342,7 @@ impl Snapshot {
                     return Ok((snapshot, node_errors));
                 }
                 Err(error) if is_isolated_failure(&error) => {
-                    let source_doc = evaluation_doc.as_ref().unwrap_or(doc);
-                    let Some(node_id) = unsupported_feature_owner(source_doc, &error) else {
+                    let Some(node_id) = unsupported_feature_owner(doc, &error) else {
                         return Err(error);
                     };
                     if node_errors.contains_key(&node_id) {
@@ -355,35 +354,14 @@ impl Snapshot {
                             "unsupported feature owner disappeared during evaluation",
                         )
                     })?;
-                    if owner
-                        .modifiers
-                        .iter()
-                        .all(|modifier| !modifier.is_active(context.purpose))
+                    let is_instance = instance_collection_target(owner)?.is_some();
+                    if !is_instance
+                        && owner
+                            .modifiers
+                            .iter()
+                            .all(|modifier| !modifier.is_active(context.purpose))
                     {
-                        let node = evaluation_doc.nodes.get_mut(&node_id).ok_or_else(|| {
-                            PotError::new(
-                                ErrorCode::InternalError,
-                                "unsupported feature owner disappeared during evaluation",
-                            )
-                        })?;
-                        // An instance has no modifier to disable: its failed join makes it an empty
-                        // node, leaving its members untouched, and its modifiers are disabled too.
-                        let instance = instance_collection_target(node)?.is_some();
-                        if !instance
-                            && node
-                                .modifiers
-                                .iter()
-                                .all(|modifier| !modifier.is_active(context.purpose))
-                        {
-                            return Err(error);
-                        }
-                        for modifier in &mut node.modifiers {
-                            modifier.enabled = false;
-                        }
-                        if instance {
-                            "empty".clone_into(&mut node.kind);
-                            node.properties.remove(INSTANCE_COLLECTION_PROPERTY);
-                        }
+                        return Err(error);
                     }
                     suppressed.insert(node_id.clone());
                     let mut details = error.details.clone();
@@ -1437,7 +1415,10 @@ impl Snapshot {
             &evaluated_node_ids,
         )?;
         for (id, node) in &doc.nodes {
-            if !nodes.contains_key(id) || instance_collection_target(node)?.is_none() {
+            if !nodes.contains_key(id)
+                || gate.suppressed.contains(id)
+                || instance_collection_target(node)?.is_none()
+            {
                 continue;
             }
             let matrix = matrices.get(id).copied().ok_or_else(|| {
@@ -1538,10 +1519,10 @@ pub(crate) fn evaluated_array_curve_path_length(
     let Some(curve_world_matrix) = world_matrices.get(&curve_id).copied() else {
         return Ok(None);
     };
-    let length = crate::geom::modifiers::evaluated_curve_path_length(curve_data, curve_world_matrix)?;
+    let length =
+        crate::geom::modifiers::evaluated_curve_path_length(curve_data, curve_world_matrix)?;
     Ok(Some((curve_id, length)))
 }
-
 
 /// Modifier state for one evaluation. `purpose` selects the viewport or render stack, and
 /// `suppressed` nodes lost their modifiers to an unsupported-feature error. Every consumer asks
@@ -1858,19 +1839,15 @@ fn object_mesh_dependencies(
         other: node_dependencies(),
     };
     for (owner_id, node) in &doc.nodes {
-        for modifier in node
-            .modifiers
-            .iter()
-            .filter(|modifier| {
-                if let Some((target_id, modifier_id)) = only_modifier
-                    && target_id == owner_id
-                {
-                    modifier.enabled && &modifier.id == modifier_id
-                } else {
-                    gate.is_active(owner_id, modifier)
-                }
-            })
-        {
+        for modifier in node.modifiers.iter().filter(|modifier| {
+            if let Some((target_id, modifier_id)) = only_modifier
+                && target_id == owner_id
+            {
+                modifier.enabled && &modifier.id == modifier_id
+            } else {
+                gate.is_active(owner_id, modifier)
+            }
+        }) {
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
                 "boolean" | "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => {
                     &["object"]
