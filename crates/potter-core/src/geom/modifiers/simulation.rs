@@ -532,7 +532,7 @@ pub fn displace_volume(
     let Some(texture) = texture.filter(|_| strength != 0.0) else {
         return Ok(volume.clone());
     };
-    let texture = VolumeDisplacement::new(
+    let mut texture = VolumeDisplacement::new(
         params,
         texture,
         rng,
