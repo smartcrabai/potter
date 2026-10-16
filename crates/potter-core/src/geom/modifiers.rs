@@ -100,14 +100,20 @@ pub(crate) fn blender_transform_point_f32(matrix: &[f32; 16], point: glam::Vec3)
 }
 
 
-fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+/// Blender `mul_m4_m4m4` grouping: SIMD on x86_64/ARM64, scalar on other targets.
+pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
     let mut result = [0.0; 16];
     for row in 0..4 {
         for column in 0..4 {
-            result[column * 4 + row] = right[column * 4] * left[row]
-                + right[column * 4 + 1] * left[4 + row]
-                + right[column * 4 + 2] * left[8 + row]
-                + right[column * 4 + 3] * left[12 + row];
+            let term0 = right[column * 4] * left[row];
+            let term1 = right[column * 4 + 1] * left[4 + row];
+            let term2 = right[column * 4 + 2] * left[8 + row];
+            let term3 = right[column * 4 + 3] * left[12 + row];
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            let value = (term0 + term1) + (term2 + term3);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let value = term0 + term1 + term2 + term3;
+            result[column * 4 + row] = value;
         }
     }
     result
