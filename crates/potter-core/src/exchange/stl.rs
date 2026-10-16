@@ -116,9 +116,6 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
         facet_normals_disagree |= facet_normal_disagrees(stored, corners);
         faces.push(face);
     }
-    if faces.is_empty() {
-        return Err(stl_error("binary STL contains no triangles"));
-    }
     // Blender ignores stored facet normals and recomputes them from winding. Potter does the same,
     // but reports a contradicted normal instead of dropping it silently.
     let losses = if facet_normals_disagree {

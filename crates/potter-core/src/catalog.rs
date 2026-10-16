@@ -809,24 +809,24 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "modifier.remesh",
-            "BLOCKS, SMOOTH, and SHARP dual-contouring plus VOXEL signed-distance remesh with resource-capped grids",
+            "BLOCKS, SMOOTH, and SHARP dual-contouring (Blender DualCon octree port) plus VOXEL signed-distance remesh with resource-capped grids",
             "REMESH",
             &["modifier.create", "modifier.apply"],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "modifier.remesh.voxel_adaptivity",
-            "Blender VOXEL remesh with nonzero adaptivity",
+            "Blender VOXEL remesh with adaptivity (OpenVDB adaptive volumeToMesh)",
             "REMESH",
             &["modifier.create", "modifier.apply"],
-            "OpenVDB adaptive volume meshing is not implemented; zero-adaptivity uniform voxel remeshing is supported.",
+            [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "modifier.remesh.open_nonmanifold",
-            "Blender dual-contouring Remesh with unresolved open-surface ring paths",
+            "Blender dual-contouring Remesh on open, non-manifold, mixed, and disconnected meshes, with in-octree component removal",
             "REMESH",
             &["modifier.create", "modifier.apply"],
-            "Open/non-manifold meshes with sign-mask transitions not covered by closed leaf-ring paths remain unsupported; the recursive Blender patchSplit/connectFace repair is not implemented.",
+            [true, true, true, true, true, false, false],
         ),
         supported(
             "modifier.ocean",
