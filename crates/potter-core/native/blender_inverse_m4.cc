@@ -2,6 +2,8 @@
 
 // Mirrors Blender 5.2.2 intern/eigen/intern/matrix.cc using Eigen commit
 // 8a1083e9bf41b91fdea6546681f806154efdc25a (Eigen/src/LU/InverseImpl.h).
+// Upstream archive SHA-256: cc28a84fdec496c6777596350ea805519bf10f717d21044ae6ba3dd562183a26.
+// Eigen is MPL-2.0; see vendor/eigen/COPYING.MPL2.
 #include <Eigen/LU>
 
 #include <cstring>
