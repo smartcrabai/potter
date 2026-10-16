@@ -790,13 +790,16 @@ fn subdivide_skin_target_face(
             "Skin target face index is out of range",
         )
     })?;
-    let mut longest_edge = None;
-    let mut longest_length = f32::NEG_INFINITY;
+    let mut longest_edge = face
+        .first()
+        .zip(face.get(1))
+        .map(|(first, second)| (*first, *second));
+    let mut longest_length = 0.0;
     for corner in 0..face.len() {
         let first = face[corner];
         let second = face[(corner + 1) % face.len()];
         let length = skin_float_distance_squared(points[first], points[second]);
-        if length > longest_length {
+        if length >= longest_length {
             longest_length = length;
             longest_edge = Some((first, second));
         }
