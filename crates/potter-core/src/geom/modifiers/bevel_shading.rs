@@ -474,6 +474,7 @@ pub(super) fn shade_output(
         return Ok(());
     }
     // Sharp flags are final now; the fans and their frames come from the mesh without custom data.
+
     let mut starts = Vec::with_capacity(polygons.len());
     let mut total = 0;
     for polygon in &polygons {
