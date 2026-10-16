@@ -173,7 +173,11 @@ impl Projects {
         avatar.push(render_limit("body"));
         Ok(Self {
             applied: new_project(root, "applied", &cube(&[array("cube", true, true)]))?,
-            viewport_only: new_project(root, "viewport-only", &cube(&[array("cube", true, false)]))?,
+            viewport_only: new_project(
+                root,
+                "viewport-only",
+                &cube(&[array("cube", true, false)]),
+            )?,
             render_only: new_project(root, "render-only", &cube(&[array("cube", false, true)]))?,
             base: new_project(root, "base", &cube(&[]))?,
             render_limit: new_project(root, "render-limit", &cube(&[render_limit("cube")]))?,
@@ -295,8 +299,7 @@ fn mesh_exports_evaluate_the_stack_their_purpose_names() -> TestResult {
             continue;
         }
         let vertices = |project: &Path, name: &str| -> TestResult<u64> {
-            let result =
-                export_result(project, format, extension, None, directory.path(), name)?;
+            let result = export_result(project, format, extension, None, directory.path(), name)?;
             evaluated_vertices(&result)
         };
         let applied = vertices(&projects.applied, "applied")?;

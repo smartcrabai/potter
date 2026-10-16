@@ -22,7 +22,12 @@ pub fn run(args: ValidateArgs) -> Result<(Option<SceneInfo>, Value)> {
         }
         _ => None,
     };
-    let mut report = validate::validate(project.doc(), format)?;
+    let mut report = validate::validate_with_context(
+        project.doc(),
+        format,
+        Some(project.path()),
+        Some(project.cache_directory()),
+    )?;
     if let Some(format @ ("vrm" | "vrm0")) = format {
         let version = if format == "vrm" {
             AvatarVersion::V1
@@ -36,7 +41,12 @@ pub fn run(args: ValidateArgs) -> Result<(Option<SceneInfo>, Value)> {
                 purpose: export_purpose(format),
                 ..EvaluationContext::default()
             };
-            match Snapshot::evaluate_with_cache(project.doc(), &context, Some(project.path())) {
+            match Snapshot::evaluate_with_cache(
+                project.doc(),
+                &context,
+                Some(project.path()),
+                Some(project.cache_directory()),
+            ) {
                 Ok(snapshot) => {
                     if let Err(error) =
                         crate::exchange::vrm::validate_output(project.doc(), &snapshot, version)

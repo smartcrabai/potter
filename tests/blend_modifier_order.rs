@@ -60,7 +60,7 @@ use Step::{Create, Pin};
 struct Case {
     name: &'static str,
     steps: &'static [Step],
-    /// Potter's stack after the steps, bottom to top, as (name, use_pin_to_last).
+    /// Potter's stack after the steps, bottom to top, as (name, `use_pin_to_last`).
     expected: &'static [(&'static str, bool)],
 }
 
@@ -268,7 +268,7 @@ fn blender_5_2() -> TestResult<Option<PathBuf>> {
     Ok(None)
 }
 
-fn apply(doc: &SceneDoc, operation: Value) -> TestResult<SceneDoc> {
+fn apply(doc: &SceneDoc, operation: &Value) -> TestResult<SceneDoc> {
     let batch = json!({
         "schema_version": 1,
         "base_revision": doc.revision,
@@ -280,7 +280,7 @@ fn apply(doc: &SceneDoc, operation: Value) -> TestResult<SceneDoc> {
 fn stack_doc(steps: &[Step]) -> TestResult<SceneDoc> {
     let mut doc = apply(
         &SceneDoc::new(SCENE_ID.to_owned()),
-        json!({"op": "node.create", "id": OBJECT, "kind": "box", "params": {"size": 2.0}}),
+        &json!({"op": "node.create", "id": OBJECT, "kind": "box", "params": {"size": 2.0}}),
     )?;
     for step in steps {
         let operation = match *step {
@@ -299,12 +299,12 @@ fn stack_doc(steps: &[Step]) -> TestResult<SceneDoc> {
                 "set": {"params": {"use_pin_to_last": pinned}},
             }),
         };
-        doc = apply(&doc, operation)?;
+        doc = apply(&doc, &operation)?;
     }
     Ok(doc)
 }
 
-/// Potter's stack for `OBJECT`, bottom to top, as (name, use_pin_to_last).
+/// Potter's stack for `OBJECT`, bottom to top, as (name, `use_pin_to_last`).
 fn potter_stack(doc: &SceneDoc) -> TestResult<Vec<(String, bool)>> {
     let node = doc
         .nodes
@@ -502,15 +502,19 @@ fn imported_blender_stack_order_survives_reexport() -> TestResult<()> {
 }
 
 #[test]
-fn blender_existing_stack_replaces_wrong_type_and_removes_stale_modifier_before_planning() -> TestResult<()> {
+fn blender_existing_stack_replaces_wrong_type_and_removes_stale_modifier_before_planning()
+-> TestResult<()> {
     let Some(blender) = blender_5_2()? else {
         return Ok(());
     };
     let directory = tempdir()?;
     let root = directory.path();
-    let bridge_source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/potter-core/src/exchange/blend_bridge.py");
-    fs::write(root.join("blend_bridge_source.py"), fs::read(bridge_source)?)?;
+    let bridge_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/potter-core/src/exchange/blend_bridge.py");
+    fs::write(
+        root.join("blend_bridge_source.py"),
+        fs::read(bridge_source)?,
+    )?;
     run_blender_script(
         &blender,
         "existing_stack.py",

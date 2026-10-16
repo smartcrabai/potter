@@ -72,15 +72,16 @@ fn modifier(
     show_viewport: bool,
     show_render: bool,
 ) -> Value {
-    json!({
+    let mut value = json!({
         "op": "modifier.create",
         "target": {"id": SUBJECT},
         "id": id,
         "type": modifier_type,
-        "params": params,
         "show_viewport": show_viewport,
         "show_render": show_render,
-    })
+    });
+    value["params"] = params;
+    value
 }
 
 fn node_modifiers(doc: &SceneDoc) -> TestResult<Vec<Modifier>> {
@@ -96,7 +97,10 @@ fn data_block(doc: &SceneDoc) -> TestResult<&DataBlock> {
         .nodes
         .get(&Id::new(SUBJECT)?)
         .ok_or("subject node is missing")?;
-    let data_id = node.data.as_ref().ok_or("subject node has no geometry data")?;
+    let data_id = node
+        .data
+        .as_ref()
+        .ok_or("subject node has no geometry data")?;
     doc.data_blocks
         .get(data_id)
         .ok_or_else(|| "subject data block is missing".into())
@@ -161,7 +165,13 @@ fn hidden_earlier_array_stays_and_the_target_applies_to_base() -> TestResult<()>
         false,
         true,
     );
-    let subdivision = modifier("subdivision", "subdivision", json!({"levels": 1}), true, true);
+    let subdivision = modifier(
+        "subdivision",
+        "subdivision",
+        json!({"levels": 1}),
+        true,
+        true,
+    );
     let before = node_modifiers(&build(&[array.clone(), subdivision.clone()])?)?;
 
     let applied = apply_target(&[array, subdivision.clone()], "subdivision")?;
@@ -236,7 +246,13 @@ fn modifiers_after_the_target_keep_their_order_and_flags() -> TestResult<()> {
         true,
         false,
     );
-    let subdivision = modifier("subdivision", "subdivision", json!({"levels": 1}), true, true);
+    let subdivision = modifier(
+        "subdivision",
+        "subdivision",
+        json!({"levels": 1}),
+        true,
+        true,
+    );
     let displace = modifier(
         "displace",
         "displace",
@@ -244,7 +260,13 @@ fn modifiers_after_the_target_keep_their_order_and_flags() -> TestResult<()> {
         false,
         true,
     );
-    let solidify = modifier("solidify", "solidify", json!({"thickness": 0.1}), true, false);
+    let solidify = modifier(
+        "solidify",
+        "solidify",
+        json!({"thickness": 0.1}),
+        true,
+        false,
+    );
     let extra = [array, subdivision.clone(), displace, solidify];
     let before = node_modifiers(&build(&extra)?)?;
 
@@ -270,8 +292,20 @@ fn modifiers_after_the_target_keep_their_order_and_flags() -> TestResult<()> {
 
 #[test]
 fn hidden_target_is_applied_and_its_viewport_flag_is_ignored() -> TestResult<()> {
-    let subdivision = modifier("subdivision", "subdivision", json!({"levels": 1}), false, true);
-    let solidify = modifier("solidify", "solidify", json!({"thickness": 0.1}), false, false);
+    let subdivision = modifier(
+        "subdivision",
+        "subdivision",
+        json!({"levels": 1}),
+        false,
+        true,
+    );
+    let solidify = modifier(
+        "solidify",
+        "solidify",
+        json!({"thickness": 0.1}),
+        false,
+        false,
+    );
     let extra = [subdivision.clone(), solidify];
     let before = node_modifiers(&build(&extra)?)?;
 
@@ -309,7 +343,13 @@ fn vertex_groups_persist_and_match_the_target_alone() -> TestResult<()> {
         false,
         true,
     );
-    let subdivision = modifier("subdivision", "subdivision", json!({"levels": 1}), true, true);
+    let subdivision = modifier(
+        "subdivision",
+        "subdivision",
+        json!({"levels": 1}),
+        true,
+        true,
+    );
 
     let mut stacked = groups.clone();
     stacked.extend([array, subdivision.clone()]);
@@ -347,7 +387,13 @@ fn shape_keys_still_refuse_apply_when_a_predecessor_is_hidden() -> TestResult<()
         false,
         true,
     );
-    let subdivision = modifier("subdivision", "subdivision", json!({"levels": 1}), true, true);
+    let subdivision = modifier(
+        "subdivision",
+        "subdivision",
+        json!({"levels": 1}),
+        true,
+        true,
+    );
     let doc = build(&[shape_key, array, subdivision])?;
 
     let error = run(&doc, &apply_op("subdivision"))

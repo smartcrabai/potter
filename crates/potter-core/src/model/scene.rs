@@ -1472,7 +1472,7 @@ pub struct ModifierRuntime {
     pub warp_from: Option<[f64; 3]>,
     pub warp_to: Option<[f64; 3]>,
     pub hook_target_position: Option<[f64; 3]>,
-    pub use_render_levels: bool,
+    pub use_render_settings: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -34,6 +34,7 @@ pub fn run(args: PreviewArgs) -> Result<(Option<SceneInfo>, Value)> {
     let previews = render_previews(
         project.doc(),
         project.path(),
+        project.cache_directory(),
         &PreviewRequest {
             views: &views,
             camera_id: args.camera.as_deref(),

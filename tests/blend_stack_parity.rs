@@ -281,6 +281,7 @@ fn gear_bevel_array_subdivision_weighted_normal_stack_stops_at_unsupported_blend
         &document,
         &potter_core::eval::EvaluationContext::default(),
         None,
+        None,
         &std::collections::BTreeSet::from([cap_id.clone()]),
     )?;
     assert!(cap_only.meshes.contains_key(&cap_id));

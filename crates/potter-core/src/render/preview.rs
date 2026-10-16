@@ -75,7 +75,8 @@ impl Drop for StagedView {
 
 pub fn render_previews(
     doc: &SceneDoc,
-    scene_root: &Path,
+    project_root: &Path,
+    cache_directory: &Path,
     request: &PreviewRequest<'_>,
 ) -> Result<Vec<Value>> {
     if !(MIN_SIZE..=MAX_SIZE).contains(&request.size) {
@@ -87,10 +88,14 @@ pub fn render_previews(
     }
     let mode = parse_mode(request.mode)?;
     let labels = resolve_views(request.views, request.camera_id)?;
-    let (snapshot, node_errors) =
-        Snapshot::evaluate_available_with_cache(doc, request.context, Some(scene_root))?;
+    let (snapshot, node_errors) = Snapshot::evaluate_available_with_cache(
+        doc,
+        request.context,
+        Some(project_root),
+        Some(cache_directory),
+    )?;
     let images = if matches!(mode, Mode::Beauty) {
-        super::path::load_images(doc, scene_root, request.staged_assets)?
+        super::path::load_images(doc, project_root, request.staged_assets)?
     } else {
         BTreeMap::new()
     };
@@ -178,7 +183,7 @@ pub fn render_previews(
             let key = render_key.strip_prefix("sha256:").ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "render key has an invalid prefix")
             })?;
-            scene_root
+            project_root
                 .join(".potter/previews")
                 .join(format!("r{}", snapshot.revision))
                 .join(key)
@@ -209,6 +214,7 @@ pub fn render_previews(
 pub(crate) fn render_camera_frame(
     doc: &SceneDoc,
     context: &EvaluationContext,
+    project_root: &Path,
     cache_directory: &Path,
     camera_id: &str,
     width: u32,
@@ -225,8 +231,9 @@ pub(crate) fn render_camera_frame(
         ));
     }
     let mode = parse_mode(mode_name)?;
-    let snapshot = Snapshot::evaluate_with_cache(doc, context, Some(cache_directory))?;
-    let images = super::path::load_images(doc, cache_directory, None)?;
+    let snapshot =
+        Snapshot::evaluate_with_cache(doc, context, Some(project_root), Some(cache_directory))?;
+    let images = super::path::load_images(doc, project_root, None)?;
     let geometry = extract_geometry(
         doc,
         &snapshot,

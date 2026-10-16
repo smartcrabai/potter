@@ -6076,6 +6076,7 @@ fn attach_native_target_vertex_orders(doc: &mut SceneDoc) {
             doc,
             &crate::eval::EvaluationContext::default(),
             None,
+            None,
             &selected,
         )
         .ok();
