@@ -30,6 +30,8 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("modifier params must be an object")?
@@ -661,8 +663,12 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
     let scene_path = scene.join("scene.json");
     let serialized = fs::read(&scene_path)?;
     let doc: SceneDoc = serde_json::from_slice(&serialized)?;
-    let snapshot =
-        Snapshot::evaluate_with_cache(&doc, &EvaluationContext::default(), Some(&scene))?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &doc,
+        &EvaluationContext::default(),
+        Some(&scene),
+        Some(&scene.join(".potter/cache")),
+    )?;
     let body = snapshot
         .meshes
         .get(&potter_core::model::Id::new("body")?)
@@ -678,6 +684,7 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
         &procedural_scene,
         &EvaluationContext::default(),
         Some(&scene),
+        Some(&scene.join(".potter/cache")),
     )
     .err()
     .ok_or("procedural texture mask unexpectedly evaluated")?;

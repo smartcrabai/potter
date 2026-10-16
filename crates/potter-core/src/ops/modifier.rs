@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::EvaluationPurpose,
     geom::modifiers::evaluate_modifiers_with_groups_at_frame,
     model::{DataBlock, Id, Modifier, SceneDoc, ShapeKey, ShapeKeyData},
     params::{self, ParameterFamily},
@@ -113,7 +114,9 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 view_layer: None,
                 frame: Some(engine.evaluation_frame),
                 adaptive_render: None,
+                purpose: EvaluationPurpose::Preview,
             },
+            engine.asset_root,
             None,
             &bind_nodes,
         )?;
@@ -293,7 +296,17 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     check_fields(
         engine,
         operation,
-        &["op", "target", "id", "type", "name", "enabled", "params"],
+        &[
+            "op",
+            "target",
+            "id",
+            "type",
+            "name",
+            "enabled",
+            "show_viewport",
+            "show_render",
+            "params",
+        ],
         &["target", "id", "type"],
     )?;
     let targets = targets(engine, operation)?;
@@ -316,6 +329,8 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             .to_owned(),
     };
     let enabled = read_bool(engine, operation, "enabled", true)?;
+    let show_viewport = read_bool(engine, operation, "show_viewport", true)?;
+    let show_render = read_bool(engine, operation, "show_render", true)?;
     let params = read_params(engine, operation.get("params"), "params")?;
     validate_parameter_map(
         engine,
@@ -364,15 +379,25 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             .nodes
             .get_mut(&target)
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "node disappeared"))?;
-        node.modifiers.push(Modifier {
-            id: id.clone(),
-            modifier_type: modifier_type.clone(),
-            name: name.clone(),
-            enabled,
-            params: modifier_params,
-            binding_data: None,
-            runtime: crate::model::ModifierRuntime::default(),
-        });
+        let index = insertion_index(&node.modifiers, &modifier_type);
+        let pinned = pin_flag(&modifier_params);
+        node.modifiers.insert(
+            index,
+            Modifier {
+                id: id.clone(),
+                modifier_type: modifier_type.clone(),
+                name: name.clone(),
+                enabled,
+                show_viewport,
+                show_render,
+                params: modifier_params,
+                binding_data: None,
+                runtime: crate::model::ModifierRuntime::default(),
+            },
+        );
+        if pinned {
+            settle_pin(&mut node.modifiers, index);
+        }
         engine.mark("nodes", &target, ChangeKind::Updated);
         changed = true;
     }
@@ -395,7 +420,16 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine.error(ErrorCode::InvalidOperation, "set must be an object", "/set")
         })?;
     for key in set.keys() {
-        if !["name", "enabled", "params", "type"].contains(&key.as_str()) {
+        if ![
+            "name",
+            "enabled",
+            "show_viewport",
+            "show_render",
+            "params",
+            "type",
+        ]
+        .contains(&key.as_str())
+        {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown modifier set field `{key}`"),
@@ -515,11 +549,37 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 )
             })?;
         }
+        if let Some(value) = set.get("show_viewport") {
+            modifier.show_viewport = value.as_bool().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "modifier show_viewport must be a boolean",
+                )
+            })?;
+        }
+        if let Some(value) = set.get("show_render") {
+            modifier.show_render = value.as_bool().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "modifier show_render must be a boolean",
+                )
+            })?;
+        }
         modifier_type.clone_into(&mut modifier.modifier_type);
         if let Some(params) = modifier_params {
             modifier.params = params;
         }
-        if modifier != &before {
+        let pin_changed = pin_flag(&before.params) != pin_flag(&modifier.params);
+        let modified = modifier != &before;
+        if pin_changed
+            && let Some(index) = node
+                .modifiers
+                .iter()
+                .position(|candidate| candidate.id == id)
+        {
+            settle_pin(&mut node.modifiers, index);
+        }
+        if modified {
             engine.mark("nodes", &target, ChangeKind::Updated);
             changed = true;
         }
@@ -625,8 +685,17 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
             ));
         }
         if current != index {
-            let modifier = node.modifiers.remove(current);
-            node.modifiers.insert(index, modifier);
+            let reached = partial_move_target(&node.modifiers, current, index);
+            if reached != index {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!(
+                        "modifier `{id}` cannot move to index {index}: pin-to-last or original-data order stops it at index {reached}"
+                    ),
+                    "/index",
+                ));
+            }
+            move_modifier(&mut node.modifiers, current, index);
             engine.mark("nodes", &target, ChangeKind::Updated);
             changed = true;
         }
@@ -634,10 +703,178 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
     Ok(changed)
 }
 
+/// Blender's `ModifierTypeType::OnlyDeform` for each Potter modifier type.
+fn only_deform(modifier_type: &str) -> bool {
+    matches!(
+        modifier_type,
+        "armature"
+            | "cast"
+            | "cloth"
+            | "collision"
+            | "corrective_smooth"
+            | "curve"
+            | "displace"
+            | "hook"
+            | "laplacian_deform"
+            | "laplacian_smooth"
+            | "lattice"
+            | "mesh_cache"
+            | "mesh_deform"
+            | "particle_system"
+            | "shrinkwrap"
+            | "simple_deform"
+            | "smooth"
+            | "soft_body"
+            | "surface_deform"
+            | "warp"
+            | "wave"
+    )
+}
+
+/// Blender's `eModifierTypeFlag_RequiresOriginalData` modifier types.
+fn requires_original_data(modifier_type: &str) -> bool {
+    matches!(modifier_type, "multires" | "soft_body")
+}
+
+/// Blender's `eModifierFlag_PinLast`, stored as the `use_pin_to_last` parameter.
+fn pin_flag(params: &Map<String, Value>) -> bool {
+    params
+        .get("use_pin_to_last")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn is_pinned(modifier: &Modifier) -> bool {
+    pin_flag(&modifier.params)
+}
+
+/// Blender's `BKE_modifiers_add_at_end_if_possible`: a new modifier goes before the trailing pinned
+/// block. Hook and original-data types go before the first modifier that is not deform-only.
+pub(crate) fn insertion_index(stack: &[Modifier], modifier_type: &str) -> usize {
+    if modifier_type == "hook" || requires_original_data(modifier_type) {
+        let mut index = 0;
+        while index < stack.len() && only_deform(&stack[index].modifier_type) {
+            if stack.get(index + 1).is_some_and(is_pinned) {
+                break;
+            }
+            index += 1;
+        }
+        return index;
+    }
+    let mut index = stack.len();
+    while index > 0 && is_pinned(&stack[index - 1]) {
+        index -= 1;
+    }
+    index
+}
+
+/// Blender's `object_modifier_check_move_before`: whether `modifier` may move above `previous`.
+fn may_move_before(modifier: &Modifier, previous: &Modifier) -> bool {
+    let unpins_past_pinned = is_pinned(modifier) && !is_pinned(previous);
+    let past_original_data =
+        requires_original_data(&previous.modifier_type) && !only_deform(&modifier.modifier_type);
+    !unpins_past_pinned && !past_original_data
+}
+
+/// Blender's `object_modifier_check_move_after`: whether `modifier` may move below `next`.
+fn may_move_after(modifier: &Modifier, next: &Modifier) -> bool {
+    let unpins_before_pinned = is_pinned(next) && !is_pinned(modifier);
+    let past_non_deform =
+        requires_original_data(&modifier.modifier_type) && !only_deform(&next.modifier_type);
+    !unpins_before_pinned && !past_non_deform
+}
+
+/// Index reached when moving `stack[from]` towards `to`: stops before the first refused step, as
+/// Blender's `modifier_move_to_index` does with `allow_partial`. Returns `from` when blocked at once.
+fn partial_move_target(stack: &[Modifier], from: usize, to: usize) -> usize {
+    let moving = &stack[from];
+    let mut current = from;
+    if from < to {
+        while current < to && may_move_after(moving, &stack[current + 1]) {
+            current += 1;
+        }
+    } else {
+        while current > to && may_move_before(moving, &stack[current - 1]) {
+            current -= 1;
+        }
+    }
+    current
+}
+
+fn move_modifier(stack: &mut Vec<Modifier>, from: usize, to: usize) {
+    let modifier = stack.remove(from);
+    stack.insert(to, modifier);
+}
+
+/// Blender's `rna_Modifier_use_pin_to_last_set` move: a pinned modifier moves down past the
+/// unpinned modifiers after it; an unpinned one moves up past the pinned modifiers before it.
+fn settle_pin(stack: &mut Vec<Modifier>, index: usize) {
+    let mut target = index;
+    if is_pinned(&stack[index]) {
+        while target + 1 < stack.len() && !is_pinned(&stack[target + 1]) {
+            target += 1;
+        }
+    } else {
+        while target > 0 && is_pinned(&stack[target - 1]) {
+            target -= 1;
+        }
+    }
+    let reached = partial_move_target(stack, index, target);
+    if reached != index {
+        move_modifier(stack, index, reached);
+    }
+}
+
 /// `modifier.attribute_dropped` reports output that was applied with attributes lost, so it is
 /// surfaced as a warning on every apply path instead of failing the operation.
 fn is_attribute_dropped(warning: &PotError) -> bool {
     warning.details.get("feature_id").and_then(Value::as_str) == Some("modifier.attribute_dropped")
+}
+
+fn ensure_single_user_data(engine: &mut Engine<'_>, targets: &[Id]) -> Result<()> {
+    for target in targets {
+        let data_id = engine
+            .doc
+            .nodes
+            .get(target)
+            .and_then(|node| node.data.clone())
+            .ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!("node `{target}` has no geometry data"),
+                    "/target",
+                )
+            })?;
+        if super::data_user_count(engine, &data_id) <= 1 {
+            continue;
+        }
+        let copy = engine
+            .doc
+            .data_blocks
+            .get(&data_id)
+            .cloned()
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::TargetNotFound,
+                    format!("data block `{data_id}` was not found"),
+                )
+            })?;
+        let new_id = super::unique_data_id(
+            engine,
+            target,
+            "_mesh_single",
+            super::DataIdCollisionHandling::ReserveSuffix,
+            "data ID suffix exhausted",
+        )?;
+        engine.doc.data_blocks.insert(new_id.clone(), copy);
+        if let Some(node) = engine.doc.nodes.get_mut(target) {
+            node.data = Some(new_id.clone());
+        }
+        engine.mark("data_blocks", &new_id, ChangeKind::Created);
+        engine.mark("nodes", target, ChangeKind::Updated);
+        engine.map_id("data_blocks", &data_id, &new_id);
+    }
+    Ok(())
 }
 
 fn apply_modifier(
@@ -688,35 +925,7 @@ fn apply_modifier(
         ));
     }
     if scope == Some("single_user") {
-        for (target, data_id) in &data_targets {
-            if super::data_user_count(engine, data_id) > 1 {
-                let copy = engine
-                    .doc
-                    .data_blocks
-                    .get(data_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::TargetNotFound,
-                            format!("data block `{data_id}` was not found"),
-                        )
-                    })?;
-                let new_id = super::unique_data_id(
-                    engine,
-                    target,
-                    "_mesh_single",
-                    super::DataIdCollisionHandling::ReserveSuffix,
-                    "data ID suffix exhausted",
-                )?;
-                engine.doc.data_blocks.insert(new_id.clone(), copy);
-                if let Some(node) = engine.doc.nodes.get_mut(target) {
-                    node.data = Some(new_id.clone());
-                }
-                engine.mark("data_blocks", &new_id, ChangeKind::Created);
-                engine.mark("nodes", target, ChangeKind::Updated);
-                engine.map_id("data_blocks", data_id, &new_id);
-            }
-        }
+        ensure_single_user_data(engine, &targets)?;
     }
     let mut changed = false;
     let mut edited_data = Vec::<Id>::new();
@@ -735,279 +944,14 @@ fn apply_modifier(
         if edited_data.contains(&data_id) {
             continue;
         }
-        let modifiers = engine
-            .doc
-            .nodes
-            .get(&target)
-            .map(|node| node.modifiers.clone())
-            .unwrap_or_default();
-        let index = modifiers
-            .iter()
-            .position(|modifier| modifier.id == modifier_id)
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::TargetNotFound,
-                    format!("modifier `{modifier_id}` was not found on node `{target}`"),
-                )
-            })?;
-        crate::geom::modifiers::validate_boolean_topology_suffix(&modifiers, index)?;
-        let evaluated = {
-            let data_block = engine.doc.data_blocks.get(&data_id).ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::TargetNotFound,
-                    format!("data block `{data_id}` was not found"),
-                )
-            })?;
-            let output = data_block.mesh.as_ref().ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidOperation,
-                    format!("data block `{data_id}` has no mesh"),
-                )
-            })?;
-            let modifier_stack = &modifiers[..=index];
-            let uses_armature = modifier_stack
-                .iter()
-                .any(|modifier| modifier.enabled && modifier.modifier_type == "armature");
-            let uses_lattice = modifier_stack
-                .iter()
-                .any(|modifier| modifier.enabled && modifier.modifier_type == "lattice");
-            let uses_volume_node = modifier_stack.iter().any(|modifier| {
-                modifier.enabled
-                    && modifier.modifier_type == "volume_to_mesh"
-                    && modifier.params.get("volume").is_some_and(Value::is_string)
-            });
-            let uses_scene_operand = modifier_stack.iter().any(|modifier| {
-                if !modifier.enabled {
-                    return false;
-                }
-                match modifier.modifier_type.as_str() {
-                    "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform" => {
-                        ["object", "collection", "target"]
-                            .iter()
-                            .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
-                    }
-                    "curve"
-                    | "hook"
-                    | "data_transfer"
-                    | "vertex_weight_proximity"
-                    | "normal_edit" => ["object", "target"]
-                        .iter()
-                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                    "uv_project" => modifier
-                        .params
-                        .get("projectors")
-                        .is_some_and(Value::is_array),
-                    "uv_warp" => ["object_from", "object_to"]
-                        .iter()
-                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                    "warp" => ["object_from", "object_to"]
-                        .iter()
-                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                    "vertex_weight_edit" | "vertex_weight_mix" => modifier
-                        .params
-                        .get("mask_tex_map_object")
-                        .is_some_and(Value::is_string),
-                    "array" => ["start_cap", "end_cap"]
-                        .iter()
-                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                    _ => false,
-                }
-            });
-            // Vertex-group readers consume the mesh attribute, so attach source weights whenever the
-            // block has groups; the evaluated output then carries the remapped weights.
-            let prepared_output = (!data_block.vertex_groups.is_empty()).then(|| {
-                let mut mesh = output.clone();
-                crate::eval::attach_vertex_group_weights(&mut mesh, data_block);
-                mesh
-            });
-            if !allow_shape_keys && data_block.shape_keys.is_some() {
-                return Err(PotError::with_details(
-                    ErrorCode::UnsupportedFeature,
-                    "Modifier cannot be applied to a mesh with shape keys",
-                    json!({"feature_id":"modifier.apply.shape_key_guard","modifier_id":modifier_id}),
-                ));
-            }
-            if !uses_armature && !uses_lattice && !uses_volume_node && !uses_scene_operand {
-                let source = prepared_output.as_ref().unwrap_or(output);
-                let evaluation = evaluate_modifiers_with_groups_at_frame(
-                    source,
-                    modifier_stack,
-                    &engine.doc.node_groups,
-                    engine.evaluation_frame,
-                )?;
-                engine.warnings.extend(
-                    evaluation
-                        .warnings
-                        .into_iter()
-                        .filter(is_attribute_dropped)
-                        .map(|warning| crate::eval::attach_node_owner(warning, &target)),
-                );
-                evaluation.mesh
-            } else {
-                let frame = engine.evaluation_frame;
-                let scene_snapshot = if uses_scene_operand {
-                    Some(crate::eval::Snapshot::evaluate_with_cache(
-                        engine.doc,
-                        &crate::eval::EvaluationContext {
-                            frame: Some(frame),
-                            ..crate::eval::EvaluationContext::default()
-                        },
-                        engine.asset_root,
-                    )?)
-                } else {
-                    None
-                };
-                let empty_meshes = BTreeMap::new();
-                let evaluated_operand_meshes = scene_snapshot
-                    .as_ref()
-                    .map_or(&empty_meshes, |snapshot| &snapshot.meshes);
-                let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
-                let world_matrices: BTreeMap<_, _> = if let Some(snapshot) = &scene_snapshot {
-                    snapshot
-                        .nodes
-                        .iter()
-                        .map(|(id, node)| {
-                            (id.clone(), glam::DMat4::from_cols_array(&node.world_matrix))
-                        })
-                        .collect()
-                } else {
-                    crate::eval::rig::evaluate_world_matrices_with_drivers(
-                        engine.doc,
-                        frame,
-                        &driver_values,
-                    )?
-                };
-                let base_object_meshes: BTreeMap<_, _> = engine
-                    .doc
-                    .nodes
-                    .iter()
-                    .filter_map(|(node_id, node)| {
-                        let data_id = node.data.as_ref()?;
-                        let data_block = engine.doc.data_blocks.get(data_id)?;
-                        (data_block.data_type == "mesh")
-                            .then(|| data_block.mesh.as_ref().map(|mesh| (node_id.clone(), mesh)))
-                            .flatten()
-                    })
-                    .collect();
-                let volume_data = if uses_volume_node {
-                    crate::eval::load_vdb_volume_data(engine.doc, engine.asset_root)?
-                } else {
-                    BTreeMap::new()
-                };
-                let source = prepared_output.as_ref().unwrap_or(output);
-                let object_world = world_matrices.get(&target).copied().ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::EvaluationFailed,
-                        "modifier subject transform is unavailable",
-                    )
-                })?;
-                let evaluation = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
-                    source.clone(),
-                    modifier_stack,
-                    &engine.doc.node_groups,
-                    frame,
-                    object_world,
-                    &world_matrices,
-                    &base_object_meshes,
-                    evaluated_operand_meshes,
-                    &BTreeMap::new(),
-                    None,
-                    |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                        "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
-                            mesh,
-                            data_block,
-                            modifier,
-                            object_world,
-                            engine.doc,
-                            frame,
-                            &world_matrices,
-                            &driver_values,
-                            engine.asset_root,
-                            engine
-                                .doc
-                                .scenes
-                                .get(&engine.doc.active_scene)
-                                .map_or(24, |scene| scene.fps),
-                            engine
-                                .doc
-                                .scenes
-                                .get(&engine.doc.active_scene)
-                                .map_or(1.0, |scene| scene.fps_base),
-                            evaluated_operand_meshes,
-                        ),
-                        "lattice" => apply_lattice_modifier(
-                            mesh,
-                            data_block,
-                            &target,
-                            modifier,
-                            engine.doc,
-                            &world_matrices,
-                        ),
-                        "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
-                            mesh,
-                            modifier,
-                            &target,
-                            engine.doc,
-                            &world_matrices,
-                            &volume_data,
-                        ),
-                        "surface_deform" | "mesh_deform" => {
-                            crate::eval::apply_scene_deform_modifier(
-                                mesh,
-                                modifier,
-                                &target,
-                                engine.doc,
-                                &world_matrices,
-                                evaluated_operand_meshes,
-                                modifier_warnings,
-                            )
-                        }
-                        "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                            crate::eval::apply_scene_operand_modifier(
-                                mesh,
-                                modifier,
-                                &target,
-                                engine.doc,
-                                &world_matrices,
-                                evaluated_operand_meshes,
-                            )
-                        }
-                        "vertex_weight_edit"
-                        | "vertex_weight_mix"
-                        | "vertex_weight_proximity"
-                        | "normal_edit"
-                        | "uv_project"
-                        | "uv_warp"
-                        | "data_transfer" => crate::eval::apply_scene_attribute_modifier(
-                            mesh,
-                            modifier,
-                            &target,
-                            engine.doc,
-                            &world_matrices,
-                            evaluated_operand_meshes,
-                            engine.asset_root,
-                        ),
-                        _ => Err(PotError::new(
-                            ErrorCode::InternalError,
-                            "custom modifier callback received an unexpected type",
-                        )),
-                    },
-                )?;
-                let (dropped, blocking): (Vec<PotError>, Vec<PotError>) = evaluation
-                    .warnings
-                    .into_iter()
-                    .partition(is_attribute_dropped);
-                if let Some(warning) = blocking.into_iter().next() {
-                    return Err(warning);
-                }
-                engine.warnings.extend(
-                    dropped
-                        .into_iter()
-                        .map(|warning| crate::eval::attach_node_owner(warning, &target)),
-                );
-                evaluation.mesh
-            }
-        };
+        let target_modifier = modifier_to_apply(engine, &target, &modifier_id)?;
+        let evaluated = evaluate_modifier_output(
+            engine,
+            &target,
+            &data_id,
+            &target_modifier,
+            allow_shape_keys,
+        )?;
         // The evaluated `vertex_groups` attribute is a view of DataBlock weights keyed by this mesh's
         // IDs. Persist it as the weights and keep the transient attribute out of stored mesh data.
         let mut evaluated = evaluated;
@@ -1038,7 +982,7 @@ fn apply_modifier(
             }
         }
         if let Some(node) = engine.doc.nodes.get_mut(&target) {
-            node.modifiers.drain(..=index);
+            node.modifiers.retain(|modifier| modifier.id != modifier_id);
         }
         if mesh_changed {
             super::clear_primitive_metadata(engine, &data_id);
@@ -1055,6 +999,354 @@ fn apply_modifier(
         changed = true;
     }
     Ok(changed)
+}
+fn modifier_to_apply(engine: &Engine<'_>, target: &Id, modifier_id: &Id) -> Result<Modifier> {
+    let stack = engine
+        .doc
+        .nodes
+        .get(target)
+        .map(|node| node.modifiers.as_slice())
+        .unwrap_or_default();
+    let index = stack
+        .iter()
+        .position(|modifier| &modifier.id == modifier_id)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                format!("modifier `{modifier_id}` was not found on node `{target}`"),
+            )
+        })?;
+    if stack[index].modifier_type == "boolean" {
+        let validator_stack: Vec<Modifier> = stack
+            .iter()
+            .enumerate()
+            .map(|(position, modifier)| {
+                if position == index {
+                    modifier.clone()
+                } else {
+                    modifier.for_purpose(EvaluationPurpose::Preview)
+                }
+            })
+            .collect();
+        crate::geom::modifiers::validate_boolean_topology_suffix(&validator_stack, index)?;
+    }
+    Ok(stack[index].clone())
+}
+
+fn evaluate_modifier_output(
+    engine: &mut Engine<'_>,
+    target: &Id,
+    data_id: &Id,
+    target_modifier: &Modifier,
+    allow_shape_keys: bool,
+) -> Result<crate::geom::Mesh> {
+    let modifier_id = &target_modifier.id;
+    let modifier_stack = std::slice::from_ref(target_modifier);
+    let evaluated = {
+        let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                format!("data block `{data_id}` was not found"),
+            )
+        })?;
+        let output = data_block.mesh.as_ref().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidOperation,
+                format!("data block `{data_id}` has no mesh"),
+            )
+        })?;
+        let uses_armature = modifier_stack
+            .iter()
+            .any(|modifier| modifier.enabled && modifier.modifier_type == "armature");
+        let uses_lattice = modifier_stack
+            .iter()
+            .any(|modifier| modifier.enabled && modifier.modifier_type == "lattice");
+        let uses_volume_node = modifier_stack.iter().any(|modifier| {
+            modifier.enabled
+                && modifier.modifier_type == "volume_to_mesh"
+                && modifier.params.get("volume").is_some_and(Value::is_string)
+        });
+        let uses_scene_context = modifier_stack.iter().any(|modifier| {
+            if !modifier.enabled {
+                return false;
+            }
+            match modifier.modifier_type.as_str() {
+                "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform" => {
+                    ["object", "collection", "target"]
+                        .iter()
+                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
+                }
+                "curve" | "hook" | "data_transfer" | "vertex_weight_proximity" | "normal_edit" => {
+                    ["object", "target"]
+                        .iter()
+                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
+                }
+                "uv_project" => modifier
+                    .params
+                    .get("projectors")
+                    .is_some_and(Value::is_array),
+                "uv_warp" => ["object_from", "object_to"]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
+                "warp" => ["object_from", "object_to"]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
+                "vertex_weight_edit" | "vertex_weight_mix" => modifier
+                    .params
+                    .get("mask_tex_map_object")
+                    .is_some_and(Value::is_string),
+                "screw" => modifier.params.get("object").is_some_and(Value::is_string),
+                "array" => {
+                    (modifier.params.get("fit_type").and_then(Value::as_str) == Some("FIT_CURVE")
+                        && modifier.params.get("curve").is_some_and(Value::is_string))
+                        || ["start_cap", "end_cap"]
+                            .iter()
+                            .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
+                        || (modifier
+                            .params
+                            .get("use_object_offset")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                            && modifier
+                                .params
+                                .get("offset_object")
+                                .is_some_and(Value::is_string))
+                }
+                _ => false,
+            }
+        });
+        // Vertex-group readers consume the mesh attribute, so attach source weights whenever the
+        // block has groups; the evaluated output then carries the remapped weights.
+        let prepared_output = (!data_block.vertex_groups.is_empty()).then(|| {
+            let mut mesh = output.clone();
+            crate::eval::attach_vertex_group_weights(&mut mesh, data_block);
+            mesh
+        });
+        if !allow_shape_keys && data_block.shape_keys.is_some() {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Modifier cannot be applied to a mesh with shape keys",
+                json!({"feature_id":"modifier.apply.shape_key_guard","modifier_id":modifier_id}),
+            ));
+        }
+        if !uses_armature && !uses_lattice && !uses_volume_node && !uses_scene_context {
+            let source = prepared_output.as_ref().unwrap_or(output);
+            let evaluation = evaluate_modifiers_with_groups_at_frame(
+                source,
+                modifier_stack,
+                &engine.doc.node_groups,
+                engine.evaluation_frame,
+            )?;
+            engine.warnings.extend(
+                evaluation
+                    .warnings
+                    .into_iter()
+                    .filter(is_attribute_dropped)
+                    .map(|warning| crate::eval::attach_node_owner(warning, target)),
+            );
+            evaluation.mesh
+        } else {
+            let frame = engine.evaluation_frame;
+            let operand_snapshot = if uses_scene_context {
+                Some(
+                    crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
+                        engine.doc,
+                        &crate::eval::EvaluationContext {
+                            frame: Some(frame),
+                            ..crate::eval::EvaluationContext::default()
+                        },
+                        engine.asset_root,
+                        engine.cache_directory,
+                        target,
+                        modifier_id,
+                    )?,
+                )
+            } else {
+                None
+            };
+            let empty_meshes = BTreeMap::new();
+            let evaluated_operand_meshes = operand_snapshot
+                .as_ref()
+                .map_or(&empty_meshes, |snapshot| &snapshot.meshes);
+            let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
+            let mut world_matrices = if let Some(snapshot) = &operand_snapshot {
+                let scene = engine.doc.scenes.get(&engine.doc.active_scene);
+                crate::eval::rig::evaluate_world_matrices_with_evaluated_meshes(
+                    engine.doc,
+                    frame,
+                    &driver_values,
+                    engine.asset_root,
+                    scene.map_or(24, |scene| scene.fps),
+                    scene.map_or(1.0, |scene| scene.fps_base),
+                    &snapshot.meshes,
+                )?
+            } else {
+                let scene = engine.doc.scenes.get(&engine.doc.active_scene);
+                crate::eval::rig::evaluate_world_matrices_with_resources(
+                    engine.doc,
+                    frame,
+                    &driver_values,
+                    engine.asset_root,
+                    scene.map_or(24, |scene| scene.fps),
+                    scene.map_or(1.0, |scene| scene.fps_base),
+                )?
+            };
+            if let Some(snapshot) = &operand_snapshot {
+                for (node_id, node) in &snapshot.nodes {
+                    world_matrices.insert(
+                        node_id.clone(),
+                        glam::DMat4::from_cols_array(&node.world_matrix),
+                    );
+                }
+                world_matrices.extend(
+                    snapshot
+                        .transform_world_matrices
+                        .iter()
+                        .map(|(id, matrix)| (id.clone(), *matrix)),
+                );
+            }
+            let curve_path_lengths = crate::eval::evaluated_array_curve_path_length(
+                engine.doc,
+                target_modifier,
+                &world_matrices,
+            )?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+            let base_object_meshes: BTreeMap<_, _> = engine
+                .doc
+                .nodes
+                .iter()
+                .filter_map(|(node_id, node)| {
+                    let data_id = node.data.as_ref()?;
+                    let data_block = engine.doc.data_blocks.get(data_id)?;
+                    (data_block.data_type == "mesh")
+                        .then(|| data_block.mesh.as_ref().map(|mesh| (node_id.clone(), mesh)))
+                        .flatten()
+                })
+                .collect();
+            let volume_data = if uses_volume_node {
+                crate::eval::load_vdb_volume_data(engine.doc, engine.asset_root)?
+            } else {
+                BTreeMap::new()
+            };
+            let source = prepared_output.as_ref().unwrap_or(output);
+            let object_world = world_matrices.get(target).copied().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "modifier subject transform is unavailable",
+                )
+            })?;
+            let evaluation = crate::geom::modifiers::evaluate_modifiers_with_scene_context(
+                source.clone(),
+                modifier_stack,
+                &engine.doc.node_groups,
+                frame,
+                object_world,
+                &world_matrices,
+                &base_object_meshes,
+                evaluated_operand_meshes,
+                &curve_path_lengths,
+                crate::eval::ModifierEvaluationContext {
+                    purpose: crate::eval::EvaluationPurpose::Preview,
+                    project_root: engine.asset_root,
+                    cache_directory: engine.cache_directory,
+                },
+                None,
+                |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
+                    "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
+                        mesh,
+                        data_block,
+                        modifier,
+                        object_world,
+                        engine.doc,
+                        frame,
+                        &world_matrices,
+                        &driver_values,
+                        engine.asset_root,
+                        engine
+                            .doc
+                            .scenes
+                            .get(&engine.doc.active_scene)
+                            .map_or(24, |scene| scene.fps),
+                        engine
+                            .doc
+                            .scenes
+                            .get(&engine.doc.active_scene)
+                            .map_or(1.0, |scene| scene.fps_base),
+                        evaluated_operand_meshes,
+                    ),
+                    "lattice" => apply_lattice_modifier(
+                        mesh,
+                        data_block,
+                        target,
+                        modifier,
+                        engine.doc,
+                        &world_matrices,
+                    ),
+                    "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
+                        mesh,
+                        modifier,
+                        target,
+                        engine.doc,
+                        &world_matrices,
+                        &volume_data,
+                    ),
+                    "surface_deform" | "mesh_deform" => crate::eval::apply_scene_deform_modifier(
+                        mesh,
+                        modifier,
+                        target,
+                        engine.doc,
+                        &world_matrices,
+                        evaluated_operand_meshes,
+                        modifier_warnings,
+                    ),
+                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                        crate::eval::apply_scene_operand_modifier(
+                            mesh,
+                            modifier,
+                            target,
+                            engine.doc,
+                            &world_matrices,
+                            evaluated_operand_meshes,
+                        )
+                    }
+                    "vertex_weight_edit"
+                    | "vertex_weight_mix"
+                    | "vertex_weight_proximity"
+                    | "normal_edit"
+                    | "uv_project"
+                    | "uv_warp"
+                    | "data_transfer" => crate::eval::apply_scene_attribute_modifier(
+                        mesh,
+                        modifier,
+                        target,
+                        engine.doc,
+                        &world_matrices,
+                        evaluated_operand_meshes,
+                        engine.asset_root,
+                    ),
+                    _ => Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "custom modifier callback received an unexpected type",
+                    )),
+                },
+            )?;
+            let (dropped, blocking): (Vec<PotError>, Vec<PotError>) = evaluation
+                .warnings
+                .into_iter()
+                .partition(is_attribute_dropped);
+            if let Some(warning) = blocking.into_iter().next() {
+                return Err(warning);
+            }
+            engine.warnings.extend(
+                dropped
+                    .into_iter()
+                    .map(|warning| crate::eval::attach_node_owner(warning, target)),
+            );
+            evaluation.mesh
+        }
+    };
+    Ok(evaluated)
 }
 fn apply_modifier_as_shape_key(
     engine: &mut Engine<'_>,
@@ -1090,26 +1382,44 @@ fn apply_modifier_as_shape_key(
             })
         })
         .transpose()?;
-    let mut temp_doc = engine.doc.clone();
-    let mut temp_operation = Map::new();
-    temp_operation.insert("op".to_owned(), Value::String("modifier.apply".to_owned()));
-    for field in ["target", "modifier_id", "scope"] {
-        if let Some(value) = operation.get(field) {
-            temp_operation.insert(field.to_owned(), value.clone());
-        }
+    let scope = super::parse_scope(
+        engine,
+        operation.get("scope"),
+        "/scope",
+        "scope must be a string",
+        "scope must be shared or single_user",
+        true,
+    )?;
+    let mut data_targets = Vec::new();
+    for target in &selected {
+        let data_id = engine
+            .doc
+            .nodes
+            .get(target)
+            .and_then(|node| node.data.clone())
+            .ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!("node `{target}` has no geometry data"),
+                    "/target",
+                )
+            })?;
+        data_targets.push((target.clone(), data_id));
     }
-    let mut temp_engine = Engine {
-        doc: &mut temp_doc,
-        changes: super::ChangeSet::default(),
-        id_mappings: Map::new(),
-        warnings: Vec::new(),
-        operation_index: engine.operation_index,
-        evaluation_frame: engine.evaluation_frame,
-        asset_root: engine.asset_root,
-        pending_assets: BTreeMap::new(),
-    };
-    apply_modifier(&mut temp_engine, &temp_operation, true)?;
-    engine.warnings.extend(temp_engine.warnings);
+    let shared = data_targets
+        .iter()
+        .any(|(_, data_id)| super::data_user_count(engine, data_id) > 1);
+    if shared && scope.is_none() {
+        return Err(engine.error(
+            ErrorCode::SharedDataRequiresScope,
+            "shared geometry updates require scope",
+            "/scope",
+        ));
+    }
+    if scope == Some("single_user") {
+        ensure_single_user_data(engine, &selected)?;
+    }
+    let mut evaluated_by_data = BTreeMap::<Id, crate::geom::Mesh>::new();
     for target in selected {
         let original_data_id = engine
             .doc
@@ -1123,20 +1433,24 @@ fn apply_modifier_as_shape_key(
                     "/target",
                 )
             })?;
-        let evaluated_data_id = temp_doc
-            .nodes
-            .get(&target)
-            .and_then(|node| node.data.as_ref())
-            .ok_or_else(|| {
-                PotError::new(ErrorCode::InternalError, "evaluated target has no data")
-            })?;
-        let evaluated = temp_doc
-            .data_blocks
-            .get(evaluated_data_id)
-            .and_then(|data| data.mesh.as_ref())
-            .ok_or_else(|| {
-                PotError::new(ErrorCode::InternalError, "evaluated target has no mesh")
-            })?;
+        let cache_shared = shared && scope == Some("shared");
+        let evaluated =
+            if cache_shared && let Some(evaluated) = evaluated_by_data.get(&original_data_id) {
+                evaluated.clone()
+            } else {
+                let target_modifier = modifier_to_apply(engine, &target, &modifier_id)?;
+                let evaluated = evaluate_modifier_output(
+                    engine,
+                    &target,
+                    &original_data_id,
+                    &target_modifier,
+                    true,
+                )?;
+                if cache_shared {
+                    evaluated_by_data.insert(original_data_id.clone(), evaluated.clone());
+                }
+                evaluated
+            };
         let source_data = engine
             .doc
             .data_blocks
@@ -1147,7 +1461,7 @@ fn apply_modifier_as_shape_key(
         let source_mesh = source_data.mesh.as_ref().ok_or_else(|| {
             PotError::new(ErrorCode::InvalidOperation, "target data block has no mesh")
         })?;
-        if !same_topology(source_mesh, evaluated) {
+        if !same_topology(source_mesh, &evaluated) {
             return Err(PotError::with_details(
                 ErrorCode::InvalidOperation,
                 "Modifier cannot be applied as a shape key because it changes the mesh topology",
@@ -1214,12 +1528,12 @@ fn apply_modifier_as_shape_key(
         );
         if !keep_modifier
             && let Some(node) = engine.doc.nodes.get_mut(&target)
-            && let Some(index) = node
+            && node
                 .modifiers
                 .iter()
-                .position(|modifier| modifier.id == modifier_id)
+                .any(|modifier| modifier.id == modifier_id)
         {
-            node.modifiers.drain(..=index);
+            node.modifiers.retain(|modifier| modifier.id != modifier_id);
             engine.mark("nodes", &target, ChangeKind::Updated);
         }
         engine.mark("data_blocks", &original_data_id, ChangeKind::Updated);

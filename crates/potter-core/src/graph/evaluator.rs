@@ -1277,6 +1277,8 @@ impl Evaluator<'_> {
             modifier_type: "subdivision".to_owned(),
             name: "Graph Subdivision Surface".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params: Map::from_iter([("levels".to_owned(), json!(level))]),
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),

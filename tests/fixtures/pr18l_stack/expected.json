@@ -1,0 +1,1693 @@
+{
+  "apply_viewport_disabled": {
+    "array": {
+      "data_changed": true,
+      "disabled_message_printed_during_probes": false,
+      "modifier": "array",
+      "operator_result": "FINISHED",
+      "refused": false,
+      "show_render": true,
+      "show_viewport": false,
+      "stack_after": [
+        "taper"
+      ],
+      "vertices_after": 24,
+      "vertices_before": 8
+    },
+    "taper": {
+      "data_changed": true,
+      "disabled_message_printed_during_probes": false,
+      "modifier": "taper",
+      "operator_result": "FINISHED",
+      "refused": false,
+      "show_render": true,
+      "show_viewport": false,
+      "stack_after": [
+        "array"
+      ],
+      "vertices_after": 8,
+      "vertices_before": 8
+    }
+  },
+  "blender": {
+    "build_hash": "d13f752e3b9c",
+    "version": "5.2.2 LTS"
+  },
+  "cases": {
+    "S_create_before_pinned": {
+      "description": "array pinned, then taper created: new modifier inserts before trailing pinned",
+      "group": "stack",
+      "name": "S_create_before_pinned",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "6b10a8ba3524883ab02be41c07fbd80778c15b94fd359c1117637200220d3795",
+        "vertices": 24
+      },
+      "render_stack": [
+        "taper",
+        "array"
+      ],
+      "stack": [
+        "taper",
+        "array"
+      ],
+      "step_results": [
+        null,
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "6b10a8ba3524883ab02be41c07fbd80778c15b94fd359c1117637200220d3795",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "taper",
+        "array"
+      ]
+    },
+    "S_create_pinned": {
+      "description": "array then taper, taper pinned afterwards",
+      "group": "stack",
+      "name": "S_create_pinned",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "render_stack": [
+        "array",
+        "taper"
+      ],
+      "stack": [
+        "array",
+        "taper"
+      ],
+      "step_results": [
+        null,
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "pin",
+          "name": "taper",
+          "value": true
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "array",
+        "taper"
+      ]
+    },
+    "S_delete_middle": {
+      "description": "taper, array, smooth; delete the middle array",
+      "group": "stack",
+      "name": "S_delete_middle",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 6,
+        "position_sha": "811e1858448a9baefa542bdde068f01648e0f2789a3592679716f15d628bc45e",
+        "vertices": 8
+      },
+      "render_stack": [
+        "taper",
+        "third"
+      ],
+      "stack": [
+        "taper",
+        "third"
+      ],
+      "step_results": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "delete",
+          "name": "array"
+        }
+      ],
+      "viewport": {
+        "faces": 6,
+        "position_sha": "811e1858448a9baefa542bdde068f01648e0f2789a3592679716f15d628bc45e",
+        "vertices": 8
+      },
+      "viewport_stack": [
+        "taper",
+        "third"
+      ]
+    },
+    "S_move_blocked": {
+      "description": "array then pinned taper; moving array past pinned taper is refused",
+      "group": "stack",
+      "name": "S_move_blocked",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "render_stack": [
+        "array",
+        "taper"
+      ],
+      "stack": [
+        "array",
+        "taper"
+      ],
+      "step_results": [
+        null,
+        null,
+        null,
+        "CANCELLED"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "pin",
+          "name": "taper",
+          "value": true
+        },
+        {
+          "action": "move",
+          "name": "array",
+          "to_index": 1
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "array",
+        "taper"
+      ]
+    },
+    "S_move_plain": {
+      "description": "taper, array, third; move third to index 0",
+      "group": "stack",
+      "name": "S_move_plain",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "631d24f43c0a561b9326085da60419809099c45149b36c7ba2cbdb02fd4d75c3",
+        "vertices": 24
+      },
+      "render_stack": [
+        "third",
+        "taper",
+        "array"
+      ],
+      "stack": [
+        "third",
+        "taper",
+        "array"
+      ],
+      "step_results": [
+        null,
+        null,
+        null,
+        "FINISHED"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "move",
+          "name": "third",
+          "to_index": 0
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "631d24f43c0a561b9326085da60419809099c45149b36c7ba2cbdb02fd4d75c3",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "third",
+        "taper",
+        "array"
+      ]
+    },
+    "S_pin_first": {
+      "description": "taper pinned to last: moves past array",
+      "group": "stack",
+      "name": "S_pin_first",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "render_stack": [
+        "array",
+        "taper"
+      ],
+      "stack": [
+        "array",
+        "taper"
+      ],
+      "step_results": [
+        null,
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "taper",
+          "value": true
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "array",
+        "taper"
+      ]
+    },
+    "S_pin_then_unpin": {
+      "description": "taper pinned then unpinned: unpin does not move it forward",
+      "group": "stack",
+      "name": "S_pin_then_unpin",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "render_stack": [
+        "array",
+        "taper"
+      ],
+      "stack": [
+        "array",
+        "taper"
+      ],
+      "step_results": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "taper",
+          "value": true
+        },
+        {
+          "action": "pin",
+          "name": "taper",
+          "value": false
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "array",
+        "taper"
+      ]
+    },
+    "S_unpinned": {
+      "description": "taper then array, no pins: default append order",
+      "group": "stack",
+      "name": "S_unpinned",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "6b10a8ba3524883ab02be41c07fbd80778c15b94fd359c1117637200220d3795",
+        "vertices": 24
+      },
+      "render_stack": [
+        "taper",
+        "array"
+      ],
+      "stack": [
+        "taper",
+        "array"
+      ],
+      "step_results": [
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "6b10a8ba3524883ab02be41c07fbd80778c15b94fd359c1117637200220d3795",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "taper",
+        "array"
+      ]
+    },
+    "V_both_off": {
+      "description": "array hidden for both purposes",
+      "group": "visibility",
+      "name": "V_both_off",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 6,
+        "position_sha": "d31f60d5f82f19b6aaab6d6b282cc3061f8cb6e744c2e9c1ab1df8d682069aaf",
+        "vertices": 8
+      },
+      "render_stack": [
+        "taper"
+      ],
+      "stack": [
+        "taper",
+        "array"
+      ],
+      "step_results": [
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array",
+          "show_render": false,
+          "show_viewport": false
+        }
+      ],
+      "viewport": {
+        "faces": 6,
+        "position_sha": "d31f60d5f82f19b6aaab6d6b282cc3061f8cb6e744c2e9c1ab1df8d682069aaf",
+        "vertices": 8
+      },
+      "viewport_stack": [
+        "taper"
+      ]
+    },
+    "V_enabled_off_potter_equivalent": {
+      "description": "array with both show flags false; Blender has no enabled flag, so this is the Blender form of Potter enabled=false. The Rust test also runs the enabled=false form.",
+      "group": "visibility",
+      "name": "V_enabled_off_potter_equivalent",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": "enabled_false",
+      "render": {
+        "faces": 6,
+        "position_sha": "d31f60d5f82f19b6aaab6d6b282cc3061f8cb6e744c2e9c1ab1df8d682069aaf",
+        "vertices": 8
+      },
+      "render_stack": [
+        "taper"
+      ],
+      "stack": [
+        "taper",
+        "array"
+      ],
+      "step_results": [
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array",
+          "show_render": false,
+          "show_viewport": false
+        }
+      ],
+      "viewport": {
+        "faces": 6,
+        "position_sha": "d31f60d5f82f19b6aaab6d6b282cc3061f8cb6e744c2e9c1ab1df8d682069aaf",
+        "vertices": 8
+      },
+      "viewport_stack": [
+        "taper"
+      ]
+    },
+    "V_pinned_with_hidden": {
+      "description": "taper pinned and hidden for render; array unpinned and visible",
+      "group": "visibility",
+      "name": "V_pinned_with_hidden",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "7b2bed204a54a1bfdb94350fa0bc2d82f0819e9b030313c1ebe19a588d42b1fc",
+        "vertices": 24
+      },
+      "render_stack": [
+        "array"
+      ],
+      "stack": [
+        "array",
+        "taper"
+      ],
+      "step_results": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "taper",
+          "value": true
+        },
+        {
+          "action": "visibility",
+          "name": "taper",
+          "show_render": false
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "54fbef42f4be6d9177fb2decc56bef872ea48c33a33b83ce9ceda4db34e2d225",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "array",
+        "taper"
+      ]
+    },
+    "V_render_only": {
+      "description": "array hidden in viewport, visible for render",
+      "group": "visibility",
+      "name": "V_render_only",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 18,
+        "position_sha": "6b10a8ba3524883ab02be41c07fbd80778c15b94fd359c1117637200220d3795",
+        "vertices": 24
+      },
+      "render_stack": [
+        "taper",
+        "array"
+      ],
+      "stack": [
+        "taper",
+        "array"
+      ],
+      "step_results": [
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array",
+          "show_viewport": false
+        }
+      ],
+      "viewport": {
+        "faces": 6,
+        "position_sha": "d31f60d5f82f19b6aaab6d6b282cc3061f8cb6e744c2e9c1ab1df8d682069aaf",
+        "vertices": 8
+      },
+      "viewport_stack": [
+        "taper"
+      ]
+    },
+    "V_viewport_only": {
+      "description": "array visible in viewport, hidden for render",
+      "group": "visibility",
+      "name": "V_viewport_only",
+      "obj_viewport_matches_depsgraph": true,
+      "potter_equivalent_variant": null,
+      "render": {
+        "faces": 6,
+        "position_sha": "d31f60d5f82f19b6aaab6d6b282cc3061f8cb6e744c2e9c1ab1df8d682069aaf",
+        "vertices": 8
+      },
+      "render_stack": [
+        "taper"
+      ],
+      "stack": [
+        "taper",
+        "array"
+      ],
+      "step_results": [
+        null,
+        null
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array",
+          "show_render": false
+        }
+      ],
+      "viewport": {
+        "faces": 18,
+        "position_sha": "6b10a8ba3524883ab02be41c07fbd80778c15b94fd359c1117637200220d3795",
+        "vertices": 24
+      },
+      "viewport_stack": [
+        "taper",
+        "array"
+      ]
+    }
+  },
+  "checks": {
+    "I_array_then_cloth_operator_matches_rna": true,
+    "I_array_then_cloth_stack": true,
+    "I_array_then_hook_operator_matches_rna": true,
+    "I_array_then_hook_stack": true,
+    "I_array_then_multires_operator_matches_rna": true,
+    "I_array_then_multires_stack": true,
+    "I_array_then_soft_body_operator_matches_rna": true,
+    "I_array_then_soft_body_stack": true,
+    "I_pinned_array_then_cloth_operator_matches_rna": true,
+    "I_pinned_array_then_cloth_stack": true,
+    "I_pinned_array_then_collision_operator_matches_rna": true,
+    "I_pinned_array_then_collision_stack": true,
+    "I_pinned_array_then_dynamic_paint_operator_matches_rna": true,
+    "I_pinned_array_then_dynamic_paint_stack": true,
+    "I_pinned_array_then_fluid_operator_matches_rna": true,
+    "I_pinned_array_then_fluid_stack": true,
+    "I_pinned_array_then_hook_operator_matches_rna": true,
+    "I_pinned_array_then_hook_stack": true,
+    "I_pinned_array_then_multires_operator_matches_rna": true,
+    "I_pinned_array_then_multires_stack": true,
+    "I_pinned_array_then_particle_system_operator_matches_rna": true,
+    "I_pinned_array_then_particle_system_stack": true,
+    "I_pinned_array_then_soft_body_operator_matches_rna": true,
+    "I_pinned_array_then_soft_body_stack": true,
+    "I_taper_array_then_hook_operator_matches_rna": true,
+    "I_taper_array_then_hook_stack": true,
+    "I_taper_pinned_smooth_then_hook_operator_matches_rna": true,
+    "I_taper_pinned_smooth_then_hook_stack": true,
+    "I_taper_pinned_smooth_then_multires_operator_matches_rna": true,
+    "I_taper_pinned_smooth_then_multires_stack": true,
+    "I_taper_pinned_smooth_then_soft_body_operator_matches_rna": true,
+    "I_taper_pinned_smooth_then_soft_body_stack": true,
+    "I_taper_smooth_then_hook_operator_matches_rna": true,
+    "I_taper_smooth_then_hook_stack": true,
+    "I_taper_smooth_then_multires_operator_matches_rna": true,
+    "I_taper_smooth_then_multires_stack": true,
+    "I_taper_smooth_then_soft_body_operator_matches_rna": true,
+    "I_taper_smooth_then_soft_body_stack": true,
+    "S_create_before_pinned_stack": true,
+    "S_create_pinned_stack": true,
+    "S_delete_middle_stack": true,
+    "S_move_blocked_refused": true,
+    "S_move_blocked_stack_unchanged": true,
+    "S_move_plain_stack": true,
+    "S_pin_first_stack_is_array_taper": true,
+    "S_pin_then_unpin_stack_is_array_taper": true,
+    "V_enabled_off_equals_both_off": true,
+    "V_pinned_with_hidden_render_stack": true,
+    "V_pinned_with_hidden_viewport_stack": true,
+    "V_render_only_viewport_drops_array": true,
+    "V_viewport_only_render_drops_array": true,
+    "taper_array_order_changes_geometry": true
+  },
+  "generator": "tests/fixtures/pr18l_stack/generate.py",
+  "insertion_cases": {
+    "I_array_then_cloth": {
+      "description": "array then cloth: cloth is not original-data, so it appends",
+      "expected_pinned": [
+        false,
+        false
+      ],
+      "expected_stack": [
+        "array",
+        "cloth"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false
+      ],
+      "stack": [
+        "array",
+        "cloth"
+      ],
+      "stack_types": [
+        "ARRAY",
+        "CLOTH"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "cloth",
+          "name": "cloth"
+        }
+      ]
+    },
+    "I_array_then_hook": {
+      "description": "array then hook: hook goes before the non-deform array",
+      "expected_pinned": [
+        false,
+        false
+      ],
+      "expected_stack": [
+        "hook",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false
+      ],
+      "stack": [
+        "hook",
+        "array"
+      ],
+      "stack_types": [
+        "HOOK",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_array_then_multires": {
+      "description": "array then multires: original-data type goes before the non-deform array",
+      "expected_pinned": [
+        false,
+        false
+      ],
+      "expected_stack": [
+        "multires",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false
+      ],
+      "stack": [
+        "multires",
+        "array"
+      ],
+      "stack_types": [
+        "MULTIRES",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "multires",
+          "name": "multires"
+        }
+      ]
+    },
+    "I_array_then_soft_body": {
+      "description": "array then soft body: original-data type goes before the non-deform array",
+      "expected_pinned": [
+        false,
+        false
+      ],
+      "expected_stack": [
+        "soft",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false
+      ],
+      "stack": [
+        "soft",
+        "array"
+      ],
+      "stack_types": [
+        "SOFT_BODY",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "soft_body",
+          "name": "soft"
+        }
+      ]
+    },
+    "I_pinned_array_then_cloth": {
+      "description": "pinned array then cloth: cloth appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "cloth",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "cloth",
+        "array"
+      ],
+      "stack_types": [
+        "CLOTH",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "cloth",
+          "name": "cloth"
+        }
+      ]
+    },
+    "I_pinned_array_then_collision": {
+      "description": "pinned array then collision: appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "collision",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "collision",
+        "array"
+      ],
+      "stack_types": [
+        "COLLISION",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "collision",
+          "name": "collision"
+        }
+      ]
+    },
+    "I_pinned_array_then_dynamic_paint": {
+      "description": "pinned array then dynamic paint: appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "paint",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "paint",
+        "array"
+      ],
+      "stack_types": [
+        "DYNAMIC_PAINT",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "dynamic_paint",
+          "name": "paint"
+        }
+      ]
+    },
+    "I_pinned_array_then_fluid": {
+      "description": "pinned array then fluid: appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "fluid",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "fluid",
+        "array"
+      ],
+      "stack_types": [
+        "FLUID",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "fluid",
+          "name": "fluid"
+        }
+      ]
+    },
+    "I_pinned_array_then_hook": {
+      "description": "pinned array then hook: a valid pinned stack still accepts hook at the front",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "hook",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "hook",
+        "array"
+      ],
+      "stack_types": [
+        "HOOK",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_pinned_array_then_multires": {
+      "description": "pinned array then multires: original-data type goes before the pinned array",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "multires",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "multires",
+        "array"
+      ],
+      "stack_types": [
+        "MULTIRES",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "multires",
+          "name": "multires"
+        }
+      ]
+    },
+    "I_pinned_array_then_particle_system": {
+      "description": "pinned array then particle system: appends before the trailing pinned block",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "particles",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "particles",
+        "array"
+      ],
+      "stack_types": [
+        "PARTICLE_SYSTEM",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "particle_system",
+          "name": "particles"
+        }
+      ]
+    },
+    "I_pinned_array_then_soft_body": {
+      "description": "pinned array then soft body: original-data type goes before the pinned array",
+      "expected_pinned": [
+        false,
+        true
+      ],
+      "expected_stack": [
+        "soft",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        true
+      ],
+      "stack": [
+        "soft",
+        "array"
+      ],
+      "stack_types": [
+        "SOFT_BODY",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "pin",
+          "name": "array",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "soft_body",
+          "name": "soft"
+        }
+      ]
+    },
+    "I_taper_array_then_hook": {
+      "description": "taper then array then hook: hook goes after the deform taper, before the array",
+      "expected_pinned": [
+        false,
+        false,
+        false
+      ],
+      "expected_stack": [
+        "taper",
+        "hook",
+        "array"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        false
+      ],
+      "stack": [
+        "taper",
+        "hook",
+        "array"
+      ],
+      "stack_types": [
+        "SIMPLE_DEFORM",
+        "HOOK",
+        "ARRAY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "array",
+          "name": "array"
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_taper_pinned_smooth_then_hook": {
+      "description": "taper then pinned smooth then hook: hook goes in front of the pinned block",
+      "expected_pinned": [
+        false,
+        false,
+        true
+      ],
+      "expected_stack": [
+        "hook",
+        "taper",
+        "third"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        true
+      ],
+      "stack": [
+        "hook",
+        "taper",
+        "third"
+      ],
+      "stack_types": [
+        "HOOK",
+        "SIMPLE_DEFORM",
+        "SMOOTH"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "pin",
+          "name": "third",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_taper_pinned_smooth_then_multires": {
+      "description": "taper then pinned smooth then multires: multires goes in front of the stack",
+      "expected_pinned": [
+        false,
+        false,
+        true
+      ],
+      "expected_stack": [
+        "multires",
+        "taper",
+        "third"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        true
+      ],
+      "stack": [
+        "multires",
+        "taper",
+        "third"
+      ],
+      "stack_types": [
+        "MULTIRES",
+        "SIMPLE_DEFORM",
+        "SMOOTH"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "pin",
+          "name": "third",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "multires",
+          "name": "multires"
+        }
+      ]
+    },
+    "I_taper_pinned_smooth_then_soft_body": {
+      "description": "taper then pinned smooth then soft body: soft body goes in front of the stack",
+      "expected_pinned": [
+        false,
+        false,
+        true
+      ],
+      "expected_stack": [
+        "soft",
+        "taper",
+        "third"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        true
+      ],
+      "stack": [
+        "soft",
+        "taper",
+        "third"
+      ],
+      "stack_types": [
+        "SOFT_BODY",
+        "SIMPLE_DEFORM",
+        "SMOOTH"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "pin",
+          "name": "third",
+          "value": true
+        },
+        {
+          "action": "create",
+          "kind": "soft_body",
+          "name": "soft"
+        }
+      ]
+    },
+    "I_taper_smooth_then_hook": {
+      "description": "taper then smooth then hook: all deform, hook appends",
+      "expected_pinned": [
+        false,
+        false,
+        false
+      ],
+      "expected_stack": [
+        "taper",
+        "third",
+        "hook"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        false
+      ],
+      "stack": [
+        "taper",
+        "third",
+        "hook"
+      ],
+      "stack_types": [
+        "SIMPLE_DEFORM",
+        "SMOOTH",
+        "HOOK"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "create",
+          "kind": "hook",
+          "name": "hook"
+        }
+      ]
+    },
+    "I_taper_smooth_then_multires": {
+      "description": "taper then smooth then multires: all deform, multires appends",
+      "expected_pinned": [
+        false,
+        false,
+        false
+      ],
+      "expected_stack": [
+        "taper",
+        "third",
+        "multires"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        false
+      ],
+      "stack": [
+        "taper",
+        "third",
+        "multires"
+      ],
+      "stack_types": [
+        "SIMPLE_DEFORM",
+        "SMOOTH",
+        "MULTIRES"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "create",
+          "kind": "multires",
+          "name": "multires"
+        }
+      ]
+    },
+    "I_taper_smooth_then_soft_body": {
+      "description": "taper then smooth then soft body: all deform, soft body appends",
+      "expected_pinned": [
+        false,
+        false,
+        false
+      ],
+      "expected_stack": [
+        "taper",
+        "third",
+        "soft"
+      ],
+      "operator_matches_rna": true,
+      "pinned": [
+        false,
+        false,
+        false
+      ],
+      "stack": [
+        "taper",
+        "third",
+        "soft"
+      ],
+      "stack_types": [
+        "SIMPLE_DEFORM",
+        "SMOOTH",
+        "SOFT_BODY"
+      ],
+      "steps": [
+        {
+          "action": "create",
+          "kind": "taper",
+          "name": "taper"
+        },
+        {
+          "action": "create",
+          "kind": "smooth",
+          "name": "third"
+        },
+        {
+          "action": "create",
+          "kind": "soft_body",
+          "name": "soft"
+        }
+      ]
+    }
+  },
+  "kinds": {
+    "array": {
+      "blender_type": "ARRAY",
+      "params": {
+        "count": 3,
+        "relative_offset_displace": [
+          1.5,
+          0.0,
+          0.0
+        ],
+        "use_relative_offset": true
+      },
+      "potter_type": "array"
+    },
+    "cloth": {
+      "blender_type": "CLOTH",
+      "params": {},
+      "potter_settings": {
+        "tension_stiffness": 12.0
+      },
+      "potter_type": "cloth"
+    },
+    "collision": {
+      "blender_type": "COLLISION",
+      "params": {},
+      "potter_settings": {
+        "thickness": 0.01
+      },
+      "potter_type": "collision"
+    },
+    "dynamic_paint": {
+      "blender_type": "DYNAMIC_PAINT",
+      "params": {},
+      "potter_settings": {
+        "role": "canvas"
+      },
+      "potter_type": "dynamic_paint"
+    },
+    "fluid": {
+      "blender_type": "FLUID",
+      "params": {},
+      "potter_settings": {
+        "resolution": 4,
+        "type": "liquid"
+      },
+      "potter_type": "fluid"
+    },
+    "hook": {
+      "blender_type": "HOOK",
+      "params": {
+        "object": "hook_target"
+      },
+      "potter_type": "hook"
+    },
+    "multires": {
+      "blender_type": "MULTIRES",
+      "params": {},
+      "potter_settings": {
+        "levels": 1,
+        "render_levels": 1
+      },
+      "potter_type": "multires"
+    },
+    "particle_system": {
+      "blender_type": "PARTICLE_SYSTEM",
+      "params": {},
+      "potter_settings": {
+        "lifetime": 12.0,
+        "rate": 1.0
+      },
+      "potter_type": "particle_system"
+    },
+    "smooth": {
+      "blender_type": "SMOOTH",
+      "params": {
+        "factor": 0.5
+      },
+      "potter_type": "smooth"
+    },
+    "soft_body": {
+      "blender_type": "SOFT_BODY",
+      "params": {},
+      "potter_settings": {
+        "goal_strength": 0.7
+      },
+      "potter_type": "soft_body"
+    },
+    "taper": {
+      "blender_type": "SIMPLE_DEFORM",
+      "params": {
+        "deform_axis": "Z",
+        "deform_method": "TAPER",
+        "factor": 0.5
+      },
+      "potter_type": "simple_deform"
+    }
+  },
+  "notes": [
+    "Python exposes only the viewport depsgraph (Depsgraph.mode is read-only); the render depsgraph is read through wm.obj_export with export_eval_mode='DAG_EVAL_RENDER'.",
+    "Every case asserts that the OBJ DAG_EVAL_VIEWPORT export has the same counts and hash as the viewport depsgraph to_mesh() result.",
+    "OBJ positions are written with 6 decimals and the hash rounds to 5. SMOOTH averages neighbour positions, so stack positions are not all decimal-exact; the render hash equals the viewport hash in every case where visibility does not differ (V_viewport_only, V_render_only and V_pinned_with_hidden differ by design). Irrational deformers (TWIST, BEND) were not used: float32 storage makes 5-decimal hashes of irrational positions unstable.",
+    "The third modifier is SMOOTH (factor 0.5, deterministic) rather than MIRROR: Potter's Mirror diverges from Blender in merge (use_mirror_merge, PR-B), so MIRROR cannot be matched by these cases.",
+    "Render-time handlers (bpy.app.handlers.render_pre) receive depsgraph=None and bpy.context.evaluated_depsgraph_get() is VIEWPORT there, so no in-process RENDER depsgraph was reachable; wm.obj_export is the render path.",
+    "Blender 5.2 modifiers have no enabled flag; Potter enabled=false is represented in Blender by show_viewport=False and show_render=False. The Rust test also runs the enabled=false form for V_enabled_off_potter_equivalent.",
+    "Blender's stack list is evaluation order: index 0 is evaluated first.",
+    "modifier_apply does not refuse a viewport-disabled (or render-disabled) modifier in background mode; it applies it. The refusal message 'Modifier is disabled' was not printed.",
+    "Move refusal is observed through the modifier_move_to_index operator result (CANCELLED); the stack is unchanged.",
+    "insertion_cases are stack-order only (no geometry). Each case is built through modifiers.new and through object.modifier_add; operator_matches_rna records that both paths produce the same stack.",
+    "Observed Blender placement: [U]+SOFT_BODY -> [SB,U]; [S,D]+MULTIRES -> [S,D,M]; [S,D(pinned)]+MULTIRES -> [M,S,D]; [S,U]+HOOK -> [S,H,U]; [S,D]+HOOK -> [S,D,H]; [U(pinned)]+HOOK -> [H,U(pinned)].",
+    "Observed append placement before the trailing pinned block: CLOTH, COLLISION, DYNAMIC_PAINT, FLUID and PARTICLE_SYSTEM ([U]+CLOTH -> [U,C]; [U(pinned)]+CLOTH -> [C,U(pinned)]). CLOTH therefore does not take the original-data placement.",
+    "object.multires_subdivide adds a level to an existing Multires and returned CANCELLED on objects without one (empty, ARRAY, pinned ARRAY, deform-only stacks), so Multires creation is probed with object.modifier_add(type='MULTIRES').",
+    "potter_settings in KINDS are Potter-only operation settings (physics settings, multires levels). Blender stack order does not depend on them, and they are not applied to Blender modifiers.",
+    "Pin semantics use the use_pin_to_last RNA setter (rna_Modifier_use_pin_to_last_set), not the move operator."
+  ],
+  "oracle": "tests/fixtures/pr18l_stack/blender_oracle.py",
+  "position_hash": {
+    "algorithm": "sha256",
+    "decimals": 5,
+    "serialization": "for each vertex: f'{x:.5f} {y:.5f} {z:.5f}' with '-0.00000' -> '0.00000'; sort the lines bytewise; payload = concatenation of line + '\\n'; hash = lowercase hex sha256(payload as UTF-8)"
+  },
+  "render_method": {
+    "render": "bpy.ops.wm.obj_export(export_eval_mode='DAG_EVAL_RENDER', apply_modifiers=True, forward_axis='Y', up_axis='Z', global_scale=1.0); counts from v/f lines; positions as written by the OBJ writer (6 decimals)",
+    "viewport": "bpy.context.evaluated_depsgraph_get() + Object.evaluated_get().to_mesh(); positions are Blender float32 values exposed as Python floats"
+  },
+  "schema": "pr18l.modifier_stack_semantics.v1"
+}

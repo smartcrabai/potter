@@ -13,7 +13,7 @@ use super::util::parse_id;
 use crate::{
     cli::{BakeArgs, BakeKind},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     geom::Mesh,
     model::Id,
     response::SceneInfo,
@@ -70,15 +70,21 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             .transpose()?,
         frame: None,
         adaptive_render: None,
+        purpose: EvaluationPurpose::Render,
     };
-    let cache_directory = project.path().to_path_buf();
+    let cache_directory = project.cache_directory();
     let mut stage = BakeStage::create(&args.out)?;
     let mut files = Vec::new();
     let mut baked_frames = Vec::new();
     for (frame_index, frame) in frames.into_iter().enumerate() {
         let mut frame_context = context.clone();
         frame_context.frame = Some(frame);
-        let snapshot = Snapshot::evaluate_with_cache(doc, &frame_context, Some(&cache_directory))?;
+        let snapshot = Snapshot::evaluate_with_cache(
+            doc,
+            &frame_context,
+            Some(project.path()),
+            Some(cache_directory),
+        )?;
         match args.kind {
             BakeKind::Animation => {
                 let transforms = snapshot.nodes.iter().filter(|(id, _)| target.as_ref().is_none_or(|target| *id == target)).map(|(id, evaluated)| (id.to_string(), json!({"world_matrix":evaluated.world_matrix,"bounds":evaluated.bounds,"dimensions":evaluated.dimensions}))).collect::<BTreeMap<_,_>>();

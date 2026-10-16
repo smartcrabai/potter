@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     cli::PickDomain,
     error::{ErrorCode, PotError, Result},
-    eval::{AdaptiveRenderRequest, EvaluationContext, Snapshot},
+    eval::{AdaptiveRenderRequest, EvaluationContext, EvaluationPurpose, Snapshot},
     hash,
     model::{Id, SceneDoc},
 };
@@ -111,6 +111,7 @@ struct Hit {
 
 pub fn pick(
     doc: &SceneDoc,
+    project_root: &Path,
     cache_directory: &Path,
     manifest_path: &Path,
     pixel: (u32, u32),
@@ -169,13 +170,20 @@ pub fn pick(
             "render profile does not match scene",
         ));
     }
+    let purpose = match manifest.settings.get("visibility").and_then(Value::as_str) {
+        Some("render") => EvaluationPurpose::Render,
+        Some("viewport") => EvaluationPurpose::Preview,
+        _ => return Err(render_invalid("manifest visibility setting is invalid")),
+    };
     let context = EvaluationContext {
         scene_id: Some(scene_id),
         view_layer: manifest.view_layer.clone(),
         frame: Some(manifest.frame),
         adaptive_render: manifest.adaptive_render.clone(),
+        purpose,
     };
-    let snapshot = Snapshot::evaluate_with_cache(doc, &context, Some(cache_directory))?;
+    let snapshot =
+        Snapshot::evaluate_with_cache(doc, &context, Some(project_root), Some(cache_directory))?;
     if snapshot.revision != manifest.revision
         || snapshot.scene_hash != manifest.scene_hash
         || snapshot.evaluation_hash != manifest.evaluation_hash
@@ -243,19 +251,7 @@ pub fn pick(
             "element mapping belongs to a different object",
         ));
     }
-    let visibility = match manifest.settings.get("visibility").and_then(Value::as_str) {
-        Some("render") => true,
-        Some("viewport") => false,
-        _ => return Err(render_invalid("manifest visibility setting is invalid")),
-    };
-    let geometry = extract_geometry(
-        doc,
-        &snapshot,
-        Mode::Solid,
-        visibility,
-        false,
-        &BTreeMap::new(),
-    )?;
+    let geometry = extract_geometry(doc, &snapshot, Mode::Solid, false, &BTreeMap::new())?;
     verify_mapping_matches_geometry(&manifest, &geometry)?;
     let camera = camera_from_manifest(&manifest.camera)?;
     let (ray_origin, ray_direction) =

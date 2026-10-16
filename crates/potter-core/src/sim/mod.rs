@@ -8,10 +8,7 @@ pub mod particles;
 pub mod softbody;
 mod solver;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
@@ -20,6 +17,7 @@ use serde_json::{Value, json};
 use crate::geom::metaball::{MetaballData, MetaballElement};
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::ModifierGate,
     geom::Mesh,
     model::{ForceFieldType, Id, Modifier, Node, RigidBodyType, SceneDoc},
 };
@@ -233,11 +231,13 @@ pub(crate) fn evaluate_stack_modifier(
     scene_id: &Id,
     node_id: &Id,
     modifier: &Modifier,
-    input_mesh: &Mesh,
+    input_mesh: Mesh,
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
-    cache_directory: Option<&Path>,
+    scene_hash: &str,
+    gate: ModifierGate<'_>,
 ) -> Result<StackModifierResult> {
+    let cache_directory = gate.context.cache_directory;
     let (property, system) = match modifier.modifier_type.as_str() {
         "cloth" => ("physics_cloth", "cloth"),
         "soft_body" => ("physics_soft_body", "soft_body"),
@@ -324,7 +324,7 @@ pub(crate) fn evaluate_stack_modifier(
                 let requests_unborn =
                     candidate.params.get("show_unborn").and_then(Value::as_bool) == Some(true);
                 requests_unborn
-                    && candidate.enabled
+                    && gate.is_active(target_id, candidate)
                     && same_system_index
                     && ((candidate.modifier_type == "particle_instance"
                         && candidate.params.get("object").and_then(Value::as_str)
@@ -343,8 +343,8 @@ pub(crate) fn evaluate_stack_modifier(
         settings
     };
     let solver_settings = normalize_solver_settings(settings, system);
-    let base_key = cache::cache_key(doc, scene_id, frame, matrices)?;
-    let input_mesh_snapshot = serde_json::to_value(input_mesh).map_err(|error| {
+    let base_key = cache::cache_key(scene_hash, scene_id, frame, matrices, gate)?;
+    let input_mesh_snapshot = serde_json::to_value(&input_mesh).map_err(|error| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
             "could not serialize physics modifier input geometry",
@@ -398,7 +398,7 @@ pub(crate) fn evaluate_stack_modifier(
     } else {
         local_collision_triangles(&collision_meshes, node_id, invert_matrix(matrix, node_id)?)
     };
-    let mut mesh = input_mesh.clone();
+    let mut mesh = input_mesh;
     let mut particles = None;
     match system {
         "cloth" => {
@@ -686,17 +686,25 @@ fn set_vertex_positions(mesh: &mut Mesh, positions: Vec<DVec3>, node_id: &Id) ->
 
 /// Evaluate deterministic physics systems for `frame` and optionally cache their result.
 ///
-/// When `cache_directory` is supplied, results are read from and atomically written to
-/// `.potter/cache` below that directory.
-pub fn evaluate(
+/// When the gate's cache directory is supplied, results are stored directly in that directory.
+pub(crate) fn evaluate(
     doc: &SceneDoc,
     scene_id: &Id,
     frame: f64,
     base_world_matrices: &BTreeMap<Id, DMat4>,
-    cache_directory: Option<&Path>,
+    scene_hash: &str,
+    gate: ModifierGate<'_>,
 ) -> Result<Option<SimulationResult>> {
-    let mut result = solver::evaluate(doc, scene_id, frame, base_world_matrices, cache_directory)?;
-    let key = cache::cache_key(doc, scene_id, frame, base_world_matrices)?;
+    let cache_directory = gate.context.cache_directory;
+    let key = cache::cache_key(scene_hash, scene_id, frame, base_world_matrices, gate)?;
+    let mut result = solver::evaluate(
+        doc,
+        scene_id,
+        frame,
+        base_world_matrices,
+        cache_directory,
+        &key,
+    )?;
     let members = scene_members(doc, scene_id)?;
     let has_physics = members.iter().any(|id| {
         doc.nodes.get(id).is_some_and(|node| {
@@ -1352,14 +1360,4 @@ fn setting_color(settings: &Value) -> Option<[f64; 4]> {
         return None;
     };
     Some([r.as_f64()?, g.as_f64()?, b.as_f64()?, a.as_f64()?])
-}
-
-/// Compute the content address for a simulation input snapshot.
-pub fn cache_key(
-    doc: &SceneDoc,
-    scene_id: &Id,
-    frame: f64,
-    base_world_matrices: &BTreeMap<Id, DMat4>,
-) -> Result<String> {
-    cache::cache_key(doc, scene_id, frame, base_world_matrices)
 }

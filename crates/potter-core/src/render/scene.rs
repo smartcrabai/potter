@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::Snapshot,
+    eval::{EvaluationPurpose, Snapshot},
     geom::{
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         normals::render_corner_normals,
@@ -113,7 +113,6 @@ pub(super) fn extract_geometry(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     mode: Mode,
-    render_visibility: bool,
     path_traced: bool,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<Geometry> {
@@ -150,7 +149,7 @@ pub(super) fn extract_geometry(
     for (node_id, node) in &doc.nodes {
         if !visible_nodes.contains(node_id)
             || !node.visible
-            || (render_visibility && !node.render_visible)
+            || (snapshot.purpose == EvaluationPurpose::Render && !node.render_visible)
         {
             continue;
         }

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::Snapshot,
+    eval::{EvaluationPurpose, Snapshot},
     geom::{Mesh, normals::corner_normals, uv_layers},
     model::{
         Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode,
@@ -321,7 +321,14 @@ pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
                     )
                 })?
             };
-            write_geometry(&mut output, geometry_id, node, mesh, data_block)?;
+            write_geometry(
+                &mut output,
+                geometry_id,
+                node,
+                mesh,
+                data_block,
+                snapshot.purpose,
+            )?;
         }
         let mesh_model = object_ids.geometry.is_some();
         let rotation = DQuat::from_xyzw(
@@ -906,7 +913,7 @@ fn build_deformers(
         let enabled = node
             .modifiers
             .iter()
-            .filter(|modifier| modifier.enabled)
+            .filter(|modifier| modifier.is_active(snapshot.purpose))
             .collect::<Vec<_>>();
         let skin_modifiers = enabled
             .iter()
@@ -1230,6 +1237,7 @@ fn write_geometry(
     node: &Node,
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
+    purpose: EvaluationPurpose,
 ) -> Result<()> {
     // Shading and UV attributes have their own FBX layers. Color layers and generic attributes
     // are not written here; `exchange::attribute_losses` reports them.
@@ -1254,7 +1262,7 @@ fn write_geometry(
             || node
                 .modifiers
                 .iter()
-                .any(|modifier| modifier.enabled && modifier.modifier_type == "armature")
+                .any(|modifier| modifier.is_active(purpose) && modifier.modifier_type == "armature")
     }) {
         let metadata = serde_json::to_string(&json!({
             "shape_keys": &data.shape_keys,

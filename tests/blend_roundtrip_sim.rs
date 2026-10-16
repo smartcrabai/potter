@@ -212,7 +212,7 @@ for key, value in {'domain_type':'LIQUID', 'resolution_max':19, 'use_adaptive_do
     setattr(domain, key, value)
 expected['settings']['fluid_domain'] = {
     'settings':fields(domain, domain_fields), 'role':'DOMAIN',
-    'enabled':bool(domain_mod.show_viewport and domain_mod.show_render)}
+    'show_viewport':bool(domain_mod.show_viewport), 'show_render':bool(domain_mod.show_render)}
 expected['geometry']['FluidDomain'] = geometry(fluid_domain)
 
 fluid_flow = make_mesh('FluidFlow')
@@ -231,7 +231,7 @@ for key, value in {'density':2.4, 'fuel_amount':1.3, 'temperature':1.2,
     setattr(flow, key, value)
 expected['settings']['fluid_flow'] = {
     'settings':fields(flow, flow_fields), 'role':'FLOW',
-    'enabled':bool(flow_mod.show_viewport and flow_mod.show_render)}
+    'show_viewport':bool(flow_mod.show_viewport), 'show_render':bool(flow_mod.show_render)}
 expected['geometry']['FluidFlow'] = geometry(fluid_flow)
 
 fluid_effector = make_mesh('FluidEffector')
@@ -248,7 +248,7 @@ for key, value in {'effector_type':'GUIDE', 'surface_distance':0.23,
     setattr(effector, key, value)
 expected['settings']['fluid_effector'] = {
     'settings':fields(effector, effector_fields), 'role':'EFFECTOR',
-    'enabled':bool(effector_mod.show_viewport and effector_mod.show_render)}
+    'show_viewport':bool(effector_mod.show_viewport), 'show_render':bool(effector_mod.show_render)}
 expected['geometry']['FluidEffector'] = geometry(fluid_effector)
 
 emitter = make_mesh('ParticleEmitter')
@@ -421,11 +421,11 @@ canvas_mod = bpy.data.objects['DynamicPaintCanvas'].modifiers['CanvasSettingsFix
 canvas_surfaces = canvas_mod.canvas_settings.canvas_surfaces
 checks['dynamic_paint_canvas'] = {'settings':{}, 'canvas_surfaces':[fields(canvas_surfaces[0], ['surface_format','surface_type','is_active','use_dissolve','dissolve_speed','use_drying','dry_speed','frame_start','frame_end'])], 'role':'canvas'}
 domain_mod = bpy.data.objects['FluidDomain'].modifiers['FluidDomainSettingsFixture']
-checks['fluid_domain'] = {'settings':fields(domain_mod.domain_settings, ['domain_type','resolution_max','use_adaptive_domain','cache_frame_start','cache_frame_end','cache_frame_offset','cache_data_format','cache_mesh_format','cache_directory','time_scale']), 'role':'DOMAIN', 'enabled':bool(domain_mod.show_viewport and domain_mod.show_render)}
+checks['fluid_domain'] = {'settings':fields(domain_mod.domain_settings, ['domain_type','resolution_max','use_adaptive_domain','cache_frame_start','cache_frame_end','cache_frame_offset','cache_data_format','cache_mesh_format','cache_directory','time_scale']), 'role':'DOMAIN', 'show_viewport':bool(domain_mod.show_viewport), 'show_render':bool(domain_mod.show_render)}
 flow_mod = bpy.data.objects['FluidFlow'].modifiers['FluidFlowSettingsFixture']
-checks['fluid_flow'] = {'settings':fields(flow_mod.flow_settings, ['density','fuel_amount','temperature','flow_type','flow_behavior','flow_source','use_absolute','use_initial_velocity','velocity_coord','surface_distance']), 'role':'FLOW', 'enabled':bool(flow_mod.show_viewport and flow_mod.show_render)}
+checks['fluid_flow'] = {'settings':fields(flow_mod.flow_settings, ['density','fuel_amount','temperature','flow_type','flow_behavior','flow_source','use_absolute','use_initial_velocity','velocity_coord','surface_distance']), 'role':'FLOW', 'show_viewport':bool(flow_mod.show_viewport), 'show_render':bool(flow_mod.show_render)}
 effector_mod = bpy.data.objects['FluidEffector'].modifiers['FluidEffectorSettingsFixture']
-checks['fluid_effector'] = {'settings':fields(effector_mod.effector_settings, ['effector_type','surface_distance','use_plane_init','velocity_factor','guide_mode','use_effector','subframes']), 'role':'EFFECTOR', 'enabled':bool(effector_mod.show_viewport and effector_mod.show_render)}
+checks['fluid_effector'] = {'settings':fields(effector_mod.effector_settings, ['effector_type','surface_distance','use_plane_init','velocity_factor','guide_mode','use_effector','subframes']), 'role':'EFFECTOR', 'show_viewport':bool(effector_mod.show_viewport), 'show_render':bool(effector_mod.show_render)}
 emitter = bpy.data.objects['ParticleEmitter']
 particle_system = emitter.particle_systems[0]
 checks['particle_system'] = {'settings':fields(particle_system.settings, ['count','frame_start','frame_end','lifetime','lifetime_random','emit_from','physics_type','normal_factor','factor_random','particle_size','size_random','render_type','child_type']), 'point_cache':cache_values(particle_system), 'seed':int(particle_system.seed)}
@@ -678,6 +678,17 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
             &scene["nodes"][node_id]["properties"][property_name]
         };
         assert_physics_settings(settings, &expected["settings"][case_name], case_name);
+        if let Some(show_viewport) = expected["settings"][case_name].get("show_viewport") {
+            assert_eq!(imported_modifier["enabled"], true, "{case_name}.enabled");
+            assert_eq!(
+                imported_modifier["show_viewport"], *show_viewport,
+                "{case_name}.show_viewport"
+            );
+            assert_eq!(
+                imported_modifier["show_render"], expected["settings"][case_name]["show_render"],
+                "{case_name}.show_render"
+            );
+        }
     }
 
     let catalog = potter_core::catalog::feature_catalog();

@@ -494,20 +494,26 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
             .nodes
             .get_mut(&node_id)
             .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "node was not found"))?;
-        node.modifiers.push(Modifier {
-            id: modifier_id.clone(),
-            modifier_type: "multires".to_owned(),
-            name: "Multires".to_owned(),
-            enabled: true,
-            params: Map::from_iter([
-                ("levels".to_owned(), json!(levels)),
-                ("sculpt_levels".to_owned(), json!(levels)),
-                ("render_levels".to_owned(), json!(render_levels)),
-                ("total_levels".to_owned(), json!(levels)),
-            ]),
-            binding_data: None,
-            runtime: crate::model::ModifierRuntime::default(),
-        });
+        let index = super::modifier::insertion_index(&node.modifiers, "multires");
+        node.modifiers.insert(
+            index,
+            Modifier {
+                id: modifier_id.clone(),
+                modifier_type: "multires".to_owned(),
+                name: "Multires".to_owned(),
+                enabled: true,
+                show_viewport: true,
+                show_render: true,
+                params: Map::from_iter([
+                    ("levels".to_owned(), json!(levels)),
+                    ("sculpt_levels".to_owned(), json!(levels)),
+                    ("render_levels".to_owned(), json!(render_levels)),
+                    ("total_levels".to_owned(), json!(levels)),
+                ]),
+                binding_data: None,
+                runtime: crate::model::ModifierRuntime::default(),
+            },
+        );
         engine.mark("nodes", &node_id, ChangeKind::Updated);
         changed = true;
     }

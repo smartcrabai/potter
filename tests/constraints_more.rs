@@ -2129,6 +2129,7 @@ with open(output_path, "w", encoding="utf-8") as output:
                 ..EvaluationContext::default()
             },
             Some(&project),
+            Some(&project.join(".potter/cache")),
         )?;
         let armature_id = Id::new("arm".to_owned())?;
         let bone_id = Id::new("root".to_owned())?;

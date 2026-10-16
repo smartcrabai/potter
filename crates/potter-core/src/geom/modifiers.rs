@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::ModifierEvaluationContext,
     graph::{self, NodeGroup},
     model::{CameraData, Id, Modifier, Registry, RenderSettings},
 };
@@ -163,6 +164,7 @@ pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
+        ModifierEvaluationContext::default(),
         None,
         custom_modifier,
     )
@@ -179,6 +181,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     object_meshes: &BTreeMap<Id, &Mesh>,
     evaluated_object_meshes: &BTreeMap<Id, Mesh>,
     curve_path_lengths: &BTreeMap<Id, f64>,
+    context: ModifierEvaluationContext<'_>,
     adaptive_render: Option<&AdaptiveRenderContext<'_>>,
     mut custom_modifier: impl FnMut(&mut Mesh, &Modifier, &mut Vec<PotError>) -> Result<()>,
 ) -> Result<ModifierEvaluation> {
@@ -189,6 +192,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     }
     let mut instance_paths = Vec::new();
     let mut warnings = Vec::new();
+    let last_subdivision_index = modifiers.iter().rposition(|modifier| {
+        modifier.enabled && modifier.modifier_type == "subdivision"
+    });
     for (modifier_index, modifier) in modifiers
         .iter()
         .enumerate()
@@ -321,13 +327,14 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 &evaluated,
                 modifier,
                 owner_world_matrix,
-                if modifier_index + 1 == modifiers.len() {
+                context,
+                if Some(modifier_index) == last_subdivision_index {
                     adaptive_render
                 } else {
                     None
                 },
             )?,
-            "multires" => subdivision(&evaluated, modifier)?,
+            "multires" => subdivision(&evaluated, modifier, context)?,
             "solidify" => solidify(&evaluated, modifier)?,
             "triangulate" => triangulate(&evaluated, modifier)?,
             "bevel" => bevel(&evaluated, modifier)?,
@@ -336,7 +343,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "displace" => displace(&evaluated, modifier, owner_world_matrix)?,
             "smooth" => smooth(&evaluated, modifier)?,
             "simple_deform" => advanced::simple_deform(&evaluated, modifier)?,
-            "screw" => advanced::screw(&evaluated, modifier)?,
+            "screw" => advanced::screw(&evaluated, modifier, context)?,
             "shrinkwrap" => advanced::shrinkwrap(&evaluated, modifier)?,
             "curve" => advanced::curve(&evaluated, modifier)?,
             "hook" => advanced::hook(&evaluated, modifier)?,
@@ -362,7 +369,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,
             "remesh" => remesh_modes::remesh_modifier(&evaluated, modifier)?,
-            "ocean" => ocean::ocean(&evaluated, modifier, frame)?,
+            "ocean" => ocean::ocean(&evaluated, modifier, frame, context)?,
             _ => return Err(unsupported_modifier(modifier)),
         };
         let dropped: Vec<String> = attributes_before
@@ -2218,14 +2225,19 @@ struct SubdivisionOptions {
     use_creases: bool,
 }
 
-fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    Ok(subdivision_with_samples(mesh, modifier)?.0)
+fn subdivision(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    context: ModifierEvaluationContext<'_>,
+) -> Result<Mesh> {
+    Ok(subdivision_with_samples(mesh, modifier, context)?.0)
 }
 
 fn subdivision_with_adaptive_context(
     mesh: &Mesh,
     modifier: &Modifier,
     owner_world_matrix: DMat4,
+    context: ModifierEvaluationContext<'_>,
     adaptive_render: Option<&AdaptiveRenderContext<'_>>,
 ) -> Result<Mesh> {
     if modifier.modifier_type == "subdivision"
@@ -2244,7 +2256,7 @@ fn subdivision_with_adaptive_context(
             })?,
         );
     }
-    subdivision(mesh, modifier)
+    subdivision(mesh, modifier, context)
 }
 
 fn adaptive_subdivision(
@@ -2432,6 +2444,7 @@ fn adaptive_subdivision(
 fn subdivision_with_samples(
     mesh: &Mesh,
     modifier: &Modifier,
+    context: ModifierEvaluationContext<'_>,
 ) -> Result<(Mesh, Option<Samples>, Option<subdivision_limit::LimitSurface>)> {
     validated(mesh)?;
     let multires_data = if modifier.modifier_type == "multires" {
@@ -2452,7 +2465,7 @@ fn subdivision_with_samples(
     } else {
         None
     };
-    let level_name = if modifier.runtime.use_render_levels {
+    let level_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
         "render_levels"
     } else {
         "levels"
@@ -2866,8 +2879,8 @@ pub(crate) fn sculpt_multires(
     sculpt_modifier
         .params
         .insert("levels".to_owned(), json!(effective_sculpt_levels));
-    sculpt_modifier.runtime.use_render_levels = false;
-    let (mut sculpt_mesh, samples, limit) = subdivision_with_samples(source, &sculpt_modifier)?;
+    let (mut sculpt_mesh, samples, limit) =
+        subdivision_with_samples(source, &sculpt_modifier, ModifierEvaluationContext::default())?;
     let samples = samples.ok_or_else(|| {
         PotError::new(
             ErrorCode::InternalError,
@@ -6027,6 +6040,8 @@ mod tests {
             modifier_type: modifier_type.to_owned(),
             name: "Modifier".to_owned(),
             enabled,
+            show_viewport: true,
+            show_render: true,
             params: serde_json::Map::new(),
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),

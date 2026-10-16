@@ -1572,6 +1572,7 @@ fn assert_imported_evaluation(
                         ..EvaluationContext::default()
                     },
                     Some(project),
+                    Some(&project.join(".potter/cache")),
                 ) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
@@ -2418,6 +2419,7 @@ fn blender_follow_path_curve_mesh_parity() -> TestResult {
             ..EvaluationContext::default()
         },
         Some(&project),
+        Some(&project.join(".potter/cache")),
     )?;
     let curve_mesh = snapshot
         .meshes
@@ -2698,6 +2700,7 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
                 ..EvaluationContext::default()
             },
             Some(&project),
+            Some(&project.join(".potter/cache")),
         )
         .err()
         .ok_or("IK X/Z Swing ellipse limits unexpectedly evaluated")?;
@@ -2737,6 +2740,7 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
                 ..EvaluationContext::default()
             },
             Some(&project),
+            Some(&project.join(".potter/cache")),
         )?;
         for (name, bone_id) in bone_names.iter().zip(&bone_ids) {
             let actual = snapshot
@@ -2770,6 +2774,7 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
                 ..EvaluationContext::default()
             },
             Some(&project),
+            Some(&project.join(".potter/cache")),
         )?;
         for (name, bone_id) in bone_names.iter().zip(&bone_ids) {
             let actual = snapshot
@@ -2966,8 +2971,12 @@ fn blender_target_project_boundary_edge_fallback_roundtrip() -> TestResult {
         constraint.params["shrinkwrap_type"],
         before["constraint"]["shrinkwrap_type"]
     );
-    let snapshot =
-        Snapshot::evaluate_with_cache(&doc, &EvaluationContext::default(), Some(&project))?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &doc,
+        &EvaluationContext::default(),
+        Some(&project),
+        Some(&project.join(".potter/cache")),
+    )?;
     let actual = snapshot
         .nodes
         .get(owner_id)

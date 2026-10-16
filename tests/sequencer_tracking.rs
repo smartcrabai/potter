@@ -369,10 +369,12 @@ fn sequencer_render_writes_crossfade_frame_and_frame_aligned_audio() {
             ..Strip::default()
         },
     ];
+    let cache_directory = directory.path().join(".potter/cache");
     let result = render_sequence(
         &document,
         &EvaluationContext::default(),
         directory.path(),
+        &cache_directory,
         None,
         &[2.0],
         "png",
