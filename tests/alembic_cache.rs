@@ -1337,6 +1337,7 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
         "override_frame_fractional_interpolated",
         "override_frame_fractional_no_interpolation",
         "sequence_same_size_reordered_connectivity",
+        "nonsequence_animated_same_size_reordered_connectivity",
         "read_attributes_only",
         "read_no_color",
         "read_poly_only",
@@ -1369,11 +1370,16 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
             &json!([{"op":"node.create","id":"body","name":"OracleReceiver","kind":"box","params":{}}]),
         )?;
         let (positions, faces) = oracle_receiver_geometry(case_id);
+        if case_id == "nonsequence_animated_same_size_reordered_connectivity" {
+            assert_eq!(oracle_case["cache_file"]["is_sequence"], false);
+            assert_eq!(oracle_case["modifier"]["read_data"], json!(["VERT"]));
+        }
         set_receiver_mesh(
             &target,
             &positions,
             &faces,
-            case_id == "sequence_same_size_reordered_connectivity",
+            case_id == "sequence_same_size_reordered_connectivity"
+                || case_id == "nonsequence_animated_same_size_reordered_connectivity",
         )?;
         add_oracle_cache(&target, &fixture_dir, oracle_case)?;
         let frames = oracle_case["frames"]
@@ -1382,6 +1388,24 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
         for expected in frames {
             assert!(expected.get("error").is_none_or(Value::is_null));
             let missing_sequence = case_id == "is_sequence_missing_file";
+            if case_id == "nonsequence_animated_same_size_reordered_connectivity" {
+                let uv_map = &expected["attributes"]["UVMap"];
+                assert_eq!(uv_map["domain"], "CORNER");
+                assert_eq!(uv_map["type"], "FLOAT2");
+                let values: Vec<[f64; 2]> =
+                    serde_json::from_value(uv_map["values"].clone())?;
+                assert_eq!(values.len(), 11);
+                let input_uv: Vec<[f64; 2]> = serde_json::from_value(json!([
+                    [20.0, 10.0], [20.0, 11.0], [20.0, 12.0], [20.0, 13.0],
+                    [21.0, 10.0], [21.0, 11.0], [21.0, 12.0],
+                    [22.0, 10.0], [22.0, 11.0], [22.0, 12.0], [22.0, 13.0]
+                ]))?;
+                if expected["frame"].as_i64() == Some(1) {
+                    assert_eq!(values, input_uv);
+                } else {
+                    assert_ne!(values, input_uv);
+                }
+            }
             let actual = evaluated_mesh(
                 &target,
                 expected["frame"]

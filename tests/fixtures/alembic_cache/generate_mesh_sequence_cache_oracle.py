@@ -16,6 +16,8 @@ The script writes, next to itself:
 - `seq.000<k>.abc`: one single-frame file per frame of `/Animated` for `is_sequence` cases.
 - `reordered.000<k>.abc`: same-size file-sequence samples with reversed face-corner connectivity and
   asymmetric UVs, exercising the cache topology-change reread.
+- `reordered_animated.abc`: a non-sequence archive whose `/Reordered` face-corner connectivity
+  reverses the first face at frame 2, with asymmetric UVs for the animated-topology regression.
 - `oracle.json`: per case, the CacheFile settings, the modifier settings, and the evaluated mesh of
   each frame (local positions, faces in Blender loop order, corner normals, custom-normal flag and
   every non-internal attribute with full values).
@@ -238,6 +240,39 @@ def build_reordered_source(faces):
     return obj
 
 
+def add_reordered_topology_nodes(obj):
+    """Reverse only the first face after frame 1, keeping mesh dimensions unchanged."""
+    tree = bpy.data.node_groups.new("ReorderedTopology", "GeometryNodeTree")
+    tree.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    tree.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    nodes, links = tree.nodes, tree.links
+    group_in = nodes.new("NodeGroupInput")
+    group_out = nodes.new("NodeGroupOutput")
+    index = nodes.new("GeometryNodeInputIndex")
+    first_face = nodes.new("FunctionNodeCompare")
+    first_face.data_type = "INT"
+    first_face.operation = "EQUAL"
+    first_face.inputs["B"].default_value = 0
+    links.new(index.outputs["Index"], first_face.inputs["A"])
+    flip = nodes.new("GeometryNodeFlipFaces")
+    links.new(group_in.outputs["Geometry"], flip.inputs["Mesh"])
+    links.new(first_face.outputs["Result"], flip.inputs["Selection"])
+    time = nodes.new("GeometryNodeInputSceneTime")
+    after_first_frame = nodes.new("FunctionNodeCompare")
+    after_first_frame.data_type = "FLOAT"
+    after_first_frame.operation = "GREATER_THAN"
+    after_first_frame.inputs["B"].default_value = 1.5
+    links.new(time.outputs["Frame"], after_first_frame.inputs["A"])
+    switch = nodes.new("GeometryNodeSwitch")
+    switch.input_type = "GEOMETRY"
+    links.new(after_first_frame.outputs["Result"], switch.inputs["Switch"])
+    links.new(group_in.outputs["Geometry"], switch.inputs["False"])
+    links.new(flip.outputs["Mesh"], switch.inputs["True"])
+    links.new(switch.outputs["Output"], group_out.inputs["Geometry"])
+    modifier = obj.modifiers.new("AnimatedTopology", "NODES")
+    modifier.node_group = tree
+
+
 def export_selected(obj, path, start, end, *, uvs=False):
     # The exporter samples the current frame for single-frame ranges, so start there explicitly.
     bpy.context.scene.frame_set(start)
@@ -398,6 +433,18 @@ def main():
         )
         bpy.data.objects.remove(reordered, do_unlink=True)
         bpy.data.meshes.remove(mesh)
+    reordered_animated = build_reordered_source(FACES)
+    add_reordered_topology_nodes(reordered_animated)
+    mesh = reordered_animated.data
+    export_selected(
+        reordered_animated,
+        os.path.join(OUT, "reordered_animated.abc"),
+        FRAMES[0],
+        FRAMES[1],
+        uvs=True,
+    )
+    bpy.data.objects.remove(reordered_animated, do_unlink=True)
+    bpy.data.meshes.remove(mesh)
 
     # Remove the source objects; receivers are created below from fresh meshes.
     for obj in list(bpy.data.objects):
@@ -408,6 +455,7 @@ def main():
     seq_path = os.path.join(OUT, "seq.0001.abc")
     uv_only_path = os.path.join(OUT, "uv_only.abc")
     reordered_path = os.path.join(OUT, "reordered.0001.abc")
+    reordered_animated_path = os.path.join(OUT, "reordered_animated.abc")
 
     def receiver(name, verts, faces):
         return new_object(name, verts, faces)
@@ -421,6 +469,7 @@ def main():
         for index, item in enumerate(layer.data):
             item.uv = (20.0 + index, -10.0 - index)
         return obj
+
 
     cases = []
     cases.append(run_case(
@@ -527,6 +576,11 @@ def main():
     cases.append(run_case(
         "axis_settings_mesh_data_unchanged", same_topology(), animated_path, ANIMATED_PATH,
         {"forward_axis": "POS_Y", "up_axis": "POS_Z"}, {}, [1, 3],
+    ))
+    cases.append(run_case(
+        "nonsequence_animated_same_size_reordered_connectivity",
+        same_topology_with_uv(), reordered_animated_path, REORDERED_PATH,
+        {"is_sequence": False}, {"read_data": ["VERT"]}, [1, 2],
     ))
 
     bpy.ops.wm.alembic_import(filepath=animated_path, as_background_job=False)
