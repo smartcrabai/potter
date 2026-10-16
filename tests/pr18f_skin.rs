@@ -264,19 +264,22 @@ fn assert_blender_geometry<F: AsRef<[usize]>>(
 ) {
     assert_eq!(result.vertices.len(), vertices.len());
     assert_eq!(result.faces.len(), faces.len());
-    let expected_index: HashMap<usize, usize> = vertices
-        .iter()
-        .enumerate()
-        .map(|(index, position)| {
-            let position = DVec3::from_array(*position);
-            let storage = result
-                .vertices
-                .iter()
-                .position(|vertex| vertex.co.distance(position) < 1.0e-6)
-                .unwrap();
-            (storage, index)
-        })
-        .collect();
+    let mut matched = vec![false; result.vertices.len()];
+    let mut expected_index = HashMap::with_capacity(vertices.len());
+    for (index, position) in vertices.iter().enumerate() {
+        let position = DVec3::from_array(*position);
+        let storage = result
+            .vertices
+            .iter()
+            .enumerate()
+            .find_map(|(storage, vertex)| {
+                (!matched[storage] && vertex.co.distance(position) < 1.0e-6)
+                    .then_some(storage)
+            })
+            .expect("Blender Skin vertex is present");
+        matched[storage] = true;
+        expected_index.insert(storage, index);
+    }
     let storage_of_id: HashMap<u32, usize> = result
         .vertices
         .iter()
@@ -328,6 +331,27 @@ fn smooth_face_count(result: &Mesh) -> usize {
                 .filter(|flag| flag.as_bool() == Some(true))
                 .count()
         })
+}
+
+fn assert_skin_oracle(result: &Mesh, oracle: &str) {
+    let expected: Value = serde_json::from_str(oracle).expect("parse Blender Skin oracle");
+    assert_eq!(expected["blender_version"], "5.2.2");
+    let vertices: Vec<[f64; 3]> =
+        serde_json::from_value(expected["vertices"].clone()).expect("Skin oracle vertices");
+    let faces: Vec<Vec<usize>> =
+        serde_json::from_value(expected["faces"].clone()).expect("Skin oracle faces");
+    let smooth: Vec<bool> =
+        serde_json::from_value(expected["face_smooth"].clone()).expect("Skin oracle shading");
+    assert_blender_geometry(result, &vertices, &faces);
+    assert!(result.faces.iter().all(|face| face.material_index == 0));
+    assert_eq!(
+        result.edges.len(),
+        expected["edges"].as_u64().expect("Skin oracle edge count") as usize
+    );
+    assert_eq!(
+        smooth_face_count(result),
+        smooth.iter().filter(|value| **value).count()
+    );
 }
 
 
@@ -525,7 +549,7 @@ fn y_branch_smoothing_matches_blender_coordinates() {
 }
 
 #[test]
-fn detached_branch_frame_repair_is_explicitly_refused() {
+fn detached_branch_matches_blender_after_topology_repair() {
     let vertices = [
         [0.0, 0.0, 0.0],
         [0.0944871312282557, 1.3947412142144908, -0.6789465782603507],
@@ -539,20 +563,19 @@ fn detached_branch_frame_repair_is_explicitly_refused() {
         ([0.14344811822036752, 0.12353176588156564], false),
         ([0.379951191640614, 0.26134121447787595], false),
     ];
-    let error = evaluate_modifiers(
+    let result = evaluate_modifiers(
         &skeleton(&vertices, &edges, Some(&skin)),
         &[skin_modifier(json!({}))],
     )
-    .unwrap_err();
-    assert_eq!(error.code, ErrorCode::UnsupportedFeature);
-    assert_eq!(
-        error.details["feature_id"],
-        "modifier.skin.branch_hull_topology_repair"
+    .unwrap();
+    assert_skin_oracle(
+        &result,
+        include_str!("fixtures/pr18f_skin_detached_branch.json"),
     );
 }
 
 #[test]
-fn detached_branch_no_good_verts_repair_is_explicitly_refused() {
+fn detached_branch_without_good_vertices_matches_blender() {
     let vertices = [
         [0.0, 0.0, 0.0],
         [-0.615750305639683, -0.2491899355187869, -0.656205807326401],
@@ -570,16 +593,119 @@ fn detached_branch_no_good_verts_repair_is_explicitly_refused() {
         ([0.8666491075896481, 0.3874494757263359], false),
         ([0.3010493443071548, 0.646648963948643], false),
     ];
-    let error = evaluate_modifiers(
+    let result = evaluate_modifiers(
         &skeleton(&vertices, &edges, Some(&skin)),
         &[skin_modifier(json!({}))],
     )
-    .unwrap_err();
-    assert_eq!(error.code, ErrorCode::UnsupportedFeature);
-    assert_eq!(
-        error.details["feature_id"],
-        "modifier.skin.branch_hull_topology_repair"
+    .unwrap();
+    assert_skin_oracle(
+        &result,
+        include_str!("fixtures/pr18f_skin_nogood_branch.json"),
     );
+}
+
+#[test]
+fn detached_skin_repair_preserves_point_colors_and_vertex_groups() {
+    let vertices = [
+        [0.0, 0.0, 0.0],
+        [0.0944871312282557, 1.3947412142144908, -0.6789465782603507],
+        [0.582235576162845, 0.133558627622563, -1.9779341711897558],
+        [0.4590388331551346, 1.4484963036383605, 0.06981012119291923],
+    ];
+    let edges = [[0, 1], [0, 2], [0, 3]];
+    let skin = [
+        ([0.46170452834529013, 0.3036252966189872], true),
+        ([0.5412495143022006, 0.6302679453037413], false),
+        ([0.14344811822036752, 0.12353176588156564], false),
+        ([0.379951191640614, 0.26134121447787595], false),
+    ];
+    let mut mesh = skeleton(&vertices, &edges, Some(&skin));
+    let mut weights = serde_json::Map::new();
+    for vertex in &mesh.vertices {
+        weights.insert(format!("v{}", vertex.id), json!(1.0));
+    }
+    mesh.attributes
+        .insert("vertex_groups".to_owned(), json!({"Weight": weights}));
+    let source_vertex_count = mesh.vertices.len();
+    mesh.attributes.insert(
+        "blender_attributes".to_owned(),
+        json!([
+            {
+                "name": "SkinPoint",
+                "domain": "POINT",
+                "data_type": "FLOAT",
+                "values": vec![json!(1.75); source_vertex_count]
+            },
+            {
+                "name": "SkinColor",
+                "domain": "POINT",
+                "data_type": "FLOAT_COLOR",
+                "values": vec![json!([0.25, 0.5, 0.75, 1.0]); source_vertex_count]
+            }
+        ]),
+    );
+
+    let result = evaluate_modifiers(&mesh, &[skin_modifier(json!({}))]).unwrap();
+    let weights = result.attributes["vertex_groups"]["Weight"]
+        .as_object()
+        .unwrap();
+    for vertex in &result.vertices {
+        assert_eq!(
+            weights
+                .get(&format!("v{}", vertex.id))
+                .and_then(Value::as_f64),
+            Some(1.0)
+        );
+    }
+    let attributes = result.attributes["blender_attributes"].as_array().unwrap();
+    let point_values = attributes
+        .iter()
+        .find(|attribute| attribute["name"] == "SkinPoint")
+        .unwrap()["values"]
+        .as_array()
+        .unwrap();
+    assert_eq!(point_values.len(), result.vertices.len());
+    assert!(point_values.iter().all(|value| value.as_f64() == Some(1.75)));
+    let color_values = attributes
+        .iter()
+        .find(|attribute| attribute["name"] == "SkinColor")
+        .unwrap()["values"]
+        .as_array()
+        .unwrap();
+    assert_eq!(color_values.len(), result.vertices.len());
+    assert!(
+        color_values
+            .iter()
+            .all(|value| value == &json!([0.25, 0.5, 0.75, 1.0]))
+    );
+}
+
+#[test]
+fn loose_skin_branch_skips_edge_subdivision() {
+    let regular = evaluate_modifiers(
+        &skeleton(&Y_INPUT_VERTICES, &Y_EDGES, Some(&Y_SKIN)),
+        &[skin_modifier(json!({}))],
+    )
+    .unwrap();
+    let mut loose_mesh = skeleton(&Y_INPUT_VERTICES, &Y_EDGES, Some(&Y_SKIN));
+    loose_mesh.attributes.insert(
+        "blender_skin_vertices".to_owned(),
+        Value::Array(
+            Y_SKIN
+                .iter()
+                .enumerate()
+                .map(|(index, (radius, root))| {
+                    json!({"radius": radius, "root": root, "loose": index == 0})
+                })
+                .collect(),
+        ),
+    );
+    let loose = evaluate_modifiers(&loose_mesh, &[skin_modifier(json!({}))]).unwrap();
+    assert!(
+        loose.vertices.len() < regular.vertices.len(),
+        "loose branch should omit the intermediate frames"
+    );
+    assert!(!loose.attributes.contains_key("blender_skin_vertices"));
 }
 
 #[test]

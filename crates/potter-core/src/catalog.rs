@@ -656,13 +656,6 @@ pub fn feature_catalog() -> Value {
             &["modifier.create", "modifier.apply"],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
-            "modifier.skin.branch_hull_topology_repair",
-            "Detached branch-frame topology repair for the Skin modifier",
-            "SKIN",
-            &["modifier.create", "modifier.apply"],
-            "Some branch hulls require Blender's detached-frame extrusion and weld repair.",
-        ),
         supported(
             "modifier.vertex_weight_edit",
             "Vertex Weight Edit with curve falloff and constant, group, or image masks",

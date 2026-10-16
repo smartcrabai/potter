@@ -5,6 +5,106 @@
 
 use super::*;
 
+use std::ptr::NonNull;
+
+#[repr(C)]
+struct PotterSkinHull {
+    _private: [u8; 0],
+}
+
+unsafe extern "C" {
+    fn potter_skin_hull_compute(
+        coordinates: *const f32,
+        vertex_count: usize,
+        result: *mut *mut PotterSkinHull,
+    ) -> i32;
+    fn potter_skin_hull_triangle_index_count(hull: *const PotterSkinHull) -> usize;
+    fn potter_skin_hull_copy_triangle_indices(
+        hull: *const PotterSkinHull,
+        destination: *mut u32,
+        capacity: usize,
+    ) -> i32;
+    fn potter_skin_hull_free(hull: *mut PotterSkinHull);
+}
+
+struct SkinHullHandle(NonNull<PotterSkinHull>);
+
+impl Drop for SkinHullHandle {
+    fn drop(&mut self) {
+        unsafe { potter_skin_hull_free(self.0.as_ptr()) };
+    }
+}
+
+fn bullet_hull_faces(points: &[DVec3], input: &[usize]) -> Result<Vec<Vec<usize>>> {
+    let mut coordinates = Vec::with_capacity(input.len() * 3);
+    for &index in input {
+        let point = points[index];
+        let coordinate = [point.x as f32, point.y as f32, point.z as f32];
+        if !coordinate.into_iter().all(f32::is_finite) {
+            return Err(PotError::new(
+                ErrorCode::EvaluationFailed,
+                "Skin hull input cannot be represented as Blender float coordinates",
+            ));
+        }
+        coordinates.extend(coordinate);
+    }
+
+    let mut raw_hull = std::ptr::null_mut();
+    let status = unsafe {
+        potter_skin_hull_compute(coordinates.as_ptr(), input.len(), &mut raw_hull)
+    };
+    if status != 0 {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            format!("Skin Bullet convex hull failed with native status {status}"),
+        ));
+    }
+    let hull = SkinHullHandle(NonNull::new(raw_hull).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::EvaluationFailed,
+            "Skin Bullet convex hull returned no result",
+        )
+    })?);
+    let index_count = unsafe { potter_skin_hull_triangle_index_count(hull.0.as_ptr()) };
+    if index_count % 3 != 0 {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "Skin Bullet convex hull returned an invalid triangle index count",
+        ));
+    }
+    let mut triangle_indices = vec![0_u32; index_count];
+    let status = unsafe {
+        potter_skin_hull_copy_triangle_indices(
+            hull.0.as_ptr(),
+            triangle_indices.as_mut_ptr(),
+            triangle_indices.len(),
+        )
+    };
+    if status != 0 {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            format!("Skin Bullet convex hull copy failed with native status {status}"),
+        ));
+    }
+
+    triangle_indices
+        .chunks_exact(3)
+        .map(|triangle| {
+            triangle
+                .iter()
+                .map(|index| {
+                    input.get(*index as usize).copied().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "Skin Bullet convex hull returned an invalid original vertex index",
+                        )
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
 #[expect(
     clippy::manual_midpoint,
     reason = "matches Blender's float evaluation order for parity"
@@ -14,6 +114,19 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let source_indices = id_indices(mesh);
     let radii = mesh.attributes.get("skin_radii").and_then(Value::as_object);
     let roots = mesh.attributes.get("skin_roots").and_then(Value::as_object);
+    let skin_vertices = mesh
+        .attributes
+        .get("blender_skin_vertices")
+        .and_then(Value::as_array);
+    let node_loose: Vec<bool> = (0..mesh.vertices.len())
+        .map(|index| {
+            skin_vertices
+                .and_then(|vertices| vertices.get(index))
+                .and_then(|vertex| vertex.get("loose"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .collect();
     let branch_smoothing = number_param(modifier, "branch_smoothing")?;
     if !(0.0..=1.0).contains(&branch_smoothing) {
         return Err(invalid_parameter(
@@ -71,29 +184,29 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         edge_endpoints.push([first, second]);
         edge_lengths.push(length);
     }
-    if edge_endpoints
-        .iter()
-        .any(|[first, second]| degrees[*first] > 2 && degrees[*second] > 2)
-    {
-        return Err(unsupported_skin(
-            modifier,
-            "branch_hull_topology_repair",
-            "Skin modifier topology repair between adjacent branch hulls is not supported",
-        ));
-    }
     let mut edge_chains = Vec::with_capacity(mesh.edges.len());
     for (edge_index, [first, second]) in edge_endpoints.iter().copied().enumerate() {
         let first_radius = node_radii[first];
         let second_radius = node_radii[second];
         let average_radius =
             (first_radius[0] + first_radius[1] + second_radius[0] + second_radius[1]) * 0.5;
-        let mut subdivisions = if average_radius > 0.0 {
+        let first_is_branch = degrees[first] > 2;
+        let second_is_branch = degrees[second] > 2;
+        let loose_branch = (first_is_branch && node_loose[first])
+            || (second_is_branch && node_loose[second]);
+        let mut subdivisions = if loose_branch {
+            if first_is_branch && second_is_branch {
+                2
+            } else {
+                0
+            }
+        } else if average_radius > 0.0 {
             (edge_lengths[edge_index] / average_radius).min(128.0) as usize
         } else {
             // Blender crashes on a negative subdivision count; keep the finite radii accepted.
             0
         };
-        if degrees[first] > 2 && degrees[second] > 2 && subdivisions < 2 {
+        if first_is_branch && second_is_branch && subdivisions < 2 {
             subdivisions = 2;
         }
         let first_half = (first_radius[0] + first_radius[1]) * 0.5;
@@ -306,24 +419,28 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             frame_vertex_ids[frame_index][corner] = target;
         }
     }
-    let mut faces: Vec<Polygon> = Vec::with_capacity(mesh.edges.len() * 32 + 2);
     let mut branch_faces = Vec::new();
-    for ring_frames in branch_rings {
+    let mut detached_frames = Vec::new();
+    for ring_frames in &branch_rings {
         let rings: Vec<[usize; 4]> = ring_frames
             .iter()
             .map(|frame| frame_vertex_ids[*frame])
             .collect();
-        let hull = branch_hull_faces(modifier, &points, &rings, symmetry_axes)?;
-        if hull.frame_states.iter().any(|(detached, _)| *detached) {
-            return Err(unsupported_skin(
-                modifier,
-                "branch_hull_topology_repair",
-                "Detached branch frames require Blender's BMesh topology repair",
-            ));
+        let hull = branch_hull_faces(&points, &rings, &mut branch_faces)?;
+        for (&frame, (detached, inside)) in ring_frames.iter().zip(hull.frame_states) {
+            if detached {
+                detached_frames.push((frame, inside));
+            }
         }
-        branch_faces.extend(hull.faces);
     }
     branch_faces = merge_triangle_faces(&points, branch_faces, symmetry_axes);
+    repair_detached_branch_frames(
+        &mut points,
+        &mut origins,
+        &mut frame_vertex_ids,
+        &mut branch_faces,
+        &detached_frames,
+    );
     smooth_branch_hull_points(&mut points, &branch_faces, branch_smoothing);
     faces.extend(branch_faces.into_iter().map(|face| (face, 0)));
     for ids in seam_frames.iter().flatten() {
@@ -483,155 +600,96 @@ fn frame_side_length(frame: [DVec3; 4]) -> f64 {
     (frame[0].distance(frame[1]) + frame[1].distance(frame[2])) * 0.5
 }
 struct BranchHullBuild {
-    faces: Vec<Vec<usize>>,
     frame_states: Vec<(bool, [bool; 4])>,
 }
 
-/// Builds Bullet-like supporting facets and the frame state used by Blender's hull repair.
 fn branch_hull_faces(
-    modifier: &Modifier,
     points: &[DVec3],
     rings: &[[usize; 4]],
+    faces: &mut Vec<Vec<usize>>,
 ) -> Result<BranchHullBuild> {
-    let mut input = Vec::with_capacity(rings.len() * 4);
-    for ring in rings {
-        for vertex in ring {
-            if !input.iter().any(|existing| {
-                points[*existing].distance_squared(points[*vertex]) <= 1.0e-16
-            }) {
-                input.push(*vertex);
-            }
-        }
-    }
-    if input.len() < 4 {
-        return Err(unsupported_skin(
-            modifier,
-            "branch_hull",
-            "Branch hull requires at least four distinct frame corners",
-        ));
-    }
-    let center = input
-        .iter()
-        .map(|vertex| points[*vertex])
-        .sum::<DVec3>()
-        / input.len() as f64;
-    let mut facet_keys = HashSet::new();
-    let mut hull_faces = Vec::<Vec<usize>>::new();
-    let mut all_triangles = Vec::<[usize; 3]>::new();
-    for first in 0..input.len() {
-        for second in first + 1..input.len() {
-            for third in second + 1..input.len() {
-                let a = points[input[first]];
-                let b = points[input[second]];
-                let c = points[input[third]];
-                let normal = (b - a).cross(c - a).normalize_or_zero();
-                if normal.length_squared() <= f64::EPSILON {
-                    continue;
-                }
-                let mut has_positive = false;
-                let mut has_negative = false;
-                for vertex in &input {
-                    let distance = (points[*vertex] - a).dot(normal);
-                    has_positive |= distance > 1.0e-6;
-                    has_negative |= distance < -1.0e-6;
-                }
-                if has_positive && has_negative {
-                    continue;
-                }
-                let outward = if normal.dot(center - a) > 0.0 {
-                    -normal
-                } else {
-                    normal
-                };
-                let coplanar: Vec<usize> = input
-                    .iter()
-                    .copied()
-                    .filter(|vertex| (points[*vertex] - a).dot(normal).abs() <= 1.0e-6)
-                    .collect();
-                if coplanar.len() < 3 {
-                    continue;
-                }
-                let face = convex_face_boundary(points, &coplanar, outward);
-                if face.len() < 3 {
-                    continue;
-                }
-                let mut key = face.clone();
-                key.sort_unstable();
-                if !facet_keys.insert(key) {
-                    continue;
-                }
-                hull_faces.push(face.clone());
-                for index in 2..face.len() {
-                    all_triangles.push([face[0], face[index - 1], face[index]]);
-                }
-            }
-        }
-    }
+    let mut input: Vec<usize> = rings.iter().flatten().copied().collect();
+    input.sort_unstable();
+    input.dedup();
+    let hull_start = faces.len();
+    faces.extend(bullet_hull_faces(points, &input)?);
+
     let mut hull_vertices = HashSet::new();
     let mut hull_edges = HashSet::new();
-    for face in &hull_faces {
-        hull_vertices.extend(face.iter().copied());
-        for index in 0..face.len() {
-            let first = face[index];
-            let second = face[(index + 1) % face.len()];
+    for face in faces.iter() {
+        for corner in 0..face.len() {
+            let first = face[corner];
+            let second = face[(corner + 1) % face.len()];
             hull_edges.insert(ordered_edge(first, second));
         }
     }
-    let mut removed_triangles = vec![false; all_triangles.len()];
+    for face in &faces[hull_start..] {
+        hull_vertices.extend(face.iter().copied());
+    }
+
+    let mut removed_faces = vec![false; faces.len()];
     let mut frame_states = Vec::with_capacity(rings.len());
     for ring in rings {
-        let inside: [bool; 4] =
-            std::array::from_fn(|index| !hull_vertices.contains(&ring[index]));
-        let initially_detached = inside.iter().any(|value| *value)
-            || (0..4).any(|index| {
-                !hull_edges.contains(&ordered_edge(ring[index], ring[(index + 1) % 4]))
-            });
-        let cap_triangles: Vec<usize> = all_triangles
-            .iter()
-            .enumerate()
-            .filter_map(|(index, triangle)| {
-                triangle.iter().all(|vertex| ring.contains(vertex)).then_some(index)
+        let mut inside = [false; 4];
+        let first_inside = (0..4)
+            .filter(|corner| !hull_vertices.contains(&ring[*corner]))
+            .min_by_key(|corner| ring[*corner]);
+        let mut detached = false;
+        if let Some(corner) = first_inside {
+            inside[corner] = true;
+            detached = true;
+        }
+        if !detached
+            && (0..4).any(|corner| {
+                !hull_edges.contains(&ordered_edge(ring[corner], ring[(corner + 1) % 4]))
             })
-            .collect();
-        let diagonal_pair = if cap_triangles.len() == 2 {
-            let first = all_triangles[cap_triangles[0]];
-            let second = all_triangles[cap_triangles[1]];
-            let shared: Vec<usize> = first
-                .iter()
-                .copied()
-                .filter(|vertex| second.contains(vertex))
-                .collect();
-            shared.len() == 2
-                && (ordered_edge(shared[0], shared[1])
-                    == ordered_edge(ring[0], ring[2])
-                    || ordered_edge(shared[0], shared[1])
-                        == ordered_edge(ring[1], ring[3]))
-        } else {
-            false
-        };
-        let detached = initially_detached || !diagonal_pair;
+        {
+            detached = true;
+        }
+
         if !detached {
-            for triangle in cap_triangles {
-                removed_triangles[triangle] = true;
+            let diagonal = if hull_edges.contains(&ordered_edge(ring[0], ring[2])) {
+                Some(ordered_edge(ring[0], ring[2]))
+            } else if hull_edges.contains(&ordered_edge(ring[1], ring[3])) {
+                Some(ordered_edge(ring[1], ring[3]))
+            } else {
+                None
+            };
+            let contained_faces = diagonal.map(|diagonal| {
+                let mut pair = [0; 2];
+                let mut count = 0;
+                for (index, face) in faces.iter().enumerate() {
+                    if face_has_edge(face, diagonal) {
+                        if count < pair.len() {
+                            pair[count] = index;
+                        }
+                        count += 1;
+                    }
+                }
+                (pair, count)
+            });
+            if let Some((pair, 2)) = contained_faces {
+                removed_faces[pair[0]] = true;
+                removed_faces[pair[1]] = true;
+            } else {
+                detached = true;
             }
         }
         frame_states.push((detached, inside));
     }
-    let triangles: Vec<[usize; 3]> = all_triangles
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, triangle)| (!removed_triangles[index]).then_some(triangle))
-        .collect();
-    if triangles.is_empty() {
-        return Err(unsupported_skin(
-            modifier,
-            "branch_hull",
-            "Branch hull did not produce any faces",
-        ));
-    }
-    Ok(BranchHullBuild {
-        faces: triangles.into_iter().map(|triangle| triangle.to_vec()).collect(),
-        frame_states,
+
+    let mut face_index = 0;
+    faces.retain(|_| {
+        let keep = !removed_faces[face_index];
+        face_index += 1;
+        keep
+    });
+    Ok(BranchHullBuild { frame_states })
+}
+
+fn face_has_edge(face: &[usize], edge: (usize, usize)) -> bool {
+    (0..face.len()).any(|corner| {
+        ordered_edge(face[corner], face[(corner + 1) % face.len()]) == edge
     })
 }
 
@@ -643,68 +701,344 @@ fn ordered_edge(first: usize, second: usize) -> (usize, usize) {
     }
 }
 
-fn convex_face_boundary(points: &[DVec3], coplanar: &[usize], normal: DVec3) -> Vec<usize> {
-    let Some(&first) = coplanar.first() else {
-        return Vec::new();
-    };
-    let center = coplanar
-        .iter()
-        .map(|vertex| points[*vertex])
-        .sum::<DVec3>()
-        / coplanar.len() as f64;
-    let mut u = (points[first] - center).normalize_or_zero();
-    if u.length_squared() <= f64::EPSILON
-        && let Some(second) = coplanar.get(1)
+fn repair_detached_branch_frames(
+    points: &mut Vec<DVec3>,
+    origins: &mut Vec<Vec<(usize, f64)>>,
+    frame_vertex_ids: &mut [[usize; 4]],
+    faces: &mut Vec<Vec<usize>>,
+    detached_frames: &[(usize, [bool; 4])],
+) -> Result<()> {
+    for &(frame_index, inside) in detached_frames {
+        let frame = frame_vertex_ids.get(frame_index).copied().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "Skin detached frame index is out of range",
+            )
+        })?;
+        let target = skin_hole_target_face(points, faces, frame);
+        let has_degenerate_coincidence = target.is_some_and(|face| {
+            !inside.iter().any(|is_inside| *is_inside)
+                && faces[face].iter().any(|vertex| frame.contains(vertex))
+        });
+
+        for corner in 0..4 {
+            if inside[corner] {
+                continue;
+            }
+            let source = frame_vertex_ids[frame_index][corner];
+            let duplicate = points.len();
+            points.push(points[source]);
+            origins.push(origins[source].clone());
+            frame_vertex_ids[frame_index][corner] = duplicate;
+        }
+
+        if let Some(target) = target
+            && !has_degenerate_coincidence
+        {
+            if faces[target].len() == 3 {
+                subdivide_skin_target_face(points, origins, faces, target)?;
+            }
+            if faces[target].len() == 4 {
+                let target_ring = faces[target].clone();
+                let frame = frame_vertex_ids[frame_index];
+                let order = skin_choose_quad_bridge_order(points, target_ring.as_slice(), frame);
+                for corner in 0..4 {
+                    let next = (corner + 1) % 4;
+                    append_welded_face(
+                        faces,
+                        [
+                            target_ring[next],
+                            frame[order[next]],
+                            frame[order[corner]],
+                            target_ring[corner],
+                        ],
+                    );
+                }
+                continue;
+            }
+        }
+        faces.push(frame_vertex_ids[frame_index].to_vec());
+    }
+    Ok(())
+}
+
+fn subdivide_skin_target_face(
+    points: &mut Vec<DVec3>,
+    origins: &mut Vec<Vec<(usize, f64)>>,
+    faces: &mut [Vec<usize>],
+    target: usize,
+) -> Result<()> {
+    let face = faces.get(target).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "Skin target face index is out of range",
+        )
+    })?;
+    let mut longest_edge = None;
+    let mut longest_length = f32::NEG_INFINITY;
+    for corner in 0..face.len() {
+        let first = face[corner];
+        let second = face[(corner + 1) % face.len()];
+        let length = skin_float_distance_squared(points[first], points[second]);
+        if length > longest_length {
+            longest_length = length;
+            longest_edge = Some((first, second));
+        }
+    }
+    let (first, second) = longest_edge.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "Skin triangular target face has no edge",
+        )
+    })?;
+    let a = points[first];
+    let b = points[second];
+    let midpoint = DVec3::new(
+        ((a.x as f32 + b.x as f32) * 0.5) as f64,
+        ((a.y as f32 + b.y as f32) * 0.5) as f64,
+        ((a.z as f32 + b.z as f32) * 0.5) as f64,
+    );
+    let mut midpoint_origin = std::collections::BTreeMap::<usize, f64>::new();
+    for &(source, weight) in &origins[first] {
+        *midpoint_origin.entry(source).or_default() += weight * 0.5;
+    }
+    for &(source, weight) in &origins[second] {
+        *midpoint_origin.entry(source).or_default() += weight * 0.5;
+    }
+    let midpoint_index = points.len();
+    points.push(midpoint);
+    origins.push(midpoint_origin.into_iter().collect());
+
+    let split_edge = ordered_edge(first, second);
+    let mut found_edge = false;
+    for face in faces {
+        let mut subdivided = Vec::with_capacity(face.len() + 1);
+        for corner in 0..face.len() {
+            let current = face[corner];
+            let next = face[(corner + 1) % face.len()];
+            subdivided.push(current);
+            if ordered_edge(current, next) == split_edge {
+                subdivided.push(midpoint_index);
+                found_edge = true;
+            }
+        }
+        if subdivided.len() != face.len() {
+            *face = subdivided;
+        }
+    }
+    if !found_edge {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "Skin target face subdivision edge disappeared",
+        ));
+    }
+    Ok(())
+}
+
+fn append_welded_face(faces: &mut Vec<Vec<usize>>, corners: [usize; 4]) {
+    let mut face = Vec::with_capacity(4);
+    for vertex in corners {
+        if face.last() != Some(&vertex) {
+            face.push(vertex);
+        }
+    }
+    if face.first() == face.last() {
+        face.pop();
+    }
+    if face.len() < 3
+        || face
+            .iter()
+            .enumerate()
+            .any(|(index, vertex)| face[..index].contains(vertex))
     {
-        u = (points[*second] - center).normalize_or_zero();
+        return;
     }
-    let v = normal.cross(u).normalize_or_zero();
-    let mut projected: Vec<(f64, f64, usize)> = coplanar
-        .iter()
-        .map(|vertex| {
-            let relative = points[*vertex] - center;
-            (relative.dot(u), relative.dot(v), *vertex)
-        })
-        .collect();
-    projected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
-    let turn = |a: (f64, f64, usize), b: (f64, f64, usize), c: (f64, f64, usize)| {
-        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
-    };
-    let mut boundary = Vec::with_capacity(projected.len() * 2);
-    for point in &projected {
-        while boundary.len() >= 2
-            && turn(
-                projected[boundary[boundary.len() - 2]],
-                projected[boundary[boundary.len() - 1]],
-                *point,
-            ) <= 1.0e-12
-        {
-            boundary.pop();
+    faces.push(face);
+}
+
+fn skin_hole_target_face(
+    points: &[DVec3],
+    faces: &[Vec<usize>],
+    frame: [usize; 4],
+) -> Option<usize> {
+    let frame_center = skin_frame_center(points, frame);
+    let frame_normal = skin_float_normalize(skin_float_cross(
+        skin_float_sub(
+            skin_float_point(points[frame[3]]),
+            skin_float_point(points[frame[1]]),
+        ),
+        skin_float_sub(
+            skin_float_point(points[frame[2]]),
+            skin_float_point(points[frame[0]]),
+        ),
+    ));
+    let mut isect_target = None;
+    let mut center_target = None;
+    let mut best_isect_distance = f32::MAX;
+    let mut best_center_distance = f32::MAX;
+
+    for (face_index, face) in faces.iter().enumerate() {
+        if let Some(&first) = face.first() {
+            let mut previous = first;
+            for &vertex in face.iter().skip(1) {
+                if previous != first
+                    && let Some(distance) = skin_ray_triangle(
+                        frame_center,
+                        frame_normal,
+                        skin_float_point(points[first]),
+                        skin_float_point(points[previous]),
+                        skin_float_point(points[vertex]),
+                    )
+                    && distance < best_isect_distance
+                {
+                    isect_target = Some(face_index);
+                    best_isect_distance = distance;
+                }
+                previous = vertex;
+            }
         }
-        boundary.push(*point);
-    }
-    let lower_len = boundary.len();
-    for point in projected.iter().rev().skip(1) {
-        while boundary.len() > lower_len
-            && turn(
-                projected[boundary[boundary.len() - 2]],
-                projected[boundary[boundary.len() - 1]],
-                *point,
-            ) <= 1.0e-12
-        {
-            boundary.pop();
+
+        let mut face_center = [0.0; 3];
+        for &vertex in face {
+            face_center = skin_float_add(face_center, skin_float_point(points[vertex]));
         }
-        boundary.push(*point);
+        for component in &mut face_center {
+            *component /= face.len() as f32;
+        }
+        let distance = skin_float_length(skin_float_sub(frame_center, face_center));
+        if distance < best_center_distance {
+            center_target = Some(face_index);
+            best_center_distance = distance;
+        }
     }
-    if boundary.len() > 1 {
-        boundary.pop();
+
+    if isect_target.is_none() || best_center_distance < best_isect_distance / 2.0 {
+        center_target
+    } else {
+        isect_target
     }
-    let mut result: Vec<usize> = boundary.into_iter().map(|point| point.2).collect();
-    let start_id = coplanar.iter().copied().min().unwrap_or(first);
-    if let Some(start) = result.iter().position(|vertex| *vertex == start_id) {
-        result.rotate_left(start);
+}
+
+fn skin_choose_quad_bridge_order(
+    points: &[DVec3],
+    target: &[usize],
+    frame: [usize; 4],
+) -> [usize; 4] {
+    let mut best = [0; 4];
+    let mut shortest = f32::MAX;
+    for reversed in 0..2 {
+        for rotation in 0..4 {
+            let mut order = [0; 4];
+            for corner in 0..4 {
+                order[corner] = if reversed == 0 {
+                    (corner + rotation) % 4
+                } else {
+                    3 - ((corner + rotation) % 4)
+                };
+            }
+            let mut length = 0.0;
+            for corner in 0..4 {
+                length += skin_float_distance_squared(
+                    points[target[corner]],
+                    points[frame[order[corner]]],
+                );
+            }
+            if length < shortest {
+                shortest = length;
+                best = order;
+            }
+        }
     }
-    result
+    best
+}
+
+fn skin_ray_triangle(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    v0: [f32; 3],
+    v1: [f32; 3],
+    v2: [f32; 3],
+) -> Option<f32> {
+    let edge1 = skin_float_sub(v1, v0);
+    let edge2 = skin_float_sub(v2, v0);
+    let p = skin_float_cross(direction, edge2);
+    let determinant = skin_float_dot(edge1, p);
+    if determinant > -1.0e-8 && determinant < 1.0e-8 {
+        return None;
+    }
+    let inverse = 1.0 / determinant;
+    let s = skin_float_sub(origin, v0);
+    let u = inverse * skin_float_dot(s, p);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = skin_float_cross(s, edge1);
+    let v = inverse * skin_float_dot(direction, q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let distance = inverse * skin_float_dot(edge2, q);
+    (distance >= 0.0).then_some(distance)
+}
+
+fn skin_frame_center(points: &[DVec3], frame: [usize; 4]) -> [f32; 3] {
+    let mut center = skin_float_add(
+        skin_float_point(points[frame[0]]),
+        skin_float_point(points[frame[1]]),
+    );
+    center = skin_float_add(center, skin_float_point(points[frame[2]]));
+    center = skin_float_add(center, skin_float_point(points[frame[3]]));
+    center.map(|component| component * 0.25)
+}
+
+fn skin_float_point(point: DVec3) -> [f32; 3] {
+    [point.x as f32, point.y as f32, point.z as f32]
+}
+
+fn skin_float_add(first: [f32; 3], second: [f32; 3]) -> [f32; 3] {
+    [
+        first[0] + second[0],
+        first[1] + second[1],
+        first[2] + second[2],
+    ]
+}
+
+fn skin_float_sub(first: [f32; 3], second: [f32; 3]) -> [f32; 3] {
+    [
+        first[0] - second[0],
+        first[1] - second[1],
+        first[2] - second[2],
+    ]
+}
+
+fn skin_float_cross(first: [f32; 3], second: [f32; 3]) -> [f32; 3] {
+    [
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    ]
+}
+
+fn skin_float_dot(first: [f32; 3], second: [f32; 3]) -> f32 {
+    first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
+}
+
+fn skin_float_distance_squared(first: DVec3, second: DVec3) -> f32 {
+    let difference = skin_float_sub(skin_float_point(first), skin_float_point(second));
+    skin_float_dot(difference, difference)
+}
+
+fn skin_float_length(vector: [f32; 3]) -> f32 {
+    skin_float_dot(vector, vector).sqrt()
+}
+
+fn skin_float_normalize(vector: [f32; 3]) -> [f32; 3] {
+    let length = skin_float_length(vector);
+    if length == 0.0 {
+        [0.0; 3]
+    } else {
+        [vector[0] / length, vector[1] / length, vector[2] / length]
+    }
 }
 
 
@@ -1139,11 +1473,4 @@ fn skin_radius(
         ));
     }
     Ok([first, second])
-}
-fn unsupported_skin(modifier: &Modifier, feature: &str, message: &str) -> PotError {
-    PotError::with_details(
-        ErrorCode::UnsupportedFeature,
-        message,
-        serde_json::json!({"feature_id": format!("modifier.skin.{feature}"), "modifier_id": modifier.id}),
-    )
 }

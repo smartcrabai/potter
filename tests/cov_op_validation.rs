@@ -850,7 +850,7 @@ fn solve_object_accepts_the_four_track_boundary_and_persists_a_valid_solve() {
 }
 
 #[test]
-fn modifier_apply_reports_shape_key_and_unsupported_failures() {
+fn modifier_apply_reports_shape_key_failures() {
     let cases = [
         invalid_case(
             "shape keys guard modifier application",
@@ -863,17 +863,6 @@ fn modifier_apply_reports_shape_key_and_unsupported_failures() {
             "UNSUPPORTED_FEATURE",
             None,
             Some("modifier.apply.shape_key_guard"),
-        ),
-        invalid_case(
-            "skin adjacent branch hulls require topology repair",
-            json!([
-                {"op":"node.create","id":"skeleton","kind":"box","params":{"size":1.0}},
-                {"op":"modifier.create","target":{"id":"skeleton"},"id":"skin","type":"skin","params":{}}
-            ]),
-            json!({"op":"modifier.apply","target":{"id":"skeleton"},"modifier_id":"skin"}),
-            "UNSUPPORTED_FEATURE",
-            None,
-            Some("modifier.skin.branch_hull_topology_repair"),
         ),
     ];
     run_invalid_cases(&cases);
@@ -903,4 +892,29 @@ fn modifier_apply_commits_topology_changes_and_removes_the_applied_modifier() {
     let mesh = document.data_blocks[data_id].mesh.as_ref().unwrap();
     assert_eq!(mesh.faces.len(), 2);
     assert!(mesh.faces.iter().all(|face| face.vertices.len() == 3));
+}
+
+#[test]
+fn modifier_apply_evaluates_adjacent_skin_branch_hulls() {
+    let (_directory, scene) = setup_scene(&json!([
+        {"op":"node.create","id":"skeleton","kind":"box","params":{"size":1.0}},
+        {"op":"modifier.create","target":{"id":"skeleton"},"id":"skin","type":"skin","params":{}}
+    ]));
+    let output = apply(
+        &scene,
+        1,
+        &json!([{"op":"modifier.apply","target":{"id":"skeleton"},"modifier_id":"skin"}]),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document: SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let node = &document.nodes[&Id::new("skeleton").unwrap()];
+    assert!(node.modifiers.is_empty(), "{:?}", node.modifiers);
+    let data_id = node.data.as_ref().unwrap();
+    let mesh = document.data_blocks[data_id].mesh.as_ref().unwrap();
+    assert!(!mesh.faces.is_empty());
 }
