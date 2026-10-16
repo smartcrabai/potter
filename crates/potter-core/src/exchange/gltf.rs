@@ -3392,7 +3392,6 @@ fn preserve_vrm0_expression_variants(
 }
 fn preserve_vrm_material_variants(
     version: AvatarVersion,
-    doc: &SceneDoc,
     surfaces: &BTreeMap<Id, ResolvedSurface>,
     avatar: &AvatarSettings,
     material_indices: &BTreeMap<Id, usize>,
@@ -4623,7 +4622,6 @@ fn export_with_root_inner(
         )?;
         preserve_vrm_material_variants(
             version,
-            doc,
             &surfaces,
             avatar,
             &material_indices,

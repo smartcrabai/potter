@@ -982,7 +982,7 @@ pub(crate) fn uv_texture_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss
         .filter_map(|((material, layer, node, slot), render_layer)| {
             render_layer.is_none().then_some(Loss {
                 feature_id: "uv.layer_missing".to_owned(),
-                data_id: Some(material.clone()),
+                data_id: Some(material.to_string()),
                 reason: match layer {
                     Some(layer) => format!(
                         "material `{material}` samples UV layer `{layer}`, which node `{node}` does not have for slot {slot} and has no render layer to fall back to"

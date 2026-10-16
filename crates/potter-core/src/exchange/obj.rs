@@ -329,23 +329,34 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                 json!({ "path": path.display().to_string() }),
             ));
         }
+        let has_uvs = !uvs.is_empty();
         meshes = declared
             .into_iter()
             .enumerate()
-            .map(|(index, name)| ExchangeMesh {
-                id: format!("object_{index}"),
-                name: if name.is_empty() {
-                    format!("Object {index}")
+            .map(|(index, name)| {
+                let (uv_layers, uv_active, uv_render) = if has_uvs {
+                    single_uv_set(Vec::new())
                 } else {
-                    name
-                },
-                positions: Vec::new(),
-                faces: Vec::new(),
-                normals: None,
-                mirrored: false,
-                singular: false,
-                vertex_normals: Vec::new(),
-                smooth: Vec::new(),
+                    (Vec::new(), None, None)
+                };
+                ExchangeMesh {
+                    id: format!("object_{index}"),
+                    name: if name.is_empty() {
+                        format!("Object {index}")
+                    } else {
+                        name
+                    },
+                    positions: Vec::new(),
+                    faces: Vec::new(),
+                    normals: None,
+                    mirrored: false,
+                    singular: false,
+                    vertex_normals: Vec::new(),
+                    smooth: Vec::new(),
+                    uv_layers,
+                    uv_active,
+                    uv_render,
+                }
             })
             .collect();
     }
@@ -531,6 +542,23 @@ mod tests {
             assert!((read[0] - written[0]).abs() < 1.0e-6);
             assert!((read[1] - written[1]).abs() < 1.0e-6);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_declared_object_keeps_uv_metadata_when_texture_coordinates_exist() -> Result<()> {
+        let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
+        fs::write(file.path(), "o empty\nvt 0.25\n").map_err(|error| PotError::io(&error))?;
+        let (meshes, _) = import(file.path())?;
+        let mesh = meshes
+            .first()
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "OBJ object is missing"))?;
+        assert!(mesh.faces.is_empty());
+        assert_eq!(mesh.uv_layers.len(), 1);
+        assert_eq!(mesh.uv_layers[0].name, "UVMap");
+        assert!(mesh.uv_layers[0].corners.is_empty());
+        assert_eq!(mesh.uv_active, Some(0));
+        assert_eq!(mesh.uv_render, Some(0));
         Ok(())
     }
 }
