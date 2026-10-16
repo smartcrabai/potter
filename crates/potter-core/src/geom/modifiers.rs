@@ -77,6 +77,84 @@ impl MergedGeometry {
 const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
+/// Build Blender's shrinkwrap space pair with its f32 matrix operation order.
+pub(crate) fn blender_space_transform_f32(
+    local: DMat4,
+    target: DMat4,
+) -> ([f32; 16], [f32; 16]) {
+    let local = local.to_cols_array().map(|value| value as f32);
+    let target = target.to_cols_array().map(|value| value as f32);
+    let inverse_target = blender_inverse_m4(target);
+    let local_to_target = blender_multiply_m4(inverse_target, local);
+    let target_to_local = blender_inverse_m4(local_to_target);
+    (local_to_target, target_to_local)
+}
+
+/// Apply Blender's column-major C transform expression to an f32 point.
+pub(crate) fn blender_transform_point_f32(matrix: &[f32; 16], point: glam::Vec3) -> glam::Vec3 {
+    glam::Vec3::new(
+        point.x * matrix[0] + point.y * matrix[4] + matrix[8] * point.z + matrix[12],
+        point.x * matrix[1] + point.y * matrix[5] + matrix[9] * point.z + matrix[13],
+        point.x * matrix[2] + point.y * matrix[6] + matrix[10] * point.z + matrix[14],
+    )
+}
+
+
+fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+    let mut result = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            result[column * 4 + row] = right[column * 4] * left[row]
+                + right[column * 4 + 1] * left[4 + row]
+                + right[column * 4 + 2] * left[8 + row]
+                + right[column * 4 + 3] * left[12 + row];
+        }
+    }
+    result
+}
+
+fn blender_cofactor_4x4(matrix: &[f32; 16], row: usize, column: usize) -> f32 {
+    let i1 = (row + 1) % 4;
+    let i2 = (row + 2) % 4;
+    let i3 = (row + 3) % 4;
+    let j1 = (column + 1) % 4;
+    let j2 = (column + 2) % 4;
+    let j3 = (column + 3) % 4;
+    let det3 = |i1, i2, i3, j1, j2, j3| {
+        matrix[j1 * 4 + i1]
+            * (matrix[j2 * 4 + i2] * matrix[j3 * 4 + i3]
+                - matrix[j3 * 4 + i2] * matrix[j2 * 4 + i3])
+    };
+    det3(i1, i2, i3, j1, j2, j3)
+        + det3(i2, i3, i1, j1, j2, j3)
+        + det3(i3, i1, i2, j1, j2, j3)
+}
+
+pub(crate) fn blender_inverse_m4(matrix: [f32; 16]) -> [f32; 16] {
+    let mut result = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            let cofactor = blender_cofactor_4x4(&matrix, column, row);
+            result[column * 4 + row] = if (row + column) & 1 == 0 {
+                cofactor
+            } else {
+                -cofactor
+            };
+        }
+    }
+    let determinant = matrix[0] * result[0]
+        + matrix[1] * result[4]
+        + matrix[2] * result[8]
+        + matrix[3] * result[12];
+    if determinant == 0.0 || !determinant.is_finite() {
+        return [0.0; 16];
+    }
+    for value in &mut result {
+        *value /= determinant;
+    }
+    result
+}
+
 /// Result of evaluating a modifier stack, including realized graph instance paths.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModifierEvaluation {
