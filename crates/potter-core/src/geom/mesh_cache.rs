@@ -340,7 +340,14 @@ fn apply_cache_attributes(
         for layer in uv_layers {
             check_cache_uv_layer(mesh, modifier, layer)?;
         }
-        write_cache_uvs(mesh, modifier, uv_layers, warnings)?;
+        write_cache_uvs(
+            mesh,
+            modifier,
+            uv_layers,
+            sample.canonical_uv_layer.as_deref(),
+            read.polygons,
+            warnings,
+        )?;
     }
     if read.color {
         let mut store = color_layers::read(mesh);
@@ -440,6 +447,8 @@ fn write_cache_uvs(
     mesh: &mut Mesh,
     modifier: &Modifier,
     cached: &[ExchangeUvLayer],
+    canonical_uv_layer: Option<&str>,
+    read_polygons: bool,
     warnings: &mut Vec<PotError>,
 ) -> Result<()> {
     if cached.is_empty() {
@@ -447,10 +456,19 @@ fn write_cache_uvs(
     }
     let mut layers = uv_layers::read_layers(mesh);
     for cached_layer in cached {
-        let index = match layers
+        let existing = layers
             .iter()
-            .position(|layer| layer.name == cached_layer.name)
+            .position(|layer| layer.name == cached_layer.name);
+        // Blender streams arbitrary UV GeomParams with the UV flag; the canonical `.geom/uv`
+        // layer is populated only by the POLY path. Preserve an existing canonical layer, or
+        // materialize its zero row on a new mesh as Blender does.
+        if !read_polygons
+            && canonical_uv_layer == Some(cached_layer.name.as_str())
+            && existing.is_some()
         {
+            continue;
+        }
+        let index = match existing {
             Some(index) => index,
             None if layers.len() < uv_layers::MAX_LAYERS => {
                 layers.push(UvLayer::new(

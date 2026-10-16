@@ -2559,6 +2559,8 @@ pub(crate) struct MeshCacheSample {
     pub faces: Vec<Vec<usize>>,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
+    /// Canonical `.geom/uv` layer; Blender leaves it unchanged for UV-only reads without POLY.
+    pub canonical_uv_layer: Option<String>,
     pub normals: Option<Vec<[f64; 3]>>,
     pub colors: Vec<MeshCacheColor>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
@@ -2567,8 +2569,8 @@ pub(crate) struct MeshCacheSample {
 /// Read a `PolyMesh`'s evaluated attributes and time samples from an Ogawa archive.
 ///
 /// The object path is an Alembic path, including the archive's virtual `root` segment.
-/// `read_uv`, `read_color`, and `velocity_name` avoid decoding unrequested geometric parameters.
-/// Each UV `GeomParam` becomes one layer, named by its `sourceName` or its own name.
+/// `read_polygons` controls topology-normal and canonical-UV values; UV-only reads stream the
+/// named custom UV parameters, leaving an existing canonical UV layer unchanged.
 ///
 /// # Errors
 ///
@@ -2582,7 +2584,7 @@ pub(crate) fn read_mesh_cache(
     object_path: &str,
     read_uv: bool,
     read_color: bool,
-    read_normals: bool,
+    read_polygons: bool,
     velocity_name: &str,
 ) -> Result<Vec<MeshCacheSample>> {
     let archive = parse_archive(bytes)?;
@@ -2627,7 +2629,14 @@ pub(crate) fn read_mesh_cache(
         Vec::new()
     };
     let uv_names = uv_layer_names(&uv);
-    let normals = read_normals
+    let canonical_uv_index = property(&geom.children, "uv")
+        .filter(|parameter| is_uv_geomparam(parameter))
+        .and_then(|canonical| {
+            uv.iter()
+                .position(|parameter| std::ptr::eq(*parameter, canonical))
+        });
+    let canonical_uv_layer = canonical_uv_index.and_then(|index| uv_names.get(index).cloned());
+    let normals = read_polygons
         .then(|| property(&geom.children, "N"))
         .flatten();
     let color_params = if read_color {
@@ -2735,20 +2744,29 @@ pub(crate) fn read_mesh_cache(
                 uv.iter()
                     .copied()
                     .zip(&uv_names)
-                    .map(|(parameter, name)| -> Result<ExchangeUvLayer> {
-                        let values = geomparam_values_property(parameter)?;
-                        validate_cache_parameter_samples(values, sample_count)?;
-                        let (scope, tuples) = geomparam_values(
-                            bytes,
-                            parameter,
-                            &geometry_sample,
-                            2,
-                            sample_slot(values, sample_index),
-                        )?;
-                        let corners = cache_uv_faces(&file_faces, &scope, &tuples)?
-                            .into_iter()
-                            .map(uv_to_storage)
-                            .collect();
+                    .enumerate()
+                    .map(|(index, (parameter, name))| -> Result<ExchangeUvLayer> {
+                        let corners: Vec<Vec<[f64; 2]>> =
+                            if canonical_uv_index == Some(index) && !read_polygons {
+                                file_faces
+                                    .iter()
+                                    .map(|face| vec![[0.0, 0.0]; face.len()])
+                                    .collect()
+                            } else {
+                                let values = geomparam_values_property(parameter)?;
+                                validate_cache_parameter_samples(values, sample_count)?;
+                                let (scope, tuples) = geomparam_values(
+                                    bytes,
+                                    parameter,
+                                    &geometry_sample,
+                                    2,
+                                    sample_slot(values, sample_index),
+                                )?;
+                                cache_uv_faces(&file_faces, &scope, &tuples)?
+                                    .into_iter()
+                                    .map(uv_to_storage)
+                                    .collect()
+                            };
                         Ok(ExchangeUvLayer {
                             name: name.clone(),
                             corners,
@@ -2846,6 +2864,7 @@ pub(crate) fn read_mesh_cache(
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,
+            canonical_uv_layer: canonical_uv_layer.clone(),
             normals: cache_normals,
             colors,
             velocities,

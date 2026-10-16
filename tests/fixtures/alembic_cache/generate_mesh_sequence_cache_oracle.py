@@ -11,6 +11,8 @@ The script writes, next to itself:
   colors, corner custom normals, a `velocity` point attribute from Geometry Nodes, and a non-trivial
   object transform). Frame k holds exactly the positions `P[k]` through shape key `K<k>`.
 - `topo.abc`: `/TopoSource`, a cube whose faces are triangulated from frame 3 on (topology change).
+- `uv_only.abc`: static `/UvOnly` PolyMesh with one asymmetric face-corner UV layer for the
+  independent UV-only MeshSequenceCache case.
 - `seq.000<k>.abc`: one single-frame file per frame of `/Animated` for `is_sequence` cases.
 - `oracle.json`: per case, the CacheFile settings, the modifier settings, and the evaluated mesh of
   each frame (local positions, faces in Blender loop order, corner normals, custom-normal flag and
@@ -32,6 +34,7 @@ FPS = 24
 # Blender writes each Alembic object as an Xform with the PolyMesh as its child of the same name.
 ANIMATED_PATH = "/Animated/Animated"
 TOPO_PATH = "/TopoSource/TopoSource"
+UV_ONLY_PATH = "/UvOnly/UvOnly"
 FRAMES = [1, 2, 3, 4]
 
 REST = [
@@ -156,24 +159,6 @@ def build_animated():
         for value_frame in FRAMES:
             key.value = 1.0 if value_frame == frame else 0.0
             key.keyframe_insert("value", frame=value_frame)
-    uv_values = [
-        ("Base", [
-            (0.137, 0.223), (0.619, 0.357), (0.283, 0.881), (0.947, 0.569),
-            (0.731, 0.163), (0.194, 0.907), (0.853, 0.421),
-            (0.367, 0.689), (0.521, 0.241), (0.063, 0.773), (0.917, 0.487),
-        ]),
-        ("Light", [
-            (0.731, 0.163), (0.194, 0.907), (0.853, 0.421), (0.367, 0.689),
-            (0.137, 0.223), (0.619, 0.357), (0.283, 0.881), (0.947, 0.569),
-            (0.861, 0.147), (0.293, 0.953), (0.742, 0.312),
-        ]),
-    ]
-    for layer_name, corners in uv_values:
-        layer = mesh.uv_layers.new(name=layer_name)
-        for item, uv in zip(layer.data, corners):
-            item.uv = uv
-    mesh.uv_layers.active_index = mesh.uv_layers.find("Light")
-    mesh.uv_layers.active_render_index = 0
     # Corner custom normals (asymmetric, not normalized on input) and colors.
     loops = len(mesh.loops)
     normals = []
@@ -209,7 +194,30 @@ def build_animated():
     return obj
 
 
-def export_selected(obj, path, start, end):
+def build_uv_only():
+    obj = new_object("UvOnly", REST, FACES)
+    uv_values = [
+        ("Base", [
+            (0.137, 0.223), (0.619, 0.357), (0.283, 0.881), (0.947, 0.569),
+            (0.731, 0.163), (0.194, 0.907), (0.853, 0.421),
+            (0.367, 0.689), (0.521, 0.241), (0.063, 0.773), (0.917, 0.487),
+        ]),
+        ("Light", [
+            (0.731, 0.163), (0.194, 0.907), (0.853, 0.421), (0.367, 0.689),
+            (0.137, 0.223), (0.619, 0.357), (0.283, 0.881), (0.947, 0.569),
+            (0.861, 0.147), (0.293, 0.953), (0.742, 0.312),
+        ]),
+    ]
+    for name, corners in uv_values:
+        layer = obj.data.uv_layers.new(name=name)
+        for item, uv in zip(layer.data, corners):
+            item.uv = uv
+    obj.data.uv_layers.active_index = obj.data.uv_layers.find("Light")
+    obj.data.uv_layers.active_render_index = 0
+    return obj
+
+
+def export_selected(obj, path, start, end, *, uvs=False):
     # The exporter samples the current frame for single-frame ranges, so start there explicitly.
     bpy.context.scene.frame_set(start)
     bpy.ops.object.select_all(action="DESELECT")
@@ -220,7 +228,7 @@ def export_selected(obj, path, start, end):
         selected=True,
         start=start,
         end=end,
-        uvs=True,
+        uvs=uvs,
         normals=True,
         vcolors=True,
         orcos=False,
@@ -344,11 +352,19 @@ def main():
     animated = build_animated()
     topo = new_object("TopoSource", CUBE_VERTS, CUBE_FACES)
     add_velocity_and_topology_nodes(topo, "TopoGraph", triangulate_from=2.5)
+    uv_only = build_uv_only()
 
     export_selected(animated, os.path.join(OUT, "animated.abc"), FRAMES[0], FRAMES[-1])
     export_selected(topo, os.path.join(OUT, "topo.abc"), FRAMES[0], FRAMES[-1])
     for frame in FRAMES:
         export_selected(animated, os.path.join(OUT, f"seq.{frame:04d}.abc"), frame, frame)
+    export_selected(
+        uv_only,
+        os.path.join(OUT, "uv_only.abc"),
+        FRAMES[0],
+        FRAMES[-1],
+        uvs=True,
+    )
 
     # Remove the source objects; receivers are created below from fresh meshes.
     for obj in list(bpy.data.objects):
@@ -357,6 +373,7 @@ def main():
     animated_path = os.path.join(OUT, "animated.abc")
     topo_path = os.path.join(OUT, "topo.abc")
     seq_path = os.path.join(OUT, "seq.0001.abc")
+    uv_only_path = os.path.join(OUT, "uv_only.abc")
 
     def receiver(name, verts, faces):
         return new_object(name, verts, faces)
@@ -422,7 +439,7 @@ def main():
         {}, {"read_data": ["VERT", "POLY"]}, [1, 3],
     ))
     cases.append(run_case(
-        "read_uv_only", same_topology(), animated_path, ANIMATED_PATH,
+        "read_uv_only", same_topology(), uv_only_path, UV_ONLY_PATH,
         {}, {"read_data": ["UV"]}, [1, 3],
     ))
     cases.append(run_case(
