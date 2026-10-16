@@ -2543,22 +2543,31 @@ fn import_polymesh(
     Ok(mesh)
 }
 
+/// One decoded named color parameter in a Blender Alembic mesh sample.
+#[derive(Clone, Debug)]
+pub(crate) struct MeshCacheColor {
+    pub name: String,
+    pub scope: String,
+    pub values: Vec<Vec<f64>>,
+}
+
 /// Decoded time sample used by Blender's Alembic mesh cache modifier.
 #[derive(Clone, Debug)]
 pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
-    /// Every UV layer of the sample, in file order, named as Blender names it.
+    /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
-    pub colors: Option<(String, Vec<Vec<f64>>)>,
+    pub normals: Option<Vec<[f64; 3]>>,
+    pub colors: Vec<MeshCacheColor>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
 }
 
 /// Read a `PolyMesh`'s evaluated attributes and time samples from an Ogawa archive.
 ///
 /// The object path is an Alembic path, including the archive's virtual `root` segment.
-/// `read_uv` and `read_color` avoid decoding unrequested geometric parameters.
+/// `read_uv`, `read_color`, and `velocity_name` avoid decoding unrequested geometric parameters.
 /// Each UV `GeomParam` becomes one layer, named by its `sourceName` or its own name.
 ///
 /// # Errors
@@ -2573,7 +2582,8 @@ pub(crate) fn read_mesh_cache(
     object_path: &str,
     read_uv: bool,
     read_color: bool,
-    read_velocity: bool,
+    read_normals: bool,
+    velocity_name: &str,
 ) -> Result<Vec<MeshCacheSample>> {
     let archive = parse_archive(bytes)?;
     let object = alembic_object_at_path(&archive.objects, object_path)?;
@@ -2617,13 +2627,41 @@ pub(crate) fn read_mesh_cache(
         Vec::new()
     };
     let uv_names = uv_layer_names(&uv);
-    let color = read_color
-        .then(|| property(&geom.children, "color").or_else(|| property(&geom.children, "Cs")))
+    let normals = read_normals
+        .then(|| property(&geom.children, "N"))
         .flatten();
-    let velocity = read_velocity
-        .then(|| property(&geom.children, "velocities").or_else(|| property(&geom.children, "v")))
-        .flatten()
-        .filter(|parameter| matches!(parameter.property_type, 0 | 2));
+    let color_params = if read_color {
+        geom.children
+            .iter()
+            .find(|property| {
+                property.property_type == 0
+                    && matches!(property.name.as_str(), "arbGeomParams" | ".arbGeomParams")
+            })
+            .map(|properties| {
+                properties
+                    .children
+                    .iter()
+                    .filter(|property| {
+                        property
+                            .metadata
+                            .get("isGeomParam")
+                            .is_some_and(|value| value == "true")
+                            && matches!(
+                                property.metadata.get("interpretation").map(String::as_str),
+                                Some("rgb" | "rgba")
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let velocity = if velocity_name.is_empty() {
+        None
+    } else {
+        find_named_array_property(&object.properties, velocity_name)
+    };
     let mut sample_count = positions
         .sample_count
         .max(counts.sample_count)
@@ -2632,7 +2670,23 @@ pub(crate) fn read_mesh_cache(
         .into_iter()
         .max_by_key(|parameter| parameter.sample_count)
         .ok_or_else(|| import_error("Alembic PolyMesh has no time-sampled properties"))?;
-    for parameter in uv.iter().copied().chain(color).chain(velocity) {
+    for parameter in uv
+        .iter()
+        .copied()
+        .chain([normals, velocity].into_iter().flatten())
+    {
+        let values = geomparam_values_property(parameter)?;
+        sample_count = sample_count.max(values.sample_count);
+        if values.sample_count != 1 && values.sample_count != sample_count {
+            return Err(import_error(
+                "Alembic geom parameter sample counts are inconsistent",
+            ));
+        }
+        if values.sample_count > time_property.sample_count {
+            time_property = values;
+        }
+    }
+    for parameter in &color_params {
         let values = geomparam_values_property(parameter)?;
         sample_count = sample_count.max(values.sample_count);
         if values.sample_count != 1 && values.sample_count != sample_count {
@@ -2668,7 +2722,7 @@ pub(crate) fn read_mesh_cache(
             .collect::<Vec<_>>();
         let face_counts = decode_i32_sample(bytes, counts, face_sample)?;
         let face_indices = decode_i32_sample(bytes, indices, index_sample)?;
-        // Keep cache UVs in file-corner order; the cache modifier reverses them only with polygons.
+        // Keep cache UV rows in file-corner order; the mesh writer reverses each row once.
         let file_faces = decode_faces(&points, &face_counts, &face_indices)?;
         let geometry_sample = MeshSample {
             positions: points.clone(),
@@ -2681,7 +2735,7 @@ pub(crate) fn read_mesh_cache(
                 uv.iter()
                     .copied()
                     .zip(&uv_names)
-                    .map(|(parameter, name)| {
+                    .map(|(parameter, name)| -> Result<ExchangeUvLayer> {
                         let values = geomparam_values_property(parameter)?;
                         validate_cache_parameter_samples(values, sample_count)?;
                         let (scope, tuples) = geomparam_values(
@@ -2703,7 +2757,35 @@ pub(crate) fn read_mesh_cache(
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        let colors = color
+        let cache_normals = normals
+            .map(|parameter| {
+                let values = geomparam_values_property(parameter)?;
+                validate_cache_parameter_samples(values, sample_count)?;
+                let extent = usize::from(values.extent);
+                if extent != 3 {
+                    return Err(unsupported(
+                        "alembic.normal_extent",
+                        format!("Alembic normal extent {extent} is unsupported"),
+                    ));
+                }
+                let (scope, tuples) = geomparam_values(
+                    bytes,
+                    parameter,
+                    &geometry_sample,
+                    extent,
+                    sample_slot(values, sample_index),
+                )?;
+                let corners = normal_corners(&file_faces, &scope, &tuples)?;
+                reverse_corner_runs(&file_faces, corners).map(|corners| {
+                    corners
+                        .into_iter()
+                        .map(|normal| potter_vector(normal.to_array()))
+                        .collect()
+                })
+            })
+            .transpose()?;
+        let colors = color_params
+            .iter()
             .map(|parameter| {
                 let values = geomparam_values_property(parameter)?;
                 validate_cache_parameter_samples(values, sample_count)?;
@@ -2721,10 +2803,14 @@ pub(crate) fn read_mesh_cache(
                     extent,
                     sample_slot(values, sample_index),
                 )?;
-                let tuples = potter_scoped_values(&file_faces, &scope, tuples)?;
-                Ok((scope, tuples))
+                let values = potter_scoped_values(&file_faces, &scope, tuples)?;
+                Ok(MeshCacheColor {
+                    name: parameter.name.clone(),
+                    scope,
+                    values,
+                })
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
         let velocities = velocity
             .map(|parameter| {
                 let values = geomparam_values_property(parameter)?;
@@ -2760,11 +2846,25 @@ pub(crate) fn read_mesh_cache(
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,
+            normals: cache_normals,
             colors,
             velocities,
         });
     }
     Ok(result)
+}
+
+fn find_named_array_property<'a>(
+    properties: &'a [ParsedProperty],
+    name: &str,
+) -> Option<&'a ParsedProperty> {
+    properties.iter().find_map(|property| {
+        if property.name == name && property.property_type == 2 {
+            Some(property)
+        } else {
+            find_named_array_property(&property.children, name)
+        }
+    })
 }
 
 /// Sample the cumulative Alembic Xform world matrix at the requested cache time and spatial scale.

@@ -8,15 +8,13 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    exchange::{
-        ExchangeUvLayer,
-        alembic::{self, MeshCacheSample},
-    },
+    exchange::{ExchangeUvLayer, alembic::{self, MeshCacheSample}},
     model::Modifier,
     params::{self, ParameterFamily},
 };
 
 use super::{
+    clnor::{self, NormalCodeOptions, SetterInput},
     Mesh,
     color_layers::{self, ColorDomain, ColorLayer},
     uv_layers::{self, UvLayer},
@@ -49,6 +47,37 @@ pub(crate) fn evaluate(
     let object_path = string_param(modifier, "object_path")?;
     let frame_offset = number_param(modifier, "frame_offset")?;
     let velocity_scale = number_param(modifier, "velocity_scale")?;
+    let velocity_name = modifier
+        .params
+        .get("velocity_name")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params::default_value(
+                ParameterFamily::Modifier,
+                &modifier.modifier_type,
+                "velocity_name",
+            )
+            .and_then(Value::as_str)
+        })
+        .ok_or_else(|| invalid_parameter(modifier, "velocity_name", "a string"))?;
+    let velocity_unit = modifier
+        .params
+        .get("velocity_unit")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params::default_value(
+                ParameterFamily::Modifier,
+                &modifier.modifier_type,
+                "velocity_unit",
+            )
+            .and_then(Value::as_str)
+        })
+        .unwrap_or("SECOND");
+    let sequence = modifier
+        .params
+        .get("is_sequence")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let override_frame = match modifier.params.get("override_frame") {
         None | Some(Value::Null) => None,
         Some(value) => Some(
@@ -61,7 +90,9 @@ pub(crate) fn evaluate(
         ),
     };
     let interpolate = bool_param(modifier, "use_vertex_interpolation")?;
-    let read = read_params(modifier)?;
+    let requested = override_frame.unwrap_or(frame);
+    let mut read = read_params(modifier)?;
+    let mut warnings = Vec::new();
     let rate = f64::from(fps) / fps_base;
     if !rate.is_finite() || rate <= 0.0 {
         return Err(PotError::with_details(
@@ -70,8 +101,11 @@ pub(crate) fn evaluate(
             json!({"modifier_id":modifier.id,"fps":fps,"fps_base":fps_base}),
         ));
     }
-    let cache_frame = override_frame.unwrap_or(frame);
-    let time_seconds = (cache_frame - frame_offset) / rate;
+    let time_seconds = if sequence {
+        requested
+    } else {
+        (requested - frame_offset) / rate
+    };
     if !time_seconds.is_finite() {
         return Err(PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -79,51 +113,69 @@ pub(crate) fn evaluate(
             json!({"modifier_id":modifier.id,"frame":frame,"time_seconds":time_seconds}),
         ));
     }
-
-    let key = format!(
-        "{resource_hash}\0{object_path}\0{}\0{}\0{}",
-        read.uv,
-        read.color,
-        velocity_scale != 0.0
-    );
-    let samples = {
-        let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "Alembic mesh cache lock is poisoned",
-            )
-        })?;
-        if let Some(samples) = parsed.get(&key) {
-            Arc::clone(samples)
-        } else {
-            let samples = Arc::new(alembic::read_mesh_cache(
-                archive_bytes,
-                object_path,
-                read.uv,
-                read.color,
-                velocity_scale != 0.0,
-            )?);
-            if samples.windows(2).any(|pair| {
-                pair.first()
-                    .zip(pair.get(1))
-                    .is_some_and(|(first, second)| first.time_seconds > second.time_seconds)
-            }) {
-                return Err(PotError::with_details(
-                    ErrorCode::EvaluationFailed,
-                    "Alembic mesh cache sample times are not ordered",
-                    json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
-                ));
-            }
-            parsed.insert(key, Arc::clone(&samples));
-            samples
-        }
+    let velocity_factor = if velocity_unit == "FRAME" {
+        velocity_scale * rate
+    } else if velocity_unit == "SECOND" {
+        velocity_scale
+    } else {
+        return Err(invalid_parameter(
+            modifier,
+            "velocity_unit",
+            "FRAME or SECOND",
+        ));
     };
+    let mut samples = cached_mesh_cache_samples(
+        archive_bytes,
+        resource_hash,
+        resource,
+        object_path,
+        read,
+        velocity_name,
+        velocity_factor != 0.0,
+        modifier,
+    )?;
     if samples.is_empty() {
         return Err(PotError::with_details(
             ErrorCode::EvaluationFailed,
             "Alembic PolyMesh has no samples",
             json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
         ));
+    }
+    let topology_changed = {
+        let sample = sample_at_time(&samples, time_seconds, interpolate).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic PolyMesh has no samples",
+                json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+            )
+        })?;
+        mesh.vertices.len() != sample.sample.positions.len()
+            || !topology_matches(mesh, &sample.sample.faces)
+    };
+    if topology_changed {
+        read = ReadAttributes {
+            vertices: true,
+            polygons: true,
+            uv: true,
+            color: true,
+        };
+        samples = cached_mesh_cache_samples(
+            archive_bytes,
+            resource_hash,
+            resource,
+            object_path,
+            read,
+            velocity_name,
+            velocity_factor != 0.0,
+            modifier,
+        )?;
+        if samples.is_empty() {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic PolyMesh has no samples",
+                json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+            ));
+        }
     }
     let sample = sample_at_time(&samples, time_seconds, interpolate).ok_or_else(|| {
         PotError::with_details(
@@ -132,66 +184,122 @@ pub(crate) fn evaluate(
             json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
         )
     })?;
-    if (!read.vertices || !read.polygons) && mesh.vertices.len() != sample.sample.positions.len() {
-        return Err(PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "Alembic vertex count does not match the input mesh when topology replacement is disabled",
-            json!({
-                "modifier_id":modifier.id,
-                "resource":resource,
-                "object_path":object_path,
-                "input_vertex_count":mesh.vertices.len(),
-                "cache_vertex_count":sample.sample.positions.len(),
-                "read_vertices":read.vertices,
-                "read_polygons":read.polygons,
-            }),
-        ));
-    }
-    let mut warnings = Vec::new();
-    if !read.polygons {
-        if read.vertices {
-            for (index, vertex) in mesh.vertices.iter_mut().enumerate() {
-                vertex.co = evaluated_position(&sample, index, modifier)?;
-            }
-        }
+    if topology_changed {
+        let positions = sample
+            .sample
+            .positions
+            .iter()
+            .enumerate()
+            .map(|(index, _)| evaluated_position(&sample, index, modifier))
+            .collect::<Result<Vec<_>>>()?;
+        let mut evaluated = Mesh::from_positions_and_faces(positions, sample.sample.faces.clone())
+            .map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "Alembic cache topology is invalid for the selected vertex sample",
+                    json!({"modifier_id":modifier.id,"reason":error.to_string()}),
+                )
+            })?;
+        carry_uv_store(mesh, &mut evaluated);
         apply_cache_attributes(
-            mesh,
+            &mut evaluated,
             sample.sample,
             read,
-            velocity_scale,
+            velocity_factor,
             modifier,
             &mut warnings,
         )?;
-        validate_cache_output(mesh, modifier)?;
+        validate_cache_output(&evaluated, modifier)?;
+        *mesh = evaluated;
         return Ok(warnings);
     }
-    let positions = if read.vertices {
-        (0..sample.sample.positions.len())
-            .map(|index| evaluated_position(&sample, index, modifier))
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        mesh.vertices.iter().map(|vertex| vertex.co).collect()
-    };
-    let mut evaluated = Mesh::from_positions_and_faces(positions, sample.sample.faces.clone())
-        .map_err(|error| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "Alembic cache topology is invalid for the selected vertex sample",
-                json!({"modifier_id":modifier.id,"reason":error.to_string()}),
-            )
-        })?;
-    carry_uv_store(mesh, &mut evaluated);
+    if read.vertices {
+        for (index, vertex) in mesh.vertices.iter_mut().enumerate() {
+            vertex.co = evaluated_position(&sample, index, modifier)?;
+        }
+    }
     apply_cache_attributes(
-        &mut evaluated,
+        mesh,
         sample.sample,
         read,
-        velocity_scale,
+        velocity_factor,
         modifier,
         &mut warnings,
     )?;
-    validate_cache_output(&evaluated, modifier)?;
-    *mesh = evaluated;
+    validate_cache_output(mesh, modifier)?;
     Ok(warnings)
+}
+
+fn topology_matches(mesh: &Mesh, cache_faces: &[Vec<usize>]) -> bool {
+    let corner_count = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+    if mesh.vertices.len() == 0
+        || mesh.faces.len() != cache_faces.len()
+        || corner_count != cache_faces.iter().map(Vec::len).sum::<usize>()
+    {
+        return false;
+    }
+    let indices = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<HashMap<_, _>>();
+    mesh.faces.iter().zip(cache_faces).all(|(face, cache_face)| {
+        face.vertices.len() == cache_face.len()
+            && face.vertices.iter().zip(cache_face).all(|(id, index)| {
+                indices.get(id).is_some_and(|mesh_index| mesh_index == index)
+            })
+    })
+}
+
+fn cached_mesh_cache_samples(
+    archive_bytes: &[u8],
+    resource_hash: &str,
+    resource: &str,
+    object_path: &str,
+    read: ReadAttributes,
+    velocity_name: &str,
+    read_velocity: bool,
+    modifier: &Modifier,
+) -> Result<Arc<Vec<MeshCacheSample>>> {
+    let velocity_parameter = if read_velocity { velocity_name } else { "" };
+    let key = format!(
+        "{resource_hash}\0{object_path}\0{}\0{}\0{}\0{}",
+        read.uv,
+        read.color,
+        read.polygons,
+        velocity_parameter
+    );
+    let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "Alembic mesh cache lock is poisoned",
+        )
+    })?;
+    if let Some(samples) = parsed.get(&key) {
+        return Ok(Arc::clone(samples));
+    }
+    let samples = Arc::new(alembic::read_mesh_cache(
+        archive_bytes,
+        object_path,
+        read.uv,
+        read.color,
+        read.polygons,
+        velocity_parameter,
+    )?);
+    if samples.windows(2).any(|pair| {
+        pair.first()
+            .zip(pair.get(1))
+            .is_some_and(|(first, second)| first.time_seconds > second.time_seconds)
+    }) {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic mesh cache sample times are not ordered",
+            json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+        ));
+    }
+    parsed.insert(key, Arc::clone(&samples));
+    Ok(samples)
 }
 
 fn apply_cache_attributes(
@@ -202,6 +310,30 @@ fn apply_cache_attributes(
     modifier: &Modifier,
     warnings: &mut Vec<PotError>,
 ) -> Result<()> {
+    if read.polygons
+        && let Some(normals) = &sample.normals
+    {
+        let corner_count = mesh.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+        if normals.len() != corner_count {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic corner normal count does not match the selected mesh topology",
+                json!({"modifier_id":modifier.id,"normal_count":normals.len(),"corner_count":corner_count}),
+            ));
+        }
+        let vectors = normals
+            .iter()
+            .map(|normal| Some(DVec3::from_array(*normal)))
+            .collect::<Vec<_>>();
+        clnor::encode_vectors(
+            mesh,
+            Some(&vectors),
+            NormalCodeOptions {
+                corner_order: None,
+                setter_input: SetterInput::NormalizeInput,
+            },
+        )?;
+    }
     if read.uv
         && let Some(uv_layers) = &sample.uv_layers
     {
@@ -210,11 +342,27 @@ fn apply_cache_attributes(
         }
         write_cache_uvs(mesh, modifier, uv_layers, warnings)?;
     }
-    if read.color
-        && let Some((scope, colors)) = &sample.colors
-    {
-        let (domain, values) = cache_colors(mesh, scope, colors, modifier)?;
-        write_cache_colors(mesh, domain, values);
+    if read.color {
+        let mut store = color_layers::read(mesh);
+        for color in &sample.colors {
+            let (domain, values) = cache_colors(mesh, &color.scope, &color.values, modifier)?;
+            let layer = ColorLayer {
+                name: color.name.clone(),
+                domain,
+                values,
+            };
+            if let Some(index) = store.index_of(&layer.name) {
+                store.layers[index] = layer;
+            } else {
+                store.layers.push(layer);
+            }
+        }
+        if !sample.colors.is_empty() {
+            color_layers::write(mesh, &store);
+            for color in &sample.colors {
+                set_cache_color_data_type(mesh, &color.name)?;
+            }
+        }
     }
     if velocity_scale != 0.0
         && let Some((scope, velocities)) = &sample.velocities
@@ -243,9 +391,33 @@ fn apply_cache_attributes(
     Ok(())
 }
 
-/// Carries the input mesh's UV layers onto the replacement mesh that a topology read builds. Rows
-/// are per face and corner, so they keep their values only while the corner layout is unchanged.
-/// Otherwise the layers keep their names, order, and selectors, with no values.
+fn set_cache_color_data_type(mesh: &mut Mesh, name: &str) -> Result<()> {
+    let metadata = mesh
+        .attributes
+        .entry("blender_metadata".to_owned())
+        .or_insert_with(|| json!({}));
+    let metadata = metadata.as_object_mut().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Blender mesh metadata is not an object",
+            json!({"attribute":"blender_metadata","color":name}),
+        )
+    })?;
+    let color_types = metadata
+        .entry("color_data_types".to_owned())
+        .or_insert_with(|| json!({}));
+    let color_types = color_types.as_object_mut().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Blender color data-type metadata is not an object",
+            json!({"color":name}),
+        )
+    })?;
+    color_types.insert(name.to_owned(), json!("BYTE_COLOR"));
+    Ok(())
+}
+
+/// Carries UV layers to a topology replacement, clearing rows only when the face layout differs.
 fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
     let mut store = uv_layers::read(input);
     let same_layout = input.faces.len() == replacement.faces.len()
@@ -263,36 +435,36 @@ fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
     uv_layers::write(replacement, &store);
 }
 
-/// Writes each cached UV layer into the layer its name gives, creating the layer when the mesh
-/// lacks it. Alembic UV face-corner rows are reversed into Potter mesh-loop order whether or not
-/// cache polygons replace the input faces. A layer's values are replaced; its pins and the other
-/// layers are kept. A cached layer with no room left under the mesh limit is reported and not
-/// written. The active and render names keep their layers while those exist; otherwise they name
-/// the first layer the cache wrote.
+/// Writes named cache UV layers through the canonical store, reversing each file-corner row once.
 fn write_cache_uvs(
     mesh: &mut Mesh,
     modifier: &Modifier,
     cached: &[ExchangeUvLayer],
     warnings: &mut Vec<PotError>,
 ) -> Result<()> {
-    let mut store = uv_layers::read(mesh);
-    let mut first_written = None;
+    if cached.is_empty() {
+        return Ok(());
+    }
+    let mut layers = uv_layers::read_layers(mesh);
     for cached_layer in cached {
-        let index = match store.index_of(&cached_layer.name) {
+        let index = match layers
+            .iter()
+            .position(|layer| layer.name == cached_layer.name)
+        {
             Some(index) => index,
-            None if store.layers.len() < uv_layers::MAX_LAYERS => {
-                store.layers.push(UvLayer::new(
+            None if layers.len() < uv_layers::MAX_LAYERS => {
+                layers.push(UvLayer::new(
                     cached_layer.name.clone(),
                     vec![None; mesh.faces.len()],
                 ));
-                store.layers.len() - 1
+                layers.len() - 1
             }
             None => {
                 warnings.push(layer_limit_warning(modifier, &cached_layer.name));
                 continue;
             }
         };
-        let layer = store.layers.get_mut(index).ok_or_else(|| {
+        let layer = layers.get_mut(index).ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "UV layer index is out of range")
         })?;
         layer.faces = cached_layer
@@ -300,39 +472,21 @@ fn write_cache_uvs(
             .iter()
             .map(|corners| Some(corners.iter().rev().copied().collect()))
             .collect();
-        if first_written.is_none() {
-            first_written = Some(cached_layer.name.clone());
-        }
     }
-    let active_exists = store
-        .active
-        .as_deref()
-        .is_some_and(|name| store.index_of(name).is_some());
-    if !active_exists {
-        store.active.clone_from(&first_written);
-    }
-    let render_exists = store
-        .render
-        .as_deref()
-        .is_some_and(|name| store.index_of(name).is_some());
-    if !render_exists {
-        store.render.clone_from(&first_written);
-    }
-    uv_layers::write(mesh, &store);
+    uv_layers::write_layers(mesh, &layers);
     Ok(())
 }
 
-fn check_cache_uv_layer(mesh: &Mesh, modifier: &Modifier, layer: &ExchangeUvLayer) -> Result<()> {
+fn check_cache_uv_layer(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    layer: &ExchangeUvLayer,
+) -> Result<()> {
     if layer.corners.len() != mesh.faces.len() {
         return Err(PotError::with_details(
             ErrorCode::EvaluationFailed,
             "Alembic UV face count does not match the selected mesh topology",
-            json!({
-                "modifier_id":modifier.id,
-                "layer":layer.name,
-                "cache_faces":layer.corners.len(),
-                "mesh_faces":mesh.faces.len(),
-            }),
+            json!({"modifier_id":modifier.id,"layer":layer.name,"cache_faces":layer.corners.len(),"mesh_faces":mesh.faces.len()}),
         ));
     }
     if let Some((face, uv)) = mesh
@@ -344,19 +498,12 @@ fn check_cache_uv_layer(mesh: &Mesh, modifier: &Modifier, layer: &ExchangeUvLaye
         return Err(PotError::with_details(
             ErrorCode::EvaluationFailed,
             "Alembic UV corner count does not match the selected face topology",
-            json!({
-                "modifier_id":modifier.id,
-                "layer":layer.name,
-                "face_id":face.id,
-                "cache_corners":uv.len(),
-                "mesh_corners":face.vertices.len(),
-            }),
+            json!({"modifier_id":modifier.id,"layer":layer.name,"face_id":face.id,"cache_corners":uv.len(),"mesh_corners":face.vertices.len()}),
         ));
     }
     Ok(())
 }
 
-/// The warning for a cached UV layer the mesh has no room for. The layer is not written.
 fn layer_limit_warning(modifier: &Modifier, layer: &str) -> PotError {
     PotError::with_details(
         ErrorCode::LimitExceeded,
@@ -384,20 +531,62 @@ fn validate_cache_output(mesh: &Mesh, modifier: &Modifier) -> Result<()> {
     })
 }
 
-/// The color layer that Alembic colors fill. It shares the default layer name of vertex painting.
-const CACHE_COLOR_LAYER: &str = "color";
-
-/// The cache's colors as one layer's values in storage order. Point scopes give one value per vertex.
-/// Uniform colors (one per face) become one value per corner, which the corner domain can hold.
-/// Colors are stored unchanged, since Alembic colors are linear.
 fn cache_colors(
     mesh: &Mesh,
     scope: &str,
     colors: &[Vec<f64>],
     modifier: &Modifier,
 ) -> Result<(ColorDomain, Vec<[f64; 4]>)> {
-    match scope {
-        "constant" => {
+    let corner_count = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .sum::<usize>();
+    let expected = match scope {
+        "constant" => 1,
+        "vertex" | "varying" => mesh.vertices.len(),
+        "uniform" => mesh.faces.len(),
+        "facevarying" => corner_count,
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic cache color scope is unsupported",
+                json!({"modifier_id":modifier.id,"scope":scope}),
+            ));
+        }
+    };
+    if colors.len() != expected {
+        return Err(invalid_color_count(modifier, colors.len(), expected));
+    }
+    let vertex_indices = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut values = Vec::with_capacity(corner_count);
+    let mut corner_offset = 0;
+    for (face_index, face) in mesh.faces.iter().enumerate() {
+        for vertex_id in &face.vertices {
+            let vertex_index = vertex_indices.get(vertex_id).copied().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "Alembic color face references a missing vertex",
+                )
+            })?;
+            let color_index = match scope {
+                "constant" => 0,
+                "vertex" | "varying" => vertex_index,
+                "uniform" => face_index,
+                "facevarying" => corner_offset,
+                _ => {
+                    return Err(PotError::with_details(
+                        ErrorCode::EvaluationFailed,
+                        "Alembic cache color scope is unsupported",
+                        json!({"modifier_id":modifier.id,"scope":scope}),
+                    ));
+                }
+            };
             let color = colors
                 .first()
                 .ok_or_else(|| invalid_color_count(modifier, 0, 1))?;
@@ -454,30 +643,7 @@ fn cache_colors(
             json!({"modifier_id":modifier.id,"scope":scope}),
         )),
     }
-}
-
-/// Writes the cache colors as the `color` layer of the color store, replacing a layer of that name.
-/// The layer becomes the active or render layer only when the store has none.
-fn write_cache_colors(mesh: &mut Mesh, domain: ColorDomain, values: Vec<[f64; 4]>) {
-    let mut store = color_layers::read(mesh);
-    store.layers.retain(|layer| layer.name != CACHE_COLOR_LAYER);
-    store.layers.push(ColorLayer {
-        name: CACHE_COLOR_LAYER.to_owned(),
-        domain,
-        values,
-    });
-    if store.render_index().is_none() {
-        store.render = Some(CACHE_COLOR_LAYER.to_owned());
-    }
-    if store
-        .active
-        .as_deref()
-        .and_then(|active| store.index_of(active))
-        .is_none()
-    {
-        store.active = Some(CACHE_COLOR_LAYER.to_owned());
-    }
-    color_layers::write(mesh, &store);
+    Ok((ColorDomain::Corner, values))
 }
 
 fn rgba_color(color: &[f64], modifier: &Modifier) -> Result<[f64; 4]> {
@@ -538,6 +704,7 @@ fn read_params(modifier: &Modifier) -> Result<ReadAttributes> {
             Some("POLY") => attributes.polygons = true,
             Some("UV") => attributes.uv = true,
             Some("COLOR") => attributes.color = true,
+            // Blender's Alembic stream reader does not map generic properties through this flag.
             Some("ATTRIBUTES") => {}
             _ => {
                 return Err(invalid_parameter(
@@ -673,7 +840,7 @@ mod tests {
     use super::lerp_position;
 
     #[test]
-    fn cache_colors_map_to_point_and_corner_mesh_domains() -> Result<(), Box<dyn std::error::Error>>
+    fn cache_color_scopes_use_named_linear_corner_store() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut mesh = super::Mesh::from_positions_and_faces(
             vec![glam::DVec3::ZERO, glam::DVec3::X, glam::DVec3::Y],
@@ -695,14 +862,34 @@ mod tests {
             vec![0.0, 1.0, 0.0],
             vec![0.0, 0.0, 1.0],
         ];
-        let (domain, values) = super::cache_colors(&mesh, "vertex", &point_values, &modifier)?;
-        assert_eq!(domain, super::ColorDomain::Point);
-        super::write_cache_colors(&mut mesh, domain, values);
+        let (domain, values) =
+            super::cache_colors(&mesh, "vertex", &point_values, &modifier)?;
+        assert_eq!(domain, super::ColorDomain::Corner);
+        let mut store = super::color_layers::read(&mesh);
+        store.layers.push(super::ColorLayer {
+            name: "PointGeom".to_owned(),
+            domain,
+            values: values.clone(),
+        });
+        super::color_layers::write(&mut mesh, &store);
+        super::set_cache_color_data_type(&mut mesh, "PointGeom")?;
+        assert_eq!(
+            mesh.attributes["blender_metadata"]["color_data_types"]["PointGeom"],
+            "BYTE_COLOR"
+        );
+        let point_key = super::attribute_keys::storage_key("PointGeom");
+        assert!(mesh.attributes.contains_key(point_key.as_ref()));
         let point = super::color_layers::read(&mesh);
-        let point_layer = point.layers.first().ok_or("point color layer is missing")?;
-        assert_eq!(point_layer.name, "color");
-        assert_eq!(point_layer.domain, super::ColorDomain::Point);
-        assert_eq!(point_layer.values[0], [1.0, 0.0, 0.0, 1.0]);
+        let point_layer = point.layers.first().ok_or("point geom color layer is missing")?;
+        assert_eq!(point_layer.domain, super::ColorDomain::Corner);
+        assert_eq!(
+            point_layer.values,
+            vec![
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+            ]
+        );
 
         let corner_values = [
             vec![1.0, 0.0, 0.0],
@@ -711,23 +898,24 @@ mod tests {
         ];
         let (domain, values) =
             super::cache_colors(&mesh, "facevarying", &corner_values, &modifier)?;
-        assert_eq!(domain, super::ColorDomain::Corner);
-        super::write_cache_colors(&mut mesh, domain, values);
-        let corner = super::color_layers::read(&mesh);
-        let corner_layer = corner
-            .layers
-            .first()
-            .ok_or("corner color layer is missing")?;
-        assert_eq!(corner_layer.name, "color");
-        assert_eq!(corner_layer.domain, super::ColorDomain::Corner);
+        let mut store = super::color_layers::read(&mesh);
+        store.layers.push(super::ColorLayer {
+            name: "CornerGeom".to_owned(),
+            domain,
+            values,
+        });
+        super::color_layers::write(&mut mesh, &store);
+        super::set_cache_color_data_type(&mut mesh, "CornerGeom")?;
         assert_eq!(
-            corner_layer.values,
-            vec![
-                [1.0, 0.0, 0.0, 1.0],
-                [0.0, 1.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0, 1.0],
-            ]
+            mesh.attributes["blender_metadata"]["color_data_types"]["CornerGeom"],
+            "BYTE_COLOR"
         );
+        let corner_key = super::attribute_keys::storage_key("CornerGeom");
+        assert!(mesh.attributes.contains_key(corner_key.as_ref()));
+        let corner = super::color_layers::read(&mesh);
+        let corner_layer = corner.layers.get(1).ok_or("corner geom color layer is missing")?;
+        assert_eq!(corner_layer.domain, super::ColorDomain::Corner);
+        assert_eq!(corner_layer.values, point_layer.values);
         Ok(())
     }
 
