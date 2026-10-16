@@ -660,11 +660,12 @@ fn attach_native_target_vertices(
                 continue;
             };
             let modifier_name = modifier
-                .get("name")
+                .get("blender_name")
+                .or_else(|| modifier.get("name"))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(|| {
-                    invalid_intermediate("native Surface Deform modifier has no name")
+                    invalid_intermediate("native Surface Deform modifier has no Blender name")
                 })?;
             let vertices = target_mesh
                 .get("vertices")
@@ -1832,6 +1833,7 @@ fn build_imported_graph(
             action.slots = slots;
         }
     }
+    let mut modifier_ids_by_object = BTreeMap::<String, Vec<String>>::new();
     for item in objects {
         let name = string_field(item, "name")?;
         let id = object_ids
@@ -1914,6 +1916,10 @@ fn build_imported_graph(
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("modifier");
+                let blender_name = modifier
+                    .get("blender_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(modifier_name);
                 let modifier_type = modifier
                     .get("type")
                     .and_then(Value::as_str)
@@ -2064,7 +2070,7 @@ fn build_imported_graph(
                 }
                 modifier_ids.insert(modifier_id.clone());
                 mappings.insert(
-                    format!("Modifier:{}:{modifier_name}", id.as_str()),
+                    format!("Modifier:{}:{modifier_id}", id.as_str()),
                     modifier_id.clone(),
                 );
                 Ok(Modifier {
@@ -2076,14 +2082,29 @@ fn build_imported_graph(
                         .get("enabled")
                         .and_then(Value::as_bool)
                         .unwrap_or(true),
+                    show_viewport: modifier
+                        .get("show_viewport")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    show_render: modifier
+                        .get("show_render")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
                     params,
                     binding_data: native_bindings
-                        .get(&(name.to_owned(), modifier_name.to_owned()))
+                        .get(&(name.to_owned(), blender_name.to_owned()))
                         .cloned(),
                     runtime: crate::model::ModifierRuntime::default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        modifier_ids_by_object.insert(
+            name.to_owned(),
+            modifiers
+                .iter()
+                .map(|modifier| modifier.id.as_str().to_owned())
+                .collect(),
+        );
         let material_slots = item
             .get("materials")
             .and_then(Value::as_array)
@@ -2439,9 +2460,34 @@ fn build_imported_graph(
         "active_scene": active_name,
         "id_mappings": id_mappings.clone(),
     });
+    let mut compatibility_intermediate = (*raw).clone();
+    if let Some(source_objects) = compatibility_intermediate
+        .get_mut("objects")
+        .and_then(Value::as_array_mut)
+    {
+        for source_object in source_objects {
+            let Some(source_name) = source_object.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(modifier_ids) = modifier_ids_by_object.get(source_name) else {
+                continue;
+            };
+            if let Some(source_modifiers) = source_object
+                .get_mut("modifiers")
+                .and_then(Value::as_array_mut)
+            {
+                for (source_modifier, modifier_id) in source_modifiers.iter_mut().zip(modifier_ids)
+                {
+                    if let Some(source_modifier) = source_modifier.as_object_mut() {
+                        source_modifier.insert("potter_id".to_owned(), json!(modifier_id));
+                    }
+                }
+            }
+        }
+    }
     doc.compatibility.insert(
         "blender_adapter".to_owned(),
-        json!({"intermediate": raw, "id_mappings": id_mappings.clone()}),
+        json!({"intermediate": compatibility_intermediate, "id_mappings": id_mappings.clone()}),
     );
     doc.validate()?;
     attach_native_target_vertex_orders(&mut doc);
@@ -6259,6 +6305,7 @@ fn attach_native_target_vertex_orders(doc: &mut SceneDoc) {
             doc,
             &crate::eval::EvaluationContext::default(),
             None,
+            None,
             &selected,
         )
         .ok();
@@ -7169,6 +7216,13 @@ mod tests {
             .get(&Id::new(id)?)
             .ok_or_else(|| invalid_intermediate("test action was not imported"))
     }
+    fn export_context() -> crate::eval::EvaluationContext {
+        crate::eval::EvaluationContext {
+            purpose: crate::eval::EvaluationPurpose::Render,
+            ..crate::eval::EvaluationContext::default()
+        }
+    }
+
     fn optional_blender() -> Option<PathBuf> {
         match resolve_blender(None) {
             Ok(blender) => Some(blender),
@@ -7602,7 +7656,7 @@ mod tests {
         let project = Project::init(directory.path().join("project"))?;
         let doc = shader_roundtrip_scene()?;
         let output = directory.path().join("shader-roundtrip.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -7931,7 +7985,7 @@ mod tests {
         let project = Project::init(directory.path().join("project"))?;
         let doc = roundtrip_scene()?;
         let output = directory.path().join("roundtrip.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         let options = ExportOptions {
             allow_lossy: false,
             pack: false,
@@ -8141,7 +8195,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
 
         let project = Project::init(directory.path().join("project"))?;
         let output = directory.path().join("table-roundtrip.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &imported.doc,
             &project,
@@ -8529,7 +8583,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             Some(true)
         );
         let project = Project::init(directory.path().join("project"))?;
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         let output_path = directory.path().join("returned.blend");
         let options = ExportOptions {
             allow_lossy: true,
@@ -8756,7 +8810,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         let project = Project::init(directory.path().join("project"))?;
         let doc = primitive_scene()?;
         let output = directory.path().join("primitives.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -8982,7 +9036,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         assert!(approximately(tip_bone.roll, -0.4));
         let project = Project::init(directory.path().join("project"))?;
         let roundtrip = directory.path().join("rig-roundtrip.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &imported.doc,
             &project,
@@ -9219,7 +9273,7 @@ print("RIGPROBE " + json.dumps({"groups": groups, "shapes": shape_names,
         let project = Project::init(directory.path().join("project"))?;
         let doc = rig_graph_scene()?;
         let output = directory.path().join("rig-ids.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -9356,7 +9410,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         }
         let project = Project::init(directory.path().join("project"))?;
         let output = directory.path().join("edited.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -9459,7 +9513,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "root collection missing"))?;
         root.objects = vec![Id::new("animated")?, Id::new("plain")?];
         let output = directory.path().join("transforms.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -9663,7 +9717,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         .doc;
         let project = Project::init(directory.path().join("project"))?;
         let output = directory.path().join("overlay.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         export_blend(
             &doc,
             &project,
@@ -9801,7 +9855,7 @@ print("OVERLAY " + json.dumps({"bevel": round(bevel.width, 3) if bevel else None
             .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "root collection missing"))?
             .objects = vec![node_id];
         let output = directory.path().join("root-shear.blend");
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         let report = export_blend(
             &doc,
             &project,
@@ -10214,7 +10268,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 allow_lossy: true,
                 pack: false,
                 blender: Some(&blender),
-                context: &crate::eval::EvaluationContext::default(),
+                context: &export_context(),
             },
         )?;
         assert!(report.losses.iter().any(|loss| {
@@ -10384,7 +10438,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert!(active_scene.active_clip.is_none());
 
         let project = Project::init(directory.path().join("project"))?;
-        let context = crate::eval::EvaluationContext::default();
+        let context = export_context();
         let strict_output = directory.path().join("strict.blend");
         let Err(strict_error) = export_blend(
             &doc,

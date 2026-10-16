@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use glam::DMat4;
 use serde_json::{Map, Value, json};
@@ -18,6 +21,15 @@ pub struct ValidationReport {
 }
 
 pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport> {
+    validate_with_context(doc, format, None, None)
+}
+
+pub fn validate_with_context(
+    doc: &SceneDoc,
+    format: Option<&str>,
+    project_root: Option<&Path>,
+    cache_directory: Option<&Path>,
+) -> Result<ValidationReport> {
     let mut issues = Vec::new();
     let mut checks = vec![
         check("schema", "supported", Value::Null),
@@ -522,8 +534,15 @@ pub fn validate(doc: &SceneDoc, format: Option<&str>) -> Result<ValidationReport
         },
         None => checks.push(check("avatar_settings", "supported", Value::Null)),
     }
-    let context = crate::eval::EvaluationContext::default();
-    let evaluation = crate::eval::Snapshot::evaluate(doc, &context);
+    let purpose = format
+        .map(crate::commands::export::export_purpose)
+        .unwrap_or_default();
+    let context = crate::eval::EvaluationContext {
+        purpose,
+        ..crate::eval::EvaluationContext::default()
+    };
+    let evaluation =
+        crate::eval::Snapshot::evaluate_with_cache(doc, &context, project_root, cache_directory);
     match &evaluation {
         Ok(snapshot) => {
             for (id, evaluated) in &snapshot.nodes {

@@ -176,6 +176,7 @@ pub(crate) fn export(
                     scene_id: Some(snapshot.scene_id.clone()),
                     view_layer: snapshot.view_layer.clone(),
                     frame: Some(*frame),
+                    purpose: snapshot.purpose,
                 },
             )?;
             &owned
@@ -4119,6 +4120,7 @@ mod tests {
             &doc,
             &EvaluationContext {
                 frame: Some(1.0),
+                purpose: crate::eval::EvaluationPurpose::Render,
                 ..EvaluationContext::default()
             },
         )?;
@@ -4358,6 +4360,7 @@ mod tests {
             &doc,
             &EvaluationContext {
                 frame: Some(1.0),
+                purpose: crate::eval::EvaluationPurpose::Render,
                 ..EvaluationContext::default()
             },
         )?;

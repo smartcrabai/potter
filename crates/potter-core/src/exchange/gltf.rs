@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{Snapshot, mesh_vertex_weights},
+    eval::{EvaluationPurpose, Snapshot, mesh_vertex_weights},
     geom::{
         Mesh, MeshError, edge_key,
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
@@ -551,11 +551,15 @@ struct SkinBinding {
     joint_ids: Vec<Id>,
 }
 
-fn skin_binding(doc: &SceneDoc, node: &Node) -> Result<Option<SkinBinding>> {
+fn skin_binding(
+    doc: &SceneDoc,
+    node: &Node,
+    purpose: EvaluationPurpose,
+) -> Result<Option<SkinBinding>> {
     let modifiers = node
         .modifiers
         .iter()
-        .filter(|modifier| modifier.enabled && modifier.modifier_type == "armature")
+        .filter(|modifier| modifier.is_active(purpose) && modifier.modifier_type == "armature")
         .collect::<Vec<_>>();
     if modifiers.is_empty() {
         return Ok(None);
@@ -564,7 +568,7 @@ fn skin_binding(doc: &SceneDoc, node: &Node) -> Result<Option<SkinBinding>> {
         || node
             .modifiers
             .iter()
-            .any(|modifier| modifier.enabled && modifier.modifier_type != "armature")
+            .any(|modifier| modifier.is_active(purpose) && modifier.modifier_type != "armature")
     {
         return Err(unsupported_export(
             "rig.skin_modifier_stack",
@@ -1487,6 +1491,7 @@ fn source_mesh_for_export<'a>(
     node: &Node,
     data_block: &'a DataBlock,
     evaluated: &'a Mesh,
+    purpose: EvaluationPurpose,
 ) -> Result<&'a Mesh> {
     let Some(shape_keys) = data_block
         .shape_keys
@@ -1498,7 +1503,7 @@ fn source_mesh_for_export<'a>(
     if node
         .modifiers
         .iter()
-        .any(|modifier| modifier.enabled && modifier.modifier_type != "armature")
+        .any(|modifier| modifier.is_active(purpose) && modifier.modifier_type != "armature")
     {
         return Err(unsupported_export(
             "mesh.shape_key_modifier_stack",
@@ -2126,7 +2131,7 @@ pub(crate) fn vrm_frame_maps(
             .as_ref()
             .and_then(|data_id| doc.data_blocks.get(data_id))
             .is_some_and(|data| data.data_type == "mesh")
-            && let Some(binding) = skin_binding(doc, node)?
+            && let Some(binding) = skin_binding(doc, node, snapshot.purpose)?
         {
             armature_ids.insert(binding.armature_node);
         }
@@ -3667,7 +3672,7 @@ pub(crate) fn validate_vrm_mesh_references(
         else {
             continue;
         };
-        let Some(binding) = skin_binding(doc, node)? else {
+        let Some(binding) = skin_binding(doc, node, snapshot.purpose)? else {
             continue;
         };
         validate_skin_binding_export(
@@ -3700,7 +3705,7 @@ pub(crate) fn validate_vrm_mesh_references(
                 continue;
             };
             (
-                source_mesh_for_export(node, data_block, evaluated)?,
+                source_mesh_for_export(node, data_block, evaluated, snapshot.purpose)?,
                 Some(data_block),
             )
         } else if instance_collection_target(node)?.is_some() {
@@ -3885,7 +3890,7 @@ fn export_with_root_inner(
         else {
             continue;
         };
-        let Some(binding) = skin_binding(doc, node)? else {
+        let Some(binding) = skin_binding(doc, node, snapshot.purpose)? else {
             continue;
         };
         validate_skin_binding_export(
@@ -3929,7 +3934,7 @@ fn export_with_root_inner(
             else {
                 continue;
             };
-            let mesh = source_mesh_for_export(node, data_block, evaluated)?;
+            let mesh = source_mesh_for_export(node, data_block, evaluated, snapshot.purpose)?;
             (mesh, Some(data_id), None, Some(data_block))
         } else if let Some(target) = instance_collection_target(node)? {
             (evaluated, None, Some(target), None)
@@ -6922,6 +6927,8 @@ pub(crate) fn import_indexed(
                 modifier_type: "armature".to_owned(),
                 name: "Armature".to_owned(),
                 enabled: true,
+                show_viewport: true,
+                show_render: true,
                 params,
                 binding_data: None,
                 runtime: crate::model::ModifierRuntime::default(),
@@ -8833,7 +8840,7 @@ mod tests {
         eval::{EvaluationContext, Snapshot},
         exchange::ImportedGraph,
         model::SceneDoc,
-        ops::{apply_batch, apply_batch_with_asset_root},
+        ops::{apply_batch, apply_batch_with_project_context},
     };
 
     use super::{
@@ -8860,7 +8867,7 @@ mod tests {
 
     fn scene_with_asset_root(root: &std::path::Path, operations: &Value) -> TestResult<SceneDoc> {
         let initial = SceneDoc::new(uuid::Uuid::new_v4().to_string());
-        let applied = apply_batch_with_asset_root(
+        let applied = apply_batch_with_project_context(
             &initial,
             &json!({
                 "schema_version": 1,
@@ -8868,6 +8875,7 @@ mod tests {
                 "operations": operations
             }),
             root,
+            None,
         )?;
         for (digest, bytes) in applied.asset_blobs {
             let hex = digest

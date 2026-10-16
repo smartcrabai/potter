@@ -349,7 +349,7 @@ fn boolean_decimate_solidify_topology_divergence_is_gated_for_exact_and_float() 
             .ok_or("Boolean host node is missing")?;
         assert_eq!(node.modifiers.len(), 3);
         for (index, modifier) in node.modifiers.iter_mut().enumerate() {
-            modifier.enabled = index == 0;
+            modifier.show_viewport = index == 0;
         }
         let snapshot = Snapshot::evaluate(&boolean_only, &EvaluationContext::default())?;
         let potter_mesh = snapshot

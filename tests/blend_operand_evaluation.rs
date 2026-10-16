@@ -638,6 +638,8 @@ fn blender_object_mesh_operands_use_same_frame_evaluated_geometry() -> TestResul
         modifier_type: "boolean".to_owned(),
         name: "Cycle back to host".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::json!({"object":host_id.as_str()})
             .as_object()
             .cloned()

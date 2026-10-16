@@ -473,16 +473,14 @@ fn write_node(
                 .is_some_and(|keys| !keys.keys.is_empty())
                 || !data.vertex_groups.is_empty()
                 || !data.vertex_weights.is_empty()
-                || node
-                    .modifiers
-                    .iter()
-                    .any(|modifier| modifier.enabled && modifier.modifier_type == "armature")
+                || node.modifiers.iter().any(|modifier| {
+                    modifier.is_active(snapshot.purpose) && modifier.modifier_type == "armature"
+                })
         });
         if preserves_source_features
-            && node
-                .modifiers
-                .iter()
-                .any(|modifier| modifier.enabled && modifier.modifier_type != "armature")
+            && node.modifiers.iter().any(|modifier| {
+                modifier.is_active(snapshot.purpose) && modifier.modifier_type != "armature"
+            })
         {
             return Err(unsupported(
                 "mesh.rig_modifier_stack",
@@ -564,16 +562,14 @@ fn write_mesh(
             "USD mesh vertex count changed during export",
         ));
     }
-    let has_skel_binding = node
-        .modifiers
-        .iter()
-        .any(|modifier| modifier.enabled && modifier.modifier_type == "armature")
-        || node
-            .data
-            .as_ref()
-            .and_then(|data_id| doc.data_blocks.get(data_id))
-            .and_then(|data| data.shape_keys.as_ref())
-            .is_some_and(|shape_keys| !shape_keys.keys.is_empty());
+    let has_skel_binding = node.modifiers.iter().any(|modifier| {
+        modifier.is_active(snapshot.purpose) && modifier.modifier_type == "armature"
+    }) || node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .and_then(|data| data.shape_keys.as_ref())
+        .is_some_and(|shape_keys| !shape_keys.keys.is_empty());
     if has_skel_binding {
         indent(output, depth);
         line(output, "def Mesh \"Geometry\" (");
@@ -714,10 +710,9 @@ fn write_deformation(
         .shape_keys
         .as_ref()
         .is_some_and(|shape_keys| !shape_keys.keys.is_empty());
-    let has_skin = node
-        .modifiers
-        .iter()
-        .any(|modifier| modifier.enabled && modifier.modifier_type == "armature");
+    let has_skin = node.modifiers.iter().any(|modifier| {
+        modifier.is_active(snapshot.purpose) && modifier.modifier_type == "armature"
+    });
     if !has_shapes && !has_skin && data.vertex_groups.is_empty() && data.vertex_weights.is_empty() {
         return Ok(());
     }
@@ -763,7 +758,7 @@ fn write_skin_binding(
     let active = node
         .modifiers
         .iter()
-        .filter(|modifier| modifier.enabled)
+        .filter(|modifier| modifier.is_active(snapshot.purpose))
         .collect::<Vec<_>>();
     let skin_modifiers = active
         .iter()

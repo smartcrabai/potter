@@ -9,16 +9,18 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::ExportArgs,
-    commands::util::{check_extension, exchange_format_name, with_load_warnings},
+    commands::util::{
+        check_extension, evaluation_context, exchange_format_name, with_load_warnings,
+    },
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     exchange::{
         self, ExportOptions, Loss,
         gltf::is_color_attribute,
         material_surface::{material_is_used, resolve_surface},
     },
     hash,
-    model::{AvatarVersion, Id, LightType, SceneDoc},
+    model::{AvatarVersion, LightType, SceneDoc},
     response::SceneInfo,
     store::Project,
 };
@@ -26,8 +28,13 @@ use crate::{
 pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
     let project = Project::open(&args.scene)?;
     let doc = project.doc().clone();
-    let context = evaluation_context(&args.context)?;
     let format = exchange_format_name(args.format);
+    let context = evaluation_context(
+        args.context.scene_id.as_deref(),
+        args.context.view_layer.as_deref(),
+        args.context.frame,
+        export_purpose(format),
+    )?;
     check_extension(&args.out, format, "output extension does not match format")?;
     let view = export_view(args.view.as_deref(), format)?;
     if !matches!(
@@ -105,7 +112,12 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             "losses": report.losses,
         })
     } else {
-        let snapshot = Snapshot::evaluate_with_cache(&doc, &context, Some(project.path()))?;
+        let snapshot = Snapshot::evaluate_with_cache(
+            &doc,
+            &context,
+            Some(project.path()),
+            Some(project.cache_directory()),
+        )?;
         let mut warnings = snapshot.warnings.clone();
         let meshes = exchange::evaluated_meshes(&doc, &snapshot)?;
         let mut losses = export_losses(&doc, format);
@@ -258,7 +270,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             .iter()
             .filter(|path| *path != &args.out)
             .collect::<Vec<_>>();
-        let conversions = export_conversions(&doc, &meshes, format);
+        let conversions = export_conversions(&doc, &meshes, format, snapshot.purpose);
         let warnings = with_load_warnings(&warnings, &project)?;
         json!({
             "format": format,
@@ -300,12 +312,17 @@ fn export_view<'a>(requested: Option<&'a str>, format: &str) -> Result<&'a str> 
     Ok(view)
 }
 
-fn evaluation_context(context: &crate::cli::Context) -> Result<EvaluationContext> {
-    Ok(EvaluationContext {
-        scene_id: context.scene_id.as_deref().map(Id::new).transpose()?,
-        view_layer: context.view_layer.as_deref().map(Id::new).transpose()?,
-        frame: context.frame,
-    })
+/// Modifier stack an export evaluates, following Blender 5.2.2's default for each writer:
+/// `Render` for PLY, STL, USD, and Alembic; `Preview` (the viewport stack) for OBJ, glTF, GLB,
+/// VRM, and FBX. BLEND and BVH evaluate no modifiers. SVG and PDF have no Blender writer and keep
+/// the render stack.
+pub(crate) fn export_purpose(format: &str) -> EvaluationPurpose {
+    match format {
+        "ply" | "stl" | "usd" | "usdc" | "usda" | "usdz" | "alembic" | "svg" | "pdf" => {
+            EvaluationPurpose::Render
+        }
+        _ => EvaluationPurpose::Preview,
+    }
 }
 
 fn context_json(context: &EvaluationContext, snapshot: &Snapshot) -> Value {
@@ -654,6 +671,7 @@ fn export_conversions(
     doc: &SceneDoc,
     meshes: &[exchange::ExchangeMesh],
     format: &str,
+    purpose: EvaluationPurpose,
 ) -> Vec<Value> {
     let mut values = Vec::new();
     if matches!(format, "obj" | "stl" | "ply" | "pdf" | "svg") {
@@ -672,11 +690,11 @@ fn export_conversions(
             json!({ "feature_id": "coordinate_system", "conversion": "potter_z_up_to_gltf_y_up" }),
         );
     }
-    if doc
-        .nodes
-        .values()
-        .any(|node| node.modifiers.iter().any(|modifier| modifier.enabled))
-    {
+    if doc.nodes.values().any(|node| {
+        node.modifiers
+            .iter()
+            .any(|modifier| modifier.is_active(purpose))
+    }) {
         values.push(json!({ "feature_id": "modifier.evaluation", "conversion": "evaluated_mesh" }));
     }
     if matches!(

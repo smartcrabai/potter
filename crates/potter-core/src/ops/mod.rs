@@ -440,6 +440,7 @@ struct Engine<'a> {
     operation_index: usize,
     evaluation_frame: f64,
     asset_root: Option<&'a Path>,
+    cache_directory: Option<&'a Path>,
     pending_assets: BTreeMap<String, Vec<u8>>,
     warnings: Vec<PotError>,
 }
@@ -494,21 +495,23 @@ impl Engine<'_> {
 }
 
 pub fn apply_batch(doc: &SceneDoc, batch: &Value) -> Result<ApplyOutcome> {
-    apply_batch_internal(doc, batch, None)
+    apply_batch_internal(doc, batch, None, None)
 }
 
-pub fn apply_batch_with_asset_root(
+pub fn apply_batch_with_project_context(
     doc: &SceneDoc,
     batch: &Value,
-    asset_root: &Path,
+    project_root: &Path,
+    cache_directory: Option<&Path>,
 ) -> Result<ApplyOutcome> {
-    apply_batch_internal(doc, batch, Some(asset_root))
+    apply_batch_internal(doc, batch, Some(project_root), cache_directory)
 }
 
 fn apply_batch_internal(
     doc: &SceneDoc,
     batch: &Value,
     asset_root: Option<&Path>,
+    cache_directory: Option<&Path>,
 ) -> Result<ApplyOutcome> {
     let batch_object = batch.as_object().ok_or_else(|| {
         PotError::with_details(
@@ -609,6 +612,7 @@ fn apply_batch_internal(
             operation_index: index,
             evaluation_frame,
             asset_root,
+            cache_directory,
             pending_assets: std::mem::take(&mut pending_assets),
             warnings: std::mem::take(&mut warnings),
         };

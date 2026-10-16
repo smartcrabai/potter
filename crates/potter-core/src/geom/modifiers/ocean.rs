@@ -14,6 +14,7 @@ use serde_json::{Map, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    eval::ModifierEvaluationContext,
     geom::{GridParams, Mesh},
     model::Modifier,
 };
@@ -66,7 +67,12 @@ impl std::ops::Mul for Complex {
 }
 
 /// Evaluate either the generated periodic grid or an input mesh displaced by the spectrum.
-pub(super) fn ocean(mesh: &Mesh, modifier: &Modifier, _frame: f64) -> Result<Mesh> {
+pub(super) fn ocean(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    _frame: f64,
+    context: ModifierEvaluationContext<'_>,
+) -> Result<Mesh> {
     let geometry_mode =
         string_param_with_expected(modifier, "geometry_mode", "a Blender enum or string")?;
     if !["GENERATE", "DISPLACE"].contains(&geometry_mode) {
@@ -76,16 +82,20 @@ pub(super) fn ocean(mesh: &Mesh, modifier: &Modifier, _frame: f64) -> Result<Mes
             "GENERATE or DISPLACE",
         ));
     }
-    let _render_resolution = resolution_param(modifier, "resolution")?;
-    let viewport_resolution = resolution_param(modifier, "viewport_resolution")?;
-    let geometry_resolution = usize::try_from(viewport_resolution)
+    let resolution_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
+        "resolution"
+    } else {
+        "viewport_resolution"
+    };
+    let resolution = resolution_param(modifier, resolution_name)?;
+    let geometry_resolution = usize::try_from(resolution)
         .map_err(|_| {
             PotError::new(
                 ErrorCode::LimitExceeded,
                 "ocean resolution exceeds mesh limits",
             )
         })?
-        .checked_mul(usize::try_from(viewport_resolution).map_err(|_| {
+        .checked_mul(usize::try_from(resolution).map_err(|_| {
             PotError::new(
                 ErrorCode::LimitExceeded,
                 "ocean resolution exceeds mesh limits",
@@ -708,6 +718,7 @@ impl BlenderRng {
 #[cfg(test)]
 mod tests {
     use crate::{
+        eval::ModifierEvaluationContext,
         geom::{GridParams, Mesh},
         model::{Id, Modifier},
     };
@@ -730,6 +741,8 @@ mod tests {
                 modifier_type: "ocean".to_owned(),
                 name: "Ocean".to_owned(),
                 enabled: true,
+                show_viewport: true,
+                show_render: true,
                 params: serde_json::from_value::<Map<String, serde_json::Value>>(json!({
                     "geometry_mode":"DISPLACE", "resolution":4, "spatial_size":8.0,
                     "random_seed":12, "choppiness":choppiness, "time":2.0
@@ -738,10 +751,11 @@ mod tests {
                 runtime: crate::model::ModifierRuntime::default(),
             })
         };
-        let first = ocean(&source, &create(0.0)?, 1.0)?;
-        let repeated = ocean(&source, &create(0.0)?, 1.0)?;
+        let context = ModifierEvaluationContext::default();
+        let first = ocean(&source, &create(0.0)?, 1.0, context)?;
+        let repeated = ocean(&source, &create(0.0)?, 1.0, context)?;
         assert_eq!(first, repeated);
-        let chopped = ocean(&source, &create(2.0)?, 1.0)?;
+        let chopped = ocean(&source, &create(2.0)?, 1.0, context)?;
         assert!(
             first
                 .vertices

@@ -204,17 +204,26 @@ fn simple_deform_bend(coordinates: [f64; 3], cut: [f64; 3], axis: usize, factor:
     }
 }
 
-pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+pub(super) fn screw(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    context: crate::eval::ModifierEvaluationContext<'_>,
+) -> Result<Mesh> {
     // Blender returns an empty template before reading any Screw parameters.
     if mesh.vertices.is_empty() {
         return Ok(mesh.clone());
     }
-    let steps = usize::try_from(uint_param(modifier, "steps")?)
-        .map_err(|_| invalid_parameter(modifier, "steps", "an integer from 1 to 4096"))?;
+    let steps_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
+        "render_steps"
+    } else {
+        "steps"
+    };
+    let steps = usize::try_from(uint_param(modifier, steps_name)?)
+        .map_err(|_| invalid_parameter(modifier, steps_name, "an integer from 1 to 4096"))?;
     if !(1..=4096).contains(&steps) {
         return Err(invalid_parameter(
             modifier,
-            "steps",
+            steps_name,
             "an integer from 1 to 4096",
         ));
     }
@@ -2938,6 +2947,8 @@ mod tests {
             modifier_type: modifier_type.to_owned(),
             name: modifier_type.to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params: serde_json::from_value(params).unwrap(),
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),

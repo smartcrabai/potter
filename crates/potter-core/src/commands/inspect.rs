@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 use crate::{
     cli::InspectArgs,
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, Snapshot, animation::animated_transform},
+    eval::{EvaluationContext, EvaluationPurpose, Snapshot, animation::animated_transform},
     geom::{Mesh, uv_layers},
-    model::{Collection, DataBlock, Id, Material, Node, Scene, SceneDoc, World},
+    model::{Collection, DataBlock, Id, Material, Modifier, Node, Scene, SceneDoc, World},
     response::SceneInfo,
     store::Project,
 };
@@ -22,8 +22,12 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
         args.context.view_layer.as_deref(),
         args.context.frame,
     )?;
-    let (snapshot, node_errors) =
-        Snapshot::evaluate_available_with_cache(doc, &context, Some(project.path()))?;
+    let (snapshot, node_errors) = Snapshot::evaluate_available_with_cache(
+        doc,
+        &context,
+        Some(project.path()),
+        Some(project.cache_directory()),
+    )?;
     let driver_values = crate::eval::rig::evaluate_drivers(doc, snapshot.frame)?;
     let items = if let Some(value) = args.id.as_deref() {
         let id = parse_id(value)?;
@@ -177,6 +181,7 @@ fn evaluation_context(
         scene_id,
         view_layer,
         frame,
+        purpose: EvaluationPurpose::Preview,
     })
 }
 
@@ -425,6 +430,11 @@ fn node_item(
     let world_transform = WorldTransform::from_matrix(evaluated.world_matrix);
     let local_matrix = animated_transform.matrix().to_cols_array();
 
+    let modifiers = node
+        .modifiers
+        .iter()
+        .map(modifier_item)
+        .collect::<Result<Vec<_>>>()?;
     Ok(json!({
         "type": "node",
         "id": id,
@@ -453,7 +463,7 @@ fn node_item(
         "force_field": node.force_field,
         "sharing": { "users": users, "count": users.len(), "shared": users.len() > 1 },
         "materials": node.materials,
-        "modifiers": node.modifiers,
+        "modifiers": modifiers,
         "visible": node.visible,
         "render_visible": node.render_visible,
         "selectable": node.selectable,
@@ -477,6 +487,13 @@ fn node_item(
         "dimensions": evaluated.dimensions,
         "evaluated_geometry": evaluated_geometry,
     }))
+}
+
+fn modifier_item(modifier: &Modifier) -> Result<Value> {
+    let mut value = serde_json::to_value(modifier).map_err(PotError::internal_json)?;
+    value["show_viewport"] = json!(modifier.show_viewport);
+    value["show_render"] = json!(modifier.show_render);
+    Ok(value)
 }
 
 fn world_item(doc: &SceneDoc, id: &Id, world: &World) -> Value {

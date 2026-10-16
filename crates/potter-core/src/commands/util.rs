@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     cli::{ExchangeFormat, UndoArgs},
     error::{ErrorCode, PotError, Result},
-    eval::EvaluationContext,
+    eval::{EvaluationContext, EvaluationPurpose},
     model::{Id, SceneDoc},
     response::SceneInfo,
     store::{HistoryDirection, Project},
@@ -94,6 +94,7 @@ pub(super) fn evaluation_context(
     scene_id: Option<&str>,
     view_layer: Option<&str>,
     frame: Option<f64>,
+    purpose: EvaluationPurpose,
 ) -> Result<EvaluationContext> {
     if frame.is_some_and(|value| !value.is_finite()) {
         return Err(PotError::invalid_argument("frame must be finite"));
@@ -106,6 +107,7 @@ pub(super) fn evaluation_context(
             .map(|value| Id::new(value.to_owned()))
             .transpose()?,
         frame,
+        purpose,
     })
 }
 

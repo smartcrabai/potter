@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{SlotBinding, Snapshot},
+    eval::{EvaluationPurpose, SlotBinding, Snapshot},
     geom::{Mesh, normals::corner_normals, uv_layers},
     model::{
         Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode,
@@ -366,6 +366,7 @@ pub(crate) fn export_with_root_allow_lossy(
                 data_block,
                 snapshot.slot_count(node_id, node),
                 allow_lossy,
+                snapshot.purpose,
             )?;
         }
         let mesh_model = object_ids.geometry.is_some();
@@ -1162,7 +1163,7 @@ fn build_deformers(
         let enabled = node
             .modifiers
             .iter()
-            .filter(|modifier| modifier.enabled)
+            .filter(|modifier| modifier.is_active(snapshot.purpose))
             .collect::<Vec<_>>();
         let skin_modifiers = enabled
             .iter()
@@ -1488,6 +1489,7 @@ fn write_geometry(
     data_block: Option<&DataBlock>,
     material_slot_count: usize,
     allow_lossy: bool,
+    purpose: EvaluationPurpose,
 ) -> Result<()> {
     // Shading attributes and UV layers have their own FBX layers. Unsupported attributes are
     // skipped only for lossy export and are reported by `commands::export::export_losses`.
@@ -1538,7 +1540,7 @@ fn write_geometry(
             || node
                 .modifiers
                 .iter()
-                .any(|modifier| modifier.enabled && modifier.modifier_type == "armature")
+                .any(|modifier| modifier.is_active(purpose) && modifier.modifier_type == "armature")
     }) {
         let metadata = serde_json::to_string(&json!({
             "shape_keys": &data.shape_keys,

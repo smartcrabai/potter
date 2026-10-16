@@ -253,6 +253,8 @@ fn modifier(id: impl Into<String>, modifier_type: &str, params: &Value) -> TestR
         modifier_type: modifier_type.to_owned(),
         name: id,
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("modifier params must be an object")?

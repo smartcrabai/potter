@@ -121,7 +121,7 @@ fn scene_schema() -> Value {
         "force_field":{"type":"object","properties":{"type":{"enum":["wind","vortex","force"]},"strength":{"type":"number"},"falloff":{"type":"number","minimum":0}},"additionalProperties":false},
         "collection":{"type":"object","required":["name","children","objects"],"properties":{"name":{"type":"string"},"children":{"type":"array","items":{"$ref":"#/$defs/id"}},"objects":{"type":"array","items":{"$ref":"#/$defs/id"}}},"additionalProperties":false},
         "transform":{"type":"object","required":["translation","rotation","scale","rotation_mode"],"properties":{"translation":{"$ref":"#/$defs/vec3"},"rotation":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"scale":{"$ref":"#/$defs/vec3"},"rotation_mode":{"type":"string"}},"additionalProperties":false},
-        "modifier":{"type":"object","required":["id","type","name","enabled","params"],"properties":{"id":{"$ref":"#/$defs/id"},"type":{"type":"string"},"name":{"type":"string"},"enabled":{"type":"boolean"},"params":{"type":"object"}},"additionalProperties":false},
+        "modifier":{"type":"object","required":["id","type","name","enabled","params"],"properties":{"id":{"$ref":"#/$defs/id"},"type":{"type":"string"},"name":{"type":"string"},"enabled":{"type":"boolean"},"show_viewport":{"type":"boolean"},"show_render":{"type":"boolean"},"params":{"type":"object"}},"additionalProperties":false},
         "library":{"type":"object","required":["name","kind","uri","resolved_path","resource","hash","status","linked_ids","overrides","items","source_project"],"properties":{"name":{"type":"string"},"kind":{"enum":["potter_project","blend"]},"uri":{"type":"string"},"resolved_path":{"type":"string"},"resource":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"hash":{"type":"string"},"status":{"enum":["ok","missing","changed"]},"linked_ids":{"type":"object","propertyNames":{"enum":["nodes","data_blocks","materials","collections","actions","node_groups","worlds","resources"]},"additionalProperties":{"type":"array","items":{"$ref":"#/$defs/id"}}},"overrides":{"type":"array","items":{"$ref":"#/$defs/library_override"}},"items":{"type":"object","additionalProperties":{"type":"string"}},"source_project":{"type":["string","null"]}},"additionalProperties":false},
         "library_override":{"type":"object","required":["registry","id","reference_id","properties"],"properties":{"registry":{"type":"string"},"id":{"$ref":"#/$defs/id"},"reference_id":{"$ref":"#/$defs/id"},"properties":{"type":"array","items":{"$ref":"#/$defs/library_override_property"}}},"additionalProperties":false},
         "library_override_property":{"type":"object","required":["path","operation","value"],"properties":{"path":{"type":"string"},"operation":{"enum":["replace","insert_after","delete"]},"value":{}},"additionalProperties":false},
@@ -906,11 +906,20 @@ fn operation_contract(name: &str) -> OperationContract {
             json!({}),
         ),
         "modifier.create" => (
-            vec!["target", "id", "type", "name", "enabled", "params"],
+            vec![
+                "target",
+                "id",
+                "type",
+                "name",
+                "enabled",
+                "show_viewport",
+                "show_render",
+                "params",
+            ],
             vec!["op", "target", "id", "type"],
             "object",
             "object modifier stack",
-            json!({"name":"type","enabled":true,"params":{}}),
+            json!({"name":"type","enabled":true,"show_viewport":true,"show_render":true,"params":{}}),
         ),
         "modifier.update" => (
             vec!["target", "modifier_id", "set"],
@@ -2090,7 +2099,8 @@ fn field_schema(operation: &str, field: &str) -> Value {
         "method" => json!({"enum":["box","smart","cube"],"default":"box"}),
         "shape" => json!({"enum":["box","sphere","convex_hull","mesh"]}),
         "active" | "visible" | "render_visible" | "selectable" | "enabled" | "double_sided"
-        | "recursive" | "cascade_data" | "unlink" | "keep_world" | "merge" | "individual" => {
+        | "show_viewport" | "show_render" | "recursive" | "cascade_data" | "unlink"
+        | "keep_world" | "merge" | "individual" => {
             json!({"type":"boolean"})
         }
         "deform" | "inherit_rotation" | "use_connect" => json!({"type":"boolean"}),
@@ -2276,7 +2286,7 @@ fn set_schema(operation: &str) -> Value {
         }),
         "material.update" => material_set_properties(),
         "modifier.update" => {
-            json!({"name":{"type":"string"},"enabled":{"type":"boolean"},"type":{"enum":params::type_names(ParameterFamily::Modifier)},"params":{"type":"object"}})
+            json!({"name":{"type":"string"},"enabled":{"type":"boolean"},"show_viewport":{"type":"boolean"},"show_render":{"type":"boolean"},"type":{"enum":params::type_names(ParameterFamily::Modifier)},"params":{"type":"object"}})
         }
         "action.update" => {
             json!({"name":{"type":"string"},"fcurves":{"type":"array","items":{"$ref":"#/$defs/fcurve"}}})

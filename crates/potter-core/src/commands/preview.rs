@@ -4,6 +4,7 @@ use crate::{
     cli::{PreviewArgs, PreviewMode},
     commands::util::evaluation_context,
     error::Result,
+    eval::EvaluationPurpose,
     render::{PreviewRequest, render_previews},
     response::SceneInfo,
     store::Project,
@@ -15,6 +16,7 @@ pub fn run(args: PreviewArgs) -> Result<(Option<SceneInfo>, Value)> {
         args.context.scene_id.as_deref(),
         args.context.view_layer.as_deref(),
         args.context.frame,
+        EvaluationPurpose::Preview,
     )?;
     let views = args
         .views
@@ -32,6 +34,7 @@ pub fn run(args: PreviewArgs) -> Result<(Option<SceneInfo>, Value)> {
     let previews = render_previews(
         project.doc(),
         project.path(),
+        project.cache_directory(),
         &PreviewRequest {
             views: &views,
             camera_id: args.camera.as_deref(),
@@ -40,7 +43,6 @@ pub fn run(args: PreviewArgs) -> Result<(Option<SceneInfo>, Value)> {
             out: args.out.as_deref(),
             overwrite: args.overwrite,
             context: &context,
-            render_visibility: false,
             staged_assets: None,
         },
     )?;

@@ -798,6 +798,8 @@ mod tests {
             modifier_type: "mesh_sequence_cache".to_owned(),
             name: "Mesh Sequence Cache".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params: serde_json::Map::new(),
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
