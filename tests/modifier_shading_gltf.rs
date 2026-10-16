@@ -6,10 +6,8 @@
 //! normals are the reference. The scene is rebuilt through the CLI from the fixture's own input
 //! values, and the exported GLB is matched to Blender's output corners by position.
 //!
-//! Potter's output geometry does not match Blender's yet. Only 4 faces on each side of the mirror
-//! plane (the faces at x = +-0.82) have glTF triangles at the same positions, so only those 32
-//! corners are compared. Every other Blender face is uncompared and reported. The compared face
-//! set and corner count are pinned, so a change in either direction fails the test.
+//! Every Blender corner is compared: each Blender face must have glTF triangles at its positions,
+//! and every such corner must match Blender's normal within the quantized tolerance.
 
 use std::{collections::HashMap, fs, path::Path};
 

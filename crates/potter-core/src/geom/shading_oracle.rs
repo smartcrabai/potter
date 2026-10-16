@@ -31,6 +31,15 @@ const NORMAL_TOLERANCE: f64 = 1.0e-5;
 /// (`normals_split_custom_set`), so a copied or interpolated value can differ by about 1e-4.
 const QUANTIZED_NORMAL_TOLERANCE: f64 = 2.0e-4;
 
+/// Fixtures whose stack Potter refuses with a typed feature, as `(fixture, feature_id)`.
+const REFUSED: &[(&str, &str)] = &[
+    ("mirror_cube_bisect_flip", "modifier.mirror.bisect"),
+    (
+        "remesh_smooth_mode_grid",
+        "modifier.remesh.open_nonmanifold",
+    ),
+];
+
 /// Fixtures whose flags match Blender exactly and whose corner normals are within tolerance.
 const EXACT: &[&str] = &[
     "array_cube",
@@ -73,6 +82,7 @@ const EXACT: &[&str] = &[
     "triangulate_cube_drop",
     "triangulate_cube_drop_ctrl",
     "triangulate_cube_keep",
+    "triangulate_cube_keep_jitter",
     "triangulate_grid_drop",
     "triangulate_grid_keep",
     "weld_split_cube",
@@ -434,10 +444,12 @@ fn compare(fixture: &Value, mesh: &Mesh) -> TestResult<Report> {
     let smooth = smooth_face_flags(mesh)?;
     let sharp = sharp_edge_flags(mesh)?;
     let normals = corner_normals(mesh, &positions)?;
-    let normal_tolerance = if fixture["input"]["custom_normals"].is_null() {
-        NORMAL_TOLERANCE
-    } else {
+    // Blender stores every custom normal as 16-bit codes, so any mesh that carries custom normals is
+    // judged at the quantized tolerance, whether they came from the input or the modifier.
+    let normal_tolerance = if mesh.attributes.contains_key("custom_normal") {
         QUANTIZED_NORMAL_TOLERANCE
+    } else {
+        NORMAL_TOLERANCE
     };
     let mut report = Report {
         faces: mesh.faces.len(),
@@ -580,5 +592,17 @@ fn exact_shading_fixtures_match_blender() -> TestResult {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // Blender's output for these stacks is evaluated by no modifier yet, so Potter refuses them with
+    // the feature that names the gap instead of a silent difference.
+    for (name, feature) in REFUSED {
+        let Err(error) = evaluate_fixture(name) else {
+            return Err(format!("{name} must be refused").into());
+        };
+        let feature_id = error
+            .downcast_ref::<crate::error::PotError>()
+            .and_then(|error| error.details.get("feature_id"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(feature_id, Some(*feature), "{name}");
+    }
     Ok(())
 }

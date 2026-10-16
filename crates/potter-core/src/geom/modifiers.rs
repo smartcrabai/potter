@@ -17,12 +17,13 @@ use crate::{
     params::{self, ParameterFamily},
 };
 
-use super::clnor::rebuild_custom_normals;
+use super::clnor::{corner_normal_attribute, settle_custom_normals, transfer_custom_normals};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
     normals::{
-        average_custom_normals_by_fan, face_normal, safe_acos_approx, sharp_edge_flags, vector3,
+        average_custom_normals_by_fan, corner_normals, face_normal, safe_acos_approx,
+        sharp_edge_flags, vector3,
     },
     provenance::{Origin, mean_value_corners, normalize_custom_normals, remap_attributes},
     uv_layers::{self, uv_default, uv_map_entry_layer},
@@ -272,6 +273,10 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 Err(error) => return Err(error),
             }
             continue;
+        }
+        // Blender's setter has settled custom normals before a modifier reads them (clnor.rs).
+        if let Some(settled) = settle_custom_normals(&evaluated)? {
+            evaluated = settled;
         }
         let attributes_before = attribute_labels(&evaluated);
         evaluated = match modifier.modifier_type.as_str() {
@@ -1021,19 +1026,6 @@ fn reflect_custom_normals(mesh: &mut Mesh, copy_masks: &[usize], axes: &[usize])
 
 fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     validated(mesh)?;
-    // Bisect cuts the mesh at the mirror plane and needs cut-vertex data this path does not build.
-    for key in ["use_bisect_axis", "use_bisect_flip_axis"] {
-        if parameter_value(modifier, key)
-            .and_then(Value::as_array)
-            .is_some_and(|flags| flags.iter().any(|flag| flag.as_bool() == Some(true)))
-        {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                "Blender mirror bisect is not supported",
-                json!({"feature_id": "modifier.mirror.bisect", "modifier_id": modifier.id, "parameter": key}),
-            ));
-        }
-    }
     let enabled = if let Some(value) = parameter_value(modifier, "use_axis") {
         let values = value
             .as_array()
@@ -1053,6 +1045,24 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     } else {
         [true, false, false]
     };
+    // Blender cuts the mesh at a mirrored axis's plane when that axis is bisected; a bisect on an
+    // axis that is not mirrored changes nothing, so only the mirrored case is refused.
+    let bisect: Vec<bool> = parameter_value(modifier, "use_bisect_axis")
+        .and_then(Value::as_array)
+        .map(|flags| {
+            flags
+                .iter()
+                .map(|flag| flag.as_bool() == Some(true))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(axis) = (0..3).find(|&axis| enabled[axis] && bisect.get(axis) == Some(&true)) {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Blender mirror bisect on a mirrored axis is not supported",
+            json!({"feature_id": "modifier.mirror.bisect", "modifier_id": modifier.id, "axis": axis}),
+        ));
+    }
     let selected: Vec<_> = enabled
         .iter()
         .enumerate()
@@ -3019,8 +3029,20 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &origin,
         mesh,
     )?;
-    if !keep_custom_normals && let Some(values) = rebuild_custom_normals(mesh, &result, &sources)? {
-        result.attributes.insert("custom_normal".to_owned(), values);
+    if keep_custom_normals && !mesh.attributes.contains_key("custom_normal") {
+        // MOD_triangulate.cc keeps the pre-split corner normals as custom normals, so the triangles
+        // keep the shading of the faces they were cut from.
+        let computed = corner_normals(mesh, &positions(mesh))?;
+        let vectors: Vec<DVec3> = sources
+            .iter()
+            .map(|source| source.map_or(DVec3::ZERO, |corner| computed[corner]))
+            .collect();
+        let keep = vec![true; result.faces.len()];
+        if let Some(value) = corner_normal_attribute(&result, &vectors, &keep) {
+            result.attributes.insert("custom_normal".to_owned(), value);
+        }
+    } else if !keep_custom_normals {
+        transfer_custom_normals(mesh, &mut result, &sources)?;
     }
     Ok(result)
 }
@@ -3220,9 +3242,7 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let origin = Origin::copies(point_sources.into_iter().map(Some), face_sources);
     let mut result = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
-    if let Some(values) = rebuild_custom_normals(mesh, &result, &corner_sources)? {
-        result.attributes.insert("custom_normal".to_owned(), values);
-    }
+    transfer_custom_normals(mesh, &mut result, &corner_sources)?;
     Ok(result)
 }
 
@@ -3572,10 +3592,21 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let loop_slide = bool_param(modifier, "loop_slide", true)?;
     let harden_normals = bool_param(modifier, "harden_normals", false)?;
     let mark_sharp = bool_param(modifier, "mark_sharp", false)?;
-    if bool_param(modifier, "mark_seam", false)? {
+    // Blender's mark_seam copies the input's seams onto the new rungs (check_edge_data_seam_sharp_edges),
+    // so it changes nothing on a mesh without seams.
+    let input_seam = mesh
+        .attributes
+        .get("blender_edge_flags")
+        .and_then(Value::as_array)
+        .is_some_and(|flags| {
+            flags
+                .iter()
+                .any(|entry| entry.get("seam").and_then(Value::as_bool) == Some(true))
+        });
+    if bool_param(modifier, "mark_seam", false)? && input_seam {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
-            "bevel mark_seam is not supported",
+            "bevel mark_seam on a mesh with seam edges is not supported",
             json!({
                 "feature_id": "modifier.bevel.mark_seam",
                 "modifier_id": modifier.id,
@@ -3599,10 +3630,14 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ));
     }
 
-    if (harden_normals || mark_sharp) && (affect != "EDGES" || segments != 1) {
+    // harden_normals needs the single-edge bevel. mark_sharp only marks rungs of input sharp edges
+    // (mark_sharp_rungs), so it needs that bevel only when the input has sharp edges.
+    let input_sharp = sharp_edge_flags(mesh)?.contains(&true);
+    let single_edge_bevel = affect == "EDGES" && segments == 1;
+    if (harden_normals || (mark_sharp && input_sharp)) && !single_edge_bevel {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
-            "bevel harden_normals and mark_sharp are evaluated for single-segment EDGES bevels only",
+            "bevel harden_normals and mark_sharp on sharp edges are evaluated for single-segment EDGES bevels only",
             json!({
                 "feature_id": "modifier.bevel.shading_segments",
                 "modifier_id": modifier.id,
@@ -4767,9 +4802,7 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         raw_normals: false,
     };
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
-    if let Some(values) = rebuild_custom_normals(mesh, &result, &sources)? {
-        result.attributes.insert("custom_normal".to_owned(), values);
-    }
+    transfer_custom_normals(mesh, &mut result, &sources)?;
     Ok(result)
 }
 
@@ -5240,12 +5273,14 @@ fn union(parent: &mut [usize], first: usize, second: usize) {
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
 
+    use std::collections::HashMap;
+
     use glam::{DMat4, DVec3};
     use proptest::prelude::*;
     use serde_json::json;
 
     use crate::{
-        error::ErrorCode,
+        error::{ErrorCode, PotError},
         geom::{BoxParams, Mesh},
         model::{CurveData, CurvePoint, CurveSpline, Id, Modifier},
     };
@@ -5454,6 +5489,416 @@ mod tests {
         .unwrap();
         assert_eq!(mirrored.vertices.len(), 3);
         assert_eq!(mirrored.faces.len(), 1);
+    }
+
+    /// A box with every face smooth and the given custom normals: `(face index, vector)` pairs, one
+    /// vector per corner of that face.
+    fn smooth_box_with_custom(faces: &[(usize, DVec3)]) -> Mesh {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        crate::geom::normals::shade_faces_smooth(&mut mesh);
+        let values: serde_json::Map<String, serde_json::Value> = mesh
+            .faces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, face)| {
+                let (_, normal) = faces.iter().find(|(face_index, _)| *face_index == index)?;
+                Some((
+                    format!("f{}", face.id),
+                    json!(vec![normal.to_array(); face.vertices.len()]),
+                ))
+            })
+            .collect();
+        mesh.attributes.insert(
+            "custom_normal".to_owned(),
+            json!({"domain": "corner", "type": "float3", "values": values}),
+        );
+        mesh
+    }
+
+    /// Vertex positions of `mesh` by vertex ID.
+    fn positions_by_id(mesh: &Mesh) -> HashMap<u32, DVec3> {
+        mesh.vertices
+            .iter()
+            .map(|vertex| (vertex.id, vertex.co))
+            .collect()
+    }
+
+    /// Case A: a planar Triangulate changes no shading. The authored normal stays on the two
+    /// triangles of its face, the four edges where it disagrees with its neighbours become sharp
+    /// (Blender's setter), and no other triangle has a custom normal.
+    #[test]
+    fn planar_triangulate_keeps_authored_normal_and_marks_split_edges() {
+        let authored = DVec3::new(0.195, 0.098, -0.976).normalize();
+        let base = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let bottom = base
+            .faces
+            .iter()
+            .position(|face| {
+                let points = positions_by_id(&base);
+                face.vertices.iter().all(|id| points[id].z < -0.999)
+            })
+            .unwrap();
+        let mesh = smooth_box_with_custom(&[(bottom, authored)]);
+        let settled = crate::geom::clnor::settle_custom_normals(&mesh)
+            .unwrap()
+            .unwrap();
+        let input_normals = crate::geom::normals::corner_normals(
+            &settled,
+            &mesh
+                .vertices
+                .iter()
+                .map(|vertex| vertex.co)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let result = evaluate_modifiers(&mesh, &[with_params("triangulate", json!({}))]).unwrap();
+        let points = positions_by_id(&result);
+        let sharp = crate::geom::normals::sharp_edge_flags(&result).unwrap();
+        let bottom_edges = result
+            .edges
+            .iter()
+            .zip(&sharp)
+            .filter(|(edge, _)| edge.vertices.iter().all(|id| points[id].z < -0.999))
+            .filter(|(_, flag)| **flag)
+            .count();
+        assert_eq!(
+            bottom_edges, 4,
+            "the four bottom edges split the bottom fan"
+        );
+
+        let rows = result.attributes["custom_normal"]["values"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "only the two triangles of the authored face keep a vector"
+        );
+        let output = crate::geom::normals::corner_normals(
+            &result,
+            &result
+                .vertices
+                .iter()
+                .map(|vertex| vertex.co)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        // Every output corner keeps the shading of the input corner it was cut from.
+        let mut corner = 0;
+        for face in &result.faces {
+            let corner_points: Vec<DVec3> = face.vertices.iter().map(|id| points[id]).collect();
+            let source = mesh
+                .faces
+                .iter()
+                .enumerate()
+                .find(|(_, source)| {
+                    corner_points.iter().all(|point| {
+                        source
+                            .vertices
+                            .iter()
+                            .any(|id| (positions_by_id(&mesh)[id] - *point).length() < 1.0e-9)
+                    })
+                })
+                .map(|(index, _)| index)
+                .unwrap();
+            for (position, point) in corner_points.iter().enumerate() {
+                let source_position = mesh.faces[source]
+                    .vertices
+                    .iter()
+                    .position(|id| (positions_by_id(&mesh)[id] - *point).length() < 1.0e-9)
+                    .unwrap();
+                let source_corner = mesh.faces[..source]
+                    .iter()
+                    .map(|face| face.vertices.len())
+                    .sum::<usize>()
+                    + source_position;
+                assert!(
+                    (output[corner + position] - input_normals[source_corner]).length() < 1.0e-3,
+                    "triangle corner shading changed"
+                );
+            }
+            corner += face.vertices.len();
+        }
+    }
+
+    /// Case B: Mirror does not average two custom normals across an edge their faces split on. The
+    /// two faces disagree, so the shared edge is sharp, and the copy of the first face keeps its own
+    /// vector along that edge.
+    #[test]
+    fn mirror_keeps_custom_normals_on_either_side_of_a_split_edge() {
+        let base = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let points = positions_by_id(&base);
+        let centre = |face: &crate::geom::Face| {
+            face.vertices.iter().map(|id| points[id]).sum::<DVec3>() / face.vertices.len() as f64
+        };
+        let first = (0..base.faces.len())
+            .min_by(|a, b| {
+                centre(&base.faces[*a])
+                    .x
+                    .total_cmp(&centre(&base.faces[*b]).x)
+            })
+            .unwrap();
+        let second = (0..base.faces.len())
+            .filter(|index| *index != first)
+            .find(|index| {
+                base.faces[*index]
+                    .vertices
+                    .iter()
+                    .filter(|id| base.faces[first].vertices.contains(id))
+                    .count()
+                    == 2
+            })
+            .unwrap();
+        let first_normal = DVec3::new(-1.0, 0.3, 0.1).normalize();
+        let second_normal = DVec3::new(0.2, -1.0, 0.4).normalize();
+        let mesh = smooth_box_with_custom(&[(first, first_normal), (second, second_normal)]);
+        let shared: Vec<u32> = base.faces[first]
+            .vertices
+            .iter()
+            .copied()
+            .filter(|id| base.faces[second].vertices.contains(id))
+            .collect();
+
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "mirror",
+                json!({"use_axis": [true, false, false], "use_mirror_merge": false}),
+            )],
+        )
+        .unwrap();
+        let result_points = positions_by_id(&result);
+        let sharp = crate::geom::normals::sharp_edge_flags(&result).unwrap();
+        let split = result
+            .edges
+            .iter()
+            .zip(&sharp)
+            .any(|(edge, flag)| *flag && shared.iter().all(|id| edge.vertices.contains(id)));
+        assert!(split, "the edge between the two faces must be sharp");
+
+        let normals = crate::geom::normals::corner_normals(
+            &result,
+            &result
+                .vertices
+                .iter()
+                .map(|vertex| vertex.co)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut corner = 0;
+        let mut checked = 0;
+        for face in &result.faces {
+            let face_points: Vec<u32> = face.vertices.clone();
+            let is_first_copy = base.faces[first]
+                .vertices
+                .iter()
+                .all(|id| face_points.contains(id))
+                && face_points.len() == 4;
+            if is_first_copy {
+                for (position, id) in face_points.iter().enumerate() {
+                    if shared.contains(id) {
+                        assert!(
+                            (normals[corner + position] - first_normal).length() < 1.0e-3,
+                            "a corner on the split edge took the other face's normal"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            corner += face.vertices.len();
+        }
+        assert_eq!(
+            checked, 2,
+            "both corners of the shared edge on the original face are checked"
+        );
+        let _ = result_points;
+    }
+
+    /// A Triangulate with keep on a mesh without custom normals stores its pre-split normals: the
+    /// output's custom normals equal the input's corner normals for every corner of a flat face.
+    #[test]
+    fn triangulate_keep_without_custom_normals_stores_pre_split_normals() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        crate::geom::normals::shade_faces_smooth(&mut mesh);
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "triangulate",
+                json!({"keep_custom_normals": true}),
+            )],
+        )
+        .unwrap();
+        assert!(result.attributes.contains_key("custom_normal"));
+        let without = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "triangulate",
+                json!({"keep_custom_normals": false}),
+            )],
+        )
+        .unwrap();
+        assert!(!without.attributes.contains_key("custom_normal"));
+    }
+
+    /// `use_normal_flip` reverses every screw quad, so each face's normal changes sign.
+    #[test]
+    fn screw_normal_flip_reverses_every_face() {
+        // A profile quad in the XZ plane, off the axis: each edge sweeps into faces that do not cross.
+        let mesh = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(3.0, 0.0, 0.0),
+                DVec3::new(4.0, 0.0, 0.0),
+                DVec3::new(4.0, 0.0, 1.0),
+                DVec3::new(3.0, 0.0, 1.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )
+        .unwrap();
+        // Faces keyed by their sorted, rounded corner positions, so the comparison does not depend on
+        // the order the faces are emitted in.
+        let normals_by_corners = |result: &Mesh| -> HashMap<Vec<[i64; 3]>, DVec3> {
+            let points = positions_by_id(result);
+            result
+                .faces
+                .iter()
+                .map(|face| {
+                    let corners: Vec<DVec3> = face.vertices.iter().map(|id| points[id]).collect();
+                    let mut key: Vec<[i64; 3]> = corners
+                        .iter()
+                        .map(|point| point.to_array().map(|c| (c * 1.0e6).round() as i64))
+                        .collect();
+                    key.sort_unstable();
+                    (key, crate::geom::normals::face_normal(&corners))
+                })
+                .collect()
+        };
+        // Three steps close the full turn into three distinct rings.
+        let plain = normals_by_corners(
+            &evaluate_modifiers(&mesh, &[with_params("screw", json!({"steps": 3}))]).unwrap(),
+        );
+        let flipped = normals_by_corners(
+            &evaluate_modifiers(
+                &mesh,
+                &[with_params(
+                    "screw",
+                    json!({"steps": 3, "use_normal_flip": true}),
+                )],
+            )
+            .unwrap(),
+        );
+        assert_eq!(plain.len(), 12);
+        assert_eq!(flipped.len(), 12);
+        for (corners, before) in &plain {
+            let after = flipped
+                .get(corners)
+                .unwrap_or_else(|| panic!("flipped screw lacks a face {corners:?}"));
+            assert!(
+                before.dot(*after) < -0.99,
+                "screw face did not flip: {before:?} then {after:?} corners {corners:?}"
+            );
+        }
+    }
+
+    fn refused_feature(error: &PotError) -> Option<&str> {
+        error
+            .details
+            .get("feature_id")
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// Each typed refusal is raised where Blender acts, and each stays silent where Blender does
+    /// nothing (`mirror bisect` on an unmirrored axis, `mark_seam` without seams, `mark_sharp`
+    /// without sharp edges).
+    #[test]
+    fn shading_refusals_name_their_feature_only_where_blender_acts() {
+        let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+
+        let error = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "mirror",
+                json!({"use_axis": [true, false, false], "use_bisect_axis": [true, false, false]}),
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(refused_feature(&error), Some("modifier.mirror.bisect"));
+        evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "mirror",
+                json!({"use_axis": [true, false, false], "use_bisect_axis": [false, true, false]}),
+            )],
+        )
+        .unwrap();
+
+        let mut seamed = mesh.clone();
+        let edges: Vec<serde_json::Value> = seamed
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(index, _)| json!({"sharp": false, "seam": index == 0}))
+            .collect();
+        seamed
+            .attributes
+            .insert("blender_edge_flags".to_owned(), json!(edges));
+        let error = evaluate_modifiers(
+            &seamed,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "mark_seam": true}),
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(refused_feature(&error), Some("modifier.bevel.mark_seam"));
+        evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "mark_seam": true}),
+            )],
+        )
+        .unwrap();
+
+        let error = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "segments": 2, "harden_normals": true}),
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused_feature(&error),
+            Some("modifier.bevel.shading_segments")
+        );
+        evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
+            )],
+        )
+        .unwrap();
+
+        let mut sharp = mesh.clone();
+        let key = format!("e{}", sharp.edges[0].id);
+        sharp.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": {key: true}}),
+        );
+        let error = evaluate_modifiers(
+            &sharp,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused_feature(&error),
+            Some("modifier.bevel.shading_segments")
+        );
     }
 
     #[test]

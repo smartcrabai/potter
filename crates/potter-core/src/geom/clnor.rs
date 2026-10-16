@@ -19,7 +19,9 @@ use std::f64::consts::TAU;
 use glam::DVec3;
 use serde_json::{Map, Value, json};
 
-use super::normals::{face_normal, safe_acos_approx, sharp_edge_flags, smooth_face_flags, vector3};
+use super::normals::{
+    corner_normals, face_normal, safe_acos_approx, sharp_edge_flags, smooth_face_flags, vector3,
+};
 use super::{Mesh, edge_key};
 use crate::error::{ErrorCode, PotError, Result};
 
@@ -33,7 +35,7 @@ const SAME_TOLERANCE: f64 = 1.0e-4;
 /// The space of one fan (`CornerNormalSpace`). The default is the invalid space: it decodes to the
 /// zero vector.
 #[derive(Clone, Copy, Debug, Default)]
-struct Space {
+pub(crate) struct Space {
     lnor: DVec3,
     vec_ref: DVec3,
     vec_ortho: DVec3,
@@ -88,7 +90,7 @@ impl Space {
     }
 
     /// The custom normal a code pair stands for (`corner_space_custom_data_to_normal`).
-    fn decode(&self, codes: [i32; 2]) -> DVec3 {
+    pub(crate) fn decode(&self, codes: [i32; 2]) -> DVec3 {
         if codes[0] == 0 || !self.is_valid() {
             return self.lnor;
         }
@@ -117,7 +119,7 @@ impl Space {
 
     /// The code pair of a custom normal (`corner_space_custom_normal_to_data`). The zero pair
     /// stands for "no custom normal" and decodes to the fan normal.
-    fn encode(&self, custom: DVec3) -> [i32; 2] {
+    pub(crate) fn encode(&self, custom: DVec3) -> [i32; 2] {
         let same = (self.lnor - custom).abs().max_element() <= SAME_TOLERANCE;
         if custom == DVec3::ZERO || same || !self.is_valid() {
             return [0, 0];
@@ -159,10 +161,10 @@ fn code(value: f64) -> i32 {
 
 /// The fans of one mesh. `corners[k]` lists the global corners of fan `k` in Blender's traversal
 /// order and `spaces[k]` is its space. `fan_of[c]` is the fan of global corner `c`.
-struct Fans {
-    corners: Vec<Vec<usize>>,
-    spaces: Vec<Space>,
-    fan_of: Vec<usize>,
+pub(crate) struct Fans {
+    pub(crate) corners: Vec<Vec<usize>>,
+    pub(crate) spaces: Vec<Space>,
+    pub(crate) fan_of: Vec<usize>,
 }
 
 /// The link of one local edge around a vertex (`EdgeInfo`).
@@ -187,7 +189,7 @@ struct FanCorner {
 /// Fans and spaces of a mesh given by vertex positions, faces (vertex indices), smooth flags, and
 /// sharp edges (vertex-index pairs). Corners join a fan through an edge that is not sharp, whose
 /// faces are both smooth, and whose faces wind the same way.
-fn fans(
+pub(crate) fn fans(
     points: &[DVec3],
     faces: &[Vec<usize>],
     smooth: &[bool],
@@ -460,10 +462,169 @@ fn authored_vectors(mesh: &Mesh) -> Option<Vec<DVec3>> {
     )
 }
 
-/// The `custom_normal` attribute of `output`, rebuilt from `source` the way Blender rebuilds it
-/// after a topology change. `sources[c]` is the global source corner (in `source.faces` order)
-/// whose code output corner `c` copies, or `None` for a corner with no source. Returns `None` when
-/// `source` has no custom normals.
+/// The faces using one vertex-index edge, each with the global corners at its two ends.
+type EdgeUses = HashMap<(usize, usize), Vec<(usize, [(usize, usize); 2])>>;
+
+/// The corner normals of `mesh` without its custom normals, at `positions`.
+fn plain_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
+    let mut plain = mesh.clone();
+    plain.attributes.remove("custom_normal");
+    corner_normals(&plain, positions)
+}
+
+/// `authored` where a corner has a custom normal, `computed` elsewhere.
+fn fill_custom(authored: &[DVec3], computed: &[DVec3]) -> Vec<DVec3> {
+    authored
+        .iter()
+        .zip(computed)
+        .map(|(custom, normal)| {
+            if *custom == DVec3::ZERO {
+                *normal
+            } else {
+                *custom
+            }
+        })
+        .collect()
+}
+
+/// `mesh` with its `custom_normal` set to `vectors`, one per corner.
+fn with_custom_normals(mesh: &Mesh, vectors: &[DVec3]) -> Mesh {
+    let mut settled = mesh.clone();
+    if let Some(value) = corner_normal_attribute(mesh, vectors, &vec![true; mesh.faces.len()]) {
+        settled.attributes.insert("custom_normal".to_owned(), value);
+    }
+    settled
+}
+
+/// Blender's `mesh_normals_corner_custom_set` applied to a mesh with custom normals before they are
+/// read: a corner without a custom normal takes its computed corner normal, and a fan whose corners
+/// disagree is cut at the edge between them, which becomes sharp. The corners without a custom
+/// normal then take the computed normals of the cut mesh. Returns `None` when the mesh has no
+/// `custom_normal` attribute.
+///
+/// # Errors
+///
+/// Returns the errors of [`corner_normals`] when the mesh is invalid.
+pub(crate) fn settle_custom_normals(mesh: &Mesh) -> Result<Option<Mesh>> {
+    let Some(authored) = authored_vectors(mesh) else {
+        return Ok(None);
+    };
+    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    let filled = fill_custom(&authored, &plain_corner_normals(mesh, &positions)?);
+
+    let index_of: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let smooth = smooth_face_flags(mesh)?;
+    let fans = mesh_fans(mesh)?;
+    let mut sharp = sharp_edge_flags(mesh)?;
+    // Per vertex-index edge: each face using it, with the global corner at each end.
+    let mut uses: EdgeUses = HashMap::new();
+    let mut offset = 0;
+    for (face_index, face) in mesh.faces.iter().enumerate() {
+        let count = face.vertices.len();
+        for corner in 0..count {
+            let ends = [corner, (corner + 1) % count];
+            let vertices = ends.map(|end| index_of[&face.vertices[end]]);
+            let corners = ends.map(|end| offset + end);
+            uses.entry(edge_key(vertices[0], vertices[1]))
+                .or_default()
+                .push((
+                    face_index,
+                    [(vertices[0], corners[0]), (vertices[1], corners[1])],
+                ));
+        }
+        offset += count;
+    }
+    let edge_index: HashMap<(usize, usize), usize> = mesh
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| {
+            (
+                edge_key(index_of[&edge.vertices[0]], index_of[&edge.vertices[1]]),
+                index,
+            )
+        })
+        .collect();
+    let mut marked = false;
+    for (key, faces) in &uses {
+        let [(first, first_ends), (second, second_ends)] = faces.as_slice() else {
+            continue;
+        };
+        if !smooth[*first] || !smooth[*second] {
+            continue;
+        }
+        // Only corners of one fan can disagree: that fan is cut at the edge between them.
+        let differs = first_ends.iter().any(|&(vertex, corner)| {
+            second_ends.iter().any(|&(other, other_corner)| {
+                other == vertex
+                    && fans.fan_of[corner] == fans.fan_of[other_corner]
+                    && filled[corner].dot(filled[other_corner]) < 1.0 - 1.0e-4
+            })
+        });
+        if let Some(&index) = edge_index.get(key)
+            && differs
+        {
+            sharp[index] = true;
+            marked = true;
+        }
+    }
+    if !marked {
+        return Ok(Some(with_custom_normals(mesh, &filled)));
+    }
+
+    let mut cut = mesh.clone();
+    let values: Map<String, Value> = mesh
+        .edges
+        .iter()
+        .zip(&sharp)
+        .map(|(edge, flag)| (format!("e{}", edge.id), json!(flag)))
+        .collect();
+    cut.attributes.insert(
+        "sharp".to_owned(),
+        json!({"domain": "edge", "type": "bool", "values": values}),
+    );
+    let cut_computed = plain_corner_normals(&cut, &positions)?;
+    Ok(Some(with_custom_normals(
+        &cut,
+        &fill_custom(&authored, &cut_computed),
+    )))
+}
+
+/// The `custom_normal` attribute of `output` holding `vectors`, one per output corner in face order.
+/// A face whose `keep` flag is false has no row, so its corners carry no custom normal. `None` when
+/// no face is kept.
+pub(crate) fn corner_normal_attribute(
+    output: &Mesh,
+    vectors: &[DVec3],
+    keep: &[bool],
+) -> Option<Value> {
+    let mut values = Map::new();
+    let mut corner = 0;
+    for (face, kept) in output.faces.iter().zip(keep) {
+        let end = corner + face.vertices.len();
+        if *kept {
+            let row: Vec<Value> = vectors[corner..end]
+                .iter()
+                .map(|normal| json!(normal.to_array()))
+                .collect();
+            values.insert(format!("f{}", face.id), Value::Array(row));
+        }
+        corner = end;
+    }
+    (!values.is_empty()).then(|| json!({"domain": "corner", "type": "float3", "values": values}))
+}
+
+/// The `custom_normal` attribute of `output`, rebuilt from `source` the way Blender rebuilds it after
+/// a topology change. `source` must be settled ([`settle_custom_normals`]). `sources[c]` is the
+/// global source corner (in `source.faces` order) whose code output corner `c` copies, or `None` for
+/// a corner with no source. A fan whose codes average to zero has no custom normal: its corners
+/// decode to the fan normal, and a face with no such fan keeps no row. Returns `None` when `source`
+/// has no custom normals or no output fan keeps one.
 ///
 /// # Errors
 ///
@@ -494,6 +655,7 @@ pub(crate) fn rebuild_custom_normals(
 
     let output_fans = mesh_fans(output)?;
     let mut vectors = vec![DVec3::ZERO; output_corners];
+    let mut fan_keeps = vec![false; output_fans.corners.len()];
     for (fan, corners) in output_fans.corners.iter().enumerate() {
         // Blender sums the codes of a fan's corners and divides with integer truncation.
         let mut sum = [0_i32; 2];
@@ -503,29 +665,38 @@ pub(crate) fn rebuild_custom_normals(
             sum[1] += pair[1];
         }
         let count = i32::try_from(corners.len()).unwrap_or(i32::MAX);
-        let normal = output_fans.spaces[fan].decode([sum[0] / count, sum[1] / count]);
+        let average = [sum[0] / count, sum[1] / count];
+        fan_keeps[fan] = average != [0, 0];
+        let normal = output_fans.spaces[fan].decode(average);
         for &corner in corners {
             vectors[corner] = normal;
         }
     }
 
-    let mut values = Map::new();
+    let mut keep = Vec::with_capacity(output.faces.len());
     let mut corner = 0;
     for face in &output.faces {
-        let count = face.vertices.len();
-        let normals: Vec<Value> = vectors[corner..corner + count]
-            .iter()
-            .map(|normal| json!(normal.to_array()))
-            .collect();
-        values.insert(format!("f{}", face.id), Value::Array(normals));
-        corner += count;
+        let end = corner + face.vertices.len();
+        keep.push((corner..end).any(|c| fan_keeps[output_fans.fan_of[c]]));
+        corner = end;
     }
-    let mut entry = source
-        .attributes
-        .get("custom_normal")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    entry.insert("values".to_owned(), Value::Object(values));
-    Ok(Some(Value::Object(entry)))
+    Ok(corner_normal_attribute(output, &vectors, &keep))
+}
+
+/// Sets `output`'s `custom_normal` from `source` as [`rebuild_custom_normals`] gives it, replacing
+/// whatever the provenance copied in: a corner with no fan custom normal is not stored.
+///
+/// # Errors
+///
+/// Returns the errors of [`rebuild_custom_normals`].
+pub(crate) fn transfer_custom_normals(
+    source: &Mesh,
+    output: &mut Mesh,
+    sources: &[Option<usize>],
+) -> Result<()> {
+    output.attributes.remove("custom_normal");
+    if let Some(value) = rebuild_custom_normals(source, output, sources)? {
+        output.attributes.insert("custom_normal".to_owned(), value);
+    }
+    Ok(())
 }

@@ -20,8 +20,8 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
-        corner_space::CornerFans,
-        normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags, smooth_face_flags},
+        clnor::transfer_custom_normals,
+        normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags},
         provenance::Origin,
     },
 };
@@ -285,20 +285,23 @@ pub(super) fn screw(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let segments = if closed { ring_count } else { ring_count - 1 };
     let mut faces = Vec::with_capacity(segments * source_edges.len());
+    let flip = bool_param(modifier, "use_normal_flip", false)?;
     for step in 0..segments {
         let next_step = (step + 1) % ring_count;
         for [first, second] in &source_edges {
             // Blender's screw loops run against the profile edge's winding, so each face's cycle runs
-            // back from the next ring to this one.
-            faces.push((
-                vec![
-                    next_step * source_positions.len() + second,
-                    next_step * source_positions.len() + first,
-                    step * source_positions.len() + first,
-                    step * source_positions.len() + second,
-                ],
-                0,
-            ));
+            // back from the next ring to this one. `use_normal_flip` reverses every quad (quad_ord in
+            // MOD_screw.cc).
+            let mut quad = vec![
+                next_step * source_positions.len() + second,
+                next_step * source_positions.len() + first,
+                step * source_positions.len() + first,
+                step * source_positions.len() + second,
+            ];
+            if flip {
+                quad.reverse();
+            }
+            faces.push((quad, 0));
         }
     }
     let vertex_count = source_positions.len();
@@ -2136,51 +2139,10 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             serde_json::json!({"domain": "edge", "type": "bool", "values": values}),
         );
     }
-    if let Some(input_normals) = &custom_corners {
-        // Blender copies each corner's raw 16-bit custom data and reads it back in the output's
-        // fans, so a copied normal is re-expressed in its new fan's space (see corner_space.rs).
-        let input_smooth = smooth_face_flags(mesh)?;
-        let input_fans = CornerFans::new(
-            &face_indices,
-            &source_positions,
-            &input_smooth,
-            &source_sharp,
-        );
-        let input_data = input_fans.encode(input_normals);
-        let data: Vec<[i16; 2]> = source_corners
-            .iter()
-            .map(|corner| input_data[*corner])
-            .collect();
-        let output_faces: Vec<Vec<usize>> = result
-            .faces
-            .iter()
-            .map(|face| face.vertices.iter().map(|id| result_indices[id]).collect())
-            .collect();
-        let output_positions: Vec<DVec3> = result.vertices.iter().map(|vertex| vertex.co).collect();
-        let output_smooth = smooth_face_flags(&result)?;
-        let output_fans = CornerFans::new(
-            &output_faces,
-            &output_positions,
-            &output_smooth,
-            &output_sharp,
-        );
-        let normals = output_fans.decode(&data);
-        let mut values = serde_json::Map::new();
-        let mut corner = 0;
-        for face in &result.faces {
-            let end = corner + face.vertices.len();
-            let corner_normals: Vec<Value> = normals[corner..end]
-                .iter()
-                .map(|normal| serde_json::json!([normal.x, normal.y, normal.z]))
-                .collect();
-            values.insert(format!("f{}", face.id), Value::Array(corner_normals));
-            corner = end;
-        }
-        result.attributes.insert(
-            "custom_normal".to_owned(),
-            serde_json::json!({"domain": "corner", "type": "float3", "values": values}),
-        );
-    }
+    // Each output corner copies the raw custom data of its source corner, which its new fan decodes
+    // (BM_elem_attrs_copy in bmesh_wireframe.cc, read back through the output fans).
+    let sources: Vec<Option<usize>> = source_corners.iter().map(|corner| Some(*corner)).collect();
+    transfer_custom_normals(mesh, &mut result, &sources)?;
     result.attributes.remove("wireframe_use_crease");
     result.attributes.remove("wireframe_crease_weight");
     if use_crease {
@@ -2474,7 +2436,8 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .iter()
                 .map(|quad| {
                     let normal = (points[quad[2]] - points[quad[0]])
-                        .cross(points[quad[3]] - points[quad[1]]);
+                        .cross(points[quad[3]] - points[quad[1]])
+                        .normalize_or_zero();
                     normal.dot(centre - centre_of(quad))
                 })
                 .sum();
