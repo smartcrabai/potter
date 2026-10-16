@@ -1539,7 +1539,11 @@ fn validate_attribute_modifier_params_inner(
         "data_transfer" => &["object"],
         _ => &[],
     };
-    if let Some(field) = required.iter().find(|field| !params.contains_key(**field)) {
+    // An explicit null is no reference at all, so a required reference counts as missing.
+    if let Some(field) = required
+        .iter()
+        .find(|field| params.get(**field).is_none_or(Value::is_null))
+    {
         return Err(invalid_attribute_modifier_parameter(
             modifier_type,
             field,

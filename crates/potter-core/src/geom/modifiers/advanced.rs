@@ -465,6 +465,18 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
+/// Blender's automatic cast half-extent per axis: the larger of the mesh's absolute extremes.
+fn cast_auto_half_extent(points: &[DVec3]) -> DVec3 {
+    let mut lo = DVec3::splat(f64::INFINITY);
+    let mut hi = DVec3::splat(f64::NEG_INFINITY);
+    for point in points {
+        lo = lo.min(*point);
+        hi = hi.max(*point);
+    }
+    let half = |lo: f64, hi: f64| if lo.abs() > hi.abs() { lo.abs() } else { hi };
+    DVec3::new(half(lo.x, hi.x), half(lo.y, hi.y), half(lo.z, hi.z))
+}
+
 pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let cast_type = string_param(modifier, "cast_type")?.to_ascii_uppercase();
     let factor = number_param(modifier, "factor")?;
@@ -473,51 +485,97 @@ pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     let radius = number_param(modifier, "radius")?;
     let size = number_param(modifier, "size")?;
-    if radius <= 0.0 || size <= 0.0 {
+    if radius < 0.0 || size < 0.0 {
         return Err(invalid_parameter(
             modifier,
             "radius",
-            "positive radius and size",
+            "a non-negative radius and size",
         ));
     }
     let use_radius_as_size = bool_param(modifier, "use_radius_as_size")?;
-    let cast_size = if use_radius_as_size { radius } else { size };
     // `origin` is not in the cast schema; an explicit value is honoured, else the zero origin applies.
     let center = if modifier.params.contains_key("origin") {
         vec3_param(modifier, "origin")?
     } else {
         DVec3::ZERO
     };
+    // Blender: a radius of zero (within FLT_EPSILON) leaves the cast unbounded.
+    let limit = (radius > f64::from(f32::EPSILON)).then_some(radius);
+    let points: Vec<DVec3> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co - center)
+        .collect();
     let mut result = mesh.clone();
-    for vertex in &mut result.vertices {
-        let point = vertex.co - center;
-        let mut direction = point;
-        if cast_type == "CYLINDER" {
-            direction.z = 0.0;
-        }
-        if radius > f64::EPSILON && direction.length() > radius {
-            continue;
-        }
-        let target = match cast_type.as_str() {
-            "SPHERE" => point
-                .try_normalize()
-                .map_or(DVec3::ZERO, |unit| unit * cast_size),
-            "CYLINDER" => {
-                direction
-                    .try_normalize()
-                    .map_or(DVec3::ZERO, |unit| unit * cast_size)
-                    + DVec3::Z * point.z
+    match cast_type.as_str() {
+        "SPHERE" | "CYLINDER" => {
+            let mut length = if use_radius_as_size { radius } else { size };
+            if length <= 0.0 {
+                // Blender's automatic size: the mean vertex distance from the centre, 10 when that is zero.
+                let total: f64 = points.iter().map(|point| point.length()).sum();
+                let mean = total / usize_as_f64(points.len());
+                length = if mean > 0.0 { mean } else { 10.0 };
             }
-            "CUBOID" => point.clamp(DVec3::splat(-cast_size), DVec3::splat(cast_size)),
-            _ => {
-                return Err(invalid_parameter(
-                    modifier,
-                    "cast_type",
-                    "SPHERE, CYLINDER, or CUBOID",
-                ));
+            let flatten = cast_type == "CYLINDER";
+            for (vertex, point) in result.vertices.iter_mut().zip(&points) {
+                // Blender clears the Z axis for cylinders (MOD_CAST_Z), so the projection is planar.
+                let direction = if flatten {
+                    DVec3::new(point.x, point.y, 0.0)
+                } else {
+                    *point
+                };
+                if limit.is_some_and(|limit| direction.length() > limit) {
+                    continue;
+                }
+                let mut target = direction.normalize_or_zero() * length;
+                if flatten {
+                    target.z = point.z;
+                }
+                vertex.co = center + point.lerp(target, factor);
             }
-        };
-        vertex.co = center + point.lerp(target, factor);
+        }
+        "CUBOID" => {
+            // Blender: an explicit half-extent when one applies, else the mesh's symmetric bounds.
+            let explicit = if use_radius_as_size {
+                limit.map(|_| radius)
+            } else {
+                (size > 0.0).then_some(size)
+            };
+            let half = explicit.map_or_else(|| cast_auto_half_extent(&points), DVec3::splat);
+            for (vertex, point) in result.vertices.iter_mut().zip(&points) {
+                if limit.is_some_and(|limit| point.abs().max_element() > limit) {
+                    continue;
+                }
+                // Blender projects each vertex onto the box wall of its octant along the ray from the centre.
+                let apex = DVec3::new(
+                    if point.x > 0.0 { half.x } else { -half.x },
+                    if point.y > 0.0 { half.y } else { -half.y },
+                    if point.z > 0.0 { half.z } else { -half.z },
+                );
+                let ratio = *point / apex;
+                let mut best = ratio.x;
+                let mut coord = 0;
+                if ratio.y > best {
+                    best = ratio.y;
+                    coord = 1;
+                }
+                if ratio.z > best {
+                    coord = 2;
+                }
+                if point[coord].abs() < f64::from(f32::EPSILON) {
+                    continue;
+                }
+                let target = *point * (apex[coord] / point[coord]);
+                vertex.co = center + point.lerp(target, factor);
+            }
+        }
+        _ => {
+            return Err(invalid_parameter(
+                modifier,
+                "cast_type",
+                "SPHERE, CYLINDER, or CUBOID",
+            ));
+        }
     }
     validated(&result)?;
     Ok(result)

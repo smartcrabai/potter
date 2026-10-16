@@ -1,13 +1,17 @@
 {
-  "description": "Diagnostic coverage inventory only; tests do not consume this file as an allow-list. A family below means its schema properties are not behaviorally covered by PR18-A except for the exact type.parameter scenarios named here. No unexercised entry asserts a Blender divergence or no-op.",
+  "description": "Diagnostic coverage inventory only; tests do not consume this file as an allow-list. A family below means its schema properties are not behaviorally covered by PR18-A except for the exact type.parameter scenarios named here, and each label states the only values that were compared. No unexercised entry asserts a Blender divergence or no-op.",
   "behavior_scenarios": {
-    "edge_split.use_edge_angle": "edge_split_no_angle",
-    "triangulate.min_vertices": "triangulate_min_vertices5",
-    "solidify.solidify_mode": "solidify_nonmanifold",
-    "decimate.ratio": "decimate_half",
-    "screw.angle": "screw_default_angle",
-    "array.fit_length": "array_fit_length_fixed_count (inert only while fit_type=FIXED_COUNT)",
-    "array.use_apply_on_spline": "apply_on_spline_mesh (mesh-only no-op check)"
+    "edge_split.use_edge_angle (use_edge_angle=false)": "edge_split_no_angle",
+    "triangulate.min_vertices (min_vertices=5)": "triangulate_min_vertices5",
+    "solidify.solidify_mode (NON_MANIFOLD)": "solidify_nonmanifold",
+    "decimate.ratio (0.5)": "decimate_half",
+    "screw.angle (default 2π only)": "screw_default_angle",
+    "array.fit_length (FIXED_COUNT no-op only)": "array_fit_length_fixed_count",
+    "array.use_apply_on_spline (mesh-only no-op only)": "apply_on_spline_mesh",
+    "cast.cast_type (CYLINDER at factor 0.5, CUBOID with explicit size; SPHERE default is a no-op on a box)": "cast_cylinder, cast_cuboid_size, cast_default",
+    "cast.cast_type CUBOID with auto bounds (no-op on a box)": "cast_cuboid_auto_bounds",
+    "cast.radius and cast.size (radius-as-size and explicit-size paths)": "cast_radius_sets_length, cast_size_sets_length, cast_radius_excludes_all",
+    "cast.use_radius_as_size (false only in cast_size_sets_length and cast_radius_excludes_all)": "cast_size_sets_length, cast_radius_excludes_all"
   },
   "unexercised_by_owner": {
     "B": ["mirror.*"],
@@ -15,7 +19,11 @@
     "D": ["solidify.* except solidify_mode"],
     "E": ["shrinkwrap.*"],
     "F": [
-      "armature.*", "cast.*", "corrective_smooth.*", "curve.*", "displace.*", "hook.*",
+      "armature.*",
+      "cast.factor except 0.5",
+      "cast.use_x, cast.use_y, cast.use_z (only their Blender default true is exercised)",
+      "cast.use_transform, cast.object, cast.vertex_group, cast.invert_vertex_group",
+      "corrective_smooth.*", "curve.*", "displace.*", "hook.*",
       "laplacian_deform.*", "laplacian_smooth.*", "lattice.*", "mesh_deform.*",
       "simple_deform.*", "skin.*", "smooth.*", "surface_deform.*", "warp.*", "wave.*"
     ],
@@ -37,8 +45,10 @@
       "soft_body.*", "volume_displace.*", "volume_to_mesh.*"
     ],
     "P": [
-      "array.* except fit_length and the array.use_apply_on_spline scenario", "build.*",
-      "screw.* except angle", "weld.*", "wireframe.*"
+      "array.* except fit_length at FIXED_COUNT and use_apply_on_spline on a mesh",
+      "build.*",
+      "screw.* except the default angle 2π",
+      "weld.*", "wireframe.*"
     ],
     "Q": ["mesh_cache.*", "mesh_sequence_cache.*"],
     "PR14": ["bevel.*"],
@@ -48,5 +58,5 @@
     ],
     "PR17": ["boolean.*"]
   },
-  "interpretation": "Runtime-default and schema/op acceptance tests do not count as parameter-behavior coverage. Properties outside the named scenarios remain unexercised, not silently supported, inert, or divergent. Their owners remain the audit implementation slices listed above."
+  "interpretation": "Runtime-default and schema acceptance checks do not count as parameter-behavior coverage. Properties outside the named scenarios remain unexercised, not silently supported, inert, or divergent. Their owners remain the audit implementation slices listed above."
 }

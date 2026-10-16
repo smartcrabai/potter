@@ -808,29 +808,32 @@ pub(super) fn update_linked_modifier_settings(
             "modifier physics target disappeared",
         )
     })?;
-    if is_particle_registry_entry {
-        let registry = node
-            .properties
-            .get_mut("physics_particle_systems")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "particle settings registry is invalid",
-                )
-            })?;
-        registry.insert(modifier_id.to_string(), Value::Object(settings));
-    } else {
-        node.properties
-            .insert(property.to_owned(), Value::Object(settings));
-        if system == "particle_emitter" {
-            node.properties.insert(
-                "physics_particle_emitter_modifier_id".to_owned(),
-                Value::String(modifier_id.to_string()),
-            );
+    // A flag-only update has no physics settings to write; the stored settings stay as they are.
+    if !settings.is_empty() {
+        if is_particle_registry_entry {
+            let registry = node
+                .properties
+                .get_mut("physics_particle_systems")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "particle settings registry is invalid",
+                    )
+                })?;
+            registry.insert(modifier_id.to_string(), Value::Object(settings));
+        } else {
+            node.properties
+                .insert(property.to_owned(), Value::Object(settings));
+            if system == "particle_emitter" {
+                node.properties.insert(
+                    "physics_particle_emitter_modifier_id".to_owned(),
+                    Value::String(modifier_id.to_string()),
+                );
+            }
         }
+        engine.mark("nodes", target, ChangeKind::Updated);
     }
-    engine.mark("nodes", target, ChangeKind::Updated);
     modifier_flags.insert(
         "settings_id".to_owned(),
         Value::String(modifier_id.to_string()),

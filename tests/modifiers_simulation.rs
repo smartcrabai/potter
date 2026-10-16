@@ -148,6 +148,74 @@ fn physics_operations_create_stack_entries_linked_to_their_settings() -> Result<
     Ok(())
 }
 
+#[test]
+fn modifier_flag_updates_keep_linked_physics_settings() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("physics-flags");
+    let batch = directory.path().join("operations.json");
+    initialize(&scene)?;
+    apply(
+        &scene,
+        &batch,
+        &json!([
+            {"op":"node.create","id":"body","kind":"box","params":{}},
+            {"op":"physics.cloth.create","target":{"id":"body"},"settings":{"mass":2.0,"quality":7,"tension_stiffness":12.0}},
+            {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"rate":1.0,"lifetime":12.0}},
+            {"op":"modifier.create","target":{"id":"body"},"id":"second_emitter","type":"particle_system","params":{"settings_id":"second_emitter","show_expanded":true}}
+        ]),
+        0,
+    )?;
+    // The modifier path stores no emitter settings for a registry entry (import provides them), so
+    // seed the entry the way an import does, then check the flag-only update leaves it intact.
+    let seeded_path = scene.join("scene.json");
+    let mut seeded: Value = serde_json::from_slice(&fs::read(&seeded_path)?)?;
+    seeded["nodes"]["body"]["properties"]["physics_particle_systems"]["second_emitter"] =
+        json!({"rate":3.0,"lifetime":5.0});
+    fs::write(&seeded_path, serde_json::to_vec(&seeded)?)?;
+    let before: Value = serde_json::from_slice(&fs::read(&seeded_path)?)?;
+    let stored_before = before["nodes"]["body"]["properties"].clone();
+    assert_eq!(stored_before["physics_cloth"]["mass"], 2.0);
+    assert_eq!(
+        stored_before["physics_particle_systems"]["second_emitter"]["rate"],
+        3.0
+    );
+
+    apply(
+        &scene,
+        &batch,
+        &json!([
+            {"op":"modifier.update","target":{"id":"body"},"modifier_id":"physics_cloth","set":{"params":{"show_expanded":false}}},
+            {"op":"modifier.update","target":{"id":"body"},"modifier_id":"second_emitter","set":{"params":{"show_expanded":false}}}
+        ]),
+        1,
+    )?;
+    let after: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let stored_after = &after["nodes"]["body"]["properties"];
+    assert_eq!(
+        stored_after["physics_cloth"],
+        stored_before["physics_cloth"]
+    );
+    assert_eq!(
+        stored_after["physics_particle_emitter"],
+        stored_before["physics_particle_emitter"]
+    );
+    assert_eq!(
+        stored_after["physics_particle_systems"],
+        stored_before["physics_particle_systems"]
+    );
+    let modifiers = after["nodes"]["body"]["modifiers"]
+        .as_array()
+        .ok_or("modifier stack missing")?;
+    for id in ["physics_cloth", "second_emitter"] {
+        let modifier = modifiers
+            .iter()
+            .find(|modifier| modifier["id"] == id)
+            .ok_or_else(|| format!("{id} modifier missing"))?;
+        assert_eq!(modifier["params"]["show_expanded"], false);
+    }
+    Ok(())
+}
+
 fn injected_particles(
     states: &Value,
 ) -> Result<Vec<potter_core::sim::ParticleState>, Box<dyn Error>> {

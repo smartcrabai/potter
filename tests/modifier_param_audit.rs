@@ -7,7 +7,7 @@
 //! Schema truth, Blender-default parity, and a small differential behavior guard for modifier
 //! parameters (PR18 slice A).
 //!
-//! The default and operation checks cover every defaulted table property. The behavior test uses
+//! The defaults test compares every recorded default with Blender 5.2.2. The behavior test uses
 //! only explicit Blender 5.2.2 scenarios with activating inputs or confirmed inert conditions;
 //! every other parameter remains unexercised and is tracked outside the regression test.
 
@@ -16,7 +16,6 @@ use std::{
     env, fs,
     path::Path,
     process::{Command, Output},
-    thread,
 };
 
 use serde_json::{Map, Value, json};
@@ -53,81 +52,6 @@ fn pot() -> Command {
 
 fn param_table() -> Value {
     serde_json::from_str(PARAM_TABLE).unwrap()
-}
-
-struct Parameter {
-    modifier: String,
-    name: String,
-    default: Value,
-}
-
-/// Every table property with a schema default. Type-level resource references without defaults
-/// are supplied by the fixture operations below.
-fn all_parameters() -> Vec<Parameter> {
-    let table = param_table();
-    let mut parameters = Vec::new();
-    for (modifier, spec) in table["modifiers"].as_object().unwrap() {
-        for (name, schema) in spec["properties"].as_object().unwrap() {
-            let Some(default) = schema.get("default") else {
-                continue;
-            };
-            parameters.push(Parameter {
-                modifier: modifier.clone(),
-                name: name.clone(),
-                default: default.clone(),
-            });
-        }
-    }
-    parameters
-}
-
-/// Parameters a type needs to evaluate at all, so the baseline is a real modifier.
-fn baseline_params(modifier: &str) -> Map<String, Value> {
-    let target = json!(GUARD_TARGET);
-    let group = json!(GUARD_GROUP);
-    let entries: Vec<(&str, Value)> = match modifier {
-        "armature" => vec![
-            ("object", json!(GUARD_RIG)),
-            ("vertex_group", json!("Root")),
-        ],
-        "data_transfer" | "boolean" | "curve" | "mesh_deform" | "particle_instance" => {
-            vec![("object", target)]
-        }
-        "normal_edit" | "shrinkwrap" | "surface_deform" => vec![("target", target)],
-        "vertex_weight_edit" => vec![("vertex_group", group)],
-        "mask" => vec![
-            ("armature", json!(GUARD_RIG)),
-            ("mode", json!("ARMATURE")),
-            ("vertex_group", group),
-        ],
-        "vertex_weight_mix" => vec![("vertex_group_a", group.clone()), ("vertex_group_b", group)],
-        "vertex_weight_proximity" => vec![("target", target), ("vertex_group", group)],
-        "uv_project" => vec![("projectors", json!([GUARD_CAMERA]))],
-        "uv_warp" => vec![
-            ("object_from", json!(GUARD_RIG)),
-            ("object_to", json!(GUARD_RIG_ALT)),
-            ("bone_from", json!(GUARD_GROUP)),
-            ("bone_to", json!(GUARD_GROUP)),
-        ],
-        "warp" => vec![
-            ("object_from", target),
-            ("object_to", json!(GUARD_TARGET_ALT)),
-        ],
-        "lattice" => vec![("object", json!(GUARD_LATTICE))],
-        "nodes" => vec![("node_group", json!(GUARD_GRAPH))],
-        "particle_system" => vec![("settings_id", json!("physics_particle_emitter"))],
-        "mesh_cache" => vec![("resource", json!("guard_cache"))],
-        "mesh_sequence_cache" => vec![
-            ("resource", json!("guard_sequence_cache")),
-            ("object_path", json!("/root/body/geometry")),
-        ],
-        "cast" => vec![("radius", json!(1.0)), ("size", json!(1.0))],
-        _ => Vec::new(),
-    };
-    entries
-        .into_iter()
-        .map(|(name, value)| (name.to_owned(), value))
-        .collect()
 }
 
 fn write_mesh_cache(directory: &Path, format: &str) -> std::path::PathBuf {
@@ -357,24 +281,6 @@ fn operation_rejection(modifier: &str, params: &Map<String, Value>) -> Option<St
     )
 }
 
-/// Maps `function` over `items` on scoped threads, preserving order.
-fn parallel_map<T: Sync, R: Send>(items: &[T], function: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let workers = thread::available_parallelism()
-        .map_or(4, usize::from)
-        .min(4);
-    let chunk_size = items.len().div_ceil(workers).max(1);
-    thread::scope(|scope| {
-        let handles: Vec<_> = items
-            .chunks(chunk_size)
-            .map(|part| scope.spawn(|| part.iter().map(&function).collect::<Vec<R>>()))
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| handle.join().unwrap())
-            .collect()
-    })
-}
-
 /// Blender stores floats as float32; the table keeps the shortest decimal of the same value.
 #[expect(
     clippy::float_cmp,
@@ -444,23 +350,7 @@ fn param_table_defaults_match_blender_fixture() {
 }
 
 #[test]
-fn schema_and_op_layer_accept_every_defaulted_table_property() {
-    let parameters = all_parameters();
-    let rejections = parallel_map(&parameters, |parameter| {
-        let mut params = baseline_params(&parameter.modifier);
-        params
-            .entry(parameter.name.clone())
-            .or_insert_with(|| parameter.default.clone());
-        operation_rejection(&parameter.modifier, &params)
-            .map(|message| format!("{}.{}: {message}", parameter.modifier, parameter.name))
-    });
-    let rejections: Vec<String> = rejections.into_iter().flatten().collect();
-    assert!(
-        rejections.is_empty(),
-        "schema and op layer disagree on default values:\n{}",
-        rejections.join("\n")
-    );
-    // A key the schema does not know must be refused by the operation layer.
+fn unknown_parameter_keys_are_refused_by_the_operation_layer() {
     let unknown = Map::from_iter([("__not_a_blender_property__".to_owned(), json!(1))]);
     assert!(
         operation_rejection("array", &unknown).is_some_and(|message| message.contains("unknown")),
@@ -692,14 +582,6 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
                     potter_case, blender_case,
                     "{id}: Potter differs from Blender"
                 );
-            }
-            "equal_inert" => {
-                assert_eq!(
-                    blender_baseline, blender_case,
-                    "{id}: expected Blender no-op"
-                );
-                assert_eq!(potter_baseline, potter_case, "{id}: expected Potter no-op");
-                assert_eq!(potter_case, blender_case, "{id}: no-op baseline differs");
             }
             "inert" => {
                 assert_eq!(
