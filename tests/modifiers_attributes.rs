@@ -4,17 +4,13 @@ use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh, ResolvedTexture,
+        Mesh,
         modifiers::{
             attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
             evaluate_modifiers,
         },
-        resolve_texture,
     },
-    image::{ImageData, ImageInterpolation, encode_pixels},
-    model::{
-        CameraData, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Modifier, SceneDoc,
-    },
+    model::{CameraData, Modifier, SceneDoc},
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -33,8 +29,6 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
-        show_viewport: true,
-        show_render: true,
         params: params
             .as_object()
             .ok_or("modifier params must be an object")?
@@ -104,74 +98,12 @@ fn scene_operand_with_space(
         ),
         camera,
         armature: false,
+        object_scale: glam::DVec3::ONE,
+        selected_bones: std::collections::BTreeSet::new(),
+        deforming_bones: std::collections::BTreeSet::new(),
+        layer_selection:
+            potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(),
     }
-}
-
-fn resolved_mask_texture(
-    image_data: &ImageData,
-    texture_id: &str,
-    inline_image_record: bool,
-) -> Result<ResolvedTexture, Box<dyn Error>> {
-    let directory = tempdir()?;
-    let bytes = encode_pixels(image_data.width, image_data.height, &image_data.pixels)?;
-    let blob = potter_core::hash::sha256(&bytes);
-    let hash = blob
-        .strip_prefix("sha256:")
-        .ok_or("image blob hash prefix missing")?;
-    let blob_path = directory
-        .path()
-        .join("assets")
-        .join("sha256")
-        .join(hash)
-        .join("blob");
-    fs::create_dir_all(
-        blob_path
-            .parent()
-            .ok_or("image blob has no parent directory")?,
-    )?;
-    fs::write(&blob_path, &bytes)?;
-
-    let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-    let texture_id = Id::new(texture_id.to_owned())?;
-    let image_id = if inline_image_record {
-        Id::new("mask_image_pixels")?
-    } else {
-        texture_id.clone()
-    };
-    doc.images.insert(
-        image_id.clone(),
-        Image {
-            name: "Mask".to_owned(),
-            source: ImageSource::Packed,
-            colorspace: ImageColorspace::Linear,
-            width: image_data.width,
-            height: image_data.height,
-            tiles: Vec::new(),
-            blob: Some(blob),
-            source_path: None,
-            source_hash: None,
-            alpha_mode: ImageAlphaMode::Straight,
-        },
-    );
-    if inline_image_record {
-        doc.resources.insert(
-            texture_id.clone(),
-            json!({
-                "storage":"inline",
-                "kind":"legacy_texture",
-                "texture_type":"IMAGE",
-                "image":image_id.as_str(),
-                "settings":{"use_interpolation":false}
-            }),
-        );
-    }
-    doc.validate()?;
-    let lookup_id = if inline_image_record {
-        &texture_id
-    } else {
-        &image_id
-    };
-    Ok(resolve_texture(&doc, lookup_id, Some(directory.path()))?)
 }
 
 fn scene_operand_with_identity_space(mesh: Mesh, camera: Option<CameraData>) -> SceneOperand {
@@ -180,6 +112,7 @@ fn scene_operand_with_identity_space(mesh: Mesh, camera: Option<CameraData>) -> 
     ];
     scene_operand_with_space(mesh, IDENTITY, IDENTITY, IDENTITY, camera)
 }
+
 #[test]
 fn vertex_weight_mix_applies_blender_operation_to_selected_vertices() -> Result<(), Box<dyn Error>>
 {
@@ -545,38 +478,6 @@ fn mesh_cache_mdd_interpolates_resource_frames() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[test]
-fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Error>> {
-    let source = weighted_line()?;
-    let image = ImageData {
-        width: 1,
-        height: 1,
-        pixels: vec![[0.0, 0.0, 0.0, 1.0]],
-        tiles: BTreeMap::new(),
-        interpolation: ImageInterpolation::Closest,
-    };
-    let resolved_texture = resolved_mask_texture(&image, "mask_image", false)?;
-    let edit = modifier(
-        "vertex_weight_edit",
-        json!({
-            "vertex_group":"A",
-            "falloff_type":"SHARP",
-            "normalize":false,
-            "mask_texture":"mask_image",
-            "mask_tex_use_channel":"RED",
-            "mask_tex_mapping":"LOCAL"
-        }),
-    )?;
-    let result = evaluate_with_context(
-        &source,
-        &edit,
-        &BTreeMap::new(),
-        Some(&resolved_texture),
-        DMat4::IDENTITY,
-    )?;
-    assert_eq!(weights(&result, "A")?, [0.25, 0.75]);
-    Ok(())
-}
 
 #[test]
 #[expect(
@@ -717,7 +618,7 @@ fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
     Ok(())
 }
 #[test]
-fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
+fn cli_applies_image_texture_mask_and_unknown_texture_fails()
 -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
@@ -763,12 +664,8 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
     let scene_path = scene.join("scene.json");
     let serialized = fs::read(&scene_path)?;
     let doc: SceneDoc = serde_json::from_slice(&serialized)?;
-    let snapshot = Snapshot::evaluate_with_cache(
-        &doc,
-        &EvaluationContext::default(),
-        Some(&scene),
-        Some(&scene.join(".potter/cache")),
-    )?;
+    let snapshot =
+        Snapshot::evaluate_with_cache(&doc, &EvaluationContext::default(), Some(&scene))?;
     let body = snapshot
         .meshes
         .get(&potter_core::model::Id::new("body")?)
@@ -784,13 +681,12 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
         &procedural_scene,
         &EvaluationContext::default(),
         Some(&scene),
-        Some(&scene.join(".potter/cache")),
     )
     .err()
-    .ok_or("procedural texture mask unexpectedly evaluated")?;
+    .ok_or("unknown texture ID unexpectedly resolved")?;
     assert_eq!(
-        error.details["feature_id"],
-        json!("modifier.vertex_weight_edit.texture_type")
+        error.code,
+        potter_core::error::ErrorCode::TargetNotFound
     );
     Ok(())
 }
@@ -1714,8 +1610,7 @@ fn blender_quantize_loop_normals(
     )?)?)
 }
 #[test]
-fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
--> Result<(), Box<dyn Error>> {
+fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
         eprintln!("skipping modifier Blender parity test: Blender is unavailable");
         return Ok(());
@@ -2530,83 +2425,6 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &expected["data_transfer_domains"],
         1.0e-4,
     )?;
-    let image = ImageData {
-        width: 2,
-        height: 2,
-        pixels: vec![
-            [0.0, 0.0, 0.0, 1.0],
-            [0.25, 0.25, 0.25, 1.0],
-            [0.6, 0.6, 0.6, 1.0],
-            [1.0, 1.0, 1.0, 1.0],
-        ],
-        tiles: BTreeMap::new(),
-        interpolation: ImageInterpolation::Closest,
-    };
-    let resolved_texture = resolved_mask_texture(&image, "image_mask", true)?;
-    let subject_world = DMat4::from_scale_rotation_translation(
-        DVec3::new(0.8, 0.7, 1.0),
-        DQuat::from_rotation_z(0.2),
-        DVec3::new(0.25, -0.25, 0.0),
-    );
-    let map_object_world = DMat4::from_scale_rotation_translation(
-        DVec3::new(1.5, 0.75, 1.0),
-        DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4),
-        DVec3::new(0.75, 0.25, 0.0),
-    );
-    for mapping in ["LOCAL", "GLOBAL", "OBJECT", "UV"] {
-        let mut mask_mesh = quad.clone();
-        if mapping == "UV" {
-            // Blender's V-up values, stored V-down.
-            mask_mesh.attributes.insert(
-                "uv_layers".to_owned(),
-                uv_layers_attribute(&json!([{
-                    "face_id":0,
-                    "uv":flip_v(&json!([[0.13,0.17],[0.73,0.24],[0.84,0.81],[0.2,0.69]]))
-                }])),
-            );
-        }
-        let mut operands = BTreeMap::new();
-        if mapping == "OBJECT" {
-            operands.insert(
-                "mask_tex_map_object".to_owned(),
-                vec![scene_operand(
-                    Mesh::default(),
-                    map_object_world,
-                    None,
-                )],
-            );
-        }
-        let mask_modifier = modifier(
-            "vertex_weight_edit",
-            json!({
-                "vertex_group":"A","falloff_type":"SHARP","normalize":false,
-                "mask_texture":"image_mask","mask_tex_use_channel":"RED",
-                "mask_tex_mapping":mapping,"mask_tex_uv_layer":"UVMap",
-                "mask_tex_map_object":"mask_object"
-            }),
-        )?;
-        let masked = evaluate_with_context(
-            &mask_mesh,
-            &mask_modifier,
-            &operands,
-            Some(&resolved_texture),
-            subject_world,
-        )?;
-        let key = format!("texture_mask_{}", mapping.to_lowercase());
-        let baseline_key = format!("baseline_{key}");
-        assert_material_change(
-            &format!("image mask mapping {mapping}"),
-            &expected[&baseline_key],
-            &expected[&key],
-            1.0e-5,
-        )?;
-        assert_parity(
-            &format!("image mask mapping {mapping}"),
-            &json!(vertex_weights(&masked, "A")?),
-            &expected[&key],
-            1.0e-5,
-        )?;
-    }
 
     for evaluation_frame in [0.25, 0.75] {
         let mut pc2_mesh = quad.clone();
@@ -3099,198 +2917,5 @@ fn assert_normal_parity(
         max_angle <= tolerance,
         "{label} normal angle {max_angle}; actual={worst_actual:?}, expected={worst_expected:?}"
     );
-    Ok(())
-}
-
-/// Blender's UV values of the UV Data Transfer probe, per corner in V-up.
-const TRANSFER_SOURCE: [[f64; 2]; 4] = [[0.3, 0.7], [0.6, 0.2], [0.9, 0.4], [0.1, 0.8]];
-const TRANSFER_DESTINATION: [[f64; 2]; 4] = [[0.2, 0.2], [0.4, 0.6], [0.7, 0.1], [0.5, 0.9]];
-/// Blender's factor 0.5 result over `TRANSFER_DESTINATION`: the midpoint of destination and source.
-const TRANSFER_HALF: [[f64; 2]; 4] = [[0.25, 0.45], [0.5, 0.4], [0.8, 0.25], [0.3, 0.85]];
-/// Blender's factor 0.5 result into a layer the destination lacks, which starts at zero in V-up.
-const TRANSFER_GENERATED_HALF: [[f64; 2]; 4] = [[0.15, 0.35], [0.3, 0.1], [0.45, 0.2], [0.05, 0.4]];
-
-/// A `uv_layers` attribute with one layer `name` on face 0, holding Blender V-up `values`, stored V-down.
-fn named_uv_layers(name: &str, values: [[f64; 2]; 4]) -> Value {
-    json!({
-        "layers": [{"name": name, "faces": [{"face_id": 0, "uv": flip_v(&json!(values))}]}],
-        "active": name,
-        "render": name
-    })
-}
-
-/// A quad carrying one UV layer `name` with Blender V-up `values`.
-fn uv_layer_quad(name: &str, values: [[f64; 2]; 4]) -> Result<Mesh, Box<dyn Error>> {
-    let mut mesh = Mesh::from_positions_and_faces(
-        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
-        vec![vec![0, 1, 2, 3]],
-    )?;
-    mesh.attributes
-        .insert("uv_layers".to_owned(), named_uv_layers(name, values));
-    Ok(mesh)
-}
-
-/// Blender V-up corner values of layer `name` on face 0 of `mesh`.
-fn transferred_uv(mesh: &Mesh, name: &str) -> Result<Vec<[f64; 2]>, Box<dyn Error>> {
-    let store = mesh
-        .attributes
-        .get("uv_layers")
-        .ok_or("uv_layers missing")?;
-    let layer = store["layers"]
-        .as_array()
-        .ok_or("uv_layers layers missing")?
-        .iter()
-        .find(|layer| layer["name"] == name)
-        .ok_or_else(|| format!("no `{name}` layer"))?;
-    layer["faces"][0]["uv"]
-        .as_array()
-        .ok_or("uv row missing")?
-        .iter()
-        .map(|corner| -> Result<[f64; 2], Box<dyn Error>> {
-            Ok([
-                corner[0].as_f64().ok_or("U must be a number")?,
-                1.0 - corner[1].as_f64().ok_or("V must be a number")?,
-            ])
-        })
-        .collect()
-}
-
-fn assert_uv_close(actual: &[[f64; 2]], expected: &[[f64; 2]]) {
-    assert_eq!(actual.len(), expected.len(), "corner count");
-    for (actual, expected) in actual.iter().zip(expected) {
-        assert!(
-            (actual[0] - expected[0]).abs() < 1.0e-9 && (actual[1] - expected[1]).abs() < 1.0e-9,
-            "UV {actual:?} differs from Blender {expected:?}"
-        );
-    }
-}
-
-/// Runs a TOPOLOGY UV Data Transfer of `source` onto `destination`.
-fn run_uv_transfer(
-    destination: &Mesh,
-    source: &Mesh,
-    mix_mode: &str,
-    factor: f64,
-) -> Result<Mesh, Box<dyn Error>> {
-    let transfer = modifier(
-        "data_transfer",
-        json!({
-            "object": "source",
-            "use_loop_data": true,
-            "data_types_loops": ["UV"],
-            "loop_mapping": "TOPOLOGY",
-            "layers_uv_select_src": "ALL",
-            "layers_uv_select_dst": "NAME",
-            "mix_mode": mix_mode,
-            "mix_factor": factor
-        }),
-    )?;
-    let mut operands = BTreeMap::new();
-    operands.insert(
-        "object".to_owned(),
-        vec![scene_operand(source.clone(), DMat4::IDENTITY, None)],
-    );
-    Ok(evaluate_with_context(
-        destination,
-        &transfer,
-        &operands,
-        None,
-        DMat4::IDENTITY,
-    )?)
-}
-
-#[test]
-fn data_transfer_uv_mixes_by_factor_and_ignores_add_sub_mul_like_blender()
--> Result<(), Box<dyn Error>> {
-    // Blender 5.2.2 probe: a UV transfer gives the REPLACE result for ADD, SUB, and MUL alike, lerped
-    // from destination to source by factor. Blender's RNA offers only REPLACE for UV alone; the probe
-    // selected a color loop type too, and the UV result was the same.
-    let source = uv_layer_quad("Src", TRANSFER_SOURCE)?;
-    let destination = uv_layer_quad("Src", TRANSFER_DESTINATION)?;
-    for (mode, factor, expected) in [
-        ("ADD", 1.0, TRANSFER_SOURCE),
-        ("SUB", 1.0, TRANSFER_SOURCE),
-        ("MUL", 1.0, TRANSFER_SOURCE),
-        ("ADD", 0.5, TRANSFER_HALF),
-        ("SUB", 0.5, TRANSFER_HALF),
-        ("MUL", 0.5, TRANSFER_HALF),
-    ] {
-        let result = run_uv_transfer(&destination, &source, mode, factor)?;
-        assert_uv_close(&transferred_uv(&result, "Src")?, &expected);
-    }
-    Ok(())
-}
-
-#[test]
-fn data_transfer_uv_into_missing_layer_starts_at_blender_zero() -> Result<(), Box<dyn Error>> {
-    // Blender 5.2.2 probe: a layer generated for the transfer is zero in V-up, so a factor 0.5 transfer
-    // gives half the source, and a factor 1 transfer gives the source.
-    let source = uv_layer_quad("Src", TRANSFER_SOURCE)?;
-    let destination = uv_layer_quad("UVMap", TRANSFER_DESTINATION)?;
-    let half = run_uv_transfer(&destination, &source, "REPLACE", 0.5)?;
-    assert_uv_close(&transferred_uv(&half, "Src")?, &TRANSFER_GENERATED_HALF);
-    let full = run_uv_transfer(&destination, &source, "ADD", 1.0)?;
-    assert_uv_close(&transferred_uv(&full, "Src")?, &TRANSFER_SOURCE);
-    Ok(())
-}
-
-#[test]
-fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn Error>> {
-    // Blender 5.2.2 probe: a 1x4 Non-Color image, rows 0.1, 0.3, 0.6, 0.9 from bottom to top, with
-    // Closest sampling. UV mapping at V-up (0.13, 0.12), (0.73, 0.38), (0.84, 0.62), (0.2, 0.88) gives
-    // mask weights 0.1, 0.3, 0.6, 0.9. Each row is picked by its V-up coordinate, not its stored one.
-    let mut mesh = Mesh::from_positions_and_faces(
-        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
-        vec![vec![0, 1, 2, 3]],
-    )?;
-    mesh.attributes.insert(
-        "uv_layers".to_owned(),
-        named_uv_layers(
-            "UVMap",
-            [[0.13, 0.12], [0.73, 0.38], [0.84, 0.62], [0.2, 0.88]],
-        ),
-    );
-    mesh.attributes.insert(
-        "vertex_groups".to_owned(),
-        json!({
-            "A": {"v0": 0.0, "v1": 0.0, "v2": 0.0, "v3": 0.0},
-            "B": {"v0": 1.0, "v1": 1.0, "v2": 1.0, "v3": 1.0}
-        }),
-    );
-    let image = ImageData {
-        width: 1,
-        height: 4,
-        pixels: vec![
-            [0.1, 0.1, 0.1, 1.0],
-            [0.3, 0.3, 0.3, 1.0],
-            [0.6, 0.6, 0.6, 1.0],
-            [0.9, 0.9, 0.9, 1.0],
-        ],
-        tiles: BTreeMap::new(),
-        interpolation: ImageInterpolation::Closest,
-    };
-    let mix = modifier(
-        "vertex_weight_mix",
-        json!({
-            "vertex_group_a": "A",
-            "vertex_group_b": "B",
-            "mix_mode": "SET",
-            "mix_set": "ALL",
-            "mask_texture": "image_mask",
-            "mask_tex_use_channel": "RED",
-            "mask_tex_mapping": "UV",
-            "mask_tex_uv_layer": "UVMap"
-        }),
-    )?;
-    let result =
-        evaluate_with_context(&mesh, &mix, &BTreeMap::new(), Some(&image), DMat4::IDENTITY)?;
-    let weights = vertex_weights(&result, "A")?;
-    assert_eq!(weights.len(), 4);
-    for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {
-        assert!(
-            (weight - expected).abs() < 1.0e-9,
-            "mask weight {weight} differs from Blender {expected}"
-        );
-    }
     Ok(())
 }
