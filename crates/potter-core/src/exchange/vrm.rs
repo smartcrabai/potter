@@ -1,3 +1,4 @@
+pub mod import;
 mod mtoon;
 pub(crate) use mtoon::uv_textures;
 
@@ -318,7 +319,24 @@ fn map_head_offset(avatar: &AvatarSettings, mappings: &VrmWriterMappings<'_>) ->
     map_local_vector(mappings, &reference, offset)
 }
 
+/// Tolerance of the exporter's uniform-frame check. Its frames are f64, so this is tight.
+const EXPORT_FRAME_TOLERANCE: f64 = 1e-8;
+
 fn uniform_frame_scale(matrix: &DMat4, label: &str) -> Result<f64> {
+    uniform_scale(matrix, EXPORT_FRAME_TOLERANCE).ok_or_else(|| {
+        unsupported_export(
+            "vrm.collider_frame_scale",
+            &format!(
+                "{label} cannot be represented by the normalized frame's uniform scalar scale."
+            ),
+        )
+    })
+}
+
+/// The uniform scale of a frame: its three axes are orthogonal and of equal length, each within
+/// `tolerance` (relative to the scale). `None` when the frame is not such a similarity. The exporter
+/// (f64 frames) and the importer (f32 glTF frames, looser tolerance) both use this one check.
+pub(crate) fn uniform_scale(matrix: &DMat4, tolerance: f64) -> Option<f64> {
     let axes = [
         matrix.transform_vector3(DVec3::X),
         matrix.transform_vector3(DVec3::Y),
@@ -326,27 +344,19 @@ fn uniform_frame_scale(matrix: &DMat4, label: &str) -> Result<f64> {
     ];
     let lengths = axes.map(DVec3::length);
     let scale = lengths[0];
-    let length_tolerance = scale * 1e-8;
     if !scale.is_finite()
         || scale <= f64::EPSILON
         || lengths
             .iter()
-            .any(|length| !length.is_finite() || (*length - scale).abs() > length_tolerance)
-        || {
-            let axes = axes.map(|axis| axis / scale);
-            axes[0].dot(axes[1]).abs() > 1e-8
-                || axes[0].dot(axes[2]).abs() > 1e-8
-                || axes[1].dot(axes[2]).abs() > 1e-8
-        }
+            .any(|length| !length.is_finite() || (*length - scale).abs() > scale * tolerance)
     {
-        return Err(unsupported_export(
-            "vrm.collider_frame_scale",
-            &format!(
-                "{label} cannot be represented by the normalized frame's uniform scalar scale."
-            ),
-        ));
+        return None;
     }
-    Ok(scale)
+    let unit = axes.map(|axis| axis / scale);
+    let orthogonal = unit[0].dot(unit[1]).abs() <= tolerance
+        && unit[0].dot(unit[2]).abs() <= tolerance
+        && unit[1].dot(unit[2]).abs() <= tolerance;
+    orthogonal.then_some(scale)
 }
 
 fn nearly_equal(left: f64, right: f64) -> bool {
@@ -1247,6 +1257,12 @@ pub(crate) fn append_extensions(
     binary: &mut Vec<u8>,
     views: &mut Vec<Value>,
 ) -> Result<()> {
+    // Potter-only round-trip data: VRM 0.x cannot carry every typed meta field (name, license URL,
+    // copyright). VRM 1.0 carries them all, so its import decodes `VRMC_vrm.meta` without this copy.
+    if version == AvatarVersion::V0 {
+        root["extras"]["potter"]["avatar_meta"] = serde_json::to_value(&avatar.meta)
+            .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
+    }
     let extension = match version {
         AvatarVersion::V1 => vrm1_extension(
             doc,
@@ -1429,6 +1445,9 @@ fn vrm1_extension(
             mtoon_extension,
         )?;
         mark_extension_used(root, "VRMC_materials_mtoon")?;
+        if !mtoon.texture_transforms.is_empty() {
+            mark_extension_used(root, "KHR_texture_transform")?;
+        }
     }
     Ok(extension)
 }
@@ -1850,9 +1869,10 @@ fn vrm0_extension(
         extension["blendShapeMaster"] = vrm0_expressions(doc, avatar, mappings, root)?;
     }
     if let Some(spring) = &avatar.spring_bone {
-        let secondary = vrm0_spring_bone(doc, spring, mappings)?;
+        let (secondary, meta) = vrm0_spring_bone(doc, spring, mappings)?;
         if secondary.as_object().is_some_and(|value| !value.is_empty()) {
             extension["secondaryAnimation"] = secondary;
+            root["extras"]["potter"]["vrm0SpringBone"] = meta;
         }
     }
     if !doc.materials.is_empty() {
@@ -2123,9 +2143,11 @@ fn vrm0_spring_bone(
     doc: &SceneDoc,
     spring: &AvatarSpringBone,
     mappings: &VrmWriterMappings<'_>,
-) -> Result<Value> {
-    let (collider_groups, group_expansions) = legacy_collider_groups(doc, spring, mappings)?;
+) -> Result<(Value, Value)> {
+    let (collider_groups, group_expansions, legacy_groups) =
+        legacy_collider_groups(doc, spring, mappings)?;
     let mut bone_groups = Vec::with_capacity(spring.springs.len());
+    let mut bone_meta = Vec::with_capacity(spring.springs.len());
     for chain in &spring.springs {
         let Some(first) = chain.joints.first() else {
             return Err(PotError::new(
@@ -2133,6 +2155,11 @@ fn vrm0_spring_bone(
                 "spring chain has no joints",
             ));
         };
+        let joints = chain
+            .joints
+            .iter()
+            .map(|joint| resolve_node_ref(doc, &joint.node, mappings))
+            .collect::<Result<Vec<_>>>()?;
         let bones = vec![legacy_spring_root(doc, chain, mappings)?];
         let collider_group_indices = chain
             .collider_groups
@@ -2162,6 +2189,7 @@ fn vrm0_spring_bone(
         if let Some(center) = &chain.center {
             group["center"] = json!(resolve_node_ref(doc, center, mappings)?);
         }
+        bone_meta.push(json!({ "joints": joints }));
         bone_groups.push(group);
     }
     let mut value = json!({});
@@ -2171,17 +2199,30 @@ fn vrm0_spring_bone(
     if !bone_groups.is_empty() {
         value["boneGroups"] = json!(bone_groups);
     }
-    Ok(value)
+    // Potter-only metadata for root `extras.potter`: VRM 0.x cannot name collider groups, order their
+    // colliders, or mark a chain's terminal joint.
+    let meta = json!({
+        "colliderGroups": spring.collider_groups.iter().map(|group| json!({ "name": group.name, "colliders": group.colliders })).collect::<Vec<_>>(),
+        "legacyColliderGroups": legacy_groups,
+        "boneGroups": bone_meta
+    });
+    Ok((value, meta))
 }
+
+type LegacyColliderGroups = (Vec<Value>, Vec<Vec<usize>>, Vec<Value>);
+
+/// Expands each Potter collider group into one VRM 0.x group per node. Returns the VRM groups, the
+/// Potter group → VRM group indices, and per VRM group its Potter group and collider indices.
 fn legacy_collider_groups(
     doc: &SceneDoc,
     spring: &AvatarSpringBone,
     mappings: &VrmWriterMappings<'_>,
-) -> Result<(Vec<Value>, Vec<Vec<usize>>)> {
+) -> Result<LegacyColliderGroups> {
     let mut output = Vec::new();
+    let mut legacy_meta = Vec::new();
     let mut expansions = Vec::with_capacity(spring.collider_groups.len());
-    for group in &spring.collider_groups {
-        let mut by_node = Vec::<(usize, Vec<Value>)>::new();
+    for (group_index, group) in spring.collider_groups.iter().enumerate() {
+        let mut by_node = Vec::<(usize, Vec<Value>, Vec<usize>)>::new();
         for collider_index in &group.colliders {
             let collider = spring.colliders.get(*collider_index).ok_or_else(|| {
                 PotError::new(
@@ -2203,20 +2244,24 @@ fn legacy_collider_groups(
                 "offset": legacy_z_reflected_vec3(offset),
                 "radius": radius
             });
-            if let Some((_, colliders)) = by_node.iter_mut().find(|(index, _)| *index == node) {
+            if let Some((_, colliders, indices)) =
+                by_node.iter_mut().find(|(index, _, _)| *index == node)
+            {
                 colliders.push(item);
+                indices.push(*collider_index);
             } else {
-                by_node.push((node, vec![item]));
+                by_node.push((node, vec![item], vec![*collider_index]));
             }
         }
         let mut expanded = Vec::with_capacity(by_node.len());
-        for (node, colliders) in by_node {
+        for (node, colliders, indices) in by_node {
             expanded.push(output.len());
             output.push(json!({ "node": node, "colliders": colliders }));
+            legacy_meta.push(json!({ "group": group_index, "colliders": indices }));
         }
         expansions.push(expanded);
     }
-    Ok((output, expansions))
+    Ok((output, expansions, legacy_meta))
 }
 
 fn vrm0_material_properties(

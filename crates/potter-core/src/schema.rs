@@ -388,7 +388,8 @@ fn avatar_settings_schema() -> Value {
         "uv_animation_mask_texture":texture,
         "uv_animation_scroll_x_speed_factor":{"type":"number","default":0},
         "uv_animation_scroll_y_speed_factor":{"type":"number","default":0},
-        "uv_animation_rotation_speed_factor":{"type":"number","default":0}
+        "uv_animation_rotation_speed_factor":{"type":"number","default":0},
+        "texture_transforms":{"type":"object","propertyNames":{"enum":["shadeMultiplyTexture","shadingShiftTexture","matcapTexture","rimMultiplyTexture","outlineWidthMultiplyTexture","uvAnimationMaskTexture"]},"additionalProperties":{"type":"object","properties":{"offset":vec_schema(2),"rotation":{"type":"number","default":0},"scale":vec_schema(2)},"additionalProperties":false}}
     },"additionalProperties":false});
     json!({
         "type":"object","required":["armature","humanoid","meta"],

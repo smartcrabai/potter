@@ -6,6 +6,7 @@ use std::{
     path::Path,
 };
 
+use super::material_graph;
 use glam::{DMat4, DQuat, DVec3};
 use serde_json::{Value, json};
 
@@ -171,15 +172,43 @@ impl TextureExport {
         let offset = binary.len();
         binary.extend_from_slice(&encoded);
         let view = push_view(views, offset, encoded.len(), None);
+        let mut potter = json!({ "packed": packed.sources });
+        // A grey copy of one source channel (VRM 0.x masks) also names that source and channel, so the
+        // VRM importer can recover the original image; `remapped_channel` is the glTF component index.
+        if let Some((image, component)) = Self::single_channel_copy(&texture.channels) {
+            potter["id"] = json!(image.as_str());
+            potter["remapped_channel"] = json!(component);
+            // The copy's name is derived from its source; the importer restores that source name.
+            potter["source_name"] = json!(texture_image_for_export(doc, image)?.name);
+        }
         let index = self.images.len();
         self.images.push(json!({
             "name": packed.name,
             "bufferView": view,
             "mimeType": "image/png",
-            "extras": { "potter": { "packed": packed.sources } }
+            "extras": { "potter": potter }
         }));
         self.packed_image_indices.insert(key, index);
         Ok(index)
+    }
+
+    /// The source image and glTF component (0 = R, 1 = G, 2 = B) when a texture's RGB all read one
+    /// channel of one image and its alpha is constant: the grey copy the VRM masks use.
+    fn single_channel_copy(channels: &[Option<ChannelSource>; 4]) -> Option<(&Id, usize)> {
+        let [Some(red), Some(green), Some(blue), None] = channels else {
+            return None;
+        };
+        let component = |source: &ChannelSource| match source.channel {
+            TextureChannel::Red => 0,
+            TextureChannel::Green => 1,
+            TextureChannel::Blue => 2,
+            TextureChannel::Alpha => 3,
+        };
+        let same = red.image == green.image
+            && red.image == blue.image
+            && red.channel == green.channel
+            && red.channel == blue.channel;
+        (same && component(red) < 3).then_some((&red.image, component(red)))
     }
 
     pub(crate) fn export_image_index(
@@ -1650,7 +1679,7 @@ pub(crate) struct VrmFrameMaps {
     bone_world_matrices: BTreeMap<(Id, Id), DMat4>,
 }
 
-fn avatar_basis(version: AvatarVersion) -> DMat4 {
+pub(crate) fn avatar_basis(version: AvatarVersion) -> DMat4 {
     match version {
         AvatarVersion::V1 => POT_TO_GLTF,
         AvatarVersion::V0 => DMat4::from_rotation_y(std::f64::consts::PI) * POT_TO_GLTF,
@@ -3818,6 +3847,12 @@ fn export_with_root_inner(
             potter_extras["pose"] = serde_json::to_value(&node.pose)
                 .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
         }
+        if let Some(scale) = frame_maps
+            .and_then(|frames| frames.mesh_geometry_scales.get(id))
+            .filter(|scale| **scale != DVec3::ONE)
+        {
+            potter_extras["vrm_baked_scale"] = json!(scale.to_array());
+        }
         gltf_node["extras"] = json!({ "potter": potter_extras });
         if let Some(parent) = &node.parent {
             let _ = node_indices
@@ -4490,8 +4525,10 @@ fn import_images(
             .or_else(|| image_value["name"].as_str())
             .unwrap_or("image");
         let id = unique_import_id(suggested, "image", index, &mut used_ids)?;
-        let name = image_value["name"]
+        // A single-channel copy (VRM masks) is named `<source>_packed`; the Potter image keeps the source name.
+        let name = image_value["extras"]["potter"]["source_name"]
             .as_str()
+            .or_else(|| image_value["name"].as_str())
             .map_or(source_name, str::to_owned);
         doc.images.insert(
             id.clone(),
@@ -4511,6 +4548,90 @@ fn import_images(
         image_ids.push(id);
     }
     Ok(image_ids)
+}
+/// The `KHR_texture_transform` of a texture info, or `None` when it is absent or the identity. A `texCoord`
+/// override other than 0 (a UV set Potter does not import yet) is not applied; `gltf_import_losses` reports
+/// it as `material.texture_uv_set`.
+fn texture_transform(info: &Value) -> Result<Option<super::material_surface::TextureTransform>> {
+    let Some(extension) = info["extensions"]["KHR_texture_transform"].as_object() else {
+        return Ok(None);
+    };
+    if transform_reads_other_uv_set(info) {
+        return Ok(None);
+    }
+    let numbers = |key: &str, default: &[f64]| -> Result<Vec<f64>> {
+        match extension.get(key) {
+            None | Some(Value::Null) => Ok(default.to_vec()),
+            Some(value) => value
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .map(Value::as_f64)
+                        .collect::<Option<Vec<f64>>>()
+                })
+                .filter(|items| items.len() == default.len())
+                .ok_or_else(|| {
+                    import_error(format!("glTF KHR_texture_transform `{key}` is invalid"))
+                }),
+        }
+    };
+    let offset = numbers("offset", &[0.0, 0.0])?;
+    let scale = numbers("scale", &[1.0, 1.0])?;
+    let rotation = match extension.get("rotation") {
+        None | Some(Value::Null) => 0.0,
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| import_error("glTF KHR_texture_transform rotation is invalid"))?,
+    };
+    let transform = super::material_surface::TextureTransform {
+        offset: [offset[0], offset[1]],
+        rotation,
+        scale: [scale[0], scale[1]],
+    };
+    Ok((!transform.is_identity()).then_some(transform))
+}
+
+/// Whether a texture info reads a UV set other than 0, the only set Potter imports.
+fn reads_other_uv_set(info: &Value) -> bool {
+    info["texCoord"].as_u64().unwrap_or(0) != 0
+}
+
+/// Whether the `KHR_texture_transform` of a texture info overrides the UV set to one other than 0.
+fn transform_reads_other_uv_set(info: &Value) -> bool {
+    info["extensions"]["KHR_texture_transform"]["texCoord"]
+        .as_u64()
+        .unwrap_or(0)
+        != 0
+}
+
+/// Every texture slot of a glTF material that a graph can hold, each with its transform. An emissive or
+/// occlusion texture that reads another UV set is skipped and reported as `material.texture_uv_set`.
+fn material_textures(
+    material: &Value,
+    root: &Value,
+    image_ids: &[Id],
+) -> Result<material_graph::GraphTextures> {
+    let slot = |info: &Value| -> Result<Option<material_graph::SlotTexture>> {
+        let transform = texture_transform(info)?;
+        Ok(import_texture_ref(info, root, image_ids)?
+            .map(|texture| material_graph::SlotTexture { texture, transform }))
+    };
+    let optional_slot = |info: &Value| -> Result<Option<material_graph::SlotTexture>> {
+        if reads_other_uv_set(info) {
+            return Ok(None);
+        }
+        slot(info)
+    };
+    let pbr = &material["pbrMetallicRoughness"];
+    Ok(material_graph::GraphTextures {
+        base_color: slot(&pbr["baseColorTexture"])?,
+        metallic_roughness: slot(&pbr["metallicRoughnessTexture"])?,
+        normal: slot(&material["normalTexture"])?,
+        normal_scale: material["normalTexture"]["scale"].as_f64().unwrap_or(1.0),
+        emissive: optional_slot(&material["emissiveTexture"])?,
+        occlusion: optional_slot(&material["occlusionTexture"])?,
+    })
 }
 
 fn import_texture_ref(info: &Value, root: &Value, image_ids: &[Id]) -> Result<Option<TextureRef>> {
@@ -4612,6 +4733,45 @@ fn node_world_matrices(nodes: &[Value], parents: &[Option<usize>]) -> Result<Vec
         .collect()
 }
 
+/// The rest-world matrix of each imported skin bone, using the armature and glTF node frames.
+fn imported_bone_world_matrices(
+    doc: &SceneDoc,
+    skins: &[ImportedSkin],
+    node_ids: &[Id],
+    node_worlds: &[DMat4],
+    basis: DMat4,
+) -> Result<BTreeMap<(Id, Id), DMat4>> {
+    let mut worlds = BTreeMap::new();
+    let mut armatures = BTreeSet::new();
+    let inverse_basis = basis.inverse();
+    for skin in skins {
+        if !armatures.insert(skin.armature_node.clone()) {
+            continue;
+        }
+        let armature = doc
+            .data_blocks
+            .get(&skin.armature_data_id)
+            .and_then(|data| data.armature.as_ref())
+            .ok_or_else(|| import_error("imported skin armature data is missing"))?;
+        let armature_world = node_ids
+            .iter()
+            .position(|id| id == &skin.armature_node)
+            .map_or(DMat4::IDENTITY, |index| {
+                inverse_basis * node_worlds[index] * basis
+            });
+        for (bone_id, matrices) in
+            crate::eval::rig::evaluate_bone_matrices(armature, &BTreeMap::new())?
+        {
+            let world = armature_world * matrices.rest;
+            if !finite_matrix(world) {
+                return Err(import_error("imported skin bone transform is non-finite"));
+            }
+            worlds.insert((skin.armature_node.clone(), bone_id), world);
+        }
+    }
+    Ok(worlds)
+}
+
 type ImportedSkinGraph = (
     Vec<ImportedSkin>,
     BTreeSet<usize>,
@@ -4619,22 +4779,99 @@ type ImportedSkinGraph = (
     Vec<Id>,
 );
 
+/// Which armature a skin belongs to, chosen as Blender's glTF importer does. A Potter export names its
+/// armature node; any other skin takes the deepest common ancestor of its joints and skeleton (`None`
+/// for the scene root), or that node's parent when the ancestor is itself a joint.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ArmatureKey {
+    Node(usize),
+    Ancestor(Option<usize>),
+}
+
+/// Skins that share one armature: one armature whose bones are the union of the member skins' joints.
+struct SkinGroup {
+    armature_node_index: Option<usize>,
+    first_skin: usize,
+    /// Joint nodes of every member skin, in first-seen order.
+    joints: Vec<usize>,
+    /// Raw inverse bind matrix of each joint, from the first member skin that lists it.
+    inverse_binds: BTreeMap<usize, Option<DMat4>>,
+}
+
+/// The glTF node indices from the scene root down to `node`, `node` included.
+fn ancestor_path(parents: &[Option<usize>], node: usize) -> Vec<usize> {
+    let mut path = vec![node];
+    let mut current = node;
+    while let Some(parent) = parents[current] {
+        path.push(parent);
+        current = parent;
+    }
+    path.reverse();
+    path
+}
+
+/// Blender's armature node for a skin: the deepest common ancestor of `nodes` (`None` for the scene
+/// root), or its parent when that ancestor is one of `joints`.
+fn armature_ancestor(
+    parents: &[Option<usize>],
+    nodes: &[usize],
+    joints: &[usize],
+) -> Option<usize> {
+    let mut common: Option<Vec<usize>> = None;
+    for node in nodes {
+        let path = ancestor_path(parents, *node);
+        common = Some(match common {
+            None => path,
+            Some(previous) => previous
+                .iter()
+                .zip(&path)
+                .take_while(|(left, right)| left == right)
+                .map(|(left, _)| *left)
+                .collect(),
+        });
+    }
+    let ancestor = common.and_then(|path| path.last().copied());
+    match ancestor {
+        Some(node) if joints.contains(&node) => parents[node],
+        other => other,
+    }
+}
+
+/// The nearest ancestor of `node` that is one of `joints`.
+fn nearest_joint_ancestor(
+    parents: &[Option<usize>],
+    node: usize,
+    joints: &[usize],
+) -> Option<usize> {
+    let mut current = parents[node];
+    while let Some(parent) = current {
+        if joints.contains(&parent) {
+            return Some(parent);
+        }
+        current = parents[parent];
+    }
+    None
+}
+
 fn import_skins(
     root: &Value,
     buffers: &[Vec<u8>],
     node_values: &[Value],
     parents: &[Option<usize>],
+    source_node_worlds: &[DMat4],
     node_ids: &[Id],
     doc: &mut SceneDoc,
     used_data_ids: &mut BTreeSet<Id>,
     used_node_ids: &mut BTreeSet<Id>,
+    basis: DMat4,
 ) -> Result<ImportedSkinGraph> {
     let skin_values = root["skins"].as_array().map_or(&[][..], Vec::as_slice);
-    let world_matrices = node_world_matrices(node_values, parents)?;
-    let mut skins = Vec::with_capacity(skin_values.len());
-    let mut joint_nodes = BTreeSet::new();
-    let mut armature_data_ids = BTreeMap::new();
-    let mut synthetic_roots = Vec::new();
+    let world_matrices = source_node_worlds;
+    // Skins with the same `ArmatureKey` form one armature.
+    let mut groups = Vec::<SkinGroup>::new();
+    let mut group_by_key = BTreeMap::<ArmatureKey, usize>::new();
+    let mut skin_groups = Vec::with_capacity(skin_values.len());
+    let mut skin_joints = Vec::with_capacity(skin_values.len());
     for (skin_index, skin) in skin_values.iter().enumerate() {
         let joints = skin["joints"]
             .as_array()
@@ -4679,32 +4916,63 @@ fn import_skins(
                 "glTF inverse bind matrix count does not match skin joints",
             ));
         }
-        joint_nodes.extend(joint_indices.iter().copied());
-        let mut bone_ids = Vec::with_capacity(joint_indices.len());
-        let mut bone_id_by_raw = BTreeMap::new();
-        let mut used_bone_ids = BTreeSet::new();
-        for (joint_order, joint_index) in joint_indices.iter().enumerate() {
-            let joint = &node_values[*joint_index];
-            let raw_id = joint["extras"]["potter"]["bone_id"]
-                .as_str()
-                .or_else(|| joint["extras"]["potter"]["id"].as_str())
-                .or_else(|| joint["name"].as_str())
-                .unwrap_or("bone");
-            let id = unique_import_id(raw_id, "bone", joint_order, &mut used_bone_ids)?;
-            bone_id_by_raw.insert(raw_id.to_owned(), id.clone());
-            bone_ids.push(id);
-        }
-        let armature_raw_id = skin["extras"]["potter"]["armature_id"].as_str();
-        let armature_node_index = armature_raw_id.and_then(|raw_id| {
-            node_ids
-                .iter()
-                .position(|node_id| node_id.as_str() == raw_id)
+        let armature_node_index = skin["extras"]["potter"]["armature_id"]
+            .as_str()
+            .and_then(|raw_id| node_ids.iter().position(|id| id.as_str() == raw_id));
+        let key = if let Some(index) = armature_node_index {
+            ArmatureKey::Node(index)
+        } else {
+            let mut nodes = joint_indices.clone();
+            if let Some(skeleton) = skin["skeleton"].as_u64() {
+                let skeleton = usize::try_from(skeleton)
+                    .ok()
+                    .filter(|index| *index < node_values.len())
+                    .ok_or_else(|| import_error("glTF skin skeleton is missing"))?;
+                nodes.push(skeleton);
+            }
+            ArmatureKey::Ancestor(armature_ancestor(parents, &nodes, &joint_indices))
+        };
+        let group = *group_by_key.entry(key).or_insert_with(|| {
+            groups.push(SkinGroup {
+                armature_node_index,
+                first_skin: skin_index,
+                joints: Vec::new(),
+                inverse_binds: BTreeMap::new(),
+            });
+            groups.len() - 1
         });
-        let armature_node_id = if let Some(index) = armature_node_index {
+        for (order, joint_index) in joint_indices.iter().enumerate() {
+            let entry = &mut groups[group];
+            if !entry.inverse_binds.contains_key(joint_index) {
+                entry.joints.push(*joint_index);
+                entry.inverse_binds.insert(
+                    *joint_index,
+                    inverse_bind_matrices
+                        .as_ref()
+                        .and_then(|matrices| matrices.get(order))
+                        .copied(),
+                );
+            }
+        }
+        skin_groups.push(group);
+        skin_joints.push(joint_indices);
+    }
+    let joint_nodes = skin_joints
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut armature_data_ids = BTreeMap::new();
+    let mut synthetic_roots = Vec::new();
+    // Per group: its armature node, its armature Data-Block, and the bone ID of each joint node.
+    let mut group_armatures = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let skin = &skin_values[group.first_skin];
+        let armature_node_id = if let Some(index) = group.armature_node_index {
             node_ids[index].clone()
         } else {
-            let suggested = format!("armature_skin_{skin_index}");
-            let id = unique_import_id(&suggested, "armature", skin_index, used_node_ids)?;
+            let suggested = format!("armature_skin_{}", group.first_skin);
+            let id = unique_import_id(&suggested, "armature", group.first_skin, used_node_ids)?;
             doc.nodes.insert(
                 id.clone(),
                 Node {
@@ -4718,27 +4986,40 @@ fn import_skins(
             synthetic_roots.push(id.clone());
             id
         };
-        let armature_metadata = armature_node_index
-            .and_then(|index| node_values.get(index))
-            .and_then(|node| node["extras"]["potter"]["armature"].as_object())
+        let mut bone_id_by_joint = BTreeMap::new();
+        let mut used_bone_ids = BTreeSet::new();
+        for (order, joint_index) in group.joints.iter().enumerate() {
+            let joint = &node_values[*joint_index];
+            let raw_id = joint["extras"]["potter"]["bone_id"]
+                .as_str()
+                .or_else(|| joint["extras"]["potter"]["id"].as_str())
+                .or_else(|| joint["name"].as_str())
+                .unwrap_or("bone");
+            let id = unique_import_id(raw_id, "bone", order, &mut used_bone_ids)?;
+            bone_id_by_joint.insert(*joint_index, id);
+        }
+        let armature_metadata = group
+            .armature_node_index
+            .and_then(|index| node_values[index]["extras"]["potter"]["armature"].as_object())
             .map(|_| {
+                let index = group.armature_node_index.unwrap_or_default();
                 serde_json::from_value::<ArmatureData>(
-                    node_values[armature_node_index.unwrap_or_default()]["extras"]["potter"]
-                        ["armature"]
-                        .clone(),
+                    node_values[index]["extras"]["potter"]["armature"].clone(),
                 )
-                .map_err(|error| import_error(format!("glTF armature metadata is invalid: {error}")))
+                .map_err(|error| {
+                    import_error(format!("glTF armature metadata is invalid: {error}"))
+                })
             })
             .transpose()?;
         let armature = if let Some(armature) = armature_metadata {
             armature
         } else {
-            let joint_set = joint_indices.iter().copied().collect::<BTreeSet<_>>();
+            let bone_ids = bone_id_by_joint.values().cloned().collect::<BTreeSet<_>>();
             let mut bones = BTreeMap::new();
-            for (joint_order, joint_index) in joint_indices.iter().enumerate() {
+            for joint_index in &group.joints {
                 let joint_node = &node_values[*joint_index];
                 let extras = &joint_node["extras"]["potter"];
-                let id = bone_ids[joint_order].clone();
+                let id = bone_id_by_joint[joint_index].clone();
                 if let Some(metadata) = extras.get("bone").filter(|value| value.is_object()) {
                     let bone: Bone = serde_json::from_value(metadata.clone()).map_err(|error| {
                         import_error(format!("glTF bone metadata is invalid: {error}"))
@@ -4751,23 +5032,24 @@ fn import_skins(
                     bones.insert(id, bone);
                     continue;
                 }
-                let joint_bind = inverse_bind_matrices
-                    .as_ref()
-                    .and_then(|matrices| matrices.get(joint_order))
-                    .map_or(world_matrices[*joint_index], glam::DMat4::inverse);
+                // The rest matrix is the inverse of the inverse bind matrix, or the node's world
+                // matrix when the skin has none.
+                let joint_bind = group
+                    .inverse_binds
+                    .get(joint_index)
+                    .and_then(Option::as_ref)
+                    .map_or_else(|| world_matrices[*joint_index], glam::DMat4::inverse);
                 if !finite_matrix(joint_bind) {
                     return Err(import_error("glTF inverse bind matrix is singular"));
                 }
-                let converted = POT_TO_GLTF.inverse() * joint_bind * POT_TO_GLTF;
+                let converted = basis.inverse() * joint_bind * basis;
                 let head = converted.transform_point3(DVec3::ZERO);
                 let mut tail = converted.transform_point3(DVec3::Y);
                 if head.distance_squared(tail) <= f64::EPSILON {
                     tail = head + DVec3::Y;
                 }
-                let parent = parents[*joint_index]
-                    .filter(|parent| joint_set.contains(parent))
-                    .and_then(|parent| joint_indices.iter().position(|value| *value == parent))
-                    .map(|parent_order| bone_ids[parent_order].clone());
+                let parent = nearest_joint_ancestor(parents, *joint_index, &group.joints)
+                    .and_then(|parent| bone_id_by_joint.get(&parent).cloned());
                 let name = joint_node["name"]
                     .as_str()
                     .map_or_else(|| id.to_string(), str::to_owned);
@@ -4796,11 +5078,19 @@ fn import_skins(
                 ..ArmatureData::default()
             }
         };
-        let data_suggested = armature_node_index
+        let data_suggested = group
+            .armature_node_index
             .and_then(|index| node_values[index]["extras"]["potter"]["data_id"].as_str())
-            .map_or_else(|| format!("armature_skin_{skin_index}_data"), str::to_owned);
-        let armature_data_id =
-            unique_import_id(&data_suggested, "armature_data", skin_index, used_data_ids)?;
+            .map_or_else(
+                || format!("armature_skin_{}_data", group.first_skin),
+                str::to_owned,
+            );
+        let armature_data_id = unique_import_id(
+            &data_suggested,
+            "armature_data",
+            group.first_skin,
+            used_data_ids,
+        )?;
         doc.data_blocks.insert(
             armature_data_id.clone(),
             DataBlock {
@@ -4810,16 +5100,23 @@ fn import_skins(
                 ..DataBlock::default()
             },
         );
-        let imported_armature_data_id = armature_data_id.clone();
-        if let Some(index) = armature_node_index {
-            armature_data_ids.insert(index, armature_data_id);
+        if let Some(index) = group.armature_node_index {
+            armature_data_ids.insert(index, armature_data_id.clone());
         } else if let Some(node) = doc.nodes.get_mut(&armature_node_id) {
-            node.data = Some(armature_data_id);
+            node.data = Some(armature_data_id.clone());
         }
+        group_armatures.push((armature_node_id, armature_data_id, bone_id_by_joint));
+    }
+    let mut skins = Vec::with_capacity(skin_values.len());
+    for (group_index, joint_indices) in skin_groups.into_iter().zip(skin_joints) {
+        let (armature_node, armature_data_id, bone_id_by_joint) = &group_armatures[group_index];
         skins.push(ImportedSkin {
-            armature_node: armature_node_id,
-            armature_data_id: imported_armature_data_id,
-            joint_ids: bone_ids,
+            armature_node: armature_node.clone(),
+            armature_data_id: armature_data_id.clone(),
+            joint_ids: joint_indices
+                .iter()
+                .map(|joint| bone_id_by_joint[joint].clone())
+                .collect(),
             joint_node_indices: joint_indices,
         });
     }
@@ -4851,6 +5148,7 @@ fn restore_skin_weights(
     mesh_values: &[Value],
     data_ids: &[Id],
     mesh_skin_weights: &[Option<Vec<SkinVertexWeights>>],
+    ids_stale: bool,
 ) -> Result<Id> {
     let data_id = data_ids
         .get(mesh_index)
@@ -4882,11 +5180,11 @@ fn restore_skin_weights(
         .collect::<Vec<_>>();
     let source_vertex_ids = match potter_vertex_ids(mesh_value)? {
         // Copies of one Potter vertex rejoin, so the skin has one entry per welded vertex.
-        Some(ids) => {
+        Some(ids) if !ids_stale => {
             let mut seen = BTreeSet::new();
             ids.into_iter().filter(|id| seen.insert(*id)).collect()
         }
-        None => vertex_order.clone(),
+        _ => vertex_order.clone(),
     };
     if vertex_order.len() != joint_weights.len() || source_vertex_ids.len() != vertex_order.len() {
         return Err(import_error(
@@ -4914,7 +5212,8 @@ fn restore_skin_weights(
         .iter()
         .map(|group| group.id.clone())
         .collect::<BTreeSet<_>>();
-    let exact_weight_metadata = mesh_value["extras"]["potter"]["vertex_weights"].is_object();
+    let exact_weight_metadata =
+        !ids_stale && mesh_value["extras"]["potter"]["vertex_weights"].is_object();
     let exact_vertex_weights = exact_weight_metadata.then(|| source_block.vertex_weights.clone());
     let vertex_weights = if let Some(exact) = exact_vertex_weights {
         for (vertex_id, row) in &exact {
@@ -4987,14 +5286,42 @@ fn restore_skin_weights(
     Ok(data_id)
 }
 
+/// glTF identities behind an import; the VRM decoder resolves glTF indices through these.
+pub(crate) struct GltfIndex {
+    /// glTF JSON root, read by the VRM decoder for extensions and accessors.
+    pub(crate) root: Value,
+    /// Potter-to-glTF axis basis of this import (`POT_TO_GLTF` for glTF, the avatar basis for VRM).
+    pub(crate) basis: DMat4,
+    pub(crate) node_ids: Vec<Id>,
+    /// World matrices of glTF nodes in glTF space, indexed like `nodes`.
+    pub(crate) node_worlds: Vec<DMat4>,
+    pub(crate) material_ids: Vec<Id>,
+    pub(crate) image_ids: Vec<Id>,
+    /// Per glTF mesh: the Potter shape-key ID of each morph target, in target order.
+    pub(crate) mesh_shape_key_ids: Vec<Vec<Id>>,
+    /// glTF joint node index to (armature node, bone) for every skinned joint.
+    pub(crate) joint_bones: BTreeMap<usize, (Id, Id)>,
+}
+
 pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::ImportedGraph> {
+    import_indexed(path, scene_id, POT_TO_GLTF).map(|(graph, _)| graph)
+}
+
+/// Imports glTF or GLB with Potter axes mapped through `basis` (VRM 0.x adds a Ry(180) turn).
+pub(crate) fn import_indexed(
+    path: &Path,
+    scene_id: String,
+    basis: DMat4,
+) -> Result<(crate::exchange::ImportedGraph, GltfIndex)> {
     fn import_shape_keys(
         mesh_value: &Value,
         welded_source_ids: Option<&[u32]>,
         mesh: &Mesh,
         morph_deltas: &[Vec<[f64; 3]>],
-    ) -> Result<ShapeKeyData> {
-        if mesh_value["extras"]["potter"]["shape_key_data"].is_object() {
+    ) -> Result<(ShapeKeyData, Vec<Id>)> {
+        if welded_source_ids.is_some()
+            && mesh_value["extras"]["potter"]["shape_key_data"].is_object()
+        {
             let mut shape_keys = serde_json::from_value::<ShapeKeyData>(
                 mesh_value["extras"]["potter"]["shape_key_data"].clone(),
             )
@@ -5024,7 +5351,15 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             for key in shape_keys.keys.values_mut() {
                 key.positions = remap_positions(std::mem::take(&mut key.positions))?;
             }
-            return Ok(shape_keys);
+            let ids = mesh_value["extras"]["potter"]["shape_keys"]
+                .as_array()
+                .map_or_else(Vec::new, |entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry["id"].as_str().and_then(|id| Id::new(id).ok()))
+                        .collect()
+                });
+            return Ok((shape_keys, ids));
         }
         let metadata = mesh_value["extras"]["potter"]["shape_keys"]
             .as_array()
@@ -5151,7 +5486,7 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                 pending.remove(&index);
             }
         }
-        Ok(result)
+        Ok((result, key_ids))
     }
     let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
     let is_glb = bytes.starts_with(b"glTF");
@@ -5214,6 +5549,7 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
     let material_values = root["materials"].as_array().map_or(&[][..], Vec::as_slice);
     let mut material_ids = Vec::with_capacity(material_values.len());
     let mut used_material_ids = BTreeSet::new();
+    let mut graph_materials = Vec::<(Id, material_graph::GraphTextures)>::new();
     for (index, material) in material_values.iter().enumerate() {
         let suggested = material["extras"]["potter"]["id"]
             .as_str()
@@ -5256,17 +5592,18 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                 *component *= peak / emission_strength;
             }
         }
-        let base_color_texture = import_texture_ref(
-            &material["pbrMetallicRoughness"]["baseColorTexture"],
-            &root,
-            &image_ids,
-        )?;
-        let metallic_roughness_texture = import_texture_ref(
-            &material["pbrMetallicRoughness"]["metallicRoughnessTexture"],
-            &root,
-            &image_ids,
-        )?;
-        let normal_texture = import_texture_ref(&material["normalTexture"], &root, &image_ids)?;
+        let textures = material_textures(material, &root, &image_ids)?;
+        // A texture a Potter texture field cannot hold (transform, emissive, occlusion, normal scale)
+        // moves into the material graph, as Blender's importer builds one; the fields stay empty.
+        let graph_needed = textures.needs_graph();
+        let field = |slot: &Option<material_graph::SlotTexture>| {
+            (!graph_needed)
+                .then(|| slot.as_ref().map(|slot| slot.texture.clone()))
+                .flatten()
+        };
+        let base_color_texture = field(&textures.base_color);
+        let metallic_roughness_texture = field(&textures.metallic_roughness);
+        let normal_texture = field(&textures.normal);
         let value = Material {
             name: material["name"]
                 .as_str()
@@ -5294,18 +5631,34 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             roughness_texture: metallic_roughness_texture,
             ..Material::default()
         };
+        if graph_needed {
+            graph_materials.push((id.clone(), textures));
+        }
         doc.materials.insert(id.clone(), value);
         material_ids.push(id);
+    }
+    // Materials whose textures need a graph move them now; their texture fields are cleared.
+    for (material_id, textures) in &graph_materials {
+        material_graph::move_textures_to_graph(&mut doc, material_id, textures)?;
     }
 
     let mut data_ids = Vec::<Id>::new();
     let mut mesh_materials = Vec::<Vec<Id>>::new();
     let mut mesh_skin_weights = Vec::<Option<Vec<SkinVertexWeights>>>::new();
+    let mut mesh_ids_stale = Vec::<bool>::new();
     let mesh_values = root["meshes"].as_array().map_or(&[][..], Vec::as_slice);
     let mut used_data_ids = BTreeSet::new();
     let mut morph_normal_loss = false;
     let mut polygon_loss = false;
+    let mut vertex_ids_loss = false;
+    let inverse_basis = basis.inverse();
+    let baked_mesh_scales = baked_mesh_scales(&root)?;
+    let mut mesh_shape_key_ids = Vec::<Vec<Id>>::new();
     for (mesh_index, mesh_value) in mesh_values.iter().enumerate() {
+        let baked = baked_mesh_scales
+            .get(&mesh_index)
+            .copied()
+            .unwrap_or(DVec3::ONE);
         let suggested = mesh_value["extras"]["potter"]["data_id"]
             .as_str()
             .or_else(|| mesh_value["name"].as_str())
@@ -5352,9 +5705,11 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                 positions.extend(
                     decoded
                         .iter()
-                        .map(|point| DVec3::from_array(axis_from_gltf(*point))),
+                        .map(|point| DVec3::from_array(potter_point(inverse_basis, baked, *point))),
                 );
             }
+            // Base NORMAL values, kept for the morph NORMAL deltas of this primitive.
+            let mut base_normal_values = None;
             if let Some(accessor) = primitive["attributes"]["NORMAL"].as_u64() {
                 let accessor = usize::try_from(accessor)
                     .map_err(|_| import_error("glTF NORMAL accessor exceeds platform range"))?;
@@ -5363,12 +5718,11 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                     return Err(import_error("glTF NORMAL count does not match POSITION"));
                 }
                 if first_use {
-                    normals.extend(
-                        values
-                            .iter()
-                            .map(|normal| DVec3::from_array(axis_from_gltf(*normal))),
-                    );
+                    normals.extend(values.iter().map(|normal| {
+                        DVec3::from_array(potter_normal(inverse_basis, baked, *normal))
+                    }));
                 }
+                base_normal_values = Some(values);
             } else {
                 has_missing_normals = true;
                 if first_use {
@@ -5425,8 +5779,11 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                     ));
                 }
                 if first_use {
-                    morph_deltas[target_index]
-                        .extend(values.iter().map(|delta| axis_from_gltf(*delta)));
+                    morph_deltas[target_index].extend(
+                        values
+                            .iter()
+                            .map(|delta| potter_point(inverse_basis, baked, *delta)),
+                    );
                 }
                 if let Some(accessor) = target["NORMAL"].as_u64() {
                     let accessor = usize::try_from(accessor).map_err(|_| {
@@ -5439,8 +5796,16 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                         ));
                     }
                     if first_use {
-                        morph_normal_deltas[target_index]
-                            .extend(values.iter().map(|delta| axis_from_gltf(*delta)));
+                        morph_normal_deltas[target_index].extend(values.iter().enumerate().map(
+                            |(vertex, delta)| {
+                                potter_normal_delta(
+                                    inverse_basis,
+                                    baked,
+                                    base_normal_values.as_deref().map(|base| base[vertex]),
+                                    *delta,
+                                )
+                            },
+                        ));
                     }
                 } else {
                     morph_normals_missing = true;
@@ -5513,7 +5878,14 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
         }
         primitive_starts.push(polygons.len());
         // Copies of one Potter vertex, split per UV and normal, rejoin here; corners keep their own normals.
-        let source_ids = potter_vertex_ids(mesh_value)?;
+        // Potter's vertex IDs must describe these vertices. Another tool may have changed them (the
+        // VRM Add-on keeps mesh extras but drops root ones), so stale IDs are ignored and reported.
+        let parsed_ids = potter_vertex_ids(mesh_value)?;
+        let ids_stale = parsed_ids
+            .as_ref()
+            .is_some_and(|ids| ids.len() != positions.len());
+        vertex_ids_loss |= ids_stale;
+        let source_ids = parsed_ids.filter(|_| !ids_stale);
         let (welded_of, first) = weld_copies(positions.len(), source_ids.as_deref())?;
         if welded_of
             .iter()
@@ -5532,19 +5904,32 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             .collect::<Vec<_>>();
         // Potter's stored polygons replace the triangles, which carry only materials and UVs here.
         // A record that does not describe these triangles falls back to them and reports a loss.
-        let restored = match potter_polygons(
+        let parsed_polygons = potter_polygons(
             mesh_value,
             &root,
             &binaries,
             positions.len(),
             primitives.len(),
-        )? {
+        );
+        // A record written before another tool changed the vertices is stale: its fields are sized for
+        // the old vertex count, so it no longer parses. Stale vertex IDs make that case a loss.
+        let polygon_record = match parsed_polygons {
+            Err(_) if ids_stale => PotterPolygons::UnknownVersion,
+            parsed => parsed?,
+        };
+        let restored = match polygon_record {
             PotterPolygons::Absent => None,
             PotterPolygons::UnknownVersion => {
                 polygon_loss = true;
                 None
             }
-            PotterPolygons::Faces(faces) => {
+            PotterPolygons::Faces(mut faces) => {
+                // A mirrored bake reversed each face's corners at export; the import undoes the bake, so restore them.
+                if baked.element_product() < 0.0 {
+                    for corners in &mut faces.corners {
+                        corners.reverse();
+                    }
+                }
                 let restored = restore_polygons(
                     &faces,
                     &polygons,
@@ -5637,15 +6022,16 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                 morph_normal_loss = true;
             }
         }
-        let shape_keys = if morph_deltas.is_empty() {
-            None
+        let (shape_keys, morph_key_ids) = if morph_deltas.is_empty() {
+            (None, Vec::new())
         } else {
-            Some(import_shape_keys(
+            let (keys, ids) = import_shape_keys(
                 mesh_value,
                 source_ids_welded.as_deref(),
                 &mesh,
                 &welded_morphs,
-            )?)
+            )?;
+            (Some(keys), ids)
         };
         let joint_data = first
             .iter()
@@ -5708,18 +6094,25 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
         data_ids.push(data_id);
         mesh_materials.push(slots);
         mesh_skin_weights.push(imported_joint_data);
+        mesh_ids_stale.push(ids_stale);
+        mesh_shape_key_ids.push(morph_key_ids);
     }
 
     let camera_ids = import_cameras(&root, &mut doc, &mut used_data_ids)?;
     let light_ids = import_lights(&root, &mut doc, &mut used_data_ids)?;
     let node_values = root["nodes"].as_array().map_or(&[][..], Vec::as_slice);
     let parents = node_parent_indices(node_values)?;
+    let source_node_worlds = node_world_matrices(node_values, &parents)?;
+    let inverse_basis = basis.inverse();
     let mut used_node_ids = BTreeSet::new();
     let node_ids = node_values
         .iter()
         .enumerate()
         .map(|(index, node)| {
-            let suggested = node["extras"]["potter"]["id"].as_str().unwrap_or("node");
+            let suggested = node["extras"]["potter"]["id"]
+                .as_str()
+                .or_else(|| node["name"].as_str())
+                .unwrap_or("node");
             unique_import_id(suggested, "node", index, &mut used_node_ids)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -5728,17 +6121,50 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
         &binaries,
         node_values,
         &parents,
+        &source_node_worlds,
         &node_ids,
         &mut doc,
         &mut used_data_ids,
         &mut used_node_ids,
+        basis,
     )?;
+    let mut joint_bones = BTreeMap::<usize, (Id, Id)>::new();
+    for skin in &imported_skins {
+        for (joint_index, joint_id) in skin.joint_node_indices.iter().zip(&skin.joint_ids) {
+            joint_bones.insert(*joint_index, (skin.armature_node.clone(), joint_id.clone()));
+        }
+    }
+    let bone_worlds =
+        imported_bone_world_matrices(&doc, &imported_skins, &node_ids, &source_node_worlds, basis)?;
     let mut restored_skins = BTreeMap::<Id, Id>::new();
     for (index, node_value) in node_values.iter().enumerate() {
         if joint_nodes.contains(&index) {
             continue;
         }
-        let local = POT_TO_GLTF.inverse() * node_matrix(node_value)? * POT_TO_GLTF;
+        let bone_parent =
+            parents[index].and_then(|parent_index| joint_bones.get(&parent_index).cloned());
+        let mut gltf_local = node_matrix(node_value)?;
+        if let Some(scale) = baked_node_scale(node_value)? {
+            gltf_local *= DMat4::from_scale(scale);
+        }
+        let local = if let Some((armature, bone)) = &bone_parent {
+            let bone_world = bone_worlds
+                .get(&(armature.clone(), bone.clone()))
+                .copied()
+                .ok_or_else(|| {
+                    import_error("glTF bone-parented node has no imported bone frame")
+                })?;
+            let gltf_parent_world =
+                parents[index].map_or(DMat4::IDENTITY, |parent| source_node_worlds[parent]);
+            let source_world = inverse_basis * gltf_parent_world * gltf_local * basis;
+            let inverse_bone = bone_world.inverse();
+            if !finite_matrix(inverse_bone) {
+                return Err(import_error("glTF bone-parent frame is singular"));
+            }
+            inverse_bone * source_world
+        } else {
+            inverse_basis * gltf_local * basis
+        };
         let (scale, rotation, translation) = local.to_scale_rotation_translation();
         if !scale.is_finite() || !rotation.is_finite() || !translation.is_finite() {
             return Err(import_error(
@@ -5832,6 +6258,7 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                     mesh_values,
                     &data_ids,
                     &mesh_skin_weights,
+                    mesh_ids_stale[mesh_index],
                 )?;
                 restored_skins.insert(data_id, skin.armature_node.clone());
             }
@@ -5879,19 +6306,6 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
                 str::to_owned,
             )
         };
-        let bone_parent = parents[index].and_then(|parent_index| {
-            imported_skins.iter().find_map(|skin| {
-                skin.joint_node_indices
-                    .iter()
-                    .position(|joint_index| *joint_index == parent_index)
-                    .map(|joint_offset| {
-                        (
-                            skin.armature_node.clone(),
-                            skin.joint_ids[joint_offset].clone(),
-                        )
-                    })
-            })
-        });
         let (parent, parent_type, parent_bone) = if let Some((armature, bone)) = bone_parent {
             (Some(armature), crate::model::ParentType::Bone, Some(bone))
         } else {
@@ -5962,7 +6376,7 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
         .get_mut(&root_collection)
         .ok_or_else(|| PotError::new(ErrorCode::InternalError, "root collection is missing"))?
         .objects = scene_roots;
-    let mut losses = import_animations(&root, &binaries, &node_ids, &mut doc)?;
+    let mut losses = import_animations(&root, &binaries, &node_ids, &mut doc, basis)?;
     losses.extend(gltf_import_losses(&root));
     if morph_normal_loss {
         losses.push(crate::exchange::Loss {
@@ -5987,15 +6401,37 @@ pub(crate) fn import(path: &Path, scene_id: String) -> Result<crate::exchange::I
             ),
         });
     }
+    if vertex_ids_loss {
+        losses.push(crate::exchange::Loss {
+            feature_id: "mesh.vertex_ids".to_owned(),
+            data_id: None,
+            reason: "glTF Potter vertex IDs do not match the mesh vertices; the file was edited by another tool, so its Potter vertex, shape-key, weight and group metadata are ignored".to_owned(),
+            suggestion: Some(
+                "use --allow-lossy to import the geometry without the stale Potter metadata".to_owned(),
+            ),
+        });
+    }
     doc.validate()?;
-    Ok(crate::exchange::ImportedGraph {
+    let node_worlds = source_node_worlds;
+    let index = GltfIndex {
+        root,
+        basis,
+        node_ids,
+        node_worlds,
+        material_ids,
+        image_ids,
+        mesh_shape_key_ids,
+        joint_bones,
+    };
+    let graph = crate::exchange::ImportedGraph {
         doc,
         losses,
         id_mappings: json!({}),
         compat_blobs,
         assets,
         source: json!({ "format": if is_glb { "glb" } else { "gltf" }, "path": path.display().to_string() }),
-    })
+    };
+    Ok((graph, index))
 }
 
 /// Morph position deltas per welded vertex and morph NORMAL deltas per face corner, in Potter axes.
@@ -6554,6 +6990,7 @@ fn import_animations(
     buffers: &[Vec<u8>],
     node_ids: &[Id],
     doc: &mut SceneDoc,
+    basis: DMat4,
 ) -> Result<Vec<crate::exchange::Loss>> {
     let animation_values = root["animations"].as_array().map_or(&[][..], Vec::as_slice);
     let mut losses = Vec::new();
@@ -6672,17 +7109,20 @@ fn import_animations(
             }
             let internal_path = path.to_owned();
             let mut component_values = vec![Vec::<f64>::with_capacity(times.len()); dimensions];
+            let inverse_basis = basis.inverse();
+            let basis_rotation = DQuat::from_mat4(&basis);
             for key_index in 0..times.len() {
                 let source_offset = key_index * dimensions * if cubic { 3 } else { 1 };
                 let value_offset = source_offset + if cubic { dimensions } else { 0 };
                 let mut value = values[value_offset..value_offset + dimensions].to_vec();
                 if path == "transform.translation" {
-                    let position = axis_from_gltf([value[0], value[1], value[2]]);
+                    let position = inverse_basis
+                        .transform_vector3(DVec3::new(value[0], value[1], value[2]))
+                        .to_array();
                     value.copy_from_slice(&position);
                 } else if path == "transform.rotation_quaternion" {
                     let rotation = DQuat::from_xyzw(value[0], value[1], value[2], value[3]);
-                    let basis = pot_to_gltf_rotation();
-                    let potter_rotation = basis.conjugate() * rotation * basis;
+                    let potter_rotation = basis_rotation.conjugate() * rotation * basis_rotation;
                     // F-Curve rotation components use Blender's (w, x, y, z) order.
                     value.copy_from_slice(&[
                         potter_rotation.w,
@@ -6862,15 +7302,39 @@ fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
     }
     if root["materials"].as_array().is_some_and(|materials| {
         materials.iter().any(|material| {
-            material["occlusionTexture"].is_object() || material["emissiveTexture"].is_object()
+            material["occlusionTexture"]["strength"]
+                .as_f64()
+                .is_some_and(|strength| !crate::float::equal_f64(strength, 1.0))
+        })
+    }) {
+        // Blender's importer ignores occlusion strength too; Potter's graph has no input for it.
+        losses.push(crate::exchange::Loss {
+            feature_id: "material.occlusion_strength".to_owned(),
+            data_id: None,
+            reason: "glTF occlusion strength is not represented by Potter; occlusion is applied at full strength".to_owned(),
+            suggestion: Some("use --allow-lossy to import occlusion at full strength".to_owned()),
+        });
+    }
+    if root["materials"].as_array().is_some_and(|materials| {
+        materials.iter().any(|material| {
+            let pbr = &material["pbrMetallicRoughness"];
+            [
+                &pbr["baseColorTexture"],
+                &pbr["metallicRoughnessTexture"],
+                &material["normalTexture"],
+            ]
+            .into_iter()
+            .any(transform_reads_other_uv_set)
+                || [&material["emissiveTexture"], &material["occlusionTexture"]]
+                    .into_iter()
+                    .any(|info| reads_other_uv_set(info) || transform_reads_other_uv_set(info))
         })
     }) {
         losses.push(crate::exchange::Loss {
-            feature_id: "material.texture".to_owned(),
+            feature_id: "material.texture_uv_set".to_owned(),
             data_id: None,
-            reason: "glTF occlusion and emissive textures are not represented by Potter materials"
-                .to_owned(),
-            suggestion: Some("use --allow-lossy or remove unsupported texture roles".to_owned()),
+            reason: "glTF texture reads a UV set other than TEXCOORD_0; Potter imports only that set, so the transform (or the emissive or occlusion texture) is not imported".to_owned(),
+            suggestion: Some("use --allow-lossy to import without it".to_owned()),
         });
     }
     if root["extensionsUsed"].as_array().is_some_and(|extensions| {
@@ -6882,6 +7346,7 @@ fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
                         | "KHR_materials_emissive_strength"
                         | "KHR_materials_transmission"
                         | "KHR_materials_ior"
+                        | "KHR_texture_transform"
                 )
             })
         })
@@ -7376,6 +7841,82 @@ pub(crate) fn axis_from_gltf(point: [f64; 3]) -> [f64; 3] {
     [point[0], -point[2], point[1]]
 }
 
+/// Maps a glTF point or delta to Potter axes, undoing the VRM baked geometry scale first.
+fn potter_point(inverse_basis: DMat4, baked: DVec3, point: [f64; 3]) -> [f64; 3] {
+    inverse_basis
+        .transform_vector3(DVec3::from_array(point) / baked)
+        .to_array()
+}
+
+/// Maps a glTF normal to Potter axes; the baked scale acts on normals as its inverse transpose.
+fn potter_normal(inverse_basis: DMat4, baked: DVec3, normal: [f64; 3]) -> [f64; 3] {
+    let mapped = inverse_basis.transform_vector3(DVec3::from_array(normal) * baked);
+    if baked == DVec3::ONE {
+        mapped.to_array()
+    } else {
+        mapped.normalize_or_zero().to_array()
+    }
+}
+/// Maps a morph target's NORMAL delta to Potter axes. glTF stores the delta as a difference of two
+/// output normals (`output_normals`), so the morphed normal is `base + delta`. The Potter delta is the
+/// difference of the mapped morphed and base normals, which keeps a non-uniform baked scale exact.
+/// Without the base normal (the check is then skipped) the delta is zero.
+fn potter_normal_delta(
+    inverse_basis: DMat4,
+    baked: DVec3,
+    base: Option<[f64; 3]>,
+    delta: [f64; 3],
+) -> [f64; 3] {
+    let Some(base) = base else {
+        return [0.0; 3];
+    };
+    let morphed = potter_normal(
+        inverse_basis,
+        baked,
+        std::array::from_fn(|axis| base[axis] + delta[axis]),
+    );
+    let original = potter_normal(inverse_basis, baked, base);
+    std::array::from_fn(|axis| morphed[axis] - original[axis])
+}
+
+/// The VRM baked scale recorded on a glTF node: non-uniform or mirrored mesh scale moved into geometry.
+fn baked_node_scale(node: &Value) -> Result<Option<DVec3>> {
+    let value = &node["extras"]["potter"]["vrm_baked_scale"];
+    if value.is_null() {
+        return Ok(None);
+    }
+    let scale = serde_json::from_value::<[f64; 3]>(value.clone())
+        .map(DVec3::from_array)
+        .map_err(|_| import_error("glTF VRM baked scale is invalid"))?;
+    if scale
+        .to_array()
+        .iter()
+        .any(|component| !component.is_finite() || *component == 0.0)
+    {
+        return Err(import_error(
+            "glTF VRM baked scale must be finite and nonzero",
+        ));
+    }
+    Ok(Some(scale))
+}
+
+/// Baked scale per glTF mesh index, taken from the first node that instances the mesh.
+fn baked_mesh_scales(root: &Value) -> Result<BTreeMap<usize, DVec3>> {
+    let mut scales = BTreeMap::new();
+    for node in root["nodes"].as_array().map_or(&[][..], Vec::as_slice) {
+        let Some(scale) = baked_node_scale(node)? else {
+            continue;
+        };
+        if let Some(mesh) = node["mesh"]
+            .as_u64()
+            .and_then(|mesh| usize::try_from(mesh).ok())
+        {
+            scales.entry(mesh).or_insert(scale);
+        }
+    }
+    Ok(scales)
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::{prelude::*, test_runner::TestCaseError};
@@ -7394,7 +7935,9 @@ mod tests {
         ops::{apply_batch, apply_batch_with_asset_root},
     };
 
-    use super::{axis_from_gltf, axis_to_gltf, export_with_root, gltf_import_losses, import};
+    use super::{
+        axis_from_gltf, axis_to_gltf, export_with_root, gltf_import_losses, import, to_glb,
+    };
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
     /// Rewrites an exported glTF document and its binary buffer.
@@ -8134,7 +8677,7 @@ mod tests {
         let losses = gltf_import_losses(&json!({
             "nodes": [{"mesh": 0, "weights": [1.0]}],
             "meshes": [{"weights": [0.0]}],
-            "materials": [{"occlusionTexture": {"index": 0}}],
+            "materials": [{"occlusionTexture": {"index": 0, "strength": 0.5}}],
             "extensionsUsed": ["KHR_draco_mesh_compression"]
         }));
         let features = losses
@@ -8145,7 +8688,7 @@ mod tests {
             features,
             [
                 "gltf.extension",
-                "material.texture",
+                "material.occlusion_strength",
                 "mesh.shape_key_instance_weights"
             ]
             .into_iter()
@@ -9397,6 +9940,184 @@ mod tests {
             origin_keys,
             vec![[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]],
             "a shared POSITION must not discard the second primitive's morph target"
+        );
+        Ok(())
+    }
+    /// Appends `bytes` to the GLB binary chunk as a buffer view and returns its index.
+    fn push_view(bin: &mut Vec<u8>, views: &mut Vec<Value>, bytes: &[u8]) -> usize {
+        while !bin.len().is_multiple_of(4) {
+            bin.push(0);
+        }
+        views.push(json!({ "buffer": 0, "byteOffset": bin.len(), "byteLength": bytes.len() }));
+        bin.extend_from_slice(bytes);
+        views.len() - 1
+    }
+
+    /// A GLB with one skinned triangle per skin. `nodes` and `skins` are glTF arrays; each skin gets
+    /// identity inverse bind matrices, and skin `i` is drawn by mesh `i`. Scene roots are the nodes no
+    /// other node lists as a child.
+    fn skinned_glb(nodes: &Value, skins: &Value) -> TestResult<Vec<u8>> {
+        let skins = skins.as_array().ok_or("skins must be an array")?;
+        let mut bin = Vec::<u8>::new();
+        let mut views = Vec::<Value>::new();
+        let positions = [0.0_f32, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1, 0.0];
+        let position_view = push_view(
+            &mut bin,
+            &mut views,
+            &positions
+                .iter()
+                .copied()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let joints_view = push_view(&mut bin, &mut views, &[0_u8; 12]);
+        let weights = [1.0_f32, 0.0, 0.0, 0.0].repeat(3);
+        let weights_view = push_view(
+            &mut bin,
+            &mut views,
+            &weights
+                .iter()
+                .copied()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let mut accessors = vec![
+            json!({ "bufferView": position_view, "componentType": 5126, "count": 3, "type": "VEC3" }),
+            json!({ "bufferView": joints_view, "componentType": 5121, "count": 3, "type": "VEC4" }),
+            json!({ "bufferView": weights_view, "componentType": 5126, "count": 3, "type": "VEC4" }),
+        ];
+        let identity = [
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let mut skin_values = Vec::with_capacity(skins.len());
+        for skin in skins {
+            let count = skin["joints"].as_array().map_or(0, Vec::len);
+            let bytes = identity
+                .iter()
+                .copied()
+                .cycle()
+                .take(16 * count)
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<u8>>();
+            let view = push_view(&mut bin, &mut views, &bytes);
+            accessors.push(json!({ "bufferView": view, "componentType": 5126, "count": count, "type": "MAT4" }));
+            let mut skin = skin.clone();
+            skin["inverseBindMatrices"] = json!(accessors.len() - 1);
+            skin_values.push(skin);
+        }
+        let meshes = skins
+            .iter()
+            .map(|_| json!({ "primitives": [{ "attributes": { "POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2 } }] }))
+            .collect::<Vec<_>>();
+        let node_values = nodes.as_array().ok_or("nodes must be an array")?;
+        let listed = node_values
+            .iter()
+            .flat_map(|node| node["children"].as_array().cloned().unwrap_or_default())
+            .filter_map(|child| child.as_u64())
+            .collect::<BTreeSet<_>>();
+        let roots = (0..node_values.len())
+            .filter(|index| !listed.contains(&(*index as u64)))
+            .collect::<Vec<_>>();
+        let document = json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": roots }],
+            "nodes": nodes,
+            "meshes": meshes,
+            "skins": skin_values,
+            "accessors": accessors,
+            "bufferViews": views,
+            "buffers": [{ "byteLength": bin.len() }]
+        });
+        Ok(to_glb(&serde_json::to_vec(&document)?, &bin)?)
+    }
+
+    /// The armatures a GLB imports as, each as its bones mapped to their parent bones, sorted.
+    fn imported_armatures(glb: &[u8]) -> TestResult<Vec<BTreeMap<String, Option<String>>>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("skins.glb");
+        std::fs::write(&path, glb)?;
+        let graph = import(&path, uuid::Uuid::new_v4().to_string())?;
+        let mut armatures = graph
+            .doc
+            .data_blocks
+            .values()
+            .filter(|block| block.data_type == "armature")
+            .map(|block| {
+                block.armature.as_ref().map_or_else(BTreeMap::new, |data| {
+                    data.bones
+                        .iter()
+                        .map(|(id, bone)| {
+                            (
+                                id.to_string(),
+                                bone.parent.as_ref().map(ToString::to_string),
+                            )
+                        })
+                        .collect()
+                })
+            })
+            .collect::<Vec<_>>();
+        armatures.sort();
+        Ok(armatures)
+    }
+
+    fn bones(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(id, parent)| ((*id).to_owned(), parent.map(str::to_owned)))
+            .collect()
+    }
+
+    /// Two skins whose joint sets share `hips` form one armature with the union of their joints, as
+    /// Blender's importer builds it: both skins' deepest common ancestor is `Armature`.
+    #[test]
+    fn skins_sharing_a_joint_tree_import_as_one_armature() -> TestResult {
+        let nodes = json!([
+            { "name": "Armature", "children": [1] },
+            { "name": "hips", "translation": [0.0, 1.0, 0.0], "children": [2, 3] },
+            { "name": "spine", "translation": [0.0, 1.0, 0.0] },
+            { "name": "leg", "translation": [0.2, -0.5, 0.0] },
+            { "name": "meshA", "mesh": 0, "skin": 0 },
+            { "name": "meshB", "mesh": 1, "skin": 1 }
+        ]);
+        let skins = json!([{ "joints": [1, 2] }, { "joints": [1, 3] }]);
+        let glb = skinned_glb(&nodes, &skins)?;
+        assert_eq!(
+            imported_armatures(&glb)?,
+            vec![bones(&[
+                ("hips", None),
+                ("leg", Some("hips")),
+                ("spine", Some("hips")),
+            ])],
+            "the armature holds the union of both skins' joints under their glTF parents"
+        );
+        Ok(())
+    }
+
+    /// Two characters under one empty root: each skin's deepest common ancestor is its own character
+    /// node, so Blender imports two armatures and Potter must too.
+    #[test]
+    fn skins_of_separate_characters_under_a_shared_root_stay_separate() -> TestResult {
+        let nodes = json!([
+            { "name": "Root", "children": [1, 5] },
+            { "name": "Char0", "children": [2, 4] },
+            { "name": "hipsA", "children": [3] },
+            { "name": "spineA" },
+            { "name": "meshA", "mesh": 0, "skin": 0 },
+            { "name": "Char1", "children": [6, 8] },
+            { "name": "hipsB", "children": [7] },
+            { "name": "spineB" },
+            { "name": "meshB", "mesh": 1, "skin": 1 }
+        ]);
+        let skins = json!([{ "joints": [2, 3] }, { "joints": [6, 7] }]);
+        let glb = skinned_glb(&nodes, &skins)?;
+        assert_eq!(
+            imported_armatures(&glb)?,
+            vec![
+                bones(&[("hipsa", None), ("spinea", Some("hipsa"))]),
+                bones(&[("hipsb", None), ("spineb", Some("hipsb"))]),
+            ],
+            "each character keeps its own armature"
         );
         Ok(())
     }

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    float::equal_f64,
     model::{Id, SceneDoc, TextureRef},
 };
 
@@ -374,6 +375,10 @@ pub struct AvatarMtoon {
     pub uv_animation_scroll_x_speed_factor: f64,
     pub uv_animation_scroll_y_speed_factor: f64,
     pub uv_animation_rotation_speed_factor: f64,
+    /// Transforms of `MToon` texture slots, keyed by the VRM 1.0 slot field name (for example
+    /// `shadeMultiplyTexture`). Each key must name a slot that holds a texture.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub texture_transforms: BTreeMap<String, AvatarTextureTransform>,
 }
 
 impl Default for AvatarMtoon {
@@ -403,6 +408,7 @@ impl Default for AvatarMtoon {
             uv_animation_scroll_x_speed_factor: 0.0,
             uv_animation_scroll_y_speed_factor: 0.0,
             uv_animation_rotation_speed_factor: 0.0,
+            texture_transforms: BTreeMap::new(),
         }
     }
 }
@@ -412,6 +418,36 @@ impl Default for AvatarMtoon {
 pub struct AvatarMtoonShadingShiftTexture {
     pub texture: TextureRef,
     pub scale: f64,
+}
+
+/// A VRM 1.0 `KHR_texture_transform` on one `MToon` texture slot (`texture_transforms`). The default
+/// is the identity, which a stored entry must not be.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AvatarTextureTransform {
+    pub offset: [f64; 2],
+    pub rotation: f64,
+    pub scale: [f64; 2],
+}
+
+impl Default for AvatarTextureTransform {
+    fn default() -> Self {
+        Self {
+            offset: [0.0; 2],
+            rotation: 0.0,
+            scale: [1.0; 2],
+        }
+    }
+}
+
+impl AvatarTextureTransform {
+    /// Whether this transform leaves texture coordinates unchanged.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.offset.iter().all(|value| equal_f64(*value, 0.0))
+            && equal_f64(self.rotation, 0.0)
+            && self.scale.iter().all(|value| equal_f64(*value, 1.0))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -541,6 +577,12 @@ const HUMANOID_ROLES: &[&str] = &[
     "rightLittleIntermediate",
     "rightLittleDistal",
 ];
+
+/// Whether `role` is an official VRM 1.0 humanoid bone name that Potter can map.
+#[must_use]
+pub fn is_humanoid_role(role: &str) -> bool {
+    HUMANOID_ROLES.contains(&role)
+}
 
 pub fn validate_avatar_settings(doc: &SceneDoc, settings: &AvatarSettings) -> Result<()> {
     validate_meta(doc, &settings.meta)?;
@@ -1059,7 +1101,7 @@ fn spring_ref_parent<'a>(
     }
 }
 
-fn validate_spring(doc: &SceneDoc, spring: &AvatarSpringBone) -> Result<()> {
+pub(crate) fn validate_spring(doc: &SceneDoc, spring: &AvatarSpringBone) -> Result<()> {
     for (index, collider) in spring.colliders.iter().enumerate() {
         let pointer = format!("/avatar/spring_bone/colliders/{index}");
         validate_node_ref(doc, &collider.node, &pointer)?;
@@ -1410,6 +1452,45 @@ fn validate_mtoon(doc: &SceneDoc, material_id: &Id, material: &AvatarMtoon) -> R
     if let Some(texture) = &material.uv_animation_mask_texture {
         validate_texture(doc, texture, &pointer("uv_animation_mask_texture"))?;
     }
+    for (slot, transform) in &material.texture_transforms {
+        let location = pointer(&format!("texture_transforms/{slot}"));
+        match mtoon_texture_slot_is_set(material, slot) {
+            None => {
+                return Err(avatar_error(
+                    format!("MToon texture transform `{slot}` is not a VRM 1.0 texture slot."),
+                    &location,
+                ));
+            }
+            Some(false) => {
+                return Err(avatar_error(
+                    format!("MToon texture transform `{slot}` needs a texture in that slot."),
+                    &location,
+                ));
+            }
+            Some(true) => {}
+        }
+        if transform.is_identity() {
+            return Err(avatar_error(
+                "MToon texture transform is the identity; remove the entry instead.",
+                &location,
+            ));
+        }
+        finite_array(
+            &transform.offset,
+            "MToon texture transform offset must be finite.",
+            &location,
+        )?;
+        finite_array(
+            &transform.scale,
+            "MToon texture transform scale must be finite.",
+            &location,
+        )?;
+        finite(
+            transform.rotation,
+            "MToon texture transform rotation must be finite.",
+            &location,
+        )?;
+    }
     Ok(())
 }
 
@@ -1421,6 +1502,20 @@ fn validate_texture(doc: &SceneDoc, texture: &TextureRef, pointer: &str) -> Resu
         ));
     }
     Ok(())
+}
+
+/// Whether the VRM 1.0 `MToon` texture slot `slot` holds a texture; `None` when `slot` is not a slot.
+fn mtoon_texture_slot_is_set(material: &AvatarMtoon, slot: &str) -> Option<bool> {
+    let set = match slot {
+        "shadeMultiplyTexture" => material.shade_multiply_texture.is_some(),
+        "shadingShiftTexture" => material.shading_shift_texture.is_some(),
+        "matcapTexture" => material.matcap_texture.is_some(),
+        "rimMultiplyTexture" => material.rim_multiply_texture.is_some(),
+        "outlineWidthMultiplyTexture" => material.outline_width_multiply_texture.is_some(),
+        "uvAnimationMaskTexture" => material.uv_animation_mask_texture.is_some(),
+        _ => return None,
+    };
+    Some(set)
 }
 
 fn finite_color(values: &[f64; 3], pointer: &str) -> Result<()> {

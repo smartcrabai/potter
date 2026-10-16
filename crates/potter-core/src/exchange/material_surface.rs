@@ -50,6 +50,15 @@ pub(crate) struct TextureTransform {
     pub(crate) scale: [f64; 2],
 }
 
+impl TextureTransform {
+    /// Whether this transform leaves texture coordinates unchanged.
+    pub(crate) fn is_identity(&self) -> bool {
+        crate::float::equal_f64_array(&self.offset, &[0.0; 2])
+            && crate::float::equal_f64(self.rotation, 0.0)
+            && crate::float::equal_f64_array(&self.scale, &[1.0; 2])
+    }
+}
+
 /// One glTF texture: four output channels (R, G, B, A) plus sampling state.
 ///
 /// `channels[i] == None` means the glTF channel is the constant 1.0 (Blender fills unlinked
@@ -682,12 +691,6 @@ fn point_transform(location: [f64; 2], scale: [f64; 2], turn: f64) -> TextureTra
     }
 }
 
-fn is_identity_transform(transform: &TextureTransform) -> bool {
-    crate::float::equal_f64_array(&transform.offset, &[0.0; 2])
-        && crate::float::equal_f64(transform.rotation, 0.0)
-        && crate::float::equal_f64_array(&transform.scale, &[1.0; 2])
-}
-
 /// Longest chain of Reroute nodes followed upstream; longer chains are reported as unlinked.
 const MAX_REROUTE_DEPTH: usize = 64;
 
@@ -890,7 +893,7 @@ impl<'a> GraphReducer<'a> {
                 None
             }
         };
-        Ok((uv_layer, transform.filter(|t| !is_identity_transform(t))))
+        Ok((uv_layer, transform.filter(|t| !t.is_identity())))
     }
 
     /// An image texture read, with its channel selection.

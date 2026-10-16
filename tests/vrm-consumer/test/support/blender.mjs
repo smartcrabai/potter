@@ -55,9 +55,14 @@ export async function setupBlender() {
     { env, encoding: 'utf8', timeout: 300_000 },
   );
   const output = `${install.stdout ?? ''}${install.stderr ?? ''}`;
-  if (install.status !== 0 || !/STATUS Installed "vrm"/.test(output)) {
+  // The installed tree is the result. Concurrent Blender installs can exit 0 without printing
+  // `STATUS Installed "vrm"` (the line is lost while the tree is complete), so the status line is not required.
+  // A real failure (for example a truncated zip) is reported by Blender as an `ERROR` line, also with exit 0.
+  const installed = path.join(userResources, 'extensions', 'user_default', 'vrm', 'blender_manifest.toml');
+  if (install.status !== 0 || /ERROR/.test(output) || !existsSync(installed)) {
     await rm(userResources, { recursive: true, force: true });
-    return { reason: `VRM Add-on install failed (exit ${install.status}): ${output.slice(-1000)}` };
+    const errors = output.split('\n').filter((line) => line.includes('ERROR')).join('\n');
+    return { reason: `VRM Add-on install failed (exit ${install.status}): ${errors || output.slice(-1000)}` };
   }
   return { blender, userResources };
 }

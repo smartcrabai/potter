@@ -408,6 +408,7 @@ pub mod bvh;
 pub mod fbx;
 pub mod fbx_binary;
 pub mod gltf;
+pub(crate) mod material_graph;
 pub(crate) mod material_surface;
 pub mod obj;
 pub mod pdf;
