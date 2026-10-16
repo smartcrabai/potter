@@ -10,11 +10,14 @@ use serde_json::{Value, json};
 
 use serde::de::DeserializeOwned;
 
-use super::{ImportedGraph, Loss, import_error, shading};
+use super::{
+    ExchangeUvLayer, ImportedGraph, Loss, import_error, import_uv_layers, shading, unique_uv_name,
+    uv_import_loss,
+};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::{Mesh, normals::corner_normals},
+    geom::{Mesh, normals::corner_normals, uv_layers},
     model::{
         Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageAlphaMode,
         ImageColorspace, ImageSource, Interpolation, Keyframe, Material, Node, SceneDoc,
@@ -74,7 +77,7 @@ struct TextureExport {
     material_id: Id,
     property: &'static str,
     path: String,
-    uv_map: Option<String>,
+    uv_layer: String,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +99,28 @@ pub(crate) fn export_with_root(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     project_root: &Path,
+) -> Result<Vec<u8>> {
+    export_with_root_allow_lossy(doc, snapshot, project_root, false)
+}
+
+/// Export ASCII FBX, optionally dropping attributes reported by the command's lossy-export gate.
+pub(crate) fn export_allow_lossy(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    allow_lossy: bool,
+) -> Result<Vec<u8>> {
+    if allow_lossy {
+        export_with_root_allow_lossy(doc, snapshot, Path::new("."), true)
+    } else {
+        export(doc, snapshot)
+    }
+}
+
+pub(crate) fn export_with_root_allow_lossy(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    project_root: &Path,
+    allow_lossy: bool,
 ) -> Result<Vec<u8>> {
     let _ = project_root;
     doc.validate()?;
@@ -326,7 +351,14 @@ pub(crate) fn export_with_root(
                     )
                 })?
             };
-            write_geometry(&mut output, geometry_id, node, mesh, data_block)?;
+            write_geometry(
+                &mut output,
+                geometry_id,
+                node,
+                mesh,
+                data_block,
+                allow_lossy,
+            )?;
         }
         let mesh_model = object_ids.geometry.is_some();
         let rotation = DQuat::from_xyzw(
@@ -436,7 +468,7 @@ pub(crate) fn export_with_root(
             texture.id,
             quote(&material.name),
             quote(&material.name),
-            quote(texture.uv_map.as_deref().unwrap_or("")),
+            quote(&texture.uv_layer),
             texture.property,
             quote(&texture.path),
             quote(&texture.path),
@@ -693,11 +725,86 @@ fn build_texture_exports(
                 material_id: material_id.clone(),
                 property,
                 path: path.to_string_lossy().into_owned(),
-                uv_map: texture.uv_map.clone(),
+                uv_layer: texture_uv_set(doc, material_id, texture.uv_layer.as_deref()),
             });
         }
     }
     Ok(output)
+}
+
+/// The layer a material texture samples, as FBX's `UVSet`. The first mesh that uses the material
+/// resolves the reference. A layer name that mesh lacks falls back to its render layer, which
+/// `uv_texture_losses` reports.
+fn texture_uv_set(doc: &SceneDoc, material_id: &Id, uv_layer: Option<&str>) -> String {
+    let Some(store) = doc
+        .nodes
+        .values()
+        .find(|node| node.materials.contains(material_id))
+        .and_then(|node| node.data.as_ref())
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .and_then(|data| data.mesh.as_ref())
+        .map(uv_layers::read)
+    else {
+        return uv_layer.unwrap_or_default().to_owned();
+    };
+    let (index, _) = store.resolve(uv_layer);
+    index
+        .and_then(|index| store.layers.get(index))
+        .map(|layer| layer.name.clone())
+        .unwrap_or_default()
+}
+
+/// Losses for material textures that name a UV layer which a mesh using the material lacks. FBX
+/// writes the render layer for those textures instead.
+pub(crate) fn uv_texture_losses(doc: &SceneDoc) -> Vec<Loss> {
+    let mut missing = BTreeSet::<(String, String, String)>::new();
+    for (material_id, material) in &doc.materials {
+        let textures = [
+            &material.base_color_texture,
+            &material.roughness_texture,
+            &material.metallic_texture,
+            &material.normal_texture,
+        ];
+        for texture in textures.into_iter().flatten() {
+            let Some(name) = texture.uv_layer.as_deref() else {
+                continue;
+            };
+            for (node_id, node) in doc
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.materials.contains(material_id))
+            {
+                let Some(mesh) = node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id))
+                    .and_then(|data| data.mesh.as_ref())
+                else {
+                    continue;
+                };
+                if uv_layers::read(mesh).resolve(Some(name)).1.is_some() {
+                    missing.insert((
+                        material_id.to_string(),
+                        name.to_owned(),
+                        node_id.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    missing
+        .into_iter()
+        .map(|(material, layer, node)| Loss {
+            feature_id: "uv.layer_missing".to_owned(),
+            data_id: Some(material.clone()),
+            reason: format!(
+                "material `{material}` samples UV layer `{layer}`, which node `{node}` does not have; FBX samples the render layer instead"
+            ),
+            suggestion: Some(
+                "add the UV layer to the mesh, or point the texture at the render layer".to_owned(),
+            ),
+        })
+        .collect()
 }
 
 type BoneModelIds = BTreeMap<(Id, Id), i64>;
@@ -1160,12 +1267,15 @@ fn write_geometry(
     node: &Node,
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
+    allow_lossy: bool,
 ) -> Result<()> {
-    // Shading attributes are carried by the exported normal layer; any other attribute is refused.
-    if mesh
-        .attributes
-        .keys()
-        .any(|name| !crate::geom::normals::SHADING_ATTRIBUTES.contains(&name.as_str()))
+    // Shading attributes and UV layers have their own FBX layers. Unsupported attributes are
+    // skipped only for lossy export and are reported by `commands::export::export_losses`.
+    if !allow_lossy
+        && mesh.attributes.keys().any(|name| {
+            name != uv_layers::ATTRIBUTE
+                && !crate::geom::normals::SHADING_ATTRIBUTES.contains(&name.as_str())
+        })
     {
         return Err(PotError::with_details(
             ErrorCode::UnrepresentableFeature,
@@ -1294,6 +1404,7 @@ fn write_geometry(
     }
     output.push_str("\n\t\t}\n");
     write_normal_layer(output, mesh)?;
+    write_uv_layers(output, mesh)?;
     if !node.materials.is_empty() {
         write!(output, "\t\tLayerElementMaterial: 0 {{\n\t\t\tVersion: 101\n\t\t\tName: \"\"\n\t\t\tMappingInformationType: \"ByPolygon\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tMaterials: *{} {{\n\t\t\t\ta: ", mesh.faces.len()).map_err(write_error)?;
         for (index, face) in mesh.faces.iter().enumerate() {
@@ -1317,7 +1428,20 @@ fn write_geometry(
     if !node.materials.is_empty() {
         output.push_str("\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementMaterial\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
     }
-    output.push_str("\t\t}\n\t}\n");
+    // Blender keeps the first UV layer in layer 0 and gives each further layer its own layer.
+    let uv_count = uv_layers::read(mesh).layers.len();
+    if uv_count > 0 {
+        output.push_str("\t\t\tLayerElement: {\n\t\t\t\tType: \"LayerElementUV\"\n\t\t\t\tTypedIndex: 0\n\t\t\t}\n");
+    }
+    output.push_str("\t\t}\n");
+    for index in 1..uv_count {
+        write!(
+            output,
+            "\t\tLayer: {index} {{\n\t\t\tVersion: 100\n\t\t\tLayerElement: {{\n\t\t\t\tType: \"LayerElementUV\"\n\t\t\t\tTypedIndex: {index}\n\t\t\t}}\n\t\t}}\n"
+        )
+        .map_err(write_error)?;
+    }
+    output.push_str("\t}\n");
     Ok(())
 }
 
@@ -1364,6 +1488,57 @@ fn write_normal_layer(output: &mut String, mesh: &Mesh) -> Result<()> {
     let encoded = indices.iter().map(usize::to_string).collect::<Vec<_>>();
     output.push_str(&encoded.join(","));
     output.push_str("\n\t\t\t}\n\t\t}\n");
+    Ok(())
+}
+
+/// Writes one `LayerElementUV` per UV layer, named by the layer, in Blender's layout: each distinct
+/// value once, indexed per polygon vertex. FBX stores V up, as Blender writes it, so `v` is flipped
+/// from storage.
+fn write_uv_layers(output: &mut String, mesh: &Mesh) -> Result<()> {
+    let store = uv_layers::read(mesh);
+    for (layer_index, layer) in store.layers.iter().enumerate() {
+        let mut unique = BTreeMap::<[u64; 2], usize>::new();
+        let mut values = Vec::<[f64; 2]>::new();
+        let mut indices = Vec::<usize>::new();
+        for (face_index, face) in mesh.faces.iter().enumerate() {
+            let entry = layer.faces.get(face_index).and_then(Option::as_ref);
+            for corner in 0..face.vertices.len() {
+                let [u, v] = entry
+                    .and_then(|corners| corners.get(corner))
+                    .copied()
+                    .unwrap_or([0.0, 0.0]);
+                let value = [u, 1.0 - v];
+                let key = value.map(|component| (component + 0.0).to_bits());
+                let index = *unique.entry(key).or_insert_with(|| {
+                    values.push(value);
+                    values.len() - 1
+                });
+                indices.push(index);
+            }
+        }
+        write!(
+            output,
+            "\t\tLayerElementUV: {layer_index} {{\n\t\t\tVersion: 101\n\t\t\tName: \"{}\"\n\t\t\tMappingInformationType: \"ByPolygonVertex\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tUV: *{} {{\n\t\t\t\ta: ",
+            quote(&layer.name),
+            values.len().saturating_mul(2)
+        )
+        .map_err(write_error)?;
+        let components = values
+            .iter()
+            .flatten()
+            .map(|value| fmt_num(*value))
+            .collect::<Vec<_>>();
+        output.push_str(&components.join(","));
+        write!(
+            output,
+            "\n\t\t\t}}\n\t\t\tUVIndex: *{} {{\n\t\t\t\ta: ",
+            indices.len()
+        )
+        .map_err(write_error)?;
+        let encoded = indices.iter().map(usize::to_string).collect::<Vec<_>>();
+        output.push_str(&encoded.join(","));
+        output.push_str("\n\t\t\t}\n\t\t}\n");
+    }
     Ok(())
 }
 
@@ -1496,7 +1671,6 @@ fn import_bytes_with_base(
                 }
                 let geometry = parse_geometry(object, id, &mut losses)?;
                 for attribute in [
-                    "LayerElementUV",
                     "LayerElementTangent",
                     "LayerElementBinormal",
                     "LayerElementColor",
@@ -1725,7 +1899,7 @@ fn import_bytes_with_base(
             .ok_or_else(|| import_error("FBX texture material was not imported"))?;
         let texture_ref = TextureRef {
             image: image_id,
-            uv_map: texture.uv_map.clone(),
+            uv_layer: texture.uv_layer.clone(),
             interpolation: crate::image::ImageInterpolation::Linear,
         };
         match property {
@@ -1785,6 +1959,7 @@ fn import_bytes_with_base(
             if let Some(normals) = &geometry.normals {
                 shading::import_shading(&mut mesh, normals)?;
             }
+            import_uv_layers(&mut mesh, &geometry.uv_layers, Some(0), Some(0));
             for (face_index, face) in mesh.faces.iter_mut().enumerate() {
                 let slot = geometry
                     .material_indices
@@ -1903,6 +2078,8 @@ struct ImportedGeometry {
     deformation: Option<Value>,
     /// Mesh-local corner normals in `faces` order, unit length; `None` when absent.
     normals: Option<Vec<DVec3>>,
+    /// UV layers in file order; empty when the geometry has none.
+    uv_layers: Vec<ExchangeUvLayer>,
 }
 
 fn decode_deformation_field<T: DeserializeOwned>(
@@ -1942,7 +2119,7 @@ struct ImportedMaterial {
 struct ImportedTexture {
     numeric_id: i64,
     file_name: String,
-    uv_map: Option<String>,
+    uv_layer: Option<String>,
     property: Option<String>,
 }
 #[derive(Clone, Debug)]
@@ -2158,12 +2335,14 @@ fn parse_geometry(
             suggestion: None,
         });
     }
+    let layers = parse_uv_layers(node, positions.len(), &faces, geometry_id, losses)?;
     Ok(ImportedGeometry {
         positions,
         faces,
         material_indices,
         deformation,
         normals,
+        uv_layers: layers,
     })
 }
 
@@ -2269,6 +2448,147 @@ fn parse_normal_layer(
     Ok(Some(normals))
 }
 
+/// Reads every `LayerElementUV` of a geometry as a UV layer, in file order, with corners in
+/// `faces` order in storage convention. FBX stores V up, as Blender does, so `v` is flipped. A
+/// layer whose mapping is unsupported is a loss, and layers past the limit are losses too.
+fn parse_uv_layers(
+    node: &FbxNode,
+    point_count: usize,
+    faces: &[Vec<usize>],
+    geometry_id: i64,
+    losses: &mut Vec<Loss>,
+) -> Result<Vec<ExchangeUvLayer>> {
+    let mut layers = Vec::<ExchangeUvLayer>::new();
+    for layer in node
+        .children
+        .iter()
+        .filter(|child| child.name == "LayerElementUV")
+    {
+        let raw_name = layer
+            .child("Name")
+            .and_then(FbxNode::first_arg)
+            .unwrap_or("");
+        if layers.len() == uv_layers::MAX_LAYERS {
+            losses.push(uv_import_loss(
+                &geometry_id.to_string(),
+                format!(
+                    "FBX geometry has more than {} UV layers; layer `{raw_name}` is not represented",
+                    uv_layers::MAX_LAYERS
+                ),
+            ));
+            continue;
+        }
+        let Some(values) =
+            parse_uv_values(layer, point_count, faces, geometry_id, raw_name, losses)?
+        else {
+            continue;
+        };
+        let mut corners = Vec::with_capacity(faces.len());
+        let mut start = 0;
+        for face in faces {
+            corners.push(values[start..start + face.len()].to_vec());
+            start += face.len();
+        }
+        let name = unique_uv_name(raw_name, &layers);
+        layers.push(ExchangeUvLayer { name, corners });
+    }
+    Ok(layers)
+}
+
+/// Values per polygon corner, or `None` after a loss when the layer's mapping is unsupported.
+fn parse_uv_values(
+    layer: &FbxNode,
+    point_count: usize,
+    faces: &[Vec<usize>],
+    geometry_id: i64,
+    name: &str,
+    losses: &mut Vec<Loss>,
+) -> Result<Option<Vec<[f64; 2]>>> {
+    let mapping = layer
+        .child("MappingInformationType")
+        .and_then(FbxNode::first_arg)
+        .unwrap_or("");
+    let reference = layer
+        .child("ReferenceInformationType")
+        .and_then(FbxNode::first_arg)
+        .unwrap_or("");
+    let by_corner = match mapping {
+        "ByPolygonVertex" => true,
+        "ByVertice" | "ByVertex" => false,
+        _ => {
+            losses.push(uv_import_loss(
+                &geometry_id.to_string(),
+                format!("FBX LayerElementUV `{name}` mapping `{mapping}` is not represented in the Potter mesh model"),
+            ));
+            return Ok(None);
+        }
+    };
+    let indexed = match reference {
+        "Direct" => false,
+        "IndexToDirect" => true,
+        _ => {
+            losses.push(uv_import_loss(
+                &geometry_id.to_string(),
+                format!("FBX LayerElementUV `{name}` reference `{reference}` is not represented in the Potter mesh model"),
+            ));
+            return Ok(None);
+        }
+    };
+    let raw = numeric_array(
+        layer
+            .child("UV")
+            .ok_or_else(|| import_error("FBX LayerElementUV has no UV array"))?,
+    )?;
+    if raw.len() % 2 != 0 || raw.iter().any(|value| !value.is_finite()) {
+        return Err(import_error("FBX UV array must contain finite uv pairs"));
+    }
+    let vectors = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| [pair[0], 1.0 - pair[1]])
+        .collect::<Vec<_>>();
+    let indices = if indexed {
+        Some(integer_array(layer.child("UVIndex").ok_or_else(|| {
+            import_error("FBX LayerElementUV has no UVIndex array")
+        })?)?)
+    } else {
+        None
+    };
+    let polygon_points = faces.iter().flatten().copied().collect::<Vec<_>>();
+    let element_count = indices.as_ref().map_or(vectors.len(), Vec::len);
+    let expected = if by_corner {
+        polygon_points.len()
+    } else {
+        point_count
+    };
+    if element_count != expected {
+        return Err(import_error(
+            "FBX LayerElementUV count does not match its mapping",
+        ));
+    }
+    let mut values = Vec::with_capacity(polygon_points.len());
+    for (corner, point) in polygon_points.iter().enumerate() {
+        let element = if by_corner { corner } else { *point };
+        let value_index = match &indices {
+            Some(indices) => {
+                let raw = indices
+                    .get(element)
+                    .ok_or_else(|| import_error("FBX LayerElementUV index is missing"))?;
+                usize::try_from(*raw)
+                    .map_err(|_| import_error("FBX LayerElementUV index is negative"))?
+            }
+            None => element,
+        };
+        values.push(
+            *vectors
+                .get(value_index)
+                .ok_or_else(|| import_error("FBX LayerElementUV index is outside the UV array"))?,
+        );
+    }
+    Ok(Some(values))
+}
+
 fn normal_loss(geometry_id: i64, reason: impl Into<String>) -> Loss {
     Loss {
         feature_id: "mesh.normals".to_owned(),
@@ -2315,11 +2635,11 @@ fn parse_texture(node: &FbxNode, numeric_id: i64) -> Result<ImportedTexture> {
         .ok_or_else(|| import_error("FBX texture has no file path"))?
         .to_owned();
     let properties = node.child("Properties70");
-    let uv_map = read_string_property(properties, "UVSet").filter(|value| !value.is_empty());
+    let uv_layer = read_string_property(properties, "UVSet").filter(|value| !value.is_empty());
     Ok(ImportedTexture {
         numeric_id,
         file_name,
-        uv_map,
+        uv_layer,
         property: read_string_property(properties, "potter:property"),
     })
 }
@@ -3011,4 +3331,71 @@ fn quote(value: &str) -> String {
 
 fn write_error(_: std::fmt::Error) -> PotError {
     PotError::new(ErrorCode::InternalError, "writing FBX text failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lex, parse_nodes, parse_uv_layers, write_uv_layers};
+    use crate::{
+        error::{ErrorCode, PotError, Result},
+        exchange::Loss,
+        geom::{
+            Mesh,
+            uv_layers::{self, UvLayer, UvStore},
+        },
+    };
+    use glam::DVec3;
+
+    fn triangle() -> Result<Mesh> {
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
+            .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))
+    }
+
+    fn assert_close(actual: &[[f64; 2]], expected: &[[f64; 2]]) {
+        assert_eq!(actual.len(), expected.len());
+        for (left, right) in actual.iter().zip(expected) {
+            assert!(
+                (left[0] - right[0]).abs() < 1.0e-12 && (left[1] - right[1]).abs() < 1.0e-12,
+                "{left:?} != {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn layer_element_uv_round_trips_names_order_and_storage_values() -> Result<()> {
+        let mut mesh = triangle()?;
+        let corners = |values: [[f64; 2]; 3]| vec![Some(values.to_vec())];
+        uv_layers::write(
+            &mut mesh,
+            &UvStore {
+                layers: vec![
+                    UvLayer::new("UVMap", corners([[0.1, 0.25], [0.5, 0.75], [0.9, 0.0]])),
+                    UvLayer::new("Second", corners([[0.2, 0.1], [0.6, 0.3], [0.4, 0.0]])),
+                ],
+                active: Some("UVMap".to_owned()),
+                render: Some("UVMap".to_owned()),
+            },
+        );
+        let mut text = String::from("Geometry: 1, \"Geometry::Triangle\", \"Mesh\" {\n");
+        write_uv_layers(&mut text, &mesh)?;
+        text.push_str("}\n");
+        let nodes = parse_nodes(&lex(&text)?)?;
+        let geometry = nodes
+            .first()
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "FBX test has no geometry"))?;
+        let mut losses = Vec::<Loss>::new();
+        let layers = parse_uv_layers(geometry, 3, &[vec![0, 1, 2]], 1, &mut losses)?;
+        assert!(losses.is_empty());
+        let names = layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["UVMap", "Second"]);
+        assert_close(
+            &layers[0].corners[0],
+            &[[0.1, 0.25], [0.5, 0.75], [0.9, 0.0]],
+        );
+        assert_close(&layers[1].corners[0], &[[0.2, 0.1], [0.6, 0.3], [0.4, 0.0]]);
+        Ok(())
+    }
 }

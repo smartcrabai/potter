@@ -5,7 +5,10 @@ use serde::Serialize;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::Mesh,
+    geom::{
+        Mesh,
+        uv_layers::{self, UvLayer, UvStore},
+    },
     model::{DataBlock, Id, Node, SceneDoc, Transform},
 };
 
@@ -69,6 +72,155 @@ pub(crate) struct ExchangeMesh {
     /// Per face: whether a corner normal differs from the face's flat normal, in local space.
     /// Empty for imported meshes, where every face counts as flat.
     pub smooth: Vec<bool>,
+    /// UV layers in mesh order: glTF `TEXCOORD_n` and Blender's layer order.
+    pub uv_layers: Vec<ExchangeUvLayer>,
+    /// Index into `uv_layers` of the active (edit target) layer. OBJ and PLY write this layer.
+    pub uv_active: Option<usize>,
+    /// Index into `uv_layers` of the render layer.
+    pub uv_render: Option<usize>,
+}
+
+/// One UV layer of an exchange mesh.
+#[derive(Clone, Debug)]
+pub(crate) struct ExchangeUvLayer {
+    pub name: String,
+    /// Per face, the corner `[u, v]` values in `faces` order, in Potter's storage convention (v
+    /// down). A face without an entry holds `[0, 0]` per corner.
+    pub corners: Vec<Vec<[f64; 2]>>,
+}
+
+/// Corner values of `layer` for each face of `faces`, in storage convention.
+fn uv_corners(layer: &UvLayer, faces: &[crate::geom::Face]) -> Vec<Vec<[f64; 2]>> {
+    faces
+        .iter()
+        .enumerate()
+        .map(|(index, face)| {
+            let entry = layer.faces.get(index).and_then(Option::as_ref);
+            (0..face.vertices.len())
+                .map(|corner| {
+                    entry
+                        .and_then(|values| values.get(corner))
+                        .copied()
+                        .unwrap_or([0.0, 0.0])
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Writes imported UV layers into `mesh`. Layer `k` takes the corners of `layers[k]`, keyed by
+/// storage face index, which `Mesh::from_positions_and_faces` keeps in `faces` order. `active` and
+/// `render` index into `layers`.
+pub(super) fn import_uv_layers(
+    mesh: &mut Mesh,
+    layers: &[ExchangeUvLayer],
+    active: Option<usize>,
+    render: Option<usize>,
+) {
+    let name_of = |index: Option<usize>| {
+        index
+            .and_then(|index| layers.get(index))
+            .map(|layer| layer.name.clone())
+    };
+    let store = UvStore {
+        layers: layers
+            .iter()
+            .map(|layer| {
+                UvLayer::new(
+                    layer.name.clone(),
+                    layer.corners.iter().cloned().map(Some).collect(),
+                )
+            })
+            .collect(),
+        active: name_of(active),
+        render: name_of(render),
+    };
+    uv_layers::write(mesh, &store);
+}
+
+/// A UV layer name an importer can store: `raw` when it is non-empty and unused, else `UVMap`, or
+/// `raw` with a Blender-style `.001` suffix when it is taken.
+pub(super) fn unique_uv_name(raw: &str, taken: &[ExchangeUvLayer]) -> String {
+    let base = if raw.is_empty() { "UVMap" } else { raw };
+    let is_taken = |candidate: &str| taken.iter().any(|layer| layer.name == candidate);
+    if !is_taken(base) {
+        return base.to_owned();
+    }
+    let mut suffix = 1_u32;
+    loop {
+        let candidate = format!("{base}.{suffix:03}");
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+/// Loss for a UV layer an importer cannot represent.
+pub(super) fn uv_import_loss(data_id: &str, reason: impl Into<String>) -> Loss {
+    Loss {
+        feature_id: "mesh.uv_layer".to_owned(),
+        data_id: Some(data_id.to_owned()),
+        reason: reason.into(),
+        suggestion: Some("export as usda, usdc, fbx, or alembic to keep every UV layer".to_owned()),
+    }
+}
+
+/// The one UV set a file format carries, as the layer `UVMap`, which is both active and render.
+/// `corners` is per face in storage convention, aligned with the mesh faces.
+pub(super) fn single_uv_set(
+    corners: Vec<Vec<[f64; 2]>>,
+) -> (Vec<ExchangeUvLayer>, Option<usize>, Option<usize>) {
+    (
+        vec![ExchangeUvLayer {
+            name: "UVMap".to_owned(),
+            corners,
+        }],
+        Some(0),
+        Some(0),
+    )
+}
+
+/// Loss entries for UV layers a format does not write. OBJ and PLY write only the active layer.
+/// STL has no UV coordinates, so every layer is lost. Alembic omits the layers whose names it
+/// reserves. Other formats keep every layer.
+pub(crate) fn uv_layer_losses(format: &str, meshes: &[ExchangeMesh]) -> Vec<Loss> {
+    let mut losses = Vec::new();
+    for mesh in meshes {
+        for (index, layer) in mesh.uv_layers.iter().enumerate() {
+            let (reason, suggestion) = match format {
+                "obj" | "ply" if mesh.uv_active != Some(index) => (
+                    format!(
+                        "{format} stores only the active UV layer; UV layer `{}` is lost",
+                        layer.name
+                    ),
+                    "export as usda, usdc, fbx, or alembic to keep every UV layer",
+                ),
+                "stl" => (
+                    format!(
+                        "stl stores no UV coordinates; UV layer `{}` is lost",
+                        layer.name
+                    ),
+                    "export as obj, ply, usda, fbx, or alembic to keep UV coordinates",
+                ),
+                "alembic" if alembic::reserves_uv_layer_name(&layer.name) => (
+                    format!(
+                        "Alembic reserves the property name `{0}`; UV layer `{0}` is not written",
+                        layer.name
+                    ),
+                    "rename the UV layer, or export as usda, usdc, or fbx to keep it",
+                ),
+                _ => continue,
+            };
+            losses.push(Loss {
+                feature_id: "mesh.uv_layer".to_owned(),
+                data_id: Some(mesh.id.clone()),
+                reason,
+                suggestion: Some(suggestion.to_owned()),
+            });
+        }
+    }
+    losses
 }
 
 pub(crate) fn evaluated_meshes(
@@ -125,6 +277,17 @@ pub(crate) fn evaluated_meshes(
             };
             faces.push(indices);
         }
+        let uv = uv_layers::read(source);
+        let uv_layer_list = uv
+            .layers
+            .iter()
+            .map(|layer| ExchangeUvLayer {
+                name: layer.name.clone(),
+                corners: uv_corners(layer, &source.faces),
+            })
+            .collect::<Vec<_>>();
+        let uv_active = uv.active.as_deref().and_then(|name| uv.index_of(name));
+        let uv_render = uv.render_index();
         output.push(ExchangeMesh {
             id: node_id.to_string(),
             name: node.name.clone(),
@@ -135,6 +298,9 @@ pub(crate) fn evaluated_meshes(
             smooth: shading.smooth,
             singular: shading::is_singular(matrix),
             mirrored: shading::is_mirrored(matrix),
+            uv_layers: uv_layer_list,
+            uv_active,
+            uv_render,
         });
     }
     Ok(output)
@@ -221,6 +387,12 @@ pub(crate) fn graph_from_meshes(meshes: Vec<ExchangeMesh>, scene_id: String) -> 
                 .collect::<Vec<_>>();
             shading::import_shading(&mut mesh, &normals)?;
         }
+        import_uv_layers(
+            &mut mesh,
+            &geometry.uv_layers,
+            geometry.uv_active,
+            geometry.uv_render,
+        );
         doc.data_blocks.insert(
             data_id.clone(),
             DataBlock {
@@ -420,3 +592,71 @@ pub mod usd;
 pub mod usdc;
 mod vector;
 pub mod vrm;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{ExchangeMesh, ExchangeUvLayer};
+
+    /// One triangle with two UV layers. Layer 0 is `UVMap` and is the render layer. Layer 1 is
+    /// `Lightmap` and is the active layer, which OBJ and PLY write.
+    pub(crate) fn triangle_with_layers() -> ExchangeMesh {
+        ExchangeMesh {
+            id: "triangle".to_owned(),
+            name: "Triangle".to_owned(),
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            faces: vec![vec![0, 1, 2]],
+            normals: Some(vec![[0.0, 0.0, 1.0]; 3]),
+            mirrored: false,
+            singular: false,
+            vertex_normals: Vec::new(),
+            smooth: vec![false],
+            uv_layers: vec![
+                ExchangeUvLayer {
+                    name: "UVMap".to_owned(),
+                    corners: vec![vec![[0.1, 0.25], [0.5, 0.75], [0.9, 0.0]]],
+                },
+                ExchangeUvLayer {
+                    name: "Lightmap".to_owned(),
+                    corners: vec![vec![[0.2, 0.1], [0.6, 0.3], [0.4, 0.0]]],
+                },
+            ],
+            uv_active: Some(1),
+            uv_render: Some(0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_support::triangle_with_layers, uv_layer_losses};
+
+    #[test]
+    fn obj_and_ply_lose_every_layer_except_the_active_one() {
+        let meshes = [triangle_with_layers()];
+        for format in ["obj", "ply"] {
+            let losses = uv_layer_losses(format, &meshes);
+            assert_eq!(losses.len(), 1, "{format}");
+            assert_eq!(losses[0].feature_id, "mesh.uv_layer");
+            assert!(losses[0].reason.contains("UVMap"), "{format}");
+        }
+    }
+
+    #[test]
+    fn stl_loses_every_layer_and_layered_formats_lose_none() {
+        let meshes = [triangle_with_layers()];
+        assert_eq!(uv_layer_losses("stl", &meshes).len(), 2);
+        for format in ["usda", "usdc", "fbx", "fbx-binary", "alembic", "glb"] {
+            assert!(uv_layer_losses(format, &meshes).is_empty(), "{format}");
+        }
+    }
+
+    #[test]
+    fn alembic_loses_only_the_names_it_reserves() {
+        let mut mesh = triangle_with_layers();
+        mesh.uv_layers[0].name = "P".to_owned();
+        let losses = uv_layer_losses("alembic", &[mesh]);
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].feature_id, "mesh.uv_layer");
+        assert!(losses[0].reason.contains("`P`"), "{}", losses[0].reason);
+    }
+}

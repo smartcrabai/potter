@@ -403,7 +403,9 @@ fn cli_angle_and_conformal_unwrap_preserve_planar_grid_similarity() -> Result<()
         let mesh = &document["data_blocks"]["grid_mesh"]["mesh"];
         let vertices = mesh["vertices"].as_array().unwrap();
         let mut uv_by_vertex: Vec<Option<[f64; 2]>> = vec![None; vertices.len()];
-        let uv_entries = mesh["attributes"]["uv_map"].as_array().unwrap();
+        let uv_entries = mesh["attributes"]["uv_layers"]["layers"][0]["faces"]
+            .as_array()
+            .unwrap();
         for face in mesh["faces"].as_array().unwrap() {
             let face_id = face["id"].as_u64().unwrap();
             let entry = uv_entries

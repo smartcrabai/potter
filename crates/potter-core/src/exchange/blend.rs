@@ -13,7 +13,10 @@ use serde_json::{Map, Value, json};
 use crate::{
     color::{ColorManagement, ViewTransform},
     error::{ErrorCode, PotError, Result},
-    geom::{Edge, Face, IdCounters, Mesh, Vertex},
+    geom::{
+        Edge, Face, IdCounters, Mesh, Vertex,
+        uv_layers::{self, UvLayer, UvStore},
+    },
     graph::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
     model::{
         Action, ActionSlot, ArmatureData, Bone, CameraData, CameraProjection, Collection,
@@ -125,8 +128,9 @@ pub fn export_blend(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent).map_err(|error| PotError::io(&error))?;
-    let document = serde_json::to_value(doc).map_err(PotError::internal_json)?;
+    let mut document = serde_json::to_value(doc).map_err(PotError::internal_json)?;
     let scene_hash = crate::hash::sha256(&crate::hash::canonicalize(&document)?);
+    add_blender_uv_fields(doc, &mut document);
     let (document, asset_files) = prepare_blend_export_resources(document, project, out)?;
     let input = temporary_path("blend-export-input.json")?;
     let script = temporary_path("blend-bridge.py")?;
@@ -226,6 +230,69 @@ pub fn export_blend(
             .collect(),
         losses,
     })
+}
+
+/// Writes the Blender-convention UV fields of every mesh data-block into the document sent to the
+/// bridge: `uv_layers` (one row per loop in face order, Blender V up, with per-loop pin flags),
+/// `uv_active`, and `uv_render`. The store holds storage values (v down), so each v is flipped.
+fn add_blender_uv_fields(doc: &SceneDoc, document: &mut Value) {
+    for (data_id, data) in &doc.data_blocks {
+        let Some(mesh) = &data.mesh else {
+            continue;
+        };
+        let Some(mesh_value) = document
+            .get_mut("data_blocks")
+            .and_then(|blocks| blocks.get_mut(data_id.as_str()))
+            .and_then(|block| block.get_mut("mesh"))
+        else {
+            continue;
+        };
+        let store = uv_layers::read(mesh);
+        let first = (!store.layers.is_empty()).then_some(0);
+        let active = store
+            .active
+            .as_deref()
+            .and_then(|name| store.index_of(name))
+            .or(first);
+        let render = store.render_index().or(first);
+        mesh_value["uv_layers"] = Value::Array(
+            store
+                .layers
+                .iter()
+                .map(|layer| {
+                    let (values, pins) = blender_uv_loops(mesh, layer);
+                    json!({"name": layer.name, "values": values, "pins": pins})
+                })
+                .collect(),
+        );
+        mesh_value["uv_active"] = json!(active);
+        mesh_value["uv_render"] = json!(render);
+    }
+}
+
+/// A layer's per-loop values and pin flags in Blender convention. Loops follow storage face order.
+/// A face without an entry takes the store default: `[0, 0]` in storage convention, unpinned.
+fn blender_uv_loops(mesh: &Mesh, layer: &UvLayer) -> (Value, Value) {
+    let mut values = Vec::new();
+    let mut pins = Vec::new();
+    for (index, face) in mesh.faces.iter().enumerate() {
+        let corners = layer.faces.get(index).and_then(Option::as_ref);
+        let flags = layer.pinned.get(index).and_then(Option::as_ref);
+        for corner in 0..face.vertices.len() {
+            let [u, v] = corners
+                .and_then(|corners| corners.get(corner))
+                .copied()
+                .unwrap_or([0.0, 0.0]);
+            values.push(json!([u, 1.0 - v]));
+            pins.push(json!(
+                flags
+                    .and_then(|flags| flags.get(corner))
+                    .copied()
+                    .unwrap_or(false)
+            ));
+        }
+    }
+    (Value::Array(values), Value::Array(pins))
 }
 
 fn prepare_blend_export_resources(
@@ -391,6 +458,7 @@ fn prepare_blend_export_resources(
             files.push(destination);
         }
     }
+    add_blender_image_pixels(&mut document, project)?;
     Ok((document, files))
 }
 
@@ -412,6 +480,26 @@ fn library_layout_base(document: &Value) -> Option<PathBuf> {
         }
     }
     Some(base)
+}
+
+fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<()> {
+    let Some(images) = document.get_mut("images").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    for image_json in images.values_mut() {
+        let image: Image =
+            serde_json::from_value(image_json.clone()).map_err(PotError::internal_json)?;
+        if image.blob.is_none() && image.source_path.as_deref().is_none_or(str::is_empty) {
+            continue;
+        }
+        let data = crate::image::load_image_data(
+            &image,
+            project.path(),
+            crate::image::ImageInterpolation::Linear,
+        )?;
+        image_json["pixels"] = json!(data.pixels);
+    }
+    Ok(())
 }
 
 fn resolve_export_resource_path(project: &Project, uri: &str) -> Option<PathBuf> {
@@ -1476,8 +1564,15 @@ fn build_imported_graph(
             "Image",
         )?;
         if let Some(image_model) = item.get("potter_image").filter(|value| value.is_object()) {
-            let image: Image = serde_json::from_value(image_model.clone())
+            let mut image: Image = serde_json::from_value(image_model.clone())
                 .map_err(|_| invalid_intermediate("image metadata is invalid"))?;
+            if image.source == ImageSource::Packed
+                && let Some(packed) =
+                    imported_image_from_resource(item, &resource_ids, &resource_assets, &doc)?
+            {
+                image.blob = packed.blob;
+                image.source_hash = packed.source_hash;
+            }
             doc.images.insert(id, image);
         } else if let Some(image) =
             imported_image_from_resource(item, &resource_ids, &resource_assets, &doc)?
@@ -2366,13 +2461,6 @@ fn imported_image_from_resource(
     doc: &SceneDoc,
 ) -> Result<Option<Image>> {
     let name = string_field(item, "name")?;
-    if item
-        .get("source")
-        .and_then(Value::as_str)
-        .is_some_and(|source| source != "FILE")
-    {
-        return Ok(None);
-    }
     let resource_id = item
         .get("filepath")
         .and_then(Value::as_str)
@@ -4216,17 +4304,29 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
                 .unwrap_or(false),
         );
     }
+    let uv = convert_uv_layers(item, &faces)?;
+    let uv_layer_names = uv
+        .layers
+        .iter()
+        .map(|layer| layer.name.as_str())
+        .collect::<BTreeSet<_>>();
     let mut attributes = Map::new();
-    attributes.insert(
-        "blender_uv_layers".to_owned(),
-        item.get("uv_layers").cloned().unwrap_or_else(|| json!([])),
-    );
     attributes.insert("blender_edge_flags".to_owned(), json!(edge_metadata));
     attributes.insert("blender_polygon_smooth".to_owned(), json!(smooth));
-    attributes.insert(
-        "blender_attributes".to_owned(),
-        item.get("attributes").cloned().unwrap_or_else(|| json!([])),
-    );
+    let blender_attributes = item
+        .get("attributes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !is_uv_layer_attribute(entry, &uv_layer_names))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !blender_attributes.is_empty() {
+        attributes.insert(
+            "blender_attributes".to_owned(),
+            Value::Array(blender_attributes),
+        );
+    }
     if let Some(skin_vertices) = item
         .get("skin_vertices")
         .and_then(Value::as_array)
@@ -4257,16 +4357,104 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         edge: next_counter(edges.len())?,
         face: next_counter(faces.len())?,
     };
-    let mesh = Mesh {
+    let mut mesh = Mesh {
         vertices,
         edges,
         faces,
         attributes,
         next_id,
     };
+    uv_layers::write(&mut mesh, &uv);
     mesh.validate()
         .map_err(|error| invalid_intermediate(&format!("invalid mesh data: {error}")))?;
     Ok(mesh)
+}
+
+/// Reads the mesh's UV layers from the intermediate `uv_layers`, whose values are Blender V-up rows
+/// with one entry per loop in face order, into the store's storage convention (v down).
+fn convert_uv_layers(item: &Value, faces: &[Face]) -> Result<UvStore> {
+    let mut layers = Vec::new();
+    for raw_layer in optional_array(item, "uv_layers")? {
+        let name = string_field(raw_layer, "name")?;
+        let values = optional_array(raw_layer, "values")?;
+        let pins = optional_array(raw_layer, "pins")?;
+        let mut loop_start = 0_usize;
+        let mut corners_by_face = Vec::with_capacity(faces.len());
+        let mut pinned_by_face = Vec::with_capacity(faces.len());
+        for face in faces {
+            let loop_end = loop_start + face.vertices.len();
+            let corners = values
+                .get(loop_start..loop_end)
+                .map(|loops| loops.iter().map(storage_uv).collect::<Result<Vec<_>>>())
+                .transpose()?;
+            corners_by_face.push(corners);
+            // Pin flags are kept only for faces with a pinned corner, as the store holds them.
+            let flags = pins
+                .get(loop_start..loop_end)
+                .map(|loops| loops.iter().map(loop_pin).collect::<Result<Vec<_>>>())
+                .transpose()?
+                .filter(|flags| flags.iter().any(|&pinned| pinned));
+            pinned_by_face.push(flags);
+            loop_start = loop_end;
+        }
+        let mut layer = UvLayer::new(name, corners_by_face);
+        layer.pinned = pinned_by_face;
+        layers.push(layer);
+    }
+    let layer_name = |index: Option<usize>| {
+        index
+            .and_then(|index| layers.get(index))
+            .map(|layer| layer.name.clone())
+    };
+    let active = layer_name(layer_index_field(item, "uv_active")).or_else(|| layer_name(Some(0)));
+    let render = layer_name(layer_index_field(item, "uv_render")).or_else(|| layer_name(Some(0)));
+    Ok(UvStore {
+        layers,
+        active,
+        render,
+    })
+}
+
+/// One Blender `[u, v]` loop value, flipped into storage convention (v down).
+fn storage_uv(value: &Value) -> Result<[f64; 2]> {
+    let pair = value
+        .as_array()
+        .filter(|pair| pair.len() == 2)
+        .ok_or_else(|| invalid_intermediate("mesh UV value is invalid"))?;
+    let (Some(u), Some(v)) = (pair[0].as_f64(), pair[1].as_f64()) else {
+        return Err(invalid_intermediate("mesh UV value is invalid"));
+    };
+    Ok([u, 1.0 - v])
+}
+
+/// One Blender per-loop pin flag.
+fn loop_pin(value: &Value) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| invalid_intermediate("mesh UV pin is invalid"))
+}
+
+fn layer_index_field(item: &Value, key: &str) -> Option<usize> {
+    item.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+}
+
+/// Whether an intermediate attribute holds UV layer data that the `uv_layers` store already holds. Blender
+/// keeps each layer as a FLOAT2 corner attribute, and its pin flags as a BOOLEAN corner attribute named
+/// `.pn.<layer>`; restoring both from the store avoids duplicates.
+fn is_uv_layer_attribute(attribute: &Value, layer_names: &BTreeSet<&str>) -> bool {
+    let Some(name) = attribute.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let data_type = attribute.get("data_type").and_then(Value::as_str);
+    let corner = attribute.get("domain").and_then(Value::as_str) == Some("CORNER");
+    let layer_data = data_type == Some("FLOAT2") && layer_names.contains(name);
+    let pin_flags = data_type == Some("BOOLEAN")
+        && name
+            .strip_prefix(".pn.")
+            .is_some_and(|layer| layer_names.contains(layer));
+    corner && (layer_data || pin_flags)
 }
 
 fn parse_shape_keys(
@@ -5706,7 +5894,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             for attribute in mesh.attributes.keys() {
                 if !matches!(
                     attribute.as_str(),
-                    "blender_uv_layers"
+                    "uv_layers"
                         | "blender_edge_flags"
                         | "blender_polygon_smooth"
                         | "blender_metadata"
@@ -6454,6 +6642,124 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn intermediate_uv_layers_become_storage_values_with_active_and_render_layers() -> Result<()> {
+        let item = json!({
+            "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}, {"co": [1.0, 1.0, 0.0]}, {"co": [0.0, 1.0, 0.0]}],
+            "edges": [{"v": [0, 1]}, {"v": [1, 2]}, {"v": [2, 3]}, {"v": [3, 0]}],
+            "polygons": [{"v": [0, 1, 2, 3], "material_index": 0, "smooth": false}],
+            "uv_layers": [
+                {"name": "Base", "values": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]], "pins": [false, true, false, false]},
+                {"name": "Detail", "values": [[0.0, 0.25], [0.5, 0.5], [1.0, 0.75], [0.25, 1.0]]}
+            ],
+            "uv_active": 1,
+            "uv_render": 0,
+            "attributes": [
+                {"name": "Base", "domain": "CORNER", "data_type": "FLOAT2", "values": []},
+                {"name": ".pn.Base", "domain": "CORNER", "data_type": "BOOLEAN", "values": []},
+                {"name": ".select_vert", "domain": "POINT", "data_type": "BOOLEAN", "values": []},
+                {"name": ".uv_select_face", "domain": "CORNER", "data_type": "BOOLEAN", "values": []},
+                {"name": ".edge_verts", "domain": "EDGE", "data_type": "INT32_2D", "values": []},
+                {"name": ".corner_vert", "domain": "CORNER", "data_type": "INT", "values": []},
+                {"name": ".corner_edge", "domain": "CORNER", "data_type": "INT", "values": []},
+                {"name": "position", "domain": "POINT", "data_type": "FLOAT_VECTOR", "values": []},
+                {"name": "sharp_face", "domain": "FACE", "data_type": "BOOLEAN", "values": []},
+                {"name": "sharp_edge", "domain": "EDGE", "data_type": "BOOLEAN", "values": []},
+                {"name": "uv_seam", "domain": "EDGE", "data_type": "BOOLEAN", "values": []},
+                {"name": "custom_normal", "domain": "CORNER", "data_type": "INT16_2D", "values": []},
+                {"name": "material_index", "domain": "FACE", "data_type": "INT", "values": []},
+                {"name": "crease_edge", "domain": "EDGE", "data_type": "FLOAT", "values": []},
+                {"name": "custom", "domain": "POINT", "data_type": "FLOAT", "values": []}
+            ]
+        });
+        let mesh = convert_mesh(&item)?;
+        let store = uv_layers::read(&mesh);
+        assert_eq!(
+            store
+                .layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Base", "Detail"]
+        );
+        assert_eq!(store.active.as_deref(), Some("Detail"));
+        assert_eq!(store.render.as_deref(), Some("Base"));
+        let base = store.layers[0].faces[0]
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("base layer has no face entry"))?;
+        for (actual, expected) in base
+            .iter()
+            .zip([[0.1, 0.8], [0.3, 0.6], [0.5, 0.4], [0.7, 0.2]])
+        {
+            assert!((actual[0] - expected[0]).abs() < 1.0e-12);
+            assert!((actual[1] - expected[1]).abs() < 1.0e-12);
+        }
+        let base_pinned = store
+            .layers
+            .first()
+            .and_then(|layer| layer.pinned.first())
+            .ok_or_else(|| invalid_intermediate("base UV pin flags are missing"))?;
+        assert_eq!(base_pinned, &Some(vec![false, true, false, false]));
+        let detail_pinned = store
+            .layers
+            .get(1)
+            .and_then(|layer| layer.pinned.first())
+            .ok_or_else(|| invalid_intermediate("detail UV pin flags are missing"))?;
+        assert!(detail_pinned.is_none());
+        let attributes = mesh.attributes["blender_attributes"]
+            .as_array()
+            .ok_or_else(|| invalid_intermediate("blender attributes are missing"))?;
+        assert!(
+            attributes
+                .iter()
+                .all(|entry| entry["name"] != "Base" && entry["name"] != ".pn.Base"),
+            "UV layer and pin attributes are held by the store"
+        );
+        assert_eq!(attributes.len(), 13);
+        Ok(())
+    }
+    #[test]
+    fn exported_loops_carry_pin_flags_and_blender_v() -> Result<()> {
+        let item = json!({
+            "vertices": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}, {"co": [1.0, 1.0, 0.0]}, {"co": [0.0, 1.0, 0.0]}],
+            "edges": [{"v": [0, 1]}, {"v": [1, 2]}, {"v": [2, 3]}, {"v": [3, 0]}],
+            "polygons": [{"v": [0, 1, 2, 3], "material_index": 0, "smooth": false}],
+            "uv_layers": [
+                {"name": "Base", "values": [[0.1, 0.8], [0.3, 0.6], [0.5, 0.4], [0.7, 0.2]], "pins": [false, true, false, false]},
+                {"name": "Detail", "values": [[0.0, 0.25], [0.5, 0.5], [1.0, 0.75], [0.25, 1.0]]}
+            ],
+            "uv_active": 0,
+            "uv_render": 0,
+            "attributes": []
+        });
+        let mesh = convert_mesh(&item)?;
+        let store = uv_layers::read(&mesh);
+        let base_layer = store
+            .layers
+            .first()
+            .ok_or_else(|| invalid_intermediate("base UV layer is missing"))?;
+        let (values, pins) = blender_uv_loops(&mesh, base_layer);
+        assert_eq!(pins, json!([false, true, false, false]));
+        for (loop_index, expected) in [0.8, 0.6, 0.4, 0.2].into_iter().enumerate() {
+            let actual = values
+                .as_array()
+                .and_then(|values| values.get(loop_index))
+                .and_then(|value| value.get(1))
+                .and_then(Value::as_f64)
+                .ok_or_else(|| invalid_intermediate("exported UV value is missing"))?;
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "loop {loop_index}: {actual}"
+            );
+        }
+        let detail_layer = store
+            .layers
+            .get(1)
+            .ok_or_else(|| invalid_intermediate("detail UV layer is missing"))?;
+        let (_, detail_pins) = blender_uv_loops(&mesh, detail_layer);
+        assert_eq!(detail_pins, json!([false, false, false, false]));
+        Ok(())
     }
     #[test]
     fn blend_header_rejects_writer_versions_newer_than_profile() -> Result<()> {

@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 #![expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "Blender adapter fixtures use fixed valid paths and values"
 )]
 
@@ -614,20 +615,30 @@ fn modifier_attribute(mesh: &potter_core::geom::Mesh, group: &str) -> Vec<Value>
         .collect()
 }
 
+/// Corner UVs of `layer` in Blender convention (v up). The store holds v down, so each v is flipped.
 fn modifier_uvs(mesh: &potter_core::geom::Mesh, layer: &str) -> Vec<Value> {
-    let entries = mesh.attributes.get("uv_map").and_then(Value::as_array);
+    let layers = mesh
+        .attributes
+        .get("uv_layers")
+        .and_then(|store| store["layers"].as_array());
+    let entries = layers
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["name"].as_str() == Some(layer))
+        .and_then(|entry| entry["faces"].as_array());
     let mut result = Vec::new();
     for face in &mesh.faces {
-        if let Some(uv) = entries
+        let Some(uv) = entries
             .into_iter()
             .flatten()
-            .find(|entry| {
-                entry["face_id"].as_u64() == Some(u64::from(face.id))
-                    && entry["layer"].as_str().unwrap_or("UVMap") == layer
-            })
+            .find(|entry| entry["face_id"].as_u64() == Some(u64::from(face.id)))
             .and_then(|entry| entry["uv"].as_array())
-        {
-            result.extend(uv.iter().cloned());
+        else {
+            continue;
+        };
+        for corner in uv {
+            let v = corner[1].as_f64().expect("stored UV v is a number");
+            result.push(json!([corner[0].clone(), 1.0 - v]));
         }
     }
     result

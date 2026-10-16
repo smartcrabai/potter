@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Mesh, sculpt as sculpt_geom},
+    geom::{Mesh, sculpt as sculpt_geom, uv_layers},
     image::{ImageData, ImageInterpolation, encode_pixels, load_image_data_with_staged},
     model::{DataBlock, Id, ImageSource, ImageTile},
 };
@@ -433,7 +433,7 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
         engine,
         operation,
         &[
-            "op", "target", "scope", "image", "uv_map", "samples", "falloff", "symmetry", "seed",
+            "op", "target", "scope", "image", "uv_layer", "samples", "falloff", "symmetry", "seed",
             "color", "blend",
         ],
         &["target", "image", "samples", "color"],
@@ -478,20 +478,17 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
             "/blend",
         ));
     }
-    let uv_map_name = operation
-        .get("uv_map")
-        .and_then(Value::as_str)
-        .unwrap_or("uv_map");
-    if operation
-        .get("uv_map")
-        .is_some_and(|value| !value.is_string())
-    {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "uv_map must be a string",
-            "/uv_map",
-        ));
-    }
+    let uv_layer = match operation.get("uv_layer") {
+        None => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        Some(_) => {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "uv_layer must be a string",
+                "/uv_layer",
+            ));
+        }
+    };
     let stroke = parse_paint_stroke(engine, operation)?;
     let symmetry_mask = stroke_symmetry_mask(&stroke);
     let targets = super::sculpt::prepare_mesh_targets(engine, operation)?;
@@ -511,7 +508,7 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
                     "/target",
                 )
             })?;
-        let uv_faces = read_corner_uvs(engine, &mesh, uv_map_name)?;
+        let uv_faces = read_corner_uvs(engine, &mesh, uv_layer)?;
         collect_texture_influences(
             &mesh,
             world,
@@ -616,85 +613,66 @@ fn texture(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
     Ok(true)
 }
 
+/// Corner UVs of the layer `requested` names, or of the render layer when `requested` is `None`.
+/// Keyed by face ID; faces without an entry are absent.
 fn read_corner_uvs(
     engine: &Engine<'_>,
     mesh: &Mesh,
-    attribute_name: &str,
+    requested: Option<&str>,
 ) -> Result<BTreeMap<u32, Vec<DVec2>>> {
-    let entries = mesh
-        .attributes
-        .get(attribute_name)
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            engine.error(
-                ErrorCode::InvalidOperation,
-                format!("texture paint requires mesh corner UV attribute `{attribute_name}`"),
-                "/uv_map",
-            )
-        })?;
+    let store = uv_layers::read(mesh);
+    let layer = match store.resolve(requested) {
+        (Some(index), None) => store.layers.get(index),
+        _ => None,
+    }
+    .ok_or_else(|| super::uv::layer_missing(requested))?;
+    check_unique_face_rows(engine, mesh, &layer.name)?;
     let mut faces = BTreeMap::new();
-    for entry in entries {
-        let face_id = entry
-            .get("face_id")
-            .and_then(Value::as_u64)
-            .and_then(|id| u32::try_from(id).ok())
-            .ok_or_else(|| {
-                engine.error(
+    for (face, values) in mesh.faces.iter().zip(&layer.faces) {
+        let Some(values) = values else {
+            continue;
+        };
+        let mut corners = Vec::with_capacity(values.len());
+        for uv in values {
+            if !uv[0].is_finite() || !uv[1].is_finite() {
+                return Err(engine.error(
                     ErrorCode::SceneInvalid,
-                    "UV entry has an invalid face ID",
-                    "/uv_map",
-                )
-            })?;
-        let coordinates = entry.get("uv").and_then(Value::as_array).ok_or_else(|| {
-            engine.error(
-                ErrorCode::SceneInvalid,
-                "UV entry has no corner coordinates",
-                "/uv_map",
-            )
-        })?;
-        let mut corners = Vec::with_capacity(coordinates.len());
-        for coordinate in coordinates {
-            let pair = coordinate
-                .as_array()
-                .filter(|pair| pair.len() == 2)
-                .ok_or_else(|| {
-                    engine.error(
-                        ErrorCode::SceneInvalid,
-                        "UV corner must be a coordinate pair",
-                        "/uv_map",
-                    )
-                })?;
-            let u = pair[0]
-                .as_f64()
-                .filter(|value| value.is_finite())
-                .ok_or_else(|| {
-                    engine.error(
-                        ErrorCode::SceneInvalid,
-                        "UV coordinate must be finite",
-                        "/uv_map",
-                    )
-                })?;
-            let v = pair[1]
-                .as_f64()
-                .filter(|value| value.is_finite())
-                .ok_or_else(|| {
-                    engine.error(
-                        ErrorCode::SceneInvalid,
-                        "UV coordinate must be finite",
-                        "/uv_map",
-                    )
-                })?;
-            corners.push(DVec2::new(u, v));
+                    "UV coordinate must be finite",
+                    "/uv_layer",
+                ));
+            }
+            corners.push(DVec2::new(uv[0], uv[1]));
         }
-        if faces.insert(face_id, corners).is_some() {
+        faces.insert(face.id, corners);
+    }
+    Ok(faces)
+}
+
+/// Rejects a stored layer whose rows repeat a face ID. `uv_layers::read` keeps one row per face,
+/// so a repeated row would otherwise be dropped without a trace.
+fn check_unique_face_rows(engine: &Engine<'_>, mesh: &Mesh, layer_name: &str) -> Result<()> {
+    let rows = mesh
+        .attributes
+        .get(uv_layers::ATTRIBUTE)
+        .and_then(|store| store.get("layers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|layer| layer.get("name").and_then(Value::as_str) == Some(layer_name))
+        .and_then(|layer| layer.get("faces"))
+        .and_then(Value::as_array);
+    let mut seen = BTreeSet::new();
+    for entry in rows.into_iter().flatten() {
+        let face_id = entry.get("face_id").and_then(Value::as_u64);
+        if !face_id.is_some_and(|id| seen.insert(id)) {
             return Err(engine.error(
                 ErrorCode::SceneInvalid,
                 "UV map repeats a face ID",
-                "/uv_map",
+                "/uv_layer",
             ));
         }
     }
-    Ok(faces)
+    Ok(())
 }
 
 fn collect_texture_influences(

@@ -707,7 +707,7 @@ fn parse_texture_ref(
         )
     })?;
     for key in object.keys() {
-        if !["image", "uv_map", "interpolation"].contains(&key.as_str()) {
+        if !["image", "uv_layer", "interpolation"].contains(&key.as_str()) {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("unknown texture reference field `{key}`"),
@@ -737,14 +737,14 @@ fn parse_texture_ref(
             &operation_pointer(engine.operation_index, &format!("{pointer}/image")),
         ));
     }
-    let uv_map = match object.get("uv_map") {
+    let uv_layer = match object.get("uv_layer") {
         None | Some(Value::Null) => None,
-        Some(Value::String(uv_map)) => Some(uv_map.clone()),
+        Some(Value::String(uv_layer)) => Some(uv_layer.clone()),
         Some(_) => {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
-                "uv_map must be a string or null",
-                &operation_pointer(engine.operation_index, &format!("{pointer}/uv_map")),
+                "uv_layer must be a string or null",
+                &operation_pointer(engine.operation_index, &format!("{pointer}/uv_layer")),
             ));
         }
     };
@@ -762,7 +762,7 @@ fn parse_texture_ref(
     };
     Ok(Some(TextureRef {
         image: image_id,
-        uv_map,
+        uv_layer,
         interpolation,
     }))
 }

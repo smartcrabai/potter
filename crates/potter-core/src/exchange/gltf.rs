@@ -16,6 +16,7 @@ use crate::{
     geom::{
         Face, Mesh, MeshError, edge_key,
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
+        uv_layers::{self, UvLayer, UvStore},
     },
     image::{ImageData, ImageInterpolation, load_image_data},
     model::{
@@ -27,11 +28,11 @@ use crate::{
 };
 
 use super::{
-    import_error, is_default_material_graph,
+    Loss, import_error, is_default_material_graph,
     material_surface::{
         AlphaMode, ChannelSource, ResolvedSurface, SampledTexture, TextureChannel,
-        TextureTransform, TextureWrap, TexturedNormal, material_is_used, resolve_fields_surface,
-        resolve_surface,
+        TextureTransform, TextureWrap, TexturedNormal, feature_id, material_is_used,
+        resolve_fields_surface, resolve_surface,
     },
     shading,
 };
@@ -74,13 +75,15 @@ impl TextureExport {
         self.uses_texture_transform
     }
 
-    /// Texture info for a sampled texture: `index`, `texCoord` (always the mesh's first UV layer),
-    /// and `KHR_texture_transform` when the texture has a transform. `reads` names the channels
-    /// the slot samples; the rest are free to hold the image's own values.
+    /// Texture info for a sampled texture: `index`, `texCoord` (the TEXCOORD index its UV layer
+    /// resolves to for the material, see [`TexCoords`]), and `KHR_texture_transform` when the texture
+    /// has a transform. `reads` names the channels the slot samples; the rest are free to hold the
+    /// image's own values.
     pub(crate) fn sampled_info(
         &mut self,
         texture: &SampledTexture,
         reads: [bool; 4],
+        tex_coords: &TexCoords,
         doc: &SceneDoc,
         root_path: &Path,
         binary: &mut Vec<u8>,
@@ -89,7 +92,8 @@ impl TextureExport {
         let mut filled = texture.clone();
         fill_unread(&mut filled.channels, reads);
         let index = self.sampled_index(&filled, doc, root_path, binary, views)?;
-        let mut info = json!({ "index": index, "texCoord": 0 });
+        let tex_coord = tex_coords.get(&texture.uv_layer).copied().unwrap_or(0);
+        let mut info = json!({ "index": index, "texCoord": tex_coord });
         if let Some(transform) = &texture.transform {
             self.uses_texture_transform = true;
             info["extensions"] = json!({ "KHR_texture_transform": transform_json(transform) });
@@ -934,142 +938,12 @@ struct ExportVertexLayout {
     face_indices: BTreeMap<u32, BTreeMap<u32, u32>>,
 }
 
-/// Name of a mesh's default UV layer: the first `uv_map` entry's `layer`, or else the first Blender
-/// layer. `None` when the mesh names no layer, which is Potter's default.
-pub(crate) fn mesh_default_uv_layer(attributes: &serde_json::Map<String, Value>) -> Option<String> {
-    if let Some(entries) = attributes.get("uv_map").and_then(Value::as_array) {
-        return entries
-            .iter()
-            .find_map(|entry| entry["layer"].as_str().map(str::to_owned));
-    }
-    attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .and_then(|layers| layers.first())
-        .and_then(|layer| layer["name"].as_str())
-        .map(str::to_owned)
-}
-
-fn invalid_uv() -> PotError {
-    PotError::new(ErrorCode::SceneInvalid, "UV coordinate is invalid")
-}
-
-/// Parses one `[u, v]` UV coordinate; both components must be finite.
-fn parse_uv(value: &Value) -> Result<[f64; 2]> {
-    let values = value
-        .as_array()
-        .filter(|values| values.len() == 2)
-        .ok_or_else(invalid_uv)?;
-    let uv = [
-        values[0].as_f64().ok_or_else(invalid_uv)?,
-        values[1].as_f64().ok_or_else(invalid_uv)?,
-    ];
-    if !uv[0].is_finite() || !uv[1].is_finite() {
-        return Err(PotError::new(
-            ErrorCode::SceneInvalid,
-            "UV coordinate is non-finite",
-        ));
-    }
-    Ok(uv)
-}
-
-/// One UV set from `uv_map` entries: each entry gives one face's corner coordinates.
-fn uv_map_set(mesh: &Mesh, entries: &[Value]) -> Result<BTreeMap<u32, Vec<[f64; 2]>>> {
-    let faces = mesh
-        .faces
-        .iter()
-        .map(|face| (face.id, face))
-        .collect::<BTreeMap<_, _>>();
-    let mut set = BTreeMap::<u32, Vec<[f64; 2]>>::new();
-    for entry in entries {
-        let face_id = entry["face_id"]
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "UV face ID is invalid"))?;
-        let face = faces.get(&face_id).ok_or_else(|| {
-            PotError::new(ErrorCode::SceneInvalid, "UV map references a missing face")
-        })?;
-        let coordinates = entry["uv"].as_array().ok_or_else(|| {
-            PotError::new(ErrorCode::SceneInvalid, "UV face coordinates are missing")
-        })?;
-        if coordinates.len() != face.vertices.len() {
-            return Err(PotError::new(
-                ErrorCode::SceneInvalid,
-                "UV corner count does not match its face",
-            ));
-        }
-        // shortcut: entries with a `layer` key come from Blender-layer code paths (UV modifiers) and
-        // keep Blender's V-up values, so they are flipped here. PR12 (one `uv_layers` store) should
-        // store one convention and delete this flip.
-        let blender_layer = entry.get("layer").is_some();
-        let values = coordinates
-            .iter()
-            .map(|value| {
-                parse_uv(value).map(|[u, v]| if blender_layer { [u, 1.0 - v] } else { [u, v] })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(previous) = set.get(&face_id)
-            && previous != &values
-        {
-            return Err(PotError::new(
-                ErrorCode::SceneInvalid,
-                "UV map repeats a face with conflicting coordinates",
-            ));
-        }
-        set.insert(face_id, values);
-    }
-    Ok(set)
-}
-
-/// Export UV sets as per-face corner values keyed by face ID. A `uv_map` attribute is one set and
-/// takes precedence; otherwise each `blender_uv_layers` layer is a set, in layer order.
-fn export_uv_sets(mesh: &Mesh) -> Result<Vec<BTreeMap<u32, Vec<[f64; 2]>>>> {
-    if let Some(entries) = mesh.attributes.get("uv_map").and_then(Value::as_array) {
-        return Ok(vec![uv_map_set(mesh, entries)?]);
-    }
-    let layers = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    layers
-        .iter()
-        .map(|layer| {
-            let values = layer["values"].as_array().ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "blender UV layer values are missing",
-                )
-            })?;
-            let mut set = BTreeMap::new();
-            let mut corner = 0;
-            for face in &mesh.faces {
-                let end = corner + face.vertices.len();
-                let coordinates = values.get(corner..end).ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::SceneInvalid,
-                        "blender UV layer corner count does not match mesh corners",
-                    )
-                })?;
-                // Blender's V runs up; glTF's runs down (Blender 5.2's exporter writes 1 - v).
-                let uvs = coordinates
-                    .iter()
-                    .map(|value| parse_uv(value).map(|[u, v]| [u, 1.0 - v]))
-                    .collect::<Result<Vec<_>>>()?;
-                set.insert(face.id, uvs);
-                corner = end;
-            }
-            Ok(set)
-        })
-        .collect()
-}
-
 fn export_vertex_layout(
     mesh: &Mesh,
     layers: &[Vec<DVec3>],
     fallback_normal: DVec3,
 ) -> Result<ExportVertexLayout> {
-    let uv_sets = export_uv_sets(mesh)?;
+    let uv_sets = uv_layers::read_layers(mesh);
     let vertex_indices = mesh
         .vertices
         .iter()
@@ -1091,7 +965,7 @@ fn export_vertex_layout(
     let mut corners_by_vertex =
         vec![Vec::<(u32, u32, usize, Vec<[f64; 2]>)>::new(); mesh.vertices.len()];
     let mut corner = 0;
-    for face in &mesh.faces {
+    for (face_index, face) in mesh.faces.iter().enumerate() {
         for (position, vertex_id) in face.vertices.iter().enumerate() {
             let source_index = vertex_indices.get(vertex_id).copied().ok_or_else(|| {
                 PotError::new(
@@ -1101,8 +975,11 @@ fn export_vertex_layout(
             })?;
             let uvs: Vec<[f64; 2]> = uv_sets
                 .iter()
-                .map(|set| {
-                    set.get(&face.id)
+                .map(|layer| {
+                    layer
+                        .faces
+                        .get(face_index)
+                        .and_then(Option::as_ref)
                         .and_then(|values| values.get(position))
                         .copied()
                         .unwrap_or([0.0, 0.0])
@@ -1570,19 +1447,16 @@ const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 17] = [
 fn blender_attribute_exportable(mesh: &Mesh, entry: &Value) -> bool {
     let name = entry["name"].as_str().unwrap_or_default();
     let color = is_color_attribute(entry);
-    let uv_layer = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .is_some_and(|layers| layers.iter().any(|layer| layer["name"] == name));
+    let uv_layer = uv_layers::read_layers(mesh)
+        .iter()
+        .any(|layer| layer.name == name);
     BLENDER_BOOKKEEPING_ATTRIBUTES.contains(&name) || color || uv_layer
 }
 
 fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) -> Result<()> {
     for (name, value) in &mesh.attributes {
         let supported = match name.as_str() {
-            "uv_map"
-            | "blender_uv_layers"
+            "uv_layers"
             | "blender_polygon_smooth"
             | "blender_edge_flags"
             | "seam"
@@ -2590,6 +2464,7 @@ pub(crate) struct VrmWriterMappings<'a> {
     pub(crate) bone_indices: &'a BTreeMap<Id, BTreeMap<Id, usize>>,
     pub(crate) material_indices: &'a BTreeMap<Id, usize>,
     pub(crate) surfaces: &'a BTreeMap<Id, ResolvedSurface>,
+    pub(crate) tex_coords: &'a TexCoordPlan,
     pub(crate) node_mesh_indices: &'a mut BTreeMap<Id, usize>,
     pub(crate) node_offset_matrices: &'a BTreeMap<Id, DMat4>,
     pub(crate) bone_offset_matrices: &'a BTreeMap<(Id, Id), DMat4>,
@@ -2691,6 +2566,7 @@ fn material_value(
     id: &Id,
     material: &Material,
     surface: &ResolvedSurface,
+    tex_coords: &TexCoords,
     doc: &SceneDoc,
     root_path: &Path,
     texture_export: &mut TextureExport,
@@ -2722,6 +2598,7 @@ fn material_value(
         pbr["baseColorTexture"] = texture_export.sampled_info(
             texture,
             base_reads(surface),
+            tex_coords,
             doc,
             root_path,
             binary,
@@ -2729,8 +2606,15 @@ fn material_value(
         )?;
     }
     if let Some(texture) = &surface.metallic_roughness_texture {
-        pbr["metallicRoughnessTexture"] =
-            texture_export.sampled_info(texture, reads::MR, doc, root_path, binary, views)?;
+        pbr["metallicRoughnessTexture"] = texture_export.sampled_info(
+            texture,
+            reads::MR,
+            tex_coords,
+            doc,
+            root_path,
+            binary,
+            views,
+        )?;
     }
     let mut value = json!({
         "name": material.name,
@@ -2751,17 +2635,32 @@ fn material_value(
         value["extras"]["potter"]["ior"] = json!(material.ior);
     }
     if let Some(texture) = &surface.emissive.texture {
-        value["emissiveTexture"] =
-            texture_export.sampled_info(texture, reads::RGB, doc, root_path, binary, views)?;
+        value["emissiveTexture"] = texture_export.sampled_info(
+            texture,
+            reads::RGB,
+            tex_coords,
+            doc,
+            root_path,
+            binary,
+            views,
+        )?;
     }
     if let Some(normal) = &surface.normal {
-        value["normalTexture"] =
-            textured_normal_info(normal, doc, root_path, texture_export, binary, views)?;
+        value["normalTexture"] = textured_normal_info(
+            normal,
+            tex_coords,
+            doc,
+            root_path,
+            texture_export,
+            binary,
+            views,
+        )?;
     }
     if let Some(occlusion) = &surface.occlusion {
         let mut info = texture_export.sampled_info(
             &occlusion.texture,
             reads::R,
+            tex_coords,
             doc,
             root_path,
             binary,
@@ -2796,7 +2695,15 @@ fn material_value(
         if let Some(texture) = &transmission.texture {
             extension.insert(
                 "transmissionTexture".to_owned(),
-                texture_export.sampled_info(texture, reads::R, doc, root_path, binary, views)?,
+                texture_export.sampled_info(
+                    texture,
+                    reads::R,
+                    tex_coords,
+                    doc,
+                    root_path,
+                    binary,
+                    views,
+                )?,
             );
         }
         add_extension(
@@ -2825,7 +2732,15 @@ fn material_value(
         if let Some(texture) = &clearcoat.texture {
             extension.insert(
                 "clearcoatTexture".to_owned(),
-                texture_export.sampled_info(texture, reads::R, doc, root_path, binary, views)?,
+                texture_export.sampled_info(
+                    texture,
+                    reads::R,
+                    tex_coords,
+                    doc,
+                    root_path,
+                    binary,
+                    views,
+                )?,
             );
         }
         if !crate::float::equal_f64(clearcoat.roughness_factor, 0.0) {
@@ -2837,13 +2752,29 @@ fn material_value(
         if let Some(texture) = &clearcoat.roughness_texture {
             extension.insert(
                 "clearcoatRoughnessTexture".to_owned(),
-                texture_export.sampled_info(texture, reads::G, doc, root_path, binary, views)?,
+                texture_export.sampled_info(
+                    texture,
+                    reads::G,
+                    tex_coords,
+                    doc,
+                    root_path,
+                    binary,
+                    views,
+                )?,
             );
         }
         if let Some(normal) = &clearcoat.normal {
             extension.insert(
                 "clearcoatNormalTexture".to_owned(),
-                textured_normal_info(normal, doc, root_path, texture_export, binary, views)?,
+                textured_normal_info(
+                    normal,
+                    tex_coords,
+                    doc,
+                    root_path,
+                    texture_export,
+                    binary,
+                    views,
+                )?,
             );
         }
         add_extension(
@@ -2861,7 +2792,15 @@ fn material_value(
         if let Some(texture) = &sheen.color_texture {
             extension.insert(
                 "sheenColorTexture".to_owned(),
-                texture_export.sampled_info(texture, reads::RGB, doc, root_path, binary, views)?,
+                texture_export.sampled_info(
+                    texture,
+                    reads::RGB,
+                    tex_coords,
+                    doc,
+                    root_path,
+                    binary,
+                    views,
+                )?,
             );
         }
         if !crate::float::equal_f64(sheen.roughness_factor, 0.0) {
@@ -2873,7 +2812,15 @@ fn material_value(
         if let Some(texture) = &sheen.roughness_texture {
             extension.insert(
                 "sheenRoughnessTexture".to_owned(),
-                texture_export.sampled_info(texture, reads::A, doc, root_path, binary, views)?,
+                texture_export.sampled_info(
+                    texture,
+                    reads::A,
+                    tex_coords,
+                    doc,
+                    root_path,
+                    binary,
+                    views,
+                )?,
             );
         }
         add_extension(
@@ -2891,7 +2838,15 @@ fn material_value(
         if let Some(texture) = &specular.texture {
             extension.insert(
                 "specularTexture".to_owned(),
-                texture_export.sampled_info(texture, reads::A, doc, root_path, binary, views)?,
+                texture_export.sampled_info(
+                    texture,
+                    reads::A,
+                    tex_coords,
+                    doc,
+                    root_path,
+                    binary,
+                    views,
+                )?,
             );
         }
         if !crate::float::equal_f64_array(&specular.color_factor, &[1.0; 3]) {
@@ -2903,7 +2858,15 @@ fn material_value(
         if let Some(texture) = &specular.color_texture {
             extension.insert(
                 "specularColorTexture".to_owned(),
-                texture_export.sampled_info(texture, reads::RGB, doc, root_path, binary, views)?,
+                texture_export.sampled_info(
+                    texture,
+                    reads::RGB,
+                    tex_coords,
+                    doc,
+                    root_path,
+                    binary,
+                    views,
+                )?,
             );
         }
         add_extension(
@@ -2947,72 +2910,218 @@ fn add_extension(
 /// `normalTexture` or `clearcoatNormalTexture` info; `scale` is written only when it is not 1.
 fn textured_normal_info(
     normal: &TexturedNormal,
+    tex_coords: &TexCoords,
     doc: &SceneDoc,
     root_path: &Path,
     texture_export: &mut TextureExport,
     binary: &mut Vec<u8>,
     views: &mut Vec<Value>,
 ) -> Result<Value> {
-    let mut info =
-        texture_export.sampled_info(&normal.texture, reads::RGB, doc, root_path, binary, views)?;
+    let mut info = texture_export.sampled_info(
+        &normal.texture,
+        reads::RGB,
+        tex_coords,
+        doc,
+        root_path,
+        binary,
+        views,
+    )?;
     if !crate::float::equal_f64(normal.scale, 1.0) {
         info["scale"] = json!(normal.scale);
     }
     Ok(info)
 }
 
-/// Checks a used material's textures against its mesh's UV data. Material textures sample the
-/// exported `TEXCOORD_0` layer; sampling another layer is a loss, not an error.
-fn validate_mesh_material_uv(
-    material_id: &Id,
-    surfaces: &BTreeMap<Id, ResolvedSurface>,
-    avatar: Option<&AvatarSettings>,
-    mesh: &Mesh,
-    has_uv: bool,
-) -> Result<()> {
-    let surface = surfaces.get(material_id).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::SceneInvalid,
-            "node material reference is missing",
-        )
-    })?;
-    if !has_uv && !surface_textures(surface).is_empty() {
-        return Err(unsupported_export(
-            "material.texture_uv_map",
-            "textured materials require UV coordinates on the exported mesh",
-        ));
-    }
-    if let Some(mtoon) = avatar.and_then(|avatar| avatar.mtoon.get(material_id)) {
-        let default_layer = mesh_default_uv_layer(&mesh.attributes);
-        for texture in super::vrm::uv_textures(mtoon) {
-            validate_mtoon_texture_uv_map(texture, has_uv, default_layer.as_deref())?;
-        }
-    }
-    Ok(())
+/// `texCoord` of each UV layer reference a material samples, keyed by the reference (`None` is the
+/// render layer). The value is the TEXCOORD index the reference resolves to on the first mesh that
+/// uses the material. A reference no layer has falls back to the render layer, and reports a loss.
+pub(crate) type TexCoords = BTreeMap<Option<String>, usize>;
+
+/// Empty `texCoord` map for a material no mesh uses: its references read `TEXCOORD_0`.
+static NO_TEX_COORDS: TexCoords = BTreeMap::new();
+
+/// The `texCoord` plan of one export: each material's [`TexCoords`] and the losses resolving them
+/// reported.
+pub(crate) struct TexCoordPlan {
+    coords: BTreeMap<Id, TexCoords>,
+    losses: Vec<Loss>,
 }
 
-fn validate_mtoon_texture_uv_map(
-    texture: &TextureRef,
-    has_uv: bool,
-    default_layer: Option<&str>,
-) -> Result<()> {
-    if texture
-        .uv_map
-        .as_deref()
-        .is_some_and(|name| name != "uv_map" && Some(name) != default_layer)
-    {
-        return Err(unsupported_export(
-            "material.texture_uv_map",
-            "VRM MToon textures support only the mesh's default UV map.",
-        ));
+impl TexCoordPlan {
+    /// The `texCoord` map of `material`.
+    pub(crate) fn for_material(&self, material: &Id) -> &TexCoords {
+        self.coords.get(material).unwrap_or(&NO_TEX_COORDS)
     }
-    if !has_uv {
-        return Err(unsupported_export(
-            "material.texture_uv_map",
-            "A VRM MToon texture is assigned to an exported mesh without UV coordinates.",
-        ));
+}
+
+/// Resolves the UV layer references of every texture on the meshes that use its material, and the
+/// losses that resolution reports. glTF materials are written once and hold one `texCoord` per
+/// texture, so each reference takes the index from the first mesh that uses the material. A later
+/// mesh that resolves a reference differently is reported as `mesh.uv_layer`; a reference that falls
+/// back to the render layer, or a mesh without layers, is reported as `uv.layer_missing`.
+pub(crate) fn tex_coord_plan(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    surfaces: &BTreeMap<Id, ResolvedSurface>,
+    vrm: Option<(&AvatarSettings, AvatarVersion)>,
+) -> Result<TexCoordPlan> {
+    let mut references = BTreeMap::<Id, BTreeSet<Option<String>>>::new();
+    for (material_id, surface) in surfaces {
+        references.insert(
+            material_id.clone(),
+            surface_textures(surface)
+                .into_iter()
+                .map(|texture| texture.uv_layer.clone())
+                .collect(),
+        );
     }
-    Ok(())
+    if let Some((avatar, _)) = vrm {
+        for (material_id, mtoon) in &avatar.mtoon {
+            let Some(set) = references.get_mut(material_id) else {
+                continue;
+            };
+            set.extend(super::vrm::uv_textures(mtoon).map(|texture| texture.uv_layer.clone()));
+        }
+    }
+    let visible = super::render_visible_nodes(doc, snapshot)?;
+    let mut plan = TexCoordPlan {
+        coords: BTreeMap::new(),
+        losses: Vec::new(),
+    };
+    let mut reported = BTreeSet::<(Id, Option<String>, Id, &'static str)>::new();
+    for (node_id, node) in &doc.nodes {
+        if !node.visible || !node.render_visible || !visible.contains(node_id) {
+            continue;
+        }
+        let Some(evaluated) = snapshot.meshes.get(node_id) else {
+            continue;
+        };
+        if evaluated.vertices.is_empty() {
+            continue;
+        }
+        let (mesh, instanced) = if let Some(data_id) = &node.data {
+            let Some(data_block) = doc
+                .data_blocks
+                .get(data_id)
+                .filter(|data| data.data_type == "mesh")
+            else {
+                continue;
+            };
+            (source_mesh_for_export(node, data_block, evaluated)?, false)
+        } else if instance_collection_target(node)?.is_some() {
+            (evaluated, true)
+        } else {
+            continue;
+        };
+        let layers = uv_layers::read(mesh);
+        for material_id in used_material_ids(node, mesh, instanced)? {
+            let texture_refs = references.get(material_id).ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "node material reference is missing",
+                )
+            })?;
+            for reference in texture_refs {
+                let (index, missing) = layers.resolve(reference.as_deref());
+                let layer = reference
+                    .as_deref()
+                    .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
+                if (missing.is_some() || index.is_none())
+                    && reported.insert((
+                        material_id.clone(),
+                        reference.clone(),
+                        node_id.clone(),
+                        feature_id::UV_LAYER_MISSING,
+                    ))
+                {
+                    plan.losses.push(Loss {
+                        feature_id: feature_id::UV_LAYER_MISSING.to_owned(),
+                        data_id: Some(material_id.to_string()),
+                        reason: format!(
+                            "material `{material_id}` samples UV layer {layer}, which mesh `{node_id}` does not have; the texture exports at TEXCOORD_0"
+                        ),
+                        suggestion: Some(
+                            "name the layer on the mesh, or set the texture's UV layer to the render layer".to_owned(),
+                        ),
+                    });
+                }
+                let index = index.unwrap_or(0);
+                let coords = plan.coords.entry(material_id.clone()).or_default();
+                match coords.get(reference) {
+                    None => {
+                        coords.insert(reference.clone(), index);
+                    }
+                    Some(first) if *first != index => {
+                        if reported.insert((
+                            material_id.clone(),
+                            reference.clone(),
+                            node_id.clone(),
+                            feature_id::MESH_UV_LAYER,
+                        )) {
+                            plan.losses.push(Loss {
+                                feature_id: feature_id::MESH_UV_LAYER.to_owned(),
+                                data_id: Some(material_id.to_string()),
+                                reason: format!(
+                                    "material `{material_id}` samples UV layer {layer} at TEXCOORD_{first} on the first mesh that uses it, but TEXCOORD_{index} on mesh `{node_id}`; a glTF material holds one texCoord per texture, so `{node_id}` samples TEXCOORD_{first}"
+                                ),
+                                suggestion: Some(
+                                    "give the meshes that share this material the same layer order".to_owned(),
+                                ),
+                            });
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    // VRM 0.x MToon textures carry no `texCoord`, so they sample TEXCOORD_0. A texture on another
+    // layer exports from TEXCOORD_0 under this loss; without `--allow-lossy` the export is refused.
+    let mut v0_losses = Vec::new();
+    if let Some((avatar, AvatarVersion::V0)) = vrm {
+        for (material_id, mtoon) in &avatar.mtoon {
+            let Some(surface) = surfaces.get(material_id) else {
+                continue;
+            };
+            let coords = plan.for_material(material_id);
+            let layers = surface_textures(surface)
+                .into_iter()
+                .map(|texture| texture.uv_layer.clone())
+                .chain(super::vrm::uv_textures(mtoon).map(|texture| texture.uv_layer.clone()))
+                .collect::<BTreeSet<_>>();
+            for layer in layers {
+                let index = coords.get(&layer).copied().unwrap_or(0);
+                if index != 0 {
+                    let name = layer
+                        .as_deref()
+                        .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
+                    v0_losses.push(Loss {
+                        feature_id: feature_id::VRM_V0_MTOON_UV_LAYER.to_owned(),
+                        data_id: Some(material_id.to_string()),
+                        reason: format!(
+                            "VRM 0.x MToon textures sample TEXCOORD_0; material `{material_id}` samples UV layer {name} (TEXCOORD_{index}), which exports from TEXCOORD_0"
+                        ),
+                        suggestion: Some(
+                            "export VRM 1.0, or sample these textures from the first UV layer".to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    plan.losses.extend(v0_losses);
+    Ok(plan)
+}
+
+/// UV layer losses of a glTF or VRM export of `doc`, as [`tex_coord_plan`] reports them. `vrm` is
+/// the avatar and version of a VRM export, whose `MToon` textures take part.
+pub(crate) fn uv_layer_losses(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    vrm: Option<(&AvatarSettings, AvatarVersion)>,
+) -> Result<Vec<Loss>> {
+    let surfaces = resolve_material_surfaces(doc)?;
+    Ok(tex_coord_plan(doc, snapshot, &surfaces, vrm)?.losses)
 }
 
 fn validate_shape_key_export(shape_keys: &ShapeKeyData) -> Result<()> {
@@ -3102,7 +3211,6 @@ pub(crate) fn validate_vrm_mesh_references(
     frames: &VrmFrameMaps,
     version: AvatarVersion,
 ) -> Result<()> {
-    let surfaces = resolve_material_surfaces(doc)?;
     validate_vrm_texture_images(doc, avatar)?;
     let visible = super::render_visible_nodes(doc, snapshot)?;
     let mut rest_world_cache = BTreeMap::<Id, BTreeMap<Id, DMat4>>::new();
@@ -3188,15 +3296,6 @@ pub(crate) fn validate_vrm_mesh_references(
                 true,
             )?;
         }
-        for material_id in used_material_ids(node, mesh, data_block.is_none())? {
-            validate_mesh_material_uv(
-                material_id,
-                &surfaces,
-                Some(avatar),
-                mesh,
-                !export.layout.uvs.is_empty(),
-            )?;
-        }
         exported_mesh_nodes.insert(node_id.clone());
     }
     for annotation in avatar
@@ -3243,6 +3342,7 @@ fn export_with_root_inner(
     let mut materials = Vec::<Value>::new();
     let mut texture_export = TextureExport::new();
     let surfaces = resolve_material_surfaces(doc)?;
+    let tex_coords = tex_coord_plan(doc, snapshot, &surfaces, vrm)?;
     for (id, material) in &doc.materials {
         material_indices.insert(id.clone(), materials.len());
         let surface = surfaces.get(id).ok_or_else(|| {
@@ -3252,6 +3352,7 @@ fn export_with_root_inner(
             id,
             material,
             surface,
+            tex_coords.for_material(id),
             doc,
             root_path,
             &mut texture_export,
@@ -3378,15 +3479,6 @@ fn export_with_root_inner(
         let MeshExportLayout { layout, key_deltas } =
             mesh_export_layout(mesh, data_block, geometry_scale, geometry_basis)?;
         let uv_sets = &layout.uvs;
-        for material_id in used_material_ids(node, mesh, data_block.is_none())? {
-            validate_mesh_material_uv(
-                material_id,
-                &surfaces,
-                vrm.map(|(avatar, _)| avatar),
-                mesh,
-                !uv_sets.is_empty(),
-            )?;
-        }
         if let Some(shape_keys) = data_block
             .and_then(|data| data.shape_keys.as_ref())
             .filter(|shape_keys| !shape_keys.keys.is_empty())
@@ -4010,6 +4102,7 @@ fn export_with_root_inner(
                 bone_indices: &bone_indices,
                 material_indices: &material_indices,
                 surfaces: &surfaces,
+                tex_coords: &tex_coords,
                 node_mesh_indices: &mut node_mesh_indices,
                 node_offset_matrices: &frames.node_offset_matrices,
                 bone_offset_matrices: &frames.bone_offset_matrices,
@@ -4549,16 +4642,11 @@ fn import_images(
     }
     Ok(image_ids)
 }
-/// The `KHR_texture_transform` of a texture info, or `None` when it is absent or the identity. A `texCoord`
-/// override other than 0 (a UV set Potter does not import yet) is not applied; `gltf_import_losses` reports
-/// it as `material.texture_uv_set`.
+/// The `KHR_texture_transform` of a texture info, or `None` when it is absent or the identity.
 fn texture_transform(info: &Value) -> Result<Option<super::material_surface::TextureTransform>> {
     let Some(extension) = info["extensions"]["KHR_texture_transform"].as_object() else {
         return Ok(None);
     };
-    if transform_reads_other_uv_set(info) {
-        return Ok(None);
-    }
     let numbers = |key: &str, default: &[f64]| -> Result<Vec<f64>> {
         match extension.get(key) {
             None | Some(Value::Null) => Ok(default.to_vec()),
@@ -4592,21 +4680,22 @@ fn texture_transform(info: &Value) -> Result<Option<super::material_surface::Tex
     Ok((!transform.is_identity()).then_some(transform))
 }
 
-/// Whether a texture info reads a UV set other than 0, the only set Potter imports.
-fn reads_other_uv_set(info: &Value) -> bool {
-    info["texCoord"].as_u64().unwrap_or(0) != 0
-}
-
-/// Whether the `KHR_texture_transform` of a texture info overrides the UV set to one other than 0.
-fn transform_reads_other_uv_set(info: &Value) -> bool {
+/// The UV set a texture info samples. A `KHR_texture_transform` `texCoord` overrides `texCoord` for the
+/// texture it transforms, as the extension specifies.
+pub(crate) fn texture_info_set(info: &Value) -> u64 {
     info["extensions"]["KHR_texture_transform"]["texCoord"]
         .as_u64()
-        .unwrap_or(0)
-        != 0
+        .unwrap_or_else(|| info["texCoord"].as_u64().unwrap_or(0))
 }
 
-/// Every texture slot of a glTF material that a graph can hold, each with its transform. An emissive or
-/// occlusion texture that reads another UV set is skipped and reported as `material.texture_uv_set`.
+/// The layer a texture info samples on import. `None` is the render layer, which is layer 0 after import.
+/// Sets past the layer limit fall back to it; `gltf_import_losses` reports them.
+pub(crate) fn imported_uv_layer(info: &Value) -> Option<String> {
+    let set = usize::try_from(texture_info_set(info)).ok()?;
+    (set > 0 && set < uv_layers::MAX_LAYERS).then(|| uv_set_layer_name(set))
+}
+
+/// Every texture slot of a glTF material that a graph can hold, each with its transform.
 fn material_textures(
     material: &Value,
     root: &Value,
@@ -4617,34 +4706,33 @@ fn material_textures(
         Ok(import_texture_ref(info, root, image_ids)?
             .map(|texture| material_graph::SlotTexture { texture, transform }))
     };
-    let optional_slot = |info: &Value| -> Result<Option<material_graph::SlotTexture>> {
-        if reads_other_uv_set(info) {
-            return Ok(None);
-        }
-        slot(info)
-    };
     let pbr = &material["pbrMetallicRoughness"];
     Ok(material_graph::GraphTextures {
         base_color: slot(&pbr["baseColorTexture"])?,
         metallic_roughness: slot(&pbr["metallicRoughnessTexture"])?,
         normal: slot(&material["normalTexture"])?,
         normal_scale: material["normalTexture"]["scale"].as_f64().unwrap_or(1.0),
-        emissive: optional_slot(&material["emissiveTexture"])?,
-        occlusion: optional_slot(&material["occlusionTexture"])?,
+        emissive: slot(&material["emissiveTexture"])?,
+        occlusion: slot(&material["occlusionTexture"])?,
     })
+}
+
+/// Layer name of glTF `TEXCOORD_n` on import: `UVMap` for set 0 and `UVMap.00n` after it, as
+/// Blender names its layers.
+fn uv_set_layer_name(set: usize) -> String {
+    if set == 0 {
+        "UVMap".to_owned()
+    } else {
+        format!("UVMap.{set:03}")
+    }
 }
 
 fn import_texture_ref(info: &Value, root: &Value, image_ids: &[Id]) -> Result<Option<TextureRef>> {
     if !info.is_object() {
         return Ok(None);
     }
-    if info["texCoord"].as_u64().unwrap_or(0) != 0 {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "glTF material texture uses an unsupported UV set",
-            json!({ "feature_id": "material.texture_uv_set", "status": "not_supported" }),
-        ));
-    }
+    // Sets past the layer limit fall back to the render layer; `gltf_import_losses` reports them.
+    let uv_layer = imported_uv_layer(info);
     let texture_index = usize::try_from(
         info["index"]
             .as_u64()
@@ -4681,7 +4769,7 @@ fn import_texture_ref(info: &Value, root: &Value, image_ids: &[Id]) -> Result<Op
     };
     Ok(Some(TextureRef {
         image,
-        uv_map: Some("uv_map".to_owned()),
+        uv_layer,
         interpolation,
     }))
 }
@@ -5667,11 +5755,19 @@ pub(crate) fn import_indexed(
         let primitives = mesh_value["primitives"]
             .as_array()
             .ok_or_else(|| import_error("glTF mesh primitives are missing"))?;
+        // Stored UV layers: one per `TEXCOORD_n` the primitives use, up to the layer limit.
+        let uv_set_count = primitives
+            .iter()
+            .flat_map(|primitive| primitive["attributes"].as_object().into_iter().flatten())
+            .filter_map(|(name, _)| name.strip_prefix("TEXCOORD_")?.parse::<usize>().ok())
+            .map(|set| set + 1)
+            .max()
+            .unwrap_or(0)
+            .min(uv_layers::MAX_LAYERS);
         let mut positions = Vec::<DVec3>::new();
         let mut polygons = Vec::<Vec<usize>>::new();
         let mut face_material_indices = Vec::<u32>::new();
-        let mut face_uvs = Vec::<Vec<[f64; 2]>>::new();
-        let mut has_uvs = false;
+        let mut face_uvs = Vec::<Vec<CornerUvs>>::new();
         let mut slots = Vec::<Id>::new();
         let mut morph_target_count = None;
         let mut morph_deltas = Vec::<Vec<[f64; 3]>>::new();
@@ -5683,12 +5779,6 @@ pub(crate) fn import_indexed(
         let mut primitive_starts = Vec::<usize>::new();
         let mut vertex_bases = BTreeMap::<VertexPayload, usize>::new();
         for primitive in primitives {
-            if primitive["attributes"]["TEXCOORD_1"].is_object() {
-                return Err(unsupported_export(
-                    "material.texture_uv_set",
-                    "glTF import supports only TEXCOORD_0",
-                ));
-            }
             let mode = primitive["mode"].as_u64().unwrap_or(4);
             let accessor_index = usize::try_from(
                 primitive["attributes"]["POSITION"]
@@ -5729,22 +5819,22 @@ pub(crate) fn import_indexed(
                     normals.extend(std::iter::repeat_n(DVec3::ZERO, decoded.len()));
                 }
             }
-            let primitive_uvs = if let Some(accessor) =
-                primitive["attributes"]["TEXCOORD_0"].as_u64()
-            {
-                has_uvs = true;
+            // Each stored set is read per vertex; a primitive without the set reads `[0, 0]`.
+            let mut primitive_uvs = Vec::<Vec<[f64; 2]>>::with_capacity(uv_set_count);
+            for set in 0..uv_set_count {
+                let Some(accessor) = primitive["attributes"][format!("TEXCOORD_{set}")].as_u64()
+                else {
+                    primitive_uvs.push(Vec::new());
+                    continue;
+                };
                 let accessor = usize::try_from(accessor)
                     .map_err(|_| import_error("glTF TEXCOORD accessor exceeds platform range"))?;
                 let values = read_vec2(&root, &binaries, accessor)?;
                 if values.len() != decoded.len() {
-                    return Err(import_error(
-                        "glTF TEXCOORD_0 count does not match POSITION",
-                    ));
+                    return Err(import_error("glTF TEXCOORD count does not match POSITION"));
                 }
-                Some(values)
-            } else {
-                None
-            };
+                primitive_uvs.push(values);
+            }
             let target_values = primitive["targets"]
                 .as_array()
                 .map_or(&[][..], Vec::as_slice);
@@ -5863,14 +5953,18 @@ pub(crate) fn import_indexed(
             )?;
             face_material_indices[face_start..].fill(material_slot);
             for polygon in &polygons[face_start..] {
-                let uv = polygon
+                let uv: Vec<CornerUvs> = polygon
                     .iter()
                     .map(|vertex_index| {
                         primitive_uvs
-                            .as_ref()
-                            .and_then(|values| values.get(vertex_index.saturating_sub(base)))
-                            .copied()
-                            .unwrap_or([0.0, 0.0])
+                            .iter()
+                            .map(|values| {
+                                values
+                                    .get(vertex_index.saturating_sub(base))
+                                    .copied()
+                                    .unwrap_or([0.0, 0.0])
+                            })
+                            .collect::<CornerUvs>()
                     })
                     .collect();
                 face_uvs.push(uv);
@@ -5977,16 +6071,26 @@ pub(crate) fn import_indexed(
         for (face, material_index) in mesh.faces.iter_mut().zip(face_material_indices) {
             face.material_index = material_index;
         }
-        if has_uvs {
-            mesh.attributes.insert(
-                "uv_map".to_owned(),
-                json!(
-                    mesh.faces
-                        .iter()
-                        .zip(face_uvs)
-                        .map(|(face, uv)| json!({ "face_id": face.id, "uv": uv }))
-                        .collect::<Vec<_>>()
-                ),
+        if uv_set_count > 0 {
+            let layers = (0..uv_set_count)
+                .map(|set| {
+                    UvLayer::new(
+                        uv_set_layer_name(set),
+                        face_uvs
+                            .iter()
+                            .map(|corners| Some(corners.iter().map(|corner| corner[set]).collect()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let first = uv_set_layer_name(0);
+            uv_layers::write(
+                &mut mesh,
+                &UvStore {
+                    layers,
+                    active: Some(first.clone()),
+                    render: Some(first),
+                },
             );
         }
         let morph_normals_complete = !morph_deltas.is_empty() && !morph_normals_missing;
@@ -6673,8 +6777,11 @@ fn potter_polygons(
     }))
 }
 
-/// Corner UVs of each face, in face corner order.
-type CornerUvs = Vec<Vec<[f64; 2]>>;
+/// One polygon corner's UV values, one per stored UV layer in layer order.
+type CornerUvs = Vec<[f64; 2]>;
+
+/// The corner UVs of each face, in face corner order.
+type FaceUvs = Vec<Vec<CornerUvs>>;
 
 /// Restores the stored faces onto the triangles, which the importer read per primitive in order.
 /// Faces take their primitive's next `corners - 2` triangles in face order, and those triangles
@@ -6685,9 +6792,9 @@ fn restore_polygons(
     faces: &PotterFaces,
     triangles: &[Vec<usize>],
     slots: &[u32],
-    uvs: &[Vec<[f64; 2]>],
+    uvs: &[Vec<CornerUvs>],
     primitive_starts: &[usize],
-) -> Option<(Vec<u32>, CornerUvs)> {
+) -> Option<(Vec<u32>, FaceUvs)> {
     // Cursors into each primitive's triangles; `primitive_starts` ends with the total count.
     let mut cursors = primitive_starts
         .iter()
@@ -6718,7 +6825,7 @@ fn restore_polygons(
             .iter()
             .zip(owned_uvs)
             .flat_map(|(triangle, triangle_uvs)| {
-                triangle.iter().copied().zip(triangle_uvs.iter().copied())
+                triangle.iter().copied().zip(triangle_uvs.iter().cloned())
             })
             .collect::<Vec<_>>();
         corner_values.sort_unstable_by_key(|(corner, _)| *corner);
@@ -6728,7 +6835,7 @@ fn restore_polygons(
                 let index = corner_values
                     .binary_search_by_key(corner, |(value, _)| *value)
                     .ok()?;
-                corner_values.get(index).map(|(_, uv)| *uv)
+                corner_values.get(index).map(|(_, uv)| uv.clone())
             })
             .collect::<Option<Vec<_>>>()?;
         materials.push(*slots.get(start)?);
@@ -7274,6 +7381,13 @@ fn read_float_accessor(
     Ok((values, dimensions))
 }
 
+/// Whether a glTF attribute name is a `TEXCOORD_n` set past the stored UV layer limit.
+fn texcoord_past_limit(name: &str) -> bool {
+    name.strip_prefix("TEXCOORD_")
+        .and_then(|set| set.parse::<usize>().ok())
+        .is_some_and(|set| set >= uv_layers::MAX_LAYERS)
+}
+
 fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
     let mut losses = Vec::new();
     if root["nodes"].as_array().is_some_and(|nodes| {
@@ -7315,26 +7429,44 @@ fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
             suggestion: Some("use --allow-lossy to import occlusion at full strength".to_owned()),
         });
     }
-    if root["materials"].as_array().is_some_and(|materials| {
-        materials.iter().any(|material| {
+    // Each stored UV layer is one TEXCOORD set, so sets past the layer limit, and texture references
+    // to them, cannot be kept.
+    let texcoord_beyond = root["meshes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
+        .filter_map(|primitive| primitive["attributes"].as_object())
+        .flat_map(|attributes| attributes.keys())
+        .any(|name| texcoord_past_limit(name));
+    let texture_past_limit = root["materials"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|material| {
             let pbr = &material["pbrMetallicRoughness"];
             [
                 &pbr["baseColorTexture"],
                 &pbr["metallicRoughnessTexture"],
                 &material["normalTexture"],
+                &material["emissiveTexture"],
+                &material["occlusionTexture"],
             ]
-            .into_iter()
-            .any(transform_reads_other_uv_set)
-                || [&material["emissiveTexture"], &material["occlusionTexture"]]
-                    .into_iter()
-                    .any(|info| reads_other_uv_set(info) || transform_reads_other_uv_set(info))
         })
-    }) {
+        .any(|info| {
+            usize::try_from(texture_info_set(info)).is_ok_and(|set| set >= uv_layers::MAX_LAYERS)
+        });
+    if texcoord_beyond || texture_past_limit {
         losses.push(crate::exchange::Loss {
-            feature_id: "material.texture_uv_set".to_owned(),
+            feature_id: feature_id::MESH_UV_LAYER.to_owned(),
             data_id: None,
-            reason: "glTF texture reads a UV set other than TEXCOORD_0; Potter imports only that set, so the transform (or the emissive or occlusion texture) is not imported".to_owned(),
-            suggestion: Some("use --allow-lossy to import without it".to_owned()),
+            reason: format!(
+                "glTF UV sets past the {} layer limit cannot be stored; they import as absent and texture references to them sample the render layer",
+                uv_layers::MAX_LAYERS
+            ),
+            suggestion: Some(
+                "use --allow-lossy or keep each mesh to the layer limit's TEXCOORD sets".to_owned(),
+            ),
         });
     }
     if root["extensionsUsed"].as_array().is_some_and(|extensions| {
@@ -7927,6 +8059,7 @@ mod tests {
     use crate::geom::{
         Mesh,
         normals::{sharp_edge_flags, smooth_face_flags},
+        uv_layers::{self, UvLayer, UvStore},
     };
     use crate::{
         eval::{EvaluationContext, Snapshot},
@@ -7937,6 +8070,7 @@ mod tests {
 
     use super::{
         axis_from_gltf, axis_to_gltf, export_with_root, gltf_import_losses, import, to_glb,
+        uv_layer_losses,
     };
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -8334,7 +8468,7 @@ mod tests {
             directory.path(),
             &json!([
                 {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
-                {"op":"material.create","id":"surface","base_color_texture":{"image":"paint","uv_map":"uv_map","interpolation":"closest"}},
+                {"op":"material.create","id":"surface","base_color_texture":{"image":"paint","interpolation":"closest"}},
                 {"op":"node.create","id":"skin_mesh","kind":"box","params":{"size":2.0},"material":"surface"},
                 {"op":"uv.unwrap","target":{"id":"skin_mesh"},"method":"smart"},
                 {"op":"uv.pin","target":{"id":"skin_mesh"}},
@@ -8453,22 +8587,13 @@ mod tests {
             .and_then(|node| node.data.as_ref())
             .and_then(|data_id| source.data_blocks.get(data_id))
             .and_then(|data| data.mesh.as_ref())
-            .and_then(|mesh| mesh.attributes.get("uv_map"))
-            .and_then(Value::as_array)
-            .ok_or("source UV map is missing")?
-            .iter()
-            .flat_map(|face| face["uv"].as_array().into_iter().flatten())
-            .map(|coordinate| -> TestResult<[f64; 2]> {
-                Ok([
-                    coordinate[0]
-                        .as_f64()
-                        .ok_or("source U coordinate is missing")?,
-                    coordinate[1]
-                        .as_f64()
-                        .ok_or("source V coordinate is missing")?,
-                ])
-            })
-            .collect::<TestResult<Vec<_>>>()?;
+            .and_then(|mesh| uv_layers::read_layers(mesh).into_iter().next())
+            .ok_or("source UV layer is missing")?
+            .faces
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<[f64; 2]>>();
         assert!(exported_uvs.iter().all(|actual| {
             source_uvs.iter().any(|expected| {
                 (actual[0] - expected[0]).abs() <= f64::from(f32::EPSILON)
@@ -8906,6 +9031,15 @@ mod tests {
         let snapshot = Snapshot::evaluate(doc, &EvaluationContext::default())?;
         let (document, binary) =
             export_with_root(doc, &snapshot, directory.path(), Some("scene.bin"))?;
+        Ok((serde_json::from_slice(&document)?, binary))
+    }
+
+    fn export_root_and_binary_at_root(
+        doc: &SceneDoc,
+        root: &std::path::Path,
+    ) -> TestResult<(Value, Vec<u8>)> {
+        let snapshot = Snapshot::evaluate(doc, &EvaluationContext::default())?;
+        let (document, binary) = export_with_root(doc, &snapshot, root, Some("scene.bin"))?;
         Ok((serde_json::from_slice(&document)?, binary))
     }
 
@@ -9719,32 +9853,16 @@ mod tests {
             .collect()
     }
 
-    /// Corner UVs per face, in face order, as flat `u, v` runs.
+    /// Corner UVs of the first UV layer per face, in face order, as flat `u, v` runs.
     fn face_uvs(mesh: &Mesh) -> TestResult<Vec<Vec<f64>>> {
-        let entries = mesh
-            .attributes
-            .get("uv_map")
-            .and_then(Value::as_array)
-            .ok_or("uv_map is missing")?;
-        let mut by_face = BTreeMap::new();
-        for entry in entries {
-            let face_id = entry["face_id"].as_u64().ok_or("uv face ID is missing")?;
-            let mut values = Vec::new();
-            for corner in entry["uv"].as_array().ok_or("uv corners are missing")? {
-                values.push(corner[0].as_f64().ok_or("uv value is missing")?);
-                values.push(corner[1].as_f64().ok_or("uv value is missing")?);
-            }
-            by_face.insert(face_id, values);
-        }
-        Ok(mesh
+        let layer = uv_layers::read_layers(mesh)
+            .into_iter()
+            .next()
+            .ok_or("uv layer is missing")?;
+        Ok(layer
             .faces
             .iter()
-            .map(|face| {
-                by_face
-                    .get(&u64::from(face.id))
-                    .cloned()
-                    .unwrap_or_default()
-            })
+            .map(|values| values.iter().flatten().flat_map(|corner| *corner).collect())
             .collect())
     }
 
@@ -10121,66 +10239,213 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Stores three UV layers on `mesh`, `UVMap`, `UVMap.001`, and `UVMap.002`, rendering `render`.
+    /// Layer `k` holds `k / 4 + corner / 8` in U and `1 / 2 + k / 4 - corner / 8` in V, exact in f32.
+    fn store_three_uv_layers(mesh: &mut Mesh, render: &str) {
+        let layers = ["UVMap", "UVMap.001", "UVMap.002"]
+            .into_iter()
+            .enumerate()
+            .map(|(set, name)| {
+                let faces = mesh
+                    .faces
+                    .iter()
+                    .map(|face| {
+                        Some(
+                            (0..face.vertices.len())
+                                .map(|corner| {
+                                    [
+                                        set as f64 * 0.25 + corner as f64 * 0.125,
+                                        0.5 + set as f64 * 0.25 - corner as f64 * 0.125,
+                                    ]
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                UvLayer::new(name, faces)
+            })
+            .collect();
+        uv_layers::write(
+            mesh,
+            &UvStore {
+                layers,
+                active: Some("UVMap".to_owned()),
+                render: Some(render.to_owned()),
+            },
+        );
+    }
+
+    /// The three-layer store on every mesh data block of `doc`.
+    fn store_three_uv_layers_everywhere(doc: &mut SceneDoc, render: &str) {
+        for data in doc.data_blocks.values_mut() {
+            if let Some(mesh) = data.mesh.as_mut() {
+                store_three_uv_layers(mesh, render);
+            }
+        }
+    }
+
+    /// Asserts two UV lists hold the same values in any order.
+    fn assert_same_uvs(actual: &[[f64; 2]], expected: &[[f64; 2]]) {
+        let sorted = |values: &[[f64; 2]]| {
+            let mut values = values.to_vec();
+            values.sort_by(|left, right| {
+                left[0]
+                    .total_cmp(&right[0])
+                    .then(left[1].total_cmp(&right[1]))
+            });
+            values
+        };
+        assert_eq!(sorted(actual), sorted(expected));
+    }
+
+    #[test]
+    fn three_uv_layers_export_as_texcoord_sets_and_import_by_name() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let mut doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
+                {"op":"material.create","id":"named","base_color_texture":{"image":"paint","interpolation":"linear"}},
+                {"op":"material.create","id":"default","base_color_texture":{"image":"paint","interpolation":"linear"}},
+                {"op":"node.create","id":"named_quad","kind":"plane","params":{"size":2.0},"material":"named"},
+                {"op":"node.create","id":"default_quad","kind":"plane","params":{"size":2.0},"material":"default"}
+            ]),
+        )?;
+        store_three_uv_layers_everywhere(&mut doc, "UVMap");
+        let named = doc
+            .materials
+            .get_mut(&crate::model::Id::new("named")?)
+            .ok_or("named material is missing")?;
+        named
+            .base_color_texture
+            .as_mut()
+            .ok_or("named texture is missing")?
+            .uv_layer = Some("UVMap.002".to_owned());
+
+        let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+        let buffers = vec![binary];
+        let stored = uv_layers::read_layers(first_mesh(&doc)?);
+        assert_eq!(stored.len(), 3);
+        for mesh_value in document["meshes"].as_array().ok_or("meshes are missing")? {
+            let attributes = &mesh_value["primitives"][0]["attributes"];
+            for (set, layer) in stored.iter().enumerate() {
+                let accessor = attributes[format!("TEXCOORD_{set}")]
+                    .as_u64()
+                    .ok_or("TEXCOORD set is missing")?;
+                let exported = super::read_vec2(&document, &buffers, usize::try_from(accessor)?)?;
+                let values = layer
+                    .faces
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert_same_uvs(&exported, &values);
+            }
+            assert!(
+                attributes["TEXCOORD_3"].is_null(),
+                "only the stored layers export"
+            );
+        }
+        for material in document["materials"]
+            .as_array()
+            .ok_or("materials are missing")?
+        {
+            let coord = material["pbrMetallicRoughness"]["baseColorTexture"]["texCoord"].as_u64();
+            match material["extras"]["potter"]["id"].as_str() {
+                Some("named") => assert_eq!(coord, Some(2), "a named layer takes its TEXCOORD"),
+                Some("default") => {
+                    assert_eq!(coord, Some(0), "a null layer takes the render layer");
+                }
+                _ => {}
+            }
+        }
+
+        let (imported, _) = round_trip_in(&doc, root.path())?;
+        let imported_mesh = first_mesh(&imported.doc)?;
+        let store = uv_layers::read(imported_mesh);
+        let names = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["UVMap", "UVMap.001", "UVMap.002"]);
+        assert_eq!(store.active.as_deref(), Some("UVMap"));
+        assert_eq!(store.render.as_deref(), Some("UVMap"));
+        for (imported_layer, stored_layer) in store.layers.iter().zip(&stored) {
+            assert_eq!(imported_layer.faces, stored_layer.faces);
+        }
+        let mut texture_layers = imported
+            .doc
+            .materials
+            .values()
+            .map(|material| {
+                material
+                    .base_color_texture
+                    .as_ref()
+                    .and_then(|texture| texture.uv_layer.clone())
+            })
+            .collect::<Vec<_>>();
+        texture_layers.sort();
+        assert_eq!(texture_layers, vec![None, Some("UVMap.002".to_owned())]);
+        Ok(())
+    }
+
+    #[test]
+    fn texture_naming_a_missing_uv_layer_reports_uv_layer_missing() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let mut doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.25,0.5,0.75,1.0]},
+                {"op":"material.create","id":"paint_mat","base_color_texture":{"image":"paint","interpolation":"linear"}},
+                {"op":"node.create","id":"quad","kind":"plane","params":{"size":2.0},"material":"paint_mat"}
+            ]),
+        )?;
+        store_three_uv_layers_everywhere(&mut doc, "UVMap");
+        let material = doc
+            .materials
+            .get_mut(&crate::model::Id::new("paint_mat")?)
+            .ok_or("material is missing")?;
+        material
+            .base_color_texture
+            .as_mut()
+            .ok_or("texture is missing")?
+            .uv_layer = Some("Missing".to_owned());
+
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let losses = uv_layer_losses(&doc, &snapshot, None)?;
+        assert!(
+            losses.iter().any(|loss| {
+                loss.feature_id == "uv.layer_missing"
+                    && loss.data_id.as_deref() == Some("paint_mat")
+            }),
+            "{losses:?}"
+        );
+        // The texture still exports, sampling the render layer.
+        let (document, _) = export_root_and_binary_at_root(&doc, root.path())?;
+        assert_eq!(
+            document["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["texCoord"]
+                .as_u64(),
+            Some(0)
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod material_texture_tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
-    use glam::DVec3;
-    use serde_json::json;
+    use crate::model::Id;
 
-    use crate::{geom::Mesh, model::Id};
-
-    use super::{
-        ChannelSource, TextureChannel, export_uv_sets, fill_unread, identity_image, reads,
-    };
-
-    fn quad() -> Mesh {
-        Mesh::from_positions_and_faces(
-            vec![
-                DVec3::new(0.0, 0.0, 0.0),
-                DVec3::new(1.0, 0.0, 0.0),
-                DVec3::new(1.0, 1.0, 0.0),
-                DVec3::new(0.0, 1.0, 0.0),
-            ],
-            vec![vec![0, 1, 2, 3]],
-        )
-        .unwrap()
-    }
+    use super::{ChannelSource, TextureChannel, fill_unread, identity_image, reads};
 
     fn source(image: &str, channel: TextureChannel) -> ChannelSource {
         ChannelSource {
             image: Id::new(image).unwrap(),
             channel,
         }
-    }
-
-    #[test]
-    fn uv_entries_with_a_layer_key_are_flipped_to_gltf_v() {
-        let mut mesh = quad();
-        let face = mesh.faces[0].id;
-        mesh.attributes.insert(
-            "uv_map".to_owned(),
-            json!([{"face_id": face, "layer": "UVMap",
-                    "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 0.25], [0.0, 0.25]]}]),
-        );
-        let sets = export_uv_sets(&mesh).unwrap();
-        assert_eq!(sets.len(), 1);
-        let uvs = &sets[0][&face];
-        assert_eq!(uvs[2], [1.0, 0.75]);
-        assert_eq!(uvs[3], [0.0, 0.75]);
-    }
-
-    #[test]
-    fn native_uv_entries_without_a_layer_key_keep_their_values() {
-        let mut mesh = quad();
-        let face = mesh.faces[0].id;
-        mesh.attributes.insert(
-            "uv_map".to_owned(),
-            json!([{"face_id": face, "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 0.25], [0.0, 0.25]]}]),
-        );
-        let sets = export_uv_sets(&mesh).unwrap();
-        assert_eq!(sets[0][&face][2], [1.0, 0.25]);
     }
 
     #[test]

@@ -1432,6 +1432,7 @@ fn vrm1_extension(
         let mtoon_extension = mtoon::v1(
             surface,
             mtoon,
+            mappings.tex_coords.for_material(material_id),
             doc,
             root_path,
             texture_export,
@@ -1943,7 +1944,7 @@ fn vrm0_meta(
     if let Some(thumbnail) = &meta.thumbnail {
         let texture = TextureRef {
             image: thumbnail.clone(),
-            uv_map: None,
+            uv_layer: None,
             interpolation: ImageInterpolation::Linear,
         };
         let index = texture_export.sampled_index(

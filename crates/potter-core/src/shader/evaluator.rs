@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use glam::{DQuat, DVec3, EulerRot};
 use serde_json::{Value as JsonValue, json};
@@ -192,6 +195,8 @@ pub struct HitContext<'a> {
     pub image_data: Option<&'a BTreeMap<String, ImageData>>,
     pub uv: [f64; 2],
     pub uv_maps: Option<&'a [(&'a str, [f64; 2])]>,
+    /// Sink for `uv.layer_missing` warnings; see [`HitContext::with_warnings`].
+    pub warnings: Option<&'a RefCell<Vec<JsonValue>>>,
     pub tangent_frame: Option<(DVec3, DVec3)>,
     pub generated: DVec3,
     pub position: DVec3,
@@ -209,6 +214,7 @@ impl<'a> HitContext<'a> {
             node_groups,
             uv: [0.0; 2],
             uv_maps: None,
+            warnings: None,
             tangent_frame: None,
             generated: DVec3::ZERO,
             position: DVec3::ZERO,
@@ -233,6 +239,14 @@ impl<'a> HitContext<'a> {
         self
     }
 
+    /// Collect `uv.layer_missing` warnings raised while evaluating this hit. Without a sink the
+    /// render UV is still used, but the warning is not recorded.
+    #[must_use]
+    pub const fn with_warnings(mut self, warnings: &'a RefCell<Vec<JsonValue>>) -> Self {
+        self.warnings = Some(warnings);
+        self
+    }
+
     /// Provide the per-hit tangent and bitangent for tangent-space normal mapping.
     #[must_use]
     pub const fn with_tangent_frame(mut self, tangent: DVec3, bitangent: DVec3) -> Self {
@@ -241,13 +255,37 @@ impl<'a> HitContext<'a> {
     }
 }
 
+/// Writes `(layer name, UV)` pairs into `table` in layer order and returns the filled prefix, ready
+/// for [`HitContext::with_uv_maps`]. Nothing is allocated.
+///
+/// # Errors
+///
+/// Returns `LIMIT_EXCEEDED` when there are more layers than `table` holds.
+pub fn fill_uv_maps<'a, 'n>(
+    table: &'a mut [(&'n str, [f64; 2])],
+    maps: impl IntoIterator<Item = (&'n str, [f64; 2])>,
+) -> Result<&'a [(&'n str, [f64; 2])]> {
+    let mut count = 0;
+    for map in maps {
+        let slot = table.get_mut(count).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "mesh has more UV layers than one hit can carry",
+            )
+        })?;
+        *slot = map;
+        count += 1;
+    }
+    Ok(&table[..count])
+}
+
 /// Evaluate a material's shader graph at a surface hit. Materials without a node tree use their PBR fields.
 ///
 /// # Errors
 ///
 /// Returns `TARGET_NOT_FOUND` for a missing shader graph or image, `INVALID_OPERATION` for an invalid graph,
 /// `EVALUATION_FAILED` for a cycle or missing material output, and `UNSUPPORTED_FEATURE` for unsupported
-/// node behavior or unresolved image pixels and named UV maps in the hit context.
+/// node behavior or unresolved image pixels in the hit context.
 pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result<BsdfParams> {
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
@@ -463,24 +501,10 @@ fn sample_material_texture(texture: &TextureRef, hit_ctx: &HitContext<'_>) -> Re
             json!({"image_id":image_id}),
         )
     })?;
-    let uv = if let Some(uv_map) = texture.uv_map.as_deref() {
-        hit_ctx
-            .uv_maps
-            .and_then(|maps| {
-                maps.iter()
-                    .find(|(name, _)| *name == uv_map)
-                    .map(|(_, coordinates)| *coordinates)
-            })
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::UnsupportedFeature,
-                    format!("UV map `{uv_map}` was not resolved in the hit context"),
-                    json!({"feature_id":"shader.material_texture.uv_map","uv_map":uv_map,"image_id":image_id}),
-                )
-            })?
-    } else {
-        hit_ctx.uv
-    };
+    let uv = texture
+        .uv_layer
+        .as_deref()
+        .map_or(hit_ctx.uv, |layer| named_uv(hit_ctx, layer));
     let tile = if image.tiles.is_empty() { 0 } else { 1001 };
     let pixel = sample_with_interpolation(image, uv, tile, texture.interpolation);
     if pixel.iter().any(|component| !component.is_finite()) {
@@ -615,6 +639,7 @@ impl Evaluator<'_, '_, '_, '_> {
                 }
             }
             "ShaderNodeTexCoord" => self.tex_coord(socket),
+            "ShaderNodeUVMap" => self.uv_map(node, socket),
             "ShaderNodeNormalMap" => self.normal_map(node_id, socket),
             "ShaderNodeFresnel" => self.fresnel(node_id, socket),
             "ShaderNodeLayerWeight" => self.layer_weight(node_id, socket),
@@ -1249,6 +1274,20 @@ impl Evaluator<'_, '_, '_, '_> {
         Ok(Value::Vector(value))
     }
 
+    /// `ShaderNodeUVMap`: the UV of the layer named by the node, or the render UV when it names none.
+    fn uv_map(&self, node: &GraphNode, socket: &str) -> Result<Value> {
+        if socket != "UV" {
+            return Err(invalid(format!("unknown UV Map output `{socket}`")));
+        }
+        let uv = node
+            .properties
+            .get("uv_map")
+            .and_then(JsonValue::as_str)
+            .filter(|layer| !layer.is_empty())
+            .map_or(self.hit_ctx.uv, |layer| named_uv(self.hit_ctx, layer));
+        Ok(Value::Vector(DVec3::new(uv[0], uv[1], 0.0)))
+    }
+
     fn normal_map(&mut self, id: &Id, socket: &str) -> Result<Value> {
         if socket != "Normal" {
             return Err(invalid(format!("unknown Normal Map output `{socket}`")));
@@ -1589,6 +1628,29 @@ fn invalid(message: impl Into<String>) -> PotError {
 
 fn eval_error(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, message)
+}
+
+/// UV of layer `layer` at this hit. A layer the mesh does not carry falls back to the render UV and
+/// records a `uv.layer_missing` warning.
+fn named_uv(hit_ctx: &HitContext<'_>, layer: &str) -> [f64; 2] {
+    if let Some((_, uv)) = hit_ctx
+        .uv_maps
+        .and_then(|maps| maps.iter().find(|(name, _)| *name == layer))
+    {
+        return *uv;
+    }
+    if let Some(warnings) = hit_ctx.warnings {
+        let warning = json!({
+            "code": "uv.layer_missing",
+            "message": format!("UV layer `{layer}` is not on this mesh; the render layer was used"),
+            "layer": layer,
+        });
+        let mut recorded = warnings.borrow_mut();
+        if !recorded.contains(&warning) {
+            recorded.push(warning);
+        }
+    }
+    hit_ctx.uv
 }
 
 fn unsupported_node(id: &Id, kind: &str) -> PotError {

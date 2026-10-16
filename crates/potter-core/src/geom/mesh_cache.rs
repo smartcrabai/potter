@@ -13,7 +13,10 @@ use crate::{
     params::{self, ParameterFamily},
 };
 
-use super::Mesh;
+use super::{
+    Mesh,
+    uv_layers::{self, UvLayer},
+};
 
 static CACHE_SAMPLES: LazyLock<Mutex<HashMap<String, Arc<Vec<MeshCacheSample>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -204,16 +207,7 @@ fn apply_cache_attributes(
                 json!({"modifier_id":modifier.id,"face_id":face.id,"cache_corners":uv.len(),"mesh_corners":face.vertices.len()}),
             ));
         }
-        mesh.attributes.insert(
-            "uv_map".to_owned(),
-            Value::Array(
-                mesh.faces
-                    .iter()
-                    .zip(uv_faces)
-                    .map(|(face, uv)| json!({"face_id":face.id,"uv":uv}))
-                    .collect(),
-            ),
-        );
+        write_cache_uvs(mesh, modifier, uv_faces)?;
     }
     if read.color
         && let Some((scope, colors)) = &sample.colors
@@ -245,6 +239,44 @@ fn apply_cache_attributes(
             json!({"scope":scope,"values":scaled}),
         );
     }
+    Ok(())
+}
+
+/// Writes the cache's corner UVs into the layer that the modifier names with `uv_layer`, or into
+/// the render layer when it names none. A named layer the mesh lacks is created. The layer's values
+/// and pins are replaced; its other layers are kept.
+fn write_cache_uvs(mesh: &mut Mesh, modifier: &Modifier, uv_faces: &[Vec<[f64; 2]>]) -> Result<()> {
+    let mut store = uv_layers::read(mesh);
+    let name = match modifier.params.get("uv_layer").and_then(Value::as_str) {
+        Some(name) => name.to_owned(),
+        None => store.render.clone().unwrap_or_else(|| "UVMap".to_owned()),
+    };
+    let index = if let Some(index) = store.index_of(&name) {
+        index
+    } else {
+        if store.layers.len() >= uv_layers::MAX_LAYERS {
+            return Err(PotError::with_details(
+                ErrorCode::LimitExceeded,
+                "Alembic UV cache needs a UV layer beyond the mesh limit",
+                json!({"feature_id":"uv.layer_limit","modifier_id":modifier.id}),
+            ));
+        }
+        store
+            .layers
+            .push(UvLayer::new(name.clone(), vec![None; mesh.faces.len()]));
+        if store.layers.len() == 1 {
+            store.active = Some(name.clone());
+            store.render = Some(name);
+        }
+        store.layers.len() - 1
+    };
+    let layer = store
+        .layers
+        .get_mut(index)
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "UV layer index is out of range"))?;
+    layer.faces = uv_faces.iter().map(|uv| Some(uv.clone())).collect();
+    layer.pinned = vec![None; mesh.faces.len()];
+    uv_layers::write(mesh, &store);
     Ok(())
 }
 
