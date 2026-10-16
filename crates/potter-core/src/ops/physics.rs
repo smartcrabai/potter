@@ -3,6 +3,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     model::{ForceField, Id, Modifier, Node, RigidBody, RigidBodyWorld},
+    params::{self, ParameterFamily},
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer};
@@ -659,22 +660,25 @@ fn physics_property(system: &str) -> &'static str {
     }
 }
 
-/// Modifier-level properties (base flags and the fluid and dynamic-paint type selectors) are not
-/// physics settings: they move out of `settings` and stay on the modifier.
-fn split_modifier_flags(settings: &mut Map<String, Value>) -> Map<String, Value> {
+/// Modifier-level properties (the base flags plus the type selectors) are not physics settings: they
+/// move out of `settings` and stay on the modifier. The keys are the modifier schema's own
+/// properties minus `settings_id`, so this split cannot drift from the operation-layer validation.
+fn split_modifier_flags(
+    modifier_type: &str,
+    settings: &mut Map<String, Value>,
+) -> Map<String, Value> {
+    let schema_keys: Vec<String> = params::type_spec(ParameterFamily::Modifier, modifier_type)
+        .and_then(|spec| spec.get("properties"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|properties| properties.keys())
+        .filter(|key| key.as_str() != "settings_id")
+        .cloned()
+        .collect();
     let mut flags = Map::new();
-    for flag in [
-        "show_in_editmode",
-        "show_on_cage",
-        "show_expanded",
-        "is_active",
-        "use_pin_to_last",
-        "use_apply_on_spline",
-        "fluid_type",
-        "ui_type",
-    ] {
-        if let Some(value) = settings.remove(flag) {
-            flags.insert(flag.to_owned(), value);
+    for flag in schema_keys {
+        if let Some(value) = settings.remove(&flag) {
+            flags.insert(flag, value);
         }
     }
     flags
@@ -700,7 +704,7 @@ pub(super) fn create_linked_modifier_settings(
             "/params/settings_id",
         ));
     }
-    let mut modifier_flags = split_modifier_flags(&mut settings);
+    let mut modifier_flags = split_modifier_flags(modifier_type, &mut settings);
     let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     validate_system_target(engine, target, &node)?;
     validate_physics_settings(engine, system, &settings)?;
@@ -779,7 +783,7 @@ pub(super) fn update_linked_modifier_settings(
     }
     let mut settings = params.clone();
     settings.remove("settings_id");
-    let mut modifier_flags = split_modifier_flags(&mut settings);
+    let mut modifier_flags = split_modifier_flags(modifier_type, &mut settings);
     let property = physics_property(system);
     let node = physics_node(engine, target, "modifier physics", "/target/id")?;
     let is_particle_registry_entry = system == "particle_emitter"
