@@ -68,6 +68,8 @@ image = { version = "0.25", default-features = false, features = [
 jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "6f2926e0c63d885f5858daed5246566a7838e948" }
 jsonschema = "=0.58.6"
 lz4_flex = "0.14"
+num-rational = "0.4.2"
+num-traits = "0.2.19"
 png = "0.18"
 potter-core = { path = "crates/potter-core" }
 potter-workflow = { path = "crates/potter-workflow" }

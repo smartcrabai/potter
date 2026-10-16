@@ -4,6 +4,40 @@
 //! scale-relative coplanar tolerance that absorbs transform roundoff on planar faces.
 //! The same tolerance reunites coordinates introduced by floating-point edge interpolation.
 
+// Mesh Arrangements modules: exercised by unit tests until PR17a-2 wires them into the modifier.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
+)]
+mod cdt;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
+)]
+mod exact;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
+)]
+mod imesh;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
+)]
+mod input;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
+)]
+mod intersect;
+#[cfg(test)]
+mod tests;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the Boolean modifier in PR17a-2")
+)]
+mod triangulate;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use glam::DVec3;
