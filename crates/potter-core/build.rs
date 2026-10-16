@@ -51,6 +51,9 @@ fn main() -> Result<(), io::Error> {
         eigen
             .opt_level(2)
             .flag("-mdynamic-no-pic")
+            .flag("-pipe")
+            .flag("-funsigned-char")
+            .flag("-fno-strict-aliasing")
             .flag("-ffp-contract=off");
     }
     eigen.compile("potter_blender_inverse");
