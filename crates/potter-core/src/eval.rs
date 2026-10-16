@@ -2032,6 +2032,25 @@ pub(crate) fn read_cache_resource(
     })?;
     crate::cache_sequence::read_cache_resource_record(resource, resource_id.as_str(), project_root)
 }
+/// Create the ordinary binary-resource record used for one cache sequence frame.
+pub(crate) fn cache_sequence_resource_record(
+    uri: &str,
+    kind: &str,
+    hash: &str,
+    packed_bytes: Option<&[u8]>,
+) -> Value {
+    let mut record = json!({
+        "uri": uri,
+        "kind": kind,
+        "hash": hash,
+        "packed": packed_bytes.is_some(),
+    });
+    if let Some(bytes) = packed_bytes {
+        record["bytes"] = json!(bytes);
+    }
+    record
+}
+
 
 pub(crate) fn load_vdb_volume_data(
     doc: &SceneDoc,
@@ -3337,7 +3356,7 @@ fn apply_mesh_sequence_cache_modifier(
     } else {
         read_cache_resource(doc, project_root, &resource_id)?
     };
-    warnings.extend(crate::geom::mesh_cache::evaluate(
+    let cache_warnings = crate::geom::mesh_cache::evaluate(
         mesh,
         modifier,
         frame,
@@ -3345,7 +3364,12 @@ fn apply_mesh_sequence_cache_modifier(
         fps_base,
         &actual_hash,
         &bytes,
-    )?);
+    )?;
+    warnings.extend(
+        cache_warnings
+            .into_iter()
+            .map(|warning| attach_node_owner(warning, node_id)),
+    );
     Ok(())
 }
 
@@ -3583,6 +3607,7 @@ fn read_cache_sequence_resource(
         Err(error) => Err(error),
     }
 }
+
 
 const MAX_RENDERED_PARTICLES: usize = 100_000;
 

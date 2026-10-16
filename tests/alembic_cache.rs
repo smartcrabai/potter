@@ -1793,7 +1793,6 @@ fn resource_pack_sequence_rejects_out_of_directory_symlink_without_commit()
     );
     Ok(())
 }
-
 #[test]
 fn blender_topology_change_forces_full_cache_read_with_vertex_only_flag()
 -> Result<(), Box<dyn Error>> {
