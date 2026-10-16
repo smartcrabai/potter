@@ -42,6 +42,7 @@ const GLTF_SUPPORTED_EXTENSIONS: &[&str] = &[
     "KHR_materials_emissive_strength",
     "KHR_materials_transmission",
     "KHR_materials_ior",
+    "KHR_texture_transform",
 ];
 
 /// Imports a `.vrm` file as the given VRM version into a new scene graph.
@@ -127,8 +128,6 @@ fn unsupported_extension_losses(root: &Value, version: AvatarVersion) -> Vec<Los
         AvatarVersion::V1 => &["VRMC_vrm", "VRMC_springBone", "VRMC_materials_mtoon"],
         AvatarVersion::V0 => &["VRM"],
     };
-    // Transforms on base color, metallic-roughness and normal slots, and VRM 1.0 `MToon` slots, are imported.
-    let transform_unhandled = crate::exchange::material_graph::unhandled_texture_transforms(root);
     let mut losses = root["extensionsUsed"]
         .as_array()
         .map_or(&[][..], Vec::as_slice)
@@ -138,7 +137,6 @@ fn unsupported_extension_losses(root: &Value, version: AvatarVersion) -> Vec<Los
             !GLTF_SUPPORTED_EXTENSIONS.contains(name)
                 && !decoded.contains(name)
                 && *name != "KHR_materials_unlit"
-                && (*name != "KHR_texture_transform" || transform_unhandled)
         })
         .map(|name| Loss {
             feature_id: format!("vrm.extension.{name}"),

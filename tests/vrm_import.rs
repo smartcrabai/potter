@@ -1208,3 +1208,55 @@ fn vrm0_main_texture_transform_moves_the_base_color_texture_into_a_graph() -> Te
     );
     Ok(())
 }
+
+#[test]
+fn vrm1_base_color_texture_transform_round_trips_through_vrm_export() -> TestResult {
+    let (directory, source) = new_fixture()?;
+    let vrm = directory.path().join("transformed.vrm");
+    export(&source, "vrm", &vrm)?;
+    let transform = json!({ "offset": [0.2, 0.1], "rotation": 0.25, "scale": [1.5, 2.0] });
+    edit_glb(&vrm, |document| {
+        let material = document["materials"]
+            .as_array_mut()
+            .and_then(|materials| {
+                materials.iter_mut().find(|material| {
+                    material["pbrMetallicRoughness"]["baseColorTexture"].is_object()
+                })
+            })
+            .ok_or("the fixture has no textured material")?;
+        material["pbrMetallicRoughness"]["baseColorTexture"]["extensions"] =
+            json!({ "KHR_texture_transform": transform.clone() });
+        document["extensionsUsed"]
+            .as_array_mut()
+            .ok_or("no extensionsUsed")?
+            .push(json!("KHR_texture_transform"));
+        Ok(())
+    })?;
+    let (_fresh_directory, project) = init_project()?;
+    assert_eq!(import_losses(&project, &vrm, "vrm")?, loss_ids(&[]));
+    let again = directory.path().join("again.vrm");
+    export(&project, "vrm", &again)?;
+    let document = glb_json(&again)?;
+    let exported = document["materials"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|material| {
+            &material["pbrMetallicRoughness"]["baseColorTexture"]["extensions"]["KHR_texture_transform"]
+        })
+        .find(|value| value.is_object())
+        .ok_or("no exported base color transform")?;
+    for (key, expected) in [("offset", [0.2, 0.1]), ("scale", [1.5, 2.0])] {
+        let values = exported[key].as_array().ok_or("no exported vector")?;
+        for (value, expected) in values.iter().zip(expected) {
+            let value = value.as_f64().ok_or("exported component is not a number")?;
+            assert!(
+                (value - expected).abs() < 1e-12,
+                "{key}: {value} != {expected}"
+            );
+        }
+    }
+    let rotation = exported["rotation"].as_f64().ok_or("no rotation")?;
+    assert!((rotation - 0.25).abs() < 1e-12);
+    Ok(())
+}

@@ -172,15 +172,43 @@ impl TextureExport {
         let offset = binary.len();
         binary.extend_from_slice(&encoded);
         let view = push_view(views, offset, encoded.len(), None);
+        let mut potter = json!({ "packed": packed.sources });
+        // A grey copy of one source channel (VRM 0.x masks) also names that source and channel, so the
+        // VRM importer can recover the original image; `remapped_channel` is the glTF component index.
+        if let Some((image, component)) = Self::single_channel_copy(&texture.channels) {
+            potter["id"] = json!(image.as_str());
+            potter["remapped_channel"] = json!(component);
+            // The copy's name is derived from its source; the importer restores that source name.
+            potter["source_name"] = json!(texture_image_for_export(doc, image)?.name);
+        }
         let index = self.images.len();
         self.images.push(json!({
             "name": packed.name,
             "bufferView": view,
             "mimeType": "image/png",
-            "extras": { "potter": { "packed": packed.sources } }
+            "extras": { "potter": potter }
         }));
         self.packed_image_indices.insert(key, index);
         Ok(index)
+    }
+
+    /// The source image and glTF component (0 = R, 1 = G, 2 = B) when a texture's RGB all read one
+    /// channel of one image and its alpha is constant: the grey copy the VRM masks use.
+    fn single_channel_copy(channels: &[Option<ChannelSource>; 4]) -> Option<(&Id, usize)> {
+        let [Some(red), Some(green), Some(blue), None] = channels else {
+            return None;
+        };
+        let component = |source: &ChannelSource| match source.channel {
+            TextureChannel::Red => 0,
+            TextureChannel::Green => 1,
+            TextureChannel::Blue => 2,
+            TextureChannel::Alpha => 3,
+        };
+        let same = red.image == green.image
+            && red.image == blue.image
+            && red.channel == green.channel
+            && red.channel == blue.channel;
+        (same && component(red) < 3).then_some((&red.image, component(red)))
     }
 
     pub(crate) fn export_image_index(
@@ -4497,7 +4525,7 @@ fn import_images(
             .or_else(|| image_value["name"].as_str())
             .unwrap_or("image");
         let id = unique_import_id(suggested, "image", index, &mut used_ids)?;
-        // A VRM 0.x channel copy is named `<source>_channel_<n>`; the Potter image keeps the source name.
+        // A single-channel copy (VRM masks) is named `<source>_packed`; the Potter image keeps the source name.
         let name = image_value["extras"]["potter"]["source_name"]
             .as_str()
             .or_else(|| image_value["name"].as_str())
@@ -4523,7 +4551,7 @@ fn import_images(
 }
 /// The `KHR_texture_transform` of a texture info, or `None` when it is absent or the identity. Its
 /// `texCoord` override must be 0, the only UV set Potter imports.
-fn texture_transform(info: &Value) -> Result<Option<material_graph::TextureTransform>> {
+fn texture_transform(info: &Value) -> Result<Option<super::material_surface::TextureTransform>> {
     let Some(extension) = info["extensions"]["KHR_texture_transform"].as_object() else {
         return Ok(None);
     };
@@ -4563,12 +4591,37 @@ fn texture_transform(info: &Value) -> Result<Option<material_graph::TextureTrans
             .as_f64()
             .ok_or_else(|| import_error("glTF KHR_texture_transform rotation is invalid"))?,
     };
-    let transform = material_graph::TextureTransform {
+    let transform = super::material_surface::TextureTransform {
         offset: [offset[0], offset[1]],
         rotation,
         scale: [scale[0], scale[1]],
     };
-    Ok((!transform.is_identity()).then_some(transform))
+    let identity = crate::float::equal_f64_array(&transform.offset, &[0.0; 2])
+        && crate::float::equal_f64(transform.rotation, 0.0)
+        && crate::float::equal_f64_array(&transform.scale, &[1.0; 2]);
+    Ok((!identity).then_some(transform))
+}
+
+/// Every texture slot of a glTF material that a graph can hold, each with its transform.
+fn material_textures(
+    material: &Value,
+    root: &Value,
+    image_ids: &[Id],
+) -> Result<material_graph::GraphTextures> {
+    let slot = |info: &Value| -> Result<Option<material_graph::SlotTexture>> {
+        let transform = texture_transform(info)?;
+        Ok(import_texture_ref(info, root, image_ids)?
+            .map(|texture| material_graph::SlotTexture { texture, transform }))
+    };
+    let pbr = &material["pbrMetallicRoughness"];
+    Ok(material_graph::GraphTextures {
+        base_color: slot(&pbr["baseColorTexture"])?,
+        metallic_roughness: slot(&pbr["metallicRoughnessTexture"])?,
+        normal: slot(&material["normalTexture"])?,
+        normal_scale: material["normalTexture"]["scale"].as_f64().unwrap_or(1.0),
+        emissive: slot(&material["emissiveTexture"])?,
+        occlusion: slot(&material["occlusionTexture"])?,
+    })
 }
 
 fn import_texture_ref(info: &Value, root: &Value, image_ids: &[Id]) -> Result<Option<TextureRef>> {
@@ -5446,7 +5499,7 @@ pub(crate) fn import_indexed(
     let material_values = root["materials"].as_array().map_or(&[][..], Vec::as_slice);
     let mut material_ids = Vec::with_capacity(material_values.len());
     let mut used_material_ids = BTreeSet::new();
-    let mut material_transforms = Vec::<(Id, material_graph::SlotTransforms)>::new();
+    let mut graph_materials = Vec::<(Id, material_graph::GraphTextures)>::new();
     for (index, material) in material_values.iter().enumerate() {
         let suggested = material["extras"]["potter"]["id"]
             .as_str()
@@ -5489,17 +5542,18 @@ pub(crate) fn import_indexed(
                 *component *= peak / emission_strength;
             }
         }
-        let base_color_texture = import_texture_ref(
-            &material["pbrMetallicRoughness"]["baseColorTexture"],
-            &root,
-            &image_ids,
-        )?;
-        let metallic_roughness_texture = import_texture_ref(
-            &material["pbrMetallicRoughness"]["metallicRoughnessTexture"],
-            &root,
-            &image_ids,
-        )?;
-        let normal_texture = import_texture_ref(&material["normalTexture"], &root, &image_ids)?;
+        let textures = material_textures(material, &root, &image_ids)?;
+        // A texture a Potter texture field cannot hold (transform, emissive, occlusion, normal scale)
+        // moves into the material graph, as Blender's importer builds one; the fields stay empty.
+        let graph_needed = textures.needs_graph();
+        let field = |slot: &Option<material_graph::SlotTexture>| {
+            (!graph_needed)
+                .then(|| slot.as_ref().map(|slot| slot.texture.clone()))
+                .flatten()
+        };
+        let base_color_texture = field(&textures.base_color);
+        let metallic_roughness_texture = field(&textures.metallic_roughness);
+        let normal_texture = field(&textures.normal);
         let value = Material {
             name: material["name"]
                 .as_str()
@@ -5527,22 +5581,15 @@ pub(crate) fn import_indexed(
             roughness_texture: metallic_roughness_texture,
             ..Material::default()
         };
-        let transforms = material_graph::SlotTransforms {
-            base_color: texture_transform(&material["pbrMetallicRoughness"]["baseColorTexture"])?,
-            metallic_roughness: texture_transform(
-                &material["pbrMetallicRoughness"]["metallicRoughnessTexture"],
-            )?,
-            normal: texture_transform(&material["normalTexture"])?,
-        };
-        if !transforms.is_empty() {
-            material_transforms.push((id.clone(), transforms));
+        if graph_needed {
+            graph_materials.push((id.clone(), textures));
         }
         doc.materials.insert(id.clone(), value);
         material_ids.push(id);
     }
-    // A transformed texture needs its Mapping node, so those materials move into a shader graph.
-    for (material_id, transforms) in &material_transforms {
-        material_graph::move_textures_to_graph(&mut doc, material_id, transforms)?;
+    // Materials whose textures need a graph move them now; their texture fields are cleared.
+    for (material_id, textures) in &graph_materials {
+        material_graph::move_textures_to_graph(&mut doc, material_id, textures)?;
     }
 
     let mut data_ids = Vec::<Id>::new();
@@ -7194,18 +7241,19 @@ fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
     }
     if root["materials"].as_array().is_some_and(|materials| {
         materials.iter().any(|material| {
-            material["occlusionTexture"].is_object() || material["emissiveTexture"].is_object()
+            material["occlusionTexture"]["strength"]
+                .as_f64()
+                .is_some_and(|strength| !crate::float::equal_f64(strength, 1.0))
         })
     }) {
+        // Blender's importer ignores occlusion strength too; Potter's graph has no input for it.
         losses.push(crate::exchange::Loss {
-            feature_id: "material.texture".to_owned(),
+            feature_id: "material.occlusion_strength".to_owned(),
             data_id: None,
-            reason: "glTF occlusion and emissive textures are not represented by Potter materials"
-                .to_owned(),
-            suggestion: Some("use --allow-lossy or remove unsupported texture roles".to_owned()),
+            reason: "glTF occlusion strength is not represented by Potter; occlusion is applied at full strength".to_owned(),
+            suggestion: Some("use --allow-lossy to import occlusion at full strength".to_owned()),
         });
     }
-    let unhandled_transform = material_graph::unhandled_texture_transforms(root);
     if root["extensionsUsed"].as_array().is_some_and(|extensions| {
         extensions.iter().any(|extension| {
             extension.as_str().is_some_and(|name| {
@@ -7215,7 +7263,8 @@ fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
                         | "KHR_materials_emissive_strength"
                         | "KHR_materials_transmission"
                         | "KHR_materials_ior"
-                ) && (name != "KHR_texture_transform" || unhandled_transform)
+                        | "KHR_texture_transform"
+                )
             })
         })
     }) {
@@ -8545,7 +8594,7 @@ mod tests {
         let losses = gltf_import_losses(&json!({
             "nodes": [{"mesh": 0, "weights": [1.0]}],
             "meshes": [{"weights": [0.0]}],
-            "materials": [{"occlusionTexture": {"index": 0}}],
+            "materials": [{"occlusionTexture": {"index": 0, "strength": 0.5}}],
             "extensionsUsed": ["KHR_draco_mesh_compression"]
         }));
         let features = losses
@@ -8556,7 +8605,7 @@ mod tests {
             features,
             [
                 "gltf.extension",
-                "material.texture",
+                "material.occlusion_strength",
                 "mesh.shape_key_instance_weights"
             ]
             .into_iter()

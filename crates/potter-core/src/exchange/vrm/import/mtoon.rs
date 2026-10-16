@@ -9,7 +9,8 @@ use crate::{
     error::Result,
     exchange::{
         gltf::GltfIndex,
-        material_graph::{SlotTransforms, TextureTransform, move_textures_to_graph},
+        material_graph::{GraphTextures, move_textures_to_graph},
+        material_surface::TextureTransform,
     },
     float::equal_f64,
     image::ImageInterpolation,
@@ -936,17 +937,15 @@ pub(super) fn move_main_texture_transforms(
         let Some(material_id) = index.material_ids.get(material_index) else {
             continue;
         };
-        let movable = doc.materials.get(material_id).is_some_and(|material| {
-            material.base_color_texture.is_some() && material.node_tree.is_none()
-        });
-        if !movable {
-            continue;
-        }
-        let transforms = SlotTransforms {
-            base_color: Some(transform),
-            ..SlotTransforms::default()
+        let textures = match doc.materials.get(material_id) {
+            Some(material)
+                if material.node_tree.is_none() && material.base_color_texture.is_some() =>
+            {
+                GraphTextures::from_fields(material, Some(transform))
+            }
+            _ => continue,
         };
-        move_textures_to_graph(doc, material_id, &transforms)?;
+        move_textures_to_graph(doc, material_id, &textures)?;
         moved.insert(material_id.clone());
     }
     Ok(moved)
@@ -981,5 +980,8 @@ fn main_texture_transform(vectors: &Value) -> Option<TextureTransform> {
         rotation: 0.0,
         scale: [scale_x, scale_y],
     };
-    (!transform.is_identity()).then_some(transform)
+    let identity = crate::float::equal_f64_array(&transform.offset, &[0.0; 2])
+        && crate::float::equal_f64(transform.rotation, 0.0)
+        && crate::float::equal_f64_array(&transform.scale, &[1.0; 2]);
+    (!identity).then_some(transform)
 }

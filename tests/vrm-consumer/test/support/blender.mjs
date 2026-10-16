@@ -57,7 +57,9 @@ export async function setupBlender() {
   const output = `${install.stdout ?? ''}${install.stderr ?? ''}`;
   if (install.status !== 0 || !/STATUS Installed "vrm"/.test(output)) {
     await rm(userResources, { recursive: true, force: true });
-    return { reason: `VRM Add-on install failed (exit ${install.status}): ${output.slice(-1000)}` };
+    // Blender exits 0 when it cannot extract the zip and reports only `ERROR ...` lines; keep those.
+    const errors = output.split('\n').filter((line) => line.includes('ERROR')).join('\n');
+    return { reason: `VRM Add-on install failed (exit ${install.status}): ${errors || output.slice(-1000)}` };
   }
   return { blender, userResources };
 }

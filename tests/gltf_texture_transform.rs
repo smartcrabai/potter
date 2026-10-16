@@ -1,7 +1,8 @@
-//! A glTF base color texture with `KHR_texture_transform` imports as a material graph: Image Texture
-//! fed by Mapping (Blender's Location, Rotation and Scale for the transform) fed by Texture Coordinate.
+//! glTF texture slots that Potter's texture fields cannot hold import as material graphs, as Blender's
+//! glTF importer builds them: transformed textures through Mapping, emissive and occlusion textures
+//! into the Principled BSDF and the `glTF Material Output` group, and normal map scale as Strength.
 
-use std::{error::Error, fs, path::Path, process::Command};
+use std::{error::Error, fs, path::Path, path::PathBuf, process::Command};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -26,12 +27,8 @@ fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
 }
 
-fn cli_json(output: &std::process::Output) -> TestResult<Value> {
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-
-/// Writes a triangle whose base color texture carries `transform` and returns the glTF path.
-fn write_gltf(directory: &Path, transform: &Value) -> TestResult<std::path::PathBuf> {
+/// A glTF triangle whose only material is `material`, written into `directory`.
+fn write_gltf(directory: &Path, material: &Value) -> TestResult<PathBuf> {
     fs::write(directory.join("image.png"), PNG)?;
     fs::write(directory.join("buffer.bin"), BUFFER)?;
     let document = json!({
@@ -43,16 +40,7 @@ fn write_gltf(directory: &Path, transform: &Value) -> TestResult<std::path::Path
             "attributes": { "POSITION": 0, "TEXCOORD_0": 1 },
             "material": 0
         }] }],
-        "materials": [{
-            "name": "Textured",
-            "pbrMetallicRoughness": {
-                "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
-                "baseColorTexture": {
-                    "index": 0,
-                    "extensions": { "KHR_texture_transform": transform.clone() }
-                }
-            }
-        }],
+        "materials": [material],
         "textures": [{ "source": 0 }],
         "images": [{ "uri": "image.png", "mimeType": "image/png" }],
         "accessors": [
@@ -72,9 +60,31 @@ fn write_gltf(directory: &Path, transform: &Value) -> TestResult<std::path::Path
     Ok(path)
 }
 
-fn import_project(transform: &Value) -> TestResult<Value> {
+/// A material whose base color texture carries `transform`.
+fn transformed_material(transform: &Value) -> Value {
+    json!({
+        "name": "Textured",
+        "pbrMetallicRoughness": {
+            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+            "baseColorTexture": {
+                "index": 0,
+                "extensions": { "KHR_texture_transform": transform.clone() }
+            }
+        }
+    })
+}
+
+/// An imported triangle: its directory (kept alive), its project and the scene JSON.
+struct Imported {
+    directory: TempDir,
+    project: PathBuf,
+    scene: Value,
+}
+
+/// Imports `material` as a glTF without `--allow-lossy`: any loss fails the import.
+fn import(material: &Value) -> TestResult<Imported> {
     let directory = TempDir::new()?;
-    let gltf = write_gltf(directory.path(), transform)?;
+    let gltf = write_gltf(directory.path(), material)?;
     let project = directory.path().join("scene");
     let init = pot().arg("init").arg(&project).arg("--json").output()?;
     assert!(init.status.success(), "pot init failed");
@@ -85,16 +95,18 @@ fn import_project(transform: &Value) -> TestResult<Value> {
         .arg(&gltf)
         .args(["--format", "gltf", "--base-revision", "0", "--json"])
         .output()?;
-    let envelope = cli_json(&output)?;
+    let envelope: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(envelope["ok"], true, "import failed: {envelope}");
     let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    Ok(scene)
+    Ok(Imported {
+        directory,
+        project,
+        scene,
+    })
 }
 
-#[test]
-fn transformed_base_color_imports_as_a_mapped_image_texture_graph() -> TestResult {
-    let scene =
-        import_project(&json!({ "offset": [0.25, 0.5], "rotation": 0.5, "scale": [2.0, 3.0] }))?;
+/// The shader graph of the only material of `scene`.
+fn only_graph(scene: &Value) -> TestResult<&Value> {
     let material = scene["materials"]
         .as_object()
         .and_then(|materials| materials.values().next())
@@ -102,20 +114,45 @@ fn transformed_base_color_imports_as_a_mapped_image_texture_graph() -> TestResul
     let graph_id = material["node_tree"]
         .as_str()
         .ok_or("material has no shader graph")?;
+    Ok(&scene["node_groups"][graph_id])
+}
+
+/// The node of `graph` with type `node_type` and its ID.
+fn node_of<'a>(graph: &'a Value, node_type: &str) -> TestResult<(&'a str, &'a Value)> {
+    graph["nodes"]
+        .as_object()
+        .and_then(|nodes| nodes.iter().find(|(_, node)| node["type"] == node_type))
+        .map(|(id, node)| (id.as_str(), node))
+        .ok_or_else(|| format!("no {node_type} node").into())
+}
+
+fn has_link(graph: &Value, from: &str, from_socket: &str, to: &str, to_socket: &str) -> bool {
+    graph["links"].as_array().is_some_and(|links| {
+        links.iter().any(|link| {
+            link["from_node"] == from
+                && link["from_socket"] == from_socket
+                && link["to_node"] == to
+                && link["to_socket"] == to_socket
+        })
+    })
+}
+
+#[test]
+fn transformed_base_color_imports_as_a_mapped_image_texture_graph() -> TestResult {
+    let imported = import(&transformed_material(
+        &json!({ "offset": [0.25, 0.5], "rotation": 0.5, "scale": [2.0, 3.0] }),
+    ))?;
+    let scene = &imported.scene;
+    let material = scene["materials"]
+        .as_object()
+        .and_then(|materials| materials.values().next())
+        .ok_or("no material")?;
     assert!(
         material["base_color_texture"].is_null(),
         "the graph holds the texture"
     );
-    let graph = &scene["node_groups"][graph_id];
-    let nodes = &graph["nodes"];
-    let mapping = nodes
-        .as_object()
-        .and_then(|nodes| {
-            nodes
-                .values()
-                .find(|node| node["type"] == "ShaderNodeMapping")
-        })
-        .ok_or("no Mapping node")?;
+    let graph = only_graph(scene)?;
+    let (mapping_id, mapping) = node_of(graph, "ShaderNodeMapping")?;
     // Blender's glTF importer: Location = (ox + sy sin r, 1 - oy - sy cos r), Rotation z = r, Scale = (sx, sy, 1).
     let (sin, cos) = 0.5_f64.sin_cos();
     let location = mapping["inputs"]["Location"]
@@ -126,53 +163,153 @@ fn transformed_base_color_imports_as_a_mapped_image_texture_graph() -> TestResul
     assert_eq!(mapping["inputs"]["Rotation"][2], json!(0.5));
     assert_eq!(mapping["inputs"]["Scale"], json!([2.0, 3.0, 1.0]));
     assert_eq!(mapping["properties"]["vector_type"], "POINT");
-    let links = graph["links"].as_array().ok_or("no links")?;
-    let has_link = |from: &str, from_socket: &str, to: &str, to_socket: &str| {
-        links.iter().any(|link| {
-            link["from_node"] == from
-                && link["from_socket"] == from_socket
-                && link["to_node"] == to
-                && link["to_socket"] == to_socket
-        })
-    };
-    let image = nodes
-        .as_object()
-        .and_then(|nodes| {
-            nodes
-                .iter()
-                .find(|(_, node)| node["type"] == "ShaderNodeTexImage")
-        })
-        .map(|(id, _)| id.clone())
-        .ok_or("no Image Texture node")?;
-    let coord = nodes
-        .as_object()
-        .and_then(|nodes| {
-            nodes
-                .iter()
-                .find(|(_, node)| node["type"] == "ShaderNodeTexCoord")
-        })
-        .map(|(id, _)| id.clone())
-        .ok_or("no Texture Coordinate node")?;
-    let mapping_id = nodes
-        .as_object()
-        .and_then(|nodes| {
-            nodes
-                .iter()
-                .find(|(_, node)| node["type"] == "ShaderNodeMapping")
-        })
-        .map(|(id, _)| id.clone())
-        .ok_or("no Mapping id")?;
-    assert!(
-        has_link(&coord, "UV", &mapping_id, "Vector"),
-        "coordinates feed Mapping"
+    let (image_id, _) = node_of(graph, "ShaderNodeTexImage")?;
+    let (coord_id, _) = node_of(graph, "ShaderNodeTexCoord")?;
+    assert!(has_link(graph, coord_id, "UV", mapping_id, "Vector"));
+    assert!(has_link(graph, mapping_id, "Vector", image_id, "Vector"));
+    assert!(has_link(
+        graph,
+        image_id,
+        "Color",
+        "principled",
+        "Base Color"
+    ));
+    Ok(())
+}
+
+#[test]
+fn transformed_base_color_round_trips_through_glb_export() -> TestResult {
+    let transform = json!({ "offset": [0.25, 0.5], "rotation": 0.5, "scale": [2.0, 3.0] });
+    let imported = import(&transformed_material(&transform))?;
+    let out = imported.directory.path().join("out.glb");
+    let export = pot()
+        .arg("export")
+        .arg(&imported.project)
+        .args(["--format", "glb", "--out"])
+        .arg(&out)
+        .arg("--json")
+        .output()?;
+    let envelope: Value = serde_json::from_slice(&export.stdout)?;
+    assert_eq!(envelope["ok"], true, "glb export failed: {envelope}");
+    let bytes = fs::read(&out)?;
+    let json_length = usize::try_from(u32::from_le_bytes(bytes[12..16].try_into()?))?;
+    let document: Value = serde_json::from_slice(&bytes[20..20 + json_length])?;
+    let exported = &document["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["extensions"]
+        ["KHR_texture_transform"];
+    assert_eq!(exported["offset"], transform["offset"], "offset survives");
+    assert_eq!(exported["scale"], transform["scale"], "scale survives");
+    let rotation = exported["rotation"].as_f64().ok_or("no rotation")?;
+    assert!((rotation - 0.5).abs() < 1e-12, "rotation survives");
+    Ok(())
+}
+
+#[test]
+fn emissive_and_occlusion_textures_import_as_graph_nodes_without_loss() -> TestResult {
+    let imported = import(&json!({
+        "name": "Lit",
+        "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+        "emissiveFactor": [1.0, 1.0, 1.0],
+        "emissiveTexture": { "index": 0 },
+        "occlusionTexture": {
+            "index": 0,
+            "extensions": { "KHR_texture_transform": { "offset": [0.5, 0.0] } }
+        }
+    }))?;
+    let graph = only_graph(&imported.scene)?;
+    let (split_id, _) = node_of(graph, "ShaderNodeSeparateColor")?;
+    let (group_id, group) = node_of(graph, "ShaderNodeGroup")?;
+    assert_eq!(
+        group["properties"]["node_tree"]["name"],
+        "glTF Material Output"
     );
     assert!(
-        has_link(&mapping_id, "Vector", &image, "Vector"),
-        "Mapping feeds the texture"
+        has_link(graph, split_id, "Red", group_id, "Occlusion"),
+        "occlusion's red channel feeds the group's Occlusion input"
+    );
+    let output_group = &imported.scene["node_groups"]["gltf_material_output"];
+    assert_eq!(output_group["name"], "glTF Material Output");
+    assert_eq!(output_group["interface"]["inputs"][0]["id"], "Occlusion");
+    let (image_id, _) = node_of(graph, "ShaderNodeTexImage")?;
+    assert!(
+        has_link(graph, image_id, "Color", "principled", "Emission Color"),
+        "a white emissive factor leaves the texture color unmultiplied"
+    );
+    Ok(())
+}
+
+#[test]
+fn normal_texture_scale_becomes_the_normal_map_strength() -> TestResult {
+    let imported = import(&json!({
+        "name": "Bumpy",
+        "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+        "normalTexture": { "index": 0, "scale": 0.5 }
+    }))?;
+    let graph = only_graph(&imported.scene)?;
+    let (normal_id, normal_map) = node_of(graph, "ShaderNodeNormalMap")?;
+    assert_eq!(normal_map["inputs"]["Strength"], json!(0.5));
+    assert!(has_link(graph, normal_id, "Normal", "principled", "Normal"));
+    Ok(())
+}
+
+#[test]
+fn occlusion_strength_other_than_one_is_reported_as_a_loss() -> TestResult {
+    let directory = TempDir::new()?;
+    let gltf = write_gltf(
+        directory.path(),
+        &json!({
+            "name": "Occluded",
+            "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+            "occlusionTexture": { "index": 0, "strength": 0.5 }
+        }),
+    )?;
+    let project = directory.path().join("scene");
+    pot().arg("init").arg(&project).arg("--json").output()?;
+    let output = pot()
+        .arg("import")
+        .arg(&project)
+        .arg("--file")
+        .arg(&gltf)
+        .args(["--format", "gltf", "--base-revision", "0", "--json"])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a strength loss refuses the import"
+    );
+    assert!(stdout.contains("material.occlusion_strength"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn emissive_and_occlusion_graphs_export_back_to_their_gltf_slots() -> TestResult {
+    let imported = import(&json!({
+        "name": "Lit",
+        "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+        "emissiveFactor": [1.0, 1.0, 1.0],
+        "emissiveTexture": { "index": 0 },
+        "occlusionTexture": { "index": 0 }
+    }))?;
+    let out = imported.directory.path().join("out.glb");
+    let export = pot()
+        .arg("export")
+        .arg(&imported.project)
+        .args(["--format", "glb", "--out"])
+        .arg(&out)
+        .arg("--json")
+        .output()?;
+    let envelope: Value = serde_json::from_slice(&export.stdout)?;
+    assert_eq!(envelope["ok"], true, "glb export failed: {envelope}");
+    let bytes = fs::read(&out)?;
+    let json_length = usize::try_from(u32::from_le_bytes(bytes[12..16].try_into()?))?;
+    let document: Value = serde_json::from_slice(&bytes[20..20 + json_length])?;
+    let material = &document["materials"][0];
+    assert!(
+        material["emissiveTexture"].is_object(),
+        "emissive texture is exported"
     );
     assert!(
-        has_link(&image, "Color", "principled", "Base Color"),
-        "the texture feeds Base Color"
+        material["occlusionTexture"].is_object(),
+        "occlusion texture is exported"
     );
     Ok(())
 }
