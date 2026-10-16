@@ -3136,7 +3136,7 @@ pub(crate) fn tex_coord_plan(
             else {
                 continue;
             };
-            source_mesh_for_export(node, data_block, evaluated)?
+            source_mesh_for_export(node, data_block, evaluated, snapshot.purpose)?
         } else if instance_collection_target(node)?.is_some() {
             evaluated
         } else {
