@@ -1633,6 +1633,14 @@ impl Default for Node {
     }
 }
 
+impl Node {
+    /// Material of slot `index` in this node's own material list; `None` past its end.
+    #[must_use]
+    pub fn material_slot(&self, index: usize) -> Option<&Id> {
+        self.materials.get(index)
+    }
+}
+
 fn default_true() -> bool {
     true
 }

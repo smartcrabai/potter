@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
@@ -11,7 +12,9 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Aabb, CylinderParams, IcosphereParams, Mesh, modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
+        Aabb, CylinderParams, IcosphereParams, Mesh,
+        concat::{Part, concatenate, rotate_corner_normals, uv_covered_faces},
+        modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
         normals::SHADING_ATTRIBUTES,
     },
     hash,
@@ -166,6 +169,15 @@ pub struct EvaluatedStroke {
     pub cyclic: bool,
 }
 
+/// Material and UV coverage of one slot of an evaluated collection instance's table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotBinding {
+    /// Material the slot binds, or `None` for an empty slot.
+    pub material: Option<Id>,
+    /// Whether every face using the slot has a UV entry in the layer exported as `TEXCOORD_0`.
+    pub uv: bool,
+}
+
 /// Stable evaluation of one scene document and its context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,6 +200,10 @@ pub struct Snapshot {
     /// Instance source paths recorded by geometry-node modifiers.
     #[serde(skip)]
     pub instance_paths: BTreeMap<Id, Vec<Vec<Id>>>,
+    /// Material slot table and UV coverage of each evaluated collection instance's mesh: every face
+    /// indexes its table, whose slots are each member's slots in member order.
+    #[serde(skip)]
+    pub instance_bindings: BTreeMap<Id, Vec<SlotBinding>>,
     /// World-space Grease Pencil strokes held at the selected frame.
     #[serde(skip)]
     pub strokes: BTreeMap<Id, Vec<EvaluatedStroke>>,
@@ -212,6 +228,46 @@ pub struct Snapshot {
     /// VDB-aware volume payloads resolved for this evaluation; omitted from snapshots on disk.
     #[serde(skip)]
     pub volume_data: BTreeMap<Id, crate::geom::volume::VolumeData>,
+}
+
+impl Snapshot {
+    /// Material bound by a face slot on a node's evaluated mesh.
+    #[must_use]
+    pub fn slot_material<'a>(
+        &'a self,
+        node_id: &Id,
+        node: &'a Node,
+        slot: usize,
+    ) -> Option<&'a Id> {
+        match self.instance_bindings.get(node_id) {
+            Some(table) => table
+                .get(slot)
+                .and_then(|binding| binding.material.as_ref()),
+            None => node.material_slot(slot),
+        }
+    }
+
+    /// Number of material slots a face may index; an empty material list still allows slot zero.
+    #[must_use]
+    pub fn slot_count(&self, node_id: &Id, node: &Node) -> usize {
+        self.instance_bindings
+            .get(node_id)
+            .map_or(node.materials.len(), Vec::len)
+    }
+
+    /// Per slot, whether the slot's faces have UVs for export. Two rules, one per node kind:
+    /// - Instance: an instance's table carries, per used slot, whether every face indexing it is
+    ///   covered by its member's first UV layer (`concat::uv_covered_faces`); a corner without a value
+    ///   joins as `[0, 0]`, so coverage is per face rather than whole-mesh.
+    /// - Plain node: every slot is the exporter's rule (`exports_texcoord0`): set 0 exists, since the
+    ///   exporter writes `TEXCOORD_0` for the whole mesh and fills missing face values with `[0, 0]`.
+    #[must_use]
+    pub fn slot_uv_table(&self, node_id: &Id, node: &Node, mesh: &Mesh) -> Vec<bool> {
+        match self.instance_bindings.get(node_id) {
+            Some(table) => table.iter().map(|binding| binding.uv).collect(),
+            None => vec![crate::exchange::gltf::exports_texcoord0(mesh); node.materials.len()],
+        }
+    }
 }
 
 impl Snapshot {
@@ -288,11 +344,12 @@ impl Snapshot {
                     for node_id in node_errors.keys() {
                         snapshot.meshes.remove(node_id);
                         snapshot.instance_paths.remove(node_id);
+                        snapshot.instance_bindings.remove(node_id);
                         snapshot.strokes.remove(node_id);
                     }
                     return Ok((snapshot, node_errors));
                 }
-                Err(error) if error.code == ErrorCode::UnsupportedFeature => {
+                Err(error) if is_isolated_failure(&error) => {
                     let source_doc = evaluation_doc.as_ref().unwrap_or(doc);
                     let Some(node_id) = unsupported_feature_owner(source_doc, &error) else {
                         return Err(error);
@@ -308,11 +365,18 @@ impl Snapshot {
                                 "unsupported feature owner disappeared during evaluation",
                             )
                         })?;
-                        if node.modifiers.iter().all(|modifier| !modifier.enabled) {
+                        // An instance has no modifier to disable: its failed join makes it an empty
+                        // node, leaving its members untouched, and its modifiers are disabled too.
+                        let instance = instance_collection_target(node)?.is_some();
+                        if !instance && node.modifiers.iter().all(|modifier| !modifier.enabled) {
                             return Err(error);
                         }
                         for modifier in &mut node.modifiers {
                             modifier.enabled = false;
+                        }
+                        if instance {
+                            "empty".clone_into(&mut node.kind);
+                            node.properties.remove(INSTANCE_COLLECTION_PROPERTY);
                         }
                     }
                     let mut details = error.details.clone();
@@ -591,6 +655,7 @@ impl Snapshot {
         let mut nodes = BTreeMap::new();
         let mut meshes = BTreeMap::new();
         let mut instance_paths = BTreeMap::new();
+        let mut instance_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
         let mut modifier_warnings = Vec::new();
         for id in &mesh_evaluation_order {
@@ -1357,10 +1422,11 @@ impl Snapshot {
                     "evaluated collection instance world matrix is missing",
                 )
             })?;
-            let (mesh, paths) =
+            let (mesh, paths, bindings) =
                 evaluate_collection_instance(doc, id, &matrices, &meshes, &mut BTreeSet::new())?;
             let bounds = mesh_bounds(&mesh, matrix)?;
             if !mesh.vertices.is_empty() {
+                instance_bindings.insert(id.clone(), bindings);
                 meshes.insert(id.clone(), mesh);
             }
             if !paths.is_empty() {
@@ -1384,6 +1450,7 @@ impl Snapshot {
             evaluation_hash,
             nodes,
             instance_paths,
+            instance_bindings,
             meshes,
             strokes,
             volume_data,
@@ -3558,13 +3625,87 @@ fn instance_collection_target(node: &Node) -> Result<Option<Id>> {
     })
 }
 
+/// Marks a collection instance's join failure with the instance as its owner, so evaluation isolates
+/// that instance alone.
+const INSTANCE_JOIN_FAILURE: &str = "collection_instance_join_failed";
+
+/// A collection member placed in its instance: its mesh (borrowed from the evaluated meshes when it
+/// is a plain object), its world matrix, and the material slot table its faces index.
+struct CollectionMember<'a> {
+    mesh: Cow<'a, Mesh>,
+    matrix: DMat4,
+    slots: Vec<Option<Id>>,
+}
+
+/// A plain member's slot table: its material list, or one empty slot when it has none.
+fn member_slots(node: &Node) -> Vec<Option<Id>> {
+    if node.materials.is_empty() {
+        vec![None]
+    } else {
+        node.materials.iter().cloned().map(Some).collect()
+    }
+}
+
+/// A collection instance's joined mesh, its slot bindings (each member's slots in member order, with
+/// UV coverage), and each member's source path.
+type CollectionEvaluation = (Mesh, Vec<Vec<Id>>, Vec<SlotBinding>);
+
+/// Per slot of a `slot_count`-entry table: whether every face indexing the slot is covered. Unused
+/// slots are `false`; a face past the table is ignored, since export rejects it.
+fn fold_slot_coverage(mesh: &Mesh, covered: &[bool], slot_count: usize) -> Vec<bool> {
+    let mut slots = vec![None::<bool>; slot_count];
+    for (face, &face_covered) in mesh.faces.iter().zip(covered) {
+        let Some(entry) = usize::try_from(face.material_index)
+            .ok()
+            .and_then(|slot| slots.get_mut(slot))
+        else {
+            continue;
+        };
+        *entry = Some(entry.unwrap_or(true) && face_covered);
+    }
+    slots
+        .into_iter()
+        .map(|entry| entry.unwrap_or(false))
+        .collect()
+}
+
+/// Binds each slot of a joined mesh's table to its material and to whether its faces are covered.
+fn slot_bindings(mesh: &Mesh, covered: &[bool], slots: Vec<Option<Id>>) -> Vec<SlotBinding> {
+    let uv = fold_slot_coverage(mesh, covered, slots.len());
+    slots
+        .into_iter()
+        .zip(uv)
+        .map(|(material, uv)| SlotBinding { material, uv })
+        .collect()
+}
+
+/// Tags a join failure with the collection instance that owns it.
+fn instance_join_error(mut error: PotError, instance_id: &Id) -> PotError {
+    let mut details = match std::mem::take(&mut error.details) {
+        Value::Object(details) => details,
+        _ => Map::new(),
+    };
+    details.insert("node_id".to_owned(), json!(instance_id));
+    details.insert(INSTANCE_JOIN_FAILURE.to_owned(), json!(true));
+    error.details = Value::Object(details);
+    error
+}
+
+/// Whether evaluation isolates `error`'s owner: an unsupported feature, or a collection instance
+/// join failure tagged by [`instance_join_error`].
+fn is_isolated_failure(error: &PotError) -> bool {
+    error.code == ErrorCode::UnsupportedFeature
+        || error.details.get(INSTANCE_JOIN_FAILURE).is_some()
+}
+
+/// Joins a collection instance's members and nested instances into one mesh.
 fn evaluate_collection_instance(
     doc: &SceneDoc,
     instance_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &BTreeMap<Id, Mesh>,
     active_instances: &mut BTreeSet<Id>,
-) -> Result<(Mesh, Vec<Vec<Id>>)> {
+) -> Result<CollectionEvaluation> {
     let instance_node = doc.nodes.get(instance_id).ok_or_else(|| {
         PotError::new(
             ErrorCode::SceneInvalid,
@@ -3584,7 +3725,7 @@ fn evaluate_collection_instance(
             json!({ "node_id": instance_id, "collection": target }),
         ));
     }
-    let mut mesh = Mesh::new();
+    let mut members = Vec::new();
     let mut paths = Vec::new();
     append_collection_geometry(
         doc,
@@ -3595,27 +3736,56 @@ fn evaluate_collection_instance(
         active_instances,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
-        &mut mesh,
+        &mut members,
         &mut paths,
     )?;
     active_instances.remove(instance_id);
-    Ok((mesh, paths))
+    let mut slots = Vec::new();
+    let mut parts = Vec::with_capacity(members.len());
+    for member in members {
+        let material_offset = u32::try_from(slots.len()).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "collection instance has too many material slots",
+            )
+        })?;
+        let slot_count = member.slots.len();
+        parts.push(Part {
+            mesh: member.mesh,
+            matrix: member.matrix,
+            material_offset,
+            slot_count,
+        });
+        slots.extend(member.slots);
+    }
+    // Per joined face: whether its member has a value on every corner of its first UV layer. Read
+    // before `concatenate` consumes the members; a joined corner without a value is `[0, 0]`.
+    let covered = uv_covered_faces(&parts);
+    let mesh = concatenate(parts).map_err(|error| instance_join_error(error, instance_id))?;
+    if covered.len() != mesh.faces.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "collection instance UV coverage does not match its faces",
+        ));
+    }
+    let bindings = slot_bindings(&mesh, &covered, slots);
+    Ok((mesh, paths, bindings))
 }
 
 #[expect(
     clippy::too_many_arguments,
     reason = "keeps recursive instance traversal state explicit"
 )]
-fn append_collection_geometry(
+fn append_collection_geometry<'a>(
     doc: &SceneDoc,
     instance_id: &Id,
     collection_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
-    meshes: &BTreeMap<Id, Mesh>,
+    meshes: &'a BTreeMap<Id, Mesh>,
     active_instances: &mut BTreeSet<Id>,
     visited_collections: &mut BTreeSet<Id>,
     collection_stack: &mut BTreeSet<Id>,
-    output: &mut Mesh,
+    members: &mut Vec<CollectionMember<'a>>,
     paths: &mut Vec<Vec<Id>>,
 ) -> Result<()> {
     if collection_stack.contains(collection_id) {
@@ -3647,12 +3817,25 @@ fn append_collection_geometry(
         if !source_node.visible || !source_node.render_visible {
             continue;
         }
-        let (nested_mesh, nested_paths) = if instance_collection_target(source_node)?.is_some() {
-            evaluate_collection_instance(doc, object_id, matrices, meshes, active_instances)?
-        } else if let Some(source_mesh) = meshes.get(object_id) {
-            (source_mesh.clone(), vec![vec![object_id.clone()]])
+        let member = if instance_collection_target(source_node)?.is_some() {
+            let (mesh, paths, bindings) =
+                evaluate_collection_instance(doc, object_id, matrices, meshes, active_instances)?;
+            let slots: Vec<Option<Id>> = bindings
+                .into_iter()
+                .map(|binding| binding.material)
+                .collect();
+            Some((Cow::Owned(mesh), paths, slots))
         } else {
-            (Mesh::new(), Vec::new())
+            meshes.get(object_id).map(|source_mesh| {
+                (
+                    Cow::Borrowed(source_mesh),
+                    vec![vec![object_id.clone()]],
+                    member_slots(source_node),
+                )
+            })
+        };
+        let Some((nested_mesh, nested_paths, slots)) = member else {
+            continue;
         };
         if !nested_mesh.vertices.is_empty() {
             let source_matrix = matrices.get(object_id).copied().ok_or_else(|| {
@@ -3661,7 +3844,11 @@ fn append_collection_geometry(
                     "collection member world matrix is missing",
                 )
             })?;
-            append_transformed_mesh(output, &nested_mesh, source_matrix)?;
+            members.push(CollectionMember {
+                mesh: nested_mesh,
+                matrix: source_matrix,
+                slots,
+            });
             for path in nested_paths {
                 let mut full_path = Vec::with_capacity(path.len() + 1);
                 full_path.push(instance_id.clone());
@@ -3680,7 +3867,7 @@ fn append_collection_geometry(
             active_instances,
             visited_collections,
             collection_stack,
-            output,
+            members,
             paths,
         )?;
     }
@@ -3703,7 +3890,7 @@ fn inject_dynamic_paint_colors(mesh: &mut Mesh, colors: &[[f64; 4]]) {
     crate::geom::color_layers::write(mesh, &store);
 }
 
-/// Instances copy each source's attributes, remapping the face- and edge-keyed shading ones.
+/// Particle copies: each template's attributes, with its face- and edge-keyed shading remapped.
 fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> Result<()> {
     if output.vertices.is_empty() {
         output.attributes = source
