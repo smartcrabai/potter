@@ -90,13 +90,21 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
     let needs_edges = source.attributes.contains_key("crease_edge")
         || source.attributes.contains_key("blender_edge_flags")
         || source.attributes.contains_key("sharp")
-        || entries.iter().any(|entry| text(entry, "domain") == "EDGE");
+        || entries.iter().any(|entry| text(entry, "domain") == "EDGE")
+        || source
+            .attributes
+            .values()
+            .any(|value| named_domain(value).as_deref() == Some("edge"));
     let needs_corners = source.attributes.contains_key("blender_uv_layers")
         || source.attributes.contains_key("uv_map")
         || source.attributes.contains_key("custom_normal")
         || entries
             .iter()
-            .any(|entry| text(entry, "domain") == "CORNER");
+            .any(|entry| text(entry, "domain") == "CORNER")
+        || source
+            .attributes
+            .values()
+            .any(|value| named_domain(value).as_deref() == Some("corner"));
     let mut edge_origin = Vec::new();
     if needs_edges || needs_corners {
         let output_vertex_index: HashMap<u32, usize> = output
@@ -174,7 +182,7 @@ pub(crate) fn remap_attributes(source: &Mesh, output: &mut Mesh, origin: &Origin
             "blender_polygon_smooth" => value
                 .as_array()
                 .map(|flags| Value::Array(sources.polygon_smooth(flags))),
-            _ => None,
+            _ => sources.named_attribute(value),
         };
         attributes.insert(key.clone(), remapped.unwrap_or_else(|| value.clone()));
     }
@@ -196,6 +204,12 @@ fn corner_offsets(face_sizes: impl Iterator<Item = usize>) -> Vec<usize> {
 /// The string field `key` of a JSON entry, or `""`.
 fn text<'a>(entry: &'a Value, key: &str) -> &'a str {
     entry.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The `domain` of a named element attribute (one with a `values` object), lowercased.
+fn named_domain(value: &Value) -> Option<String> {
+    value.get("values")?.as_object()?;
+    Some(text(value, "domain").to_ascii_lowercase())
 }
 
 /// `entry` with its `values` replaced; the old values array is not cloned.
@@ -861,6 +875,111 @@ impl Sources<'_> {
             }
         }
         output
+    }
+    /// A named attribute keyed by element ID (`{"domain","type","values":{prefix+id: value}}`), moved to
+    /// the output's IDs. Point and edge values blend over their source elements, a face value copies its
+    /// source face's, and corner values (one array per face) blend over the source corners. Other domains
+    /// are copied unchanged by the caller.
+    fn named_attribute(&self, attribute: &Value) -> Option<Value> {
+        let domain = named_domain(attribute)?;
+        let kind = text(attribute, "type").to_ascii_uppercase();
+        let values = attribute.get("values").and_then(Value::as_object)?;
+        let mut output = Map::new();
+        match domain.as_str() {
+            "point" => {
+                let by_id: HashMap<u32, &Value> = keyed_values(values, "v");
+                for (vertex, sources) in self.output.vertices.iter().zip(&self.origin.vertices) {
+                    let blended = blend(
+                        sources.iter().filter_map(|(index, weight)| {
+                            let id = self.source.vertices.get(*index)?.id;
+                            by_id.get(&id).map(|value| (*value, *weight))
+                        }),
+                        &kind,
+                    );
+                    if let Some(value) = blended {
+                        output.insert(format!("v{}", vertex.id), value);
+                    }
+                }
+            }
+            "edge" => {
+                let by_id: HashMap<u32, &Value> = keyed_values(values, "e");
+                for (edge, sources) in self.output.edges.iter().zip(self.edge_origin) {
+                    let blended = blend(
+                        sources.iter().filter_map(|(index, weight)| {
+                            let id = self.source.edges.get(*index)?.id;
+                            by_id.get(&id).map(|value| (*value, *weight))
+                        }),
+                        &kind,
+                    );
+                    if let Some(value) = blended {
+                        output.insert(format!("e{}", edge.id), value);
+                    }
+                }
+            }
+            "face" => {
+                for (face, source) in self.output.faces.iter().zip(&self.origin.faces) {
+                    let value = source
+                        .and_then(|index| self.source.faces.get(index))
+                        .and_then(|source| values.get(&format!("f{}", source.id)));
+                    if let Some(value) = value {
+                        output.insert(format!("f{}", face.id), value.clone());
+                    }
+                }
+            }
+            "corner" => {
+                let source_offsets =
+                    corner_offsets(self.source.faces.iter().map(|face| face.vertices.len()));
+                let source_corners: usize = self
+                    .source
+                    .faces
+                    .iter()
+                    .map(|face| face.vertices.len())
+                    .sum();
+                let mut authored: Vec<Option<&Value>> = vec![None; source_corners];
+                for (index, face) in self.source.faces.iter().enumerate() {
+                    let Some(corners) = values
+                        .get(&format!("f{}", face.id))
+                        .and_then(Value::as_array)
+                    else {
+                        continue;
+                    };
+                    for (corner, value) in corners.iter().enumerate().take(face.vertices.len()) {
+                        authored[source_offsets[index] + corner] = Some(value);
+                    }
+                }
+                let output_offsets =
+                    corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
+                for (face_index, face) in self.output.faces.iter().enumerate() {
+                    let corners =
+                        &self.corner_origin[output_offsets[face_index]..][..face.vertices.len()];
+                    let row: Vec<Option<Value>> = corners
+                        .iter()
+                        .map(|sources| {
+                            blend(
+                                sources.iter().filter_map(|(source, weight)| {
+                                    authored
+                                        .get(*source)
+                                        .copied()
+                                        .flatten()
+                                        .map(|value| (value, *weight))
+                                }),
+                                &kind,
+                            )
+                        })
+                        .collect();
+                    if row.iter().all(Option::is_none) {
+                        continue;
+                    }
+                    let row = row
+                        .into_iter()
+                        .map(|value| value.unwrap_or_else(|| default_value(&kind)))
+                        .collect();
+                    output.insert(format!("f{}", face.id), Value::Array(row));
+                }
+            }
+            _ => return None,
+        }
+        Some(with_values(attribute, Value::Object(output)))
     }
 }
 

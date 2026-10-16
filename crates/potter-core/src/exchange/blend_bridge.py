@@ -1230,6 +1230,8 @@ def mesh_dump(mesh):
         uv_layers.append({"name": layer.name, "active": index == mesh.uv_layers.active_index,
                           "values": [plain(item.uv) for item in layer.data]})
     attrs = []
+    custom_normals = any(attr.name == "custom_normal" for attr in mesh.attributes)
+    corner_normals = [plain(normal.vector) for normal in mesh.corner_normals] if custom_normals else None
     try:
         for attr in mesh.attributes:
             vals = []
@@ -1254,6 +1256,7 @@ def mesh_dump(mesh):
     return {"name": mesh.name_full, "potter_id": mesh.get("potter.id"),
             "library": library_reference(mesh), "vertices": vertices,
             "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "attributes": attrs,
+            "corner_normals": corner_normals,
             "skin_vertices": skin_vertices,
             "shape_keys": _mesh_shape_keys(mesh),
             "descriptor": json.loads(mesh.get("potter.descriptor_json", "null")),

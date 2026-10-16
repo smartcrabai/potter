@@ -4257,13 +4257,26 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         edge: next_counter(edges.len())?,
         face: next_counter(faces.len())?,
     };
-    let mesh = Mesh {
+    let mut mesh = Mesh {
         vertices,
         edges,
         faces,
         attributes,
         next_id,
     };
+    if let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null()) {
+        let normals = raw
+            .as_array()
+            .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
+            .iter()
+            .map(|normal| {
+                parse_vec3_value(normal)
+                    .map(glam::DVec3::from_array)
+                    .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        super::shading::import_shading(&mut mesh, &normals)?;
+    }
     mesh.validate()
         .map_err(|error| invalid_intermediate(&format!("invalid mesh data: {error}")))?;
     Ok(mesh)

@@ -251,7 +251,7 @@ pub(super) fn extract_geometry(
                 });
                 let material_id = usize::try_from(face.material_index)
                     .ok()
-                    .and_then(|index| node.materials.get(index));
+                    .and_then(|slot| snapshot.slot_material(node_id, node, slot));
                 let material_index = material_id.map_or(0, |id| {
                     if let Some(index) = material_indices.get(id).copied() {
                         index

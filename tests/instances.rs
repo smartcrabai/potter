@@ -1,5 +1,7 @@
 #![expect(clippy::unwrap_used, reason = "integration test setup")]
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use potter_core::{
@@ -205,4 +207,117 @@ fn instanced_custom_normals_rotate_with_the_instance_transform() {
             "{corner:?}"
         );
     }
+}
+
+#[test]
+fn collection_instance_keeps_each_members_material_slots() {
+    let doc = apply(
+        &SceneDoc::new("4ae99b7f-471e-4c30-95a1-d8bfce8d2576".to_owned()),
+        &json!([
+            {"op":"material.create","id":"jacket"},
+            {"op":"material.create","id":"skin"},
+            {"op":"collection.create","id":"source"},
+            {"op":"node.create","id":"box_a","kind":"box","collection":"source","params":{"size":1.0}},
+            {"op":"node.update","target":{"id":"box_a"},"set":{"materials":["jacket","skin"]}},
+            {"op":"mesh.set_attribute","target":{"id":"box_a"},"elements":{"domain":"face","ids":["f1"]},"material_index":1},
+            {"op":"uv.unwrap","target":{"id":"box_a"},"method":"smart"},
+            {"op":"node.create","id":"box_b","kind":"box","collection":"source","params":{"size":1.0},"transform":{"translation":[2.0,0.0,0.0]}},
+            {"op":"node.update","target":{"id":"box_b"},"set":{"materials":["skin"]}},
+            {"op":"collection.instance_create","id":"instance","collection":"source","transform":{"translation":[4.0,0.0,0.0]}}
+        ]),
+    )
+    .unwrap();
+    let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
+    let instance = Id::new("instance").unwrap();
+    let jacket = Id::new("jacket").unwrap();
+    let skin = Id::new("skin").unwrap();
+    // Each member's slots follow it: box_a's jacket and skin, then box_b's skin.
+    assert_eq!(
+        snapshot.instance_materials[&instance],
+        vec![Some(jacket), Some(skin.clone()), Some(skin)]
+    );
+    assert_eq!(
+        snapshot.instance_material_uvs[&instance],
+        vec![true, true, false]
+    );
+    let slots: Vec<u32> = snapshot.meshes[&instance]
+        .faces
+        .iter()
+        .map(|face| face.material_index)
+        .collect();
+    assert_eq!(slots.iter().filter(|slot| **slot == 0).count(), 5);
+    assert_eq!(slots.iter().filter(|slot| **slot == 1).count(), 1);
+    assert_eq!(slots.iter().filter(|slot| **slot == 2).count(), 6);
+}
+
+#[test]
+fn collection_instance_keeps_each_members_uvs_after_face_gaps() {
+    let doc = apply(
+        &SceneDoc::new("4ae99b7f-471e-4c30-95a1-d8bfce8d2576".to_owned()),
+        &json!([
+            {"op":"collection.create","id":"source"},
+            {"op":"node.create","id":"box_a","kind":"box","collection":"source","params":{"size":1.0}},
+            {"op":"mesh.delete","target":{"id":"box_a"},"elements":{"domain":"face","ids":["f0"]}},
+            {"op":"uv.unwrap","target":{"id":"box_a"},"method":"smart"},
+            {"op":"node.create","id":"box_b","kind":"box","collection":"source","params":{"size":1.0},"transform":{"translation":[2.0,0.0,0.0]}},
+            {"op":"uv.unwrap","target":{"id":"box_b"},"method":"smart"},
+            {"op":"collection.instance_create","id":"instance","collection":"source","transform":{"translation":[4.0,0.0,0.0]}}
+        ]),
+    )
+    .unwrap();
+    let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
+    let mesh = &snapshot.meshes[&Id::new("instance").unwrap()];
+    let entries = mesh.attributes["uv_map"].as_array().unwrap();
+    // Both members keep a UV entry for every face, and each entry names a face of the joined mesh.
+    let mut face_ids: Vec<u64> = entries
+        .iter()
+        .map(|entry| entry["face_id"].as_u64().unwrap())
+        .collect();
+    face_ids.sort_unstable();
+    face_ids.dedup();
+    let mut mesh_face_ids: Vec<u64> = mesh.faces.iter().map(|face| u64::from(face.id)).collect();
+    mesh_face_ids.sort_unstable();
+    assert_eq!(mesh.faces.len(), 11);
+    assert_eq!(face_ids, mesh_face_ids);
+    for face in &mesh.faces {
+        let entry = entries
+            .iter()
+            .find(|entry| entry["face_id"] == json!(face.id))
+            .unwrap();
+        assert_eq!(entry["uv"].as_array().unwrap().len(), face.vertices.len());
+    }
+}
+
+#[test]
+fn nested_collection_instances_carry_member_materials_upward() {
+    let base = SceneDoc::new("4ae99b7f-471e-4c30-95a1-d8bfce8d2576".to_owned());
+    let doc = apply(&base, &json!([
+        {"op":"material.create","id":"jacket"},
+        {"op":"material.create","id":"skin"},
+        {"op":"collection.create","id":"source"},
+        {"op":"node.create","id":"box","kind":"box","collection":"source","params":{}},
+        {"op":"node.update","target":{"id":"box"},"set":{"materials":["jacket"]}},
+        {"op":"collection.create","id":"wrapper"},
+        {"op":"node.create","id":"side","kind":"box","collection":"wrapper","params":{}},
+        {"op":"node.update","target":{"id":"side"},"set":{"materials":["skin"]}},
+        {"op":"collection.instance_create","id":"inner","collection":"source"},
+        {"op":"collection.link","collection":"wrapper","object":"inner"},
+        {"op":"collection.instance_create","id":"outer","collection":"wrapper","transform":{"translation":[5.0,0.0,0.0]}}
+    ]))
+    .unwrap();
+    let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
+    let outer = Id::new("outer").unwrap();
+    let table = &snapshot.instance_materials[&outer];
+    let jacket = Id::new("jacket").unwrap();
+    let skin = Id::new("skin").unwrap();
+    assert_eq!(table.len(), 2);
+    assert!(table.contains(&Some(jacket)) && table.contains(&Some(skin)));
+    // The inner instance's jacket faces and the side's skin faces each keep their material.
+    let mut counts = BTreeMap::<Option<Id>, usize>::new();
+    for face in &snapshot.meshes[&outer].faces {
+        let slot = usize::try_from(face.material_index).unwrap();
+        *counts.entry(table[slot].clone()).or_default() += 1;
+    }
+    assert_eq!(counts.values().sum::<usize>(), 12);
+    assert!(counts.values().all(|count| *count == 6));
 }

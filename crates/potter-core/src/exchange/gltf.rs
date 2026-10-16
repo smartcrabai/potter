@@ -14,7 +14,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{Snapshot, mesh_vertex_weights},
     geom::{
-        Face, Mesh, MeshError, edge_key,
+        Mesh, MeshError, edge_key,
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
     },
     image::{ImageData, ImageInterpolation, load_image_data},
@@ -1482,33 +1482,35 @@ fn mesh_export_layout(
     Ok(MeshExportLayout { layout, key_deltas })
 }
 
-/// Material slot a face exports to. Collection-instance meshes carry no per-source material
-/// lists, so all their faces use the instancing node's slot 0.
-// shortcut: instance meshes drop per-face material slots, resolve source material lists during evaluation to upgrade
-fn export_material_slot(face: &Face, instanced: bool) -> u32 {
-    if instanced { 0 } else { face.material_index }
-}
-
-/// Face material slots actually bound by faces, validated against the node material list.
-fn used_material_ids<'a>(node: &'a Node, mesh: &Mesh, instanced: bool) -> Result<Vec<&'a Id>> {
-    let mut slots = BTreeSet::new();
+/// Material slots actually bound by faces, validated against a node's evaluated slot table.
+fn used_material_bindings<'a>(
+    node_id: &Id,
+    node: &'a Node,
+    snapshot: &'a Snapshot,
+    mesh: &Mesh,
+) -> Result<Vec<(usize, &'a Id)>> {
+    let slot_count = snapshot.slot_count(node_id, node);
+    let mut used = BTreeSet::new();
     for face in &mesh.faces {
-        let raw_slot = export_material_slot(face, instanced);
-        let slot = usize::try_from(raw_slot)
+        let slot = usize::try_from(face.material_index)
             .ok()
-            .filter(|slot| *slot < node.materials.len().max(1))
+            .filter(|slot| *slot < slot_count.max(1))
             .ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::SceneInvalid,
                     "mesh face material slot is outside the node material list",
-                    json!({ "face_id": face.id, "slot": raw_slot, "material_count": node.materials.len() }),
+                    json!({ "face_id": face.id, "slot": face.material_index, "material_count": slot_count }),
                 )
             })?;
-        slots.insert(slot);
+        used.insert(slot);
     }
-    Ok(slots
+    Ok(used
         .into_iter()
-        .filter_map(|slot| node.materials.get(slot))
+        .filter_map(|slot| {
+            snapshot
+                .slot_material(node_id, node, slot)
+                .map(|material| (slot, material))
+        })
         .collect())
 }
 
@@ -1542,10 +1544,10 @@ fn valid_vertex_groups_attribute(attribute: &Value, data_block: &DataBlock) -> b
 /// Blender per-element attributes that carry no exported data: editor selection, cached
 /// topology, the vertex positions, and the shading flag already kept in `blender_polygon_smooth`.
 /// Blender 5.2 attributes the writer skips. Each one's data is carried elsewhere (face slots in
-/// `Face.material_index`, edge flags in `blender_edge_flags`, shading in `blender_polygon_smooth`),
-/// is editor state, or is topology kept in the mesh; hidden geometry is written, as Blender's
-/// exporter writes it (`primitive_extract.py` reads no hide flags).
-const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 17] = [
+/// `Face.material_index`, edge flags in `blender_edge_flags`, custom normals in the decoded
+/// `custom_normal` attribute), is editor state, or is topology kept in the mesh; hidden geometry is
+/// written, as Blender's exporter writes it (`primitive_extract.py` reads no hide flags).
+const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 18] = [
     "material_index",
     "sharp_edge",
     "uv_seam",
@@ -1563,6 +1565,7 @@ const BLENDER_BOOKKEEPING_ATTRIBUTES: [&str; 17] = [
     "sharp_face",
     ".hide_vert",
     ".hide_edge",
+    "custom_normal",
 ];
 
 /// Whether a `blender_attributes` entry carries data the writer ignores on purpose. Color layers
@@ -1597,8 +1600,10 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
                     .iter()
                     .all(|entry| blender_attribute_exportable(mesh, entry))
             }),
+            // An instance mesh has no data block to hold groups. Blender's exporter writes vertex
+            // groups only as skin weights, so an instance's member groups are not written either.
             "vertex_groups" => {
-                data_block.is_some_and(|block| valid_vertex_groups_attribute(value, block))
+                data_block.is_none_or(|block| valid_vertex_groups_attribute(value, block))
             }
             _ => false,
         };
@@ -3188,14 +3193,14 @@ pub(crate) fn validate_vrm_mesh_references(
                 true,
             )?;
         }
-        for material_id in used_material_ids(node, mesh, data_block.is_none())? {
-            validate_mesh_material_uv(
-                material_id,
-                &surfaces,
-                Some(avatar),
-                mesh,
-                !export.layout.uvs.is_empty(),
-            )?;
+        for (slot, material_id) in used_material_bindings(node_id, node, snapshot, mesh)? {
+            let has_uv = snapshot
+                .instance_material_uvs
+                .get(node_id)
+                .and_then(|uvs| uvs.get(slot))
+                .copied()
+                .unwrap_or(!export.layout.uvs.is_empty());
+            validate_mesh_material_uv(material_id, &surfaces, Some(avatar), mesh, has_uv)?;
         }
         exported_mesh_nodes.insert(node_id.clone());
     }
@@ -3270,7 +3275,7 @@ fn export_with_root_inner(
         .collect::<BTreeMap<_, _>>();
     let mut meshes = Vec::<Value>::new();
     let mut mesh_indices = BTreeMap::<(Id, Option<[u64; 3]>, Vec<Id>), usize>::new();
-    let mut instance_mesh_indices = BTreeMap::<(Id, Option<[u64; 3]>, Vec<Id>), usize>::new();
+    let mut instance_mesh_indices = BTreeMap::<(Id, Option<[u64; 3]>), usize>::new();
     let mut node_mesh_indices = BTreeMap::<Id, usize>::new();
     let mut skin_bindings = BTreeMap::<Id, SkinBinding>::new();
     let mut data_skin_bindings = BTreeMap::<Id, SkinBinding>::new();
@@ -3360,8 +3365,7 @@ fn export_with_root_inner(
             continue;
         }
         if let Some(target) = &instance_target
-            && let Some(index) =
-                instance_mesh_indices.get(&(target.clone(), mesh_variant, node.materials.clone()))
+            && let Some(index) = instance_mesh_indices.get(&(target.clone(), mesh_variant))
         {
             node_mesh_indices.insert(node_id.clone(), *index);
             continue;
@@ -3378,13 +3382,19 @@ fn export_with_root_inner(
         let MeshExportLayout { layout, key_deltas } =
             mesh_export_layout(mesh, data_block, geometry_scale, geometry_basis)?;
         let uv_sets = &layout.uvs;
-        for material_id in used_material_ids(node, mesh, data_block.is_none())? {
+        for (slot, material_id) in used_material_bindings(node_id, node, snapshot, mesh)? {
+            let has_uv = snapshot
+                .instance_material_uvs
+                .get(node_id)
+                .and_then(|uvs| uvs.get(slot))
+                .copied()
+                .unwrap_or(!uv_sets.is_empty());
             validate_mesh_material_uv(
                 material_id,
                 &surfaces,
                 vrm.map(|(avatar, _)| avatar),
                 mesh,
-                !uv_sets.is_empty(),
+                has_uv,
             )?;
         }
         if let Some(shape_keys) = data_block
@@ -3509,7 +3519,7 @@ fn export_with_root_inner(
                     PotError::new(ErrorCode::InternalError, "mesh triangulation is incomplete")
                 })?;
             let face_indices = layout.face_indices.get(&face.id);
-            let slot = export_material_slot(face, data_block.is_none());
+            let slot = face.material_index;
             face_slots.push(slot);
             let indices = slot_indices.entry(slot).or_default();
             for triangle in face_triangles {
@@ -3597,16 +3607,10 @@ fn export_with_root_inner(
             }));
             let mut primitive =
                 json!({ "attributes": attributes.clone(), "indices": index_accessor, "mode": 4 });
-            if !node.materials.is_empty() {
-                let material_id = usize::try_from(*slot)
-                    .ok()
-                    .and_then(|slot| node.materials.get(slot))
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::SceneInvalid,
-                            "mesh face material slot is outside the node material list",
-                        )
-                    })?;
+            if let Some(material_id) = usize::try_from(*slot)
+                .ok()
+                .and_then(|slot| snapshot.slot_material(node_id, node, slot))
+            {
                 let material_index =
                     material_indices.get(material_id).copied().ok_or_else(|| {
                         PotError::new(
@@ -3726,8 +3730,7 @@ fn export_with_root_inner(
             );
         }
         if let Some(target) = instance_target {
-            instance_mesh_indices
-                .insert((target, mesh_variant, node.materials.clone()), mesh_index);
+            instance_mesh_indices.insert((target, mesh_variant), mesh_index);
         }
         node_mesh_indices.insert(node_id.clone(), mesh_index);
     }
@@ -9211,7 +9214,9 @@ mod tests {
     }
 
     #[test]
-    fn collection_instance_with_multi_material_faces_exports_one_primitive() -> TestResult {
+    fn collection_instance_exports_one_primitive_per_member_material() -> TestResult {
+        // Members keep their own slot lists, as Blender's flattened instance nodes do: box_a
+        // contributes jacket (5 faces) and skin (1 face), box_b its skin (6 faces).
         let doc = scene(&json!([
             {"op":"material.create","id":"jacket"},
             {"op":"material.create","id":"skin"},
@@ -9219,6 +9224,8 @@ mod tests {
             {"op":"node.create","id":"box_a","kind":"box","collection":"source","params":{"size":1.0}},
             {"op":"node.update","target":{"id":"box_a"},"set":{"materials":["jacket","skin"]}},
             {"op":"mesh.set_attribute","target":{"id":"box_a"},"elements":{"domain":"face","ids":["f1"]},"material_index":1},
+            {"op":"node.create","id":"box_b","kind":"box","collection":"source","params":{"size":1.0},"transform":{"translation":[2.0,0.0,0.0]}},
+            {"op":"node.update","target":{"id":"box_b"},"set":{"materials":["skin"]}},
             {"op":"collection.instance_create","id":"instance","collection":"source","transform":{"translation":[4.0,0.0,0.0]}}
         ]))?;
         let (root, _) = export_root_and_binary(&doc)?;
@@ -9231,11 +9238,21 @@ mod tests {
         let primitives = instance["primitives"]
             .as_array()
             .ok_or("primitives are missing")?;
-        assert_eq!(primitives.len(), 1, "instances export every face on slot 0");
-        assert!(
-            primitives[0].get("material").is_none(),
-            "the instancing node has no material slot"
-        );
+        let materials: Vec<Value> = primitives
+            .iter()
+            .map(|primitive| primitive["material"].clone())
+            .collect();
+        assert_eq!(materials, [json!(0), json!(1), json!(1)]);
+        let index_counts: Vec<u64> = primitives
+            .iter()
+            .map(|primitive| {
+                let accessor = primitive["indices"].as_u64().unwrap_or(u64::MAX);
+                root["accessors"][usize::try_from(accessor).unwrap_or(usize::MAX)]["count"]
+                    .as_u64()
+                    .unwrap_or(0)
+            })
+            .collect();
+        assert_eq!(index_counts, [30, 6, 36]);
         Ok(())
     }
 

@@ -4,13 +4,17 @@ use std::{
     path::Path,
 };
 
-use glam::{DMat3, DMat4, DQuat, DVec3};
+use glam::{DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Aabb, CylinderParams, IcosphereParams, Mesh, normals::SHADING_ATTRIBUTES},
+    geom::{
+        Aabb, CylinderParams, IcosphereParams, Mesh,
+        concat::{Part, concatenate, rotate_corner_normals},
+        normals::SHADING_ATTRIBUTES,
+    },
     hash,
     model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
     params::{self, ParameterFamily},
@@ -86,6 +90,13 @@ pub struct Snapshot {
     /// Instance source paths recorded by geometry-node modifiers.
     #[serde(skip)]
     pub instance_paths: BTreeMap<Id, Vec<Vec<Id>>>,
+    /// Material slot table of each evaluated collection instance: every face of its mesh indexes it,
+    /// with each member's slots in member order (`None` for a slot without material).
+    #[serde(skip)]
+    pub instance_materials: BTreeMap<Id, Vec<Option<Id>>>,
+    /// Whether each slot in an evaluated collection instance's material table has member UVs.
+    #[serde(skip)]
+    pub instance_material_uvs: BTreeMap<Id, Vec<bool>>,
     /// World-space Grease Pencil strokes held at the selected frame.
     #[serde(skip)]
     pub strokes: BTreeMap<Id, Vec<EvaluatedStroke>>,
@@ -110,6 +121,30 @@ pub struct Snapshot {
     /// VDB-aware volume payloads resolved for this evaluation; omitted from snapshots on disk.
     #[serde(skip)]
     pub volume_data: BTreeMap<Id, crate::geom::volume::VolumeData>,
+}
+
+impl Snapshot {
+    /// Material bound by a face slot on a node's evaluated mesh.
+    #[must_use]
+    pub fn slot_material<'a>(
+        &'a self,
+        node_id: &Id,
+        node: &'a Node,
+        slot: usize,
+    ) -> Option<&'a Id> {
+        match self.instance_materials.get(node_id) {
+            Some(table) => table.get(slot).and_then(Option::as_ref),
+            None => node.materials.get(slot),
+        }
+    }
+
+    /// Number of explicitly present material slots; an empty material list allows face slot zero.
+    #[must_use]
+    pub fn slot_count(&self, node_id: &Id, node: &Node) -> usize {
+        self.instance_materials
+            .get(node_id)
+            .map_or(node.materials.len(), Vec::len)
+    }
 }
 
 impl Snapshot {
@@ -185,6 +220,8 @@ impl Snapshot {
                     for node_id in node_errors.keys() {
                         snapshot.meshes.remove(node_id);
                         snapshot.instance_paths.remove(node_id);
+                        snapshot.instance_materials.remove(node_id);
+                        snapshot.instance_material_uvs.remove(node_id);
                         snapshot.strokes.remove(node_id);
                     }
                     return Ok((snapshot, node_errors));
@@ -482,6 +519,8 @@ impl Snapshot {
         let mut nodes = BTreeMap::new();
         let mut meshes = BTreeMap::new();
         let mut instance_paths = BTreeMap::new();
+        let mut instance_materials = BTreeMap::new();
+        let mut instance_material_uvs = BTreeMap::new();
         let mut strokes = BTreeMap::new();
         let mut modifier_warnings = Vec::new();
         for id in &mesh_evaluation_order {
@@ -1253,11 +1292,13 @@ impl Snapshot {
                     "evaluated collection instance world matrix is missing",
                 )
             })?;
-            let (mesh, paths) =
+            let (mesh, paths, slots, slot_uvs) =
                 evaluate_collection_instance(doc, id, &matrices, &meshes, &mut BTreeSet::new())?;
             let bounds = mesh_bounds(&mesh, matrix)?;
             if !mesh.vertices.is_empty() {
                 meshes.insert(id.clone(), mesh);
+                instance_materials.insert(id.clone(), slots);
+                instance_material_uvs.insert(id.clone(), slot_uvs);
             }
             if !paths.is_empty() {
                 instance_paths.insert(id.clone(), paths);
@@ -1280,6 +1321,8 @@ impl Snapshot {
             evaluation_hash,
             nodes,
             instance_paths,
+            instance_materials,
+            instance_material_uvs,
             meshes,
             strokes,
             volume_data,
@@ -3454,13 +3497,36 @@ fn instance_collection_target(node: &Node) -> Result<Option<Id>> {
     })
 }
 
+/// A collection member placed in its instance: its mesh, its world matrix, and the material slot
+/// table its faces index.
+struct CollectionMember {
+    mesh: Mesh,
+    matrix: DMat4,
+    slots: Vec<Option<Id>>,
+    slot_uvs: Vec<bool>,
+}
+
+/// A plain member's slot table: its material list, or one empty slot when it has none.
+fn member_slots(node: &Node) -> Vec<Option<Id>> {
+    if node.materials.is_empty() {
+        vec![None]
+    } else {
+        node.materials.iter().cloned().map(Some).collect()
+    }
+}
+
+/// A collection instance's joined mesh, the combined material slot table its faces index (each
+/// member's slots in member order), and each member's source path.
+type CollectionEvaluation = (Mesh, Vec<Vec<Id>>, Vec<Option<Id>>, Vec<bool>);
+
+/// Joins a collection instance's members and nested instances into one mesh.
 fn evaluate_collection_instance(
     doc: &SceneDoc,
     instance_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &BTreeMap<Id, Mesh>,
     active_instances: &mut BTreeSet<Id>,
-) -> Result<(Mesh, Vec<Vec<Id>>)> {
+) -> Result<CollectionEvaluation> {
     let instance_node = doc.nodes.get(instance_id).ok_or_else(|| {
         PotError::new(
             ErrorCode::SceneInvalid,
@@ -3480,7 +3546,7 @@ fn evaluate_collection_instance(
             json!({ "node_id": instance_id, "collection": target }),
         ));
     }
-    let mut mesh = Mesh::new();
+    let mut members = Vec::new();
     let mut paths = Vec::new();
     append_collection_geometry(
         doc,
@@ -3491,11 +3557,30 @@ fn evaluate_collection_instance(
         active_instances,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
-        &mut mesh,
+        &mut members,
         &mut paths,
     )?;
     active_instances.remove(instance_id);
-    Ok((mesh, paths))
+    let mut slots = Vec::new();
+    let mut slot_uvs = Vec::new();
+    let mut parts = Vec::with_capacity(members.len());
+    for member in &members {
+        let material_offset = u32::try_from(slots.len()).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "collection instance has too many material slots",
+            )
+        })?;
+        parts.push(Part {
+            mesh: &member.mesh,
+            matrix: member.matrix,
+            material_offset,
+        });
+        slots.extend(member.slots.iter().cloned());
+        slot_uvs.extend(member.slot_uvs.iter().copied());
+    }
+    let mesh = concatenate(&parts)?;
+    Ok((mesh, paths, slots, slot_uvs))
 }
 
 #[expect(
@@ -3511,7 +3596,7 @@ fn append_collection_geometry(
     active_instances: &mut BTreeSet<Id>,
     visited_collections: &mut BTreeSet<Id>,
     collection_stack: &mut BTreeSet<Id>,
-    output: &mut Mesh,
+    members: &mut Vec<CollectionMember>,
     paths: &mut Vec<Vec<Id>>,
 ) -> Result<()> {
     if collection_stack.contains(collection_id) {
@@ -3543,13 +3628,22 @@ fn append_collection_geometry(
         if !source_node.visible || !source_node.render_visible {
             continue;
         }
-        let (nested_mesh, nested_paths) = if instance_collection_target(source_node)?.is_some() {
-            evaluate_collection_instance(doc, object_id, matrices, meshes, active_instances)?
-        } else if let Some(source_mesh) = meshes.get(object_id) {
-            (source_mesh.clone(), vec![vec![object_id.clone()]])
-        } else {
-            (Mesh::new(), Vec::new())
-        };
+        let (nested_mesh, nested_paths, slots, slot_uvs) =
+            if instance_collection_target(source_node)?.is_some() {
+                evaluate_collection_instance(doc, object_id, matrices, meshes, active_instances)?
+            } else if let Some(source_mesh) = meshes.get(object_id) {
+                let slots = member_slots(source_node);
+                let slot_uvs =
+                    vec![crate::geom::uv_layers::has_uv_layers(source_mesh); slots.len()];
+                (
+                    source_mesh.clone(),
+                    vec![vec![object_id.clone()]],
+                    slots,
+                    slot_uvs,
+                )
+            } else {
+                (Mesh::new(), Vec::new(), Vec::new(), Vec::new())
+            };
         if !nested_mesh.vertices.is_empty() {
             let source_matrix = matrices.get(object_id).copied().ok_or_else(|| {
                 PotError::new(
@@ -3557,7 +3651,22 @@ fn append_collection_geometry(
                     "collection member world matrix is missing",
                 )
             })?;
-            append_transformed_mesh(output, &nested_mesh, source_matrix)?;
+            let slot_count = slots.len();
+            if nested_mesh.faces.iter().any(|face| {
+                usize::try_from(face.material_index).map_or(true, |slot| slot >= slot_count)
+            }) {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "collection member face material slot is outside its material list",
+                    json!({ "node_id": object_id, "material_count": slot_count }),
+                ));
+            }
+            members.push(CollectionMember {
+                mesh: nested_mesh,
+                matrix: source_matrix,
+                slots,
+                slot_uvs,
+            });
             for path in nested_paths {
                 let mut full_path = Vec::with_capacity(path.len() + 1);
                 full_path.push(instance_id.clone());
@@ -3576,7 +3685,7 @@ fn append_collection_geometry(
             active_instances,
             visited_collections,
             collection_stack,
-            output,
+            members,
             paths,
         )?;
     }
@@ -3584,7 +3693,7 @@ fn append_collection_geometry(
     Ok(())
 }
 
-/// Instances copy each source's attributes, remapping the face- and edge-keyed shading ones.
+/// Particle copies: each template's attributes, with its face- and edge-keyed shading remapped.
 fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> Result<()> {
     if output.vertices.is_empty() {
         output.attributes = source
@@ -3702,31 +3811,6 @@ fn merge_shading(
         }
     }
     Ok(())
-}
-
-/// Rotates `custom_normal` corner vectors into instance space. Malformed entries pass through
-/// unchanged so the normal computation rejects them.
-fn rotate_corner_normals(value: &Value, normal_matrix: DMat3) -> Value {
-    let Some(corners) = value.as_array() else {
-        return value.clone();
-    };
-    Value::Array(
-        corners
-            .iter()
-            .map(|corner| {
-                let vector = corner
-                    .as_array()
-                    .and_then(|components| match components.as_slice() {
-                        [x, y, z] => Some(DVec3::new(x.as_f64()?, y.as_f64()?, z.as_f64()?)),
-                        _ => None,
-                    });
-                match vector {
-                    Some(vector) => json!((normal_matrix * vector).normalize_or_zero().to_array()),
-                    None => corner.clone(),
-                }
-            })
-            .collect(),
-    )
 }
 
 fn evaluate_grease_pencil(
