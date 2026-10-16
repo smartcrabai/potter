@@ -3146,6 +3146,7 @@ pub(crate) fn apply_scene_attribute_modifier(
     Ok(())
 }
 
+
 pub(crate) fn apply_scene_deform_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,

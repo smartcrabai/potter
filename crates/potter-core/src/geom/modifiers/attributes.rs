@@ -79,30 +79,30 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     evaluate_with_context(mesh, modifier, &BTreeMap::new(), None, DMat4::IDENTITY)
 }
 
-/// Evaluate an attribute modifier with scene operands and an optional image mask.
+/// Evaluate an attribute modifier with a resolved scene texture.
 pub fn evaluate_with_context(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
-    mask_image: Option<&crate::image::ImageData>,
+    texture: Option<&crate::geom::ResolvedTexture>,
     subject_world: DMat4,
 ) -> Result<Mesh> {
     evaluate_with_context_and_subject_name(
         mesh,
         modifier,
         operands,
-        mask_image,
+        texture,
         subject_world,
         "",
     )
 }
 
-/// Evaluate an attribute modifier with the subject object name for Blender's seeded mapping.
+/// Evaluate with the subject name used by Blender's seeded weight mappings.
 pub fn evaluate_with_context_and_subject_name(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
-    mask_image: Option<&crate::image::ImageData>,
+    texture: Option<&crate::geom::ResolvedTexture>,
     subject_world: DMat4,
     subject_name: &str,
 ) -> Result<Mesh> {
@@ -110,56 +110,37 @@ pub fn evaluate_with_context_and_subject_name(
         mesh,
         modifier,
         operands,
-        mask_image,
+        texture,
         subject_world,
         subject_name,
         &AttributeLayerSelection::default(),
     )
 }
 
-/// Evaluate with ordered layer selectors for the destination object.
+/// Evaluate with ordered destination layer selectors and a seed-zero modifier RNG.
 pub fn evaluate_with_transfer_context(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
-    mask_image: Option<&crate::image::ImageData>,
+    texture: Option<&crate::geom::ResolvedTexture>,
     subject_world: DMat4,
     subject_name: &str,
     subject_layer_selection: &AttributeLayerSelection,
 ) -> Result<Mesh> {
-    evaluate_with_texture_source_context(
+    let mut rng = crate::blender_rng::BlenderRng::seed_random(0);
+    evaluate_with_texture_context(
         mesh,
         modifier,
         operands,
-        mask_image.map(crate::geom::legacy_texture::TextureSource::Image),
+        texture.map(crate::geom::ResolvedTexture::source),
         subject_world,
         subject_name,
         subject_layer_selection,
+        &mut rng,
     )
 }
 
-/// Evaluate scene-resolved textures through the shared legacy/image sampler.
-pub(crate) fn evaluate_with_resolved_texture_context(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
-    texture: Option<&crate::geom::legacy_texture::ResolvedTexture>,
-    subject_world: DMat4,
-    subject_name: &str,
-    subject_layer_selection: &AttributeLayerSelection,
-) -> Result<Mesh> {
-    evaluate_with_texture_source_context(
-        mesh,
-        modifier,
-        operands,
-        texture.map(crate::geom::legacy_texture::ResolvedTexture::source),
-        subject_world,
-        subject_name,
-        subject_layer_selection,
-    )
-}
-
-fn evaluate_with_texture_source_context(
+pub(crate) fn evaluate_with_texture_context(
     mesh: &Mesh,
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
@@ -167,6 +148,7 @@ fn evaluate_with_texture_source_context(
     subject_world: DMat4,
     subject_name: &str,
     subject_layer_selection: &AttributeLayerSelection,
+    rng: &mut crate::blender_rng::BlenderRng,
 ) -> Result<Mesh> {
     if modifier.modifier_type == "data_transfer"
         && (modifier.params.get("object").is_none_or(Value::is_null)
@@ -180,7 +162,7 @@ fn evaluate_with_texture_source_context(
         return Ok(mesh.clone());
     }
     let texture_weights =
-        texture_mask_weights(mesh, modifier, operands, texture, subject_world)?;
+        texture_mask_weights(mesh, modifier, operands, texture, subject_world, rng)?;
     match modifier.modifier_type.as_str() {
         "vertex_weight_edit" => {
             vertex_weight_edit(mesh, modifier, texture_weights.as_ref(), subject_name)

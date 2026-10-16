@@ -8,6 +8,7 @@ pub(super) fn texture_mask_weights(
     operands: &BTreeMap<String, Vec<SceneOperand>>,
     texture: Option<crate::geom::legacy_texture::TextureSource<'_>>,
     subject_world: DMat4,
+    rng: &mut crate::blender_rng::BlenderRng,
 ) -> Result<Option<BTreeMap<u32, f64>>> {
     if modifier.modifier_type == "vertex_weight_proximity"
         && (optional_string(modifier, "target")?.is_none()
@@ -82,7 +83,7 @@ pub(super) fn texture_mask_weights(
                 }),
             _ => unreachable!("texture mapping was validated"),
         };
-        let sample = crate::geom::legacy_texture::sample(texture, coordinate)?;
+        let sample = crate::geom::legacy_texture::sample(texture, coordinate, rng)?;
         let value = match channel {
             "INT" => sample.intensity,
             "ALPHA" => sample.alpha,
