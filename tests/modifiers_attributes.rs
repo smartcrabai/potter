@@ -174,6 +174,12 @@ fn resolved_mask_texture(
     Ok(resolve_texture(&doc, lookup_id, Some(directory.path()))?)
 }
 
+fn scene_operand_with_identity_space(mesh: Mesh, camera: Option<CameraData>) -> SceneOperand {
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    scene_operand_with_space(mesh, IDENTITY, IDENTITY, IDENTITY, camera)
+}
 #[test]
 fn vertex_weight_mix_applies_blender_operation_to_selected_vertices() -> Result<(), Box<dyn Error>>
 {
@@ -405,9 +411,11 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
     let mut operands = BTreeMap::new();
     operands.insert(
         "target".to_owned(),
-        vec![scene_operand(
+        vec![scene_operand_with_space(
             Mesh::default(),
-            DMat4::from_translation(DVec3::new(2.0, 0.0, 0.0)),
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0],
             None,
         )],
     );
@@ -485,7 +493,7 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
     let mut operands = BTreeMap::new();
     operands.insert(
         "object".to_owned(),
-        vec![scene_operand(source, DMat4::IDENTITY, None)],
+        vec![scene_operand_with_identity_space(source, None)],
     );
     let transfer = modifier(
         "data_transfer",
@@ -2360,7 +2368,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let mut source_operands = BTreeMap::new();
     source_operands.insert(
         "object".to_owned(),
-        vec![scene_operand(source, DMat4::IDENTITY, None)],
+        vec![scene_operand_with_identity_space(source, None)],
     );
     let transferred = evaluate_with_context(
         &destination,
@@ -2409,11 +2417,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         let mut point_operands = BTreeMap::new();
         point_operands.insert(
             "object".to_owned(),
-            vec![scene_operand(
-                interpolation_source.clone(),
-                DMat4::IDENTITY,
-                None,
-            )],
+            vec![scene_operand_with_identity_space(interpolation_source.clone(), None)],
         );
         let transferred = evaluate_with_context(
             &point_destination,
@@ -2485,7 +2489,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     let mut domain_operands = BTreeMap::new();
     domain_operands.insert(
         "object".to_owned(),
-        vec![scene_operand(domain_source, DMat4::IDENTITY, None)],
+        vec![scene_operand_with_identity_space(domain_source, None)],
     );
     let domain_transfer = modifier(
         "data_transfer",
