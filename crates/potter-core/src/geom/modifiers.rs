@@ -2204,6 +2204,7 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         modifier.modifier_type == "multires" && !modifier.params.contains_key("use_limit_surface");
     let use_limit_surface =
         levels > 0 && !simple && (multires_unset || bool_param(modifier, "use_limit_surface")?);
+    let uv_layer_count = uv_layers::layer_count(mesh);
     if levels > 0 {
         let first_level_faces = mesh
             .faces
@@ -2214,7 +2215,6 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .ok_or_else(|| {
                 PotError::new(ErrorCode::LimitExceeded, "subdivision face count overflows")
             })?;
-        let uv_layer_count = uv_layers::layer_count(mesh);
         check_subdivision_budget(
             first_level_faces,
             mesh.vertices.len(),
@@ -2228,30 +2228,101 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     if !bool_param(modifier, "use_custom_normals")? {
         result.attributes.remove("custom_normal");
     }
-    let mut uv = if levels > 0 {
-        Some(subdivision_uv::UvSubdivision::new(mesh, uv_options)?)
-    } else {
-        None
-    };
-    for _ in 0..levels {
+    let with_fans = uv_layer_count > 0 && uv_options.linear != subdivision_uv::FvarLinear::All;
+    let (mut source_polygons, mut source_edges, mut edge_creases, mut position, mut uv) =
+        if levels > 0 {
+            let source_polygons = polygons(&result)?;
+            let source_edges = loose_edges(&result)?;
+            let edge_creases = edge_crease_weights(&result, options.use_creases)?;
+            let position = subdivision_uv::Position::new(
+                &source_polygons,
+                &source_edges,
+                &edge_creases,
+                result.vertices.len(),
+                with_fans,
+            );
+            let uv = subdivision_uv::UvSubdivision::new(mesh, uv_options, &position)?;
+            (
+                source_polygons,
+                source_edges,
+                edge_creases,
+                Some(position),
+                Some(uv),
+            )
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::<(usize, usize), f64>::new(),
+                None,
+                None,
+            )
+        };
+    for level in 0..levels {
+        let position = position.as_ref().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "subdivision topology is missing for a requested level",
+            )
+        })?;
         let next = if simple {
             subdivision_uv::subdivide_simple_once(
                 &result,
+                position,
+                &source_polygons,
+                &source_edges,
+                &edge_creases,
                 options.use_creases,
                 options.raw_normals,
             )?
         } else {
-            subdivide_once(&result, options)?
+            subdivide_once(
+                &result,
+                options,
+                position,
+                &source_polygons,
+                &source_edges,
+                &edge_creases,
+            )?
         };
         if let Some(uv) = uv.as_mut() {
-            uv.refine(&result)?;
+            uv.refine(position)?;
         }
         result = next;
+        if level + 1 < levels {
+            source_polygons = polygons(&result)?;
+            source_edges = loose_edges(&result)?;
+            edge_creases = edge_crease_weights(&result, options.use_creases)?;
+            position = Some(subdivision_uv::Position::new(
+                &source_polygons,
+                &source_edges,
+                &edge_creases,
+                result.vertices.len(),
+                with_fans,
+            ));
+        }
     }
     normalize_custom_normals(&mut result);
+    let final_position = if use_limit_surface || uv.is_some() {
+        let source_polygons = polygons(&result)?;
+        let source_edges = loose_edges(&result)?;
+        let edge_creases = edge_crease_weights(&result, options.use_creases)?;
+        Some(subdivision_uv::Position::new(
+            &source_polygons,
+            &source_edges,
+            &edge_creases,
+            result.vertices.len(),
+            with_fans,
+        ))
+    } else {
+        None
+    };
     if use_limit_surface {
+        let final_position = final_position.as_ref().ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "limit-surface topology is missing")
+        })?;
         let output_vertex_count = result.vertices.len();
-        let limit_positions = limit_surface_positions(&result, options)?;
+        let limit_positions = limit_surface_positions(&result, final_position)?;
         let corner_limits = boundary_corner_limits(mesh, quality)?;
         let control_points = positions(mesh);
         for index in 0..output_vertex_count {
@@ -2263,7 +2334,14 @@ fn subdivision(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         }
     }
     if let Some(uv) = uv {
-        uv.write_back(&mut result, use_limit_surface.then_some(quality))?;
+        let uv_position = final_position.as_ref().or(position.as_ref()).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "subdivision UV topology is missing")
+        })?;
+        uv.write_back(
+            &mut result,
+            uv_position,
+            use_limit_surface.then_some(quality),
+        )?;
     }
     Ok(result)
 }
@@ -2374,47 +2452,22 @@ fn check_subdivision_budget(
     Ok(())
 }
 
-fn limit_surface_positions(mesh: &Mesh, options: SubdivisionOptions) -> Result<Vec<DVec3>> {
+fn limit_surface_positions(
+    mesh: &Mesh,
+    position: &subdivision_uv::Position,
+) -> Result<Vec<DVec3>> {
     let source_points = positions(mesh);
-    let source_polygons = polygons(mesh)?;
-    let mut edge_faces = BTreeMap::<(usize, usize), Vec<usize>>::new();
-    for (face_index, (face, _)) in source_polygons.iter().enumerate() {
-        for (first, second) in cyclic_pairs(face) {
-            edge_faces
-                .entry(edge_key(*first, *second))
-                .or_default()
-                .push(face_index);
-        }
-    }
-    for [first, second] in loose_edges(mesh)? {
-        edge_faces.entry(edge_key(first, second)).or_default();
-    }
-    let non_manifold = NonManifold::new(
-        source_points.len(),
-        source_polygons.iter().map(|(face, _)| face.as_slice()),
-    );
-    let sharp_edges = non_manifold.sharpened(&edge_crease_weights(mesh, options.use_creases)?);
-    let mut vertex_faces = vec![Vec::new(); source_points.len()];
-    let mut vertex_edges = vec![Vec::new(); source_points.len()];
-    for (face_index, (face, _)) in source_polygons.iter().enumerate() {
-        for index in face {
-            vertex_faces[*index].push(face_index);
-        }
-    }
-    for edge in edge_faces.keys() {
-        vertex_edges[edge.0].push(*edge);
-        vertex_edges[edge.1].push(*edge);
-    }
-
     let mut limit_points = Vec::with_capacity(source_points.len());
     for (index, point) in source_points.iter().copied().enumerate() {
-        let faces = &vertex_faces[index];
-        let edges = &vertex_edges[index];
-        if faces.is_empty() || edges.is_empty() {
+        let edges = &position.vertex_edges
+            [position.vertex_edge_starts[index]..position.vertex_edge_starts[index + 1]];
+        let corners = &position.vertex_corners
+            [position.vertex_starts[index]..position.vertex_starts[index + 1]];
+        if corners.is_empty() || edges.is_empty() {
             limit_points.push(point);
             continue;
         }
-        if non_manifold.corner(index) {
+        if position.non_manifold_corners[index] {
             limit_points.push(point);
             continue;
         }
@@ -2423,21 +2476,20 @@ fn limit_surface_positions(mesh: &Mesh, options: SubdivisionOptions) -> Result<V
         let mut boundary_count = 0_usize;
         let mut crease_neighbors = [(0_usize, 0.0_f64); 3];
         let mut crease_count = 0_usize;
-        for edge in edges {
-            let neighbor = if edge.0 == index { edge.1 } else { edge.0 };
-            if edge_faces
-                .get(edge)
-                .is_some_and(|incident| incident.len() == 1)
-            {
+        for &edge in edges {
+            let ends = position.edge_ends[edge];
+            let neighbor = if ends.0 == index { ends.1 } else { ends.0 };
+            let sides = &position.edge_sides
+                [position.edge_starts[edge]..position.edge_starts[edge + 1]];
+            if sides.len() == 1 {
                 if boundary_count < boundary_neighbors.len() {
                     boundary_neighbors[boundary_count] = neighbor;
                 }
                 boundary_count += 1;
             }
-            if let Some(sharpness) = sharp_edges.get(edge)
-                && *sharpness > 0.0
-            {
-                let mut candidate = (neighbor, *sharpness);
+            let sharpness = position.edge_sharp[edge];
+            if sharpness > 0.0 {
+                let mut candidate = (neighbor, sharpness);
                 for slot in &mut crease_neighbors {
                     if candidate.1 > slot.1 {
                         std::mem::swap(&mut candidate, slot);
@@ -2463,41 +2515,44 @@ fn limit_surface_positions(mesh: &Mesh, options: SubdivisionOptions) -> Result<V
         } else {
             let valence = usize_as_f64(edges.len());
             let mut edge_neighbor_sum = DVec3::ZERO;
-            for edge in edges {
-                let neighbor = if edge.0 == index { edge.1 } else { edge.0 };
+            for &edge in edges {
+                let ends = position.edge_ends[edge];
+                let neighbor = if ends.0 == index { ends.1 } else { ends.0 };
                 edge_neighbor_sum += source_points[neighbor];
             }
             let mut opposite_point_sum = DVec3::ZERO;
-            for face_index in faces {
-                let face = &source_polygons[*face_index].0;
-                if face.len() != 4 {
+            for &corner in corners {
+                let face = position.face_of[corner];
+                let start = position.starts[face];
+                let end = position.starts[face + 1];
+                if end - start != 4 {
                     return Err(PotError::new(
                         ErrorCode::EvaluationFailed,
                         "limit-surface evaluation requires subdivided quad faces",
                     ));
                 }
-                let corner = face
-                    .iter()
-                    .position(|vertex| *vertex == index)
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::EvaluationFailed,
-                            "subdivision vertex-face adjacency is inconsistent",
-                        )
-                    })?;
-                opposite_point_sum += source_points[face[(corner + 2) % 4]];
+                opposite_point_sum += source_points
+                    [position.corner_vertex[start + (corner - start + 2) % 4]];
             }
             let smooth_limit =
                 (point * (valence * valence) + edge_neighbor_sum * 4.0 + opposite_point_sum)
                     / (valence * (valence + 5.0));
-            if crease_count >= 3 && crease_neighbors[2].1 >= 1.0 {
-                point
-            } else if crease_count >= 2 {
+            let crease_limit = (point * 4.0
+                + source_points[crease_neighbors[0].0]
+                + source_points[crease_neighbors[1].0])
+                / 6.0;
+            if crease_count >= 3 {
+                let crease_weight = crease_neighbors[0].1.min(crease_neighbors[1].1).min(1.0);
+                let corner_weight = crease_neighbors[0]
+                    .1
+                    .min(crease_neighbors[1].1)
+                    .min(crease_neighbors[2].1)
+                    .min(1.0);
+                smooth_limit
+                    .lerp(crease_limit, crease_weight)
+                    .lerp(point, corner_weight)
+            } else if crease_count == 2 {
                 let sharpness = crease_neighbors[0].1.min(crease_neighbors[1].1).min(1.0);
-                let crease_limit = (point * 4.0
-                    + source_points[crease_neighbors[0].0]
-                    + source_points[crease_neighbors[1].0])
-                    / 6.0;
                 smooth_limit.lerp(crease_limit, sharpness)
             } else {
                 smooth_limit
@@ -2559,6 +2614,15 @@ fn boundary_corner_limits(mesh: &Mesh, quality: u64) -> Result<BTreeMap<usize, D
     Ok(limits)
 }
 
+const BLENDER_EDGE_CREASE_MAX_SHARPNESS: f64 = 10.0;
+
+fn blender_edge_crease_sharpness(crease: f64) -> f64 {
+    BLENDER_EDGE_CREASE_MAX_SHARPNESS * crease * crease
+}
+
+fn blender_edge_crease_from_sharpness(sharpness: f64) -> f64 {
+    (sharpness / BLENDER_EDGE_CREASE_MAX_SHARPNESS).sqrt()
+}
 fn edge_crease_weights(mesh: &Mesh, enabled: bool) -> Result<BTreeMap<(usize, usize), f64>> {
     if !enabled {
         return Ok(BTreeMap::new());
@@ -2600,7 +2664,10 @@ fn edge_crease_weights(mesh: &Mesh, enabled: bool) -> Result<BTreeMap<(usize, us
                 .ok_or_else(|| {
                     PotError::invalid_argument("crease edge references a missing vertex")
                 })?;
-            creases.insert(edge_key(first, second), value);
+            creases.insert(
+                edge_key(first, second),
+                blender_edge_crease_sharpness(value),
+            );
         }
     }
     Ok(creases)
@@ -2791,89 +2858,108 @@ fn edge_index(polygon: &[usize], edge: (usize, usize)) -> Option<usize> {
         .find(|&index| edge_key(polygon[index], polygon[(index + 1) % polygon.len()]) == edge)
 }
 
-fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
+fn subdivide_once(
+    mesh: &Mesh,
+    options: SubdivisionOptions,
+    position: &subdivision_uv::Position,
+    source_polygons: &[Polygon],
+    source_edges: &[[usize; 2]],
+    edge_creases: &BTreeMap<(usize, usize), f64>,
+) -> Result<Mesh> {
     let source_points = positions(mesh);
-    let source_polygons = polygons(mesh)?;
-    let source_edges = loose_edges(mesh)?;
-    let mut edge_faces: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
-    for (face_index, (face, _)) in source_polygons.iter().enumerate() {
-        for (first, second) in cyclic_pairs(face) {
-            edge_faces
-                .entry(edge_key(*first, *second))
-                .or_default()
-                .push(face_index);
-        }
-    }
-    for [first, second] in &source_edges {
-        edge_faces.entry(edge_key(*first, *second)).or_default();
-    }
-    let edge_creases = edge_crease_weights(mesh, options.use_creases)?;
-    let non_manifold = NonManifold::new(
-        source_points.len(),
-        source_polygons.iter().map(|(face, _)| face.as_slice()),
-    );
-    let sharp_edges = non_manifold.sharpened(&edge_creases);
     let mut face_points = Vec::with_capacity(source_polygons.len());
-    for (face, _) in &source_polygons {
+    for (face, _) in source_polygons {
         face_points.push(
             face.iter()
                 .fold(DVec3::ZERO, |sum, index| sum + source_points[*index])
                 / usize_as_f64(face.len()),
         );
     }
-    let mut vertex_faces = vec![Vec::new(); source_points.len()];
-    let mut vertex_edges = vec![Vec::new(); source_points.len()];
-    for (face_index, (face, _)) in source_polygons.iter().enumerate() {
-        for index in face {
-            vertex_faces[*index].push(face_index);
-        }
-    }
-    for edge in edge_faces.keys() {
-        vertex_edges[edge.0].push(*edge);
-        vertex_edges[edge.1].push(*edge);
-    }
+
     let mut updated_points =
-        Vec::with_capacity(source_points.len() + edge_faces.len() + source_polygons.len());
+        Vec::with_capacity(source_points.len() + position.edge_ends.len() + source_polygons.len());
     for (index, point) in source_points.iter().enumerate() {
-        let boundary_neighbors: Vec<_> = vertex_edges[index]
-            .iter()
-            .filter(|edge| edge_faces.get(edge).is_some_and(|faces| faces.len() == 1))
-            .map(|edge| if edge.0 == index { edge.1 } else { edge.0 })
-            .collect();
-        let smooth = if boundary_neighbors.len() == 2 {
-            if options.preserve_corners && vertex_faces[index].len() == 1 {
+        let edges = &position.vertex_edges
+            [position.vertex_edge_starts[index]..position.vertex_edge_starts[index + 1]];
+        let corners = &position.vertex_corners
+            [position.vertex_starts[index]..position.vertex_starts[index + 1]];
+        let mut boundary_neighbors = [0_usize; 2];
+        let mut boundary_count = 0;
+        for &edge in edges {
+            let sides = &position.edge_sides
+                [position.edge_starts[edge]..position.edge_starts[edge + 1]];
+            if sides.len() == 1 {
+                if boundary_count < boundary_neighbors.len() {
+                    let ends = position.edge_ends[edge];
+                    boundary_neighbors[boundary_count] =
+                        if ends.0 == index { ends.1 } else { ends.0 };
+                }
+                boundary_count += 1;
+            }
+        }
+        let smooth = if boundary_count == 2 {
+            if options.preserve_corners && corners.len() == 1 {
                 *point
             } else {
                 *point * 0.75
                     + (source_points[boundary_neighbors[0]] + source_points[boundary_neighbors[1]])
                         * 0.125
             }
-        } else if !vertex_edges[index].is_empty() && !vertex_faces[index].is_empty() {
-            let face_average = vertex_faces[index]
+        } else if !edges.is_empty() && !corners.is_empty() {
+            let face_average = corners
                 .iter()
-                .fold(DVec3::ZERO, |sum, face| sum + face_points[*face])
-                / usize_as_f64(vertex_faces[index].len());
-            let edge_midpoint_average =
-                vertex_edges[index].iter().fold(DVec3::ZERO, |sum, edge| {
-                    sum + (source_points[edge.0] + source_points[edge.1]) * 0.5
-                }) / usize_as_f64(vertex_edges[index].len());
-            let n = usize_as_f64(vertex_edges[index].len());
-            (face_average + edge_midpoint_average * 2.0 + *point * (n - 3.0)) / n
+                .fold(DVec3::ZERO, |sum, corner| {
+                    sum + face_points[position.face_of[*corner]]
+                })
+                / usize_as_f64(corners.len());
+            let edge_midpoint_average = edges
+                .iter()
+                .fold(DVec3::ZERO, |sum, edge| {
+                    let ends = position.edge_ends[*edge];
+                    sum + (source_points[ends.0] + source_points[ends.1]) * 0.5
+                })
+                / usize_as_f64(edges.len());
+            let valence = usize_as_f64(edges.len());
+            (face_average + edge_midpoint_average * 2.0 + *point * (valence - 3.0)) / valence
         } else {
             *point
         };
-        let mut crease_neighbors = vertex_edges[index]
-            .iter()
-            .filter_map(|edge| {
-                sharp_edges
-                    .get(edge)
-                    .map(|sharpness| (if edge.0 == index { edge.1 } else { edge.0 }, *sharpness))
-            })
-            .collect::<Vec<_>>();
-        crease_neighbors.sort_by(|first, second| second.1.total_cmp(&first.1));
-        let updated = if non_manifold.corner(index) {
+
+        let mut crease_neighbors = [(0_usize, 0.0_f64); 3];
+        let mut crease_count = 0_usize;
+        for &edge in edges {
+            let sharpness = position.edge_sharp[edge];
+            if sharpness <= 0.0 {
+                continue;
+            }
+            let ends = position.edge_ends[edge];
+            let neighbor = if ends.0 == index { ends.1 } else { ends.0 };
+            let mut slot = 0;
+            while slot < crease_neighbors.len() && sharpness <= crease_neighbors[slot].1 {
+                slot += 1;
+            }
+            if slot < crease_neighbors.len() {
+                for next in (slot + 1..crease_neighbors.len()).rev() {
+                    crease_neighbors[next] = crease_neighbors[next - 1];
+                }
+                crease_neighbors[slot] = (neighbor, sharpness);
+            }
+            crease_count = (crease_count + 1).min(crease_neighbors.len());
+        }
+        let updated = if position.non_manifold_corners[index] {
             *point
-        } else if crease_neighbors.len() >= 2 {
+        } else if crease_count >= 3 {
+            let crease = *point * 0.75
+                + (source_points[crease_neighbors[0].0] + source_points[crease_neighbors[1].0])
+                    * 0.125;
+            let crease_weight = crease_neighbors[0].1.min(crease_neighbors[1].1).min(1.0);
+            let corner_weight = crease_neighbors[0]
+                .1
+                .min(crease_neighbors[1].1)
+                .min(crease_neighbors[2].1)
+                .min(1.0);
+            smooth.lerp(crease, crease_weight).lerp(*point, corner_weight)
+        } else if crease_count == 2 {
             let sharpness = crease_neighbors[0].1.min(crease_neighbors[1].1).min(1.0);
             let crease = *point * 0.75
                 + (source_points[crease_neighbors[0].0] + source_points[crease_neighbors[1].0])
@@ -2884,37 +2970,40 @@ fn subdivide_once(mesh: &Mesh, options: SubdivisionOptions) -> Result<Mesh> {
         };
         updated_points.push(updated);
     }
+
     let mut edge_point_indices = BTreeMap::new();
-    for (edge, faces) in &edge_faces {
+    for &edge_index in &position.edge_order {
+        let edge = position.edge_ends[edge_index];
         let midpoint = (source_points[edge.0] + source_points[edge.1]) * 0.5;
-        let smooth = if faces.len() == 2 {
+        let sides = &position.edge_sides
+            [position.edge_starts[edge_index]..position.edge_starts[edge_index + 1]];
+        let smooth = if sides.len() == 2 {
+            let first_face = position.face_of[sides[0]];
+            let second_face = position.face_of[sides[1]];
             (source_points[edge.0]
                 + source_points[edge.1]
-                + face_points[faces[0]]
-                + face_points[faces[1]])
+                + face_points[first_face]
+                + face_points[second_face])
                 * 0.25
         } else {
             midpoint
         };
-        let point = sharp_edges.get(edge).map_or(smooth, |sharpness| {
-            smooth.lerp(midpoint, sharpness.min(1.0))
-        });
-        edge_point_indices.insert(*edge, updated_points.len());
+        let point = smooth.lerp(midpoint, position.edge_sharp[edge_index].min(1.0));
+        edge_point_indices.insert(edge, updated_points.len());
         updated_points.push(point);
     }
     updated_points.extend(face_points);
     subdivision_uv::subdivided_mesh(
         mesh,
         updated_points,
-        &source_polygons,
-        &source_edges,
+        source_polygons,
+        source_edges,
         &edge_point_indices,
-        &edge_creases,
+        edge_creases,
         options.use_creases,
         options.raw_normals,
     )
 }
-
 fn triangulate_quad_method(modifier: &Modifier) -> Result<QuadMethod> {
     const EXPECTED: &str = "BEAUTY, FIXED, FIXED_ALTERNATE, SHORTEST_DIAGONAL, or LONGEST_DIAGONAL";
     Ok(
@@ -5189,7 +5278,10 @@ mod tests {
         model::{CurveData, CurvePoint, CurveSpline, Id, Modifier},
     };
 
-    use super::{check_subdivision_budget, evaluate_modifiers, evaluated_curve_path_length};
+    use super::{
+        blender_edge_crease_from_sharpness, blender_edge_crease_sharpness,
+        check_subdivision_budget, evaluate_modifiers, evaluated_curve_path_length,
+    };
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
         Modifier {

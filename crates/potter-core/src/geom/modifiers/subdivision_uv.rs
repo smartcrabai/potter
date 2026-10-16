@@ -12,14 +12,13 @@
 //! picks the linear option and `boundary_smooth` the boundary-corner option. SIMPLE subdivision uses
 //! bilinear positions, and its UVs are linear too (Blender makes every edge and vertex sharp).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use glam::{DVec2, DVec3};
 use serde_json::{Map, json};
 
 use super::{
-    NonManifold, Polygon, build_mesh, edge_crease_weights, loose_edges, polygons, positions,
-    usize_as_f64,
+    NonManifold, Polygon, blender_edge_crease_from_sharpness, build_mesh, positions, usize_as_f64,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -118,13 +117,14 @@ pub(super) struct UvSubdivision {
     layers: Vec<Layer>,
 }
 
-/// Rule that refines one value's vertex point.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Rule {
     /// Sharp corner: the value does not move.
     Corner,
-    /// Smooth boundary: `3/4 v + 1/8 (a + b)` with the values at the ends of its sharp edges.
-    Crease([usize; 2]),
+    /// Semi-sharp corner blended from the smooth rule.
+    BlendedCorner(f64),
+    /// Smooth boundary blended from the smooth rule according to crease sharpness.
+    Crease([usize; 2], f64),
     /// Smooth interior value: Catmull-Clark vertex rule.
     Smooth,
 }
@@ -136,9 +136,8 @@ struct Topology {
     edge_ends: Vec<[usize; 2]>,
     /// Face-varying edge of each corner's side, towards its next corner.
     side_edge: Vec<usize>,
-    /// For each face-varying edge whose edge point is the smooth average (continuous, manifold,
-    /// sharp-free), the faces on its two sides.
-    edge_smooth: Vec<Option<[usize; 2]>>,
+    /// For each face-varying edge with a smooth portion, adjacent faces and crease weight.
+    edge_smooth: Vec<Option<([usize; 2], f64)>>,
 }
 
 /// Per value: corner count, sum of face points, sum of edge-neighbour values (each neighbour counted
@@ -170,34 +169,28 @@ struct Fan {
     closed: bool,
 }
 
-/// The edge between consecutive fan corners (`index - 1` and `index`); boundary links sit at the ends
-/// of an open fan.
 #[derive(Clone, Copy)]
 struct Link {
     mismatch: bool,
-    sharp: bool,
+    sharpness: f64,
 }
 
-/// Position topology of one level, built once and shared by every UV layer. Corners are global
-/// indices, as in [`Channel`].
-struct Position {
-    /// First corner of each face; `starts[f + 1]` ends face `f`.
-    starts: Vec<usize>,
-    /// Face owning each corner.
-    face_of: Vec<usize>,
-    /// Vertex at each corner.
-    corner_vertex: Vec<usize>,
-    /// Position edge of each corner's side, towards its next corner.
-    corner_edge: Vec<usize>,
-    /// Sides of position edge `e` are `edge_sides[edge_starts[e]..edge_starts[e + 1]]`, in corner order.
-    edge_starts: Vec<usize>,
-    edge_sides: Vec<usize>,
-    /// Whether each position edge is sharp (crease weight at least 1).
-    edge_sharp: Vec<bool>,
-    /// Corners at vertex `v` are `vertex_corners[vertex_starts[v]..vertex_starts[v + 1]]`, in corner order.
-    vertex_starts: Vec<usize>,
-    vertex_corners: Vec<usize>,
-    /// Fan of each vertex (`None` when it is not one manifold fan). Empty unless built with fans.
+/// Position topology of one level, shared by geometry and all face-varying layers.
+pub(super) struct Position {
+    pub(super) starts: Vec<usize>,
+    pub(super) face_of: Vec<usize>,
+    pub(super) corner_vertex: Vec<usize>,
+    pub(super) corner_edge: Vec<usize>,
+    pub(super) edge_starts: Vec<usize>,
+    pub(super) edge_sides: Vec<usize>,
+    pub(super) edge_ends: Vec<(usize, usize)>,
+    pub(super) edge_order: Vec<usize>,
+    pub(super) edge_sharp: Vec<f64>,
+    pub(super) vertex_starts: Vec<usize>,
+    pub(super) vertex_corners: Vec<usize>,
+    pub(super) vertex_edge_starts: Vec<usize>,
+    pub(super) vertex_edges: Vec<usize>,
+    pub(super) non_manifold_corners: Vec<bool>,
     fans: Vec<Option<Fan>>,
 }
 
@@ -223,44 +216,63 @@ fn group(keys: &[usize], buckets: usize) -> (Vec<usize>, Vec<usize>) {
 }
 
 impl Position {
-    /// Position topology of a mesh's polygons. `with_fans` computes every vertex's fan, which only
-    /// the non-linear rules read.
-    fn new(
-        polys: &[Vec<usize>],
+    /// Position topology shared by the geometry and every face-varying channel at this level.
+    pub(super) fn new(
+        polys: &[Polygon],
+        loose_edges: &[[usize; 2]],
         creases: &BTreeMap<(usize, usize), f64>,
         vertex_count: usize,
         with_fans: bool,
     ) -> Self {
-        // OpenSubdiv makes non-manifold edges infinitely sharp in the face-varying topology too.
-        let creases =
-            NonManifold::new(vertex_count, polys.iter().map(Vec::as_slice)).sharpened(creases);
-        let total: usize = polys.iter().map(Vec::len).sum();
+        let non_manifold = NonManifold::new(
+            vertex_count,
+            polys.iter().map(|(face, _)| face.as_slice()),
+        );
+        let sharpness = non_manifold.sharpened(creases);
+        let total: usize = polys.iter().map(|(face, _)| face.len()).sum();
         let mut starts = Vec::with_capacity(polys.len() + 1);
         let mut face_of = Vec::with_capacity(total);
         let mut corner_vertex = Vec::with_capacity(total);
         starts.push(0);
-        for (face, poly) in polys.iter().enumerate() {
+        for (face_index, (poly, _)) in polys.iter().enumerate() {
             corner_vertex.extend_from_slice(poly);
-            face_of.extend(std::iter::repeat_n(face, poly.len()));
+            face_of.extend(std::iter::repeat_n(face_index, poly.len()));
             starts.push(corner_vertex.len());
         }
 
-        let mut edge_index: HashMap<(usize, usize), usize> = HashMap::with_capacity(total / 2 + 1);
-        let mut corner_edge = Vec::with_capacity(total);
+        let mut edge_index: HashMap<(usize, usize), usize> =
+            HashMap::with_capacity(total / 2 + loose_edges.len());
+        let mut edge_ends = Vec::with_capacity(total / 2 + loose_edges.len());
         let mut edge_sharp = Vec::new();
-        for poly in polys {
-            let size = poly.len();
-            for corner in 0..size {
-                let key = edge_key(poly[corner], poly[(corner + 1) % size]);
+        let mut corner_edge = Vec::with_capacity(total);
+        for (poly, _) in polys {
+            for corner in 0..poly.len() {
+                let key = edge_key(poly[corner], poly[(corner + 1) % poly.len()]);
                 let edge = *edge_index.entry(key).or_insert_with(|| {
-                    edge_sharp.push(creases.get(&key).is_some_and(|sharpness| *sharpness >= 1.0));
-                    edge_sharp.len() - 1
+                    edge_ends.push(key);
+                    edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
+                    edge_ends.len() - 1
                 });
                 corner_edge.push(edge);
             }
         }
-        let (edge_starts, edge_sides) = group(&corner_edge, edge_sharp.len());
+        for &[first, second] in loose_edges {
+            let key = edge_key(first, second);
+            edge_index.entry(key).or_insert_with(|| {
+                edge_ends.push(key);
+                edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
+                edge_ends.len() - 1
+            });
+        }
+        let (edge_starts, edge_sides) = group(&corner_edge, edge_ends.len());
         let (vertex_starts, vertex_corners) = group(&corner_vertex, vertex_count);
+        let endpoints = edge_ends
+            .iter()
+            .flat_map(|(first, second)| [*first, *second])
+            .collect::<Vec<_>>();
+        let (vertex_edge_starts, vertex_edges) = group(&endpoints, vertex_count);
+        let mut edge_order: Vec<usize> = (0..edge_ends.len()).collect();
+        edge_order.sort_unstable_by_key(|edge| edge_ends[*edge]);
 
         let mut position = Self {
             starts,
@@ -269,9 +281,16 @@ impl Position {
             corner_edge,
             edge_starts,
             edge_sides,
+            edge_ends,
+            edge_order,
             edge_sharp,
             vertex_starts,
             vertex_corners,
+            vertex_edge_starts,
+            vertex_edges,
+            non_manifold_corners: (0..vertex_count)
+                .map(|vertex| non_manifold.corner(vertex))
+                .collect(),
             fans: Vec::new(),
         };
         if with_fans {
@@ -317,8 +336,8 @@ impl Position {
         self.edge_sides_of(self.corner_edge[corner]).len()
     }
 
-    /// Whether the position edge that leaves `corner` towards its next corner is sharp.
-    fn sharp(&self, corner: usize) -> bool {
+
+    fn sharpness(&self, corner: usize) -> f64 {
         self.edge_sharp[self.corner_edge[corner]]
     }
 
@@ -331,10 +350,17 @@ impl Position {
             return None;
         }
         let other = *sides.iter().find(|candidate| **candidate != side)?;
+        let next = self.next(side);
+        let other_next = self.next(other);
+        if self.corner_vertex[side] != self.corner_vertex[other_next]
+            || self.corner_vertex[next] != self.corner_vertex[other]
+        {
+            return None;
+        }
         Some(if self.corner_vertex[other] == vertex {
             other
         } else {
-            self.next(other)
+            other_next
         })
     }
 
@@ -387,6 +413,7 @@ impl Position {
         (fans.len() == 1).then(|| fans.pop()).flatten()
     }
 }
+
 
 /// Per-layer walk: channel values over the shared position topology.
 struct Walk<'a> {
@@ -445,7 +472,7 @@ fn link(walk: &Walk, fan: &Fan, index: usize) -> Link {
     if !fan.closed && (index == 0 || index == size) {
         return Link {
             mismatch: false,
-            sharp: true,
+            sharpness: f64::INFINITY,
         };
     }
     let before = fan.corners[(index + size - 1) % size];
@@ -453,7 +480,7 @@ fn link(walk: &Walk, fan: &Fan, index: usize) -> Link {
     let after_back = walk.side_edge[walk.position.prev(after)];
     Link {
         mismatch: walk.side_edge[before] != after_back,
-        sharp: walk.position.sharp(before),
+        sharpness: walk.position.sharpness(before),
     }
 }
 
@@ -489,13 +516,25 @@ fn vertex_rules(walk: &Walk, fan: &Fan, options: UvOptions, rules: &mut [Rule]) 
 
     if !processed {
         let value = walk.value(fan.corners[0]);
-        let sharp: Vec<usize> = (0..link_count)
-            .filter(|index| links[*index].sharp)
+        let mut sharp: Vec<(usize, f64)> = (0..link_count)
+            .filter_map(|index| {
+                (links[index].sharpness > 0.0).then_some((index, links[index].sharpness))
+            })
             .collect();
-        rules[value] = if vertex_sharp || sharp.len() > 2 {
+        sharp.sort_unstable_by(|first, second| second.1.total_cmp(&first.1));
+        rules[value] = if vertex_sharp {
             Rule::Corner
+        } else if sharp.len() > 2 {
+            if sharp[2].1 >= 1.0 {
+                Rule::Corner
+            } else {
+                Rule::BlendedCorner(sharp[2].1)
+            }
         } else if let &[first, second] = sharp.as_slice() {
-            Rule::Crease([link_end(walk, fan, first), link_end(walk, fan, second)])
+            Rule::Crease(
+                [link_end(walk, fan, first.0), link_end(walk, fan, second.0)],
+                first.1.min(second.1),
+            )
         } else {
             Rule::Smooth
         };
@@ -517,7 +556,7 @@ fn vertex_rules(walk: &Walk, fan: &Fan, options: UvOptions, rules: &mut [Rule]) 
                 value: values[0],
                 size,
                 inf: (0..size)
-                    .filter(|other| *other != index && links[*other].sharp)
+                    .filter(|other| *other != index && links[*other].sharpness > 0.0)
                     .count(),
                 disct: 0,
                 ends: Some([
@@ -561,7 +600,7 @@ fn vertex_rules(walk: &Walk, fan: &Fan, options: UvOptions, rules: &mut [Rule]) 
             let interior = first + 1..=last;
             let inf = interior
                 .clone()
-                .filter(|p| links[corner_of(*p)].sharp)
+                .filter(|p| links[corner_of(*p)].sharpness > 0.0)
                 .count();
             let disct = interior.filter(|p| links[corner_of(*p)].mismatch).count();
             let ends = Some([
@@ -601,7 +640,8 @@ fn vertex_rules(walk: &Walk, fan: &Fan, options: UvOptions, rules: &mut [Rule]) 
             if span.disct > 0 || all_sharp || span.inf > 0 || (span.size == 1 && fvar_sharp) {
                 Rule::Corner
             } else {
-                span.ends.map_or(Rule::Corner, Rule::Crease)
+                span.ends
+                    .map_or(Rule::Corner, |ends| Rule::Crease(ends, f64::INFINITY))
             };
     }
 }
@@ -651,9 +691,13 @@ fn classify(channel: &Channel, position: &Position, options: UvOptions) -> Topol
             let [first, second] = first_sides[edge];
             (options.linear != FvarLinear::All
                 && side_counts[edge] == 2
-                && position.side_faces(first) == 2
-                && !position.sharp(first))
-            .then(|| [position.face_of[first], position.face_of[second]])
+                && position.side_faces(first) == 2)
+                .then(|| {
+                    (
+                        [position.face_of[first], position.face_of[second]],
+                        position.sharpness(first),
+                    )
+                })
         })
         .collect();
     Topology {
@@ -662,6 +706,14 @@ fn classify(channel: &Channel, position: &Position, options: UvOptions) -> Topol
         side_edge,
         edge_smooth,
     }
+}
+fn smooth_vertex(uv: DVec2, sum: Sums) -> DVec2 {
+    if sum.count == 0 {
+        return uv;
+    }
+    let count = usize_as_f64(sum.count);
+    let edge_midpoints = (uv * count + sum.neighbours * 0.5) / (2.0 * count);
+    (sum.face / count + edge_midpoints * 2.0 + uv * (count - 3.0)) / count
 }
 
 /// One refinement level of a channel: vertex points, face-varying edge points, and face points, in
@@ -674,27 +726,26 @@ fn refine_channel(channel: Channel, topology: &Topology) -> Channel {
     let mut child_uvs: Vec<DVec2> = (0..value_count)
         .map(|value| {
             let uv = uvs[value];
+            let smooth = smooth_vertex(uv, sums[value]);
             match topology.rules[value] {
                 Rule::Corner => uv,
-                Rule::Crease([first, second]) => uv * 0.75 + (uvs[first] + uvs[second]) * 0.125,
-                Rule::Smooth => {
-                    let sum = sums[value];
-                    if sum.count == 0 {
-                        uv
-                    } else {
-                        let count = usize_as_f64(sum.count);
-                        let edge_midpoints = (uv * count + sum.neighbours * 0.5) / (2.0 * count);
-                        (sum.face / count + edge_midpoints * 2.0 + uv * (count - 3.0)) / count
-                    }
+                Rule::BlendedCorner(weight) => smooth.lerp(uv, weight.min(1.0)),
+                Rule::Crease([first, second], weight) => {
+                    let crease = uv * 0.75 + (uvs[first] + uvs[second]) * 0.125;
+                    smooth.lerp(crease, weight.min(1.0))
                 }
+                Rule::Smooth => smooth,
             }
         })
         .collect();
     for (edge, [first, second]) in topology.edge_ends.iter().enumerate() {
         child_uvs.push(match topology.edge_smooth[edge] {
-            Some([first_face, second_face]) => {
-                (uvs[*first] + uvs[*second] + face_centers[first_face] + face_centers[second_face])
-                    * 0.25
+            Some(([first_face, second_face], weight)) => {
+                let smooth =
+                    (uvs[*first] + uvs[*second] + face_centers[first_face] + face_centers[second_face])
+                        * 0.25;
+                let linear = (uvs[*first] + uvs[*second]) * 0.5;
+                smooth.lerp(linear, weight.min(1.0))
             }
             None => (uvs[*first] + uvs[*second]) * 0.5,
         });
@@ -738,21 +789,28 @@ impl Layer {
         let uvs = &self.current.uvs;
         (0..uvs.len())
             .map(|value| {
+                let uv = uvs[value];
                 let sum = sums[value];
+                let smooth = if sum.count == 0 {
+                    uv
+                } else {
+                    let count = usize_as_f64(sum.count);
+                    (uv * (count * count) + sum.neighbours * 2.0 + sum.opposite)
+                        / (count * (count + 5.0))
+                };
                 match topology.rules[value] {
-                    Rule::Corner => uvs[value],
-                    Rule::Crease([first, second]) if sum.count == 1 => {
-                        self.corner_limit(value, [first, second], quality)
+                    Rule::Corner => uv,
+                    Rule::BlendedCorner(weight) => smooth.lerp(uv, weight.min(1.0)),
+                    Rule::Crease([first, second], weight) if sum.count == 1 => {
+                        let regular = (uv * 4.0 + uvs[first] + uvs[second]) / 6.0;
+                        let corner = self.corner_limit(value, [first, second], quality);
+                        regular.lerp(corner, weight.min(1.0))
                     }
-                    Rule::Crease([first, second]) => {
-                        (uvs[value] * 4.0 + uvs[first] + uvs[second]) / 6.0
+                    Rule::Crease([first, second], weight) => {
+                        let crease = (uv * 4.0 + uvs[first] + uvs[second]) / 6.0;
+                        smooth.lerp(crease, weight.min(1.0))
                     }
-                    Rule::Smooth if sum.count == 0 => uvs[value],
-                    Rule::Smooth => {
-                        let count = usize_as_f64(sum.count);
-                        (uvs[value] * (count * count) + sum.neighbours * 2.0 + sum.opposite)
-                            / (count * (count + 5.0))
-                    }
+                    Rule::Smooth => smooth,
                 }
             })
             .collect()
@@ -783,13 +841,6 @@ impl Layer {
     }
 }
 
-/// Polygon vertex indices of `mesh`, in face and corner order.
-fn polygon_vertices(mesh: &Mesh) -> Result<Vec<Vec<usize>>> {
-    Ok(polygons(mesh)?
-        .into_iter()
-        .map(|(vertices, _)| vertices)
-        .collect())
-}
 
 /// Blender's UV connection tolerance (`STD_UV_CONNECT_LIMIT`).
 const UV_CONNECT_LIMIT: f64 = 0.0001;
@@ -867,7 +918,11 @@ fn corner_uvs(position: &Position, layer: &UvLayer) -> Vec<DVec2> {
 
 impl UvSubdivision {
     /// Face-varying channels of every UV layer of `mesh` (the level-0 state).
-    pub(super) fn new(mesh: &Mesh, options: UvOptions) -> Result<Self> {
+    pub(super) fn new(
+        mesh: &Mesh,
+        options: UvOptions,
+        position: &Position,
+    ) -> Result<Self> {
         let layers = uv_layers::read_layers(mesh);
         if layers.is_empty() {
             return Ok(Self {
@@ -875,24 +930,16 @@ impl UvSubdivision {
                 layers: Vec::new(),
             });
         }
-        let polys = polygon_vertices(mesh)?;
-        let creases = edge_crease_weights(mesh, options.use_creases)?;
-        let position = Position::new(
-            &polys,
-            &creases,
-            mesh.vertices.len(),
-            options.linear != FvarLinear::All,
-        );
         let layers = layers
             .into_iter()
             .map(|layer| {
-                let base = channel_from(&position, &corner_uvs(&position, &layer));
-                let topology = classify(&base, &position, options);
+                let base = channel_from(position, &corner_uvs(position, &layer));
+                let topology = classify(&base, position, options);
                 let base_ends = topology
                     .rules
                     .iter()
                     .map(|rule| match rule {
-                        Rule::Crease(ends) => Some(*ends),
+                        Rule::Crease(ends, _) => Some(*ends),
                         _ => None,
                     })
                     .collect();
@@ -907,21 +954,10 @@ impl UvSubdivision {
         Ok(Self { options, layers })
     }
 
-    /// Refines every channel from `parent`, the mesh the channels currently describe.
-    pub(super) fn refine(&mut self, parent: &Mesh) -> Result<()> {
-        if self.layers.is_empty() {
-            return Ok(());
-        }
-        let polys = polygon_vertices(parent)?;
-        let creases = edge_crease_weights(parent, self.options.use_creases)?;
-        let position = Position::new(
-            &polys,
-            &creases,
-            parent.vertices.len(),
-            self.options.linear != FvarLinear::All,
-        );
+    /// Refines every channel over the shared position topology for its parent level.
+    pub(super) fn refine(&mut self, position: &Position) -> Result<()> {
         for layer in &mut self.layers {
-            let topology = classify(&layer.current, &position, self.options);
+            let topology = classify(&layer.current, position, self.options);
             layer.current = refine_channel(std::mem::take(&mut layer.current), &topology);
         }
         Ok(())
@@ -929,27 +965,19 @@ impl UvSubdivision {
 
     /// Writes the channels to the final mesh's UV attributes. `quality` gives the limit surface
     /// (`use_limit_surface`), or `None` for the refined values.
-    pub(super) fn write_back(&self, result: &mut Mesh, quality: Option<u64>) -> Result<()> {
+    pub(super) fn write_back(
+        &self,
+        result: &mut Mesh,
+        position: &Position,
+        quality: Option<u64>,
+    ) -> Result<()> {
         if self.layers.is_empty() {
             return Ok(());
         }
-        let polys = polygon_vertices(result)?;
-        let limit = match quality {
-            Some(quality) => {
-                let creases = edge_crease_weights(result, self.options.use_creases)?;
-                let position = Position::new(
-                    &polys,
-                    &creases,
-                    result.vertices.len(),
-                    self.options.linear != FvarLinear::All,
-                );
-                Some((quality, position))
-            }
-            None => None,
-        };
+        let limit = quality.map(|quality| (quality, position));
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            if layer.current.face_count() != polys.len() {
+            if layer.current.face_count() != position.starts.len() - 1 {
                 return Err(PotError::new(
                     ErrorCode::InternalError,
                     "subdivision UV channel does not match the output faces",
@@ -987,26 +1015,16 @@ impl UvSubdivision {
     }
 }
 
-/// One level of bilinear (`SIMPLE`) subdivision: original points stay, each edge gets its midpoint,
-/// and each face its centroid. Every corner becomes one quad, as in `subdivide_once`.
 pub(super) fn subdivide_simple_once(
     mesh: &Mesh,
+    position: &Position,
+    source_polygons: &[Polygon],
+    source_edges: &[[usize; 2]],
+    edge_creases: &BTreeMap<(usize, usize), f64>,
     use_creases: bool,
     raw_normals: bool,
 ) -> Result<Mesh> {
     let source_points = positions(mesh);
-    let source_polygons = polygons(mesh)?;
-    let source_edges = loose_edges(mesh)?;
-    let mut edges = BTreeSet::new();
-    for (face, _) in &source_polygons {
-        for (first, second) in super::cyclic_pairs(face) {
-            edges.insert(edge_key(*first, *second));
-        }
-    }
-    for [first, second] in &source_edges {
-        edges.insert(edge_key(*first, *second));
-    }
-    let edge_creases = edge_crease_weights(mesh, use_creases)?;
     let face_points: Vec<DVec3> = source_polygons
         .iter()
         .map(|(face, _)| {
@@ -1017,18 +1035,19 @@ pub(super) fn subdivide_simple_once(
         .collect();
     let mut points = source_points.clone();
     let mut edge_point_indices = BTreeMap::new();
-    for edge in &edges {
-        edge_point_indices.insert(*edge, points.len());
+    for &edge_index in &position.edge_order {
+        let edge = position.edge_ends[edge_index];
+        edge_point_indices.insert(edge, points.len());
         points.push((source_points[edge.0] + source_points[edge.1]) * 0.5);
     }
     points.extend(face_points);
     subdivided_mesh(
         mesh,
         points,
-        &source_polygons,
-        &source_edges,
+        source_polygons,
+        source_edges,
         &edge_point_indices,
-        &edge_creases,
+        edge_creases,
         use_creases,
         raw_normals,
     )
@@ -1038,7 +1057,7 @@ pub(super) fn subdivide_simple_once(
 /// the refined vertices, then one point per edge in `edge_points` key order, then one per source face.
 /// Every source corner becomes one quad `[corner, next edge point, face point, previous edge point]`,
 /// faces in source order. Loose edges split at their edge point, and each output vertex records its
-/// source origin. With `use_creases`, child edges keep the crease minus one level.
+/// source origin. Internal sharpness decays by one level and is stored as Blender's crease value.
 pub(super) fn subdivided_mesh(
     mesh: &Mesh,
     points: Vec<DVec3>,
@@ -1126,8 +1145,11 @@ pub(super) fn subdivided_mesh(
             } else {
                 (edge.vertices[1], edge.vertices[0])
             };
-            if let Some(weight) = next_creases.get(&ordered) {
-                values.insert(format!("e{}", edge.id), json!(weight));
+            if let Some(sharpness) = next_creases.get(&ordered) {
+                values.insert(
+                    format!("e{}", edge.id),
+                    json!(blender_edge_crease_from_sharpness(*sharpness)),
+                );
             }
         }
         output.attributes.insert(
