@@ -4389,7 +4389,7 @@ mod tests {
             pod: 6,
             extent: 1,
             sample_count,
-            first_changed: if constant { 0 } else { 1 },
+            first_changed: usize::from(!constant),
             last_changed: if constant {
                 0
             } else {

@@ -78,6 +78,8 @@ struct MaterialExport {
     uv_layers: [Option<String>; 4],
 }
 
+type MaterialBindings = BTreeMap<(Id, usize), i64>;
+
 #[derive(Clone, Debug)]
 struct TextureExport {
     id: i64,
@@ -782,7 +784,7 @@ fn build_material_exports(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     next_id: &mut i64,
-) -> Result<(Vec<MaterialExport>, BTreeMap<(Id, usize), i64>)> {
+) -> Result<(Vec<MaterialExport>, MaterialBindings)> {
     let mut output = Vec::new();
     let mut variants = BTreeMap::<(Id, [Option<String>; 4]), i64>::new();
     let mut bindings = BTreeMap::new();
@@ -3850,7 +3852,7 @@ mod tests {
                 blob: None,
                 source_path: Some(image_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&pixels)),
-                alpha_mode: Default::default(),
+                alpha_mode: ImageAlphaMode::default(),
             },
         );
         let material_id = Id::new("shared")?;

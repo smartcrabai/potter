@@ -83,8 +83,8 @@ pub(crate) fn evaluate(
     let mut samples = cached_mesh_cache_samples(
         archive_bytes,
         resource_hash,
-        &resource,
-        &object_path,
+        resource,
+        object_path,
         read,
         velocity_scale != 0.0,
         modifier,
@@ -122,8 +122,8 @@ pub(crate) fn evaluate(
         samples = cached_mesh_cache_samples(
             archive_bytes,
             resource_hash,
-            &resource,
-            &object_path,
+            resource,
+            object_path,
             read,
             velocity_scale != 0.0,
             modifier,

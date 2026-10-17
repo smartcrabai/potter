@@ -605,10 +605,7 @@ pub(crate) fn restore_gltf_normal_map_handedness(group: &mut NodeGroup) {
     group.links.extend(links);
 }
 
-fn only_link<'a>(
-    links: &'a [GraphLink],
-    predicate: impl Fn(&GraphLink) -> bool,
-) -> Option<&'a GraphLink> {
+fn only_link(links: &[GraphLink], predicate: impl Fn(&GraphLink) -> bool) -> Option<&GraphLink> {
     let mut matching = links.iter().filter(|link| predicate(link));
     let first = matching.next()?;
     matching.next().is_none().then_some(first)

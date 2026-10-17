@@ -553,10 +553,10 @@ mod tests {
         let mesh = meshes
             .first()
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "OBJ object is missing"))?;
-        assert!(mesh.faces.is_empty());
+        assert_eq!(mesh.faces, Vec::<Vec<usize>>::new());
         assert_eq!(mesh.uv_layers.len(), 1);
         assert_eq!(mesh.uv_layers[0].name, "UVMap");
-        assert!(mesh.uv_layers[0].corners.is_empty());
+        assert_eq!(mesh.uv_layers[0].corners, Vec::<Vec<[f64; 2]>>::new());
         assert_eq!(mesh.uv_active, Some(0));
         assert_eq!(mesh.uv_render, Some(0));
         Ok(())

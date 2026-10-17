@@ -635,8 +635,7 @@ pub(crate) fn upgrade_mesh_v1(
         let render_name = layers[render_index].name.clone();
         let active_name = legacy_active
             .filter(|index| kept.contains(index))
-            .map(|index| layers[index].name.clone())
-            .unwrap_or_else(|| render_name.clone());
+            .map_or_else(|| render_name.clone(), |index| layers[index].name.clone());
         attributes.insert(
             ATTRIBUTE.to_owned(),
             json!({"layers": stored, "active": active_name, "render": render_name}),

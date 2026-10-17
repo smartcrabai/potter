@@ -3435,8 +3435,7 @@ fn preserve_vrm_material_variants(
                 })?;
                 let base_name = root["materials"][base_index]["name"]
                     .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| material_id.to_string());
+                    .map_or_else(|| material_id.to_string(), str::to_owned);
                 let mut variant_name = format!("{base_name}__potter_uv_variant_{index}");
                 while !used_names.insert(variant_name.clone()) {
                     variant_name.push('_');
@@ -11823,7 +11822,11 @@ mod tests {
                 .iter()
                 .any(|loss| loss.feature_id == "uv.layer_missing")
         );
-        assert!(warnings.is_empty());
+        assert_eq!(
+            warnings,
+            Vec::new(),
+            "unexpected UV-layer fallback warnings"
+        );
 
         let (document, _) = export_root_and_binary_at_root(&doc, root.path())?;
         let mesh = document["meshes"]

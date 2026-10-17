@@ -669,7 +669,12 @@ mod tests {
 
         let mut mesh = quad_with_seam_uvs();
         mesh.uv_layers[0].corners[0][0][0] = f64::MAX;
-        let error = export(&[mesh]).expect_err("out-of-range UV should fail PLY export");
+        let error = export(&[mesh]).err().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "out-of-range UV should fail PLY export",
+            )
+        })?;
         assert_eq!(error.code, ErrorCode::ExportFailed);
         assert_eq!(
             error.message,
