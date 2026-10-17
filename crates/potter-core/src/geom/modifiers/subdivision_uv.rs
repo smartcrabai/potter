@@ -15,19 +15,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use glam::{DVec2, DVec3, Vec3};
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use super::{
     NonManifold, Polygon, build_mesh, edge_crease_weights, loose_edges, polygons, positions,
     usize_as_f64,
 };
 use crate::{
+    color::{linear_to_srgb, srgb_to_linear},
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
         clnor::{self, NormalCodeOptions, SetterInput},
+        color_layers::{self, ColorDomain},
         edge_key,
-        provenance::Origin,
+        provenance::{Origin, corner_sources},
         uv_layers::{self, UvLayer},
     },
 };
@@ -1509,6 +1511,7 @@ pub(super) fn subdivided_mesh(
         corners: None,
     };
     let mut output = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
+    encode_byte_colors(mesh, &origin, &mut output);
     if use_creases && mesh.attributes.contains_key("crease_edge") {
         let mut next_creases = BTreeMap::new();
         for (edge, sharpness) in edge_creases {
@@ -1547,6 +1550,94 @@ pub(super) fn subdivided_mesh(
         );
     }
     Ok(output)
+}
+
+/// Blender interpolates a `BYTE_COLOR` layer in its stored bytes: RGB holds sRGB-encoded bytes and alpha is
+/// linear. Each subdivided value mixes its sources' bytes and truncates the sum to a byte, so the result is
+/// not a linear mix. Potter's colour store is linear, so every byte-typed layer is re-blended here from the
+/// same origins the attribute remap used, and float layers keep the linear remap.
+fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
+    let Some(types) = source
+        .attributes
+        .get("blender_metadata")
+        .and_then(|metadata| metadata.get("color_data_types"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let byte_layers: BTreeSet<&str> = types
+        .iter()
+        .filter(|(_, data_type)| data_type.as_str() == Some("BYTE_COLOR"))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if byte_layers.is_empty() {
+        return;
+    }
+    let source_store = color_layers::read(source);
+    let mut store = color_layers::read(output);
+    let output_vertex_index: HashMap<u32, usize> = output
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let corners = corner_sources(source, origin, output, &output_vertex_index);
+    for layer in &mut store.layers {
+        if !byte_layers.contains(layer.name.as_str()) {
+            continue;
+        }
+        let Some(source_layer) = source_store
+            .layers
+            .iter()
+            .find(|candidate| candidate.name == layer.name)
+        else {
+            continue;
+        };
+        let sources = match layer.domain {
+            ColorDomain::Point => origin.vertices.as_slice(),
+            ColorDomain::Corner => corners.as_slice(),
+        };
+        layer.values = sources
+            .iter()
+            .map(|sources| mix_byte_color(&source_layer.values, sources))
+            .collect();
+    }
+    color_layers::write(output, &store);
+}
+
+/// One output value of a `BYTE_COLOR` layer: each source's stored byte times its origin weight, summed and
+/// truncated to a byte per channel, then decoded back to linear. A value with no source is opaque black, as
+/// the attribute remap's default.
+fn mix_byte_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [f64; 4] {
+    let mut bytes = [0.0_f64; 4];
+    let mut found = false;
+    for (index, weight) in sources {
+        let Some(value) = values.get(*index) else {
+            continue;
+        };
+        found = true;
+        for (channel, component) in value.iter().enumerate() {
+            let encoded = if channel < 3 {
+                linear_to_srgb(*component)
+            } else {
+                *component
+            };
+            bytes[channel] += weight * (encoded * 255.0).round();
+        }
+    }
+    if !found {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let mut color = [0.0; 4];
+    for (channel, &byte) in bytes.iter().enumerate() {
+        let unit = (byte + 1.0e-9).floor().clamp(0.0, 255.0) / 255.0;
+        color[channel] = if channel < 3 {
+            srgb_to_linear(unit)
+        } else {
+            unit
+        };
+    }
+    color
 }
 
 #[cfg(test)]

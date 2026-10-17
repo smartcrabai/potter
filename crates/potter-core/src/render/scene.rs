@@ -1976,10 +1976,16 @@ fn shade(
             );
         }
     }
-    // Reflectance weights every reflective closure (ambient, direct, environment). Emission adds
-    // radiance without reflection, so the caller adds it unscaled (Cycles' `EmissionNode::compile`,
-    // intern/cycles/scene/shader_nodes.cpp:3071-3098).
-    let result = result * reflectance.clamp(0.0, 1.0);
+    // Beauty only: Solid/preview keeps Blender Solid's viewport-colour rule and ignores the closure
+    // weight. In Beauty, reflectance weights every reflective closure (ambient, direct,
+    // environment); emission is added unscaled by the caller, as Cycles' `EmissionNode::compile`
+    // (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only NODE_CLOSURE_EMISSION.
+    let reflectance = if matches!(mode, Mode::Beauty) {
+        reflectance.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let result = result * reflectance;
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
     Ok([result.x, result.y, result.z, base[3]])
 }

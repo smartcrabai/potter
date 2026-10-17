@@ -5758,9 +5758,12 @@ def _restore_data_materials(data_raw, data_blocks, material_map, linked_data_blo
                 raise ValueError("data block %s references missing material %s"
                                  % (data_id, material_id))
             data.materials.append(material)
+        # Zero is Blender's default, and assigning it creates a `material_index` attribute. Only the
+        # non-zero indices are written, so a mesh whose faces all use slot 0 keeps no such attribute.
         if indices is not None:
             for polygon, index in zip(data.polygons, indices):
-                polygon.material_index = index
+                if index:
+                    polygon.material_index = index
 
 
 def _restore_object_material_slots(obj, node, material_map, scene):
@@ -5794,31 +5797,35 @@ def _restore_object_material_slots(obj, node, material_map, scene):
             raise ValueError("object %s has unknown material slot link %r" % (obj.name, link))
 
 
-def _pack_image(image):
-    """Packs an image's current pixels into the .blend.
+def _pack_image(image, channels):
+    """Packs a float image's pixels into the .blend from the bytes of Blender's file writer.
 
-    A float buffer is packed from the bytes Blender's file writer produces. Blender 5.2.2's packed-buffer path
-    (`image.pack()` without data) leaves the OpenEXR line-offset table empty, so the file writer is the source.
-    Byte buffers keep `image.pack()`.
+    Blender 5.2.2's packed-buffer path (`image.pack()` without data) leaves the OpenEXR line-offset table
+    empty, so the file writer produces the bytes. The file writer converts the buffer from its colour space
+    to the file colour space (blenkernel image_save.cc, IMB_colormanagement_imbuf_for_write), and that target
+    is sRGB here, so the buffer is tagged sRGB for the save: the packed values are the pixel values. Changing
+    the colour space drops the buffer, so the pixels are written again; the declared colour space is restored.
     """
-    if not image.is_float:
-        image.pack()
-        return
+    declared = image.colorspace_settings.name
     descriptor, path = tempfile.mkstemp(suffix=".exr")
     os.close(descriptor)
     previous_path = image.filepath_raw
     previous_format = image.file_format
     try:
+        image.colorspace_settings.name = "sRGB"
+        image.pixels.foreach_set(channels)
+        image.update()
         image.filepath_raw = path
         image.file_format = "OPEN_EXR"
         image.save()
         with open(path, "rb") as handle:
             data = handle.read()
+        image.pack(data=data, data_len=len(data))
     finally:
         image.filepath_raw = previous_path
         image.file_format = previous_format
+        image.colorspace_settings.name = declared
         os.remove(path)
-    image.pack(data=data, data_len=len(data))
 
 
 def export_doc(doc, target, pack, scene_hash, context):
@@ -5986,21 +5993,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
         if sidecar is None and pixels is not None:
-            # Changing the colour space drops the float buffer, so the save colour space is set before the pixels.
-            # Blender's EXR save converts an sRGB float buffer to linear; the packed buffer is saved as Linear
-            # Rec.709 and the declared sRGB is restored afterwards.
-            declared = image.colorspace_settings.name
-            save_linear = image.is_float and declared == "sRGB"
-            if save_linear:
-                image.colorspace_settings.name = "Linear Rec.709"
-            image.pixels.foreach_set(
-                [channel for pixel in pixels for channel in pixel])
-            image.update()
-            try:
-                _pack_image(image)
-            finally:
-                if save_linear:
-                    image.colorspace_settings.name = declared
+            _pack_image(image, [channel for pixel in pixels for channel in pixel])
         if item.get("source") == "packed" and image.packed_file is None:
             image.pack()
         set_id(image, image_id)

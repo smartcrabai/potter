@@ -1600,7 +1600,13 @@ fn blender_quantize_loop_normals(
     let script_path = root.join("normal_quantization.py");
     fs::write(&script_path, BLENDER_LOOP_NORMAL_QUANTIZATION_SCRIPT)?;
     let output = Command::new(blender)
-        .args(["--background", "--factory-startup", "--python"])
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
         .arg(script_path)
         .args(["--"])
         .arg(root)
@@ -1932,7 +1938,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &blender,
         &root,
         &weighted_mesh,
-        &corner_normals(&weighted)?,
+        &corner_normal_vectors_json(&weighted)?,
     )?;
     assert_normal_stimulus(
         "weighted_normal FACE_AREA",
@@ -1967,7 +1973,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &blender,
             &root,
             &sharp_mesh,
-            &corner_normals(&weighted_sharp)?,
+            &corner_normal_vectors_json(&weighted_sharp)?,
         )?,
         &expected["weighted_normal_sharp"],
         1.0e-5,
@@ -1997,7 +2003,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &blender,
             &root,
             &weighted_face_mesh,
-            &corner_normals(&weighted_face)?,
+            &corner_normal_vectors_json(&weighted_face)?,
         )?,
         &expected["weighted_normal_face_influence"],
         1.0e-5,
@@ -2820,6 +2826,15 @@ fn corner_normals(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         result.extend(corners.iter().cloned());
     }
     Ok(Value::Array(result))
+}
+
+/// The evaluated corner vectors of `mesh` in flattened face order, as JSON. The stored custom normals are
+/// `normal_code` pairs, which are not vectors, so they decode through the public evaluator first.
+fn corner_normal_vectors_json(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
+    let normals = potter_core::geom::corner_normal_vectors(mesh)?;
+    Ok(Value::Array(
+        normals.iter().map(|normal| json!(normal.to_array())).collect(),
+    ))
 }
 
 fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {

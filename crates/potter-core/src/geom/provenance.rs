@@ -367,7 +367,7 @@ fn edge_sources(
 /// `sf`) on output vertex `v` takes the input vertices of `v` that belong to `sf`, weighted by their
 /// origin weights renormalised over those vertices, each mapped to its corner in `sf`. A corner with
 /// no such vertex, or on a generated face, has no sources and takes the domain default.
-fn corner_sources(
+pub(crate) fn corner_sources(
     source: &Mesh,
     origin: &Origin,
     output: &Mesh,
