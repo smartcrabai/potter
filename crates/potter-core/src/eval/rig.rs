@@ -7138,14 +7138,15 @@ fn apply_pose_drivers(
         let Some((bone_key, channel)) = pose_channel_path(path) else {
             continue;
         };
-        let pose = pose_driver_bone_id(armature, &bone_key)
-            .and_then(|bone_id| pose_bones.get_mut(&bone_id))
-            .ok_or_else(|| {
-                evaluation_error_with(
-                    "pose driver targets an unknown bone",
-                    json!({ "node": node_id, "bone_id": bone_key }),
-                )
-            })?;
+        let bone_id = pose_driver_bone_id(armature, &bone_key).ok_or_else(|| {
+            evaluation_error_with(
+                "pose driver targets an unknown bone",
+                json!({ "node": node_id, "bone_id": bone_key }),
+            )
+        })?;
+        // A bone the node has not posed still exists in the armature; it starts at rest, as
+        // evaluate_bone_matrices treats a missing pose entry.
+        let pose = pose_bones.entry(bone_id).or_default();
         let values = match channel {
             "location" | "translation" => &mut pose.translation[..],
             "rotation" => &mut pose.rotation[..],
