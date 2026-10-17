@@ -1171,7 +1171,6 @@ fn object_of<'a>(mesh: &'a Mesh, key: &str) -> Option<&'a Map<String, Value>> {
     mesh.attributes.get(key)?.as_object()
 }
 
-
 /// The object under `key` of each operand that has one, with the operand's index.
 fn objects_of<'a>(operands: &[Operand<'a>], key: &str) -> Vec<(usize, &'a Map<String, Value>)> {
     operands
@@ -1187,12 +1186,12 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{OutputMaterials, polys_to_mesh};
-    use crate::geom::{Mesh, uv_layers};
     use crate::geom::boolean::{
         dissolve::Poly,
         imesh::{Arena, NO_INDEX},
         input::Operand,
     };
+    use crate::geom::{Mesh, uv_layers};
 
     type TestResult = Result<(), String>;
 
