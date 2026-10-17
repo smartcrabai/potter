@@ -30,6 +30,28 @@ pub const NORMAL_TOLERANCE: f64 = 1.0e-4;
 /// `NORMAL_TOLERANCE`.
 pub const BLENDER_NORMAL_TOLERANCE: f64 = 2.0e-4;
 
+/// Bound for normals that pass through custom-normal codes on both sides of a comparison. Blender stores
+/// custom normals as int16 pairs, so the exported value and the Blender reference are both quantized.
+pub const QUANTIZED_NORMAL_TOLERANCE: f64 = 2.0e-4;
+
+/// Corners per face and faces per box in the reference order (`Mixed`, `Mirror`, `NonUni` by box).
+const CORNERS_PER_FACE: usize = 4;
+const FACES_PER_BOX: usize = 6;
+/// The face (`f2`) of each box that carries custom normals in this fixture.
+const CUSTOM_NORMAL_FACE: usize = 2;
+
+/// The one corner-normal bound for reference corner `index`. A corner of a custom-normal face has
+/// codes on both sides, so it takes `QUANTIZED_NORMAL_TOLERANCE`; every other corner is automatic or
+/// smooth and keeps `NORMAL_TOLERANCE`.
+pub fn corner_normal_tolerance(index: usize) -> f64 {
+    let face = index / CORNERS_PER_FACE;
+    if face % FACES_PER_BOX == CUSTOM_NORMAL_FACE {
+        QUANTIZED_NORMAL_TOLERANCE
+    } else {
+        NORMAL_TOLERANCE
+    }
+}
+
 /// Inverse of Potter's OBJ axes: a file line `(x, z, -y)` is Potter's `(x, y, z)`.
 pub fn obj_to_potter(value: [f64; 3]) -> [f64; 3] {
     [value[0], -value[2], value[1]]
@@ -321,7 +343,7 @@ pub fn assert_matches_reference(observed: &[ObservedCorner]) -> TestResult<f64> 
         "corner count differs from the Blender reference"
     );
     let mut worst = 0.0_f64;
-    for expected in &reference {
+    for (index, expected) in reference.iter().enumerate() {
         let found = observed
             .iter()
             .filter(|corner| {
@@ -339,8 +361,9 @@ pub fn assert_matches_reference(observed: &[ObservedCorner]) -> TestResult<f64> 
         let error = (0..3)
             .map(|axis| (found[0].normal[axis] - expected.normal[axis]).abs())
             .fold(0.0_f64, f64::max);
+        let tolerance = corner_normal_tolerance(index);
         assert!(
-            error <= NORMAL_TOLERANCE,
+            error <= tolerance,
             "normal {:?} differs from Blender {:?} at corner {:?} (error {error})",
             found[0].normal,
             expected.normal,
