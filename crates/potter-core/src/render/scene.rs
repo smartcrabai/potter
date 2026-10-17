@@ -2283,6 +2283,8 @@ mod shading_normal_tests {
     use glam::{DMat4, DVec3};
     use serde_json::json;
 
+    use crate::error::{ErrorCode, PotError};
+
     use super::{
         ColorSlotReferences, carried_color_layers, color_layer_references, corner_values,
         extract_geometry, source_has_color_layer, subdivide_displaced, surface_shader,

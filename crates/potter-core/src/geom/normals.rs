@@ -504,6 +504,14 @@ fn find(parent: &mut [usize], mut index: usize) -> usize {
     index
 }
 
+pub(crate) fn vector3(value: &Value) -> Option<DVec3> {
+    let [x, y, z] = value.as_array()?.as_slice() else {
+        return None;
+    };
+    let vector = DVec3::new(x.as_f64()?, y.as_f64()?, z.as_f64()?);
+    vector.is_finite().then_some(vector)
+}
+
 fn mesh_error(error: &MeshError) -> PotError {
     PotError::with_details(
         ErrorCode::InvalidArgument,

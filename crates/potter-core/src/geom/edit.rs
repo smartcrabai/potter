@@ -8,6 +8,7 @@ use crate::{
     geom::{
         Face, Mesh, MeshError,
         attribute_keys::storage_key,
+        clnor::{self, NormalCodeOptions, SetterInput},
         color_layers::{self, ColorDomain, ColorLayer},
         edge_key,
         uv_layers::{self, UvLayer, UvStore},

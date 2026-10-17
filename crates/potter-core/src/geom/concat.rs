@@ -1339,7 +1339,7 @@ mod tests {
             .and_then(Value::as_object_mut)
             .unwrap()
             .insert("values".to_owned(), Value::Object(normal_codes));
-        let source_normals = super::normals::corner_normals(&source, &source_positions).unwrap();
+        let source_normals = crate::geom::normals::corner_normals(&source, &source_positions).unwrap();
         let source_codes = super::clnor::corner_codes(&source).unwrap().unwrap();
         assert!(
             source_codes
@@ -1365,7 +1365,7 @@ mod tests {
             .map(|vertex| vertex.co)
             .collect::<Vec<_>>();
         let identity_normals =
-            super::normals::corner_normals(&identity, &identity_positions).unwrap();
+            crate::geom::normals::corner_normals(&identity, &identity_positions).unwrap();
         for (corner, (source, actual)) in source_normals.iter().zip(&identity_normals).enumerate() {
             assert!(
                 actual.abs_diff_eq(*source, 2.0e-4),
@@ -1381,11 +1381,11 @@ mod tests {
             .iter()
             .map(|vertex| vertex.co)
             .collect::<Vec<_>>();
-        let output_normals = super::normals::corner_normals(&joined, &output_positions).unwrap();
+        let output_normals = crate::geom::normals::corner_normals(&joined, &output_positions).unwrap();
         let output_codes = super::clnor::corner_codes(&joined).unwrap().unwrap();
         assert_eq!(output_codes.len(), source_codes.len());
         let output_order = super::clnor::corner_order(&joined).unwrap().unwrap();
-        let transformed = super::normals::normal_matrix(mirror);
+        let transformed = crate::geom::normals::normal_matrix(mirror);
         let uv_store = crate::geom::uv_layers::read(&joined);
         let uv = &uv_store.layers[0];
         let mut corner_base = 0;
@@ -1489,7 +1489,7 @@ mod tests {
             .iter()
             .map(|vertex| vertex.co)
             .collect::<Vec<_>>();
-        let normals = super::normals::corner_normals(&joined, &positions).unwrap();
+        let normals = crate::geom::normals::corner_normals(&joined, &positions).unwrap();
         assert!(normals.iter().all(|normal| *normal == DVec3::ZERO));
     }
 

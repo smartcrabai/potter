@@ -34,6 +34,7 @@ const MTOON_TEXTURES: [&str; 5] = [
 ];
 
 /// A scene document read from bytes, with diagnostics from its schema upgrade.
+#[derive(Debug)]
 pub struct ParsedScene {
     pub doc: SceneDoc,
     /// Diagnostics for legacy data the upgrade skipped or dropped.

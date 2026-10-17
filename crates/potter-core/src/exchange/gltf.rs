@@ -10246,6 +10246,7 @@ fn baked_mesh_scales(root: &Value) -> Result<BTreeMap<usize, DVec3>> {
 
 #[cfg(test)]
 mod tests {
+    use glam::DVec3;
     use proptest::{prelude::*, test_runner::TestCaseError};
     use serde_json::{Value, json};
 
@@ -11845,7 +11846,7 @@ mod tests {
             .ok_or("mesh primitives are missing")?;
         assert_eq!(primitives.len(), 2);
         let buffers = vec![binary];
-        for (primitive, name, expected, other) in primitives.iter().zip([
+        for (primitive, (name, expected, other)) in primitives.iter().zip([
             ("First", [0.1, 0.2, 0.3, 1.0], [0.7, 0.8, 0.9, 1.0]),
             ("Second", [0.7, 0.8, 0.9, 1.0], [0.1, 0.2, 0.3, 1.0]),
         ]) {
@@ -11873,7 +11874,8 @@ mod tests {
         let metadata = &document["meshes"][0]["extras"]["potter"]["color_attributes"];
         assert_eq!(metadata["layers"][0]["name"], json!("First"));
         assert_eq!(metadata["layers"][1]["name"], json!("Second"));
-        let (imported, _) = round_trip_in(&doc, &tempfile::tempdir()?)?;
+        let reimport_root = tempfile::tempdir()?;
+        let (imported, _) = round_trip_in(&doc, reimport_root.path())?;
         let restored = crate::geom::color_layers::read(first_mesh(&imported.doc)?);
         assert_eq!(restored.layers[0].name, "First");
         assert_eq!(restored.layers[1].name, "Second");

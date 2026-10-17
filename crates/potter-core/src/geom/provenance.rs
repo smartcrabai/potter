@@ -1628,7 +1628,6 @@ mod tests {
                 vec![(1, 0.5), (3, 0.5)],
                 Vec::new(),
             ]),
-            raw_normals: false,
         };
 
         remap_attributes(&source, &mut output, &origin).expect("remap");
