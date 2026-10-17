@@ -1125,7 +1125,7 @@ pub struct RenderSettings {
     #[serde(default)]
     pub passes: Vec<String>,
     /// Blender's view-layer cryptomatte accuracy setting (`ViewLayer.use_pass_cryptomatte_accurate`,
-    /// rna_scene.cc). It changes how the cryptomatte pass is generated and is not a pass itself.
+    /// `rna_scene.cc`). It changes how the cryptomatte pass is generated and is not a pass itself.
     #[serde(default)]
     pub cryptomatte_accurate: bool,
     #[serde(default)]
