@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt::Write as _, fs, path::Path};
 use glam::DVec3;
 use serde_json::json;
 
-use super::{ExchangeMesh, Loss, shading};
+use super::{ExchangeMesh, Loss, shading, single_uv_set};
 use crate::error::{ErrorCode, PotError, Result};
 
 /// Blender's default OBJ axes (forward -Z, up Y): Potter's Z-up `(x, y, z)` is written as
@@ -21,6 +21,7 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut object = String::from("mtllib scene.mtl\n");
     let mut base = 0_usize;
     let mut normal_base = 0_usize;
+    let mut uv_base = 0_usize;
     for mesh in meshes {
         object.push_str("o ");
         object.push_str(&obj_name(&mesh.name));
@@ -38,8 +39,33 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
             normals
         };
         let normals = normals.into_iter().map(to_obj_axes).collect::<Vec<_>>();
-        let (normal_lines, corner_ids) = normal_table(&normals);
+        let (normal_lines, corner_ids) = indexed_table(&normals, |normal| {
+            format!("vn {:.6} {:.6} {:.6}", normal[0], normal[1], normal[2])
+        });
         for line in &normal_lines {
+            object.push_str(line);
+            object.push('\n');
+        }
+        let uv_values = mesh
+            .uv_active
+            .and_then(|index| mesh.uv_layers.get(index))
+            .map(|layer| {
+                shading::baked_corners(mesh, &layer.corners)
+                    .into_iter()
+                    .flatten()
+                    .map(|[u, v]| [u, 1.0 - v])
+                    .collect::<Vec<_>>()
+            });
+        // Blender writes the active layer's `vt` lines in first-use order, one per distinct value.
+        // Storage V points down; Blender's OBJ writes raw Blender V, which points up.
+        let (uv_lines, uv_ids) = match uv_values {
+            Some(values) => {
+                let (lines, ids) = indexed_table(&values, |[u, v]| format!("vt {u:.6} {v:.6}"));
+                (lines, Some(ids))
+            }
+            None => (Vec::new(), None),
+        };
+        for line in &uv_lines {
             object.push_str(line);
             object.push('\n');
         }
@@ -81,7 +107,22 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
                             "OBJ normal count does not match faces",
                         )
                     })?;
-                write!(object, "//{normal}")
+                let uv = match &uv_ids {
+                    Some(ids) => first_corner
+                        .checked_add(offset)
+                        .and_then(|corner| ids.get(corner))
+                        .and_then(|local| uv_base.checked_add(*local))
+                        .and_then(|index| index.checked_add(1))
+                        .map(|index| index.to_string())
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::ExportFailed,
+                                "OBJ UV count does not match faces",
+                            )
+                        })?,
+                    None => String::new(),
+                };
+                write!(object, "/{uv}/{normal}")
                     .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
             }
             object.push('\n');
@@ -92,21 +133,24 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
         normal_base = normal_base
             .checked_add(normal_lines.len())
             .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "OBJ normal index overflow"))?;
+        uv_base = uv_base
+            .checked_add(uv_lines.len())
+            .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "OBJ UV index overflow"))?;
     }
     let material = "newmtl potter_default\nKd 0.6 0.6 0.6\nKa 0 0 0\nKs 0 0 0\nNs 18\n";
     Ok((object.into_bytes(), material.as_bytes().to_vec()))
 }
 
-/// Blender's `vn` table for one object: unique normals in first-use order, as `vn` lines, plus
-/// each corner's 0-based index into that table.
-fn normal_table(normals: &[[f64; 3]]) -> (Vec<String>, Vec<usize>) {
+/// Blender's indexed table for one object: unique entries in first-use order, as text lines, plus
+/// each value's 0-based index into those lines.
+fn indexed_table<T>(values: &[T], line: impl Fn(&T) -> String) -> (Vec<String>, Vec<usize>) {
     let mut lines = Vec::<String>::new();
     let mut lookup = BTreeMap::<String, usize>::new();
-    let mut corner_ids = Vec::with_capacity(normals.len());
-    for normal in normals {
-        let line = format!("vn {:.6} {:.6} {:.6}", normal[0], normal[1], normal[2]);
-        let index = *lookup.entry(line.clone()).or_insert_with(|| {
-            lines.push(line);
+    let mut corner_ids = Vec::with_capacity(values.len());
+    for value in values {
+        let text = line(value);
+        let index = *lookup.entry(text.clone()).or_insert_with(|| {
+            lines.push(text);
             lines.len() - 1
         });
         corner_ids.push(index);
@@ -130,9 +174,16 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
         singular: false,
         vertex_normals: Vec::new(),
         smooth: Vec::new(),
+        uv_layers: Vec::new(),
+        uv_active: None,
+        uv_render: None,
     };
     // Normal named by each face corner of `current`, in face order.
     let mut corner_normals = Vec::<Option<DVec3>>::new();
+    // Storage UV of each `vt` line, in file order (`vt` indices are global), and the UV named by
+    // each face corner of `current`, in face order.
+    let mut uvs = Vec::<[f64; 2]>::new();
+    let mut corner_uvs = Vec::<Option<[f64; 2]>>::new();
     // Whether an `s` group is on at the current line, and whether any face of `current` was read
     // while one was on.
     let mut group_on = false;
@@ -161,11 +212,28 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                 }
                 normals.push(normal);
             }
+            "vt" => {
+                // Blender's OBJ writes raw V, which points up; Potter stores V down. The OBJ format
+                // makes `v` optional with a default of 0, so `vt u` is a complete coordinate.
+                let u = parse_floats(words.by_ref(), 1, line_number)?[0];
+                let v = if words.clone().next().is_some() {
+                    parse_floats(words, 1, line_number)?[0]
+                } else {
+                    0.0
+                };
+                uvs.push([u, 1.0 - v]);
+            }
             "o" | "g" => {
                 let name = words.collect::<Vec<_>>().join(" ");
                 declared.push(name.clone());
                 if !current.faces.is_empty() || !current.positions.is_empty() {
-                    finish_object(&mut current, &corner_normals, smoothed, &mut losses);
+                    finish_object(
+                        &mut current,
+                        &corner_normals,
+                        &corner_uvs,
+                        smoothed,
+                        &mut losses,
+                    );
                     meshes.push(current);
                     current = ExchangeMesh {
                         id: format!("object_{}", meshes.len()),
@@ -181,8 +249,12 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                         singular: false,
                         vertex_normals: Vec::new(),
                         smooth: Vec::new(),
+                        uv_layers: Vec::new(),
+                        uv_active: None,
+                        uv_render: None,
                     };
                     corner_normals.clear();
+                    corner_uvs.clear();
                     smoothed = false;
                     remap.clear();
                 } else if !name.is_empty() {
@@ -197,6 +269,7 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             "f" => {
                 let mut face = Vec::new();
                 let mut face_normals = Vec::new();
+                let mut face_uvs = Vec::new();
                 for token in words {
                     let raw_index = token
                         .split('/')
@@ -219,10 +292,19 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                         None => None,
                     };
                     face_normals.push(normal);
+                    let uv = match token.split('/').nth(1).filter(|value| !value.is_empty()) {
+                        Some(value) => {
+                            let index = resolve_index(value, uvs.len(), line_number)?;
+                            Some(*uvs.get(index).ok_or_else(|| parse_error(line_number))?)
+                        }
+                        None => None,
+                    };
+                    face_uvs.push(uv);
                 }
                 if face.len() >= 3 {
                     current.faces.push(face);
                     corner_normals.extend(face_normals);
+                    corner_uvs.extend(face_uvs);
                     smoothed |= group_on;
                 }
             }
@@ -230,7 +312,13 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
         }
     }
     if !current.faces.is_empty() || !current.positions.is_empty() {
-        finish_object(&mut current, &corner_normals, smoothed, &mut losses);
+        finish_object(
+            &mut current,
+            &corner_normals,
+            &corner_uvs,
+            smoothed,
+            &mut losses,
+        );
         meshes.push(current);
     }
     if meshes.is_empty() {
@@ -241,23 +329,34 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                 json!({ "path": path.display().to_string() }),
             ));
         }
+        let has_uvs = !uvs.is_empty();
         meshes = declared
             .into_iter()
             .enumerate()
-            .map(|(index, name)| ExchangeMesh {
-                id: format!("object_{index}"),
-                name: if name.is_empty() {
-                    format!("Object {index}")
+            .map(|(index, name)| {
+                let (uv_layers, uv_active, uv_render) = if has_uvs {
+                    single_uv_set(Vec::new())
                 } else {
-                    name
-                },
-                positions: Vec::new(),
-                faces: Vec::new(),
-                normals: None,
-                mirrored: false,
-                singular: false,
-                vertex_normals: Vec::new(),
-                smooth: Vec::new(),
+                    (Vec::new(), None, None)
+                };
+                ExchangeMesh {
+                    id: format!("object_{index}"),
+                    name: if name.is_empty() {
+                        format!("Object {index}")
+                    } else {
+                        name
+                    },
+                    positions: Vec::new(),
+                    faces: Vec::new(),
+                    normals: None,
+                    mirrored: false,
+                    singular: false,
+                    vertex_normals: Vec::new(),
+                    smooth: Vec::new(),
+                    uv_layers,
+                    uv_active,
+                    uv_render,
+                }
             })
             .collect();
     }
@@ -277,11 +376,13 @@ fn resolve_index(token: &str, count: usize, line: usize) -> Result<usize> {
     }
 }
 
-/// Sets `mesh.normals` when every face corner names a normal. Partial normals are dropped and
-/// smooth groups without any normals are kept as losses, so neither vanishes silently.
+/// Sets `mesh.normals` when every face corner names a normal, and the UV layer when every corner
+/// names a `vt`. Partial values are dropped and smooth groups without any normals are kept as
+/// losses, so nothing vanishes silently.
 fn finish_object(
     mesh: &mut ExchangeMesh,
     corner_normals: &[Option<DVec3>],
+    corner_uvs: &[Option<[f64; 2]>],
     smoothed: bool,
     losses: &mut Vec<Loss>,
 ) {
@@ -307,6 +408,25 @@ fn finish_object(
             data_id: Some(mesh.name.clone()),
             reason: "smooth groups without vn normals are not mapped to shading".to_owned(),
             suggestion: Some("write vn normals (f v//vn) to keep smooth shading".to_owned()),
+        });
+    }
+    let supplied_uvs = corner_uvs.iter().flatten().count();
+    if supplied_uvs > 0 && supplied_uvs == corner_uvs.len() {
+        let mut values = corner_uvs.iter().flatten().copied();
+        let corners = mesh
+            .faces
+            .iter()
+            .map(|face| values.by_ref().take(face.len()).collect::<Vec<_>>())
+            .collect();
+        (mesh.uv_layers, mesh.uv_active, mesh.uv_render) = single_uv_set(corners);
+    } else if supplied_uvs > 0 {
+        losses.push(Loss {
+            feature_id: "mesh.uv_layer".to_owned(),
+            data_id: Some(mesh.name.clone()),
+            reason: "some face corners have no vt coordinate; partial UVs are ignored".to_owned(),
+            suggestion: Some(
+                "write a vt index on every face corner (f v/vt) to keep UV coordinates".to_owned(),
+            ),
         });
     }
 }
@@ -358,4 +478,87 @@ pub(crate) fn imported_graph(
 ) -> Result<crate::exchange::ImportedGraph> {
     let (meshes, losses) = import(path)?;
     crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "obj", losses)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{export, import};
+    use crate::{
+        error::{ErrorCode, PotError, Result},
+        exchange::test_support::triangle_with_layers,
+    };
+    use std::fs;
+
+    #[test]
+    fn writes_the_active_layer_as_blender_v_with_corner_indices() -> Result<()> {
+        let (object, _) = export(&[triangle_with_layers()])?;
+        let text = String::from_utf8_lossy(&object);
+        let vt = text
+            .lines()
+            .filter(|line| line.starts_with("vt "))
+            .collect::<Vec<_>>();
+        // Lightmap is active; its storage V flips to Blender's V.
+        assert_eq!(
+            vt,
+            [
+                "vt 0.200000 0.900000",
+                "vt 0.600000 0.700000",
+                "vt 0.400000 1.000000"
+            ]
+        );
+        let face = text
+            .lines()
+            .find(|line| line.starts_with("f "))
+            .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "OBJ face is missing"))?;
+        let corners = face.split_whitespace().skip(1).collect::<Vec<_>>();
+        assert_eq!(corners.len(), 3);
+        for (index, corner) in corners.iter().enumerate() {
+            let fields = corner.split('/').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[1], (index + 1).to_string());
+            assert_ne!(fields[0], "");
+            assert_ne!(fields[2], "");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn imports_vt_as_the_uv_layer_in_storage_convention() -> Result<()> {
+        let original = triangle_with_layers();
+        let (object, _) = export(std::slice::from_ref(&original))?;
+        let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
+        fs::write(file.path(), object).map_err(|error| PotError::io(&error))?;
+        let (imported, _) = import(file.path())?;
+        let layer = imported[0]
+            .uv_layers
+            .first()
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "OBJ import has no UV layer"))?;
+        assert_eq!(layer.name, "UVMap");
+        // The export writes the active layer, Lightmap, so that is the layer that comes back.
+        for (read, written) in layer.corners[0]
+            .iter()
+            .zip(&original.uv_layers[1].corners[0])
+        {
+            assert!((read[0] - written[0]).abs() < 1.0e-6);
+            assert!((read[1] - written[1]).abs() < 1.0e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_declared_object_keeps_uv_metadata_when_texture_coordinates_exist() -> Result<()> {
+        let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
+        fs::write(file.path(), "o empty\nvt 0.25\n").map_err(|error| PotError::io(&error))?;
+        let (meshes, _) = import(file.path())?;
+        let mesh = meshes
+            .first()
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "OBJ object is missing"))?;
+        assert_eq!(mesh.faces, Vec::<Vec<usize>>::new());
+        assert_eq!(mesh.uv_layers.len(), 1);
+        assert_eq!(mesh.uv_layers[0].name, "UVMap");
+        assert_eq!(mesh.uv_layers[0].corners, Vec::<Vec<[f64; 2]>>::new());
+        assert_eq!(mesh.uv_active, Some(0));
+        assert_eq!(mesh.uv_render, Some(0));
+        Ok(())
+    }
 }

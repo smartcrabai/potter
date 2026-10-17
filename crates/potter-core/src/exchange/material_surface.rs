@@ -67,7 +67,7 @@ impl TextureTransform {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SampledTexture {
     pub(crate) channels: [Option<ChannelSource>; 4],
-    /// Potter UV layer name. `None` means the mesh's default layer (`TEXCOORD_0`).
+    /// UV layer name. `None` is the render layer, which exports as the texture's `texCoord`.
     pub(crate) uv_layer: Option<String>,
     pub(crate) interpolation: ImageInterpolation,
     /// Wrap modes for S and T.
@@ -197,10 +197,17 @@ pub(crate) mod feature_id {
     pub(crate) const VOLUME: &str = "material.shader_graph.volume";
     /// Loss: sampler state glTF cannot express exactly (Cubic/Smart interpolation, CLIP extension).
     pub(crate) const SAMPLER: &str = "material.shader_graph.sampler";
-    /// Loss: Potter material texture references on a graph material (the graph is authoritative).
+    /// Loss: a material's texture fields that the output cannot hold. glTF: the graph is authoritative and ignores them.
+    /// `.blend`: the authored graph does not drive its output from a Principled BSDF, or a linked Normal input takes a normal texture.
     pub(crate) const MATERIAL_TEXTURES: &str = "material.shader_graph.material_textures";
-    /// Loss: a texture samples a UV layer other than the exported `TEXCOORD_0` layer.
-    pub(crate) const TEXTURE_UV_LAYER: &str = "material.texture_uv_set";
+    /// Loss: a mesh UV layer the format cannot hold, or a texture set that samples layers that
+    /// cannot share one `texCoord` (a packed texture, or a material shared by meshes that order
+    /// their layers differently).
+    pub(crate) const MESH_UV_LAYER: &str = "mesh.uv_layer";
+    /// Loss: a stored UV layer reference names no layer on the mesh, so it falls back to the render layer.
+    pub(crate) const UV_LAYER_MISSING: &str = "uv.layer_missing";
+    /// Loss: a VRM 0.x `MToon` texture samples a non-zero UV layer; VRM 0.x has no `texCoord`, so it exports from `TEXCOORD_0`.
+    pub(crate) const VRM_V0_MTOON_UV_LAYER: &str = "vrm.v0.mtoon_uv_layer";
 }
 
 /// Whether any node of `doc` references the material in its slot array.
@@ -302,12 +309,9 @@ fn push_loss(
     });
 }
 
-/// Potter UV layer names: `""` and `"uv_map"` are the default layer (`None`).
-fn normalize_uv_layer(name: Option<&str>) -> Option<String> {
-    match name {
-        None | Some("" | "uv_map") => None,
-        Some(other) => Some(other.to_owned()),
-    }
+/// The layer a shader `ShaderNodeUVMap` node names: an empty name is the render layer (`None`).
+fn uv_layer_name(name: Option<&str>) -> Option<String> {
+    name.filter(|name| !name.is_empty()).map(str::to_owned)
 }
 
 /// Channels R, G, B, A each read the same channel of `image`.
@@ -352,7 +356,7 @@ fn sampled_from_ref(
 ) -> SampledTexture {
     SampledTexture {
         channels,
-        uv_layer: normalize_uv_layer(reference.uv_map.as_deref()),
+        uv_layer: reference.uv_layer.clone(),
         interpolation: reference.interpolation,
         wrap: [TextureWrap::Repeat; 2],
         transform: None,
@@ -370,12 +374,10 @@ fn metallic_roughness_from_refs(
 ) -> Option<SampledTexture> {
     let base = roughness.or(metallic)?;
     if let (Some(rough), Some(metal)) = (roughness, metallic) {
-        if normalize_uv_layer(rough.uv_map.as_deref())
-            != normalize_uv_layer(metal.uv_map.as_deref())
-        {
+        if rough.uv_layer != metal.uv_layer {
             push_loss(
                 losses,
-                feature_id::TEXTURE_UV_LAYER,
+                feature_id::MESH_UV_LAYER,
                 material_id,
                 "roughness and metallic textures sample different UV layers; the packed \
                  metallicRoughness texture uses the roughness texture's layer"
@@ -636,7 +638,7 @@ fn normal_texture(sample: &Sample) -> SampledTexture {
 /// Describes why two texture reads cannot share one glTF texture.
 fn sampling_mismatch(first: &TexBase, second: &TexBase) -> Option<(&'static str, &'static str)> {
     if first.uv_layer != second.uv_layer {
-        Some((feature_id::TEXTURE_UV_LAYER, "UV layer"))
+        Some((feature_id::MESH_UV_LAYER, "UV layer"))
     } else if first.interpolation != second.interpolation || first.wrap != second.wrap {
         Some((feature_id::SAMPLER, "sampler state"))
     } else if first.transform != second.transform {
@@ -674,7 +676,7 @@ fn prop_str<'n>(node: &'n GraphNode, key: &str) -> Option<&'n str> {
 }
 
 fn uv_map_layer(node: &GraphNode) -> Option<String> {
-    normalize_uv_layer(prop_str(node, "uv_map"))
+    uv_layer_name(prop_str(node, "uv_map"))
 }
 
 /// glTF `KHR_texture_transform` from a Blender point mapping (verified against Blender 5.2:
@@ -2979,7 +2981,7 @@ mod tests {
             .unwrap()
             .base_color_texture = Some(TextureRef {
             image: id("img"),
-            uv_map: None,
+            uv_layer: None,
             interpolation: ImageInterpolation::Linear,
         });
         let (_, losses) = resolved(&doc);

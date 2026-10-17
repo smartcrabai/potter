@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "integration test setup")]
 
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap};
 
 use glam::DVec3;
 use potter_core::{
@@ -9,7 +9,7 @@ use potter_core::{
     image::{ImageData, ImageInterpolation, ImageTileData},
     model::{Id, Material, Registry, SceneDoc, TextureRef},
     ops::apply_batch,
-    shader::{HitContext, evaluate_surface},
+    shader::{HitContext, HitUvLayers, evaluate_surface},
 };
 use serde_json::json;
 
@@ -46,10 +46,10 @@ fn image_data(width: u32, height: u32, pixels: Vec<[f64; 4]>) -> ImageData {
     }
 }
 
-fn texture_ref(image: &str, uv_map: Option<&str>) -> TextureRef {
+fn texture_ref(image: &str, uv_layer: Option<&str>) -> TextureRef {
     TextureRef {
         image: Id::new(image).unwrap(),
-        uv_map: uv_map.map(str::to_owned),
+        uv_layer: uv_layer.map(str::to_owned),
         interpolation: ImageInterpolation::Closest,
     }
 }
@@ -320,6 +320,85 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
 }
 
 #[test]
+fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
+    let images = BTreeMap::from([(
+        "test_image".to_owned(),
+        ImageData {
+            width: 1,
+            height: 1,
+            pixels: vec![[0.25, 0.25, 0.25, 1.0]],
+            tiles: BTreeMap::from([
+                (
+                    1002,
+                    ImageTileData {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![[0.0, 1.0, 0.0, 1.0]],
+                    },
+                ),
+                (
+                    1011,
+                    ImageTileData {
+                        width: 1,
+                        height: 2,
+                        pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+                    },
+                ),
+            ]),
+            interpolation: ImageInterpolation::Closest,
+        },
+    )]);
+    let make_material = |mapped: bool, vector: [f64; 3]| {
+        let mut graph = NodeGroup::new("UDIM Image", GraphKind::Shader);
+        add_node(&mut graph, "out", "OutputMaterial", &[]);
+        add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
+        if mapped {
+            add_node(
+                &mut graph,
+                "mapping",
+                "ShaderNodeMapping",
+                &[("Vector", json!(vector))],
+            );
+            add_node(&mut graph, "image", "ShaderNodeTexImage", &[]);
+            link(&mut graph, "mapping", "Vector", "image", "Vector");
+        } else {
+            add_node(
+                &mut graph,
+                "image",
+                "ShaderNodeTexImage",
+                &[("Vector", json!(vector))],
+            );
+        }
+        let image = graph.nodes.get_mut(&Id::new("image").unwrap()).unwrap();
+        image
+            .properties
+            .insert("image".to_owned(), json!("test_image"));
+        image
+            .properties
+            .insert("interpolation".to_owned(), json!("closest"));
+        link(&mut graph, "image", "Color", "principled", "Base Color");
+        link(&mut graph, "principled", "BSDF", "out", "Surface");
+        material_with_graph(graph)
+    };
+
+    let cases = [
+        ([0.25, 1.25, 0.0], [0.0, 0.0, 1.0, 1.0]),
+        ([1.25, 0.25, 0.0], [0.0, 1.0, 0.0, 1.0]),
+        ([0.25, 2.25, 0.0], [0.0; 4]),
+    ];
+    for mapped in [false, true] {
+        for (vector, expected) in cases {
+            let (material, groups) = make_material(mapped, vector);
+            let context = HitContext::new(&groups).with_images(&images);
+            assert_eq!(
+                evaluate_surface(&material, &context).unwrap().base_color,
+                expected,
+            );
+        }
+    }
+}
+
+#[test]
 fn image_texture_without_resolved_pixels_reports_unsupported_feature() {
     let mut graph = NodeGroup::new("Missing image", GraphKind::Shader);
     add_node(&mut graph, "out", "OutputMaterial", &[]);
@@ -382,16 +461,23 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     material.base_color = [0.5, 0.25, 0.75, 1.0];
     material.metallic = 0.5;
     material.roughness = 0.8;
-    material.base_color_texture = Some(texture_ref("base_image", Some("uv_map")));
+    material.base_color_texture = Some(texture_ref("base_image", Some("UVMap")));
     material.roughness_texture = Some(texture_ref("roughness_image", None));
     material.metallic_texture = Some(texture_ref("metallic_image", None));
     material.normal_texture = Some(texture_ref("normal_image", None));
     let image_data = material_texture_images();
-    let uv_maps = [("uv_map", [0.75, 0.5])];
+    let names = ["UVMap".to_owned()];
+    let layers = HitUvLayers {
+        names: &names,
+        corners: &[[[0.75, 0.5]; 3]],
+        positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+        barycentric: [1.0 / 3.0; 3],
+        render: Some(0),
+        available_mask: None,
+    };
     let mut context = HitContext::new(&groups)
         .with_images(&image_data)
-        .with_uv_maps(&uv_maps)
-        .with_tangent_frame(DVec3::X, DVec3::Y);
+        .with_uv_layers(layers);
     context.uv = [0.25, 0.5];
     let simple = evaluate_surface(&material, &context).unwrap();
     assert_eq!(simple.base_color, [0.0, 0.25, 0.0, 1.0]);
@@ -403,20 +489,82 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     material.node_tree = Some(graph_id);
     let graph_backed = evaluate_surface(&material, &context).unwrap();
     assert_eq!(graph_backed, simple);
-    let no_images = HitContext::new(&groups).with_uv_maps(&uv_maps);
+    let no_images = HitContext::new(&groups).with_uv_layers(layers);
     let error = evaluate_surface(&material, &no_images).unwrap_err();
     assert_eq!(error.code, ErrorCode::UnsupportedFeature);
     assert_eq!(
         error.details["feature_id"],
         json!("shader.material_texture.image_data")
     );
-    material.base_color_texture.as_mut().unwrap().uv_map = Some("missing_uv".to_owned());
-    let error = evaluate_surface(&material, &context).unwrap_err();
-    assert_eq!(error.code, ErrorCode::UnsupportedFeature);
-    assert_eq!(
-        error.details["feature_id"],
-        json!("shader.material_texture.uv_map")
-    );
+    material.base_color_texture.as_mut().unwrap().uv_layer = None;
+    let render_uv = evaluate_surface(&material, &context).unwrap();
+    material.base_color_texture.as_mut().unwrap().uv_layer = Some("missing_uv".to_owned());
+    let warnings = RefCell::new(Vec::new());
+    let fallback = evaluate_surface(&material, &context.with_warnings(&warnings)).unwrap();
+    assert_eq!(fallback, render_uv);
+    assert_eq!(warnings.borrow().len(), 1);
+    assert_eq!(warnings.borrow()[0]["code"], json!("uv.layer_missing"));
+    assert_eq!(warnings.borrow()[0]["layer"], json!("missing_uv"));
+}
+
+fn uv_map_material(layer: &str) -> (Material, Registry<NodeGroup>) {
+    let mut graph = NodeGroup::new("UV map", GraphKind::Shader);
+    add_node(&mut graph, "out", "OutputMaterial", &[]);
+    add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
+    add_node(&mut graph, "uv", "ShaderNodeUVMap", &[]);
+    add_node(&mut graph, "image", "ShaderNodeTexImage", &[]);
+    let uv_node = graph.nodes.get_mut(&Id::new("uv").unwrap()).unwrap();
+    uv_node.properties.insert("uv_map".to_owned(), json!(layer));
+    let image_node = graph.nodes.get_mut(&Id::new("image").unwrap()).unwrap();
+    image_node
+        .properties
+        .insert("image".to_owned(), json!("test_image"));
+    image_node
+        .properties
+        .insert("interpolation".to_owned(), json!("closest"));
+    link(&mut graph, "uv", "UV", "image", "Vector");
+    link(&mut graph, "image", "Color", "principled", "Base Color");
+    link(&mut graph, "principled", "BSDF", "out", "Surface");
+    material_with_graph(graph)
+}
+
+#[test]
+fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
+    let images = BTreeMap::from([(
+        "test_image".to_owned(),
+        image_data(2, 1, vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]]),
+    )]);
+    let names = ["UVMap".to_owned(), "Detail".to_owned()];
+    let layers = HitUvLayers {
+        names: &names,
+        corners: &[[[0.25, 0.5]; 3], [[0.75, 0.5]; 3]],
+        positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+        barycentric: [1.0 / 3.0; 3],
+        render: Some(0),
+        available_mask: None,
+    };
+
+    let (named_material, named_groups) = uv_map_material("Detail");
+    let warnings = RefCell::new(Vec::new());
+    let mut context = HitContext::new(&named_groups)
+        .with_images(&images)
+        .with_uv_layers(layers)
+        .with_warnings(&warnings);
+    context.uv = [0.25, 0.5];
+    let named = evaluate_surface(&named_material, &context).unwrap();
+    assert_eq!(named.base_color, [0.0, 1.0, 0.0, 1.0]);
+    assert!(warnings.borrow().is_empty());
+
+    let (missing_material, missing_groups) = uv_map_material("Missing");
+    let context = HitContext::new(&missing_groups)
+        .with_images(&images)
+        .with_uv_layers(layers)
+        .with_warnings(&warnings);
+    let fallback = evaluate_surface(&missing_material, &context).unwrap();
+    assert_eq!(fallback.base_color, [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(warnings.borrow().len(), 1);
+    assert_eq!(warnings.borrow()[0]["code"], json!("uv.layer_missing"));
+    assert_eq!(warnings.borrow()[0]["layer"], json!("Missing"));
 }
 #[test]
 fn bump_node_perturbs_principled_normal_from_height_gradient() {

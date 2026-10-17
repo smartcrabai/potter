@@ -615,6 +615,84 @@ pub fn validate_with_context(
                         Ok(meshes) => {
                             losses
                                 .extend(crate::exchange::shading::shading_losses(format, &meshes));
+                            losses.extend(crate::exchange::uv_layer_losses(format, &meshes));
+                            if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
+                                let vrm = match (format, doc.avatar.as_ref()) {
+                                    ("vrm", Some(avatar)) => {
+                                        Some((avatar, crate::model::AvatarVersion::V1))
+                                    }
+                                    ("vrm0", Some(avatar)) => {
+                                        Some((avatar, crate::model::AvatarVersion::V0))
+                                    }
+                                    _ => None,
+                                };
+                                match crate::exchange::gltf::uv_layer_diagnostics(
+                                    doc, snapshot, vrm,
+                                ) {
+                                    Ok((uv_losses, uv_warnings)) => {
+                                        losses.extend(uv_losses);
+                                        for warning in uv_warnings {
+                                            let code = warning
+                                                .details
+                                                .get("feature_id")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("uv.layer_missing")
+                                                .to_owned();
+                                            let data_id = warning
+                                                .details
+                                                .get("material_id")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_owned);
+                                            issue(
+                                                &mut issues,
+                                                "warning",
+                                                &code,
+                                                &warning.message,
+                                                data_id,
+                                                None,
+                                                warning.details,
+                                            );
+                                        }
+                                    }
+                                    Err(error) => issue(
+                                        &mut issues,
+                                        "error",
+                                        "EVALUATION_FAILED",
+                                        &error.message,
+                                        None,
+                                        None,
+                                        error.details,
+                                    ),
+                                }
+                            }
+                            if matches!(format, "fbx" | "fbx-binary") {
+                                losses
+                                    .extend(crate::exchange::fbx::uv_texture_losses(doc, snapshot));
+                                for warning in
+                                    crate::exchange::fbx::uv_texture_warnings(doc, snapshot)
+                                {
+                                    let code = warning
+                                        .details
+                                        .get("feature_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("uv.layer_missing")
+                                        .to_owned();
+                                    let data_id = warning
+                                        .details
+                                        .get("material_id")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned);
+                                    issue(
+                                        &mut issues,
+                                        "warning",
+                                        &code,
+                                        &warning.message,
+                                        data_id,
+                                        None,
+                                        warning.details,
+                                    );
+                                }
+                            }
                         }
                         Err(error) => issue(
                             &mut issues,

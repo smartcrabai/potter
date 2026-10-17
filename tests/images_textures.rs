@@ -106,7 +106,7 @@ fn generated_image_pixels_material_reference_and_delete_guard() -> Result<(), Bo
         &json!([
             {"op":"image.create","id":"paint","name":"Paint","width":16,"height":16,"colorspace":"srgb","fill_color":[0.1,0.2,0.3,1.0]},
             {"op":"image.create","id":"orphan","width":1,"height":1,"fill_color":[0.0,0.0,0.0,1.0]},
-            {"op":"material.create","id":"surface","base_color_texture":{"image":"paint","uv_map":"uv_map","interpolation":"closest"}}
+            {"op":"material.create","id":"surface","base_color_texture":{"image":"paint","uv_layer":"UVMap","interpolation":"closest"}}
         ]),
     )?;
 
@@ -128,8 +128,8 @@ fn generated_image_pixels_material_reference_and_delete_guard() -> Result<(), Bo
         "paint"
     );
     assert_eq!(
-        created["materials"]["surface"]["base_color_texture"]["uv_map"],
-        "uv_map"
+        created["materials"]["surface"]["base_color_texture"]["uv_layer"],
+        "UVMap"
     );
     assert_eq!(
         created["materials"]["surface"]["base_color_texture"]["interpolation"],
@@ -141,15 +141,15 @@ fn generated_image_pixels_material_reference_and_delete_guard() -> Result<(), Bo
             "op":"material.update",
             "target":{"id":"surface"},
             "set":{
-                "roughness_texture":{"image":"paint","uv_map":null,"interpolation":"linear"},
-                "metallic_texture":{"image":"paint","uv_map":"uv_map","interpolation":"closest"},
+                "roughness_texture":{"image":"paint","uv_layer":null,"interpolation":"linear"},
+                "metallic_texture":{"image":"paint","uv_layer":"UVMap","interpolation":"closest"},
                 "normal_texture":{"image":"paint"}
             }
         }]),
     )?;
     let textured_material = scene_doc(&scene)?["materials"]["surface"].clone();
     assert_eq!(textured_material["roughness_texture"]["image"], "paint");
-    assert!(textured_material["roughness_texture"]["uv_map"].is_null());
+    assert!(textured_material["roughness_texture"]["uv_layer"].is_null());
     assert_eq!(
         textured_material["roughness_texture"]["interpolation"],
         "linear"
@@ -226,16 +226,17 @@ fn texture_paint_maps_world_stroke_through_face_corner_uvs() -> Result<(), Box<d
         &scene,
         &json!([
             {"op":"image.create","id":"canvas","width":16,"height":16,"fill_color":[0.0,0.0,0.0,1.0]},
-            {"op":"material.create","id":"surface","base_color_texture":{"image":"canvas","uv_map":"uv_map","interpolation":"closest"}},
+            {"op":"material.create","id":"surface","base_color_texture":{"image":"canvas","uv_layer":"UVMap","interpolation":"closest"}},
             {"op":"node.create","id":"body","kind":"box","params":{"size":2},"material":"surface"},
             {"op":"uv.unwrap","target":{"id":"body"},"elements":{"domain":"face","ids":["f1"]},"method":"smart"}
         ]),
     )?;
 
     let before = scene_doc(&scene)?;
-    let uv_entries = before["data_blocks"]["body_mesh"]["mesh"]["attributes"]["uv_map"]
-        .as_array()
-        .ok_or_else(|| std::io::Error::other("box has no face-corner UV map"))?;
+    let uv_entries =
+        before["data_blocks"]["body_mesh"]["mesh"]["attributes"]["uv_layers"]["layers"][0]["faces"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("box has no face-corner UV map"))?;
     let top_uv = uv_entries
         .iter()
         .find(|entry| entry["face_id"] == 1)

@@ -5,7 +5,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, Result},
-    geom::{Edge, Face, Mesh, Vertex},
+    geom::{
+        Edge, Face, Mesh, Vertex,
+        uv_layers::{self, UvLayer},
+    },
     model::{DataBlock, Id, Node, ShapeKey, ShapeKeyData, VertexGroup},
 };
 
@@ -416,6 +419,8 @@ fn append_mesh(
     source_materials: &[Id],
 ) -> Result<ElementMapping> {
     let mut mapping = ElementMapping::default();
+    // Source face `i` lands at storage index `face_offset + i` once appended.
+    let face_offset = destination.faces.len();
     let mut used_vertices: BTreeSet<_> = destination.vertices.iter().map(|item| item.id).collect();
     let mut used_edges: BTreeSet<_> = destination.edges.iter().map(|item| item.id).collect();
     let mut used_faces: BTreeSet<_> = destination.faces.iter().map(|item| item.id).collect();
@@ -514,6 +519,7 @@ fn append_mesh(
             material_index,
         });
     }
+    merge_uv_layers(destination, source, face_offset)?;
     merge_mesh_attributes(
         engine,
         &mut destination.attributes,
@@ -591,6 +597,50 @@ fn validate_material_indices(engine: &Engine<'_>, input: &JoinInput, mesh: &Mesh
     Ok(())
 }
 
+/// Merges the source mesh's UV layers into `destination` by name. Source face `i` was appended at
+/// storage index `face_offset + i`. A layer the destination lacks is appended (up to the layer
+/// limit); a layer both share merges per face. The destination keeps its active and render layers,
+/// or takes the source's when it had none.
+fn merge_uv_layers(destination: &mut Mesh, source: &Mesh, face_offset: usize) -> Result<()> {
+    let source_store = uv_layers::read(source);
+    if source_store.layers.is_empty() {
+        return Ok(());
+    }
+    let mut store = uv_layers::read(destination);
+    let destination_was_empty = store.layers.is_empty();
+    for source_layer in &source_store.layers {
+        let index = if let Some(index) = store.index_of(&source_layer.name) {
+            index
+        } else {
+            if store.layers.len() >= uv_layers::MAX_LAYERS {
+                return Err(super::uv::layer_limit());
+            }
+            store.layers.push(UvLayer::new(
+                source_layer.name.clone(),
+                vec![None; destination.faces.len()],
+            ));
+            store.layers.len() - 1
+        };
+        let layer = &mut store.layers[index];
+        for (source_index, (values, pins)) in source_layer
+            .faces
+            .iter()
+            .zip(&source_layer.pinned)
+            .enumerate()
+        {
+            let target = face_offset + source_index;
+            layer.faces[target].clone_from(values);
+            layer.pinned[target].clone_from(pins);
+        }
+    }
+    if destination_was_empty {
+        store.active = source_store.active;
+        store.render = source_store.render;
+    }
+    uv_layers::write(destination, &store);
+    Ok(())
+}
+
 fn merge_mesh_attributes(
     engine: &Engine<'_>,
     destination: &mut Map<String, Value>,
@@ -598,25 +648,16 @@ fn merge_mesh_attributes(
     mapping: &ElementMapping,
 ) -> Result<()> {
     for (name, source_attribute) in source {
+        // UV layers merge by name in `merge_uv_layers`, which needs the face mapping.
+        if name == uv_layers::ATTRIBUTE {
+            continue;
+        }
         let mut remapped = source_attribute.clone();
         remap_attribute(engine, name, &mut remapped, mapping)?;
         let Some(destination_attribute) = destination.get_mut(name) else {
             destination.insert(name.clone(), remapped);
             continue;
         };
-        if name == "uv_map" {
-            let (Some(destination_entries), Some(source_entries)) =
-                (destination_attribute.as_array_mut(), remapped.as_array())
-            else {
-                return Err(attribute_error(
-                    engine,
-                    name,
-                    "UV map attributes must be arrays",
-                ));
-            };
-            destination_entries.extend(source_entries.iter().cloned());
-            continue;
-        }
         let (Some(destination_object), Some(source_object)) =
             (destination_attribute.as_object_mut(), remapped.as_object())
         else {
@@ -683,29 +724,6 @@ fn remap_attribute(
     attribute: &mut Value,
     mapping: &ElementMapping,
 ) -> Result<()> {
-    if name == "uv_map" {
-        let Some(entries) = attribute.as_array_mut() else {
-            return Err(attribute_error(
-                engine,
-                name,
-                "UV map attributes must be arrays",
-            ));
-        };
-        for entry in entries {
-            let face_id = entry
-                .get("face_id")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| {
-                    attribute_error(engine, name, "UV map contains an invalid face ID")
-                })?;
-            let remapped = mapping.faces.get(&face_id).copied().ok_or_else(|| {
-                attribute_error(engine, name, "UV map refers to a missing source face")
-            })?;
-            entry["face_id"] = json!(remapped);
-        }
-        return Ok(());
-    }
     let Some(attribute_object) = attribute.as_object_mut() else {
         return Err(attribute_error(
             engine,
@@ -1203,8 +1221,12 @@ mod tests {
             json!({"domain":"vertices","type":"float","values":{"v0":2.0}}),
         );
         source_mesh.attributes.insert(
-            "uv_map".to_owned(),
-            json!([{"face_id":0,"uv":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]}]),
+            "uv_layers".to_owned(),
+            json!({
+                "layers": [{"name": "UVMap", "faces": [{"face_id": 0, "uv": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]}]}],
+                "active": "UVMap",
+                "render": "UVMap"
+            }),
         );
         doc.nodes
             .get_mut(&Id::new("target").unwrap())
@@ -1247,7 +1269,10 @@ mod tests {
         assert_eq!(joined.vertices[3].id, 3);
         assert_eq!(joined.faces[1].id, 1);
         assert_eq!(joined.attributes["weights"]["values"]["v3"], json!(2.0));
-        assert_eq!(joined.attributes["uv_map"][0]["face_id"], json!(1));
+        assert_eq!(
+            joined.attributes["uv_layers"]["layers"][0]["faces"][0]["face_id"],
+            json!(1)
+        );
         assert_eq!(
             engine.doc.nodes[&target].materials[1],
             Id::new("source_material").unwrap()

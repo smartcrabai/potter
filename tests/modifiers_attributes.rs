@@ -152,8 +152,12 @@ fn uv_warp_preserves_unknown_attributes_and_updates_named_uv_layer() -> Result<(
     let mut mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     mesh.attributes.insert(
-        "uv_map".to_owned(),
-        json!([{"face_id":0,"layer":"UVMap","uv":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]}]),
+        "uv_layers".to_owned(),
+        json!({
+            "layers": [{"name":"UVMap","faces":[{"face_id":0,"uv":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]}]}],
+            "active": "UVMap",
+            "render": "UVMap"
+        }),
     );
     mesh.attributes.insert("marker".to_owned(), json!(true));
     let result = evaluate_modifiers(
@@ -173,56 +177,88 @@ fn uv_warp_preserves_unknown_attributes_and_updates_named_uv_layer() -> Result<(
     )?;
     assert_eq!(result.attributes["marker"], json!(true));
     assert_eq!(
-        result.attributes["uv_map"][0]["uv"],
-        json!([[0.25, -0.5], [1.25, -0.5], [0.25, 0.5]])
+        result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
+        json!([[0.25, 0.5], [1.25, 0.5], [0.25, 1.5]])
     );
     Ok(())
 }
 
 #[test]
-fn uv_warp_empty_layer_selector_uses_active_layer() -> Result<(), Box<dyn Error>> {
+fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
     let mut mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     mesh.attributes.insert(
-        "blender_uv_layers".to_owned(),
-        json!([
-            {"name":"Inactive","active":false,"values":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]},
-            {"name":"Active","active":true,"values":[[0.1,0.2],[0.3,0.4],[0.5,0.6]]}
-        ]),
+        "uv_layers".to_owned(),
+        json!({
+            "layers": [
+                {"name":"UVMap","faces":[{"face_id":0,"uv":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]}]},
+                {"name":"Second","faces":[{"face_id":0,"uv":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]}]}
+            ],
+            "active": "Second",
+            "render": "UVMap"
+        }),
     );
     let result = evaluate_modifiers(
         &mesh,
         &[modifier(
             "uv_warp",
-            json!({"uv_layer":"","offset":[0.25,0.0]}),
+            json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
         )?],
     )?;
-    let entries = result.attributes["uv_map"]
-        .as_array()
-        .ok_or("UV warp did not write UV entries")?;
-    let uv_layer = |name: &str| {
-        entries
-            .iter()
-            .find(|entry| entry["layer"] == name)
-            .and_then(|entry| entry["uv"].as_array())
-            .cloned()
+    let layers = &result.attributes["uv_layers"]["layers"];
+    assert_eq!(
+        layers[0]["faces"][0]["uv"],
+        json!([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    );
+    assert_eq!(
+        layers[1]["faces"][0]["uv"],
+        json!([[0.25, 0.5], [1.25, 0.5], [0.25, 1.5]])
+    );
+    Ok(())
+}
+
+#[test]
+fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<dyn Error>> {
+    let mesh =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "uv_warp",
+            json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
+        )?],
+    )?;
+    assert_eq!(result.attributes["uv_layers"]["active"], json!("UVMap"));
+    assert_eq!(result.attributes["uv_layers"]["render"], json!("UVMap"));
+    assert_eq!(
+        result.attributes["uv_layers"]["layers"][0]["name"],
+        json!("UVMap")
+    );
+    assert_eq!(
+        result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
+        json!([[0.25, 0.5], [0.25, 0.5], [0.25, 0.5]])
+    );
+    Ok(())
+}
+
+#[test]
+fn uv_warp_named_layer_the_mesh_lacks_is_an_error() -> Result<(), Box<dyn Error>> {
+    let mut mesh =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        json!({
+            "layers": [{"name":"UVMap","faces":[{"face_id":0,"uv":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]}]}],
+            "active": "UVMap",
+            "render": "UVMap"
+        }),
+    );
+    let Err(error) = evaluate_modifiers(&mesh, &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?])
+    else {
+        return Err("a named layer the mesh lacks must be an error".into());
     };
-    assert_eq!(
-        uv_layer("Active"),
-        Some(vec![
-            json!([0.35, 0.2]),
-            json!([0.55, 0.4]),
-            json!([0.75, 0.6])
-        ])
-    );
-    assert_eq!(
-        uv_layer("Inactive"),
-        Some(vec![
-            json!([0.0, 0.0]),
-            json!([1.0, 0.0]),
-            json!([0.0, 1.0])
-        ])
-    );
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidArgument);
+    assert_eq!(error.details["code"], json!("modifier.uv_layer_missing"));
     Ok(())
 }
 
@@ -305,10 +341,18 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
 
 #[test]
 fn uv_project_uses_camera_projection_and_writes_corner_uvs() -> Result<(), Box<dyn Error>> {
-    let mesh = Mesh::from_positions_and_faces(
+    let mut mesh = Mesh::from_positions_and_faces(
         vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
         vec![vec![0, 1, 2, 3]],
     )?;
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        json!({
+            "layers": [{"name":"UVMap","faces":[{"face_id":0,"uv":[[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0]]}]}],
+            "active": "UVMap",
+            "render": "UVMap"
+        }),
+    );
     let camera = CameraData::default();
     let mut operands = BTreeMap::new();
     operands.insert(
@@ -331,12 +375,13 @@ fn uv_project_uses_camera_projection_and_writes_corner_uvs() -> Result<(), Box<d
         }),
     )?;
     let result = evaluate_with_context(&mesh, &projection, &operands, None, DMat4::IDENTITY)?;
-    let uv = result.attributes["uv_map"][0]["uv"][0]
+    let uv = result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"][0]
         .as_array()
         .ok_or("projected UV missing")?;
     let expected = 0.5 - 0.5 / (2.0 * 3.0 * (36.0 / 100.0));
     assert!((uv[0].as_f64().ok_or("U missing")? - expected).abs() < 1.0e-5);
-    assert!((uv[1].as_f64().ok_or("V missing")? - expected).abs() < 1.0e-5);
+    // Potter stores V down; the projected V is `expected` in Blender's V-up space.
+    assert!((uv[1].as_f64().ok_or("V missing")? - (1.0 - expected)).abs() < 1.0e-5);
     Ok(())
 }
 
@@ -2040,8 +2085,8 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         DMat4::IDENTITY,
     )?;
     let projected_uvs = json!([
-        projected.attributes["uv_map"][0]["uv"],
-        projected.attributes["uv_map"][1]["uv"]
+        flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
+        flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
     ]);
     assert_material_change(
         "uv_project multi-projector",
@@ -2089,8 +2134,8 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         DMat4::IDENTITY,
     )?;
     let orthographic_uvs = json!([
-        orthographic.attributes["uv_map"][0]["uv"],
-        orthographic.attributes["uv_map"][1]["uv"]
+        flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
+        flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
     ]);
     assert_material_change(
         "uv_project orthographic aspect and scale",
@@ -2132,8 +2177,8 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         DMat4::IDENTITY,
     )?;
     let orthographic_clamped_uvs = json!([
-        orthographic_clamped.attributes["uv_map"][0]["uv"],
-        orthographic_clamped.attributes["uv_map"][1]["uv"]
+        flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
+        flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
     ]);
     assert_material_change(
         "uv_project orthographic aspect clamp",
@@ -2163,7 +2208,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_parity(
         "uv_warp scale/rotation",
-        &warped.attributes["uv_map"][0]["uv"],
+        &flip_v(&warped.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
         &expected["uv_warp"],
         1.0e-5,
     )?;
@@ -2214,7 +2259,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_parity(
         "uv_warp object transforms and vertex group",
-        &warp_transform_result.attributes["uv_map"][0]["uv"],
+        &flip_v(&warp_transform_result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
         &expected["uv_warp_transforms"],
         1.0e-5,
     )?;
@@ -2316,8 +2361,11 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     }
     let mut domain_source = quad.clone();
     domain_source.attributes.insert(
-        "uv_map".to_owned(),
-        json!([{"face_id":0,"layer":"UVMap","uv":[[0.25,0.25],[1.25,0.25],[1.25,1.25],[0.25,1.25]]}]),
+        "uv_layers".to_owned(),
+        uv_layers_attribute(&json!([{
+            "face_id":0,
+            "uv":flip_v(&json!([[0.25,0.25],[1.25,0.25],[1.25,1.25],[0.25,1.25]]))
+        }])),
     );
     domain_source
         .attributes
@@ -2415,13 +2463,13 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     for mapping in ["LOCAL", "GLOBAL", "OBJECT", "UV"] {
         let mut mask_mesh = quad.clone();
         if mapping == "UV" {
+            // Blender's V-up values, stored V-down.
             mask_mesh.attributes.insert(
-                "uv_map".to_owned(),
-                json!([{
+                "uv_layers".to_owned(),
+                uv_layers_attribute(&json!([{
                     "face_id":0,
-                    "layer":"UVMap",
-                    "uv":[[0.13,0.17],[0.73,0.24],[0.84,0.81],[0.2,0.69]]
-                }]),
+                    "uv":flip_v(&json!([[0.13,0.17],[0.73,0.24],[0.84,0.81],[0.2,0.69]]))
+                }])),
             );
         }
         let mut operands = BTreeMap::new();
@@ -2622,8 +2670,9 @@ fn quad_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
         vec![vec![0, 1, 2, 3]],
     )?;
     mesh.attributes.insert(
-        "uv_map".to_owned(),
-        json!([{"face_id":0,"layer":"UVMap","uv":[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0]]}]),
+        "uv_layers".to_owned(),
+        // Blender V-up (0,0),(1,0),(1,1),(0,1), stored V down.
+        uv_layers_attribute(&json!([{"face_id":0,"uv":[[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]}])),
     );
     mesh.attributes.insert(
         "vertex_groups".to_owned(),
@@ -2696,6 +2745,28 @@ fn weighted_normal_mesh(sharp_edge: bool) -> Result<Mesh, Box<dyn Error>> {
     Ok(mesh)
 }
 
+/// Flips one `[u, v]` corner between Potter's V-down storage and Blender's V-up values.
+fn flip_corner(corner: &Value) -> Value {
+    json!([corner[0], 1.0 - corner[1].as_f64().unwrap_or(f64::NAN)])
+}
+
+/// Flips every corner of a corner list between Potter's V-down storage and Blender's V-up values.
+fn flip_v(corners: &Value) -> Value {
+    Value::Array(
+        corners
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(flip_corner)
+            .collect(),
+    )
+}
+
+/// A `uv_layers` attribute holding one `UVMap` layer that is both active and render.
+fn uv_layers_attribute(faces: &Value) -> Value {
+    json!({"layers": [{"name": "UVMap", "faces": faces}], "active": "UVMap", "render": "UVMap"})
+}
+
 fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
     let mut mesh = Mesh::from_positions_and_faces(
         vec![
@@ -2711,11 +2782,11 @@ fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
         vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
     )?;
     mesh.attributes.insert(
-        "uv_map".to_owned(),
-        json!([
-            {"face_id":0,"layer":"UVMap","uv":[[0,0],[1,0],[1,1],[0,1]]},
-            {"face_id":1,"layer":"UVMap","uv":[[0,0],[1,0],[1,1],[0,1]]}
-        ]),
+        "uv_layers".to_owned(),
+        uv_layers_attribute(&json!([
+            {"face_id":0,"uv":[[0,1],[1,1],[1,0],[0,0]]},
+            {"face_id":1,"uv":[[0,1],[1,1],[1,0],[0,0]]}
+        ])),
     );
     Ok(mesh)
 }
@@ -2749,11 +2820,11 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         vec![vec![0, 1, 2], vec![0, 2, 3]],
     )?;
     mesh.attributes.insert(
-        "uv_map".to_owned(),
-        json!([
-            {"face_id":0,"layer":"UVMap","uv":[[0,0],[1,0],[1,1]]},
-            {"face_id":1,"layer":"UVMap","uv":[[0,0],[1,1],[0,1]]}
-        ]),
+        "uv_layers".to_owned(),
+        uv_layers_attribute(&json!([
+            {"face_id":0,"uv":[[0,1],[1,1],[1,0]]},
+            {"face_id":1,"uv":[[0,1],[1,0],[0,0]]}
+        ])),
     );
     mesh.attributes.insert("sharp_edges".to_owned(), json!([]));
     mesh.attributes.insert(
@@ -2835,22 +2906,19 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         );
     }
     let mut uv = Vec::new();
-    let uv_entries = mesh
+    let uv_faces = mesh
         .attributes
-        .get("uv_map")
-        .and_then(Value::as_array)
+        .get("uv_layers")
+        .and_then(|store| store["layers"][0]["faces"].as_array())
         .ok_or("transferred UV layers missing")?;
     for face in &mesh.faces {
-        let entry = uv_entries
+        let entry = uv_faces
             .iter()
-            .find(|entry| {
-                entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(face.id))
-                    && entry.get("layer").and_then(Value::as_str) == Some("UVMap")
-            })
+            .find(|entry| entry.get("face_id").and_then(Value::as_u64) == Some(u64::from(face.id)))
             .and_then(|entry| entry.get("uv"))
             .and_then(Value::as_array)
             .ok_or("transferred face UVs missing")?;
-        uv.extend(entry.iter().cloned());
+        uv.extend(entry.iter().map(flip_corner));
     }
     let corner_values = |name: &str| -> Result<Value, Box<dyn Error>> {
         let values = mesh
@@ -2934,5 +3002,198 @@ fn assert_normal_parity(
         max_angle <= tolerance,
         "{label} normal angle {max_angle}; actual={worst_actual:?}, expected={worst_expected:?}"
     );
+    Ok(())
+}
+
+/// Blender's UV values of the UV Data Transfer probe, per corner in V-up.
+const TRANSFER_SOURCE: [[f64; 2]; 4] = [[0.3, 0.7], [0.6, 0.2], [0.9, 0.4], [0.1, 0.8]];
+const TRANSFER_DESTINATION: [[f64; 2]; 4] = [[0.2, 0.2], [0.4, 0.6], [0.7, 0.1], [0.5, 0.9]];
+/// Blender's factor 0.5 result over `TRANSFER_DESTINATION`: the midpoint of destination and source.
+const TRANSFER_HALF: [[f64; 2]; 4] = [[0.25, 0.45], [0.5, 0.4], [0.8, 0.25], [0.3, 0.85]];
+/// Blender's factor 0.5 result into a layer the destination lacks, which starts at zero in V-up.
+const TRANSFER_GENERATED_HALF: [[f64; 2]; 4] = [[0.15, 0.35], [0.3, 0.1], [0.45, 0.2], [0.05, 0.4]];
+
+/// A `uv_layers` attribute with one layer `name` on face 0, holding Blender V-up `values`, stored V-down.
+fn named_uv_layers(name: &str, values: [[f64; 2]; 4]) -> Value {
+    json!({
+        "layers": [{"name": name, "faces": [{"face_id": 0, "uv": flip_v(&json!(values))}]}],
+        "active": name,
+        "render": name
+    })
+}
+
+/// A quad carrying one UV layer `name` with Blender V-up `values`.
+fn uv_layer_quad(name: &str, values: [[f64; 2]; 4]) -> Result<Mesh, Box<dyn Error>> {
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    mesh.attributes
+        .insert("uv_layers".to_owned(), named_uv_layers(name, values));
+    Ok(mesh)
+}
+
+/// Blender V-up corner values of layer `name` on face 0 of `mesh`.
+fn transferred_uv(mesh: &Mesh, name: &str) -> Result<Vec<[f64; 2]>, Box<dyn Error>> {
+    let store = mesh
+        .attributes
+        .get("uv_layers")
+        .ok_or("uv_layers missing")?;
+    let layer = store["layers"]
+        .as_array()
+        .ok_or("uv_layers layers missing")?
+        .iter()
+        .find(|layer| layer["name"] == name)
+        .ok_or_else(|| format!("no `{name}` layer"))?;
+    layer["faces"][0]["uv"]
+        .as_array()
+        .ok_or("uv row missing")?
+        .iter()
+        .map(|corner| -> Result<[f64; 2], Box<dyn Error>> {
+            Ok([
+                corner[0].as_f64().ok_or("U must be a number")?,
+                1.0 - corner[1].as_f64().ok_or("V must be a number")?,
+            ])
+        })
+        .collect()
+}
+
+fn assert_uv_close(actual: &[[f64; 2]], expected: &[[f64; 2]]) {
+    assert_eq!(actual.len(), expected.len(), "corner count");
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual[0] - expected[0]).abs() < 1.0e-9 && (actual[1] - expected[1]).abs() < 1.0e-9,
+            "UV {actual:?} differs from Blender {expected:?}"
+        );
+    }
+}
+
+/// Runs a TOPOLOGY UV Data Transfer of `source` onto `destination`.
+fn run_uv_transfer(
+    destination: &Mesh,
+    source: &Mesh,
+    mix_mode: &str,
+    factor: f64,
+) -> Result<Mesh, Box<dyn Error>> {
+    let transfer = modifier(
+        "data_transfer",
+        json!({
+            "object": "source",
+            "use_loop_data": true,
+            "data_types_loops": ["UV"],
+            "loop_mapping": "TOPOLOGY",
+            "layers_uv_select_src": "ALL",
+            "layers_uv_select_dst": "NAME",
+            "mix_mode": mix_mode,
+            "mix_factor": factor
+        }),
+    )?;
+    let mut operands = BTreeMap::new();
+    operands.insert(
+        "object".to_owned(),
+        vec![scene_operand(source.clone(), DMat4::IDENTITY, None)],
+    );
+    Ok(evaluate_with_context(
+        destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+    )?)
+}
+
+#[test]
+fn data_transfer_uv_mixes_by_factor_and_ignores_add_sub_mul_like_blender()
+-> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a UV transfer gives the REPLACE result for ADD, SUB, and MUL alike, lerped
+    // from destination to source by factor. Blender's RNA offers only REPLACE for UV alone; the probe
+    // selected a color loop type too, and the UV result was the same.
+    let source = uv_layer_quad("Src", TRANSFER_SOURCE)?;
+    let destination = uv_layer_quad("Src", TRANSFER_DESTINATION)?;
+    for (mode, factor, expected) in [
+        ("ADD", 1.0, TRANSFER_SOURCE),
+        ("SUB", 1.0, TRANSFER_SOURCE),
+        ("MUL", 1.0, TRANSFER_SOURCE),
+        ("ADD", 0.5, TRANSFER_HALF),
+        ("SUB", 0.5, TRANSFER_HALF),
+        ("MUL", 0.5, TRANSFER_HALF),
+    ] {
+        let result = run_uv_transfer(&destination, &source, mode, factor)?;
+        assert_uv_close(&transferred_uv(&result, "Src")?, &expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn data_transfer_uv_into_missing_layer_starts_at_blender_zero() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a layer generated for the transfer is zero in V-up, so a factor 0.5 transfer
+    // gives half the source, and a factor 1 transfer gives the source.
+    let source = uv_layer_quad("Src", TRANSFER_SOURCE)?;
+    let destination = uv_layer_quad("UVMap", TRANSFER_DESTINATION)?;
+    let half = run_uv_transfer(&destination, &source, "REPLACE", 0.5)?;
+    assert_uv_close(&transferred_uv(&half, "Src")?, &TRANSFER_GENERATED_HALF);
+    let full = run_uv_transfer(&destination, &source, "ADD", 1.0)?;
+    assert_uv_close(&transferred_uv(&full, "Src")?, &TRANSFER_SOURCE);
+    Ok(())
+}
+
+#[test]
+fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a 1x4 Non-Color image, rows 0.1, 0.3, 0.6, 0.9 from bottom to top, with
+    // Closest sampling. UV mapping at V-up (0.13, 0.12), (0.73, 0.38), (0.84, 0.62), (0.2, 0.88) gives
+    // mask weights 0.1, 0.3, 0.6, 0.9. Each row is picked by its V-up coordinate, not its stored one.
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        named_uv_layers(
+            "UVMap",
+            [[0.13, 0.12], [0.73, 0.38], [0.84, 0.62], [0.2, 0.88]],
+        ),
+    );
+    mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({
+            "A": {"v0": 0.0, "v1": 0.0, "v2": 0.0, "v3": 0.0},
+            "B": {"v0": 1.0, "v1": 1.0, "v2": 1.0, "v3": 1.0}
+        }),
+    );
+    let image = ImageData {
+        width: 1,
+        height: 4,
+        pixels: vec![
+            [0.1, 0.1, 0.1, 1.0],
+            [0.3, 0.3, 0.3, 1.0],
+            [0.6, 0.6, 0.6, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+        ],
+        tiles: BTreeMap::new(),
+        interpolation: ImageInterpolation::Closest,
+    };
+    let mix = modifier(
+        "vertex_weight_mix",
+        json!({
+            "vertex_group_a": "A",
+            "vertex_group_b": "B",
+            "mix_mode": "SET",
+            "mix_set": "ALL",
+            "mask_texture": "image_mask",
+            "mask_tex_use_channel": "RED",
+            "mask_tex_mapping": "UV",
+            "mask_tex_uv_layer": "UVMap"
+        }),
+    )?;
+    let result =
+        evaluate_with_context(&mesh, &mix, &BTreeMap::new(), Some(&image), DMat4::IDENTITY)?;
+    let weights = vertex_weights(&result, "A")?;
+    assert_eq!(weights.len(), 4);
+    for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {
+        assert!(
+            (weight - expected).abs() < 1.0e-9,
+            "mask weight {weight} differs from Blender {expected}"
+        );
+    }
     Ok(())
 }

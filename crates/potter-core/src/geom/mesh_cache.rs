@@ -8,17 +8,25 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    exchange::alembic::{self, MeshCacheSample},
+    exchange::{
+        ExchangeUvLayer,
+        alembic::{self, MeshCacheSample},
+    },
     model::Modifier,
     params::{self, ParameterFamily},
 };
 
-use super::Mesh;
+use super::{
+    Mesh,
+    uv_layers::{self, UvLayer},
+};
 
 static CACHE_SAMPLES: LazyLock<Mutex<HashMap<String, Arc<Vec<MeshCacheSample>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Replace a mesh with the requested Alembic cache sample.
+///
+/// Returns the warnings for cache data the mesh could not take, such as UV layers past the limit.
 ///
 /// # Errors
 ///
@@ -35,7 +43,8 @@ pub(crate) fn evaluate(
     fps_base: f64,
     resource_hash: &str,
     archive_bytes: &[u8],
-) -> Result<()> {
+    is_sequence: bool,
+) -> Result<Vec<PotError>> {
     let resource = string_param(modifier, "resource")?;
     let object_path = string_param(modifier, "object_path")?;
     let frame_offset = number_param(modifier, "frame_offset")?;
@@ -52,7 +61,7 @@ pub(crate) fn evaluate(
         ),
     };
     let interpolate = bool_param(modifier, "use_vertex_interpolation")?;
-    let read = read_params(modifier)?;
+    let mut read = read_params(modifier)?;
     let rate = f64::from(fps) / fps_base;
     if !rate.is_finite() || rate <= 0.0 {
         return Err(PotError::with_details(
@@ -71,50 +80,61 @@ pub(crate) fn evaluate(
         ));
     }
 
-    let key = format!(
-        "{resource_hash}\0{object_path}\0{}\0{}\0{}",
-        read.uv,
-        read.color,
-        velocity_scale != 0.0
-    );
-    let samples = {
-        let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "Alembic mesh cache lock is poisoned",
-            )
-        })?;
-        if let Some(samples) = parsed.get(&key) {
-            Arc::clone(samples)
-        } else {
-            let samples = Arc::new(alembic::read_mesh_cache(
-                archive_bytes,
-                object_path,
-                read.uv,
-                read.color,
-                velocity_scale != 0.0,
-            )?);
-            if samples.windows(2).any(|pair| {
-                pair.first()
-                    .zip(pair.get(1))
-                    .is_some_and(|(first, second)| first.time_seconds > second.time_seconds)
-            }) {
-                return Err(PotError::with_details(
-                    ErrorCode::EvaluationFailed,
-                    "Alembic mesh cache sample times are not ordered",
-                    json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
-                ));
-            }
-            parsed.insert(key, Arc::clone(&samples));
-            samples
-        }
-    };
+    let mut samples = cached_mesh_cache_samples(
+        archive_bytes,
+        resource_hash,
+        resource,
+        object_path,
+        read,
+        velocity_scale != 0.0,
+        modifier,
+    )?;
     if samples.is_empty() {
         return Err(PotError::with_details(
             ErrorCode::EvaluationFailed,
             "Alembic PolyMesh has no samples",
             json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
         ));
+    }
+    let topology_changed = {
+        let sample = sample_at_time(&samples, time_seconds, interpolate).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic PolyMesh has no samples",
+                json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+            )
+        })?;
+        let input_corners = mesh
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
+        let cache_corners = sample.sample.faces.iter().map(Vec::len).sum::<usize>();
+        let dimensions_changed = mesh.vertices.len() != sample.sample.positions.len()
+            || mesh.faces.len() != sample.sample.faces.len()
+            || input_corners != cache_corners;
+        dimensions_changed
+            || ((is_sequence || sample.sample.has_multiple_topology_samples)
+                && !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces))
+    };
+    if topology_changed {
+        read = ReadAttributes::ALL;
+        samples = cached_mesh_cache_samples(
+            archive_bytes,
+            resource_hash,
+            resource,
+            object_path,
+            read,
+            velocity_scale != 0.0,
+            modifier,
+        )?;
+        if samples.is_empty() {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "Alembic PolyMesh has no samples",
+                json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+            ));
+        }
     }
     let sample = sample_at_time(&samples, time_seconds, interpolate).ok_or_else(|| {
         PotError::with_details(
@@ -123,30 +143,59 @@ pub(crate) fn evaluate(
             json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
         )
     })?;
-    if (!read.vertices || !read.polygons) && mesh.vertices.len() != sample.sample.positions.len() {
-        return Err(PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "Alembic vertex count does not match the input mesh when topology replacement is disabled",
-            json!({
-                "modifier_id":modifier.id,
-                "resource":resource,
-                "object_path":object_path,
-                "input_vertex_count":mesh.vertices.len(),
-                "cache_vertex_count":sample.sample.positions.len(),
-                "read_vertices":read.vertices,
-                "read_polygons":read.polygons,
-            }),
-        ));
+    let mut warnings = Vec::new();
+    if topology_changed {
+        let positions = sample
+            .sample
+            .positions
+            .iter()
+            .enumerate()
+            .map(|(index, _)| evaluated_position(&sample, index, modifier))
+            .collect::<Result<Vec<_>>>()?;
+        let mut evaluated = Mesh::from_positions_and_faces(positions, sample.sample.faces.clone())
+            .map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "Alembic cache topology is invalid for the selected vertex sample",
+                    json!({"modifier_id":modifier.id,"reason":error.to_string()}),
+                )
+            })?;
+        apply_cache_attributes(
+            &mut evaluated,
+            sample.sample,
+            read,
+            velocity_scale,
+            modifier,
+            &mut warnings,
+        )?;
+        validate_cache_output(&evaluated, modifier)?;
+        *mesh = evaluated;
+        return Ok(warnings);
     }
+    // With unchanged topology and POLY disabled, Blender updates selected streams on the receiver.
     if !read.polygons {
         if read.vertices {
-            for (index, vertex) in mesh.vertices.iter_mut().enumerate() {
-                vertex.co = evaluated_position(&sample, index, modifier)?;
+            let positions = sample
+                .sample
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| evaluated_position(&sample, index, modifier))
+                .collect::<Result<Vec<_>>>()?;
+            for (vertex, position) in mesh.vertices.iter_mut().zip(positions) {
+                vertex.co = position;
             }
         }
-        apply_cache_attributes(mesh, sample.sample, read, velocity_scale, modifier)?;
+        apply_cache_attributes(
+            mesh,
+            sample.sample,
+            read,
+            velocity_scale,
+            modifier,
+            &mut warnings,
+        )?;
         validate_cache_output(mesh, modifier)?;
-        return Ok(());
+        return Ok(warnings);
     }
     let positions = if read.vertices {
         (0..sample.sample.positions.len())
@@ -163,57 +212,110 @@ pub(crate) fn evaluate(
                 json!({"modifier_id":modifier.id,"reason":error.to_string()}),
             )
         })?;
+    carry_uv_store(mesh, &mut evaluated);
     apply_cache_attributes(
         &mut evaluated,
         sample.sample,
         read,
         velocity_scale,
         modifier,
+        &mut warnings,
     )?;
     validate_cache_output(&evaluated, modifier)?;
     *mesh = evaluated;
-    Ok(())
+    Ok(warnings)
 }
 
+fn topology_matches(mesh: &Mesh, cache_vertex_count: usize, cache_faces: &[Vec<usize>]) -> bool {
+    let corner_count = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .sum::<usize>();
+    if mesh.vertices.is_empty()
+        || mesh.vertices.len() != cache_vertex_count
+        || mesh.faces.len() != cache_faces.len()
+        || corner_count != cache_faces.iter().map(Vec::len).sum::<usize>()
+    {
+        return false;
+    }
+    let indices = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<HashMap<_, _>>();
+    mesh.faces
+        .iter()
+        .zip(cache_faces)
+        .all(|(face, cache_face)| {
+            face.vertices.len() == cache_face.len()
+                && face.vertices.iter().zip(cache_face).all(|(id, index)| {
+                    indices
+                        .get(id)
+                        .is_some_and(|mesh_index| mesh_index == index)
+                })
+        })
+}
+
+fn cached_mesh_cache_samples(
+    archive_bytes: &[u8],
+    resource_hash: &str,
+    resource: &str,
+    object_path: &str,
+    read: ReadAttributes,
+    read_velocity: bool,
+    modifier: &Modifier,
+) -> Result<Arc<Vec<MeshCacheSample>>> {
+    let key = format!(
+        "{resource_hash}\0{object_path}\0{}\0{}\0{}",
+        read.uv, read.color, read_velocity
+    );
+    let mut parsed = CACHE_SAMPLES.lock().map_err(|_| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "Alembic mesh cache lock is poisoned",
+        )
+    })?;
+    if let Some(samples) = parsed.get(&key) {
+        return Ok(Arc::clone(samples));
+    }
+    let samples = Arc::new(alembic::read_mesh_cache(
+        archive_bytes,
+        object_path,
+        read.uv,
+        read.color,
+        read_velocity,
+    )?);
+    if samples.windows(2).any(|pair| {
+        pair.first()
+            .zip(pair.get(1))
+            .is_some_and(|(first, second)| first.time_seconds > second.time_seconds)
+    }) {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic mesh cache sample times are not ordered",
+            json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
+        ));
+    }
+    parsed.insert(key, Arc::clone(&samples));
+    Ok(samples)
+}
 fn apply_cache_attributes(
     mesh: &mut Mesh,
     sample: &MeshCacheSample,
     read: ReadAttributes,
     velocity_scale: f64,
     modifier: &Modifier,
+    warnings: &mut Vec<PotError>,
 ) -> Result<()> {
     if read.uv
-        && let Some(uv_faces) = &sample.uv_faces
+        && let Some(uv_layers) = &sample.uv_layers
     {
-        if uv_faces.len() != mesh.faces.len() {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "Alembic UV face count does not match the selected mesh topology",
-                json!({"modifier_id":modifier.id,"cache_faces":uv_faces.len(),"mesh_faces":mesh.faces.len()}),
-            ));
+        for layer in uv_layers {
+            check_cache_uv_layer(mesh, modifier, layer)?;
         }
-        if let Some((face, uv)) = mesh
-            .faces
-            .iter()
-            .zip(uv_faces)
-            .find(|(face, uv)| face.vertices.len() != uv.len())
-        {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "Alembic UV corner count does not match the selected face topology",
-                json!({"modifier_id":modifier.id,"face_id":face.id,"cache_corners":uv.len(),"mesh_corners":face.vertices.len()}),
-            ));
-        }
-        mesh.attributes.insert(
-            "uv_map".to_owned(),
-            Value::Array(
-                mesh.faces
-                    .iter()
-                    .zip(uv_faces)
-                    .map(|(face, uv)| json!({"face_id":face.id,"uv":uv}))
-                    .collect(),
-            ),
-        );
+        write_cache_uvs(mesh, modifier, uv_layers, warnings)?;
     }
     if read.color
         && let Some((scope, colors)) = &sample.colors
@@ -246,6 +348,138 @@ fn apply_cache_attributes(
         );
     }
     Ok(())
+}
+
+/// Carries the input mesh's UV layers onto the replacement mesh that a topology read builds. Rows
+/// are per face and corner, so they keep their values only while the corner layout is unchanged.
+/// Otherwise the layers keep their names, order, and selectors, with no values.
+fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
+    let mut store = uv_layers::read(input);
+    let same_layout = input.faces.len() == replacement.faces.len()
+        && input
+            .faces
+            .iter()
+            .zip(&replacement.faces)
+            .all(|(old, new)| old.vertices.len() == new.vertices.len());
+    if !same_layout {
+        for layer in &mut store.layers {
+            layer.faces = vec![None; replacement.faces.len()];
+            layer.pinned = vec![None; replacement.faces.len()];
+        }
+    }
+    uv_layers::write(replacement, &store);
+}
+
+/// Writes each cached UV layer into the layer its name gives, creating the layer when the mesh
+/// lacks it. Alembic UV face-corner rows are reversed into Potter mesh-loop order whether or not
+/// cache polygons replace the input faces. A layer's values are replaced; its pins and the other
+/// layers are kept. A cached layer with no room left under the mesh limit is reported and not
+/// written. The active and render names keep their layers while those exist; otherwise they name
+/// the first layer the cache wrote.
+fn write_cache_uvs(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    cached: &[ExchangeUvLayer],
+    warnings: &mut Vec<PotError>,
+) -> Result<()> {
+    let mut store = uv_layers::read(mesh);
+    let mut first_written = None;
+    for cached_layer in cached {
+        let index = match store.index_of(&cached_layer.name) {
+            Some(index) => index,
+            None if store.layers.len() < uv_layers::MAX_LAYERS => {
+                store.layers.push(UvLayer::new(
+                    cached_layer.name.clone(),
+                    vec![None; mesh.faces.len()],
+                ));
+                store.layers.len() - 1
+            }
+            None => {
+                warnings.push(layer_limit_warning(modifier, &cached_layer.name));
+                continue;
+            }
+        };
+        let layer = store.layers.get_mut(index).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "UV layer index is out of range")
+        })?;
+        layer.faces = cached_layer
+            .corners
+            .iter()
+            .map(|corners| Some(corners.iter().rev().copied().collect()))
+            .collect();
+        if first_written.is_none() {
+            first_written = Some(cached_layer.name.clone());
+        }
+    }
+    let active_exists = store
+        .active
+        .as_deref()
+        .is_some_and(|name| store.index_of(name).is_some());
+    if !active_exists {
+        store.active.clone_from(&first_written);
+    }
+    let render_exists = store
+        .render
+        .as_deref()
+        .is_some_and(|name| store.index_of(name).is_some());
+    if !render_exists {
+        store.render.clone_from(&first_written);
+    }
+    uv_layers::write(mesh, &store);
+    Ok(())
+}
+
+fn check_cache_uv_layer(mesh: &Mesh, modifier: &Modifier, layer: &ExchangeUvLayer) -> Result<()> {
+    if layer.corners.len() != mesh.faces.len() {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic UV face count does not match the selected mesh topology",
+            json!({
+                "modifier_id":modifier.id,
+                "layer":layer.name,
+                "cache_faces":layer.corners.len(),
+                "mesh_faces":mesh.faces.len(),
+            }),
+        ));
+    }
+    if let Some((face, uv)) = mesh
+        .faces
+        .iter()
+        .zip(&layer.corners)
+        .find(|(face, uv)| face.vertices.len() != uv.len())
+    {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic UV corner count does not match the selected face topology",
+            json!({
+                "modifier_id":modifier.id,
+                "layer":layer.name,
+                "face_id":face.id,
+                "cache_corners":uv.len(),
+                "mesh_corners":face.vertices.len(),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+/// The warning for a cached UV layer the mesh has no room for. The layer is not written.
+fn layer_limit_warning(modifier: &Modifier, layer: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::LimitExceeded,
+        format!(
+            "Mesh Sequence Cache UV layer `{layer}` was not written: the mesh already has {} UV layers",
+            uv_layers::MAX_LAYERS
+        ),
+        json!({
+            "feature_id":"uv.layer_limit",
+            "status":"dropped",
+            "modifier_id":modifier.id,
+            "modifier_type":modifier.modifier_type,
+            "layer":layer,
+            "limit":uv_layers::MAX_LAYERS,
+        }),
+    )
 }
 
 fn validate_cache_output(mesh: &Mesh, modifier: &Modifier) -> Result<()> {
@@ -362,6 +596,14 @@ struct ReadAttributes {
     uv: bool,
     color: bool,
 }
+impl ReadAttributes {
+    const ALL: Self = Self {
+        vertices: true,
+        polygons: true,
+        uv: true,
+        color: true,
+    };
+}
 
 fn read_params(modifier: &Modifier) -> Result<ReadAttributes> {
     let Some(value) = modifier.params.get("read_data").or_else(|| {
@@ -371,12 +613,7 @@ fn read_params(modifier: &Modifier) -> Result<ReadAttributes> {
             "read_data",
         )
     }) else {
-        return Ok(ReadAttributes {
-            vertices: true,
-            polygons: true,
-            uv: true,
-            color: true,
-        });
+        return Ok(ReadAttributes::ALL);
     };
     let values = value.as_array().ok_or_else(|| {
         invalid_parameter(modifier, "read_data", "an array of Blender read-data flags")
@@ -526,7 +763,26 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::{Value, json};
 
-    use super::lerp_position;
+    use super::{lerp_position, topology_matches};
+    use crate::geom::Mesh;
+
+    #[test]
+    fn topology_identity_detects_same_size_corner_reorder() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mesh = Mesh::from_positions_and_faces(
+            vec![
+                glam::DVec3::ZERO,
+                glam::DVec3::X,
+                glam::DVec3::ONE,
+                glam::DVec3::Y,
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )?;
+        assert!(topology_matches(&mesh, 4, &[vec![0, 1, 2, 3]]));
+        assert!(!topology_matches(&mesh, 4, &[vec![3, 2, 1, 0]]));
+        assert!(!topology_matches(&mesh, 5, &[vec![0, 1, 2, 3]]));
+        Ok(())
+    }
 
     #[test]
     fn cache_colors_map_to_point_and_corner_mesh_domains() -> Result<(), Box<dyn std::error::Error>>

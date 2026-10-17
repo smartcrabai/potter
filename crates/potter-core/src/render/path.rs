@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
 use glam::{DMat4, DVec3};
 
@@ -8,13 +8,13 @@ use crate::{
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
-    shader::{BsdfParams, HitContext, evaluate_surface},
+    shader::{BsdfParams, HitContext, HitUvLayers, evaluate_surface, height_gradient},
 };
 
 use super::{
     bvh::{Bvh, BvhHit},
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, blend_uv, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, ObjectRecord},
@@ -350,7 +350,13 @@ pub(super) fn render(
         });
     let bvh = Bvh::build(&geometry.triangles)?;
     let lights = collect_lights(doc, snapshot);
-    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images)?;
+    let volumes = collect_volumes(
+        doc,
+        snapshot,
+        scene.unit.scale_length,
+        images,
+        &geometry.shader_warnings,
+    )?;
     let world_importance = WorldImportanceSampler::build(doc, &snapshot.scene_id, images)?;
     let mut output = RasterOutput {
         rgba: allocate(rgba_len, 0_u8, "RGBA image")?,
@@ -510,12 +516,13 @@ pub(super) fn composite_realtime_volumes(
     film_transparent: bool,
     images: &BTreeMap<String, ImageData>,
     output: &mut RasterOutput,
+    warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<()> {
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
-    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images)?;
+    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images, warnings)?;
     if volumes.is_empty() {
         return Ok(());
     }
@@ -1127,14 +1134,7 @@ fn make_surface(
             }
         }
     };
-    let uv = [
-        triangle.uv[0][0] * hit.barycentric[0]
-            + triangle.uv[1][0] * hit.barycentric[1]
-            + triangle.uv[2][0] * hit.barycentric[2],
-        triangle.uv[0][1] * hit.barycentric[0]
-            + triangle.uv[1][1] * hit.barycentric[1]
-            + triangle.uv[2][1] * hit.barycentric[2],
-    ];
+    let uv = blend_uv(&triangle.uv, hit.barycentric);
     let object = object_for_index(&geometry.objects, triangle.object_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1166,14 +1166,23 @@ fn make_surface(
     } else {
         point
     };
-    let uv_maps = [("uv_map", uv)];
-    let (tangent, bitangent) = triangle_tangent_frame(triangle, normal);
+    let element = triangle
+        .element_index
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| geometry.elements.get(index));
+    let layers = HitUvLayers {
+        names: &object.uv_layers,
+        corners: &triangle.layer_uvs,
+        positions: triangle.positions,
+        barycentric: hit.barycentric,
+        render: element.map_or(object.uv_render, |element| element.uv_render),
+        available_mask: element.and_then(|element| element.uv_available_mask),
+    };
     let mut context = HitContext::new(&doc.node_groups)
         .with_images(images)
-        .with_tangent_frame(tangent, bitangent);
-    if triangle.uv_available {
-        context = context.with_uv_maps(&uv_maps);
-    }
+        .with_uv_layers(layers)
+        .with_warnings(&geometry.shader_warnings);
     context.uv = uv;
     context.generated = object_position;
     context.position = point;
@@ -1193,7 +1202,10 @@ fn make_surface(
         _ => params.alpha.clamp(0.0, 1.0),
     };
     if params.displacement_height != 0.0 && material.displacement_method != "displacement" {
-        params.normal = displacement_bump_normal(material, context, tangent, bitangent, normal)?;
+        let gradient = height_gradient(&context, normal, |sample| {
+            evaluate_surface(material, sample).map(|surface| surface.displacement_height)
+        })?;
+        params.normal = normal - gradient;
     }
     params.normal = if params.normal.is_finite() {
         params.normal.normalize_or_zero()
@@ -1215,88 +1227,11 @@ fn make_surface(
     })
 }
 
-fn displacement_bump_normal(
-    material: &crate::model::Material,
-    context: HitContext<'_>,
-    tangent: DVec3,
-    bitangent: DVec3,
-    normal: DVec3,
-) -> Result<DVec3> {
-    let step = 1.0e-3;
-    let positive_u = displacement_sample(material, context, [step, 0.0], tangent, bitangent)?;
-    let negative_u = displacement_sample(material, context, [-step, 0.0], tangent, bitangent)?;
-    let positive_v = displacement_sample(material, context, [0.0, step], tangent, bitangent)?;
-    let negative_v = displacement_sample(material, context, [0.0, -step], tangent, bitangent)?;
-    let gradient_u = (positive_u - negative_u) / (2.0 * step);
-    let gradient_v = (positive_v - negative_v) / (2.0 * step);
-    Ok((normal - tangent * gradient_u - bitangent * gradient_v).normalize_or_zero())
-}
-
-fn displacement_sample(
-    material: &crate::model::Material,
-    context: HitContext<'_>,
-    uv_offset: [f64; 2],
-    tangent: DVec3,
-    bitangent: DVec3,
-) -> Result<f64> {
-    let displacement = tangent * uv_offset[0] + bitangent * uv_offset[1];
-    let mut sample_context = context;
-    sample_context.uv[0] += uv_offset[0];
-    sample_context.uv[1] += uv_offset[1];
-    sample_context.generated += displacement;
-    sample_context.position += displacement;
-    sample_context.object += displacement;
-    evaluate_surface(material, &sample_context).map(|params| params.displacement_height)
-}
-
 fn object_for_index(objects: &[ObjectRecord], object_index: u32) -> Option<&ObjectRecord> {
     object_index
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
         .and_then(|index| objects.get(index))
-}
-
-fn triangle_tangent_frame(triangle: &super::raster::Triangle, normal: DVec3) -> (DVec3, DVec3) {
-    let edge1 = triangle.positions[1] - triangle.positions[0];
-    let edge2 = triangle.positions[2] - triangle.positions[0];
-    let uv1 = [
-        triangle.uv[1][0] - triangle.uv[0][0],
-        triangle.uv[1][1] - triangle.uv[0][1],
-    ];
-    let uv2 = [
-        triangle.uv[2][0] - triangle.uv[0][0],
-        triangle.uv[2][1] - triangle.uv[0][1],
-    ];
-    let determinant = uv1[0] * uv2[1] - uv1[1] * uv2[0];
-    let (raw_tangent, raw_bitangent) =
-        if determinant.is_finite() && determinant.abs() > f64::EPSILON {
-            (
-                (edge1 * uv2[1] - edge2 * uv1[1]) / determinant,
-                (edge2 * uv1[0] - edge1 * uv2[0]) / determinant,
-            )
-        } else {
-            (edge1, normal.cross(edge1))
-        };
-    let tangent = (raw_tangent - normal * raw_tangent.dot(normal)).normalize_or_zero();
-    let fallback = if normal.z.abs() < 0.9 {
-        normal.cross(DVec3::Z).normalize_or_zero()
-    } else {
-        normal.cross(DVec3::Y).normalize_or_zero()
-    };
-    let tangent = if tangent == DVec3::ZERO {
-        fallback
-    } else {
-        tangent
-    };
-    let bitangent =
-        (raw_bitangent - normal * raw_bitangent.dot(normal) - tangent * raw_bitangent.dot(tangent))
-            .normalize_or_zero();
-    let bitangent = if bitangent == DVec3::ZERO {
-        normal.cross(tangent).normalize_or_zero()
-    } else {
-        bitangent
-    };
-    (tangent, bitangent)
 }
 
 #[expect(
@@ -1770,6 +1705,7 @@ fn collect_volumes<'a>(
     snapshot: &'a Snapshot,
     meters_per_unit: f64,
     images: &BTreeMap<String, ImageData>,
+    warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<Vec<VolumeInstance<'a>>> {
     let mut volumes = Vec::new();
     for (node_id, node) in &doc.nodes {
@@ -1840,7 +1776,9 @@ fn collect_volumes<'a>(
             .and_then(|material_id| doc.materials.get(material_id));
         let evaluated_material = if let Some(material) = material {
             let local_center = (bounds_min + bounds_max) * 0.5;
-            let mut context = HitContext::new(&doc.node_groups).with_images(images);
+            let mut context = HitContext::new(&doc.node_groups)
+                .with_images(images)
+                .with_warnings(warnings);
             context.object = local_center;
             context.generated = local_center;
             context.position = matrix.transform_point3(local_center);

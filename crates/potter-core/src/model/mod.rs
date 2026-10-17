@@ -1,6 +1,8 @@
 mod avatar;
 mod id;
+pub mod migrate;
 mod rig;
+pub use migrate::{ParsedScene, parse_scene, upgrade_scene};
 mod scene;
 mod transform;
 

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashSet},
+};
 
 use glam::{DMat3, DMat4, DVec3};
 use serde::Serialize;
@@ -6,15 +9,18 @@ use serde::Serialize;
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot},
-    geom::normals::render_corner_normals,
+    geom::{
+        normals::render_corner_normals,
+        uv_layers::{self, UvStore},
+    },
     image::ImageData,
     model::{Id, Material, SceneDoc},
-    shader::{HitContext, evaluate_displacement},
+    shader::{HitContext, HitUvLayers, evaluate_displacement},
 };
 
 use super::{
     bvh::Bvh,
-    raster::{AlphaMode, Line, Mode, SurfaceShader, Triangle, blend_corner_normals},
+    raster::{AlphaMode, Line, Mode, SurfaceShader, Triangle, blend_corner_normals, blend_uv},
 };
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -23,6 +29,12 @@ pub(super) struct ObjectRecord {
     pub node_id: Id,
     pub data_id: Option<Id>,
     pub instance_path: Vec<Id>,
+    /// UV layer names in layer order, matching `Triangle::layer_uvs`. Not part of the output.
+    #[serde(skip)]
+    pub uv_layers: Vec<String>,
+    /// Index of the render layer in `uv_layers`; `None` without layers. Not part of the output.
+    #[serde(skip)]
+    pub uv_render: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -31,6 +43,12 @@ pub(super) struct ElementRecord {
     pub node_id: Id,
     pub domain: String,
     pub element_id: String,
+    /// Per-face UV binding metadata read by triangles through their retained `element_index`.
+    #[serde(skip)]
+    pub uv_render: Option<usize>,
+    /// Source-member layers available to this face; `None` for ordinary meshes.
+    #[serde(skip)]
+    pub uv_available_mask: Option<u8>,
 }
 
 pub(super) struct Geometry {
@@ -41,7 +59,22 @@ pub(super) struct Geometry {
     pub elements: Vec<ElementRecord>,
     pub bounds: Option<(DVec3, DVec3)>,
     pub warnings: Vec<serde_json::Value>,
+    /// Warnings recorded while shading hits, such as `uv.layer_missing`.
+    pub shader_warnings: RefCell<Vec<serde_json::Value>>,
     pub shadows: Option<RealtimeShadows>,
+}
+
+impl Geometry {
+    /// Extraction warnings, then each distinct warning recorded while shading hits.
+    pub(super) fn all_warnings(&self) -> Vec<serde_json::Value> {
+        let mut all = self.warnings.clone();
+        for warning in self.shader_warnings.borrow().iter() {
+            if !all.contains(warning) {
+                all.push(warning.clone());
+            }
+        }
+        all
+    }
 }
 
 /// Shadow acceleration for the realtime Beauty engine; built once per geometry and shared by
@@ -103,6 +136,7 @@ pub(super) fn extract_geometry(
     let mut elements = Vec::new();
     let mut bounds: Option<(DVec3, DVec3)> = None;
     let mut warnings = Vec::new();
+    let shader_warnings: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
     for (node_id, node) in &doc.nodes {
         if !visible_nodes.contains(node_id)
             || !node.visible
@@ -194,6 +228,19 @@ pub(super) fn extract_geometry(
                 "too many objects for the ID buffer",
             )
         })?;
+        let uv_store = mesh.map_or_else(UvStore::default, uv_layers::read);
+        if uv_store.layers.len() > uv_layers::MAX_LAYERS {
+            return Err(PotError::new(
+                ErrorCode::LimitExceeded,
+                "mesh has more UV layers than the supported maximum",
+            ));
+        }
+        let uv_names: Vec<String> = uv_store
+            .layers
+            .iter()
+            .map(|layer| layer.name.clone())
+            .collect();
+        let uv_render = (!uv_names.is_empty()).then_some(uv_store.render_index().unwrap_or(0));
         objects.push(ObjectRecord {
             index: object_index,
             node_id: node_id.clone(),
@@ -204,6 +251,8 @@ pub(super) fn extract_geometry(
                 .and_then(|paths| paths.first())
                 .cloned()
                 .unwrap_or_default(),
+            uv_layers: uv_names.clone(),
+            uv_render,
         });
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
@@ -235,6 +284,13 @@ pub(super) fn extract_geometry(
             let face_normals = world_face_normals(mesh, matrix, node_id, &mut warnings);
             let mut triangle_offset = 0_usize;
             for (face_index, face) in mesh.faces.iter().enumerate() {
+                let material_slot = usize::try_from(face.material_index).ok();
+                let binding =
+                    material_slot.and_then(|slot| snapshot.slot_binding(node_id, node, slot));
+                let render_layer = binding.map_or(uv_render, |binding| {
+                    binding.uv.render_index.map(usize::from)
+                });
+                let uv_available_mask = binding.map(|binding| binding.uv.available_mask);
                 let face_corner_normals = face_normals[face_index].as_deref();
                 let element_index = u32::try_from(elements.len() + 1).map_err(|_| {
                     PotError::new(
@@ -247,10 +303,11 @@ pub(super) fn extract_geometry(
                     node_id: node_id.clone(),
                     domain: "face".to_owned(),
                     element_id: format!("f{}", face.id),
+                    uv_render: render_layer,
+                    uv_available_mask,
                 });
-                let material_id = usize::try_from(face.material_index)
-                    .ok()
-                    .and_then(|slot| snapshot.slot_material(node_id, node, slot));
+                let material_id =
+                    material_slot.and_then(|slot| snapshot.slot_material(node_id, node, slot));
                 let material_index = material_id.map_or(0, |id| {
                     if let Some(index) = material_indices.get(id).copied() {
                         index
@@ -265,7 +322,6 @@ pub(super) fn extract_geometry(
                 });
                 let material = materials.get(material_index);
                 let base_color = material.map_or([0.6, 0.6, 0.6, 1.0], |value| value.base_color);
-                let face_uv = read_face_uvs(mesh, face.id);
                 let face_triangle_count = face.vertices.len().checked_sub(2).ok_or_else(|| {
                     PotError::new(
                         ErrorCode::SceneInvalid,
@@ -290,8 +346,8 @@ pub(super) fn extract_geometry(
                     })?;
                 for triangle in face_triangles {
                     let mut positions = [DVec3::ZERO; 3];
-                    let mut uv = [[0.0; 2]; 3];
                     let corners = triangle_corners(face, triangle);
+                    let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
                     for (index, vertex_id) in triangle.iter().enumerate() {
                         let local = vertex_positions.get(vertex_id).copied().ok_or_else(|| {
                             PotError::new(
@@ -300,13 +356,10 @@ pub(super) fn extract_geometry(
                             )
                         })?;
                         positions[index] = matrix.transform_point3(local);
-                        uv[index] = corners[index]
-                            .and_then(|corner| {
-                                face_uv.as_ref().and_then(|values| values.get(corner))
-                            })
-                            .copied()
-                            .unwrap_or([0.0; 2]);
                     }
+                    let uv = render_layer
+                        .and_then(|index| layer_uvs.get(index).copied())
+                        .unwrap_or([[0.0, 1.0]; 3]);
                     let raw_normal =
                         (positions[1] - positions[0]).cross(positions[2] - positions[0]);
                     if raw_normal.length_squared() <= f64::EPSILON || !raw_normal.is_finite() {
@@ -353,15 +406,29 @@ pub(super) fn extract_geometry(
                         double_sided: material.is_some_and(|value| value.double_sided),
                         material_index,
                         uv,
-                        uv_available: face_uv.is_some(),
+                        layer_uvs,
                         normals: corner_normals,
                     };
                     if let Some(material) = material.filter(|material| {
                         material.displacement_method == "displacement"
                             && material.node_tree.is_some()
                     }) {
+                        let layers = HitUvLayers {
+                            names: &uv_names,
+                            corners: &triangle.layer_uvs,
+                            positions: triangle.positions,
+                            barycentric: [1.0, 0.0, 0.0],
+                            render: render_layer,
+                            available_mask: uv_available_mask,
+                        };
                         triangles.extend(subdivide_displaced_triangle(
-                            doc, material, matrix, &triangle, images,
+                            doc,
+                            material,
+                            matrix,
+                            &triangle,
+                            images,
+                            layers,
+                            &shader_warnings,
                         )?);
                     } else {
                         triangles.push(triangle);
@@ -412,6 +479,8 @@ pub(super) fn extract_geometry(
                         "vertex".to_owned()
                     },
                     element_id: format!("{}{}", if pointcloud { "p" } else { "v" }, vertex.id),
+                    uv_render: None,
+                    uv_available_mask: None,
                 });
                 let radius = read_vertex_number(mesh, "point_radius", vertex.id)
                     .unwrap_or(0.02)
@@ -482,6 +551,8 @@ pub(super) fn extract_geometry(
                         node_id: node_id.clone(),
                         domain: "point".to_owned(),
                         element_id: format!("p{stroke_number}_{point_number}"),
+                        uv_render: None,
+                        uv_available_mask: None,
                     });
                     let extent = DVec3::splat(radius);
                     bounds = Some(match bounds {
@@ -512,6 +583,8 @@ pub(super) fn extract_geometry(
                     node_id: node_id.clone(),
                     domain: "stroke".to_owned(),
                     element_id: format!("s{stroke_index}"),
+                    uv_render: None,
+                    uv_available_mask: None,
                 });
                 let mut segment_count = stroke.points_world.len().saturating_sub(1);
                 if stroke.cyclic && stroke.points_world.len() > 2 {
@@ -576,6 +649,8 @@ pub(super) fn extract_geometry(
                     node_id: node_id.clone(),
                     domain: "hair_curve".to_owned(),
                     element_id: format!("h{curve_index}"),
+                    uv_render: None,
+                    uv_available_mask: None,
                 });
                 let radius = curve.radius * radius_scale;
                 for point in &curve.points {
@@ -618,6 +693,7 @@ pub(super) fn extract_geometry(
         elements,
         bounds,
         warnings,
+        shader_warnings,
         shadows: None,
     };
     if !path_traced && matches!(mode, Mode::Beauty) && !geometry.triangles.is_empty() {
@@ -625,7 +701,7 @@ pub(super) fn extract_geometry(
         let shadow_maps = build_point_shadow_maps(doc, snapshot, &geometry.triangles)?;
         let bvh = Bvh::build(&geometry.triangles)?;
         for index in 0..geometry.triangles.len() {
-            let triangle = geometry.triangles[index];
+            let triangle = &geometry.triangles[index];
             if triangle.normals.is_some() {
                 // Smooth triangles are shaded per pixel from their corner normals.
                 continue;
@@ -902,7 +978,7 @@ fn subdivide_realtime_triangles(triangles: &[Triangle]) -> Result<Vec<Triangle>>
         // Smooth triangles are shaded per pixel from their corner normals, so splitting them
         // would only multiply the raster and shadow work without changing the lighting.
         if triangle.normals.is_some() {
-            refined.push(*triangle);
+            refined.push(triangle.clone());
             continue;
         }
         for half in subdivide_triangle_once(triangle) {
@@ -921,32 +997,37 @@ fn subdivide_triangle_once(triangle: &Triangle) -> [Triangle; 4] {
         (triangle.positions[1] + triangle.positions[2]) * 0.5,
         (triangle.positions[2] + triangle.positions[0]) * 0.5,
     ];
-    let uv = [
-        triangle.uv[0],
-        triangle.uv[1],
-        triangle.uv[2],
-        [
-            f64::midpoint(triangle.uv[0][0], triangle.uv[1][0]),
-            f64::midpoint(triangle.uv[0][1], triangle.uv[1][1]),
-        ],
-        [
-            f64::midpoint(triangle.uv[1][0], triangle.uv[2][0]),
-            f64::midpoint(triangle.uv[1][1], triangle.uv[2][1]),
-        ],
-        [
-            f64::midpoint(triangle.uv[2][0], triangle.uv[0][0]),
-            f64::midpoint(triangle.uv[2][1], triangle.uv[0][1]),
-        ],
-    ];
-    let subtriangles = [[0, 3, 5], [3, 1, 4], [5, 4, 2], [3, 4, 5]];
-    let mut result = [*triangle; 4];
-    for (subtriangle, corners) in subtriangles.into_iter().enumerate() {
-        for (corner, vertex) in corners.into_iter().enumerate() {
-            result[subtriangle].positions[corner] = positions[vertex];
-            result[subtriangle].uv[corner] = uv[vertex];
-        }
-    }
-    result
+    let uv = corner_midpoints(triangle.uv);
+    let layer_uvs: Vec<[[f64; 2]; 6]> = triangle
+        .layer_uvs
+        .iter()
+        .map(|corners| corner_midpoints(*corners))
+        .collect();
+    let subtriangles: [[usize; 3]; 4] = [[0, 3, 5], [3, 1, 4], [5, 4, 2], [3, 4, 5]];
+    subtriangles.map(|corners| {
+        triangle.with_corners(
+            corners.map(|vertex| positions[vertex]),
+            corners.map(|vertex| uv[vertex]),
+            layer_uvs
+                .iter()
+                .map(|table| corners.map(|vertex| table[vertex]))
+                .collect(),
+        )
+    })
+}
+
+/// The three corners of a triangle followed by the midpoints of its edges (0-1, 1-2, 2-0).
+fn corner_midpoints(corners: [[f64; 2]; 3]) -> [[f64; 2]; 6] {
+    let midpoint =
+        |a: [f64; 2], b: [f64; 2]| [f64::midpoint(a[0], b[0]), f64::midpoint(a[1], b[1])];
+    [
+        corners[0],
+        corners[1],
+        corners[2],
+        midpoint(corners[0], corners[1]),
+        midpoint(corners[1], corners[2]),
+        midpoint(corners[2], corners[0]),
+    ]
 }
 
 fn subdivide_displaced_triangle(
@@ -955,11 +1036,17 @@ fn subdivide_displaced_triangle(
     object_to_world: DMat4,
     triangle: &Triangle,
     images: &BTreeMap<String, ImageData>,
+    layers: HitUvLayers<'_>,
+    warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<[Triangle; 4]> {
     subdivide_displaced(triangle, object_to_world, |sample| {
         let mut context = HitContext::new(&doc.node_groups)
             .with_images(images)
-            .with_tangent_frame(sample.tangent, sample.bitangent);
+            .with_uv_layers(HitUvLayers {
+                barycentric: sample.barycentric,
+                ..layers
+            })
+            .with_warnings(warnings);
         context.uv = sample.uv;
         context.position = sample.point;
         context.object = sample.object;
@@ -974,10 +1061,10 @@ struct DisplacementSample {
     point: DVec3,
     object: DVec3,
     uv: [f64; 2],
+    /// Barycentric weights of the sample over the triangle's corners.
+    barycentric: [f64; 3],
     /// Blended corner normal the sample moves along, or the face normal on flat triangles.
     normal: DVec3,
-    tangent: DVec3,
-    bitangent: DVec3,
 }
 
 /// Splits a triangle into four and moves its six sample points by `displacement`.
@@ -994,34 +1081,6 @@ fn subdivide_displaced(
     let normal = (triangle.positions[1] - triangle.positions[0])
         .cross(triangle.positions[2] - triangle.positions[0])
         .normalize_or_zero();
-    let uv1 = [
-        triangle.uv[1][0] - triangle.uv[0][0],
-        triangle.uv[1][1] - triangle.uv[0][1],
-    ];
-    let uv2 = [
-        triangle.uv[2][0] - triangle.uv[0][0],
-        triangle.uv[2][1] - triangle.uv[0][1],
-    ];
-    let determinant = uv1[0] * uv2[1] - uv1[1] * uv2[0];
-    let (tangent, bitangent) = if determinant.abs() > f64::EPSILON {
-        (
-            ((triangle.positions[1] - triangle.positions[0]) * uv2[1]
-                - (triangle.positions[2] - triangle.positions[0]) * uv1[1])
-                / determinant,
-            ((triangle.positions[2] - triangle.positions[0]) * uv1[0]
-                - (triangle.positions[1] - triangle.positions[0]) * uv2[0])
-                / determinant,
-        )
-    } else {
-        let tangent = if normal.z.abs() < 0.999 {
-            normal.cross(DVec3::Z)
-        } else {
-            normal.cross(DVec3::Y)
-        };
-        (tangent, normal.cross(tangent))
-    };
-    let tangent = tangent.normalize_or_zero();
-    let bitangent = bitangent.normalize_or_zero();
     let barycentric = [
         [1.0, 0.0, 0.0],
         [0.5, 0.5, 0.0],
@@ -1032,6 +1091,7 @@ fn subdivide_displaced(
     ];
     let mut positions = [DVec3::ZERO; 6];
     let mut uvs = [[0.0; 2]; 6];
+    let mut layer_samples = vec![[[0.0; 2]; 6]; triangle.layer_uvs.len()];
     let mut sample_normals = [normal; 6];
     let world_to_object = object_to_world.inverse();
     let inverse_is_finite = world_to_object
@@ -1043,14 +1103,7 @@ fn subdivide_displaced(
         let point = triangle.positions[0] * weights[0]
             + triangle.positions[1] * weights[1]
             + triangle.positions[2] * weights[2];
-        let uv = [
-            triangle.uv[0][0] * weights[0]
-                + triangle.uv[1][0] * weights[1]
-                + triangle.uv[2][0] * weights[2],
-            triangle.uv[0][1] * weights[0]
-                + triangle.uv[1][1] * weights[1]
-                + triangle.uv[2][1] * weights[2],
-        ];
+        let uv = blend_uv(&triangle.uv, weights);
         let object = if inverse_is_finite {
             world_to_object.transform_point3(point)
         } else {
@@ -1063,22 +1116,27 @@ fn subdivide_displaced(
             point,
             object,
             uv,
+            barycentric: weights,
             normal: sample_normal,
-            tangent,
-            bitangent,
         };
         let displacement = displacement(&sample)?;
         positions[index] = point + sample_normal * displacement;
         sample_normals[index] = sample_normal;
         uvs[index] = uv;
-    }
-    let indices = [[0, 1, 2], [1, 3, 4], [2, 4, 5], [1, 4, 2]];
-    let mut result = [*triangle; 4];
-    for (subtriangle, corners) in indices.iter().enumerate() {
-        for (corner, vertex) in corners.iter().copied().enumerate() {
-            result[subtriangle].positions[corner] = positions[vertex];
-            result[subtriangle].uv[corner] = uvs[vertex];
+        for (table, corners) in layer_samples.iter_mut().zip(&triangle.layer_uvs) {
+            table[index] = blend_uv(corners, weights);
         }
+    }
+    let indices: [[usize; 3]; 4] = [[0, 1, 2], [1, 3, 4], [2, 4, 5], [1, 4, 2]];
+    Ok(indices.map(|corners| {
+        let mut subtriangle = triangle.with_corners(
+            corners.map(|vertex| positions[vertex]),
+            corners.map(|vertex| uvs[vertex]),
+            layer_samples
+                .iter()
+                .map(|table| corners.map(|vertex| table[vertex]))
+                .collect(),
+        );
         if triangle.normals.is_some() {
             let average = corners
                 .iter()
@@ -1090,10 +1148,10 @@ fn subdivide_displaced(
             if face.dot(average) < 0.0 {
                 face = -face;
             }
-            result[subtriangle].normals = Some([face; 3]);
+            subtriangle.normals = Some([face; 3]);
         }
-    }
-    Ok(result)
+        subtriangle
+    }))
 }
 
 fn collect_collection_nodes(
@@ -1232,21 +1290,6 @@ impl SurfaceShader for SceneShader<'_> {
     }
 }
 
-fn read_face_uvs(mesh: &crate::geom::Mesh, face_id: u32) -> Option<Vec<[f64; 2]>> {
-    mesh.attributes
-        .get("uv_map")?
-        .as_array()?
-        .iter()
-        .find(|entry| {
-            entry.get("face_id").and_then(serde_json::Value::as_u64) == Some(u64::from(face_id))
-        })?
-        .get("uv")?
-        .as_array()?
-        .iter()
-        .map(|coordinate| Some([coordinate.get(0)?.as_f64()?, coordinate.get(1)?.as_f64()?]))
-        .collect()
-}
-
 /// Face-corner index of each triangle vertex; the UV and shading-normal lookups share it.
 fn triangle_corners(face: &crate::geom::Face, triangle: &[u32; 3]) -> [Option<usize>; 3] {
     triangle.map(|vertex_id| {
@@ -1254,6 +1297,31 @@ fn triangle_corners(face: &crate::geom::Face, triangle: &[u32; 3]) -> [Option<us
             .iter()
             .position(|face_vertex| *face_vertex == vertex_id)
     })
+}
+
+/// Corner UVs of every UV layer for a triangle whose vertices sit at face corners `corners`, in
+/// layer order. A layer with no entry for the face samples canonical UV `[0, 1]` at each corner.
+fn triangle_layer_uvs(
+    store: &UvStore,
+    face_index: usize,
+    corners: [Option<usize>; 3],
+) -> Vec<[[f64; 2]; 3]> {
+    store
+        .layers
+        .iter()
+        .map(|layer| {
+            let values = layer
+                .faces
+                .get(face_index)
+                .and_then(|entry| entry.as_deref());
+            corners.map(|corner| {
+                corner
+                    .and_then(|corner| values.and_then(|values| values.get(corner)))
+                    .copied()
+                    .unwrap_or([0.0, 1.0])
+            })
+        })
+        .collect()
 }
 
 /// Per-corner values for a triangle, or `None` when any corner is not on the face.
@@ -1714,9 +1782,15 @@ mod shading_normal_tests {
     use glam::{DMat4, DVec3};
     use serde_json::json;
 
-    use super::{corner_values, subdivide_displaced, triangle_corners, world_face_normals};
+    use super::{
+        corner_values, subdivide_displaced, triangle_corners, triangle_layer_uvs,
+        world_face_normals,
+    };
     use crate::{
-        geom::Mesh,
+        geom::{
+            Mesh,
+            uv_layers::{UvLayer, UvStore},
+        },
         model::Id,
         render::raster::{AlphaMode, Triangle},
     };
@@ -1733,6 +1807,18 @@ mod shading_normal_tests {
             json!({"domain": "face", "type": "bool", "values": {"f0": smooth}}),
         );
         mesh
+    }
+
+    #[test]
+    fn absent_uv_rows_use_the_canonical_storage_default() {
+        let store = UvStore {
+            layers: vec![UvLayer::new("UVMap", vec![None])],
+            ..UvStore::default()
+        };
+        assert_eq!(
+            triangle_layer_uvs(&store, 0, [Some(0), Some(1), Some(2)]),
+            vec![[[0.0, 1.0]; 3]],
+        );
     }
 
     #[test]
@@ -1791,7 +1877,7 @@ mod shading_normal_tests {
             double_sided: false,
             material_index: 0,
             uv: [[0.0; 2]; 3],
-            uv_available: false,
+            layer_uvs: Vec::new(),
             normals: Some(normals),
         }
     }

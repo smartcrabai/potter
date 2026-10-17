@@ -1,0 +1,5776 @@
+{
+  "schema_version": 1,
+  "scene_id": "3045085c-1230-41f8-8870-4a20313f55a9",
+  "revision": 2,
+  "active_scene": "scene_main",
+  "profile": {
+    "blender": "5.2.2"
+  },
+  "scenes": {
+    "scene_main": {
+      "name": "Scene",
+      "root_collection": "collection_root",
+      "view_layers": {
+        "view_main": {
+          "name": "View Layer",
+          "excluded_collections": []
+        }
+      },
+      "frame_current": 1.0,
+      "frame_start": 1,
+      "frame_end": 250,
+      "fps": 24,
+      "fps_base": 1.0,
+      "camera": null,
+      "world": null,
+      "active_clip": null,
+      "unit": {
+        "system": "metric",
+        "scale_length": 1.0
+      },
+      "render": {
+        "resolution_x": 1920,
+        "resolution_y": 1080,
+        "resolution_percentage": 100,
+        "samples": 64,
+        "seed": 0,
+        "max_bounces": 4,
+        "film_transparent": false,
+        "engine": "path",
+        "use_sequencer": false,
+        "audio_codec": "wav",
+        "passes": [
+          "combined"
+        ],
+        "motion_blur": false,
+        "shutter": 0.5,
+        "motion_blur_samples": 8
+      },
+      "use_compositing": false,
+      "compositor": null,
+      "color_management": {
+        "display_device": "sRGB",
+        "view_transform": "standard",
+        "look": "none",
+        "exposure": 0.0,
+        "gamma": 1.0,
+        "curve": []
+      },
+      "markers": [],
+      "rigid_body_world": null,
+      "sequencer": {
+        "channels": 32,
+        "strips": []
+      }
+    }
+  },
+  "collections": {
+    "collection_root": {
+      "name": "Collection",
+      "children": [],
+      "objects": [
+        "node_cube"
+      ]
+    }
+  },
+  "nodes": {
+    "node_cube": {
+      "name": "Cube",
+      "kind": "mesh",
+      "primitive": null,
+      "tags": [],
+      "parent": null,
+      "parent_inverse": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "transform": {
+        "translation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "rotation_mode": "XYZ"
+      },
+      "data": "mesh_cube",
+      "materials": [],
+      "modifiers": [],
+      "visible": true,
+      "render_visible": true,
+      "selectable": true,
+      "action": null,
+      "nla_tracks": [],
+      "properties": {
+        "blender_object_metadata": {
+          "delta_location": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "delta_rotation_euler": "Euler((0.0, 0.0, 0.0), 'XYZ')",
+          "delta_rotation_quaternion": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "delta_scale": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "matrix_basis": [
+            [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              1.0,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ]
+          ],
+          "matrix_local": [
+            [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              1.0,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ]
+          ],
+          "matrix_world": [
+            [
+              1.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              1.0,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ]
+          ],
+          "parent_bone": "",
+          "parent_type": "OBJECT",
+          "rna_properties": {
+            "active_material": null,
+            "active_material_index": 0,
+            "active_selection_set": 0,
+            "active_shape_key_index": 0,
+            "add_rest_position_attribute": false,
+            "asset_data": null,
+            "color": [
+              1.0,
+              1.0,
+              1.0,
+              1.0
+            ],
+            "delta_location": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "delta_rotation_euler": "Euler((0.0, 0.0, 0.0), 'XYZ')",
+            "delta_rotation_quaternion": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "delta_scale": [
+              1.0,
+              1.0,
+              1.0
+            ],
+            "dimensions": [
+              2.0,
+              2.0,
+              2.0
+            ],
+            "display_bounds_type": "BOX",
+            "display_type": "TEXTURED",
+            "empty_display_size": 1.0,
+            "empty_display_type": "PLAIN_AXES",
+            "empty_image_depth": "DEFAULT",
+            "empty_image_offset": [
+              0.0,
+              0.0
+            ],
+            "empty_image_side": "DOUBLE_SIDED",
+            "hide_probe_plane": false,
+            "hide_probe_sphere": false,
+            "hide_probe_volume": false,
+            "hide_render": false,
+            "hide_select": false,
+            "hide_surface_pick": false,
+            "hide_viewport": false,
+            "instance_collection": null,
+            "instance_faces_scale": 1.0,
+            "instance_type": "NONE",
+            "is_holdout": false,
+            "is_runtime_data": false,
+            "is_shadow_catcher": false,
+            "lightgroup": "",
+            "location": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lock_location": [
+              false,
+              false,
+              false
+            ],
+            "lock_rotation": [
+              false,
+              false,
+              false
+            ],
+            "lock_rotation_w": false,
+            "lock_rotations_4d": true,
+            "lock_scale": [
+              false,
+              false,
+              false
+            ],
+            "matrix_basis": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "matrix_local": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "matrix_parent_inverse": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "matrix_world": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "name": "Cube",
+            "parent_bone": "",
+            "parent_bone_head_tail_factor": 1.0,
+            "parent_type": "OBJECT",
+            "parent_vertices": [
+              0,
+              0,
+              0
+            ],
+            "pass_index": 0,
+            "rotation_axis_angle": [
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            "rotation_euler": "Euler((0.0, 0.0, 0.0), 'XYZ')",
+            "rotation_mode": "XYZ",
+            "rotation_quaternion": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "scale": [
+              1.0,
+              1.0,
+              1.0
+            ],
+            "shadow_terminator_geometry_offset": 0.10000000149011612,
+            "shadow_terminator_normal_offset": 0.0,
+            "shadow_terminator_shading_offset": 0.0,
+            "show_all_edges": false,
+            "show_axis": false,
+            "show_bounds": false,
+            "show_empty_image_only_axis_aligned": false,
+            "show_empty_image_orthographic": true,
+            "show_empty_image_perspective": true,
+            "show_in_front": false,
+            "show_instancer_for_render": true,
+            "show_instancer_for_viewport": true,
+            "show_name": false,
+            "show_only_shape_key": false,
+            "show_texture_space": false,
+            "show_transparent": false,
+            "show_wire": false,
+            "tag": false,
+            "track_axis": "POS_Y",
+            "up_axis": "Z",
+            "use_camera_lock_parent": false,
+            "use_empty_image_alpha": false,
+            "use_extra_user": false,
+            "use_fake_user": false,
+            "use_grease_pencil_lights": false,
+            "use_instance_faces_scale": false,
+            "use_instance_vertices_rotation": false,
+            "use_mesh_mirror_x": false,
+            "use_mesh_mirror_y": false,
+            "use_mesh_mirror_z": false,
+            "use_parent_final_indices": false,
+            "use_shape_key_edit_mode": false,
+            "use_simulation_cache": true,
+            "visible_camera": true,
+            "visible_diffuse": true,
+            "visible_glossy": true,
+            "visible_raycast": true,
+            "visible_shadow": true,
+            "visible_transmission": true,
+            "visible_volume_scatter": true
+          }
+        }
+      },
+      "rigid_body": null,
+      "force_field": null,
+      "parent_type": "object",
+      "parent_bone": null,
+      "pose": {},
+      "constraints": [],
+      "drivers": []
+    }
+  },
+  "data_blocks": {
+    "mesh_cube": {
+      "type": "mesh",
+      "descriptor": null,
+      "mesh": {
+        "vertices": [
+          {
+            "id": 1,
+            "co": [
+              -1.0,
+              -1.0,
+              -1.0
+            ]
+          },
+          {
+            "id": 2,
+            "co": [
+              -1.0,
+              -1.0,
+              1.0
+            ]
+          },
+          {
+            "id": 3,
+            "co": [
+              -1.0,
+              1.0,
+              -1.0
+            ]
+          },
+          {
+            "id": 4,
+            "co": [
+              -1.0,
+              1.0,
+              1.0
+            ]
+          },
+          {
+            "id": 5,
+            "co": [
+              1.0,
+              -1.0,
+              -1.0
+            ]
+          },
+          {
+            "id": 6,
+            "co": [
+              1.0,
+              -1.0,
+              1.0
+            ]
+          },
+          {
+            "id": 7,
+            "co": [
+              1.0,
+              1.0,
+              -1.0
+            ]
+          },
+          {
+            "id": 8,
+            "co": [
+              1.0,
+              1.0,
+              1.0
+            ]
+          }
+        ],
+        "edges": [
+          {
+            "id": 1,
+            "v": [
+              3,
+              1
+            ]
+          },
+          {
+            "id": 2,
+            "v": [
+              1,
+              2
+            ]
+          },
+          {
+            "id": 3,
+            "v": [
+              2,
+              4
+            ]
+          },
+          {
+            "id": 4,
+            "v": [
+              4,
+              3
+            ]
+          },
+          {
+            "id": 5,
+            "v": [
+              7,
+              3
+            ]
+          },
+          {
+            "id": 6,
+            "v": [
+              4,
+              8
+            ]
+          },
+          {
+            "id": 7,
+            "v": [
+              8,
+              7
+            ]
+          },
+          {
+            "id": 8,
+            "v": [
+              5,
+              7
+            ]
+          },
+          {
+            "id": 9,
+            "v": [
+              8,
+              6
+            ]
+          },
+          {
+            "id": 10,
+            "v": [
+              6,
+              5
+            ]
+          },
+          {
+            "id": 11,
+            "v": [
+              1,
+              5
+            ]
+          },
+          {
+            "id": 12,
+            "v": [
+              6,
+              2
+            ]
+          }
+        ],
+        "faces": [
+          {
+            "id": 1,
+            "v": [
+              1,
+              2,
+              4,
+              3
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 2,
+            "v": [
+              3,
+              4,
+              8,
+              7
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 3,
+            "v": [
+              7,
+              8,
+              6,
+              5
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 4,
+            "v": [
+              5,
+              6,
+              2,
+              1
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 5,
+            "v": [
+              3,
+              7,
+              5,
+              1
+            ],
+            "material_index": 0
+          },
+          {
+            "id": 6,
+            "v": [
+              8,
+              4,
+              2,
+              6
+            ],
+            "material_index": 0
+          }
+        ],
+        "attributes": {
+          "blender_attributes": [
+            {
+              "data_type": "FLOAT2",
+              "domain": "CORNER",
+              "name": "Base",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "data_type": "BOOLEAN",
+              "domain": "POINT",
+              "name": ".select_vert",
+              "values": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            },
+            {
+              "data_type": "BOOLEAN",
+              "domain": "EDGE",
+              "name": ".select_edge",
+              "values": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            },
+            {
+              "data_type": "BOOLEAN",
+              "domain": "FACE",
+              "name": ".select_poly",
+              "values": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            },
+            {
+              "data_type": "BOOLEAN",
+              "domain": "FACE",
+              "name": "sharp_face",
+              "values": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            },
+            {
+              "data_type": "BOOLEAN",
+              "domain": "CORNER",
+              "name": ".uv_select_vert",
+              "values": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            },
+            {
+              "data_type": "BOOLEAN",
+              "domain": "CORNER",
+              "name": ".uv_select_edge",
+              "values": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            },
+            {
+              "data_type": "BOOLEAN",
+              "domain": "FACE",
+              "name": ".uv_select_face",
+              "values": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            },
+            {
+              "data_type": "FLOAT_VECTOR",
+              "domain": "POINT",
+              "name": "position",
+              "values": [
+                [
+                  -1.0,
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  -1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  -1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  1.0,
+                  1.0
+                ]
+              ]
+            },
+            {
+              "data_type": "INT32_2D",
+              "domain": "EDGE",
+              "name": ".edge_verts",
+              "values": [
+                [
+                  2,
+                  0
+                ],
+                [
+                  0,
+                  1
+                ],
+                [
+                  1,
+                  3
+                ],
+                [
+                  3,
+                  2
+                ],
+                [
+                  6,
+                  2
+                ],
+                [
+                  3,
+                  7
+                ],
+                [
+                  7,
+                  6
+                ],
+                [
+                  4,
+                  6
+                ],
+                [
+                  7,
+                  5
+                ],
+                [
+                  5,
+                  4
+                ],
+                [
+                  0,
+                  4
+                ],
+                [
+                  5,
+                  1
+                ]
+              ]
+            },
+            {
+              "data_type": "INT",
+              "domain": "CORNER",
+              "name": ".corner_vert",
+              "values": [
+                0,
+                1,
+                3,
+                2,
+                2,
+                3,
+                7,
+                6,
+                6,
+                7,
+                5,
+                4,
+                4,
+                5,
+                1,
+                0,
+                2,
+                6,
+                4,
+                0,
+                7,
+                3,
+                1,
+                5
+              ]
+            },
+            {
+              "data_type": "INT",
+              "domain": "CORNER",
+              "name": ".corner_edge",
+              "values": [
+                1,
+                2,
+                3,
+                0,
+                3,
+                5,
+                6,
+                4,
+                6,
+                8,
+                9,
+                7,
+                9,
+                11,
+                1,
+                10,
+                4,
+                7,
+                10,
+                0,
+                5,
+                2,
+                11,
+                8
+              ]
+            },
+            {
+              "data_type": "FLOAT2",
+              "domain": "CORNER",
+              "name": "Set1",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "data_type": "FLOAT2",
+              "domain": "CORNER",
+              "name": "Set2",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "data_type": "FLOAT2",
+              "domain": "CORNER",
+              "name": "Set3",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "data_type": "FLOAT2",
+              "domain": "CORNER",
+              "name": "Set4",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "data_type": "FLOAT2",
+              "domain": "CORNER",
+              "name": "Set5",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "data_type": "FLOAT2",
+              "domain": "CORNER",
+              "name": "Set6",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "data_type": "FLOAT2",
+              "domain": "CORNER",
+              "name": "Set7",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            }
+          ],
+          "blender_edge_flags": [
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            },
+            {
+              "seam": false,
+              "sharp": false
+            }
+          ],
+          "blender_metadata": {
+            "custom_properties": {},
+            "fake_user": false,
+            "rna_properties": {
+              "asset_data": null,
+              "auto_texspace": true,
+              "is_runtime_data": false,
+              "name": "Cube",
+              "radial_symmetry": [
+                1,
+                1,
+                1
+              ],
+              "remesh_mode": "VOXEL",
+              "remesh_voxel_adaptivity": 0.0,
+              "remesh_voxel_size": 0.10000000149011612,
+              "tag": false,
+              "texco_mesh": null,
+              "texspace_location": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "texspace_size": [
+                1.0,
+                1.0,
+                1.0
+              ],
+              "texture_mesh": null,
+              "use_auto_texspace": true,
+              "use_extra_user": false,
+              "use_fake_user": false,
+              "use_mirror_topology": false,
+              "use_mirror_vertex_groups": true,
+              "use_mirror_x": false,
+              "use_mirror_y": false,
+              "use_mirror_z": false,
+              "use_paint_bone_selection": true,
+              "use_paint_mask": false,
+              "use_paint_mask_vertex": false,
+              "use_remesh_fix_poles": false,
+              "use_remesh_preserve_attributes": true,
+              "use_remesh_preserve_volume": true,
+              "uv_layer_clone": null,
+              "uv_layer_clone_index": 0,
+              "uv_layer_stencil": null,
+              "uv_layer_stencil_index": 0
+            },
+            "users": 1
+          },
+          "blender_polygon_smooth": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "blender_uv_layers": [
+            {
+              "name": "Base",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "name": "Set1",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "name": "Set2",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "name": "Set3",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "name": "Set4",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "name": "Set5",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "name": "Set6",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            },
+            {
+              "name": "Set7",
+              "values": [
+                [
+                  0.375,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.0
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.375,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.25
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ],
+                [
+                  0.625,
+                  1.0
+                ],
+                [
+                  0.375,
+                  1.0
+                ],
+                [
+                  0.125,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.5
+                ],
+                [
+                  0.375,
+                  0.75
+                ],
+                [
+                  0.125,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.5
+                ],
+                [
+                  0.875,
+                  0.75
+                ],
+                [
+                  0.625,
+                  0.75
+                ]
+              ]
+            }
+          ],
+          "uv_map": [
+            {
+              "face_id": 1,
+              "uv": [
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  -1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 2,
+              "uv": [
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  -1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 3,
+              "uv": [
+                [
+                  1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  -1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 4,
+              "uv": [
+                [
+                  1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  -1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 5,
+              "uv": [
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  1.0,
+                  -1.0
+                ],
+                [
+                  -1.0,
+                  -1.0
+                ]
+              ]
+            },
+            {
+              "face_id": 6,
+              "uv": [
+                [
+                  1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  1.0
+                ],
+                [
+                  -1.0,
+                  -1.0
+                ],
+                [
+                  1.0,
+                  -1.0
+                ]
+              ]
+            }
+          ]
+        },
+        "next_id": {
+          "vertex": 9,
+          "edge": 13,
+          "face": 7
+        }
+      },
+      "camera": null,
+      "light": null,
+      "grease_pencil": null,
+      "armature": null,
+      "shape_keys": {
+        "basis": {},
+        "keys": {},
+        "absolute": false,
+        "evaluation_time": 0.0,
+        "action": null,
+        "action_slot": null,
+        "muted_action_curves": []
+      },
+      "vertex_groups": [],
+      "vertex_weights": {},
+      "curve": null,
+      "surface": null,
+      "text": null,
+      "hair_curves": null,
+      "metaball": null,
+      "lattice": null,
+      "pointcloud": null,
+      "volume": null
+    }
+  },
+  "materials": {},
+  "images": {},
+  "movie_clips": {},
+  "masks": {},
+  "worlds": {},
+  "node_groups": {},
+  "actions": {},
+  "resources": {},
+  "libraries": {},
+  "compatibility": {
+    "eight_blender_adapter": {
+      "id_mappings": {
+        "Collection:Scene Collection": "collection_scene_collection",
+        "Mesh:Cube": "mesh_cube",
+        "Object:Cube": "node_cube",
+        "Scene:Scene": "scene_scene",
+        "ViewLayer:scene_scene:ViewLayer": "view_viewlayer"
+      },
+      "intermediate": {
+        "actions": [],
+        "active_scene": "Scene",
+        "armatures": [],
+        "blender_version": "5.2.2",
+        "bridge_version": 1,
+        "cameras": [],
+        "collections": [
+          {
+            "children": [],
+            "custom_properties": {},
+            "fake_user": false,
+            "hide_render": false,
+            "hide_viewport": false,
+            "library": null,
+            "name": "Scene Collection",
+            "objects": [
+              "Cube"
+            ],
+            "potter_id": null
+          }
+        ],
+        "curves": [],
+        "file_version": [
+          5,
+          2,
+          45
+        ],
+        "grease_pencil": [],
+        "images": [],
+        "libraries": [],
+        "lights": [],
+        "materials": [],
+        "meshes": [
+          {
+            "attributes": [
+              {
+                "data_type": "FLOAT2",
+                "domain": "CORNER",
+                "name": "Base",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "data_type": "BOOLEAN",
+                "domain": "POINT",
+                "name": ".select_vert",
+                "values": [
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true
+                ]
+              },
+              {
+                "data_type": "BOOLEAN",
+                "domain": "EDGE",
+                "name": ".select_edge",
+                "values": [
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true
+                ]
+              },
+              {
+                "data_type": "BOOLEAN",
+                "domain": "FACE",
+                "name": ".select_poly",
+                "values": [
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true
+                ]
+              },
+              {
+                "data_type": "BOOLEAN",
+                "domain": "FACE",
+                "name": "sharp_face",
+                "values": [
+                  true,
+                  true,
+                  true,
+                  true,
+                  true,
+                  true
+                ]
+              },
+              {
+                "data_type": "BOOLEAN",
+                "domain": "CORNER",
+                "name": ".uv_select_vert",
+                "values": [
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false
+                ]
+              },
+              {
+                "data_type": "BOOLEAN",
+                "domain": "CORNER",
+                "name": ".uv_select_edge",
+                "values": [
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false
+                ]
+              },
+              {
+                "data_type": "BOOLEAN",
+                "domain": "FACE",
+                "name": ".uv_select_face",
+                "values": [
+                  false,
+                  false,
+                  false,
+                  false,
+                  false,
+                  false
+                ]
+              },
+              {
+                "data_type": "FLOAT_VECTOR",
+                "domain": "POINT",
+                "name": "position",
+                "values": [
+                  [
+                    -1.0,
+                    -1.0,
+                    -1.0
+                  ],
+                  [
+                    -1.0,
+                    -1.0,
+                    1.0
+                  ],
+                  [
+                    -1.0,
+                    1.0,
+                    -1.0
+                  ],
+                  [
+                    -1.0,
+                    1.0,
+                    1.0
+                  ],
+                  [
+                    1.0,
+                    -1.0,
+                    -1.0
+                  ],
+                  [
+                    1.0,
+                    -1.0,
+                    1.0
+                  ],
+                  [
+                    1.0,
+                    1.0,
+                    -1.0
+                  ],
+                  [
+                    1.0,
+                    1.0,
+                    1.0
+                  ]
+                ]
+              },
+              {
+                "data_type": "INT32_2D",
+                "domain": "EDGE",
+                "name": ".edge_verts",
+                "values": [
+                  [
+                    2,
+                    0
+                  ],
+                  [
+                    0,
+                    1
+                  ],
+                  [
+                    1,
+                    3
+                  ],
+                  [
+                    3,
+                    2
+                  ],
+                  [
+                    6,
+                    2
+                  ],
+                  [
+                    3,
+                    7
+                  ],
+                  [
+                    7,
+                    6
+                  ],
+                  [
+                    4,
+                    6
+                  ],
+                  [
+                    7,
+                    5
+                  ],
+                  [
+                    5,
+                    4
+                  ],
+                  [
+                    0,
+                    4
+                  ],
+                  [
+                    5,
+                    1
+                  ]
+                ]
+              },
+              {
+                "data_type": "INT",
+                "domain": "CORNER",
+                "name": ".corner_vert",
+                "values": [
+                  0,
+                  1,
+                  3,
+                  2,
+                  2,
+                  3,
+                  7,
+                  6,
+                  6,
+                  7,
+                  5,
+                  4,
+                  4,
+                  5,
+                  1,
+                  0,
+                  2,
+                  6,
+                  4,
+                  0,
+                  7,
+                  3,
+                  1,
+                  5
+                ]
+              },
+              {
+                "data_type": "INT",
+                "domain": "CORNER",
+                "name": ".corner_edge",
+                "values": [
+                  1,
+                  2,
+                  3,
+                  0,
+                  3,
+                  5,
+                  6,
+                  4,
+                  6,
+                  8,
+                  9,
+                  7,
+                  9,
+                  11,
+                  1,
+                  10,
+                  4,
+                  7,
+                  10,
+                  0,
+                  5,
+                  2,
+                  11,
+                  8
+                ]
+              },
+              {
+                "data_type": "FLOAT2",
+                "domain": "CORNER",
+                "name": "Set1",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "data_type": "FLOAT2",
+                "domain": "CORNER",
+                "name": "Set2",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "data_type": "FLOAT2",
+                "domain": "CORNER",
+                "name": "Set3",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "data_type": "FLOAT2",
+                "domain": "CORNER",
+                "name": "Set4",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "data_type": "FLOAT2",
+                "domain": "CORNER",
+                "name": "Set5",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "data_type": "FLOAT2",
+                "domain": "CORNER",
+                "name": "Set6",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "data_type": "FLOAT2",
+                "domain": "CORNER",
+                "name": "Set7",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              }
+            ],
+            "custom_properties": {},
+            "descriptor": null,
+            "edges": [
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  2,
+                  0
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  0,
+                  1
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  1,
+                  3
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  3,
+                  2
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  6,
+                  2
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  3,
+                  7
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  7,
+                  6
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  4,
+                  6
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  7,
+                  5
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  5,
+                  4
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  0,
+                  4
+                ]
+              },
+              {
+                "seam": false,
+                "sharp": false,
+                "v": [
+                  5,
+                  1
+                ]
+              }
+            ],
+            "fake_user": false,
+            "library": null,
+            "name": "Cube",
+            "polygons": [
+              {
+                "material_index": 0,
+                "smooth": false,
+                "v": [
+                  0,
+                  1,
+                  3,
+                  2
+                ]
+              },
+              {
+                "material_index": 0,
+                "smooth": false,
+                "v": [
+                  2,
+                  3,
+                  7,
+                  6
+                ]
+              },
+              {
+                "material_index": 0,
+                "smooth": false,
+                "v": [
+                  6,
+                  7,
+                  5,
+                  4
+                ]
+              },
+              {
+                "material_index": 0,
+                "smooth": false,
+                "v": [
+                  4,
+                  5,
+                  1,
+                  0
+                ]
+              },
+              {
+                "material_index": 0,
+                "smooth": false,
+                "v": [
+                  2,
+                  6,
+                  4,
+                  0
+                ]
+              },
+              {
+                "material_index": 0,
+                "smooth": false,
+                "v": [
+                  7,
+                  3,
+                  1,
+                  5
+                ]
+              }
+            ],
+            "potter_id": null,
+            "rna_properties": {
+              "asset_data": null,
+              "auto_texspace": true,
+              "is_runtime_data": false,
+              "name": "Cube",
+              "radial_symmetry": [
+                1,
+                1,
+                1
+              ],
+              "remesh_mode": "VOXEL",
+              "remesh_voxel_adaptivity": 0.0,
+              "remesh_voxel_size": 0.10000000149011612,
+              "tag": false,
+              "texco_mesh": null,
+              "texspace_location": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "texspace_size": [
+                1.0,
+                1.0,
+                1.0
+              ],
+              "texture_mesh": null,
+              "use_auto_texspace": true,
+              "use_extra_user": false,
+              "use_fake_user": false,
+              "use_mirror_topology": false,
+              "use_mirror_vertex_groups": true,
+              "use_mirror_x": false,
+              "use_mirror_y": false,
+              "use_mirror_z": false,
+              "use_paint_bone_selection": true,
+              "use_paint_mask": false,
+              "use_paint_mask_vertex": false,
+              "use_remesh_fix_poles": false,
+              "use_remesh_preserve_attributes": true,
+              "use_remesh_preserve_volume": true,
+              "uv_layer_clone": null,
+              "uv_layer_clone_index": 0,
+              "uv_layer_stencil": null,
+              "uv_layer_stencil_index": 0
+            },
+            "shape_keys": {
+              "absolute": false,
+              "basis": [],
+              "evaluation_time": 0.0,
+              "keys": []
+            },
+            "skin_vertices": [],
+            "users": 1,
+            "uv_layers": [
+              {
+                "name": "Base",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "name": "Set1",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "name": "Set2",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "name": "Set3",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "name": "Set4",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "name": "Set5",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "name": "Set6",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              },
+              {
+                "name": "Set7",
+                "values": [
+                  [
+                    0.375,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.0
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.375,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.25
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    1.0
+                  ],
+                  [
+                    0.375,
+                    1.0
+                  ],
+                  [
+                    0.125,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.5
+                  ],
+                  [
+                    0.375,
+                    0.75
+                  ],
+                  [
+                    0.125,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.5
+                  ],
+                  [
+                    0.875,
+                    0.75
+                  ],
+                  [
+                    0.625,
+                    0.75
+                  ]
+                ]
+              }
+            ],
+            "vertices": [
+              {
+                "co": [
+                  -1.0,
+                  -1.0,
+                  -1.0
+                ]
+              },
+              {
+                "co": [
+                  -1.0,
+                  -1.0,
+                  1.0
+                ]
+              },
+              {
+                "co": [
+                  -1.0,
+                  1.0,
+                  -1.0
+                ]
+              },
+              {
+                "co": [
+                  -1.0,
+                  1.0,
+                  1.0
+                ]
+              },
+              {
+                "co": [
+                  1.0,
+                  -1.0,
+                  -1.0
+                ]
+              },
+              {
+                "co": [
+                  1.0,
+                  -1.0,
+                  1.0
+                ]
+              },
+              {
+                "co": [
+                  1.0,
+                  1.0,
+                  -1.0
+                ]
+              },
+              {
+                "co": [
+                  1.0,
+                  1.0,
+                  1.0
+                ]
+              }
+            ]
+          }
+        ],
+        "movie_clips": [],
+        "node_groups": [],
+        "objects": [
+          {
+            "action": null,
+            "action_slot": null,
+            "constraints": [],
+            "custom_properties": {},
+            "data_name": "Cube",
+            "delta_location": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "delta_rotation_euler": "Euler((0.0, 0.0, 0.0), 'XYZ')",
+            "delta_rotation_quaternion": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "delta_scale": [
+              1.0,
+              1.0,
+              1.0
+            ],
+            "drivers": [],
+            "force_field": null,
+            "hide_render": false,
+            "hide_select": false,
+            "hide_set": false,
+            "hide_set_by_view_layer": {
+              "Scene": {
+                "ViewLayer": false
+              }
+            },
+            "hide_viewport": false,
+            "instance_collection": null,
+            "library": null,
+            "location": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "materials": [],
+            "matrix_basis": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "matrix_local": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "matrix_parent_inverse": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "matrix_world": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "modifiers": [],
+            "name": "Cube",
+            "nla_tracks": [],
+            "override_library": null,
+            "parent": null,
+            "parent_bone": "",
+            "parent_type": "OBJECT",
+            "pose": [],
+            "potter_id": null,
+            "rigid_body": null,
+            "rna_properties": {
+              "active_material": null,
+              "active_material_index": 0,
+              "active_selection_set": 0,
+              "active_shape_key_index": 0,
+              "add_rest_position_attribute": false,
+              "asset_data": null,
+              "color": [
+                1.0,
+                1.0,
+                1.0,
+                1.0
+              ],
+              "delta_location": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "delta_rotation_euler": "Euler((0.0, 0.0, 0.0), 'XYZ')",
+              "delta_rotation_quaternion": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ],
+              "delta_scale": [
+                1.0,
+                1.0,
+                1.0
+              ],
+              "dimensions": [
+                2.0,
+                2.0,
+                2.0
+              ],
+              "display_bounds_type": "BOX",
+              "display_type": "TEXTURED",
+              "empty_display_size": 1.0,
+              "empty_display_type": "PLAIN_AXES",
+              "empty_image_depth": "DEFAULT",
+              "empty_image_offset": [
+                0.0,
+                0.0
+              ],
+              "empty_image_side": "DOUBLE_SIDED",
+              "hide_probe_plane": false,
+              "hide_probe_sphere": false,
+              "hide_probe_volume": false,
+              "hide_render": false,
+              "hide_select": false,
+              "hide_surface_pick": false,
+              "hide_viewport": false,
+              "instance_collection": null,
+              "instance_faces_scale": 1.0,
+              "instance_type": "NONE",
+              "is_holdout": false,
+              "is_runtime_data": false,
+              "is_shadow_catcher": false,
+              "lightgroup": "",
+              "location": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "lock_location": [
+                false,
+                false,
+                false
+              ],
+              "lock_rotation": [
+                false,
+                false,
+                false
+              ],
+              "lock_rotation_w": false,
+              "lock_rotations_4d": true,
+              "lock_scale": [
+                false,
+                false,
+                false
+              ],
+              "matrix_basis": [
+                [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              ],
+              "matrix_local": [
+                [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              ],
+              "matrix_parent_inverse": [
+                [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              ],
+              "matrix_world": [
+                [
+                  1.0,
+                  0.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0
+                ],
+                [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              ],
+              "name": "Cube",
+              "parent_bone": "",
+              "parent_bone_head_tail_factor": 1.0,
+              "parent_type": "OBJECT",
+              "parent_vertices": [
+                0,
+                0,
+                0
+              ],
+              "pass_index": 0,
+              "rotation_axis_angle": [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              "rotation_euler": "Euler((0.0, 0.0, 0.0), 'XYZ')",
+              "rotation_mode": "XYZ",
+              "rotation_quaternion": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ],
+              "scale": [
+                1.0,
+                1.0,
+                1.0
+              ],
+              "shadow_terminator_geometry_offset": 0.10000000149011612,
+              "shadow_terminator_normal_offset": 0.0,
+              "shadow_terminator_shading_offset": 0.0,
+              "show_all_edges": false,
+              "show_axis": false,
+              "show_bounds": false,
+              "show_empty_image_only_axis_aligned": false,
+              "show_empty_image_orthographic": true,
+              "show_empty_image_perspective": true,
+              "show_in_front": false,
+              "show_instancer_for_render": true,
+              "show_instancer_for_viewport": true,
+              "show_name": false,
+              "show_only_shape_key": false,
+              "show_texture_space": false,
+              "show_transparent": false,
+              "show_wire": false,
+              "tag": false,
+              "track_axis": "POS_Y",
+              "up_axis": "Z",
+              "use_camera_lock_parent": false,
+              "use_empty_image_alpha": false,
+              "use_extra_user": false,
+              "use_fake_user": false,
+              "use_grease_pencil_lights": false,
+              "use_instance_faces_scale": false,
+              "use_instance_vertices_rotation": false,
+              "use_mesh_mirror_x": false,
+              "use_mesh_mirror_y": false,
+              "use_mesh_mirror_z": false,
+              "use_parent_final_indices": false,
+              "use_shape_key_edit_mode": false,
+              "use_simulation_cache": true,
+              "visible_camera": true,
+              "visible_diffuse": true,
+              "visible_glossy": true,
+              "visible_raycast": true,
+              "visible_shadow": true,
+              "visible_transmission": true,
+              "visible_volume_scatter": true
+            },
+            "rotation_axis_angle": [
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            "rotation_euler": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "rotation_mode": "XYZ",
+            "rotation_quaternion": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ],
+            "scale": [
+              1.0,
+              1.0,
+              1.0
+            ],
+            "type": "MESH",
+            "vertex_groups": [],
+            "volume_bounds": null
+          }
+        ],
+        "other_datablocks": [],
+        "resources": [],
+        "scenes": [
+          {
+            "active_clip": null,
+            "camera": null,
+            "color_management": {
+              "curve": [],
+              "display_device": "sRGB",
+              "exposure": 0.0,
+              "gamma": 1.0,
+              "look": "none",
+              "view_transform": "ag_x"
+            },
+            "compositor": null,
+            "custom_properties": {},
+            "fps": 24,
+            "fps_base": 1.0,
+            "frame_current": 1.0,
+            "frame_end": 250,
+            "frame_start": 1,
+            "markers": [],
+            "name": "Scene",
+            "potter_id": null,
+            "render": {
+              "audio_codec": "none",
+              "engine": "realtime",
+              "engine_native": "BLENDER_EEVEE",
+              "film_transparent": false,
+              "max_bounces": 12,
+              "passes": [
+                "combined",
+                "cryptomatte_accurate"
+              ],
+              "resolution_percentage": 100,
+              "resolution_x": 1920,
+              "resolution_y": 1080,
+              "samples": 64,
+              "seed": 0,
+              "use_sequencer": true
+            },
+            "rigid_body_world": null,
+            "rna_properties": {
+              "active_clip": null,
+              "allow_preroll": false,
+              "annotation": null,
+              "asset_data": null,
+              "audio_distance_model": "INVERSE_CLAMPED",
+              "audio_doppler_factor": 1.0,
+              "audio_doppler_speed": 343.29998779296875,
+              "audio_volume": 1.0,
+              "background_set": null,
+              "compositing_node_group": null,
+              "frame_current": 1,
+              "frame_end": 250,
+              "frame_float": 1.0,
+              "frame_preview_end": 0,
+              "frame_preview_start": 0,
+              "frame_start": 1,
+              "frame_step": 1,
+              "frame_subframe": 0.0,
+              "gravity": [
+                0.0,
+                0.0,
+                -9.8100004196167
+              ],
+              "is_runtime_data": false,
+              "lock_frame_selection_to_range": false,
+              "name": "Scene",
+              "playback_loop_mode": "INFINITE",
+              "show_keys_from_selected_only": true,
+              "show_subframe": false,
+              "simulation_frame_end": 250,
+              "simulation_frame_start": 1,
+              "sync_mode": "NONE",
+              "tag": false,
+              "time_jump_delta": 1.0,
+              "time_jump_unit": "SECOND",
+              "use_audio": true,
+              "use_audio_scrub": false,
+              "use_custom_simulation_range": false,
+              "use_extra_user": true,
+              "use_fake_user": false,
+              "use_gravity": true,
+              "use_nodes": true,
+              "use_preview_range": false,
+              "use_stamp_note": ""
+            },
+            "root_collection": "Scene Collection",
+            "sequencer": {
+              "channels": 129,
+              "strips": []
+            },
+            "use_compositing": true,
+            "view_layers": [
+              {
+                "excluded_collections": [],
+                "name": "ViewLayer",
+                "potter_id": null
+              }
+            ],
+            "world": null
+          }
+        ],
+        "texts": [],
+        "unused_datablocks": [],
+        "volumes": []
+      }
+    },
+    "exchange_import_r0_eight_blend": {
+      "blobs": [
+        {
+          "hash": "sha256:5b52799e987604e1a526f5ad5c632daf7a119b56cdf355a39d29429a3edf0e71",
+          "name": "eight.blend",
+          "path": "compat/sha256/5b52799e987604e1a526f5ad5c632daf7a119b56cdf355a39d29429a3edf0e71/eight.blend"
+        },
+        {
+          "hash": "sha256:5b52799e987604e1a526f5ad5c632daf7a119b56cdf355a39d29429a3edf0e71",
+          "name": "original.blend",
+          "path": "compat/sha256/5b52799e987604e1a526f5ad5c632daf7a119b56cdf355a39d29429a3edf0e71/original.blend"
+        }
+      ],
+      "format": "blend",
+      "source": {
+        "active_scene": "Scene",
+        "blender_version": "5.2.2",
+        "file_version": [
+          5,
+          2,
+          45
+        ],
+        "format": "blend",
+        "id_mappings": {
+          "Collection:Scene Collection": "collection_scene_collection",
+          "Mesh:Cube": "mesh_cube",
+          "Object:Cube": "node_cube",
+          "Scene:Scene": "scene_scene",
+          "ViewLayer:scene_scene:ViewLayer": "view_viewlayer"
+        },
+        "path": "/tmp/fx/eight.blend"
+      }
+    }
+  },
+  "history": {
+    "head": "sha256:31321aed319e05be1200b41e6e7ba878e1f518dd96e01a85e508e11f661b6025",
+    "undo": [
+      "sha256:597dba99cd2a14c44712ad23333882609bc0e9f667e0c0e379b3ac3124f1397d",
+      "sha256:8ba387d7394659e21477b89c41e50cd18982379b5dbb0430689cebae9a585bdb"
+    ],
+    "redo": []
+  }
+}

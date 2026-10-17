@@ -525,7 +525,7 @@ fn fixture_operations() -> Vec<Value> {
             // Not the glTF default of 1.5: the MToon IOR fallback must restore it from extras.potter.ior.
             "base_color": [0.8, 0.65, 0.5, 1.0],
             "ior": 1.45,
-            "base_color_texture": {"image": "tex_albedo", "uv_map": "uv_map"},
+            "base_color_texture": {"image": "tex_albedo", "uv_layer": null},
         }),
         // Non-uniformly scaled and skinned with shape keys: the exporter bakes the scale into the
         // geometry and morph NORMAL deltas must survive the bake.

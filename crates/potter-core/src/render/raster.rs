@@ -54,10 +54,11 @@ pub(crate) enum AlphaMode {
     Blend,
     Clip,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Triangle {
     pub(crate) positions: [DVec3; 3],
     pub(crate) object_index: u32,
+    /// Source element index; face records carry per-slot UV bindings through subdivision copies.
     pub(crate) element_index: u32,
     pub(crate) color: [f64; 4],
     pub(crate) alpha_mode: AlphaMode,
@@ -65,9 +66,39 @@ pub(crate) struct Triangle {
     pub(crate) double_sided: bool,
     pub(crate) material_index: usize,
     pub(crate) uv: [[f64; 2]; 3],
-    pub(crate) uv_available: bool,
+    /// Corner UVs of every UV layer of the source mesh, in layer order; empty without layers.
+    pub(crate) layer_uvs: Vec<[[f64; 2]; 3]>,
     /// World-space corner shading normals; `None` for flat faces, which keep their geometric normal.
     pub(crate) normals: Option<[DVec3; 3]>,
+}
+
+impl Triangle {
+    /// This triangle's shading attributes over new corner geometry.
+    pub(crate) fn with_corners(
+        &self,
+        positions: [DVec3; 3],
+        uv: [[f64; 2]; 3],
+        layer_uvs: Vec<[[f64; 2]; 3]>,
+    ) -> Self {
+        Self {
+            positions,
+            object_index: self.object_index,
+            element_index: self.element_index,
+            color: self.color,
+            alpha_mode: self.alpha_mode,
+            alpha_threshold: self.alpha_threshold,
+            double_sided: self.double_sided,
+            material_index: self.material_index,
+            uv,
+            layer_uvs,
+            normals: self.normals,
+        }
+    }
+
+    /// A copy without the per-layer UVs, for passes that only shade the triangle.
+    pub(crate) fn shading_copy(&self) -> Self {
+        self.with_corners(self.positions, self.uv, Vec::new())
+    }
 }
 
 /// Lighting for triangles with corner normals, evaluated at each visible hit.
@@ -118,6 +149,14 @@ pub(crate) fn blend_corner_normals(
     } else {
         normal
     }
+}
+
+/// Barycentric blend of one UV layer's corner values.
+pub(crate) fn blend_uv(corners: &[[f64; 2]; 3], weights: [f64; 3]) -> [f64; 2] {
+    [
+        corners[0][0] * weights[0] + corners[1][0] * weights[1] + corners[2][0] * weights[2],
+        corners[0][1] * weights[0] + corners[1][1] * weights[1] + corners[2][1] * weights[2],
+    ]
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1262,7 +1301,7 @@ fn prepare_triangles(triangles: &[Triangle]) -> Result<Vec<PreparedTriangle>> {
             edge2,
             normal,
             edge_altitudes: [edge0_altitude, edge1_altitude, edge2_altitude],
-            source: *triangle,
+            source: triangle.shading_copy(),
         });
     }
     Ok(prepared)
@@ -1748,7 +1787,7 @@ mod smooth_shading_tests {
             double_sided: false,
             material_index: 0,
             uv: [[0.0; 2]; 3],
-            uv_available: false,
+            layer_uvs: Vec::new(),
             normals,
         }
     }
@@ -1851,11 +1890,12 @@ mod smooth_shading_tests {
     #[test]
     fn ambient_visibility_mirrors_smooth_rays_back_above_the_geometric_surface() {
         let plane = triangle(None);
-        let bvh = crate::render::bvh::Bvh::build(&[plane]).expect("plane builds");
+        let bvh =
+            crate::render::bvh::Bvh::build(std::slice::from_ref(&plane)).expect("plane builds");
         // The shading normal leans 30 degrees from the plane, so some rays dip below it.
         let visibility = super::ambient_visibility(
             &bvh,
-            &[plane],
+            std::slice::from_ref(&plane),
             DVec3::ZERO,
             DVec3::Z,
             DVec3::new(0.866, 0.0, 0.5),

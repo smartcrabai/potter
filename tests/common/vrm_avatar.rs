@@ -222,7 +222,7 @@ pub fn avatar_operations() -> Vec<Value> {
             "name": "Avatar Skin",
             "base_color": [0.8, 0.65, 0.5, 1.0],
             "ior": 1.45,
-            "base_color_texture": {"image": "tex_albedo", "uv_map": "uv_map"},
+            "base_color_texture": {"image": "tex_albedo", "uv_layer": "uv_map"},
         }),
         json!({"op": "node.create", "id": "body", "kind": "box", "params": {"size": 1.0}, "material": "skin_material", "transform": {"scale": [1.0, 2.0, 0.5]}}),
         json!({"op": "uv.unwrap", "target": {"id": "body"}, "elements": {"domain": "face", "ids": ["f1"]}, "method": "smart"}),

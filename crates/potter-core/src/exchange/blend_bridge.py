@@ -1219,6 +1219,13 @@ def _modifier_node_inputs(modifier):
     return result
 
 
+def _uv_layer_index(layers, attribute):
+    index = getattr(layers, attribute, None)
+    if index is None or not 0 <= index < len(layers):
+        return -1
+    return int(index)
+
+
 def mesh_dump(mesh):
     vertices = [{"co": plain(v.co)} for v in mesh.vertices]
     edges = [{"v": list(edge.vertices), "sharp": bool(getattr(edge, "use_edge_sharp", False)),
@@ -1226,9 +1233,11 @@ def mesh_dump(mesh):
     polygons = [{"v": list(poly.vertices), "material_index": int(poly.material_index),
                  "smooth": bool(poly.use_smooth)} for poly in mesh.polygons]
     uv_layers = []
-    for index, layer in enumerate(mesh.uv_layers):
-        uv_layers.append({"name": layer.name, "active": index == mesh.uv_layers.active_index,
-                          "values": [plain(item.uv) for item in layer.data]})
+    for layer in mesh.uv_layers:
+        uv_layers.append({"name": layer.name, "values": [plain(item.uv) for item in layer.data],
+                          "pins": [bool(item.pin_uv) for item in layer.data]})
+    uv_active = _uv_layer_index(mesh.uv_layers, "active_index")
+    uv_render = _uv_layer_index(mesh.uv_layers, "active_render_index")
     attrs = []
     custom_normals = any(attr.name == "custom_normal" for attr in mesh.attributes)
     corner_normals = [plain(normal.vector) for normal in mesh.corner_normals] if custom_normals else None
@@ -1255,7 +1264,8 @@ def mesh_dump(mesh):
                          for vertex in mesh.skin_vertices[0].data]
     return {"name": mesh.name_full, "potter_id": mesh.get("potter.id"),
             "library": library_reference(mesh), "vertices": vertices,
-            "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "attributes": attrs,
+            "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "uv_active": uv_active,
+            "uv_render": uv_render, "attributes": attrs,
             "corner_normals": corner_normals,
             "skin_vertices": skin_vertices,
             "shape_keys": _mesh_shape_keys(mesh),
@@ -2921,17 +2931,32 @@ def mesh_create(name, raw, block_id):
             polygon.use_smooth = bool(native_smooth.get("f%d" % face_ids[index], False))
         elif index < len(polygon_smooth) and polygon_smooth[index]:
             polygon.use_smooth = True
-    uv_layers = attributes.get("blender_uv_layers", raw.get("uv_layers", []))
-    for index, layer in enumerate(uv_layers):
+    uv_layers = raw.get("uv_layers", [])
+    if len(uv_layers) > 8:
+        raise ValueError("a Blender mesh holds at most 8 UV layers, got %d" % len(uv_layers))
+    for layer in uv_layers:
         uv = mesh.uv_layers.new(name=layer["name"])
-        for item_index, item in enumerate(layer.get("values", [])):
-            if item_index < len(uv.data):
-                uv.data[item_index].uv = item
-        if layer.get("active"):
-            mesh.uv_layers.active_index = index
+        for index, item in enumerate(layer.get("values", [])):
+            if index < len(uv.data):
+                uv.data[index].uv = item
+        pins = layer.get("pins", [])
+        # Blender creates a pin attribute as soon as any loop is written, so an all-false layer is left unpinned.
+        if any(pins):
+            for index, pinned in enumerate(pins):
+                if index < len(uv.data):
+                    uv.data[index].pin_uv = bool(pinned)
+    layer_names = {layer["name"] for layer in uv_layers}
+    uv_active = raw.get("uv_active")
+    if isinstance(uv_active, int) and 0 <= uv_active < len(mesh.uv_layers):
+        mesh.uv_layers.active_index = uv_active
+    uv_render = raw.get("uv_render")
+    if isinstance(uv_render, int) and 0 <= uv_render < len(mesh.uv_layers):
+        mesh.uv_layers.active_render_index = uv_render
     for source in attributes.get("blender_attributes", []):
         name = source.get("name")
         if not name or name in ("position", ".corner_vert", ".corner_edge", ".edge_verts"):
+            continue
+        if source.get("data_type") == "FLOAT2" and source.get("domain") == "CORNER" and name in layer_names:
             continue
         if name in superseded:
             continue
@@ -3131,17 +3156,86 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
     return socket_map
 
 
+def _encode_gltf_normal_map_handedness(nodes, links, normal_name):
+    # glTF/Potter tangent V points down; Blender's Normal Map node uses V-up, so G becomes 1-G.
+    color_links = [link for link in links
+                   if link.get("to_node") == normal_name
+                   and link.get("to_socket") == "Color"]
+    if len(color_links) != 1:
+        raise ValueError("imported glTF Normal Map must have one Color input")
+    source = color_links[0]
+    links.remove(source)
+    used_names = {node["name"] for node in nodes}
+
+    def unique_name(base):
+        name = base
+        index = 1
+        while name in used_names:
+            name = "%s_%d" % (base, index)
+            index += 1
+        used_names.add(name)
+        return name
+
+    multiply_name = unique_name("Potter GLTF Normal Green Multiply")
+    add_name = unique_name("Potter GLTF Normal Green Add")
+    normal_node = next(node for node in nodes if node["name"] == normal_name)
+    location = normal_node.get("location", [0.0, 0.0])
+    try:
+        x, y = float(location[0]), float(location[1])
+    except (IndexError, TypeError, ValueError):
+        x, y = 0.0, 0.0
+    nodes.extend([
+        {"name": multiply_name, "potter_id": None, "type": "ShaderNodeVectorMath",
+         "location": [x - 180.0, y], "properties": {"operation": "MULTIPLY"},
+         "custom_properties": {},
+         "inputs": [{"identifier": "Vector_001", "name": "Vector_001",
+                     "default": [1.0, -1.0, 1.0]}]},
+        {"name": add_name, "potter_id": None, "type": "ShaderNodeVectorMath",
+         "location": [x - 90.0, y], "properties": {"operation": "ADD"},
+         "custom_properties": {},
+         "inputs": [{"identifier": "Vector_001", "name": "Vector_001",
+                     "default": [0.0, 1.0, 0.0]}]},
+    ])
+    links.extend([
+        {"from_node": source["from_node"], "from_socket": source["from_socket"],
+         "to_node": multiply_name, "to_socket": "Vector"},
+        {"from_node": multiply_name, "from_socket": "Vector",
+         "to_node": add_name, "to_socket": "Vector"},
+        {"from_node": add_name, "from_socket": "Vector",
+         "to_node": normal_name, "to_socket": "Color"},
+    ])
+
+
 def _model_group_tree(group):
     tree_type = {"geometry": "GeometryNodeTree", "shader": "ShaderNodeTree",
                  "compositor": "CompositorNodeTree"}.get(group.get("kind"), "")
-    node_names = {identifier: node.get("name", identifier)
-                  for identifier, node in group.get("nodes", {}).items()}
-    nodes = []
+    node_names = {}
+    used_node_names = set()
     for identifier, node in group.get("nodes", {}).items():
+        name = node.get("name") or identifier
+        if name in used_node_names:
+            name = identifier
+            suffix = 1
+            while name in used_node_names:
+                name = "%s_%d" % (identifier, suffix)
+                suffix += 1
+        used_node_names.add(name)
+        node_names[identifier] = name
+    nodes = []
+    imported_normal_nodes = []
+    for identifier, node in group.get("nodes", {}).items():
+        display_name = node.get("name") or identifier
         properties = dict(node.get("properties", {}))
         custom_properties = properties.pop("_blender_custom_properties", {})
+        imported_normal_map = properties.pop("potter_gltf_imported_normal_map", False) is True
+        if imported_normal_map:
+            if node.get("type") != "ShaderNodeNormalMap":
+                raise ValueError("glTF normal-map metadata is on a non-Normal Map node")
+            imported_normal_nodes.append(node_names[identifier])
         nodes.append({
             "name": node_names[identifier],
+            "label": ("%s (%s)" % (display_name, identifier)
+                      if node_names[identifier] != display_name else node.get("label", "")),
             "potter_id": identifier,
             "type": blender_node_type(node.get("type", "Node"), tree_type),
             "location": node.get("location", [0.0, 0.0]),
@@ -3163,6 +3257,8 @@ def _model_group_tree(group):
             "to_node": to_node,
             "to_socket": link.get("to_socket", ""),
         })
+    for normal_name in imported_normal_nodes:
+        _encode_gltf_normal_map_handedness(nodes, links, normal_name)
     return {
         "name": group.get("name"),
         "type": tree_type,
@@ -4138,6 +4234,12 @@ def _resource_path(doc, reference):
         return None
     path = path[7:] if path.startswith("file://") else path
     return os.path.abspath(path) if not path.startswith("//") else bpy.path.abspath(path)
+
+def _export_sidecar_path(doc, reference):
+    # The sidecar copy the export wrote for a linked image's source: the export_path of the resource `_resource_path` finds.
+    resource = _resource_record_for_reference(doc, reference)
+    path = resource.get("export_path") if resource else None
+    return os.path.abspath(path) if path else None
 
 
 def _relative_blend_path(path, target):
@@ -5139,11 +5241,34 @@ def export_doc(doc, target, pack, scene_hash, context):
                     apply_exclusion(child)
             apply_exclusion(view_layer.layer_collection)
         scene["potter.view_layer_ids_json"] = json.dumps(view_layer_ids, sort_keys=True)
+    image_map = {}
     for image_id, item in doc.get("images", {}).items():
         image = bpy.data.images.new(item["name"], width=int(item["width"]),
                                     height=int(item["height"]), alpha=True)
+        sidecar = _export_sidecar_path(doc, item.get("source_path"))
+        if sidecar is not None:
+            # A linked image is a FILE image on the sidecar copy the export wrote, so the .blend carries its pixels.
+            image.source = "FILE"
+            image.filepath = _relative_blend_path(sidecar, target)
+            image.reload()
+        colorspace = {
+            "srgb": "sRGB",
+            "linear": "Linear Rec.709",
+            "non_color": "Non-Color",
+        }.get(item.get("colorspace"))
+        if colorspace is not None:
+            image.colorspace_settings.name = colorspace
+        pixels = item.get("pixels")
+        if sidecar is None and pixels is not None:
+            image.pixels.foreach_set(
+                [channel for pixel in pixels for channel in pixel])
+            image.update()
+        if item.get("source") == "packed":
+            image.pack()
         set_id(image, image_id)
-        image["potter.image_json"] = json.dumps(item, sort_keys=True)
+        image_metadata = {key: value for key, value in item.items() if key != "pixels"}
+        image["potter.image_json"] = json.dumps(image_metadata, sort_keys=True)
+        image_map[image_id] = image
         image.use_fake_user = True
     data_raw = doc.get("data_blocks", {})
     linked_data_blocks = linked_maps["data_blocks"]
@@ -5525,6 +5650,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                 raise ValueError("scene references missing MovieClip %s" % clip_id)
             scene_map[scene_id].active_clip = clip
     id_lookup.update({tree.name_full: tree for tree in group_map.values()})
+    id_lookup.update({image.name_full: image for image in image_map.values()})
+    id_lookup.update(image_map)
     id_lookup.update({image.name_full: image for image in linked_maps["resources"].values()})
     socket_maps = _populate_geometry_groups(group_map, group_sources, id_lookup)
     for material_id, item in doc.get("materials", {}).items():

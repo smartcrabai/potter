@@ -27,7 +27,7 @@ use super::{
         sharp_edge_flags, vector3,
     },
     provenance::{Origin, mean_value_corners, normalize_custom_normals, remap_attributes},
-    uv_layers::{self, uv_default, uv_map_entry_layer},
+    uv_layers,
 };
 
 mod advanced;
@@ -1729,47 +1729,16 @@ fn copy_keyed_value(cap: &Mesh, source: &mut Mesh, name: &str, from: &str, to: S
 /// Storage order is the input, then the start cap, then the end cap, matching the source indices
 /// `array` reports. Input elements keep their IDs; cap elements get fresh IDs after them. Like
 /// Blender's array modifier, a cap contributes UV data only: each input UV layer gains the matching
-/// cap layer's corner values (default where the cap lacks the layer), and cap `uv_map` entries join
-/// the layers the input maps. Every other attribute stays input-only, so cap elements take defaults.
+/// cap layer's corner values, face by face. Where the cap lacks the layer, its corners take Blender's
+/// `[0, 0]` in V-up, stored as `[0, 1]`. Every
+/// other attribute stays input-only, so cap elements take defaults.
 fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
     let mut source = mesh.clone();
     let mut vertex_next = next_element_id(mesh.vertices.iter().map(|vertex| vertex.id))?;
     let mut edge_next = next_element_id(mesh.edges.iter().map(|edge| edge.id))?;
     let mut face_next = next_element_id(mesh.faces.iter().map(|face| face.id))?;
-    let input_corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
-    let input_uv_map_layers: HashSet<String> = mesh
-        .attributes
-        .get("uv_map")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|entry| uv_map_entry_layer(entry).to_owned())
-        .collect();
-    let mut uv_map = mesh
-        .attributes
-        .get("uv_map")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    // Input `blender_uv_layers` layers, each with its values extended by every cap in turn.
-    let uv_layers = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut uv_values: Vec<Vec<Value>> = uv_layers
-        .iter()
-        .map(|layer| {
-            let mut values = layer
-                .get("values")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            values.resize(values.len().max(input_corners), uv_default());
-            values
-        })
-        .collect();
+    // Input UV layers, each extended face by face with every cap in turn.
+    let mut uv_store = uv_layers::read(mesh);
     for cap in caps {
         let mut vertex_ids = HashMap::with_capacity(cap.vertices.len());
         for vertex in &cap.vertices {
@@ -1826,71 +1795,22 @@ fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
                 format!("e{new}"),
             );
         }
-        let cap_corners: usize = cap.faces.iter().map(|face| face.vertices.len()).sum();
-        let cap_uv = cap_uv_layers(cap);
-        for (layer, values) in uv_layers.iter().zip(&mut uv_values) {
-            let name = layer.get("name").and_then(Value::as_str);
-            let cap_values = cap_uv
-                .iter()
-                .find(|(known, _)| Some(known.as_str()) == name)
-                .map(|(_, values)| values);
-            values.extend((0..cap_corners).map(|corner| {
-                cap_values
-                    .and_then(|cap_values| cap_values.get(corner))
+        let cap_uv = uv_layers::read_layers(cap);
+        for layer in &mut uv_store.layers {
+            let cap_layer = cap_uv.iter().find(|known| known.name == layer.name);
+            for (index, face) in cap.faces.iter().enumerate() {
+                let uv = cap_layer
+                    .and_then(|known| known.faces.get(index))
                     .cloned()
-                    .unwrap_or_else(uv_default)
-            }));
-        }
-        let mut start = 0;
-        for face in &cap.faces {
-            let count = face.vertices.len();
-            for (name, values) in &cap_uv {
-                if input_uv_map_layers.contains(name) {
-                    let uv: Vec<Value> = (start..start + count)
-                        .map(|corner| values.get(corner).cloned().unwrap_or_else(uv_default))
-                        .collect();
-                    uv_map.push(json!({"face_id": face_ids[&face.id], "layer": name, "uv": uv}));
-                }
+                    .flatten()
+                    .unwrap_or_else(|| vec![[0.0, 1.0]; face.vertices.len()]);
+                layer.faces.push(Some(uv));
+                layer.pinned.push(None);
             }
-            start += count;
         }
     }
-    if let Some(layers) = source
-        .attributes
-        .get_mut("blender_uv_layers")
-        .and_then(Value::as_array_mut)
-    {
-        for (layer, values) in layers.iter_mut().zip(uv_values) {
-            layer["values"] = Value::Array(values);
-        }
-    }
-    if mesh.attributes.contains_key("uv_map") {
-        source
-            .attributes
-            .insert("uv_map".to_owned(), Value::Array(uv_map));
-    }
+    uv_layers::write(&mut source, &uv_store);
     Ok(source)
-}
-
-/// A cap's UV layers by name, as per-corner values over the cap's faces, default where a face has no
-/// value.
-fn cap_uv_layers(cap: &Mesh) -> Vec<(String, Vec<Value>)> {
-    uv_layers::read_layers(cap)
-        .into_iter()
-        .map(|layer| {
-            let values = layer
-                .faces
-                .iter()
-                .zip(&cap.faces)
-                .flat_map(|(uv, face)| {
-                    (0..face.vertices.len()).map(move |corner| {
-                        uv.as_ref().map_or_else(uv_default, |uv| json!(uv[corner]))
-                    })
-                })
-                .collect();
-            (layer.name, values)
-        })
-        .collect()
 }
 
 /// The first element ID after `ids`, or zero when there are none.
@@ -1951,18 +1871,23 @@ fn array_corner_origin(
 }
 
 /// Rewrites the UV values of a rebuilt `mesh` in every store of each layer. `transform(face, corner,
-/// uv)` maps one corner's `[u, v]`, where `face` is the output polygon index and `corner` the corner
-/// position within it.
+/// uv)` maps one corner's `[u, v]` in Blender's V-up convention, where `face` is the output polygon
+/// index and `corner` the corner position within it. The store is V-down, so values convert here.
 fn map_uv_values(mesh: &mut Mesh, transform: impl Fn(usize, usize, [f64; 2]) -> [f64; 2]) {
     let mut layers = uv_layers::read_layers(mesh);
     for layer in &mut layers {
         for (face, values) in layer.faces.iter_mut().enumerate() {
             for (corner, uv) in values.iter_mut().flatten().enumerate() {
-                *uv = transform(face, corner, *uv);
+                *uv = flip_v(transform(face, corner, flip_v(*uv)));
             }
         }
     }
     uv_layers::write_layers(mesh, &layers);
+}
+
+/// Converts `[u, v]` between the store's V-down and Blender's V-up. The map is its own inverse.
+fn flip_v([u, v]: [f64; 2]) -> [f64; 2] {
+    [u, 1.0 - v]
 }
 
 /// Each merged edge's first source: the pre-merge edge with the lowest index among those merging onto
@@ -5199,7 +5124,10 @@ mod tests {
 
     use crate::{
         error::{ErrorCode, PotError},
-        geom::{BoxParams, Mesh},
+        geom::{
+            BoxParams, Mesh,
+            uv_layers::{self, UvLayer},
+        },
         model::{CurveData, CurvePoint, CurveSpline, Id, Modifier},
     };
 
@@ -5267,12 +5195,12 @@ mod tests {
             vec![vec![0, 1, 2]],
         )
         .unwrap();
-        mesh.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            json!([{
-                "name": "UVMap",
-                "values": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]
-            }]),
+        uv_layers::write_layers(
+            &mut mesh,
+            &[UvLayer::new(
+                "UVMap",
+                vec![Some(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])],
+            )],
         );
         let modifier = with_params(
             "array",
@@ -5287,16 +5215,15 @@ mod tests {
 
         let result = evaluate_modifiers(&mesh, &[modifier]).unwrap();
 
+        let layers = uv_layers::read_layers(&result);
+        assert_eq!(layers.len(), 1);
         assert_eq!(
-            result.attributes["blender_uv_layers"][0]["values"],
-            json!([
-                [0.0, 0.0],
-                [1.0, 0.0],
-                [1.0, 1.0],
-                [0.25, -0.5],
-                [1.25, -0.5],
-                [1.25, 0.5]
-            ])
+            layers[0].faces,
+            vec![
+                Some(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+                // Offsets apply in Blender's V-up space, so stored v is 1 - (Blender v + offset_v).
+                Some(vec![[0.25, 0.5], [1.25, 0.5], [1.25, 1.5]]),
+            ]
         );
     }
 
@@ -5312,18 +5239,20 @@ mod tests {
         assert_eq!(mirrored([1.25, 0.25]), [1.75, 0.75]);
     }
 
-    /// A UV tool writes `uv_map` and leaves the imported `blender_uv_layers` stale. A later mirror
-    /// must carry the `uv_map` UVs into both stores, never the stale imported ones.
+    /// A UV warp followed by a mirror carries the warped store UVs into every mirrored face.
     #[test]
-    fn uv_map_overrides_stale_blender_uv_layer_through_later_rebuild() {
+    fn uv_warp_then_mirror_rebuilds_every_store_face() {
         let mut mesh = Mesh::from_positions_and_faces(
             vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
             vec![vec![0, 1, 2, 3]],
         )
         .unwrap();
-        mesh.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            json!([{"name": "UVMap", "values": [[0.1, 0.2], [0.3, 0.2], [0.3, 0.4], [0.1, 0.4]]}]),
+        uv_layers::write_layers(
+            &mut mesh,
+            &[UvLayer::new(
+                "UVMap",
+                vec![Some(vec![[0.1, 0.2], [0.3, 0.2], [0.3, 0.4], [0.1, 0.4]])],
+            )],
         );
         let warp = with_params(
             "uv_warp",
@@ -5335,22 +5264,18 @@ mod tests {
         );
         let out = evaluate_modifiers(&mesh, &[warp, mirror]).unwrap();
         let warped: [[f64; 2]; 4] = [[0.6, 0.2], [0.8, 0.2], [0.8, 0.4], [0.6, 0.4]];
-        let is_warped = |uv: &serde_json::Value| {
-            warped.iter().any(|want| {
-                (want[0] - uv[0].as_f64().unwrap()).abs() < 1e-9
-                    && (want[1] - uv[1].as_f64().unwrap()).abs() < 1e-9
-            })
+        let is_warped = |uv: &[f64; 2]| {
+            warped
+                .iter()
+                .any(|want| (want[0] - uv[0]).abs() < 1e-9 && (want[1] - uv[1]).abs() < 1e-9)
         };
-        let stored = out.attributes["blender_uv_layers"][0]["values"]
-            .as_array()
-            .unwrap();
-        assert_eq!(stored.len(), 8);
-        assert!(stored.iter().all(is_warped), "stale blender UV: {stored:?}");
-        let entries = out.attributes["uv_map"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        for entry in entries {
-            let uv = entry["uv"].as_array().unwrap();
-            assert!(uv.iter().all(is_warped), "stale uv_map UV: {uv:?}");
+        let layers = uv_layers::read_layers(&out);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].faces.len(), 2);
+        for face in &layers[0].faces {
+            let uv = face.as_ref().unwrap();
+            assert_eq!(uv.len(), 4);
+            assert!(uv.iter().all(is_warped), "stale store UV: {uv:?}");
         }
     }
 
@@ -5860,19 +5785,20 @@ mod tests {
         })
         .unwrap();
         let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
-        let layers: Vec<serde_json::Value> = ["UV0", "UV1", "UV2", "UV3"]
+        let layers: Vec<UvLayer> = ["UV0", "UV1", "UV2", "UV3"]
             .into_iter()
             .map(|name| {
-                let values: Vec<serde_json::Value> = (0..corners)
-                    .map(|index| json!([(index % 7) as f64 / 7.0, (index % 5) as f64 / 5.0]))
+                let mut values =
+                    (0..corners).map(|index| [(index % 7) as f64 / 7.0, (index % 5) as f64 / 5.0]);
+                let faces: Vec<Option<Vec<[f64; 2]>>> = mesh
+                    .faces
+                    .iter()
+                    .map(|face| Some(values.by_ref().take(face.vertices.len()).collect()))
                     .collect();
-                json!({"name": name, "values": values})
+                UvLayer::new(name, faces)
             })
             .collect();
-        mesh.attributes.insert(
-            "blender_uv_layers".to_owned(),
-            serde_json::Value::Array(layers),
-        );
+        uv_layers::write_layers(&mut mesh, &layers);
         let error = evaluate_modifiers(&mesh, &[with_params("subdivision", json!({"levels": 5}))])
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::LimitExceeded);

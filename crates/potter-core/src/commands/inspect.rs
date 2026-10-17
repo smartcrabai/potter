@@ -7,12 +7,13 @@ use crate::{
     cli::InspectArgs,
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, EvaluationPurpose, Snapshot, animation::animated_transform},
+    geom::{Mesh, uv_layers},
     model::{Collection, DataBlock, Id, Material, Modifier, Node, Scene, SceneDoc, World},
     response::SceneInfo,
     store::Project,
 };
 
-use super::util::parse_id;
+use super::util::{parse_id, with_load_warnings};
 pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
     let project = Project::open(args.scene)?;
     let doc = project.doc();
@@ -102,6 +103,7 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
                 .is_some_and(|node_id| item_ids.contains(node_id))
         });
     }
+    let warnings = with_load_warnings(&warnings, &project)?;
     let scene = project.info()?;
     Ok((
         Some(scene),
@@ -551,6 +553,7 @@ fn data_item(doc: &SceneDoc, id: &Id, data: &DataBlock) -> Value {
         })),
         "text": data.text,
         "hair_curves": data.hair_curves.as_ref().map(|hair| json!({"curve_count":hair.curves.len()})),
+        "uv_layers": uv_layers_item(data.mesh.as_ref()),
         "users": users,
         "sharing": { "count": users.len(), "shared": users.len() > 1 },
         "geometry": { "vertices": vertices, "edges": edges, "faces": faces, "triangles": triangles },
@@ -569,8 +572,53 @@ fn material_item(doc: &SceneDoc, id: &Id, material: &Material) -> Value {
         "double_sided":material.double_sided,
         "library":linkage["library"],
         "library_name":linkage["library_name"],
-        "editable":linkage["editable"]
+        "editable":linkage["editable"],
+        "textures": material_textures_item(material)
     })
+}
+
+/// The UV layers of a mesh in layer order, with its active and render flags.
+fn uv_layers_item(mesh: Option<&Mesh>) -> Value {
+    let Some(mesh) = mesh else {
+        return json!([]);
+    };
+    let store = uv_layers::read(mesh);
+    Value::Array(
+        store
+            .layers
+            .iter()
+            .map(|layer| {
+                json!({
+                    "name": layer.name,
+                    "active": store.active.as_deref() == Some(layer.name.as_str()),
+                    "render": store.render.as_deref() == Some(layer.name.as_str()),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Each texture slot a material sets, with its image and UV layer (`null` is the render layer).
+fn material_textures_item(material: &Material) -> Value {
+    let slots = [
+        ("base_color_texture", material.base_color_texture.as_ref()),
+        ("roughness_texture", material.roughness_texture.as_ref()),
+        ("metallic_texture", material.metallic_texture.as_ref()),
+        ("normal_texture", material.normal_texture.as_ref()),
+    ];
+    Value::Object(
+        slots
+            .into_iter()
+            .filter_map(|(slot, texture)| {
+                texture.map(|texture| {
+                    (
+                        slot.to_owned(),
+                        json!({"image": texture.image, "uv_layer": texture.uv_layer}),
+                    )
+                })
+            })
+            .collect(),
+    )
 }
 
 fn collection_item(doc: &SceneDoc, id: &Id, collection: &Collection) -> Value {

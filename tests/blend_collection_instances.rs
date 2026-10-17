@@ -53,7 +53,7 @@ enum Check {
     /// Blender-authored members joined with a Potter `uv.unwrap` member. Blender's members match
     /// Blender's export; the Potter member matches its own standalone export.
     MixedWithPotterUnwrap,
-    /// A textured member without UVs is refused, and Blender exports it without `TEXCOORD_0`.
+    /// A textured member without UVs is refused strictly and emits no TEXCOORD sets when lossy.
     TexturedWithoutUv,
     /// A user metadata conflict fails only the instance that owns it.
     ConflictIsolated,
@@ -88,6 +88,7 @@ struct Corner {
 #[derive(Debug)]
 struct Primitive {
     material: Option<String>,
+    material_index: Option<usize>,
     texcoord_sets: usize,
     corners: Vec<Corner>,
     mirrored: bool,
@@ -419,10 +420,12 @@ fn read_primitive(
             uvs,
         });
     }
+    let material_index = primitive["material"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok());
     Ok(Primitive {
-        material: primitive["material"]
-            .as_u64()
-            .and_then(|slot| materials.get(slot as usize).cloned()),
+        material: material_index.and_then(|index| materials.get(index).cloned()),
+        material_index,
         texcoord_sets,
         corners,
         mirrored: determinant3(world) < 0.0,
@@ -1036,10 +1039,17 @@ fn run_case(
                 "--overwrite",
                 "--json",
             ])?;
+            let losses = refusal["error"]["details"]["result"]["losses"].as_array();
             ensure(
-                refusal["error"]["code"] == "UNSUPPORTED_FEATURE"
-                    && refusal["error"]["details"]["feature_id"] == "material.texture_uv_map",
-                format!("a textured member without UVs must be refused: {refusal}"),
+                refusal["error"]["code"] == "UNREPRESENTABLE_FEATURE"
+                    && losses.is_some_and(|losses| {
+                        losses
+                            .iter()
+                            .any(|loss| loss["feature_id"] == "uv.layer_missing")
+                    }),
+                format!(
+                    "a textured member without UVs must be refused for its missing-UV loss: {refusal}"
+                ),
             )?;
             ensure(
                 !potter_glb.exists(),
@@ -1052,6 +1062,41 @@ fn run_case(
                         && primitive.texcoord_sets == 0
                 }),
                 "Blender must export the textured member without TEXCOORD_0",
+            )?;
+            run_pot_json(&[
+                "export",
+                project_text,
+                "--format",
+                "glb",
+                "--out",
+                potter_glb_text,
+                "--allow-lossy",
+                "--overwrite",
+                "--json",
+            ])?;
+            let exported = primitives(&potter_glb)?;
+            ensure(
+                exported.iter().any(|primitive| {
+                    primitive.material.as_deref() == Some("textured")
+                        && primitive.texcoord_sets == 0
+                }),
+                "lossy export must preserve UV absence on the textured primitive",
+            )?;
+            let (gltf, _) = read_glb(&potter_glb)?;
+            let textured_material_index = exported
+                .iter()
+                .find(|primitive| {
+                    primitive.material.as_deref() == Some("textured")
+                        && primitive.texcoord_sets == 0
+                })
+                .and_then(|primitive| primitive.material_index)
+                .ok_or("lossy export has no UV-less textured primitive material")?;
+            let textured_material = gltf["materials"]
+                .get(textured_material_index)
+                .ok_or("UV-less primitive material index is out of range")?;
+            ensure(
+                textured_material["pbrMetallicRoughness"]["baseColorTexture"].is_null(),
+                "lossy export must omit the unsupported texture",
             )?;
             return Ok(());
         }
