@@ -1,5 +1,5 @@
-# Blender fixtures for tests/mesh_cache_uv_layers.rs. Writes `two_layers.abc` and a second
-# animated archive whose `UVMap` has asymmetric loop values while a same-size face winding flips.
+# Blender fixtures for tests/mesh_cache_uv_layers.rs. Writes static, animated-connectivity, and
+# animated-position-only caches; UV corners are asymmetric so their associations are observable.
 # Run: Blender -b --factory-startup -P generate.py -- <output directory>
 import json
 import bpy
@@ -7,6 +7,11 @@ import sys
 
 out = sys.argv[sys.argv.index("--") + 1]
 bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+scene.render.fps = 24
+scene.frame_start = 1
+scene.frame_end = 1
+scene.frame_set(1)
 bpy.ops.mesh.primitive_plane_add(size=2)
 ob = bpy.context.object
 ob.name = "Plane"
@@ -21,14 +26,13 @@ for layer, values in zip(me.uv_layers, (BASE, LIGHT)):
         datum.uv = uv
 me.uv_layers.active_index = 1
 me.uv_layers.active_render_index = 0
-bpy.ops.wm.alembic_export(filepath=out + "/two_layers.abc", uvs=True, selected=False)
+bpy.ops.wm.alembic_export(
+    filepath=out + "/two_layers.abc", uvs=True, selected=False, start=1, end=1)
 
 # A single animated archive changes only face-corner connectivity at frame 2. The
 # UV loop values are asymmetric so a topology reread can be matched to positions.
-scene = bpy.context.scene
-scene.render.fps = 24
-scene.frame_start = 1
 scene.frame_end = 2
+scene.frame_set(1)
 reordered_vertices = [
     (-1.0, -1.0, 0.0),
     (1.0, -1.0, 0.0),
@@ -107,3 +111,45 @@ for frame in (1, 2):
 with open(out + "/reordered_topology.json", "w", encoding="utf-8") as handle:
     json.dump({"frames": oracle_frames}, handle, indent=2)
     handle.write("\n")
+
+# Animate positions across two logical samples while keeping face counts and indices constant.
+constant_mesh = bpy.data.meshes.new("ConstantTopology")
+constant_mesh.from_pydata(reordered_vertices, [], [(0, 1, 2, 3)])
+constant_mesh.update()
+constant = bpy.data.objects.new("ConstantTopology", constant_mesh)
+scene.collection.objects.link(constant)
+constant_uv = constant_mesh.uv_layers.new(name="UVMap")
+for datum, uv in zip(constant_uv.data, BASE):
+    datum.uv = uv
+constant.shape_key_add(name="Basis")
+moved = constant.shape_key_add(name="Moved")
+for point in moved.data:
+    point.co.z += 0.5
+moved.value = 0.0
+moved.keyframe_insert(data_path="value", frame=1)
+moved.value = 1.0
+moved.keyframe_insert(data_path="value", frame=2)
+scene.frame_set(1)
+bpy.ops.object.select_all(action="DESELECT")
+constant.select_set(True)
+bpy.context.view_layer.objects.active = constant
+bpy.ops.wm.alembic_export(
+    filepath=out + "/constant_topology.abc",
+    selected=True,
+    start=1,
+    end=2,
+    uvs=True,
+    normals=True,
+    vcolors=True,
+    orcos=False,
+    face_sets=False,
+    global_scale=1.0,
+    triangulate=False,
+    flatten=False,
+    use_instancing=False,
+    export_custom_properties=False,
+    export_hair=False,
+    export_particles=False,
+    init_scene_frame_range=False,
+    as_background_job=False,
+)

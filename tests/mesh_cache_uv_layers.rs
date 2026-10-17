@@ -1,9 +1,10 @@
 //! Mesh Sequence Cache reads every UV geom parameter into the layer its `sourceName` names.
 //!
-//! `two_layers.abc` checks named UV parameters; `reordered_topology.abc` is one animated Blender
-//! archive where frame 2 reverses face-corner connectivity without changing counts. Expected UVs
-//! are paired with Blender-evaluated corner positions, not a presumed file or face order. Blender
-//! stores V up; Potter stores V down.
+//! `two_layers.abc` is a one-sample static cache; `constant_topology.abc` animates points across
+//! multiple logical samples while face counts and indices remain constant. `reordered_topology.abc`
+//! reverses frame 2 face-corner connectivity without changing counts. Expected UVs are paired with
+//! Blender-evaluated corner positions, not a presumed file or face order. Blender stores V up;
+//! Potter stores V down.
 
 use std::{
     error::Error,
@@ -650,6 +651,106 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
             &expected,
             name,
         );
+    }
+    assert!(evaluated.warnings.is_empty(), "{:?}", evaluated.warnings);
+    Ok(())
+}
+
+#[test]
+fn constant_multisample_topology_rebuilds_vertex_only_receiver_connectivity() -> TestResult {
+    let directory = tempdir()?;
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mesh_cache_uv");
+    let archive = fixture_dir.join("constant_topology.abc");
+    let object_path = "/ConstantTopology/ConstantTopology";
+    let source_scene = directory.path().join("constant-source.pot");
+    scene_with_archive(
+        &source_scene,
+        &archive,
+        vec![cache_modifier_for(&["VERT", "POLY", "UV"], object_path)],
+    )?;
+    let source = evaluate_body(&source_scene)?;
+    let source_faces: Vec<Vec<u32>> = source
+        .mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.clone())
+        .collect();
+    let source_layers = layers(&source.store)?;
+    let mut receiver = source.mesh.clone();
+    for face in &mut receiver.faces {
+        face.vertices.rotate_left(1);
+    }
+    let receiver_faces: Vec<Vec<u32>> = receiver
+        .faces
+        .iter()
+        .map(|face| face.vertices.clone())
+        .collect();
+    assert_ne!(receiver_faces, source_faces);
+    let corner_counts: Vec<usize> = receiver
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .collect();
+    let uv_store = receiver
+        .attributes
+        .get_mut("uv_layers")
+        .ok_or("cache source mesh has no UV store")?;
+    let uv_layers = uv_store
+        .get_mut("layers")
+        .and_then(Value::as_array_mut)
+        .ok_or("cache source UV store has no layers")?;
+    for uv_layer in uv_layers {
+        let rows = uv_layer
+            .get_mut("faces")
+            .and_then(Value::as_array_mut)
+            .ok_or("cache source UV layer has no face rows")?;
+        assert_eq!(rows.len(), corner_counts.len());
+        for (row, corner_count) in rows.iter_mut().zip(&corner_counts) {
+            let uv = row
+                .get_mut("uv")
+                .and_then(Value::as_array_mut)
+                .ok_or("cache source UV row has no corners")?;
+            assert_eq!(uv.len(), *corner_count);
+            uv.rotate_left(1);
+            if let Some(pinned) = row.get_mut("pinned") {
+                let pinned = pinned
+                    .as_array_mut()
+                    .ok_or("cache source UV pins are not an array")?;
+                assert_eq!(pinned.len(), *corner_count);
+                pinned.rotate_left(1);
+            }
+        }
+    }
+
+    let receiver_scene = directory.path().join("constant-receiver.pot");
+    scene_with_archive(
+        &receiver_scene,
+        &archive,
+        vec![cache_modifier_for(&["VERT"], object_path)],
+    )?;
+    replace_body_mesh(&receiver_scene, &receiver)?;
+    let evaluated = evaluate_body(&receiver_scene)?;
+    let evaluated_faces: Vec<Vec<u32>> = evaluated
+        .mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.clone())
+        .collect();
+    assert_eq!(evaluated_faces, source_faces);
+    assert_ne!(evaluated_faces, receiver_faces);
+    assert_eq!(evaluated.corner_positions, source.corner_positions);
+    let output_layers = layers(&evaluated.store)?;
+    assert_eq!(layer_names(&output_layers), layer_names(&source_layers));
+    for (name, source_uvs) in &source_layers {
+        let output_uvs = layer(&output_layers, name)?;
+        assert_corners(output_uvs, source_uvs, name);
+        let expected = source
+            .corner_positions
+            .iter()
+            .copied()
+            .zip(source_uvs.iter().copied())
+            .collect::<Vec<_>>();
+        assert_corner_associations(&evaluated.corner_positions, output_uvs, &expected, name);
     }
     assert!(evaluated.warnings.is_empty(), "{:?}", evaluated.warnings);
     Ok(())

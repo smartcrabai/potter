@@ -2562,8 +2562,9 @@ pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
-    /// Whether face counts or indices have multiple nonconstant Alembic samples.
-    pub connectivity_is_animated: bool,
+    /// Whether face counts or indices have multiple logical Alembic samples. Constant values still
+    /// have multiple logical samples even though their stored payload is read from sample zero.
+    pub has_multiple_topology_samples: bool,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
     pub colors: Option<(String, Vec<Vec<f64>>)>,
@@ -2579,10 +2580,10 @@ pub(crate) struct MeshCacheSample {
 /// # Errors
 ///
 /// Returns import errors for malformed archives or paths without a `PolyMesh`.
-fn cache_connectivity_is_animated(counts: &ParsedProperty, indices: &ParsedProperty) -> bool {
+fn cache_has_multiple_topology_samples(counts: &ParsedProperty, indices: &ParsedProperty) -> bool {
     [counts, indices]
         .into_iter()
-        .any(|property| property.sample_count > 1 && !property.constant)
+        .any(|property| property.sample_count > 1)
 }
 
 #[expect(
@@ -2632,7 +2633,7 @@ pub(crate) fn read_mesh_cache(
         .ok_or_else(|| import_error("Alembic PolyMesh .faceCounts array is missing"))?;
     let indices = property(&geom.children, ".faceIndices")
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
-    let connectivity_is_animated = cache_connectivity_is_animated(counts, indices);
+    let has_multiple_topology_samples = cache_has_multiple_topology_samples(counts, indices);
     let uv = if read_uv {
         uv_geom_parameters(geom)
     } else {
@@ -2779,7 +2780,7 @@ pub(crate) fn read_mesh_cache(
         )?;
         result.push(MeshCacheSample {
             time_seconds: sample_time,
-            connectivity_is_animated,
+            has_multiple_topology_samples,
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,
@@ -4381,7 +4382,7 @@ mod tests {
     }
 
     #[test]
-    fn constant_topology_properties_keep_the_static_reader_shortcut() {
+    fn constant_topology_properties_keep_storage_but_require_multisample_checks() {
         let property = |name: &str, sample_count, constant| ParsedProperty {
             name: name.to_owned(),
             property_type: 2,
@@ -4400,28 +4401,105 @@ mod tests {
             children: Vec::new(),
             samples: Vec::new(),
         };
+        let one_sample_counts = property(".faceCounts", 1, true);
+        let one_sample_indices = property(".faceIndices", 1, true);
+        assert!(!cache_has_multiple_topology_samples(
+            &one_sample_counts,
+            &one_sample_indices
+        ));
+
         let constant_counts = property(".faceCounts", 4, true);
         let constant_indices = property(".faceIndices", 4, true);
-        assert!(!cache_connectivity_is_animated(
+        assert!(cache_has_multiple_topology_samples(
             &constant_counts,
             &constant_indices
         ));
+        assert_eq!(sample_storage_count(&constant_counts), 1);
+        assert_eq!(sample_storage_count(&constant_indices), 1);
 
         let changing_indices = property(".faceIndices", 4, false);
-        assert!(cache_connectivity_is_animated(
+        assert!(cache_has_multiple_topology_samples(
             &constant_counts,
             &changing_indices
         ));
         let changing_counts = property(".faceCounts", 4, false);
-        assert!(cache_connectivity_is_animated(
+        assert!(cache_has_multiple_topology_samples(
             &changing_counts,
             &constant_indices
         ));
+    }
 
-        let single_sample_indices = property(".faceIndices", 1, true);
-        assert!(!cache_connectivity_is_animated(
-            &constant_counts,
-            &single_sample_indices
-        ));
+    #[test]
+    fn blender_constant_topology_fixture_retains_logical_sample_metadata() -> Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mesh_cache_uv/constant_topology.abc");
+        let bytes = std::fs::read(path).map_err(|error| PotError::io(&error))?;
+        let archive = parse_archive(&bytes)?;
+        let object =
+            alembic_object_at_path(&archive.objects, "/ConstantTopology/ConstantTopology")?;
+        let geom = property(&object.properties, ".geom")
+            .ok_or_else(|| import_error("fixture PolyMesh .geom is missing"))?;
+        let face_counts = property(&geom.children, ".faceCounts")
+            .ok_or_else(|| import_error("fixture PolyMesh .faceCounts is missing"))?;
+        let face_indices = property(&geom.children, ".faceIndices")
+            .ok_or_else(|| import_error("fixture PolyMesh .faceIndices is missing"))?;
+        for property in [face_counts, face_indices] {
+            assert!(
+                property.constant,
+                "topology property should store one constant value"
+            );
+            assert!(
+                property.sample_count > 1,
+                "topology property needs multiple logical samples"
+            );
+            assert_eq!(sample_storage_count(property), 1);
+        }
+
+        let samples = read_mesh_cache(
+            &bytes,
+            "/ConstantTopology/ConstantTopology",
+            true,
+            false,
+            false,
+        )?;
+        assert!(
+            samples.len() > 1,
+            "animated points should have multiple cache samples"
+        );
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample.has_multiple_topology_samples)
+        );
+        let first = samples
+            .first()
+            .ok_or_else(|| import_error("cache sample is missing"))?;
+        let second = samples
+            .get(1)
+            .ok_or_else(|| import_error("second cache sample is missing"))?;
+        assert_eq!(first.faces, second.faces);
+        assert_ne!(first.positions, second.positions);
+        let static_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mesh_cache_uv/two_layers.abc");
+        let static_bytes = std::fs::read(static_path).map_err(|error| PotError::io(&error))?;
+        let static_archive = parse_archive(&static_bytes)?;
+        let static_object = alembic_object_at_path(&static_archive.objects, "/Plane/Plane")?;
+        let static_geom = property(&static_object.properties, ".geom")
+            .ok_or_else(|| import_error("static fixture PolyMesh .geom is missing"))?;
+        for name in [".faceCounts", ".faceIndices"] {
+            let property = property(&static_geom.children, name)
+                .ok_or_else(|| import_error("static fixture topology property is missing"))?;
+            assert_eq!(property.sample_count, 1);
+            assert!(property.constant);
+            assert_eq!(sample_storage_count(property), 1);
+        }
+        let static_samples = read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false)?;
+        assert_eq!(static_samples.len(), 1);
+        assert!(
+            static_samples
+                .iter()
+                .all(|sample| !sample.has_multiple_topology_samples)
+        );
+        Ok(())
     }
 }

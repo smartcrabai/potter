@@ -114,7 +114,7 @@ pub(crate) fn evaluate(
             || mesh.faces.len() != sample.sample.faces.len()
             || input_corners != cache_corners;
         dimensions_changed
-            || ((is_sequence || sample.sample.connectivity_is_animated)
+            || ((is_sequence || sample.sample.has_multiple_topology_samples)
                 && !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces))
     };
     if topology_changed {
