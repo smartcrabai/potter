@@ -171,9 +171,11 @@ scene.camera = camera
 blend_path = os.path.join(OUT, "reserved_color_oracle.blend")
 bpy.ops.wm.save_as_mainfile(filepath=blend_path)
 
-# Render Blender's own numeric reference at the exact pixels the CLI test samples.
-bpy.ops.render.render(write_still=False)
-render_result = bpy.data.images["Render Result"]
+# Render Blender's own numeric reference at the exact pixels the CLI test samples. In background
+# mode `Render Result` keeps size (0, 0) even after a render, so the linear EXR is written and reloaded.
+scene.render.filepath = os.path.join(OUT, "reserved_color_render.exr")
+bpy.ops.render.render(write_still=True)
+render_result = bpy.data.images.load(scene.render.filepath)
 render_width, render_height = render_result.size
 probe_pixels = {}
 probe_uv = {}
