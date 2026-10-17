@@ -24,6 +24,8 @@ import bpy
 import sys
 
 output = sys.argv[sys.argv.index("--") + 1]
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete()
 bpy.ops.mesh.primitive_cube_add()
 obj = bpy.context.object
 mesh = obj.data
@@ -43,10 +45,12 @@ if hidden is None:
 hidden.data[0].value = True
 bpy.context.view_layer.objects.active = obj
 obj.select_set(True)
-# Same final mask as paint.mask_flood_fill(mode="VALUE", value=0.25): every vertex gets 0.25.
-# Written through the mesh API because the operator's undo push aborts headless Blender.
-for item in mask.data:
-    item.value = 0.25
+# Headless Blender aborts in the sculpt undo push unless an undo step exists first.
+bpy.ops.ed.undo_push(message="multires mask fixture")
+bpy.ops.object.mode_set(mode="SCULPT")
+bpy.ops.paint.mask_flood_fill(mode="VALUE", value=0.25)
+bpy.ops.object.mode_set(mode="OBJECT")
+mask = mesh.attributes[".sculpt_mask"]
 mask.data[0].value = 0.75
 bpy.ops.wm.save_as_mainfile(filepath=output)
 "#;
