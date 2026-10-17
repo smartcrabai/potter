@@ -131,7 +131,7 @@ fn attach(doc: &mut SceneDoc, node: &str, material: &str) {
         .get_mut(&Id::new(node).unwrap())
         .unwrap()
         .materials
-        .push(Id::new(material).unwrap());
+        .push(Some(Id::new(material).unwrap()));
 }
 
 /// Two unit boxes `a` and `b`, each with a `Light` layer and a `uv_project` modifier naming it.
