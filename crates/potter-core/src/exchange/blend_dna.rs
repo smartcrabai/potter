@@ -107,7 +107,28 @@ pub(crate) fn read_multires_displacements(bytes: &[u8]) -> Result<BTreeMap<Strin
     BlendFile::parse(bytes)?.read_multires_displacements()
 }
 /// Patch Blender's already-allocated MDisps, GridPaintMask, and hidden buffers in place.
+///
+/// Blender 5.2 saves compressed `.blend` files by default. Zstd input is decoded, patched in
+/// its decoded layout, and re-encoded as a single zstd frame, so the file keeps the container
+/// Blender wrote. Uncompressed input is patched directly.
 pub(crate) fn patch_multires_export_data(
+    bytes: &mut Vec<u8>,
+    mesh_name: &str,
+    record: &Value,
+) -> Result<(), String> {
+    if bytes.starts_with(&ZSTD_MAGIC) {
+        let mut decoded = decompress_blend(bytes.as_slice())?;
+        patch_decoded_multires_export_data(&mut decoded, mesh_name, record)?;
+        *bytes = ruzstd::encoding::compress_to_vec(
+            decoded.as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        return Ok(());
+    }
+    patch_decoded_multires_export_data(bytes, mesh_name, record)
+}
+
+fn patch_decoded_multires_export_data(
     bytes: &mut [u8],
     mesh_name: &str,
     record: &Value,
