@@ -377,8 +377,6 @@ apply result: committed, changed, base_revision, candidate_revision, changes, op
 - Assets return URI, hash, kind, owner, packed / external, missing / changed status, library relationships, and restoration conditions. check verifies actual files against their hashes.
 - Do not incorporate external asset changes into the source of truth through observation alone. Use apply / import to update the URI and hash.
 
-- Alembic Mesh Sequence Cache resources may be packed with `resource.pack` and `sequence: {"start": start, "end": end}`. The int32 range is inclusive and every requested frame must exist. Each `sequence_frames` leaf uses the binary-resource fields `uri`, `kind`, one authoritative `hash`, and `packed`; `bytes` is present only for packed leaves. `resource.unpack` writes the leaves with a numbered path pattern. A missing linked source frame warns and leaves the input mesh unchanged; missing or corrupt packed records and digest mismatches fail evaluation. Evaluation never opens an external file for a frame absent from the manifest.
-
 ## 8. Preview, Render, and Bake
 
 ### Preview Views and Modes
