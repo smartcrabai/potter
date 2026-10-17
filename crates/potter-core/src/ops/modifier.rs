@@ -488,28 +488,53 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 })
             })
             .transpose()?;
-        let modifier_params = if let Some(params) = params {
+        let modifier_params = if let Some(raw) = params {
+            // A JSON null removes its key; every other entry is a value to validate and set.
+            let assigned: Map<String, Value> = raw
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
             validate_parameter_map(
                 engine,
                 ParameterFamily::Modifier,
                 modifier_type,
-                &params,
+                &assigned,
                 "/set/params",
             )?;
-            validate_modifier_resource(engine, modifier_type, &params, "/set/params")?;
+            validate_modifier_resource(engine, modifier_type, &assigned, "/set/params")?;
             if modifier_type == "volume_displace" {
-                validate_volume_displace_params(engine, &params)?;
+                validate_volume_displace_params(engine, &assigned)?;
             } else if is_attribute_modifier_type(modifier_type) {
-                validate_attribute_modifier_params(engine, modifier_type, &params, "/set/params")?;
+                validate_attribute_modifier_params(
+                    engine,
+                    modifier_type,
+                    &assigned,
+                    "/set/params",
+                )?;
             }
-            validate_particle_modifier_params(engine, modifier_type, &params)?;
-            Some(super::physics::update_linked_modifier_settings(
+            validate_particle_modifier_params(engine, modifier_type, &assigned)?;
+            let linked = super::physics::update_linked_modifier_settings(
                 engine,
                 &target,
                 &id,
                 modifier_type,
-                &params,
-            )?)
+                &assigned,
+            )?;
+            // The same type merges into the current params (RNA property semantics). A type change
+            // replaces them, because the old params do not belong to the new type.
+            let mut merged = if modifier_type == existing.modifier_type {
+                existing.params.clone()
+            } else {
+                Map::new()
+            };
+            for (key, value) in &raw {
+                if value.is_null() {
+                    merged.remove(key);
+                }
+            }
+            merged.extend(linked);
+            Some(merged)
         } else {
             None
         };
