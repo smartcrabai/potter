@@ -6525,7 +6525,22 @@ fn parse_shape_keys(
     mesh_name: &str,
     mappings: &mut BTreeMap<String, String>,
 ) -> Result<(Option<ShapeKeyData>, BTreeMap<Id, String>)> {
-    let Some(raw) = item.get("shape_keys").filter(|value| !value.is_null()) else {
+    // The bridge reports an empty record for a mesh without a Blender Key; that is no shape keys.
+    let Some(raw) = item
+        .get("shape_keys")
+        .filter(|value| !value.is_null())
+        .filter(|value| {
+            let has_basis = value
+                .get("basis")
+                .and_then(Value::as_array)
+                .is_some_and(|basis| !basis.is_empty());
+            let has_keys = value
+                .get("keys")
+                .and_then(Value::as_array)
+                .is_some_and(|keys| !keys.is_empty());
+            has_basis || has_keys
+        })
+    else {
         return Ok((None, BTreeMap::new()));
     };
     let key_items = optional_array(raw, "keys")?;
