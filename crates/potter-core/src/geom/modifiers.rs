@@ -146,46 +146,13 @@ pub fn evaluate_modifiers(mesh: &Mesh, modifiers: &[Modifier], subject_name: &st
     Ok(evaluate_modifiers_with_groups(mesh, modifiers, &BTreeMap::new(), subject_name)?.mesh)
 }
 
-/// Evaluate modifiers with scene geometry-node groups and ordered custom callbacks.
-///
-/// The mesh is owned so callers that have already produced a pre-modifier mesh can avoid
-/// an extra clone. The callback runs for armature/lattice modifiers and volume-to-mesh
-/// modifiers that reference scene volume data by ID.
-///
-/// # Errors
-///
-/// Returns an error for unsupported modifiers, invalid parameters, missing groups, or graph
-/// and custom modifier evaluation failures.
-pub fn evaluate_modifiers_with_groups_and_custom(
-    evaluated: Mesh,
-    modifiers: &[Modifier],
-    node_groups: &Registry<NodeGroup>,
-    subject_name: &str,
-    custom_modifier: impl FnMut(
-        &mut Mesh,
-        &Modifier,
-        &mut Vec<PotError>,
-        Option<&[DVec3]>,
-        &mut BlenderRng,
-    ) -> Result<()>,
-) -> Result<ModifierEvaluation> {
-    evaluate_modifiers_with_groups_and_custom_at_frame(
-        evaluated,
-        modifiers,
-        node_groups,
-        1.0,
-        subject_name,
-        custom_modifier,
-    )
-}
-
 /// Evaluate modifiers with node groups and a scene frame.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid frames, unsupported modifiers, invalid parameters,
 /// missing groups, graph evaluation failures, or custom modifier failures.
-pub fn evaluate_modifiers_with_groups_and_custom_at_frame(
+pub(crate) fn evaluate_modifiers_with_groups_and_custom_at_frame(
     evaluated: Mesh,
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,

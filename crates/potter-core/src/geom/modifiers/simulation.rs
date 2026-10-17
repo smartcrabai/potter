@@ -520,7 +520,7 @@ fn quad_cut_fragments(
 }
 
 /// Resamples inline or VDB scalar volume grids using mapped texture color as a displacement vector.
-pub fn displace_volume(
+pub(crate) fn displace_volume(
     volume: &VolumeData,
     params: &Map<String, Value>,
     texture: Option<crate::geom::legacy_texture::TextureSource<'_>>,

@@ -104,22 +104,6 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
     Ok(output)
 }
 
-/// Per joined face, whether the member supplied a value on every corner of its first UV layer.
-/// Joined defaults store `[0, 1]`, which exports as glTF's `[0, 0]`, so the mesh alone cannot
-/// distinguish authored coordinates from synthesized defaults.
-pub(crate) fn uv_covered_faces(parts: &[Part<'_>]) -> Vec<bool> {
-    parts
-        .iter()
-        .flat_map(|part| {
-            let first = read_layers(&part.mesh).into_iter().next();
-            (0..part.mesh.faces.len()).map(move |face| {
-                first
-                    .as_ref()
-                    .is_some_and(|layer| layer.faces[face].is_some())
-            })
-        })
-        .collect()
-}
 /// Places one member's mesh under IDs counted from `first_ids`. Elements are built in one pass over
 /// the source, attributes are remapped and shading canonicalised, and UVs are read. A mirrored member
 /// reverses its corners. Vertices move to the instance space last, and custom normals rotate with
@@ -923,7 +907,7 @@ mod tests {
     use glam::{DMat4, DVec3};
     use serde_json::{Map, Value, json};
 
-    use super::{Part, concatenate, uv_covered_faces};
+    use super::{Part, concatenate};
     use crate::geom::normals::smooth_face_flags;
     use crate::geom::uv_layers::{self, UvLayer, UvStore};
     use crate::geom::{BoxParams, Mesh};
@@ -1170,11 +1154,6 @@ mod tests {
             member(&second, DMat4::IDENTITY, 0, 1),
             member(&third, DMat4::IDENTITY, 0, 1),
         ];
-        assert_eq!(
-            uv_covered_faces(&parts),
-            [vec![true; 12], vec![false; 6]].concat()
-        );
-
         let joined = concatenate(parts).unwrap();
         let store = uv_layers::read(&joined);
         assert_eq!(

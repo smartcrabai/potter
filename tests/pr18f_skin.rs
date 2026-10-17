@@ -7,12 +7,15 @@
 //! `tests/fixtures/pr18f_skin_oracle.py`; vertices match by position and faces by vertex cycle,
 //! so storage order does not matter.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use glam::DVec3;
 use potter_core::{
     error::ErrorCode,
-    geom::{Mesh, modifiers::evaluate_modifiers},
+    geom::{
+        Mesh,
+        modifiers::{evaluate_modifiers, evaluate_modifiers_with_groups},
+    },
     model::{Id, Modifier, ModifierRuntime},
 };
 use serde_json::{Value, json};
@@ -208,6 +211,8 @@ fn skin_modifier(params: Value) -> Modifier {
         modifier_type: "skin".to_owned(),
         name: "skin".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::from_value(params).unwrap(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
@@ -368,6 +373,8 @@ fn hook_uses_current_indices_after_skin_drops_origindex() {
         modifier_type: "hook".to_owned(),
         name: "Hook after Skin".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::from_value(json!({
             "vertex_indices": [0],
             "matrix_inverse": glam::DMat4::IDENTITY.to_cols_array()
@@ -861,7 +868,13 @@ fn zero_average_edge_radius_is_accepted_without_subdivision() {
 #[test]
 fn skeleton_without_root_reports_blender_modifier_warning_and_keeps_input() {
     let mesh = skeleton(&LINE_INPUT_VERTICES, &LINE_EDGES, Some(&LINE_NO_ROOT_SKIN));
-    let result = evaluate_modifiers(&mesh, &[skin_modifier(json!({}))], SUBJECT_NAME).unwrap();
+    let result = evaluate_modifiers_with_groups(
+        &mesh,
+        &[skin_modifier(json!({}))],
+        &BTreeMap::new(),
+        SUBJECT_NAME,
+    )
+    .unwrap();
     assert_eq!(result.mesh, mesh);
     assert_eq!(result.warnings.len(), 1);
     assert_eq!(result.warnings[0].details["modifier_warning"], true);

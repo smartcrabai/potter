@@ -35,7 +35,7 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
     check_fields(
         engine,
         operation,
-        &["op", "id", "uri", "kind"],
+        &["op", "id", "uri", "kind", "sequence"],
         &["id", "uri"],
     )?;
     let id = read_id(engine, operation, "id")?;
@@ -75,6 +75,17 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
                 &operation_pointer(engine.operation_index, "uri"),
             )
         })?;
+    if let Some(sequence) = operation.get("sequence") {
+        if kind != "alembic" {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "resource sequence packing requires kind `alembic`",
+                &operation_pointer(engine.operation_index, "kind"),
+            ));
+        }
+        let (start, end) = sequence_range(engine, sequence)?;
+        return pack_sequence(engine, id, uri, kind, start, end);
+    }
     let path = resolve_path(uri);
     if !path.is_file() {
         return Err(engine.error(

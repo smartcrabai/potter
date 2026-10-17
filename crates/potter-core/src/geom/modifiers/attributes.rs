@@ -810,34 +810,6 @@ fn polygon_normal(points: &[DVec3]) -> DVec3 {
     normal.normalize_or_zero()
 }
 
-fn polygon_area(points: &[DVec3]) -> f64 {
-    if points.len() < 3 {
-        return 0.0;
-    }
-    let origin = points[0];
-    (1..points.len() - 1)
-        .map(|index| {
-            (points[index] - origin)
-                .cross(points[index + 1] - origin)
-                .length()
-                * 0.5
-        })
-        .sum()
-}
-
-fn corner_angle(mesh: &Mesh, face: &Face, vertex_id: u32) -> Result<f64> {
-    let index = face
-        .vertices
-        .iter()
-        .position(|id| *id == vertex_id)
-        .ok_or_else(|| PotError::invalid_argument("face corner vertex was not found"))?;
-    let points = face_points(mesh, &face.vertices)?;
-    let center = points[index];
-    let previous = (points[(index + points.len() - 1) % points.len()] - center).normalize_or_zero();
-    let next = (points[(index + 1) % points.len()] - center).normalize_or_zero();
-    Ok(previous.angle_between(next))
-}
-
 fn get_group_weights(mesh: &Mesh, group: &str) -> Result<BTreeMap<u32, f64>> {
     let groups = mesh
         .attributes
@@ -955,17 +927,6 @@ fn curve_points(modifier: &Modifier) -> Result<Option<CurveMappingTable>> {
     })
 }
 
-fn one_operand<'a>(
-    operands: &'a BTreeMap<String, Vec<SceneOperand>>,
-    name: &str,
-    modifier: &Modifier,
-) -> Result<&'a SceneOperand> {
-    operands
-        .get(name)
-        .and_then(|values| values.first())
-        .ok_or_else(|| invalid(modifier, name, "a resolved scene object operand"))
-}
-
 fn string_set(modifier: &Modifier, name: &str) -> Result<Vec<String>> {
     match modifier.params.get(name) {
         None => Ok(Vec::new()),
@@ -1049,14 +1010,6 @@ fn axis_vector(axis: &str) -> Option<DVec3> {
         "POS_Z" => Some(DVec3::Z),
         "NEG_Z" => Some(DVec3::NEG_Z),
         _ => None,
-    }
-}
-fn selected_axis(axis: &str, modifier: &Modifier, parameter: &str) -> Result<DVec3> {
-    match axis {
-        "X" => Ok(DVec3::X),
-        "Y" => Ok(DVec3::Y),
-        "Z" => Ok(DVec3::Z),
-        _ => Err(invalid(modifier, parameter, "X, Y, or Z")),
     }
 }
 

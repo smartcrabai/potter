@@ -34,6 +34,8 @@ struct Layers {
     names: Vec<String>,
     corners: Vec<[[f64; 2]; 3]>,
     render: Option<usize>,
+    /// Bit `i` marks layer `i`; every layer of this mesh is available.
+    available_mask: Option<u8>,
 }
 
 impl Layers {
@@ -42,6 +44,9 @@ impl Layers {
             names: layers.iter().map(|(name, _)| (*name).to_owned()).collect(),
             corners: layers.iter().map(|(_, corners)| *corners).collect(),
             render: layers.iter().position(|(name, _)| *name == render),
+            available_mask: Some(
+                (0..layers.len()).fold(0_u8, |mask, index| mask | (1_u8 << index)),
+            ),
         }
     }
 
@@ -52,6 +57,7 @@ impl Layers {
             positions: POSITIONS,
             barycentric: CENTRE,
             render: self.render,
+            available_mask: self.available_mask,
         }
     }
 }

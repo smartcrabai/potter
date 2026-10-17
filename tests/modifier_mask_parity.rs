@@ -124,6 +124,8 @@ fn mask_modifier(params: Value) -> Result<Modifier, Box<dyn Error>> {
         modifier_type: "mask".to_owned(),
         name: "Mask".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("mask params must be an object")?
@@ -334,11 +336,23 @@ fn armature_scene(
     if has_armature {
         let mut armature = ArmatureData::default();
         for (name, bone_id) in [("B1", "mask_bone_b1"), ("B2", "mask_bone_b2")] {
-            let mut bone = Bone::default();
-            bone.name = name.to_owned();
-            bone.head = [0.0, 0.0, 0.0];
-            bone.tail = [0.0, 0.5, 0.0];
-            bone.select = selected_bones.contains(&name);
+            let bone = Bone {
+                name: name.to_owned(),
+                parent: None,
+                head: [0.0, 0.0, 0.0],
+                tail: [0.0, 0.5, 0.0],
+                roll: 0.0,
+                deform: true,
+                inherit_rotation: true,
+                use_connect: false,
+                custom_shape: None,
+                envelope_distance: 0.25,
+                envelope_weight: 1.0,
+                head_radius: 0.1,
+                tail_radius: 0.1,
+                select: selected_bones.contains(&name),
+                bbone_settings: BTreeMap::new(),
+            };
             armature.bones.insert(Id::new(bone_id)?, bone);
         }
         let mut armature_data = DataBlock::default();
@@ -357,7 +371,7 @@ fn armature_scene(
             },
         );
     }
-    let root = Id::from_static("collection_root");
+    let root = Id::new("collection_root")?;
     let objects = &mut doc
         .collections
         .get_mut(&root)

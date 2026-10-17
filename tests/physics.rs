@@ -656,23 +656,21 @@ fn dynamic_paint_colors_only_vertices_inside_brush_radius() {
     use glam::{DMat4, DVec3};
     use potter_core::geom::{Mesh, Vertex};
 
-    let canvas = Mesh {
-        vertices: vec![
-            Vertex {
-                id: 8,
-                co: DVec3::ZERO,
-            },
-            Vertex {
-                id: 2,
-                co: DVec3::X,
-            },
-            Vertex {
-                id: 9,
-                co: DVec3::new(2.0, 0.0, 0.0),
-            },
-        ],
-        ..Mesh::default()
-    };
+    let mut canvas = Mesh::default();
+    canvas.vertices = vec![
+        Vertex {
+            id: 8,
+            co: DVec3::ZERO,
+        },
+        Vertex {
+            id: 2,
+            co: DVec3::X,
+        },
+        Vertex {
+            id: 9,
+            co: DVec3::new(2.0, 0.0, 0.0),
+        },
+    ];
     let colors = potter_core::sim::dynamic_paint::paint(
         &canvas,
         DMat4::IDENTITY,

@@ -119,7 +119,7 @@ pub(crate) enum LegacyTexture {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct ProceduralSamplerSettings {
+pub(crate) struct ProceduralSamplerSettings {
     kind: u8,
     noise_size: f32,
     turbulence: f32,
@@ -296,13 +296,6 @@ enum ResolvedTextureKind {
 }
 
 impl ResolvedTexture {
-    pub(crate) fn is_image(&self) -> bool {
-        matches!(
-            &self.resolved,
-            ResolvedTextureKind::Image(_) | ResolvedTextureKind::ImageWithSettings { .. }
-        )
-    }
-
     pub(crate) fn source(&self) -> TextureSource<'_> {
         match &self.resolved {
             ResolvedTextureKind::Image(image) => TextureSource::Image(image),
@@ -1011,15 +1004,6 @@ pub(crate) fn parse_record(id: &str, value: &Value) -> Result<LegacyTexture> {
             })
         }
     }
-}
-
-/// Validates an inline `legacy_texture` record in `doc.resources`.
-///
-/// # Errors
-///
-/// Returns the errors of [`parse_record`].
-pub(crate) fn validate_record(id: &Id, value: &Value) -> Result<()> {
-    parse_record(&id.to_string(), value).map(|_| ())
 }
 
 /// Validates a record and its image reference without loading the image pixels.
@@ -3755,9 +3739,9 @@ mod tests {
             Encoding::FAST_LOSSLESS,
             SpecificChannels::build()
                 .with_channel::<f32>("Z")
-                .with_pixels(
-                    |position: Vec2<usize>| if position.1 == 0 { 0.75_f32 } else { 0.25_f32 },
-                ),
+                .with_pixels(|position: Vec2<usize>| {
+                    (if position.1 == 0 { 0.75_f32 } else { 0.25_f32 },)
+                }),
         );
         let rgba_layer = |name: &str, view: &str, top: [f32; 4], bottom: [f32; 4]| {
             let mut attributes = LayerAttributes::named(name);

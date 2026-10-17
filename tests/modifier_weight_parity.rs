@@ -537,6 +537,8 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("modifier parameters must be an object")?
@@ -570,7 +572,7 @@ fn source_mesh() -> Result<Mesh, Box<dyn Error>> {
 }
 
 fn target_mesh() -> Result<Mesh, Box<dyn Error>> {
-    Mesh::from_positions_and_faces(
+    let mesh = Mesh::from_positions_and_faces(
         vec![
             DVec3::ZERO,
             DVec3::new(2.0, 0.0, 0.0),
@@ -578,7 +580,8 @@ fn target_mesh() -> Result<Mesh, Box<dyn Error>> {
             DVec3::new(0.0, 1.5, 0.0),
         ],
         vec![vec![0, 1, 2, 3]],
-    )
+    )?;
+    Ok(mesh)
 }
 
 fn weights(mesh: &Mesh, group: &str) -> Result<Vec<f64>, Box<dyn Error>> {
@@ -808,11 +811,11 @@ fn weight_edit_curve_handles_and_raw_controls_match_blender_runtime() -> Result<
         ("AUTO", json!(WEIGHT_HANDLE_POINTS)),
         (
             "AUTO_CLAMPED",
-            json!(WEIGHT_HANDLE_POINTS.map(|point| [point[0], point[1], "AUTO_CLAMPED"])),
+            json!(WEIGHT_HANDLE_POINTS.map(|point| json!([point[0], point[1], "AUTO_CLAMPED"]))),
         ),
         (
             "VECTOR",
-            json!(WEIGHT_HANDLE_POINTS.map(|point| [point[0], point[1], "VECTOR"])),
+            json!(WEIGHT_HANDLE_POINTS.map(|point| json!([point[0], point[1], "VECTOR"]))),
         ),
     ];
     let mut auto_weights = None;
@@ -1634,8 +1637,12 @@ fn cli_applies_and_inspects_all_vertex_weight_modifiers() -> Result<(), Box<dyn 
     assert!(inspection["result"]["items"][0]["evaluated_geometry"]["positions"].is_array());
 
     let document: SceneDoc = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let snapshot =
-        Snapshot::evaluate_with_cache(&document, &EvaluationContext::default(), Some(&scene))?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &document,
+        &EvaluationContext::default(),
+        Some(&scene),
+        None,
+    )?;
     let body = snapshot
         .meshes
         .get(&Id::new("body")?)
@@ -1714,8 +1721,12 @@ fn cli_null_target_proximity_preserves_input_weights() -> Result<(), Box<dyn Err
     let inspection: Value = serde_json::from_slice(&inspected.stdout)?;
     assert!(inspection["result"]["items"][0]["evaluated_geometry"]["positions"].is_array());
     let document: SceneDoc = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let snapshot =
-        Snapshot::evaluate_with_cache(&document, &EvaluationContext::default(), Some(&scene))?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &document,
+        &EvaluationContext::default(),
+        Some(&scene),
+        None,
+    )?;
     let body = snapshot
         .meshes
         .get(&Id::new("body")?)
@@ -1879,8 +1890,12 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
             );
         }
     }
-    let snapshot =
-        Snapshot::evaluate_with_cache(&document, &EvaluationContext::default(), Some(&scene))?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &document,
+        &EvaluationContext::default(),
+        Some(&scene),
+        None,
+    )?;
     for mapping in mappings {
         for channel in channels {
             let object_id = Id::new(format!(

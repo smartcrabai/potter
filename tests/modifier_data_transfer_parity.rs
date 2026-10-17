@@ -29,6 +29,8 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("modifier params must be an object")?
@@ -2774,21 +2776,21 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
             "crease_edge",
             "edge",
             "float",
-            json!([0.0; 4]),
+            json!([0.0, 0.0, 0.0, 0.0]),
         )?;
         set_domain_attribute(
             &mut destination,
             "bevel_weight_edge",
             "edge",
             "float",
-            json!([0.0; 4]),
+            json!([0.0, 0.0, 0.0, 0.0]),
         )?;
         set_domain_attribute(
             &mut destination,
             "freestyle_edge",
             "edge",
             "bool",
-            json!([false; 4]),
+            json!([false, false, false, false]),
         )?;
         set_domain_attribute(
             &mut destination,

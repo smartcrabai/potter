@@ -1218,6 +1218,8 @@ fn modifier(modifier_type: &str, params: Value, object_matrix: Option<[f64; 16]>
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::from_value(params).unwrap(),
         binding_data: None,
         runtime: ModifierRuntime {

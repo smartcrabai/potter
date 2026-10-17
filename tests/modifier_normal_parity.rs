@@ -143,7 +143,7 @@ fn parameter_case(
         "sharp_edges":sharp_edges,
         "smooth":smooth,
         "custom_normals":custom_normals,
-        "subject_transform":None,
+        "subject_transform":None::<Value>,
     })
 }
 
@@ -716,6 +716,8 @@ fn modifier(case: &Value) -> Result<Modifier, Box<dyn Error>> {
             .to_owned(),
         name: "Normal modifier parity".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: case["params"]
             .as_object()
             .ok_or("modifier params missing")?
@@ -992,6 +994,8 @@ fn weighted_normal_uses_blenders_ranked_weight_curve() -> Result<(), Box<dyn Err
         modifier_type: "weighted_normal".to_owned(),
         name: "Ranked weight curve".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: json!({"mode":"FACE_AREA","weight":80,"thresh":0.01})
             .as_object()
             .ok_or("params missing")?
@@ -1042,6 +1046,8 @@ fn weighted_normal_threshold_includes_exact_compare_boundary() -> Result<(), Box
         modifier_type: "weighted_normal".to_owned(),
         name: "Inclusive threshold boundary".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: json!({"mode":"FACE_AREA","weight":80,"thresh":0.25})
             .as_object()
             .ok_or("params missing")?
@@ -1081,6 +1087,8 @@ fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>
         modifier_type: "normal_edit".to_owned(),
         name: "Directional sign".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: json!({"mode":"DIRECTIONAL","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"target":"target","use_direction_parallel":false,"no_polynors_fix":true}).as_object().ok_or("params missing")?.clone(),
         binding_data: None,
         runtime: ModifierRuntime::default(),

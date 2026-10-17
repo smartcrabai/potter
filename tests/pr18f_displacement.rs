@@ -238,6 +238,8 @@ fn modifier(modifier_type: &str, params: Value) -> Modifier {
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::from_value(params).unwrap(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
@@ -773,7 +775,7 @@ const WARP_CURVE_HANDLE_POINTS: [[f64; 2]; 5] = [
 ];
 
 fn warp_curve_handles(handle: &str) -> Value {
-    json!(WARP_CURVE_HANDLE_POINTS.map(|point| [point[0], point[1], handle]))
+    json!(WARP_CURVE_HANDLE_POINTS.map(|point| json!([point[0], point[1], handle])))
 }
 
 fn blender_5_2() -> Option<PathBuf> {

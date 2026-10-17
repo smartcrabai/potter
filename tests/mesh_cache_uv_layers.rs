@@ -143,6 +143,7 @@ fn evaluate_body(scene: &Path) -> TestResult<Evaluated> {
             ..potter_core::eval::EvaluationContext::default()
         },
         Some(project.path()),
+        Some(project.cache_directory()),
     )?;
     let mesh = snapshot
         .meshes

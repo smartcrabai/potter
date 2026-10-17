@@ -13,7 +13,7 @@ use potter_core::{
     graph::{GraphKind, GraphNode, NodeGroup},
     image::ImageInterpolation,
     model::{Id, Modifier, ModifierRuntime, SceneDoc, TextureRef},
-    ops::{ApplyOutcome, OP_NAMES, apply_batch, apply_batch_with_asset_root},
+    ops::{ApplyOutcome, OP_NAMES, apply_batch, apply_batch_with_project_context},
     schema::schema,
 };
 use serde_json::{Value, json};
@@ -36,7 +36,7 @@ fn apply(doc: &SceneDoc, operations: Value) -> Result<SceneDoc, PotError> {
 }
 
 fn apply_at(doc: &SceneDoc, operations: Value, root: &Path) -> Result<ApplyOutcome, PotError> {
-    apply_batch_with_asset_root(doc, &batch(doc, operations), root)
+    apply_batch_with_project_context(doc, &batch(doc, operations), root, None)
 }
 
 fn node_mesh<'a>(doc: &'a SceneDoc, node: &str) -> &'a Mesh {
@@ -105,6 +105,8 @@ fn add_modifier(doc: &mut SceneDoc, node: &str, modifier_type: &str, params: Val
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params,
         binding_data: None,
         runtime: ModifierRuntime::default(),

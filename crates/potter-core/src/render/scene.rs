@@ -74,7 +74,6 @@ pub(super) struct Geometry {
     pub materials: Vec<Material>,
     pub objects: Vec<ObjectRecord>,
     pub elements: Vec<ElementRecord>,
-    pub bounds: Option<(DVec3, DVec3)>,
     pub warnings: Vec<serde_json::Value>,
     /// Warnings recorded while shading hits, such as `uv.layer_missing`.
     pub shader_warnings: RefCell<Vec<serde_json::Value>>,
@@ -209,7 +208,6 @@ pub(super) fn extract_geometry(
     let mut lines = Vec::new();
     let mut objects = Vec::new();
     let mut elements = Vec::new();
-    let mut bounds: Option<(DVec3, DVec3)> = None;
     let mut warnings = Vec::new();
     let shader_warnings: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
     for (node_id, node) in &doc.nodes {
@@ -286,17 +284,6 @@ pub(super) fn extract_geometry(
             )
         })?;
         let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-        if volume.is_some()
-            && let Some(volume_bounds) = evaluated.bounds
-        {
-            bounds = Some(match bounds {
-                Some((current_min, current_max)) => (
-                    current_min.min(volume_bounds.min),
-                    current_max.max(volume_bounds.max),
-                ),
-                None => (volume_bounds.min, volume_bounds.max),
-            });
-        }
         let object_index = u32::try_from(objects.len() + 1).map_err(|_| {
             PotError::new(
                 ErrorCode::LimitExceeded,
@@ -365,18 +352,6 @@ pub(super) fn extract_geometry(
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
         {
-            let mut min = DVec3::splat(f64::INFINITY);
-            let mut max = DVec3::splat(f64::NEG_INFINITY);
-            for vertex in &mesh.vertices {
-                let point = matrix.transform_point3(vertex.co);
-                min = min.min(point);
-                max = max.max(point);
-            }
-            bounds = Some(match bounds {
-                Some((current_min, current_max)) => (current_min.min(min), current_max.max(max)),
-                None => (min, max),
-            });
-
             let vertex_positions: std::collections::BTreeMap<u32, DVec3> = mesh
                 .vertices
                 .iter()
@@ -637,14 +612,6 @@ pub(super) fn extract_geometry(
                     .and_then(|colors| colors.get(slot))
                     .copied()
                     .unwrap_or(default_point_color);
-                let extent = DVec3::splat(radius);
-                bounds = Some(match bounds {
-                    Some((current_min, current_max)) => (
-                        current_min.min(position - extent),
-                        current_max.max(position + extent),
-                    ),
-                    None => (position - extent, position + extent),
-                });
                 lines.push(Line {
                     start: position,
                     end: position,
@@ -703,14 +670,6 @@ pub(super) fn extract_geometry(
                         element_id: format!("p{stroke_number}_{point_number}"),
                         uv_render: None,
                         uv_available_mask: None,
-                    });
-                    let extent = DVec3::splat(radius);
-                    bounds = Some(match bounds {
-                        Some((current_min, current_max)) => (
-                            current_min.min(position - extent),
-                            current_max.max(position + extent),
-                        ),
-                        None => (position - extent, position + extent),
                     });
                     lines.push(Line {
                         start: position,
@@ -803,17 +762,6 @@ pub(super) fn extract_geometry(
                     uv_available_mask: None,
                 });
                 let radius = curve.radius * radius_scale;
-                for point in &curve.points {
-                    let position = matrix.transform_point3(DVec3::from_array(*point));
-                    let extent = DVec3::splat(radius);
-                    bounds = Some(match bounds {
-                        Some((current_min, current_max)) => (
-                            current_min.min(position - extent),
-                            current_max.max(position + extent),
-                        ),
-                        None => (position - extent, position + extent),
-                    });
-                }
                 let segment_count = curve.points.len().saturating_sub(1).max(1);
                 for segment in 0..segment_count {
                     let start = matrix.transform_point3(DVec3::from_array(curve.points[segment]));
@@ -841,7 +789,6 @@ pub(super) fn extract_geometry(
         materials,
         objects,
         elements,
-        bounds,
         warnings,
         shader_warnings,
         shadows: None,

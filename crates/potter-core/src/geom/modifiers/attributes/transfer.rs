@@ -1,6 +1,7 @@
 //! Data transfer modifier: per-domain mapping, layer selection, and mixing.
 
 use super::*;
+use crate::blender_rng::BlenderRng;
 use crate::geom::color_layers::{self, ColorDomain};
 use crate::geom::spatial::BoundsBvh;
 use crate::geom::uv_layers::{UvLayer, read as read_uv_store, read_layers, write_layers};
@@ -1338,11 +1339,6 @@ impl AStarWorkspace {
 }
 
 #[derive(Default)]
-struct BlenderRng {
-    state: u64,
-}
-
-#[derive(Default)]
 struct PolyProjectionWorkspace {
     weights: Vec<f32>,
     touched: Vec<usize>,
@@ -1352,18 +1348,6 @@ struct PolyProjectionWorkspace {
 struct EdgeProjectionWorkspace {
     weights: Vec<f32>,
     touched: Vec<usize>,
-}
-impl BlenderRng {
-    fn with_seed(seed: u32) -> Self {
-        Self {
-            state: (u64::from(seed) << 16) | 0x330e,
-        }
-    }
-
-    fn get_float(&mut self) -> f32 {
-        self.state = self.state.wrapping_mul(0x5deece66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
-        (self.state >> 17) as u32 as f32 / 2_147_483_648.0
-    }
 }
 struct TransferMapContext<'a> {
     source: &'a Mesh,
@@ -1547,7 +1531,7 @@ impl<'a> TransferMapContext<'a> {
             destination_layer_selection,
             selected_bones,
             deforming_bones,
-            poly_rng: RefCell::new(BlenderRng::with_seed(0)),
+            poly_rng: RefCell::new(BlenderRng::seed(0)),
             poly_face_map_cache: RefCell::new(BTreeMap::new()),
             poly_projection: RefCell::new(PolyProjectionWorkspace::default()),
             edge_projection: RefCell::new(EdgeProjectionWorkspace::default()),
@@ -2981,30 +2965,6 @@ fn nearest_vertex(context: &TransferMapContext<'_>, point: DVec3) -> Option<usiz
         .map(|(index, _, ())| index)
 }
 
-fn nearest_vertex_in_island(
-    context: &TransferMapContext<'_>,
-    point: DVec3,
-    graph: &SourceFaceGraph,
-    island_index: usize,
-) -> Option<usize> {
-    let island = graph.islands.get(island_index)?;
-    let point = point.as_vec3();
-    context
-        .source_vertex_bvh
-        .nearest(
-            point.as_dvec3(),
-            blender_max_distance_squared(context.max_distance),
-            |index, _| {
-                if island.vertices.binary_search(&index).is_err() {
-                    return None;
-                }
-                let position = context.source_positions.get(index)?.as_vec3();
-                Some((f64::from(position.distance_squared(point)), ()))
-            },
-        )
-        .map(|(index, _, ())| index)
-}
-
 fn nearest_edge(context: &TransferMapContext<'_>, point: DVec3) -> Option<(usize, DVec3, f64)> {
     let point_f32 = point.as_vec3();
     let max_distance_squared = blender_max_distance_squared(context.max_distance);
@@ -4230,20 +4190,6 @@ fn transfer_mask_weight(
     let weight = weights.get(&vertex_id).copied().unwrap_or(0.0);
     if invert { 1.0 - weight } else { weight }
 }
-fn source_loop_value<'a>(
-    mesh: &Mesh,
-    values: &'a Map<String, Value>,
-    loop_index: usize,
-) -> Option<&'a Value> {
-    let face_index = loop_face_index(mesh, loop_index);
-    let face = mesh.faces.get(face_index)?;
-    let corner = loop_index.checked_sub(loop_start(mesh, face_index))?;
-    values
-        .get(&format!("f{}", face.id))?
-        .as_array()?
-        .get(corner)
-}
-
 fn layer_uv_at_loop(mesh: &Mesh, layer: &UvLayer, loop_index: usize) -> Option<[f64; 2]> {
     let face_index = loop_face_index(mesh, loop_index);
     let corner = loop_index.checked_sub(loop_start(mesh, face_index))?;

@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, error::Error, fs, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fs,
+    path::Path,
+    process::Command,
+};
 
 use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
@@ -31,6 +37,8 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("modifier params must be an object")?
@@ -370,9 +378,6 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
         "target".to_owned(),
         vec![scene_operand_with_space(
             Mesh::default(),
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0,
-            ],
             [
                 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0,
             ],
@@ -1289,7 +1294,7 @@ fn cli_applies_image_texture_mask_and_unknown_texture_fails() -> Result<(), Box<
     let serialized = fs::read(&scene_path)?;
     let doc: SceneDoc = serde_json::from_slice(&serialized)?;
     let snapshot =
-        Snapshot::evaluate_with_cache(&doc, &EvaluationContext::default(), Some(&scene))?;
+        Snapshot::evaluate_with_cache(&doc, &EvaluationContext::default(), Some(&scene), None)?;
     let body = snapshot
         .meshes
         .get(&potter_core::model::Id::new("body")?)
@@ -1305,6 +1310,7 @@ fn cli_applies_image_texture_mask_and_unknown_texture_fails() -> Result<(), Box<
         &procedural_scene,
         &EvaluationContext::default(),
         Some(&scene),
+        None,
     )
     .err()
     .ok_or("unknown texture ID unexpectedly resolved")?;
@@ -2464,17 +2470,8 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let mut geometry_operands = BTreeMap::new();
     geometry_operands.insert(
         "target".to_owned(),
-        vec![scene_operand_with_space(
+        vec![scene_operand_with_identity_space(
             Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?,
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            ],
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            ],
-            [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            ],
             None,
         )],
     );
