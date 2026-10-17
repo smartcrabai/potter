@@ -16,7 +16,7 @@ use std::{
 
 use exchange_normals::{
     ObservedCorner, TestResult, assert_matches_reference, export, export_strict, init,
-    obj_to_potter, observed_corners, pot, usd_world_corners, write_fixture_scene,
+    normal_tolerance, obj_to_potter, observed_corners, pot, usd_world_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -247,7 +247,7 @@ fn assert_triangle_corners(imported: &Imported) -> TestResult {
                 corner.corner
             );
             assert!(
-                (corner.normal[axis] - normal[axis]).abs() <= 1.0e-6,
+                (corner.normal[axis] - normal[axis]).abs() <= normal_tolerance(true),
                 "corner normal {:?} differs from {normal:?}",
                 corner.normal
             );

@@ -40,16 +40,23 @@ const FACES_PER_BOX: usize = 6;
 /// The face (`f2`) of each box that carries custom normals in this fixture.
 const CUSTOM_NORMAL_FACE: usize = 2;
 
-/// The one corner-normal bound for reference corner `index`. A corner of a custom-normal face has
-/// codes on both sides, so it takes `QUANTIZED_NORMAL_TOLERANCE`; every other corner is automatic or
-/// smooth and keeps `NORMAL_TOLERANCE`.
-pub fn corner_normal_tolerance(index: usize) -> f64 {
-    let face = index / CORNERS_PER_FACE;
-    if face % FACES_PER_BOX == CUSTOM_NORMAL_FACE {
+/// The one corner-normal bound for a comparison. `passes_custom_codes` is true when the compared value
+/// went through custom-normal codes where Blender also stores short2 custom normals (its exporters emit
+/// the code-decoded normal, its importers create custom normals). Those take `QUANTIZED_NORMAL_TOLERANCE`;
+/// everything else keeps `NORMAL_TOLERANCE`.
+pub fn normal_tolerance(passes_custom_codes: bool) -> f64 {
+    if passes_custom_codes {
         QUANTIZED_NORMAL_TOLERANCE
     } else {
         NORMAL_TOLERANCE
     }
+}
+
+/// The corner-normal bound for reference corner `index`: a corner of a custom-normal face passes through
+/// codes on both sides, every other corner is automatic or smooth.
+pub fn corner_normal_tolerance(index: usize) -> f64 {
+    let face = index / CORNERS_PER_FACE;
+    normal_tolerance(face % FACES_PER_BOX == CUSTOM_NORMAL_FACE)
 }
 
 /// Inverse of Potter's OBJ axes: a file line `(x, z, -y)` is Potter's `(x, y, z)`.

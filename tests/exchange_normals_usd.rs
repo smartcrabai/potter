@@ -11,7 +11,7 @@ mod exchange_normals;
 use std::{fs, path::Path, process::Output};
 
 use exchange_normals::{
-    NORMAL_TOLERANCE, ObservedCorner, TestResult, assert_matches_reference, export, init, pot,
+    ObservedCorner, TestResult, assert_matches_reference, export, init, normal_tolerance, pot,
     usd_world_corners, write_fixture_scene,
 };
 use serde_json::{Value, json};
@@ -61,7 +61,7 @@ fn unit(value: [f64; 3]) -> [f64; 3] {
 fn assert_normal(observed: [f64; 3], expected: [f64; 3]) {
     for axis in 0..3 {
         assert!(
-            (observed[axis] - expected[axis]).abs() <= NORMAL_TOLERANCE,
+            (observed[axis] - expected[axis]).abs() <= normal_tolerance(true),
             "normal {observed:?} differs from expected {expected:?}"
         );
     }
