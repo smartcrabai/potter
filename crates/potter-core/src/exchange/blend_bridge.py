@@ -3447,14 +3447,19 @@ def _ensure_multires_sculpt_layers(obj):
             if obj.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
             if requested_mask_level is not None:
-                # Blender allocates per-grid GridPaintMask only through a sculpt operator, and
-                # headless Blender aborts in its undo push unless an undo step exists first. The
-                # flood fill sets uniform values; export's MDisps-style patch then writes the
-                # real per-grid values in place, and fails loudly if that patch cannot run.
+                # Blender allocates per-grid GridPaintMask only when a sculpt mask operator changes
+                # values; filling an all-zero mask with 0.0 is a no-op and allocates nothing. Fill
+                # with a value that always changes the mask (1.0 if all zero, else 0.0). The
+                # export's per-grid patch then overwrites every grid value, so the fill value only
+                # forces the allocation. Headless Blender aborts in the sculpt undo push unless an
+                # undo step exists first.
+                sculpt_mask = mesh.attributes.get(".sculpt_mask")
+                current = [item.value for item in sculpt_mask.data] if sculpt_mask is not None else []
+                fill_value = 1.0 if all(value == 0.0 for value in current) else 0.0
                 bpy.ops.ed.undo_push(message="Potter multires mask allocation")
             bpy.ops.object.mode_set(mode="SCULPT")
             if requested_mask_level is not None:
-                bpy.ops.paint.mask_flood_fill(mode="VALUE", value=0.0)
+                bpy.ops.paint.mask_flood_fill(mode="VALUE", value=fill_value)
             bpy.context.view_layer.update()
             bpy.ops.object.mode_set(mode="OBJECT")
     finally:
