@@ -3050,7 +3050,7 @@ pub(crate) fn apply_scene_attribute_modifier(
     subject_id: &Id,
     doc: &SceneDoc,
     references: &SceneReferences<'_>,
-    _texture_rng: &mut crate::blender_rng::BlenderRng,
+    texture_rng: &mut crate::blender_rng::BlenderRng,
 ) -> Result<()> {
     if modifier.modifier_type == "vertex_weight_proximity"
         && modifier.params.get("target").is_none_or(Value::is_null)
@@ -3134,14 +3134,17 @@ pub(crate) fn apply_scene_attribute_modifier(
         )?
         .map(|matrix| matrix.to_cols_array());
     }
-    *mesh = crate::geom::modifiers::attributes::evaluate_with_resolved_texture_context(
+    *mesh = crate::geom::modifiers::attributes::evaluate_with_texture_context(
         mesh,
         &resolved,
         &operands,
-        texture.as_ref(),
+        texture
+            .as_ref()
+            .map(crate::geom::legacy_texture::ResolvedTexture::source),
         subject_world,
         &subject.name,
         &subject_layer_selection,
+        texture_rng,
     )?;
     Ok(())
 }
