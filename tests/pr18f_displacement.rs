@@ -742,10 +742,11 @@ fn displace_texture_uses_named_native_uv_layer() -> Result<(), Box<dyn std::erro
         json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"X","strength":1.0,"mid_level":0.5,"texture":"blend_tex","texture_coords":"UV","uv_layer":"UVMap"}}),
     ];
     let mesh = scene_subject(&operations, None)?;
-    // Blender 5.2.2's local Blend oracle permuted by the named UV layer's horizontal flip.
+    // Blender 5.2.2 displace on the product's box corner UVs (see
+    // tests/fixtures/pr18f_displacement/generate_named_uv_exact_oracle.py).
     let expected = [
-        [1.0, -1.0, 0.0],
         [-1.5, -1.0, 0.0],
+        [1.0, -1.0, 0.0],
         [-1.0, 1.0, 0.0],
         [1.5, 1.0, 0.0],
     ];
