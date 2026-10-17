@@ -183,45 +183,31 @@ fn face_values<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a [Value]> {
         .map(Vec::as_slice)
 }
 
-/// Per-face UV corners of layer `UVMap`, in `mesh.faces` order. Read as Potter's UV reader does: the
-/// `blender_uv_layers` `UVMap` values split by corner count, then each `uv_map` row of that layer
-/// (`face_id`, `layer` defaulting to `UVMap`) replaces its face. A face without a value is `None`.
+/// Per-face UV corners of layer `UVMap`, in `mesh.faces` order, read from the `uv_layers` store (the
+/// layer's `faces` rows, each keyed by `face_id` with one `uv` pair per corner). The store keeps V
+/// down, as glTF does, so V is flipped to Blender's convention. A face without a row is `None`.
 fn uv_map_faces(mesh: &Mesh) -> TestResult<Vec<Option<Vec<[f64; 2]>>>> {
     let mut faces: Vec<Option<Vec<[f64; 2]>>> = vec![None; mesh.faces.len()];
-    let base = mesh
-        .attributes
-        .get("blender_uv_layers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|layer| layer.get("name").and_then(Value::as_str) == Some("UVMap"));
-    if let Some(layer) = base {
-        let values = uv_pairs(layer.get("values").unwrap_or(&Value::Null))?;
-        let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
-        if values.len() == corners {
-            let mut next = values.into_iter();
-            for (index, face) in mesh.faces.iter().enumerate() {
-                faces[index] = Some(next.by_ref().take(face.vertices.len()).collect());
-            }
-        }
-    }
     let face_index: HashMap<u64, usize> = mesh
         .faces
         .iter()
         .enumerate()
         .map(|(index, face)| (u64::from(face.id), index))
         .collect();
-    for entry in mesh
+    let layer = mesh
         .attributes
-        .get("uv_map")
+        .get("uv_layers")
+        .and_then(|store| store.get("layers"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-    {
-        let layer = entry
-            .get("layer")
-            .and_then(Value::as_str)
-            .unwrap_or("UVMap");
+        .find(|layer| layer.get("name").and_then(Value::as_str) == Some("UVMap"));
+    let rows = layer
+        .and_then(|layer| layer.get("faces"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for entry in rows {
         let Some(&index) = entry
             .get("face_id")
             .and_then(Value::as_u64)
@@ -229,11 +215,11 @@ fn uv_map_faces(mesh: &Mesh) -> TestResult<Vec<Option<Vec<[f64; 2]>>>> {
         else {
             continue;
         };
-        if layer != "UVMap" {
-            continue;
-        }
         if let Some(row) = entry.get("uv").filter(|value| value.is_array()) {
-            let uv = uv_pairs(row)?;
+            let uv: Vec<[f64; 2]> = uv_pairs(row)?
+                .into_iter()
+                .map(|[u, v]| [u, 1.0 - v])
+                .collect();
             if uv.len() == mesh.faces[index].vertices.len() {
                 faces[index] = Some(uv);
             }
