@@ -16,6 +16,8 @@ mod blender_checked;
 mod blender_script_guarded;
 #[path = "common/process.rs"]
 mod process;
+#[path = "common/exchange_normals.rs"]
+mod exchange_normals;
 
 use blender_checked::blender_executable;
 use blender_script_guarded::run_blender_script;
@@ -799,7 +801,7 @@ fn assert_attribute_case(
                 &quantized,
                 expected_item["normals"].as_array().unwrap(),
                 &format!("{name} output loop normals after Blender short2 storage"),
-                1.0e-5,
+                exchange_normals::normal_tolerance(true),
             );
         }
         "OwnerUVProject" | "OwnerUVWarp" | "OwnerDataTransfer" => assert_flat_float_arrays(

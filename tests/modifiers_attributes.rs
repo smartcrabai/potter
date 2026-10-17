@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_file.rs"]
 mod blender_file;
+#[path = "common/exchange_normals.rs"]
+mod exchange_normals;
 
 use blender_file::blender_executable;
 
@@ -131,7 +133,8 @@ fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
             json!({"mode":"FACE_AREA","weight":50}),
         )?],
     )?;
-    let normals = result.attributes["custom_normal"]["values"]["f0"]
+    let evaluated = evaluated_face_normals(&result, "f0")?;
+    let normals = evaluated
         .as_array()
         .ok_or("custom corner normals missing")?;
     assert_eq!(normals.len(), 3);
@@ -331,11 +334,13 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
         }),
     )?;
     let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
-    let normal = result.attributes["custom_normal"]["values"]["f0"][0]
+    let evaluated = evaluated_face_normals(&result, "f0")?;
+    let normal = evaluated[0]
         .as_array()
         .ok_or("custom normal missing")?;
-    assert!((normal[0].as_f64().ok_or("normal x missing")? + 1.0).abs() < 1.0e-12);
-    assert!(normal[1].as_f64().ok_or("normal y missing")?.abs() < 1.0e-12);
+    let tolerance = exchange_normals::normal_tolerance(true);
+    assert!((normal[0].as_f64().ok_or("normal x missing")? + 1.0).abs() < tolerance);
+    assert!(normal[1].as_f64().ok_or("normal y missing")?.abs() < tolerance);
     Ok(())
 }
 
@@ -2017,7 +2022,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_normal_parity(
         "normal_edit RADIAL/COPY",
-        &normals.attributes["custom_normal"]["values"]["f0"],
+        &evaluated_face_normals(&normals, "f0")?,
         &expected["normal_edit"],
         1.0e-4,
     )?;
@@ -2047,7 +2052,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_normal_parity(
         "normal_edit DIRECTIONAL/ADD",
-        &directional_result.attributes["custom_normal"]["values"]["f0"],
+        &evaluated_face_normals(&directional_result, "f0")?,
         &expected["normal_edit_directional"],
         1.0e-4,
     )?;
@@ -2962,6 +2967,24 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         "smooth":face_values("smooth")?,
         "freestyle":face_values("freestyle_face")?
     }))
+}
+
+/// The evaluated corner normals of face `face` (`f<id>`) as JSON vectors, through the public evaluator.
+fn evaluated_face_normals(mesh: &Mesh, face: &str) -> Result<Value, Box<dyn Error>> {
+    let normals = potter_core::geom::corner_normal_vectors(mesh)?;
+    let mut base = 0;
+    for mesh_face in &mesh.faces {
+        let count = mesh_face.vertices.len();
+        if format!("f{}", mesh_face.id) == face {
+            let corners: Vec<[f64; 3]> = normals[base..base + count]
+                .iter()
+                .map(|normal| normal.to_array())
+                .collect();
+            return Ok(json!(corners));
+        }
+        base += count;
+    }
+    Err(format!("face {face} is missing").into())
 }
 
 fn assert_normal_parity(
