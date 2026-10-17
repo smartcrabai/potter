@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::geom::metaball::{MetaballData, MetaballElement};
-use crate::eval::ModifierGate;
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::ModifierGate,
@@ -1272,15 +1271,72 @@ fn fluid_flow_sources(
                     json!({"node_id":node_id}),
                 )
             })?;
+        // Native flow rates count particles per frame. Imported liquid INFLOW density supplies the
+        // rate only when no native rate was authored.
+        let imported_density = if settings.get("flow_type").is_some()
+            || settings.get("flow_behavior").is_some()
+        {
+            match setting_string(settings, "flow_type") {
+                Some("LIQUID") => {}
+                Some("SMOKE" | "FIRE" | "BOTH") => {
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        "smoke and fire fluid flows are not supported",
+                        json!({"feature_id":"physics.fluid.smoke_fire","node_id":node_id}),
+                    ));
+                }
+                Some(flow_type) => {
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        format!("Blender fluid flow type `{flow_type}` is not supported"),
+                        json!({"feature_id":"physics.fluid.flow_type","node_id":node_id,"flow_type":flow_type}),
+                    ));
+                }
+                None => {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "Blender fluid flow behavior requires a flow_type",
+                        json!({"node_id":node_id}),
+                    ));
+                }
+            }
+            match setting_string(settings, "flow_behavior") {
+                Some("INFLOW") => {}
+                Some(flow_behavior) => {
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        format!("Blender fluid flow behavior `{flow_behavior}` is not supported"),
+                        json!({"feature_id":"physics.fluid.flow_behavior","node_id":node_id,"flow_behavior":flow_behavior}),
+                    ));
+                }
+                None => {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "Blender fluid flow type requires a flow_behavior",
+                        json!({"node_id":node_id}),
+                    ));
+                }
+            }
+            let density = setting_number(settings, "density", 0.0, "fluid", "a finite number")?;
+            if !(0.0..=10.0).contains(&density) {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "Blender fluid flow density must be between 0 and 10",
+                    json!({"node_id":node_id,"density":density}),
+                ));
+            }
+            Some(density)
+        } else {
+            None
+        };
+        let inflow_rate = if settings.get("inflow_rate").is_some() {
+            nonnegative_setting(settings, "inflow_rate", 0.0, "fluid")?
+        } else {
+            imported_density.unwrap_or(0.0)
+        };
         flows.push(fluid::FlowSource {
             triangles: fluid_mesh_triangles(doc, matrices, node, node_id)?,
-            inflow_rate: setting_number(
-                settings,
-                "inflow_rate",
-                0.0,
-                "fluid",
-                "a finite number",
-            )?,
+            inflow_rate,
         });
     }
     Ok(flows)

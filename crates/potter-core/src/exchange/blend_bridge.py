@@ -2659,17 +2659,23 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
         settings = node_properties.get(physics_property, {})
     else:
         settings = {}
+    dynamic_paint_role = settings.get("role") if kind == "dynamic_paint" else None
+    if kind == "dynamic_paint" and dynamic_paint_role is None:
+        ui_type = params.get("ui_type", getattr(modifier, "ui_type", "CANVAS"))
+        dynamic_paint_role = "brush" if ui_type == "BRUSH" else "canvas"
+    if kind == "dynamic_paint" and dynamic_paint_role not in ("brush", "canvas"):
+        raise ValueError("Dynamic Paint role must be brush or canvas")
     dynamic_paint_temporary_link = False
-    if kind == "dynamic_paint" and settings.get("role") in ("brush", "canvas"):
+    if kind == "dynamic_paint":
         dynamic_paint_temporary_link = _ensure_dynamic_paint_role(
-            modifier, obj, settings["role"])
+            modifier, obj, dynamic_paint_role)
     rna_params = dict(params)
     for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve"):
         rna_params.pop(parameter, None)
     set_rna(modifier, rna_params, id_lookup)
     _restore_modifier_id_references(modifier, rna_params, id_lookup)
-    if kind == "dynamic_paint" and settings.get("role") in ("brush", "canvas"):
-        modifier.ui_type = settings["role"].upper()
+    if kind == "dynamic_paint":
+        modifier.ui_type = dynamic_paint_role.upper()
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
         _set_curve_mapping(modifier, params["map_curve"])
     if kind == "mesh_cache" and params.get("resource"):
@@ -2697,8 +2703,10 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
         if kind in ("cloth", "soft_body", "collision"):
             settings_block = getattr(modifier, "settings", None)
         elif kind == "dynamic_paint":
-            settings_block = (getattr(modifier, "brush_settings", None)
-                              or getattr(modifier, "canvas_settings", None))
+            settings_name = "brush_settings" if dynamic_paint_role == "brush" else "canvas_settings"
+            settings_block = getattr(modifier, settings_name, None)
+            if settings_block is None:
+                raise ValueError("Dynamic Paint %s settings are missing" % dynamic_paint_role)
         elif kind == "fluid":
             settings_name = {
                 "DOMAIN": "domain_settings",
@@ -2717,6 +2725,8 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj):
             set_rna(getattr(modifier, "collision_settings", None),
                     collision_settings, id_lookup)
         if canvas_surfaces:
+            if kind != "dynamic_paint" or dynamic_paint_role != "canvas":
+                raise ValueError("Dynamic Paint canvas surfaces require canvas role")
             canvas_settings = getattr(modifier, "canvas_settings", None)
             if canvas_settings is None:
                 raise ValueError("Dynamic Paint canvas settings are missing")

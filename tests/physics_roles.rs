@@ -113,7 +113,7 @@ fn dynamic_paint_role_and_ui_type_stay_consistent_on_every_write_path() {
             {"op":"node.create","id":"canvas","kind":"grid","params":{"size":1.0,"x_subdivisions":2,"y_subdivisions":2}},
             {"op":"node.create","id":"direct","kind":"box","params":{"size":0.5}},
             {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush"}},
-            {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas"}},
+            {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"],"surface_format":"weight"}},
             {"op":"modifier.create","target":{"id":"direct"},"id":"direct_dp","type":"dynamic_paint","params":{"ui_type":"BRUSH"}}
         ]),
     );
@@ -135,16 +135,31 @@ fn dynamic_paint_role_and_ui_type_stay_consistent_on_every_write_path() {
         &json!([{
             "op":"physics.dynamic_paint.update",
             "target":{"id":"canvas"},
+            "set":{"strength":0.5}
+        }]),
+    );
+    let document = scene_document(&scene);
+    assert_eq!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["brushes"], json!(["brush"]));
+    assert_eq!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["surface_format"], "weight");
+
+    apply_ok(
+        &scene,
+        2,
+        &json!([{
+            "op":"physics.dynamic_paint.update",
+            "target":{"id":"canvas"},
             "set":{"role":"brush"}
         }]),
     );
     let document = scene_document(&scene);
     assert_eq!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"], "brush");
+    assert!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"].get("brushes").is_none());
+    assert!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"].get("surface_format").is_none());
     assert_eq!(document["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"], "BRUSH");
 
     apply_ok(
         &scene,
-        2,
+        3,
         &json!([{
             "op":"modifier.update",
             "target":{"id":"canvas"},
@@ -155,6 +170,9 @@ fn dynamic_paint_role_and_ui_type_stay_consistent_on_every_write_path() {
     let document = scene_document(&scene);
     assert_eq!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"], "canvas");
     assert_eq!(document["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"], "CANVAS");
+    assert!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"].get("brushes").is_none());
+    assert!(document["nodes"]["canvas"]["properties"]["physics_dynamic_paint"].get("surface_format").is_none());
+
 }
 
 #[test]
@@ -261,6 +279,21 @@ fn setup_flow_scene(scene: &Path, with_effector: bool) {
     apply_ok(scene, 0, &Value::Array(operations));
 }
 
+// Blender FlowSettings are imported directly, outside the native physics operation schema.
+fn set_imported_flow_settings(scene: &Path, flow_type: &str, flow_behavior: &str, density: f64) {
+    let mut document = scene_document(scene);
+    let settings = document["nodes"]["flow"]["properties"]["physics_fluid"]
+        .as_object_mut()
+        .unwrap();
+    settings.remove("type");
+    settings.remove("inflow_rate");
+    settings.insert("flow_type".to_owned(), json!(flow_type));
+    settings.insert("flow_behavior".to_owned(), json!(flow_behavior));
+    settings.insert("density".to_owned(), json!(density));
+    fs::write(scene.join("scene.json"), serde_json::to_vec(&document).unwrap()).unwrap();
+}
+
+
 #[test]
 fn flow_emits_into_domains_and_effectors_only_affect_domain_output() {
     let directory = tempdir().unwrap();
@@ -307,6 +340,75 @@ fn flow_emits_into_domains_and_effectors_only_affect_domain_output() {
     let plain_particles = &plain_frame["fluid_particles"]["domain"];
     let blocked_particles = &blocked_frame["fluid_particles"]["domain"];
     assert_ne!(plain_particles, blocked_particles);
+}
+
+#[test]
+fn imported_liquid_inflow_emits_without_native_rate_and_other_modes_stay_unsupported() {
+    let directory = tempdir().unwrap();
+    let liquid = directory.path().join("imported-liquid-flow");
+    setup_flow_scene(&liquid, false);
+    set_imported_flow_settings(&liquid, "LIQUID", "INFLOW", 8.0);
+    let document = scene_document(&liquid);
+    let flow_settings = &document["nodes"]["flow"]["properties"]["physics_fluid"];
+    assert!(flow_settings.get("inflow_rate").is_none());
+    assert_eq!(flow_settings["flow_type"], "LIQUID");
+    assert_eq!(flow_settings["flow_behavior"], "INFLOW");
+    assert_eq!(flow_settings["density"], 8.0);
+
+    let frame = bake(
+        &liquid,
+        &directory.path().join("imported-liquid-flow-bake"),
+        "1:1",
+        0,
+    );
+    assert!(!frame["fluid_particles"]["domain"].as_array().unwrap().is_empty());
+
+    let native_override = directory.path().join("imported-flow-native-rate");
+    setup_flow_scene(&native_override, false);
+    set_imported_flow_settings(&native_override, "LIQUID", "INFLOW", 1.0);
+    let mut native_override_document = scene_document(&native_override);
+    native_override_document["nodes"]["flow"]["properties"]["physics_fluid"]["inflow_rate"] =
+        json!(8.0);
+    fs::write(
+        native_override.join("scene.json"),
+        serde_json::to_vec(&native_override_document).unwrap(),
+    )
+    .unwrap();
+    let native_override_frame = bake(
+        &native_override,
+        &directory.path().join("imported-flow-native-rate-bake"),
+        "1:1",
+        0,
+    );
+    assert_eq!(
+        native_override_frame["fluid_particles"]["domain"],
+        frame["fluid_particles"]["domain"]
+    );
+
+    for (flow_type, flow_behavior, feature_id) in [
+        ("SMOKE", "INFLOW", "physics.fluid.smoke_fire"),
+        ("LIQUID", "GEOMETRY", "physics.fluid.flow_behavior"),
+    ] {
+        let scene = directory
+            .path()
+            .join(format!("unsupported-{flow_type}-{flow_behavior}"));
+        setup_flow_scene(&scene, false);
+        set_imported_flow_settings(&scene, flow_type, flow_behavior, 1.0);
+        let output = pot()
+            .arg("bake")
+            .arg(&scene)
+            .arg("--kind")
+            .arg("simulation")
+            .arg("--frames")
+            .arg("1:1")
+            .arg("--out")
+            .arg(directory.path().join(format!("{flow_type}-{flow_behavior}-bake")))
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(response(&output)["error"]["details"]["feature_id"], feature_id);
+    }
 }
 
 fn assert_operation_error(output: &Output, pointer: &str) {

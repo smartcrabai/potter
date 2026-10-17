@@ -238,5 +238,10 @@ fn volume_object_modifier_extracts_a_mesh() {
         !extracted.faces.is_empty(),
         "volume conversion produced no faces"
     );
-    assert!((extracted.bounds().unwrap().size().y).abs() < 1.0e-12);
+    let bounds = extracted.bounds().unwrap();
+    assert!((bounds.size().y).abs() < 1.0e-12);
+    assert!((bounds.min.x + 1.0).abs() < 1.0e-6);
+    assert!(bounds.max.x.abs() < 1.0e-6);
+    assert!(bounds.min.z.abs() < 1.0e-6);
+    assert!((bounds.max.z - 1.0).abs() < 1.0e-6);
 }

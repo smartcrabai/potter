@@ -458,6 +458,27 @@ with open(output, 'w', encoding='utf-8') as handle:
                'frame_start':scene.frame_start, 'frame_end':scene.frame_end}, handle)
 ";
 
+const REOPEN_DYNAMIC_PAINT_ROLES: &str = r"
+import bpy, json, sys
+arguments = sys.argv[sys.argv.index('--') + 1:]
+bpy.ops.wm.open_mainfile(filepath=arguments[1])
+
+def role_state(object_name, modifier_name):
+    modifier = bpy.data.objects[object_name].modifiers[modifier_name]
+    return {
+        'ui_type': modifier.ui_type,
+        'has_brush_settings': modifier.brush_settings is not None,
+        'has_canvas_settings': modifier.canvas_settings is not None,
+    }
+
+result = {
+    'canvas_object': role_state('DynamicPaintCanvas', 'CanvasSettingsFixture'),
+    'brush_object': role_state('DynamicPaintBrush', 'BrushSettingsFixture'),
+}
+with open(arguments[2], 'w', encoding='utf-8') as handle:
+    json.dump(result, handle)
+";
+
 fn assert_subset(actual: &Value, expected: &Value, context: &str) {
     match expected {
         Value::Object(values) => {
@@ -565,6 +586,10 @@ fn assert_physics_settings(actual: &Value, expected: &Value, context: &str) {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fixture keeps imported settings, history, role transitions, and Blender reopen checks end to end"
+)]
 #[test]
 fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<(), Box<dyn Error>>
 {
@@ -857,5 +882,121 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
             &format!("reopened frame 1 {object_name}"),
         );
     }
+    let canvas_id = mappings["Object:DynamicPaintCanvas"].as_str().unwrap();
+    let brush_id = mappings["Object:DynamicPaintBrush"].as_str().unwrap();
+    let canvas_modifier_id = modifier(&scene, canvas_id, "CanvasSettingsFixture")["id"]
+        .as_str()
+        .unwrap();
+    let brush_modifier_id = modifier(&scene, brush_id, "BrushSettingsFixture")["id"]
+        .as_str()
+        .unwrap();
+    let imported_canvas_surfaces = scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"]["canvas_surfaces"].clone();
+    let imported_brush_color = scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"]["paint_color"].clone();
+    let imported_compatibility = scene["compatibility"]["blender_adapter"]["intermediate"].clone();
+    let imported_history_head = scene["history"]["head"].as_str().unwrap().to_owned();
+    let history_hash = imported_history_head.strip_prefix("sha256:").unwrap();
+    let history_blob_path = project
+        .join("history")
+        .join("sha256")
+        .join(history_hash)
+        .join("blob.json");
+    let imported_history_blob = fs::read(&history_blob_path)?;
+
+    let same_role_batch = json!({
+        "schema_version":1,
+        "base_revision":scene["revision"],
+        "operations":[
+            {"op":"physics.dynamic_paint.update","target":{"id":canvas_id},"set":{"strength":0.5}},
+            {"op":"modifier.update","target":{"id":canvas_id},"modifier_id":canvas_modifier_id,"set":{"params":{"ui_type":"CANVAS"}}},
+            {"op":"physics.dynamic_paint.update","target":{"id":brush_id},"set":{"strength":0.75}},
+            {"op":"modifier.update","target":{"id":brush_id},"modifier_id":brush_modifier_id,"set":{"params":{"ui_type":"BRUSH"}}}
+        ]
+    });
+    let same_role_path = root.join("dynamic_paint_same_role.json");
+    fs::write(&same_role_path, serde_json::to_vec(&same_role_batch)?)?;
+    pot_json(&[
+        "apply",
+        project.to_str().unwrap(),
+        "--file",
+        same_role_path.to_str().unwrap(),
+    ])?;
+    let same_role_scene: Value =
+        serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    assert_eq!(
+        same_role_scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"]["canvas_surfaces"],
+        imported_canvas_surfaces
+    );
+    assert_eq!(
+        same_role_scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"]["paint_color"],
+        imported_brush_color
+    );
+    assert_eq!(
+        same_role_scene["compatibility"]["blender_adapter"]["intermediate"],
+        imported_compatibility
+    );
+    assert!(same_role_scene["history"]["undo"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(imported_history_head)));
+    assert_eq!(fs::read(&history_blob_path)?, imported_history_blob);
+
+    let transition_batch = json!({
+        "schema_version":1,
+        "base_revision":same_role_scene["revision"],
+        "operations":[
+            {"op":"modifier.update","target":{"id":canvas_id},"modifier_id":canvas_modifier_id,"set":{"params":{"ui_type":"BRUSH"}}},
+            {"op":"modifier.update","target":{"id":brush_id},"modifier_id":brush_modifier_id,"set":{"params":{"ui_type":"CANVAS"}}}
+        ]
+    });
+    let transition_path = root.join("dynamic_paint_role_transitions.json");
+    fs::write(&transition_path, serde_json::to_vec(&transition_batch)?)?;
+    pot_json(&[
+        "apply",
+        project.to_str().unwrap(),
+        "--file",
+        transition_path.to_str().unwrap(),
+    ])?;
+    let transitioned_scene: Value =
+        serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let canvas_settings = &transitioned_scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"];
+    let brush_settings = &transitioned_scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"];
+    assert_eq!(canvas_settings["role"], "brush");
+    assert!(canvas_settings.get("canvas_surfaces").is_none());
+    assert!(canvas_settings.get("surface_format").is_none());
+    assert_eq!(modifier(&transitioned_scene, canvas_id, "CanvasSettingsFixture")["params"]["ui_type"], "BRUSH");
+    assert_eq!(brush_settings["role"], "canvas");
+    assert!(brush_settings.get("paint_color").is_none());
+    assert!(brush_settings.get("use_velocity_alpha").is_none());
+    assert_eq!(modifier(&transitioned_scene, brush_id, "BrushSettingsFixture")["params"]["ui_type"], "CANVAS");
+
+    let transitioned_blend = root.join("dynamic_paint_role_transitions.blend");
+    pot_json(&[
+        "export",
+        project.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--out",
+        transitioned_blend.to_str().unwrap(),
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let transitioned_reopen_path = root.join("dynamic_paint_role_reopened.json");
+    run_blender_script(
+        &blender,
+        "reopen_dynamic_paint_roles.py",
+        REOPEN_DYNAMIC_PAINT_ROLES,
+        root,
+        &[&transitioned_blend, &transitioned_reopen_path],
+        "Dynamic Paint role export failed",
+        run_guarded,
+    )?;
+    let transitioned_reopened: Value =
+        serde_json::from_slice(&fs::read(transitioned_reopen_path)?)?;
+    assert_eq!(transitioned_reopened["canvas_object"]["ui_type"], "BRUSH");
+    assert!(transitioned_reopened["canvas_object"]["has_brush_settings"].as_bool().unwrap());
+    assert!(!transitioned_reopened["canvas_object"]["has_canvas_settings"].as_bool().unwrap());
+    assert_eq!(transitioned_reopened["brush_object"]["ui_type"], "CANVAS");
+    assert!(!transitioned_reopened["brush_object"]["has_brush_settings"].as_bool().unwrap());
+    assert!(transitioned_reopened["brush_object"]["has_canvas_settings"].as_bool().unwrap());
     Ok(())
 }
