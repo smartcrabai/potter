@@ -714,37 +714,20 @@ impl Snapshot {
                     .flatten()
             })
             .collect();
-        let curve_path_lengths = BTreeMap::new();
+        let mut curve_path_lengths = BTreeMap::new();
         for owner_id in &mesh_evaluation_order {
             let Some(owner) = doc.nodes.get(owner_id) else {
                 continue;
             };
-            for modifier in owner
-                .modifiers
-                .iter()
-                .enumerate()
-                .filter_map(|(index, modifier)| {
-                    (gate.is_active_at(owner_id, index, modifier)
-                        && modifier.modifier_type == "array"
-                        && modifier
-                            .params
-                            .get("fit_type")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("FIT_CURVE"))
-                    .then_some(modifier)
-                })
-            {
-                let Some(curve_reference) = modifier
-                    .params
-                    .get("curve")
-                    .and_then(serde_json::Value::as_str)
-                else {
+            for (index, modifier) in owner.modifiers.iter().enumerate() {
+                if !gate.is_active_at(owner_id, index, modifier) {
                     continue;
-                };
-                let Ok(curve_id) = Id::new(curve_reference) else {
-                    continue;
-                };
-                let _ = curve_path_lengths.contains_key(&curve_id);
+                }
+                if let Some((curve_id, length)) =
+                    evaluated_array_curve_path_length(doc, modifier, &matrices)?
+                {
+                    curve_path_lengths.entry(curve_id).or_insert(length);
+                }
             }
         }
         let simulation = crate::sim::evaluate(

@@ -721,3 +721,22 @@ fn displace_blend_texture_uses_mapping_object_coordinates() {
         &BLEND_TEXTURE_OBJECT,
     );
 }
+
+#[test]
+fn array_fit_curve_evaluates_the_curve_path_in_preview() {
+    let doc = apply(
+        &base_scene(),
+        &json!([
+            {"op":"curve.create","id":"path","dimensions":"three_d","transform":{"scale":[2.0,2.0,2.0]},
+             "splines":[{"type":"poly","points":[{"co":[0.0,0.0,0.0]},{"co":[2.0,0.0,0.0]}],
+                         "order":2,"cyclic":false,"resolution":1,"use_endpoint":true}]},
+            {"op":"node.create","id":"subj","kind":"box","params":{"size":1.0}},
+            {"op":"modifier.create","target":{"id":"subj"},"id":"array","type":"array",
+             "params":{"count":2,"fit_type":"FIT_CURVE","curve":"path","use_relative_offset":true,
+                       "relative_offset_displace":[1.0,0.0,0.0],"use_constant_offset":false}}
+        ]),
+    );
+    // Two copies of the eight box corners. Preview needs the curve path length, which the
+    // evaluation pass records before the array runs.
+    assert_eq!(evaluated_mesh(&doc, "subj", None).vertices.len(), 16);
+}
