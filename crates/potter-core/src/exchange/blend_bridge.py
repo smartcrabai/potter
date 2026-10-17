@@ -219,6 +219,8 @@ def plain(value, depth=0):
         return matrix_rows(value)
     if all(hasattr(value, axis) for axis in ("r", "g", "b")):
         return [float(value.r), float(value.g), float(value.b)]
+    if isinstance(value, Euler):
+        return [float(value.x), float(value.y), float(value.z)]
     if hasattr(value, "w") and hasattr(value, "to_euler"):
         return [value.x, value.y, value.z, value.w]
     if hasattr(value, "to_list"):
