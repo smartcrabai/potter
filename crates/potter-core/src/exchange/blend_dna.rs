@@ -1,5 +1,8 @@
-use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
+use std::{
+    collections::{BTreeMap, HashSet},
+    mem::size_of,
+};
 
 use serde_json::{Map, Number, Value};
 
@@ -25,10 +28,42 @@ fn multires_grid_len(total_levels: u32) -> Result<usize, String> {
     let samples = side
         .checked_mul(side)
         .ok_or_else(|| "Blender multires grid size overflow".to_owned())?;
-    if samples > MAX_ARRAY_ELEMENTS {
-        return Err("Blender multires grid exceeds the element limit".into());
-    }
     Ok(samples)
+}
+
+fn multires_auxiliary_peak_bytes(mask_samples: u128, hidden_samples: u128) -> Result<u64, String> {
+    let json_bytes_per_sample = (size_of::<Value>() as u128)
+        .checked_mul(4)
+        .ok_or_else(|| "multires JSON memory estimate overflows".to_owned())?;
+    let bytes = mask_samples
+        .checked_mul(size_of::<f32>() as u128 + json_bytes_per_sample)
+        .and_then(|mask| {
+            hidden_samples
+                .checked_mul(size_of::<bool>() as u128 + json_bytes_per_sample)
+                .and_then(|hidden| mask.checked_add(hidden))
+        })
+        .ok_or_else(|| "multires auxiliary memory estimate overflows".to_owned())?;
+    u64::try_from(bytes).map_err(|_| "multires auxiliary memory estimate exceeds u64".to_owned())
+}
+
+fn json_grid_sample_count(raw: Option<&Value>) -> Result<u128, String> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    raw.as_array()
+        .ok_or_else(|| "multires sample grids must be arrays".to_owned())?
+        .iter()
+        .try_fold(0_u128, |count, grid| {
+            let samples = grid
+                .as_array()
+                .ok_or_else(|| "multires sample grid must be an array".to_owned())?;
+            count
+                .checked_add(
+                    u128::try_from(samples.len())
+                        .map_err(|_| "multires sample count exceeds platform limits")?,
+                )
+                .ok_or_else(|| "multires sample count overflows".to_owned())
+        })
 }
 
 /// Read native bound-data fields from Blender's serialized modifier structs.
@@ -68,6 +103,27 @@ pub(crate) fn read_multires_displacements(bytes: &[u8]) -> Result<BTreeMap<Strin
     };
 
     BlendFile::parse(bytes)?.read_multires_displacements()
+}
+/// Patch Blender's already-allocated MDisps, GridPaintMask, and hidden buffers in place.
+pub(crate) fn patch_multires_export_data(
+    bytes: &mut [u8],
+    mesh_name: &str,
+    record: &Value,
+) -> Result<(), String> {
+    let patches = {
+        let file = BlendFile::parse(bytes)?;
+        multires_export_patches(&file, mesh_name, record)?
+    };
+    for (offset, patch) in patches {
+        let end = offset
+            .checked_add(patch.len())
+            .ok_or_else(|| "Blender multires patch range overflows".to_owned())?;
+        let destination = bytes
+            .get_mut(offset..end)
+            .ok_or_else(|| "Blender multires patch exceeds the file".to_owned())?;
+        destination.copy_from_slice(&patch);
+    }
+    Ok(())
 }
 
 fn decompress_blend(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -1253,6 +1309,7 @@ impl<'a> BlendFile<'a> {
 
     fn read_multires_displacements(&self) -> Result<BTreeMap<String, Value>, String> {
         const CD_MDISPS: i64 = 19;
+        const CD_GRID_PAINT_MASK: i64 = 35;
         const CD_FLAG_EXTERNAL: i64 = 1 << 3;
         let object_struct = self
             .schema
@@ -1311,9 +1368,12 @@ impl<'a> BlendFile<'a> {
                 {
                     continue;
                 }
-                let full_mesh_name = self
-                    .schema
-                    .string_at_path(self.bytes, mesh_struct, mesh_offset, &["id", "name"])?;
+                let full_mesh_name = self.schema.string_at_path(
+                    self.bytes,
+                    mesh_struct,
+                    mesh_offset,
+                    &["id", "name"],
+                )?;
                 let mesh_name = full_mesh_name
                     .get(2..)
                     .unwrap_or(&full_mesh_name)
@@ -1362,6 +1422,9 @@ impl<'a> BlendFile<'a> {
                             })?;
                         let levels = u32::try_from(levels)
                             .map_err(|_| "Blender multires total level is out of range")?;
+                        if levels > 13 {
+                            return Err("Blender multires total level exceeds 13".into());
+                        }
                         if levels != 0 {
                             match mesh_levels.entry(mesh_name.clone()) {
                                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1406,6 +1469,7 @@ impl<'a> BlendFile<'a> {
             .schema
             .struct_index("MDisps")
             .ok_or_else(|| "Blender DNA schema does not contain MDisps".to_owned())?;
+        let grid_paint_mask_struct = self.schema.struct_index("GridPaintMask");
         let mut output = BTreeMap::new();
         for block in &self.blocks {
             if block.sdna_index >= self.schema.structs.len()
@@ -1418,10 +1482,14 @@ impl<'a> BlendFile<'a> {
                 return Err("Blender Mesh block exceeds the element limit".into());
             }
             for mesh_index in 0..block.count {
-                let mesh_offset = checked_array_item_offset(block.data_offset, mesh_index, mesh_size)?;
-                let full_mesh_name = self
-                    .schema
-                    .string_at_path(self.bytes, mesh_struct, mesh_offset, &["id", "name"])?;
+                let mesh_offset =
+                    checked_array_item_offset(block.data_offset, mesh_index, mesh_size)?;
+                let full_mesh_name = self.schema.string_at_path(
+                    self.bytes,
+                    mesh_struct,
+                    mesh_offset,
+                    &["id", "name"],
+                )?;
                 let mesh_name = full_mesh_name
                     .get(2..)
                     .unwrap_or(&full_mesh_name)
@@ -1452,13 +1520,12 @@ impl<'a> BlendFile<'a> {
                 } else {
                     "ldata"
                 };
-                let (ldata_offset, ldata_field) = self.schema.field_address(
-                    mesh_struct,
-                    mesh_offset,
-                    &[corner_data_name],
-                )?;
+                let (ldata_offset, ldata_field) =
+                    self.schema
+                        .field_address(mesh_struct, mesh_offset, &[corner_data_name])?;
                 if ldata_field.pointer
-                    || self.schema.struct_for_type(ldata_field.type_index) != Some(custom_data_struct)
+                    || self.schema.struct_for_type(ldata_field.type_index)
+                        != Some(custom_data_struct)
                 {
                     return Err("Blender Mesh corner data is not inline CustomData".into());
                 }
@@ -1495,12 +1562,12 @@ impl<'a> BlendFile<'a> {
                 let filepath = if external_pointer == 0 {
                     String::new()
                 } else {
-                    let (external_block, external_offset) = self.resolve(
-                        external_pointer,
-                        self.schema.structs[external_struct].size,
-                    )?;
+                    let (external_block, external_offset) =
+                        self.resolve(external_pointer, self.schema.structs[external_struct].size)?;
                     if external_block.sdna_index != external_struct {
-                        return Err("Blender CustomData external pointer has an invalid type".into());
+                        return Err(
+                            "Blender CustomData external pointer has an invalid type".into()
+                        );
                     }
                     self.schema.string_at_path(
                         self.bytes,
@@ -1509,32 +1576,52 @@ impl<'a> BlendFile<'a> {
                         &["filepath"],
                     )?
                 };
-                let layers =
-                    self.read_struct_array(layers_pointer, layer_count, layer_struct)?;
+                let layers = self.read_struct_array(layers_pointer, layer_count, layer_struct)?;
                 let mut mdisps_layer = false;
                 let mut mdisps_external = false;
                 let mut mdisps_data = 0_u64;
+                let mut grid_paint_mask_data = 0_u64;
+                let mut grid_paint_mask_layer = false;
                 for layer in layers {
-                    if layer.get("type").and_then(Value::as_i64) == Some(CD_MDISPS) {
-                        if mdisps_layer {
-                            return Err(format!("Mesh {mesh_name} has multiple CD_MDISPS layers"));
+                    match layer.get("type").and_then(Value::as_i64) {
+                        Some(CD_MDISPS) => {
+                            if mdisps_layer {
+                                return Err(format!(
+                                    "Mesh {mesh_name} has multiple CD_MDISPS layers"
+                                ));
+                            }
+                            mdisps_layer = true;
+                            let flags = layer
+                                .get("flag")
+                                .and_then(Value::as_i64)
+                                .ok_or_else(|| "Blender CD_MDISPS layer has no flags".to_owned())?;
+                            // Blender 5.2 clears CD_FLAG_EXTERNAL when packing the vectors inline.
+                            mdisps_external = flags & CD_FLAG_EXTERNAL != 0;
+                            mdisps_data =
+                                layer.get("data").and_then(Value::as_u64).ok_or_else(|| {
+                                    "Blender CD_MDISPS layer has no data pointer".to_owned()
+                                })?;
                         }
-                        mdisps_layer = true;
-                        let flags = layer
-                            .get("flag")
-                            .and_then(Value::as_i64)
-                            .ok_or_else(|| "Blender CD_MDISPS layer has no flags".to_owned())?;
-                        // Blender 5.2 clears CD_FLAG_EXTERNAL when packing the vectors inline.
-                        mdisps_external = flags & CD_FLAG_EXTERNAL != 0;
-                        mdisps_data = layer
-                            .get("data")
-                            .and_then(Value::as_u64)
-                            .ok_or_else(|| {
-                                "Blender CD_MDISPS layer has no data pointer".to_owned()
-                            })?;
+                        Some(CD_GRID_PAINT_MASK) => {
+                            if grid_paint_mask_layer {
+                                return Err(format!(
+                                    "Mesh {mesh_name} has multiple CD_GRID_PAINT_MASK layers"
+                                ));
+                            }
+                            grid_paint_mask_layer = true;
+                            grid_paint_mask_data =
+                                layer.get("data").and_then(Value::as_u64).ok_or_else(|| {
+                                    "Blender CD_GRID_PAINT_MASK layer has no data pointer"
+                                        .to_owned()
+                                })?;
+                        }
+                        _ => {}
                     }
                 }
-                if !mdisps_layer || total_levels == 0 || (!mdisps_external && mdisps_data == 0) {
+                if total_levels == 0
+                    || (!mdisps_layer && grid_paint_mask_data == 0)
+                    || (!mdisps_external && mdisps_data == 0 && grid_paint_mask_data == 0)
+                {
                     continue;
                 }
                 let mut record = Map::new();
@@ -1552,21 +1639,40 @@ impl<'a> BlendFile<'a> {
                             Value::String(filepath),
                         )])),
                     );
-                } else {
-                    record.insert(
-                        "values".to_owned(),
-                        self.read_inline_mdisps(
-                            mesh_struct,
-                            mesh_offset,
-                            mdisps_data,
-                            loop_count,
-                            total_levels,
-                            mdisps_struct,
-                            &mesh_name,
-                        )?,
-                    );
                 }
-                if output.insert(mesh_name.clone(), Value::Object(record)).is_some() {
+                if mdisps_data != 0 {
+                    let mdisps = self.read_mdisps_layer_data(
+                        mesh_struct,
+                        mesh_offset,
+                        mdisps_data,
+                        loop_count,
+                        total_levels,
+                        mdisps_struct,
+                        &mesh_name,
+                        !mdisps_external,
+                    )?;
+                    record.extend(mdisps);
+                }
+                if grid_paint_mask_data != 0 {
+                    let grid_paint_mask_struct = grid_paint_mask_struct.ok_or_else(|| {
+                        "Blender DNA schema has no GridPaintMask struct".to_owned()
+                    })?;
+                    let hidden_samples = json_grid_sample_count(record.get("hidden"))?;
+                    if let Some(masks) = self.read_grid_paint_masks(
+                        grid_paint_mask_data,
+                        loop_count,
+                        total_levels,
+                        grid_paint_mask_struct,
+                        &mesh_name,
+                        hidden_samples,
+                    )? {
+                        record.insert("paint_mask".to_owned(), masks);
+                    }
+                }
+                if output
+                    .insert(mesh_name.clone(), Value::Object(record))
+                    .is_some()
+                {
                     return Err(format!("duplicate Blender Mesh name {mesh_name}"));
                 }
             }
@@ -1574,7 +1680,7 @@ impl<'a> BlendFile<'a> {
         Ok(output)
     }
 
-    fn read_inline_mdisps(
+    fn read_mdisps_layer_data(
         &self,
         mesh_struct: usize,
         mesh_offset: usize,
@@ -1583,14 +1689,8 @@ impl<'a> BlendFile<'a> {
         total_levels: u32,
         mdisps_struct: usize,
         mesh_name: &str,
-    ) -> Result<Value, String> {
-        let expected_grid_len = multires_grid_len(total_levels)?;
-        let vector_count = expected_grid_len
-            .checked_mul(loop_count)
-            .ok_or_else(|| "Blender MDisps vector count overflow".to_owned())?;
-        if vector_count > MAX_ARRAY_ELEMENTS {
-            return Err("Blender MDisps grids exceed the element limit".into());
-        }
+        include_disps: bool,
+    ) -> Result<Map<String, Value>, String> {
         let mdisps_size = self.schema.structs[mdisps_struct].size;
         let data_size = mdisps_size
             .checked_mul(loop_count)
@@ -1602,10 +1702,13 @@ impl<'a> BlendFile<'a> {
         {
             return Err("Blender CD_MDISPS data pointer is misaligned".into());
         }
-        let mut corners = Vec::with_capacity(loop_count);
+        let mut metadata = Vec::with_capacity(loop_count);
+        let mut grid_levels = Vec::with_capacity(loop_count);
+        let mut max_level = total_levels;
+        let mut total_samples = 0_u128;
+        let mut has_hidden = false;
         for corner_index in 0..loop_count {
-            let corner_offset =
-                checked_array_item_offset(data_offset, corner_index, mdisps_size)?;
+            let corner_offset = checked_array_item_offset(data_offset, corner_index, mdisps_size)?;
             let totdisp = self
                 .schema
                 .integer_at_path(
@@ -1616,8 +1719,9 @@ impl<'a> BlendFile<'a> {
                     self.header.endian,
                 )?
                 .ok_or_else(|| "Blender MDisps has no totdisp field".to_owned())?;
-            let totdisp = checked_count(totdisp, "MDisps displacement")?;
-            let _level = self
+            let totdisp = usize::try_from(totdisp)
+                .map_err(|_| format!("negative MDisps displacement count on mesh {mesh_name}"))?;
+            let level = self
                 .schema
                 .integer_at_path(
                     self.bytes,
@@ -1627,11 +1731,29 @@ impl<'a> BlendFile<'a> {
                     self.header.endian,
                 )?
                 .ok_or_else(|| "Blender MDisps has no level field".to_owned())?;
-            if totdisp != expected_grid_len {
+            let level = u32::try_from(level).map_err(|_| {
+                format!("Mesh {mesh_name} corner {corner_index} has an invalid MDisps level")
+            })?;
+            let level = if level == 0 { total_levels } else { level };
+            if level == 0 || level > total_levels || level > 13 {
                 return Err(format!(
-                    "Mesh {mesh_name} corner {corner_index} has {totdisp} MDisps samples; expected {expected_grid_len} for total level {total_levels}"
+                    "Mesh {mesh_name} corner {corner_index} has an invalid MDisps level"
                 ));
             }
+            let grid_len = multires_grid_len(level)?;
+            if totdisp != 0 && totdisp != grid_len {
+                return Err(format!(
+                    "Mesh {mesh_name} corner {corner_index} has {totdisp} MDisps samples; level {level} requires {grid_len}"
+                ));
+            }
+            let grid_len = if totdisp == 0 { grid_len } else { totdisp };
+            max_level = max_level.max(level);
+            total_samples = total_samples
+                .checked_add(
+                    u128::try_from(grid_len)
+                        .map_err(|_| "MDisps sample count exceeds platform limits")?,
+                )
+                .ok_or_else(|| "Blender MDisps sample count overflow".to_owned())?;
             let disps = self.schema.optional_pointer_at_path(
                 self.bytes,
                 mdisps_struct,
@@ -1640,7 +1762,78 @@ impl<'a> BlendFile<'a> {
                 self.header.endian,
                 self.header.pointer_size,
             )?;
-            corners.push(self.read_mdisps_grid(disps, totdisp)?);
+            let hidden = self.schema.optional_pointer_at_path(
+                self.bytes,
+                mdisps_struct,
+                corner_offset,
+                &["hidden"],
+                self.header.endian,
+                self.header.pointer_size,
+            )?;
+            has_hidden |= hidden != 0;
+            metadata.push((grid_len, disps, hidden));
+            grid_levels.push(Value::from(level));
+        }
+        let hidden_samples = if has_hidden { total_samples } else { 0 };
+        let source_bytes = u64::try_from(self.bytes.len())
+            .map_err(|_| "Blender source file size exceeds memory accounting limits")?;
+        let additional_bytes = multires_auxiliary_peak_bytes(0, hidden_samples)?
+            .checked_add(source_bytes)
+            .ok_or_else(|| "multires source memory estimate overflows".to_owned())?;
+        crate::geom::modifiers::check_multires_grid_capacity(
+            loop_count,
+            max_level,
+            additional_bytes,
+        )
+        .map_err(|error| error.message.to_string())?;
+        let mut corners = Vec::with_capacity(if include_disps { loop_count } else { 0 });
+        let mut hidden_grids = Vec::with_capacity(if has_hidden { loop_count } else { 0 });
+        let uint_type = if has_hidden {
+            Some(
+                self.schema
+                    .type_names
+                    .iter()
+                    .position(|name| name == "uint" || name == "unsigned int")
+                    .ok_or_else(|| {
+                        "Blender DNA schema has no unsigned-int bitmap type".to_owned()
+                    })?,
+            )
+        } else {
+            None
+        };
+        for (grid_len, disps, hidden) in metadata {
+            if include_disps {
+                corners.push(self.read_mdisps_grid(disps, grid_len)?);
+            }
+            if has_hidden {
+                if hidden == 0 {
+                    hidden_grids.push(Value::Array(vec![Value::Bool(false); grid_len]));
+                } else {
+                    let word_count = grid_len
+                        .checked_add(31)
+                        .ok_or_else(|| "Blender hidden bitmap size overflow".to_owned())?
+                        / 32;
+                    let words = self.read_scalar_array(
+                        hidden,
+                        word_count,
+                        uint_type.ok_or_else(|| {
+                            "Blender hidden bitmap type is unavailable".to_owned()
+                        })?,
+                    )?;
+                    let mut bits = Vec::with_capacity(grid_len);
+                    for sample in 0..grid_len {
+                        let word =
+                            words
+                                .get(sample / 32)
+                                .and_then(Value::as_u64)
+                                .ok_or_else(|| {
+                                    "Blender MDisps hidden bitmap word is invalid".to_owned()
+                                })?;
+                        bits.push(Value::Bool((word & (1_u64 << (sample % 32))) != 0));
+                    }
+                    hidden_grids.push(Value::Array(bits));
+                }
+            }
         }
 
         let polygon_count = self
@@ -1665,9 +1858,9 @@ impl<'a> BlendFile<'a> {
             .into_iter()
             .find(|name| self.schema.field(mesh_struct, name).is_some());
         let face_ranges = if let Some(field_name) = face_offsets_field {
-            let (_, field) =
-                self.schema
-                    .field_address(mesh_struct, mesh_offset, &[field_name])?;
+            let (_, field) = self
+                .schema
+                .field_address(mesh_struct, mesh_offset, &[field_name])?;
             if !field.pointer
                 || !field.dimensions.is_empty()
                 || self.schema.type_names[field.type_index] != "int"
@@ -1772,20 +1965,113 @@ impl<'a> BlendFile<'a> {
             }
             ranges
         };
-        let mut values = Map::new();
-        for (face_index, (start, end)) in face_ranges.into_iter().enumerate() {
-            let face_values = corners
-                .get(start..end)
-                .ok_or_else(|| "Blender polygon corners exceed MDisps data".to_owned())?;
-            let face_id = face_index
-                .checked_add(1)
-                .ok_or_else(|| "Blender polygon face ID overflows".to_owned())?;
-            values.insert(
-                format!("f{face_id}"),
-                Value::Array(face_values.to_vec()),
-            );
+        let mut record = Map::new();
+        record.insert("grid_levels".to_owned(), Value::Array(grid_levels));
+        if include_disps {
+            let mut values = Map::new();
+            for (face_index, (start, end)) in face_ranges.into_iter().enumerate() {
+                let face_values = corners
+                    .get(start..end)
+                    .ok_or_else(|| "Blender polygon corners exceed MDisps data".to_owned())?;
+                let face_id = face_index
+                    .checked_add(1)
+                    .ok_or_else(|| "Blender polygon face ID overflows".to_owned())?;
+                values.insert(format!("f{face_id}"), Value::Array(face_values.to_vec()));
+            }
+            record.insert("values".to_owned(), Value::Object(values));
         }
-        Ok(Value::Object(values))
+        if has_hidden {
+            record.insert("hidden".to_owned(), Value::Array(hidden_grids));
+        }
+        Ok(record)
+    }
+
+    fn read_grid_paint_masks(
+        &self,
+        pointer: u64,
+        loop_count: usize,
+        total_levels: u32,
+        mask_struct: usize,
+        mesh_name: &str,
+        hidden_samples: u128,
+    ) -> Result<Option<Value>, String> {
+        let masks = self.read_struct_array(pointer, loop_count, mask_struct)?;
+        let mut metadata = Vec::with_capacity(loop_count);
+        let mut max_level = 0_u32;
+        let mut total_samples = 0_u128;
+        let mut has_mask = false;
+        for (index, mask) in masks.iter().enumerate() {
+            let level = mask
+                .get("level")
+                .and_then(Value::as_u64)
+                .and_then(|level| u32::try_from(level).ok())
+                .filter(|level| *level <= 13)
+                .ok_or_else(|| {
+                    format!("Mesh {mesh_name} GridPaintMask {index} has an invalid level")
+                })?;
+            let data = mask.get("data").and_then(Value::as_u64).ok_or_else(|| {
+                format!("Mesh {mesh_name} GridPaintMask {index} has no data pointer")
+            })?;
+            if data != 0 && level == 0 {
+                return Err(format!(
+                    "Mesh {mesh_name} GridPaintMask {index} has data at level zero"
+                ));
+            }
+            let sample_count = if level == 0 {
+                0
+            } else {
+                multires_grid_len(level)?
+            };
+            max_level = max_level.max(level);
+            total_samples = total_samples
+                .checked_add(
+                    u128::try_from(sample_count)
+                        .map_err(|_| "GridPaintMask sample count exceeds platform limits")?,
+                )
+                .ok_or_else(|| "Blender GridPaintMask sample count overflow".to_owned())?;
+            has_mask |= data != 0;
+            metadata.push((level, sample_count, data));
+        }
+        if !has_mask {
+            return Ok(None);
+        }
+        if max_level > total_levels {
+            return Err(format!(
+                "Mesh {mesh_name} GridPaintMask level exceeds its multires modifier"
+            ));
+        }
+        let source_bytes = u64::try_from(self.bytes.len())
+            .map_err(|_| "Blender source file size exceeds memory accounting limits")?;
+        let additional_bytes = multires_auxiliary_peak_bytes(total_samples, hidden_samples)?
+            .checked_add(source_bytes)
+            .ok_or_else(|| "multires source memory estimate overflows".to_owned())?;
+        crate::geom::modifiers::check_multires_grid_capacity(
+            loop_count,
+            total_levels,
+            additional_bytes,
+        )
+        .map_err(|error| error.message.to_string())?;
+        let mut result = Vec::with_capacity(loop_count);
+        for (index, (level, sample_count, data)) in metadata.into_iter().enumerate() {
+            let values = if sample_count == 0 {
+                Vec::new()
+            } else if data == 0 {
+                vec![Value::from(0.0); sample_count]
+            } else {
+                self.read_multires_float_array(data, sample_count)?
+            };
+            if values.iter().any(|value| {
+                value
+                    .as_f64()
+                    .is_none_or(|number| !number.is_finite() || !(number as f32).is_finite())
+            }) {
+                return Err(format!(
+                    "Mesh {mesh_name} GridPaintMask {index} contains a non-finite value"
+                ));
+            }
+            result.push(serde_json::json!({"level":level,"values":values}));
+        }
+        Ok(Some(Value::Array(result)))
     }
 
     fn read_mdisps_grid(&self, pointer: u64, totdisp: usize) -> Result<Value, String> {
@@ -1837,7 +2123,6 @@ impl<'a> BlendFile<'a> {
         }
         Ok(Value::Array(values))
     }
-
 
     fn read_modifier_payload(
         &self,
@@ -2571,7 +2856,30 @@ impl<'a> BlendFile<'a> {
         count: usize,
         type_index: usize,
     ) -> Result<Vec<Value>, String> {
-        if count > MAX_ARRAY_ELEMENTS {
+        self.read_scalar_array_with_limit(pointer, count, type_index, true)
+    }
+
+    fn read_multires_float_array(&self, pointer: u64, count: usize) -> Result<Vec<Value>, String> {
+        let float_type = self
+            .schema
+            .type_names
+            .iter()
+            .position(|name| name == "float")
+            .ok_or_else(|| "Blender DNA schema does not contain float".to_owned())?;
+        if self.schema.type_lengths[float_type] != 4 {
+            return Err("Blender multires float width is unsupported".into());
+        }
+        self.read_scalar_array_with_limit(pointer, count, float_type, false)
+    }
+
+    fn read_scalar_array_with_limit(
+        &self,
+        pointer: u64,
+        count: usize,
+        type_index: usize,
+        apply_element_limit: bool,
+    ) -> Result<Vec<Value>, String> {
+        if apply_element_limit && count > MAX_ARRAY_ELEMENTS {
             return Err("Blender pointer array exceeds the element limit".into());
         }
         if count == 0 {
@@ -2656,6 +2964,514 @@ impl<'a> BlendFile<'a> {
             })
             .collect()
     }
+}
+
+type MultiresPatch = (usize, Vec<u8>);
+
+fn multires_export_patches(
+    file: &BlendFile<'_>,
+    mesh_name: &str,
+    record: &Value,
+) -> Result<Vec<MultiresPatch>, String> {
+    let mesh_struct = file
+        .schema
+        .struct_index("Mesh")
+        .ok_or_else(|| "Blender DNA schema does not contain Mesh".to_owned())?;
+    let custom_data_struct = file
+        .schema
+        .struct_index("CustomData")
+        .ok_or_else(|| "Blender DNA schema does not contain CustomData".to_owned())?;
+    let layer_struct = file
+        .schema
+        .struct_index("CustomDataLayer")
+        .ok_or_else(|| "Blender DNA schema does not contain CustomDataLayer".to_owned())?;
+    let mdisps_struct = file
+        .schema
+        .struct_index("MDisps")
+        .ok_or_else(|| "Blender DNA schema does not contain MDisps".to_owned())?;
+    let grid_paint_mask_struct = file.schema.struct_index("GridPaintMask");
+    let mut patches = Vec::new();
+    let mut found_mesh = false;
+    let mesh_size = file.schema.structs[mesh_struct].size;
+
+    for block in &file.blocks {
+        if block.sdna_index >= file.schema.structs.len()
+            || file.schema.structs[block.sdna_index].type_index
+                != file.schema.structs[mesh_struct].type_index
+        {
+            continue;
+        }
+        if mesh_size == 0
+            || mesh_size
+                .checked_mul(block.count)
+                .is_none_or(|size| size > block.len)
+        {
+            return Err("Blender Mesh block is shorter than its SDNA count".into());
+        }
+        for mesh_index in 0..block.count {
+            let mesh_offset = checked_array_item_offset(block.data_offset, mesh_index, mesh_size)?;
+            let full_name = file.schema.string_at_path(
+                file.bytes,
+                mesh_struct,
+                mesh_offset,
+                &["id", "name"],
+            )?;
+            let source_name = full_name.get(2..).unwrap_or(&full_name);
+            if source_name != mesh_name {
+                continue;
+            }
+            found_mesh = true;
+            let loop_count = file
+                .schema
+                .integer_at_path(
+                    file.bytes,
+                    mesh_struct,
+                    mesh_offset,
+                    &["corners_num"],
+                    file.header.endian,
+                )?
+                .or(file.schema.integer_at_path(
+                    file.bytes,
+                    mesh_struct,
+                    mesh_offset,
+                    &["totloop"],
+                    file.header.endian,
+                )?)
+                .ok_or_else(|| "Blender Mesh has no corner count".to_owned())?;
+            let loop_count = checked_count(loop_count, "Mesh corner")?;
+            let raw_values = record.get("values").and_then(Value::as_array);
+            let raw_levels = record.get("grid_levels").and_then(Value::as_array);
+            let total_levels = record
+                .get("total_levels")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| (1..=13).contains(value))
+                .ok_or_else(|| "multires patch has an invalid total level".to_owned())?;
+            if raw_values.is_some_and(|values| values.len() != loop_count)
+                || raw_levels.is_some_and(|levels| levels.len() != loop_count)
+            {
+                return Err("multires patch arrays do not match Blender loop count".into());
+            }
+            let mut levels = Vec::with_capacity(loop_count);
+            for loop_index in 0..loop_count {
+                let level = raw_levels
+                    .and_then(|levels| levels[loop_index].as_u64())
+                    .and_then(|level| u32::try_from(level).ok())
+                    .unwrap_or(total_levels);
+                if level == 0 || level > total_levels || level > 13 {
+                    return Err(format!(
+                        "multires patch loop {loop_index} has an invalid level"
+                    ));
+                }
+                let grid_len =
+                    grid_vector_count(level).map_err(|error| error.message.to_string())?;
+                if let Some(raw_values) = raw_values {
+                    let grid = raw_values[loop_index]
+                        .as_array()
+                        .filter(|grid| grid.len() == grid_len)
+                        .ok_or_else(|| {
+                            format!("multires patch loop {loop_index} has an invalid grid size")
+                        })?;
+                    for (sample, vector) in grid.iter().enumerate() {
+                        let components = vector
+                            .as_array()
+                            .filter(|components| components.len() == 3)
+                            .ok_or_else(|| {
+                                format!(
+                                    "multires patch loop {loop_index} sample {sample} is invalid"
+                                )
+                            })?;
+                        if components.iter().any(|component| {
+                            component.as_f64().is_none_or(|value| {
+                                !value.is_finite() || !(value as f32).is_finite()
+                            })
+                        }) {
+                            return Err(
+                                "multires patch displacement is non-finite or exceeds f32 range"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                levels.push(level);
+            }
+
+            let corner_data_name = if file.schema.field(mesh_struct, "corner_data").is_some() {
+                "corner_data"
+            } else {
+                "ldata"
+            };
+            let (custom_data_offset, custom_data_field) =
+                file.schema
+                    .field_address(mesh_struct, mesh_offset, &[corner_data_name])?;
+            if custom_data_field.pointer
+                || file.schema.struct_for_type(custom_data_field.type_index)
+                    != Some(custom_data_struct)
+            {
+                return Err("Blender Mesh corner data is not inline CustomData".into());
+            }
+            let layer_count = file
+                .schema
+                .integer_at_path(
+                    file.bytes,
+                    custom_data_struct,
+                    custom_data_offset,
+                    &["totlayer"],
+                    file.header.endian,
+                )?
+                .ok_or_else(|| "Blender CustomData has no layer count".to_owned())?;
+            let layer_count = checked_count(layer_count, "CustomData layer")?;
+            let layer_pointer = file.schema.optional_pointer_at_path(
+                file.bytes,
+                custom_data_struct,
+                custom_data_offset,
+                &["layers"],
+                file.header.endian,
+                file.header.pointer_size,
+            )?;
+            let layers = file.read_struct_array(layer_pointer, layer_count, layer_struct)?;
+            let mut mdisps_data = 0_u64;
+            let mut external = false;
+            let mut mask_data = 0_u64;
+            for layer in layers {
+                match layer.get("type").and_then(Value::as_i64) {
+                    Some(19) => {
+                        mdisps_data =
+                            layer.get("data").and_then(Value::as_u64).ok_or_else(|| {
+                                "Blender CD_MDISPS layer has no data pointer".to_owned()
+                            })?;
+                        external = layer
+                            .get("flag")
+                            .and_then(Value::as_i64)
+                            .is_some_and(|flag| flag & (1 << 3) != 0);
+                    }
+                    Some(35) => {
+                        mask_data = layer.get("data").and_then(Value::as_u64).ok_or_else(|| {
+                            "Blender CD_GRID_PAINT_MASK layer has no data pointer".to_owned()
+                        })?;
+                    }
+                    _ => {}
+                }
+            }
+            if mdisps_data == 0 {
+                return Err(format!(
+                    "Blender mesh {mesh_name} has no allocated MDisps layer"
+                ));
+            }
+            let mdisps_size = file.schema.structs[mdisps_struct].size;
+            let mdisps_bytes = mdisps_size
+                .checked_mul(loop_count)
+                .ok_or_else(|| "Blender MDisps patch size overflows".to_owned())?;
+            let (mdisps_block, mdisps_offset) = file.resolve(mdisps_data, mdisps_bytes)?;
+            if mdisps_block.sdna_index != mdisps_struct
+                || mdisps_size == 0
+                || (mdisps_offset - mdisps_block.data_offset) % mdisps_size != 0
+            {
+                return Err("Blender MDisps patch pointer is misaligned".into());
+            }
+            let raw_hidden = record.get("hidden").and_then(Value::as_array);
+            if raw_hidden.is_some_and(|hidden| hidden.len() != loop_count) {
+                return Err("multires hidden patch does not match Blender loops".into());
+            }
+            for loop_index in 0..loop_count {
+                let mdisps_offset =
+                    checked_array_item_offset(mdisps_offset, loop_index, mdisps_size)?;
+                let level = levels[loop_index];
+                let grid_len =
+                    grid_vector_count(level).map_err(|error| error.message.to_string())?;
+                let raw_grid = raw_values.and_then(|values| values.get(loop_index));
+                patches.push(patch_integer_field(
+                    file,
+                    mdisps_struct,
+                    mdisps_offset,
+                    "totdisp",
+                    u32::try_from(grid_len).map_err(|_| "MDisps grid count exceeds u32")?,
+                )?);
+                patches.push(patch_integer_field(
+                    file,
+                    mdisps_struct,
+                    mdisps_offset,
+                    "level",
+                    level,
+                )?);
+                if let Some(raw_grid) = raw_grid {
+                    let disps = file.schema.optional_pointer_at_path(
+                        file.bytes,
+                        mdisps_struct,
+                        mdisps_offset,
+                        &["disps"],
+                        file.header.endian,
+                        file.header.pointer_size,
+                    )?;
+                    if !external {
+                        patches.push(patch_float3_json_array(file, disps, raw_grid)?);
+                    }
+                }
+                if let Some(hidden) = raw_hidden {
+                    let bits = hidden[loop_index]
+                        .as_array()
+                        .filter(|bits| bits.len() == grid_len)
+                        .ok_or_else(|| {
+                            format!("multires hidden patch loop {loop_index} has an invalid size")
+                        })?;
+                    let hidden_pointer = file.schema.optional_pointer_at_path(
+                        file.bytes,
+                        mdisps_struct,
+                        mdisps_offset,
+                        &["hidden"],
+                        file.header.endian,
+                        file.header.pointer_size,
+                    )?;
+                    let words = bitmap_words(bits)?;
+                    if hidden_pointer == 0 {
+                        if words.iter().any(|word| *word != 0) {
+                            return Err(format!(
+                                "Blender mesh {mesh_name} loop {loop_index} has no hidden bitmap storage"
+                            ));
+                        }
+                    } else if !words.is_empty() {
+                        patches.push(patch_u32_array(file, hidden_pointer, &words)?);
+                    }
+                }
+            }
+
+            if let Some(mask_records) = record.get("paint_mask").and_then(Value::as_array) {
+                if mask_records.len() != loop_count {
+                    return Err("multires paint-mask patch does not match Blender loops".into());
+                }
+                let mask_struct = grid_paint_mask_struct
+                    .ok_or_else(|| "Blender DNA schema has no GridPaintMask struct".to_owned())?;
+                if mask_data == 0 {
+                    return Err(format!(
+                        "Blender mesh {mesh_name} has no allocated GridPaintMask layer"
+                    ));
+                }
+                let mask_size = file.schema.structs[mask_struct].size;
+                let mask_bytes = mask_size
+                    .checked_mul(loop_count)
+                    .ok_or_else(|| "GridPaintMask patch size overflows".to_owned())?;
+                let (mask_block, mask_offset) = file.resolve(mask_data, mask_bytes)?;
+                if mask_block.sdna_index != mask_struct
+                    || mask_size == 0
+                    || (mask_offset - mask_block.data_offset) % mask_size != 0
+                {
+                    return Err("Blender GridPaintMask patch pointer is misaligned".into());
+                }
+                for (loop_index, mask_record) in mask_records.iter().enumerate() {
+                    let mask_offset =
+                        checked_array_item_offset(mask_offset, loop_index, mask_size)?;
+                    let level = mask_record
+                        .get("level")
+                        .and_then(Value::as_u64)
+                        .and_then(|level| u32::try_from(level).ok())
+                        .filter(|level| *level <= 13)
+                        .ok_or_else(|| {
+                            format!("GridPaintMask loop {loop_index} has an invalid level")
+                        })?;
+                    let values = mask_record
+                        .get("values")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            format!("GridPaintMask loop {loop_index} has invalid values")
+                        })?;
+                    let expected = if level == 0 {
+                        0
+                    } else {
+                        grid_vector_count(level).map_err(|error| error.message.to_string())?
+                    };
+                    if values.len() != expected {
+                        return Err(format!(
+                            "GridPaintMask loop {loop_index} has an invalid size"
+                        ));
+                    }
+                    patches.push(patch_integer_field(
+                        file,
+                        mask_struct,
+                        mask_offset,
+                        "level",
+                        level,
+                    )?);
+                    let data = file.schema.optional_pointer_at_path(
+                        file.bytes,
+                        mask_struct,
+                        mask_offset,
+                        &["data"],
+                        file.header.endian,
+                        file.header.pointer_size,
+                    )?;
+                    if level == 0 {
+                        patches.push(patch_null_pointer_field(
+                            file,
+                            mask_struct,
+                            mask_offset,
+                            "data",
+                        )?);
+                    } else {
+                        patches.push(patch_float_json_array(file, data, values)?);
+                    }
+                }
+            }
+        }
+    }
+    if !found_mesh {
+        return Err(format!(
+            "Blender Mesh {mesh_name} was not found for multires patch"
+        ));
+    }
+    Ok(patches)
+}
+
+fn patch_null_pointer_field(
+    file: &BlendFile<'_>,
+    struct_index: usize,
+    base_offset: usize,
+    field_name: &str,
+) -> Result<MultiresPatch, String> {
+    let (offset, field) = file
+        .schema
+        .field_address(struct_index, base_offset, &[field_name])?;
+    if !field.pointer || field.size != file.header.pointer_size {
+        return Err(format!("Blender DNA {field_name} is not a pointer"));
+    }
+    Ok((offset, vec![0; file.header.pointer_size]))
+}
+
+fn patch_integer_field(
+    file: &BlendFile<'_>,
+    struct_index: usize,
+    base_offset: usize,
+    field_name: &str,
+    value: u32,
+) -> Result<MultiresPatch, String> {
+    let (offset, field) = file
+        .schema
+        .field_address(struct_index, base_offset, &[field_name])?;
+    if field.pointer || !field.dimensions.is_empty() || field.size != 4 {
+        return Err(format!("Blender DNA {field_name} is not a 32-bit scalar"));
+    }
+    let bytes = match file.header.endian {
+        Endian::Little => value.to_le_bytes(),
+        Endian::Big => value.to_be_bytes(),
+    };
+    Ok((offset, bytes.to_vec()))
+}
+
+fn patch_float_json_array(
+    file: &BlendFile<'_>,
+    pointer: u64,
+    values: &[Value],
+) -> Result<MultiresPatch, String> {
+    let byte_count = values
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| "Blender float-array patch size overflows".to_owned())?;
+    let (block, offset) = file.resolve(pointer, byte_count)?;
+    if (offset - block.data_offset) % 4 != 0 {
+        return Err("Blender float-array patch pointer is misaligned".into());
+    }
+    let mut bytes = Vec::with_capacity(byte_count);
+    for value in values {
+        let value = value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| "GridPaintMask value is non-finite".to_owned())?
+            as f32;
+        if !value.is_finite() {
+            return Err("GridPaintMask value exceeds f32 range".into());
+        }
+        let encoded = match file.header.endian {
+            Endian::Little => value.to_le_bytes(),
+            Endian::Big => value.to_be_bytes(),
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+    Ok((offset, bytes))
+}
+
+fn patch_float3_json_array(
+    file: &BlendFile<'_>,
+    pointer: u64,
+    grid_value: &Value,
+) -> Result<MultiresPatch, String> {
+    let grid = grid_value
+        .as_array()
+        .ok_or_else(|| "MDisps patch grid is not an array".to_owned())?;
+    let float_count = grid
+        .len()
+        .checked_mul(3)
+        .ok_or_else(|| "Blender MDisps float count overflows".to_owned())?;
+    let byte_count = float_count
+        .checked_mul(4)
+        .ok_or_else(|| "Blender MDisps patch size overflows".to_owned())?;
+    let (block, offset) = file.resolve(pointer, byte_count)?;
+    if (offset - block.data_offset) % 4 != 0 {
+        return Err("Blender MDisps float pointer is misaligned".into());
+    }
+    let mut bytes = Vec::with_capacity(byte_count);
+    for (sample, vector) in grid.iter().enumerate() {
+        let components = vector
+            .as_array()
+            .filter(|components| components.len() == 3)
+            .ok_or_else(|| format!("MDisps patch vector {sample} is invalid"))?;
+        for component in components {
+            let value = component
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| "multires patch displacement is non-finite".to_owned())?
+                as f32;
+            if !value.is_finite() {
+                return Err("multires patch displacement exceeds f32 range".into());
+            }
+            let encoded = match file.header.endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            };
+            bytes.extend_from_slice(&encoded);
+        }
+    }
+    Ok((offset, bytes))
+}
+
+fn patch_u32_array(
+    file: &BlendFile<'_>,
+    pointer: u64,
+    values: &[u32],
+) -> Result<MultiresPatch, String> {
+    let byte_count = values
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| "Blender bitmap patch size overflows".to_owned())?;
+    let (block, offset) = file.resolve(pointer, byte_count)?;
+    if (offset - block.data_offset) % 4 != 0 {
+        return Err("Blender bitmap pointer is misaligned".into());
+    }
+    let mut bytes = Vec::with_capacity(byte_count);
+    for value in values {
+        let encoded = match file.header.endian {
+            Endian::Little => value.to_le_bytes(),
+            Endian::Big => value.to_be_bytes(),
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+    Ok((offset, bytes))
+}
+
+fn bitmap_words(bits: &[Value]) -> Result<Vec<u32>, String> {
+    let word_count = bits
+        .len()
+        .checked_add(31)
+        .ok_or_else(|| "Blender bitmap patch count overflows".to_owned())?
+        / 32;
+    let mut words = vec![0_u32; word_count];
+    for (index, value) in bits.iter().enumerate() {
+        let hidden = value
+            .as_bool()
+            .ok_or_else(|| "MDisps hidden sample is not boolean".to_owned())?;
+        if hidden {
+            words[index / 32] |= 1_u32 << (index % 32);
+        }
+    }
+    Ok(words)
 }
 
 fn checked_array_item_offset(
@@ -2814,7 +3630,10 @@ fn parse_blocks(bytes: &[u8], header: Header) -> Result<Vec<Block>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlendFile, Endian, Header, Schema, parse_blocks};
+    use super::{
+        BlendFile, Endian, Header, Schema, parse_blocks, patch_multires_export_data,
+        read_multires_displacements,
+    };
 
     fn must<T>(result: Result<T, String>) -> T {
         match result {
@@ -2994,6 +3813,59 @@ mod tests {
         let (data_block, offset) = must(parsed.resolve(0x1002, 3));
         assert_eq!(&parsed.bytes[offset..offset + 3], &[3, 4, 5]);
         assert_eq!(data_block.old_address, 0x1000);
+    }
+
+    #[test]
+    fn patches_per_loop_mdisps_levels_in_place() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/multires/mr_inline.blend");
+        let mut bytes = std::fs::read(fixture).unwrap();
+        let original = must(read_multires_displacements(&bytes));
+        let (mesh_name, record) = original.iter().next().expect("fixture has multires mesh");
+        let source_values = record["values"].as_object().expect("fixture MDisps values");
+        let mut levels = Vec::new();
+        let mut grids = Vec::new();
+        let mut loop_index = 0_usize;
+        for face_index in 1..=source_values.len() {
+            let face = source_values
+                .get(&format!("f{face_index}"))
+                .and_then(serde_json::Value::as_array)
+                .expect("fixture face grids");
+            for grid in face {
+                let level = if loop_index % 2 == 0 { 1_u32 } else { 2_u32 };
+                let mut samples = grid.as_array().expect("fixture grid samples").clone();
+                if level == 1 {
+                    samples.truncate(4);
+                }
+                grids.push(serde_json::Value::Array(samples));
+                levels.push(level);
+                loop_index += 1;
+            }
+        }
+        let patch = serde_json::json!({
+            "total_levels": 2,
+            "grid_levels": levels,
+            "values": grids,
+        });
+        must(patch_multires_export_data(&mut bytes, mesh_name, &patch));
+        let patched = must(read_multires_displacements(&bytes));
+        let record = &patched[mesh_name];
+        assert_eq!(record["grid_levels"], patch["grid_levels"]);
+        let mut loop_index = 0_usize;
+        for face_index in 1..=source_values.len() {
+            let face = record["values"]
+                .get(&format!("f{face_index}"))
+                .and_then(serde_json::Value::as_array)
+                .expect("patched face grids");
+            for grid in face {
+                let expected = if loop_index % 2 == 0 { 4 } else { 9 };
+                assert_eq!(
+                    grid.as_array().expect("patched grid samples").len(),
+                    expected
+                );
+                loop_index += 1;
+            }
+        }
     }
 
     #[test]

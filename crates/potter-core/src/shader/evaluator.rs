@@ -1176,7 +1176,9 @@ impl Evaluator<'_, '_, '_, '_> {
         } else {
             ("Fac", "Color1", "Color2", "Color", "MixRGB")
         };
-        let factor = self.scalar_input(id, &[factor_socket], 0.5)?.clamp(0.0, 1.0);
+        let factor = self
+            .scalar_input(id, &[factor_socket], 0.5)?
+            .clamp(0.0, 1.0);
         let first = self.color_input(id, &[first_socket], [0.5, 0.5, 0.5, 1.0])?;
         let second = self.color_input(id, &[second_socket], [0.5, 0.5, 0.5, 1.0])?;
         let blended = match blend.as_str() {
@@ -1903,7 +1905,11 @@ mod tests {
         )
         .unwrap();
         for (actual, expected) in params.base_color.iter().zip([0.2, 0.3, 0.5, 0.75]) {
-            assert!((actual - expected).abs() < 1e-12, "base color {:?}", params.base_color);
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "base color {:?}",
+                params.base_color
+            );
         }
 
         // A layer the mesh does not carry reads opaque black and records a warning.

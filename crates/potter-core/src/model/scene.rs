@@ -461,7 +461,6 @@ impl SceneDoc {
             .and_then(|data_id| self.data_blocks.get(data_id))
             .is_some_and(|data| data.camera.is_some())
     }
-
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1202,7 +1201,6 @@ impl Default for RenderSettings {
         }
     }
 }
-
 
 fn default_shutter() -> f64 {
     0.5

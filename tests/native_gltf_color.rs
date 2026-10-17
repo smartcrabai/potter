@@ -9,14 +9,14 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
 
 use std::{collections::BTreeSet, fs};
 
@@ -68,9 +68,15 @@ fn accessor_bits(glb: &Glb, index: u64, width: usize) -> TestResult<Vec<Vec<u32>
     if accessor["componentType"] != 5126 {
         return Err("accessor must be float32".into());
     }
-    let count = usize::try_from(accessor["count"].as_u64().ok_or("accessor count is missing")?)?;
+    let count = usize::try_from(
+        accessor["count"]
+            .as_u64()
+            .ok_or("accessor count is missing")?,
+    )?;
     let view = &glb.json["bufferViews"][usize::try_from(
-        accessor["bufferView"].as_u64().ok_or("accessor has no bufferView")?,
+        accessor["bufferView"]
+            .as_u64()
+            .ok_or("accessor has no bufferView")?,
     )?];
     let view_offset = usize::try_from(view["byteOffset"].as_u64().unwrap_or(0))?;
     let accessor_offset = usize::try_from(accessor["byteOffset"].as_u64().unwrap_or(0))?;
@@ -96,12 +102,17 @@ fn accessor_bits(glb: &Glb, index: u64, width: usize) -> TestResult<Vec<Vec<u32>
 }
 
 fn bits(values: &[f64]) -> Vec<u32> {
-    values.iter().map(|value| (*value as f32).to_bits()).collect()
+    values
+        .iter()
+        .map(|value| (*value as f32).to_bits())
+        .collect()
 }
 
 /// Per-corner tuples of a stored mesh: position, then each named layer's value at that corner.
 fn expanded_corners(mesh: &Value, layers: &[&str]) -> TestResult<BTreeSet<Vec<u32>>> {
-    let vertices = mesh["vertices"].as_array().ok_or("mesh vertices are missing")?;
+    let vertices = mesh["vertices"]
+        .as_array()
+        .ok_or("mesh vertices are missing")?;
     let mut corners = BTreeSet::new();
     for face in mesh["faces"].as_array().ok_or("mesh faces are missing")? {
         let face_id = face["id"].as_u64().ok_or("face id is missing")?;
@@ -133,7 +144,9 @@ fn primitive_corners(glb: &Glb, primitive: &Value) -> TestResult<BTreeSet<Vec<u3
     let attributes = &primitive["attributes"];
     let position = accessor_bits(
         glb,
-        attributes["POSITION"].as_u64().ok_or("POSITION is missing")?,
+        attributes["POSITION"]
+            .as_u64()
+            .ok_or("POSITION is missing")?,
         3,
     )?;
     let mut columns = vec![position];
@@ -161,7 +174,10 @@ fn primitive_corners(glb: &Glb, primitive: &Value) -> TestResult<BTreeSet<Vec<u3
 fn glb_primitives(glb: &Glb) -> TestResult<Vec<BTreeSet<Vec<u32>>>> {
     let mut sets = Vec::new();
     for mesh in glb.json["meshes"].as_array().ok_or("GLB has no meshes")? {
-        for primitive in mesh["primitives"].as_array().ok_or("mesh has no primitives")? {
+        for primitive in mesh["primitives"]
+            .as_array()
+            .ok_or("mesh has no primitives")?
+        {
             sets.push(primitive_corners(glb, primitive)?);
         }
     }
@@ -182,7 +198,8 @@ fn color_columns(mesh: &Value) -> TestResult<Vec<String>> {
 }
 
 #[test]
-fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_generics() -> TestResult {
+fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_generics() -> TestResult
+{
     let Some(blender) = blender() else {
         return Ok(());
     };
@@ -217,7 +234,9 @@ fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_gener
         "generic attributes must be reported as losses: {features:?}"
     );
     assert!(
-        !features.iter().any(|feature| feature == "mesh.color_attribute"),
+        !features
+            .iter()
+            .any(|feature| feature == "mesh.color_attribute"),
         "color layers are representable in glTF: {features:?}"
     );
     assert!(
@@ -260,10 +279,7 @@ fn glb_colors_import_back_into_color_layers_per_corner() -> TestResult {
     let out = root.path().join("oracle.glb");
     export_raw(&blender, &project, "glb", &out, true)?;
     let back = root.path().join("back");
-    pot()
-        .arg("init")
-        .arg(&back)
-        .output()?;
+    pot().arg("init").arg(&back).output()?;
     let imported = pot()
         .arg("import")
         .arg(&back)
@@ -287,7 +303,11 @@ fn glb_colors_import_back_into_color_layers_per_corner() -> TestResult {
     let mesh = blocks
         .values()
         .filter_map(|block| block.get("mesh"))
-        .find(|mesh| mesh["attributes"]["color_layers"]["layers"].as_array().is_some_and(|layers| layers.len() == ORACLE_COLUMNS.len()))
+        .find(|mesh| {
+            mesh["attributes"]["color_layers"]["layers"]
+                .as_array()
+                .is_some_and(|layers| layers.len() == ORACLE_COLUMNS.len())
+        })
         .ok_or("imported glTF has no color layers")?;
     let names = color_columns(mesh)?;
     assert_eq!(names.len(), ORACLE_COLUMNS.len(), "imported layer count");

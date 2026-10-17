@@ -60,6 +60,7 @@ pub(super) struct AdaptiveDicingConfig {
 /// Pixel measures follow Cycles `scene/camera.cpp:722-878`; panorama uses the ray-differential
 /// transfer from `kernel/camera/camera.h:381-432` and `kernel/util/differential.h:130-154`.
 struct CameraDicingFrame {
+    world_to_camera: DMat4,
     orthographic_pixel_width: f64,
     orthographic_v1: DVec3,
     orthographic_v2: DVec3,
@@ -76,6 +77,20 @@ impl CameraDicingFrame {
                 "adaptive dicing camera transform must be invertible",
             ));
         }
+        let camera_position = camera_to_world.transform_point3(DVec3::ZERO);
+        let forward = normalized(camera_to_world.transform_vector3(-DVec3::Z));
+        let up_hint = normalized(camera_to_world.transform_vector3(DVec3::Y));
+        let right = normalized(forward.cross(up_hint));
+        let up = normalized(right.cross(forward));
+        // Match the unit camera axes used by preview/raster while retaining the evaluated origin.
+        let camera_to_world = DMat4::from_cols(
+            right.extend(0.0),
+            up.extend(0.0),
+            (-forward).extend(0.0),
+            camera_position.extend(1.0),
+        );
+        let world_to_camera = camera_to_world.inverse();
+
         let width = f64::from(camera.resolution[0]);
         let height = f64::from(camera.resolution[1]);
         let ycor = height / width;
@@ -91,6 +106,7 @@ impl CameraDicingFrame {
             camera.sensor_height_mm
         };
         let mut frame = Self {
+            world_to_camera,
             orthographic_pixel_width: 0.0,
             orthographic_v1: DVec3::ZERO,
             orthographic_v2: DVec3::ZERO,
@@ -105,8 +121,7 @@ impl CameraDicingFrame {
                 let dx = camera_to_world.transform_vector3(DVec3::X * pixel_step);
                 let dy = camera_to_world.transform_vector3(DVec3::Y * pixel_step);
                 frame.orthographic_pixel_width = dx.length().min(dy.length());
-                frame.orthographic_v1 =
-                    orthographic_camera_point(camera, width, height);
+                frame.orthographic_v1 = orthographic_camera_point(camera, width, height);
                 frame.orthographic_v2 = orthographic_camera_point(camera, 0.0, 0.0);
             }
             CameraProjection::Perspective => {
@@ -133,8 +148,10 @@ impl CameraDicingFrame {
                 let d_direction = normalized(center_world + dx) - direction;
                 let tangent = d_direction - direction * d_direction.dot(direction);
                 frame.perspective_pixel_scale = tangent.length();
-                let right = positive_camera_point(perspective_camera_point(camera, width, height * 0.5));
-                let left = positive_camera_point(perspective_camera_point(camera, 0.0, height * 0.5));
+                let right =
+                    positive_camera_point(perspective_camera_point(camera, width, height * 0.5));
+                let left =
+                    positive_camera_point(perspective_camera_point(camera, 0.0, height * 0.5));
                 let top = positive_camera_point(perspective_camera_point(camera, width * 0.5, 0.0));
                 let bottom =
                     positive_camera_point(perspective_camera_point(camera, width * 0.5, height));
@@ -189,8 +206,7 @@ fn normalized(vector: DVec3) -> DVec3 {
 }
 
 fn camera_view_factors(camera: &AdaptiveCamera) -> (f64, f64) {
-    let height_over_width =
-        f64::from(camera.resolution[1]) / f64::from(camera.resolution[0]);
+    let height_over_width = f64::from(camera.resolution[1]) / f64::from(camera.resolution[0]);
     let horizontal_fit = match camera.sensor_fit.as_str() {
         "HORIZONTAL" => true,
         "VERTICAL" => false,
@@ -198,7 +214,11 @@ fn camera_view_factors(camera: &AdaptiveCamera) -> (f64, f64) {
     };
     (
         height_over_width,
-        if horizontal_fit { 1.0 } else { height_over_width },
+        if horizontal_fit {
+            1.0
+        } else {
+            height_over_width
+        },
     )
 }
 
@@ -209,8 +229,7 @@ fn orthographic_camera_point(camera: &AdaptiveCamera, x: f64, y: f64) -> DVec3 {
     let ndc_x = 2.0 * x / width - 1.0;
     let ndc_y = 1.0 - 2.0 * y / height;
     DVec3::new(
-        (ndc_x + 2.0 * camera.shift_x * view_factor) * camera.ortho_scale
-            / (2.0 * view_factor),
+        (ndc_x + 2.0 * camera.shift_x * view_factor) * camera.ortho_scale / (2.0 * view_factor),
         (ndc_y + 2.0 * camera.shift_y * view_factor / ycor) * ycor * camera.ortho_scale
             / (2.0 * view_factor),
         0.0,
@@ -305,10 +324,16 @@ fn diced_triangle_bytes() -> u128 {
 
 fn check_diced_capacity(vertices: usize, triangles: usize, extra_bytes: u128) -> Result<()> {
     let vertices = u128::try_from(vertices).map_err(|_| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive dicing capacity overflows")
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive dicing capacity overflows",
+        )
     })?;
     let triangles = u128::try_from(triangles).map_err(|_| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive dicing capacity overflows")
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive dicing capacity overflows",
+        )
     })?;
     if triangles > MAX_SUBDIVISION_TRIANGLES {
         return Err(PotError::new(
@@ -353,13 +378,15 @@ fn curve_temporary_bytes(
     candidate_points: usize,
     candidate_count: usize,
 ) -> Result<u128> {
-    let point_count = retained_points.checked_add(candidate_points).ok_or_else(|| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive curve point count overflows")
-    })?;
-    let candidates = dicing_buffer_bytes(
-        candidate_count,
-        size_of::<(f64, f64, Vec<f64>)>() * 2,
-    )?;
+    let point_count = retained_points
+        .checked_add(candidate_points)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "adaptive curve point count overflows",
+            )
+        })?;
+    let candidates = dicing_buffer_bytes(candidate_count, size_of::<(f64, f64, Vec<f64>)>() * 2)?;
     let curve_map_bytes = dicing_buffer_bytes(curve_count, 128)?;
     let point_bytes = dicing_buffer_bytes(point_count, size_of::<f64>())?
         .checked_mul(2)
@@ -461,12 +488,16 @@ impl DicedBuilder {
                     "adaptive dicing vertex count overflows",
                 )
             })?;
-        let triangles = self.faces.len().checked_add(extra_triangles).ok_or_else(|| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "adaptive dicing triangle count overflows",
-            )
-        })?;
+        let triangles = self
+            .faces
+            .len()
+            .checked_add(extra_triangles)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "adaptive dicing triangle count overflows",
+                )
+            })?;
         if u128::try_from(triangles).unwrap_or(u128::MAX) > MAX_SUBDIVISION_TRIANGLES {
             return Err(PotError::new(
                 ErrorCode::LimitExceeded,
@@ -616,20 +647,31 @@ pub(super) fn dice(
     let max_segments = 1usize.checked_shl(config.max_subdivisions).ok_or_else(|| {
         PotError::invalid_argument("adaptive subdivision maximum exceeds addressable edge factors")
     })?;
-    let patch_count = base_faces.iter().try_fold(0usize, |count, face| {
-        count.checked_add(if face.len() == 4 { 1 } else { face.len() })
-    }).ok_or_else(|| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive ptex patch count overflows")
-    })?;
+    let patch_count = base_faces
+        .iter()
+        .try_fold(0usize, |count, face| {
+            count.checked_add(if face.len() == 4 { 1 } else { face.len() })
+        })
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "adaptive ptex patch count overflows",
+            )
+        })?;
     let edge_request_count = patch_count.checked_mul(4).ok_or_else(|| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive edge request count overflows")
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive edge request count overflows",
+        )
     })?;
     let minimum_triangles = patch_count.checked_mul(2).ok_or_else(|| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive patch triangle estimate overflows")
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive patch triangle estimate overflows",
+        )
     })?;
     let patch_storage = dicing_buffer_bytes(patch_count, size_of::<Patch>())?;
-    let request_storage =
-        dicing_buffer_bytes(edge_request_count, size_of::<EdgeRequest>() + 128)?;
+    let request_storage = dicing_buffer_bytes(edge_request_count, size_of::<EdgeRequest>() + 128)?;
     let tree_storage = dicing_buffer_bytes(patch_count, 128)?;
     let patch_bytes = patch_storage
         .checked_add(request_storage)
@@ -762,8 +804,7 @@ pub(super) fn dice(
             let mut points = (*full_edge).clone();
             let has_ngon_half = candidates.iter().any(|(lo, hi, _)| {
                 (*lo <= PARAM_EPSILON && (*hi - 0.5).abs() <= PARAM_EPSILON)
-                    || ((*lo - 0.5).abs() <= PARAM_EPSILON
-                        && *hi >= 1.0 - PARAM_EPSILON)
+                    || ((*lo - 0.5).abs() <= PARAM_EPSILON && *hi >= 1.0 - PARAM_EPSILON)
             });
             if matches!(curve, CurveKey::BaseEdge(_, _))
                 && has_ngon_half
@@ -798,14 +839,15 @@ pub(super) fn dice(
         };
         points.sort_by(f64::total_cmp);
         points.dedup_by(|left, right| (*left - *right).abs() <= PARAM_EPSILON);
-        retained_curve_points = retained_curve_points
-            .checked_add(points.len())
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::LimitExceeded,
-                    "adaptive retained curve point count overflows",
-                )
-            })?;
+        retained_curve_points =
+            retained_curve_points
+                .checked_add(points.len())
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "adaptive retained curve point count overflows",
+                    )
+                })?;
         check_diced_capacity(
             0,
             minimum_triangles,
@@ -829,6 +871,7 @@ pub(super) fn dice(
             &curve_points,
             surface,
             config,
+            camera_frame.as_ref(),
             target_size,
             max_segments,
             &mut builder,
@@ -1129,13 +1172,15 @@ fn edge_measure(
     match config.space {
         AdaptiveSpace::Object => Ok(local_delta.length()),
         AdaptiveSpace::Pixel => {
-            let camera = config.camera.as_ref().expect("pixel dicing camera validated");
+            let camera = config
+                .camera
+                .as_ref()
+                .expect("pixel dicing camera validated");
             let first_world = config.object_to_world.transform_point3(first);
             let second_world = config.object_to_world.transform_point3(second);
             let midpoint = (first_world + second_world) * 0.5;
             let frame = camera_frame.expect("pixel dicing camera frame validated");
-            let pixel_width =
-                world_pixel_width(camera, frame, midpoint, config.offscreen_scale)?;
+            let pixel_width = world_pixel_width(camera, frame, midpoint, config.offscreen_scale)?;
             let length = (second_world - first_world).length() / pixel_width;
             if length.is_finite() {
                 Ok(length)
@@ -1155,7 +1200,7 @@ fn world_pixel_width(
     world: DVec3,
     offscreen_scale: f64,
 ) -> Result<f64> {
-    let local = camera.world_to_camera.transform_point3(world);
+    let local = frame.world_to_camera.transform_point3(world);
     if !local.is_finite() {
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1260,6 +1305,7 @@ fn dice_patch(
     curve_points: &BTreeMap<CurveKey, Vec<f64>>,
     surface: &LimitSurface,
     config: &AdaptiveDicingConfig,
+    camera_frame: Option<&CameraDicingFrame>,
     target_size: f64,
     max_segments: usize,
     builder: &mut DicedBuilder,
@@ -1333,26 +1379,15 @@ fn dice_patch(
         for &curve_index in &indices[..indices.len() - 1] {
             let parameter = points[curve_index];
             let sample = sample_on_edge(patch, edge_index, parameter);
-            let key = shared_vertex_key(
-                edge.curve,
-                parameter,
-                curve_index,
-                curve_points,
-                base_faces,
-            )?;
+            let key =
+                shared_vertex_key(edge.curve, parameter, curve_index, curve_points, base_faces)?;
             let index = builder.vertex(key, sample, surface)?;
             edge_vertices[edge_index].push(GridVertex { index, sample });
         }
         let last_index = *indices.last().expect("at least two edge samples");
         let parameter = points[last_index];
         let sample = sample_on_edge(patch, edge_index, parameter);
-        let key = shared_vertex_key(
-            edge.curve,
-            parameter,
-            last_index,
-            curve_points,
-            base_faces,
-        )?;
+        let key = shared_vertex_key(edge.curve, parameter, last_index, curve_points, base_faces)?;
         let index = builder.vertex(key, sample, surface)?;
         edge_vertices[edge_index].push(GridVertex { index, sample });
     }
@@ -1375,7 +1410,8 @@ fn dice_patch(
         return builder.zip_boundaries(&top, &edge_vertices[0]);
     }
 
-    let area = patch_area(patch, surface, config)?;
+    let area = patch_area(patch, surface, config, camera_frame)?;
+
     let target_triangle_area = 0.5 * target_size * target_size;
     if !target_triangle_area.is_finite() || target_triangle_area <= 0.0 {
         return Err(PotError::invalid_argument(
@@ -1405,36 +1441,33 @@ fn dice_patch(
     let grid_mu = scaled_grid_factor(scale, mu, grid_cap)?;
     let grid_mv = scaled_grid_factor(scale, mv, grid_cap)?;
     if grid_mu == 1 || grid_mv == 1 {
-        let patch_triangles = edge_segments.iter().try_fold(0usize, |total, &count| {
-            total.checked_add(count)
-        }).ok_or_else(|| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "adaptive patch fan triangle estimate overflows",
-            )
-        })?;
+        let patch_triangles = edge_segments
+            .iter()
+            .try_fold(0usize, |total, &count| total.checked_add(count))
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "adaptive patch fan triangle estimate overflows",
+                )
+            })?;
         builder.check_capacity(1, patch_triangles, edge_temp_bytes)?;
         return dice_patch_fan(patch, &edge_vertices, surface, builder);
     }
 
     // Cycles dice.cpp:63-97 estimates patch area from a 3x3 projected sample and solves an
     // interior scale against edge factors; its grid is stitched to independently diced edges.
-    let grid_inner_vertices = (grid_mu - 1)
-        .checked_mul(grid_mv - 1)
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "adaptive interior vertex estimate overflows",
-            )
-        })?;
-    let interior_cells = (grid_mu - 2)
-        .checked_mul(grid_mv - 2)
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "adaptive interior cell estimate overflows",
-            )
-        })?;
+    let grid_inner_vertices = (grid_mu - 1).checked_mul(grid_mv - 1).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive interior vertex estimate overflows",
+        )
+    })?;
+    let interior_cells = (grid_mu - 2).checked_mul(grid_mv - 2).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive interior cell estimate overflows",
+        )
+    })?;
     let interior_triangles = interior_cells.checked_mul(2).ok_or_else(|| {
         PotError::new(
             ErrorCode::LimitExceeded,
@@ -1450,14 +1483,15 @@ fn dice_patch(
                 "adaptive stitch triangle estimate overflows",
             )
         })?;
-    let outer_stitches = edge_segments.iter().try_fold(0usize, |total, &count| {
-        total.checked_add(count)
-    }).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "adaptive boundary triangle estimate overflows",
-        )
-    })?;
+    let outer_stitches = edge_segments
+        .iter()
+        .try_fold(0usize, |total, &count| total.checked_add(count))
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "adaptive boundary triangle estimate overflows",
+            )
+        })?;
     let patch_triangles = interior_triangles
         .checked_add(inner_stitches)
         .and_then(|count| count.checked_add(outer_stitches))
@@ -1468,16 +1502,28 @@ fn dice_patch(
             )
         })?;
     let grid_rows = grid_mv.checked_add(1).ok_or_else(|| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive grid row count overflows")
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive grid row count overflows",
+        )
     })?;
     let grid_columns = grid_mu.checked_add(1).ok_or_else(|| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive grid column count overflows")
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive grid column count overflows",
+        )
     })?;
     let grid_cells = grid_rows.checked_mul(grid_columns).ok_or_else(|| {
-        PotError::new(ErrorCode::LimitExceeded, "adaptive grid cell count overflows")
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "adaptive grid cell count overflows",
+        )
     })?;
     let mut grid_temporary_bytes = dicing_buffer_bytes(grid_cells, size_of::<GridVertex>())?
-        .checked_add(dicing_buffer_bytes(grid_rows, size_of::<Vec<GridVertex>>())?)
+        .checked_add(dicing_buffer_bytes(
+            grid_rows,
+            size_of::<Vec<GridVertex>>(),
+        )?)
         .ok_or_else(|| {
             PotError::new(
                 ErrorCode::LimitExceeded,
@@ -1590,6 +1636,7 @@ fn patch_area(
     patch: &Patch,
     surface: &LimitSurface,
     config: &AdaptiveDicingConfig,
+    camera_frame: Option<&CameraDicingFrame>,
 ) -> Result<f64> {
     let mut points = [[DVec3::ZERO; 3]; 3];
     for (i, row) in points.iter_mut().enumerate() {
@@ -1598,6 +1645,7 @@ fn patch_area(
                 patch,
                 surface,
                 config,
+                camera_frame,
                 i as f64 * 0.5,
                 j as f64 * 0.5,
             )?;
@@ -1645,6 +1693,7 @@ fn patch_measure_point(
     patch: &Patch,
     surface: &LimitSurface,
     config: &AdaptiveDicingConfig,
+    camera_frame: Option<&CameraDicingFrame>,
     u: f64,
     v: f64,
 ) -> Result<DVec3> {
@@ -1663,9 +1712,15 @@ fn patch_measure_point(
     match config.space {
         AdaptiveSpace::Object => Ok(point),
         AdaptiveSpace::Pixel => {
-            let camera = config.camera.as_ref().expect("pixel dicing camera validated");
+            let camera = config
+                .camera
+                .as_ref()
+                .expect("pixel dicing camera validated");
             let world = config.object_to_world.transform_point3(point);
-            let camera_point = camera.world_to_camera.transform_point3(world);
+            let camera_point = camera_frame
+                .expect("pixel dicing camera frame validated")
+                .world_to_camera
+                .transform_point3(world);
             let raster = camera_raster_position(camera, camera_point);
             if raster.is_finite() {
                 Ok(DVec3::new(raster.x, raster.y, 0.0))
@@ -1691,8 +1746,7 @@ fn camera_raster_position(camera: &AdaptiveCamera, local: DVec3) -> DVec2 {
     let view_factor = if horizontal_fit { 1.0 } else { ycor };
     let ndc = match camera.projection {
         CameraProjection::Orthographic => DVec2::new(
-            2.0 * local.x * view_factor / camera.ortho_scale
-                - 2.0 * camera.shift_x * view_factor,
+            2.0 * local.x * view_factor / camera.ortho_scale - 2.0 * camera.shift_x * view_factor,
             2.0 * local.y * view_factor / (ycor * camera.ortho_scale)
                 - 2.0 * camera.shift_y * view_factor / ycor,
         ),
@@ -1706,8 +1760,7 @@ fn camera_raster_position(camera: &AdaptiveCamera, local: DVec3) -> DVec2 {
             DVec2::new(
                 2.0 * local.x * view_factor * camera.lens_mm / (depth * sensor_size)
                     - 2.0 * camera.shift_x * view_factor,
-                2.0 * local.y * view_factor * camera.lens_mm
-                    / (depth * ycor * sensor_size)
+                2.0 * local.y * view_factor * camera.lens_mm / (depth * ycor * sensor_size)
                     - 2.0 * camera.shift_y * view_factor / ycor,
             )
         }
@@ -1732,7 +1785,7 @@ fn camera_raster_position(camera: &AdaptiveCamera, local: DVec3) -> DVec2 {
             } else {
                 DVec2::new(
                     direction.x.atan2(direction.z) / std::f64::consts::PI,
-                    direction.y.clamp(-1.0, 1.0) / std::f64::consts::FRAC_PI_2,
+                    direction.y.clamp(-1.0, 1.0).asin() / std::f64::consts::FRAC_PI_2,
                 )
             };
             // Existing raster rays add 2*shift in NDC (raster.rs:1017-1019), so invert that
@@ -1743,10 +1796,7 @@ fn camera_raster_position(camera: &AdaptiveCamera, local: DVec3) -> DVec2 {
             )
         }
     };
-    DVec2::new(
-        (ndc.x + 1.0) * 0.5 * width,
-        (1.0 - ndc.y) * 0.5 * height,
-    )
+    DVec2::new((ndc.x + 1.0) * 0.5 * width, (1.0 - ndc.y) * 0.5 * height)
 }
 // Match render/preview.rs:462-465: stored panorama type selects equirectangular or equidistant;
 // the separate Fisheye projection maps to equidistant.
@@ -1772,9 +1822,7 @@ fn shared_vertex_key(
     base_faces: &[Vec<usize>],
 ) -> Result<DicedVertexKey> {
     match curve {
-        CurveKey::BaseEdge(a, _) if parameter <= PARAM_EPSILON => {
-            Ok(DicedVertexKey::BaseVertex(a))
-        }
+        CurveKey::BaseEdge(a, _) if parameter <= PARAM_EPSILON => Ok(DicedVertexKey::BaseVertex(a)),
         CurveKey::BaseEdge(_, b) if parameter >= 1.0 - PARAM_EPSILON => {
             Ok(DicedVertexKey::BaseVertex(b))
         }
@@ -1784,7 +1832,10 @@ fn shared_vertex_key(
         }
         CurveKey::NgonSpoke(face, edge) if parameter <= PARAM_EPSILON => {
             let corners = base_faces.get(face).ok_or_else(|| {
-                PotError::new(ErrorCode::InternalError, "n-gon spoke references a missing face")
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "n-gon spoke references a missing face",
+                )
             })?;
             let a = corners[edge];
             let b = corners[(edge + 1) % corners.len()];
@@ -1838,20 +1889,113 @@ fn dice_patch_fan(
     Ok(())
 }
 
-fn dice_single_quad(edge_vertices: &[Vec<GridVertex>; 4], builder: &mut DicedBuilder) -> Result<()> {
+fn dice_single_quad(
+    edge_vertices: &[Vec<GridVertex>; 4],
+    builder: &mut DicedBuilder,
+) -> Result<()> {
     let c0 = edge_vertices[0][0];
     let c1 = *edge_vertices[0].last().expect("patch edge has a corner");
     let c2 = *edge_vertices[1].last().expect("patch edge has a corner");
     let c3 = *edge_vertices[2].last().expect("patch edge has a corner");
-    let diagonal_02 = builder.local_positions[c0.index]
-        .distance_squared(builder.local_positions[c2.index]);
-    let diagonal_13 = builder.local_positions[c1.index]
-        .distance_squared(builder.local_positions[c3.index]);
+    let diagonal_02 =
+        builder.local_positions[c0.index].distance_squared(builder.local_positions[c2.index]);
+    let diagonal_13 =
+        builder.local_positions[c1.index].distance_squared(builder.local_positions[c3.index]);
     if diagonal_02 <= diagonal_13 {
         builder.emit_triangle(c0, c1, c2)?;
         builder.emit_triangle(c0, c2, c3)
     } else {
         builder.emit_triangle(c0, c1, c3)?;
         builder.emit_triangle(c1, c2, c3)
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "small deterministic adaptive camera checks"
+)]
+mod tests {
+    use super::{AdaptiveCamera, CameraDicingFrame, camera_raster_position, world_pixel_width};
+    use crate::model::CameraProjection;
+    use glam::{DMat4, DVec3};
+
+    fn camera(projection: CameraProjection, camera_to_world: DMat4) -> AdaptiveCamera {
+        AdaptiveCamera {
+            world_to_camera: camera_to_world.inverse(),
+            projection,
+            lens_mm: 50.0,
+            sensor_width_mm: 36.0,
+            sensor_height_mm: 24.0,
+            sensor_fit: "AUTO".to_owned(),
+            panorama_type: "equirectangular".to_owned(),
+            clip_start: 0.1,
+            ortho_scale: 8.0,
+            shift_x: 0.0,
+            shift_y: 0.0,
+            resolution: [100, 80],
+        }
+    }
+
+    #[test]
+    fn camera_object_scale_does_not_change_pixel_metrics_or_origin() {
+        let position = DVec3::new(4.0, -2.0, 3.0);
+        let unit = DMat4::from_cols(
+            DVec3::X.extend(0.0),
+            DVec3::Y.extend(0.0),
+            DVec3::Z.extend(0.0),
+            position.extend(1.0),
+        );
+        let scaled = DMat4::from_cols(
+            (DVec3::X * 2.0).extend(0.0),
+            (DVec3::Y * 3.0).extend(0.0),
+            (DVec3::Z * 4.0).extend(0.0),
+            position.extend(1.0),
+        );
+
+        for projection in [
+            CameraProjection::Orthographic,
+            CameraProjection::Perspective,
+            CameraProjection::Panorama,
+            CameraProjection::Fisheye,
+        ] {
+            let unit_camera = camera(projection, unit);
+            let scaled_camera = camera(projection, scaled);
+            let unit_frame = CameraDicingFrame::build(&unit_camera).unwrap();
+            let scaled_frame = CameraDicingFrame::build(&scaled_camera).unwrap();
+            assert_eq!(
+                unit_frame.orthographic_pixel_width,
+                scaled_frame.orthographic_pixel_width
+            );
+            assert_eq!(
+                unit_frame.perspective_pixel_scale,
+                scaled_frame.perspective_pixel_scale
+            );
+            assert_eq!(
+                unit_frame.perspective_frustum,
+                scaled_frame.perspective_frustum
+            );
+            assert_eq!(
+                unit_frame.panorama_pixel_scale,
+                scaled_frame.panorama_pixel_scale
+            );
+
+            let world = position + DVec3::new(0.25, 0.5, -4.0);
+            let unit_local = unit_frame.world_to_camera.transform_point3(world);
+            let scaled_local = scaled_frame.world_to_camera.transform_point3(world);
+            assert!((unit_local - DVec3::new(0.25, 0.5, -4.0)).length() < 1.0e-12);
+            assert!((scaled_local - unit_local).length() < 1.0e-12);
+            let unit_width = world_pixel_width(&unit_camera, &unit_frame, world, 1.0).unwrap();
+            let scaled_width =
+                world_pixel_width(&scaled_camera, &scaled_frame, world, 1.0).unwrap();
+            assert!((scaled_width - unit_width).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn equirectangular_raster_y_uses_latitude() {
+        let camera = camera(CameraProjection::Panorama, DMat4::IDENTITY);
+        let raster = camera_raster_position(&camera, DVec3::new(0.0, 1.0, -1.0));
+        assert!((raster.y - 20.0).abs() < 1.0e-12);
     }
 }

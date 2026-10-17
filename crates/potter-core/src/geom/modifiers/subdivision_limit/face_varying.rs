@@ -15,7 +15,9 @@ use glam::DVec2;
 
 use super::super::subdivision_uv::{FvarLinear, ValueMap};
 use super::{
-    level::{Level, VTag, RULE_CORNER, RULE_CREASE, SHARPNESS_INFINITE, is_infinite, is_semi_sharp},
+    level::{
+        Level, RULE_CORNER, RULE_CREASE, SHARPNESS_INFINITE, VTag, is_infinite, is_semi_sharp,
+    },
     refine::Refined,
 };
 
@@ -64,7 +66,11 @@ impl FVarTag {
         if !self.mismatch {
             return tag;
         }
-        tag.rule = if self.crease { RULE_CREASE } else { RULE_CORNER };
+        tag.rule = if self.crease {
+            RULE_CREASE
+        } else {
+            RULE_CORNER
+        };
         if self.crease || self.semi_sharp {
             tag.inf_sharp = false;
             tag.inf_sharp_crease = true;
@@ -118,8 +124,10 @@ pub(super) fn base(
     level.derive_base_tags(false, &non_manifold);
     for edge in 0..level.edge_count() {
         let [a, b] = level.edges[edge];
-        let position_edge = geometric_edges
-            [&(map.vertex[a].min(map.vertex[b]), map.vertex[a].max(map.vertex[b]))];
+        let position_edge = geometric_edges[&(
+            map.vertex[a].min(map.vertex[b]),
+            map.vertex[a].max(map.vertex[b]),
+        )];
         level.etags[edge].non_manifold |= geometry.etags[position_edge].non_manifold
             || is_inconsistently_wound_edge(geometry, position_edge);
         level.etags[edge].linear = linear_edges[position_edge];
@@ -191,7 +199,11 @@ fn fan(geometry: &Level, vertex: usize) -> Option<Fan> {
                 [only] if *only == face => return None,
                 _ => {}
             }
-            face = if around[0] == face { *around.get(1)? } else { around[0] };
+            face = if around[0] == face {
+                *around.get(1)?
+            } else {
+                around[0]
+            };
             corner = geometry.face_edges[face]
                 .iter()
                 .position(|&e| e == next_edge)?;
@@ -368,7 +380,14 @@ fn values(
     linear: FvarLinear,
     preserve_corners: bool,
     input: &ValueMap,
-) -> (ValueMap, Vec<f64>, Vec<bool>, Vec<FVarTag>, Vec<Option<usize>>, Vec<bool>) {
+) -> (
+    ValueMap,
+    Vec<f64>,
+    Vec<bool>,
+    Vec<FVarTag>,
+    Vec<Option<usize>>,
+    Vec<bool>,
+) {
     let vertex_count = geometry.vertex_count();
     let make_smooth_corners_sharp = !preserve_corners && linear.corners_sharp();
     let mut mismatch = vec![false; geometry.edge_count()];
@@ -405,7 +424,8 @@ fn values(
                 if around.len() < 2 {
                     continue;
                 }
-                let value_at = |face: usize| input.corners[face][geometry.corner_of(face, position)];
+                let value_at =
+                    |face: usize| input.corners[face][geometry.corner_of(face, position)];
                 let first = value_at(around[0]);
                 if around[1..].iter().any(|&face| value_at(face) != first) {
                     mismatch[edge] = true;
@@ -449,7 +469,11 @@ fn values(
     }
 
     let mut map = ValueMap {
-        corners: input.corners.iter().map(|corners| vec![0; corners.len()]).collect(),
+        corners: input
+            .corners
+            .iter()
+            .map(|corners| vec![0; corners.len()])
+            .collect(),
         vertex: Vec::new(),
         uvs: Vec::new(),
     };
@@ -515,9 +539,8 @@ fn values(
                         ..FVarTag::default()
                     }
                 } else {
-                    let is_inf_sharp = all_sharp
-                        || span.inf > 0
-                        || (span.size == 1 && linear.corners_sharp());
+                    let is_inf_sharp =
+                        all_sharp || span.inf > 0 || (span.size == 1 && linear.corners_sharp());
                     let xordinary = if span.size == 1 {
                         !is_inf_sharp
                     } else {
@@ -558,7 +581,14 @@ fn values(
             map.corners[face][corner] = first + vertex.sibling[i];
         }
     }
-    (map, sharpness, non_manifold_values, fvar_tags, dependent_sources, linear_edges)
+    (
+        map,
+        sharpness,
+        non_manifold_values,
+        fvar_tags,
+        dependent_sources,
+        linear_edges,
+    )
 }
 
 /// Position topology marks edges traversed in the same direction by both incident faces as

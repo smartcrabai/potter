@@ -6,14 +6,14 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "the shared native oracle module exposes helpers not used by this test"
 )]
 mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
 
 use std::{error::Error, fs, path::Path};
 
@@ -96,7 +96,10 @@ fn field_image_alpha_times_base_alpha_renders_and_round_trips_through_blend() ->
     let root = tempdir()?;
     let (oracle_blend, _) = build_oracle(&blender, root.path())?;
     let (project, import_report) = import_blend(&blender, root.path(), "project", &oracle_blend)?;
-    assert!(losses(&import_report).is_empty(), "oracle import lost data: {import_report}");
+    assert!(
+        losses(&import_report).is_empty(),
+        "oracle import lost data: {import_report}"
+    );
     let imported_scene = read_scene(&project)?;
     let plane = node_id(&imported_scene, "TexturePlane")?;
     let active_scene = imported_scene["active_scene"]
@@ -126,7 +129,10 @@ fn field_image_alpha_times_base_alpha_renders_and_round_trips_through_blend() ->
                      "film_transparent": true, "engine": "path"}}
         ]),
     )?;
-    assert_eq!(authored["ok"], true, "field material setup failed: {authored}");
+    assert_eq!(
+        authored["ok"], true,
+        "field material setup failed: {authored}"
+    );
 
     // The sample point is inside TexturePlane; all color channels are immaterial to this alpha proof.
     let exr_dir = root.path().join("rendered");
@@ -139,7 +145,10 @@ fn field_image_alpha_times_base_alpha_renders_and_round_trips_through_blend() ->
         .arg("--json");
     let output = native_oracle::checked(&mut render, "Potter transparent alpha render")?;
     let render_report: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(render_report["ok"], true, "render did not report success: {render_report}");
+    assert_eq!(
+        render_report["ok"], true,
+        "render did not report success: {render_report}"
+    );
     let exr = exr_dir.join("frame_0001.exr");
     assert!(fs::metadata(&exr)?.len() > 0, "Potter wrote an empty EXR");
     let loaded = apply_operations(
@@ -187,7 +196,12 @@ fn field_image_alpha_times_base_alpha_renders_and_round_trips_through_blend() ->
         BLENDER_ALPHA_GRAPH_SCRIPT,
     )?;
     let blender_dump_path = root.path().join("blender_alpha_graph.json");
-    run_blender(&blender, &inspect_script, Some(&exported_blend), &blender_dump_path)?;
+    run_blender(
+        &blender,
+        &inspect_script,
+        Some(&exported_blend),
+        &blender_dump_path,
+    )?;
     let blender_graph: Value = serde_json::from_slice(&fs::read(&blender_dump_path)?)?;
     assert_eq!(blender_graph["surface_render_method"], "BLENDED");
     assert_eq!(blender_graph["alpha_mode"], "blend");

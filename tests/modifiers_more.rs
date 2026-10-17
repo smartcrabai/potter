@@ -448,8 +448,8 @@ fn boolean_modifier_apply_resolves_scene_object_operand() -> Result<(), Box<dyn 
 #[test]
 fn subdivision_accepts_level_six_within_the_evaluated_budget() {
     let source = Mesh::box_mesh(BoxParams::default()).unwrap();
-    let result = evaluate_modifiers(&source, &[modifier("subdivision", json!({"levels": 6}))])
-        .unwrap();
+    let result =
+        evaluate_modifiers(&source, &[modifier("subdivision", json!({"levels": 6}))]).unwrap();
     assert_eq!(result.faces.len(), 24_576);
     assert_eq!(result.vertices.len(), 24_578);
     let clamped = evaluate_modifiers(
@@ -474,11 +474,13 @@ fn subdivision_accepts_level_six_within_the_evaluated_budget() {
     assert_eq!(multires_level_six.vertices.len(), 24_578);
     let resource_limited = evaluate_modifiers(
         &source,
-        &[modifier("multires", json!({"levels": 11, "total_levels": 11}))],
+        &[modifier(
+            "multires",
+            json!({"levels": 11, "total_levels": 11}),
+        )],
     )
     .unwrap_err();
     assert_eq!(resource_limited.code, ErrorCode::LimitExceeded);
-
 }
 
 #[test]

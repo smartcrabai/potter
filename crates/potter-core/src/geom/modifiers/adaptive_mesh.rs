@@ -8,8 +8,9 @@ use crate::{
 };
 
 use super::{
-    Mesh, MeshError, mesh_error,
+    Mesh, MeshError,
     adaptive_dicing::DicedTopology,
+    mesh_error,
     provenance::{Origin, remap_attributes},
     subdivision_limit::{LimitSurface, Sample},
     subdivision_normals,
@@ -26,7 +27,8 @@ pub(super) fn assemble(
     linear: FvarLinear,
     preserve_corners: bool,
     input_corner_normals: Option<&[DVec3]>,
-) -> Result<Mesh> {
+    analytic_normals: bool,
+) -> Result<(Mesh, Option<Vec<Option<DVec3>>>)> {
     if base_faces.len() != source.faces.len() {
         return Err(PotError::invalid_argument(
             "adaptive mesh base faces must match the source mesh",
@@ -52,7 +54,10 @@ pub(super) fn assemble(
     for face in base_faces {
         face_corner_starts.push(source_corner_count);
         source_corner_count = source_corner_count.checked_add(face.len()).ok_or_else(|| {
-            PotError::new(ErrorCode::LimitExceeded, "adaptive mesh corner count overflows")
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "adaptive mesh corner count overflows",
+            )
         })?;
     }
     if input_corner_normals.is_some_and(|normals| normals.len() != source_corner_count) {
@@ -62,6 +67,8 @@ pub(super) fn assemble(
     }
 
     let mut result = Mesh::new();
+    let mut adaptive_normals =
+        analytic_normals.then(|| Vec::with_capacity(topology.samples.vertices.len()));
     let mut origin = Origin {
         vertices: Vec::with_capacity(topology.samples.vertices.len()),
         faces: Vec::with_capacity(topology.faces.len()),
@@ -72,6 +79,11 @@ pub(super) fn assemble(
             invalid_topology("adaptive mesh vertex is missing its limit-surface sample")
         })?;
         validate_sample(base_faces, sample)?;
+        // Cycles 5.2.2 EdgeDice::set_vertex stores the patch's normalized dPdu × dPdv.
+        if let Some(normals) = &mut adaptive_normals {
+            let (_, du, dv) = surface.point_and_derivatives(sample)?;
+            normals.push(Some(du.cross(dv).normalize_or_zero()));
+        }
         if !position.is_finite() {
             return Err(PotError::new(
                 ErrorCode::EvaluationFailed,
@@ -110,20 +122,21 @@ pub(super) fn assemble(
         let ids = indices
             .iter()
             .map(|&index| {
-                result
-                    .vertices
-                    .get(index)
-                    .map(|vertex| vertex.id)
-                    .ok_or(MeshError::InvalidTopology(
-                        "adaptive mesh face references a missing vertex",
-                    ))
+                result.vertices.get(index).map(|vertex| vertex.id).ok_or(
+                    MeshError::InvalidTopology("adaptive mesh face references a missing vertex"),
+                )
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         output_faces.push(Ok((ids, material_index)));
         origin.faces.push(Some(source_face));
-        output_corner_count = output_corner_count.checked_add(samples.len()).ok_or_else(|| {
-            PotError::new(ErrorCode::LimitExceeded, "adaptive mesh corner count overflows")
-        })?;
+        output_corner_count = output_corner_count
+            .checked_add(samples.len())
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "adaptive mesh corner count overflows",
+                )
+            })?;
         let corners = origin.corners.as_mut().expect("corner origins are enabled");
         corners.reserve(samples.len());
         for &sample in samples {
@@ -181,7 +194,7 @@ pub(super) fn assemble(
         clnor::write_codes(&mut result, None, normal_options)?;
     }
     super::validated(&result)?;
-    Ok(result)
+    Ok((result, adaptive_normals))
 }
 
 fn validate_sample(base_faces: &[Vec<usize>], sample: Sample) -> Result<()> {
@@ -211,12 +224,7 @@ fn add_sample_weights(
     source_index: impl Fn(usize) -> usize,
 ) {
     let (u, v) = (sample.u, sample.v);
-    let bilinear = [
-        (1.0 - u) * (1.0 - v),
-        u * (1.0 - v),
-        u * v,
-        (1.0 - u) * v,
-    ];
+    let bilinear = [(1.0 - u) * (1.0 - v), u * (1.0 - v), u * v, (1.0 - u) * v];
     if face_size == 4 {
         for (corner, weight) in bilinear.into_iter().enumerate() {
             add_weight(weights, source_index(corner), weight);
@@ -250,4 +258,112 @@ fn add_weight(weights: &mut Vec<(usize, f64)>, index: usize, weight: f64) {
 
 fn invalid_topology(message: &'static str) -> PotError {
     PotError::new(ErrorCode::InternalError, message)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "small adaptive topology fixture")]
+
+    use std::collections::BTreeMap;
+
+    use glam::DVec3;
+
+    use super::super::subdivision_limit::{BaseSharpness, Samples};
+    use super::{DicedTopology, FvarLinear, LimitSurface, Mesh, Sample, assemble};
+
+    #[test]
+    fn output_normals_follow_each_unique_vertex_ptex_derivative() {
+        let source = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::new(-1.0, -1.0, 0.0),
+                DVec3::new(1.0, -1.0, 0.0),
+                DVec3::new(1.0, 1.0, 1.0),
+                DVec3::new(-1.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )
+        .unwrap();
+        let base_faces = vec![vec![0, 1, 2, 3]];
+        let positions: Vec<DVec3> = source.vertices.iter().map(|vertex| vertex.co).collect();
+        let edge_sharpness = BTreeMap::new();
+        let non_manifold = [false; 4];
+        let surface = LimitSurface::build(
+            &base_faces,
+            &positions,
+            BaseSharpness::Creases {
+                edges: &edge_sharpness,
+                non_manifold: &non_manifold,
+                preserve_corners: false,
+            },
+            1,
+        );
+        let samples = vec![
+            Sample {
+                face: 0,
+                ptex: 0,
+                u: 0.2,
+                v: 0.2,
+            },
+            Sample {
+                face: 0,
+                ptex: 0,
+                u: 0.8,
+                v: 0.2,
+            },
+            Sample {
+                face: 0,
+                ptex: 0,
+                u: 0.5,
+                v: 0.8,
+            },
+        ];
+        let topology = DicedTopology {
+            faces: vec![vec![0, 1, 2]],
+            samples: Samples {
+                vertices: samples.iter().copied().map(Some).collect(),
+                corners: vec![samples.clone()],
+            },
+            positions: samples
+                .iter()
+                .map(|sample| surface.evaluate(*sample))
+                .collect(),
+        };
+        let expected: Vec<DVec3> = samples
+            .iter()
+            .map(|sample| {
+                let (_, du, dv) = surface.point_and_derivatives(*sample).unwrap();
+                du.cross(dv).normalize_or_zero()
+            })
+            .collect();
+        let (_, normals) = assemble(
+            &source,
+            &base_faces,
+            &topology,
+            &surface,
+            &[],
+            FvarLinear::All,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let normals = normals.unwrap();
+        assert_eq!(normals.len(), topology.positions.len());
+        for (actual, expected) in normals.iter().zip(expected) {
+            assert!((actual.unwrap() - expected).length() < 1.0e-12);
+        }
+        let (_, simple_normals) = assemble(
+            &source,
+            &base_faces,
+            &topology,
+            &surface,
+            &[],
+            FvarLinear::All,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(simple_normals.is_none());
+    }
 }

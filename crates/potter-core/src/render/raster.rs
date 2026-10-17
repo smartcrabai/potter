@@ -1776,7 +1776,9 @@ mod smooth_shading_tests {
 
     impl SurfaceShader for RecordingShader {
         fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 3]> {
-            self.calls.borrow_mut().push((hit.point, hit.normal, hit.geometric));
+            self.calls
+                .borrow_mut()
+                .push((hit.point, hit.normal, hit.geometric));
             Ok([0.25, 0.5, 0.75])
         }
     }

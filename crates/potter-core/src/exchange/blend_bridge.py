@@ -20,6 +20,8 @@ ALPHA_MODE_PROPERTY = "potter.alpha_mode"
 ALPHA_MODES = ("opaque", "clip", "blend")
 DEFERRED_MDISPS_FILEPATHS = {}
 RESTORED_MDISPS_MESHES = {}
+MULTIRES_MASK_LEVEL_BY_MESH = {}
+MULTIRES_HIDDEN_MESHES = set()
 POTTER_TO_BLENDER_ANIMATION_PATH = {
     "transform.translation": "location",
     "transform.rotation_euler": "rotation_euler",
@@ -3355,6 +3357,124 @@ def _apply_blender_attributes(mesh, attributes, layer_names, layout):
             _set_attribute_item(attribute.data[index], source["data_type"], value)
 
 
+def _apply_multires_control_data(mesh, attributes, face_items, layout):
+    record = attributes.get("multires_displacement")
+    if not isinstance(record, dict):
+        return
+    corner_count = sum(len(face.get("v", [])) for face in face_items)
+    grid_levels = record.get("grid_levels")
+    if grid_levels is None:
+        grid_levels = [int(record.get("total_levels", 0))] * corner_count
+    if len(grid_levels) != corner_count:
+        raise ValueError("multires grid_levels do not match mesh corners")
+    mesh_key = mesh.as_pointer()
+    paint_masks = record.get("paint_mask")
+    if paint_masks:
+        MULTIRES_MASK_LEVEL_BY_MESH[mesh_key] = max(
+            1, max(int(mask.get("level", 0)) for mask in paint_masks))
+    if record.get("hidden") is not None:
+        MULTIRES_HIDDEN_MESHES.add(mesh_key)
+    for field, name, data_type in (("paint_mask", ".sculpt_mask", "FLOAT"),
+                                   ("hidden", ".hide_vert", "BOOLEAN")):
+        grids = record.get(field)
+        if grids is None:
+            continue
+        if len(grids) != corner_count:
+            raise ValueError("multires %s grids do not match mesh corners" % field)
+        corner_values = []
+        # Blender recreates GridPaintMask from its fourth control-vertex sample when sculpt data is ensured.
+        for index, grid in enumerate(grids):
+            if field == "paint_mask":
+                level = int(grid.get("level", 0))
+                values = grid.get("values", [])
+            else:
+                level = int(grid_levels[index])
+                values = grid
+            if level == 0:
+                if values:
+                    raise ValueError("multires %s grid %d has samples at level zero" % (field, index))
+                corner_values.append(0.0 if field == "paint_mask" else False)
+                continue
+            side = (1 << (level - 1)) + 1
+            if len(values) != side * side:
+                raise ValueError("multires %s grid %d has an invalid size" % (field, index))
+            corner_values.append(values[3] if field == "paint_mask" else values[-1])
+        attribute = mesh.attributes.get(name)
+        if attribute is None:
+            corner_values = layout.loops(corner_values, "multires %s control values" % field)
+            point_values = [None] * len(mesh.vertices)
+            for loop_index, value in enumerate(corner_values):
+                point_index = mesh.loops[loop_index].vertex_index
+                previous = point_values[point_index]
+                if previous is not None and previous != value:
+                    raise ValueError("multires %s control values disagree at a shared vertex" % field)
+                point_values[point_index] = value
+            attribute = mesh.attributes.new(name=name, type=data_type, domain="POINT")
+            for index, value in enumerate(point_values):
+                _set_attribute_item(attribute.data[index], data_type,
+                                    value if value is not None else (0.0 if field == "paint_mask" else False))
+        elif attribute.data_type != data_type or attribute.domain != "POINT":
+            raise ValueError("Blender %s attribute has the wrong domain or type" % name)
+
+def _ensure_multires_sculpt_layers(obj):
+    if obj.type != "MESH" or obj.library is not None:
+        return
+    multires = next((modifier for modifier in obj.modifiers if modifier.type == "MULTIRES"), None)
+    if multires is None:
+        return
+    mesh = obj.data
+    mesh_key = mesh.as_pointer()
+    if not any(mesh.attributes.get(name) is not None
+               for name in (".sculpt_mask", ".hide_vert", ".hide_poly")):
+        return
+    scene = next((scene for scene in bpy.data.scenes if obj in scene.objects), None)
+    if scene is None or not scene.view_layers:
+        return
+    view_layer = scene.view_layers[0]
+    previous_active = view_layer.objects.active
+    was_selected = obj.select_get(view_layer=view_layer)
+    previous_sculpt_level = int(multires.sculpt_levels)
+    previous_show_viewport = bool(multires.show_viewport)
+    multires.show_viewport = True
+    requested_mask_level = MULTIRES_MASK_LEVEL_BY_MESH.get(mesh_key)
+    if requested_mask_level is not None:
+        if requested_mask_level > int(multires.total_levels):
+            raise ValueError("GridPaintMask level exceeds the Multires modifier total level")
+        multires.sculpt_levels = requested_mask_level
+    hide_attribute = mesh.attributes.get(".hide_vert")
+    previous_hide_values = None
+    if mesh_key in MULTIRES_HIDDEN_MESHES:
+        if hide_attribute is None or hide_attribute.domain != "POINT" or hide_attribute.data_type != "BOOLEAN":
+            raise ValueError("multires hidden samples need a point hide attribute")
+        previous_hide_values = [bool(item.value) for item in hide_attribute.data]
+        for item in hide_attribute.data:
+            item.value = True
+    try:
+        with bpy.context.temp_override(
+                scene=scene, view_layer=view_layer, object=obj, active_object=obj,
+                selected_objects=[obj], selected_editable_objects=[obj]):
+            obj.select_set(True, view_layer=view_layer)
+            view_layer.objects.active = obj
+            if obj.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            bpy.ops.object.mode_set(mode="SCULPT")
+            bpy.context.view_layer.update()
+            bpy.ops.object.mode_set(mode="OBJECT")
+    finally:
+        if obj.mode == "SCULPT":
+            with bpy.context.temp_override(
+                    scene=scene, view_layer=view_layer, object=obj, active_object=obj,
+                    selected_objects=[obj], selected_editable_objects=[obj]):
+                bpy.ops.object.mode_set(mode="OBJECT")
+        if previous_hide_values is not None:
+            hide_attribute = mesh.attributes.get(".hide_vert")
+            for index, value in enumerate(previous_hide_values):
+                hide_attribute.data[index].value = value
+        multires.sculpt_levels = previous_sculpt_level
+        multires.show_viewport = previous_show_viewport
+        obj.select_set(was_selected, view_layer=view_layer)
+        view_layer.objects.active = previous_active
+
 def _apply_color_designation(mesh, attributes):
     """Active and render color layers, set after every color layer (native or Blender-only) exists.
 
@@ -3426,6 +3546,7 @@ def mesh_create(name, raw, block_id):
     _apply_native_crease(mesh, attributes, edge_items, edge_of)
     _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, face_items, edge_of, layout)
     _apply_blender_attributes(mesh, attributes, layer_names, layout)
+    _apply_multires_control_data(mesh, attributes, face_items, layout)
     _apply_color_designation(mesh, attributes)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
@@ -5484,6 +5605,8 @@ def export_doc(doc, target, pack, scene_hash, context):
     DEFERRED_ID_ASSIGNMENTS.clear()
     DEFERRED_MDISPS_FILEPATHS.clear()
     RESTORED_MDISPS_MESHES.clear()
+    MULTIRES_MASK_LEVEL_BY_MESH.clear()
+    MULTIRES_HIDDEN_MESHES.clear()
     # when invoked by Blender builds that ignore the startup flag.
     for scene in bpy.data.scenes:
         scene.camera = None
@@ -6436,6 +6559,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         text = _text_from_string(item.get("name", "Imported Text"), item.get("body", ""))
         set_id(text, item.get("potter_id"))
         set_props(text, item.get("custom_properties", {}))
+    for obj in object_map.values():
+        _ensure_multires_sculpt_layers(obj)
+
     output_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(output_dir, exist_ok=True)
     if pack:

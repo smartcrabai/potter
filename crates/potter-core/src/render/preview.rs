@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{AdaptiveCameraOverride, AdaptiveRenderRequest, EvaluationContext, EvaluationPurpose, Snapshot},
+    eval::{
+        AdaptiveCameraOverride, AdaptiveRenderRequest, EvaluationContext, EvaluationPurpose,
+        Snapshot,
+    },
     hash,
     model::{CameraData, CameraProjection, Id, SceneDoc},
 };
@@ -88,48 +91,46 @@ pub fn render_previews(
     }
     let mode = parse_mode(request.mode)?;
     let labels = resolve_views(request.views, request.camera_id)?;
-    let scene_id = request.context.scene_id.as_ref().unwrap_or(&doc.active_scene);
-    let scene = doc.scenes.get(scene_id).ok_or_else(|| {
-        PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist")
-    })?;
-    let adaptive_enabled = matches!(mode, Mode::Beauty)
-        && scene.render.engine == "path"
-        && has_adaptive_subsurf(doc);
+    let scene_id = request
+        .context
+        .scene_id
+        .as_ref()
+        .unwrap_or(&doc.active_scene);
+    let scene = doc
+        .scenes
+        .get(scene_id)
+        .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
+    let adaptive_enabled =
+        matches!(mode, Mode::Beauty) && scene.render.engine == "path" && has_adaptive_subsurf(doc);
     let images = if matches!(mode, Mode::Beauty) {
         super::path::load_images(doc, project_root, request.staged_assets)?
     } else {
         BTreeMap::new()
     };
-    let (base_snapshot, base_geometry) =
-        if request.camera_id.is_none() || !adaptive_enabled {
-            let (snapshot, node_errors) = Snapshot::evaluate_available_with_cache(
-                doc,
-                request.context,
-                Some(project_root),
-                Some(cache_directory),
-            )?;
-            let mut geometry = extract_geometry(
-                doc,
-                &snapshot,
-                mode,
-                matches!(mode, Mode::Beauty),
-                &images,
-            )?;
-            for (node_id, error) in &node_errors {
-                geometry.warnings.push(json!({
-                    "code": "UNSUPPORTED_FEATURE",
-                    "feature_id": error.details.get("feature_id"),
-                    "node_id": node_id,
-                    "message": error.message,
-                }));
-            }
-            geometry
-                .warnings
-                .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
-            (Some(snapshot), Some(geometry))
-        } else {
-            (None, None)
-        };
+    let (base_snapshot, base_geometry) = if request.camera_id.is_none() || !adaptive_enabled {
+        let (snapshot, node_errors) = Snapshot::evaluate_available_with_cache(
+            doc,
+            request.context,
+            Some(project_root),
+            Some(cache_directory),
+        )?;
+        let mut geometry =
+            extract_geometry(doc, &snapshot, mode, matches!(mode, Mode::Beauty), &images)?;
+        for (node_id, error) in &node_errors {
+            geometry.warnings.push(json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": error.details.get("feature_id"),
+                "node_id": node_id,
+                "message": error.message,
+            }));
+        }
+        geometry
+            .warnings
+            .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
+        (Some(snapshot), Some(geometry))
+    } else {
+        (None, None)
+    };
     let mut pending = Vec::with_capacity(labels.len());
     for label in labels {
         let prepared_from_base = if request.camera_id.is_none() {
@@ -149,9 +150,7 @@ pub fn render_previews(
             .transpose()?;
         let adaptive_render = adaptive_enabled.then(|| AdaptiveRenderRequest {
             camera_id: camera_id.clone(),
-            camera_override: prepared_from_base
-                .as_ref()
-                .map(adaptive_camera_override),
+            camera_override: prepared_from_base.as_ref().map(adaptive_camera_override),
             resolution: [request.size, request.size],
             dicing_rate: scene.render.preview_dicing_rate,
         });
@@ -166,8 +165,7 @@ pub fn render_previews(
                 Some(project_root),
                 Some(cache_directory),
             )?;
-            let mut geometry =
-                extract_geometry(doc, &snapshot, mode, true, &images)?;
+            let mut geometry = extract_geometry(doc, &snapshot, mode, true, &images)?;
             geometry
                 .warnings
                 .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
@@ -187,10 +185,7 @@ pub fn render_previews(
             .as_ref()
             .or(base_geometry.as_ref())
             .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InternalError,
-                    "preview geometry is missing",
-                )
+                PotError::new(ErrorCode::InternalError, "preview geometry is missing")
             })?;
         let prepared = if let Some(camera_id) = request.camera_id {
             stored_camera(doc, snapshot, camera_id)?

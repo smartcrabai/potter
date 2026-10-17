@@ -4340,10 +4340,26 @@ mod tests {
         // Sampling never refuses; strict export refuses on the losses from `attribute_losses`.
         assert!(mesh_sample(&mesh).is_ok());
         let losses = crate::exchange::mesh_attribute_losses("alembic", "triangle", &mesh);
-        assert!(losses.iter().any(|loss| loss.feature_id == "mesh.color_attribute"));
-        assert!(losses.iter().any(|loss| loss.reason.contains("mesh attribute `weight`")));
-        assert!(losses.iter().any(|loss| loss.reason.contains("mesh attribute `seam`")));
-        assert!(losses.iter().all(|loss| !loss.reason.contains("alembic_normals")));
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "mesh.color_attribute")
+        );
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.reason.contains("mesh attribute `weight`"))
+        );
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.reason.contains("mesh attribute `seam`"))
+        );
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("alembic_normals"))
+        );
         Ok(())
     }
 }

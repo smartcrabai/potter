@@ -48,7 +48,11 @@ fn dot(a: Vec3, b: Vec3) -> f32 {
 
 /// `math::cross`.
 fn cross(a: Vec3, b: Vec3) -> Vec3 {
-    Vec3::new(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+    Vec3::new(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    )
 }
 
 /// `math::normalize`: divides by the length. A vector too short to have a direction is zero.
@@ -82,7 +86,8 @@ fn safe_acos(cosine: f32) -> f32 {
         1.0
     };
     let acos = (1.0 - clamped).sqrt()
-        * (1.5707963267 + clamped * (-0.213300989 + clamped * (0.077980478 + clamped * -0.02164095)));
+        * (1.5707963267
+            + clamped * (-0.213300989 + clamped * (0.077980478 + clamped * -0.02164095)));
     if cosine < 0.0 { PI - acos } else { acos }
 }
 
@@ -106,7 +111,11 @@ fn face_normal(points: &[Vec3], face: &[usize]) -> Vec3 {
             normalize_reciprocal(normal)
         }
     };
-    if normal == Vec3::ZERO { Vec3::Z } else { normal }
+    if normal == Vec3::ZERO {
+        Vec3::Z
+    } else {
+        normal
+    }
 }
 
 /// The semantic authored/automatic state stored in Blender's two short loop codes.
@@ -172,7 +181,11 @@ impl Space {
         let dtp = dot(vec_ref, other);
         let ref_beta = if dtp < TRIGO_THRESHOLD {
             let beta = safe_acos(dtp);
-            if dot(vec_ortho, other) < 0.0 { TAU - beta } else { beta }
+            if dot(vec_ortho, other) < 0.0 {
+                TAU - beta
+            } else {
+                beta
+            }
         } else {
             TAU
         };
@@ -195,7 +208,11 @@ impl Space {
             return self.lnor;
         }
         let alpha_factor = codes[0] as f32 / CODE_SCALE;
-        let alpha_range = if alpha_factor > 0.0 { self.ref_alpha } else { TAU - self.ref_alpha };
+        let alpha_range = if alpha_factor > 0.0 {
+            self.ref_alpha
+        } else {
+            TAU - self.ref_alpha
+        };
         let alpha = alpha_range * alpha_factor;
         let sin_alpha = alpha.sin();
         let mut custom = self.lnor * alpha.cos();
@@ -204,7 +221,11 @@ impl Space {
             custom += self.vec_ref * sin_alpha;
             return custom;
         }
-        let beta_range = if beta_factor > 0.0 { self.ref_beta } else { TAU - self.ref_beta };
+        let beta_range = if beta_factor > 0.0 {
+            self.ref_beta
+        } else {
+            TAU - self.ref_beta
+        };
         let beta = beta_range * beta_factor;
         custom += self.vec_ref * (sin_alpha * beta.cos());
         custom += self.vec_ortho * (sin_alpha * beta.sin());
@@ -304,7 +325,10 @@ pub(crate) fn fans(
         total += face.len();
     }
     let points: Vec<Vec3> = points.iter().map(|point| point.as_vec3()).collect();
-    let face_normals: Vec<Vec3> = faces.iter().map(|face| face_normal(&points, face)).collect();
+    let face_normals: Vec<Vec3> = faces
+        .iter()
+        .map(|face| face_normal(&points, face))
+        .collect();
     let mut around: Vec<Vec<(usize, usize)>> = vec![Vec::new(); points.len()];
     for (face_index, face) in faces.iter().enumerate() {
         for (corner, &vertex) in face.iter().enumerate() {
@@ -485,7 +509,10 @@ fn fan_normal(
     let mut sum = Vec3::ZERO;
     for &local in fan {
         let corner = &corners[local];
-        let factor = safe_acos(dot(directions[corner.edge_prev], directions[corner.edge_next]));
+        let factor = safe_acos(dot(
+            directions[corner.edge_prev],
+            directions[corner.edge_next],
+        ));
         sum += face_normals[corner.face] * factor;
     }
     normalize(sum)
@@ -584,12 +611,16 @@ pub(crate) fn corner_order(mesh: &Mesh) -> Result<Option<Vec<usize>>> {
             .get(&format!("f{}", face.id))
             .and_then(Value::as_array)
             .filter(|row| row.len() == face.vertices.len())
-            .ok_or_else(|| normal_state_error("custom normal corner_order row has the wrong size"))?;
+            .ok_or_else(|| {
+                normal_state_error("custom normal corner_order row has the wrong size")
+            })?;
         for value in row {
             let ordinal = value
                 .as_u64()
                 .and_then(|ordinal| usize::try_from(ordinal).ok())
-                .ok_or_else(|| normal_state_error("custom normal corner_order entries must be ordinals"))?;
+                .ok_or_else(|| {
+                    normal_state_error("custom normal corner_order entries must be ordinals")
+                })?;
             flattened.push(ordinal);
         }
     }
@@ -678,7 +709,13 @@ pub(crate) fn mesh_fans(mesh: &Mesh, positions: &[DVec3], numbering: &[usize]) -
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(fans(&points, &faces, &smooth_face_flags(mesh)?, &sharp, numbering))
+    Ok(fans(
+        &points,
+        &faces,
+        &smooth_face_flags(mesh)?,
+        &sharp,
+        numbering,
+    ))
 }
 
 fn resolved_corner_order(mesh: &Mesh, provided: Option<&[usize]>) -> Result<Vec<usize>> {
@@ -690,10 +727,7 @@ fn resolved_corner_order(mesh: &Mesh, provided: Option<&[usize]>) -> Result<Vec<
 }
 
 /// The fan-evaluated loop normals for a typed code buffer, including Auto corners.
-pub(crate) fn evaluate_fan_codes(
-    fans: &Fans,
-    codes: &[CornerNormalCode],
-) -> Result<Vec<Vec3>> {
+pub(crate) fn evaluate_fan_codes(fans: &Fans, codes: &[CornerNormalCode]) -> Result<Vec<Vec3>> {
     if codes.len() != fans.fan_of.len() {
         return Err(normal_state_error(
             "custom normal codes must match the mesh corners",
@@ -789,7 +823,10 @@ fn code_value(code: CornerNormalCode) -> Value {
 
 /// The identity basis is the default, so it is never stored.
 fn is_identity(order: &[usize]) -> bool {
-    order.iter().enumerate().all(|(corner, &ordinal)| corner == ordinal)
+    order
+        .iter()
+        .enumerate()
+        .all(|(corner, &ordinal)| corner == ordinal)
 }
 
 /// One row per face in `mesh.faces` order, keyed `f<id>`, cut from values in corner order.
@@ -798,7 +835,10 @@ fn face_rows(mesh: &Mesh, flat: Vec<Value>) -> Map<String, Value> {
     let mut start = 0;
     for face in &mesh.faces {
         let end = start + face.vertices.len();
-        rows.insert(format!("f{}", face.id), Value::Array(flat[start..end].to_vec()));
+        rows.insert(
+            format!("f{}", face.id),
+            Value::Array(flat[start..end].to_vec()),
+        );
         start = end;
     }
     rows
@@ -836,7 +876,10 @@ fn store_state(
     }
     if let Some(order) = order {
         let flat: Vec<Value> = order.iter().map(|&ordinal| Value::from(ordinal)).collect();
-        attribute.insert("corner_order".to_owned(), Value::Object(face_rows(mesh, flat)));
+        attribute.insert(
+            "corner_order".to_owned(),
+            Value::Object(face_rows(mesh, flat)),
+        );
     }
     mesh.attributes
         .insert("custom_normal".to_owned(), Value::Object(attribute));
@@ -901,7 +944,10 @@ fn mark_custom_normal_edges(
         let count = vertices.len();
         for corner in 0..count {
             outgoing.push(edge_key(vertices[corner], vertices[(corner + 1) % count]));
-            incoming.push(edge_key(vertices[(corner + count - 1) % count], vertices[corner]));
+            incoming.push(edge_key(
+                vertices[(corner + count - 1) % count],
+                vertices[corner],
+            ));
         }
     }
     let mut sharp = sharp_edge_flags(mesh)?;
@@ -1175,11 +1221,7 @@ pub(crate) fn transfer_custom_normals(
 ) -> Result<()> {
     let source_count = corner_count(source);
     let output_count = corner_count(output);
-    if sources.len() != output_count
-        || sources
-            .iter()
-            .flatten()
-            .any(|&index| index >= source_count)
+    if sources.len() != output_count || sources.iter().flatten().any(|&index| index >= source_count)
     {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -1192,8 +1234,7 @@ pub(crate) fn transfer_custom_normals(
             order.to_vec()
         }
         None => {
-            let source_order = corner_order(source)?
-                .unwrap_or_else(|| (0..source_count).collect());
+            let source_order = corner_order(source)?.unwrap_or_else(|| (0..source_count).collect());
             compact_corner_order(&source_order, sources)
         }
     };
@@ -1218,8 +1259,8 @@ mod tests {
 
     use super::{
         CornerNormalCode, NormalCodeOptions, SetterInput, corner_codes, corner_count,
-        corner_custom_normals, corner_order, encode_vector_updates, encode_vectors,
-        evaluate_codes, mesh_fans, rebuild_custom_normals, settle_custom_normals, write_codes,
+        corner_custom_normals, corner_order, encode_vector_updates, encode_vectors, evaluate_codes,
+        mesh_fans, rebuild_custom_normals, settle_custom_normals, write_codes,
     };
     use crate::geom::{
         BoxParams, Mesh,
@@ -1274,7 +1315,11 @@ mod tests {
             .expect("present layer");
         assert_eq!(read[0], CornerNormalCode::Authored([12_000, 7_000]));
         assert_eq!(read[1], CornerNormalCode::ExplicitZero);
-        assert_eq!(read[2], CornerNormalCode::Auto, "zero code canonicalizes to Auto");
+        assert_eq!(
+            read[2],
+            CornerNormalCode::Auto,
+            "zero code canonicalizes to Auto"
+        );
         assert!(read[3..].iter().all(|code| *code == CornerNormalCode::Auto));
         assert!(mesh.attributes["custom_normal"]["values"].is_object());
 
@@ -1376,9 +1421,11 @@ mod tests {
         let codes = corner_codes(&mesh)
             .expect("read codes")
             .expect("custom layer present");
-        assert!(codes
-            .iter()
-            .any(|code| matches!(code, CornerNormalCode::Authored(_))));
+        assert!(
+            codes
+                .iter()
+                .any(|code| matches!(code, CornerNormalCode::Authored(_)))
+        );
         assert!(codes.contains(&CornerNormalCode::ExplicitZero));
         let positions = positions_of(&mesh);
         let normals = corner_custom_normals(&mesh, &positions, options())
@@ -1417,9 +1464,17 @@ mod tests {
 
         mesh.vertices[0].co += DVec3::new(0.2, 0.0, 0.0);
         let positions = positions_of(&mesh);
-        let after = evaluate_codes(&mesh, &codes, &positions, options()).expect("deformed evaluate");
-        assert!(codes.iter().any(|code| matches!(code, CornerNormalCode::Authored(_))));
-        assert_eq!(corner_codes(&mesh).expect("codes unchanged"), Some(codes.clone()));
+        let after =
+            evaluate_codes(&mesh, &codes, &positions, options()).expect("deformed evaluate");
+        assert!(
+            codes
+                .iter()
+                .any(|code| matches!(code, CornerNormalCode::Authored(_)))
+        );
+        assert_eq!(
+            corner_codes(&mesh).expect("codes unchanged"),
+            Some(codes.clone())
+        );
         assert!(
             (0..codes.len())
                 .filter(|&corner| matches!(codes[corner], CornerNormalCode::Authored(_)))
@@ -1434,18 +1489,24 @@ mod tests {
         let count = corner_count(&mesh);
         let vectors = vec![Some(probe()); count];
         encode_vectors(&mut mesh, Some(vectors.as_slice()), options()).expect("set normals");
-        let before = corner_codes(&mesh).expect("read codes").expect("layer present");
+        let before = corner_codes(&mesh)
+            .expect("read codes")
+            .expect("layer present");
         let positions = positions_of(&mesh);
         let identity: Vec<usize> = (0..count).collect();
         let fans = mesh_fans(&mesh, &positions, &identity).expect("fans");
         // A small nudge stays inside the sharpness threshold, so the setter marks no edge.
         let nudged = (probe() + DVec3::new(0.0, 0.0, 1.0e-3)).normalize();
-        encode_vector_updates(&mut mesh, &[(0, Some(nudged))], options())
-            .expect("update corner 0");
-        let after = corner_codes(&mesh).expect("read codes").expect("layer present");
+        encode_vector_updates(&mut mesh, &[(0, Some(nudged))], options()).expect("update corner 0");
+        let after = corner_codes(&mesh)
+            .expect("read codes")
+            .expect("layer present");
         assert_ne!(after[0], before[0], "the touched fan is re-encoded");
         for corner in (0..count).filter(|&corner| fans.fan_of[corner] != fans.fan_of[0]) {
-            assert_eq!(after[corner], before[corner], "corner {corner} is in an untouched fan");
+            assert_eq!(
+                after[corner], before[corner],
+                "corner {corner} is in an untouched fan"
+            );
         }
     }
 
@@ -1495,7 +1556,10 @@ mod tests {
         );
         settle_custom_normals(&mut mesh).expect("settle");
         let attribute = &mesh.attributes["custom_normal"];
-        assert!(attribute.get("corner_order").is_none(), "an identity basis is dropped");
+        assert!(
+            attribute.get("corner_order").is_none(),
+            "an identity basis is dropped"
+        );
         assert!(
             attribute["values"]
                 .as_object()
@@ -1520,8 +1584,7 @@ mod tests {
             setter_input: SetterInput::AlreadyNormalized,
         };
         let doubled = vec![Some(probe() * 2.0); count];
-        encode_vectors(&mut mesh, Some(doubled.as_slice()), public_setter)
-            .expect("public setter");
+        encode_vectors(&mut mesh, Some(doubled.as_slice()), public_setter).expect("public setter");
         let decoded = corner_custom_normals(&mesh, &positions, public_setter)
             .expect("evaluate")
             .expect("layer present");
@@ -1604,11 +1667,9 @@ mod tests {
             },
         )
         .expect("Subdivision setter");
-        let output_fans =
-            mesh_fans(&subdivision_mesh, &positions, &identity).expect("output fans");
+        let output_fans = mesh_fans(&subdivision_mesh, &positions, &identity).expect("output fans");
         assert_eq!(
-            output_fans.corners[output_fans.fan_of[zero_corner]],
-            corners,
+            output_fans.corners[output_fans.fan_of[zero_corner]], corners,
             "a zero input is replaced by the computed corner normal before fan splitting"
         );
         let output_codes = corner_codes(&subdivision_mesh)

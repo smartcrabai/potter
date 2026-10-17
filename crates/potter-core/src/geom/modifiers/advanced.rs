@@ -2915,12 +2915,7 @@ mod tests {
         let mut source = Mesh::box_mesh(BoxParams::default()).unwrap();
         let corner_count: usize = source.faces.iter().map(|face| face.vertices.len()).sum();
         let codes: Vec<CornerNormalCode> = (0..corner_count)
-            .map(|corner| {
-                CornerNormalCode::Authored([
-                    i16::try_from(corner + 1).unwrap(),
-                    -1_000,
-                ])
-            })
+            .map(|corner| CornerNormalCode::Authored([i16::try_from(corner + 1).unwrap(), -1_000]))
             .collect();
         let mut loop_order: Vec<usize> = (0..corner_count).collect();
         loop_order[..4].rotate_left(1);
@@ -2959,7 +2954,6 @@ mod tests {
             "the subset retains the source codes for its copied loops"
         );
     }
-
 
     #[test]
     fn shrinkwrap_offset_moves_each_projected_vertex_by_the_requested_distance() {

@@ -305,7 +305,10 @@ fn render_settings_have_spec_defaults_and_update_atomically() -> Result<(), Box<
     );
     assert_eq!(initial["scenes"]["scene_main"]["render"]["samples"], 64);
     assert_eq!(initial["scenes"]["scene_main"]["render"]["max_bounces"], 4);
-    assert_eq!(initial["scenes"]["scene_main"]["render"]["dicing_rate"], 1.0);
+    assert_eq!(
+        initial["scenes"]["scene_main"]["render"]["dicing_rate"],
+        1.0
+    );
     assert_eq!(
         initial["scenes"]["scene_main"]["render"]["preview_dicing_rate"],
         8.0

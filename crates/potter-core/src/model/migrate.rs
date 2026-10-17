@@ -250,9 +250,12 @@ fn blender_custom_normal_codes(
     values
         .iter()
         .map(|value| {
-            let pair = value.as_array().filter(|pair| pair.len() == 2).ok_or_else(|| {
-                invalid("version-2 custom_normal INT16_2D values must be signed 16-bit pairs")
-            })?;
+            let pair = value
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(|| {
+                    invalid("version-2 custom_normal INT16_2D values must be signed 16-bit pairs")
+                })?;
             let component = |value: &Value| {
                 value
                     .as_i64()
@@ -273,9 +276,7 @@ fn blender_custom_normal_codes(
 }
 
 /// Reads the former keyed float3 custom-normal store in face-corner order.
-fn legacy_custom_normal_vectors(
-    mesh: &crate::geom::Mesh,
-) -> Result<Vec<Option<glam::DVec3>>> {
+fn legacy_custom_normal_vectors(mesh: &crate::geom::Mesh) -> Result<Vec<Option<glam::DVec3>>> {
     let values = mesh
         .attributes
         .get("custom_normal")
@@ -334,8 +335,11 @@ fn is_v2_native_attribute(key: &str, attribute: &Value) -> bool {
     let kind = attribute.get("type").and_then(Value::as_str);
     matches!(
         (key, domain, kind),
-        ("custom_normal", Some("corner"), Some("float3" | "normal_code"))
-            | ("sharp" | "seam", Some("edge"), Some("bool"))
+        (
+            "custom_normal",
+            Some("corner"),
+            Some("float3" | "normal_code")
+        ) | ("sharp" | "seam", Some("edge"), Some("bool"))
             | ("shade_smooth", Some("face"), Some("bool"))
             | ("crease_edge", Some("edge"), Some("float"))
     )
@@ -581,9 +585,7 @@ fn classify(
     {
         return Entry::Dropped;
     }
-    if name.is_empty()
-        || name.starts_with('.')
-        || attributes.contains_key(user_key(name).as_str())
+    if name.is_empty() || name.starts_with('.') || attributes.contains_key(user_key(name).as_str())
     {
         return Entry::Kept;
     }
@@ -723,7 +725,10 @@ fn value_has_type(value: &Value, kind: &str) -> bool {
 
 fn numbers(value: &Value, count: usize) -> bool {
     value.as_array().is_some_and(|items| {
-        items.len() == count && items.iter().all(|item| item.as_f64().is_some_and(f64::is_finite))
+        items.len() == count
+            && items
+                .iter()
+                .all(|item| item.as_f64().is_some_and(f64::is_finite))
     })
 }
 
@@ -1084,7 +1089,11 @@ mod tests {
     fn version_two_blender_keys_become_native_keys() -> TestResult {
         let mesh = triangle_mesh()?;
         let face = format!("f{}", mesh.faces[0].id);
-        let edges: Vec<String> = mesh.edges.iter().map(|edge| format!("e{}", edge.id)).collect();
+        let edges: Vec<String> = mesh
+            .edges
+            .iter()
+            .map(|edge| format!("e{}", edge.id))
+            .collect();
         let vertices: Vec<String> = mesh
             .vertices
             .iter()
@@ -1127,22 +1136,42 @@ mod tests {
         let attributes = &migrated.attributes;
         assert!(!attributes.contains_key("blender_polygon_smooth"));
         assert!(!attributes.contains_key("blender_edge_flags"));
-        assert_eq!(attributes["shade_smooth"]["values"][face.as_str()], json!(true));
-        assert_eq!(attributes["sharp"]["values"][edges[0].as_str()], json!(true));
-        assert_eq!(attributes["sharp"]["values"][edges[1].as_str()], json!(false));
+        assert_eq!(
+            attributes["shade_smooth"]["values"][face.as_str()],
+            json!(true)
+        );
+        assert_eq!(
+            attributes["sharp"]["values"][edges[0].as_str()],
+            json!(true)
+        );
+        assert_eq!(
+            attributes["sharp"]["values"][edges[1].as_str()],
+            json!(false)
+        );
         assert_eq!(attributes["seam"]["values"][edges[1].as_str()], json!(true));
-        assert_eq!(attributes["seam"]["values"][edges[0].as_str()], json!(false));
+        assert_eq!(
+            attributes["seam"]["values"][edges[0].as_str()],
+            json!(false)
+        );
         assert_eq!(attributes["seam"]["type"], json!("bool"));
 
         let store = crate::geom::color_layers::read(&migrated);
-        let names: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(names, ["Col", "Paint"]);
         assert_eq!(store.active.as_deref(), Some("Col"));
         assert_eq!(store.render.as_deref(), Some("Col"));
         assert_eq!(store.layers[0].values[1], [0.4, 0.5, 0.6, 0.5]);
         assert_eq!(
             store.layers[1].values,
-            vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]]
+            vec![
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0]
+            ]
         );
         assert_eq!(
             attributes["blender_metadata"]["color_data_types"],
@@ -1155,7 +1184,10 @@ mod tests {
 
         assert_eq!(attributes["_wetness"]["domain"], json!("point"));
         assert_eq!(attributes["_wetness"]["type"], json!("float"));
-        assert_eq!(attributes["_wetness"]["values"][vertices[0].as_str()], json!(0.5));
+        assert_eq!(
+            attributes["_wetness"]["values"][vertices[0].as_str()],
+            json!(0.5)
+        );
         assert_eq!(attributes["face_group"]["type"], json!("int"));
         assert_eq!(attributes["face_group"]["values"][face.as_str()], json!(7));
         assert_eq!(attributes["_marked"]["type"], json!("bool"));
@@ -1180,15 +1212,17 @@ mod tests {
             .collect();
         assert_eq!(kept, ["EdgeColor", ".select_vert"]);
         Ok(())
-
     }
-
 
     #[test]
     fn version_two_custom_normal_codes_become_native_code_and_auto_values() -> TestResult {
         let mesh = triangle_mesh()?;
         let face = format!("f{}", mesh.faces[0].id);
-        let edges: Vec<String> = mesh.edges.iter().map(|edge| format!("e{}", edge.id)).collect();
+        let edges: Vec<String> = mesh
+            .edges
+            .iter()
+            .map(|edge| format!("e{}", edge.id))
+            .collect();
         let source = version_two_document(
             &mesh,
             json!({
@@ -1216,10 +1250,7 @@ mod tests {
             attributes["sharp"]["values"][edges[0].as_str()],
             json!(true)
         );
-        assert_eq!(
-            attributes["seam"]["values"][edges[0].as_str()],
-            json!(true)
-        );
+        assert_eq!(attributes["seam"]["values"][edges[0].as_str()], json!(true));
 
         assert_eq!(attributes["custom_normal"]["domain"], json!("corner"));
         assert_eq!(attributes["custom_normal"]["type"], json!("normal_code"));
@@ -1229,14 +1260,14 @@ mod tests {
         assert_eq!(corners[0], json!([16000, 0]));
         assert_eq!(corners[1], Value::Null);
         assert_eq!(corners[2], Value::Null);
-        assert!(!attributes
-            .get("blender_attributes")
-            .and_then(Value::as_array)
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry["name"] == "custom_normal")
-            }));
+        assert!(
+            !attributes
+                .get("blender_attributes")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| entry["name"] == "custom_normal")
+                })
+        );
         Ok(())
     }
 
@@ -1276,10 +1307,7 @@ mod tests {
     #[test]
     fn malformed_version_two_custom_normal_codes_are_scene_invalid() -> TestResult {
         let mesh = triangle_mesh()?;
-        for values in [
-            json!([[0, 0], [32768, 0], [0, 0]]),
-            json!([[0, 0], [0, 0]]),
-        ] {
+        for values in [json!([[0, 0], [32768, 0], [0, 0]]), json!([[0, 0], [0, 0]])] {
             let source = version_two_document(
                 &mesh,
                 json!({
@@ -1320,7 +1348,11 @@ mod tests {
         let migrated = migrated_mesh(&source)?;
         assert_eq!(migrated.attributes["color"]["domain"], json!("point"));
         let store = crate::geom::color_layers::read(&migrated);
-        let names: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(names, ["color", "color.001"]);
         assert_eq!(
             store.layers[1].domain,
@@ -1328,7 +1360,11 @@ mod tests {
         );
         assert_eq!(
             store.layers[1].values,
-            vec![[0.0, 0.0, 0.0, 1.0], [0.5, 0.25, 0.125, 1.0], [0.0, 0.0, 0.0, 1.0]]
+            vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [0.5, 0.25, 0.125, 1.0],
+                [0.0, 0.0, 0.0, 1.0]
+            ]
         );
         Ok(())
     }
@@ -1359,7 +1395,11 @@ mod tests {
             json!(0.2)
         );
         let store = crate::geom::color_layers::read(&migrated);
-        let names: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(names, ["color.001"]);
         assert_eq!(store.active.as_deref(), Some("color.001"));
         assert_eq!(store.render.as_deref(), Some("color.001"));
@@ -1398,7 +1438,11 @@ mod tests {
         );
         assert_eq!(attributes["color_layers"]["layers"], json!(["Tint"]));
         let store = crate::geom::color_layers::read(&migrated);
-        let names: Vec<&str> = store.layers.iter().map(|layer| layer.name.as_str()).collect();
+        let names: Vec<&str> = store
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .collect();
         assert_eq!(names, ["Tint"]);
         assert_eq!(store.active.as_deref(), Some("Tint"));
         assert_eq!(store.render.as_deref(), Some("Tint"));

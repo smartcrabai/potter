@@ -14,8 +14,9 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot, mesh_vertex_weights},
     geom::{
-        Face, Mesh, MeshError, attribute_keys, clnor, edge_key,
+        Face, Mesh, MeshError, attribute_keys, clnor,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+        edge_key,
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},
         uv_layers::{self, UvLayer, UvStore},
     },
@@ -1063,8 +1064,7 @@ fn color_plan(
         match store.resolve(reference.as_deref()) {
             (Some(index), _) => {
                 plan.slot_layers.insert(slot, index);
-                if surface.is_some_and(|surface| !matches!(surface.alpha_mode, AlphaMode::Opaque))
-                {
+                if surface.is_some_and(|surface| !matches!(surface.alpha_mode, AlphaMode::Opaque)) {
                     plan.translucent.insert(slot);
                 }
             }
@@ -1114,7 +1114,9 @@ fn export_vertex_layout(
         .map(|face| face.vertices.len())
         .sum::<usize>();
     if layers.iter().any(|layer| layer.len() != corner_count)
-        || colors.iter().any(|color| color.corners.len() != corner_count)
+        || colors
+            .iter()
+            .any(|color| color.corners.len() != corner_count)
     {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -1497,22 +1499,80 @@ struct MeshExportLayout {
     key_deltas: Vec<Vec<DVec3>>,
 }
 
+fn adaptive_export_normals<'a>(
+    snapshot: &'a Snapshot,
+    node_id: &Id,
+    data_block: Option<&DataBlock>,
+) -> Option<&'a [Option<DVec3>]> {
+    if data_block
+        .and_then(|data| data.shape_keys.as_ref())
+        .is_some_and(|shape_keys| !shape_keys.keys.is_empty())
+    {
+        // VRM's shape-key layout uses the authored base mesh, not this evaluated render surface.
+        None
+    } else {
+        snapshot.adaptive_normals.get(node_id).map(Vec::as_slice)
+    }
+}
+
+fn adaptive_corner_normals(
+    mesh: &Mesh,
+    positions: &[DVec3],
+    adaptive_normals: &[Option<DVec3>],
+) -> Result<Vec<DVec3>> {
+    if adaptive_normals.len() != mesh.vertices.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "adaptive normal count does not match exported mesh vertices",
+        ));
+    }
+    let mut corners = corner_normals(mesh, positions)?;
+    let smooth = smooth_face_flags(mesh)?;
+    if !smooth.iter().any(|smooth| *smooth) {
+        return Ok(corners);
+    }
+    let vertex_indices: BTreeMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let mut corner = 0;
+    for (face, smooth) in mesh.faces.iter().zip(smooth) {
+        for vertex_id in &face.vertices {
+            if smooth
+                && let Some(normal) = vertex_indices
+                    .get(vertex_id)
+                    .and_then(|index| adaptive_normals.get(*index))
+                    .copied()
+                    .flatten()
+            {
+                corners[corner] = normal;
+            }
+            corner += 1;
+        }
+    }
+    Ok(corners)
+}
+
 fn mesh_export_layout(
     mesh: &Mesh,
     data_block: Option<&DataBlock>,
     geometry_scale: DVec3,
     basis: DMat4,
+    adaptive_normals: Option<&[Option<DVec3>]>,
 ) -> Result<MeshExportLayout> {
     let key_deltas = match data_block {
         Some(block) => shape_key_deltas(mesh, block)?,
         None => Vec::new(),
     };
     let base = shape_key_base_positions(mesh, data_block);
-    let mut layers = vec![output_normals(
-        &corner_normals(mesh, &base)?,
-        geometry_scale,
-        basis,
-    )];
+    let base_normals = if let Some(normals) = adaptive_normals {
+        adaptive_corner_normals(mesh, &base, normals)?
+    } else {
+        corner_normals(mesh, &base)?
+    };
+    let mut layers = vec![output_normals(&base_normals, geometry_scale, basis)];
     for deltas in &key_deltas {
         let morphed = base
             .iter()
@@ -3379,7 +3439,9 @@ pub(crate) fn unwritten_attribute_losses(mesh: &Mesh, owner: &str) -> Vec<Loss> 
                     losses.push(export_loss(
                         owner,
                         "mesh.attribute",
-                        format!("glTF export does not write Blender custom properties on mesh `{owner}`"),
+                        format!(
+                            "glTF export does not write Blender custom properties on mesh `{owner}`"
+                        ),
                         SUGGESTION,
                     ));
                 }
@@ -3485,7 +3547,12 @@ fn color_losses(
         } else {
             continue;
         };
-        losses.push(export_loss(owner, "mesh.color_attribute", reason, SUGGESTION));
+        losses.push(export_loss(
+            owner,
+            "mesh.color_attribute",
+            reason,
+            SUGGESTION,
+        ));
     }
     for slot in &plan.translucent {
         let Some(layer) = plan
@@ -3495,7 +3562,11 @@ fn color_losses(
         else {
             continue;
         };
-        if layer.values.iter().any(|color| !crate::float::equal_f64(color[3], 1.0)) {
+        if layer
+            .values
+            .iter()
+            .any(|color| !crate::float::equal_f64(color[3], 1.0))
+        {
             losses.push(export_loss(
                 owner,
                 feature_id::VERTEX_COLOR,
@@ -3679,7 +3750,13 @@ pub(crate) fn validate_vrm_mesh_references(
             .get(node_id)
             .copied()
             .unwrap_or(DVec3::ONE);
-        let export = mesh_export_layout(mesh, data_block, scale, avatar_basis(version))?;
+        let export = mesh_export_layout(
+            mesh,
+            data_block,
+            scale,
+            avatar_basis(version),
+            adaptive_export_normals(snapshot, node_id, data_block),
+        )?;
         if let (Some(data_id), Some(data_block)) = (node.data.as_ref(), data_block)
             && let Some(binding) = data_skin_bindings.get(data_id)
         {
@@ -3876,8 +3953,14 @@ fn export_with_root_inner(
             std::string::ToString::to_string,
         );
         let colors = color_plan(node, mesh, data_block.is_none(), &surfaces);
-        let MeshExportLayout { layout, key_deltas } =
-            mesh_export_layout(mesh, data_block, geometry_scale, geometry_basis)?;
+        let MeshExportLayout { layout, key_deltas } = mesh_export_layout(
+            mesh,
+            data_block,
+            geometry_scale,
+            geometry_basis,
+            vrm.as_ref()
+                .and_then(|_| adaptive_export_normals(snapshot, node_id, data_block)),
+        )?;
         let uv_sets = &layout.uvs;
         for (material_id, has_uv) in used_material_bindings(node_id, node, snapshot, mesh)? {
             validate_mesh_material_uv(
@@ -7124,9 +7207,7 @@ fn import_color_layers(
                 .iter()
                 .zip(&welded_values)
                 .map(|(copy, value)| {
-                    value.unwrap_or_else(|| {
-                        values.get(*copy).copied().flatten().unwrap_or(DEFAULT)
-                    })
+                    value.unwrap_or_else(|| values.get(*copy).copied().flatten().unwrap_or(DEFAULT))
                 })
                 .collect::<Vec<_>>();
             (ColorDomain::Point, per_vertex)
@@ -9492,7 +9573,10 @@ mod tests {
 
         set_codes(
             &mut mesh,
-            [json!([null, "explicit_zero", null]), json!(["explicit_zero", null, null])],
+            [
+                json!([null, "explicit_zero", null]),
+                json!(["explicit_zero", null, null]),
+            ],
         );
         let loss = super::explicit_zero_normal_loss(&mesh, "mesh")?
             .ok_or("explicit zero must be reported as a loss")?;
@@ -9506,12 +9590,18 @@ mod tests {
             "{loss:?}"
         );
 
-        set_codes(&mut mesh, [json!([null, null, null]), json!([null, null, null])]);
+        set_codes(
+            &mut mesh,
+            [json!([null, null, null]), json!([null, null, null])],
+        );
         assert!(super::explicit_zero_normal_loss(&mesh, "mesh")?.is_none());
 
         set_codes(
             &mut mesh,
-            [json!([[12000, 7000], null, [-3, 4]]), json!([null, [0, 9], null])],
+            [
+                json!([[12000, 7000], null, [-3, 4]]),
+                json!([null, [0, 9], null]),
+            ],
         );
         assert!(super::explicit_zero_normal_loss(&mesh, "mesh")?.is_none());
 
@@ -9546,12 +9636,11 @@ mod tests {
         vertex
             .properties
             .insert("layer_name".to_owned(), json!(layer));
-        group
-            .nodes
-            .insert(crate::model::Id::new("out")?, output);
-        group
-            .nodes
-            .insert(crate::model::Id::new("bsdf")?, GraphNode::new("ShaderNodeBsdfPrincipled"));
+        group.nodes.insert(crate::model::Id::new("out")?, output);
+        group.nodes.insert(
+            crate::model::Id::new("bsdf")?,
+            GraphNode::new("ShaderNodeBsdfPrincipled"),
+        );
         group.nodes.insert(crate::model::Id::new("paint")?, vertex);
         group.links.push(GraphLink {
             from_node: crate::model::Id::new("bsdf")?,
@@ -9648,11 +9737,8 @@ mod tests {
         let accessor = primitives[0]["attributes"]["COLOR_0"]
             .as_u64()
             .ok_or("COLOR_0 is missing")?;
-        let (colors, dimensions) = super::read_float_accessor(
-            &document,
-            &buffers,
-            usize::try_from(accessor)?,
-        )?;
+        let (colors, dimensions) =
+            super::read_float_accessor(&document, &buffers, usize::try_from(accessor)?)?;
         assert_eq!(dimensions, 4);
         let vertex_ids = mesh_value["extras"]["potter"]["vertex_ids"]
             .as_array()
@@ -9660,12 +9746,7 @@ mod tests {
         let exported = vertex_ids
             .iter()
             .zip(colors.as_chunks::<4>().0)
-            .map(|(id, color)| {
-                (
-                    id.as_u64().unwrap_or(u64::MAX),
-                    color.map(f64::to_bits),
-                )
-            })
+            .map(|(id, color)| (id.as_u64().unwrap_or(u64::MAX), color.map(f64::to_bits)))
             .collect::<BTreeSet<_>>();
         // Each corner's vertex with its corner value. Corners that share a value and a vertex
         // share an output vertex, so the sets compare exactly.
@@ -9689,11 +9770,8 @@ mod tests {
         let point_accessor = primitives[0]["attributes"]["COLOR_1"]
             .as_u64()
             .ok_or("COLOR_1 is missing")?;
-        let (point_colors, _) = super::read_float_accessor(
-            &document,
-            &buffers,
-            usize::try_from(point_accessor)?,
-        )?;
+        let (point_colors, _) =
+            super::read_float_accessor(&document, &buffers, usize::try_from(point_accessor)?)?;
         let exported_points = vertex_ids
             .iter()
             .zip(point_colors.as_chunks::<4>().0)

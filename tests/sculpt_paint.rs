@@ -9,10 +9,10 @@ use glam::DVec3;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::tempdir;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
+#[path = "common/process.rs"]
+mod process;
 
 use blender_checked::blender_executable;
 
@@ -74,10 +74,7 @@ fn inspected_geometry(scene: &std::path::Path) -> Result<Value, Box<dyn Error>> 
     inspected_geometry_for(scene, "body")
 }
 
-fn inspected_geometry_for(
-    scene: &std::path::Path,
-    id: &str,
-) -> Result<Value, Box<dyn Error>> {
+fn inspected_geometry_for(scene: &std::path::Path, id: &str) -> Result<Value, Box<dyn Error>> {
     let output = Command::new(env!("CARGO_BIN_EXE_pot"))
         .arg("inspect")
         .arg(scene)
@@ -114,8 +111,7 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
         ]),
     )?;
     let baseline_mesh = stored_mesh(&baseline_scene)?;
-    let baseline_displacement =
-        baseline_mesh["attributes"]["multires_displacement"].clone();
+    let baseline_displacement = baseline_mesh["attributes"]["multires_displacement"].clone();
     let baseline_geometry = inspected_geometry(&baseline_scene)?;
 
     let stroke = json!({
@@ -134,7 +130,10 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
     )?;
     let multires_mesh = stored_mesh(&multires_scene)?;
     let multires_displacement = &multires_mesh["attributes"]["multires_displacement"];
-    assert_ne!(multires_displacement["values"], baseline_displacement["values"]);
+    assert_ne!(
+        multires_displacement["values"],
+        baseline_displacement["values"]
+    );
     assert!(
         multires_displacement["values"]
             .as_object()
@@ -143,8 +142,7 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
     );
     let multires_geometry = inspected_geometry(&multires_scene)?;
     assert_ne!(
-        multires_geometry["positions"],
-        baseline_geometry["positions"],
+        multires_geometry["positions"], baseline_geometry["positions"],
         "native multires stroke did not change evaluated geometry"
     );
 
@@ -162,13 +160,155 @@ fn sculpt_multires_stroke_updates_mdisps_and_base_mesh_mode_preserves_grids()
     let base_mesh = stored_mesh(&base_scene)?;
     assert_ne!(base_mesh["vertices"], baseline_mesh["vertices"]);
     assert_eq!(
-        base_mesh["attributes"]["multires_displacement"],
-        baseline_displacement,
+        base_mesh["attributes"]["multires_displacement"], baseline_displacement,
         "base-mesh sculpting unexpectedly edited MDisps"
     );
     Ok(())
 }
 
+#[test]
+fn multires_sculpt_uses_driven_armature_and_shrinkwrap_prefix_for_brush_base()
+-> Result<(), Box<dyn Error>> {
+    let (_deformed_directory, deformed_scene) = create_scene()?;
+    apply(
+        &deformed_scene,
+        &json!([
+            {"op":"node.create","id":"body","kind":"plane","params":{"size":2.0},"transform":{"translation":[0.0,0.0,1.0]}},
+            {"op":"node.create","id":"surface","kind":"plane","params":{"size":8.0}},
+            {"op":"node.create","id":"arm","kind":"armature"},
+            {"op":"bone.create","target":{"id":"arm"},"id":"root","name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]},
+            {"op":"node.create","id":"controller","kind":"empty","transform":{"translation":[2.5,0.0,0.0]}},
+            {"op":"vertex_group.create","target":{"id":"body"},"id":"root_group","name":"Root"},
+            {"op":"vertex_group.assign","target":{"id":"body"},"group_id":"root_group","weights":[
+                {"vertex_id":0,"weight":1.0},{"vertex_id":1,"weight":1.0},
+                {"vertex_id":2,"weight":1.0},{"vertex_id":3,"weight":1.0}
+            ]},
+            {"op":"modifier.create","target":{"id":"body"},"id":"armature_deform","type":"armature","params":{"object":"arm","use_vertex_groups":true}},
+            {"op":"driver.create","target":{"id":"arm"},"id":"pose_x","path":"pose.bones[\"root\"].location","index":0,"type":"scripted_expression","variables":[{"name":"var","type":"transforms","target":"controller","path":"transform.translation","index":0}],"expression":"var"},
+            {"op":"modifier.create","target":{"id":"body"},"id":"shrink","type":"shrinkwrap","params":{"target":"surface","wrap_method":"NEAREST_SURFACEPOINT","wrap_mode":"ON_SURFACE"}},
+            {"op":"sculpt.multires","target":{"id":"body"},"id":"multi_one","levels":1,"render_levels":1},
+            {"op":"modifier.update","target":{"id":"body"},"id":"multi_one","set":{"params":{"levels":1,"sculpt_levels":1,"render_levels":1,"total_levels":1,"use_sculpt_base_mesh":false}}},
+            {"op":"modifier.create","target":{"id":"body"},"id":"after_multires","type":"subdivision","params":{"levels":1}},
+        ]),
+    )?;
+    let before_geometry = inspected_geometry_for(&deformed_scene, "body")?;
+    let positions = before_geometry["positions"]
+        .as_array()
+        .ok_or("driven prefix geometry has no positions")?;
+    let mean_x = positions
+        .iter()
+        .map(|position| position[0].as_f64().unwrap())
+        .sum::<f64>()
+        / positions.len() as f64;
+    let mean_z = positions
+        .iter()
+        .map(|position| position[2].as_f64().unwrap())
+        .sum::<f64>()
+        / positions.len() as f64;
+    assert!(
+        (mean_x - 2.5).abs() < 1.0e-8,
+        "Armature driver was not applied"
+    );
+    assert!(
+        (mean_z + 1.0).abs() < 1.0e-8,
+        "Shrinkwrap operand was not applied"
+    );
+
+    let (_control_directory, control_scene) = create_scene()?;
+    apply(
+        &control_scene,
+        &json!([
+            {"op":"node.create","id":"body","kind":"plane","params":{"size":2.0},"transform":{"translation":[2.5,0.0,0.0]}},
+            {"op":"sculpt.multires","target":{"id":"body"},"id":"multi_one","levels":1,"render_levels":1},
+            {"op":"modifier.update","target":{"id":"body"},"id":"multi_one","set":{"params":{"levels":1,"sculpt_levels":1,"render_levels":1,"total_levels":1,"use_sculpt_base_mesh":false}}},
+            {"op":"modifier.create","target":{"id":"body"},"id":"after_multires","type":"subdivision","params":{"levels":1}},
+        ]),
+    )?;
+    let stroke = json!([{
+        "op":"sculpt.stroke","target":{"id":"body"},"brush":"draw","scope":"shared",
+        "samples":[{"position":[2.5,0.0,0.0],"pressure":1.0,"radius":1.5,"strength":0.5,"time":0.0}],
+        "falloff":"linear","seed":7
+    }]);
+    apply_at_revision(&deformed_scene, &stroke, 1)?;
+    apply_at_revision(&control_scene, &stroke, 1)?;
+
+    let deformed_displacement =
+        stored_mesh(&deformed_scene)?["attributes"]["multires_displacement"]["values"].clone();
+    let control_displacement =
+        stored_mesh(&control_scene)?["attributes"]["multires_displacement"]["values"].clone();
+    assert!(
+        deformed_displacement
+            .as_object()
+            .is_some_and(|values| values.values().any(has_nonzero_number)),
+        "driven prefix stroke wrote no nonzero MDisps"
+    );
+    assert_eq!(
+        deformed_displacement, control_displacement,
+        "multires brush mapping must match the prefix-deformed world base"
+    );
+    let after_geometry = inspected_geometry_for(&deformed_scene, "body")?;
+    assert_ne!(
+        after_geometry["positions"], before_geometry["positions"],
+        "brush did not alter evaluated geometry at the driven prefix position"
+    );
+    Ok(())
+}
+
+#[test]
+fn sculpt_multires_stroke_respects_interpolated_control_masks() -> Result<(), Box<dyn Error>> {
+    let source = Mesh::box_mesh(potter_core::geom::BoxParams::default())?;
+    let vertex_ids: Vec<String> = source
+        .vertices
+        .iter()
+        .map(|vertex| format!("v{}", vertex.id))
+        .collect();
+
+    let (_baseline_directory, baseline_scene) = create_scene()?;
+    apply(
+        &baseline_scene,
+        &json!([
+            {"op":"node.create", "id":"body", "kind":"box", "params":{}},
+            {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1}
+        ]),
+    )?;
+    let baseline_mesh = stored_mesh(&baseline_scene)?;
+    let baseline_displacement =
+        baseline_mesh["attributes"]["multires_displacement"]["values"].clone();
+    let baseline_geometry = inspected_geometry(&baseline_scene)?;
+
+    let (_masked_directory, masked_scene) = create_scene()?;
+    apply(
+        &masked_scene,
+        &json!([
+            {"op":"node.create", "id":"body", "kind":"box", "params":{}},
+            {"op":"sculpt.mask", "target":{"id":"body"}, "scope":"shared", "action":"set",
+             "elements":{"domain":"vertex", "ids":vertex_ids}, "value":1.0},
+            {"op":"sculpt.multires", "target":{"id":"body"}, "id":"multi_one", "levels":1, "render_levels":1},
+            {"op":"sculpt.stroke", "target":{"id":"body"}, "brush":"draw", "scope":"shared",
+             "samples":[{"position":[1.0,1.0,1.0],"pressure":1.0,"radius":1.0,"strength":0.5,"time":0.0}],
+             "falloff":"linear", "seed":7}
+        ]),
+    )?;
+    let masked_mesh = stored_mesh(&masked_scene)?;
+    let stored_masks = masked_mesh["attributes"]["sculpt.mask"]["values"]
+        .as_object()
+        .ok_or("stored sculpt mask is missing")?;
+    assert!(
+        vertex_ids
+            .iter()
+            .all(|id| { stored_masks.get(id.as_str()).and_then(Value::as_f64) == Some(1.0) })
+    );
+    assert_eq!(
+        masked_mesh["attributes"]["multires_displacement"]["values"], baseline_displacement,
+        "fully masked multires stroke changed MDisps"
+    );
+    let masked_geometry = inspected_geometry(&masked_scene)?;
+    assert_eq!(
+        masked_geometry["positions"], baseline_geometry["positions"],
+        "fully masked multires stroke moved evaluated subdivision points"
+    );
+    Ok(())
+}
 
 #[test]
 fn multires_sculpt_levels_select_native_grid_resolution() -> Result<(), Box<dyn Error>> {
@@ -273,7 +413,8 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
         assert_eq!(sidecar.exists(), !pack);
         let moved_directory = source_directory.path().join(format!("moved-{stem}"));
         fs::create_dir(&moved_directory)?;
-        let moved_output = moved_directory.join(output.file_name().ok_or("missing blend filename")?);
+        let moved_output =
+            moved_directory.join(output.file_name().ok_or("missing blend filename")?);
         fs::rename(&output, &moved_output)?;
         if !pack {
             fs::rename(
@@ -321,11 +462,9 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
             .as_object()
             .and_then(|nodes| {
                 nodes.iter().find_map(|(node_id, node)| {
-                    let modifier = node
-                        .get("modifiers")?
-                        .as_array()?
-                        .iter()
-                        .find(|modifier| modifier.get("type").and_then(Value::as_str) == Some("multires"))?;
+                    let modifier = node.get("modifiers")?.as_array()?.iter().find(|modifier| {
+                        modifier.get("type").and_then(Value::as_str) == Some("multires")
+                    })?;
                     Some((
                         node_id.clone(),
                         node.get("data")?.as_str()?.to_owned(),
@@ -334,8 +473,8 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
                 })
             })
             .ok_or("imported multires node is missing")?;
-        let imported_record = imported_document["data_blocks"][data_id.as_str()]["mesh"]
-            ["attributes"]["multires_displacement"];
+        let imported_record = imported_document["data_blocks"][data_id.as_str()]["mesh"]["attributes"]
+            ["multires_displacement"];
         let imported_modifier = imported_document["nodes"][node_id.as_str()]["modifiers"]
             .as_array()
             .and_then(|modifiers| {
@@ -344,12 +483,15 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
                     .find(|modifier| modifier["type"] == "multires")
             })
             .ok_or("imported Multires modifier is missing")?;
+        assert_eq!(imported_modifier["params"]["is_external"], json!(!pack));
         assert_eq!(
-            imported_modifier["params"]["is_external"],
-            json!(!pack)
+            imported_modifier["params"]["show_only_control_edges"],
+            json!(false)
         );
-        assert_eq!(imported_modifier["params"]["show_only_control_edges"], json!(false));
-        assert_eq!(imported_modifier["params"]["use_sculpt_base_mesh"], json!(false));
+        assert_eq!(
+            imported_modifier["params"]["use_sculpt_base_mesh"],
+            json!(false)
+        );
         assert_eq!(imported_modifier["params"]["levels"], json!(1));
         assert_eq!(imported_modifier["params"]["sculpt_levels"], json!(1));
         assert_eq!(imported_modifier["params"]["render_levels"], json!(1));
@@ -377,8 +519,8 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
         )?;
         let continued_document: Value =
             serde_json::from_slice(&fs::read(import_scene.join("scene.json"))?)?;
-        let continued_record = continued_document["data_blocks"][data_id.as_str()]["mesh"]
-            ["attributes"]["multires_displacement"];
+        let continued_record = continued_document["data_blocks"][data_id.as_str()]["mesh"]["attributes"]
+            ["multires_displacement"];
         assert_ne!(continued_record["values"], imported_record["values"]);
         assert!(
             continued_record["values"]
@@ -388,15 +530,16 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
         );
         let continued_geometry = inspected_geometry_for(&import_scene, &node_id)?;
         assert_ne!(
-           continued_geometry["positions"],
-            before_geometry["positions"],
+            continued_geometry["positions"], before_geometry["positions"],
             "{stem} continuation stroke did not affect evaluated geometry"
         );
         let render_output = import_scene.join(format!("render-{stem}"));
         let rendered = Command::new(env!("CARGO_BIN_EXE_pot"))
             .arg("render")
             .arg(&import_scene)
-            .args(["--engine", "path", "--frames", "1", "--format", "png", "--out"])
+            .args([
+                "--engine", "path", "--frames", "1", "--format", "png", "--out",
+            ])
             .arg(&render_output)
             .arg("--json")
             .output()?;
@@ -426,8 +569,7 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
         )?;
         let applied_geometry = inspected_geometry_for(&import_scene, &node_id)?;
         assert_eq!(
-            applied_geometry["positions"],
-            continued_geometry["positions"],
+            applied_geometry["positions"], continued_geometry["positions"],
             "{stem} native modifier apply changed the sculpted result"
         );
     }
@@ -519,7 +661,9 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
             .unwrap()
             .iter()
             .enumerate()
-            .any(|(corner, vertex)| *vertex == json!(6) && row[corner] == json!([0.1, 0.2, 0.3, 1.0]))
+            .any(|(corner, vertex)| {
+                *vertex == json!(6) && row[corner] == json!([0.1, 0.2, 0.3, 1.0])
+            })
     });
     assert!(painted_at_v6);
     assert_eq!(
@@ -563,8 +707,7 @@ fn sculpt_multires_runs_catmull_clark_evaluation() -> Result<(), Box<dyn Error>>
     assert_eq!(item["evaluated_geometry"]["face_count"], json!(24));
     let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     assert_eq!(
-        document["data_blocks"]["body_mesh"]["mesh"]["attributes"]["multires_displacement"]
-            ["total_levels"],
+        document["data_blocks"]["body_mesh"]["mesh"]["attributes"]["multires_displacement"]["total_levels"],
         json!(1)
     );
     assert_eq!(

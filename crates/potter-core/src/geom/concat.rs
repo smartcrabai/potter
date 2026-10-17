@@ -44,6 +44,8 @@ pub(crate) struct Part<'a> {
     pub material_offset: u32,
     /// Length of the member's slot table: at least one, since an empty material list is one empty slot.
     pub slot_count: usize,
+    /// Transient local normals aligned with the member's vertex storage order.
+    pub adaptive_normals: Option<Cow<'a, [Option<DVec3>]>>,
 }
 
 /// A member placed under the joined IDs: its element tables, its attributes remapped, and its UV
@@ -51,6 +53,7 @@ pub(crate) struct Part<'a> {
 struct Placed {
     mesh: Mesh,
     uv_layers: Vec<UvLayer>,
+    adaptive_normals: Option<Vec<Option<DVec3>>>,
 }
 
 /// A placed member's attributes and element counts, the inputs of [`merge_attributes`] and
@@ -76,13 +79,40 @@ struct Piece {
 /// details name the attribute), and `SCENE_INVALID` for a malformed member. Returns
 /// `EVALUATION_FAILED` when the joined mesh is not valid.
 pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
+    Ok(concatenate_inner(parts, false)?.0)
+}
+
+/// Like [`concatenate`], while returning member-ordered transformed transient normals when present.
+pub(crate) fn concatenate_with_normals(
+    parts: Vec<Part<'_>>,
+) -> Result<(Mesh, Option<Vec<Option<DVec3>>>)> {
+    concatenate_inner(parts, true)
+}
+
+fn concatenate_inner(
+    parts: Vec<Part<'_>>,
+    include_normals: bool,
+) -> Result<(Mesh, Option<Vec<Option<DVec3>>>)> {
     let mut output = Mesh::new();
     let mut pieces = Vec::with_capacity(parts.len());
+    let mut adaptive_normals = Vec::new();
+    let mut has_adaptive_normals = false;
     for part in parts {
         let Placed {
             mut mesh,
             uv_layers,
-        } = place(&part, output.next_id)?;
+            adaptive_normals: mut member_normals,
+        } = place(&part, output.next_id, include_normals)?;
+        if include_normals {
+            if let Some(normals) = &mut member_normals {
+                has_adaptive_normals = true;
+                adaptive_normals.append(normals);
+            } else {
+                for _ in 0..mesh.vertices.len() {
+                    adaptive_normals.push(None);
+                }
+            }
+        }
         pieces.push(Piece {
             attributes: std::mem::take(&mut mesh.attributes),
             uv_layers,
@@ -112,7 +142,7 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
         write_layers(&mut output, &layers);
     }
     output.validate().map_err(|error| join_error(&error))?;
-    Ok(output)
+    Ok((output, has_adaptive_normals.then_some(adaptive_normals)))
 }
 
 /// Per joined face, whether the face's member has a value on every corner of its first UV layer,
@@ -136,7 +166,7 @@ pub(crate) fn uv_covered_faces(parts: &[Part<'_>]) -> Vec<bool> {
 /// the source, attributes are remapped and shading canonicalised, and UVs are read. A mirrored member
 /// reverses its corners. Vertices move to the instance space last, and custom normals rotate with
 /// the member's normal matrix.
-fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Placed> {
+fn place(part: &Part<'_>, first_ids: IdCounters, include_normals: bool) -> Result<Placed> {
     let source: &Mesh = &part.mesh;
     let mut mesh = Mesh {
         next_id: first_ids,
@@ -212,6 +242,25 @@ fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Placed> {
     for vertex in &mut mesh.vertices {
         vertex.co = part.matrix.transform_point3(vertex.co);
     }
+    let adaptive_normals = if include_normals {
+        part.adaptive_normals
+            .as_deref()
+            .map(|values| {
+                if values.len() != source.vertices.len() {
+                    return Err(PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "instance adaptive normals do not match member vertices",
+                    ));
+                }
+                Ok(values
+                    .iter()
+                    .map(|normal| normal.map(|normal| (normals * normal).normalize_or_zero()))
+                    .collect())
+            })
+            .transpose()?
+    } else {
+        None
+    };
     if let Some(values) = mesh
         .attributes
         .get_mut("custom_normal")
@@ -222,7 +271,11 @@ fn place(part: &Part<'_>, first_ids: IdCounters) -> Result<Placed> {
             *corners = rotate_corner_normals(corners, normals);
         }
     }
-    Ok(Placed { mesh, uv_layers })
+    Ok(Placed {
+        mesh,
+        uv_layers,
+        adaptive_normals,
+    })
 }
 
 /// Takes the next element ID from `counter`.
@@ -971,7 +1024,7 @@ mod tests {
     use glam::{DMat4, DVec3};
     use serde_json::{Map, Value, json};
 
-    use super::{Part, concatenate, uv_covered_faces};
+    use super::{Part, concatenate, concatenate_with_normals, uv_covered_faces};
     use crate::geom::normals::smooth_face_flags;
     use crate::geom::{BoxParams, Mesh};
 
@@ -989,7 +1042,28 @@ mod tests {
             matrix,
             material_offset,
             slot_count,
+            adaptive_normals: None,
         }
+    }
+
+    #[test]
+    fn adaptive_normals_follow_member_order_and_inverse_transpose() {
+        let first = cube();
+        let second = cube();
+        let mut first_part = member(&first, DMat4::from_scale(DVec3::new(2.0, 1.0, 1.0)), 0, 1);
+        first_part.adaptive_normals = Some(Cow::Owned(vec![
+            Some(DVec3::new(1.0, 1.0, 0.0));
+            first.vertices.len()
+        ]));
+        let (joined, normals) =
+            concatenate_with_normals(vec![first_part, member(&second, DMat4::IDENTITY, 1, 1)])
+                .unwrap();
+        let normals = normals.unwrap();
+        assert_eq!(normals.len(), joined.vertices.len());
+        let expected = DVec3::new(0.5, 1.0, 0.0).normalize();
+        assert!((normals[0].unwrap() - expected).length() < 1.0e-12);
+        assert!(normals[first.vertices.len()..].iter().all(Option::is_none));
+        assert!(!joined.attributes.contains_key("adaptive_normals"));
     }
 
     #[test]

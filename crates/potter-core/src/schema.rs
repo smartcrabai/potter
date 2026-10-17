@@ -2609,7 +2609,11 @@ mod tests {
     fn attribute_create_type_accepts_color_and_rejects_byte_color() -> crate::error::Result<()> {
         let create = schema("operations", Some("mesh.attribute_create"))?;
         let types = &create["properties"]["type"]["enum"];
-        assert!(types.as_array().is_some_and(|types| types.iter().any(|value| value == "color")));
+        assert!(
+            types
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "color"))
+        );
         assert!(
             types
                 .as_array()

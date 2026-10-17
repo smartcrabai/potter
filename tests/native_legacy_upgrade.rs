@@ -11,14 +11,14 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
 
 use std::{
     collections::BTreeSet,
@@ -136,7 +136,9 @@ fn paint_value(face: usize, corner: usize) -> [f64; 4] {
 /// The schema-2 mesh of the oracle's `Oracle` object, written from its explicit numbers.
 fn legacy_mesh(expected: &Value) -> TestResult<Value> {
     let oracle = &expected["oracle"];
-    let vertices = oracle["vertices"].as_array().ok_or("vertices are missing")?;
+    let vertices = oracle["vertices"]
+        .as_array()
+        .ok_or("vertices are missing")?;
     let edges = oracle["edges"].as_array().ok_or("edges are missing")?;
     let faces = oracle["faces"].as_array().ok_or("faces are missing")?;
     let face_sizes: Vec<usize> = faces
@@ -180,7 +182,9 @@ fn legacy_mesh(expected: &Value) -> TestResult<Value> {
     }
 
     let mut uv = Map::new();
-    let uv_names = oracle["uv_layers"]["names"].as_array().ok_or("UV names are missing")?;
+    let uv_names = oracle["uv_layers"]["names"]
+        .as_array()
+        .ok_or("UV names are missing")?;
     let mut uv_layers = Vec::new();
     for name in uv_names {
         let name = name.as_str().ok_or("UV name is not a string")?;
@@ -316,11 +320,7 @@ fn stored_legacy_mesh(project: &Path) -> TestResult<Value> {
 /// Checks the native store of a legacy-derived mesh against a native import of the oracle.
 fn assert_native_semantics(legacy: &Value, native: &Value) -> TestResult {
     for name in ["shade_smooth", "sharp", "seam"] {
-        json_close(
-            attribute(legacy, name)?,
-            attribute(native, name)?,
-            name,
-        );
+        json_close(attribute(legacy, name)?, attribute(native, name)?, name);
     }
     assert!(
         legacy["attributes"].get("blender_polygon_smooth").is_none(),
@@ -346,11 +346,7 @@ fn assert_native_semantics(legacy: &Value, native: &Value) -> TestResult {
     );
     for layer in native_layers {
         let name = layer.as_str().ok_or("layer name is not a string")?;
-        json_close(
-            attribute(legacy, name)?,
-            attribute(native, name)?,
-            name,
-        );
+        json_close(attribute(legacy, name)?, attribute(native, name)?, name);
     }
     // Only the Blender layers carry a source encoding; the legacy paint layer has none.
     let legacy_encodings = &attribute(legacy, "blender_metadata")?["color_data_types"];
@@ -370,9 +366,17 @@ fn assert_upgraded_normals(mesh: &Value) -> TestResult {
     for (face, row) in rows.iter().enumerate() {
         for (corner, stored) in row.iter().enumerate() {
             if face >= LEGACY_NORMAL_FACES {
-                assert_eq!(*stored, StoredCorner::Auto, "face {face} corner {corner} was frozen on upgrade");
+                assert_eq!(
+                    *stored,
+                    StoredCorner::Auto,
+                    "face {face} corner {corner} was frozen on upgrade"
+                );
             } else if (face, corner) == LEGACY_EXPLICIT_ZERO {
-                assert_eq!(*stored, StoredCorner::ExplicitZero, "face {face} corner {corner} lost its explicit zero");
+                assert_eq!(
+                    *stored,
+                    StoredCorner::ExplicitZero,
+                    "face {face} corner {corner} lost its explicit zero"
+                );
             } else {
                 assert!(
                     matches!(stored, StoredCorner::Code(_)),
@@ -435,7 +439,10 @@ fn schema_v1_fixture_upgrades_on_apply_without_retired_keys() -> TestResult {
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
     let document = read_json(&scene.join("scene.json"))?;
-    assert_eq!(document["schema_version"], 3, "apply writes the current schema");
+    assert_eq!(
+        document["schema_version"], 3,
+        "apply writes the current schema"
+    );
     let mesh = stored_oracle_or_cube(&document)?;
     for retired in ["blender_polygon_smooth", "blender_edge_flags"] {
         assert!(
@@ -443,7 +450,10 @@ fn schema_v1_fixture_upgrades_on_apply_without_retired_keys() -> TestResult {
             "{retired} survived the upgrade"
         );
     }
-    assert!(mesh["attributes"].get("uv_layers").is_some(), "UV layers were not upgraded");
+    assert!(
+        mesh["attributes"].get("uv_layers").is_some(),
+        "UV layers were not upgraded"
+    );
     Ok(())
 }
 

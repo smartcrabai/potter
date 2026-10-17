@@ -118,8 +118,10 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         let mut losses = export_losses(&doc, format);
         losses.extend(exchange::shading::shading_losses(format, &meshes));
         losses.extend(exchange::uv_layer_losses(format, &meshes));
-        if matches!(format, "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl")
-            || matches!(format, "usda" | "usdc" | "usd" | "usdz")
+        if matches!(
+            format,
+            "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl"
+        ) || matches!(format, "usda" | "usdc" | "usd" | "usdz")
         {
             losses.extend(exchange::attribute_losses(format, &doc, &snapshot)?);
         }
@@ -199,10 +201,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                 args.out.clone(),
                 exchange::fbx_binary::export(&doc, &snapshot)?,
             )],
-            "fbx" => vec![(
-                args.out.clone(),
-                exchange::fbx::export(&doc, &snapshot)?,
-            )],
+            "fbx" => vec![(args.out.clone(), exchange::fbx::export(&doc, &snapshot)?)],
             "svg" => vec![(
                 args.out.clone(),
                 exchange::svg::export(&doc, &snapshot, view)?,

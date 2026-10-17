@@ -190,7 +190,6 @@ struct Loop {
     corner_data: Vec<Value>,
 }
 
-
 struct Face {
     first: usize,
     len: usize,
@@ -2279,7 +2278,10 @@ fn collapse_write_point(
     attributes: &[PointAttribute],
     values: &[Vec<Value>],
 ) -> Result<()> {
-    if attributes.iter().all(|attribute| attribute.color_layer.is_some()) {
+    if attributes
+        .iter()
+        .all(|attribute| attribute.color_layer.is_some())
+    {
         return Ok(());
     }
     let dropped = || {
@@ -2576,7 +2578,11 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
     let corners = output
         .corner_sources
         .iter()
-        .map(|source| (*source).map(|index| vec![(index, 1.0)]).unwrap_or_default())
+        .map(|source| {
+            (*source)
+                .map(|index| vec![(index, 1.0)])
+                .unwrap_or_default()
+        })
         .collect();
     let origin = Origin {
         vertices: output.origins,
@@ -2609,10 +2615,13 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
 #[cfg(test)]
 mod tests {
     use super::{
-        BMesh, Decimator, Heap, bmesh_from_mesh, collect_color_attributes, collect_point_attributes,
-        interp_customdata_value,
+        BMesh, Decimator, Heap, bmesh_from_mesh, collect_color_attributes,
+        collect_point_attributes, interp_customdata_value,
     };
-    use crate::geom::{Mesh, color_layers::{self, ColorDomain, ColorLayer, ColorStore}};
+    use crate::geom::{
+        Mesh,
+        color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+    };
     use glam::DVec3;
     use serde_json::json;
 
@@ -2692,14 +2701,7 @@ mod tests {
             collect_color_attributes(&mesh, &store).expect("color attributes");
         let mut point_attributes = collect_point_attributes(&mesh);
         point_attributes.append(&mut point_colors);
-        let bmesh = bmesh_from_mesh(
-            &mesh,
-            &[],
-            &point_attributes,
-            &corner_attributes,
-            &[],
-            &[],
-        );
+        let bmesh = bmesh_from_mesh(&mesh, &[], &point_attributes, &corner_attributes, &[], &[]);
 
         assert_eq!(point_attributes[0].color_layer, Some(0));
         assert_eq!(bmesh.point_types[0], "BYTE_COLOR");

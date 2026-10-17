@@ -667,7 +667,6 @@ fn screw_loose_edges_full_turn_offset_stretch_v_matches_blender_oracle() -> Test
     Ok(())
 }
 
-
 // Decimate (collapse, ratio 0.5). Blender's corner positions and UVs are matched exactly by the port.
 
 #[test]

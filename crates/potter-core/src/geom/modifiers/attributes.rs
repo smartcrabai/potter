@@ -2128,9 +2128,7 @@ fn transfer_vertex_attribute(
             .attributes
             .insert(key.clone(), Value::Object(fields));
     } else {
-        destination
-            .attributes
-            .insert(key, Value::Object(output));
+        destination.attributes.insert(key, Value::Object(output));
     }
     Ok(())
 }
@@ -2425,7 +2423,11 @@ fn transfer_custom_normals(
     factor: f64,
 ) -> Result<()> {
     if clnor::corner_codes(source)?.is_none() {
-        return Err(invalid(modifier, "data_types_loops", "source custom normals"));
+        return Err(invalid(
+            modifier,
+            "data_types_loops",
+            "source custom normals",
+        ));
     }
     // Blender transfers the final loop normals: authored vectors, and computed normals where automatic.
     let source_final = corner_normals(source, &mesh_points(source))?;
@@ -2640,7 +2642,11 @@ fn transfer_color_layer(
             let name = free_attribute_name(destination, &source_name);
             let count = match domain {
                 ColorDomain::Point => destination.vertices.len(),
-                ColorDomain::Corner => destination.faces.iter().map(|face| face.vertices.len()).sum(),
+                ColorDomain::Corner => destination
+                    .faces
+                    .iter()
+                    .map(|face| face.vertices.len())
+                    .sum(),
             };
             store.layers.push(ColorLayer {
                 name: name.clone(),

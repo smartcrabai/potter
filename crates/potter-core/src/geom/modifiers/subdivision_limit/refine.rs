@@ -14,7 +14,10 @@ use super::level::{
 };
 
 /// Positions and face-varying values share the refinement; both are affine combinations.
-pub(super) trait Point: Copy + Default + Add<Output = Self> + Mul<f64, Output = Self> {}
+pub(super) trait Point:
+    Copy + Default + Add<Output = Self> + Mul<f64, Output = Self>
+{
+}
 
 impl<T: Copy + Default + Add<Output = T> + Mul<f64, Output = T>> Point for T {}
 
@@ -391,11 +394,7 @@ fn vertex_child_position<T: Point>(
                 &source_edges,
             )
         } else {
-            fractional_weight(
-                parent_vertex_sharpness,
-                child_sharpness,
-                &parent_edge_sharp,
-            )
+            fractional_weight(parent_vertex_sharpness, child_sharpness, &parent_edge_sharp)
         };
         mask = mask.blend(weight, &child_mask, 1.0 - weight);
     }
@@ -427,7 +426,16 @@ pub(super) fn refine<T: Point>(
                 .collect()
         })
         .collect();
-    assemble(parent, positions, selected, depth, &keys, &quads, false, &[])
+    assemble(
+        parent,
+        positions,
+        selected,
+        depth,
+        &keys,
+        &quads,
+        false,
+        &[],
+    )
 }
 
 /// Refines a face-varying channel over the child quads of a position refinement: `quads[f][j]` tells
@@ -505,7 +513,6 @@ pub(super) fn refine_values_adaptive<T: Point>(
     );
     Some((selected, child))
 }
-
 
 /// Child indices of a face-varying channel: the children that its child quads use, numbered in the
 /// order `child_keys` uses.
@@ -772,7 +779,15 @@ fn assemble<T: Point>(
                     ..VTag::default()
                 };
                 let point = edge_child_position(parent, positions, e, tag.rule, &face_points);
-                (tag, if linear { super::level::SHARPNESS_INFINITE } else { 0.0 }, point)
+                (
+                    tag,
+                    if linear {
+                        super::level::SHARPNESS_INFINITE
+                    } else {
+                        0.0
+                    },
+                    point,
+                )
             }
             Source::Face(f) => {
                 let corners = parent.faces[f].len();
@@ -783,14 +798,21 @@ fn assemble<T: Point>(
                     inf_sharp: linear,
                     ..VTag::default()
                 };
-                (tag, if linear { super::level::SHARPNESS_INFINITE } else { 0.0 }, face_points[f])
+                (
+                    tag,
+                    if linear {
+                        super::level::SHARPNESS_INFINITE
+                    } else {
+                        0.0
+                    },
+                    face_points[f],
+                )
             }
         };
         vertex_tags.push(tag);
         vertex_sharpness.push(sharpness);
         child_positions.push(point);
     }
-
 
     let mut level = Level::from_parts(child_faces, child_face_edges, child_edges, vertex_total);
     level.edge_sharpness = edge_sharpness_out;

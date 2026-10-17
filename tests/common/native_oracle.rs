@@ -145,7 +145,12 @@ pub fn run_blender_arguments(
 }
 
 /// Runs Blender in the background. `file` is opened first when given; `argument` follows `--`.
-pub fn run_blender(blender: &Path, script: &Path, file: Option<&Path>, argument: &Path) -> TestResult {
+pub fn run_blender(
+    blender: &Path,
+    script: &Path,
+    file: Option<&Path>,
+    argument: &Path,
+) -> TestResult {
     run_blender_arguments(blender, script, file, &[argument])
 }
 
@@ -159,7 +164,6 @@ pub fn render_texture(blender: &Path, root: &Path, blend: &Path, name: &str) -> 
     run_blender_arguments(blender, &script, Some(blend), &[&json_path, &exr_path])?;
     Ok(serde_json::from_slice(&fs::read(json_path)?)?)
 }
-
 
 /// Builds the oracle under `root/oracle`. Returns the `.blend` path and the expected numbers.
 pub fn build_oracle(blender: &Path, root: &Path) -> TestResult<(PathBuf, Value)> {
@@ -318,13 +322,18 @@ pub fn normal_code_layer(mesh: &Value) -> TestResult<Option<Vec<Vec<StoredCorner
         return Ok(None);
     }
     if layer["domain"] != "corner" || layer["type"] != "normal_code" {
-        return Err(format!("custom_normal must be a corner normal_code layer, found {layer}").into());
+        return Err(
+            format!("custom_normal must be a corner normal_code layer, found {layer}").into(),
+        );
     }
     let faces = mesh["faces"].as_array().ok_or("mesh faces are missing")?;
     let mut face_corners = Vec::with_capacity(faces.len());
     for face in faces {
         let id = face["id"].as_u64().ok_or("face id is missing")?;
-        let corners = face["v"].as_array().ok_or("face vertices are missing")?.len();
+        let corners = face["v"]
+            .as_array()
+            .ok_or("face vertices are missing")?
+            .len();
         face_corners.push((format!("f{id}"), corners));
     }
     if let Some(order) = layer.get("corner_order") {
@@ -333,9 +342,16 @@ pub fn normal_code_layer(mesh: &Value) -> TestResult<Option<Vec<Vec<StoredCorner
     if layer["values"].is_null() {
         return Ok(None);
     }
-    let values = layer["values"].as_object().ok_or("custom_normal values must be an object")?;
+    let values = layer["values"]
+        .as_object()
+        .ok_or("custom_normal values must be an object")?;
     if values.len() != faces.len() {
-        return Err(format!("custom_normal has {} rows for {} faces", values.len(), faces.len()).into());
+        return Err(format!(
+            "custom_normal has {} rows for {} faces",
+            values.len(),
+            faces.len()
+        )
+        .into());
     }
     let mut rows = Vec::with_capacity(faces.len());
     for (key, corners) in &face_corners {
@@ -344,9 +360,17 @@ pub fn normal_code_layer(mesh: &Value) -> TestResult<Option<Vec<Vec<StoredCorner
             .and_then(Value::as_array)
             .ok_or_else(|| format!("custom_normal has no row for {key}"))?;
         if row.len() != *corners {
-            return Err(format!("{key} has {corners} corners but {} stored entries", row.len()).into());
+            return Err(format!(
+                "{key} has {corners} corners but {} stored entries",
+                row.len()
+            )
+            .into());
         }
-        rows.push(row.iter().map(stored_corner).collect::<TestResult<Vec<_>>>()?);
+        rows.push(
+            row.iter()
+                .map(stored_corner)
+                .collect::<TestResult<Vec<_>>>()?,
+        );
     }
     Ok(Some(rows))
 }
@@ -359,7 +383,9 @@ pub fn normal_code_rows(mesh: &Value) -> TestResult<Vec<Vec<StoredCorner>>> {
 /// `corner_order` names exactly the mesh faces, with one entry per face corner, and its ordinals
 /// form one unique permutation of `0..corner_count`.
 fn check_corner_order(order: &Value, faces: &[(String, usize)]) -> TestResult {
-    let order = order.as_object().ok_or("corner_order must be an object keyed by face")?;
+    let order = order
+        .as_object()
+        .ok_or("corner_order must be an object keyed by face")?;
     let expected: BTreeSet<&str> = faces.iter().map(|(key, _)| key.as_str()).collect();
     let named: BTreeSet<&str> = order.keys().map(String::as_str).collect();
     if expected != named {
@@ -372,10 +398,18 @@ fn check_corner_order(order: &Value, faces: &[(String, usize)]) -> TestResult {
             .and_then(Value::as_array)
             .ok_or_else(|| format!("corner_order for {key} is not an array"))?;
         if row.len() != *corners {
-            return Err(format!("corner_order for {key} has {} entries for {corners} corners", row.len()).into());
+            return Err(format!(
+                "corner_order for {key} has {} entries for {corners} corners",
+                row.len()
+            )
+            .into());
         }
         for ordinal in row {
-            ordinals.push(ordinal.as_u64().ok_or("corner_order ordinal is not an unsigned integer")?);
+            ordinals.push(
+                ordinal
+                    .as_u64()
+                    .ok_or("corner_order ordinal is not an unsigned integer")?,
+            );
         }
     }
     ordinals.sort_unstable();

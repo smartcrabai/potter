@@ -75,27 +75,19 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             .doc
             .nodes
             .get(&node_id)
-            .and_then(|node| {
-                node.modifiers
-                    .iter()
-                    .find(|modifier| modifier.enabled && modifier.modifier_type == "multires")
-            })
-            .filter(|modifier| {
-                dyntopo_edge_length.is_none()
-                    && modifier
-                    .params
-                    .get("sculpt_levels")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|levels| levels > 0)
-                    && !modifier
-                        .params
-                        .get("use_sculpt_base_mesh")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-            })
-            .cloned();
-        let (sculpted_mesh, mesh_changed) = if let Some(modifier) = multires_modifier {
-            crate::geom::modifiers::sculpt_multires(&before, &modifier, &stroke, world)?
+            .and_then(|node| active_multires_modifier(&node.modifiers, dyntopo_edge_length))
+            .map(|(index, modifier)| (index, modifier.clone()));
+        let (mut sculpted_mesh, mesh_changed) = if let Some((modifier_index, modifier)) =
+            multires_modifier
+        {
+            let deformed_base = multires_deformed_base(engine, &node_id, &before, modifier_index)?;
+            crate::geom::modifiers::sculpt_multires(
+                &before,
+                deformed_base.as_ref().unwrap_or(&before),
+                &modifier,
+                &stroke,
+                world,
+            )?
         } else {
             let mut world_mesh = before;
             for vertex in &mut world_mesh.vertices {
@@ -113,6 +105,18 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             }
             (world_mesh, mesh_changed)
         };
+        if mesh_changed && dyntopo_edge_length.is_some() {
+            let original = engine
+                .doc
+                .data_blocks
+                .get(&data_id)
+                .and_then(|data| data.mesh.as_ref());
+            if let Some(original) = original
+                && !same_mesh_topology(original, &sculpted_mesh)
+            {
+                sculpted_mesh.attributes.remove("multires_displacement");
+            }
+        }
         if mesh_changed {
             let block = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
                 PotError::new(ErrorCode::TargetNotFound, "mesh data block disappeared")
@@ -125,6 +129,138 @@ fn apply_stroke(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         }
     }
     Ok(changed)
+}
+
+fn active_multires_modifier(
+    modifiers: &[Modifier],
+    dyntopo_edge_length: Option<f64>,
+) -> Option<(usize, &Modifier)> {
+    if dyntopo_edge_length.is_some() {
+        return None;
+    }
+    let (index, modifier) = modifiers.iter().enumerate().find(|(_, modifier)| {
+        modifier.is_active(crate::eval::EvaluationPurpose::Preview)
+            && modifier.modifier_type == "multires"
+    })?;
+    (modifier
+        .params
+        .get("sculpt_levels")
+        .and_then(Value::as_u64)
+        .is_some_and(|levels| levels > 0)
+        && !modifier
+            .params
+            .get("use_sculpt_base_mesh")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    .then_some((index, modifier))
+}
+
+fn same_mesh_topology(left: &Mesh, right: &Mesh) -> bool {
+    left.vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .eq(right.vertices.iter().map(|vertex| vertex.id))
+        && left
+            .edges
+            .iter()
+            .map(|edge| (edge.id, edge.vertices))
+            .eq(right.edges.iter().map(|edge| (edge.id, edge.vertices)))
+        && left
+            .faces
+            .iter()
+            .map(|face| (face.id, &face.vertices))
+            .eq(right.faces.iter().map(|face| (face.id, &face.vertices)))
+}
+
+// Match Blender 5.2.2's `ModifierTypeType::OnlyDeform` classification before Multires.
+fn is_only_deform_modifier(modifier_type: &str) -> bool {
+    matches!(
+        modifier_type,
+        "armature"
+            | "cast"
+            | "corrective_smooth"
+            | "curve"
+            | "displace"
+            | "hook"
+            | "lattice"
+            | "laplacian_deform"
+            | "laplacian_smooth"
+            | "mesh_cache"
+            | "mesh_deform"
+            | "shrinkwrap"
+            | "simple_deform"
+            | "smooth"
+            | "soft_body"
+            | "surface"
+            | "surface_deform"
+            | "warp"
+            | "wave"
+    )
+}
+
+fn multires_deformed_base(
+    engine: &Engine<'_>,
+    node_id: &Id,
+    source: &Mesh,
+    multires_index: usize,
+) -> Result<Option<Mesh>> {
+    let node = engine
+        .doc
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "sculpt node was not found"))?;
+    let preceding = node.modifiers.get(..multires_index).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "multires modifier index is out of range",
+        )
+    })?;
+    let keep = preceding
+        .iter()
+        .enumerate()
+        .find(|(_, modifier)| {
+            modifier.is_active(crate::eval::EvaluationPurpose::Preview)
+                && !is_only_deform_modifier(&modifier.modifier_type)
+        })
+        .map_or(preceding.len(), |(index, _)| index);
+    if !preceding[..keep]
+        .iter()
+        .any(|modifier| modifier.is_active(crate::eval::EvaluationPurpose::Preview))
+    {
+        return Ok(None);
+    }
+
+    let frame = engine.evaluation_frame;
+    let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
+    let node_ids = BTreeSet::from([node_id.clone()]);
+    let mut snapshot = crate::eval::Snapshot::evaluate_nodes_with_modifier_prefix_with_cache(
+        engine.doc,
+        &crate::eval::EvaluationContext {
+            frame: Some(frame),
+            purpose: crate::eval::EvaluationPurpose::Preview,
+            ..crate::eval::EvaluationContext::default()
+        },
+        engine.asset_root,
+        engine.cache_directory,
+        &node_ids,
+        node_id,
+        keep,
+        &driver_values,
+    )?;
+    let deformed = snapshot.meshes.remove(node_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "bounded modifier prefix snapshot omitted the sculpt target mesh",
+            json!({"node_id":node_id}),
+        )
+    })?;
+    if !same_mesh_topology(source, &deformed) {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "OnlyDeform modifier changed multires base topology",
+        ));
+    }
+    Ok(Some(deformed))
 }
 
 fn apply_dyntopo(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
@@ -482,9 +618,7 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
                 data_changed = true;
             }
         }
-        if data_changed
-            && let Some(data_id) = &data_id
-        {
+        if data_changed && let Some(data_id) = &data_id {
             engine.mark("data_blocks", data_id, ChangeKind::Updated);
         }
         let levels = levels.min(total_levels);
@@ -1009,4 +1143,37 @@ fn vector3(engine: &Engine<'_>, value: Option<&Value>, pointer: &str) -> Result<
         )?,
     ];
     Ok(DVec3::new(x, y, z))
+}
+
+#[cfg(test)]
+mod multires_selection_tests {
+    use super::*;
+
+    fn multires_modifier(id: &str, show_viewport: bool) -> Modifier {
+        Modifier {
+            id: Id::new(id).unwrap(),
+            modifier_type: "multires".to_owned(),
+            name: "Multires".to_owned(),
+            enabled: true,
+            show_viewport,
+            show_render: true,
+            params: Map::from_iter([("sculpt_levels".to_owned(), serde_json::json!(1))]),
+            binding_data: None,
+            runtime: crate::model::ModifierRuntime::default(),
+        }
+    }
+
+    #[test]
+    fn multires_sculpt_uses_preview_active_slot() {
+        let modifiers = [
+            multires_modifier("hidden_multires", false),
+            multires_modifier("active_multires", true),
+        ];
+        assert_eq!(
+            active_multires_modifier(&modifiers, None).map(|(index, _)| index),
+            Some(1)
+        );
+        let hidden_only = [multires_modifier("hidden_multires", false)];
+        assert!(active_multires_modifier(&hidden_only, None).is_none());
+    }
 }

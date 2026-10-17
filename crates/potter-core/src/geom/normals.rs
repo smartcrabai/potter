@@ -135,11 +135,7 @@ pub(crate) fn plain_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<V
 }
 
 /// Shading from the geometry and the decoded custom-normal view, where `None` means no layer.
-fn shade(
-    mesh: &Mesh,
-    positions: &[DVec3],
-    custom: Option<Vec<Option<DVec3>>>,
-) -> Result<Shading> {
+fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -> Result<Shading> {
     let index_by_id: HashMap<u32, usize> = mesh
         .vertices
         .iter()
@@ -525,7 +521,6 @@ pub(crate) fn corner_normal_domain(mesh: &Mesh) -> Result<bool> {
     Ok(sharp_faces.iter().any(|sharp| *sharp) || sharp_edges.iter().any(|sharp| *sharp))
 }
 
-
 fn union(parent: &mut [usize], first: usize, second: usize) {
     let first = find(parent, first);
     let second = find(parent, second);
@@ -775,14 +770,26 @@ mod tests {
         let mut mesh = Mesh::box_mesh(crate::geom::BoxParams::default()).expect("cube");
         let faces = mesh.faces.len();
         let edges = mesh.edges.len();
-        mesh.attributes
-            .insert("blender_polygon_smooth".to_owned(), json!(vec![true; faces]));
+        mesh.attributes.insert(
+            "blender_polygon_smooth".to_owned(),
+            json!(vec![true; faces]),
+        );
         mesh.attributes.insert(
             "blender_edge_flags".to_owned(),
             json!(vec![json!({"sharp": true, "seam": false}); edges]),
         );
-        assert!(smooth_face_flags(&mesh).expect("smooth").iter().all(|flag| !flag));
-        assert!(sharp_edge_flags(&mesh).expect("sharp").iter().all(|flag| !flag));
+        assert!(
+            smooth_face_flags(&mesh)
+                .expect("smooth")
+                .iter()
+                .all(|flag| !flag)
+        );
+        assert!(
+            sharp_edge_flags(&mesh)
+                .expect("sharp")
+                .iter()
+                .all(|flag| !flag)
+        );
     }
 
     #[test]

@@ -65,7 +65,8 @@ fn bezier_basis_derivative(t: f64) -> [f64; 4] {
 
 /// Control-point indices of the 4x4 B-spline grid touched by each corner's ring
 /// (OpenSubdiv `getQuadRegularPatchPoints`); `k = 4 * row + col` with row along `t`, col along `s`.
-const CORNER_POINTS: [[usize; 4]; 4] = [[5, 4, 0, 1], [6, 2, 3, 7], [10, 11, 15, 14], [9, 13, 12, 8]];
+const CORNER_POINTS: [[usize; 4]; 4] =
+    [[5, 4, 0, 1], [6, 2, 3, 7], [10, 11, 15, 14], [9, 13, 12, 8]];
 
 /// Boundary mask of a leaf: bit `i` is set when its edge from corner `i` to `i + 1` is singular
 /// (boundary, non-manifold, or infinitely sharp).
@@ -85,7 +86,11 @@ pub(super) fn regular_grid(level: &Level, face: usize, mask: u8) -> [Row; 16] {
         let vertex = corners[c];
         let out_boundary = mask & (1 << c) != 0;
         let in_boundary = mask & (1 << ((c + 3) % 4)) != 0;
-        let mut outer: [Row; 3] = [boundary_point.clone(), boundary_point.clone(), boundary_point.clone()];
+        let mut outer: [Row; 3] = [
+            boundary_point.clone(),
+            boundary_point.clone(),
+            boundary_point.clone(),
+        ];
         if !out_boundary && !in_boundary {
             let ring = fan(level, face, vertex);
             let opposite = ring[2];
@@ -250,10 +255,7 @@ pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
 
 /// OpenSubdiv's default Gregory derivative approximation: differentiate the Bezier basis while
 /// holding the rational interior-point blend factors fixed.
-pub(super) fn gregory_weights_and_derivatives(
-    s: f64,
-    t: f64,
-) -> ([f64; 20], [f64; 20], [f64; 20]) {
+pub(super) fn gregory_weights_and_derivatives(s: f64, t: f64) -> ([f64; 20], [f64; 20], [f64; 20]) {
     let bs = bezier_basis(s);
     let bt = bezier_basis(t);
     let ds = bezier_basis_derivative(s);
@@ -341,7 +343,12 @@ pub(super) fn tangent_coefficient(n: usize) -> f64 {
 
 /// Whether the leaf is evaluated by the B-spline (OpenSubdiv `IsPatchRegular`). `depth` is the
 /// leaf's level; `has_irregular_faces` is whether the base mesh has non-quad faces.
-pub(super) fn is_regular_leaf(level: &Level, face: usize, depth: usize, has_irregular_faces: bool) -> bool {
+pub(super) fn is_regular_leaf(
+    level: &Level,
+    face: usize,
+    depth: usize,
+    has_irregular_faces: bool,
+) -> bool {
     let corners = level.faces[face].clone();
     let tags: Vec<_> = corners.iter().map(|&v| level.vtags[v]).collect();
     let combined = super::level::VTag::combine(&tags);

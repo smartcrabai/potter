@@ -19,8 +19,7 @@ use super::{
 use crate::{
     error::Result,
     geom::{
-        Mesh,
-        edge_key,
+        Mesh, edge_key,
         provenance::Origin,
         uv_layers::{self, UvLayer},
     },
@@ -120,10 +119,8 @@ impl Position {
         creases: &BTreeMap<(usize, usize), f64>,
         vertex_count: usize,
     ) -> Self {
-        let non_manifold = NonManifold::new(
-            vertex_count,
-            polys.iter().map(|(face, _)| face.as_slice()),
-        );
+        let non_manifold =
+            NonManifold::new(vertex_count, polys.iter().map(|(face, _)| face.as_slice()));
         let sharpness = non_manifold.sharpened(creases);
         let total: usize = polys.iter().map(|(face, _)| face.len()).sum();
         let mut starts = Vec::with_capacity(polys.len() + 1);
@@ -198,7 +195,6 @@ impl Position {
         &self.vertex_corners[self.vertex_starts[vertex]..self.vertex_starts[vertex + 1]]
     }
 }
-
 
 /// Blender's UV connection tolerance (`STD_UV_CONNECT_LIMIT`).
 const UV_CONNECT_LIMIT: f64 = 0.0001;
@@ -483,4 +479,3 @@ pub(super) fn subdivided_mesh(
     }
     Ok(output)
 }
-

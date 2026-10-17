@@ -80,7 +80,11 @@ fn canonical_cycle(keys: &[usize]) -> (Vec<usize>, usize) {
 }
 
 fn edge_key(first: usize, second: usize) -> (usize, usize) {
-    if first <= second { (first, second) } else { (second, first) }
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    }
 }
 
 /// One output or oracle face, with vertices as indices into its shape's point list.
@@ -141,7 +145,9 @@ fn oracle_shape(expected: &Value) -> TestResult<Shape> {
             };
             Ok(FaceRecord {
                 vertices: indices(&face["v"])?,
-                smooth: face["smooth"].as_bool().ok_or("oracle smooth flag missing")?,
+                smooth: face["smooth"]
+                    .as_bool()
+                    .ok_or("oracle smooth flag missing")?,
                 uv: uv_layers,
                 normals,
             })
@@ -180,7 +186,11 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
-    let points = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let points = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let uv_layers = mesh
         .attributes
         .get("blender_uv_layers")
@@ -188,7 +198,9 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
         .ok_or("output UV layers missing")?
         .iter()
         .map(|layer| -> TestResult<(String, Vec<[f64; 2]>)> {
-            let name = layer["name"].as_str().ok_or("output UV layer name missing")?;
+            let name = layer["name"]
+                .as_str()
+                .ok_or("output UV layer name missing")?;
             let values = layer["values"]
                 .as_array()
                 .ok_or("output UV values missing")?
@@ -256,7 +268,11 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
     }
     for (name, values) in &uv_layers {
         if loop_offset != values.len() {
-            return Err(format!("UV layer {name} has {} loops, faces have {loop_offset}", values.len()).into());
+            return Err(format!(
+                "UV layer {name} has {} loops, faces have {loop_offset}",
+                values.len()
+            )
+            .into());
         }
     }
     let flags = mesh
@@ -315,7 +331,10 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         .map(indices)
         .collect::<TestResult<Vec<_>>>()?;
     let mut mesh = Mesh::from_positions_and_faces(vertices, faces)?;
-    for loose in spec["loose_edges"].as_array().ok_or("mesh loose edges missing")? {
+    for loose in spec["loose_edges"]
+        .as_array()
+        .ok_or("mesh loose edges missing")?
+    {
         let pair = indices(loose)?;
         if pair.len() != 2 {
             return Err("loose edge must reference two vertices".into());
@@ -464,10 +483,18 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
         ));
     }
     if actual.faces.len() != expected.faces.len() {
-        return Err(format!("face count {} != {}", actual.faces.len(), expected.faces.len()));
+        return Err(format!(
+            "face count {} != {}",
+            actual.faces.len(),
+            expected.faces.len()
+        ));
     }
     if actual.edges.len() != expected.edges.len() {
-        return Err(format!("edge count {} != {}", actual.edges.len(), expected.edges.len()));
+        return Err(format!(
+            "edge count {} != {}",
+            actual.edges.len(),
+            expected.edges.len()
+        ));
     }
     if actual.has_custom_normals != expected.has_custom_normals {
         return Err("custom-normal layer presence differs".to_owned());
@@ -525,7 +552,10 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
             .map(|vertex| to_expected[actual_clusters[*vertex]])
             .collect();
         let (cycle, rotation) = canonical_cycle(&keys);
-        actual_faces.entry(cycle).or_default().push((face, rotation));
+        actual_faces
+            .entry(cycle)
+            .or_default()
+            .push((face, rotation));
     }
     let mut expected_faces: BTreeMap<Vec<usize>, Vec<(&FaceRecord, usize)>> = BTreeMap::new();
     for face in &expected.faces {
@@ -535,7 +565,10 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
             .map(|vertex| expected_clusters[*vertex])
             .collect();
         let (cycle, rotation) = canonical_cycle(&keys);
-        expected_faces.entry(cycle).or_default().push((face, rotation));
+        expected_faces
+            .entry(cycle)
+            .or_default()
+            .push((face, rotation));
     }
     if actual_faces.keys().collect::<Vec<_>>() != expected_faces.keys().collect::<Vec<_>>() {
         return Err("canonical oriented face topology differs".to_owned());
@@ -543,7 +576,11 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
     for (cycle, expected_list) in &expected_faces {
         let actual_list = &actual_faces[cycle];
         if actual_list.len() != expected_list.len() {
-            return Err(format!("face {cycle:?} occurs {} times, Blender {}", actual_list.len(), expected_list.len()));
+            return Err(format!(
+                "face {cycle:?} occurs {} times, Blender {}",
+                actual_list.len(),
+                expected_list.len()
+            ));
         }
         for ((actual_face, actual_rotation), (expected_face, expected_rotation)) in
             actual_list.iter().zip(expected_list)
@@ -551,7 +588,9 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
             if actual_face.smooth != expected_face.smooth {
                 return Err(format!("face {cycle:?} polygon interpolation flag differs"));
             }
-            if actual_face.uv.keys().collect::<Vec<_>>() != expected_face.uv.keys().collect::<Vec<_>>() {
+            if actual_face.uv.keys().collect::<Vec<_>>()
+                != expected_face.uv.keys().collect::<Vec<_>>()
+            {
                 return Err(format!("face {cycle:?} UV layer set differs"));
             }
             for (layer, expected_values) in &expected_face.uv {
@@ -568,7 +607,9 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
                 (Some(actual_normals), Some(expected_normals)) => {
                     let actual_normals = rotated(actual_normals, *actual_rotation);
                     let expected_normals = rotated(expected_normals, *expected_rotation);
-                    for (actual_normal, expected_normal) in actual_normals.iter().zip(&expected_normals) {
+                    for (actual_normal, expected_normal) in
+                        actual_normals.iter().zip(&expected_normals)
+                    {
                         errors.normal = errors.normal.max(actual_normal.distance(*expected_normal));
                     }
                 }
@@ -578,7 +619,10 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
         }
     }
     if errors.uv > UV_TOLERANCE {
-        return Err(format!("max corner UV error {:.9e} exceeds {UV_TOLERANCE:.9e}", errors.uv));
+        return Err(format!(
+            "max corner UV error {:.9e} exceeds {UV_TOLERANCE:.9e}",
+            errors.uv
+        ));
     }
     if errors.normal > NORMAL_TOLERANCE {
         return Err(format!(
@@ -612,10 +656,22 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
     for (key, expected_list) in &expected_edges {
         let mut actual_list = actual_edges[key].clone();
         let mut expected_list = expected_list.clone();
-        actual_list.sort_by(|first, second| first.partial_cmp(second).unwrap_or(std::cmp::Ordering::Equal));
-        expected_list.sort_by(|first, second| first.partial_cmp(second).unwrap_or(std::cmp::Ordering::Equal));
+        actual_list.sort_by(|first, second| {
+            first
+                .partial_cmp(second)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        expected_list.sort_by(|first, second| {
+            first
+                .partial_cmp(second)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if actual_list.len() != expected_list.len() {
-            return Err(format!("edge {key:?} occurs {} times, Blender {}", actual_list.len(), expected_list.len()));
+            return Err(format!(
+                "edge {key:?} occurs {} times, Blender {}",
+                actual_list.len(),
+                expected_list.len()
+            ));
         }
         for ((actual_seam, actual_crease), (expected_seam, expected_crease)) in
             actual_list.iter().zip(&expected_list)
@@ -667,7 +723,9 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
         max_serialization_error <= 5.1e-8,
         "fixture max serialization rounding error {max_serialization_error:.9e} exceeds the seven-decimal bound"
     );
-    let meshes = oracle["meshes"].as_object().ok_or("oracle mesh inputs missing")?;
+    let meshes = oracle["meshes"]
+        .as_object()
+        .ok_or("oracle mesh inputs missing")?;
     let cases = oracle["cases"].as_array().ok_or("oracle cases missing")?;
     assert_matrix_coverage(cases, meshes)?;
 
@@ -676,7 +734,9 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
     for case in cases {
         let case_name = case["name"].as_str().ok_or("case name missing")?;
         let mesh_name = case["mesh"].as_str().ok_or("case mesh missing")?;
-        let spec = meshes.get(mesh_name).ok_or("case mesh not present in oracle")?;
+        let spec = meshes
+            .get(mesh_name)
+            .ok_or("case mesh not present in oracle")?;
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compare_case(case, spec)));
         match outcome {
@@ -735,7 +795,10 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         let params = &case["params"];
         let level = params["levels"].as_u64().ok_or("levels missing")?;
         let quality = params["quality"].as_u64().ok_or("quality missing")?;
-        let uv = params["uv_smooth"].as_str().ok_or("uv_smooth missing")?.to_owned();
+        let uv = params["uv_smooth"]
+            .as_str()
+            .ok_or("uv_smooth missing")?
+            .to_owned();
         let boundary = params["boundary_smooth"]
             .as_str()
             .ok_or("boundary rule missing")?
@@ -747,8 +810,7 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         levels.insert(level);
         qualities.insert(quality);
         uv_boundary_pairs.insert((uv.clone(), boundary.clone()));
-        if uv == "PRESERVE_CORNERS_AND_JUNCTIONS"
-            || uv == "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE"
+        if uv == "PRESERVE_CORNERS_AND_JUNCTIONS" || uv == "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE"
         {
             if params["use_creases"].as_bool() == Some(true) {
                 crease_dependent_uv_modes.insert(uv.clone());
@@ -763,7 +825,11 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
                 .ok_or("type missing")?
                 .to_owned(),
         );
-        crease_settings.insert(params["use_creases"].as_bool().ok_or("crease flag missing")?);
+        crease_settings.insert(
+            params["use_creases"]
+                .as_bool()
+                .ok_or("crease flag missing")?,
+        );
         custom_normal_settings.insert(
             params["use_custom_normals"]
                 .as_bool()
@@ -780,7 +846,11 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         }
     }
     assert_eq!(levels, BTreeSet::from([0, 1, 2, 3, 4, 5]), "levels");
-    assert_eq!(qualities, BTreeSet::from([1, 2, 3, 4, 5, 6, 10]), "qualities");
+    assert_eq!(
+        qualities,
+        BTreeSet::from([1, 2, 3, 4, 5, 6, 10]),
+        "qualities"
+    );
     let all_uv_modes = [
         "NONE",
         "PRESERVE_CORNERS",
@@ -791,10 +861,7 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
     ];
     assert_eq!(
         uv_modes,
-        all_uv_modes
-            .iter()
-            .map(|mode| (*mode).to_owned())
-            .collect(),
+        all_uv_modes.iter().map(|mode| (*mode).to_owned()).collect(),
         "uv_smooth modes"
     );
     assert_eq!(
@@ -807,13 +874,21 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         all_uv_modes.len() * 2,
         "uv_smooth x boundary_smooth pairs"
     );
-    assert_eq!(limit_settings, BTreeSet::from([false, true]), "use_limit_surface");
+    assert_eq!(
+        limit_settings,
+        BTreeSet::from([false, true]),
+        "use_limit_surface"
+    );
     assert_eq!(
         subdivision_types,
         BTreeSet::from(["CATMULL_CLARK".to_owned(), "SIMPLE".to_owned()]),
         "subdivision types"
     );
-    assert_eq!(crease_settings, BTreeSet::from([false, true]), "use_creases");
+    assert_eq!(
+        crease_settings,
+        BTreeSet::from([false, true]),
+        "use_creases"
+    );
     assert_eq!(
         custom_normal_settings,
         BTreeSet::from([false, true]),
@@ -860,7 +935,10 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
     let loose_edges = meshes["loose"]["loose_edges"]
         .as_array()
         .ok_or("loose edges missing")?;
-    assert!(!loose_edges.is_empty(), "loose mesh must carry a loose edge");
+    assert!(
+        !loose_edges.is_empty(),
+        "loose mesh must carry a loose edge"
+    );
     let flat = meshes["cube_flat"]["smooth"]
         .as_array()
         .ok_or("smooth flags missing")?;

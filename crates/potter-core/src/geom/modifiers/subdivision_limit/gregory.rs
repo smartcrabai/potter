@@ -118,14 +118,14 @@ pub(super) fn leaf_corner(level: &Level, face: usize, vertex: usize) -> Corner {
     // Spans are only identified where infinitely sharp edges can cut the ring; otherwise the whole
     // ring is the span.
     let test_inf_sharp_edges = tag.inf_sharp_edges && tag.rule != RULE_DART;
-    let (num_faces, face_in_ring, boundary, span_faces) = if test_inf_sharp_edges || tag.non_manifold
-    {
-        (k, span.face_in_span, span.open, span.faces.clone())
-    } else {
-        let ring = fan(level, face, vertex);
-        let index = ring.iter().position(|&f| f == face).unwrap_or(0);
-        (ring.len(), index, tag.boundary, ring)
-    };
+    let (num_faces, face_in_ring, boundary, span_faces) =
+        if test_inf_sharp_edges || tag.non_manifold {
+            (k, span.face_in_span, span.open, span.faces.clone())
+        } else {
+            let ring = fan(level, face, vertex);
+            let index = ring.iter().position(|&f| f == face).unwrap_or(0);
+            (ring.len(), index, tag.boundary, ring)
+        };
     let valence = num_faces + usize::from(boundary);
     let mut sharp = if tag.corner {
         true
@@ -254,7 +254,8 @@ fn non_manifold_corner_span(level: &Level, face: usize, vertex: usize) -> NonMan
                 break;
             };
             let next_edges = &level.face_edges[next_face];
-            let Some(edge_corner) = next_edges.iter().position(|&edge| edge == trailing_edge) else {
+            let Some(edge_corner) = next_edges.iter().position(|&edge| edge == trailing_edge)
+            else {
                 break;
             };
             trailing_face = next_face;
@@ -271,7 +272,8 @@ fn non_manifold_corner_span(level: &Level, face: usize, vertex: usize) -> NonMan
         let current = *faces.last().unwrap();
         let current_corner = *corners.last().unwrap();
         let current_edges = &level.face_edges[current];
-        let incoming = current_edges[(current_corner + current_edges.len() - 1) % current_edges.len()];
+        let incoming =
+            current_edges[(current_corner + current_edges.len() - 1) % current_edges.len()];
         let Some(next_face) = level.other_face(incoming, current) else {
             break;
         };
@@ -373,7 +375,16 @@ fn weighted_row(corner: &Corner, weights: &[f64]) -> Row {
         .iter()
         .enumerate()
         .filter(|(_, w)| **w != 0.0)
-        .map(|(j, &w)| (if j == 0 { corner.point } else { corner.ring[j - 1] }, w))
+        .map(|(j, &w)| {
+            (
+                if j == 0 {
+                    corner.point
+                } else {
+                    corner.ring[j - 1]
+                },
+                w,
+            )
+        })
         .collect()
 }
 

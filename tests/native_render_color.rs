@@ -9,14 +9,14 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
+#[path = "common/process.rs"]
+mod process;
 
 use std::{error::Error, fs, path::Path};
 

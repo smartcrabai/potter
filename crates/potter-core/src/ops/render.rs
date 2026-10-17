@@ -114,16 +114,10 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let max_bounces = optional_u32(engine, set, "max_bounces", 0, 1024)?;
     let motion_blur_samples = optional_u32(engine, set, "motion_blur_samples", 1, 64)?;
     let dicing_rate = optional_f64(engine, set, "dicing_rate", 0.1, 1000.0)?;
-    let preview_dicing_rate =
-        optional_f64(engine, set, "preview_dicing_rate", 0.1, 1000.0)?;
+    let preview_dicing_rate = optional_f64(engine, set, "preview_dicing_rate", 0.1, 1000.0)?;
     let max_subdivisions = optional_u32(engine, set, "max_subdivisions", 0, 16)?;
-    let offscreen_dicing_scale = optional_f64(
-        engine,
-        set,
-        "offscreen_dicing_scale",
-        1.0,
-        f32::MAX as f64,
-    )?;
+    let offscreen_dicing_scale =
+        optional_f64(engine, set, "offscreen_dicing_scale", 1.0, f32::MAX as f64)?;
     let dicing_camera = set
         .get("dicing_camera")
         .map(|value| {
@@ -356,9 +350,9 @@ fn optional_f64(
 ) -> Result<Option<f64>> {
     set.get(key)
         .map(|value| {
-            let number = value.as_f64().filter(|number| {
-                number.is_finite() && (minimum..=maximum).contains(number)
-            });
+            let number = value
+                .as_f64()
+                .filter(|number| number.is_finite() && (minimum..=maximum).contains(number));
             number.ok_or_else(|| {
                 engine.error(
                     ErrorCode::InvalidOperation,

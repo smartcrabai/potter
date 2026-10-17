@@ -13,15 +13,14 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
-#[path = "common/process.rs"]
-mod process;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
     reason = "each test binary uses a subset of the shared oracle helpers"
 )]
 mod native_oracle;
-
+#[path = "common/process.rs"]
+mod process;
 
 use native_oracle::{
     FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats, blender,
@@ -81,7 +80,10 @@ fn check_render(result: &Value, expected: &Value, label: &str) -> TestResult {
         "{label}: image size"
     );
     assert_eq!(result["interpolation"], "Closest", "{label}: interpolation");
-    assert_eq!(result["uv_map"], "Base", "{label}: texture must sample the Base layer");
+    assert_eq!(
+        result["uv_map"], "Base",
+        "{label}: texture must sample the Base layer"
+    );
     // The file's PNG, read by Blender (`image.pixels`, bottom row first): no flip anywhere.
     assert_grid(
         &result["image_pixels_bottom_up"],
@@ -143,16 +145,36 @@ fn check_material_links(object: &Value) -> TestResult {
         .to_owned();
 
     let base = feeding(material, &principled, "Base Color")?;
-    assert_eq!(base["type"], "ShaderNodeTexImage", "base color is a texture");
+    assert_eq!(
+        base["type"], "ShaderNodeTexImage",
+        "base color is a texture"
+    );
     assert_eq!(base["interpolation"], "Closest", "base color interpolation");
-    let base_uv = feeding(material, base["name"].as_str().unwrap_or_default(), "Vector")?;
-    assert_eq!(base_uv["type"], "ShaderNodeUVMap", "base texture has a UV Map");
+    let base_uv = feeding(
+        material,
+        base["name"].as_str().unwrap_or_default(),
+        "Vector",
+    )?;
+    assert_eq!(
+        base_uv["type"], "ShaderNodeUVMap",
+        "base texture has a UV Map"
+    );
     assert_eq!(base_uv["uv_map"], "Base", "base texture layer selection");
 
     let rough = feeding(material, &principled, "Roughness")?;
-    assert_eq!(rough["type"], "ShaderNodeTexImage", "roughness is a texture");
-    let rough_uv = feeding(material, rough["name"].as_str().unwrap_or_default(), "Vector")?;
-    assert_eq!(rough_uv["uv_map"], "Light", "uv_layer null resolves to the render layer");
+    assert_eq!(
+        rough["type"], "ShaderNodeTexImage",
+        "roughness is a texture"
+    );
+    let rough_uv = feeding(
+        material,
+        rough["name"].as_str().unwrap_or_default(),
+        "Vector",
+    )?;
+    assert_eq!(
+        rough_uv["uv_map"], "Light",
+        "uv_layer null resolves to the render layer"
+    );
     Ok(())
 }
 
@@ -270,22 +292,62 @@ fn alpha_mode_and_threshold_survive_authoring_through_blend() -> TestResult {
     let dump = blender_materials(&blender, root.path(), &exported_blend, "alpha")?;
     let glass = blender_material(&dump, "Blend Glass")?;
     assert_eq!(glass["surface_render_method"], "BLENDED");
-    assert_close(number(&glass["alpha_threshold"])?, 0.23, FLOAT_TOLERANCE, "blend threshold");
-    assert_close(number(&glass["principled_alpha"])?, 0.6, FLOAT_TOLERANCE, "blend alpha");
-    assert_close(number(&glass["principled_base_alpha"])?, 0.6, FLOAT_TOLERANCE, "blend base");
+    assert_close(
+        number(&glass["alpha_threshold"])?,
+        0.23,
+        FLOAT_TOLERANCE,
+        "blend threshold",
+    );
+    assert_close(
+        number(&glass["principled_alpha"])?,
+        0.6,
+        FLOAT_TOLERANCE,
+        "blend alpha",
+    );
+    assert_close(
+        number(&glass["principled_base_alpha"])?,
+        0.6,
+        FLOAT_TOLERANCE,
+        "blend base",
+    );
     assert_eq!(glass["alpha_mode_property"], "blend");
 
     let clip = blender_material(&dump, "Clip Leaf")?;
     assert_eq!(clip["surface_render_method"], "DITHERED");
-    assert_close(number(&clip["alpha_threshold"])?, 0.42, FLOAT_TOLERANCE, "clip threshold");
-    assert_close(number(&clip["principled_alpha"])?, 0.8, FLOAT_TOLERANCE, "clip alpha");
+    assert_close(
+        number(&clip["alpha_threshold"])?,
+        0.42,
+        FLOAT_TOLERANCE,
+        "clip threshold",
+    );
+    assert_close(
+        number(&clip["principled_alpha"])?,
+        0.8,
+        FLOAT_TOLERANCE,
+        "clip alpha",
+    );
     assert_eq!(clip["alpha_mode_property"], "clip");
 
     let opaque = blender_material(&dump, "Opaque Paint")?;
     assert_eq!(opaque["surface_render_method"], "DITHERED");
-    assert_close(number(&opaque["alpha_threshold"])?, 0.7, FLOAT_TOLERANCE, "opaque threshold");
-    assert_close(number(&opaque["principled_alpha"])?, 1.0, FLOAT_TOLERANCE, "opaque alpha");
-    assert_close(number(&opaque["principled_base_alpha"])?, 0.3, FLOAT_TOLERANCE, "opaque base");
+    assert_close(
+        number(&opaque["alpha_threshold"])?,
+        0.7,
+        FLOAT_TOLERANCE,
+        "opaque threshold",
+    );
+    assert_close(
+        number(&opaque["principled_alpha"])?,
+        1.0,
+        FLOAT_TOLERANCE,
+        "opaque alpha",
+    );
+    assert_close(
+        number(&opaque["principled_base_alpha"])?,
+        0.3,
+        FLOAT_TOLERANCE,
+        "opaque base",
+    );
     assert_eq!(opaque["alpha_mode_property"], "opaque");
 
     // Potter's view after reopening the exported file: modes, thresholds, and base alpha.
@@ -293,15 +355,40 @@ fn alpha_mode_and_threshold_survive_authoring_through_blend() -> TestResult {
     let scene = read_scene(&reimported)?;
     let glass = potter_material(&scene, "Blend Glass")?;
     assert_eq!(glass["alpha_mode"], "blend");
-    assert_close(number(&glass["alpha_threshold"])?, 0.23, FLOAT_TOLERANCE, "reimport blend");
-    assert_close(number(&glass["base_color"][3])?, 0.6, FLOAT_TOLERANCE, "reimport blend base");
+    assert_close(
+        number(&glass["alpha_threshold"])?,
+        0.23,
+        FLOAT_TOLERANCE,
+        "reimport blend",
+    );
+    assert_close(
+        number(&glass["base_color"][3])?,
+        0.6,
+        FLOAT_TOLERANCE,
+        "reimport blend base",
+    );
     let clip = potter_material(&scene, "Clip Leaf")?;
     assert_eq!(clip["alpha_mode"], "clip");
-    assert_close(number(&clip["alpha_threshold"])?, 0.42, FLOAT_TOLERANCE, "reimport clip");
+    assert_close(
+        number(&clip["alpha_threshold"])?,
+        0.42,
+        FLOAT_TOLERANCE,
+        "reimport clip",
+    );
     let opaque = potter_material(&scene, "Opaque Paint")?;
     assert_eq!(opaque["alpha_mode"], "opaque");
-    assert_close(number(&opaque["alpha_threshold"])?, 0.7, FLOAT_TOLERANCE, "reimport opaque");
-    assert_close(number(&opaque["base_color"][3])?, 0.3, FLOAT_TOLERANCE, "reimport opaque base");
+    assert_close(
+        number(&opaque["alpha_threshold"])?,
+        0.7,
+        FLOAT_TOLERANCE,
+        "reimport opaque",
+    );
+    assert_close(
+        number(&opaque["base_color"][3])?,
+        0.3,
+        FLOAT_TOLERANCE,
+        "reimport opaque base",
+    );
     Ok(())
 }
 
@@ -311,16 +398,31 @@ fn blender_authored_materials_infer_alpha_mode_from_render_state() -> TestResult
         return Ok(());
     };
     let root = tempdir()?;
-    let script = write_script(root.path(), "author_alpha_materials.py", AUTHOR_ALPHA_SCRIPT)?;
+    let script = write_script(
+        root.path(),
+        "author_alpha_materials.py",
+        AUTHOR_ALPHA_SCRIPT,
+    )?;
     let authored = root.path().join("authored.blend");
     run_blender(&blender, &script, None, &authored)?;
     let (project, _) = import_blend(&blender, root.path(), "authored_project", &authored)?;
     let scene = read_scene(&project)?;
-    assert_eq!(potter_material(&scene, "Authored Blended")?["alpha_mode"], "blend");
+    assert_eq!(
+        potter_material(&scene, "Authored Blended")?["alpha_mode"],
+        "blend"
+    );
     let dithered = potter_material(&scene, "Authored Dithered Alpha")?;
     assert_eq!(dithered["alpha_mode"], "clip");
     // The threshold is Blender's own default (0.5), not derived from the inferred mode.
-    assert_close(number(&dithered["alpha_threshold"])?, 0.5, FLOAT_TOLERANCE, "authored threshold");
-    assert_eq!(potter_material(&scene, "Authored Dithered Opaque")?["alpha_mode"], "opaque");
+    assert_close(
+        number(&dithered["alpha_threshold"])?,
+        0.5,
+        FLOAT_TOLERANCE,
+        "authored threshold",
+    );
+    assert_eq!(
+        potter_material(&scene, "Authored Dithered Opaque")?["alpha_mode"],
+        "opaque"
+    );
     Ok(())
 }

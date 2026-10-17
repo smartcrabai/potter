@@ -187,7 +187,6 @@ impl Level {
         }
     }
 
-
     pub(super) fn vertex_count(&self) -> usize {
         self.vertex_faces.len()
     }
@@ -206,7 +205,10 @@ impl Level {
 
     /// The face on the other side of `edge` from `face`, if the edge is manifold and interior.
     pub(super) fn other_face(&self, edge: usize, face: usize) -> Option<usize> {
-        self.edge_faces[edge].iter().copied().find(|&other| other != face)
+        self.edge_faces[edge]
+            .iter()
+            .copied()
+            .find(|&other| other != face)
     }
 
     /// Far endpoint of `edge` relative to `vertex`.
@@ -270,8 +272,8 @@ impl Level {
                         if boundary_count > 0 {
                             inf_irregular = false;
                         } else if edges.len() == 4 {
-                            inf_irregular = self.etags[edges[0]].inf_sharp
-                                != self.etags[edges[2]].inf_sharp;
+                            inf_irregular =
+                                self.etags[edges[0]].inf_sharp != self.etags[edges[2]].inf_sharp;
                         }
                     }
                 } else if inf_rule == RULE_CORNER
