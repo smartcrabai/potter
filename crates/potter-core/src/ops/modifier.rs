@@ -1184,6 +1184,10 @@ fn evaluate_modifier_output(
             let evaluated_operand_meshes = operand_snapshot
                 .as_ref()
                 .map_or(&empty_meshes, |snapshot| &snapshot.meshes);
+            let empty_nodes = BTreeMap::new();
+            let evaluated_operand_nodes = operand_snapshot
+                .as_ref()
+                .map_or(&empty_nodes, |snapshot| &snapshot.nodes);
             let driver_values = if operand_snapshot.is_none() {
                 crate::eval::rig::evaluate_drivers(engine.doc, frame)?
             } else {
@@ -1321,6 +1325,7 @@ fn evaluate_modifier_output(
                             engine.doc,
                             &world_matrices,
                             evaluated_operand_meshes,
+                            evaluated_operand_nodes,
                             &mut material_slots,
                         )
                     }
