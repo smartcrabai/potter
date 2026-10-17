@@ -1339,7 +1339,8 @@ mod tests {
             .and_then(Value::as_object_mut)
             .unwrap()
             .insert("values".to_owned(), Value::Object(normal_codes));
-        let source_normals = crate::geom::normals::corner_normals(&source, &source_positions).unwrap();
+        let source_normals =
+            crate::geom::normals::corner_normals(&source, &source_positions).unwrap();
         let source_codes = super::clnor::corner_codes(&source).unwrap().unwrap();
         assert!(
             source_codes
@@ -1381,7 +1382,8 @@ mod tests {
             .iter()
             .map(|vertex| vertex.co)
             .collect::<Vec<_>>();
-        let output_normals = crate::geom::normals::corner_normals(&joined, &output_positions).unwrap();
+        let output_normals =
+            crate::geom::normals::corner_normals(&joined, &output_positions).unwrap();
         let output_codes = super::clnor::corner_codes(&joined).unwrap().unwrap();
         assert_eq!(output_codes.len(), source_codes.len());
         let output_order = super::clnor::corner_order(&joined).unwrap().unwrap();
