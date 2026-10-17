@@ -1019,6 +1019,8 @@ fn hook_apply_uses_simulated_transform_reference_world_matrix() -> TestResult<()
             "linear_damping": 0.0,
             "angular_damping": 0.0,
         });
+        // Blender leaves a Hook with no listed vertices and no group unchanged (oracle
+        // `hook_noop_no_indices_no_group`), so this hook lists every vertex to move the mesh.
         let hook = modifier(
             "hook",
             "hook",
