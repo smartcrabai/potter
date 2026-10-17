@@ -201,6 +201,7 @@ fn bone_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
     let set = read_set(engine, operation)?;
     reject_unknown_set_fields(
         engine,
+        set,
         &[
             "name",
             "head",

@@ -18,7 +18,7 @@ pub(super) fn data_transfer(
     let Some(source_name) = optional_string(modifier, "object")? else {
         return Ok(mesh.clone());
     };
-    let Some(source) = operands.get(&source_name).and_then(|items| items.first()) else {
+    let Some(source) = operands.get(source_name).and_then(|items| items.first()) else {
         return Ok(mesh.clone());
     };
     let use_transform = boolean(modifier, "use_object_transform")?;
@@ -102,7 +102,7 @@ pub(super) fn data_transfer(
     let data_types_loops = string_set(modifier, "data_types_loops")?;
     let data_types_polys = string_set(modifier, "data_types_polys")?;
     let needs_loop_normals = use_loops
-        && (data_types_loops.contains("CUSTOM_NORMAL")
+        && (data_types_loops.iter().any(|name| name == "CUSTOM_NORMAL")
             || matches!(loop_mapping, "NEAREST_NORMAL" | "POLYINTERP_LNORPROJ"));
     let needs_vertex_normals = (use_vertices && vertex_mapping == "POLYINTERP_VNORPROJ")
         || (use_edges && edge_mapping == "EDGEINTERP_VNORPROJ");
@@ -1881,7 +1881,7 @@ fn build_source_face_graph(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let triangles = crate::geom::triangulate::triangulate_mesh(
+    let triangles: Vec<SourceTriangle> = crate::geom::triangulate::triangulate_mesh(
         &face_positions,
         crate::geom::triangulate::QuadMethod::Fixed,
         crate::geom::triangulate::NgonMethod::Clip,
@@ -2258,7 +2258,6 @@ fn mapped_loop_sources(
                     best = Some((index, score, center_distance));
                 }
             }
-            loop_start += source_face.vertices.len();
         }
         return best.map(|(index, _, _)| MappedSources(vec![(index, 1.0)]));
     }
@@ -2450,6 +2449,7 @@ fn loop_candidate_for_island(
     let vertex_id = *destination_face.vertices.get(destination_corner)?;
     let vertex_index = *context.destination_vertex_indices.get(&vertex_id)?;
     let destination_vertex = destination.vertices.get(vertex_index)?;
+    let point = context.point_to_source(destination_vertex.co);
     let destination_normal = context
         .destination_corner_normal(destination_face_index, destination_corner)
         .unwrap_or_else(|| {
@@ -3638,7 +3638,7 @@ fn polygon_normal_from_face(
     }
     let mut normal = glam::Vec3::ZERO;
     let mut first = None;
-    let mut previous = None;
+    let mut previous: Option<glam::Vec3> = None;
     let mut count = 0;
     for &vertex_id in &face.vertices {
         let Some(current) = position(vertex_id) else {
@@ -4370,7 +4370,7 @@ fn source_face_value(source: &Mesh, name: &str, index: usize, face_id: u32) -> O
 mod tests {
     use std::collections::BTreeMap;
 
-    use glam::{DMat4, DVec3};
+    use glam::DVec3;
     use serde_json::json;
 
     use super::data_transfer;

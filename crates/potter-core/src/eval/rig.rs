@@ -2950,12 +2950,10 @@ fn bbone_spline_parameters(
                 json!({"bone_id":bone_id,"handle":next_id}),
             )
         })?;
-        let (current_head, current_tail) = if rest {
-            let head = current.rest.w_axis.truncate();
-            (head, current.rest.transform_point3(DVec3::Y * length))
+        let current_tail = if rest {
+            current.rest.transform_point3(DVec3::Y * length)
         } else {
-            let head = current.pose.w_axis.truncate();
-            (head, current.pose.transform_point3(DVec3::Y * length))
+            current.pose.transform_point3(DVec3::Y * length)
         };
         let next_length =
             DVec3::from_array(next_bone.tail).distance(DVec3::from_array(next_bone.head));

@@ -2624,6 +2624,18 @@ fn reference_world_matrix(
         })
 }
 
+/// The armature data block of an object operand, or `None` when the object has no armature data.
+fn armature_data_for_modifier_operand<'a>(
+    object: &Node,
+    doc: &'a SceneDoc,
+) -> Option<&'a crate::model::ArmatureData> {
+    object
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .and_then(|data| data.armature.as_ref())
+}
+
 fn add_modifier_pose_armature_references(
     doc: &SceneDoc,
     modifier: &Modifier,
@@ -4755,6 +4767,29 @@ fn apply_scene_single_reference_modifier(
         scene_subject_name(doc, subject_id)?,
     )?;
     Ok(())
+}
+
+/// Warp's source and destination matrices, `inv(W_subject) * W_ref` with the bone pose folded in
+/// when `bone_from`/`bone_to` names a bone. `None` when either object is unset; Blender leaves the
+/// mesh unchanged in that case.
+fn warp_reference_matrices(
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    references: &SceneReferences<'_>,
+) -> Result<Option<(DMat4, DMat4)>> {
+    let Some(from_id) = reference_object_id(modifier, "object_from", doc)? else {
+        return Ok(None);
+    };
+    let Some(to_id) = reference_object_id(modifier, "object_to", doc)? else {
+        return Ok(None);
+    };
+    let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
+    let from_bone = reference_bone_id(modifier, "bone_from")?;
+    let to_bone = reference_bone_id(modifier, "bone_to")?;
+    let from_world = reference_world_matrix(modifier, &from_id, from_bone.as_ref(), references)?;
+    let to_world = reference_world_matrix(modifier, &to_id, to_bone.as_ref(), references)?;
+    Ok(Some((inverse * from_world, inverse * to_world)))
 }
 
 /// Displace, Wave, and Warp resolve the references Blender reads from the scene (Warp's from/to

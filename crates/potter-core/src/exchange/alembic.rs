@@ -2851,6 +2851,7 @@ pub(crate) fn read_mesh_cache(
             &archive.time_samplings,
         )?;
         result.push(MeshCacheSample {
+            time_seconds: sample_time,
             has_multiple_topology_samples,
             positions: points,
             faces: reversed_faces(&file_faces),

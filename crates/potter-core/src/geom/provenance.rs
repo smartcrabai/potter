@@ -30,6 +30,7 @@ pub(crate) struct Origin {
     /// Per output vertex: exact input storage index or `None` for Blender ORIGINDEX_NONE.
     /// The outer `None` means the output has no point ORIGINDEX layer.
     /// It is independent of weighted attribute provenance.
+    pub source_vertices: Option<Vec<Option<usize>>>,
     /// Per output polygon, in the order passed to `build_mesh`: the input polygon storage index,
     /// or `None` for a generated polygon.
     pub faces: Vec<Option<usize>>,

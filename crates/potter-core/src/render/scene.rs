@@ -2181,7 +2181,7 @@ mod shading_normal_tests {
 
     use super::{
         corner_values, subdivide_displaced, triangle_corners, triangle_layer_colors,
-        world_face_normals,
+        triangle_layer_uvs, world_face_normals,
     };
     use crate::{
         geom::{

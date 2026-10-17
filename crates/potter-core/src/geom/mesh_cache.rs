@@ -1143,7 +1143,7 @@ mod tests {
             mesh.attributes["blender_metadata"]["color_data_types"]["PointGeom"],
             "BYTE_COLOR"
         );
-        let point_key = super::attribute_keys::storage_key("PointGeom");
+        let point_key = crate::geom::attribute_keys::storage_key("PointGeom");
         assert!(mesh.attributes.contains_key(point_key.as_ref()));
         let stored = super::color_layers::read(&mesh);
         let point_layer = stored
@@ -1174,7 +1174,7 @@ mod tests {
             mesh.attributes["blender_metadata"]["color_data_types"]["CornerGeom"],
             "BYTE_COLOR"
         );
-        let corner_key = super::attribute_keys::storage_key("CornerGeom");
+        let corner_key = crate::geom::attribute_keys::storage_key("CornerGeom");
         assert!(mesh.attributes.contains_key(corner_key.as_ref()));
         let stored = super::color_layers::read(&mesh);
         let corner_layer = stored

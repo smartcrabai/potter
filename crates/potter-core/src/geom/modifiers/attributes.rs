@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use glam::{DMat3, DMat4, DVec2, DVec3, Vec2, Vec3};
+use glam::{DMat4, DVec2, DVec3, Vec2, Vec3};
 use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Edge, Face, Mesh, Vertex},
+    geom::{Edge, Face, Mesh},
     model::{CameraData, Modifier},
 };
 
@@ -24,7 +24,9 @@ use weights::{
     texture_mask_weights, vertex_weight_edit, vertex_weight_mix, vertex_weight_proximity,
 };
 
-use super::advanced::{CurveMappingTable, curve_map_table, curve_mapping_points};
+use super::advanced::{
+    CurveMappingTable, curve_map_table, curve_mapping_points, curve_mapping_settings,
+};
 use super::{
     bool_param as boolean, closest_point_triangle, invalid_parameter as invalid,
     number_param as number, schema_value, string_param as string,
@@ -190,6 +192,7 @@ pub fn evaluate_mesh_cache(
             "a finite scene frame and positive frame rate",
         ));
     }
+    let format = string(modifier, "cache_format")?;
     let samples = match format {
         "PC2" => read_pc2_metadata(bytes, modifier)?,
         "MDD" => read_mdd_metadata(bytes, modifier)?,
@@ -291,7 +294,7 @@ pub fn evaluate_mesh_cache(
     let amount = cache_float(number(modifier, "factor")?).clamp(0.0, 1.0);
     let group = optional_string(modifier, "vertex_group")?;
     let weights = group
-        .map(|name| get_group_weights(mesh, name))
+        .map(|name| get_cache_group_weights(mesh, name))
         .transpose()?
         .flatten();
     let invert_group = boolean(modifier, "invert_vertex_group")?;
@@ -835,31 +838,28 @@ fn corner_angle(mesh: &Mesh, face: &Face, vertex_id: u32) -> Result<f64> {
     Ok(previous.angle_between(next))
 }
 
-fn get_group_weights(mesh: &Mesh, group: &str) -> Result<Option<CacheVertexGroupWeights>> {
-    let Some(group_values) = mesh.attributes.get("vertex_groups") else {
-        return Ok(None);
-    };
-    let groups = group_values.as_object().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            "vertex group weights are malformed",
-            json!({"vertex_group":group}),
-        )
-    })?;
-    let Some(group_values) = groups.get(group) else {
-        return Ok(None);
-    };
-    let values = group_values.as_object().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::InvalidArgument,
-            format!("vertex group `{group}` has invalid weights"),
-            json!({"vertex_group":group}),
-        )
-    })?;
-    let has_deform_weights = groups
-        .values()
-        .filter_map(Value::as_object)
-        .any(|weights| !weights.is_empty());
+fn get_group_weights(mesh: &Mesh, group: &str) -> Result<BTreeMap<u32, f64>> {
+    let groups = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                format!("vertex group `{group}` is missing"),
+                json!({"vertex_group":group}),
+            )
+        })?;
+    let values = groups
+        .get(group)
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                format!("vertex group `{group}` is missing"),
+                json!({"vertex_group":group}),
+            )
+        })?;
     let mut result = BTreeMap::new();
     for (key, value) in values {
         let Some(id) = key
@@ -878,10 +878,35 @@ fn get_group_weights(mesh: &Mesh, group: &str) -> Result<Option<CacheVertexGroup
                 json!({"vertex_group":group,"vertex":key}),
             ));
         };
-        result.insert(id, cache_float(weight));
+        result.insert(id, weight);
     }
+    Ok(result)
+}
+
+fn get_cache_group_weights(mesh: &Mesh, group: &str) -> Result<Option<CacheVertexGroupWeights>> {
+    let Some(group_values) = mesh.attributes.get("vertex_groups") else {
+        return Ok(None);
+    };
+    let groups = group_values.as_object().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "vertex group weights are malformed",
+            json!({"vertex_group":group}),
+        )
+    })?;
+    if !groups.contains_key(group) {
+        return Ok(None);
+    }
+    let has_deform_weights = groups
+        .values()
+        .filter_map(Value::as_object)
+        .any(|weights| !weights.is_empty());
+    let values: BTreeMap<u32, f32> = get_group_weights(mesh, group)?
+        .into_iter()
+        .map(|(id, weight)| (id, cache_float(weight)))
+        .collect();
     Ok(Some(CacheVertexGroupWeights {
-        values: result,
+        values,
         has_deform_weights,
     }))
 }
@@ -966,7 +991,7 @@ fn optional_string<'a>(modifier: &'a Modifier, name: &str) -> Result<Option<&'a 
     match modifier.params.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) if value.is_empty() => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(_) => Err(invalid(modifier, name, "a string")),
     }
 }

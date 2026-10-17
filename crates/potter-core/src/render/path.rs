@@ -1160,7 +1160,7 @@ fn make_surface(
         render: element.map_or(object.uv_render, |element| element.uv_render),
         available_mask: element.and_then(|element| element.uv_available_mask),
     };
-    let tables = LayerTables::new();
+    let mut tables = LayerTables::new();
     let context = layered_context(
         doc,
         images,

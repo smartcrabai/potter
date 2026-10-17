@@ -479,7 +479,11 @@ pub(super) fn vertex_weight_proximity(
             })?
             .into_iter()
             .filter_map(|triangle| {
-                Some([*positions.get(&triangle[0])?, *positions.get(&triangle[1])?])
+                Some([
+                    *positions.get(&triangle[0])?,
+                    *positions.get(&triangle[1])?,
+                    *positions.get(&triangle[2])?,
+                ])
             })
             .collect::<Vec<_>>()
     } else {
