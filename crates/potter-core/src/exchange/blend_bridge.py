@@ -4235,6 +4235,12 @@ def _resource_path(doc, reference):
     path = path[7:] if path.startswith("file://") else path
     return os.path.abspath(path) if not path.startswith("//") else bpy.path.abspath(path)
 
+def _export_sidecar_path(doc, reference):
+    # The sidecar copy the export wrote for a linked image's source: the export_path of the resource `_resource_path` finds.
+    resource = _resource_record_for_reference(doc, reference)
+    path = resource.get("export_path") if resource else None
+    return os.path.abspath(path) if path else None
+
 
 def _relative_blend_path(path, target):
     relative = os.path.relpath(os.path.realpath(path),
@@ -5239,6 +5245,12 @@ def export_doc(doc, target, pack, scene_hash, context):
     for image_id, item in doc.get("images", {}).items():
         image = bpy.data.images.new(item["name"], width=int(item["width"]),
                                     height=int(item["height"]), alpha=True)
+        sidecar = _export_sidecar_path(doc, item.get("source_path"))
+        if sidecar is not None:
+            # A linked image is a FILE image on the sidecar copy the export wrote, so the .blend carries its pixels.
+            image.source = "FILE"
+            image.filepath = _relative_blend_path(sidecar, target)
+            image.reload()
         colorspace = {
             "srgb": "sRGB",
             "linear": "Linear Rec.709",
@@ -5247,7 +5259,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         if colorspace is not None:
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
-        if pixels is not None:
+        if sidecar is None and pixels is not None:
             image.pixels.foreach_set(
                 [channel for pixel in pixels for channel in pixel])
             image.update()

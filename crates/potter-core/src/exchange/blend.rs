@@ -299,6 +299,52 @@ fn blender_uv_loops(mesh: &Mesh, layer: &UvLayer) -> (Value, Value) {
     (Value::Array(values), Value::Array(pins))
 }
 
+/// Registers the source file of each linked image as a resource, so the export writes a sidecar copy of it and the
+/// bridge points the Blender image at that copy. An image whose source file is already a resource keeps that resource.
+fn add_linked_image_resources(document: &mut Value) {
+    let linked = document
+        .get("images")
+        .and_then(Value::as_object)
+        .map(|images| {
+            images
+                .iter()
+                .filter(|(_, image)| image.get("source").and_then(Value::as_str) == Some("file"))
+                .filter_map(|(id, image)| {
+                    let source_path = image
+                        .get("source_path")
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.is_empty())?;
+                    Some((
+                        id.clone(),
+                        source_path.to_owned(),
+                        image.get("source_hash").cloned().unwrap_or(Value::Null),
+                        image.get("name").cloned().unwrap_or(Value::Null),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let Some(resources) = document
+        .as_object_mut()
+        .map(|root| root.entry("resources").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for (image_id, source_path, hash, name) in linked {
+        let registered = resources.values().any(|resource| {
+            resource.get("uri").and_then(Value::as_str) == Some(source_path.as_str())
+        });
+        if registered {
+            continue;
+        }
+        resources.insert(
+            format!("linked_image_{image_id}"),
+            json!({"uri": source_path, "hash": hash, "kind": "image", "owner": name}),
+        );
+    }
+}
+
 fn prepare_blend_export_resources(
     mut document: Value,
     project: &Project,
@@ -325,6 +371,7 @@ fn prepare_blend_export_resources(
     if let Some(path) = original_blend_path {
         document["blender_original_blend_path"] = json!(path.to_string_lossy());
     }
+    add_linked_image_resources(&mut document);
     let resource_ids = document
         .get("resources")
         .and_then(Value::as_object)
@@ -1578,6 +1625,13 @@ fn build_imported_graph(
                 image.blob = packed.blob;
                 image.source_hash = packed.source_hash;
             }
+            // A linked image reopens from the sidecar copy that its Blender filepath names, when that copy is the image.
+            if image.source == ImageSource::File
+                && let Some(path) =
+                    reopened_sidecar_path(item, &resource_ids, &doc, image.source_hash.as_deref())
+            {
+                image.source_path = Some(path);
+            }
             doc.images.insert(id, image);
         } else if let Some(image) =
             imported_image_from_resource(item, &resource_ids, &resource_assets, &doc)?
@@ -2561,6 +2615,31 @@ fn imported_image_from_resource(
         source_hash: Some(source_hash.to_owned()),
         alpha_mode: ImageAlphaMode::Straight,
     }))
+}
+
+/// The sidecar copy a linked image reopens from: the imported resource that the image's Blender filepath names, when that
+/// resource holds the image's own content. The bridge points the image at the sidecar, so this is the reopened location.
+fn reopened_sidecar_path(
+    item: &Value,
+    resource_ids: &BTreeMap<String, String>,
+    doc: &SceneDoc,
+    source_hash: Option<&str>,
+) -> Option<String> {
+    let filepath = item
+        .get("filepath")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())?;
+    let resource_id = Id::new(resource_ids.get(filepath)?.clone()).ok()?;
+    let resource = doc.resources.get(&resource_id)?;
+    let hash = resource.get("hash").and_then(Value::as_str)?;
+    if Some(hash) != source_hash {
+        return None;
+    }
+    resource
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.is_empty())
+        .map(str::to_owned)
 }
 
 fn resolve_image_node_ids(graph_sources: &mut [Value], image_ids: &BTreeMap<String, Id>) {
@@ -8380,6 +8459,27 @@ mod tests {
                 context: &context,
             },
         )?;
+        // Both sides load their images through the product loader: a source image from its blob or linked source path,
+        // a reopened image from what the import attached to it. The source images are loaded before the originals are
+        // deleted, so the reopened sampling below can only come from the sidecar copies the .blend references.
+        let load = |image: &Image| -> Result<crate::image::ImageData> {
+            crate::image::load_image_data(
+                image,
+                directory.path(),
+                crate::image::ImageInterpolation::Linear,
+            )
+        };
+        let mut image_data = BTreeMap::new();
+        for image_id in [&shared_id, &metallic_id, &normal_id] {
+            let source_image = doc
+                .images
+                .get(image_id)
+                .ok_or_else(|| invalid_intermediate("source image is missing"))?;
+            image_data.insert(image_id.as_str().to_owned(), load(source_image)?);
+        }
+        for path in [&shared_path, &metallic_path, &normal_path] {
+            fs::remove_file(path).map_err(|error| PotError::io(&error))?;
+        }
         let imported = import_blend(&output, Some(&blender))?;
         assert!(
             imported.losses.is_empty(),
@@ -8394,35 +8494,6 @@ mod tests {
                 ((value + 0.055) / 1.055).powf(2.4)
             }
         };
-        let decode =
-            |bytes: &[u8], colorspace: ImageColorspace| -> Result<crate::image::ImageData> {
-                let (_, width, height, pixels) =
-                    crate::image::storage::decode_pixels_with_default_colorspace(
-                        bytes,
-                        Some(colorspace),
-                    )?;
-                Ok(crate::image::ImageData {
-                    width,
-                    height,
-                    pixels,
-                    tiles: BTreeMap::new(),
-                    interpolation: crate::image::ImageInterpolation::Linear,
-                })
-            };
-        let mut image_data = BTreeMap::new();
-        for (image_id, bytes) in [
-            (&shared_id, shared_bytes.as_slice()),
-            (&metallic_id, metallic_bytes.as_slice()),
-            (&normal_id, normal_bytes.as_slice()),
-        ] {
-            let colorspace = doc
-                .images
-                .get(image_id)
-                .ok_or_else(|| invalid_intermediate("source image is missing"))?
-                .colorspace;
-            image_data.insert(image_id.as_str().to_owned(), decode(bytes, colorspace)?);
-        }
-        // The reopened images decode their own bytes, in the colorspace they reopen with.
         let mut reopened_image_data = BTreeMap::new();
         for (image_id, reopened_image) in &imported.doc.images {
             let source_image = doc
@@ -8432,19 +8503,20 @@ mod tests {
             if reopened_image.colorspace != source_image.colorspace {
                 return Err(invalid_intermediate("round-trip image changed colorspace"));
             }
-            let hash = reopened_image
-                .source_hash
+            reopened_image_data.insert(image_id.as_str().to_owned(), load(reopened_image)?);
+        }
+        // Each reopened image resolves to the sidecar copy the .blend references, inside the output's sidecar directory.
+        let sidecar_dir = fs::canonicalize(directory.path().join("srgb-authored-overlay_assets"))
+            .map_err(|error| PotError::io(&error))?;
+        for (image_id, reopened_image) in &imported.doc.images {
+            let source = reopened_image
+                .source_path
                 .as_deref()
-                .ok_or_else(|| invalid_intermediate("round-trip image has no source hash"))?;
-            let bytes = imported
-                .assets
-                .iter()
-                .find(|(digest, _)| digest.as_str() == hash)
-                .map(|(_, bytes)| bytes.as_slice())
-                .ok_or_else(|| invalid_intermediate("round-trip image bytes are missing"))?;
-            reopened_image_data.insert(
-                image_id.as_str().to_owned(),
-                decode(bytes, reopened_image.colorspace)?,
+                .ok_or_else(|| invalid_intermediate("reopened image has no sidecar path"))?;
+            let source = fs::canonicalize(source).map_err(|error| PotError::io(&error))?;
+            assert!(
+                source.starts_with(&sidecar_dir),
+                "{image_id} reopened from {source:?}, not from the sidecar directory {sidecar_dir:?}"
             );
         }
 
