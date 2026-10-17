@@ -119,7 +119,11 @@ fn expanded_corners(mesh: &Value, layers: &[&str]) -> TestResult<BTreeSet<Vec<u3
         let refs = face["v"].as_array().ok_or("face vertices are missing")?;
         for (corner, vertex_ref) in refs.iter().enumerate() {
             let vertex_id = vertex_ref.as_u64().ok_or("vertex reference is missing")?;
-            let position = vec3(&vertices[usize::try_from(vertex_id)?]["co"])?;
+            let vertex = vertices
+                .iter()
+                .find(|vertex| vertex["id"].as_u64() == Some(vertex_id))
+                .ok_or("face vertex is missing from the mesh")?;
+            let position = vec3(&vertex["co"])?;
             let mut key = bits(&position);
             for layer in layers {
                 let attr = attribute(mesh, layer)?;
