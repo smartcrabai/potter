@@ -1,6 +1,6 @@
 //! Blender-gated oracle for image alpha multiplied by a field material's base alpha.
 //!
-//! The test renders the imported TexturePlane through Potter's CLI with transparent film, reads the
+//! The test renders the imported `TexturePlane` through Potter's CLI with transparent film, reads the
 //! EXR back through Potter's image loader, and checks that .blend export/import retains the field
 //! texture and alpha state. Blender's reopened node graph is checked for the same numeric product.
 

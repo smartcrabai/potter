@@ -252,14 +252,14 @@ fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_gener
     let expected = expanded_corners(oracle, &ORACLE_COLUMNS)?;
     let primitives = glb_primitives(&glb)?;
     assert!(
-        primitives.iter().any(|set| *set == expected),
+        primitives.contains(&expected),
         "no primitive holds the Oracle corners with COLOR_0..COLOR_3 = {ORACLE_COLUMNS:?}"
     );
 
     let emitter = mesh_of_node(&scene, "Emitter")?;
     let emitter_expected = expanded_corners(emitter, &["Ink"])?;
     assert!(
-        primitives.iter().any(|set| *set == emitter_expected),
+        primitives.contains(&emitter_expected),
         "the emitter's material reads Ink, which must be its COLOR_0"
     );
     Ok(())

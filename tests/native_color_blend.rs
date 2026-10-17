@@ -785,7 +785,7 @@ fn blend_export_gives_blender_the_same_flags_colors_generics_uv_and_groups() -> 
     Ok(())
 }
 /// Blender renders the source `.blend` directly; only the named-color emitter remains visible.
-/// Its centre pixel is read from the linear OpenEXR, independently of Potter's project/image path.
+/// Its centre pixel is read from the linear `OpenEXR`, independently of Potter's project/image path.
 const EMITTER_SOURCE_RENDER: &str = r#"
 import json
 import sys

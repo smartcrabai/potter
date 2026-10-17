@@ -503,6 +503,10 @@ pub fn face_loop_starts(face_sizes: &[usize]) -> Vec<usize> {
 
 /// Applies `operations` to the project at its current revision and returns the apply envelope.
 /// `root` holds the operations file.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "callers pass literal operation arrays; changing 49 call sites adds no safety"
+)]
 pub fn apply_operations(project: &Path, root: &Path, operations: Value) -> TestResult<Value> {
     let inspected = pot_json(|command| {
         command.arg("inspect").arg(project);

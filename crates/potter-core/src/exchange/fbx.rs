@@ -4163,7 +4163,7 @@ mod tests {
                 blob: None,
                 source_path: Some(image_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&pixels)),
-                alpha_mode: ImageAlphaMode::default(),
+                alpha_mode: crate::model::ImageAlphaMode::default(),
             },
         );
         let material_id = Id::new("shared")?;

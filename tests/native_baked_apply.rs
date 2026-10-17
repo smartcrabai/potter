@@ -1,6 +1,6 @@
 //! Baked modifier apply on a node with an OBJECT-linked slot and DATA slots.
 //!
-//! Blender `modifier_apply_obdata` (editors/object/object_modifier.cc, v5.2.2) calls
+//! Blender `modifier_apply_obdata` (`editors/object/object_modifier.cc`, v5.2.2) calls
 //! `BKE_object_material_from_eval_data` (blenkernel/intern/material.cc:1353), which sets the mesh's
 //! material array to the evaluated mesh's array and then `BKE_object_materials_sync_length`
 //! (material.cc:1039) resizes the object's slots. A slot the resize adds has matbits 0, so it is
