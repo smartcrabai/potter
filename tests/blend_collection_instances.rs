@@ -88,6 +88,7 @@ struct Corner {
 #[derive(Debug)]
 struct Primitive {
     material: Option<String>,
+    material_index: Option<usize>,
     texcoord_sets: usize,
     corners: Vec<Corner>,
     mirrored: bool,
@@ -419,10 +420,12 @@ fn read_primitive(
             uvs,
         });
     }
+    let material_index = primitive["material"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok());
     Ok(Primitive {
-        material: primitive["material"]
-            .as_u64()
-            .and_then(|slot| materials.get(slot as usize).cloned()),
+        material: material_index.and_then(|index| materials.get(index).cloned()),
+        material_index,
         texcoord_sets,
         corners,
         mirrored: determinant3(world) < 0.0,
@@ -1080,14 +1083,17 @@ fn run_case(
                 "lossy export must preserve UV absence on the textured primitive",
             )?;
             let (gltf, _) = read_glb(&potter_glb)?;
-            let textured_material = gltf["materials"]
-                .as_array()
-                .and_then(|materials| {
-                    materials
-                        .iter()
-                        .find(|material| material["name"] == "textured")
+            let textured_material_index = exported
+                .iter()
+                .find(|primitive| {
+                    primitive.material.as_deref() == Some("textured")
+                        && primitive.texcoord_sets == 0
                 })
-                .ok_or("lossy export must include the textured material")?;
+                .and_then(|primitive| primitive.material_index)
+                .ok_or("lossy export has no UV-less textured primitive material")?;
+            let textured_material = gltf["materials"]
+                .get(textured_material_index)
+                .ok_or("UV-less primitive material index is out of range")?;
             ensure(
                 textured_material["pbrMetallicRoughness"]["baseColorTexture"].is_null(),
                 "lossy export must omit the unsupported texture",
