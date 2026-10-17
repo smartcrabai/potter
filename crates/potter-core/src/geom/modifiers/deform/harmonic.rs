@@ -10,9 +10,9 @@
 //!   `meshdeform_matrix_solve` (lines 1445-1571).
 //! - bind store: `harmonic_coordinates_bind` (lines 1573-1741) and the static weights (1514-1523).
 //!
-//! Blender solves the system with Eigen `SparseLU` (`linear_solver.cc` 293-328). This port factors the same
-//! matrix with an unpivoted banded LU. The matrix has unit diagonals and off-diagonal weights that sum to at
-//! most one per row, so elimination without pivoting is stable and matches the direct solve.
+//! Blender solves the system with Eigen `SparseLU` (`linear_solver.cc` 293-328). This port assembles the
+//! same matrix as triplets and factors it with the same solver through the native shim
+//! `native/meshdeform_harmonic_solve.cc`, one factorization for all cage vertices' right-hand sides.
 //!
 //! Arithmetic is `f64` where Blender uses `f32`. Comparisons, branch structure, and accumulation order
 //! follow the source.
@@ -46,10 +46,6 @@ const OFFSET: [[isize; 3]; 7] = [
 ];
 /// Padding on each side of the cage box, in cells (meshlaplacian.cc:1634-1635, `2.1f`).
 const PAD_CELLS: f64 = 2.1;
-/// Upper bound on grid cells. Blender stores the same per-cell records; this keeps memory bounded.
-const MAX_CELLS: usize = 1 << 24;
-/// Upper bound on banded factor storage, in `f64` elements (1 GiB).
-const MAX_BAND_ELEMENTS: usize = 1 << 27;
 
 /// Blender's stored harmonic bind for one cage: the dynamic grid (`mmd->dyngrid`) or the static
 /// weights (`mmd->bindweights`), plus the per-vertex inside flags (`mmd->dynverts`).
@@ -64,8 +60,7 @@ pub(super) struct HarmonicBindGrid {
     /// Per source vertex: inside the cage (`mdb->inside`, stored as `dynverts`).
     pub(super) inside: Vec<bool>,
     /// Static bind only (empty when dynamic). Per source vertex, the nonzero `(cage vertex, weight)`
-    /// pairs in cage index order. Not compacted; `BKE_modifier_mdef_compact_influences` is applied by
-    /// the caller.
+    /// pairs in cage index order, uncompacted; deform.rs compacts them.
     pub(super) static_rows: Vec<Vec<(usize, f64)>>,
     /// Dynamic bind only (empty when static). Per grid cell, index `x + y*size + z*size*size`: the
     /// influences with `phi >= MIN_INFLUENCE`, normalized to sum to one. Order is Blender's linked-list
@@ -135,12 +130,13 @@ struct Variables {
     count: usize,
 }
 
-/// Row-major banded matrix with an unpivoted LU factorization stored in place. Element `(row, col)` lives at
-/// `row * stride + col + bandwidth - row`, valid for `|row - col| <= bandwidth`.
-struct BandedSystem {
-    n: usize,
-    bandwidth: usize,
-    data: Vec<f64>,
+/// Square system `A x = b` in triplet form (`mdb->varidx` unknowns, `meshdeform_matrix_add_*` entries),
+/// handed to the native Eigen `SparseLU` solve.
+struct SparseSystem {
+    size: usize,
+    rows: Vec<usize>,
+    cols: Vec<usize>,
+    values: Vec<f64>,
 }
 
 /// Mean-value direction from a cage polygon vertex to the hit point (`Float3_Len`, math_geom.cc:4157).
@@ -187,9 +183,20 @@ pub(super) fn bind_harmonic_grid(
     let mut static_rows: Vec<Vec<(usize, f64)>> =
         vec![Vec::new(); if dynamic { 0 } else { source_cage_space.len() }];
     if variables.count > 0 {
-        let system = cells.assemble(&variables)?;
-        for cage_vertex in 0..geometry.points.len() {
-            let phi = cells.solve_phi(&system, &variables, cage_vertex);
+        let cage_count = geometry.points.len();
+        let system = cells.assemble(&variables);
+        // One right-hand side column per cage vertex, solved against a single factorization.
+        let block_len = variables
+            .count
+            .checked_mul(cage_count)
+            .ok_or_else(limit_error)?;
+        let mut block = vec![0.0; block_len];
+        for (cage_vertex, rhs) in block.chunks_exact_mut(variables.count).enumerate() {
+            cells.fill_rhs(&variables, cage_vertex, rhs);
+        }
+        solve_system(&system, cage_count, &mut block)?;
+        for (cage_vertex, solution) in block.chunks_exact(variables.count).enumerate() {
+            let phi = cells.finish_phi(&variables, solution, cage_vertex);
             if dynamic {
                 push_dynamic(&mut lists, &phi, cage_vertex);
             } else {
@@ -296,15 +303,14 @@ fn face_normal(points: &[DVec3], corners: &[usize]) -> DVec3 {
 fn limit_error() -> PotError {
     PotError::new(
         ErrorCode::LimitExceeded,
-        "Mesh Deform harmonic bind exceeds the supported grid size; lower the precision",
+        "Mesh Deform harmonic bind is too large to represent; lower the precision",
     )
 }
 
-/// Cell count for `size` cells per axis, bounded by `MAX_CELLS`.
+/// Cell count for `size` cells per axis. Only arithmetic overflow is rejected.
 fn grid_cells(size: usize) -> Result<usize> {
     size.checked_mul(size)
         .and_then(|area| area.checked_mul(size))
-        .filter(|&count| count <= MAX_CELLS)
         .ok_or_else(limit_error)
 }
 
@@ -737,28 +743,19 @@ impl<'a> CellBind<'a> {
         total
     }
 
-    /// Builds the factored banded matrix (`meshdeform_matrix_add_cell`, meshlaplacian.cc:1334-1361).
-    fn assemble(&self, variables: &Variables) -> Result<BandedSystem> {
-        let mut bandwidth = 0;
+    /// Builds the system matrix in triplet form (`meshdeform_matrix_add_cell`, meshlaplacian.cc:1334-1361).
+    fn assemble(&self, variables: &Variables) -> SparseSystem {
+        let mut system = SparseSystem {
+            size: variables.count,
+            rows: Vec::new(),
+            cols: Vec::new(),
+            values: Vec::new(),
+        };
         for (cell, slot) in variables.index.iter().enumerate() {
             let Some(row) = *slot else {
                 continue;
             };
-            for dir in 1..=6 {
-                let Some(next) = self.coupling(cell, dir) else {
-                    continue;
-                };
-                if let Some(col) = variables.index[next] {
-                    bandwidth = bandwidth.max(row.abs_diff(col));
-                }
-            }
-        }
-        let mut system = BandedSystem::new(variables.count, bandwidth)?;
-        for (cell, slot) in variables.index.iter().enumerate() {
-            let Some(row) = *slot else {
-                continue;
-            };
-            system.set(row, row, 1.0);
+            system.push(row, row, 1.0);
             let total = self.total_weight(cell);
             for dir in 1..=6 {
                 let Some(next) = self.coupling(cell, dir) else {
@@ -768,24 +765,15 @@ impl<'a> CellBind<'a> {
                     continue;
                 };
                 let weight = (1.0 / self.grid.width.x) / total;
-                system.set(row, col, -weight);
+                system.push(row, col, -weight);
             }
         }
-        system.factor()?;
-        Ok(system)
+        system
     }
 
-    /// Solves for one cage vertex and returns `phi` for every cell (meshlaplacian.cc:1477-1550).
-    ///
-    /// Right-hand side: `meshdeform_matrix_add_rhs` (1363-1390). Semibound cells: 1392-1416. Exterior
-    /// cells next to a semibound cell: 1418-1443.
-    fn solve_phi(
-        &self,
-        system: &BandedSystem,
-        variables: &Variables,
-        cage_vertex: usize,
-    ) -> Vec<f64> {
-        let mut rhs = vec![0.0; variables.count];
+    /// Right-hand side for one cage vertex (`meshdeform_matrix_add_rhs`, meshlaplacian.cc:1363-1390),
+    /// written into `rhs` with one value per unknown. `rhs` must start zeroed.
+    fn fill_rhs(&self, variables: &Variables, cage_vertex: usize, rhs: &mut [f64]) {
         for (cell, slot) in variables.index.iter().enumerate() {
             let Some(row) = *slot else {
                 continue;
@@ -801,12 +789,15 @@ impl<'a> CellBind<'a> {
                 }
             }
         }
-        system.solve(&mut rhs);
+    }
 
+    /// Cell values for one cage vertex from its solved unknowns (`solution`, one per unknown). Adds the
+    /// semibound cells (meshlaplacian.cc:1392-1416) and the exterior cells next to them (1418-1443).
+    fn finish_phi(&self, variables: &Variables, solution: &[f64], cage_vertex: usize) -> Vec<f64> {
         let mut phi = vec![0.0; self.tags.len()];
         for (cell, slot) in variables.index.iter().enumerate() {
             if let Some(row) = *slot {
-                phi[cell] = rhs[row];
+                phi[cell] = solution[row];
             }
         }
         for (cell, &is_semibound) in self.semibound.iter().enumerate() {
@@ -872,88 +863,65 @@ impl Variables {
     }
 }
 
-impl BandedSystem {
-    fn new(n: usize, bandwidth: usize) -> Result<Self> {
-        let stride = bandwidth
-            .checked_mul(2)
-            .and_then(|doubled| doubled.checked_add(1))
-            .ok_or_else(limit_error)?;
-        let len = n
-            .checked_mul(stride)
-            .filter(|&len| len <= MAX_BAND_ELEMENTS)
-            .ok_or_else(limit_error)?;
-        Ok(Self {
-            n,
-            bandwidth,
-            data: vec![0.0; len],
-        })
+impl SparseSystem {
+    fn push(&mut self, row: usize, col: usize, value: f64) {
+        self.rows.push(row);
+        self.cols.push(col);
+        self.values.push(value);
     }
+}
 
-    fn stride(&self) -> usize {
-        2 * self.bandwidth + 1
-    }
+unsafe extern "C" {
+    fn potter_meshdeform_harmonic_solve(
+        size: usize,
+        entry_count: usize,
+        rows: *const usize,
+        cols: *const usize,
+        values: *const f64,
+        column_count: usize,
+        columns: *mut f64,
+    ) -> i32;
+}
 
-    fn slot(&self, row: usize, col: usize) -> usize {
-        row * self.stride() + col + self.bandwidth - row
+/// Solves `A X = B` in place with Eigen `SparseLU` (`EIG_linear_solver_solve`, linear_solver.cc 293-328).
+/// `block` holds `column_count` right-hand sides of `system.size` values each, one per cage vertex; on
+/// success it holds the solutions.
+fn solve_system(system: &SparseSystem, column_count: usize, block: &mut [f64]) -> Result<()> {
+    let size = system.size;
+    let entry_count = system.values.len();
+    if system.rows.len() != entry_count
+        || system.cols.len() != entry_count
+        || size.checked_mul(column_count) != Some(block.len())
+    {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "Mesh Deform harmonic bind system and right-hand sides disagree in size",
+        ));
     }
-
-    fn get(&self, row: usize, col: usize) -> f64 {
-        self.data[self.slot(row, col)]
+    // Eigen stores matrix indices as 32-bit integers, so larger systems cannot be represented.
+    if i32::try_from(size).is_err() || i32::try_from(entry_count).is_err() {
+        return Err(limit_error());
     }
-
-    fn set(&mut self, row: usize, col: usize, value: f64) {
-        let slot = self.slot(row, col);
-        self.data[slot] = value;
+    // SAFETY: `rows`, `cols`, and `values` each hold `entry_count` initialized elements, and `block`
+    // holds `size * column_count` initialized values (checked above). The native solver reads the
+    // triplets, overwrites `block` with the solutions, and keeps no pointer after it returns.
+    let status = unsafe {
+        potter_meshdeform_harmonic_solve(
+            size,
+            entry_count,
+            system.rows.as_ptr(),
+            system.cols.as_ptr(),
+            system.values.as_ptr(),
+            column_count,
+            block.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(PotError::invalid_operation(format!(
+            "Failed to find Mesh Deform harmonic bind solution (native status {status}; increase precision?)"
+        )));
     }
-
-    /// Unpivoted LU factorization in place. The multipliers are stored below the diagonal.
-    fn factor(&mut self) -> Result<()> {
-        let bandwidth = self.bandwidth;
-        for pivot_row in 0..self.n {
-            let pivot = self.get(pivot_row, pivot_row);
-            if pivot == 0.0 || !pivot.is_finite() {
-                return Err(PotError::invalid_operation(
-                    "Failed to find bind solution (increase precision?)",
-                ));
-            }
-            let last = (pivot_row + bandwidth).min(self.n - 1);
-            for row in pivot_row + 1..=last {
-                let below = self.get(row, pivot_row);
-                if below == 0.0 {
-                    continue;
-                }
-                let multiplier = below / pivot;
-                self.set(row, pivot_row, multiplier);
-                for col in pivot_row + 1..=last {
-                    let upper = self.get(pivot_row, col);
-                    let value = self.get(row, col) - multiplier * upper;
-                    self.set(row, col, value);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Solves `A x = rhs` in place with the factorization from [`Self::factor`].
-    fn solve(&self, rhs: &mut [f64]) {
-        let bandwidth = self.bandwidth;
-        for row in 0..self.n {
-            let first = row.saturating_sub(bandwidth);
-            let mut value = rhs[row];
-            for col in first..row {
-                value -= self.get(row, col) * rhs[col];
-            }
-            rhs[row] = value;
-        }
-        for row in (0..self.n).rev() {
-            let last = (row + bandwidth).min(self.n - 1);
-            let mut value = rhs[row];
-            for col in row + 1..=last {
-                value -= self.get(row, col) * rhs[col];
-            }
-            rhs[row] = value / self.get(row, row);
-        }
-    }
+    Ok(())
 }
 
 /// Dynamic bind: records the cage vertex's influence on each cell (`meshdeform_matrix_solve`,

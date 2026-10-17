@@ -399,8 +399,9 @@ fn native_polygon_normal(target: &Mesh, indices: &[Value], modifier: &Modifier) 
 
 /// Evaluates a bound Mesh Deform cage from its bind-time data, as Blender's `meshdeformModifier_do`
 /// does. Static binds apply the stored per-vertex cage weights; dynamic binds interpolate the stored
-/// bind grid at the current vertex positions. Evaluation never re-solves the bind against the
-/// current cage or subject.
+/// bind grid at the current vertex positions. The live `use_dynamic_bind` flag selects the layout,
+/// and a mismatched bind must be rebound. Evaluation never re-solves the bind against the current
+/// cage or subject.
 pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let Some(bind_data) = modifier.binding_data.as_ref() else {
         return Ok(mesh.clone());
@@ -448,6 +449,12 @@ fn native_mesh_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) -> Re
             "three bind-time cage coordinates per cage vertex",
         ));
     }
+    // Blender reads MOD_MDEF_DYNAMIC_BIND from the live modifier at evaluation (MOD_meshdeform.cc:258,
+    // 276), so the stored bind layout must match the live `use_dynamic_bind` flag.
+    let dynamic = bool_param(modifier, "use_dynamic_bind")?;
+    if bind_has_dynamic_layout(data) != dynamic {
+        return Err(mesh_deform_rebind_error(modifier, dynamic));
+    }
     let target_to_subject = modifier
         .runtime
         .target_to_subject
@@ -485,10 +492,6 @@ fn native_mesh_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) -> Re
     let group = group_weights(mesh, modifier)?;
     let flags = data.get("flag").and_then(Value::as_i64).unwrap_or_default();
     let invert = flags & 1 != 0 || bool_param(modifier, "invert_vertex_group")?;
-    let dynamic = data
-        .get("dynamic_bind")
-        .and_then(Value::as_bool)
-        .unwrap_or(flags & 2 != 0);
     let mut result = mesh.clone();
     if dynamic {
         native_mesh_deform_dynamic(
@@ -741,6 +744,38 @@ fn native_mesh_deform_dynamic(
         }
     }
     Ok(())
+}
+
+/// Error for a stored Mesh Deform bind whose layout disagrees with the live `use_dynamic_bind`.
+fn mesh_deform_rebind_error(modifier: &Modifier, dynamic: bool) -> PotError {
+    let expected = if dynamic { "dynamic" } else { "static" };
+    PotError::with_details(
+        ErrorCode::InvalidOperation,
+        format!(
+            "Mesh Deform modifier `{}` has a bind that does not match use_dynamic_bind (expected a {expected} bind); rebind the modifier",
+            modifier.id
+        ),
+        json!({"modifier_id": modifier.id, "use_dynamic_bind": dynamic}),
+    )
+}
+
+/// Names the modifier on a failed harmonic solve, keeping the solver's error code and details.
+fn mesh_deform_bind_error(modifier: &Modifier, error: PotError) -> PotError {
+    PotError::with_details(
+        error.code,
+        format!(
+            "Mesh Deform modifier `{}` bind failed: {}",
+            modifier.id, error.message
+        ),
+        json!({"modifier_id": modifier.id, "cause": error.details}),
+    )
+}
+
+/// Whether stored Mesh Deform data uses the dynamic grid layout rather than static bind offsets.
+fn bind_has_dynamic_layout(data: &Map<String, Value>) -> bool {
+    ["dynamic_grid", "dyngrid"]
+        .iter()
+        .any(|key| data.contains_key(*key))
 }
 
 fn native_count(
@@ -2134,14 +2169,17 @@ fn sort_polygon_from_index(corners: &[usize], start: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Binds source vertices to Blender-style cage-local harmonic coordinates. `cage_to_owner` is
-/// the bind-time map from cage-local coordinates into subject-local coordinates. The harmonic
-/// grid is solved once here and stored in Blender's Mesh Deform layout, so evaluation never
-/// re-solves against the current cage or subject.
+/// Binds source vertices to Blender-style cage-local harmonic coordinates, as
+/// `ED_mesh_deform_bind_callback` does (meshlaplacian.cc:1782-1790). `subject_world` and
+/// `cage_world` are the evaluated world matrices of the modified object and its cage. The stored
+/// `bind_matrix` is the cage world matrix (`bindmat`) and `bind_cage_coordinates` are the cage
+/// vertices in world space (`bindcagecos`). The harmonic grid is solved once here and stored in
+/// Blender's Mesh Deform layout, so evaluation never re-solves against the current cage or subject.
 pub(crate) fn bind_mesh(
     mesh: &Mesh,
     cage: &Mesh,
-    cage_to_owner: DMat4,
+    subject_world: DMat4,
+    cage_world: DMat4,
     modifier: &Modifier,
 ) -> Result<Value> {
     if cage.vertices.len() < 4 {
@@ -2149,12 +2187,14 @@ pub(crate) fn bind_mesh(
             "mesh deform binding requires at least four cage vertices",
         ));
     }
-    let owner_to_cage = cage_to_owner.inverse();
-    if !cage_to_owner.is_finite() || !owner_to_cage.is_finite() {
+    let cage_inverse = cage_world.inverse();
+    if !subject_world.is_finite() || !cage_world.is_finite() || !cage_inverse.is_finite() {
         return Err(PotError::invalid_argument(
-            "mesh deform binding requires an invertible cage transform",
+            "mesh deform binding requires invertible subject and cage transforms",
         ));
     }
+    // Blender's `cagemat` in `meshdeformModifier_do`: subject-local space into cage-local space.
+    let subject_to_cage = cage_inverse * subject_world;
     let precision = uint_param(modifier, "precision")?;
     if !(2..=10).contains(&precision) {
         return Err(invalid_parameter(
@@ -2169,15 +2209,16 @@ pub(crate) fn bind_mesh(
     let source_cage_space = mesh
         .vertices
         .iter()
-        .map(|vertex| owner_to_cage.transform_point3(vertex.co))
+        .map(|vertex| subject_to_cage.transform_point3(vertex.co))
         .collect::<Vec<_>>();
-    let grid = harmonic::bind_harmonic_grid(&source_cage_space, cage, precision, dynamic)?;
+    let grid = harmonic::bind_harmonic_grid(&source_cage_space, cage, precision, dynamic)
+        .map_err(|error| mesh_deform_bind_error(modifier, error))?;
     let cage_coordinates = cage
         .vertices
         .iter()
-        .flat_map(|vertex| cage_to_owner.transform_point3(vertex.co).to_array())
+        .flat_map(|vertex| cage_world.transform_point3(vertex.co).to_array())
         .collect::<Vec<f64>>();
-    let matrix = cage_to_owner
+    let matrix = cage_world
         .to_cols_array()
         .chunks(4)
         .map(<[f64]>::to_vec)
@@ -2187,7 +2228,6 @@ pub(crate) fn bind_mesh(
         ("type".to_owned(), json!("mesh_deform")),
         ("verts_num".to_owned(), json!(mesh.vertices.len())),
         ("cage_verts_num".to_owned(), json!(cage.vertices.len())),
-        ("dynamic_bind".to_owned(), json!(dynamic)),
         ("bind_matrix".to_owned(), json!(matrix)),
         ("bind_cage_coordinates".to_owned(), json!(cage_coordinates)),
     ]);
@@ -2231,10 +2271,11 @@ fn mesh_deform_grid_layout(
             ),
         ]
     } else {
-        let mut offsets = Vec::with_capacity(grid.static_rows.len() + 1);
+        let rows = compact_influences(&grid.static_rows);
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
         let mut influences = Vec::new();
         offsets.push(json!(0));
-        for row in &grid.static_rows {
+        for row in &rows {
             influences.extend(
                 row.iter()
                     .map(|&(vertex, weight)| json!({"vertex": vertex, "weight": weight})),
@@ -2246,6 +2287,28 @@ fn mesh_deform_grid_layout(
             ("bind_influences", Value::Array(influences)),
         ]
     }
+}
+
+/// Blender's `MESHDEFORM_MIN_INFLUENCE` (MOD_meshdeform.cc:427), used only by bind compaction.
+const MESHDEFORM_COMPACT_MIN_INFLUENCE: f64 = 0.000_01;
+
+/// Port of `BKE_modifier_mdef_compact_influences` (MOD_meshdeform.cc:429-499), applied to static
+/// binds when they are created (meshlaplacian.cc:1796-1797). Each source vertex keeps its cage
+/// weights above the threshold, in cage order, normalized to sum to one.
+fn compact_influences(rows: &[Vec<(usize, f64)>]) -> Vec<Vec<(usize, f64)>> {
+    rows.iter()
+        .map(|row| {
+            let kept: Vec<(usize, f64)> = row
+                .iter()
+                .copied()
+                .filter(|&(_, weight)| weight > MESHDEFORM_COMPACT_MIN_INFLUENCE)
+                .collect();
+            let total: f64 = kept.iter().map(|&(_, weight)| weight).sum();
+            kept.into_iter()
+                .map(|(vertex, weight)| (vertex, weight / total))
+                .collect()
+        })
+        .collect()
 }
 
 /// Stores source coordinates for a Laplacian Deform bind.
@@ -2681,8 +2744,6 @@ mod tests {
             "type": "mesh_deform",
             "verts_num": 1,
             "cage_verts_num": 1,
-            "flag": 2,
-            "dynamic_bind": true,
             "bind_cage_coordinates": [0.0, 0.0, 0.0],
             "bind_matrix": identity_rows(),
             "dynamic_grid_size": 1,
@@ -2693,6 +2754,9 @@ mod tests {
             "dynamic_vertices": [1]
         });
         let mut modifier = native_modifier("mesh_deform", binding)?;
+        modifier
+            .params
+            .insert("use_dynamic_bind".to_owned(), json!(true));
         modifier.runtime.target_mesh = Some(cage);
         let evaluated = mesh_deform(&source, &modifier)?;
         assert!(evaluated.vertices[0].co.distance(DVec3::X) < 1.0e-12);

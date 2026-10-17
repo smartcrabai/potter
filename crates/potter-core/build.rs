@@ -45,6 +45,7 @@ fn main() -> Result<(), io::Error> {
         .cpp(true)
         .std("c++14")
         .file(manifest_dir.join("native/blender_inverse_m4.cc"))
+        .file(manifest_dir.join("native/meshdeform_harmonic_solve.cc"))
         .include(&eigen_dir);
     eigen.opt_level(2);
     if target.ends_with("-apple-darwin") {
@@ -71,6 +72,8 @@ fn main() -> Result<(), io::Error> {
     }
     eigen.compile("potter_blender_inverse");
     println!("cargo:rerun-if-changed=native/blender_inverse_m4.cc");
+    println!("cargo:rerun-if-changed=native/meshdeform_harmonic_solve.cc");
+    println!("cargo:rerun-if-changed=vendor/eigen/Eigen/SparseLU");
     println!("cargo:rerun-if-changed=vendor/eigen/Eigen/LU");
     println!("cargo:rerun-if-changed=vendor/eigen/Eigen/src/LU/InverseImpl.h");
     Ok(())

@@ -205,6 +205,35 @@ fn identity_original_indices(mesh: &Mesh) -> Result<super::OriginalIndices> {
     })
 }
 
+/// Blender's `ModifierTypeType::OnlyDeform` for each Potter modifier type (the `type` of each
+/// `MOD_*.cc` `ModifierTypeInfo`). Stack insertion, move checks, and evaluation share this list.
+pub(crate) fn is_only_deform(modifier_type: &str) -> bool {
+    matches!(
+        modifier_type,
+        "armature"
+            | "cast"
+            | "cloth"
+            | "collision"
+            | "corrective_smooth"
+            | "curve"
+            | "displace"
+            | "hook"
+            | "laplacian_deform"
+            | "laplacian_smooth"
+            | "lattice"
+            | "mesh_cache"
+            | "mesh_deform"
+            | "particle_system"
+            | "shrinkwrap"
+            | "simple_deform"
+            | "smooth"
+            | "soft_body"
+            | "surface_deform"
+            | "warp"
+            | "wave"
+    )
+}
+
 pub(crate) fn evaluate_modifiers_with_scene_context(
     mut evaluated: Mesh,
     modifiers: &[Modifier],
@@ -242,32 +271,6 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     // all later masks, `BKE_modifier_calc_data_masks` in blenkernel_intern_modifier.cc) requests it.
     // `MOD_hook.cc` `required_data_mask` requests it for a Hook with a vertex list. A listed Hook before that
     // point hooks by listed value (`deformVerts_do`, no layer); one after it hooks by list position.
-    let is_deform_only = |modifier: &Modifier| {
-        matches!(
-            modifier.modifier_type.as_str(),
-            "armature"
-                | "cast"
-                | "cloth"
-                | "collision"
-                | "corrective_smooth"
-                | "curve"
-                | "displace"
-                | "hook"
-                | "laplacian_deform"
-                | "laplacian_smooth"
-                | "lattice"
-                | "mesh_cache"
-                | "mesh_deform"
-                | "particle_system"
-                | "shrinkwrap"
-                | "simple_deform"
-                | "smooth"
-                | "soft_body"
-                | "surface_deform"
-                | "warp"
-                | "wave"
-        )
-    };
     let is_listed_hook = |modifier: &Modifier| {
         modifier.modifier_type == "hook"
             && modifier
@@ -279,7 +282,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
     let first_constructive = modifiers
         .iter()
         .enumerate()
-        .find(|&(index, modifier)| is_active(index, modifier) && !is_deform_only(modifier))
+        .find(|&(index, modifier)| {
+            is_active(index, modifier) && !is_only_deform(&modifier.modifier_type)
+        })
         .map(|(index, _)| index);
     // The index at which the identity map is injected, when a later listed Hook reads it.
     let original_indices_at = first_constructive.filter(|&first| {

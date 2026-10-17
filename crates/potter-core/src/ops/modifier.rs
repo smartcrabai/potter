@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::EvaluationPurpose,
-    geom::modifiers::evaluate_modifiers_with_groups_at_frame,
+    geom::modifiers::{evaluate_modifiers_with_groups_at_frame, is_only_deform},
     model::{Id, Modifier, ShapeKey, ShapeKeyData},
     params::{self, ParameterFamily},
 };
@@ -245,7 +245,8 @@ fn bind_modifier(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 crate::geom::modifiers::deform::bind_mesh(
                     &source_bind_mesh,
                     &target_mesh,
-                    to_subject,
+                    subject_world,
+                    target_world,
                     &modifier,
                 )?
             }
@@ -712,34 +713,6 @@ fn reorder(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bo
     Ok(changed)
 }
 
-/// Blender's `ModifierTypeType::OnlyDeform` for each Potter modifier type.
-fn only_deform(modifier_type: &str) -> bool {
-    matches!(
-        modifier_type,
-        "armature"
-            | "cast"
-            | "cloth"
-            | "collision"
-            | "corrective_smooth"
-            | "curve"
-            | "displace"
-            | "hook"
-            | "laplacian_deform"
-            | "laplacian_smooth"
-            | "lattice"
-            | "mesh_cache"
-            | "mesh_deform"
-            | "particle_system"
-            | "shrinkwrap"
-            | "simple_deform"
-            | "smooth"
-            | "soft_body"
-            | "surface_deform"
-            | "warp"
-            | "wave"
-    )
-}
-
 /// Blender's `eModifierTypeFlag_RequiresOriginalData` modifier types.
 fn requires_original_data(modifier_type: &str) -> bool {
     matches!(modifier_type, "multires" | "soft_body")
@@ -762,7 +735,7 @@ fn is_pinned(modifier: &Modifier) -> bool {
 pub(crate) fn insertion_index(stack: &[Modifier], modifier_type: &str) -> usize {
     if modifier_type == "hook" || requires_original_data(modifier_type) {
         let mut index = 0;
-        while index < stack.len() && only_deform(&stack[index].modifier_type) {
+        while index < stack.len() && is_only_deform(&stack[index].modifier_type) {
             if stack.get(index + 1).is_some_and(is_pinned) {
                 break;
             }
@@ -781,7 +754,7 @@ pub(crate) fn insertion_index(stack: &[Modifier], modifier_type: &str) -> usize 
 fn may_move_before(modifier: &Modifier, previous: &Modifier) -> bool {
     let unpins_past_pinned = is_pinned(modifier) && !is_pinned(previous);
     let past_original_data =
-        requires_original_data(&previous.modifier_type) && !only_deform(&modifier.modifier_type);
+        requires_original_data(&previous.modifier_type) && !is_only_deform(&modifier.modifier_type);
     !unpins_past_pinned && !past_original_data
 }
 
@@ -789,7 +762,7 @@ fn may_move_before(modifier: &Modifier, previous: &Modifier) -> bool {
 fn may_move_after(modifier: &Modifier, next: &Modifier) -> bool {
     let unpins_before_pinned = is_pinned(next) && !is_pinned(modifier);
     let past_non_deform =
-        requires_original_data(&modifier.modifier_type) && !only_deform(&next.modifier_type);
+        requires_original_data(&modifier.modifier_type) && !is_only_deform(&next.modifier_type);
     !unpins_before_pinned && !past_non_deform
 }
 
