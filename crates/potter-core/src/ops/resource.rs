@@ -35,7 +35,7 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
     check_fields(
         engine,
         operation,
-        &["op", "id", "uri", "kind", "sequence"],
+        &["op", "id", "uri", "kind"],
         &["id", "uri"],
     )?;
     let id = read_id(engine, operation, "id")?;
@@ -75,17 +75,6 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
                 &operation_pointer(engine.operation_index, "uri"),
             )
         })?;
-    if let Some(sequence) = operation.get("sequence") {
-        if kind != "alembic" {
-            return Err(engine.error(
-                ErrorCode::InvalidOperation,
-                "resource sequence packing requires kind `alembic`",
-                &operation_pointer(engine.operation_index, "kind"),
-            ));
-        }
-        let (start, end) = sequence_range(engine, sequence)?;
-        return pack_sequence(engine, id, uri, kind, start, end);
-    }
     let path = resolve_path(uri);
     if !path.is_file() {
         return Err(engine.error(
@@ -113,91 +102,6 @@ fn pack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
     Ok(true)
 }
 
-fn sequence_range(engine: &Engine<'_>, value: &Value) -> Result<(i32, i32)> {
-    let object = value.as_object().ok_or_else(|| {
-        engine.error(
-            ErrorCode::InvalidOperation,
-            "resource sequence must contain integer start and end frames",
-            &operation_pointer(engine.operation_index, "sequence"),
-        )
-    })?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "start" | "end"))
-    {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "resource sequence accepts only start and end frame fields",
-            &operation_pointer(engine.operation_index, "sequence"),
-        ));
-    }
-    let frame = |name: &str| -> Result<i32> {
-        object
-            .get(name)
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok())
-            .ok_or_else(|| {
-                engine.error(
-                    ErrorCode::InvalidOperation,
-                    "resource sequence start and end must be int32 frames",
-                    &operation_pointer(engine.operation_index, &format!("sequence/{name}")),
-                )
-            })
-    };
-    Ok((frame("start")?, frame("end")?))
-}
-
-fn pack_sequence(
-    engine: &mut Engine<'_>,
-    id: crate::model::Id,
-    uri: &str,
-    kind: &str,
-    start: i32,
-    end: i32,
-) -> Result<bool> {
-    let pattern = resolve_path(uri);
-    let manifest = crate::cache_sequence::cache_sequence_manifest(&pattern, Some((start, end)))?;
-    let mut frames = Map::new();
-    for (frame, path) in &manifest.files {
-        let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
-        let digest = hash::sha256(&bytes);
-        if manifest.hashes.get(&frame.to_string()) != Some(&digest) {
-            return Err(PotError::with_details(
-                ErrorCode::AssetChanged,
-                format!("Alembic sequence frame {frame} changed while packing"),
-                json!({"frame":frame,"path":path,"actual_hash":digest}),
-            ));
-        }
-        let path_uri = path.to_string_lossy();
-        frames.insert(
-            frame.to_string(),
-            crate::cache_sequence::cache_sequence_resource_record(
-                &path_uri,
-                kind,
-                &digest,
-                Some(&bytes),
-            ),
-        );
-    }
-    let change = if engine.doc.resources.contains_key(&id) {
-        ChangeKind::Updated
-    } else {
-        ChangeKind::Created
-    };
-    engine.doc.resources.insert(
-        id.clone(),
-        json!({
-            "uri":uri,
-            "kind":kind,
-            "packed":true,
-            "sequence_start":start,
-            "sequence_end":end,
-            "sequence_frames":frames,
-        }),
-    );
-    engine.mark("resources", &id, change);
-    Ok(true)
-}
 fn unpack(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     check_fields(engine, operation, &["op", "id", "path"], &["id"])?;
     let id = read_id(engine, operation, "id")?;
