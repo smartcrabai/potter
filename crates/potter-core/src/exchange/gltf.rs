@@ -1757,6 +1757,9 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             "vertex_groups" => {
                 data_block.is_none_or(|block| valid_vertex_groups_attribute(value, block))
             }
+            // A user attribute the glTF writer does not store is a reported loss (see
+            // `unwritten_attribute_losses`), so allow-lossy export proceeds and strict export refuses.
+            _ if attribute_keys::user_name(name).is_some() => true,
             _ if color_layer_storage_key(mesh, name) => true,
             _ => false,
         };
