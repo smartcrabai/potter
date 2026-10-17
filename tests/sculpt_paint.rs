@@ -547,7 +547,7 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
             .arg("render")
             .arg(&import_scene)
             .args([
-                "--engine", "path", "--frames", "1", "--format", "png", "--out",
+                "--engine", "path", "--frames", "1:1", "--format", "png", "--out",
             ])
             .arg(&render_output)
             .arg("--json")
