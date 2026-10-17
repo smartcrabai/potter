@@ -3371,7 +3371,7 @@ mod tests {
             &node,
             &mesh,
             None,
-            EvaluationPurpose::Preview,
+            crate::eval::EvaluationPurpose::Preview,
         )?;
         assert!(output.contains("Geometry: 1, \"Geometry::Triangle\", \"Mesh\""));
         // The losses for these attributes come from `exchange::attribute_losses`.
