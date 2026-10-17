@@ -96,7 +96,7 @@ pub(crate) fn evaluate(
             json!({"modifier_id":modifier.id,"resource":resource,"object_path":object_path}),
         ));
     }
-    let topology_changed = {
+    let (topology_changed, cache_vertex_count) = {
         let sample = sample_at_time(&samples, time_seconds, interpolate).ok_or_else(|| {
             PotError::with_details(
                 ErrorCode::EvaluationFailed,
@@ -109,14 +109,29 @@ pub(crate) fn evaluate(
             .iter()
             .map(|face| face.vertices.len())
             .sum::<usize>();
+        let cache_vertex_count = sample.sample.positions.len();
         let cache_corners = sample.sample.faces.iter().map(Vec::len).sum::<usize>();
-        let dimensions_changed = mesh.vertices.len() != sample.sample.positions.len()
+        let dimensions_changed = mesh.vertices.len() != cache_vertex_count
             || mesh.faces.len() != sample.sample.faces.len()
             || input_corners != cache_corners;
-        dimensions_changed
-            || ((is_sequence || sample.sample.connectivity_is_animated)
-                && !topology_matches(mesh, sample.sample.positions.len(), &sample.sample.faces))
+        (
+            dimensions_changed
+                || ((is_sequence || sample.sample.connectivity_is_animated)
+                    && !topology_matches(mesh, cache_vertex_count, &sample.sample.faces)),
+            cache_vertex_count,
+        )
     };
+    if topology_changed && !read.polygons {
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic cache topology changed but POLY is not selected",
+            json!({
+                "modifier_id":modifier.id,
+                "input_vertex_count":mesh.vertices.len(),
+                "cache_vertex_count":cache_vertex_count
+            }),
+        ));
+    }
     if topology_changed {
         read = ReadAttributes::ALL;
         samples = cached_mesh_cache_samples(
