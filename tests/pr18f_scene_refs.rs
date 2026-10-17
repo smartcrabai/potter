@@ -321,6 +321,74 @@ fn warp_objects_map_from_and_to_through_the_subject_frame() {
     );
 }
 
+fn warp_bone_scene(object_from: &str, bone_from: Option<&str>) -> SceneDoc {
+    let mut params = json!({
+        "object_from": object_from,
+        "object_to": "wt",
+        "falloff_type": "NONE",
+        "strength": 1.0
+    });
+    if let Some(bone) = bone_from {
+        params["bone_from"] = json!(bone);
+    }
+    apply(
+        &base_scene(),
+        &json!([
+            {"op":"node.create","id":"subj","kind":"box","params":{"size":1.0},
+             "transform":{"translation":[1.0,2.0,3.0],"rotation_deg":[0.0,0.0,30.0],"scale":[2.0,1.0,0.5]}},
+            {"op":"node.create","id":"rig","kind":"armature","transform":{"translation":[1.0,0.0,0.0]}},
+            {"op":"bone.create","target":{"id":"rig"},"id":"bone_a","name":"Arm.L",
+             "head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]},
+            {"op":"node.create","id":"wf","kind":"empty","transform":{"translation":[1.0,0.0,0.0]}},
+            {"op":"node.create","id":"wt","kind":"empty",
+             "transform":{"translation":[0.0,2.0,1.0],"rotation_deg":[40.0,0.0,0.0]}},
+            {"op":"modifier.create","target":{"id":"subj"},"id":"warp","type":"warp","params":params}
+        ]),
+    )
+}
+
+fn warp_positions(doc: &SceneDoc) -> Vec<DVec3> {
+    evaluated_mesh(doc, "subj", None)
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect()
+}
+
+fn assert_same_positions(actual: &[DVec3], expected: &[DVec3]) {
+    assert_eq!(actual.len(), expected.len());
+    for (vertex, want) in actual.iter().zip(expected) {
+        assert!(
+            vertex.distance(*want) < TOLERANCE,
+            "{vertex:?} differs from {want:?}"
+        );
+    }
+}
+
+#[test]
+fn warp_bone_name_resolves_the_same_pose_bone_as_its_id() {
+    assert_same_positions(
+        &warp_positions(&warp_bone_scene("rig", Some("Arm.L"))),
+        &warp_positions(&warp_bone_scene("rig", Some("bone_a"))),
+    );
+}
+
+#[test]
+fn warp_missing_bone_name_uses_the_armature_object_matrix() {
+    assert_same_positions(
+        &warp_positions(&warp_bone_scene("rig", Some("Missing"))),
+        &warp_positions(&warp_bone_scene("rig", None)),
+    );
+}
+
+#[test]
+fn warp_bone_name_on_a_non_armature_uses_the_object_matrix() {
+    assert_same_positions(
+        &warp_positions(&warp_bone_scene("wf", Some("Arm.L"))),
+        &warp_positions(&warp_bone_scene("wf", None)),
+    );
+}
+
 #[test]
 fn wave_start_position_object_uses_the_subject_relative_object_location() {
     let doc = apply(

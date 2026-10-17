@@ -4771,25 +4771,62 @@ fn apply_scene_single_reference_modifier(
 
 /// Warp's source and destination matrices, `inv(W_subject) * W_ref` with the bone pose folded in
 /// when `bone_from`/`bone_to` names a bone. `None` when either object is unset; Blender leaves the
-/// mesh unchanged in that case.
+/// mesh unchanged in that case. Both object references are validated before that check.
 fn warp_reference_matrices(
     modifier: &Modifier,
     subject_id: &Id,
     doc: &SceneDoc,
     references: &SceneReferences<'_>,
 ) -> Result<Option<(DMat4, DMat4)>> {
-    let Some(from_id) = reference_object_id(modifier, "object_from", doc)? else {
-        return Ok(None);
-    };
-    let Some(to_id) = reference_object_id(modifier, "object_to", doc)? else {
+    let from_id = reference_object_id(modifier, "object_from", doc)?;
+    let to_id = reference_object_id(modifier, "object_to", doc)?;
+    let (Some(from_id), Some(to_id)) = (from_id, to_id) else {
         return Ok(None);
     };
     let inverse = subject_inverse_matrix(modifier, subject_id, references)?;
-    let from_bone = reference_bone_id(modifier, "bone_from")?;
-    let to_bone = reference_bone_id(modifier, "bone_to")?;
-    let from_world = reference_world_matrix(modifier, &from_id, from_bone.as_ref(), references)?;
-    let to_world = reference_world_matrix(modifier, &to_id, to_bone.as_ref(), references)?;
+    let from_bone = reference_bone_name(modifier, "bone_from")?;
+    let to_bone = reference_bone_name(modifier, "bone_to")?;
+    let from_world = warp_reference_world_matrix(modifier, &from_id, from_bone, doc, references)?;
+    let to_world = warp_reference_world_matrix(modifier, &to_id, to_bone, doc, references)?;
     Ok(Some((inverse * from_world, inverse * to_world)))
+}
+
+/// Warp's bone reference is a pose-bone name, matched as `armature_bone_id_by_name` does. A name
+/// that resolves to no bone uses the object's world matrix, as Blender's `matrix_from_obj_pchan`
+/// does when the pose channel is missing.
+fn warp_reference_world_matrix(
+    modifier: &Modifier,
+    object_id: &Id,
+    bone_name: Option<&str>,
+    doc: &SceneDoc,
+    references: &SceneReferences<'_>,
+) -> Result<DMat4> {
+    let bone_id = bone_name.and_then(|name| armature_bone_id_by_name(doc, object_id, name));
+    reference_world_matrix(modifier, object_id, bone_id.as_ref(), references)
+}
+
+/// A bone-name parameter as written; an absent, null, or empty value names no bone.
+fn reference_bone_name<'a>(modifier: &'a Modifier, parameter: &str) -> Result<Option<&'a str>> {
+    match modifier.params.get(parameter) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) if name.is_empty() => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.as_str())),
+        Some(_) => Err(invalid_reference(modifier, parameter, "a bone name")),
+    }
+}
+
+/// The armature bone of `object_id` whose ID or name is `name`: the match the pose-reference path
+/// and the f32 bone fallback both use.
+fn armature_bone_id_by_name(doc: &SceneDoc, object_id: &Id, name: &str) -> Option<Id> {
+    let armature = doc
+        .nodes
+        .get(object_id)
+        .and_then(|node| armature_data_for_modifier_operand(node, doc))?;
+    armature
+        .bones
+        .iter()
+        .find(|(bone_id, bone)| bone_id.as_str() == name || bone.name == name)
+        .map(|(bone_id, _)| bone_id.clone())
 }
 
 /// Displace, Wave, and Warp resolve the references Blender reads from the scene (Warp's from/to
@@ -4944,25 +4981,12 @@ fn reference_world_matrix_f32_with_bone_fallback(
         .get(bone_parameter)
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty());
-    let bone_id = bone_name.and_then(|name| {
-        doc.nodes
-            .get(object_id)
-            .and_then(|node| node.data.as_ref())
-            .and_then(|data_id| doc.data_blocks.get(data_id))
-            .and_then(|data| data.armature.as_ref())
-            .and_then(|armature| {
-                armature
-                    .bones
-                    .iter()
-                    .find(|(bone_id, bone)| bone_id.as_str() == name || bone.name == name)
-                    .map(|(bone_id, _)| bone_id)
-            })
-    });
+    let bone_id = bone_name.and_then(|name| armature_bone_id_by_name(doc, object_id, name));
     let pose_matrix = if let Some(bone_id) = bone_id {
         Some(
             bone_pose_matrices
                 .get(object_id)
-                .and_then(|bones| bones.get(bone_id))
+                .and_then(|bones| bones.get(&bone_id))
                 .ok_or_else(|| {
                     PotError::with_details(
                         ErrorCode::DependencyMissing,
