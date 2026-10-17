@@ -82,8 +82,9 @@ fn rotated<T: Clone>(values: &[T], start: usize) -> Vec<T> {
     rotated
 }
 
-/// Canonical face: the ring starts at its minimum quantized vertex, and every per-corner list
-/// rotates with it.
+/// Canonical face: the ring starts at its lexicographically smallest rotation, and every per-corner
+/// list rotates with it. Ties (repeated corners, as a degenerate quad has) are broken by the whole
+/// ring, not by the first minimum, so every ring of the same cycle canonicalizes identically.
 fn canonical_face(
     ring: &[DVec3],
     material: u64,
@@ -92,11 +93,17 @@ fn canonical_face(
     normals: Option<&[DVec3]>,
 ) -> CanonicalFace {
     let quantized: Vec<[i64; 3]> = ring.iter().copied().map(quantize_point).collect();
-    let start = quantized
-        .iter()
-        .enumerate()
-        .min_by_key(|&(_, point)| *point)
-        .map_or(0, |(index, _)| index);
+    let count = quantized.len();
+    let start = (0..count)
+        .min_by(|&left, &right| {
+            (0..count)
+                .map(|step| {
+                    quantized[(left + step) % count].cmp(&quantized[(right + step) % count])
+                })
+                .find(|ordering| ordering.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(0);
     CanonicalFace {
         ring: rotated(&quantized, start),
         material,
@@ -110,6 +117,41 @@ fn canonical_face(
             rotated(&corners, start)
         }),
     }
+}
+
+/// Whether two quantized values agree within one quantum on every component.
+fn close_within_quantum<const N: usize>(left: &[i64; N], right: &[i64; N]) -> bool {
+    left.iter()
+        .zip(right)
+        .all(|(left, right)| (left - right).abs() <= 1)
+}
+
+/// Whether two canonical faces agree: same material, `fid`, size and attribute layout, and every corner
+/// (with its UV and custom normal) within one quantum, for some rotation of `actual`.
+fn faces_match(actual: &CanonicalFace, expected: &CanonicalFace) -> bool {
+    let count = expected.ring.len();
+    if actual.ring.len() != count
+        || actual.material != expected.material
+        || actual.fid != expected.fid
+        || actual.uv.is_some() != expected.uv.is_some()
+        || actual.custom_normals.is_some() != expected.custom_normals.is_some()
+    {
+        return false;
+    }
+    (0..count).any(|shift| {
+        (0..count).all(|index| {
+            let source = (index + shift) % count;
+            close_within_quantum(&actual.ring[source], &expected.ring[index])
+                && match (&actual.uv, &expected.uv) {
+                    (Some(left), Some(right)) => close_within_quantum(&left[source], &right[index]),
+                    _ => true,
+                }
+                && match (&actual.custom_normals, &expected.custom_normals) {
+                    (Some(left), Some(right)) => close_within_quantum(&left[source], &right[index]),
+                    _ => true,
+                }
+        })
+    })
 }
 
 fn signed_volume(rings: &[Vec<DVec3>]) -> f64 {
@@ -427,15 +469,26 @@ pub fn mismatches(actual: &Canonical, expected: &Canonical) -> Vec<String> {
                 actual_faces.len(),
                 expected_faces.len()
             ));
-        } else if let Some(index) = actual_faces
-            .iter()
-            .zip(expected_faces)
-            .position(|(left, right)| left != right)
-        {
-            differences.push(format!(
-                "face {index} differs: actual {:?}, Blender {:?}",
-                actual_faces[index], expected_faces[index]
-            ));
+        } else {
+            // Expectations are rounded to 1e-6 and then quantized to 1e-5, so a value on a rounding
+            // boundary can land one quantum away. Faces match when every corner is within one quantum.
+            let mut unmatched: Vec<&CanonicalFace> = actual_faces.iter().collect();
+            for (index, expected_face) in expected_faces.iter().enumerate() {
+                match unmatched
+                    .iter()
+                    .position(|candidate| faces_match(candidate, expected_face))
+                {
+                    Some(position) => {
+                        unmatched.swap_remove(position);
+                    }
+                    None => {
+                        differences.push(format!(
+                            "face {index} differs: no Potter face matches Blender {expected_face:?}"
+                        ));
+                        break;
+                    }
+                }
+            }
         }
     }
     if actual.vertex_groups != expected.vertex_groups {
