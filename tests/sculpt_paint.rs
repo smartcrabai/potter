@@ -474,7 +474,8 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
             })
             .ok_or("imported multires node is missing")?;
         let imported_record = imported_document["data_blocks"][data_id.as_str()]["mesh"]["attributes"]
-            ["multires_displacement"];
+            ["multires_displacement"]
+            .clone();
         let imported_modifier = imported_document["nodes"][node_id.as_str()]["modifiers"]
             .as_array()
             .and_then(|modifiers| {
@@ -520,7 +521,8 @@ fn multires_blend_roundtrips_continue_sculpt_and_apply() -> Result<(), Box<dyn E
         let continued_document: Value =
             serde_json::from_slice(&fs::read(import_scene.join("scene.json"))?)?;
         let continued_record = continued_document["data_blocks"][data_id.as_str()]["mesh"]["attributes"]
-            ["multires_displacement"];
+            ["multires_displacement"]
+            .clone();
         assert_ne!(continued_record["values"], imported_record["values"]);
         assert!(
             continued_record["values"]
