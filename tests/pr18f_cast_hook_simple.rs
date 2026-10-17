@@ -1779,19 +1779,20 @@ fn hook_array_selects_all_original_copies() {
     }
 }
 
-/// Blender 5.2.2 validates each index value but sets the selection bitmap at its list position.
+/// Blender 5.2.2 hooks a listed vertex by its VALUE when no constructive modifier precedes the hook
+/// (oracle case `hook_list_position_single`): only vertex 2 moves by the hook translation.
 #[test]
-fn hook_indices_use_blender_list_position_bitmap() {
+fn hook_indices_use_listed_vertex_values_before_constructive_modifiers() {
     let mesh = subject();
     let result = evaluate_modifiers(&mesh, &[translated_index_hook(&[2])], SUBJECT_NAME).unwrap();
 
     assert!(
-        result.vertices[0]
+        result.vertices[2]
             .co
-            .distance(mesh.vertices[0].co + DVec3::X)
+            .distance(mesh.vertices[2].co + DVec3::X)
             < TOLERANCE
     );
-    assert_eq!(result.vertices[2].co, mesh.vertices[2].co);
+    assert_eq!(result.vertices[0].co, mesh.vertices[0].co);
 }
 
 /// Subdivision copies keep their ORIGINDEX while generated edge and face points remain unmapped.

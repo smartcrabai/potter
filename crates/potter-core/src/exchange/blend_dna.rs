@@ -1616,7 +1616,6 @@ impl<'a> BlendFile<'a> {
             self.header.pointer_size,
             0,
         )?;
-        set_object_member(&mut modifier, "dynamic_bind", Value::Bool(dynamic))?;
         let mut payload_found = false;
         if static_bound {
             if verts_num == 0 || cage_verts_num == 0 || offsets_ptr == 0 || cagecos_ptr == 0 {

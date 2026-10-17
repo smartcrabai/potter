@@ -1027,6 +1027,7 @@ fn hook_apply_uses_simulated_transform_reference_world_matrix() -> TestResult<()
                 "center": [0.0, 0.0, 0.0],
                 "strength": 1.0,
                 "falloff_radius": 0.0,
+                "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
             }),
             target_visible,
             true,
