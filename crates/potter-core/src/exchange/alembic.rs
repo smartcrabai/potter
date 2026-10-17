@@ -4383,7 +4383,7 @@ mod tests {
 
     #[test]
     fn constant_topology_properties_keep_storage_but_require_multisample_checks() {
-        let property = |name: &str, sample_count, constant| ParsedProperty {
+        let property = |name: &str, sample_count, constant: bool| ParsedProperty {
             name: name.to_owned(),
             property_type: 2,
             pod: 6,
