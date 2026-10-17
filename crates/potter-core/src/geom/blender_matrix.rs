@@ -81,6 +81,7 @@ impl BlenderEulerOrder {
 }
 
 /// A Blender object rotation: Euler angles in their order, or a quaternion.
+#[derive(Clone, Copy)]
 enum BlenderRotation {
     Euler(BlenderEulerOrder, [f32; 3]),
     Quaternion([f32; 4]),
@@ -122,11 +123,11 @@ fn blender_quat_to_mat3(quaternion: [f32; 4]) -> BlenderMat3 {
         + quaternion[2] * quaternion[2]
         + quaternion[3] * quaternion[3];
     let length = dot.sqrt();
-    let q = if length != 0.0 {
+    let q = if length == 0.0 {
+        [0.0, 1.0, 0.0, 0.0]
+    } else {
         let inverse = 1.0 / length;
         quaternion.map(|value| value * inverse)
-    } else {
-        [0.0, 1.0, 0.0, 0.0]
     };
     let root2 = std::f64::consts::SQRT_2;
     let q0 = root2 * f64::from(q[0]);
@@ -155,8 +156,8 @@ fn blender_quat_to_mat3(quaternion: [f32; 4]) -> BlenderMat3 {
     matrix
 }
 
-/// Blender `mul_m3_m3m3` (`math_matrix_c.cc:319`): `result[j][k] = b[j][0]*a[0][k] + b[j][1]*a[1][k]
-/// + b[j][2]*a[2][k]`, summed in index order.
+/// Blender `mul_m3_m3m3` (`math_matrix_c.cc:319`): `result[j][k]` sums `b[j][0] * a[0][k]`,
+/// `b[j][1] * a[1][k]` and `b[j][2] * a[2][k]` in index order.
 fn blender_mul_m3(a: &BlenderMat3, b: &BlenderMat3) -> BlenderMat3 {
     let mut result = [[0.0_f32; 3]; 3];
     for (j, column) in result.iter_mut().enumerate() {
@@ -168,8 +169,8 @@ fn blender_mul_m3(a: &BlenderMat3, b: &BlenderMat3) -> BlenderMat3 {
 }
 
 /// Blender `mul_m4_m4m4` (`math_matrix_c.cc:217`, scalar branch) and `float4x4 operator*`
-/// (`blenlib/intern/math_matrix.cc:27`): `result[j][k] = b[j][0]*a[0][k] + b[j][1]*a[1][k]
-/// + b[j][2]*a[2][k] + b[j][3]*a[3][k]`. The four products are summed in pairs,
+/// (`blenlib/intern/math_matrix.cc:27`): `result[j][k]` sums `b[j][0] * a[0][k]`, `b[j][1] * a[1][k]`,
+/// `b[j][2] * a[2][k]` and `b[j][3] * a[3][k]`. The four products are summed in pairs,
 /// `(p0 + p1) + (p2 + p3)`: the association the Blender arm64 build produces, checked bit for bit
 /// against the parent-inverse products of `BKE_object_where_is_calc`.
 fn blender_mul_m4(a: &BlenderMat4, b: &BlenderMat4) -> BlenderMat4 {
@@ -320,7 +321,7 @@ fn arm_reciprocal_estimate(value: f32) -> f32 {
     let fraction = f32::from_bits((bits & 0x007f_ffff) | 0x3f00_0000);
     let index = (fraction * 512.0) as u32;
     let r = (1_u32 << 19) / (2 * index + 1);
-    let estimate = ((r + 1) / 2) as f32 / 256.0;
+    let estimate = r.div_ceil(2) as f32 / 256.0;
     let magnitude = estimate * 2.0_f32.powi(-exponent);
     if value.is_sign_negative() {
         -magnitude
@@ -336,7 +337,7 @@ fn eigen_preciprocal(value: f32) -> f32 {
     let mut estimate = arm_reciprocal_estimate(value);
     for _ in 0..2 {
         let step = (2.0_f64 - f64::from(value) * f64::from(estimate)) as f32;
-        estimate = step * estimate;
+        estimate *= step;
     }
     estimate
 }
