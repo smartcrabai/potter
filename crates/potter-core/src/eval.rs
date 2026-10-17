@@ -5262,7 +5262,11 @@ pub(crate) fn apply_lattice_modifier(
     }
     // The kernel maps lattice-space offsets through inv(subject) * lattice, as Blender's latmat does.
     let lattice_to_mesh = source_inverse * lattice_world;
-    let strength = modifier_number_param(modifier, "strength")?;
+    // An absent strength is the schema default 1.0; a present value must still be a finite number.
+    let strength = match modifier.params.get("strength") {
+        None | Some(Value::Null) => 1.0,
+        Some(_) => modifier_number_param(modifier, "strength")?,
+    };
     let weights = lattice_vertex_group_weights(mesh, modifier, source_data)?
         .unwrap_or_else(|| vec![1.0; mesh.vertices.len()]);
     let fully_deformed =
