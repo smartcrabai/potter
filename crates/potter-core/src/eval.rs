@@ -1867,6 +1867,8 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
         "armature" | "lattice" | "volume_to_mesh" => &["object"],
         "hook" => &["object"],
+        "cast" => &["object"],
+        "simple_deform" => &["origin"],
         "uv_project" => &["projectors"],
         "uv_warp" => &["object_from", "object_to"],
         "displace" => &["texture_coords_object"],

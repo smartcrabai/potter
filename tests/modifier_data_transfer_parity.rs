@@ -1283,7 +1283,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
             [0.85, 0.8, -0.15, 1.0],
         ],
     )?;
-    let mut source_operand = operand(source.clone(), DMat4::IDENTITY, &[], None);
+    let source_operand = operand(source.clone(), DMat4::IDENTITY, &[], None);
     let mut operands = BTreeMap::new();
     operands.insert("object".to_owned(), vec![source_operand]);
     let transfer = modifier(
@@ -1456,7 +1456,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "data_transfer",
         json!({"object":"source","use_vert_data":true,"data_types_verts":["COLOR_VERTEX"],"vert_mapping":"TOPOLOGY","layers_vcol_vert_select_src":"ALL","layers_vcol_vert_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}),
     )?;
-    let mut point_selection = layer_selection(&[], None);
+    let point_selection = layer_selection(&[], None);
     let point_actual = evaluate_with_context(
         &point_destination,
         &point_transfer,
@@ -1502,7 +1502,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "data_transfer",
         json!({"object":"source","use_loop_data":true,"data_types_loops":["COLOR_CORNER"],"loop_mapping":"TOPOLOGY","layers_vcol_loop_select_src":"ALL","layers_vcol_loop_select_dst":"INDEX","mix_mode":"REPLACE","mix_factor":1.0}),
     )?;
-    let mut corner_selection = layer_selection(&[], None);
+    let corner_selection = layer_selection(&[], None);
     let corner_actual = evaluate_with_context(
         &corner_destination,
         &corner_transfer,

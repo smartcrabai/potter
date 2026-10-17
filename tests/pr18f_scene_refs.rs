@@ -247,7 +247,7 @@ fn hook_object_uses_inverse_subject_times_hook_matrix_inverse_and_weights() {
             {"op":"vertex_group.assign","target":{"id":"subj"},"group_id":"h",
              "weights":group_assignments(source_mesh(&staged, "subj"))},
             {"op":"modifier.create","target":{"id":"subj"},"id":"hook","type":"hook",
-             "params":{"object":"hk","vertex_group":"h","falloff_type":"NONE","strength":1.0,
+             "params":{"object":"hk","vertex_group":"H","falloff_type":"NONE","strength":1.0,
                        "matrix_inverse":HOOK_OBJECT_MATRIX_INVERSE}}
         ]),
     );

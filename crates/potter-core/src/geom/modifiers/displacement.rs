@@ -458,10 +458,8 @@ pub(crate) fn wave_textured(
     if life == 0.0 {
         return Ok(mesh.clone());
     }
-    let (start_x, start_y) = if optional_string_param(modifier, "start_position_object")?.is_some()
-    {
-        let object = runtime_matrix(modifier.runtime.object_matrix)
-            .ok_or_else(|| dependency_missing(modifier, "start_position_object"))?;
+    // The scene path resolves the start object into the runtime matrix and removes its parameter.
+    let (start_x, start_y) = if let Some(object) = runtime_matrix(modifier.runtime.object_matrix) {
         let origin = object.transform_point3(DVec3::ZERO);
         (origin.x, origin.y)
     } else {
@@ -561,15 +559,14 @@ pub(crate) fn warp_textured(
 ) -> Result<Mesh> {
     validated(mesh)?;
     let texture = required_texture(modifier, texture)?;
-    if optional_string_param(modifier, "object_from")?.is_none()
-        || optional_string_param(modifier, "object_to")?.is_none()
-    {
+    // The scene path resolves both objects into the runtime matrices and removes their parameters.
+    // An unset pair leaves the mesh unchanged, as Blender does.
+    let (Some(from), Some(to)) = (
+        runtime_matrix(modifier.runtime.warp_from_matrix),
+        runtime_matrix(modifier.runtime.warp_to_matrix),
+    ) else {
         return Ok(mesh.clone());
-    }
-    let from = runtime_matrix(modifier.runtime.warp_from_matrix)
-        .ok_or_else(|| dependency_missing(modifier, "object_from"))?;
-    let to = runtime_matrix(modifier.runtime.warp_to_matrix)
-        .ok_or_else(|| dependency_missing(modifier, "object_to"))?;
+    };
     if from.determinant().abs() <= f64::EPSILON || !from.is_finite() {
         return Err(invalid_parameter(
             modifier,

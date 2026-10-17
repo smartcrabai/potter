@@ -295,6 +295,10 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 modifier.modifier_type.as_str(),
                 "curve" | "hook" | "data_transfer"
             ) && modifier.params.get("object").is_some_and(Value::is_string))
+            || (modifier.modifier_type == "cast"
+                && modifier.params.get("object").is_some_and(Value::is_string))
+            || (modifier.modifier_type == "simple_deform"
+                && modifier.params.get("origin").is_some_and(Value::is_string))
             || (matches!(
                 modifier.modifier_type.as_str(),
                 "vertex_weight_proximity" | "normal_edit"
