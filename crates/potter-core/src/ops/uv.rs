@@ -726,7 +726,9 @@ fn reach<'a>(doc: &SceneDoc, nodes: impl IntoIterator<Item = &'a Id>) -> Reach {
     let mut pending: Vec<Id> = Vec::new();
     for node_id in nodes {
         if let Some(node) = doc.nodes.get(node_id) {
-            reached.materials.extend(node.materials.iter().flatten().cloned());
+            reached
+                .materials
+                .extend(node.materials.iter().flatten().cloned());
             pending.extend(node.modifiers.iter().filter_map(modifier_node_group));
         }
     }

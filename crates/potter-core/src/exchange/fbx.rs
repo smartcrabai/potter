@@ -1502,8 +1502,16 @@ fn writes_source_mesh(data_block: Option<&DataBlock>) -> bool {
 /// The material table the FBX mesh of `node` addresses: the node's own slots for its source mesh
 /// (deformers are written against it), otherwise the evaluated slots that the evaluated mesh's
 /// face indices name. One entry per face slot; `None` is an empty slot.
-fn fbx_material_slots(doc: &SceneDoc, snapshot: &Snapshot, node_id: &Id, node: &Node) -> Vec<Option<Id>> {
-    let data_block = node.data.as_ref().and_then(|data_id| doc.data_blocks.get(data_id));
+fn fbx_material_slots(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    node_id: &Id,
+    node: &Node,
+) -> Vec<Option<Id>> {
+    let data_block = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
     if writes_source_mesh(data_block) {
         return node.materials.clone();
     }
@@ -3773,7 +3781,9 @@ mod tests {
             .values()
             .find(|node| node.name == node_name)
             .ok_or("FBX test mesh is missing")?;
-        let material_id = node.material_slot(0).ok_or("FBX test mesh has no material")?;
+        let material_id = node
+            .material_slot(0)
+            .ok_or("FBX test mesh has no material")?;
         doc.materials
             .get(material_id)
             .and_then(|material| material.base_color_texture.as_ref())
@@ -3792,7 +3802,9 @@ mod tests {
             .get(data_id)
             .and_then(|data| data.mesh.as_ref())
             .ok_or("FBX test mesh data is missing")?;
-        let material_id = node.material_slot(0).ok_or("FBX test mesh has no material")?;
+        let material_id = node
+            .material_slot(0)
+            .ok_or("FBX test mesh has no material")?;
         let material = doc
             .materials
             .get(material_id)

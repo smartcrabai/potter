@@ -1078,10 +1078,9 @@ fn evaluate_modifier_output(
             match modifier.modifier_type.as_str() {
                 "boolean" => {
                     // Every EXACT Boolean takes the scene path, which owns its material slots.
-                    let exact = crate::geom::modifiers::BooleanSettings::parse(modifier)
-                        .is_ok_and(|settings| {
-                            settings.solver != crate::geom::modifiers::BooleanSolver::Float
-                        });
+                    let exact = crate::geom::modifiers::BooleanSettings::parse(modifier).is_ok_and(
+                        |settings| settings.solver != crate::geom::modifiers::BooleanSolver::Float,
+                    );
                     exact
                         || ["object", "collection", "target"]
                             .iter()
