@@ -923,8 +923,18 @@ fn is_integer(data_type: &str) -> bool {
     matches!(data_type, "INT" | "INT8")
 }
 
-/// Blend values by weight: numbers and equal-length number arrays interpolate componentwise
-/// (rounded for integer types); booleans OR over the positive-weight sources; anything else takes
+/// A blended float rounded to the f32 precision Blender stores attribute layers in, so a constant
+/// input blends back to exactly its value.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender stores float attribute layers as f32"
+)]
+fn stored_float(sum: f64) -> f64 {
+    f64::from(sum as f32)
+}
+
+/// Blends `items` by weight. Numbers sum (rounded for integer types, rounded to f32 for float types);
+/// arrays sum component-wise; booleans OR over the positive-weight sources; anything else takes
 /// the value of the heaviest source.
 /// `None` when there are no sources.
 fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> Option<Value> {
@@ -938,7 +948,7 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
         return Some(if is_integer(data_type) {
             json!(sum.round() as i64)
         } else {
-            json!(sum)
+            json!(stored_float(sum))
         });
     }
     if let Some(length) = first.as_array().map(Vec::len)
@@ -961,7 +971,7 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
                     if rounds {
                         json!(sum.round() as i64)
                     } else {
-                        json!(sum)
+                        json!(stored_float(sum))
                     }
                 })
                 .collect(),
