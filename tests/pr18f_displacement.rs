@@ -11,7 +11,10 @@
 //! 0 through 5 (vertex 6 is outside `G`). Blender stores float32, so the tolerance allows its
 //! rounding. Each chained case applies its first modifier to the input the second one reads.
 
-use std::collections::BTreeMap;
+#[path = "common/blender_file.rs"]
+mod blender_file;
+
+use std::{collections::BTreeMap, env, path::PathBuf, process::Command};
 
 use glam::DVec3;
 use potter_core::{
@@ -27,6 +30,7 @@ use serde_json::{Map, Value, json};
 
 /// Blender's float32 rounding; the implementation computes in f64 with the same algorithm.
 const TOLERANCE: f64 = 2.0e-5;
+const SUBJECT_NAME: &str = "DisplacementSubject";
 
 const POSITIONS: [[f64; 3]; 7] = [
     [0.0, 0.0, 0.0],
@@ -257,11 +261,11 @@ fn assert_points(label: &str, actual: &Mesh, expected: &[[f64; 3]; 7]) {
 }
 
 fn evaluate(mesh: &Mesh, modifiers: &[Modifier]) -> Mesh {
-    evaluate_modifiers(mesh, modifiers).unwrap()
+    evaluate_modifiers(mesh, modifiers, SUBJECT_NAME).unwrap()
 }
 
 fn evaluate_at(mesh: &Mesh, modifiers: &[Modifier], frame: f64) -> Mesh {
-    evaluate_modifiers_with_groups_at_frame(mesh, modifiers, &BTreeMap::new(), frame)
+    evaluate_modifiers_with_groups_at_frame(mesh, modifiers, &BTreeMap::new(), frame, SUBJECT_NAME)
         .unwrap()
         .mesh
 }
@@ -741,6 +745,184 @@ fn warp_texture_factor_matches_blender() -> Result<(), Box<dyn std::error::Error
     let mesh = scene_subject(&ops, None)?;
     assert_plane("warp texture local", &mesh, &SCENE_WARP_TEX_LOCAL);
     Ok(())
+}
+
+const WARP_CURVE_VERTICES: [[f64; 3]; 4] = [
+    [-1.0, -1.0, 0.0],
+    [1.0, -1.0, 0.0],
+    [1.0, 1.0, 0.0],
+    [-1.0, 1.0, 0.0],
+];
+const WARP_CURVE_FROM: [f64; 3] = [-0.8, -0.4, 0.0];
+const WARP_CURVE_TO: [f64; 3] = [0.0, 0.0, 2.0];
+const WARP_CURVE_RADIUS: f64 = 2.7;
+const WARP_CURVE_POINTS: [[f64; 2]; 4] = [
+    [0.0, 0.0],
+    [0.3, 0.9],
+    [0.65, 0.15],
+    [1.0, 1.0],
+];
+const WARP_CURVE_RAW_POINTS: [[f64; 2]; 5] = [
+    [-0.2, -0.2],
+    [0.7, 0.9],
+    [0.7, 0.4],
+    [0.35, 0.1],
+    [1.25, 1.2],
+];
+
+fn blender_5_2() -> Option<PathBuf> {
+    let blender = blender_file::blender_executable()?;
+    let version = match Command::new(&blender).arg("--version").output() {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+        Ok(output) => format!("Blender --version exited with {}", output.status),
+        Err(error) => format!("could not run Blender --version: {error}"),
+    };
+    if version.starts_with("Blender 5.2") {
+        return Some(blender);
+    }
+    assert!(
+        env::var_os("POTTER_REQUIRE_BLENDER").is_none_or(|value| value.is_empty()),
+        "POTTER_REQUIRE_BLENDER is set but this test requires Blender 5.2.x, found `{version}`"
+    );
+    eprintln!("skipping Warp curve parity: requires Blender 5.2.x, found `{version}`");
+    None
+}
+
+const WARP_CURVE_ORACLE: &str = r#"
+import bpy
+import json
+import sys
+
+with open(sys.argv[sys.argv.index("--") + 1], encoding="utf-8") as source:
+    data = json.load(source)
+
+bpy.ops.wm.read_factory_settings(use_empty=True)
+mesh = bpy.data.meshes.new("Warp Curve Oracle Mesh")
+mesh.from_pydata(data["vertices"], [], data["faces"])
+mesh.update()
+subject = bpy.data.objects.new("Warp Curve Oracle", mesh)
+bpy.context.scene.collection.objects.link(subject)
+source = bpy.data.objects.new("Warp From", None)
+source.location = data["from"]
+bpy.context.scene.collection.objects.link(source)
+target = bpy.data.objects.new("Warp To", None)
+target.location = data["to"]
+bpy.context.scene.collection.objects.link(target)
+
+warp = subject.modifiers.new("Warp Curve Oracle", "WARP")
+warp.object_from = source
+warp.object_to = target
+warp.falloff_type = "CURVE"
+warp.falloff_radius = data["radius"]
+warp.strength = 1.0
+curve = warp.falloff_curve.curves[0]
+while len(curve.points) > 2:
+    curve.points.remove(curve.points[-1])
+for point in data["curve"][1:-1]:
+    curve.points.new(float(point[0]), float(point[1]))
+for point, coordinates in zip(curve.points, data["curve"]):
+    point.location = tuple(coordinates)
+if data["update_curve"]:
+    warp.falloff_curve.update()
+
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = subject.evaluated_get(depsgraph)
+evaluated_mesh = evaluated.to_mesh()
+coordinates = [[float(component) for component in vertex.co] for vertex in evaluated_mesh.vertices]
+evaluated.to_mesh_clear()
+print("POTTER_WARP_CURVE=" + json.dumps(coordinates))
+"#;
+
+fn assert_warp_curve_matches_blender_522(
+    curve_points: &[[f64; 2]],
+    update_curve: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(blender) = blender_5_2() else {
+        return Ok(());
+    };
+    let operations = [
+        json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
+        json!({"op":"node.create","id":"from","kind":"empty","transform":{"translation":WARP_CURVE_FROM}}),
+        json!({"op":"node.create","id":"to","kind":"empty","transform":{"translation":WARP_CURVE_TO}}),
+        json!({
+            "op":"modifier.create",
+            "target":{"id":"subject"},
+            "id":"deform",
+            "type":"warp",
+            "params":{
+                "object_from":"from",
+                "object_to":"to",
+                "falloff_type":"CURVE",
+                "falloff_radius":WARP_CURVE_RADIUS,
+                "strength":1.0,
+                "falloff_curve":curve_points
+            }
+        }),
+    ];
+    let actual = scene_subject(&operations, None)?;
+    let directory = tempfile::tempdir()?;
+    let input_path = directory.path().join("warp_curve_input.json");
+    let script_path = directory.path().join("warp_curve_oracle.py");
+    std::fs::write(
+        &input_path,
+        serde_json::to_vec(&json!({
+            "vertices": WARP_CURVE_VERTICES,
+            "faces": [[0, 1, 2, 3]],
+            "from": WARP_CURVE_FROM,
+            "to": WARP_CURVE_TO,
+            "radius": WARP_CURVE_RADIUS,
+            "curve": curve_points,
+            "update_curve": update_curve,
+        }))?,
+    )?;
+    std::fs::write(&script_path, WARP_CURVE_ORACLE)?;
+    let output = Command::new(blender)
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(&script_path)
+        .arg("--")
+        .arg(&input_path)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Blender Warp curve oracle failed:\n{stdout}\n{stderr}"
+    );
+    let result = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("POTTER_WARP_CURVE="))
+        .expect("Blender Warp curve oracle emitted a result line");
+    let coordinates: Vec<[f64; 3]> = serde_json::from_str(result)?;
+    assert_eq!(actual.vertices.len(), coordinates.len(), "Warp curve vertex count");
+    for (index, (vertex, expected)) in actual.vertices.iter().zip(&coordinates).enumerate() {
+        let error = (vertex.co - DVec3::from_array(*expected)).abs().max_element();
+        assert!(
+            error < TOLERANCE,
+            "Warp curve vertex {index} is {:?}, Blender gives {expected:?}",
+            vertex.co
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn warp_curve_falloff_matches_blender_522() -> Result<(), Box<dyn std::error::Error>> {
+    assert_warp_curve_matches_blender_522(&WARP_CURVE_POINTS, true)
+}
+
+#[test]
+fn warp_curve_raw_controls_match_blender_522() -> Result<(), Box<dyn std::error::Error>> {
+    assert_warp_curve_matches_blender_522(&WARP_CURVE_RAW_POINTS, false)
 }
 
 #[test]

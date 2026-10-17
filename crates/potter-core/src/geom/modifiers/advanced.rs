@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use glam::{DMat3, DMat4, DQuat, DVec2, DVec3};
+use glam::{DMat3, DMat4, DQuat, DVec3, Vec2};
 use serde_json::Value;
 
 use crate::model::Modifier;
@@ -565,12 +565,12 @@ fn group_weight(weights: Option<&[f64]>, index: usize) -> f64 {
 }
 
 /// Blender's automatic cuboid half-extent per axis: the larger of the absolute extremes of the points.
-fn cast_auto_half_extent(points: &[DVec3]) -> DVec3 {
+fn cast_auto_half_extent(points: impl Iterator<Item = DVec3>) -> DVec3 {
     let mut lo = DVec3::splat(f64::INFINITY);
     let mut hi = DVec3::splat(f64::NEG_INFINITY);
     for point in points {
-        lo = lo.min(*point);
-        hi = hi.max(*point);
+        lo = lo.min(point);
+        hi = hi.max(point);
     }
     lo.abs().max(hi.abs())
 }
@@ -627,12 +627,11 @@ pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         } else if !use_radius_as_size && size > 0.0 {
             DVec3::splat(size)
         } else {
-            let points: Vec<DVec3> = mesh
-                .vertices
-                .iter()
-                .map(|vertex| vertex.co - center)
-                .collect();
-            cast_auto_half_extent(&points)
+            cast_auto_half_extent(
+                mesh.vertices
+                    .iter()
+                    .map(|vertex| forward.transform_point3(vertex.co)),
+            )
         };
         for (index, vertex) in result.vertices.iter_mut().enumerate() {
             let weight = group_weight(weights.as_deref(), index);
@@ -1080,111 +1079,253 @@ fn project_surface(
         })
 }
 
-pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let group_name = string_param(modifier, "vertex_group")?;
-    if group_name.is_empty() {
-        return Err(invalid_parameter(
-            modifier,
-            "vertex_group",
-            "a vertex-group name",
-        ));
-    }
-    let weights = mesh
+pub(super) fn mask(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    operands: &std::collections::BTreeMap<String, Vec<super::attributes::SceneOperand>>,
+) -> Result<Mesh> {
+    let groups = mesh
         .attributes
         .get("vertex_groups")
-        .and_then(Value::as_object)
-        .and_then(|groups| groups.get(group_name))
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            invalid_parameter(
-                modifier,
-                "vertex_group",
-                "a group present in mesh vertex_groups attributes",
-            )
-        })?;
-    let threshold = number_param(modifier, "threshold")?;
+        .and_then(Value::as_object);
+    let has_deform_weights = groups.is_some_and(|groups| {
+        groups
+            .values()
+            .any(|weights| weights.as_object().is_some_and(|weights| !weights.is_empty()))
+    });
     let invert = bool_param(modifier, "invert_vertex_group")?;
-    let mut selected = HashSet::new();
-    for vertex in &mesh.vertices {
-        let weight = weights
-            .get(&format!("v{}", vertex.id))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
-            return Err(invalid_parameter(
-                modifier,
-                "vertex_group",
-                "finite weights in [0, 1]",
-            ));
-        }
-        if if invert {
-            1.0 - weight > threshold
+    let Some(groups) = groups.filter(|_| has_deform_weights) else {
+        return if invert {
+            Ok(mesh.clone())
         } else {
-            weight > threshold
-        } {
-            selected.insert(vertex.id);
+            build_mesh(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &Origin::default(),
+                mesh,
+            )
+        };
+    };
+
+    let mode = string_param(modifier, "mode")?;
+    let group_name = string_param(modifier, "vertex_group")?;
+    let threshold = number_param(modifier, "threshold")?.clamp(0.0, 1.0);
+    let use_smooth = mode == "VERTEX_GROUP" && bool_param(modifier, "use_smooth")?;
+    let weights_by_group = match mode {
+        "VERTEX_GROUP" => {
+            let Some(weights) = groups.get(group_name).and_then(Value::as_object) else {
+                // Blender leaves the mesh untouched when the requested group is absent.
+                return Ok(mesh.clone());
+            };
+            vec![(group_name, weights)]
         }
+        "ARMATURE" => {
+            let Some(armature) = operands
+                .get("armature")
+                .and_then(|items| items.first())
+                .filter(|operand| operand.armature)
+            else {
+                return Ok(mesh.clone());
+            };
+            groups
+                .iter()
+                .filter(|(name, _)| armature.selected_bones.contains(*name))
+                .filter_map(|(name, value)| value.as_object().map(|weights| (name.as_str(), weights)))
+                .collect()
+        }
+        _ => return Ok(mesh.clone()),
+    };
+
+    let mut selected = Vec::with_capacity(mesh.vertices.len());
+    for vertex in &mesh.vertices {
+        let mut is_selected = false;
+        for (_, weights) in &weights_by_group {
+            let weight = weights
+                .get(&format!("v{}", vertex.id))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+                return Err(invalid_parameter(
+                    modifier,
+                    "vertex_group",
+                    "finite weights in [0, 1]",
+                ));
+            }
+            if weight > threshold {
+                is_selected = true;
+                break;
+            }
+        }
+        selected.push(if invert { !is_selected } else { is_selected });
     }
+
     let source_positions = positions(mesh);
     let source_indices = id_indices(mesh);
-    let mut keep = HashSet::new();
-    let mut retained_faces = Vec::new();
-    let mut retained_sources = Vec::new();
+    let mut vertex_map = vec![usize::MAX; source_positions.len()];
+    let mut points = Vec::with_capacity(source_positions.len());
+    let mut vertex_origins = Vec::with_capacity(source_positions.len());
+    for (source, is_selected) in selected.iter().copied().enumerate() {
+        if is_selected {
+            vertex_map[source] = points.len();
+            points.push(source_positions[source]);
+            vertex_origins.push(vec![(source, 1.0)]);
+        }
+    }
+    let mut polygons = Vec::new();
+    let mut face_origins = Vec::new();
+    let mut corner_origins = Vec::new();
+    let mut corner_offsets = Vec::with_capacity(mesh.faces.len());
+    let mut corner_offset = 0_usize;
+    for face in &mesh.faces {
+        corner_offsets.push(corner_offset);
+        corner_offset = corner_offset
+            .checked_add(face.vertices.len())
+            .ok_or_else(|| invalid_parameter(modifier, "mesh", "a valid loop count"))?;
+    }
+    let group_weights = if mode == "VERTEX_GROUP" {
+        weights_by_group.first().map(|(_, weights)| *weights)
+    } else {
+        None
+    };
+    let weight_for_index = |index: usize| {
+        let vertex_id = mesh.vertices[index].id;
+        group_weights
+            .and_then(|weights| {
+                weights
+                    .get(&format!("v{vertex_id}"))
+                    .and_then(Value::as_f64)
+            })
+            .unwrap_or(0.0)
+    };
+    let mut boundary_vertices = HashMap::<(usize, usize), usize>::new();
+    let mut boundary_vertex = |first: usize, second: usize| {
+        let key = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        if let Some(index) = boundary_vertices.get(&key) {
+            return *index;
+        }
+        let first_weight = weight_for_index(key.0);
+        let second_weight = weight_for_index(key.1);
+        let factor = (threshold - first_weight) / (second_weight - first_weight);
+        let index = points.len();
+        points.push(source_positions[key.0].lerp(source_positions[key.1], factor));
+        vertex_origins.push(vec![(key.0, 1.0 - factor), (key.1, factor)]);
+        boundary_vertices.insert(key, index);
+        index
+    };
+
     for (face_index, face) in mesh.faces.iter().enumerate() {
-        if face.vertices.iter().all(|id| selected.contains(id)) {
-            let indices = face
-                .vertices
-                .iter()
-                .map(|id| {
-                    let index = source_indices.get(id).copied().ok_or_else(|| {
-                        invalid_parameter(modifier, "mesh", "faces referencing existing vertices")
-                    })?;
-                    keep.insert(index);
-                    Ok(index)
+        let indices = face
+            .vertices
+            .iter()
+            .map(|id| {
+                source_indices.get(id).copied().ok_or_else(|| {
+                    invalid_parameter(modifier, "mesh", "faces referencing existing vertices")
                 })
-                .collect::<Result<Vec<_>>>()?;
-            retained_faces.push((indices, face.material_index));
-            retained_sources.push(Some(face_index));
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let face_selected = indices.iter().map(|index| selected[*index]).collect::<Vec<_>>();
+        if face_selected.iter().all(|value| *value) {
+            let output = indices.iter().map(|index| vertex_map[*index]).collect();
+            polygons.push((output, face.material_index));
+            face_origins.push(Some(face_index));
+            corner_origins.extend(
+                (0..indices.len()).map(|corner| vec![(corner_offsets[face_index] + corner, 1.0)]),
+            );
+            continue;
+        }
+        if !use_smooth || face_selected.iter().all(|value| !*value) {
+            continue;
+        }
+
+        let start = face_selected
+            .iter()
+            .position(|value| !value)
+            .expect("a partially selected face has an unselected corner");
+        let mut fragment = Vec::<(usize, Vec<(usize, f64)>)>::new();
+        for step in 1..=indices.len() {
+            let previous = (start + step - 1) % indices.len();
+            let current = (start + step) % indices.len();
+            let was_selected = face_selected[previous];
+            let is_selected = face_selected[current];
+            if !was_selected && is_selected {
+                let previous_index = indices[previous];
+                let current_index = indices[current];
+                let boundary = boundary_vertex(previous_index, current_index);
+                let previous_weight = weight_for_index(previous_index);
+                let current_weight = weight_for_index(current_index);
+                let factor = (threshold - previous_weight) / (current_weight - previous_weight);
+                fragment.push((
+                    boundary,
+                    vec![
+                        (corner_offsets[face_index] + previous, 1.0 - factor),
+                        (corner_offsets[face_index] + current, factor),
+                    ],
+                ));
+                fragment.push((
+                    vertex_map[current_index],
+                    vec![(corner_offsets[face_index] + current, 1.0)],
+                ));
+            } else if was_selected && is_selected {
+                fragment.push((
+                    vertex_map[indices[current]],
+                    vec![(corner_offsets[face_index] + current, 1.0)],
+                ));
+            } else if was_selected && !is_selected {
+                let previous_index = indices[previous];
+                let current_index = indices[current];
+                let boundary = boundary_vertex(previous_index, current_index);
+                let previous_weight = weight_for_index(previous_index);
+                let current_weight = weight_for_index(current_index);
+                let factor = (threshold - previous_weight) / (current_weight - previous_weight);
+                fragment.push((
+                    boundary,
+                    vec![
+                        (corner_offsets[face_index] + previous, 1.0 - factor),
+                        (corner_offsets[face_index] + current, factor),
+                    ],
+                ));
+                if fragment.len() >= 3 {
+                    polygons.push((
+                        fragment.iter().map(|(index, _)| *index).collect(),
+                        face.material_index,
+                    ));
+                    face_origins.push(Some(face_index));
+                    corner_origins.extend(fragment.drain(..).map(|(_, origin)| origin));
+                } else {
+                    fragment.clear();
+                }
+            }
         }
     }
+
     let source_loose_edges = loose_edges(mesh)?;
-    for [first, second] in &source_loose_edges {
-        if selected.contains(&mesh.vertices[*first].id)
-            && selected.contains(&mesh.vertices[*second].id)
-        {
-            keep.insert(*first);
-            keep.insert(*second);
+    let mut edges = Vec::new();
+    for [first, second] in source_loose_edges {
+        match (selected[first], selected[second], use_smooth) {
+            (true, true, _) => edges.push([vertex_map[first], vertex_map[second]]),
+            (true, false, true) => {
+                let boundary = boundary_vertex(first, second);
+                edges.push([vertex_map[first], boundary]);
+            }
+            (false, true, true) => {
+                let boundary = boundary_vertex(first, second);
+                edges.push([boundary, vertex_map[second]]);
+            }
+            _ => {}
         }
     }
-    let mut remap = vec![usize::MAX; source_positions.len()];
-    let sources: Vec<usize> = (0..source_positions.len())
-        .filter(|index| keep.contains(index))
-        .collect();
-    for (output, &source) in sources.iter().enumerate() {
-        remap[source] = output;
-    }
-    let points: Vec<DVec3> = sources
-        .iter()
-        .map(|&index| source_positions[index])
-        .collect();
-    let faces = retained_faces
-        .into_iter()
-        .map(|(face, material)| {
-            (
-                face.into_iter().map(|index| remap[index]).collect(),
-                material,
-            )
-        })
-        .collect();
-    let edges = source_loose_edges
-        .into_iter()
-        .filter_map(|[first, second]| {
-            (remap[first] != usize::MAX && remap[second] != usize::MAX)
-                .then_some([remap[first], remap[second]])
-        })
-        .collect();
-    let origin = Origin::copies(sources.into_iter().map(Some), retained_sources);
-    build_mesh(points, faces, edges, &origin, mesh)
+    let origin = Origin {
+        vertices: vertex_origins,
+        faces: face_origins,
+        corners: Some(corner_origins),
+        raw_normals: false,
+    };
+    build_mesh(points, polygons, edges, &origin, mesh)
 }
 
 #[expect(
@@ -1928,9 +2069,9 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let parent_inverse = matrix_param(modifier, "matrix_inverse")?;
     let indices = vertex_index_param(modifier)?;
     let falloff_table = if falloff == HookFalloff::Curve {
-        hook_curve_table(modifier)?
+        Some(hook_curve_table(modifier)?)
     } else {
-        Vec::new()
+        None
     };
     let weights = deform_group_weights(mesh, modifier)?;
     // Blender hooks only listed vertices; without a list, a vertex group selects them.
@@ -1958,7 +2099,7 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             offset.length_squared()
         };
         let shape = if use_falloff {
-            hook_falloff(falloff, distance_sq, radius, &falloff_table)
+            hook_falloff(falloff, distance_sq, radius, falloff_table.as_ref())
         } else {
             1.0
         };
@@ -1974,7 +2115,12 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
 }
 
 /// Blender's falloff shape for a squared distance from the hook centre (1 at the centre, 0 outside the radius).
-fn hook_falloff(falloff: HookFalloff, distance_sq: f64, radius: f64, curve: &[f64]) -> f64 {
+fn hook_falloff(
+    falloff: HookFalloff,
+    distance_sq: f64,
+    radius: f64,
+    curve: Option<&CurveMappingTable>,
+) -> f64 {
     let radius_sq = radius * radius;
     if distance_sq > radius_sq {
         return 0.0;
@@ -1986,7 +2132,7 @@ fn hook_falloff(falloff: HookFalloff, distance_sq: f64, radius: f64, curve: &[f6
     match falloff {
         HookFalloff::Constant => 1.0,
         HookFalloff::InverseSquare => 1.0 - distance_sq / radius_sq,
-        HookFalloff::Curve => curve_map_value(curve, linear),
+        HookFalloff::Curve => curve.map_or(0.0, |table| table.evaluate(linear)),
         HookFalloff::Sharp => linear * linear,
         HookFalloff::Smooth => 3.0 * linear * linear - 2.0 * linear * linear * linear,
         HookFalloff::Root => linear.sqrt(),
@@ -2069,13 +2215,18 @@ fn matrix_param(modifier: &Modifier, name: &str) -> Result<DMat4> {
     Ok(DMat4::from_cols_array(&matrix))
 }
 
-/// Hook falloff curve points, validated like Blender's CurveMapping: unit-square points with increasing x.
-fn hook_curve_table(modifier: &Modifier) -> Result<Vec<f64>> {
+/// Hook falloff controls in Blender's stored order and float precision.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "Blender CurveMapping stores control points as float"
+)]
+fn hook_curve_table(modifier: &Modifier) -> Result<CurveMappingTable> {
     let invalid = || {
         invalid_parameter(
             modifier,
             "falloff_curve",
-            "at least two [x, y] points in the unit square with increasing x",
+            "at least two finite float32 [x, y] points with evaluable endpoints",
         )
     };
     let mut points = Vec::new();
@@ -2090,34 +2241,89 @@ fn hook_curve_table(modifier: &Modifier) -> Result<Vec<f64>> {
         let (Some(x), Some(y)) = (x.as_f64(), y.as_f64()) else {
             return Err(invalid());
         };
-        if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+        if !x.is_finite() || !y.is_finite() {
             return Err(invalid());
         }
-        points.push(DVec2::new(x, y));
+        points.push(Vec2::new(x as f32, y as f32));
     }
-    if points.len() < 2
-        || points
-            .windows(2)
-            .any(|pair| matches!(pair, [first, second] if second.x <= first.x))
-    {
-        return Err(invalid());
-    }
-    Ok(curve_map_table(&points))
+    curve_map_table(&points).ok_or_else(invalid)
 }
 
 const CURVE_SAMPLES_PER_SEGMENT: usize = 32;
 const CURVE_TABLE_INTERVALS: usize = 256;
+const CURVE_TABLE_DIVISIONS: f32 = 256.0;
 
-/// Blender's CurveMapping table (`curvemap_make_table`) for auto-handled points on the unit square:
-/// Bezier segments are sampled, then resampled at equal steps over [0, 1].
-fn curve_map_table(points: &[DVec2]) -> Vec<f64> {
+/// Blender's float `CurveMapping` table: auto-handled Beziers are forward-difference sampled, then
+/// resampled at equal x intervals over the clip-extended control range. Hook and Warp share this
+/// table and its evaluator.
+pub(super) struct CurveMappingTable {
+    values: Vec<f32>,
+    ext_in: Vec2,
+    ext_out: Vec2,
+    table_min: f32,
+    table_max: f32,
+    inverse_range: f32,
+}
+
+impl CurveMappingTable {
+    /// Blender `BKE_curvemapping_evaluateF`, including endpoint extrapolation and [0, 1] clipping.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "Blender CurveMapping evaluates float inputs and table indices"
+    )]
+    pub(super) fn evaluate(&self, value: f64) -> f64 {
+        let value = value as f32;
+        let fi = (value - self.table_min) * self.inverse_range;
+        let result = if fi < 0.0 || fi > CURVE_TABLE_DIVISIONS {
+            curve_map_extend(
+                value,
+                Vec2::new(self.table_min, self.values[0]),
+                Vec2::new(self.table_max, self.values[CURVE_TABLE_INTERVALS]),
+                self.ext_in,
+                self.ext_out,
+            )
+        } else {
+            let index = fi as usize;
+            if index >= CURVE_TABLE_INTERVALS {
+                self.values[CURVE_TABLE_INTERVALS]
+            } else {
+                let fraction = fi - index as f32;
+                (1.0 - fraction) * self.values[index] + fraction * self.values[index + 1]
+            }
+        };
+        f64::from(result.clamp(0.0, 1.0))
+    }
+}
+
+/// Builds Blender's `curvemap_make_table` for raw controls in stored order,
+/// resampling over the clip-extended x range.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Blender's table loop converts its integer index to float"
+)]
+pub(super) fn curve_map_table(points: &[Vec2]) -> Option<CurveMappingTable> {
     let count = points.len();
-    let mut handles: Vec<[DVec2; 3]> = Vec::with_capacity(count);
+    if count < 2
+        || points.iter().any(|point| {
+            !point.x.is_finite() || !point.y.is_finite()
+        })
+        || points[0] == points[1]
+        || points[count - 1] == points[count - 2]
+    {
+        return None;
+    }
+    let table_min = points.iter().fold(0.0_f32, |min, point| min.min(point.x));
+    let table_max = points.iter().fold(1.0_f32, |max, point| max.max(point.x));
+    let table_range = table_max - table_min;
+    if !table_range.is_finite() || table_range <= 0.0 {
+        return None;
+    }
+
+    let mut handles: Vec<[Vec2; 3]> = Vec::with_capacity(count);
     for (index, &point) in points.iter().enumerate() {
-        let previous = index
-            .checked_sub(1)
-            .and_then(|prior| points.get(prior))
-            .copied();
+        let previous = index.checked_sub(1).and_then(|prior| points.get(prior)).copied();
         let next = points.get(index + 1).copied();
         let (before, after) = match (previous, next) {
             (Some(before), Some(after)) => (before, after),
@@ -2127,23 +2333,15 @@ fn curve_map_table(points: &[DVec2]) -> Vec<f64> {
         };
         let incoming = point - before;
         let outgoing = after - point;
-        let length_in = if incoming == DVec2::ZERO {
-            1.0
-        } else {
-            incoming.length()
-        };
-        let length_out = if outgoing == DVec2::ZERO {
-            1.0
-        } else {
-            outgoing.length()
-        };
+        let length_in = if incoming == Vec2::ZERO { 1.0 } else { incoming.length() };
+        let length_out = if outgoing == Vec2::ZERO { 1.0 } else { outgoing.length() };
         let tangent = outgoing / length_out + incoming / length_in;
-        let scale = tangent.length() * 2.5614;
+        let scale = tangent.length() * 2.5614_f32;
         let (left, right) = if scale == 0.0 {
-            (DVec2::ZERO, DVec2::ZERO)
+            (Vec2::ZERO, Vec2::ZERO)
         } else {
             (
-                point - tangent * (length_in / scale),
+                point + tangent * -(length_in / scale),
                 point + tangent * (length_out / scale),
             )
         };
@@ -2151,23 +2349,25 @@ fn curve_map_table(points: &[DVec2]) -> Vec<f64> {
     }
     if count > 2 {
         let last = count - 1;
-        // Blender clips the end handles so they never point past the neighbouring point.
         let first_length = (handles[0][1] - handles[0][2]).length();
-        let mut clipped = handles[1][0];
-        clipped.x = clipped.x.max(handles[0][1].x);
-        let offset = clipped - handles[0][1];
-        if offset.length() > f64::from(f32::EPSILON) {
-            let offset = offset * (first_length / offset.length());
-            handles[0][2] = handles[0][1] + offset;
+        let mut offset = handles[1][0];
+        offset.x = offset.x.max(handles[0][1].x);
+        offset -= handles[0][1];
+        let offset_length = offset.length();
+        if offset_length > f32::EPSILON {
+            offset *= first_length / offset_length;
+            handles[0][2] = offset + handles[0][1];
             handles[0][0] = handles[0][1] - offset;
         }
+
         let last_length = (handles[last][1] - handles[last][0]).length();
-        let mut clipped = handles[last - 1][2];
-        clipped.x = clipped.x.min(handles[last][1].x);
-        let offset = clipped - handles[last][1];
-        if offset.length() > f64::from(f32::EPSILON) {
-            let offset = offset * (last_length / offset.length());
-            handles[last][0] = handles[last][1] + offset;
+        let mut offset = handles[last - 1][2];
+        offset.x = offset.x.min(handles[last][1].x);
+        offset -= handles[last][1];
+        let offset_length = offset.length();
+        if offset_length > f32::EPSILON {
+            offset *= last_length / offset_length;
+            handles[last][0] = offset + handles[last][1];
             handles[last][2] = handles[last][1] - offset;
         }
     }
@@ -2181,75 +2381,82 @@ fn curve_map_table(points: &[DVec2]) -> Vec<f64> {
         handles[segment][2] = right_handle;
         handles[segment + 1][0] = left_handle;
     }
+
     let mut samples = Vec::with_capacity((count - 1) * CURVE_SAMPLES_PER_SEGMENT);
     for segment in 0..count - 1 {
-        for sample in 0..CURVE_SAMPLES_PER_SEGMENT {
-            let t = usize_as_f64(sample) / usize_as_f64(CURVE_SAMPLES_PER_SEGMENT - 1);
-            samples.push(cubic_bezier(
-                handles[segment][1],
-                handles[segment][2],
-                handles[segment + 1][0],
-                handles[segment + 1][1],
-                t,
-            ));
+        let start = handles[segment];
+        let end = handles[segment + 1];
+        let mut x = bezier_forward_difference(start[1].x, start[2].x, end[0].x, end[1].x);
+        let mut y = bezier_forward_difference(start[1].y, start[2].y, end[0].y, end[1].y);
+        for _ in 0..CURVE_SAMPLES_PER_SEGMENT {
+            samples.push(Vec2::new(x[0], y[0]));
+            x[0] += x[1];
+            x[1] += x[2];
+            x[2] += x[3];
+            y[0] += y[1];
+            y[1] += y[2];
+            y[2] += y[3];
         }
     }
-    let at = |index: usize| samples.get(index).copied().unwrap_or(DVec2::ZERO);
-    let last_sample = samples.len().saturating_sub(1);
-    let first_point = at(0);
-    let end_point = at(last_sample);
-    let ext_in = (handles[0][0] - handles[0][1]).normalize_or_zero();
-    let ext_out = (handles[count - 1][1] - handles[count - 1][2]).normalize_or_zero();
-    let extend = |x: f64| {
-        if x <= first_point.x {
-            if ext_in.x == 0.0 {
-                first_point.y + ext_in.y * 10000.0
-            } else {
-                first_point.y + ext_in.y * (x - first_point.x) / ext_in.x
-            }
-        } else if ext_out.x == 0.0 {
-            end_point.y - ext_out.y * 10000.0
-        } else {
-            end_point.y + ext_out.y * (x - end_point.x) / ext_out.x
-        }
-    };
+
+    let last_sample = samples.len() - 1;
+    let first_point = samples[0];
+    let end_point = samples[last_sample];
+    let ext_in = (handles[0][0] - handles[0][1]) / (handles[0][0] - handles[0][1]).length();
+    let ext_out = (handles[count - 1][1] - handles[count - 1][2])
+        / (handles[count - 1][1] - handles[count - 1][2]).length();
+    let table_step = table_range / CURVE_TABLE_DIVISIONS;
     let mut table = Vec::with_capacity(CURVE_TABLE_INTERVALS + 1);
     let mut point = 0;
     for step in 0..=CURVE_TABLE_INTERVALS {
-        let x = usize_as_f64(step) / usize_as_f64(CURVE_TABLE_INTERVALS);
-        while point < last_sample && x >= at(point).x {
+        let x = table_min + table_step * step as f32;
+        while point < last_sample && x >= samples[point].x {
             point += 1;
         }
-        let value = if point == 0 || (point == last_sample && x >= at(point).x) {
-            if (x - at(point).x).abs() <= 1.0e-6 {
-                at(point).y
+        let value = if point == 0 || (point == last_sample && x >= samples[point].x) {
+            if (x - samples[point].x).abs() < 1.0e-6_f32 {
+                samples[point].y
             } else {
-                extend(x)
+                curve_map_extend(x, first_point, end_point, ext_in, ext_out)
             }
         } else {
-            let before = at(point - 1);
-            let after = at(point);
+            let before = samples[point - 1];
+            let after = samples[point];
             let span = after.x - before.x;
-            let weight = if span > f64::from(f32::EPSILON) {
+            let factor = if span > f32::EPSILON {
                 (after.x - x) / span
             } else {
                 0.0
             };
-            weight * before.y + (1.0 - weight) * after.y
+            factor * before.y + (1.0 - factor) * after.y
         };
         table.push(value);
     }
-    table
+
+    Some(CurveMappingTable {
+        values: table,
+        ext_in,
+        ext_out,
+        table_min,
+        table_max,
+        inverse_range: CURVE_TABLE_DIVISIONS / table_range,
+    })
 }
 
-/// Blender `BKE_curve_correct_bezpart`: shortens the overlapping handles of one Bezier segment; returns the
-/// corrected (right handle of the start, left handle of the end).
-fn correct_bezier_handles(
-    start: DVec2,
-    start_handle: DVec2,
-    end_handle: DVec2,
-    end: DVec2,
-) -> (DVec2, DVec2) {
+/// Blender `BKE_curve_forward_diff_bezier`, returning the initial value and three differences.
+fn bezier_forward_difference(q0: f32, q1: f32, q2: f32, q3: f32) -> [f32; 4] {
+    let mut divisor = 31.0_f32;
+    let rt0 = q0;
+    let rt1 = 3.0_f32 * (q1 - q0) / divisor;
+    divisor *= divisor;
+    let rt2 = 3.0_f32 * (q0 - 2.0_f32 * q1 + q2) / divisor;
+    divisor *= 31.0_f32;
+    let rt3 = (q3 - q0 + 3.0_f32 * (q1 - q2)) / divisor;
+    [rt0, rt1 + rt2 + rt3, 2.0_f32 * rt2 + 6.0_f32 * rt3, 6.0_f32 * rt3]
+}
+
+/// Blender `BKE_curve_correct_bezpart`: proportionally shortens overlapping X handles.
+fn correct_bezier_handles(start: Vec2, start_handle: Vec2, end_handle: Vec2, end: Vec2) -> (Vec2, Vec2) {
     let start_delta = start - start_handle;
     let end_delta = end - end_handle;
     let span = end.x - start.x;
@@ -2261,25 +2468,18 @@ fn correct_bezier_handles(
     (start - start_delta * factor, end - end_delta * factor)
 }
 
-fn cubic_bezier(p0: DVec2, p1: DVec2, p2: DVec2, p3: DVec2, t: f64) -> DVec2 {
-    let u = 1.0 - t;
-    p0 * (u * u * u) + p1 * (3.0 * u * u * t) + p2 * (3.0 * u * t * t) + p3 * (t * t * t)
-}
-
-/// Blender `BKE_curvemapping_evaluateF` on a table from `curve_map_table`, clipped to [0, 1].
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the table position is clamped to the table size before truncation"
-)]
-fn curve_map_value(table: &[f64], value: f64) -> f64 {
-    let size = usize_as_f64(CURVE_TABLE_INTERVALS);
-    let position = (value * size).clamp(0.0, size);
-    let index = position as usize;
-    let fraction = position - usize_as_f64(index);
-    let lower = table.get(index).copied().unwrap_or(0.0);
-    let upper = table.get(index + 1).copied().unwrap_or(lower);
-    ((1.0 - fraction) * lower + fraction * upper).clamp(0.0, 1.0)
+fn curve_map_extend(x: f32, first: Vec2, last: Vec2, ext_in: Vec2, ext_out: Vec2) -> f32 {
+    if x <= first.x {
+        if ext_in.x == 0.0 {
+            first.y + ext_in.y * 10000.0_f32
+        } else {
+            first.y + ext_in.y * (x - first.x) / ext_in.x
+        }
+    } else if ext_out.x == 0.0 {
+        last.y - ext_out.y * 10000.0_f32
+    } else {
+        last.y + ext_out.y * (x - last.x) / ext_out.x
+    }
 }
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "geometry modifier unit tests")]

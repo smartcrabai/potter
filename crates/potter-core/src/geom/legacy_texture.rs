@@ -1107,6 +1107,10 @@ pub(crate) fn migrate_legacy_volume_noise_sentinel(doc: &mut SceneDoc) -> Result
     if !has_sentinel {
         return Ok(false);
     }
+    let legacy_id = Id::new("noise")?;
+    if doc.resources.contains_key(&legacy_id) || doc.images.contains_key(&legacy_id) {
+        return Ok(false);
+    }
     let existing =
         doc.resources
             .iter()

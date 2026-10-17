@@ -33,6 +33,7 @@ FALLOFFS = ["LINEAR", "CURVE", "SHARP", "SMOOTH", "ROOT",
 MIX_MODES = ["SET", "ADD", "SUB", "MUL", "DIV", "DIF", "AVG", "MIN", "MAX"]
 MIX_SETS = ["ALL", "A", "B", "OR", "AND"]
 CURVE_POINTS = [(0.0, 0.0), (0.27, 0.72), (0.61, 0.38), (1.0, 1.0)]
+WEIGHT_EDIT_CURVE_POINTS = [(0.0, 0.0), (0.5, 0.2), (1.0, 1.0)]
 
 
 def make_object(name, vertices, faces=(), location=(0, 0, 0), scale=(1, 1, 1)):
@@ -70,16 +71,33 @@ def read_group(obj, name):
     return {"weights": weights, "members": members}
 
 
-def configure_curve(modifier):
+def configure_curve(modifier, points=CURVE_POINTS):
     curve = modifier.map_curve.curves[0]
     while len(curve.points) > 2:
         curve.points.remove(curve.points[-1])
-    curve.points[0].location = CURVE_POINTS[0]
-    curve.points[1].location = CURVE_POINTS[-1]
-    for point in CURVE_POINTS[1:-1]:
+    curve.points[0].location = points[0]
+    curve.points[1].location = points[-1]
+    for point in points[1:-1]:
         curve.points.new(*point)
     modifier.map_curve.update()
 
+curve_mesh = make_object(
+    "Weight Edit Nonlinear Curve",
+    [(-0.7, 0.2, 1.1), (1.8, -0.4, 0.3), (0.2, 2.6, -0.9)],
+    [(0, 1, 2)],
+)
+add_group(curve_mesh, "A", [0.25, None, None])
+curve_modifier = curve_mesh.modifiers.new("weights", "VERTEX_WEIGHT_EDIT")
+curve_modifier.vertex_group = "A"
+curve_modifier.falloff_type = "CURVE"
+curve_modifier.invert_falloff = False
+curve_modifier.use_add = False
+curve_modifier.use_remove = False
+curve_modifier.mask_vertex_group = ""
+curve_modifier.invert_mask_vertex_group = False
+curve_modifier.normalize = False
+configure_curve(curve_modifier, WEIGHT_EDIT_CURVE_POINTS)
+result["edit_nonlinear_curve"] = read_group(curve_mesh, "A")
 
 def weight_object(name):
     obj = make_object(name, EDIT_POSITIONS)
@@ -624,6 +642,61 @@ fn assert_case(
     assert_weights(label, &weights(&result, "A")?, &expected["weights"], 2.0e-5)?;
     assert_members(label, &members(&result, "A")?, &expected["members"])?;
     Ok(result)
+}
+
+#[test]
+fn weight_edit_custom_curve_matches_blender_evaluated_weight() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let Some(expected) = oracle(directory.path())? else {
+        eprintln!("skipping weight edit curve parity test: Blender is unavailable");
+        return Ok(());
+    };
+
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(-0.7, 0.2, 1.1),
+            DVec3::new(1.8, -0.4, 0.3),
+            DVec3::new(0.2, 2.6, -0.9),
+        ],
+        vec![vec![0, 1, 2]],
+    )?;
+    mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({"A":{"v0":0.25}}),
+    );
+    let modifier = modifier(
+        "vertex_weight_edit",
+        json!({
+            "vertex_group":"A",
+            "falloff_type":"CURVE",
+            "map_curve":[[0.0,0.0],[0.5,0.2],[1.0,1.0]],
+            "default_weight":0.0,
+            "use_add":false,
+            "use_remove":false,
+            "normalize":false
+        }),
+    )?;
+    let result = evaluate_with_context(
+        &mesh,
+        &modifier,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Weight Edit Nonlinear Curve",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight edit custom curve",
+        &weights(&result, "A")?,
+        &expected["edit_nonlinear_curve"]["weights"],
+        2.0e-5,
+    )?;
+    assert_members(
+        "weight edit custom curve",
+        &members(&result, "A")?,
+        &expected["edit_nonlinear_curve"]["members"],
+    )?;
+    Ok(())
 }
 
 #[test]

@@ -207,7 +207,7 @@ fn screw_revolves_a_profile_into_a_closed_cylinder() {
             "angle": std::f64::consts::TAU,
             "axis": "Z",
         }),
-    )], "TestObject")
+    )], "ScrewProfile")
     .unwrap();
     assert_eq!(result.vertices.len(), 32);
     assert_eq!(result.faces.len(), 16);
@@ -223,7 +223,7 @@ fn simple_deform_zero_angle_is_identity() {
             "deform_method": "TWIST",
             "angle": 0.0,
         }),
-    )], "TestObject")
+    )], "DeformBox")
     .unwrap();
     assert_eq!(result, source);
 }
@@ -310,15 +310,15 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
     ];
     let uneven = cast_uneven_cube();
     // `{}` is the schema default: SPHERE, factor 0.5, radius 0, size 0, use_radius_as_size true.
-    let sphere = evaluate_modifiers(&uneven, &[modifier("cast", json!({}))], "TestObject").unwrap();
+    let sphere = evaluate_modifiers(&uneven, &[modifier("cast", json!({}))], "CastFixture").unwrap();
     assert_cast_positions(&sphere, UNEVEN_SPHERE_DEFAULT, "uneven sphere default");
     let cuboid = evaluate_modifiers(&uneven, &[modifier(
         "cast",
         json!({"cast_type": "CUBOID", "use_radius_as_size": false, "size": 1.5}),
-    )], "TestObject")
+    )], "CastFixture")
     .unwrap();
     assert_cast_positions(&cuboid, UNEVEN_CUBOID_SIZE, "uneven cuboid size 1.5");
-    let cylinder = evaluate_modifiers(&uneven, &[modifier("cast", json!({"cast_type": "CYLINDER"}))], "TestObject")
+    let cylinder = evaluate_modifiers(&uneven, &[modifier("cast", json!({"cast_type": "CYLINDER"}))], "CastFixture")
     .unwrap();
     assert_cast_positions(
         &cylinder,
@@ -326,14 +326,14 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
         "uneven cylinder default",
     );
     // Every vertex is farther than 1.2 from the origin, so the radius limit leaves all of them.
-    let limited = evaluate_modifiers(&uneven, &[modifier("cast", json!({"factor": 0.5, "radius": 1.2}))], "TestObject")
+    let limited = evaluate_modifiers(&uneven, &[modifier("cast", json!({"factor": 0.5, "radius": 1.2}))], "CastFixture")
     .unwrap();
     assert_cast_positions(&limited, UNEVEN_SOURCE, "uneven radius limit");
     // All-zero geometry: the automatic sphere/cylinder size is 10 and the cuboid bounds are zero.
     let zero = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 8], cast_cube_faces()).unwrap();
     for cast_type in ["SPHERE", "CUBOID", "CYLINDER"] {
         let result =
-            evaluate_modifiers(&zero, &[modifier("cast", json!({"cast_type": cast_type}))], "TestObject")
+            evaluate_modifiers(&zero, &[modifier("cast", json!({"cast_type": cast_type}))], "ZeroCastFixture")
                 .unwrap();
         assert_cast_positions(&result, [[0.0; 3]; 8], cast_type);
     }
@@ -342,7 +342,7 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
 #[test]
 fn modifier_parameter_errors_include_a_json_pointer() {
     let source = Mesh::box_mesh(BoxParams::default()).unwrap();
-    let error = evaluate_modifiers(&source, &[modifier("simple_deform", json!({"angle": "invalid"}))], "TestObject")
+    let error = evaluate_modifiers(&source, &[modifier("simple_deform", json!({"angle": "invalid"}))], "DeformBox")
     .unwrap_err();
     assert_eq!(error.details["pointer"], "/params/angle");
 }
@@ -357,7 +357,7 @@ fn mask_drops_faces_that_use_vertices_outside_the_group() {
         "vertex_groups".to_owned(),
         json!({"handle":{"v0":1.0,"v1":1.0,"v2":1.0,"v3":0.0}}),
     );
-    let result = evaluate_modifiers(&source, &[modifier("mask", json!({"vertex_group":"handle"}))], "TestObject")
+    let result = evaluate_modifiers(&source, &[modifier("mask", json!({"vertex_group":"handle"}))], "MaskQuad")
     .unwrap();
     assert!(result.faces.is_empty(), "{:?}", result.faces);
 }
@@ -428,7 +428,7 @@ fn skin_modifier_builds_a_closed_profile_around_skeleton_edges() {
     let first = line.insert_vertex(DVec3::ZERO).unwrap();
     let second = line.insert_vertex(DVec3::Z).unwrap();
     line.insert_edge([first, second]).unwrap();
-    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "TestObject").unwrap();
+    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "SkinSkeleton").unwrap();
     assert_eq!(result.vertices.len(), 16);
     assert_eq!(result.faces.len(), 14);
     assert!(edge_face_counts(&result).values().all(|count| *count == 2));
@@ -461,7 +461,7 @@ fn numeric_identity_settings_preserve_mesh_topology_and_positions() {
     ];
 
     for (modifier_type, params) in cases {
-        let result = evaluate_modifiers(&source, &[modifier(modifier_type, params)], "TestObject").unwrap();
+        let result = evaluate_modifiers(&source, &[modifier(modifier_type, params)], "IdentityCube").unwrap();
         assert_eq!(
             canonical_geometry(&result),
             source_geometry,
@@ -470,7 +470,7 @@ fn numeric_identity_settings_preserve_mesh_topology_and_positions() {
     }
 
     let zero_thickness_solidify =
-        evaluate_modifiers(&source, &[modifier("solidify", json!({"thickness":0.0}))], "TestObject").unwrap();
+        evaluate_modifiers(&source, &[modifier("solidify", json!({"thickness":0.0}))], "IdentityCube").unwrap();
     let solidified_geometry = canonical_geometry(&zero_thickness_solidify);
     assert_eq!(zero_thickness_solidify.vertices.len(), 16);
     assert_eq!(zero_thickness_solidify.edges.len(), 24);
@@ -493,12 +493,12 @@ fn mask_threshold_uses_a_strict_weight_cutoff() {
     let retained = evaluate_modifiers(&source, &[modifier(
         "mask",
         json!({"vertex_group":"region","threshold":0.5}),
-    )], "TestObject")
+    )], "MaskTriangle")
     .unwrap();
     let excluded = evaluate_modifiers(&source, &[modifier(
         "mask",
         json!({"vertex_group":"region","threshold":0.75}),
-    )], "TestObject")
+    )], "MaskTriangle")
     .unwrap();
     assert_eq!(retained.faces.len(), 1);
     assert!(excluded.faces.is_empty(), "{:?}", excluded.faces);
@@ -518,19 +518,19 @@ fn mirror_merge_threshold_merges_vertices_within_tolerance() {
     let merged = evaluate_modifiers(&source, &[modifier(
         "mirror",
         json!({"use_axis":[true,false,false],"use_mirror_merge":true,"merge_threshold":0.001}),
-    )], "TestObject")
+    )], "MirrorTriangle")
     .unwrap();
 
     let outside = evaluate_modifiers(&source, &[modifier(
         "mirror",
         json!({"use_axis":[true,false,false],"use_mirror_merge":true,"merge_threshold":0.0005}),
-    )], "TestObject")
+    )], "MirrorTriangle")
     .unwrap();
     assert_eq!(outside.vertices.len(), 6);
     let separate = evaluate_modifiers(&source, &[modifier(
         "mirror",
         json!({"use_axis":[true,false,false],"use_mirror_merge":false,"merge_threshold":0.001}),
-    )], "TestObject")
+    )], "MirrorTriangle")
     .unwrap();
     assert_eq!(merged.vertices.len(), 5);
     assert_eq!(merged.faces.len(), 2);
@@ -549,7 +549,7 @@ fn skin_vertex_radii_set_cross_section_bounds() {
             "1":[0.5,0.25]
         }),
     );
-    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "TestObject").unwrap();
+    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "SkinSkeleton").unwrap();
     let bounds = result.bounds().unwrap();
     assert!((bounds.min.x + 0.5).abs() < 1.0e-12);
     assert!((bounds.max.x - 0.5).abs() < 1.0e-12);
@@ -619,7 +619,7 @@ fn simple_deform_methods_match_blender_vertex_positions() {
     ];
 
     for (method, params, expected) in cases {
-        let result = evaluate_modifiers(&source, &[modifier("simple_deform", params)], "TestObject").unwrap();
+        let result = evaluate_modifiers(&source, &[modifier("simple_deform", params)], "SimpleDeformFixture").unwrap();
         for (vertex_id, position) in [
             (origin, expected[0]),
             (end, expected[1]),
@@ -648,7 +648,7 @@ fn screw_offset_extends_the_profile_along_its_axis() {
             "screw_offset":2.0,
             "axis":"Z"
         }),
-    )], "TestObject")
+    )], "ScrewProfile")
     .unwrap();
     assert_eq!(result.vertices.len(), 10);
     assert_eq!(result.faces.len(), 4);

@@ -499,9 +499,13 @@ def modifier_params(modifier):
         omitted += ("particle_system",)
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         omitted += ("map_curve",)
+    if modifier.type in ("HOOK", "WARP"):
+        omitted += ("falloff_curve",)
     params = rna_props(modifier, omitted)
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         params["map_curve"] = _curve_mapping_points(modifier.map_curve)
+    if modifier.type in ("HOOK", "WARP"):
+        params["falloff_curve"] = _curve_mapping_points(modifier.falloff_curve)
     bound_property = "is_bound" if hasattr(modifier, "is_bound") else "is_bind"
     if hasattr(modifier, bound_property):
         params["is_bound"] = bool(getattr(modifier, bound_property))
@@ -528,19 +532,19 @@ def _curve_mapping_points(mapping):
     ]
 
 
-def _set_curve_mapping(modifier, values):
-    mapping = getattr(modifier, "map_curve", None)
+def _set_curve_mapping(mapping, values, owner):
     if mapping is None or not mapping.curves or len(values) < 2:
-        raise ValueError("modifier map_curve needs at least two control points")
+        raise ValueError("%s needs at least two control points" % owner)
     points = [(float(point[0]), float(point[1])) for point in values]
     curve = mapping.curves[0]
     for point in list(curve.points)[1:-1]:
         curve.points.remove(point)
-    curve.points[0].location = points[0]
-    curve.points[-1].location = points[-1]
-    for x, y in points[1:-1]:
-        curve.points.new(x, y)
-    mapping.update()
+    curve.points[0].location = (0.0, 0.0)
+    curve.points[-1].location = (1.0, 0.0)
+    for index in range(len(points) - 2):
+        curve.points.new(float(index + 2), 0.0)
+    for point, location in zip(curve.points, points):
+        point.location = location
 
 
 
@@ -1051,10 +1055,12 @@ def _armature_bone_rolls(armature):
 
 def _armature_bbone_settings(bone):
     custom_handle_fields = ("bbone_custom_handle_start", "bbone_custom_handle_end")
+    deformation_fields = {"use_envelope_multiply", "use_scale_easing",
+                          "use_endroll_as_inroll"}
     settings = {}
     for prop in bone.bl_rna.properties:
         key = prop.identifier
-        if not key.startswith("bbone_"):
+        if not key.startswith("bbone_") and key not in deformation_fields:
             continue
         value = getattr(bone, key)
         if key in custom_handle_fields:
@@ -1074,6 +1080,11 @@ def _armature_dump(armature):
                       "roll": bone_rolls[bone.name], "deform": bool(bone.use_deform),
                       "inherit_rotation": bool(bone.use_inherit_rotation),
                       "use_connect": bool(bone.use_connect),
+                      "select": bool(bone.select),
+                      "envelope_distance": float(bone.envelope_distance),
+                      "envelope_weight": float(bone.envelope_weight),
+                      "head_radius": float(bone.head_radius),
+                      "tail_radius": float(bone.tail_radius),
                       "bbone_settings": _armature_bbone_settings(bone)})
     return {"name": armature.name_full, "potter_id": armature.get("potter.id"),
             "library": library_reference(armature),
@@ -1498,6 +1509,16 @@ def _pose_dump(obj):
                                         float(bone.ik_stiffness_y),
                                         float(bone.ik_stiffness_z)],
                        "ik_stretch": float(bone.ik_stretch),
+                       "bbone_curveinx": float(bone.bbone_curveinx),
+                       "bbone_curveinz": float(bone.bbone_curveinz),
+                       "bbone_curveoutx": float(bone.bbone_curveoutx),
+                       "bbone_curveoutz": float(bone.bbone_curveoutz),
+                       "bbone_rollin": float(bone.bbone_rollin),
+                       "bbone_rollout": float(bone.bbone_rollout),
+                       "bbone_scalein": plain(bone.bbone_scalein),
+                       "bbone_scaleout": plain(bone.bbone_scaleout),
+                       "bbone_easein": float(bone.bbone_easein),
+                       "bbone_easeout": float(bone.bbone_easeout),
                        "constraints": [
                            _constraint_dump(constraint, constraints.get(constraint.name))
                            for constraint in bone.constraints
@@ -1690,6 +1711,8 @@ def object_dump(obj):
             "constraints": constraints, "drivers": drivers, "nla_tracks": nla_tracks,
             "action": action, "action_slot": action_slot, "pose": _pose_dump(obj),
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
+            "active_vertex_group_index": int(obj.vertex_groups.active_index)
+            if len(obj.vertex_groups) else None,
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
             "volume_bounds": volume_bounds,
             "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots"))}
@@ -2812,7 +2835,8 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         dynamic_paint_temporary_link = _ensure_dynamic_paint_role(
             modifier, obj, settings["role"])
     rna_params = dict(params)
-    for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve"):
+    for parameter in ("projectors", "resource", "is_bound", "cache_filepath",
+                      "map_curve", "falloff_curve"):
         rna_params.pop(parameter, None)
     texture_id = params.get("texture")
     texture_record = doc.get("resources", {}).get(texture_id, {})
@@ -2824,7 +2848,11 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
     set_rna(modifier, rna_params, id_lookup)
     _restore_modifier_id_references(modifier, rna_params, id_lookup, texture_lookup)
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
-        _set_curve_mapping(modifier, params["map_curve"])
+        _set_curve_mapping(
+            modifier.map_curve, params["map_curve"], "modifier map_curve")
+    if kind in ("hook", "warp") and "falloff_curve" in params:
+        _set_curve_mapping(
+            modifier.falloff_curve, params["falloff_curve"], "modifier falloff_curve")
     if kind == "mesh_cache" and params.get("resource"):
         filepath = _resource_path(doc, params["resource"])
         if not filepath or not os.path.isfile(filepath):
@@ -4003,7 +4031,7 @@ def _restore_shape_keys(obj, mesh_source):
         raise ValueError("cannot restore shape keys on %s" % obj.name) from error
 
 
-def _restore_vertex_groups(obj, groups):
+def _restore_vertex_groups(obj, groups, active_index=None):
     group_ids = {}
     for source in groups:
         group = obj.vertex_groups.new(name=source["name"])
@@ -4017,9 +4045,13 @@ def _restore_vertex_groups(obj, groups):
                 group.add([index], float(item["weight"]), "REPLACE")
             except Exception as error:
                 raise ValueError("cannot restore weight for vertex group %s" % group.name) from error
+    if active_index is not None:
+        active_index = int(active_index)
+        if active_index < 0 or active_index >= len(obj.vertex_groups):
+            raise ValueError("active vertex-group index is out of range")
+        obj.vertex_groups.active_index = active_index
     if group_ids:
         obj["potter.vertex_group_ids_json"] = json.dumps(group_ids, sort_keys=True)
-
 
 def _restore_grease_pencil(data, raw, materials):
     for layer_raw in raw.get("layers", []):
@@ -4124,6 +4156,11 @@ def _restore_armature(obj, source, scene):
                 bone.use_deform = bool(item.get("deform", True))
                 bone.use_inherit_rotation = bool(item.get("inherit_rotation", True))
                 bone.use_connect = bool(item.get("use_connect", False))
+                bone.select = bool(item.get("select", False))
+                bone.envelope_distance = float(item.get("envelope_distance", 0.25))
+                bone.envelope_weight = float(item.get("envelope_weight", 1.0))
+                bone.head_radius = float(item.get("head_radius", 0.1))
+                bone.tail_radius = float(item.get("tail_radius", 0.1))
                 if item.get("potter_id"):
                     bone_ids[bone.name] = item["potter_id"]
                 edit_bones[item["name"]] = bone
@@ -4203,7 +4240,10 @@ def _canonical_pose(doc, node, source_pose):
         merged.update({key: model_item[key] for key in
                        ("location", "rotation_quaternion", "scale", "lock_ik",
                         "use_ik_limit", "ik_min", "ik_max", "ik_stiffness",
-                        "ik_stretch")})
+                        "ik_stretch", "bbone_curveinx", "bbone_curveinz",
+                        "bbone_curveoutx", "bbone_curveoutz", "bbone_rollin",
+                        "bbone_rollout", "bbone_scalein", "bbone_scaleout",
+                        "bbone_easein", "bbone_easeout")})
         source_constraints = {item.get("name"): item
                               for item in source.get("constraints", [])}
         constraints = []
@@ -4369,6 +4409,16 @@ def _restore_pose(obj, pose, id_lookup, doc, target):
                 (rotation[0], rotation[1], rotation[2], rotation[3])).to_euler(
                     bone.rotation_mode)
         bone.scale = item.get("scale", (1.0, 1.0, 1.0))
+        bone.bbone_curveinx = item.get("bbone_curveinx", 0.0)
+        bone.bbone_curveinz = item.get("bbone_curveinz", 0.0)
+        bone.bbone_curveoutx = item.get("bbone_curveoutx", 0.0)
+        bone.bbone_curveoutz = item.get("bbone_curveoutz", 0.0)
+        bone.bbone_rollin = item.get("bbone_rollin", 0.0)
+        bone.bbone_rollout = item.get("bbone_rollout", 0.0)
+        bone.bbone_scalein = item.get("bbone_scalein", (1.0, 1.0, 1.0))
+        bone.bbone_scaleout = item.get("bbone_scaleout", (1.0, 1.0, 1.0))
+        bone.bbone_easein = item.get("bbone_easein", 0.0)
+        bone.bbone_easeout = item.get("bbone_easeout", 0.0)
         bone.lock_ik_x, bone.lock_ik_y, bone.lock_ik_z = item.get(
             "lock_ik", (False, False, False))
         bone.use_ik_limit_x, bone.use_ik_limit_y, bone.use_ik_limit_z = item.get(
@@ -4412,7 +4462,12 @@ def _armature_from_model(doc, data_id, source):
     armature = doc.get("data_blocks", {}).get(data_id, {}).get("armature", {})
     bones = armature.get("bones", {})
     model_bones = {}
-    for identifier, bone in bones.items():
+    ordered_bones = dict.fromkeys(
+        [identifier for identifier in armature.get("bone_order", []) if identifier in bones]
+        + list(bones)
+    )
+    for identifier in ordered_bones:
+        bone = bones[identifier]
         parent = bones.get(bone.get("parent"), {})
         model_bones[bone.get("name", identifier)] = {
             "name": bone.get("name", identifier),
@@ -4424,6 +4479,11 @@ def _armature_from_model(doc, data_id, source):
             "deform": bone.get("deform", True),
             "inherit_rotation": bone.get("inherit_rotation", True),
             "use_connect": bone.get("use_connect", False),
+            "select": bone.get("select", False),
+            "envelope_distance": bone.get("envelope_distance", 0.25),
+            "envelope_weight": bone.get("envelope_weight", 1.0),
+            "head_radius": bone.get("head_radius", 0.1),
+            "tail_radius": bone.get("tail_radius", 0.1),
             "bbone_settings": bone.get("bbone_settings", {}),
         }
     result = dict(source)
@@ -4480,6 +4540,16 @@ def _pose_from_model(doc, node):
             "ik_max": pose.get("ik_max", [math.pi, math.pi, math.pi]),
             "ik_stiffness": pose.get("ik_stiffness", [0.0, 0.0, 0.0]),
             "ik_stretch": pose.get("ik_stretch", 0.0),
+            "bbone_curveinx": pose.get("bbone_curveinx", 0.0),
+            "bbone_curveinz": pose.get("bbone_curveinz", 0.0),
+            "bbone_curveoutx": pose.get("bbone_curveoutx", 0.0),
+            "bbone_curveoutz": pose.get("bbone_curveoutz", 0.0),
+            "bbone_rollin": pose.get("bbone_rollin", 0.0),
+            "bbone_rollout": pose.get("bbone_rollout", 0.0),
+            "bbone_scalein": pose.get("bbone_scalein", [1.0, 1.0, 1.0]),
+            "bbone_scaleout": pose.get("bbone_scaleout", [1.0, 1.0, 1.0]),
+            "bbone_easein": pose.get("bbone_easein", 0.0),
+            "bbone_easeout": pose.get("bbone_easeout", 0.0),
             "constraints": constraints,
         })
     return result
@@ -6064,7 +6134,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             groups = _vertex_groups_from_model(doc, data_id)
             if not groups:
                 groups = source_object.get("vertex_groups", [])
-            _restore_vertex_groups(obj, groups)
+            _restore_vertex_groups(obj, groups, item.get("active_vertex_group_index"))
             mesh_source = compatibility_block(doc, "meshes", "Mesh", data_id)
             if data_id not in shape_key_meshes:
                 model_shape_keys = _shape_keys_from_model(doc, data_id)

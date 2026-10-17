@@ -723,7 +723,7 @@ fn evaluate_case(case: &Value, transform: Option<&Value>) -> Result<Mesh, Box<dy
             }],
         );
     }
-    Ok(evaluate_with_context(&mesh, &modifier(case)?, &operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?)
+    Ok(evaluate_with_context(&mesh, &modifier(case)?, &operands, None, DMat4::IDENTITY, case["name"].as_str().ok_or("case name missing")?, &AttributeLayerSelection::default())?)
 }
 
 fn f32_matrix(value: &Value) -> Result<[f32; 16], Box<dyn Error>> {
@@ -886,7 +886,7 @@ fn weighted_normal_uses_blenders_ranked_weight_curve() -> Result<(), Box<dyn Err
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
-    let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "RankedWeightCurve", &AttributeLayerSelection::default())?;
     let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
     let actual = normals[0];
@@ -918,7 +918,7 @@ fn weighted_normal_threshold_includes_exact_compare_boundary() -> Result<(), Box
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
-    let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "WeightedThresholdBoundary", &AttributeLayerSelection::default())?;
     let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
     let actual = potter_core::geom::normals::corner_normals(&result, &positions)?[0];
     let expected = DVec3::new(1.75, 0.1, 2.0).normalize();
@@ -969,7 +969,7 @@ fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>
         deforming_bones: Default::default(),
         layer_selection: Default::default(),
     }]);
-    let result = evaluate_with_context(&mesh, &modifier, &operands, None, DMat4::IDENTITY, "TestObject", &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(&mesh, &modifier, &operands, None, DMat4::IDENTITY, "DirectionalNormalSubject", &AttributeLayerSelection::default())?;
     let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
     let normal = normals[0];

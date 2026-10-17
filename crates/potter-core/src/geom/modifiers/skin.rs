@@ -462,7 +462,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &mut frame_vertex_ids,
         &mut branch_faces,
         &detached_frames,
-    );
+    )?;
     smooth_branch_hull_points(
         &mut points,
         &branch_faces,

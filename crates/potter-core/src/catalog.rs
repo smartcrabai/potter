@@ -1551,10 +1551,10 @@ pub fn feature_catalog() -> Value {
         ),
         unsupported(
             "rig.bbone.segments",
-            "Armature deformation through B-Bone segments",
+            "Armature constraints weighted through B-Bone segments",
             "Armature",
             &[],
-            "Armature modifiers and Armature constraints deform vertices along curved B-Bone segments, which are not evaluated.",
+            "Armature constraints targeting multi-segment B-Bones still require evaluated per-segment target matrices.",
         ),
         supported(
             "physics.world",

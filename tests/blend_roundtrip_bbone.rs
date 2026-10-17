@@ -28,11 +28,14 @@ static BLENDER_BBONE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 const BLENDER_FIXTURE: &str = r#"
 import bpy
+import json
 import os
 import sys
 
-root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
-case = sys.argv[sys.argv.index("--") + 2]
+arguments = sys.argv[sys.argv.index("--") + 1:]
+root = os.path.realpath(arguments[0])
+case = arguments[1]
+mode = arguments[2] if len(arguments) > 2 else ""
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 
@@ -92,21 +95,66 @@ if case == "target_shape":
     constraint.head_tail = 0.35
     constraint.use_bbone_shape = True
 elif case == "armature_modifier":
+    if mode not in ("curved_linear", "curved_preserve_volume", "straight_linear", "curved_envelopes"):
+        raise ValueError("unknown B-Bone deformation mode: " + mode)
+    bone.bbone_mapping_mode = "STRAIGHT" if mode == "straight_linear" else "CURVED"
+    if mode == "curved_envelopes":
+        bone.head_radius = 0.5
+        bone.tail_radius = 0.5
+        bone.envelope_distance = 0.75
+        bone.envelope_weight = 1.0
+    rig.location = (0.31, -0.22, 0.18)
+    rig.rotation_euler = (0.11, -0.16, 0.09)
+    bendy_pose = rig.pose.bones["Bendy"]
+    bendy_pose.rotation_mode = "XYZ"
+    bendy_pose.rotation_euler = (0.19, -0.23, 0.14)
+    bendy_pose.location = (0.07, 0.11, -0.05)
+    bendy_pose.scale = (1.08, 0.93, 1.12)
+    bendy_pose.bbone_rollin = 0.27
+    start_handle_pose = rig.pose.bones["StartHandle"]
+    start_handle_pose.rotation_mode = "XYZ"
+    start_handle_pose.rotation_euler = (0.12, -0.18, 0.09)
+    end_handle_pose = rig.pose.bones["EndHandle"]
+    end_handle_pose.rotation_mode = "XYZ"
+    end_handle_pose.rotation_euler = (-0.14, 0.1, -0.12)
+    vertices = [
+        (-0.31, 0.08, 0.18), (0.43, 0.12, -0.11),
+        (-0.18, 0.37, -0.27), (0.33, 0.43, 0.24),
+        (-0.45, 0.78, 0.13), (0.16, 0.82, -0.31),
+        (-0.09, 1.18, 0.33), (0.39, 1.22, 0.04),
+        (-0.29, 1.58, -0.22), (0.25, 1.62, 0.29),
+        (-0.13, 1.9, 0.12), (0.36, 1.88, -0.17),
+    ]
+    faces = [(0, 1, 3, 2), (2, 3, 5, 4), (4, 5, 7, 6),
+             (6, 7, 9, 8), (8, 9, 11, 10)]
     mesh = bpy.data.meshes.new("CaseOwnerData")
-    mesh.from_pydata(
-        [(-0.5, 0.0, 0.0), (0.5, 0.0, 0.0), (-0.5, 1.0, 0.0), (0.5, 1.0, 0.0)],
-        [],
-        [(0, 1, 3, 2)],
-    )
+    mesh.from_pydata(vertices, [], faces)
     mesh.update()
     owner = bpy.data.objects.new("CaseOwner", mesh)
     scene.collection.objects.link(owner)
+    owner.location = (-0.27, 0.13, 0.24)
+    owner.rotation_euler = (0.09, -0.12, 0.17)
     group = owner.vertex_groups.new(name="Bendy")
-    group.add(list(range(len(mesh.vertices))), 1.0, "REPLACE")
+    if mode == "curved_envelopes":
+        group.add([0], 0.0, "REPLACE")
+    else:
+        weights = (0.45, 1.0, 0.72, 0.38, 1.0, 0.61,
+                   0.83, 0.52, 0.3, 1.0, 0.67, 0.9)
+        for index, weight in enumerate(weights):
+            group.add([index], weight, "REPLACE")
     modifier = owner.modifiers.new("WeightedBbone", "ARMATURE")
     modifier.object = rig
     modifier.use_vertex_groups = True
-    modifier.use_bone_envelopes = False
+    modifier.use_bone_envelopes = mode == "curved_envelopes"
+    modifier.use_deform_preserve_volume = mode == "curved_preserve_volume"
+    bpy.context.view_layer.update()
+    evaluated = owner.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    evaluated_mesh = evaluated.to_mesh()
+    positions = [[float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)]
+                 for vertex in evaluated_mesh.vertices]
+    evaluated.to_mesh_clear()
+    with open(os.path.join(root, "blender_geometry.json"), "w", encoding="utf-8") as handle:
+        json.dump({"input_positions": vertices, "positions": positions}, handle)
 elif case == "armature_constraint":
     owner = bpy.data.objects.new("CaseOwner", None)
     scene.collection.objects.link(owner)
@@ -231,8 +279,42 @@ fn assert_json_approximately_equal(actual: &Value, expected: &Value, context: &s
         _ => assert_eq!(actual, expected, "{context}"),
     }
 }
+fn assert_positions_close(actual: &Value, expected: &Value, context: &str) {
+    let actual = actual.as_array().unwrap();
+    let expected = expected.as_array().unwrap();
+    assert_eq!(actual.len(), expected.len(), "{context}: vertex count");
+    for (vertex, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        let actual = actual.as_array().unwrap();
+        let expected = expected.as_array().unwrap();
+        assert_eq!(actual.len(), 3, "{context}: actual vertex {vertex}");
+        assert_eq!(expected.len(), 3, "{context}: Blender vertex {vertex}");
+        for axis in 0..3 {
+            let actual = actual[axis].as_f64().unwrap();
+            let expected = expected[axis].as_f64().unwrap();
+            assert!(
+                (actual - expected).abs() <= 1.0e-4,
+                "{context}: vertex {vertex} axis {axis}: Potter {actual} != Blender {expected}"
+            );
+        }
+    }
+}
 
-fn run_blender(blender: &Path, root: &Path, case: &str) -> TestResult {
+fn assert_positions_move(input: &Value, output: &Value, context: &str) {
+    let input = input.as_array().unwrap();
+    let output = output.as_array().unwrap();
+    assert_eq!(input.len(), output.len(), "{context}: oracle vertex count");
+    assert!(
+        input.iter().zip(output).any(|(input, output)| {
+            (0..3).any(|axis| {
+                (input[axis].as_f64().unwrap() - output[axis].as_f64().unwrap()).abs()
+                    > 1.0e-4
+            })
+        }),
+        "{context}: Blender fixture did not deform any vertex"
+    );
+}
+
+fn run_blender(blender: &Path, root: &Path, case: &str, mode: Option<&str>) -> TestResult {
     let script_path = root.join("make_fixture.py");
     fs::write(&script_path, BLENDER_FIXTURE)?;
     let root = fs::canonicalize(root)?;
@@ -243,6 +325,9 @@ fn run_blender(blender: &Path, root: &Path, case: &str) -> TestResult {
         .arg("--")
         .arg(root)
         .arg(case);
+    if let Some(mode) = mode {
+        command.arg(mode);
+    }
     assert_success(&run_guarded(command)?, "Blender fixture")
 }
 
@@ -284,7 +369,7 @@ fn pot_json(arguments: &[&str]) -> TestResult<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn assert_imported_bbone_settings(doc: &SceneDoc) {
+fn assert_imported_bbone_settings(doc: &SceneDoc, mapping_mode: &str) {
     let rig = doc.nodes.values().find(|node| node.name == "Rig").unwrap();
     let armature = doc.data_blocks[rig.data.as_ref().unwrap()]
         .armature
@@ -295,7 +380,8 @@ fn assert_imported_bbone_settings(doc: &SceneDoc) {
         .values()
         .find(|bone| bone.name == "Bendy")
         .unwrap();
-    let expected = expected_settings();
+    let mut expected = expected_settings();
+    expected["bbone_mapping_mode"] = json!(mapping_mode);
     for (key, value) in expected.as_object().unwrap() {
         assert_json_approximately_equal(
             bendy.bbone_settings.get(key).unwrap(),
@@ -328,7 +414,7 @@ fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
     };
     let directory = tempdir()?;
     let root = directory.path();
-    run_blender(&blender, root, case)?;
+    run_blender(&blender, root, case, None)?;
 
     let project = root.join("project");
     pot_json(&["init", project.to_str().unwrap()])?;
@@ -355,7 +441,7 @@ fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
         .as_str()
         .unwrap();
     let doc: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    assert_imported_bbone_settings(&doc);
+    assert_imported_bbone_settings(&doc, "CURVED");
 
     let evaluation = pot_output(&["inspect", project.to_str().unwrap(), "--id", owner_id])?;
     assert!(
@@ -412,7 +498,108 @@ fn bbone_shape_target_gate_and_blend_round_trip() -> TestResult {
 
 #[test]
 fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
-    run_case("armature_modifier", "rig.bbone.segments")
+    let _guard = BLENDER_BBONE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(blender) = blender() else {
+        eprintln!("skipping B-Bone integration test: Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+
+    for mode in ["curved_linear", "curved_preserve_volume", "straight_linear", "curved_envelopes"] {
+        let root = directory.path().join(mode);
+        fs::create_dir(&root)?;
+        run_blender(&blender, &root, "armature_modifier", Some(mode))?;
+        let oracle: Value = serde_json::from_slice(&fs::read(root.join("blender_geometry.json"))?)?;
+
+        let project = root.join("project");
+        pot_json(&["init", project.to_str().unwrap()])?;
+        let imported = pot_json(&[
+            "import",
+            project.to_str().unwrap(),
+            "--file",
+            root.join("source.blend").to_str().unwrap(),
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+            blender.to_str().unwrap(),
+        ])?;
+        assert!(
+            imported["result"]["losses"].as_array().unwrap().is_empty(),
+            "{mode}: B-Bone fixture import reported losses: {imported}"
+        );
+        let owner_id = imported["result"]["id_mappings"]["Object:CaseOwner"]
+            .as_str()
+            .unwrap();
+        let doc: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+        let mapping_mode = if mode == "straight_linear" { "STRAIGHT" } else { "CURVED" };
+        assert_imported_bbone_settings(&doc, mapping_mode);
+
+        let inspected = pot_json(&["inspect", project.to_str().unwrap(), "--id", owner_id])?;
+        let owner = inspected["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == owner_id)
+            .unwrap();
+        let expected_positions = &oracle["positions"];
+        assert_positions_move(
+            &oracle["input_positions"],
+            expected_positions,
+            mode,
+        );
+        if mode == "curved_envelopes" {
+            let input = oracle["input_positions"].as_array().unwrap();
+            let output = expected_positions.as_array().unwrap();
+            for axis in 0..3 {
+                assert!(
+                    (input[0][axis].as_f64().unwrap() - output[0][axis].as_f64().unwrap()).abs()
+                        <= 1.0e-4,
+                    "curved_envelopes: matching zero-weight group fell back to envelopes"
+                );
+            }
+            assert!(
+                input.iter().skip(1).zip(output.iter().skip(1)).any(|(input, output)| {
+                    (0..3).any(|axis| {
+                        (input[axis].as_f64().unwrap() - output[axis].as_f64().unwrap()).abs()
+                            > 1.0e-4
+                    })
+                }),
+                "curved_envelopes: vertices without a matching group were not envelope-deformed"
+            );
+        }
+        assert_positions_close(
+            &owner["evaluated_geometry"]["positions"],
+            expected_positions,
+            mode,
+        );
+
+        if mode == "curved_linear" {
+            let exported = root.join("roundtrip.blend");
+            pot_json(&[
+                "export",
+                project.to_str().unwrap(),
+                "--format",
+                "blend",
+                "--out",
+                exported.to_str().unwrap(),
+                "--blender",
+                blender.to_str().unwrap(),
+            ])?;
+            let reopened = run_reopen(&blender, &root, &exported, "armature_modifier")?;
+            assert_json_approximately_equal(
+                &reopened["settings"],
+                &expected_settings(),
+                "armature modifier: reopened B-Bone RNA",
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]

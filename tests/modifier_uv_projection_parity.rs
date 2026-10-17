@@ -425,6 +425,7 @@ fn evaluate_project_case(
     subject_world: DMat4,
     projectors: Vec<(&str, DMat4, Option<CameraData>)>,
     params: Value,
+    subject_name: &str,
 ) -> Result<Mesh, Box<dyn Error>> {
     let mut operands = Vec::with_capacity(projectors.len());
     for (id, world, camera) in projectors {
@@ -437,7 +438,7 @@ fn evaluate_project_case(
         operands.into_iter().map(|(_, value)| value).collect(),
     );
     let modifier = test_modifier("uv_project", params)?;
-    Ok(evaluate_with_context(mesh, &modifier, &map, None, subject_world, "TestObject", &AttributeLayerSelection::default())?)
+    Ok(evaluate_with_context(mesh, &modifier, &map, None, subject_world, subject_name, &AttributeLayerSelection::default())?)
 }
 
 fn assert_uv_parity(name: &str, actual_mesh: &Mesh, expected: &Value, layer_name: &str) -> Result<f64, Box<dyn Error>> {
@@ -553,7 +554,7 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list() -> 
         ),
     ];
     for (name, projectors, params, layer) in cases {
-        let actual = evaluate_project_case(&mesh, subject, projectors, params)?;
+        let actual = evaluate_project_case(&mesh, subject, projectors, params, name)?;
         assert_uv_parity(name, &actual, &expected[name], layer)?;
     }
     // Blender resizes the projectors collection from `projector_count`; once imported,
@@ -580,6 +581,7 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list() -> 
                 "projectors":["pano",null,"plain"],"projector_count":count,
                 "uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0
             }),
+            "ProjectorCount",
         )?;
         let name = if count < 3 {
             "projector_count_smaller_than_array"
@@ -620,6 +622,7 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list() -> 
             ("aligned", aligned_projector, None),
         ],
         json!({"projectors":["high_scale","aligned"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
+        "ScaledNormal",
     )?;
     assert_uv_parity(
         "scaled_projector_normal_selection",
@@ -755,7 +758,7 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
         modifier.runtime.uv_warp_matrix = Some(runtime_uv_warp_matrix(
             &expected["warp_matrices"][name],
         )?);
-        let result = evaluate_with_context(&active_layer_mesh, &modifier, &BTreeMap::new(), None, subject_world, "TestObject", &AttributeLayerSelection::default())?;
+        let result = evaluate_with_context(&active_layer_mesh, &modifier, &BTreeMap::new(), None, subject_world, name, &AttributeLayerSelection::default())?;
         for layer in ["UVMap", "Secondary", "RenderOnly"] {
             assert_uv_parity(name, &result, &expected[name][layer], layer)?;
         }
@@ -803,7 +806,7 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
         modifier.runtime.uv_warp_matrix = Some(runtime_uv_warp_matrix(
             &expected["warp_matrices"][name],
         )?);
-        let result = evaluate_with_context(subject_mesh, &modifier, &operands, None, subject_world, "TestObject", &AttributeLayerSelection::default())?;
+        let result = evaluate_with_context(subject_mesh, &modifier, &operands, None, subject_world, name, &AttributeLayerSelection::default())?;
         assert_uv_parity(name, &result, &expected[name], layer)?;
     }
     let mut missing_runtime_params = base_params.as_object().ok_or("base UV Warp parameters are invalid")?.clone();
@@ -811,7 +814,7 @@ fn uv_warp_matches_blender_object_bone_group_and_axis_cases_per_loop() -> Result
     missing_runtime_params.insert("object_to".to_owned(), json!("armature"));
     missing_runtime_params.insert("bone_from".to_owned(), json!("BoneA"));
     missing_runtime_params.insert("bone_to".to_owned(), json!("BoneB"));
-    let error = evaluate_with_context(&mesh, &test_modifier("uv_warp", Value::Object(missing_runtime_params))?, &bone_operands, None, subject_world, "TestObject", &AttributeLayerSelection::default())
+    let error = evaluate_with_context(&mesh, &test_modifier("uv_warp", Value::Object(missing_runtime_params))?, &bone_operands, None, subject_world, "BonePair", &AttributeLayerSelection::default())
     .err()
     .ok_or("UV Warp accepted missing resolved bone matrices")?;
     assert_eq!(error.code, ErrorCode::EvaluationFailed);

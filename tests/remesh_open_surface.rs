@@ -196,7 +196,7 @@ fn remesh_potter(kind: &str, params: Value) -> potter_core::error::Result<Mesh> 
         .map_err(|error| potter_core::error::PotError::invalid_argument(error.to_string()))?;
     let modifier = remesh_modifier(params)
         .map_err(|error| potter_core::error::PotError::invalid_argument(error.to_string()))?;
-    evaluate_modifiers(&input, &[modifier])
+    evaluate_modifiers(&input, &[modifier], kind)
 }
 
 fn remesh(kind: &str, params: Value) -> Result<Mesh, Box<dyn Error>> {
@@ -343,7 +343,7 @@ fn remesh_high_depth_cube_hits_budget_and_empty_mesh_stays_safe() -> Result<(), 
 
     let empty = Mesh::new();
     let modifier = remesh_modifier(remesh_params("SMOOTH", 20, 0.9, 1.0, false, 0.15))?;
-    let output = evaluate_modifiers(&empty, &[modifier])?;
+    let output = evaluate_modifiers(&empty, &[modifier], "EmptyMesh")?;
     assert_eq!(counts(&output), (0, 0));
     Ok(())
 }

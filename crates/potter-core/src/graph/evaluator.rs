@@ -139,6 +139,11 @@ pub fn evaluate_at_frame(
     frame: f64,
     subject_name: &str,
 ) -> Result<GraphEvaluation> {
+    if subject_name.is_empty() {
+        return Err(PotError::invalid_argument(
+            "geometry graph evaluation requires a subject name",
+        ));
+    }
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "graph evaluation frame must be finite",

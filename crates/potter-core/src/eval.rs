@@ -4984,44 +4984,36 @@ fn volume_bounds(volume: &crate::geom::volume::VolumeData, matrix: DMat4) -> Res
             crate::geom::volume::VolumeSource::Generated(source)
                 if source.algorithm == "mesh_to_volume_fog" =>
             {
-                DVec3::splat(grid.voxel_size * 0.5)
+                0.5
             }
-            _ => DVec3::ZERO,
+            _ => 0.0,
         };
-        let local_min = grid.origin - half_voxel;
-        let local_max = grid.origin
-            + grid.voxel_size
-                * DVec3::new(
-                    f64::from(grid.dims[0] - 1),
-                    f64::from(grid.dims[1] - 1),
-                    f64::from(grid.dims[2] - 1),
-                )
-            + half_voxel;
-        if !local_min.is_finite() || !local_max.is_finite() {
-            return Err(PotError::new(
-                ErrorCode::SceneInvalid,
-                "volume grid bounds are not finite",
-            ));
-        }
+        let minimum_index = DVec3::splat(-half_voxel);
+        let maximum_index = DVec3::new(
+            f64::from(grid.dims[0] - 1),
+            f64::from(grid.dims[1] - 1),
+            f64::from(grid.dims[2] - 1),
+        ) + DVec3::splat(half_voxel);
+        let volume_to_world = matrix * grid.checked_index_to_local_matrix()?;
         for corner in 0..8 {
-            let local = DVec3::new(
+            let index = DVec3::new(
                 if corner & 1 == 0 {
-                    local_min.x
+                    minimum_index.x
                 } else {
-                    local_max.x
+                    maximum_index.x
                 },
                 if corner & 2 == 0 {
-                    local_min.y
+                    minimum_index.y
                 } else {
-                    local_max.y
+                    maximum_index.y
                 },
                 if corner & 4 == 0 {
-                    local_min.z
+                    minimum_index.z
                 } else {
-                    local_max.z
+                    maximum_index.z
                 },
             );
-            let world = matrix.transform_point3(local);
+            let world = volume_to_world.transform_point3(index);
             if !world.is_finite() {
                 return Err(PotError::new(
                     ErrorCode::SceneInvalid,

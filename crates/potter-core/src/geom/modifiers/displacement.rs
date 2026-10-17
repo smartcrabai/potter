@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use glam::{DMat3, DQuat};
+use glam::{DMat3, DQuat, Vec2};
 
 use super::*;
 use crate::blender_rng::BlenderRng;
@@ -630,7 +630,7 @@ pub(crate) fn warp_textured(
             if linear == 0.0 {
                 continue;
             }
-            warp_falloff(falloff, linear, curve.as_deref())
+            warp_falloff(falloff, linear, curve.as_ref())
         } else {
             continue;
         };
@@ -666,35 +666,48 @@ pub(crate) fn warp_textured(
     Ok(result)
 }
 
-/// The 2D falloff curve of `falloff_curve`. Only two-point curves (a straight segment in Blender's
-/// auto-handle CurveMapping) are modeled.
-fn falloff_curve(modifier: &Modifier) -> Result<Vec<[f64; 2]>> {
-    let points = schema_value(modifier, "falloff_curve")?
+/// Warp `falloff_curve` controls in Blender's stored order and float precision.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "Blender CurveMapping stores control points as float"
+)]
+fn falloff_curve(modifier: &Modifier) -> Result<super::advanced::CurveMappingTable> {
+    let invalid = || {
+        invalid_parameter(
+            modifier,
+            "falloff_curve",
+            "at least two finite float32 [x, y] points with evaluable endpoints",
+        )
+    };
+    let mut points = Vec::new();
+    for point in schema_value(modifier, "falloff_curve")?
         .as_array()
-        .ok_or_else(|| invalid_parameter(modifier, "falloff_curve", "a list of [x, y] points"))?
-        .iter()
-        .map(|point| {
-            let pair = point.as_array().filter(|pair| pair.len() == 2)?;
-            Some([pair[0].as_f64()?, pair[1].as_f64()?])
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| invalid_parameter(modifier, "falloff_curve", "a list of [x, y] points"))?;
-    if points.len() != 2 {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "warp falloff curves with more than two points are not modeled",
-            json!({"feature_id": "modifier.warp.falloff_curve", "modifier_id": modifier.id}),
-        ));
+        .ok_or_else(invalid)?
+    {
+        let coordinates = point.as_array().map_or(&[][..], Vec::as_slice);
+        let [x, y] = coordinates else {
+            return Err(invalid());
+        };
+        let (Some(x), Some(y)) = (x.as_f64(), y.as_f64()) else {
+            return Err(invalid());
+        };
+        if !x.is_finite() || !y.is_finite() {
+            return Err(invalid());
+        }
+        points.push(Vec2::new(x as f32, y as f32));
     }
-    let mut points = points;
-    points.sort_by(|left, right| left[0].total_cmp(&right[0]));
-    Ok(points)
+    super::advanced::curve_map_table(&points).ok_or_else(invalid)
 }
 
 /// The falloff of a linear distance factor `linear` in `(0, 1]` for one warp falloff type.
-fn warp_falloff(kind: &str, linear: f64, curve: Option<&[[f64; 2]]>) -> f64 {
+fn warp_falloff(
+    kind: &str,
+    linear: f64,
+    curve: Option<&super::advanced::CurveMappingTable>,
+) -> f64 {
     match kind {
-        "CURVE" => curve.map_or(linear, |curve| crate::color::sample_curve(linear, curve)),
+        "CURVE" => curve.map_or(linear, |curve| curve.evaluate(linear)),
         "SHARP" => linear * linear,
         "SMOOTH" => 3.0 * linear * linear - 2.0 * linear * linear * linear,
         "ROOT" => linear.sqrt(),

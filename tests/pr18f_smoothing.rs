@@ -21,6 +21,7 @@ use serde_json::{Map, Value, json};
 const ORACLE: &str = include_str!("fixtures/pr18f_smoothing/blender_oracle.json");
 /// Blender stores float32; the implementation computes in f64 against the same algorithm.
 const TOLERANCE: f64 = 2.0e-5;
+const SUBJECT_NAME: &str = "SmoothingSubject";
 
 fn oracle() -> Value {
     serde_json::from_str(ORACLE).unwrap()
@@ -126,7 +127,7 @@ fn assert_points(label: &str, actual: &Mesh, expected: &[DVec3]) {
 }
 
 fn evaluate(mesh: &Mesh, modifiers: &[Modifier]) -> Mesh {
-    evaluate_modifiers(mesh, modifiers).unwrap()
+    evaluate_modifiers(mesh, modifiers, SUBJECT_NAME).unwrap()
 }
 
 #[test]
@@ -310,7 +311,7 @@ fn corrective_smooth_bind_errors_are_typed() {
         "corrective_smooth",
         json!({"factor": 0.5, "iterations": 2, "rest_source": "BIND"}),
     );
-    let error = evaluate_modifiers(&mesh, &[unbound]).err().unwrap();
+    let error = evaluate_modifiers(&mesh, &[unbound], SUBJECT_NAME).err().unwrap();
     assert!(matches!(error.code, ErrorCode::DependencyMissing));
 
     let short_coords: Vec<Value> = oracle["flat"].as_array().unwrap()[..23].to_vec();
@@ -321,7 +322,7 @@ fn corrective_smooth_bind_errors_are_typed() {
         ),
         &Value::Array(short_coords),
     );
-    let error = evaluate_modifiers(&mesh, &[mismatched]).err().unwrap();
+    let error = evaluate_modifiers(&mesh, &[mismatched], SUBJECT_NAME).err().unwrap();
     assert!(matches!(error.code, ErrorCode::InvalidArgument));
 }
 

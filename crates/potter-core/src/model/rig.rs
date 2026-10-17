@@ -10,6 +10,9 @@ use super::{Id, Registry};
 pub struct ArmatureData {
     #[serde(default)]
     pub bones: Registry<Bone>,
+    /// Blender's armature iteration order for B-Bone handles and envelope mixing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bone_order: Vec<Id>,
     #[serde(default)]
     pub bone_collections: Registry<BoneCollection>,
 }
@@ -58,6 +61,8 @@ pub struct Bone {
     pub head_radius: f64,
     #[serde(default = "default_envelope_radius")]
     pub tail_radius: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub select: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bbone_settings: BTreeMap<String, Value>,
 }
@@ -74,6 +79,26 @@ pub struct PoseBone {
     pub ik_max: [f64; 3],
     pub ik_stiffness: [f64; 3],
     pub ik_stretch: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub bbone_curveinx: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub bbone_curveinz: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub bbone_curveoutx: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub bbone_curveoutz: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub bbone_rollin: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub bbone_rollout: f64,
+    #[serde(skip_serializing_if = "is_one_vec3")]
+    pub bbone_scalein: [f64; 3],
+    #[serde(skip_serializing_if = "is_one_vec3")]
+    pub bbone_scaleout: [f64; 3],
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub bbone_easein: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub bbone_easeout: f64,
 }
 
 impl Default for PoseBone {
@@ -88,6 +113,16 @@ impl Default for PoseBone {
             ik_max: [std::f64::consts::PI; 3],
             ik_stiffness: [0.0; 3],
             ik_stretch: 0.0,
+            bbone_curveinx: 0.0,
+            bbone_curveinz: 0.0,
+            bbone_curveoutx: 0.0,
+            bbone_curveoutz: 0.0,
+            bbone_rollin: 0.0,
+            bbone_rollout: 0.0,
+            bbone_scalein: [1.0; 3],
+            bbone_scaleout: [1.0; 3],
+            bbone_easein: 0.0,
+            bbone_easeout: 0.0,
         }
     }
 }
@@ -289,6 +324,17 @@ pub struct Driver {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
+}
+
+fn is_one_vec3(value: &[f64; 3]) -> bool {
+    *value == [1.0; 3]
 }
 
 fn one() -> f64 {

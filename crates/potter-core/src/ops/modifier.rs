@@ -2107,9 +2107,7 @@ fn validate_attribute_modifier_params_inner(
                 point.as_array().is_none_or(|pair| {
                     pair.len() != 2
                         || pair.iter().any(|value| {
-                            !value.as_f64().is_some_and(|value| {
-                                value.is_finite() && (0.0..=1.0).contains(&value)
-                            })
+                            value.as_f64().is_none_or(|value| !value.is_finite())
                         })
                 })
             })
@@ -2117,7 +2115,7 @@ fn validate_attribute_modifier_params_inner(
             return Err(invalid_attribute_modifier_parameter(
                 modifier_type,
                 "map_curve",
-                "at least two [x,y] points in the unit square",
+                "at least two finite [x,y] points",
             ));
         }
     }

@@ -2528,6 +2528,16 @@ fn build_imported_graph(
                     ik_max: vec3_field(pose_item, "ik_max", [std::f64::consts::PI; 3]),
                     ik_stiffness: vec3_field(pose_item, "ik_stiffness", [0.0; 3]),
                     ik_stretch: number_field(pose_item, "ik_stretch", 0.0),
+                    bbone_curveinx: number_field(pose_item, "bbone_curveinx", 0.0),
+                    bbone_curveinz: number_field(pose_item, "bbone_curveinz", 0.0),
+                    bbone_curveoutx: number_field(pose_item, "bbone_curveoutx", 0.0),
+                    bbone_curveoutz: number_field(pose_item, "bbone_curveoutz", 0.0),
+                    bbone_rollin: number_field(pose_item, "bbone_rollin", 0.0),
+                    bbone_rollout: number_field(pose_item, "bbone_rollout", 0.0),
+                    bbone_scalein: vec3_field(pose_item, "bbone_scalein", [1.0; 3]),
+                    bbone_scaleout: vec3_field(pose_item, "bbone_scaleout", [1.0; 3]),
+                    bbone_easein: number_field(pose_item, "bbone_easein", 0.0),
+                    bbone_easeout: number_field(pose_item, "bbone_easeout", 0.0),
                 },
             );
         }
@@ -2556,6 +2566,10 @@ fn build_imported_graph(
             transform,
             data: data_id,
             materials: material_slots,
+            active_vertex_group_index: item
+                .get("active_vertex_group_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok()),
             modifiers,
             visible: !item
                 .get("hide_viewport")
@@ -3536,6 +3550,7 @@ fn import_armatures(
         let raw_bones = optional_array(item, "bones")?;
         let mut bone_ids = BTreeMap::new();
         let mut bone_id_map = BTreeMap::new();
+        let mut bone_order = Vec::with_capacity(raw_bones.len());
         for raw_bone in raw_bones {
             let bone_name = string_field(raw_bone, "name")?;
             let bone_id = mapped_id(
@@ -3547,7 +3562,8 @@ fn import_armatures(
                 mappings,
                 &format!("Bone:{armature_name}"),
             )?;
-            bone_ids.insert(bone_name.to_owned(), bone_id);
+            bone_ids.insert(bone_name.to_owned(), bone_id.clone());
+            bone_order.push(bone_id);
         }
         let mut bones = Registry::new();
         for raw_bone in raw_bones {
@@ -3597,11 +3613,15 @@ fn import_armatures(
                         .get("use_connect")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    select: raw_bone
+                        .get("select")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     custom_shape: None,
-                    envelope_distance: 0.25,
-                    envelope_weight: 1.0,
-                    head_radius: 0.1,
-                    tail_radius: 0.1,
+                    envelope_distance: number_field(raw_bone, "envelope_distance", 0.25),
+                    envelope_weight: number_field(raw_bone, "envelope_weight", 1.0),
+                    head_radius: number_field(raw_bone, "head_radius", 0.1),
+                    tail_radius: number_field(raw_bone, "tail_radius", 0.1),
                     bbone_settings,
                 },
             );
@@ -3616,6 +3636,7 @@ fn import_armatures(
                 light: None,
                 armature: Some(ArmatureData {
                     bones,
+                    bone_order,
                     ..ArmatureData::default()
                 }),
                 ..DataBlock::default()

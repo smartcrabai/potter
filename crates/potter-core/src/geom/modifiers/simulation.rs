@@ -705,18 +705,38 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<
     }
     let original_origin = grid.origin;
     let voxel_size = DVec3::splat(grid.voxel_size);
-    let output_origin = original_origin - voxel_size * padding as f64;
+    let original_transform = if grid.index_to_local.is_some() {
+        Some(grid.checked_index_to_local_matrix()?)
+    } else {
+        None
+    };
+    let output_transform = original_transform
+        .map(|matrix| matrix * DMat4::from_translation(-DVec3::splat(padding as f64)));
+    let output_origin = output_transform.map_or_else(
+        || original_origin - voxel_size * padding as f64,
+        |matrix| matrix.transform_point3(DVec3::ZERO),
+    );
     let mut output = Vec::with_capacity(output_count);
     for z in 0..output_dims[2] {
         for y in 0..output_dims[1] {
             for x in 0..output_dims[0] {
-                let local_position =
-                    output_origin + voxel_size * DVec3::new(x as f64, y as f64, z as f64);
-                let displacement = texture.displacement_at(local_position)?;
-                let source_position = local_position - displacement;
-                let source_coordinate = (source_position - original_origin)
-                    .to_array()
-                    .map(|value| value / grid.voxel_size);
+                let output_index = DVec3::new(x as f64, y as f64, z as f64);
+                let local_position = output_transform.map_or_else(
+                    || output_origin + voxel_size * output_index,
+                    |matrix| matrix.transform_point3(output_index),
+                );
+                let source_coordinate = if output_transform.is_some() {
+                    let displacement = texture.displacement_at(local_position)?;
+                    (output_index - DVec3::splat(padding as f64)
+                        - displacement / grid.voxel_size)
+                        .to_array()
+                } else {
+                    let displacement = texture.displacement_at(local_position)?;
+                    let source_position = local_position - displacement;
+                    (source_position - original_origin)
+                        .to_array()
+                        .map(|value| value / grid.voxel_size)
+                };
                 let value = sample_volume_grid(&original, source_dims, source_coordinate);
                 if !value.is_finite() || value > f64::from(f32::MAX) {
                     return Err(invalid("volume displacement produced a non-finite sample"));
@@ -731,6 +751,7 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<
         u32::try_from(output_dims[2]).map_err(|_| limit("volume grid dimension exceeds limits"))?,
     ];
     grid.origin = output_origin;
+    grid.index_to_local = output_transform.map(|matrix| matrix.to_cols_array());
     grid.values = Some(output);
     grid.blob_f32 = None;
     Ok(())
@@ -808,11 +829,14 @@ fn displace_vdb_volume(
         return Err(limit("displaced VDB grid exceeds one million samples"));
     }
     let index_to_world = grid.transform.index_to_world;
-    let output_origin = index_to_world.transform_point3(DVec3::new(
+    let output_offset = DVec3::new(
         f64::from(output_minimum[0]),
         f64::from(output_minimum[1]),
         f64::from(output_minimum[2]),
-    ));
+    );
+    let output_index_to_local =
+        index_to_world * DMat4::from_translation(output_offset);
+    let output_origin = output_index_to_local.transform_point3(DVec3::ZERO);
     let mut values = Vec::with_capacity(sample_count);
     for z in 0..dimensions[2] {
         for y in 0..dimensions[1] {
@@ -858,6 +882,7 @@ fn displace_vdb_volume(
         ],
         voxel_size,
         origin: output_origin,
+        index_to_local: Some(output_index_to_local.to_cols_array()),
         values: Some(values),
         ..VolumeGrid::default()
     }];

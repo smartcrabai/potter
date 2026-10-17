@@ -1129,6 +1129,60 @@ mod tests {
         assert_native_value_noise(&record.snapshot);
         assert_eq!(record.snapshot.resources.len(), 1);
     }
+    #[test]
+    fn legacy_volume_noise_sentinel_respects_owned_ids() {
+        let noise_id = crate::model::Id::new("noise").expect("noise ID");
+        let mut resource_scene = legacy_volume_noise_scene();
+        let record = json!({
+            "storage":"inline",
+            "kind":"legacy_texture",
+            "texture_type":"NATIVE_VALUE_NOISE",
+            "settings":{}
+        });
+        resource_scene
+            .resources
+            .insert(noise_id.clone(), record.clone());
+        assert!(!crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(
+            &mut resource_scene
+        )
+        .expect("resource collision"));
+        assert_eq!(
+            resource_scene.nodes[&crate::model::Id::new("volume").expect("node ID")]
+                .modifiers[0]
+                .params["texture"],
+            json!("noise")
+        );
+        assert_eq!(resource_scene.resources[&noise_id], record);
+
+        let mut image_scene = legacy_volume_noise_scene();
+        image_scene.images.insert(
+            noise_id,
+            crate::model::Image {
+                name: "noise".to_owned(),
+                source: crate::model::ImageSource::Generated,
+                colorspace: crate::model::ImageColorspace::Srgb,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: None,
+                source_hash: None,
+                alpha_mode: crate::model::ImageAlphaMode::Straight,
+            },
+        );
+        assert!(!crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(
+            &mut image_scene
+        )
+        .expect("image collision"));
+        assert_eq!(
+            image_scene.nodes[&crate::model::Id::new("volume").expect("node ID")]
+                .modifiers[0]
+                .params["texture"],
+            json!("noise")
+        );
+        assert!(image_scene.resources.is_empty());
+    }
+
 
     #[test]
     fn version_one_texture_refs_become_layer_references() {
