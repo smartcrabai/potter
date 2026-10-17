@@ -1127,6 +1127,25 @@ fn output_external_sidecar_path(blend_file: &Path, filepath: &str) -> PathBuf {
     }
 }
 
+/// Blender mesh datablock name the bridge gives a Potter mesh, mirroring
+/// `compatibility_name` in blend_bridge.py: the `Mesh:<name>` compatibility mapping whose
+/// value is the data ID, otherwise the data ID itself.
+fn blender_mesh_name(doc: &Value, data_id: &str) -> String {
+    doc.get("compatibility")
+        .and_then(|compat| compat.get("blender_adapter"))
+        .and_then(|adapter| adapter.get("id_mappings"))
+        .and_then(Value::as_object)
+        .and_then(|mappings| {
+            mappings.iter().find_map(|(key, value)| {
+                (value.as_str() == Some(data_id))
+                    .then(|| key.strip_prefix("Mesh:"))
+                    .flatten()
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| data_id.to_owned())
+}
+
 fn patch_exported_multires(
     input: &Path,
     blend_file: &Path,
@@ -1222,11 +1241,7 @@ fn patch_exported_multires(
             )?;
             replace_created_multires_sidecar(&external_path, &bytes, created_sidecars)?;
         }
-        let mesh_name = data
-            .get("name")
-            .or_else(|| mesh.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_intermediate("multires mesh has no Blender name"))?;
+        let mesh_name = blender_mesh_name(doc, &data_id);
         let mut patch = Map::new();
         patch.insert("total_levels".to_owned(), Value::from(total_levels));
         patch.insert("grid_levels".to_owned(), json!(grid_levels));
@@ -1244,7 +1259,7 @@ fn patch_exported_multires(
         }
         super::blend_dna::patch_multires_export_data(
             &mut blend_bytes,
-            mesh_name,
+            &mesh_name,
             &Value::Object(patch),
         )
         .map_err(|error| {
