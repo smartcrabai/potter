@@ -499,6 +499,14 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
     receiver.next_id.edge = loose_edge_id
         .checked_add(1)
         .ok_or("edge ID counter overflow")?;
+    let mut probe_values = serde_json::Map::new();
+    for vertex in &receiver.vertices {
+        probe_values.insert(format!("v{}", vertex.id), json!(42.0));
+    }
+    receiver.attributes.insert(
+        "cache_receiver_probe".to_owned(),
+        json!({"domain":"point","type":"float","values":probe_values}),
+    );
     let receiver_faces: Vec<Vec<u32>> = receiver
         .faces
         .iter()
@@ -587,13 +595,6 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
         ]),
     )?;
     replace_body_mesh(&receiver_scene, &receiver)?;
-    apply(
-        &receiver_scene,
-        &json!([{
-            "op":"mesh.attribute_create","target":{"id":"body"},
-            "name":"cache_receiver_probe","domain":"point","type":"float","default":42.0
-        }]),
-    )?;
     let evaluated = evaluate_body(&receiver_scene)?;
     assert_eq!(evaluated.corner_positions, expected_corner_positions);
     assert_eq!(evaluated.mesh.faces, receiver.faces);
