@@ -131,7 +131,7 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Shading> {
             )
         })
         .transpose()?;
-    shade(mesh, positions, codes, resolved)
+    shade(mesh, positions, codes.as_deref(), resolved.as_deref())
 }
 
 /// Corner normals of `mesh` ignoring its custom-normal layer: the shading of the geometry alone.
@@ -144,8 +144,8 @@ pub(crate) fn plain_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<V
 fn shade(
     mesh: &Mesh,
     positions: &[DVec3],
-    custom_codes: Option<Vec<CornerNormalCode>>,
-    custom_normals: Option<Vec<DVec3>>,
+    custom_codes: Option<&[CornerNormalCode]>,
+    custom_normals: Option<&[DVec3]>,
 ) -> Result<Shading> {
     let index_by_id: HashMap<u32, usize> = mesh
         .vertices
@@ -231,7 +231,7 @@ fn shade(
     let mut face_smooth = Vec::with_capacity(mesh.faces.len());
     for (face_index, face) in mesh.faces.iter().enumerate() {
         let start = offsets[face_index];
-        let has_authored = custom_codes.as_ref().is_some_and(|codes| {
+        let has_authored = custom_codes.is_some_and(|codes| {
             codes[start..start + face.vertices.len()]
                 .iter()
                 .any(|code| *code != CornerNormalCode::Auto)
@@ -244,11 +244,7 @@ fn shade(
             } else {
                 face_normals[face_index]
             };
-            corners.push(
-                custom_normals
-                    .as_ref()
-                    .map_or(computed, |normals| normals[index]),
-            );
+            corners.push(custom_normals.map_or(computed, |normals| normals[index]));
         }
     }
 

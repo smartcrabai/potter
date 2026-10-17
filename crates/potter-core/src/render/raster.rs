@@ -1,6 +1,7 @@
 use glam::DVec3;
 
 use crate::error::{ErrorCode, PotError, Result};
+use crate::float::equal_f64;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Projection {
@@ -1196,13 +1197,13 @@ fn nearest_visible_hit(
                 continue;
             };
             if cursor.is_some_and(|(depth, index)| {
-                hit.depth < depth || (hit.depth == depth && triangle_index <= index)
+                hit.depth < depth || (equal_f64(hit.depth, depth) && triangle_index <= index)
             }) {
                 continue;
             }
             if nearest.is_none_or(|(closest_index, closest_hit)| {
                 hit.depth < closest_hit.depth
-                    || (hit.depth == closest_hit.depth && triangle_index < closest_index)
+                    || (equal_f64(hit.depth, closest_hit.depth) && triangle_index < closest_index)
             }) {
                 nearest = Some((triangle_index, hit));
             }
@@ -1240,7 +1241,7 @@ fn composite_sample(
         };
         let color = cached_hit
             .filter(|cached| {
-                cached.triangle_index == triangle_index && cached.hit.depth == hit.depth
+                cached.triangle_index == triangle_index && equal_f64(cached.hit.depth, hit.depth)
             })
             .map_or_else(
                 || hit_color(triangle, hit, ray, shader),

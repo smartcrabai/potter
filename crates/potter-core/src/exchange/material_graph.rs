@@ -1222,9 +1222,9 @@ mod tests {
     use crate::model::{DataBlock, Node};
 
     #[test]
-    fn material_users_includes_data_linked_meshes() {
-        let material_id = Id::new("data_material").unwrap();
-        let data_id = Id::new("mesh_data").unwrap();
+    fn material_users_includes_data_linked_meshes() -> Result<()> {
+        let material_id = Id::new("data_material")?;
+        let data_id = Id::new("mesh_data")?;
         let mut doc = SceneDoc::default();
         doc.data_blocks.insert(
             data_id.clone(),
@@ -1236,7 +1236,7 @@ mod tests {
             },
         );
         doc.nodes.insert(
-            Id::new("mesh").unwrap(),
+            Id::new("mesh")?,
             crate::model::Node {
                 data: Some(data_id),
                 ..crate::model::Node::default()
@@ -1244,6 +1244,7 @@ mod tests {
         );
 
         assert_eq!(material_users(&doc, &material_id).len(), 1);
+        Ok(())
     }
 
     #[test]

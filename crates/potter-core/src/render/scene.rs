@@ -390,9 +390,8 @@ pub(super) fn extract_geometry(
             };
             for (face_index, face) in mesh.faces.iter().enumerate() {
                 let material_slot = usize::try_from(face.material_index).ok();
-                let binding_slot = material_slot
-                    .map(|slot| slot.min(color_slot_count.saturating_sub(1)))
-                    .unwrap_or(0);
+                let binding_slot =
+                    material_slot.map_or(0, |slot| slot.min(color_slot_count.saturating_sub(1)));
                 let binding =
                     material_slot.and_then(|slot| snapshot.slot_binding(node_id, node, slot));
                 let render_layer = binding.map_or(uv_render, |binding| {
@@ -1798,10 +1797,8 @@ pub(super) fn layered_context<'a>(
             .iter()
             .zip(&object.color_layer_indices)
             .zip(&triangle.layer_colors)
-            .filter_map(|((name, source_layer), corners)| {
-                source_has_color_layer(available_mask, *source_layer)
-                    .then(|| (name.as_str(), blend_color(corners, pose.barycentric)))
-            }),
+            .filter(|((_, source_layer), _)| source_has_color_layer(available_mask, **source_layer))
+            .map(|((name, _), corners)| (name.as_str(), blend_color(corners, pose.barycentric))),
     )?;
     let color_render = object
         .color_render_layers

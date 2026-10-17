@@ -45,7 +45,7 @@ pub use scene::{
     TimelineMarker, TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack,
     UnitSettings, ViewLayer, World,
 };
-pub(crate) use scene::{material_link_at, material_slot_count, resolve_material_slot};
+pub(crate) use scene::{material_slot_count, resolve_material_slot};
 pub use transform::{Transform, canonicalize_quaternion, normalize_rotation};
 
 pub type Registry<T> = std::collections::BTreeMap<Id, T>;

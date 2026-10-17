@@ -708,7 +708,7 @@ mod tests {
         Ok((doc, index, source, variant))
     }
 
-    fn shared_material_root(mtoon: Value) -> Value {
+    fn shared_material_root(mtoon: &Value) -> Value {
         json!({
             "materials": [{
                 "name": "shared",
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn vrm_v1_material_metadata_reaches_color_variants() -> Result<()> {
-        let root = shared_material_root(json!({}));
+        let root = shared_material_root(&json!({}));
         assert_eq!(root["meshes"][0]["primitives"][0]["material"], json!(0));
         assert_eq!(root["meshes"][0]["primitives"][1]["material"], json!(0));
         assert!(root["meshes"][0]["primitives"][0]["attributes"]["COLOR_0"].is_number());
@@ -749,7 +749,7 @@ mod tests {
         });
         apply_material_render_state(&mut doc, &index);
         assert_eq!(doc.materials[&variant].alpha_mode, "blend");
-        assert_eq!(doc.materials[&variant].double_sided, true);
+        assert!(doc.materials[&variant].double_sided);
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         let mut decoder = Decoder::new(AvatarVersion::V1, &index, &doc, &snapshot, &extension);
         assert_eq!(decoder.material_id(0)?, source);
@@ -782,7 +782,7 @@ mod tests {
 
     #[test]
     fn vrm_v0_material_names_and_binds_use_originals_and_variants() -> Result<()> {
-        let root = shared_material_root(json!({}));
+        let root = shared_material_root(&json!({}));
         let (doc, index, source, variant) = shared_material_fixture(root)?;
         let extension = json!({
             "materialProperties": [{
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn vrm_v0_main_texture_transform_rebuilds_variant_graph() -> Result<()> {
-        let root = shared_material_root(json!({}));
+        let root = shared_material_root(&json!({}));
         let (mut doc, index, source, variant) = shared_material_fixture(root)?;
         let image = Id::new("image")?;
         doc.materials

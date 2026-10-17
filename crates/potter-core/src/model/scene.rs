@@ -1639,12 +1639,10 @@ pub(crate) fn material_link_at(
     links: &[MaterialLink],
     slot: usize,
 ) -> MaterialLink {
-    links.get(slot).copied().unwrap_or_else(|| {
-        if slot < object_count {
-            MaterialLink::Object
-        } else {
-            MaterialLink::Data
-        }
+    links.get(slot).copied().unwrap_or(if slot < object_count {
+        MaterialLink::Object
+    } else {
+        MaterialLink::Data
     })
 }
 

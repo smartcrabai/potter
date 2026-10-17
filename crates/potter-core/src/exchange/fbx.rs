@@ -79,6 +79,7 @@ struct MaterialExport {
 }
 
 type MaterialBindings = BTreeMap<(Id, usize), i64>;
+type MaterialSlotIndices = BTreeMap<Id, Vec<Option<u32>>>;
 
 #[derive(Clone, Debug)]
 struct TextureExport {
@@ -782,11 +783,7 @@ fn build_material_exports(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     next_id: &mut i64,
-) -> Result<(
-    Vec<MaterialExport>,
-    MaterialBindings,
-    BTreeMap<Id, Vec<Option<u32>>>,
-)> {
+) -> Result<(Vec<MaterialExport>, MaterialBindings, MaterialSlotIndices)> {
     let mut output = Vec::new();
     let mut variants = BTreeMap::<(Id, [Option<String>; 4]), i64>::new();
     let mut bindings = BTreeMap::new();
@@ -3934,8 +3931,11 @@ mod tests {
         let losses = material_slot_losses(&doc, &snapshot);
         assert_eq!(losses.len(), 1);
         assert_eq!(losses[0].feature_id, "format.fbx.material_slot_empty");
-        let strict_error = export_with_root_allow_lossy(&doc, &snapshot, Path::new("."), false)
-            .expect_err("strict FBX export must reject an empty material slot");
+        let Err(strict_error) =
+            export_with_root_allow_lossy(&doc, &snapshot, Path::new("."), false)
+        else {
+            return Err("strict FBX export must reject an empty material slot".into());
+        };
         assert_eq!(
             strict_error.details["feature_id"].as_str(),
             Some("format.fbx.material_slot_empty")
@@ -4163,7 +4163,7 @@ mod tests {
                 blob: None,
                 source_path: Some(image_path.to_string_lossy().into_owned()),
                 source_hash: Some(crate::hash::sha256(&pixels)),
-                alpha_mode: Default::default(),
+                alpha_mode: ImageAlphaMode::default(),
             },
         );
         let material_id = Id::new("shared")?;

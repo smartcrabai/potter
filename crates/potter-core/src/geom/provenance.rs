@@ -701,7 +701,7 @@ impl Sources<'_> {
                 source
                     .and_then(|index| flags.get(index))
                     .cloned()
-                    .unwrap_or_else(|| json!(false))
+                    .unwrap_or(json!(false))
             })
             .collect()
     }
@@ -1193,8 +1193,7 @@ pub(crate) fn default_value(data_type: &str) -> Value {
         "INT32_2D" => json!([0, 0]),
         "FLOAT2" => json!([0.0, 0.0]),
         "FLOAT_VECTOR" => json!([0.0, 0.0, 0.0]),
-        "FLOAT_COLOR" | "BYTE_COLOR" => json!([0.0, 0.0, 0.0, 1.0]),
-        "QUATERNION" => json!([0.0, 0.0, 0.0, 1.0]),
+        "FLOAT_COLOR" | "BYTE_COLOR" | "QUATERNION" => json!([0.0, 0.0, 0.0, 1.0]),
         _ => Value::Null,
     }
 }

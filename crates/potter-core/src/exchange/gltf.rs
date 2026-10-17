@@ -1114,14 +1114,16 @@ fn color_plan(
     surfaces: &BTreeMap<Id, ResolvedSurface>,
 ) -> ColorPlan {
     let store = color_layers::read(mesh);
-    let mut plan = ColorPlan::default();
-    plan.used_slots = mesh
-        .faces
-        .iter()
-        .map(|face| face.material_index)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let mut plan = ColorPlan {
+        used_slots: mesh
+            .faces
+            .iter()
+            .map(|face| face.material_index)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        ..ColorPlan::default()
+    };
     for &slot in &plan.used_slots {
         let Some(slot_index) = usize::try_from(slot).ok() else {
             continue;
@@ -7224,10 +7226,12 @@ pub(crate) fn import_indexed(
                     used_material_ids.len(),
                     &mut used_material_ids,
                 )?;
-                let mut material = Material::default();
-                material.name = "glTF Default".to_owned();
-                material.base_color = [1.0; 4];
-                material.alpha_mode = "opaque".to_owned();
+                let material = Material {
+                    name: "glTF Default".to_owned(),
+                    base_color: [1.0; 4],
+                    alpha_mode: "opaque".to_owned(),
+                    ..Material::default()
+                };
                 doc.materials.insert(id.clone(), material);
                 gltf_default_material = Some(id.clone());
                 id
@@ -7937,7 +7941,7 @@ pub(crate) fn import_indexed(
 /// Morph position deltas per welded vertex and morph NORMAL deltas per face corner, in Potter axes.
 type MorphNormalTarget = (Vec<[f64; 3]>, Vec<[f64; 3]>);
 
-/// Vertex-domain accessors of a glTF primitive. TEXCOORD_n and COLOR_n are left out because both are
+/// Vertex-domain accessors of a glTF primitive. `TEXCOORD_n` and `COLOR_n` are left out because both are
 /// read per face corner before UV storage and POINT/CORNER color-domain inference.
 type VertexPayload = (
     BTreeMap<String, Option<u64>>,
@@ -8024,7 +8028,7 @@ fn import_color_layers(
                 let welded = welded_of[vertex];
                 match welded_values[welded] {
                     None => welded_values[welded] = Some(value),
-                    Some(seen) => disagree |= seen != value,
+                    Some(seen) => disagree |= !crate::float::equal_f64_array(&seen, &value),
                 }
             }
         }
@@ -11150,7 +11154,7 @@ mod tests {
             to_node: crate::model::Id::new("bsdf")?,
             to_socket: "Base Color".to_owned(),
         });
-        let graph = crate::model::Id::new(&format!("{material}_graph"))?;
+        let graph = crate::model::Id::new(format!("{material}_graph"))?;
         doc.node_groups.insert(graph.clone(), group);
         doc.materials
             .get_mut(&crate::model::Id::new(material)?)
@@ -11341,7 +11345,7 @@ mod tests {
             .and_then(|data| data.materials.first())
             .and_then(Option::as_ref)
             .ok_or("material variant is missing")?;
-        assert!(imported_node.materials.is_empty());
+        assert_eq!(imported_node.materials.len(), 0);
         assert_eq!(
             imported_node.material_link(0),
             crate::model::MaterialLink::Data
@@ -11763,7 +11767,7 @@ mod tests {
             mesh,
             &surfaces,
         );
-        assert!(plan.attributes(0).is_empty());
+        assert_eq!(plan.attributes(0).len(), 0);
         assert_eq!(plan.missing.get(&0), Some(&Some("Missing".to_owned())));
         Ok(())
     }
@@ -12102,7 +12106,7 @@ mod tests {
         let second_material = data.materials[1]
             .as_ref()
             .ok_or("colorless material is missing")?;
-        assert!(node.materials.is_empty());
+        assert_eq!(node.materials.len(), 0);
         assert_eq!(data.materials.len(), 2);
         assert_ne!(first_material, second_material);
         let color_material = &imported.doc.materials[first_material];

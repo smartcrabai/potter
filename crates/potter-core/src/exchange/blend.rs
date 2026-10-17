@@ -41,9 +41,7 @@ use crate::{
     store::Project,
 };
 
-use super::{
-    ExportOptions, ExportReport, ImportedGraph, Loss, is_default_material_graph, material_graph,
-};
+use super::{ExportOptions, ExportReport, ImportedGraph, Loss, is_default_material_graph};
 
 type ImportedResourceAssets = (BTreeMap<String, String>, Vec<(String, Vec<u8>)>);
 
@@ -139,7 +137,7 @@ pub fn export_blend(
     let scene_hash = crate::hash::sha256(&crate::hash::canonicalize(&document)?);
     add_blender_uv_fields(doc, &mut document)?;
     add_blender_mesh_fields(doc, &mut document)?;
-    add_blender_material_slot_fields(doc, &mut document)?;
+    add_blender_material_slot_fields(doc, &mut document);
     texture_edits.apply(&mut document)?;
     add_blender_shader_graph_ownership(doc, &mut document);
     let (document, asset_files) = prepare_blend_export_resources(document, project, out)?;
@@ -266,19 +264,15 @@ fn add_blender_uv_fields(doc: &SceneDoc, document: &mut Value) -> Result<()> {
         } else {
             None
         };
-        let remaining_count =
-            store.layers.len() - if custom_normal_index.is_some() { 1 } else { 0 };
+        let remaining_count = store.layers.len() - usize::from(custom_normal_index.is_some());
         let first = (remaining_count != 0).then_some(0);
         let layer_index = |name: &str| {
             let index = store.index_of(name)?;
             if Some(index) == custom_normal_index {
                 return None;
             }
-            let removed_before = if custom_normal_index.is_some_and(|removed| removed < index) {
-                1
-            } else {
-                0
-            };
+            let removed_before =
+                usize::from(custom_normal_index.is_some_and(|removed| removed < index));
             Some(index - removed_before)
         };
         let active = store.active.as_deref().and_then(layer_index).or(first);
@@ -512,7 +506,7 @@ fn add_blender_mesh_fields(doc: &SceneDoc, document: &mut Value) -> Result<()> {
     Ok(())
 }
 
-fn add_blender_material_slot_fields(doc: &SceneDoc, document: &mut Value) -> Result<()> {
+fn add_blender_material_slot_fields(doc: &SceneDoc, document: &mut Value) {
     for (node_id, node) in &doc.nodes {
         let data = node
             .data
@@ -535,7 +529,6 @@ fn add_blender_material_slot_fields(doc: &SceneDoc, document: &mut Value) -> Res
         node_value["material_slot_count"] = json!(slot_count);
         node_value["material_links"] = Value::Array(links);
     }
-    Ok(())
 }
 
 /// Marks the materials whose shader graph Potter owns (none, or the generated simple graph). The bridge
@@ -2479,8 +2472,8 @@ fn build_imported_graph(
             .into_iter()
             .flatten()
             .map(|link| match link.as_str() {
-                Some("data") | Some("DATA") => Ok(MaterialLink::Data),
-                Some("object") | Some("OBJECT") => Ok(MaterialLink::Object),
+                Some("data" | "DATA") => Ok(MaterialLink::Data),
+                Some("object" | "OBJECT") => Ok(MaterialLink::Object),
                 _ => Err(invalid_intermediate(
                     "material slot link must be `data` or `object`",
                 )),
@@ -5065,45 +5058,43 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         );
     }
     uv_layers::write(&mut mesh, &uv);
-    if normal_codes.is_none() {
-        if let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null()) {
-            let normals = raw
-                .as_array()
-                .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
-                .iter()
-                .map(|normal| {
-                    parse_vec3_value(normal)
-                        .map(glam::DVec3::from_array)
-                        .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if normals.len() != loop_count {
-                return Err(invalid_intermediate(
-                    "imported normals do not match the mesh corner count",
-                ));
-            }
-            let mut sharp_edges = Vec::new();
-            for (edge, is_sharp) in mesh.edges.iter().zip(&sharp) {
-                if *is_sharp {
-                    let vertex_index = |id: u32| {
-                        id.checked_sub(1)
-                            .and_then(|index| usize::try_from(index).ok())
-                            .ok_or_else(|| {
-                                invalid_intermediate("mesh sharp edge endpoint is invalid")
-                            })
-                    };
-                    sharp_edges.push([
-                        vertex_index(edge.vertices[0])?,
-                        vertex_index(edge.vertices[1])?,
-                    ]);
-                }
-            }
-            let exact = super::shading::ExactShading {
-                smooth: smooth.clone(),
-                sharp: sharp_edges,
-            };
-            super::shading::import_shading_flags(&mut mesh, &normals, Some(&exact))?;
+    if normal_codes.is_none()
+        && let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null())
+    {
+        let normals = raw
+            .as_array()
+            .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
+            .iter()
+            .map(|normal| {
+                parse_vec3_value(normal)
+                    .map(glam::DVec3::from_array)
+                    .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if normals.len() != loop_count {
+            return Err(invalid_intermediate(
+                "imported normals do not match the mesh corner count",
+            ));
         }
+        let mut sharp_edges = Vec::new();
+        for (edge, is_sharp) in mesh.edges.iter().zip(&sharp) {
+            if *is_sharp {
+                let vertex_index = |id: u32| {
+                    id.checked_sub(1)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .ok_or_else(|| invalid_intermediate("mesh sharp edge endpoint is invalid"))
+                };
+                sharp_edges.push([
+                    vertex_index(edge.vertices[0])?,
+                    vertex_index(edge.vertices[1])?,
+                ]);
+            }
+        }
+        let exact = super::shading::ExactShading {
+            smooth: smooth.clone(),
+            sharp: sharp_edges,
+        };
+        super::shading::import_shading_flags(&mut mesh, &normals, Some(&exact))?;
     }
     mesh.validate()
         .map_err(|error| invalid_intermediate(&format!("invalid mesh data: {error}")))?;
@@ -5214,8 +5205,7 @@ fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bo
         (name, domain, data_type),
         ("position", "POINT", "FLOAT_VECTOR")
             | ("sharp_face", "FACE", "BOOLEAN")
-            | ("sharp_edge", "EDGE", "BOOLEAN")
-            | ("uv_seam", "EDGE", "BOOLEAN")
+            | ("sharp_edge" | "uv_seam", "EDGE", "BOOLEAN")
             | ("material_index", "FACE", "INT")
             | ("custom_normal", "CORNER", "INT16_2D")
     )
@@ -7282,7 +7272,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             let uv_names = blend_uv_layer_names(mesh);
             let color_data_types = blend_color_data_types(mesh);
             let normal_codes = clnor::corner_codes(mesh);
-            let has_custom_normal_layer = normal_codes.as_ref().is_ok_and(|codes| codes.is_some());
+            let has_custom_normal_layer = normal_codes.as_ref().is_ok_and(Option::is_some);
             if has_custom_normal_layer && uv_names.contains("custom_normal") {
                 losses.push(loss(
                     "mesh.uv_layer",
@@ -7320,10 +7310,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 }
             }
             if let Ok(Some(codes)) = normal_codes {
-                if codes
-                    .iter()
-                    .any(|code| *code == clnor::CornerNormalCode::ExplicitZero)
-                {
+                if codes.contains(&clnor::CornerNormalCode::ExplicitZero) {
                     losses.push(loss(
                         "blender.mesh.custom_normal_explicit_zero",
                         Some(data_id.as_str()),
@@ -7365,7 +7352,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                             mixed_fill_state = true;
                         }
                         if let Some(previous) = fill_by_material.get(material_id) {
-                            if previous != &fill {
+                            if !equal_f64_array(previous, &fill) {
                                 conflicting_fill = true;
                             }
                         } else {
@@ -8272,7 +8259,7 @@ mod tests {
             ("alembic_normals", "imported mesh normals"),
         ] {
             let (feature, detail) = refusal(key, &generic, &colors, false)
-                .expect("the bridge has no writer for Alembic mesh data");
+                .unwrap_or_else(|| panic!("the bridge has no writer for Alembic mesh data"));
             assert_eq!(feature, "mesh.attribute");
             assert!(detail.contains(key), "{detail}");
             assert!(detail.contains(reason), "{detail}");
@@ -8280,11 +8267,11 @@ mod tests {
         }
         assert!(refusal("vertex_groups", &generic, &colors, false).is_some());
         let (feature, reason) = refusal("position", &generic, &colors, false)
-            .expect("a Blender-managed name is refused");
+            .unwrap_or_else(|| panic!("a Blender-managed name is refused"));
         assert_eq!(feature, "mesh.attribute");
         assert!(reason.contains("`position`"), "{reason}");
         let (feature, _) = refusal("Loose", &color, &colors, false)
-            .expect("a color layer outside the registry is refused");
+            .unwrap_or_else(|| panic!("a color layer outside the registry is refused"));
         assert_eq!(feature, "mesh.color_attribute");
         assert!(refusal(".select_vert", &generic, &colors, false).is_some());
         let colors = BTreeSet::from(["custom_normal".to_owned()]);
@@ -8293,7 +8280,7 @@ mod tests {
             "a user color can use custom_normal when no normal-code layer exists"
         );
         let (feature, reason) = refusal("user:custom_normal", &color, &colors, true)
-            .expect("custom-normal codes occupy Blender's same attribute name");
+            .unwrap_or_else(|| panic!("custom-normal codes occupy Blender's same attribute name"));
         assert_eq!(feature, "mesh.color_attribute");
         assert!(reason.contains("same name"), "{reason}");
         let no_colors = BTreeSet::new();
@@ -8314,14 +8301,16 @@ mod tests {
             &no_colors,
             true,
         )
-        .expect("custom-normal codes occupy Blender's same attribute name");
+        .unwrap_or_else(|| panic!("custom-normal codes occupy Blender's same attribute name"));
         assert_eq!(feature, "mesh.attribute");
         assert!(reason.contains("same name"), "{reason}");
 
         let uv_names = BTreeSet::from(["UVMap".to_owned()]);
         let (feature, reason) =
             blend_attribute_refusal("UVMap", &generic, &no_colors, &uv_names, false)
-                .expect("a native attribute cannot share a Blender UV layer name");
+                .unwrap_or_else(|| {
+                    panic!("a native attribute cannot share a Blender UV layer name")
+                });
         assert_eq!(feature, "mesh.attribute");
         assert!(
             reason.contains("UVMap") && reason.contains("UV layer"),
@@ -8330,7 +8319,9 @@ mod tests {
         let uv_color_names = BTreeSet::from(["UVMap".to_owned()]);
         let (feature, reason) =
             blend_attribute_refusal("UVMap", &color, &uv_color_names, &uv_names, false)
-                .expect("a native color layer cannot share a Blender UV layer name");
+                .unwrap_or_else(|| {
+                    panic!("a native color layer cannot share a Blender UV layer name")
+                });
         assert_eq!(feature, "mesh.color_attribute");
         assert!(
             reason.contains("UVMap") && reason.contains("UV layer"),
@@ -9417,7 +9408,7 @@ mod tests {
         let image_node = |name: &str| {
             graph
                 .nodes
-                .get(&Id::new(name).expect("static graph node id"))
+                .get(&Id::new(name)?)
                 .ok_or_else(|| invalid_intermediate("native texture image node is missing"))
         };
         for (node_id, image_id, interpolation, uv_node, uv_layer) in [
@@ -9754,7 +9745,9 @@ mod tests {
             expected.keys().collect::<Vec<_>>()
         );
         for (key, expected) in expected {
-            let actual = actual.get(key).expect("corner normal exists");
+            let actual = actual
+                .get(key)
+                .unwrap_or_else(|| panic!("corner normal exists"));
             assert!(
                 actual.abs_diff_eq(*expected, BLENDER_CUSTOM_NORMAL_TOLERANCE),
                 "corner {key:?}: expected {expected:?}, got {actual:?}"
@@ -14829,7 +14822,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
                               float_input("Scale", 1.0)]}),
             json!({"name": "Principled Volume", "type": "ShaderNodeVolumePrincipled",
                    "properties": {}, "custom_properties": {"potter_material_field": "volume"},
-                   "inputs": volume_inputs}),
+                   "inputs": Value::Array(volume_inputs)}),
         ];
         if extra_image {
             nodes.push(

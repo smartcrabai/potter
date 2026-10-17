@@ -1342,11 +1342,7 @@ mod tests {
         let source_normals =
             crate::geom::normals::corner_normals(&source, &source_positions).unwrap();
         let source_codes = super::clnor::corner_codes(&source).unwrap().unwrap();
-        assert!(
-            source_codes
-                .iter()
-                .any(|code| *code == super::clnor::CornerNormalCode::Auto)
-        );
+        assert!(source_codes.contains(&super::clnor::CornerNormalCode::Auto));
         assert!(
             source_codes
                 .iter()
@@ -1657,11 +1653,7 @@ mod tests {
         joined.validate().unwrap();
         let codes = super::clnor::corner_codes(&joined).unwrap().unwrap();
         assert_eq!(codes, expected_codes);
-        assert!(
-            codes
-                .iter()
-                .any(|code| *code == super::clnor::CornerNormalCode::Auto)
-        );
+        assert!(codes.contains(&super::clnor::CornerNormalCode::Auto));
         assert!(
             codes
                 .iter()

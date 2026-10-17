@@ -415,10 +415,10 @@ mod tests {
         } else {
             "Result_Color"
         };
-        let mix_id = Id::new("mix").expect("valid test ID");
-        let background_id = Id::new("background").expect("valid test ID");
-        let output_id = Id::new("output").expect("valid test ID");
-        let world_id = Id::new("world").expect("valid test ID");
+        let mix_id = Id::new("mix")?;
+        let background_id = Id::new("background")?;
+        let output_id = Id::new("output")?;
+        let world_id = Id::new("world")?;
         let mut group = NodeGroup::new("world", GraphKind::Shader);
         group.nodes.insert(mix_id.clone(), mix);
         group.nodes.insert(
@@ -444,8 +444,10 @@ mod tests {
         ]);
         let mut groups = Registry::new();
         groups.insert(world_id.clone(), group);
-        let mut world = World::default();
-        world.node_tree = Some(world_id);
+        let world = World {
+            node_tree: Some(world_id),
+            ..Default::default()
+        };
         evaluate_world(
             &world,
             &groups,
@@ -455,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_rgba_generic_mix_sockets() {
+    fn evaluates_rgba_generic_mix_sockets() -> Result<()> {
         let mut mix = GraphNode::new("ShaderNodeMix");
         mix.properties.insert("data_type".to_owned(), json!("RGBA"));
         mix.inputs.insert("Factor_Float".to_owned(), json!(0.25));
@@ -464,22 +466,23 @@ mod tests {
         mix.inputs
             .insert("B_Color".to_owned(), json!([0.0, 0.0, 1.0, 1.0]));
 
-        assert_eq!(
-            evaluate_mix_graph(mix).unwrap(),
-            DVec3::new(0.75, 0.0, 0.25)
-        );
+        assert_eq!(evaluate_mix_graph(mix)?, DVec3::new(0.75, 0.0, 0.25));
+        Ok(())
     }
 
     #[test]
-    fn rejects_default_float_generic_mix() {
-        let error = evaluate_mix_graph(GraphNode::new("ShaderNodeMix")).unwrap_err();
+    fn rejects_default_float_generic_mix() -> Result<()> {
+        let error = evaluate_mix_graph(GraphNode::new("ShaderNodeMix"))
+            .err()
+            .ok_or_else(|| PotError::new(ErrorCode::InvalidOperation, "mix graph was accepted"))?;
 
         assert_eq!(error.code, ErrorCode::UnsupportedFeature);
         assert!(error.message.contains("FLOAT"));
+        Ok(())
     }
 
     #[test]
-    fn keeps_legacy_mix_rgb_sockets() {
+    fn keeps_legacy_mix_rgb_sockets() -> Result<()> {
         let mut mix = GraphNode::new("ShaderNodeMixRGB");
         mix.inputs.insert("Fac".to_owned(), json!(0.25));
         mix.inputs
@@ -487,9 +490,7 @@ mod tests {
         mix.inputs
             .insert("Color2".to_owned(), json!([0.0, 0.0, 1.0, 1.0]));
 
-        assert_eq!(
-            evaluate_mix_graph(mix).unwrap(),
-            DVec3::new(0.75, 0.0, 0.25)
-        );
+        assert_eq!(evaluate_mix_graph(mix)?, DVec3::new(0.75, 0.0, 0.25));
+        Ok(())
     }
 }

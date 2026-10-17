@@ -2655,6 +2655,7 @@ fn graph_surface(
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
+    #![expect(clippy::expect_used, reason = "tests")]
 
     use serde_json::{Value, json};
 
@@ -2984,7 +2985,7 @@ mod tests {
     }
 
     #[test]
-    fn native_scalar_fields_pack_red_into_glTF_channels() {
+    fn native_scalar_fields_pack_red_into_gltf_channels() {
         let texture = TextureRef {
             image: id("img"),
             uv_layer: None,

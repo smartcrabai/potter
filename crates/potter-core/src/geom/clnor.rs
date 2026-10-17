@@ -14,7 +14,7 @@
 //! `corner_space_custom_normal_to_data`, and `corner_space_custom_data_to_normal`.
 
 use std::collections::{HashMap, HashSet};
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use glam::{DVec3, Vec3};
 use serde_json::{Map, Value, json};
@@ -78,6 +78,10 @@ fn normalize_reciprocal(vector: Vec3) -> Vec3 {
 }
 
 /// Blender's single-precision `safe_acos_approx`.
+#[expect(
+    clippy::excessive_precision,
+    reason = "Blender's literal, kept bit-exact"
+)]
 fn safe_acos(cosine: f32) -> f32 {
     let magnitude = cosine.abs();
     let clamped = if magnitude < 1.0 {
@@ -86,7 +90,7 @@ fn safe_acos(cosine: f32) -> f32 {
         1.0
     };
     let acos = (1.0 - clamped).sqrt()
-        * (1.570_796_326_7
+        * (FRAC_PI_2
             + clamped * (-0.213_300_989 + clamped * (0.077_980_478 + clamped * -0.021_640_95)));
     if cosine < 0.0 { PI - acos } else { acos }
 }
@@ -161,6 +165,10 @@ pub(crate) struct NormalCodeOptions<'a> {
 
 /// The space of a fan: its normal, boundary directions, and its edge directions.
 impl Space {
+    #[expect(
+        clippy::manual_midpoint,
+        reason = "matches Blender's float evaluation order for parity"
+    )]
     fn define(lnor: Vec3, vec_ref: Vec3, vec_other: Vec3, edges: &[Vec3]) -> Self {
         let dtp_ref = dot(vec_ref, lnor);
         let dtp_other = dot(vec_other, lnor);
@@ -895,7 +903,7 @@ fn is_identity(order: &[usize]) -> bool {
 }
 
 /// One row per face in `mesh.faces` order, keyed `f<id>`, cut from values in corner order.
-fn face_rows(mesh: &Mesh, flat: Vec<Value>) -> Map<String, Value> {
+fn face_rows(mesh: &Mesh, flat: &[Value]) -> Map<String, Value> {
     let mut rows = Map::new();
     let mut start = 0;
     for face in &mesh.faces {
@@ -937,13 +945,13 @@ fn store_state(
     attribute.insert("type".to_owned(), json!("normal_code"));
     if let Some(codes) = codes {
         let flat: Vec<Value> = codes.iter().copied().map(code_value).collect();
-        attribute.insert("values".to_owned(), Value::Object(face_rows(mesh, flat)));
+        attribute.insert("values".to_owned(), Value::Object(face_rows(mesh, &flat)));
     }
     if let Some(order) = order {
         let flat: Vec<Value> = order.iter().map(|&ordinal| Value::from(ordinal)).collect();
         attribute.insert(
             "corner_order".to_owned(),
-            Value::Object(face_rows(mesh, flat)),
+            Value::Object(face_rows(mesh, &flat)),
         );
     }
     mesh.attributes
@@ -1293,15 +1301,12 @@ pub(crate) fn transfer_custom_normals(
             "custom normal transfer does not describe the rebuilt corners",
         ));
     }
-    let order = match options.corner_order {
-        Some(order) => {
-            validate_corner_order(order, output_count)?;
-            order.to_vec()
-        }
-        None => {
-            let source_order = corner_order(source)?.unwrap_or_else(|| (0..source_count).collect());
-            compact_corner_order(&source_order, sources)
-        }
+    let order = if let Some(order) = options.corner_order {
+        validate_corner_order(order, output_count)?;
+        order.to_vec()
+    } else {
+        let source_order = corner_order(source)?.unwrap_or_else(|| (0..source_count).collect());
+        compact_corner_order(&source_order, sources)
     };
     let codes = rebuild_custom_normals(
         source,

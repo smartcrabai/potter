@@ -31,17 +31,18 @@ struct SlotSources<'a> {
 
 impl SlotSources<'_> {
     fn link(&self, slot: usize) -> MaterialLink {
-        self.links.get(slot).copied().unwrap_or_else(|| {
-            if slot < self.object.len() {
+        self.links
+            .get(slot)
+            .copied()
+            .unwrap_or(if slot < self.object.len() {
                 MaterialLink::Object
             } else {
                 MaterialLink::Data
-            }
-        })
+            })
     }
 }
 
-fn slot_sources<'a>(input: &'a JoinInput) -> SlotSources<'a> {
+fn slot_sources(input: &JoinInput) -> SlotSources<'_> {
     SlotSources {
         data: &input.data.materials,
         object: &input.node.materials,

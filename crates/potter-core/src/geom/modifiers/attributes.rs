@@ -2706,14 +2706,17 @@ fn free_attribute_name(mesh: &Mesh, base: &str) -> String {
     {
         return base.to_owned();
     }
-    (1_usize..)
-        .map(|index| format!("{base}.{index:03}"))
-        .find(|name| {
-            !mesh
-                .attributes
-                .contains_key(attribute_keys::storage_key(name).as_ref())
-        })
-        .unwrap_or_else(|| base.to_owned())
+    let mut index = 1_usize;
+    loop {
+        let name = format!("{base}.{index:03}");
+        if !mesh
+            .attributes
+            .contains_key(attribute_keys::storage_key(&name).as_ref())
+        {
+            return name;
+        }
+        index += 1;
+    }
 }
 
 fn source_vertex_for(

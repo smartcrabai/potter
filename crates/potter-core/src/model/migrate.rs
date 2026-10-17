@@ -233,8 +233,7 @@ fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bo
         (name, domain, data_type),
         ("position", "POINT", "FLOAT_VECTOR")
             | ("sharp_face", "FACE", "BOOLEAN")
-            | ("sharp_edge", "EDGE", "BOOLEAN")
-            | ("uv_seam", "EDGE", "BOOLEAN")
+            | ("sharp_edge" | "uv_seam", "EDGE", "BOOLEAN")
             | ("material_index", "FACE", "INT")
             | ("custom_normal", "CORNER", "INT16_2D")
     )
@@ -501,13 +500,10 @@ fn upgrade_mesh_v2(mesh: &mut Value) -> Result<()> {
         upgrade_shading(attributes, &elements);
         (
             blender_custom_normal_codes(attributes, &elements)?,
-            attributes
-                .get("custom_normal")
-                .filter(|attribute| {
-                    attribute.get("domain").and_then(Value::as_str) == Some("corner")
-                        && attribute.get("type").and_then(Value::as_str) == Some("float3")
-                })
-                .is_some(),
+            attributes.get("custom_normal").is_some_and(|attribute| {
+                attribute.get("domain").and_then(Value::as_str) == Some("corner")
+                    && attribute.get("type").and_then(Value::as_str) == Some("float3")
+            }),
         )
     };
     let (custom_normal_attribute, legacy_sharp_attribute) = if let Some(codes) = custom_normal_codes
@@ -1031,7 +1027,7 @@ fn unique_name(base: &str, attributes: &Map<String, Value>) -> String {
     if !attributes.contains_key(crate::geom::attribute_keys::storage_key(base).as_ref()) {
         return base.to_owned();
     }
-    (1_usize..)
+    (1_usize..=usize::MAX)
         .map(|index| format!("{base}.{index:03}"))
         .find(|name| {
             !attributes.contains_key(crate::geom::attribute_keys::storage_key(name).as_ref())
@@ -1176,7 +1172,7 @@ mod tests {
         Ok(source)
     }
 
-    fn history_record(snapshot: Value) -> Value {
+    fn history_record(snapshot: &Value) -> Value {
         json!({
             "record_version": 1,
             "parent": null,
@@ -1629,7 +1625,7 @@ mod tests {
         assert_eq!(store.active.as_deref(), Some("Tint"));
         assert_eq!(store.render.as_deref(), Some("Tint"));
         let (record, history_warnings) =
-            parse_history_record(&serde_json::to_vec(&history_record(source.clone()))?)?;
+            parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
         assert_eq!(record.snapshot.schema_version, 3);
         let history_mesh = record
@@ -1691,9 +1687,12 @@ mod tests {
             migrated.attributes["user:color_layers"]["values"][vertex.as_str()],
             json!(0.25)
         );
-        assert!(crate::geom::color_layers::read(&migrated).layers.is_empty());
+        assert_eq!(
+            crate::geom::color_layers::read(&migrated).layers,
+            Vec::new()
+        );
         let (record, history_warnings) =
-            parse_history_record(&serde_json::to_vec(&history_record(source.clone()))?)?;
+            parse_history_record(&serde_json::to_vec(&history_record(&source))?)?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
         assert_eq!(record.snapshot.schema_version, 3);
         let history_mesh = record
@@ -1708,10 +1707,9 @@ mod tests {
             json!(0.25)
         );
         assert!(!history_mesh.attributes.contains_key("color_layers"));
-        assert!(
-            crate::geom::color_layers::read(history_mesh)
-                .layers
-                .is_empty()
+        assert_eq!(
+            crate::geom::color_layers::read(history_mesh).layers,
+            Vec::new()
         );
         let current = parse_scene(&serde_json::to_vec(&source)?)?.doc;
         let current = parse_scene(&serde_json::to_vec(&current)?)?.doc;

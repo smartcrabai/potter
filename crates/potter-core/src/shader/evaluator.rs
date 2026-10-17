@@ -683,6 +683,10 @@ fn sample_material_texture(
 }
 
 #[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Shader variant stays inline so Value remains Copy; boxing it would add a heap allocation per shader-node evaluation"
+)]
 enum Value {
     Scalar(f64),
     Vector(DVec3),
@@ -741,6 +745,7 @@ struct ActiveSocket {
 }
 
 /// Reusable scratch storage for evaluating shader graphs on render hits.
+#[derive(Default)]
 pub struct EvaluatorWorkspace {
     active: Vec<ActiveSocket>,
 }
@@ -755,12 +760,6 @@ impl EvaluatorWorkspace {
     }
 }
 
-impl Default for EvaluatorWorkspace {
-    fn default() -> Self {
-        Self { active: Vec::new() }
-    }
-}
-
 struct Evaluator<'graph, 'material, 'registry, 'workspace> {
     group: &'graph NodeGroup,
     material: &'material Material,
@@ -768,7 +767,7 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace> {
     workspace: &'workspace mut EvaluatorWorkspace,
 }
 
-impl<'graph, 'material, 'registry, 'workspace> Evaluator<'graph, 'material, 'registry, 'workspace> {
+impl<'registry> Evaluator<'_, '_, 'registry, '_> {
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
         let incoming =
@@ -888,9 +887,10 @@ impl<'graph, 'material, 'registry, 'workspace> Evaluator<'graph, 'material, 'reg
         match kind {
             NodeKind::OutputMaterial => Err(invalid("material output has no output sockets")),
             NodeKind::Principled => Ok(Value::Shader(self.principled(node_id)?)),
-            NodeKind::VolumePrincipled => Ok(Value::Shader(self.volume(node_id, true)?)),
+            NodeKind::VolumePrincipled | NodeKind::VolumeScatter => {
+                Ok(Value::Shader(self.volume(node_id, true)?))
+            }
             NodeKind::VolumeAbsorption => Ok(Value::Shader(self.volume(node_id, false)?)),
-            NodeKind::VolumeScatter => Ok(Value::Shader(self.volume(node_id, true)?)),
             NodeKind::Displacement => self.displacement(node_id, socket),
             NodeKind::ImageTexture => self.image_texture(node_id, socket),
             NodeKind::Emission => Ok(Value::Shader(self.emission(node_id)?)),
