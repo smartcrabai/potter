@@ -229,14 +229,10 @@ fn multires_sculpt_uses_driven_armature_and_shrinkwrap_prefix_for_brush_base()
         "samples":[{"position":[2.5,0.0,0.0],"pressure":1.0,"radius":1.5,"strength":0.5,"time":0.0}],
         "falloff":"linear","seed":7
     }]);
-    // The deformed body evaluates on the shrinkwrap surface at z=-1 (asserted above), so its stroke
-    // sample lies on that surface at the control's x and y; the control's sample lies on its z=0 surface.
-    let deformed_stroke = json!([{
-        "op":"sculpt.stroke","target":{"id":"body"},"brush":"draw","scope":"shared",
-        "samples":[{"position":[2.5,0.0,-1.0],"pressure":1.0,"radius":1.5,"strength":0.5,"time":0.0}],
-        "falloff":"linear","seed":7
-    }]);
-    apply_at_revision(&deformed_scene, &deformed_stroke, 1)?;
+    // Stroke samples are world space. The deformed body's evaluated surface is at world z=0 (its
+    // local z=-1 plus its translation z=+1), the same plane as the control, so one sample lies on
+    // both surfaces.
+    apply_at_revision(&deformed_scene, &stroke, 1)?;
     apply_at_revision(&control_scene, &stroke, 1)?;
 
     let deformed_displacement =
