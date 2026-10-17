@@ -440,7 +440,7 @@ fn schema_v1_fixture_upgrades_on_apply_without_retired_keys() -> TestResult {
     let applied = apply_operations(
         &scene,
         directory.path(),
-        json!([{"op": "node.update", "target": {"id": node}, "set": {"name": "Cube"}}]),
+        json!([{"op": "node.update", "target": {"id": node}, "set": {"name": "Cube renamed"}}]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
     let document = read_json(&scene.join("scene.json"))?;
