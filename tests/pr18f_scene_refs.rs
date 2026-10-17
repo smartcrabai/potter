@@ -441,7 +441,7 @@ fn lattice_scene(strength: f64, grouped: bool, invert: bool, missing_group: bool
     if grouped {
         operations
             .push(json!({"op":"vertex_group.create","target":{"id":"subj"},"id":"g","name":"G"}));
-        params["vertex_group"] = json!("g");
+        params["vertex_group"] = json!("G");
         params["invert_vertex_group"] = json!(invert);
     } else if missing_group {
         params["vertex_group"] = json!("missing");
