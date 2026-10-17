@@ -32,7 +32,7 @@ use crate::{
 const MIN_INFLUENCE: f64 = 0.0005;
 /// `MESHDEFORM_LEN_THRESHOLD` (meshlaplacian.cc:848).
 const LEN_THRESHOLD: f64 = 1e-6;
-/// `FLT_EPSILON` as used by `interp_weights_poly_v3` (math_geom.cc:4223).
+/// `FLT_EPSILON` as used by `interp_weights_poly_v3` (`math_geom.cc:4223`).
 const FLT_EPSILON: f64 = f32::EPSILON as f64;
 /// `MESHDEFORM_OFFSET` (meshlaplacian.cc:852-860); index 0 is the cell itself.
 const OFFSET: [[isize; 3]; 7] = [
@@ -139,7 +139,7 @@ struct SparseSystem {
     values: Vec<f64>,
 }
 
-/// Mean-value direction from a cage polygon vertex to the hit point (`Float3_Len`, math_geom.cc:4157).
+/// Mean-value direction from a cage polygon vertex to the hit point (`Float3_Len`, `math_geom.cc:4157`).
 #[derive(Clone, Copy)]
 struct Direction {
     vector: DVec3,
@@ -375,6 +375,10 @@ impl Grid {
 }
 
 /// One axis of `harmonic_coordinates_bind`'s padding: returns `(min, max, width)`.
+#[expect(
+    clippy::manual_midpoint,
+    reason = "mirrors Blender's (low + high) * 0.5 evaluation order for parity"
+)]
 fn pad_axis(low: f64, high: f64, maxwidth: f64, size: f64) -> (f64, f64, f64) {
     let center = (low + high) * 0.5;
     let mut min = center - maxwidth * 0.5;
@@ -406,8 +410,8 @@ impl RayFrame {
     /// `isect_ray_tri_watertight_v3_precalc` (math_geom.cc:1897-1922).
     fn new(direction: DVec3) -> Self {
         let kz = axis_dominant(direction);
-        let mut kx = if kz != 2 { kz + 1 } else { 0 };
-        let mut ky = if kx != 2 { kx + 1 } else { 0 };
+        let mut kx = if kz == 2 { 0 } else { kz + 1 };
+        let mut ky = if kx == 2 { 0 } else { kx + 1 };
         if direction[kz] < 0.0 {
             std::mem::swap(&mut kx, &mut ky);
         }
@@ -423,7 +427,7 @@ impl RayFrame {
     }
 }
 
-/// `axis_dominant_v3_single` (BLI_math_geom_inline.cc:86).
+/// `axis_dominant_v3_single` (`BLI_math_geom_inline.cc:86`).
 fn axis_dominant(vector: DVec3) -> usize {
     let x = vector.x.abs();
     let y = vector.y.abs();
@@ -528,7 +532,7 @@ fn boundary_phi(hit: &BoundaryHit, cage_vertex: usize) -> f64 {
 }
 
 impl Direction {
-    /// `DIR_V3_SET` (math_geom.cc:4143): `vertex - origin` and its length.
+    /// `DIR_V3_SET` (`math_geom.cc:4143`): `vertex - origin` and its length.
     fn between(vertex: DVec3, origin: DVec3) -> Self {
         let vector = vertex - origin;
         Self {
@@ -883,7 +887,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// Solves `A X = B` in place with Eigen `SparseLU` (`EIG_linear_solver_solve`, linear_solver.cc 293-328).
+/// Solves `A X = B` in place with Eigen `SparseLU` (`EIG_linear_solver_solve`, `linear_solver.cc` 293-328).
 /// `block` holds `column_count` right-hand sides of `system.size` values each, one per cage vertex; on
 /// success it holds the solutions.
 fn solve_system(system: &SparseSystem, column_count: usize, block: &mut [f64]) -> Result<()> {

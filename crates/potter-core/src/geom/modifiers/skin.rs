@@ -978,6 +978,9 @@ fn dedupe_cyclic(face: &mut Vec<usize>) {
     }
 }
 
+/// The points, their origins and faces after welded points are dropped.
+type WeldedPoints = (Vec<DVec3>, Vec<Vec<(usize, f64)>>, Vec<Polygon>);
+
 /// Blender's weld removes the vertices it merges away. Drops the `welded` points, renumbering the rest
 /// and every face that uses them.
 fn drop_welded_points(
@@ -985,7 +988,7 @@ fn drop_welded_points(
     origins: Vec<Vec<(usize, f64)>>,
     faces: Vec<Polygon>,
     welded: &[usize],
-) -> (Vec<DVec3>, Vec<Vec<(usize, f64)>>, Vec<Polygon>) {
+) -> WeldedPoints {
     let mut dropped = vec![false; points.len()];
     for &index in welded {
         if let Some(flag) = dropped.get_mut(index) {
@@ -1228,7 +1231,7 @@ fn triangle_area(points: &[DVec3], triangle: [usize; 3]) -> f64 {
 /// Blender's `hull_merge_triangles`: an edge used by exactly two triangles offers a quad, and quads
 /// are taken greedily by score. A candidate is skipped when its edge no longer has exactly two faces
 /// (`BM_edge_face_pair`) or when its triangles share a neighbouring face. The mesh seen by those
-/// checks keeps merged triangles and earlier quads, as Blender's BMesh does until the final delete.
+/// checks keeps merged triangles and earlier quads, as Blender's `BMesh` does until the final delete.
 fn merge_triangle_faces(
     points: &[DVec3],
     faces: Vec<Vec<usize>>,

@@ -760,7 +760,7 @@ fn mesh_deform_rebind_error(modifier: &Modifier, dynamic: bool) -> PotError {
 }
 
 /// Names the modifier on a failed harmonic solve, keeping the solver's error code and details.
-fn mesh_deform_bind_error(modifier: &Modifier, error: PotError) -> PotError {
+fn mesh_deform_bind_error(modifier: &Modifier, error: &PotError) -> PotError {
     PotError::with_details(
         error.code,
         format!(
@@ -2212,7 +2212,7 @@ pub(crate) fn bind_mesh(
         .map(|vertex| subject_to_cage.transform_point3(vertex.co))
         .collect::<Vec<_>>();
     let grid = harmonic::bind_harmonic_grid(&source_cage_space, cage, precision, dynamic)
-        .map_err(|error| mesh_deform_bind_error(modifier, error))?;
+        .map_err(|error| mesh_deform_bind_error(modifier, &error))?;
     let cage_coordinates = cage
         .vertices
         .iter()
@@ -2289,7 +2289,7 @@ fn mesh_deform_grid_layout(
     }
 }
 
-/// Blender's `MESHDEFORM_MIN_INFLUENCE` (MOD_meshdeform.cc:427), used only by bind compaction.
+/// Blender's `MESHDEFORM_MIN_INFLUENCE` (`MOD_meshdeform.cc:427`), used only by bind compaction.
 const MESHDEFORM_COMPACT_MIN_INFLUENCE: f64 = 0.000_01;
 
 /// Port of `BKE_modifier_mdef_compact_influences` (MOD_meshdeform.cc:429-499), applied to static
