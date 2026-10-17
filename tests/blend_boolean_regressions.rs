@@ -27,10 +27,6 @@
 mod blender_file;
 use blender_file::blender_executable;
 
-#[expect(
-    dead_code,
-    reason = "this suite uses a subset of the shared comparator"
-)]
 #[path = "fixtures/boolean_parity/comparator.rs"]
 mod comparator;
 use comparator::{
