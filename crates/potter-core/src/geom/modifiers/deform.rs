@@ -1142,6 +1142,21 @@ pub(super) fn mesh_triangles(mesh: &Mesh, coordinates: &[DVec3]) -> Result<Vec<[
                 triangles.push([vertices[0], vertices[1], vertices[2]]);
                 triangles.push([vertices[0], vertices[2], vertices[3]]);
             }
+        } else if vertices.len() > 4 {
+            let face_positions = vertices
+                .iter()
+                .map(|index| coordinates[*index].as_vec3().to_array())
+                .collect::<Vec<_>>();
+            for triangle in crate::geom::triangulate::triangulate_ngon(
+                &face_positions,
+                crate::geom::triangulate::NgonMethod::Clip,
+            ) {
+                triangles.push([
+                    vertices[triangle[0]],
+                    vertices[triangle[1]],
+                    vertices[triangle[2]],
+                ]);
+            }
         } else {
             for index in 1..vertices.len().saturating_sub(1) {
                 triangles.push([vertices[0], vertices[index], vertices[index + 1]]);
@@ -3001,8 +3016,9 @@ fn group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
 mod tests {
     use super::{
         affine_weights, closest_triangle_point, laplacian_deform, mean_value_weights, mesh_deform,
-        surface_deform,
+        mesh_triangles, surface_deform,
     };
+    use crate::geom::triangulate::{NgonMethod, triangulate_ngon};
     use crate::{
         geom::{BoxParams, Edge, Face, Mesh, Vertex},
         model::{Id, Modifier, ModifierRuntime},
@@ -3095,6 +3111,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn laplacian_concave_ngons_use_blender_polygon_fill() -> Result<(), Box<dyn std::error::Error>> {
+        let points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(3.0, 0.0, 0.0),
+            DVec3::new(3.0, 3.0, 0.0),
+            DVec3::new(2.0, 3.0, 0.0),
+            DVec3::new(2.0, 1.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(1.0, 3.0, 0.0),
+            DVec3::new(0.0, 3.0, 0.0),
+        ];
+        let mesh = Mesh::from_positions_and_faces(
+            points.clone(),
+            vec![(0..points.len()).collect::<Vec<_>>()],
+        )?;
+        let coordinates = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+        let actual = mesh_triangles(&mesh, &coordinates)?;
+        let corners = points
+            .iter()
+            .map(|point| point.as_vec3().to_array())
+            .collect::<Vec<_>>();
+        let expected = triangulate_ngon(&corners, NgonMethod::Clip);
+        let fan = (1..points.len() - 1)
+            .map(|index| [0, index, index + 1])
+            .collect::<Vec<_>>();
+        assert_ne!(expected, fan, "concave fixture must distinguish a fan");
+        assert_eq!(actual, expected);
+        Ok(())
+    }
     #[test]
     fn native_surface_deform_uses_blender_bind_weights_and_normal_offset()
     -> Result<(), Box<dyn std::error::Error>> {

@@ -322,7 +322,8 @@ fn triangulate_quad(corners: [Vec3; 4], method: QuadMethod) -> [[usize; 3]; 2] {
     ]
 }
 
-fn triangulate_ngon(corners: &[Vec3], method: NgonMethod) -> Vec<[usize; 3]> {
+/// Blender's `BLI_polyfill_calc_arena` tessellation for one face's ordered corners.
+pub(crate) fn triangulate_ngon(corners: &[[f32; 3]], method: NgonMethod) -> Vec<[usize; 3]> {
     let normal = face_normal(corners);
     let negated = [-normal[0], -normal[1], -normal[2]];
     let coords: Vec<Vec2> = corners
