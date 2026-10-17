@@ -281,7 +281,6 @@ pub(super) fn data_transfer(
                 )?,
                 "CUSTOM_NORMAL" => transfer_custom_normals(
                     &mut result,
-                    &source.mesh,
                     modifier,
                     loop_mapping,
                     factor,
@@ -379,6 +378,7 @@ fn validate_transfer_mapping(modifier: &Modifier, field: &str, value: &str) -> R
             value,
             "TOPOLOGY" | "NEAREST" | "NORMAL" | "POLYINTERP_PNORPROJ"
         ),
+        _ => false,
     };
     if valid {
         Ok(())
@@ -682,7 +682,7 @@ fn transfer_vertex_attribute(
         .cloned()
         .ok_or_else(|| invalid(modifier, name, "destination point-attribute values"))?;
     let mut output = destination_values;
-    for (index, vertex) in destination.vertices.iter().enumerate() {
+    for index in 0..destination.vertices.len() {
         let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping)
         else {
             continue;
@@ -1001,7 +1001,6 @@ fn transfer_uv(
 
 fn transfer_custom_normals(
     destination: &mut Mesh,
-    source: &Mesh,
     _modifier: &Modifier,
     mapping: &str,
     factor: f64,
@@ -2534,7 +2533,7 @@ fn loop_candidate_for_island(
             from_vertex: true,
         });
     }
-    let (source_face, hit, distance, factor) = if mapping == "POLYINTERP_LNORPROJ" {
+    let (source_face, hit, _, factor) = if mapping == "POLYINTERP_LNORPROJ" {
         let normal = context.normal_to_source(destination_normal);
         let attempts = if context.ray_radius > 0.0 { 3 } else { 1 };
         let mut ray_hit = None;
@@ -4437,6 +4436,8 @@ mod tests {
             .as_object()
             .ok_or("modifier params must be an object")?
             .clone(),
+            show_viewport: true,
+            show_render: true,
             binding_data: None,
             runtime: ModifierRuntime::default(),
         };

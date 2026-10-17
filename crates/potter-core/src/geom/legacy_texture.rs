@@ -3755,7 +3755,9 @@ mod tests {
             Encoding::FAST_LOSSLESS,
             SpecificChannels::build()
                 .with_channel::<f32>("Z")
-                .with_pixels(|position| if position.1 == 0 { 0.75_f32 } else { 0.25_f32 }),
+                .with_pixels(
+                    |position: Vec2<usize>| if position.1 == 0 { 0.75_f32 } else { 0.25_f32 },
+                ),
         );
         let rgba_layer = |name: &str, view: &str, top: [f32; 4], bottom: [f32; 4]| {
             let mut attributes = LayerAttributes::named(name);

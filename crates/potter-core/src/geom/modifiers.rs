@@ -24,7 +24,7 @@ use super::attribute_keys;
 use super::clnor::{self, CornerNormalCode, NormalCodeOptions, settle_custom_normals};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
-    Edge, Face, Mesh, MeshError, ORIGINDEX_NONE, OriginalIndices, Vertex, edge_key,
+    Edge, Face, Mesh, MeshError, ORIGINDEX_NONE, Vertex, edge_key,
     normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
     provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
     uv_layers,
@@ -4846,7 +4846,7 @@ fn bevel_vertices(
         }
         query_polygons.push(ids);
     }
-    let mut source_vertices = source_vertices.map(|mut source_vertices| {
+    let source_vertices = source_vertices.map(|mut source_vertices| {
         let mut index = 0;
         source_vertices.retain(|_| {
             let keep = used.get(index).copied().unwrap_or(false);
