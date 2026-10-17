@@ -516,7 +516,7 @@ pub fn apply_operations(project: &Path, root: &Path, operations: Value) -> TestR
         serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
             "base_revision": revision,
-            "operations": operations,
+            "operations": serde_json::to_value(operations)?,
         }))?,
     )?;
     pot_json(|command| {

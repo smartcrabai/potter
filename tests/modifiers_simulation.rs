@@ -2671,7 +2671,7 @@ baseline_evaluated.to_mesh_clear()
             .as_deref()
             .ok_or("displaced inline samples are missing")?,
     );
-    let potter_mesh = potter_core::geom::volume::volume_to_mesh(&displaced, 0.25)
+    let potter_mesh = potter_core::geom::volume::volume_to_mesh(displaced, 0.25)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let baseline_mesh = potter_core::geom::volume::volume_to_mesh(&volume, 0.25)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -2798,7 +2798,7 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
     );
     let sample_position = expected_index_to_local.transform_point3(DVec3::new(2.0, 1.0, 1.0));
     assert_eq!(
-        potter_core::geom::volume::sample_density_checked(sample_position, &displaced)?,
+        potter_core::geom::volume::sample_density_checked(sample_position, displaced)?,
         0.75,
     );
     let repeated = evaluated_volume(&document, &snapshot, "affine_repeated")?;
@@ -2814,7 +2814,7 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
         Some(expected_repeated_transform.to_cols_array()),
     );
 
-    let affine_mesh = potter_core::geom::volume::volume_to_mesh(&displaced, 0.25)?;
+    let affine_mesh = potter_core::geom::volume::volume_to_mesh(displaced, 0.25)?;
     let index_space_volume = potter_core::geom::volume::VolumeData {
         grids: vec![potter_core::geom::volume::VolumeGrid {
             dims: grid.dims,

@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, error::Error, fs, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fs,
+    process::Command,
+};
 
 use glam::{DMat4, DVec3};
 use potter_core::{
@@ -286,6 +291,9 @@ with open(root + '/expected_uv_warp.json','w') as file:
 ";
 
 fn test_modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
+    let Value::Object(params) = params else {
+        return Err("modifier parameters must be an object".into());
+    };
     Ok(Modifier {
         id: Id::new("uv_parity_modifier")?,
         modifier_type: modifier_type.to_owned(),
@@ -293,10 +301,7 @@ fn test_modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn
         enabled: true,
         show_viewport: true,
         show_render: true,
-        params: params
-            .as_object()
-            .ok_or("modifier parameters must be an object")?
-            .clone(),
+        params,
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
@@ -376,9 +381,9 @@ fn operand(world_matrix: DMat4, camera: Option<CameraData>, armature: bool) -> S
         camera,
         armature,
         object_scale: DVec3::ONE,
-        selected_bones: Default::default(),
-        deforming_bones: Default::default(),
-        layer_selection: Default::default(),
+        selected_bones: BTreeSet::default(),
+        deforming_bones: BTreeSet::default(),
+        layer_selection: AttributeLayerSelection::default(),
     }
 }
 
@@ -389,13 +394,14 @@ fn camera_data(
     lens_mm: f64,
     shift: [f64; 2],
 ) -> CameraData {
-    let mut data = CameraData::default();
-    data.projection = projection;
-    data.sensor_fit = sensor_fit.to_owned();
-    data.ortho_scale = ortho_scale;
-    data.lens_mm = lens_mm;
-    data.shift = shift;
-    data
+    CameraData {
+        projection,
+        sensor_fit: sensor_fit.to_owned(),
+        ortho_scale,
+        lens_mm,
+        shift,
+        ..CameraData::default()
+    }
 }
 
 fn matrix_from_oracle(value: &Value) -> Result<DMat4, Box<dyn Error>> {

@@ -212,19 +212,21 @@ fn legacy_mesh(expected: &Value) -> TestResult<Value> {
     uv.insert("render".to_owned(), oracle["uv_layers"]["render"].clone());
 
     let mut normal_rows = Map::new();
-    for face in 0..LEGACY_NORMAL_FACES.min(faces.len()) {
-        let row: Vec<Value> = (0..face_sizes[face])
+    for (face, face_size) in face_sizes
+        .iter()
+        .enumerate()
+        .take(LEGACY_NORMAL_FACES.min(faces.len()))
+    {
+        let row: Vec<Value> = (0..*face_size)
             .map(|corner| json!(legacy_vector(face, corner)))
             .collect();
         normal_rows.insert(format!("f{face}"), Value::Array(row));
     }
 
     let mut paint = Map::new();
-    for (face, size) in face_sizes.iter().enumerate() {
-        for corner in 0..*size {
-            let vertex = faces[face]["v"][corner]
-                .as_u64()
-                .ok_or("face vertex is missing")?;
+    for (face, face_value) in faces.iter().enumerate() {
+        for (corner, vertex) in face_value["v"].as_array().into_iter().flatten().enumerate() {
+            let vertex = vertex.as_u64().ok_or("face vertex is missing")?;
             paint.insert(
                 format!("f{face}:v{vertex}"),
                 json!(paint_value(face, corner)),

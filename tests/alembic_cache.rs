@@ -1,3 +1,5 @@
+#![expect(clippy::expect_used, reason = "integration test fixtures")]
+
 use std::{error::Error, fs, path::Path, process::Command};
 
 use serde_json::{Value, json};
@@ -633,7 +635,7 @@ fn assert_oracle_uv_layers(
     expected_names.sort_unstable();
     assert_eq!(actual_names, expected_names, "canonical UV layer names");
 
-    let actual_layers: &[Value] = actual_layers.map(Vec::as_slice).unwrap_or(&[]);
+    let actual_layers: &[Value] = actual_layers.map_or(&[], Vec::as_slice);
     let expected_positions: Vec<[f64; 3]> = serde_json::from_value(expected["positions"].clone())?;
     let actual_positions = mesh
         .vertices
@@ -740,7 +742,7 @@ fn flat_corner_normals(mesh: &potter_core::geom::Mesh) -> Vec<[f64; 3]> {
             }
             .normalize_or_zero()
             .to_array();
-            std::iter::repeat(normal).take(face.vertices.len())
+            std::iter::repeat_n(normal, face.vertices.len())
         })
         .collect()
 }
@@ -1730,10 +1732,6 @@ fn mesh_sequence_cache_vertex_only_read_rejects_count_mismatches() -> Result<(),
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "cache modifier and resource operation schemas share one oracle contract test"
-)]
 #[test]
 fn mesh_sequence_cache_and_resource_schema_describe_parameters() -> Result<(), Box<dyn Error>> {
     let schema = potter_core::schema::schema("operations", Some("modifier.create"))?;

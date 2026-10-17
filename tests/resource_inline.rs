@@ -204,8 +204,8 @@ fn asset_report_checks_each_sequence_leaf_and_rejects_missing_packed_frames()
     let first_bytes = [1_u8, 3, 5];
     let second_bytes = [2_u8, 4, 6];
     fs::write(&master, b"container master must not be read as a leaf")?;
-    fs::write(&first_path, &first_bytes)?;
-    fs::write(&second_path, &second_bytes)?;
+    fs::write(&first_path, first_bytes)?;
+    fs::write(&second_path, second_bytes)?;
 
     let mut document = read_scene(&scene)?;
     document["resources"]["cache_sequence"] = json!({

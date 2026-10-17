@@ -12,6 +12,11 @@
 //! - cube + hidden SUBSURF + hidden SOLIDIFY, apply SUBSURF: applied anyway (FINISHED), 26/24 as
 //!   alone; the stack becomes `[Solidify]` with both flags False.
 
+#![expect(
+    clippy::float_cmp,
+    reason = "the rigid-body check compares simulated matrices exactly to detect any motion"
+)]
+
 use std::{error::Error, fmt::Debug, fs, path::Path, process::Command};
 
 use glam::{DQuat, EulerRot};

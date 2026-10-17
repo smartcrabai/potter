@@ -24,6 +24,9 @@ mod blender_file;
 mod blender_script;
 
 fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
+    let Value::Object(params) = params else {
+        return Err("modifier params must be an object".into());
+    };
     Ok(Modifier {
         id: potter_core::model::Id::new("transfer_test")?,
         modifier_type: modifier_type.to_owned(),
@@ -31,10 +34,7 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         enabled: true,
         show_viewport: true,
         show_render: true,
-        params: params
-            .as_object()
-            .ok_or("modifier params must be an object")?
-            .clone(),
+        params,
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
@@ -44,7 +44,6 @@ fn layer_selection(groups: &[&str], active_group: Option<usize>) -> AttributeLay
     AttributeLayerSelection {
         vertex_group_names: groups.iter().map(|name| (*name).to_owned()).collect(),
         active_vertex_group_index: active_group,
-        ..AttributeLayerSelection::default()
     }
 }
 
@@ -224,9 +223,9 @@ fn set_domain_attribute(
     data_type: &str,
     values: Value,
 ) -> Result<(), Box<dyn Error>> {
-    let items = values
-        .as_array()
-        .ok_or("domain attribute values must be an array")?;
+    let Value::Array(items) = values else {
+        return Err("domain attribute values must be an array".into());
+    };
     let expected_len = match domain {
         "point" => mesh.vertices.len(),
         "edge" => mesh.edges.len(),
@@ -240,17 +239,17 @@ fn set_domain_attribute(
     match domain {
         "point" => {
             for (vertex, value) in mesh.vertices.iter().zip(items) {
-                entries.insert(format!("v{}", vertex.id), value.clone());
+                entries.insert(format!("v{}", vertex.id), value);
             }
         }
         "edge" => {
             for (edge, value) in mesh.edges.iter().zip(items) {
-                entries.insert(format!("e{}", edge.id), value.clone());
+                entries.insert(format!("e{}", edge.id), value);
             }
         }
         "face" => {
             for (face, value) in mesh.faces.iter().zip(items) {
-                entries.insert(format!("f{}", face.id), value.clone());
+                entries.insert(format!("f{}", face.id), value);
             }
         }
         _ => return Err("unsupported test attribute domain".into()),
@@ -470,26 +469,40 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     );
     let source_to_destination = destination_world.inverse() * source_world;
     let local_to_subject_f32 = [
-        1.3333335,
+        1.333_333_5,
         0.0,
         0.0,
         0.0,
         0.0,
-        0.7272727,
+        0.727_272_7,
         0.0,
         0.0,
         0.0,
         0.0,
         1.1,
         0.0,
-        0.33333337,
-        -0.22727272,
+        0.333_333_37,
+        -0.227_272_72,
         0.0,
         1.0,
     ];
     let subject_to_local_f32 = [
-        0.74999994, 0.0, 0.0, 0.0, 0.0, 1.3750001, 0.0, 0.0, 0.0, 0.0, 0.90909094, 0.0, -0.25,
-        0.31250003, 0.0, 1.0,
+        0.749_999_94,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.375_000_1,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.909_090_94,
+        0.0,
+        -0.25,
+        0.312_500_03,
+        0.0,
+        1.0,
     ];
     let mut source_operand = operand(source.clone(), source_to_destination, &["A"], Some(0));
     source_operand.blender_matrices_f32 = Some(SceneOperandMatricesF32 {
@@ -2262,7 +2275,7 @@ fn set_blender_attribute(
     name: &str,
     domain: &str,
     data_type: &str,
-    values: Value,
+    values: &Value,
 ) -> Result<(), Box<dyn Error>> {
     let attributes = mesh
         .attributes
@@ -2380,7 +2393,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "crease_edge",
         "EDGE",
         "FLOAT",
-        json!([0.1, 0.3, 0.5, 0.7]),
+        &json!([0.1, 0.3, 0.5, 0.7]),
     )?;
     let mut operands = BTreeMap::new();
     operands.insert(
@@ -2405,7 +2418,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "crease_edge",
             "EDGE",
             "FLOAT",
-            json!([0.0, 0.0, 0.0]),
+            &json!([0.0, 0.0, 0.0]),
         )?;
         let transfer = modifier(
             "data_transfer",
@@ -2435,7 +2448,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "crease_edge",
         "EDGE",
         "FLOAT",
-        json!([0.0, 0.0, 0.0]),
+        &json!([0.0, 0.0, 0.0]),
     )?;
     let radius_zero_transfer = modifier(
         "data_transfer",
@@ -2478,7 +2491,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "crease_edge",
         "EDGE",
         "FLOAT",
-        json!([0.0, 0.0, 0.0, 0.0]),
+        &json!([0.0, 0.0, 0.0, 0.0]),
     )?;
     let transfer = modifier(
         "data_transfer",
@@ -2515,7 +2528,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         "freestyle_face",
         "FACE",
         "BOOLEAN",
-        json!([false, true]),
+        &json!([false, true]),
     )?;
     let mut face_operands = BTreeMap::new();
     face_operands.insert(
@@ -2539,7 +2552,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "freestyle_face",
             "FACE",
             "BOOLEAN",
-            json!([false, false]),
+            &json!([false, false]),
         )?;
         let transfer = modifier(
             "data_transfer",
@@ -2599,7 +2612,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "freestyle_face",
             "FACE",
             "BOOLEAN",
-            json!(face_flags),
+            &json!(face_flags),
         )?;
         let mut oblique_operands = BTreeMap::new();
         oblique_operands.insert(
@@ -2615,7 +2628,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             "freestyle_face",
             "FACE",
             "BOOLEAN",
-            json!([false]),
+            &json!([false]),
         )?;
         let oblique_transfer = modifier(
             "data_transfer",

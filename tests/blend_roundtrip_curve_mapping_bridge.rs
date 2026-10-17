@@ -1,5 +1,5 @@
 #![expect(
-    clippy::unwrap_used,
+    clippy::expect_used,
     reason = "Blender bridge fixtures use fixed names, paths, and control-point values"
 )]
 

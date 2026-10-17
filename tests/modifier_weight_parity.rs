@@ -1,3 +1,5 @@
+#![expect(clippy::expect_used, reason = "integration test fixtures")]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -532,6 +534,9 @@ print("WEIGHT_TEXTURE_ORACLE_WRITTEN")
 "#;
 
 fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
+    let Value::Object(params) = params else {
+        return Err("modifier parameters must be an object".into());
+    };
     Ok(Modifier {
         id: Id::new("weight_test_modifier")?,
         modifier_type: modifier_type.to_owned(),
@@ -539,10 +544,7 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         enabled: true,
         show_viewport: true,
         show_render: true,
-        params: params
-            .as_object()
-            .ok_or("modifier parameters must be an object")?
-            .clone(),
+        params,
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
@@ -700,7 +702,7 @@ fn operand(
         object_scale: DVec3::ONE,
         selected_bones: BTreeSet::new(),
         deforming_bones: BTreeSet::new(),
-        layer_selection: Default::default(),
+        layer_selection: AttributeLayerSelection::default(),
     }
 }
 
@@ -1769,7 +1771,7 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
         json!({"op":"node.create","id":"texture_frame","kind":"empty","transform":{"translation":[-0.15,0.3,0.0],"scale":[0.7,1.25,1.0]}}),
         json!({"op":"node.create","id":"texture_rig","kind":"armature","transform":{"translation":[0.1,-0.1,0.0],"scale":[1.2,0.8,1.0]}}),
         json!({"op":"bone.create","target":{"id":"texture_rig"},"id":"mask_bone","name":"MaskBone","head":[0.0,0.0,0.0],"tail":[0.0,0.0,1.0]}),
-        json!({"op":"pose.set","target":{"id":"texture_rig"},"bone_id":"mask_bone","set":{"translation":[0.2,0.3,0.0],"rotation":[0.0,0.0,0.2279775235351884,0.9736663950053749]}}),
+        json!({"op":"pose.set","target":{"id":"texture_rig"},"bone_id":"mask_bone","set":{"translation":[0.2,0.3,0.0],"rotation":[0.0,0.0,0.227_977_523_535_188_4,0.973_666_395_005_374_9]}}),
     ];
     let mappings = [
         "LOCAL",

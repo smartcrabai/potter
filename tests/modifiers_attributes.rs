@@ -585,7 +585,7 @@ fn mesh_cache_frame_mode_uses_positional_indices_and_linear_snap() -> Result<(),
         "mesh_cache",
         json!({
             "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
-            "time_mode":"FRAME","eval_frame":0.000100000000001,"interpolation":"LINEAR",
+            "time_mode":"FRAME","eval_frame":0.000_100_000_000_001,"interpolation":"LINEAR",
             "deform_mode":"OVERWRITE","factor":1.0,
             "forward_axis":"POS_Y","up_axis":"POS_Z"
         }),
@@ -666,7 +666,7 @@ fn mesh_cache_mdd_time_snaps_terminal_duplicates_and_small_intervals() -> Result
         "mesh_cache",
         json!({
             "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
-            "time_mode":"TIME","eval_time":1.000025,"interpolation":"LINEAR",
+            "time_mode":"TIME","eval_time":1.000_025,"interpolation":"LINEAR",
             "deform_mode":"OVERWRITE","factor":1.0,
             "forward_axis":"POS_Y","up_axis":"POS_Z"
         }),

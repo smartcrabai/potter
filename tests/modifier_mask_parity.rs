@@ -118,7 +118,7 @@ with open(root + '/expected_mask.json','w') as file:
     json.dump(result,file)
 ";
 
-fn mask_modifier(params: Value) -> Result<Modifier, Box<dyn Error>> {
+fn mask_modifier(params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
         id: Id::new("mask_parity_modifier")?,
         modifier_type: "mask".to_owned(),
@@ -315,8 +315,10 @@ fn armature_scene(
     let mesh_data_id = Id::new("mask_mesh_data")?;
     let armature_id = Id::new("mask_armature")?;
     let armature_data_id = Id::new("mask_armature_data")?;
-    let mut mesh_data = DataBlock::default();
-    mesh_data.mesh = Some(mesh);
+    let mesh_data = DataBlock {
+        mesh: Some(mesh),
+        ..Default::default()
+    };
     doc.data_blocks.insert(mesh_data_id.clone(), mesh_data);
     let params = json!({
         "mode":"ARMATURE",
@@ -331,7 +333,7 @@ fn armature_scene(
         data: Some(mesh_data_id),
         ..Node::default()
     };
-    mesh_node.modifiers.push(mask_modifier(params)?);
+    mesh_node.modifiers.push(mask_modifier(&params)?);
     doc.nodes.insert(mesh_id.clone(), mesh_node);
     if has_armature {
         let mut armature = ArmatureData::default();
@@ -355,10 +357,12 @@ fn armature_scene(
             };
             armature.bones.insert(Id::new(bone_id)?, bone);
         }
-        let mut armature_data = DataBlock::default();
-        armature_data.data_type = "armature".to_owned();
-        armature_data.mesh = None;
-        armature_data.armature = Some(armature);
+        let armature_data = DataBlock {
+            data_type: "armature".to_owned(),
+            mesh: None,
+            armature: Some(armature),
+            ..Default::default()
+        };
         doc.data_blocks
             .insert(armature_data_id.clone(), armature_data);
         doc.nodes.insert(
@@ -431,7 +435,7 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
     ];
     for (name, params, with_group) in cases {
         let mesh = weighted_grid(with_group)?;
-        let actual = evaluate_modifiers(&mesh, &[mask_modifier(params)?], name)?;
+        let actual = evaluate_modifiers(&mesh, &[mask_modifier(&params)?], name)?;
         assert_geometry_parity(name, &actual, &expected[name])?;
     }
     let empty_group_mesh = {
@@ -456,7 +460,7 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
         let actual = evaluate_modifiers(
             &mesh,
             &[mask_modifier(
-                json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":invert}),
+                &json!({"mode":"VERTEX_GROUP","vertex_group":"G","threshold":0.5,"invert_vertex_group":invert}),
             )?],
             name,
         )?;
@@ -474,7 +478,7 @@ fn mask_vertex_group_and_armature_modes_match_blender_threshold_invert_and_smoot
     ] {
         let actual = evaluate_modifiers(
             &empty_unrelated_mesh,
-            &[mask_modifier(json!({
+            &[mask_modifier(&json!({
                 "mode":"VERTEX_GROUP","vertex_group":"MISSING","threshold":0.5,
                 "invert_vertex_group":invert
             }))?],

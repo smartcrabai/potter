@@ -314,7 +314,7 @@ fn loop_ordinals(mesh: &Value) -> TestResult<Vec<Vec<usize>>> {
             .len();
         let row: Vec<usize> = match order {
             Some(order) => order
-                .get(&format!("f{id}"))
+                .get(format!("f{id}"))
                 .and_then(Value::as_array)
                 .ok_or_else(|| format!("corner_order has no row for face {id}"))?
                 .iter()
