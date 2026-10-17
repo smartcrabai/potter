@@ -560,7 +560,7 @@ impl Snapshot {
                     "node_id": prefix.node_id,
                     "keep": prefix.keep,
                 },
-            }))?)
+            })))
         } else {
             scene_hash.clone()
         };
