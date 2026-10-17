@@ -1133,10 +1133,29 @@ fn armature_apply_uses_the_simulated_subject_transform_and_persists() -> TestRes
         .mesh
         .as_ref()
         .ok_or("reopened Armature-applied mesh is missing")?;
+    // Apply stores vertex groups as DataBlock weights and strips the evaluated `vertex_groups` view
+    // attribute, so compare the geometry and check the group weights on the data block.
     ensure_eq(
-        actual_mesh,
-        &expected_mesh,
+        &(
+            actual_mesh.vertices.clone(),
+            actual_mesh.edges.clone(),
+            actual_mesh.faces.clone(),
+        ),
+        &(
+            expected_mesh.vertices.clone(),
+            expected_mesh.edges.clone(),
+            expected_mesh.faces.clone(),
+        ),
         "reopened Armature apply uses the simulated subject transform",
+    )?;
+    ensure_eq(
+        &data_block(&reopened)?
+            .vertex_groups
+            .iter()
+            .map(|group| group.name.clone())
+            .collect::<Vec<_>>(),
+        &vec!["Root".to_owned()],
+        "reopened Armature apply keeps its Root vertex group",
     )
 }
 
