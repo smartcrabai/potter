@@ -1975,8 +1975,8 @@ mod tests {
                 .contains_key(&crate::model::Id::new("stone").unwrap())
         );
         assert_eq!(
-            reassigned.doc.nodes.values().next().unwrap().materials[0].as_str(),
-            "stone"
+            reassigned.doc.nodes.values().next().unwrap().materials[0],
+            Some(crate::model::Id::new("stone").unwrap())
         );
     }
 

@@ -1811,6 +1811,8 @@ dependencies = [
  "hex",
  "image",
  "lz4_flex",
+ "num-rational",
+ "num-traits",
  "png",
  "proptest",
  "robust",

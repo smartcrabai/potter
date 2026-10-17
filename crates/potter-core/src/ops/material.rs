@@ -619,11 +619,12 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         }
     }).transpose()?;
     for id in &targets {
-        let is_referenced = engine
-            .doc
-            .nodes
-            .values()
-            .any(|node| node.materials.contains(id));
+        let is_referenced = engine.doc.nodes.values().any(|node| {
+            node.materials
+                .iter()
+                .flatten()
+                .any(|material| material == id)
+        });
         if is_referenced && reassign.is_none() {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
@@ -652,8 +653,8 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         match &reassign {
             Some(Some(replacement)) => {
                 for material in &mut node.materials {
-                    if targets.contains(material) {
-                        *material = replacement.clone();
+                    if material.as_ref().is_some_and(|id| targets.contains(id)) {
+                        *material = Some(replacement.clone());
                         changed = true;
                     }
                 }
@@ -661,7 +662,7 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             Some(None) => {
                 let old_len = node.materials.len();
                 node.materials
-                    .retain(|material| !targets.contains(material));
+                    .retain(|material| !material.as_ref().is_some_and(|id| targets.contains(id)));
                 changed = node.materials.len() != old_len;
             }
             None => {}

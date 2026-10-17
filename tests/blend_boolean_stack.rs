@@ -16,6 +16,8 @@ use tempfile::tempdir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
+const BLENDER_REQUIRED: &str = "Blender is required for the Boolean stack parity test: install Blender 5.2, or set POTTER_BLENDER to its executable";
+
 const BOOLEAN_STACK_FIXTURE: &str = r#"
 import bpy
 import json
@@ -275,10 +277,7 @@ fn assert_catalog_gate() -> TestResult<()> {
 #[test]
 fn boolean_decimate_solidify_topology_divergence_is_gated_for_exact_and_float() -> TestResult<()> {
     const TOLERANCE: f64 = 1.0e-5;
-    let Some(blender) = blender_executable() else {
-        eprintln!("skipping Boolean stack Blender parity test: Blender is unavailable");
-        return Ok(());
-    };
+    let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
     let directory = tempdir()?;
     let root = directory.path();
     let script = root.join("boolean_stack.py");

@@ -1613,7 +1613,10 @@ fn generated_data_id(engine: &Engine<'_>, node_id: &Id, suffix: &str) -> Result<
     )
 }
 
-fn read_material_slots(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result<Vec<Id>> {
+fn read_material_slots(
+    engine: &Engine<'_>,
+    operation: &Map<String, Value>,
+) -> Result<Vec<Option<Id>>> {
     if operation.contains_key("material") && operation.contains_key("materials") {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -1641,7 +1644,7 @@ fn read_material_slots(engine: &Engine<'_>, operation: &Map<String, Value>) -> R
                 &operation_pointer(engine.operation_index, "material"),
             ));
         }
-        return Ok(vec![id]);
+        return Ok(vec![Some(id)]);
     }
     if let Some(value) = operation.get("materials") {
         return read_material_array(engine, value, "materials");
@@ -1649,20 +1652,25 @@ fn read_material_slots(engine: &Engine<'_>, operation: &Map<String, Value>) -> R
     Ok(Vec::new())
 }
 
-fn read_material_array(engine: &Engine<'_>, value: &Value, field: &str) -> Result<Vec<Id>> {
+/// Reads a material slot array: each item is a material ID, or `null` for an empty slot.
+fn read_material_array(engine: &Engine<'_>, value: &Value, field: &str) -> Result<Vec<Option<Id>>> {
     let Some(values) = value.as_array() else {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
-            "materials must be an array of material IDs",
+            "materials must be an array of material IDs or nulls",
             &operation_pointer(engine.operation_index, field),
         ));
     };
-    let mut ids = Vec::with_capacity(values.len());
+    let mut slots = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
+        if value.is_null() {
+            slots.push(None);
+            continue;
+        }
         let Some(text) = value.as_str() else {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
-                "material IDs must be strings",
+                "material IDs must be strings or null",
                 &operation_pointer(engine.operation_index, &format!("{field}/{index}")),
             ));
         };
@@ -1678,9 +1686,9 @@ fn read_material_array(engine: &Engine<'_>, value: &Value, field: &str) -> Resul
                 &operation_pointer(engine.operation_index, &format!("{field}/{index}")),
             ));
         }
-        ids.push(id);
+        slots.push(Some(id));
     }
-    Ok(ids)
+    Ok(slots)
 }
 
 fn read_matrix(engine: &Engine<'_>, value: &Value, pointer: &str) -> Result<[f64; 16]> {

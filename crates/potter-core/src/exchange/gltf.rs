@@ -3876,7 +3876,7 @@ fn export_with_root_inner(
         .map(|(index, id)| (id.clone(), index))
         .collect::<BTreeMap<_, _>>();
     let mut meshes = Vec::<Value>::new();
-    let mut mesh_indices = BTreeMap::<(Id, Option<[u64; 3]>, Vec<Id>), usize>::new();
+    let mut mesh_indices = BTreeMap::<(Id, Option<[u64; 3]>, Vec<Option<Id>>), usize>::new();
     let mut instance_mesh_indices = BTreeMap::<(Id, Option<[u64; 3]>), usize>::new();
     let mut node_mesh_indices = BTreeMap::<Id, usize>::new();
     let mut skin_bindings = BTreeMap::<Id, SkinBinding>::new();
@@ -3932,6 +3932,7 @@ fn export_with_root_inner(
         if evaluated.vertices.is_empty() {
             continue;
         }
+        let material_slots = snapshot.material_slots(node_id, node);
         let (mesh, data_id, instance_target, data_block) = if let Some(data_id) = &node.data {
             let Some(data_block) = doc
                 .data_blocks
@@ -3961,7 +3962,7 @@ fn export_with_root_inner(
         });
         if let Some(data_id) = data_id
             && let Some(index) =
-                mesh_indices.get(&(data_id.clone(), mesh_variant, node.materials.clone()))
+                mesh_indices.get(&(data_id.clone(), mesh_variant, material_slots.to_vec()))
         {
             node_mesh_indices.insert(node_id.clone(), *index);
             continue;
@@ -4352,7 +4353,7 @@ fn export_with_root_inner(
         meshes.push(mesh_value);
         if let Some(data_id) = data_id {
             mesh_indices.insert(
-                (data_id.clone(), mesh_variant, node.materials.clone()),
+                (data_id.clone(), mesh_variant, material_slots.to_vec()),
                 mesh_index,
             );
         }
@@ -6312,7 +6313,7 @@ pub(crate) fn import_indexed(
     }
 
     let mut data_ids = Vec::<Id>::new();
-    let mut mesh_materials = Vec::<Vec<Id>>::new();
+    let mut mesh_materials = Vec::<Vec<Option<Id>>>::new();
     let mut mesh_skin_weights = Vec::<Option<Vec<SkinVertexWeights>>>::new();
     let mut mesh_ids_stale = Vec::<bool>::new();
     let mesh_values = root["meshes"].as_array().map_or(&[][..], Vec::as_slice);
@@ -6349,7 +6350,7 @@ pub(crate) fn import_indexed(
         let mut polygons = Vec::<Vec<usize>>::new();
         let mut face_material_indices = Vec::<u32>::new();
         let mut face_uvs = Vec::<Vec<CornerUvs>>::new();
-        let mut slots = Vec::<Id>::new();
+        let mut slots = Vec::<Option<Id>>::new();
         let mut morph_target_count = None;
         let mut morph_deltas = Vec::<Vec<[f64; 3]>>::new();
         let mut joint_data = Vec::<Option<SkinVertexWeights>>::new();
@@ -6359,6 +6360,10 @@ pub(crate) fn import_indexed(
         let mut morph_normals_missing = false;
         let mut primitive_starts = Vec::<usize>::new();
         let mut vertex_bases = BTreeMap::<VertexPayload, usize>::new();
+        // Material-less primitives get a slot only in a mesh where some primitive has a material.
+        let has_material_primitives = primitives
+            .iter()
+            .any(|primitive| primitive["material"].is_u64());
         for primitive in primitives {
             let mode = primitive["mode"].as_u64().unwrap_or(4);
             let accessor_index = usize::try_from(
@@ -6504,23 +6509,27 @@ pub(crate) fn import_indexed(
             } else {
                 (0..decoded.len()).collect()
             };
-            let material_slot = if let Some(index) = primitive["material"].as_u64() {
-                let material_index = usize::try_from(index)
-                    .map_err(|_| import_error("glTF material index exceeds platform range"))?;
-                let id = material_ids
-                    .get(material_index)
-                    .cloned()
-                    .ok_or_else(|| import_error("glTF primitive references a missing material"))?;
-                if let Some(slot) = slots.iter().position(|candidate| candidate == &id) {
-                    u32::try_from(slot).map_err(|_| import_error("too many glTF material slots"))?
-                } else {
-                    let slot = u32::try_from(slots.len())
-                        .map_err(|_| import_error("too many glTF material slots"))?;
-                    slots.push(id);
-                    slot
+            let material = match primitive["material"].as_u64() {
+                Some(index) => {
+                    let material_index = usize::try_from(index)
+                        .map_err(|_| import_error("glTF material index exceeds platform range"))?;
+                    Some(material_ids.get(material_index).cloned().ok_or_else(|| {
+                        import_error("glTF primitive references a missing material")
+                    })?)
                 }
-            } else {
+                None => None,
+            };
+            // Blender's glTF importer gives material-less primitives one shared empty slot, and only
+            // in a mesh where some primitive has a material; otherwise the mesh keeps no slots.
+            let material_slot = if material.is_none() && !has_material_primitives {
                 0
+            } else if let Some(slot) = slots.iter().position(|candidate| candidate == &material) {
+                u32::try_from(slot).map_err(|_| import_error("too many glTF material slots"))?
+            } else {
+                let slot = u32::try_from(slots.len())
+                    .map_err(|_| import_error("too many glTF material slots"))?;
+                slots.push(material);
+                slot
             };
             let face_start = polygons.len();
             primitive_starts.push(face_start);

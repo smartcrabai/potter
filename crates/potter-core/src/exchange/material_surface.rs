@@ -214,7 +214,7 @@ pub(crate) mod feature_id {
 pub(crate) fn material_is_used(doc: &crate::model::SceneDoc, material_id: &Id) -> bool {
     doc.nodes
         .values()
-        .any(|node| node.materials.iter().any(|id| id == material_id))
+        .any(|node| node.materials.iter().flatten().any(|id| id == material_id))
 }
 
 /// Resolves a Potter material to its glTF surface and the losses the conversion reports.

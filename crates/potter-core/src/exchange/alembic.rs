@@ -110,7 +110,12 @@ pub(crate) fn export(
                 format!("Alembic export does not represent visibility or selectability on `{id}`"),
             ));
         }
-        if !allow_lossy && !node.materials.is_empty() {
+        if !allow_lossy
+            && snapshot
+                .material_slots(id, node)
+                .iter()
+                .any(Option::is_some)
+        {
             return Err(unsupported(
                 "material.binding",
                 format!("Alembic export does not represent material bindings on `{id}`"),

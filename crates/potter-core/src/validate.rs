@@ -286,7 +286,7 @@ pub fn validate_with_context(
                 json!({"target":data}),
             );
         }
-        for material in &node.materials {
+        for material in node.materials.iter().flatten() {
             if !doc.materials.contains_key(material) {
                 issue(
                     &mut issues,
@@ -608,7 +608,8 @@ pub fn validate_with_context(
                 losses.extend(crate::commands::export::avatar_settings_loss(doc, "blend"));
                 losses
             } else {
-                let mut losses = crate::commands::export::export_losses(doc, format);
+                let mut losses =
+                    crate::commands::export::export_losses(doc, format, evaluation.as_ref().ok());
                 // Shading losses need the same meshes export builds, so evaluation errors surface here too.
                 if let Ok(snapshot) = &evaluation {
                     match crate::exchange::evaluated_meshes(doc, snapshot) {

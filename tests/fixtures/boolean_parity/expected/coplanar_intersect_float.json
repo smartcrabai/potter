@@ -1,0 +1,18 @@
+{
+ "case": "coplanar_intersect_float",
+ "research_section": "3.3",
+ "solver": "FLOAT",
+ "operation": "INTERSECT",
+ "use_self": false,
+ "material_mode": "INDEX",
+ "counts": {
+  "vertices": 13,
+  "edges": 10,
+  "faces": 0
+ },
+ "face_sizes": {},
+ "volume": 0.0,
+ "faces": [],
+ "vertex_groups": {},
+ "blender_version": "5.2.2 LTS"
+}

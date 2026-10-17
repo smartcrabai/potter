@@ -448,9 +448,10 @@ pub(super) fn extract_geometry(
                 .is_some_and(|data| {
                     matches!(data.data_type.as_str(), "pointcloud" | "point_cloud")
                 });
-            let default_point_color = node
-                .materials
+            let default_point_color = snapshot
+                .material_slots(node_id, node)
                 .first()
+                .and_then(Option::as_ref)
                 .and_then(|material_id| doc.materials.get(material_id))
                 .map_or([0.6, 0.6, 0.6, 1.0], |material| material.base_color);
             let world_scale = [
@@ -616,9 +617,10 @@ pub(super) fn extract_geometry(
             ]
             .into_iter()
             .fold(0.0_f64, f64::max);
-            let color = node
-                .materials
+            let color = snapshot
+                .material_slots(node_id, node)
                 .first()
+                .and_then(Option::as_ref)
                 .and_then(|material_id| doc.materials.get(material_id))
                 .map_or([0.6, 0.6, 0.6, 1.0], |material| material.base_color);
             for (curve_index, curve) in hair.curves.iter().enumerate() {

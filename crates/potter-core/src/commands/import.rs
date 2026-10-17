@@ -464,7 +464,11 @@ fn append_graph(
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "node ID mapping is missing"))?;
         node.data = remap_option(node.data, &data_map);
         node.parent = remap_option(node.parent, &node_map);
-        node.materials = remap_vec_owned(node.materials, &material_map);
+        node.materials = node
+            .materials
+            .into_iter()
+            .map(|slot| remap_option(slot, &material_map))
+            .collect();
         node.action = remap_option(node.action, &action_map);
         for track in &mut node.nla_tracks {
             for strip in &mut track.strips {
@@ -703,13 +707,6 @@ fn remap_vec(values: &mut Vec<Id>, mapping: &BTreeMap<Id, Id>) {
             value.clone_from(mapped);
         }
     }
-}
-
-fn remap_vec_owned(values: Vec<Id>, mapping: &BTreeMap<Id, Id>) -> Vec<Id> {
-    values
-        .into_iter()
-        .map(|id| mapping.get(&id).cloned().unwrap_or(id))
-        .collect()
 }
 
 fn mapping_value(mapping: &BTreeMap<Id, Id>) -> Value {

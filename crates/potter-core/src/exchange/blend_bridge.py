@@ -826,7 +826,7 @@ def _mesh_shape_keys(mesh):
     key_data = getattr(mesh, "shape_keys", None)
     blocks = getattr(key_data, "key_blocks", ()) if key_data else ()
     if not blocks:
-        return {"absolute": False, "evaluation_time": 0.0, "basis": [], "keys": []}
+        return None
     basis = blocks[0]
     basis_data = [{"index": index, "co": plain(point.co)} for index, point in enumerate(basis.data)]
     key_ids = _id_map(key_data, "potter.shape_key_ids_json")
@@ -5607,11 +5607,17 @@ def export_doc(doc, target, pack, scene_hash, context):
         set_rna(obj, visibility_rna)
         if item.get("tags"):
             obj["potter.tags"] = item["tags"]
-        for material_id in item.get("materials", []):
+        for slot_index, material_id in enumerate(item.get("materials", [])):
+            if obj.type not in ("MESH", "CURVE", "SURFACE", "FONT", "GREASEPENCIL"):
+                continue
+            if material_id is None:
+                # An empty slot stays a slot, so face material indices keep pointing at their own slot.
+                if len(obj.data.materials) <= slot_index:
+                    obj.data.materials.append(None)
+                continue
             material = material_map.get(material_id)
-            if material and obj.type in ("MESH", "CURVE", "SURFACE", "FONT", "GREASEPENCIL"):
-                if obj.data.materials.get(material.name_full) is None:
-                    obj.data.materials.append(material)
+            if material and obj.data.materials.get(material.name_full) is None:
+                obj.data.materials.append(material)
         if obj.type == "MESH":
             groups = _vertex_groups_from_model(doc, data_id)
             if not groups:

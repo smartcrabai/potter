@@ -1474,6 +1474,8 @@ pub struct ModifierRuntime {
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
     pub operand_mesh: Option<Value>,
+    /// Operands of the EXACT Boolean in the subject's space (subject excluded), in Blender order.
+    pub boolean_operands: Vec<crate::geom::boolean::BooleanOperand>,
     pub warp_from: Option<[f64; 3]>,
     pub warp_to: Option<[f64; 3]>,
     pub hook_target_position: Option<[f64; 3]>,
@@ -1547,8 +1549,10 @@ pub struct Node {
     pub transform: Transform,
     #[serde(default)]
     pub data: Option<Id>,
+    /// Material slots in slot order. `null` is an empty slot: a face index on it has no material,
+    /// as Blender's empty material slot does. Old files holding only ids still load unchanged.
     #[serde(default)]
-    pub materials: Vec<Id>,
+    pub materials: Vec<Option<Id>>,
     #[serde(default)]
     pub modifiers: Vec<Modifier>,
     #[serde(default = "default_true")]
@@ -1610,13 +1614,12 @@ impl Default for Node {
 }
 
 impl Node {
-    /// Material of slot `index` in this node's own material list; `None` past its end.
+    /// The material bound to a slot, or `None` for an empty or missing slot.
     #[must_use]
     pub fn material_slot(&self, index: usize) -> Option<&Id> {
-        self.materials.get(index)
+        self.materials.get(index).and_then(Option::as_ref)
     }
 }
-
 fn default_true() -> bool {
     true
 }
