@@ -23,6 +23,10 @@ pub struct BsdfParams {
     pub transmission: f64,
     pub ior: f64,
     pub alpha: f64,
+    /// Weight of the reflective closures (diffuse, specular, transmission, environment). Emission
+    /// contributes no reflection, so an Emission shader sets this to 0. Mix lerps it and Add sums
+    /// it, clamped to 1.
+    pub reflectance: f64,
     pub subsurface_weight: f64,
     pub subsurface_radius: [f64; 3],
     pub subsurface_scale: f64,
@@ -59,6 +63,7 @@ impl BsdfParams {
             transmission: material.transmission,
             ior: material.ior,
             alpha: material.base_color[3],
+            reflectance: 1.0,
             subsurface_weight: 0.0,
             subsurface_radius: [1.0; 3],
             subsurface_scale: 0.05,
@@ -110,6 +115,7 @@ impl BsdfParams {
             transmission: mix_scalar(first.transmission, second.transmission),
             ior: mix_scalar(first.ior, second.ior),
             alpha: mix_scalar(first.alpha, second.alpha),
+            reflectance: mix_scalar(first.reflectance, second.reflectance),
             subsurface_weight: mix_scalar(first.subsurface_weight, second.subsurface_weight),
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: mix_scalar(first.subsurface_scale, second.subsurface_scale),
@@ -158,6 +164,7 @@ impl BsdfParams {
             transmission: first.transmission.max(second.transmission),
             ior: first.ior,
             alpha: first.alpha.max(second.alpha),
+            reflectance: (first.reflectance + second.reflectance).min(1.0),
             subsurface_weight: first.subsurface_weight.max(second.subsurface_weight),
             subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: first.subsurface_scale.max(second.subsurface_scale),
@@ -1022,6 +1029,10 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
         params.base_color = color;
         params.emission_color = [color[0], color[1], color[2]];
         params.emission_strength = self.scalar_input(id, &["Strength"], 1.0)?;
+        // An emission closure alone adds radiance and no reflection: Cycles'
+        // `EmissionNode::compile` (intern/cycles/scene/shader_nodes.cpp:3071-3098) emits only
+        // `NODE_CLOSURE_EMISSION`.
+        params.reflectance = 0.0;
         Ok(params)
     }
 
@@ -1727,6 +1738,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
         }
     }
 
+    /// `ShaderNodeAttribute`. The `Color` output is RGB with alpha 1.0: EEVEE's `node_attribute`
+    /// sets `outcol = float4(attr.xyz, 1.0f)` (`gpu/shaders/material/gpu_shader_material_attribute.glsl`).
+    /// Cycles' Color is a float3 output (`intern/cycles/scene/shader_nodes.cpp`,
+    /// `AttributeNode::compile`, `NODE_ATTR_OUTPUT_FLOAT3`). The `Alpha` output carries the layer
+    /// alpha (EEVEE `outalpha = attr.w`; Cycles `NODE_ATTR_OUTPUT_FLOAT_ALPHA`). A missing layer
+    /// loads as opaque black.
     fn attribute(&self, id: &Id, socket: &str) -> Result<Value> {
         let node = self.node(id)?;
         let name = node
@@ -1735,11 +1752,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
             .or_else(|| node.properties.get("name"))
             .and_then(JsonValue::as_str)
             .ok_or_else(|| invalid("Attribute node requires attribute_name"))?;
-        color_output(
-            layer_color(&self.hit_ctx, name, false, [0.0, 0.0, 0.0, 1.0]),
-            socket,
-            "Attribute",
-        )
+        let [red, green, blue, alpha] =
+            layer_color(&self.hit_ctx, name, false, [0.0, 0.0, 0.0, 1.0]);
+        match socket {
+            "Color" => Ok(Value::Color([red, green, blue, 1.0])),
+            _ => color_output([red, green, blue, alpha], socket, "Attribute"),
+        }
     }
 
     /// `ShaderNodeVertexColor`: the named color layer, or the render layer when the name is empty.
@@ -2555,10 +2573,10 @@ mod tests {
         let mut graph = NodeGroup::new("MissingAttributeColor", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(&mut graph, "bsdf", "ShaderNodeBsdfPrincipled", json!({}));
-        insert_node(
+        insert_node(&mut graph, "attribute", "ShaderNodeAttribute", json!({}));
+        set_properties(
             &mut graph,
             "attribute",
-            "ShaderNodeAttribute",
             json!({"attribute_type":"GEOMETRY","attribute_name":"Ghost"}),
         );
         link(&mut graph, "attribute", "Color", "bsdf", "Base Color");
@@ -2577,7 +2595,7 @@ mod tests {
             &HitContext::new(&groups).with_color_layers(&found, None),
         )
         .unwrap();
-        assert_eq!(params.base_color, source);
+        assert_eq!(params.base_color, [source[0], source[1], source[2], 1.0]);
 
         let params = evaluate_surface(
             &material,

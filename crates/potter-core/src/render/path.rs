@@ -1610,7 +1610,8 @@ fn sample_bsdf(params: &BsdfParams, view: DVec3, rng: &mut Pcg32) -> (DVec3, DVe
         );
         return (
             direction,
-            tint * (transmission_weight / p_transmission.max(1.0e-8)),
+            tint * (params.reflectance.clamp(0.0, 1.0) * transmission_weight
+                / p_transmission.max(1.0e-8)),
             false,
         );
     }
@@ -1666,7 +1667,9 @@ fn evaluate_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) 
     let diffuse = albedo
         * ((1.0 - params.metallic.clamp(0.0, 1.0)) * (1.0 - params.transmission.clamp(0.0, 1.0))
             / std::f64::consts::PI);
-    diffuse + specular
+    // Emission contributes no reflection; `reflectance` weights the reflective closures
+    // (Cycles' `EmissionNode::compile`, intern/cycles/scene/shader_nodes.cpp:3071-3098).
+    (diffuse + specular) * params.reflectance.clamp(0.0, 1.0)
 }
 
 fn smith_g1(cosine: f64, alpha_squared: f64) -> f64 {

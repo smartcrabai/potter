@@ -1467,7 +1467,7 @@ mod tests {
             }),
         )?;
         let first = mesh.vertices[0].id;
-        let second = mesh.vertices[2].id;
+        let second = mesh.vertices[1].id;
         let shared_edge = mesh
             .edges
             .iter()

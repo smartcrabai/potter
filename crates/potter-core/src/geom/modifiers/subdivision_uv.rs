@@ -1183,8 +1183,8 @@ impl NormalSubdivision {
         }
     }
 
-    /// Blender face index and loop-start slot of each sample in the current ptex grid.
-    fn blender_faces(&self) -> Vec<(usize, usize)> {
+    /// Blender face index of each sample in the current ptex grid.
+    fn blender_faces(&self) -> Vec<usize> {
         let mut offsets = Vec::with_capacity(self.faces.len());
         let mut total = 0;
         for (index, face) in self.faces.iter().enumerate() {
@@ -1199,31 +1199,31 @@ impl NormalSubdivision {
                 let face = self.corner_face[sample.corner];
                 let side = self.side(face);
                 if self.faces[face].count == 4 {
-                    (
-                        offsets[face] + quad_index(sample.x, sample.y, side),
-                        boundary_run(sample.x, sample.y, side),
-                    )
+                    offsets[face] + quad_index(sample.x, sample.y, side)
                 } else {
-                    let (index, run) = ngon_square_order(
-                        self.corner_local[sample.corner],
-                        sample.x,
-                        sample.y,
-                        side,
-                        self.faces[face].count,
-                    );
-                    (offsets[face] + index, run)
+                    offsets[face]
+                        + ngon_square_order(
+                            self.corner_local[sample.corner],
+                            sample.x,
+                            sample.y,
+                            side,
+                            self.faces[face].count,
+                        )
                 }
             })
             .collect()
     }
 
-    /// Blender loop ordinal of each output corner, in Potter order.
+    /// Blender loop ordinal of each output corner, in Potter order. `subdiv_foreach.cc` numbers each
+    /// ptex square's loops from that square's own grid corners: `rotate_indices` by the emitting
+    /// block's rotation puts grid corner `m` at loop `m`. Output corner `k` of a sample in slot
+    /// `rotation` is therefore the grid corner `(rotation + k) % 4`.
     fn loop_order(&self) -> Vec<usize> {
         let faces = self.blender_faces();
         let mut order = Vec::with_capacity(self.samples.len() * 4);
-        for (sample, &(face, run)) in self.samples.iter().zip(&faces) {
+        for (sample, &face) in self.samples.iter().zip(&faces) {
             for corner in 0..4 {
-                order.push(4 * face + (sample.rotation + corner + 4 - run) % 4);
+                order.push(4 * face + (sample.rotation + corner) % 4);
             }
         }
         order
@@ -1360,14 +1360,8 @@ fn boundary_run(x: usize, y: usize, side: usize) -> usize {
 }
 
 /// Blender's special n-gon ptex traversal order: inner squares, patch connections, centre squares, then
-/// U and V boundary squares. Returns the face index within the parent polygon and loop-start slot.
-fn ngon_square_order(
-    corner: usize,
-    x: usize,
-    y: usize,
-    side: usize,
-    corners: usize,
-) -> (usize, usize) {
+/// U and V boundary squares. Returns the face index within the parent polygon.
+fn ngon_square_order(corner: usize, x: usize, y: usize, side: usize, corners: usize) -> usize {
     let inner = side.saturating_sub(1);
     let boundary = side.saturating_sub(2);
     let inner_per_corner = inner * boundary;
@@ -1377,23 +1371,20 @@ fn ngon_square_order(
     let centre_faces = corners * centre_per_corner;
 
     if side >= 2 && (1..side).contains(&x) && (1..side - 1).contains(&y) {
-        return (corner * inner_per_corner + (y - 1) * inner + (x - 1), 0);
+        return corner * inner_per_corner + (y - 1) * inner + (x - 1);
     }
     if side >= 3 && y == side - 1 && (1..side - 1).contains(&x) {
-        return (inner_faces + corner * boundary + x - 1, 1);
+        return inner_faces + corner * boundary + x - 1;
     }
     if side >= 2 && x == side - 1 && y == side - 1 {
-        return (inner_faces + connection_faces + corner, 2);
+        return inner_faces + connection_faces + corner;
     }
 
     let boundary_start = inner_faces + connection_faces + centre_faces;
     if y == 0 {
-        (boundary_start + corner * side + x, 0)
+        boundary_start + corner * side + x
     } else {
-        (
-            boundary_start + corners * side + corner * inner + (y - 1),
-            3,
-        )
+        boundary_start + corners * side + corner * inner + (y - 1)
     }
 }
 
@@ -1590,10 +1581,18 @@ mod tests {
     }
 
     #[test]
-    fn loop_numbering_is_identity_on_level_one_and_a_permutation_on_level_two() {
+    fn loop_numbering_starts_each_square_at_its_own_corner_on_level_one() {
+        // Quad `f`'s corner `c` is ptex square `c`, numbered from its own grid corner: loop `c + k`.
         let mut state = quads(2);
         state.refine();
-        assert_eq!(state.loop_order(), (0..32).collect::<Vec<_>>());
+        let expected: Vec<usize> = (0..2)
+            .flat_map(|face| {
+                (0..4).flat_map(move |corner| {
+                    (0..4).map(move |k| 16 * face + 4 * corner + (corner + k) % 4)
+                })
+            })
+            .collect();
+        assert_eq!(state.loop_order(), expected);
         state.refine();
         let mut order = state.loop_order();
         order.sort_unstable();

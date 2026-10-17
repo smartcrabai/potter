@@ -534,6 +534,7 @@ pub(super) fn extract_geometry(
                             base_color,
                             material.map_or(0.0, |value| value.metallic),
                             material.map_or(0.8, |value| value.roughness),
+                            1.0,
                             mode,
                             None,
                             images,
@@ -887,6 +888,7 @@ pub(super) fn extract_geometry(
                 material.base_color,
                 material.metallic,
                 material.roughness,
+                1.0,
                 mode,
                 Some((&bvh, &geometry.triangles, &shadow_maps)),
                 images,
@@ -1503,6 +1505,7 @@ impl SurfaceShader for SceneShader<'_> {
             || material.map_or(1.0, |material| material.base_color[3]),
             |params| params.alpha,
         );
+        let reflectance = params.map_or(1.0, |params| params.reflectance);
         let base = [base_color[0], base_color[1], base_color[2], alpha];
         let shadow = self.geometry.shadows.as_ref().map(|shadows| {
             (
@@ -1521,6 +1524,7 @@ impl SurfaceShader for SceneShader<'_> {
             base,
             metallic,
             roughness,
+            reflectance,
             self.mode,
             shadow,
             self.images,
@@ -1877,6 +1881,7 @@ fn shade(
     base: [f64; 4],
     metallic: f64,
     roughness: f64,
+    reflectance: f64,
     mode: Mode,
     shadow: ShadowContext<'_>,
     images: &BTreeMap<String, ImageData>,
@@ -1971,6 +1976,10 @@ fn shade(
             );
         }
     }
+    // Reflectance weights every reflective closure (ambient, direct, environment). Emission adds
+    // radiance without reflection, so the caller adds it unscaled (Cycles' `EmissionNode::compile`,
+    // intern/cycles/scene/shader_nodes.cpp:3071-3098).
+    let result = result * reflectance.clamp(0.0, 1.0);
     let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
     Ok([result.x, result.y, result.z, base[3]])
 }
@@ -2523,7 +2532,7 @@ mod shading_normal_tests {
     #[test]
     fn flat_graph_triangle_renders_asymmetric_texture_and_emission_per_hit()
     -> crate::error::Result<()> {
-        let initial = SceneDoc::new("scene".to_owned());
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         let applied = crate::ops::apply_batch(
             &initial,
             &json!({
@@ -2713,7 +2722,7 @@ mod shading_normal_tests {
 
     #[test]
     fn renderer_resolves_shared_data_slots_and_object_overrides() -> crate::error::Result<()> {
-        let initial = SceneDoc::new("scene".to_owned());
+        let initial = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         let mut doc = crate::ops::apply_batch(
             &initial,
             &json!({

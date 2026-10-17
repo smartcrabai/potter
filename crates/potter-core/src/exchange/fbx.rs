@@ -977,7 +977,7 @@ fn build_texture_exports(
 fn missing_texture_uv_layers(
     doc: &SceneDoc,
     snapshot: &Snapshot,
-) -> BTreeMap<(Id, Option<String>, Id, usize), Option<String>> {
+) -> BTreeMap<(Id, Option<String>, Id, Option<String>), usize> {
     let mut missing = BTreeMap::new();
     for (node_id, node) in &doc.nodes {
         let Some(mesh) = export_mesh_for_node(doc, snapshot, node_id, node) else {
@@ -1000,10 +1000,14 @@ fn missing_texture_uv_layers(
                 let selection = resolve_texture_uv_selection(Some(&store), binding, requested);
                 if selection.missing.is_some() || selection.uv_layer.is_none() {
                     let missing_layer = selection.missing.or_else(|| requested.map(str::to_owned));
-                    missing.insert(
-                        (material_id.clone(), missing_layer, node_id.clone(), slot),
-                        selection.uv_layer,
-                    );
+                    missing
+                        .entry((
+                            material_id.clone(),
+                            missing_layer,
+                            node_id.clone(),
+                            selection.uv_layer,
+                        ))
+                        .or_insert(slot);
                 }
             }
         }
@@ -1015,9 +1019,7 @@ fn missing_texture_uv_layers(
 pub(crate) fn uv_texture_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss> {
     missing_texture_uv_layers(doc, snapshot)
         .into_iter()
-        .filter_map(|((material, layer, node, slot), render_layer)| {
-
-
+        .filter_map(|((material, layer, node, render_layer), slot)| {
             render_layer.is_none().then_some(Loss {
                 feature_id: "uv.layer_missing".to_owned(),
                 data_id: Some(material.to_string()),
@@ -1076,7 +1078,7 @@ pub(crate) fn material_slot_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<L
 pub(crate) fn uv_texture_warnings(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PotError> {
     missing_texture_uv_layers(doc, snapshot)
         .into_iter()
-        .filter_map(|((material, layer, node, slot), render_layer)| {
+        .filter_map(|((material, layer, node, render_layer), slot)| {
             Some((material, layer?, node, slot, render_layer?))
         })
         .map(|(material, layer, node, slot, render_layer)| {
@@ -3868,7 +3870,7 @@ mod tests {
         let node_id = Id::new("sheet")?;
         let mut mesh = triangle()?;
         mesh.faces[0].material_index = 2;
-        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         doc.materials
             .insert(first_material.clone(), Material::default());
         doc.materials

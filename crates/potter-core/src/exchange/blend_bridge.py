@@ -12,6 +12,7 @@ import math
 import os
 import sys
 import traceback
+import tempfile
 from mathutils import Euler, Matrix, Quaternion
 DEFERRED_ID_ASSIGNMENTS = []
 CACHE_FILES_BY_IDENTITY = {}
@@ -1954,7 +1955,7 @@ def _startup_metadata_datablock(collection_name, block):
 
 def other_datablocks_dump():
     known = {"actions", "armatures", "cache_files", "cameras", "collections", "curves", "fonts",
-             "grease_pencils_v3", "images", "libraries", "lights", "materials", "meshes",
+             "grease_pencils", "images", "libraries", "lights", "materials", "meshes",
              "movieclips", "node_groups", "objects", "scenes", "texts", "volumes", "worlds"}
     result = []
     for collection_name in dir(bpy.data):
@@ -2038,7 +2039,8 @@ def material_dump(material):
                 pass
     return {"name": material.name_full, "potter_id": material.get("potter.id"),
             "library": library_reference(material),
-            "base_color": base_color, "metallic": metallic, "roughness": roughness,
+            "base_color": base_color,
+            "metallic": metallic, "roughness": roughness,
             "emission_color": emission_color, "emission_strength": emission_strength,
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
@@ -2070,7 +2072,7 @@ def dump_all():
             "objects": [object_dump(item) for item in bpy.data.objects],
             "armatures": [_armature_dump(item) for item in bpy.data.armatures],
             "grease_pencil": [_grease_pencil_dump(item) for item in
-                              getattr(bpy.data, "grease_pencils_v3", ())],
+                              getattr(bpy.data, "grease_pencils", ())],
             "curves": [curve_dump(item) for item in bpy.data.curves],
             "volumes": [volume_dump(item) for item in getattr(bpy.data, "volumes", ())],
             "meshes": [mesh_dump(item) for item in bpy.data.meshes],
@@ -2814,7 +2816,7 @@ def _source_modifier_object_copies(doc, mesh_map):
 
     source_collections = (
         "actions", "armatures", "cameras", "collections", "curves",
-        "grease_pencils_v3", "images", "lights", "materials", "meshes",
+        "grease_pencils", "images", "lights", "materials", "meshes",
         "node_groups", "objects", "shape_keys", "volumes", "worlds",
     )
     before = {
@@ -2893,7 +2895,7 @@ def _source_modifier_object_copies(doc, mesh_map):
         bpy.data.objects.remove(source_obj, do_unlink=True)
     for collection_name in (
         "collections", "meshes", "curves", "armatures", "cameras", "lights",
-        "grease_pencils_v3", "volumes", "materials", "images", "node_groups",
+        "grease_pencils", "volumes", "materials", "images", "node_groups",
         "shape_keys", "actions", "worlds",
     ):
         collection = getattr(bpy.data, collection_name, None)
@@ -3022,6 +3024,9 @@ def _apply_native_shading(mesh, attributes, face_items, edge_items, edge_of):
     for polygon, face in zip(mesh.polygons, face_items):
         polygon.use_smooth = bool(smooth.get("f%d" % face["id"], False))
     for field, key in (("use_edge_sharp", "sharp"), ("use_seam", "seam")):
+        if attributes.get(key) is None:
+            # Setting a flag creates Blender's sharp_edge / uv_seam attribute, so an absent layer stays absent.
+            continue
         flags = _native_values(attributes, key)
         for index, edge in enumerate(edge_items):
             value = bool(flags.get("e%d" % edge["id"], False))
@@ -3069,10 +3074,19 @@ def _custom_normal_pair(entry):
     return (entry[0], entry[1])
 
 
-def _flatten_face_rows(rows, face_items, owner):
+def _attribute_default(data_type):
+    """Blender's value for an element Potter stores no entry for: zero, or opaque black for colours."""
+    if data_type in MESH_COLOR_TYPES:
+        return (0.0, 0.0, 0.0, 1.0)
+    return {"BOOLEAN": False, "INT": 0, "FLOAT": 0.0, "FLOAT2": (0.0, 0.0),
+            "FLOAT_VECTOR": (0.0, 0.0, 0.0), "QUATERNION": (0.0, 0.0, 0.0, 0.0)}[data_type]
+
+
+def _flatten_face_rows(rows, face_items, owner, default):
+    """Flattened corner values of `face_items`; a face without a row takes `default` on every corner."""
     flat = []
     for face in face_items:
-        row = _required(rows, "f%d" % face["id"], owner)
+        row = rows.get("f%d" % face["id"], [default] * len(face["v"]))
         if len(row) != len(face["v"]):
             raise ValueError("%s row f%d has %d corners, expected %d"
                              % (owner, face["id"], len(row), len(face["v"])))
@@ -3168,7 +3182,7 @@ def _apply_native_custom_normals(mesh, attributes, vector_rows, face_items, layo
         raise ValueError("Blender did not create a custom_normal layer of %d codes for mesh %s"
                          % (len(vectors), mesh.name))
     if has_codes:
-        entries = layout.loops(_flatten_face_rows(spec["values"], face_items, "custom_normal"),
+        entries = layout.loops(_flatten_face_rows(spec["values"], face_items, "custom_normal", None),
                                "custom_normal values of mesh %s" % mesh.name)
         for index, entry in enumerate(entries):
             pair = _custom_normal_pair(entry)
@@ -3194,10 +3208,11 @@ def _apply_native_colors(mesh, attributes, names, vertex_items, face_items, layo
         if domain == "point":
             layer = mesh.color_attributes.new(name=name, type=data_type, domain="POINT")
             for index, vertex in enumerate(vertex_items):
-                layer.data[index].color = _required(values, "v%d" % vertex["id"], name)
+                layer.data[index].color = values.get("v%d" % vertex["id"], _attribute_default(data_type))
         elif domain == "corner":
             layer = mesh.color_attributes.new(name=name, type=data_type, domain="CORNER")
-            colors = layout.loops(_flatten_face_rows(values, face_items, "color layer %s" % name),
+            colors = layout.loops(_flatten_face_rows(values, face_items, "color layer %s" % name,
+                                                     _attribute_default(data_type)),
                                   "color layer %s" % name)
             for index, color in enumerate(colors):
                 layer.data[index].color = color
@@ -3220,23 +3235,24 @@ def _apply_native_attributes(mesh, attributes, names, vertex_items, edge_items, 
         domain, data_type = kind
         attribute = mesh.attributes.new(name=name, type=data_type, domain=domain)
         values = spec.get("values", {})
+        default = _attribute_default(data_type)
         if domain == "POINT":
             for index, vertex in enumerate(vertex_items):
                 _set_attribute_item(attribute.data[index], data_type,
-                                    _required(values, "v%d" % vertex["id"], name))
+                                    values.get("v%d" % vertex["id"], default))
         elif domain == "EDGE":
             for index, edge in enumerate(edge_items):
-                value = _required(values, "e%d" % edge["id"], name)
+                value = values.get("e%d" % edge["id"], default)
                 target = edge_of[index]
                 if target is None:
                     raise ValueError("mesh attribute %s has no Blender edge for e%d" % (name, edge["id"]))
                 _set_attribute_item(attribute.data[target], data_type, value)
         elif domain == "FACE":
-            per_face = [_required(values, "f%d" % face["id"], name) for face in face_items]
+            per_face = [values.get("f%d" % face["id"], default) for face in face_items]
             for index, value in enumerate(layout.polygons(per_face)):
                 _set_attribute_item(attribute.data[index], data_type, value)
         else:
-            per_corner = _flatten_face_rows(values, face_items, "mesh attribute %s" % name)
+            per_corner = _flatten_face_rows(values, face_items, "mesh attribute %s" % name, default)
             for index, value in enumerate(layout.loops(per_corner, "mesh attribute %s" % name)):
                 _set_attribute_item(attribute.data[index], data_type, value)
 
@@ -3296,7 +3312,11 @@ def mesh_create(name, raw, block_id):
     spec = _custom_normal_spec(attributes)
     corner_order = None
     if spec is not None and spec.get("corner_order") is not None:
-        corner_order = _flatten_face_rows(spec["corner_order"], face_items, "custom_normal corner_order")
+        rows = spec["corner_order"]
+        missing = [face["id"] for face in face_items if "f%d" % face["id"] not in rows]
+        if missing:
+            raise ValueError("custom_normal corner_order has no row for faces %s" % missing)
+        corner_order = _flatten_face_rows(rows, face_items, "custom_normal corner_order", None)
     # Polygons and loops are built in the stored corner basis; `layout` is the only native->Blender mapping.
     layout = _loop_layout(face_items, corner_order)
     faces = [[vertex_indexes[value] for value in polygon] for polygon in layout.polygon_vertices]
@@ -3730,7 +3750,7 @@ def _load_blend_libraries(doc, target):
                         "camera": ("cameras", "Camera"),
                         "light": ("lights", "Light"),
                         "armature": ("armatures", "Armature"),
-                        "grease_pencil": ("grease_pencils_v3", "GreasePencil"),
+                        "grease_pencil": ("grease_pencils", "GreasePencil"),
                         "curve": ("curves", "Curve"),
                         "surface": ("curves", "Curve"),
                         "text": ("curves", "Curve"),
@@ -4834,7 +4854,7 @@ def _cache_file_from_alembic(filepath, identity):
         return existing
     collection_names = (
         "objects", "collections", "actions", "armatures", "cameras", "curves",
-        "grease_pencils_v3", "lights", "materials", "meshes", "node_groups",
+        "grease_pencils", "lights", "materials", "meshes", "node_groups",
         "volumes", "worlds", "cache_files",
     )
     before = {
@@ -5513,7 +5533,7 @@ def _material_field_values(material):
     if displacement is not None:
         values["displacement_scale"] = _unlinked_float(displacement, "Scale", 1.0)
         values["displacement_midlevel"] = _unlinked_float(displacement, "Midlevel", 0.5)
-    volume = _field_source(output, "Volume", "VOLUME_PRINCIPLED")
+    volume = _field_source(output, "Volume", "PRINCIPLED_VOLUME")
     if volume is not None:
         # Blender's Principled Volume Density defaults to 1.0 when the node stores none.
         values["volume_density"] = _unlinked_float(volume, "Density", 1.0)
@@ -5647,7 +5667,7 @@ def _field_graph_verdict(tree):
     return _field_graph_unchanged(tree)
 
 
-_GENERATED_FIELD_TREE_TYPES = ("BSDF_PRINCIPLED", "OUTPUT_MATERIAL", "DISPLACEMENT", "VOLUME_PRINCIPLED")
+_GENERATED_FIELD_TREE_TYPES = ("BSDF_PRINCIPLED", "OUTPUT_MATERIAL", "DISPLACEMENT", "PRINCIPLED_VOLUME")
 
 
 def _mark_generated_field_graph(tree):
@@ -5686,7 +5706,7 @@ def _restore_material_field_nodes(material, item):
     density = float(item.get("volume_density", 0.0))
     color = [float(channel) for channel in item.get("volume_color", [0.5, 0.5, 0.5])]
     anisotropy = float(item.get("volume_anisotropy", 0.0))
-    volume = _owned_field_node(material.node_tree, output, "Volume", "VOLUME_PRINCIPLED",
+    volume = _owned_field_node(material.node_tree, output, "Volume", "PRINCIPLED_VOLUME",
                                "ShaderNodeVolumePrincipled", material,
                                needed=density != 0.0 or color != [0.5, 0.5, 0.5] or anisotropy != 0.0)
     if volume is not None:
@@ -5728,6 +5748,9 @@ def _restore_data_materials(data_raw, data_blocks, material_map, linked_data_blo
         data = data_blocks.get(data_id)
         if data is None:
             continue
+        # Clearing the slots resets every polygon's material_index to 0, so the indices are kept and restored.
+        indices = ([polygon.material_index for polygon in data.polygons]
+                   if hasattr(data, "polygons") else None)
         data.materials.clear()
         for material_id in item.get("materials", []):
             material = material_map.get(material_id) if material_id is not None else None
@@ -5735,6 +5758,9 @@ def _restore_data_materials(data_raw, data_blocks, material_map, linked_data_blo
                 raise ValueError("data block %s references missing material %s"
                                  % (data_id, material_id))
             data.materials.append(material)
+        if indices is not None:
+            for polygon, index in zip(data.polygons, indices):
+                polygon.material_index = index
 
 
 def _restore_object_material_slots(obj, node, material_map, scene):
@@ -5768,6 +5794,33 @@ def _restore_object_material_slots(obj, node, material_map, scene):
             raise ValueError("object %s has unknown material slot link %r" % (obj.name, link))
 
 
+def _pack_image(image):
+    """Packs an image's current pixels into the .blend.
+
+    A float buffer is packed from the bytes Blender's file writer produces. Blender 5.2.2's packed-buffer path
+    (`image.pack()` without data) leaves the OpenEXR line-offset table empty, so the file writer is the source.
+    Byte buffers keep `image.pack()`.
+    """
+    if not image.is_float:
+        image.pack()
+        return
+    descriptor, path = tempfile.mkstemp(suffix=".exr")
+    os.close(descriptor)
+    previous_path = image.filepath_raw
+    previous_format = image.file_format
+    try:
+        image.filepath_raw = path
+        image.file_format = "OPEN_EXR"
+        image.save()
+        with open(path, "rb") as handle:
+            data = handle.read()
+    finally:
+        image.filepath_raw = previous_path
+        image.file_format = previous_format
+        os.remove(path)
+    image.pack(data=data, data_len=len(data))
+
+
 def export_doc(doc, target, pack, scene_hash, context):
     CACHE_FILES_BY_IDENTITY.clear()
     DEFERRED_ID_ASSIGNMENTS.clear()
@@ -5786,7 +5839,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         if collection.users == 0:
             bpy.data.collections.remove(collection)
     for collection_name in (
-        "actions", "armatures", "cameras", "curves", "grease_pencils_v3",
+        "actions", "armatures", "cameras", "curves", "grease_pencils",
         "images", "lights", "materials", "meshes", "node_groups", "volumes", "worlds",
     ):
         collection = getattr(bpy.data, collection_name, None)
@@ -5915,8 +5968,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene["potter.view_layer_ids_json"] = json.dumps(view_layer_ids, sort_keys=True)
     image_map = {}
     for image_id, item in doc.get("images", {}).items():
+        # Float buffers pack as OpenEXR and byte buffers as PNG (Blender image.cc), so pixels stay unquantised.
         image = bpy.data.images.new(item["name"], width=int(item["width"]),
-                                    height=int(item["height"]), alpha=True)
+                                    height=int(item["height"]), alpha=True, float_buffer=True)
         sidecar = _export_sidecar_path(doc, item.get("source_path"))
         if sidecar is not None:
             # A linked image is a FILE image on the sidecar copy the export wrote, so the .blend carries its pixels.
@@ -5932,10 +5986,22 @@ def export_doc(doc, target, pack, scene_hash, context):
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
         if sidecar is None and pixels is not None:
+            # Changing the colour space drops the float buffer, so the save colour space is set before the pixels.
+            # Blender's EXR save converts an sRGB float buffer to linear; the packed buffer is saved as Linear
+            # Rec.709 and the declared sRGB is restored afterwards.
+            declared = image.colorspace_settings.name
+            save_linear = image.is_float and declared == "sRGB"
+            if save_linear:
+                image.colorspace_settings.name = "Linear Rec.709"
             image.pixels.foreach_set(
                 [channel for pixel in pixels for channel in pixel])
             image.update()
-        if item.get("source") == "packed":
+            try:
+                _pack_image(image)
+            finally:
+                if save_linear:
+                    image.colorspace_settings.name = declared
+        if item.get("source") == "packed" and image.packed_file is None:
             image.pack()
         set_id(image, image_id)
         image_metadata = {key: value for key, value in item.items() if key != "pixels"}
@@ -6037,9 +6103,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             armature_map[data_id] = armature
         elif item.get("type") in ("grease_pencil", "grease-pencil", "grease_pencils_v3"):
             source = compatibility_block(doc, "grease_pencil", "GreasePencil", data_id)
-            collection = getattr(bpy.data, "grease_pencils_v3", None)
-            if collection is None:
-                raise ValueError("Blender does not support Grease Pencil v3 data")
+            collection = bpy.data.grease_pencils
             grease = collection.new(compatibility_name(doc, "GreasePencil", data_id,
                                                         source.get("name", data_id)))
             set_id(grease, data_id)

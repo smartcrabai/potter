@@ -1286,7 +1286,7 @@ mod tests {
 
     #[test]
     fn joins_transformed_meshes_remaps_colliding_ids_and_tracks_deletion() {
-        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         add_mesh(
             &mut doc,
             "target",
@@ -1404,7 +1404,7 @@ mod tests {
 
     #[test]
     fn joining_shared_destination_data_makes_only_the_destination_single_user() {
-        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         add_mesh(
             &mut doc,
             "target",
@@ -1471,7 +1471,7 @@ mod tests {
 
     #[test]
     fn join_preserves_data_object_links_and_empty_slot_indices() {
-        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         add_mesh(
             &mut doc,
             "target",
@@ -1583,7 +1583,7 @@ mod tests {
 
     #[test]
     fn rejects_joining_source_with_surviving_children_without_mutating() {
-        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         add_mesh(
             &mut doc,
             "target",

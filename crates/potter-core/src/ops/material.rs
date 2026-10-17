@@ -1056,7 +1056,7 @@ mod tests {
         );
         let operation = json!({
             "op":"material.delete",
-            "target":"blue",
+            "target":{"id":"blue"},
             "reassign":"green"
         });
         let mut engine = Engine {

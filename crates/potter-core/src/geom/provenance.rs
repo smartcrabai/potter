@@ -64,7 +64,7 @@ impl Origin {
 /// their source face's flag, and `sharp` and `seam` OR over source edges. Color layers are rebuilt by
 /// the canonical store, preserving order and active/render choices. `custom_normal` codes are never
 /// interpolated; [`crate::geom::clnor::transfer_custom_normals`] applies the shared code/basis rules.
-/// Elements without a source take their type's default, so no key refers to a stale element.
+/// Elements without a source get no entry, so readers take their type's default; no key refers to a stale element.
 ///
 /// # Errors
 ///
@@ -708,8 +708,10 @@ impl Sources<'_> {
 
     /// A native element attribute (`{"domain", "type", "values"}`) moved to the output elements of its
     /// domain. Point, edge, and corner values blend over their origins by weight, and a face value copies
-    /// its source face's value. Output elements without a source take the type's default. Booleans blend
-    /// as OR over the positive-weight sources, and colors blend channel by channel.
+    /// its source face's value. An output element with no source value gets no entry, so a reader takes
+    /// its type's default for the missing key and no default is ever written. A corner row is written
+    /// only when one of its corners blends a value; its other corners take the type's default. Booleans
+    /// blend as OR over the positive-weight sources, and colors blend channel by channel.
     fn native_attribute(&self, attribute: &Value) -> Value {
         let Some(values) = attribute.get("values").and_then(Value::as_object) else {
             return attribute.clone();
@@ -728,10 +730,9 @@ impl Sources<'_> {
                     .vertices
                     .iter()
                     .zip(&self.origin.vertices)
-                    .map(|(vertex, sources)| {
-                        let value =
-                            blend_sources(&stored, sources, data_type).unwrap_or_else(default);
-                        (format!("v{}", vertex.id), value)
+                    .filter_map(|(vertex, sources)| {
+                        let value = blend_sources(&stored, sources, data_type)?;
+                        Some((format!("v{}", vertex.id), value))
                     })
                     .collect()
             }
@@ -746,10 +747,9 @@ impl Sources<'_> {
                     .edges
                     .iter()
                     .zip(self.edge_origin)
-                    .map(|(edge, sources)| {
-                        let value =
-                            blend_sources(&stored, sources, data_type).unwrap_or_else(default);
-                        (format!("e{}", edge.id), value)
+                    .filter_map(|(edge, sources)| {
+                        let value = blend_sources(&stored, sources, data_type)?;
+                        Some((format!("e{}", edge.id), value))
                     })
                     .collect()
             }
@@ -758,13 +758,11 @@ impl Sources<'_> {
                 .faces
                 .iter()
                 .zip(&self.origin.faces)
-                .map(|(face, source)| {
+                .filter_map(|(face, source)| {
                     let value = source
                         .and_then(|index| self.source.faces.get(index))
-                        .and_then(|source_face| values.get(&format!("f{}", source_face.id)))
-                        .cloned()
-                        .unwrap_or_else(default);
-                    (format!("f{}", face.id), value)
+                        .and_then(|source_face| values.get(&format!("f{}", source_face.id)))?;
+                    Some((format!("f{}", face.id), value.clone()))
                 })
                 .collect(),
             "corner" => {
@@ -794,14 +792,20 @@ impl Sources<'_> {
                     .faces
                     .iter()
                     .zip(offsets)
-                    .map(|(face, offset)| {
-                        let row: Vec<Value> = self.corner_origin[offset..][..face.vertices.len()]
+                    .filter_map(|(face, offset)| {
+                        let sources = &self.corner_origin[offset..][..face.vertices.len()];
+                        let blended: Vec<Option<Value>> = sources
                             .iter()
-                            .map(|sources| {
-                                blend_sources(&stored, sources, data_type).unwrap_or_else(default)
-                            })
+                            .map(|sources| blend_sources(&stored, sources, data_type))
                             .collect();
-                        (format!("f{}", face.id), Value::Array(row))
+                        if blended.iter().all(Option::is_none) {
+                            return None;
+                        }
+                        let row = blended
+                            .into_iter()
+                            .map(|value| value.unwrap_or_else(default))
+                            .collect();
+                        Some((format!("f{}", face.id), Value::Array(row)))
                     })
                     .collect()
             }

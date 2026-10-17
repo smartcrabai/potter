@@ -108,7 +108,7 @@ fn check_shading(mesh: &Value, oracle: &Value) -> TestResult {
         .enumerate()
     {
         assert_eq!(
-            value_at(shade, &format!("f{index}"))?,
+            value_at(shade, &format!("f{}", index + 1))?,
             &face["smooth"],
             "face {index} shade_smooth"
         );
@@ -120,12 +120,12 @@ fn check_shading(mesh: &Value, oracle: &Value) -> TestResult {
         .enumerate()
     {
         assert_eq!(
-            value_at(sharp, &format!("e{index}"))?,
+            value_at(sharp, &format!("e{}", index + 1))?,
             &edge["sharp"],
             "edge {index} sharp"
         );
         assert_eq!(
-            value_at(seam, &format!("e{index}"))?,
+            value_at(seam, &format!("e{}", index + 1))?,
             &edge["seam"],
             "edge {index} seam"
         );
@@ -182,7 +182,7 @@ fn check_colors(mesh: &Value, oracle: &Value) -> TestResult {
                 assert_eq!(attr["domain"], "point", "{name} domain");
                 for (index, value) in values.iter().enumerate() {
                     assert_rgba(
-                        vec4(value_at(attr, &format!("v{index}"))?)?,
+                        vec4(value_at(attr, &format!("v{}", index + 1))?)?,
                         vec4(value)?,
                         tolerance,
                         &format!("{name} v{index}"),
@@ -192,7 +192,7 @@ fn check_colors(mesh: &Value, oracle: &Value) -> TestResult {
             Some("corner") => {
                 assert_eq!(attr["domain"], "corner", "{name} domain");
                 for (face, size) in sizes.iter().enumerate() {
-                    let row = value_at(attr, &format!("f{face}"))?
+                    let row = value_at(attr, &format!("f{}", face + 1))?
                         .as_array()
                         .ok_or("corner row is not an array")?;
                     assert_eq!(row.len(), *size, "{name} face {face} corner count");
@@ -248,7 +248,7 @@ fn check_generics(mesh: &Value, oracle: &Value) -> TestResult {
         match domain {
             "corner" => {
                 for (face, size) in sizes.iter().enumerate() {
-                    let row = value_at(attr, &format!("f{face}"))?
+                    let row = value_at(attr, &format!("f{}", face + 1))?
                         .as_array()
                         .ok_or("corner row is not an array")?;
                     assert_eq!(row.len(), *size, "{name} face {face} corner count");
@@ -270,7 +270,7 @@ fn check_generics(mesh: &Value, oracle: &Value) -> TestResult {
                 };
                 for (index, expected) in values.iter().enumerate() {
                     check_value(
-                        value_at(attr, &format!("{prefix}{index}"))?,
+                        value_at(attr, &format!("{prefix}{}", index + 1))?,
                         expected,
                         kind,
                         &format!("{name}[{index}]"),
@@ -296,6 +296,9 @@ fn check_uv(mesh: &Value, oracle: &Value) -> TestResult {
     assert_eq!(layer_names, names, "UV layer order");
     assert_eq!(store["active"], uv["active"], "UV active layer");
     assert_eq!(store["render"], uv["render"], "UV render layer");
+    let faces = mesh["faces"]
+        .as_array()
+        .ok_or("imported faces are missing")?;
     let starts = face_loop_starts(&face_sizes(oracle)?);
     for name in &names {
         let layer = store["layers"]
@@ -307,13 +310,16 @@ fn check_uv(mesh: &Value, oracle: &Value) -> TestResult {
         let expected = uv["values"][name]
             .as_array()
             .ok_or("expected UV values are missing")?;
-        for (face, start) in starts.iter().enumerate() {
+        for (face_index, start) in starts.iter().enumerate() {
+            let face_id = faces[face_index]["id"]
+                .as_u64()
+                .ok_or("imported face ID is missing")?;
             let entry = layer["faces"]
                 .as_array()
                 .ok_or("stored UV faces are missing")?
                 .iter()
-                .find(|entry| entry["face_id"].as_u64() == Some(face as u64))
-                .ok_or_else(|| format!("UV layer {name} has no face {face}"))?;
+                .find(|entry| entry["face_id"].as_u64() == Some(face_id))
+                .ok_or_else(|| format!("UV layer {name} has no face {face_id}"))?;
             let corners = entry["uv"]
                 .as_array()
                 .ok_or("stored UV corners are missing")?;
@@ -381,7 +387,7 @@ fn import_stores_shading_colors_generics_uv_and_groups_natively() -> TestResult 
 }
 
 #[test]
-fn glb_hdr_color_loss_requires_allow_lossy_and_restores_raw_extras() -> TestResult {
+fn glb_hdr_color_layers_export_raw_and_restore_from_extras() -> TestResult {
     let Some(blender) = blender() else {
         return Ok(());
     };
@@ -428,13 +434,13 @@ fn glb_hdr_color_loss_requires_allow_lossy_and_restores_raw_extras() -> TestResu
         .as_array()
         .ok_or("strict GLB loss details are missing")?;
     assert!(
-        strict_losses.iter().any(|loss| {
+        !strict_losses.iter().any(|loss| {
             loss["feature_id"] == "mesh.color_attribute"
                 && loss["reason"]
                     .as_str()
                     .is_some_and(|reason| reason.contains(&hdr_name))
         }),
-        "strict export must name the HDR layer: {strict_report}"
+        "COLOR_1 is unconstrained by glTF; strict export must not name {hdr_name}: {strict_report}"
     );
 
     let glb = root.path().join("allow-lossy.glb");
@@ -445,12 +451,12 @@ fn glb_hdr_color_loss_requires_allow_lossy_and_restores_raw_extras() -> TestResu
         String::from_utf8_lossy(&allowed.stdout)
     );
     let allowed_report: Value = serde_json::from_slice(&allowed.stdout)?;
-    assert!(losses(&allowed_report).iter().any(|loss| {
+    assert!(!losses(&allowed_report).iter().any(|loss| {
         loss["feature_id"] == "mesh.color_attribute"
             && loss["reason"]
                 .as_str()
                 .is_some_and(|reason| reason.contains(&hdr_name))
-    }));
+    }), "COLOR_1 is unconstrained by glTF; {hdr_name} must not be a color loss");
     let bytes = fs::read(&glb)?;
     assert!(bytes.len() >= 20, "GLB container is too short");
     assert_eq!(&bytes[0..4], b"glTF");
@@ -935,7 +941,16 @@ fn imported_emitter_color_renders_like_blender_after_blend_roundtrip() -> TestRe
         );
     }
     let emitter_id = node_id(&scene, "Emitter")?;
-    let material_id = scene["nodes"][&emitter_id]["materials"][0]
+    let emitter = &scene["nodes"][&emitter_id];
+    // The emitter's material is linked to its mesh data (build_oracle.py), so its slot lives on the data-block.
+    let object_linked = emitter["material_links"][0].as_str() == Some("object");
+    let slots = if object_linked {
+        &emitter["materials"]
+    } else {
+        let data = emitter["data"].as_str().ok_or("Emitter data is missing")?;
+        &scene["data_blocks"][data]["materials"]
+    };
+    let material_id = slots[0]
         .as_str()
         .ok_or("Emitter has no material assignment")?;
     let graph_id = scene["materials"][material_id]["node_tree"]

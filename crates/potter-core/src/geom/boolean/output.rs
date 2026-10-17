@@ -28,8 +28,10 @@
 //! transform, so [`joined_custom_normals`] builds them per joined corner. The remap interpolates
 //! them without normalising, and [`negate_flipped_custom_normals`] negates the flipped faces.
 //!
-//! Stores that are neither gathered nor structured (shading and metadata keys) are copied from
-//! operand A, as the BSP path does.
+//! Native generic attributes (`{"domain","type","values"}` stores keyed by element ID) join every
+//! operand's values per element, as Blender's `join_meshes` concatenates each domain. Other stores
+//! that are neither gathered nor structured (shading and metadata keys) are copied from operand A,
+//! as the BSP path does.
 //!
 //! # Deviations
 //!
@@ -91,7 +93,7 @@ pub(crate) fn polys_to_mesh(
     }
     let layout = Layout::new(operands);
     let mut joined = join(operands, &layout)?;
-    joined.mesh.attributes = join_attributes(operands, &layout)?;
+    joined.mesh.attributes = join_attributes(operands, &layout, &joined.mesh)?;
     encode_joined_custom_normals(&mut joined.mesh)?;
     uv_layers::write(&mut joined.mesh, &joined_uv_store(operands));
     let (arena_ids, planned) = plan(polys, &layout)?;
@@ -564,14 +566,37 @@ fn is_structured_key(key: &str) -> bool {
 
 /// The attribute store `J` carries into `remap_attributes`. EDGE entries and the edge stores
 /// gathered here are left out and written after the remap.
-fn join_attributes(operands: &[Operand<'_>], layout: &Layout) -> Result<Map<String, Value>> {
+fn join_attributes(
+    operands: &[Operand<'_>],
+    layout: &Layout,
+    joined: &Mesh,
+) -> Result<Map<String, Value>> {
     let mut attributes = Map::new();
     if let Some(first) = operands.first() {
         for (key, value) in &first.mesh.attributes {
-            if !is_structured_key(key) {
+            if !is_structured_key(key) && !is_native_store(value) {
                 attributes.insert(key.clone(), value.clone());
             }
         }
+    }
+    // Native generic attributes exist on any operand, so every operand's values join.
+    let mut native: Vec<(&str, &Value)> = Vec::new();
+    for operand in operands {
+        for (key, value) in &operand.mesh.attributes {
+            let name = key.as_str();
+            if !is_structured_key(name)
+                && is_native_store(value)
+                && native.iter().all(|(seen, _)| *seen != name)
+            {
+                native.push((name, value));
+            }
+        }
+    }
+    for (key, template) in native {
+        attributes.insert(
+            key.to_owned(),
+            joined_native_attribute(operands, layout, joined, key, template),
+        );
     }
     let vertex_ids: Vec<HashMap<u32, usize>> = operands
         .iter()
@@ -628,6 +653,91 @@ fn join_attributes(operands: &[Operand<'_>], layout: &Layout) -> Result<Map<Stri
         joined_blender_attributes(operands),
     );
     Ok(attributes)
+}
+
+/// A native generic attribute store: `{"domain","type","values"}` keyed by element ID.
+fn is_native_store(value: &Value) -> bool {
+    matches!(text_field(value, "domain"), "point" | "edge" | "face" | "corner")
+        && value.get("values").is_some_and(Value::is_object)
+}
+
+/// The element ID in a store key such as `f12` for prefix `f`, or `None` for another key.
+fn element_id(name: &str, prefix: char) -> Option<u32> {
+    name.strip_prefix(prefix)?.parse().ok()
+}
+
+/// A native generic attribute joined over every operand, as Blender's `join_meshes` concatenates each
+/// domain. Keys move to joined element IDs, which equal joined indices; a corner row is keyed by its
+/// joined face. An element without a value has no key and takes the default on remap.
+fn joined_native_attribute(
+    operands: &[Operand<'_>],
+    layout: &Layout,
+    joined: &Mesh,
+    key: &str,
+    template: &Value,
+) -> Value {
+    let joined_edges: HashMap<(u32, u32), u32> = joined
+        .edges
+        .iter()
+        .map(|edge| (edge_key(edge.vertices[0], edge.vertices[1]), edge.id))
+        .collect();
+    let domain = text_field(template, "domain");
+    let mut values = Map::new();
+    for (index, operand) in operands.iter().enumerate() {
+        let Some(entries) = operand
+            .mesh
+            .attributes
+            .get(key)
+            .filter(|value| is_native_store(value))
+            .and_then(|value| value.get("values"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let vertices = local_index(operand.mesh.vertices.iter().map(|vertex| vertex.id));
+        let faces = local_index(operand.mesh.faces.iter().map(|face| face.id));
+        match domain {
+            "point" => {
+                for (name, value) in entries {
+                    if let Some(&local) = element_id(name, 'v').and_then(|id| vertices.get(&id)) {
+                        values.insert(
+                            format!("v{}", layout.vertices[index].start + local),
+                            value.clone(),
+                        );
+                    }
+                }
+            }
+            "face" | "corner" => {
+                for (name, value) in entries {
+                    if let Some(&local) = element_id(name, 'f').and_then(|id| faces.get(&id)) {
+                        values.insert(
+                            format!("f{}", layout.faces[index].start + local),
+                            value.clone(),
+                        );
+                    }
+                }
+            }
+            "edge" => {
+                for edge in &operand.mesh.edges {
+                    let Some(value) = entries.get(&format!("e{}", edge.id)) else {
+                        continue;
+                    };
+                    let [first, second] = edge.vertices.map(|id| {
+                        let &local = vertices.get(&id)?;
+                        u32::try_from(layout.vertices[index].start + local).ok()
+                    });
+                    let (Some(first), Some(second)) = (first, second) else {
+                        continue;
+                    };
+                    if let Some(&joined_edge) = joined_edges.get(&edge_key(first, second)) {
+                        values.insert(format!("e{joined_edge}"), value.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    with_values(template, Value::Object(values))
 }
 
 fn insert_if(attributes: &mut Map<String, Value>, key: &str, value: Option<Value>) {
@@ -1389,6 +1499,36 @@ mod tests {
             attribute(&mesh, "blender_polygon_smooth"),
             json!([true, false, false, true])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_face_attributes_join_every_operand() -> TestResult {
+        let mut a = quad(0.0)?;
+        let mut b = quad(5.0)?;
+        // Potter's import keeps FACE INT attributes as native stores keyed by face ID, so every
+        // operand's values join, not only the first operand's.
+        set_attribute(
+            &mut a,
+            "fid",
+            json!({"domain": "face", "type": "int", "values": {"f0": 100, "f1": 101}}),
+        );
+        set_attribute(
+            &mut b,
+            "fid",
+            json!({"domain": "face", "type": "int", "values": {"f0": 200, "f1": 201}}),
+        );
+        let operands = [operand(&a), operand(&b)];
+        let mut arena = Arena::new();
+        let polys = quad_polys(&mut arena, &a, &b)?;
+        let mesh = build(&polys, &arena, &operands, &[])?;
+        let values = attribute(&mesh, "fid")["values"].clone();
+        let fids: Vec<Value> = mesh
+            .faces
+            .iter()
+            .map(|face| values[format!("f{}", face.id)].clone())
+            .collect();
+        assert_eq!(fids, vec![json!(100), json!(101), json!(200), json!(201)]);
         Ok(())
     }
 

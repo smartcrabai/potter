@@ -1150,124 +1150,98 @@ fn reflect_vector(mut vector: DVec3, mask: usize, axes: &[usize]) -> DVec3 {
     vector
 }
 
-/// Builds the unmerged mirror copies and each copy corner's reflected vector (`None` for automatic
-/// corners). The vectors are encoded in the copy's own fan spaces, so the copies carry codes whose
-/// evaluation is the reflection, before any merge.
-fn mirror_copy_normals(
+/// Blender's mirror loop numbering and reflected vectors for every copy corner, before the merge, in
+/// output polygon order (`mesh_mirror.cc`). Copy `c` is appended after the copies below its top axis
+/// bit `h`, so its loops start at `N * 2^h` plus the first loop of the copied face in that prefix. A
+/// reversed copy (odd reflection count) keeps its first corner and reverses the rest, as
+/// `mesh_flip_faces()` in `mesh_flip_faces.cc` and the `mirrorj` mapping in
+/// `BKE_mesh_mirror_apply_mirror_on_axis_for_modifier` (`mesh_mirror.cc`) assume: copy corner `m`
+/// holds source corner `(size - m) % size`.
+fn mirror_copy_states(
     mesh: &Mesh,
-    source_vectors: &[Option<DVec3>],
-    points: &[DVec3],
-    polygons: &[Polygon],
-    loose_edges: &[[usize; 2]],
+    source_order: &[usize],
+    source_vectors: Option<&[Option<DVec3>]>,
+    copy_count: usize,
     axes: &[usize],
-) -> Result<(Mesh, Vec<Option<DVec3>>)> {
-    let source_count = mesh.faces.len();
-    let vertex_count = mesh.vertices.len();
-    let origin = Origin::copies(
-        (0..points.len()).map(|point| Some(point % vertex_count)),
-        (0..polygons.len())
-            .map(|polygon| Some(polygon % source_count))
-            .collect(),
-    );
-    let mut copies = build_mesh(
-        points.to_vec(),
-        polygons.to_vec(),
-        loose_edges.to_vec(),
-        &origin,
-        mesh,
-    )?;
-    let mut source_offsets = Vec::with_capacity(source_count);
-    let mut corner_total = 0;
-    for face in &mesh.faces {
-        source_offsets.push(corner_total);
-        corner_total += face.vertices.len();
-    }
-    let mut vectors = Vec::new();
-    for (index, (face, _)) in polygons.iter().enumerate() {
-        let copy = index / source_count;
-        let source_face = index % source_count;
-        // An odd number of reflections reverses the copy's polygon: its corner `k` copies source
-        // corner `size - 1 - k`.
+) -> (Vec<usize>, Vec<Option<DVec3>>) {
+    let corners = source_order.len();
+    let mut ordinals = vec![0; copy_count * corners];
+    let mut vectors = vec![None; copy_count * corners];
+    for copy in 0..copy_count {
         let reversed = copy.count_ones() % 2 == 1;
-        let size = face.len();
-        for corner in 0..size {
-            let position = if reversed { size - 1 - corner } else { corner };
-            let source_corner = source_offsets[source_face] + position;
-            vectors.push(
-                source_vectors[source_corner].map(|vector| reflect_vector(vector, copy, axes)),
-            );
+        let (prefix, parent) = if copy == 0 {
+            (0, 0)
+        } else {
+            let top = copy.ilog2();
+            (corners << top, copy ^ (1 << top))
+        };
+        let mut start = 0;
+        for face in &mesh.faces {
+            let size = face.vertices.len();
+            let parent_first = if copy == 0 {
+                0
+            } else {
+                (start..start + size)
+                    .map(|corner| ordinals[parent * corners + corner])
+                    .min()
+                    .unwrap_or(0)
+            };
+            for m in 0..size {
+                let slot = copy * corners + start + m;
+                let source = start + if reversed { (size - m) % size } else { m };
+                ordinals[slot] = if copy == 0 {
+                    source_order[source]
+                } else {
+                    prefix + parent_first + m
+                };
+                vectors[slot] = source_vectors
+                    .and_then(|vectors| vectors[source])
+                    .map(|vector| reflect_vector(vector, copy, axes));
+            }
+            start += size;
         }
     }
-    let identity = clnor::stored_corner_order(&copies);
-    let fans = clnor::mesh_fans(&copies, &positions(&copies), &identity)?;
-    let codes: Vec<CornerNormalCode> = vectors
-        .iter()
-        .enumerate()
-        .map(|(corner, vector)| match vector {
-            Some(vector) => {
-                clnor::encode_vector_in_space(&fans.spaces[fans.fan_of[corner]], *vector)
-            }
-            None => CornerNormalCode::Auto,
-        })
-        .collect();
-    clnor::write_codes(&mut copies, Some(&codes), NormalCodeOptions::default())?;
-    Ok((copies, vectors))
+    (ordinals, vectors)
 }
 
-/// Each merged output corner's pre-merge vector: the copy corner, of the copy its polygon came from,
-/// whose point merged into the output corner's point.
-fn merged_copy_vectors(
-    copies: &Mesh,
-    vectors: &[Option<DVec3>],
+/// The merged output's vectors and loop basis. Each kept corner takes the vector and loop of the copy
+/// corner whose point merged into it; its loop is ranked among the kept corners, so the basis is a
+/// permutation of the output corners.
+fn mirror_output_states(
     merged: &MergedGeometry,
-) -> Result<Vec<Option<DVec3>>> {
-    let indices = id_indices(copies);
-    let mut offsets = Vec::with_capacity(copies.faces.len());
-    let mut corner_total = 0;
-    for face in &copies.faces {
-        offsets.push(corner_total);
-        corner_total += face.vertices.len();
+    copy_corners: &[Vec<usize>],
+    ordinals: &[usize],
+    vectors: &[Option<DVec3>],
+) -> Result<(Vec<Option<DVec3>>, Vec<usize>)> {
+    let mut offsets = Vec::with_capacity(copy_corners.len());
+    let mut total = 0;
+    for points in copy_corners {
+        offsets.push(total);
+        total += points.len();
     }
     let mut merged_vectors = Vec::new();
+    let mut merged_loops = Vec::new();
     for ((polygon, _), &source) in merged.polygons.iter().zip(&merged.polygon_sources) {
-        let copy_points: Vec<usize> = copies.faces[source]
-            .vertices
-            .iter()
-            .map(|id| indices[id])
-            .collect();
         for &point in polygon {
             let members = &merged.point_members[point];
-            let corner = copy_points
+            let corner = copy_corners[source]
                 .iter()
                 .position(|copy_point| members.contains(copy_point))
                 .ok_or_else(|| {
                     PotError::new(ErrorCode::InternalError, "mirror merge lost a copy corner")
                 })?;
-            merged_vectors.push(vectors[offsets[source] + corner]);
+            let copy = offsets[source] + corner;
+            merged_vectors.push(vectors[copy]);
+            merged_loops.push(ordinals[copy]);
         }
     }
-    Ok(merged_vectors)
-}
-
-/// Writes the merged mirror's vectors through the setter. Each output fan with a vector is re-encoded
-/// with the average of its vectors; fans without one keep their codes.
-fn mirror_merged_normals(result: &mut Mesh, vectors: &[Option<DVec3>]) -> Result<()> {
-    let fans = clnor::mesh_fans(
-        result,
-        &positions(result),
-        &clnor::stored_corner_order(result),
-    )?;
-    let mut fan_has_vector = vec![false; fans.corners.len()];
-    for (corner, vector) in vectors.iter().enumerate() {
-        fan_has_vector[fans.fan_of[corner]] |= vector.is_some();
+    let mut by_loop: Vec<usize> = (0..merged_loops.len()).collect();
+    by_loop.sort_unstable_by_key(|&corner| merged_loops[corner]);
+    let mut order = vec![0; merged_loops.len()];
+    for (rank, corner) in by_loop.into_iter().enumerate() {
+        order[corner] = rank;
     }
-    let updates: Vec<(usize, Option<DVec3>)> = vectors
-        .iter()
-        .enumerate()
-        .filter(|(corner, _)| fan_has_vector[fans.fan_of[*corner]])
-        .map(|(corner, vector)| (corner, *vector))
-        .collect();
-    clnor::encode_vector_updates(result, &updates, NormalCodeOptions::default())
+    Ok((merged_vectors, order))
 }
 
 fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -1356,8 +1330,11 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         let reverse = mask.count_ones() % 2 == 1;
         for (face, material_index) in &source_polygons {
             let mut mapped: Vec<_> = face.iter().map(|index| base + *index).collect();
-            if reverse {
-                mapped.reverse();
+            if reverse && !mapped.is_empty() {
+                // Blender's flip keeps the first corner and reverses the rest: `mesh_flip_faces()`
+                // (`mesh_flip_faces.cc`), applied to the mirrored faces by
+                // `BKE_mesh_mirror_apply_mirror_on_axis_for_modifier` (`mesh_mirror.cc`).
+                mapped[1..].reverse();
             }
             output_polygons.push((mapped, *material_index));
         }
@@ -1367,27 +1344,42 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .map(|[a, b]| [base + *a, base + *b]),
         );
     }
-    // The copies are built before the merge: their reflected custom normals are encoded in their own
-    // fan spaces, and the merged output then averages each fan through the setter.
-    let source_vectors =
-        clnor::corner_custom_normals(mesh, &source_points, NormalCodeOptions::default())?;
-    let copy_normals = source_vectors
-        .map(|vectors| {
-            mirror_copy_normals(
-                mesh,
-                &vectors,
-                &points,
-                &output_polygons,
-                &output_loose_edges,
-                &selected,
-            )
-        })
-        .transpose()?;
+    // Blender numbers the mirror's loops after the source's and reflects each copy's custom normals
+    // (`mesh_mirror.cc`). The merged output keeps the loops of the corners that survive the merge.
+    let has_values = clnor::corner_codes(mesh)?.is_some();
+    let has_state = has_values || clnor::corner_order(mesh)?.is_some();
+    let copy_corners: Vec<Vec<usize>> = output_polygons
+        .iter()
+        .map(|(face, _)| face.clone())
+        .collect();
+    let copy_states = if has_state {
+        let source_order =
+            clnor::corner_order(mesh)?.unwrap_or_else(|| clnor::stored_corner_order(mesh));
+        let source_vectors = if has_values {
+            clnor::corner_custom_normals(mesh, &source_points, NormalCodeOptions::default())?
+        } else {
+            None
+        };
+        Some(mirror_copy_states(
+            mesh,
+            &source_order,
+            source_vectors.as_deref(),
+            copy_count,
+            &selected,
+        ))
+    } else {
+        None
+    };
     let merged = if merge {
         merge_geometry(&points, output_polygons, output_loose_edges, threshold)?
     } else {
         MergedGeometry::unmerged(points, output_polygons, output_loose_edges)
     };
+    let merged_state = copy_states
+        .map(|(ordinals, vectors)| {
+            mirror_output_states(&merged, &copy_corners, &ordinals, &vectors)
+        })
+        .transpose()?;
     // Blender's merge keeps one source edge's flags per merged edge (see `first_source_edges`).
     let first_sources = if merge {
         let edges = edge_pairs(mesh)?;
@@ -1424,16 +1416,23 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .iter()
         .map(|&polygon| (polygon / source_polygons.len()).count_ones() as usize)
         .collect();
-    let merged_normals = copy_normals
-        .map(|(copies, vectors)| merged_copy_vectors(&copies, &vectors, &merged))
-        .transpose()?;
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     if let Some(first) = &first_sources {
         let edge_count = mesh.edges.len();
         apply_first_source_edge_flags(&mut result, mesh, first, |edge| edge % edge_count)?;
     }
-    if let Some(vectors) = &merged_normals {
-        mirror_merged_normals(&mut result, vectors)?;
+    if let Some((vectors, order)) = &merged_state {
+        // build_mesh carried a provisional basis across; the mirror's own numbering replaces it.
+        result.attributes.remove("custom_normal");
+        let options = NormalCodeOptions {
+            corner_order: Some(order.as_slice()),
+            setter_input: clnor::SetterInput::NormalizeInput,
+        };
+        if has_values {
+            clnor::encode_vectors(&mut result, Some(vectors.as_slice()), options)?;
+        } else {
+            clnor::write_codes(&mut result, None, options)?;
+        }
     }
     if bool_param(modifier, "use_mirror_vertex_groups")? {
         mirror_vertex_groups(mesh, &mut result, &merged.point_members, vertex_count);
@@ -3224,16 +3223,19 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &origin,
         mesh,
     )?;
-    if keep_custom_normals && clnor::corner_codes(mesh)?.is_none() {
-        // MOD_triangulate.cc keeps the pre-split corner normals as custom normals, so the triangles
-        // keep the shading of the faces they were cut from.
+    if keep_custom_normals {
+        // MOD_triangulate.cc copies the evaluated corner normals (`mesh->corner_normals()`, which
+        // include custom normals) onto the triangulated loops and re-encodes them there, so every
+        // triangle corner gets the vector of the source corner it came from. The loops are rebuilt
+        // in storage order, so no loop basis carries over.
+        result.attributes.remove("custom_normal");
         let computed = corner_normals(mesh, &positions(mesh))?;
         let vectors: Vec<Option<DVec3>> = sources
             .iter()
             .map(|source| source.map(|corner| computed[corner]))
             .collect();
         clnor::encode_vectors(&mut result, Some(&vectors), NormalCodeOptions::default())?;
-    } else if !keep_custom_normals {
+    } else if clnor::corner_codes(mesh)?.is_some() || clnor::corner_order(mesh)?.is_some() {
         clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     }
     Ok(result)
@@ -5040,17 +5042,9 @@ fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Resu
     };
     let invert_group = bool_param(modifier, "invert_vertex_group")?;
     let points = positions(mesh);
-    let indices = id_indices(mesh);
-    let mut normals = vec![DVec3::ZERO; points.len()];
-    for face in &mesh.faces {
-        let mut normal = DVec3::ZERO;
-        for (first, second) in cyclic_pairs(&face.vertices) {
-            normal += points[indices[first]].cross(points[indices[second]]);
-        }
-        for id in &face.vertices {
-            normals[indices[id]] += normal;
-        }
-    }
+    // Blender's NORMAL direction is `mesh->vert_normals_true()` (MOD_displace.cc, NOR case): the
+    // angle-weighted unit face normals of `normals_calc_verts` (mesh_normals.cc L194-224).
+    let normals = vertex_normals(&points, &polygons(mesh)?, false);
     let delta = ((1.0 - mid_level) * strength).clamp(-10_000.0, 10_000.0);
     let mut result = mesh.clone();
     for (index, vertex) in result.vertices.iter_mut().enumerate() {
@@ -5069,7 +5063,7 @@ fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Resu
             _ => None,
         };
         let direction_vector = axis.map_or_else(
-            || normals[index].normalize_or_zero(),
+            || normals[index],
             |local| {
                 if space == "GLOBAL" {
                     owner_world_matrix.transpose().transform_vector3(local)

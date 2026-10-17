@@ -1143,7 +1143,12 @@ fn color_plan(
         };
         let surface = surfaces.get(material_id);
         let Some(reference) = surface
-            .and_then(|surface| surface.vertex_color.as_ref())
+            .and_then(|surface| {
+                surface
+                    .vertex_color
+                    .as_ref()
+                    .or(surface.unmultiplied_vertex_color.as_ref())
+            })
             .map(|read| read.layer.clone())
         else {
             continue;
@@ -3521,7 +3526,8 @@ fn slot_has_nonopaque_color_alpha(
 }
 
 /// Color losses of one exported mesh. Application extras preserve every named layer and its
-/// POINT/CORNER domain. glTF's core `COLOR_n` range is narrower than canonical HDR color values.
+/// POINT/CORNER domain. glTF clamps `COLOR_0` to [0, 1] (glTF 2.0 `COLOR_0` accessor rule); the
+/// other `COLOR_n` sets keep their stored values, so only a layer read as `COLOR_0` can lose range.
 fn color_losses(
     node_id: &Id,
     node: &Node,
@@ -3536,7 +3542,7 @@ fn color_losses(
     let store = color_layers::read(mesh);
     let plan = color_plan(node_id, node, snapshot, data, mesh, surfaces);
     let mut losses = Vec::new();
-    for index in plan.carried_layers() {
+    for index in plan.slot_layers.values().copied().collect::<BTreeSet<_>>() {
         let Some(layer) = store.layers.get(index) else {
             continue;
         };
@@ -4687,26 +4693,45 @@ fn export_with_root_inner(
             None,
         );
         attributes["NORMAL"] = json!(normal_accessor);
-        // Carried logical layers use the same dense order as their COLOR_n attributes.
-        let mut color_accessors = BTreeMap::<usize, usize>::new();
+        // Carried logical layers use the same dense order as their COLOR_n attributes. glTF clamps
+        // only COLOR_0 to [0, 1] (glTF 2.0, "All components of each COLOR_0 accessor element MUST be
+        // clamped"); the other sets keep the stored values. A layer read as both gets one accessor
+        // per use.
+        let color_uses = colors
+            .used_slots
+            .iter()
+            .flat_map(|slot| colors.attributes(*slot))
+            .map(|(set, layer)| (layer, set == 0))
+            .collect::<BTreeSet<_>>();
+        let mut color_accessors = BTreeMap::<(usize, bool), usize>::new();
         for (layer, values) in carried_color_layers.iter().copied().zip(&layout.colors) {
-            let mut floats = Vec::with_capacity(values.len().saturating_mul(4));
-            for color in values {
-                for component in color {
-                    floats.push(to_f32((*component).clamp(0.0, 1.0))?);
+            for clamped in [false, true] {
+                if !color_uses.contains(&(layer, clamped)) {
+                    continue;
                 }
+                let mut floats = Vec::with_capacity(values.len().saturating_mul(4));
+                for color in values {
+                    for component in color {
+                        let component = if clamped {
+                            (*component).clamp(0.0, 1.0)
+                        } else {
+                            *component
+                        };
+                        floats.push(to_f32(component)?);
+                    }
+                }
+                let accessor = append_float_accessor(
+                    &mut binary,
+                    &mut views,
+                    &mut accessors,
+                    &floats,
+                    values.len(),
+                    "VEC4",
+                    None,
+                    None,
+                );
+                color_accessors.insert((layer, clamped), accessor);
             }
-            let accessor = append_float_accessor(
-                &mut binary,
-                &mut views,
-                &mut accessors,
-                &floats,
-                values.len(),
-                "VEC4",
-                None,
-                None,
-            );
-            color_accessors.insert(layer, accessor);
         }
         if let (Some(data_id), Some(data_block)) = (data_id, data_block)
             && let Some(binding) = data_skin_bindings.get(data_id)
@@ -4838,9 +4863,12 @@ fn export_with_root_inner(
                 json!({ "attributes": attributes.clone(), "indices": index_accessor, "mode": 4 });
             // The primitive's selected layer is COLOR_0; its source name identifies the Potter material read.
             for (set, layer) in colors.attributes(*slot) {
-                let accessor = color_accessors.get(&layer).copied().ok_or_else(|| {
-                    PotError::new(ErrorCode::InternalError, "color accessor is missing")
-                })?;
+                let accessor = color_accessors
+                    .get(&(layer, set == 0))
+                    .copied()
+                    .ok_or_else(|| {
+                        PotError::new(ErrorCode::InternalError, "color accessor is missing")
+                    })?;
                 primitive["attributes"][format!("COLOR_{set}")] = json!(accessor);
                 if set == 0 {
                     let layer_name = color_metadata["layers"][layer]["name"]
@@ -6998,7 +7026,10 @@ pub(crate) fn import_indexed(
     let mut vertex_ids_loss = false;
     let mut color_attributes_loss = false;
     let mut color_attributes_core_fallback = false;
-    let inverse_basis = basis.inverse();
+    // The basis is a rotation, so its inverse is its transpose. `inverse()` computes the cofactors
+    // by subtraction and yields -0.0 where the basis holds +0.0, so a Potter coordinate of +0.0
+    // would import as -0.0; the transpose copies the basis entries exactly.
+    let inverse_basis = basis.transpose();
     let baked_mesh_scales = baked_mesh_scales(&root)?;
     let mut mesh_shape_key_ids = Vec::<Vec<Id>>::new();
     for (mesh_index, mesh_value) in mesh_values.iter().enumerate() {
@@ -11053,9 +11084,11 @@ mod tests {
             "{losses:?}"
         );
 
+        // The native edge `seam` flag is not written by Blender's glTF exporter, so it is no loss; a
+        // user float attribute named `seam` is an unsupported generic attribute.
         mesh.attributes.insert(
-            "seam".to_owned(),
-            json!({"domain":"edge","type":"bool","values":{}}),
+            crate::geom::attribute_keys::storage_key("seam").into_owned(),
+            json!({"domain":"point","type":"float","values":{}}),
         );
         mesh.attributes.insert(
             "crease_edge".to_owned(),
@@ -11176,6 +11209,21 @@ mod tests {
             .get_mut(&crate::model::Id::new(material)?)
             .ok_or("material is missing")?
             .node_tree = Some(graph);
+        Ok(())
+    }
+
+    /// Sets the constant Alpha of the Principled BSDF in `material`'s graph (see `read_vertex_color`).
+    /// A graph material's alpha comes from its graph, so this is what makes the material translucent.
+    fn set_graph_alpha(doc: &mut SceneDoc, material: &str, alpha: f64) -> TestResult<()> {
+        let graph = crate::model::Id::new(format!("{material}_graph"))?;
+        let bsdf = doc
+            .node_groups
+            .get_mut(&graph)
+            .ok_or("material graph is missing")?
+            .nodes
+            .get_mut(&crate::model::Id::new("bsdf")?)
+            .ok_or("Principled BSDF is missing")?;
+        bsdf.inputs.insert("Alpha".to_owned(), json!(alpha));
         Ok(())
     }
 
@@ -11590,10 +11638,7 @@ mod tests {
             },
         );
         read_vertex_color(&mut doc, "paint", "Paint")?;
-        doc.materials
-            .get_mut(&crate::model::Id::new("paint")?)
-            .ok_or("material is missing")?
-            .alpha_mode = "blend".to_owned();
+        set_graph_alpha(&mut doc, "paint", 0.5)?;
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         let losses = super::mesh_export_losses(&doc, &snapshot)?;
         assert!(
@@ -12081,11 +12126,8 @@ mod tests {
                 render: Some("Paint".to_owned()),
             },
         );
-        doc.materials
-            .get_mut(&crate::model::Id::new("paint")?)
-            .ok_or("paint material is missing")?
-            .alpha_mode = "blend".to_owned();
         read_vertex_color(&mut doc, "paint", "Paint")?;
+        set_graph_alpha(&mut doc, "paint", 0.5)?;
         let imported = import_edited(&doc, |root, _| {
             let primitive = root["meshes"][0]["primitives"][0].clone();
             let mut colorless = primitive.clone();

@@ -57,6 +57,10 @@ struct Placed {
 struct Piece {
     attributes: Map<String, Value>,
     uv_layers: Vec<UvLayer>,
+    /// The member's `active` and `render` color layer names as it stated them. Placement writes a
+    /// null designation as the first layer, so the join reads these from the source mesh.
+    color_active: Option<String>,
+    color_render: Option<String>,
     vertex_base: usize,
     vertices: usize,
     edges: usize,
@@ -85,6 +89,8 @@ pub(crate) fn concatenate(parts: Vec<Part<'_>>) -> Result<Mesh> {
         pieces.push(Piece {
             attributes: std::mem::take(&mut mesh.attributes),
             uv_layers,
+            color_active: color_designation(&part.mesh, "active"),
+            color_render: color_designation(&part.mesh, "render"),
             vertex_base: output.vertices.len(),
             vertices: mesh.vertices.len(),
             edges: mesh.edges.len(),
@@ -255,7 +261,7 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
         .iter()
         .any(|key| source.attributes.contains_key(*key))
     {
-        let flags = smooth_face_flags(source)?;
+        let flags = member_smooth_flags(source)?;
         let values: Map<String, Value> = mesh
             .faces
             .iter()
@@ -271,7 +277,7 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
         .iter()
         .any(|key| source.attributes.contains_key(*key))
     {
-        let flags = sharp_edge_flags(source)?;
+        let flags = member_sharp_flags(source)?;
         let values: Map<String, Value> = mesh
             .edges
             .iter()
@@ -284,6 +290,42 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A member's smooth flag per face, read as stored. A member without a `shade_smooth` key may carry
+/// the legacy `blender_polygon_smooth` array (one bool per face) instead, which
+/// [`smooth_face_flags`] does not read.
+fn member_smooth_flags(source: &Mesh) -> Result<Vec<bool>> {
+    if !source.attributes.contains_key("shade_smooth")
+        && let Some(flags) = source
+            .attributes
+            .get("blender_polygon_smooth")
+            .and_then(Value::as_array)
+            .filter(|flags| flags.len() == source.faces.len())
+            .and_then(|flags| flags.iter().map(Value::as_bool).collect::<Option<Vec<bool>>>())
+    {
+        return Ok(flags);
+    }
+    smooth_face_flags(source)
+}
+
+/// A member's sharp flag per edge, read as stored. A member without a `sharp` key may carry the
+/// legacy `blender_edge_flags` array (one `{sharp, seam}` object per edge) instead, which
+/// [`sharp_edge_flags`] does not read.
+fn member_sharp_flags(source: &Mesh) -> Result<Vec<bool>> {
+    if !source.attributes.contains_key("sharp")
+        && let Some(edges) = source
+            .attributes
+            .get("blender_edge_flags")
+            .and_then(Value::as_array)
+            .filter(|edges| edges.len() == source.edges.len())
+    {
+        return Ok(edges
+            .iter()
+            .map(|edge| edge.get("sharp").and_then(Value::as_bool).unwrap_or(false))
+            .collect());
+    }
+    sharp_edge_flags(source)
 }
 
 /// Reverses a mirrored member's faces with every corner-keyed value: the corner order, `custom_normal`
@@ -472,7 +514,11 @@ fn merge_attribute(name: &str, members: &[Member<'_>], mesh: &Mesh) -> Result<Va
                     .get("color_layers")
                     .and_then(|layers| layers.get("layers"))
                     .and_then(Value::as_array)
-                    .is_some_and(|layers| layers.iter().any(|layer| layer.as_str() == Some(name)))
+                    .is_some_and(|layers| {
+                        layers
+                            .iter()
+                            .any(|layer| layer.as_str() == Some(attribute_name))
+                    })
         }) =>
         {
             merge_color_attribute(attribute_name, members, mesh)
@@ -826,13 +872,24 @@ fn merge_named(name: &str, members: &[Member<'_>]) -> Result<Value> {
     merged.insert("values".to_owned(), Value::Object(values));
     Ok(Value::Object(merged))
 }
+
+/// A member's own `active` or `render` color layer name, read before placement rewrites it.
+fn color_designation(mesh: &Mesh, key: &str) -> Option<String> {
+    mesh.attributes
+        .get(super::color_layers::ATTRIBUTE)?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Joins canonical color layers in first-seen order. The first valid active/render designation is
-/// retained; when none survives, the first joined layer is used.
+/// retained; when none survives, the first joined layer is used. Each member's designation is the one
+/// it stated before placement, so a null designation never claims the first layer.
 fn merge_color_layers(name: &str, members: &[Member<'_>]) -> Result<Value> {
     let mut layers = Vec::<String>::new();
     let mut active = None;
     let mut render = None;
-    for (value, _) in members {
+    for (value, piece) in members {
         let Some(value) = value else { continue };
         let object = value.as_object().ok_or_else(|| shape_error(name))?;
         let names = object
@@ -846,16 +903,10 @@ fn merge_color_layers(name: &str, members: &[Member<'_>]) -> Result<Value> {
             }
         }
         if active.is_none() {
-            active = object
-                .get("active")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            active.clone_from(&piece.color_active);
         }
         if render.is_none() {
-            render = object
-                .get("render")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            render.clone_from(&piece.color_render);
         }
     }
     let fallback = layers.first().cloned();

@@ -107,9 +107,9 @@ fn check_render(result: &Value, expected: &Value, label: &str) -> TestResult {
     Ok(())
 }
 
-/// The node that feeds `to_socket` of the node named `to_node`, from a dumped material.
-fn feeding<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResult<&'a Value> {
-    let link = material["links"]
+/// The link that feeds `to_socket` of the node named `to_node`, from a dumped material.
+fn link_into<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResult<&'a Value> {
+    material["links"]
         .as_array()
         .ok_or("dumped links are missing")?
         .iter()
@@ -117,7 +117,12 @@ fn feeding<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResul
             link["to_node"].as_str() == Some(to_node)
                 && link["to_socket"].as_str() == Some(to_socket)
         })
-        .ok_or_else(|| format!("nothing feeds {to_node}.{to_socket}"))?;
+        .ok_or_else(|| format!("nothing feeds {to_node}.{to_socket}").into())
+}
+
+/// The node that feeds `to_socket` of the node named `to_node`, from a dumped material.
+fn feeding<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResult<&'a Value> {
+    let link = link_into(material, to_node, to_socket)?;
     let source = link["from_node"].as_str().ok_or("link has no source")?;
     material["nodes"]
         .as_array()
@@ -127,8 +132,12 @@ fn feeding<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResul
         .ok_or_else(|| format!("node {source} is missing").into())
 }
 
-/// The Blender-side structure of the field material: the base texture reads `Base` into Base
-/// Color, and the roughness texture reads the render layer `Light` into Roughness.
+/// The Blender-side structure of the field material. The field keeps Potter's default factors (base
+/// color 0.6, roughness 0.8), which multiply the texture as Blender's glTF importer builds them
+/// (`material_graph.rs` `multiply_color`, `multiply_channel`). The base texture reads `Base` into a
+/// `MixRGB` MULTIPLY whose Color2 is the texture, feeding Base Color. The roughness texture reads the
+/// render layer `Light` through its Red channel and a Math MULTIPLY, feeding Roughness. Factors are
+/// unlinked constants, which the dump does not record; the links prove the chains.
 fn check_material_links(object: &Value) -> TestResult {
     let material = object["materials"]
         .as_array()
@@ -144,11 +153,17 @@ fn check_material_links(object: &Value) -> TestResult {
         .ok_or("node has no name")?
         .to_owned();
 
-    let base = feeding(material, &principled, "Base Color")?;
+    let base_mix = feeding(material, &principled, "Base Color")?;
     assert_eq!(
-        base["type"], "ShaderNodeTexImage",
-        "base color is a texture"
+        base_mix["type"], "ShaderNodeMixRGB",
+        "base color is the texture times its factor"
     );
+    let base = feeding(
+        material,
+        base_mix["name"].as_str().unwrap_or_default(),
+        "Color2",
+    )?;
+    assert_eq!(base["type"], "ShaderNodeTexImage", "base texture");
     assert_eq!(base["interpolation"], "Closest", "base color interpolation");
     let base_uv = feeding(
         material,
@@ -161,11 +176,36 @@ fn check_material_links(object: &Value) -> TestResult {
     );
     assert_eq!(base_uv["uv_map"], "Base", "base texture layer selection");
 
-    let rough = feeding(material, &principled, "Roughness")?;
+    // Potter's scalar fields read the texture's Red channel (`material_graph.rs` `channel_texture`).
+    let rough_factor = feeding(material, &principled, "Roughness")?;
     assert_eq!(
-        rough["type"], "ShaderNodeTexImage",
-        "roughness is a texture"
+        rough_factor["type"], "ShaderNodeMath",
+        "roughness is the channel times its factor"
     );
+    let rough_split = feeding(
+        material,
+        rough_factor["name"].as_str().unwrap_or_default(),
+        "Value",
+    )?;
+    assert_eq!(
+        rough_split["type"], "ShaderNodeSeparateColor",
+        "roughness is a separated texture channel"
+    );
+    let rough_link = link_into(
+        material,
+        rough_factor["name"].as_str().unwrap_or_default(),
+        "Value",
+    )?;
+    assert_eq!(
+        rough_link["from_socket"], "Red",
+        "roughness reads the texture's Red channel"
+    );
+    let rough = feeding(
+        material,
+        rough_split["name"].as_str().unwrap_or_default(),
+        "Color",
+    )?;
+    assert_eq!(rough["type"], "ShaderNodeTexImage", "roughness is a texture");
     let rough_uv = feeding(
         material,
         rough["name"].as_str().unwrap_or_default(),

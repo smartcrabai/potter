@@ -112,7 +112,9 @@ fn edges_bevel_with_uv_layers_rejects_partial_edge_selection() -> TestResult {
     // edges are not: each bottom corner has three edges, of which two are beveled.
     mesh.attributes.insert(
         "bottom".to_owned(),
-        json!([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+        json!({"domain": "point", "type": "float", "values": {
+            "v0": 1.0, "v1": 1.0, "v2": 1.0, "v3": 1.0, "v4": 0.0, "v5": 0.0, "v6": 0.0, "v7": 0.0
+        }}),
     );
     let params = json!({
         "width": 0.1,

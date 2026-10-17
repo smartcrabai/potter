@@ -31,7 +31,7 @@ const CODE_SCALE: f32 = 32767.0;
 const SAME_TOLERANCE: f32 = 1.0e-4;
 
 /// The space of one fan (`CornerNormalSpace`). The default is the invalid space: it decodes to the
-/// fan normal.
+/// zero vector, as Blender's unset `vec_lnor` does.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Space {
     lnor: Vec3,
@@ -298,6 +298,8 @@ pub(crate) struct Fans {
     pub(crate) corners: Vec<Vec<usize>>,
     pub(crate) spaces: Vec<Space>,
     pub(crate) fan_of: Vec<usize>,
+    /// `auto[k]`: fan `k`'s normal in double precision, which its Auto corners take.
+    pub(crate) auto: Vec<DVec3>,
 }
 
 /// The link of one local edge around a vertex (`EdgeInfo`).
@@ -319,7 +321,8 @@ struct FanCorner {
     edge_next: usize,
 }
 
-/// Fans and spaces of a mesh, using Blender's single-precision normal math and loop numbering.
+/// Fans and spaces of a mesh. Spaces use Blender's single-precision normal math and loop numbering;
+/// `auto` is each fan's normal in double precision, computed with the `normals` face math.
 pub(crate) fn fans(
     points: &[DVec3],
     faces: &[Vec<usize>],
@@ -332,6 +335,16 @@ pub(crate) fn fans(
     for face in faces {
         offsets.push(total);
         total += face.len();
+    }
+    // Blender's fan normal in double precision, with the face and corner math `normals` uses.
+    let mut face_normals64 = Vec::with_capacity(faces.len());
+    let mut corner_angles64 = Vec::with_capacity(total);
+    for face in faces {
+        let face_points: Vec<DVec3> = face.iter().map(|&vertex| points[vertex]).collect();
+        face_normals64.push(super::normals::face_normal(&face_points));
+        corner_angles64.extend(
+            (0..face.len()).map(|corner| super::normals::corner_angle(&face_points, corner)),
+        );
     }
     let points: Vec<Vec3> = points.iter().map(|point| point.as_vec3()).collect();
     let face_normals: Vec<Vec3> = faces
@@ -348,6 +361,7 @@ pub(crate) fn fans(
         corners: Vec::new(),
         spaces: Vec::new(),
         fan_of: vec![0; total],
+        auto: Vec::new(),
     };
     for (vertex, uses) in around.iter().enumerate() {
         if uses.is_empty() {
@@ -405,6 +419,7 @@ pub(crate) fn fans(
                 directions[last.edge_prev],
                 &fan_edges,
             );
+            let auto = auto_normal(&fan, &corners, &face_normals64, &corner_angles64);
             let index = result.spaces.len();
             let globals: Vec<usize> = fan.iter().map(|&local| corners[local].corner).collect();
             for &global in &globals {
@@ -412,9 +427,29 @@ pub(crate) fn fans(
             }
             result.corners.push(globals);
             result.spaces.push(space);
+            result.auto.push(auto);
         }
     }
     result
+}
+
+/// A fan's normal in double precision, evaluated as `normals` evaluates a smooth fan: its face
+/// normals weighted by each corner's angle, normalized. A one-corner fan keeps its face normal.
+fn auto_normal(
+    fan: &[usize],
+    corners: &[FanCorner],
+    face_normals: &[DVec3],
+    corner_angles: &[f64],
+) -> DVec3 {
+    if let [only] = fan {
+        return face_normals[corners[*only].face];
+    }
+    fan.iter()
+        .fold(DVec3::ZERO, |sum, &local| {
+            let corner = &corners[local];
+            sum + face_normals[corner.face] * corner_angles[corner.corner]
+        })
+        .normalize_or_zero()
 }
 
 /// The local index of `vertex` among the edges of one vertex, numbering new edges in order.
@@ -799,14 +834,16 @@ fn resolved_corner_order(mesh: &Mesh, provided: Option<&[usize]>) -> Result<Vec<
     Ok(corner_order(mesh)?.unwrap_or_else(|| (0..corner_count(mesh)).collect()))
 }
 
-/// The fan-evaluated loop normals for a typed code buffer, including Auto corners.
-pub(crate) fn evaluate_fan_codes(fans: &Fans, codes: &[CornerNormalCode]) -> Result<Vec<Vec3>> {
+/// Loop normals of a typed code buffer. Each fan's average pair decodes in its space. An average of
+/// `[0, 0]` in a valid space is the fan normal itself, which Auto corners take in double precision
+/// (`Fans::auto`). An invalid space decodes to zero, as Blender's unset `vec_lnor` does.
+pub(crate) fn evaluate_fan_codes(fans: &Fans, codes: &[CornerNormalCode]) -> Result<Vec<DVec3>> {
     if codes.len() != fans.fan_of.len() {
         return Err(normal_state_error(
             "custom normal codes must match the mesh corners",
         ));
     }
-    let mut normals = vec![Vec3::ZERO; codes.len()];
+    let mut normals = vec![DVec3::ZERO; codes.len()];
     for (fan, corners) in fans.corners.iter().enumerate() {
         let mut sum = [0_i32; 2];
         for &corner in corners {
@@ -817,10 +854,15 @@ pub(crate) fn evaluate_fan_codes(fans: &Fans, codes: &[CornerNormalCode]) -> Res
         }
         let count = i32::try_from(corners.len()).unwrap_or(i32::MAX);
         let average = [sum[0] / count, sum[1] / count];
-        let normal = fans.spaces[fan].decode(average);
+        let space = &fans.spaces[fan];
+        let normal = if average[0] == 0 && space.is_valid() {
+            fans.auto[fan]
+        } else {
+            space.decode(average).as_dvec3()
+        };
         for &corner in corners {
             normals[corner] = if codes[corner] == CornerNormalCode::ExplicitZero {
-                Vec3::ZERO
+                DVec3::ZERO
             } else {
                 normal
             };
@@ -838,10 +880,7 @@ pub(crate) fn evaluate_code_buffer(
 ) -> Result<Vec<DVec3>> {
     let numbering = resolved_corner_order(mesh, order)?;
     let fans = mesh_fans(mesh, positions, &numbering)?;
-    Ok(evaluate_fan_codes(&fans, codes)?
-        .into_iter()
-        .map(Vec3::as_dvec3)
-        .collect())
+    evaluate_fan_codes(&fans, codes)
 }
 
 /// Evaluates the mesh's stored custom-normal codes at `positions`.
@@ -852,15 +891,6 @@ pub(crate) fn evaluate_codes(
     options: NormalCodeOptions<'_>,
 ) -> Result<Vec<DVec3>> {
     evaluate_code_buffer(mesh, codes, positions, options.corner_order)
-}
-
-/// Converts a vector in one already-computed fan space to its canonical stored code.
-pub(crate) fn encode_vector_in_space(space: &Space, vector: DVec3) -> CornerNormalCode {
-    if vector == DVec3::ZERO {
-        return CornerNormalCode::ExplicitZero;
-    }
-    let [first, second] = space.encode(vector.as_vec3());
-    CornerNormalCode::from_pair([short(first), short(second)])
 }
 
 /// Authored/Auto view of the canonical code state; automatic entries remain `None`.
@@ -1180,7 +1210,7 @@ pub(crate) fn encode_vector_updates(
         .zip(old_normals)
         .map(|(code, normal)| match code {
             CornerNormalCode::Auto => None,
-            CornerNormalCode::Authored(_) => Some(normal.as_dvec3()),
+            CornerNormalCode::Authored(_) => Some(normal),
             CornerNormalCode::ExplicitZero => Some(DVec3::ZERO),
         })
         .collect();
@@ -1284,8 +1314,10 @@ fn compact_corner_order(source_order: &[usize], sources: &[Option<usize>]) -> Ve
     order
 }
 
-/// Writes the output's custom-normal state rebuilt from `source`, compacting loop order through
-/// the source-corner correspondence when the caller does not provide an output basis.
+/// Writes the output's custom-normal state rebuilt from `source`. A source with neither codes nor a
+/// basis is state-less, so the output keeps its own state. Otherwise the output's loop basis is the
+/// caller's, or the source basis compacted through the corner correspondence. A source with codes
+/// but no basis takes the identity basis (the output's storage order).
 pub(crate) fn transfer_custom_normals(
     source: &Mesh,
     output: &mut Mesh,
@@ -1301,12 +1333,17 @@ pub(crate) fn transfer_custom_normals(
             "custom normal transfer does not describe the rebuilt corners",
         ));
     }
-    let order = if let Some(order) = options.corner_order {
-        validate_corner_order(order, output_count)?;
-        order.to_vec()
-    } else {
-        let source_order = corner_order(source)?.unwrap_or_else(|| (0..source_count).collect());
-        compact_corner_order(&source_order, sources)
+    let source_basis = corner_order(source)?;
+    if corner_codes(source)?.is_none() && source_basis.is_none() {
+        return Ok(());
+    }
+    let order = match (options.corner_order, source_basis) {
+        (Some(order), _) => {
+            validate_corner_order(order, output_count)?;
+            order.to_vec()
+        }
+        (None, Some(source_order)) => compact_corner_order(&source_order, sources),
+        (None, None) => stored_corner_order(output),
     };
     let codes = rebuild_custom_normals(
         source,

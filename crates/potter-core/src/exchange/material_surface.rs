@@ -165,6 +165,9 @@ pub(crate) struct ResolvedSurface {
     pub(crate) base_color: TexturedValue<[f64; 4]>,
     /// The vertex color the base color multiplies (`COLOR_0`). `None` when the graph reads none.
     pub(crate) vertex_color: Option<VertexColorRead>,
+    /// A vertex color the graph reads where glTF cannot multiply it (a `VERTEX_COLOR` loss). The
+    /// layer is still written as `COLOR_0` so its data is kept; `vertex_color` takes precedence.
+    pub(crate) unmultiplied_vertex_color: Option<VertexColorRead>,
     pub(crate) metallic: f64,
     pub(crate) roughness: f64,
     /// glTF metallicRoughnessTexture: G = roughness, B = metallic.
@@ -378,9 +381,11 @@ fn sampled_from_ref(
     }
 }
 
-/// The metallicRoughness texture of a material's explicit fields: G from the roughness
-/// texture, B from the metallic texture. Each channel reads its own image; the texture's
-/// sampling state comes from the roughness reference when present.
+/// The metallicRoughness texture of a material's explicit fields: G from the roughness texture's
+/// Red channel, B from the metallic texture's Red channel. A native scalar field is read through
+/// its Red channel (`material_graph::GraphTextures::from_field_refs`), so each field packs its Red
+/// into its glTF channel. Each channel reads its own image; the texture's sampling state comes
+/// from the roughness reference when present.
 fn metallic_roughness_from_refs(
     material_id: &Id,
     roughness: Option<&TextureRef>,
@@ -412,15 +417,18 @@ fn metallic_roughness_from_refs(
             );
         }
     }
-    let green = roughness.map(|rough| ChannelSource {
+    let roughness_source = roughness.map(|rough| ChannelSource {
         image: rough.image.clone(),
-        channel: TextureChannel::Green,
+        channel: TextureChannel::Red,
     });
-    let blue = metallic.map(|metal| ChannelSource {
+    let metallic_source = metallic.map(|metal| ChannelSource {
         image: metal.image.clone(),
-        channel: TextureChannel::Blue,
+        channel: TextureChannel::Red,
     });
-    Some(sampled_from_ref(base, [None, green, blue, None]))
+    Some(sampled_from_ref(
+        base,
+        [None, roughness_source, metallic_source, None],
+    ))
 }
 
 /// Resolves the explicit fields of a material. Used for materials without a custom graph.
@@ -480,6 +488,7 @@ fn fields_surface(
         alpha_mode,
         unlit: false,
         vertex_color: None,
+        unmultiplied_vertex_color: None,
         base_color,
         metallic: material.metallic,
         roughness: material.roughness,
@@ -720,6 +729,8 @@ struct GraphReducer<'a> {
     material_id: &'a Id,
     group: &'a NodeGroup,
     losses: Vec<super::Loss>,
+    /// The first vertex color a non-base socket dropped (see `plain_color_input`).
+    dropped_vertex: Option<VertexColorRead>,
 }
 
 impl<'a> GraphReducer<'a> {
@@ -1101,7 +1112,8 @@ impl GraphReducer<'_> {
     }
 
     /// A color socket whose value a constant or texture carries. A vertex color read in it is a
-    /// loss: only the base color multiplies `COLOR_0`.
+    /// loss: only the base color multiplies `COLOR_0`. The read's layer is still kept as the
+    /// material's `COLOR_0` (`unmultiplied_vertex_color`), so the color data is exported.
     fn plain_color_input(
         &mut self,
         node_id: &Id,
@@ -1110,12 +1122,13 @@ impl GraphReducer<'_> {
         depth: usize,
     ) -> crate::error::Result<ColorIn> {
         let mut color = self.color_input(node_id, socket, default, depth)?;
-        if color.vertex.take().is_some() {
+        if let Some(read) = color.vertex.take() {
             self.loss(
                 feature_id::VERTEX_COLOR,
-                format!("node `{node_id}` reads vertex color into socket `{socket}`; glTF multiplies vertex color only into the base color, so the vertex color is dropped"),
+                format!("node `{node_id}` reads vertex color into socket `{socket}`; glTF multiplies vertex color only into the base color, so this read is not expressed; its layer is still written as COLOR_0"),
                 None,
             );
+            self.dropped_vertex = self.dropped_vertex.take().or(Some(read));
         }
         Ok(color)
     }
@@ -2567,6 +2580,7 @@ impl GraphReducer<'_> {
                 texture: base_texture,
             },
             vertex_color: base.vertex,
+            unmultiplied_vertex_color: self.dropped_vertex.take(),
             metallic: metallic.factor,
             roughness: roughness.factor,
             metallic_roughness_texture,
@@ -2619,6 +2633,7 @@ fn graph_surface(
         material_id,
         group,
         losses: Vec::new(),
+        dropped_vertex: None,
     };
     reducer.material_field_losses(material);
     let shade = if let Some(link) = reducer.link_into(output, "Surface") {

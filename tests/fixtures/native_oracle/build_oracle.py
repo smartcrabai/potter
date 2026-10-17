@@ -671,9 +671,12 @@ else:
 if matches(observed, file_rows_linear if transfer == "linear" else file_rows_unit):
     raise SystemExit("Blender pixels are in file order (top row first); expected bottom row first")
 
+# The field's base color factor (Potter's default material base color, spec "The default material"), which
+# multiplies the texture in both the Potter field and the Blender reference's MixRGB MULTIPLY.
+TEXTURE_BASE_FACTOR = 0.6
 # Expected render of the texture plane, bottom row first. The render camera sees the plane's
-# texel grid one-to-one, so a render pixel shows the texel its UV falls in. Base is flipped
-# (v' = 1 - v), so its row py is file row py; Light is the identity, so its row py is file row
+# texel grid one-to-one, so a render pixel shows the texel its UV falls in, times the factor. Base is
+# flipped (v' = 1 - v), so its row py is file row py; Light is the identity, so its row py is file row
 # (height - 1 - py). A texture that names the wrong layer, or flips twice, renders the other one.
 expected["texture"] = {
     "file": "texture.png",
@@ -684,8 +687,8 @@ expected["texture"] = {
     "blender_pixel_transfer": transfer,
     "blender_pixels_bottom_up": observed,
     "blender_row_y_holds_file_row": [TEX_HEIGHT - 1 - y for y in range(TEX_HEIGHT)],
-    "render_bottom_up_base_layer": [file_rows_linear[py] for py in range(TEX_HEIGHT)],
-    "render_bottom_up_light_layer": [file_rows_linear[TEX_HEIGHT - 1 - py] for py in range(TEX_HEIGHT)],
+    "render_bottom_up_base_layer": [[[TEXTURE_BASE_FACTOR * c for c in pixel] for pixel in file_rows_linear[py]] for py in range(TEX_HEIGHT)],
+    "render_bottom_up_light_layer": [[[TEXTURE_BASE_FACTOR * c for c in pixel] for pixel in file_rows_linear[TEX_HEIGHT - 1 - py]] for py in range(TEX_HEIGHT)],
     "plane": {
         "object": "TexturePlane",
         "location": list(PLANE_LOCATION),
@@ -695,7 +698,8 @@ expected["texture"] = {
 }
 
 # The reference: Blender's own nodes. Image Texture (Closest) with its vector from a UV Map node
-# naming "Base", feeding Base Color. render_texture.py renders this file and the Potter export.
+# naming "Base"; the texture is multiplied by the field's base color factor through a MixRGB MULTIPLY
+# (Color2 is the texture), which feeds Base Color, as Potter's export writes it.
 reference = bpy.data.materials.new("Reference")
 reference.use_nodes = True
 tree = reference.node_tree
@@ -704,8 +708,13 @@ tex.image = texture_image
 tex.interpolation = "Closest"
 uv_node = tree.nodes.new("ShaderNodeUVMap")
 uv_node.uv_map = "Base"
+factor_mix = tree.nodes.new("ShaderNodeMixRGB")
+factor_mix.blend_type = "MULTIPLY"
+factor_mix.inputs["Fac"].default_value = 1.0
+factor_mix.inputs["Color1"].default_value = (TEXTURE_BASE_FACTOR, TEXTURE_BASE_FACTOR, TEXTURE_BASE_FACTOR, 1.0)
 tree.links.new(uv_node.outputs["UV"], tex.inputs["Vector"])
-tree.links.new(tex.outputs["Color"], tree.nodes["Principled BSDF"].inputs["Base Color"])
+tree.links.new(tex.outputs["Color"], factor_mix.inputs["Color2"])
+tree.links.new(factor_mix.outputs["Color"], tree.nodes["Principled BSDF"].inputs["Base Color"])
 texture_plane.data.materials.append(reference)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, "reference.blend"))
 

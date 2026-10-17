@@ -236,14 +236,26 @@ fn check_imported_weights(scene: &Value, name: &str, expected: &Value) -> TestRe
             FLOAT_TOLERANCE,
             &format!("{name} data-block Hip vertex {index}"),
         );
-        assert_close(
-            number(&mesh["attributes"]["vertex_groups"]["Hip"][format!("v{vertex_id}")])?,
-            expected_weight,
-            FLOAT_TOLERANCE,
-            &format!("{name} mesh Hip vertex {index}"),
-        );
     }
     Ok(())
+}
+
+fn data_slot_material<'a>(scene: &'a Value, node: &str, label: &str) -> TestResult<&'a str> {
+    let node_value = &scene["nodes"][node];
+    let link = node_value["material_links"][0]
+        .as_str()
+        .ok_or_else(|| format!("{label} material slot link is missing"))?;
+    let slots = if link == "data" {
+        let data = node_value["data"]
+            .as_str()
+            .ok_or_else(|| format!("{label} object data is missing"))?;
+        &scene["data_blocks"][data]["materials"]
+    } else {
+        &node_value["materials"]
+    };
+    slots[0]
+        .as_str()
+        .ok_or_else(|| format!("{label} material assignment is missing").into())
 }
 
 fn check_imported_material(scene: &Value, expected: &Value) -> TestResult<String> {
@@ -258,12 +270,10 @@ fn check_imported_material(scene: &Value, expected: &Value) -> TestResult<String
         scene,
         names[1].as_str().ok_or("right object name is missing")?,
     )?;
-    let left_material = scene["nodes"][&left]["materials"][0]
-        .as_str()
-        .ok_or("left material assignment is missing")?;
-    let right_material = scene["nodes"][&right]["materials"][0]
-        .as_str()
-        .ok_or("right material assignment is missing")?;
+    // The shared material is linked to each mesh data-block (build_reserved_color_oracle.py appends it
+    // to `obj.data.materials`), so the slot lives on the data, not on the object.
+    let left_material = data_slot_material(scene, &left, "left")?;
+    let right_material = data_slot_material(scene, &right, "right")?;
     assert_eq!(
         left_material, right_material,
         "objects must share one material"

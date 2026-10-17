@@ -780,9 +780,30 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
             project.path(),
             crate::image::ImageInterpolation::Linear,
         )?;
-        image_json["pixels"] = json!(data.pixels);
+        image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
     }
     Ok(())
+}
+
+/// Potter's decoded pixels in Blender's image layout. Potter stores rows top-down and scene-linear values; Blender's
+/// image buffer runs bottom-up, and its pixel values are in the colour space the image declares. An sRGB image is
+/// therefore re-encoded to sRGB (HDR values stay unclamped), and every row order is reversed.
+fn blender_image_pixels(image: &Image, width: u32, pixels: &[[f64; 4]]) -> Vec<[f64; 4]> {
+    let row_width = usize::try_from(width).unwrap_or(1).max(1);
+    let mut rows: Vec<[f64; 4]> = pixels
+        .chunks(row_width)
+        .rev()
+        .flatten()
+        .copied()
+        .collect();
+    if image.colorspace == ImageColorspace::Srgb {
+        for pixel in &mut rows {
+            for channel in &mut pixel[..3] {
+                *channel = crate::color::linear_to_srgb_unclamped(*channel);
+            }
+        }
+    }
+    rows
 }
 
 fn resolve_export_resource_path(project: &Project, uri: &str) -> Option<PathBuf> {
@@ -8224,7 +8245,7 @@ mod tests {
         });
         let mesh = convert_mesh(&item)?;
         assert_eq!(mesh.attributes["user:vertex_groups"]["domain"], "point");
-        assert_eq!(mesh.attributes["user:skin_tone"]["type"], "float");
+        assert_eq!(mesh.attributes["skin_tone"]["type"], "float");
         assert!(!mesh.attributes.contains_key("blender_attributes"));
         let store = color_layers::read(&mesh);
         let layers: Vec<&str> = store
@@ -8448,7 +8469,7 @@ mod tests {
                  "matrix_basis": [], "matrix_local": [], "matrix_world": [],
                  "hide_viewport": true, "hide_render": false, "hide_select": false,
                  "materials": [null, "Red", null], "material_links": ["data", "object", "object"],
-                 "custom_properties": {"potter.tags": ["animated"]}, "rna_properties": {},
+                 "action": "Move", "custom_properties": {"potter.tags": ["animated"]}, "rna_properties": {},
                  "modifiers": [{"name": "Bevel", "type": "BEVEL", "enabled": false,
                                 "properties": {"width": 0.125}, "custom_properties": {}}],
                  "data_name_unused": null},
@@ -8910,7 +8931,7 @@ mod tests {
         );
         Ok(export_losses(&doc)
             .into_iter()
-            .filter(|loss| loss.feature_id == "blender.mesh.attribute")
+            .filter(|loss| loss.feature_id == "mesh.attribute")
             .collect())
     }
 
@@ -8935,7 +8956,7 @@ mod tests {
         assert!(mesh_attribute_losses(box_with_attributes(with_raw)?)?.is_empty());
         let unknown = vec![
             (
-                "scratch",
+                ".scratch",
                 json!({"domain": "point", "type": "float", "values": {}}),
             ),
             ("blender_attributes", json!([raw_custom_normal_entry(24)])),
@@ -8984,23 +9005,12 @@ mod tests {
                 .and_then(|values| values.get(&key))
                 .cloned()
         };
-        let custom = native("custom_normal")
-            .and_then(|corners| corners.as_array().cloned())
-            .ok_or_else(|| invalid_intermediate("imported custom normals are missing"))?;
-        assert_eq!(custom.len(), 4);
-        for corner in &custom {
-            let components = corner
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_f64)
-                .collect::<Vec<_>>();
+        let normals = crate::geom::corner_normal_vectors(&mesh)?;
+        assert_eq!(normals.len(), 4);
+        for normal in normals {
             assert!(
-                components.len() == 3
-                    && components[0].abs() < 1e-9
-                    && (components[1] - 0.6).abs() < 1e-9
-                    && (components[2] - 0.8).abs() < 1e-9,
-                "{corner}"
+                normal.abs_diff_eq(DVec3::new(0.0, 0.6, 0.8), BLENDER_CUSTOM_NORMAL_TOLERANCE),
+                "{normal:?}"
             );
         }
         assert_eq!(
@@ -9025,23 +9035,15 @@ mod tests {
             .map(|face| face.vertices.len())
             .sum::<usize>();
         // The raw entry holds zero codes, which decode to a normal other than the +X native ones.
-        let native = mesh
-            .faces
-            .iter()
-            .map(|face| {
-                (
-                    format!("f{}", face.id),
-                    Value::Array(vec![json!([1.0, 0.0, 0.0]); face.vertices.len()]),
-                )
-            })
-            .collect::<serde_json::Map<String, Value>>();
+        // Native +X normals, encoded as the mesh's one normal_code state.
+        clnor::encode_vectors(
+            &mut mesh,
+            Some(&vec![Some(DVec3::X); corner_count]),
+            clnor::NormalCodeOptions::default(),
+        )?;
         mesh.attributes.insert(
             "blender_attributes".to_owned(),
             json!([raw_custom_normal_entry(corner_count)]),
-        );
-        mesh.attributes.insert(
-            "custom_normal".to_owned(),
-            json!({"domain": "corner", "type": "float3", "values": native}),
         );
         let mut doc = roundtrip_scene()?;
         doc.data_blocks
@@ -9357,6 +9359,8 @@ mod tests {
     )]
     #[test]
     fn blender_native_texture_fields_reopen_as_linked_pbr_nodes() -> Result<()> {
+        // Blender stores material scalars as float32; one ULP near 1.0 is 1.2e-7, so 1e-6 covers the storage.
+        const F32_STORAGE_TOLERANCE: f64 = 1.0e-6;
         let Some(blender) = optional_blender() else {
             return Ok(());
         };
@@ -9395,11 +9399,14 @@ mod tests {
             .get(&Id::new("mat_red")?)
             .ok_or_else(|| invalid_intermediate("native texture material is missing"))?;
         assert_eq!(material.alpha_mode, "blend");
-        assert_eq!(material.alpha_threshold, 0.37);
-        assert_eq!(material.emission_color, [0.2, 0.3, 0.1]);
-        assert_eq!(material.emission_strength, 0.6);
-        assert_eq!(material.transmission, 0.2);
-        assert_eq!(material.ior, 1.3);
+        let close = |actual: f64, expected: f64| (actual - expected).abs() <= F32_STORAGE_TOLERANCE;
+        assert!(close(material.alpha_threshold, 0.37));
+        for (actual, expected) in material.emission_color.into_iter().zip([0.2, 0.3, 0.1]) {
+            assert!(close(actual, expected), "emission {actual} != {expected}");
+        }
+        assert!(close(material.emission_strength, 0.6));
+        assert!(close(material.transmission, 0.2));
+        assert!(close(material.ior, 1.3));
         let graph_id = material
             .node_tree
             .as_ref()
@@ -9484,13 +9491,13 @@ mod tests {
         ));
         assert!(has_link(
             "roughness_split",
-            "Green",
+            "Red",
             "roughness_factor",
             "Value"
         ));
         assert!(has_link(
             "metallic_split",
-            "Blue",
+            "Red",
             "metallic_factor",
             "Value"
         ));
@@ -10152,10 +10159,10 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             "float3"
         );
         assert_eq!(
-            imported_mesh.attributes["user:skin_tone"]["domain"],
+            imported_mesh.attributes["skin_tone"]["domain"],
             "corner"
         );
-        assert_eq!(imported_mesh.attributes["user:skin_tone"]["type"], "float");
+        assert_eq!(imported_mesh.attributes["skin_tone"]["type"], "float");
         assert!(
             clnor::corner_codes(imported_mesh)?.is_some(),
             "the source custom-normal layer must remain present"
@@ -10364,8 +10371,25 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             reopened_mesh.attributes["shade_smooth"]["values"],
             expected_smooth
         );
-        assert_eq!(reopened_mesh.attributes["sharp"]["values"], expected_sharp);
-        assert_eq!(reopened_mesh.attributes["seam"]["values"], expected_seam);
+        // Import omits an all-false flag layer (`insert_flag_attribute`), so absent means every edge is false.
+        let reopened_flag = |name: &str, key: &str| {
+            reopened_mesh
+                .attributes
+                .get(name)
+                .and_then(|attribute| attribute.get("values"))
+                .and_then(|values| values.get(key))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        for (name, expected) in [("sharp", &expected_sharp), ("seam", &expected_seam)] {
+            for (key, value) in expected.as_object().into_iter().flatten() {
+                assert_eq!(
+                    reopened_flag(name, key),
+                    value.as_bool() == Some(true),
+                    "{name} flag {key} changed on reopen"
+                );
+            }
+        }
         for (vertex, expected) in reopened_mesh.vertices.iter().zip(&expected_positions) {
             assert!(
                 vertex.co.abs_diff_eq(*expected, 1.0e-6),
@@ -12287,10 +12311,12 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             &cube.modifiers[10].params["voxel_size"],
             0.1
         ));
+        let cube_data = cube
+            .data
+            .as_ref()
+            .and_then(|data_id| imported.doc.data_blocks.get(data_id));
         let material_id = cube
-            .materials
-            .first()
-            .and_then(Option::as_ref)
+            .material_slot(cube_data, 0)
             .ok_or_else(|| invalid_intermediate("fixture material slot was not imported"))?;
         let material = imported
             .doc
@@ -12480,8 +12506,12 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .map(|curve| curve.keyframes.len()),
             Some(2)
         );
-        let roundtrip_material_id = roundtrip_cube.materials[0]
+        let roundtrip_cube_data = roundtrip_cube
+            .data
             .as_ref()
+            .and_then(|data_id| roundtrip.doc.data_blocks.get(data_id));
+        let roundtrip_material_id = roundtrip_cube
+            .material_slot(roundtrip_cube_data, 0)
             .ok_or_else(|| invalid_intermediate("round-trip cube material is missing"))?;
         let roundtrip_material = roundtrip
             .doc
@@ -12539,6 +12569,13 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
 
     fn primitive_scene() -> Result<SceneDoc> {
         let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.materials.insert(
+            Id::new("mat_red")?,
+            Material {
+                name: "Red".to_owned(),
+                ..Material::default()
+            },
+        );
         let mut nodes = Vec::new();
         for (index, (id, kind, params, translation)) in [
             ("prim_box", "box", json!({"size": 2.0}), [0.0, 0.0, 1.0]),
@@ -13294,6 +13331,13 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 slots: Vec::new(),
             },
         );
+        doc.materials.insert(
+            Id::new("mat_red")?,
+            Material {
+                name: "Red".to_owned(),
+                ..Material::default()
+            },
+        );
         let mut animated = test_node("Animated Box", "mesh_common", None, Some("act_lift"))?;
         animated.transform.translation = [-1.2, 0.0, 0.0];
         doc.nodes.insert(Id::new("animated")?, animated);
@@ -13451,10 +13495,12 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .find(|modifier| modifier.modifier_type == "bevel")
             .map(|modifier| modifier.id.clone())
             .ok_or_else(|| invalid_intermediate("bevel modifier is missing"))?;
+        let tabletop_data = tabletop
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
         let material_id = tabletop
-            .materials
-            .first()
-            .and_then(Option::as_ref)
+            .material_slot(tabletop_data, 0)
             .cloned()
             .ok_or_else(|| invalid_intermediate("tabletop material is missing"))?;
         let rod = test_node_ref(&doc, "node_riggedrod")?.clone();
