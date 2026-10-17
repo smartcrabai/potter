@@ -14,7 +14,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot, mesh_vertex_weights},
     geom::{
-        Face, Mesh, MeshError, attribute_keys, clnor,
+        Mesh, MeshError, attribute_keys, clnor,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         edge_key,
         normals::{close, corner_normals, sharp_edge_flags, smooth_face_flags},

@@ -987,60 +987,6 @@ impl Sources<'_> {
     }
 }
 
-/// Reads a three-component vector from a JSON array.
-fn vector3(value: &Value) -> Option<DVec3> {
-    let components = value
-        .as_array()
-        .filter(|components| components.len() == 3)?;
-    Some(DVec3::new(
-        components[0].as_f64()?,
-        components[1].as_f64()?,
-        components[2].as_f64()?,
-    ))
-}
-
-/// Blend of the authored custom normals at `sources`, weights renormalised over the sources that
-/// have one. Normalised unless `raw`; `None` when no source has an authored normal.
-fn blend_vectors(sources: &[(usize, f64)], authored: &[Option<DVec3>], raw: bool) -> Option<DVec3> {
-    let mut total = 0.0;
-    let mut sum = DVec3::ZERO;
-    for (index, weight) in sources {
-        if let Some(Some(normal)) = authored.get(*index) {
-            sum += *normal * *weight;
-            total += *weight;
-        }
-    }
-    if total <= 0.0 {
-        return None;
-    }
-    let blended = sum / total;
-    Some(if raw {
-        blended
-    } else {
-        blended.normalize_or_zero()
-    })
-}
-
-/// Normalises every authored `custom_normal` vector. Subdivision blends unnormalised levels and calls
-/// this once on its final mesh.
-pub(crate) fn normalize_custom_normals(mesh: &mut Mesh) {
-    let Some(values) = mesh
-        .attributes
-        .get_mut("custom_normal")
-        .and_then(|attribute| attribute.get_mut("values"))
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    for corners in values.values_mut() {
-        for value in corners.as_array_mut().into_iter().flatten() {
-            if let Some(normal) = vector3(value) {
-                *value = json!(normal.normalize_or_zero().to_array());
-            }
-        }
-    }
-}
-
 /// Index of the heaviest `(index, weight)` source; ties go to the lowest index.
 fn heaviest_source(sources: &[(usize, f64)]) -> Option<usize> {
     sources

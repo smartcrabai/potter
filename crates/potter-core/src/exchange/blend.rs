@@ -143,7 +143,7 @@ pub fn export_blend(
     let script = temporary_path("blend-bridge.py")?;
     let blend_temp = temporary_blend_path(parent)?;
     let validation = temporary_path("blend-export-validation.json")?;
-    let (document, mut asset_files, mut multires_sidecars, mut created_multires_sidecars) =
+    let (document, asset_files, multires_sidecars, mut created_multires_sidecars) =
         match prepare_blend_export_resources(document, project, out) {
             Ok(resources) => resources,
             Err(error) => {
@@ -12361,7 +12361,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
             "data_blocks": {
                 "data": {
                     "mesh": {
-                        "faces": [{"id": 1, "vertices": [0, 1, 2]}],
+                        "faces": [{"id": 1, "v": [0, 1, 2]}],
                         "attributes": {
                             "multires_displacement": {
                                 "total_levels": 1,

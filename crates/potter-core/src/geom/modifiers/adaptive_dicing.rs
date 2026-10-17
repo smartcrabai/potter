@@ -1857,7 +1857,7 @@ fn shared_vertex_key(
                 })?;
             Ok(DicedVertexKey::Curve(base_curve, midpoint))
         }
-        CurveKey::NgonSpoke(face, _) => Ok(DicedVertexKey::Curve(curve, index)),
+        CurveKey::NgonSpoke(_, _) => Ok(DicedVertexKey::Curve(curve, index)),
     }
 }
 

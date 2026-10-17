@@ -60,6 +60,7 @@ pub(crate) struct MultiresGridData {
     pub(crate) hidden_grids: Option<Vec<Vec<bool>>>,
 }
 
+#[cfg(test)]
 impl MultiresGridData {
     pub(crate) fn paint_mask_value(
         &self,
@@ -1229,6 +1230,7 @@ fn average_with_other(
     Ok(tangent_to_object(du, dv, tangent_corner, tangent))
 }
 
+#[cfg(test)]
 /// Add an object-space sculpt delta to the selected corner-grid sample.
 pub(super) fn add_sample_delta(
     mesh: &Mesh,

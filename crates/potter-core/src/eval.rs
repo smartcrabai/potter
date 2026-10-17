@@ -13,9 +13,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Aabb, CylinderParams, IcosphereParams, Mesh,
-        concat::{
-            Part, concatenate, concatenate_with_normals, rotate_corner_normals, uv_covered_faces,
-        },
+        concat::{Part, concatenate, concatenate_with_normals, uv_covered_faces},
         modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
         normals::SHADING_ATTRIBUTES,
     },

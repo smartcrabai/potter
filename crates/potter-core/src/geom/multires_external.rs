@@ -77,6 +77,7 @@ fn expected_external_sizes_for_sample_count(sample_count: usize) -> Result<(u64,
     Ok((data_size, file_size))
 }
 
+#[cfg(test)]
 /// Decode a fixed-level Blender sidecar into one grid per corner.
 pub(crate) fn read_external_grids(
     bytes: &[u8],
@@ -202,6 +203,7 @@ fn read_external_grids_for_grid_lengths(
     Ok(grids)
 }
 
+#[cfg(test)]
 /// Encode a fixed-level row-major displacement grid for each corner.
 pub(crate) fn write_external_grids(grids: &[Vec<[f32; 3]>], total_levels: u32) -> Result<Vec<u8>> {
     let levels = vec![total_levels; grids.len()];

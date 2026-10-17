@@ -2612,9 +2612,13 @@ def _bake_point_cache(obj, cache):
             scene.collection.objects.unlink(obj)
 
 
+def _owning_scene(obj, default=None):
+    scenes = obj.users_scene
+    return scenes[0] if scenes else default
+
+
 def _force_multires_external_read(obj, modifier):
-    scene = next((scene for scene in bpy.data.scenes if obj in scene.objects),
-                 bpy.context.scene)
+    scene = _owning_scene(obj, bpy.context.scene)
     view_layer = scene.view_layers[0]
     levels = int(modifier.levels)
     show_viewport = bool(modifier.show_viewport)
@@ -2632,8 +2636,7 @@ def _force_multires_external_read(obj, modifier):
 
 
 def _pack_multires_displacement(obj, modifier):
-    scene = next((scene for scene in bpy.data.scenes if obj in scene.objects),
-                 bpy.context.scene)
+    scene = _owning_scene(obj, bpy.context.scene)
     with bpy.context.temp_override(
             scene=scene, view_layer=scene.view_layers[0], object=obj,
             active_object=obj, selected_objects=[obj],
@@ -2680,8 +2683,7 @@ def _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
             seed_fd, seed_path = tempfile.mkstemp(suffix=".btx")
             os.close(seed_fd)
             os.unlink(seed_path)
-            scene = next((scene for scene in bpy.data.scenes if obj in scene.objects),
-                         bpy.context.scene)
+            scene = _owning_scene(obj, bpy.context.scene)
             with bpy.context.temp_override(
                     scene=scene, view_layer=scene.view_layers[0], object=obj,
                     active_object=obj, selected_objects=[obj],
@@ -3427,7 +3429,7 @@ def _ensure_multires_sculpt_layers(obj):
     if not any(mesh.attributes.get(name) is not None
                for name in (".sculpt_mask", ".hide_vert", ".hide_poly")):
         return
-    scene = next((scene for scene in bpy.data.scenes if obj in scene.objects), None)
+    scene = _owning_scene(obj)
     if scene is None or not scene.view_layers:
         return
     view_layer = scene.view_layers[0]
