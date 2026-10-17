@@ -1817,26 +1817,37 @@ fn validate_attribute_modifier_params_inner(
                 &[
                     "TOPOLOGY",
                     "NEAREST",
+                    "EDGE_NEAREST",
+                    "EDGEINTERP_NEAREST",
+                    "POLY_NEAREST",
                     "POLYINTERP_NEAREST",
                     "POLYINTERP_VNORPROJ",
                 ],
             ),
             (
                 "edge_mapping",
-                &["TOPOLOGY", "NEAREST", "VERT_NEAREST", "POLY_NEAREST"],
+                &[
+                    "TOPOLOGY",
+                    "VERT_NEAREST",
+                    "NEAREST",
+                    "POLY_NEAREST",
+                    "EDGEINTERP_VNORPROJ",
+                ],
             ),
             (
                 "loop_mapping",
                 &[
                     "TOPOLOGY",
+                    "NEAREST_NORMAL",
                     "NEAREST_POLYNOR",
+                    "NEAREST_POLY",
                     "POLYINTERP_NEAREST",
                     "POLYINTERP_LNORPROJ",
                 ],
             ),
             (
                 "poly_mapping",
-                &["TOPOLOGY", "NEAREST", "POLYINTERP_PNORPROJ"],
+                &["TOPOLOGY", "NEAREST", "NORMAL", "POLYINTERP_PNORPROJ"],
             ),
             (
                 "mix_mode",
@@ -1851,9 +1862,24 @@ fn validate_attribute_modifier_params_inner(
                 ],
             ),
             (
+                "layers_vgroup_select_src",
+                &["ACTIVE", "ALL", "BONE_SELECT", "BONE_DEFORM"],
+            ),
+            (
+                "layers_vcol_vert_select_src",
+                &["ACTIVE", "ALL", "BONE_SELECT", "BONE_DEFORM"],
+            ),
+            (
+                "layers_vcol_loop_select_src",
+                &["ACTIVE", "ALL", "BONE_SELECT", "BONE_DEFORM"],
+            ),
+            (
                 "layers_uv_select_src",
                 &["ACTIVE", "ALL", "BONE_SELECT", "BONE_DEFORM"],
             ),
+            ("layers_vgroup_select_dst", &["ACTIVE", "NAME", "INDEX"]),
+            ("layers_vcol_vert_select_dst", &["ACTIVE", "NAME", "INDEX"]),
+            ("layers_vcol_loop_select_dst", &["ACTIVE", "NAME", "INDEX"]),
             ("layers_uv_select_dst", &["ACTIVE", "NAME", "INDEX"]),
         ],
         _ => &[],
