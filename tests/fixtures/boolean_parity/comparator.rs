@@ -279,11 +279,16 @@ fn potter_canonical(mesh: &Mesh, world: DMat4) -> TestResult<Canonical> {
         .collect();
     let fids = face_values(mesh, "fid");
     let uv_faces = uv_map_faces(mesh)?;
-    let normal_rows = mesh
+    // Presence follows the Blender custom-normal layer, which exists when its `values` do. The
+    // values are evaluated through the public API, so the comparison sees vectors, not codes.
+    let evaluated = mesh
         .attributes
         .get("custom_normal")
         .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object);
+        .map(|_| potter_core::geom::corner_normal_vectors(mesh))
+        .transpose()
+        .map_err(|error| format!("{error:?}"))?;
+    let mut corner_base = 0;
     let mut faces = Vec::with_capacity(mesh.faces.len());
     let mut rings = Vec::with_capacity(mesh.faces.len());
     let mut face_sizes = BTreeMap::new();
@@ -302,10 +307,11 @@ fn potter_canonical(mesh: &Mesh, world: DMat4) -> TestResult<Canonical> {
             .and_then(|values| values.get(index))
             .and_then(Value::as_i64);
         let uv = uv_faces[index].as_deref();
-        let normals = normal_rows
-            .and_then(|rows| rows.get(&format!("f{}", face.id)))
-            .map(points_from_json)
-            .transpose()?;
+        let corners = face.vertices.len();
+        let normals = evaluated
+            .as_ref()
+            .map(|all| all[corner_base..corner_base + corners].to_vec());
+        corner_base += corners;
         faces.push(canonical_face(
             &ring,
             u64::from(face.material_index),

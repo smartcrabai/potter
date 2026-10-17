@@ -644,24 +644,21 @@ fn modifier_uvs(mesh: &potter_core::geom::Mesh, layer: &str) -> Vec<Value> {
     result
 }
 
-fn modifier_normals(mesh: &potter_core::geom::Mesh) -> Vec<Value> {
-    let Some(values) = mesh
+/// Evaluated per-corner normals as Blender vectors, through the public evaluator. Codes decode on
+/// their fans; the result is empty when the mesh has no custom-normal layer.
+fn modifier_normals(mesh: &potter_core::geom::Mesh) -> Result<Vec<Value>, Box<dyn Error>> {
+    if mesh
         .attributes
         .get("custom_normal")
-        .and_then(|attribute| attribute["values"].as_object())
-    else {
-        return Vec::new();
-    };
-    let mut result = Vec::new();
-    for face in &mesh.faces {
-        if let Some(corners) = values
-            .get(&format!("f{}", face.id))
-            .and_then(Value::as_array)
-        {
-            result.extend(corners.iter().cloned());
-        }
+        .and_then(|attribute| attribute.get("values"))
+        .is_none()
+    {
+        return Ok(Vec::new());
     }
-    result
+    Ok(potter_core::geom::corner_normal_vectors(mesh)?
+        .iter()
+        .map(|normal| json!(normal.to_array()))
+        .collect())
 }
 fn blender_quantize_loop_normals(
     blender: &Path,
@@ -796,7 +793,7 @@ fn assert_attribute_case(
     match name {
         "OwnerWeightEdit" | "OwnerWeightMix" | "OwnerWeightProximity" => {}
         "OwnerWeightedNormal" | "OwnerNormalEdit" => {
-            let normals = modifier_normals(evaluated);
+            let normals = modifier_normals(evaluated)?;
             let quantized = blender_quantize_loop_normals(blender, root, evaluated, &normals)?;
             assert_flat_float_arrays(
                 &quantized,
