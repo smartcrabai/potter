@@ -1700,12 +1700,17 @@ def _color_management_dump(scene):
             "gamma": float(view.gamma), "curve": curve}
 
 
+# ViewLayer.use_pass_cryptomatte_accurate is an accuracy flag, not a pass (rna_scene.cc,
+# VIEW_LAYER_CRYPTOMATTE_ACCURATE), so it is carried as render.cryptomatte_accurate.
+CRYPTOMATTE_ACCURATE_PROP = "use_pass_cryptomatte_accurate"
+
+
 def _render_passes(scene):
     passes = set()
     for layer in scene.view_layers:
         for prop in layer.bl_rna.properties:
             name = prop.identifier
-            if not name.startswith("use_pass_"):
+            if not name.startswith("use_pass_") or name == CRYPTOMATTE_ACCURATE_PROP:
                 continue
             try:
                 if bool(getattr(layer, name)):
@@ -1713,6 +1718,10 @@ def _render_passes(scene):
             except Exception:
                 continue
     return sorted(passes)
+
+
+def _cryptomatte_accurate(scene):
+    return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
 
 def _scene_compositor(scene):
@@ -1920,6 +1929,7 @@ def dump_scene(scene):
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
                 "engine_native": render_engine,
                 "passes": _render_passes(scene),
+                "cryptomatte_accurate": _cryptomatte_accurate(scene),
             },
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
             "compositor": _scene_compositor(scene),
@@ -6380,6 +6390,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         audio_codec = getattr(getattr(scene.render, "ffmpeg", None), "audio_codec", None)
         if audio_codec is not None:
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
+        for layer in scene.view_layers:
+            if hasattr(layer, CRYPTOMATTE_ACCURATE_PROP):
+                setattr(layer, CRYPTOMATTE_ACCURATE_PROP, bool(render.get("cryptomatte_accurate", False)))
         color = item.get("color_management", {})
         scene.display_settings.display_device = color.get("display_device", "sRGB")
         view = scene.view_settings

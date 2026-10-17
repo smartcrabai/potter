@@ -1548,6 +1548,10 @@ fn build_imported_graph(
                         .collect()
                 },
             ),
+            cryptomatte_accurate: render
+                .get("cryptomatte_accurate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             motion_blur: render
                 .get("motion_blur")
                 .and_then(Value::as_bool)
