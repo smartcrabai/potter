@@ -2635,20 +2635,6 @@ def _force_multires_external_read(obj, modifier):
         modifier.show_viewport = show_viewport
 
 
-def _pack_multires_displacement(obj, modifier):
-    scene = _owning_scene(obj, bpy.context.scene)
-    with bpy.context.temp_override(
-            scene=scene, view_layer=scene.view_layers[0], object=obj,
-            active_object=obj, selected_objects=[obj],
-            selected_editable_objects=[obj]):
-        result = bpy.ops.object.multires_external_pack()
-    if "FINISHED" not in result:
-        raise ValueError("Blender could not pack multires displacement grids")
-    modifier.filepath = ""
-    if modifier.is_external or modifier.filepath:
-        raise ValueError("Blender did not pack multires displacement grids")
-
-
 # Blender exposes MDisps through its native external-layer loader, not mesh.attributes.
 def _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
     node = doc.get("nodes", {}).get(node_id, {})
@@ -2660,12 +2646,16 @@ def _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
         return False
     if not record.get("values") and not record.get("external"):
         return False
+    if int(record.get("total_levels", 0)) != int(modifier.total_levels):
+        raise ValueError("multires displacement level does not match the modifier")
+    if pack:
+        # Packed layers keep the full-size grids that multires_subdivide allocated; Potter fills
+        # them in place after the save, so no external sidecar is read or packed here.
+        return True
     external = record.get("external") or {}
     filepath = external.get("filepath")
     if not isinstance(filepath, str) or not filepath:
         raise ValueError("multires displacement grids have no external filepath")
-    if int(record.get("total_levels", 0)) != int(modifier.total_levels):
-        raise ValueError("multires displacement level does not match the modifier")
     target_directory = os.path.dirname(os.path.abspath(target))
     external_path = os.path.abspath(
         os.path.join(target_directory, filepath[2:] if filepath.startswith("//") else filepath))
@@ -2674,7 +2664,7 @@ def _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
     mesh_key = obj.data.as_pointer()
     restored = RESTORED_MDISPS_MESHES.get(mesh_key)
     if restored is not None:
-        if restored != (filepath, bool(pack)):
+        if restored != filepath:
             raise ValueError("shared multires mesh has conflicting displacement state")
         return True
     seed_path = None
@@ -2696,11 +2686,8 @@ def _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
         if not modifier.is_external:
             raise ValueError("Blender did not mark multires grids as external")
         _force_multires_external_read(obj, modifier)
-        if pack:
-            _pack_multires_displacement(obj, modifier)
-        else:
-            DEFERRED_MDISPS_FILEPATHS[mesh_key] = (modifier, obj, filepath)
-        RESTORED_MDISPS_MESHES[mesh_key] = (filepath, bool(pack))
+        DEFERRED_MDISPS_FILEPATHS[mesh_key] = (modifier, obj, filepath)
+        RESTORED_MDISPS_MESHES[mesh_key] = filepath
         return True
     finally:
         if seed_path and os.path.exists(seed_path):

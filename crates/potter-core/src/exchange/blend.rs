@@ -144,7 +144,7 @@ pub fn export_blend(
     let blend_temp = temporary_blend_path(parent)?;
     let validation = temporary_path("blend-export-validation.json")?;
     let (document, mut asset_files, multires_sidecars, created_multires_sidecars) =
-        match prepare_blend_export_resources(document, project, out) {
+        match prepare_blend_export_resources(document, project, out, opts.pack) {
             Ok(resources) => resources,
             Err(error) => {
                 cleanup(&[input, script, blend_temp, validation]);
@@ -410,6 +410,7 @@ fn prepare_blend_export_resources(
     mut document: Value,
     project: &Project,
     out: &Path,
+    pack: bool,
 ) -> Result<(Value, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
     let original_blend_path = document
         .get("compatibility")
@@ -580,6 +581,7 @@ fn prepare_blend_export_resources(
         &mut files,
         &mut multires_sidecars,
         &mut created_multires_sidecars,
+        pack,
     )?;
     Ok((
         document,
@@ -615,6 +617,7 @@ fn prepare_multires_external_sidecars(
     files: &mut Vec<PathBuf>,
     multires_sidecars: &mut Vec<PathBuf>,
     created_multires_sidecars: &mut Vec<PathBuf>,
+    pack: bool,
 ) -> Result<()> {
     let sidecar_existed = sidecar.exists();
     let result = prepare_multires_external_sidecars_inner(
@@ -624,6 +627,7 @@ fn prepare_multires_external_sidecars(
         files,
         multires_sidecars,
         created_multires_sidecars,
+        pack,
     );
     if result.is_err() {
         let _ = remove_multires_sidecars(created_multires_sidecars);
@@ -642,6 +646,7 @@ fn prepare_multires_external_sidecars_inner(
     files: &mut Vec<PathBuf>,
     multires_sidecars: &mut Vec<PathBuf>,
     created_multires_sidecars: &mut Vec<PathBuf>,
+    pack: bool,
 ) -> Result<()> {
     let mut exports = Vec::new();
     if let Some(data_blocks) = document.get("data_blocks").and_then(Value::as_object) {
@@ -708,6 +713,10 @@ fn prepare_multires_external_sidecars_inner(
                 record.get("grid_levels"),
                 auxiliary_bytes,
             )?;
+            if pack {
+                // Packed exports embed these grids in the .blend; no sidecar is written.
+                continue;
+            }
             let variable_levels = loop_levels.iter().any(|level| *level != total_levels);
             let bytes = if variable_levels {
                 crate::geom::multires_external::write_external_zero_grids(
@@ -12411,6 +12420,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
             &mut files,
             &mut multires_sidecars,
             &mut created_multires_sidecars,
+            false,
         )
         .expect_err("invalid modifier params should fail after sidecar creation");
         assert_eq!(error.code, ErrorCode::SceneInvalid);
@@ -12420,7 +12430,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
     }
 
     #[test]
-    fn packed_multires_reuse_does_not_delete_identical_preexisting_sidecar() -> Result<()> {
+    fn external_multires_reuse_does_not_delete_identical_preexisting_sidecar() -> Result<()> {
         let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
         let output = directory.path().join("packed.blend");
         let sidecar = directory.path().join("packed_assets");
@@ -12442,6 +12452,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
             &mut files,
             &mut multires_sidecars,
             &mut created_multires_sidecars,
+            false,
         )?;
         assert_eq!(multires_sidecars, [sidecar_file.clone()]);
         assert!(created_multires_sidecars.is_empty());
@@ -12853,6 +12864,71 @@ print("UNSUPPORTED_POSE " + json.dumps({
         eprintln!(
             "multires oracle: inline corners=24 grid=9 z_sum={inline_z_sum}; external filepath={filepath}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_variable_level_multires_export_reimports_per_loop_levels() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/multires/mr_inline.blend");
+        let mut imported = import_blend(&fixture, Some(&blender))?;
+        let record = imported
+            .doc
+            .data_blocks
+            .values_mut()
+            .filter_map(|data| data.mesh.as_mut())
+            .find_map(|mesh| mesh.attributes.get_mut("multires_displacement"))
+            .expect("inline fixture has a multires record");
+        // Alternate level-2 and level-1 loops; level-1 grids keep their first four samples.
+        let mut loop_index = 0_usize;
+        let mut levels = Vec::new();
+        let values = record
+            .get_mut("values")
+            .and_then(Value::as_object_mut)
+            .expect("fixture multires values");
+        for corners in values.values_mut() {
+            for corner in corners.as_array_mut().expect("fixture face corners") {
+                let level = if loop_index % 2 == 0 { 2_u64 } else { 1_u64 };
+                if level == 1 {
+                    corner
+                        .as_array_mut()
+                        .expect("fixture corner grid")
+                        .truncate(4);
+                }
+                levels.push(Value::from(level));
+                loop_index += 1;
+            }
+        }
+        assert_eq!(loop_index, 24);
+        let expected_levels = Value::Array(levels);
+        record["grid_levels"] = expected_levels.clone();
+        let expected_values = record["values"].clone();
+
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        let context = crate::eval::EvaluationContext::default();
+        let output = directory.path().join("variable-packed.blend");
+        let options = ExportOptions {
+            allow_lossy: false,
+            pack: true,
+            blender: Some(&blender),
+            context: &context,
+        };
+        export_blend(&imported.doc, &project, &output, &options)?;
+        let roundtrip = import_blend(&output, Some(&blender))?;
+        let roundtrip_record = roundtrip
+            .doc
+            .data_blocks
+            .values()
+            .filter_map(|data| data.mesh.as_ref())
+            .find_map(|mesh| mesh.attributes.get("multires_displacement"))
+            .expect("round-tripped mesh has no multires record");
+        assert_eq!(roundtrip_record.get("grid_levels"), Some(&expected_levels));
+        assert_eq!(roundtrip_record.get("values"), Some(&expected_values));
+        assert!(roundtrip_record.get("external").is_none());
         Ok(())
     }
 }
