@@ -952,9 +952,12 @@ fn mesh_deform_nonuniform_bind_transform_matches_blender_translation() -> TestRe
         .map(|index| {
             let rest = flat_subject(index);
             [
-                rest[0] + 0.383_064_627_647_399_9,
-                rest[1] - 0.183_921_575_546_264_65,
-                rest[2] + 0.745_511_949_062_347_4,
+                // A uniform cage-local translation T maps to inv(S_lin) * C_lin * T in subject-local space
+                // (S_lin: subject world linear, C_lin: cage world linear); the harmonic weights reproduce
+                // translations exactly, so every vertex is rest + that constant.
+                rest[0] + 0.295_054_569_956,
+                rest[1] - 0.272_824_308_298,
+                rest[2] + 0.733_333_333_333,
             ]
         })
         .collect::<Vec<_>>();

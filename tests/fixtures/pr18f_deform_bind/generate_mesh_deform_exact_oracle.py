@@ -1,9 +1,14 @@
-"""Blender 5.2.2 oracle for the tests/pr18f_deform_bind.rs asymmetric Mesh Deform scene.
+"""Blender 5.2.2 oracle for the tests/pr18f_deform_bind.rs Mesh Deform scenes.
 
-Rebuilds exactly the scene `asymmetric_mesh_operations` builds in Rust: a 4x4-subdivision grid
-subject and a box cage with their transforms, the cage's eight vertices moved to the asymmetric
-positions before bind, the `Influence` vertex group, a MESH_DEFORM modifier at the given precision,
-bind, then the three post-bind cage vertex moves. Writes the evaluated subject positions.
+Rebuilds the exact Rust scenes:
+- `asymmetric_mesh_operations`: 4x4-subdivision grid subject, box cage (size 4) with the eight cage
+  vertices moved to asymmetric positions before bind, the `Influence` group, MESH_DEFORM at the
+  given precision, bind, then three post-bind cage vertex moves (cases `mesh_asymmetric_*`).
+- `mesh_deform_nonuniform_bind_transform_matches_blender_translation`: the same subject grid, a box
+  cage of size 6 (cage transform set), bind at precision 3, then all eight cage vertices translated
+  by CAGE_TRANSLATION after bind (case `mesh_nonuniform_translation`).
+
+Writes the evaluated subject positions for every case to OUT.json.
 
 Usage:
   Blender -b --factory-startup --python generate_mesh_deform_exact_oracle.py -- OUT.json
@@ -35,6 +40,9 @@ CAGE_ROTATION = (0.0, 0.0, -0.09983341664682815, 0.9950041652780258)  # x, y, z,
 CAGE_SCALE = (1.3, 0.8, 1.1)
 POST_BIND_MOVES = {0: (0.0, 0.0, 0.12), 2: (0.1, -0.03, 0.0), 6: (-0.04, 0.08, -0.06)}
 
+# Rust `CAGE_TRANSLATION` used by the nonuniform translation test (cage-local, all eight vertices).
+TRANSLATION_CAGE_MOVE = (0.3, -0.2, 0.5)
+
 
 def set_transform(obj, translation, rotation_xyzw, scale):
     obj.location = Vector(translation)
@@ -63,14 +71,14 @@ def subject_grid(name):
     return obj
 
 
-def cage_box(name):
-    # Rust `box` size 4.0: corners at +-2, then the eight vertices moved to ASYMMETRIC.
+def cage_box(name, corners, transform=True):
     faces = [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]
     mesh = bpy.data.meshes.new(name + "Mesh")
-    mesh.from_pydata(list(ASYMMETRIC), [], faces)
+    mesh.from_pydata(list(corners), [], faces)
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
-    set_transform(obj, CAGE_TRANSLATION, CAGE_ROTATION, CAGE_SCALE)
+    if transform:
+        set_transform(obj, CAGE_TRANSLATION, CAGE_ROTATION, CAGE_SCALE)
     return obj
 
 
@@ -90,12 +98,10 @@ def evaluated_positions(obj):
     return result
 
 
-def run_case(label, precision, dynamic, invert):
-    source = subject_grid("Subject_" + label)
-    cage = cage_box("Cage_" + label)
+def bind_and_read(label, source, cage, precision, dynamic, invert, moves, group_weights):
     group = source.vertex_groups.new(name="Influence")
-    for i in range(25):
-        group.add([i], 0.15 + 0.2 * (i % 5), 'REPLACE')
+    for index, weight in enumerate(group_weights):
+        group.add([index], weight, 'REPLACE')
     md = source.modifiers.new("MeshDeform", "MESH_DEFORM")
     md.object = cage
     md.precision = precision
@@ -105,10 +111,25 @@ def run_case(label, precision, dynamic, invert):
     activate(source)
     bpy.ops.object.meshdeform_bind(modifier=md.name)
     bpy.context.view_layer.update()
-    for index, delta in POST_BIND_MOVES.items():
+    for index, delta in moves.items():
         cage.data.vertices[index].co += Vector(delta)
     cage.data.update()
     return {"bound": bool(md.is_bound), "positions": evaluated_positions(source)}
+
+
+def run_asymmetric(label, precision, dynamic, invert):
+    source = subject_grid("Subject_" + label)
+    cage = cage_box("Cage_" + label, ASYMMETRIC)
+    weights = [0.15 + 0.2 * (i % 5) for i in range(25)]
+    return bind_and_read(label, source, cage, precision, dynamic, invert, POST_BIND_MOVES, weights)
+
+
+def run_nonuniform_translation(label):
+    source = subject_grid("Subject_" + label)
+    # Rust: box size 6.0 with the cage transform above; no Influence group (all vertices weighted 1).
+    cage = cage_box("Cage_" + label, [tuple(c * 1.5 for c in corner) for corner in BASE])
+    moves = {index: TRANSLATION_CAGE_MOVE for index in range(8)}
+    return bind_and_read(label, source, cage, 3, False, False, moves, [1.0] * 25)
 
 
 def reset():
@@ -116,14 +137,15 @@ def reset():
 
 
 results = {}
-cases = [
-    ("mesh_asymmetric_static_p2", 2, False, False),
-    ("mesh_asymmetric_static_p3", 3, False, False),
-    ("mesh_asymmetric_dynamic_p3_invert", 3, True, True),
-]
-for name, precision, dynamic, invert in cases:
-    reset()
-    results[name] = run_case(name, precision, dynamic, invert)
+reset()
+results["mesh_asymmetric_static_p2"] = run_asymmetric("mesh_asymmetric_static_p2", 2, False, False)
+reset()
+results["mesh_asymmetric_static_p3"] = run_asymmetric("mesh_asymmetric_static_p3", 3, False, False)
+reset()
+results["mesh_asymmetric_dynamic_p3_invert"] = run_asymmetric(
+    "mesh_asymmetric_dynamic_p3_invert", 3, True, True)
+reset()
+results["mesh_nonuniform_translation"] = run_nonuniform_translation("mesh_nonuniform_translation")
 
 with open(out_path(), "w") as handle:
     json.dump(results, handle, indent=1, sort_keys=True)
