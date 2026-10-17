@@ -274,6 +274,9 @@ def add_reordered_topology_nodes(obj):
 
 
 def export_selected(obj, path, start, end, *, uvs=False):
+    # Preserve committed cache fixtures and create only files that are still missing.
+    if os.path.isfile(path):
+        return
     # The exporter samples the current frame for single-frame ranges, so start there explicitly.
     bpy.context.scene.frame_set(start)
     bpy.ops.object.select_all(action="DESELECT")
@@ -404,6 +407,13 @@ def run_case(case_id, receiver_obj, cache_path, object_path, cache_kwargs, modif
 
 
 def main():
+    oracle_path = os.path.join(OUT, "oracle.json")
+    existing = None
+    if os.path.isfile(oracle_path):
+        with open(oracle_path, encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if existing.get("blender_version") != bpy.app.version_string:
+            raise RuntimeError("existing Alembic oracle uses a different Blender version")
     scene = reset_scene()
     animated = build_animated()
     topo = new_object("TopoSource", CUBE_VERTS, CUBE_FACES)
@@ -610,10 +620,19 @@ def main():
         "defaults": defaults,
         "cases": cases,
     }
-    with open(os.path.join(OUT, "oracle.json"), "w", encoding="utf-8") as handle:
+    if existing is not None:
+        existing_cases = existing.get("cases", [])
+        existing_ids = {case["id"] for case in existing_cases}
+        for case in cases:
+            if case["id"] not in existing_ids:
+                existing_cases.append(case)
+                existing_ids.add(case["id"])
+        existing["cases"] = existing_cases
+        payload = existing
+    with open(oracle_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=1, sort_keys=True, default=lambda value: list(value))
         handle.write("\n")
-    print("ORACLE_WRITTEN", os.path.join(OUT, "oracle.json"), len(cases))
+    print("ORACLE_WRITTEN", oracle_path, len(payload["cases"]))
 
 
 if __name__ == "__main__":
