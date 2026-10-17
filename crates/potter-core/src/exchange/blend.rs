@@ -143,7 +143,7 @@ pub fn export_blend(
     let script = temporary_path("blend-bridge.py")?;
     let blend_temp = temporary_blend_path(parent)?;
     let validation = temporary_path("blend-export-validation.json")?;
-    let (document, asset_files, multires_sidecars, mut created_multires_sidecars) =
+    let (document, mut asset_files, multires_sidecars, created_multires_sidecars) =
         match prepare_blend_export_resources(document, project, out) {
             Ok(resources) => resources,
             Err(error) => {
