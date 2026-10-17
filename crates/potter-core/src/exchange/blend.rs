@@ -7855,7 +7855,8 @@ mod tests {
                     texture: texture(&normal_image_id, "Detail"),
                     transform: None,
                 }),
-                normal_scale: 0.75,
+                // Blender stores this Normal Map socket at float32 precision.
+                normal_scale: f64::from(0.65_f32),
                 emissive: Some(crate::exchange::material_graph::SlotTexture {
                     texture: texture(&emissive_image_id, "UVMap"),
                     transform: Some(crate::exchange::material_surface::TextureTransform {
