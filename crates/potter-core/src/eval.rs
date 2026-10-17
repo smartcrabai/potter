@@ -301,7 +301,7 @@ impl Snapshot {
         )
     }
 
-    /// Evaluate only a modifier's classified geometry operands and required world transforms.
+    /// Evaluate only a modifier's classified geometry operands, referenced armature poses, and required world transforms.
     pub(crate) fn evaluate_modifier_operands_with_cache(
         doc: &SceneDoc,
         context: &EvaluationContext,
@@ -309,6 +309,7 @@ impl Snapshot {
         cache_directory: Option<&Path>,
         target_id: &Id,
         modifier_id: &Id,
+        driver_values: &BTreeMap<(Id, String, u32), f64>,
     ) -> Result<Self> {
         let modifier_context = ModifierEvaluationContext {
             purpose: context.purpose,
@@ -345,6 +346,9 @@ impl Snapshot {
                 let Some(reference) = doc.nodes.get(&reference_id) else {
                     continue;
                 };
+                if reference.kind == "armature" {
+                    selected_nodes.insert(reference_id.clone());
+                }
                 for constraint in &reference.constraints {
                     if constraint.enabled
                         && constraint.influence != 0.0
@@ -372,6 +376,7 @@ impl Snapshot {
             &scene_hash,
             context,
             modifier_context,
+            Some(driver_values),
             Some(&selected_nodes),
             &suppressed,
             &suppressed_instances,
@@ -415,6 +420,7 @@ impl Snapshot {
                 &scene_hash,
                 context,
                 modifier_context,
+                None,
                 None,
                 &suppressed,
                 &suppressed_instances,
@@ -570,6 +576,7 @@ impl Snapshot {
             &simulation_scene_hash,
             context,
             modifier_context,
+            None,
             selected_nodes,
             &suppressed,
             &suppressed_instances,
@@ -587,6 +594,7 @@ impl Snapshot {
         simulation_scene_hash: &str,
         context: &EvaluationContext,
         modifier_context: ModifierEvaluationContext<'_>,
+        driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
         selected_nodes: Option<&BTreeSet<Id>>,
         suppressed: &BTreeSet<Id>,
         suppressed_instances: &BTreeSet<Id>,
@@ -634,11 +642,17 @@ impl Snapshot {
             object_mesh_evaluation_order(doc, selected_nodes, gate, mesh_dependencies)?;
         let evaluated_node_ids: BTreeSet<Id> = mesh_evaluation_order.iter().cloned().collect();
 
-        let driver_values = rig::evaluate_drivers(doc, frame)?;
+        let computed_driver_values;
+        let driver_values = if let Some(driver_values) = driver_values {
+            driver_values
+        } else {
+            computed_driver_values = rig::evaluate_drivers(doc, frame)?;
+            &computed_driver_values
+        };
         let mut matrices = rig::evaluate_world_matrices_with_resources(
             doc,
             frame,
-            &driver_values,
+            driver_values,
             modifier_context.project_root,
             scene.fps,
             scene.fps_base,
@@ -771,7 +785,7 @@ impl Snapshot {
                     frame,
                     armature_world,
                     &matrices,
-                    &driver_values,
+                    driver_values,
                     modifier_context.project_root,
                     scene.fps,
                     scene.fps_base,
@@ -855,7 +869,7 @@ impl Snapshot {
                             shape_keys,
                             doc,
                             frame,
-                            &driver_values,
+                            driver_values,
                         )?;
                         rig::apply_shape_keys_with_values(
                             &mut rigged_source,
@@ -946,7 +960,7 @@ impl Snapshot {
                                 doc,
                                 frame,
                                 &matrices,
-                                &driver_values,
+                                driver_values,
                                 modifier_context.project_root,
                                 scene.fps,
                                 scene.fps_base,
@@ -1240,7 +1254,7 @@ impl Snapshot {
                                 doc,
                                 frame,
                                 &matrices,
-                                &driver_values,
+                                driver_values,
                                 modifier_context.project_root,
                                 scene.fps,
                                 scene.fps_base,
@@ -1574,7 +1588,7 @@ impl Snapshot {
             matrices = rig::evaluate_world_matrices_with_evaluated_meshes(
                 doc,
                 frame,
-                &driver_values,
+                driver_values,
                 modifier_context.project_root,
                 scene.fps,
                 scene.fps_base,
@@ -1609,7 +1623,7 @@ impl Snapshot {
                         frame,
                         armature_world,
                         &matrices,
-                        &driver_values,
+                        driver_values,
                         modifier_context.project_root,
                         scene.fps,
                         scene.fps_base,
@@ -1720,6 +1734,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
+        "armature" | "lattice" | "volume_to_mesh" => &["object"],
         "hook" => &["object"],
         "uv_project" => &["projectors"],
         "uv_warp" => &["object_from", "object_to"],

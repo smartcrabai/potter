@@ -1069,11 +1069,9 @@ fn evaluate_modifier_output(
         let uses_lattice = modifier_stack
             .iter()
             .any(|modifier| modifier.enabled && modifier.modifier_type == "lattice");
-        let uses_volume_node = modifier_stack.iter().any(|modifier| {
-            modifier.enabled
-                && modifier.modifier_type == "volume_to_mesh"
-                && modifier.params.get("volume").is_some_and(Value::is_string)
-        });
+        let uses_volume_node = modifier_stack
+            .iter()
+            .any(|modifier| modifier.enabled && modifier.modifier_type == "volume_to_mesh");
         let uses_scene_context = modifier_stack.iter().any(|modifier| {
             if !modifier.enabled {
                 return false;
@@ -1084,11 +1082,12 @@ fn evaluate_modifier_output(
                         .iter()
                         .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
                 }
-                "curve" | "hook" | "data_transfer" | "vertex_weight_proximity" | "normal_edit" => {
-                    ["object", "target"]
-                        .iter()
-                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
-                }
+                "curve" | "hook" | "data_transfer" | "normal_edit" => ["object", "target"]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
+                "vertex_weight_proximity" => ["object", "target", "mask_tex_map_object"]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
                 "uv_project" => modifier
                     .params
                     .get("projectors")
@@ -1153,61 +1152,37 @@ fn evaluate_modifier_output(
             evaluation.mesh
         } else {
             let frame = engine.evaluation_frame;
-            let operand_snapshot = if uses_scene_context {
-                Some(
-                    crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
-                        engine.doc,
-                        &crate::eval::EvaluationContext {
-                            frame: Some(frame),
-                            ..crate::eval::EvaluationContext::default()
-                        },
-                        engine.asset_root,
-                        engine.cache_directory,
-                        target,
-                        modifier_id,
-                    )?,
-                )
-            } else {
-                None
-            };
-            let empty_meshes = BTreeMap::new();
-            let evaluated_operand_meshes = operand_snapshot
-                .as_ref()
-                .map_or(&empty_meshes, |snapshot| &snapshot.meshes);
-            let driver_values = if operand_snapshot.is_none() {
-                crate::eval::rig::evaluate_drivers(engine.doc, frame)?
-            } else {
-                BTreeMap::new()
-            };
-            let world_matrices = if let Some(snapshot) = &operand_snapshot {
-                let mut matrices = snapshot
-                    .nodes
-                    .iter()
-                    .map(|(node_id, node)| {
-                        (
-                            node_id.clone(),
-                            glam::DMat4::from_cols_array(&node.world_matrix),
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                matrices.extend(
-                    snapshot
-                        .transform_world_matrices
-                        .iter()
-                        .map(|(id, matrix)| (id.clone(), *matrix)),
-                );
-                matrices
-            } else {
-                let scene = engine.doc.scenes.get(&engine.doc.active_scene);
-                crate::eval::rig::evaluate_world_matrices_with_resources(
+            let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
+            let operand_snapshot =
+                crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
                     engine.doc,
-                    frame,
-                    &driver_values,
+                    &crate::eval::EvaluationContext {
+                        frame: Some(frame),
+                        ..crate::eval::EvaluationContext::default()
+                    },
                     engine.asset_root,
-                    scene.map_or(24, |scene| scene.fps),
-                    scene.map_or(1.0, |scene| scene.fps_base),
-                )?
-            };
+                    engine.cache_directory,
+                    target,
+                    modifier_id,
+                    &driver_values,
+                )?;
+            let evaluated_operand_meshes = &operand_snapshot.meshes;
+            let mut world_matrices = operand_snapshot
+                .nodes
+                .iter()
+                .map(|(node_id, node)| {
+                    (
+                        node_id.clone(),
+                        glam::DMat4::from_cols_array(&node.world_matrix),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            world_matrices.extend(
+                operand_snapshot
+                    .transform_world_matrices
+                    .iter()
+                    .map(|(id, matrix)| (id.clone(), *matrix)),
+            );
             let curve_path_lengths = crate::eval::evaluated_array_curve_path_length(
                 engine.doc,
                 target_modifier,
@@ -1227,11 +1202,7 @@ fn evaluate_modifier_output(
                         .flatten()
                 })
                 .collect();
-            let volume_data = if uses_volume_node {
-                crate::eval::load_vdb_volume_data(engine.doc, engine.asset_root)?
-            } else {
-                BTreeMap::new()
-            };
+            let volume_data = &operand_snapshot.volume_data;
             let source = prepared_output.as_ref().unwrap_or(output);
             let object_world = world_matrices.get(target).copied().ok_or_else(|| {
                 PotError::new(
@@ -1239,12 +1210,9 @@ fn evaluate_modifier_output(
                     "modifier subject transform is unavailable",
                 )
             })?;
-            let empty_bone_matrices = BTreeMap::new();
             let references = crate::eval::SceneReferences {
                 world_matrices: &world_matrices,
-                bone_matrices: operand_snapshot
-                    .as_ref()
-                    .map_or(&empty_bone_matrices, |snapshot| &snapshot.bone_matrices),
+                bone_matrices: &operand_snapshot.bone_matrices,
                 evaluated_meshes: evaluated_operand_meshes,
                 project_root: engine.asset_root,
             };
@@ -1307,7 +1275,7 @@ fn evaluate_modifier_output(
                         target,
                         engine.doc,
                         &world_matrices,
-                        &volume_data,
+                        volume_data,
                     ),
                     "surface_deform" | "mesh_deform" => crate::eval::apply_scene_deform_modifier(
                         mesh,

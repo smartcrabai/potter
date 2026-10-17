@@ -2703,12 +2703,13 @@ def _restore_modifier_stack(obj, modifier_items):
                 ids_by_blender_name[modifier.name] = identifier
                 break
     for modifier in list(obj.modifiers):
-        identifier = ids_by_blender_name.get(modifier.name)
+        blender_name = modifier.name
+        identifier = ids_by_blender_name.get(blender_name)
         if target_types.get(identifier) != modifier.type:
             obj.modifiers.remove(modifier)
             if identifier is not None:
                 modifiers_by_id.pop(identifier, None)
-            ids_by_blender_name.pop(modifier.name, None)
+            ids_by_blender_name.pop(blender_name, None)
     for operation in _plan_modifier_stack(obj, target, ids_by_blender_name):
         _execute_stack_op(obj, operation, modifiers_by_id)
         if operation[0] == "create":

@@ -12,14 +12,16 @@
 //! - cube + hidden SUBSURF + hidden SOLIDIFY, apply SUBSURF: applied anyway (FINISHED), 26/24 as
 //!   alone; the stack becomes `[Solidify]` with both flags False.
 
-use std::{error::Error, fmt::Debug};
+use std::{error::Error, fmt::Debug, fs, path::Path, process::Command};
 
+use glam::{DQuat, EulerRot};
 use potter_core::{
     error::{ErrorCode, PotError},
     model::{DataBlock, Id, Modifier, SceneDoc},
     ops,
 };
 use serde_json::{Value, json};
+use tempfile::tempdir;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
@@ -45,10 +47,15 @@ fn run(doc: &SceneDoc, operation: &Value) -> Result<SceneDoc, PotError> {
 }
 
 /// A box node named `SUBJECT` followed by `extra`, each operation applied in turn.
-fn build(extra: &[Value]) -> TestResult<SceneDoc> {
+fn scene_operations(extra: &[Value]) -> Vec<Value> {
     let mut operations =
         vec![json!({"op": "node.create", "id": SUBJECT, "kind": "box", "params": {"size": 2.0}})];
     operations.extend_from_slice(extra);
+    operations
+}
+
+fn build(extra: &[Value]) -> TestResult<SceneDoc> {
+    let operations = scene_operations(extra);
     let mut doc = SceneDoc::new(SCENE_ID.to_owned());
     for operation in &operations {
         doc = run(&doc, operation)?;
@@ -64,6 +71,177 @@ fn apply_op(modifier_id: &str) -> Value {
 fn apply_target(extra: &[Value], modifier_id: &str) -> TestResult<SceneDoc> {
     let doc = build(extra)?;
     Ok(run(&doc, &apply_op(modifier_id))?)
+}
+fn all_vertex_weights(doc: &SceneDoc, node_id: &str) -> TestResult<Vec<Value>> {
+    Ok(data_block_for(doc, node_id)?
+        .mesh
+        .as_ref()
+        .ok_or("node mesh is missing")?
+        .vertices
+        .iter()
+        .map(|vertex| json!({"vertex_id": vertex.id, "weight": 1.0}))
+        .collect())
+}
+
+fn simulated_subject_operations() -> Vec<Value> {
+    vec![
+        json!({
+            "op": "physics.world.update",
+            "target": {"id": "scene_main"},
+            "set": {
+                "enabled": true,
+                "gravity": [0.0, 0.0, 0.0],
+                "substeps": 8,
+                "solver_iterations": 16,
+                "frame_start": 1,
+                "frame_end": 120,
+                "seed": 23,
+            },
+        }),
+        json!({
+            "op": "physics.rigid_body.create",
+            "target": {"id": SUBJECT},
+            "type": "active",
+            "mass": 1.0,
+            "shape": "box",
+            "friction": 0.0,
+            "restitution": 0.0,
+            "linear_damping": 0.0,
+            "angular_damping": 0.0,
+            "initial_velocity": [1.0, 0.0, 0.0],
+        }),
+    ]
+}
+
+fn snapshot_after_subject_motion(
+    doc: &SceneDoc,
+    frame: f64,
+    modifier_name: &str,
+) -> TestResult<potter_core::geom::Mesh> {
+    let subject_id = Id::new(SUBJECT)?;
+    let final_snapshot = potter_core::eval::Snapshot::evaluate(
+        doc,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(frame),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let initial_snapshot = potter_core::eval::Snapshot::evaluate(
+        doc,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let final_world = &final_snapshot
+        .nodes
+        .get(&subject_id)
+        .ok_or("simulated subject is missing from Snapshot")?
+        .world_matrix;
+    let initial_world = &initial_snapshot
+        .nodes
+        .get(&subject_id)
+        .ok_or("initial subject is missing from Snapshot")?
+        .world_matrix;
+    if final_world == initial_world {
+        return Err(format!("rigid-body subject did not move before {modifier_name} apply").into());
+    }
+    let final_mesh = final_snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("simulated subject mesh is missing from Snapshot")?;
+    let initial_mesh = initial_snapshot
+        .meshes
+        .get(&subject_id)
+        .ok_or("initial subject mesh is missing from Snapshot")?;
+    if final_mesh == initial_mesh {
+        return Err(format!("rigid-body motion did not change {modifier_name} output").into());
+    }
+    Ok(final_mesh.clone())
+}
+
+fn hide_target_modifier(operations: &[Value], modifier_id: &str) -> TestResult<Vec<Value>> {
+    let mut hidden = operations.to_vec();
+    let target = hidden
+        .iter_mut()
+        .find(|operation| {
+            operation.get("op").and_then(Value::as_str) == Some("modifier.create")
+                && operation.get("id").and_then(Value::as_str) == Some(modifier_id)
+        })
+        .ok_or("target modifier create operation is missing")?;
+    target["show_viewport"] = json!(false);
+    Ok(hidden)
+}
+
+fn run_cli(command: &mut Command, label: &str) -> TestResult<()> {
+    let output = command.output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+        .into())
+    }
+}
+
+fn run_cli_batch(scene: &Path, batch_path: &Path, batch: &Value) -> TestResult<()> {
+    fs::write(batch_path, serde_json::to_vec(batch)?)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+    command
+        .args(["apply"])
+        .arg(scene)
+        .args(["--file"])
+        .arg(batch_path)
+        .arg("--json");
+    run_cli(&mut command, "pot apply")
+}
+
+fn apply_project_target_and_reopen(
+    extra: &[Value],
+    modifier_id: &str,
+    frame: f64,
+) -> TestResult<SceneDoc> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let mut init = Command::new(env!("CARGO_BIN_EXE_pot"));
+    init.args(["init"]).arg(&scene).arg("--json");
+    run_cli(&mut init, "pot init")?;
+
+    let batch_path = directory.path().join("operations.json");
+    run_cli_batch(
+        &scene,
+        &batch_path,
+        &json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": scene_operations(extra),
+        }),
+    )?;
+    let project = potter_core::store::Project::open(&scene)?;
+    let base_revision = project.doc().revision;
+    let expected_stack = without(&node_modifiers_for(project.doc(), SUBJECT)?, modifier_id);
+    drop(project);
+
+    run_cli_batch(
+        &scene,
+        &batch_path,
+        &json!({
+            "schema_version": 1,
+            "base_revision": base_revision,
+            "evaluation": {"frame": frame},
+            "operations": [apply_op(modifier_id)],
+        }),
+    )?;
+    let reopened = potter_core::store::Project::open(&scene)?;
+    ensure_eq(
+        &node_modifiers_for(reopened.doc(), SUBJECT)?,
+        &expected_stack,
+        "reopened target modifier stack",
+    )?;
+    Ok(reopened.doc().clone())
 }
 
 fn modifier(
@@ -894,6 +1072,109 @@ fn hook_apply_uses_simulated_transform_reference_world_matrix() -> TestResult<()
         actual_mesh,
         expected_mesh,
         "applied Hook uses the simulated transform reference world matrix",
+    )
+}
+
+#[test]
+fn armature_apply_uses_the_simulated_subject_transform_and_persists() -> TestResult<()> {
+    let mut operations = simulated_subject_operations();
+    let unrigged = build(&operations)?;
+    let weights = all_vertex_weights(&unrigged, SUBJECT)?;
+    let rotation = DQuat::from_euler(EulerRot::XYZ, 0.45, -0.35, 0.55);
+    operations.extend([
+        json!({"op": "node.create", "id": "rig", "kind": "armature"}),
+        json!({
+            "op": "bone.create",
+            "target": {"id": "rig"},
+            "id": "root",
+            "name": "Root",
+            "head": [0.0, 0.0, -1.0],
+            "tail": [0.0, 1.0, 1.0],
+        }),
+        json!({
+            "op": "pose.set",
+            "target": {"id": "rig"},
+            "bone_id": "root",
+            "set": {
+                "translation": [0.2, -0.1, 0.3],
+                "rotation": [rotation.x, rotation.y, rotation.z, rotation.w],
+                "scale": [1.0, 1.0, 1.0],
+            },
+        }),
+        json!({"op": "vertex_group.create", "target": {"id": SUBJECT}, "id": "root_group", "name": "Root"}),
+        json!({
+            "op": "vertex_group.assign",
+            "target": {"id": SUBJECT},
+            "group_id": "root_group",
+            "weights": weights,
+        }),
+        modifier(
+            "armature",
+            "armature",
+            json!({"object": "rig", "use_vertex_groups": true}),
+            true,
+            true,
+        ),
+        modifier("tail", "subdivision", json!({"levels": 1}), false, false),
+    ]);
+    let visible_target = build(&operations)?;
+    let expected_mesh = snapshot_after_subject_motion(&visible_target, 24.0, "Armature")?;
+    let hidden_target = hide_target_modifier(&operations, "armature")?;
+    let reopened = apply_project_target_and_reopen(&hidden_target, "armature", 24.0)?;
+    let actual_mesh = data_block(&reopened)?
+        .mesh
+        .as_ref()
+        .ok_or("reopened Armature-applied mesh is missing")?;
+    ensure_eq(
+        actual_mesh,
+        &expected_mesh,
+        "reopened Armature apply uses the simulated subject transform",
+    )
+}
+
+#[test]
+fn lattice_apply_uses_the_simulated_subject_transform_and_persists() -> TestResult<()> {
+    let mut operations = simulated_subject_operations();
+    let lattice_points = [
+        [-1.0, -1.0, -1.0],
+        [1.4, -1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [1.4, 1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [1.4, -1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+        [1.4, 1.0, 1.0],
+    ];
+    operations.extend([
+        json!({
+            "op": "lattice.create",
+            "id": "cage",
+            "transform": {
+                "translation": [0.0, 0.0, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "scale": [2.0, 1.0, 1.0],
+            },
+        }),
+        json!({
+            "op": "lattice.update",
+            "target": {"id": "cage"},
+            "set": {"points": lattice_points},
+        }),
+        modifier("lattice", "lattice", json!({"object": "cage"}), true, true),
+        modifier("tail", "subdivision", json!({"levels": 1}), false, false),
+    ]);
+    let visible_target = build(&operations)?;
+    let expected_mesh = snapshot_after_subject_motion(&visible_target, 24.0, "Lattice")?;
+    let hidden_target = hide_target_modifier(&operations, "lattice")?;
+    let reopened = apply_project_target_and_reopen(&hidden_target, "lattice", 24.0)?;
+    let actual_mesh = data_block(&reopened)?
+        .mesh
+        .as_ref()
+        .ok_or("reopened Lattice-applied mesh is missing")?;
+    ensure_eq(
+        actual_mesh,
+        &expected_mesh,
+        "reopened Lattice apply uses the simulated subject transform",
     )
 }
 
