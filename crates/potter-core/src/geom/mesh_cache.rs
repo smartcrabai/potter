@@ -197,6 +197,7 @@ pub(crate) fn evaluate(
                     json!({"modifier_id":modifier.id,"reason":error.to_string()}),
                 )
             })?;
+        carry_uv_store(mesh, &mut evaluated);
         apply_cache_attributes(
             &mut evaluated,
             sample.sample,
@@ -436,6 +437,24 @@ fn set_cache_color_data_type(mesh: &mut Mesh, name: &str) -> Result<()> {
     Ok(())
 }
 
+
+/// Carries UV layers onto a topology replacement, clearing face values and pins when layout changes.
+fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
+    let mut store = uv_layers::read(input);
+    let same_layout = input.faces.len() == replacement.faces.len()
+        && input
+            .faces
+            .iter()
+            .zip(&replacement.faces)
+            .all(|(old, new)| old.vertices.len() == new.vertices.len());
+    if !same_layout {
+        for layer in &mut store.layers {
+            layer.faces = vec![None; replacement.faces.len()];
+            layer.pinned = vec![None; replacement.faces.len()];
+        }
+    }
+    uv_layers::write(replacement, &store);
+}
 
 /// Writes named cache UV layers through the canonical store, reversing each file-corner row once.
 fn write_cache_uvs(
