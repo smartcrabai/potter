@@ -746,7 +746,7 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
                 (graph, generated_graph_id("blend-overlay", material_id)?)
             }
             previous => {
-                if let Some(previous) = previous {
+                if let Some(previous) = previous.filter(|previous| !replaced.contains(previous)) {
                     replaced.push(previous.clone());
                 }
                 let mut graph = build_graph(material, &textures, false)?;
