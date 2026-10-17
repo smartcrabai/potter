@@ -7855,7 +7855,7 @@ mod tests {
                     texture: texture(&normal_image_id, "Detail"),
                     transform: None,
                 }),
-                normal_scale: 0.65,
+                normal_scale: 0.75,
                 emissive: Some(crate::exchange::material_graph::SlotTexture {
                     texture: texture(&emissive_image_id, "UVMap"),
                     transform: Some(crate::exchange::material_surface::TextureTransform {
