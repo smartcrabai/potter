@@ -4576,7 +4576,7 @@ mod tests {
 
     #[test]
     fn logical_topology_sample_counts_control_connectivity_checks() {
-        let property = |name: &str, sample_count, constant| ParsedProperty {
+        let property = |name: &str, sample_count: usize, constant: bool| ParsedProperty {
             name: name.to_owned(),
             property_type: 2,
             pod: 6,

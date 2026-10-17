@@ -254,7 +254,7 @@ pub(super) fn vertex_weight_edit(
     let mut updated = existing;
     for (vertex, weight) in mesh.vertices.iter().zip(values) {
         match updated.entry(vertex.id) {
-            Entry::Occupied(entry) => {
+            Entry::Occupied(mut entry) => {
                 if use_remove && weight <= remove_threshold {
                     entry.remove();
                 } else {
