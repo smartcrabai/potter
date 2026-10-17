@@ -12,7 +12,7 @@
 //! - occlusion through a Separate Color (Red) into the `glTF Material Output` group, which PR10's
 //!   resolver reads back as glTF occlusion.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
@@ -22,7 +22,10 @@ use crate::{
         Loss, is_default_material_graph,
         material_surface::{TextureTransform, feature_id},
     },
-    geom::{Mesh, uv_layers},
+    geom::{
+        Mesh,
+        uv_layers::{self, UvStore},
+    },
     graph::{GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
     image::ImageInterpolation,
     model::{Id, Material, SceneDoc, TextureRef},
@@ -173,7 +176,7 @@ pub(crate) fn move_textures_to_graph(
         None
     };
     let graph = build_graph(&material, textures, output_group.is_some())?;
-    let graph_id = texture_graph_id(material_id)?;
+    let graph_id = generated_graph_id("texture-graph", material_id)?;
     doc.node_groups.insert(graph_id.clone(), graph);
     let target = doc
         .materials
@@ -203,21 +206,15 @@ fn ensure_output_group(doc: &mut SceneDoc) -> Result<Id> {
     Ok(id)
 }
 
-fn build_graph(
-    material: &Material,
-    textures: &GraphTextures,
-    occlusion_group: bool,
-) -> Result<NodeGroup> {
-    let mut graph = NodeGroup::new(format!("{} Shader", material.name), GraphKind::Shader);
-    let mut principled = GraphNode::new("ShaderNodeBsdfPrincipled");
-    principled
-        .inputs
-        .insert("IOR".to_owned(), json!(material.ior));
-    principled.inputs.insert(
+/// Writes the Principled inputs that Potter's evaluator reads from a material's fields. A generated graph holds these
+/// values, and an overlaid simple-material graph takes them in place of its own.
+fn write_principled_inputs(node: &mut GraphNode, material: &Material) {
+    node.inputs.insert("IOR".to_owned(), json!(material.ior));
+    node.inputs.insert(
         "Transmission Weight".to_owned(),
         json!(material.transmission),
     );
-    principled.inputs.insert(
+    node.inputs.insert(
         "Emission Color".to_owned(),
         json!([
             material.emission_color[0],
@@ -226,22 +223,28 @@ fn build_graph(
             1.0,
         ]),
     );
-    principled.inputs.insert(
+    node.inputs.insert(
         "Emission Strength".to_owned(),
         json!(material.emission_strength),
     );
-    principled
-        .inputs
+    node.inputs
         .insert("Alpha".to_owned(), json!(material.base_color[3]));
-    principled
-        .inputs
+    node.inputs
         .insert("Base Color".to_owned(), json!(material.base_color));
-    principled
-        .inputs
+    node.inputs
         .insert("Metallic".to_owned(), json!(material.metallic));
-    principled
-        .inputs
+    node.inputs
         .insert("Roughness".to_owned(), json!(material.roughness));
+}
+
+fn build_graph(
+    material: &Material,
+    textures: &GraphTextures,
+    occlusion_group: bool,
+) -> Result<NodeGroup> {
+    let mut graph = NodeGroup::new(format!("{} Shader", material.name), GraphKind::Shader);
+    let mut principled = GraphNode::new("ShaderNodeBsdfPrincipled");
+    write_principled_inputs(&mut principled, material);
     insert(&mut graph, "principled", principled)?;
 
     let mut output = GraphNode::new("OutputMaterial");
@@ -257,15 +260,13 @@ fn build_graph(
         if crate::float::equal_f64_array(&[factor[0], factor[1], factor[2]], &[1.0; 3]) {
             connect(&mut graph, &color, "Color", "principled", "Base Color")?;
         } else {
-            let rgb = [factor[0], factor[1], factor[2]];
             multiply_color(
                 &mut graph,
-                &color,
-                "Color",
                 "base",
-                rgb,
-                "principled",
-                "Base Color",
+                None,
+                json!([factor[0], factor[1], factor[2], 1.0]),
+                (color.as_str(), "Color"),
+                ("principled", "Base Color"),
             )?;
         }
         if material.alpha_mode != "opaque" {
@@ -279,14 +280,6 @@ fn build_graph(
                 "Alpha",
             )?;
         }
-    }
-
-    if textures.metallic_roughness.is_some()
-        && (textures.roughness.is_some() || textures.metallic.is_some())
-    {
-        return Err(graph_error(
-            "a packed metallicRoughness texture cannot be combined with separate roughness or metallic textures",
-        ));
     }
 
     if let Some(slot) = &textures.metallic_roughness {
@@ -322,20 +315,12 @@ fn build_graph(
             &mut graph,
             "roughness",
             slot,
-            "Red",
             material.roughness,
             "Roughness",
         )?;
     }
     if let Some(slot) = &textures.metallic {
-        channel_texture(
-            &mut graph,
-            "metallic",
-            slot,
-            "Red",
-            material.metallic,
-            "Metallic",
-        )?;
+        channel_texture(&mut graph, "metallic", slot, material.metallic, "Metallic")?;
     }
 
     if let Some(slot) = &textures.normal {
@@ -371,12 +356,11 @@ fn build_graph(
         } else {
             multiply_color(
                 &mut graph,
-                &color,
-                "Color",
                 "emissive",
-                factor,
-                "principled",
-                "Emission Color",
+                None,
+                json!([factor[0], factor[1], factor[2], 1.0]),
+                (color.as_str(), "Color"),
+                ("principled", "Emission Color"),
             )?;
         }
     }
@@ -460,15 +444,15 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
     Ok(tex)
 }
 
-/// Links `color` (a Color output of `node`) into `to_socket`, multiplied by the RGB `factor`.
+/// Multiplies a Color input into `to`: `first` (an authored link, else the `value` default) times the `second` Color
+/// output, through a MixRGB MULTIPLY named `{name}_mix`.
 fn multiply_color(
     graph: &mut NodeGroup,
-    node: &str,
-    socket: &str,
     name: &str,
-    factor: [f64; 3],
-    to: &str,
-    to_socket: &str,
+    first: Option<GraphLink>,
+    value: Value,
+    second: (&str, &str),
+    to: (&str, &str),
 ) -> Result<()> {
     let mix = format!("{name}_mix");
     let mut mix_node = GraphNode::new("ShaderNodeMixRGB");
@@ -476,13 +460,13 @@ fn multiply_color(
         .properties
         .insert("blend_type".to_owned(), json!("MULTIPLY"));
     mix_node.inputs.insert("Fac".to_owned(), json!(1.0));
-    mix_node.inputs.insert(
-        "Color1".to_owned(),
-        json!([factor[0], factor[1], factor[2], 1.0]),
-    );
     insert(graph, &mix, mix_node)?;
-    connect(graph, node, socket, &mix, "Color2")?;
-    connect(graph, &mix, "Color", to, to_socket)
+    match first {
+        Some(link) => connect_link(graph, &link, &mix, "Color1")?,
+        None => set_input(graph, &mix, "Color1", value)?,
+    }
+    connect(graph, second.0, second.1, &mix, "Color2")?;
+    connect(graph, &mix, "Color", to.0, to.1)
 }
 
 /// Links `channel` of a `split` output (a Separate Color channel, or a texture's Alpha) into `to_socket`,
@@ -682,9 +666,9 @@ fn is_vector_math(node: &GraphNode, operation: &str, second: [f64; 3]) -> bool {
             })
 }
 
-/// Material texture work of a .blend export: the shader graphs that the export writes in place of each material's
-/// graph, the default graphs they replace, and the losses for shapes no graph can hold. The source document is not
-/// changed; the export document takes the edits.
+/// Material texture work of a .blend export: the shader graphs written in place of each material's graph, the default
+/// graphs they replace, and the losses for shapes no graph can hold. The source document is not changed; the export
+/// document takes these edits.
 #[derive(Default)]
 pub(crate) struct BlendTextureEdits {
     /// Material, its export graph's ID, and the graph. Each becomes the material's `node_tree` in the export.
@@ -705,7 +689,7 @@ const TEXTURE_FIELDS: [&str; 4] = [
 ///
 /// A material with no custom graph gets the graph its fields describe. A material with an authored graph keeps that
 /// graph: the export writes a copy of it with the fields overlaid on its Principled BSDF (`overlay_authored`). A graph
-/// shape that takes no overlay is a loss. Each field reads its own UV layer; each image keeps its declared colorspace.
+/// shape that takes no overlay is a loss. Each field reads its own UV layer, and each image keeps its declared colorspace.
 pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTextureEdits)> {
     let mut losses = Vec::new();
     let mut plans = Vec::<(&Id, &Material, GraphTextures)>::new();
@@ -713,7 +697,11 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
         if !has_texture_field(material) {
             continue;
         }
-        let users = material_users(doc, material_id);
+        // Each user mesh's UV store is read once and shared by the material's four references.
+        let stores = material_users(doc, material_id)
+            .into_iter()
+            .map(uv_layers::read)
+            .collect::<Vec<_>>();
         let [base, roughness, metallic, normal] = [
             ("base color", &material.base_color_texture),
             ("roughness", &material.roughness_texture),
@@ -722,7 +710,7 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
         ]
         .map(|(role, field)| {
             field.as_ref().map(|reference| {
-                export_reference(&users, material_id, role, reference, &mut losses)
+                export_reference(&stores, material_id, role, reference, &mut losses)
             })
         });
         plans.push((
@@ -745,7 +733,7 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
                     .get(authored)
                     .ok_or_else(|| graph_error(format!("shader graph `{authored}` is missing")))?;
                 match overlay_authored(group, material_id, material, &textures, &mut losses)? {
-                    Some(graph) => (graph, export_graph_id("texture-overlay", material_id)?),
+                    Some(graph) => (graph, generated_graph_id("blend-overlay", material_id)?),
                     None => {
                         losses.push(Loss {
                             feature_id: feature_id::MATERIAL_TEXTURES.to_owned(),
@@ -753,8 +741,7 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
                             reason: "the material's shader graph does not drive its active output from a Principled BSDF, so its texture fields cannot be written to .blend"
                                 .to_owned(),
                             suggestion: Some(
-                                "drive the active output from a Principled BSDF"
-                                    .to_owned(),
+                                "drive the active output from a Principled BSDF".to_owned(),
                             ),
                         });
                         continue;
@@ -765,18 +752,11 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
                 if let Some(previous) = previous {
                     replaced.push(previous.clone());
                 }
-                (
-                    build_graph(material, &textures, false)?,
-                    texture_graph_id(material_id)?,
-                )
+                let mut graph = build_graph(material, &textures, false)?;
+                clamp_texture_nodes(&mut graph, "");
+                (graph, generated_graph_id("blend-texture", material_id)?)
             }
         };
-        if material.node_tree.as_ref() != Some(&graph_id) && doc.node_groups.contains_key(&graph_id)
-        {
-            return Err(graph_error(format!(
-                "generated shader graph `{graph_id}` collides with an existing graph"
-            )));
-        }
         graphs.push((material_id.clone(), graph_id, graph));
     }
     let removed_graphs = replaced
@@ -852,23 +832,32 @@ fn material_users<'a>(doc: &'a SceneDoc, material_id: &Id) -> Vec<&'a Mesh> {
         .collect()
 }
 
-/// A texture reference with the layer Blender should sample. A named layer stays. The render layer (no name) becomes
-/// the layer the users' meshes render with when they agree. When they differ it stays unnamed, and Texture Coordinate
-/// `UV` samples each object's own render layer. A name that a user mesh lacks is a loss, as Potter's resolver reports it.
+/// A texture reference with the layer Blender should sample. An unnamed reference is the render layer, which Texture
+/// Coordinate `UV` reads on each object, so it stays unnamed. A named layer stays when every user mesh has it. A mesh
+/// without it samples its render layer, which is reported; a name the users resolve differently is a loss.
 fn export_reference(
-    users: &[&Mesh],
+    stores: &[UvStore],
     material_id: &Id,
     role: &str,
     reference: &TextureRef,
     losses: &mut Vec<Loss>,
 ) -> TextureRef {
-    let mut names = BTreeSet::<Option<String>>::new();
+    let Some(name) = reference
+        .uv_layer
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    else {
+        return TextureRef {
+            uv_layer: None,
+            ..reference.clone()
+        };
+    };
+    let mut resolved = BTreeSet::<Option<String>>::new();
     let mut missing = false;
-    for mesh in users {
-        let store = uv_layers::read(mesh);
-        let (index, unknown) = store.resolve(reference.uv_layer.as_deref());
+    for store in stores {
+        let (index, unknown) = store.resolve(Some(name));
         missing |= unknown.is_some();
-        names.insert(
+        resolved.insert(
             index
                 .and_then(|index| store.layers.get(index))
                 .map(|layer| layer.name.clone()),
@@ -884,13 +873,13 @@ fn export_reference(
             suggestion: None,
         });
     }
-    let uv_layer = if names.len() <= 1 {
-        names
+    let uv_layer = if resolved.len() <= 1 {
+        resolved
             .into_iter()
             .next()
             .flatten()
-            .or_else(|| reference.uv_layer.clone())
-    } else if reference.uv_layer.is_some() {
+            .or_else(|| Some(name.to_owned()))
+    } else {
         losses.push(Loss {
             feature_id: feature_id::MESH_UV_LAYER.to_owned(),
             data_id: Some(material_id.as_str().to_owned()),
@@ -899,9 +888,7 @@ fn export_reference(
             ),
             suggestion: None,
         });
-        reference.uv_layer.clone()
-    } else {
-        None
+        Some(name.to_owned())
     };
     TextureRef {
         uv_layer,
@@ -911,25 +898,18 @@ fn export_reference(
 
 /// Whether a material outside `planned` still uses the graph `graph_id`.
 fn graph_used_outside(doc: &SceneDoc, planned: &BTreeSet<&Id>, graph_id: &Id) -> bool {
-    for (material_id, material) in &doc.materials {
-        if !planned.contains(material_id) && material.node_tree.as_ref() == Some(graph_id) {
-            return true;
-        }
-    }
-    false
+    doc.materials.iter().any(|(material_id, material)| {
+        !planned.contains(material_id) && material.node_tree.as_ref() == Some(graph_id)
+    })
 }
 
-/// The ID of a graph the export generates for a material, from its purpose.
-fn export_graph_id(purpose: &str, material_id: &Id) -> Result<Id> {
+/// The ID of a graph the export generates for a material, from its purpose. Each purpose has its own ID, so a graph
+/// from another path (a glTF import) cannot share one.
+fn generated_graph_id(purpose: &str, material_id: &Id) -> Result<Id> {
     Id::new(format!(
         "shader_{}",
         &crate::hash::sha256(format!("{purpose}:{material_id}").as_bytes())[7..31]
     ))
-}
-
-/// The ID of the graph generated for a material's texture fields.
-fn texture_graph_id(material_id: &Id) -> Result<Id> {
-    export_graph_id("texture-graph", material_id)
 }
 
 /// The Normal Map node of a normal texture. It carries the importer's marker, so the bridge writes Blender's V-up
@@ -959,13 +939,26 @@ fn normal_map_node(slot: &SlotTexture, strength: f64) -> GraphNode {
     normal_map
 }
 
+/// Sets the Image Texture nodes whose IDs start with `prefix` to the Extend extension. Potter's native material textures
+/// clamp the UV to the image edge (`sample_with_interpolation`), while Blender's Image Texture repeats by default, so
+/// the export clamps the nodes it generates. Authored nodes never start with a generated prefix (`fresh_prefix`).
+fn clamp_texture_nodes(graph: &mut NodeGroup, prefix: &str) {
+    for (id, node) in &mut graph.nodes {
+        if node.node_type == "ShaderNodeTexImage" && id.as_str().starts_with(prefix) {
+            node.properties
+                .insert("extension".to_owned(), json!("EXTEND"));
+        }
+    }
+}
+
 /// The authored graph of a material with native texture fields, copied for export with the fields overlaid on its
-/// Principled BSDF as Potter's evaluator applies them after the graph. Base Color multiplies its RGB, Roughness and
+/// Principled BSDF, as Potter's evaluator applies them after the graph. Base Color multiplies its RGB, Roughness and
 /// Metallic multiply their Red channel, and Alpha multiplies its alpha on a non-opaque material (the renderer ignores
-/// alpha on an opaque one). A normal texture drives an unlinked Normal input through a Normal Map node. A linked Normal
-/// input stays as authored, and its normal texture is a loss: the native normal perturbs the linked vector, which no
-/// Blender node reproduces. Every generated node ID starts with a prefix that no authored node ID starts with. Returns
-/// `None` when the active output is not driven by a Principled BSDF.
+/// alpha on an opaque one). An unlinked Normal input takes a marked Normal Map. A linked Normal stays as authored, and
+/// its normal texture is a loss: the native normal perturbs the linked vector, which no Blender node reproduces. A
+/// simple-material Principled ignores its graph in the evaluator, so the copy takes the material's values as its inputs,
+/// and drops its marker and its links. Every generated node ID starts with a prefix that no authored node ID starts
+/// with. Returns `None` when the active output is not driven by a Principled BSDF.
 fn overlay_authored(
     group: &NodeGroup,
     material_id: &Id,
@@ -978,41 +971,41 @@ fn overlay_authored(
     };
     let prefix = fresh_prefix(group, "potter_texture");
     let mut graph = group.clone();
+    let simple = graph
+        .nodes
+        .get(&principled)
+        .is_some_and(|node| node.properties.get("potter_simple_material") == Some(&json!(true)));
+    if simple {
+        graph.links.retain(|link| link.to_node != principled);
+        if let Some(node) = graph.nodes.get_mut(&principled) {
+            node.properties.remove("potter_simple_material");
+            write_principled_inputs(node, material);
+        }
+    }
+    let inputs = graph
+        .nodes
+        .get(&principled)
+        .map(|node| node.inputs.clone())
+        .unwrap_or_default();
     if let Some(slot) = &textures.base_color {
         let base = format!("{prefix}_base");
         let texel = texture_node(&mut graph, &base, slot)?;
         let source = take_input_link(&mut graph, &principled, "Base Color");
-        let mix_name = format!("{prefix}_base_mix");
-        let mut mix = GraphNode::new("ShaderNodeMixRGB");
-        mix.properties
-            .insert("blend_type".to_owned(), json!("MULTIPLY"));
-        mix.inputs.insert("Fac".to_owned(), json!(1.0));
-        insert(&mut graph, &mix_name, mix)?;
-        match source {
-            Some(link) => connect_link(&mut graph, &link, &mix_name, "Color1")?,
-            None => set_input(
-                &mut graph,
-                &mix_name,
-                "Color1",
-                input_value(
-                    group,
-                    &principled,
-                    "Base Color",
-                    json!([0.8, 0.8, 0.8, 1.0]),
-                ),
-            )?,
-        }
-        connect(&mut graph, &texel, "Color", &mix_name, "Color2")?;
-        connect(
+        let default = inputs
+            .get("Base Color")
+            .cloned()
+            .unwrap_or_else(|| json!([0.8, 0.8, 0.8, 1.0]));
+        multiply_color(
             &mut graph,
-            &mix_name,
-            "Color",
-            principled.as_str(),
-            "Base Color",
+            &base,
+            source,
+            default,
+            (texel.as_str(), "Color"),
+            (principled.as_str(), "Base Color"),
         )?;
         if material.alpha_mode != "opaque" {
             let source = take_input_link(&mut graph, &principled, "Alpha");
-            let value = input_scalar(group, &principled, "Alpha", 1.0);
+            let value = input_scalar(&inputs, "Alpha", 1.0);
             multiply_input(
                 &mut graph,
                 source,
@@ -1024,29 +1017,29 @@ fn overlay_authored(
         }
     }
     if let Some(slot) = &textures.roughness {
+        let value = input_scalar(&inputs, "Roughness", 0.5);
         overlay_scalar(
             &mut graph,
-            group,
             &principled,
             slot,
             "Roughness",
-            0.5,
+            value,
             &format!("{prefix}_roughness"),
         )?;
     }
     if let Some(slot) = &textures.metallic {
+        let value = input_scalar(&inputs, "Metallic", 0.0);
         overlay_scalar(
             &mut graph,
-            group,
             &principled,
             slot,
             "Metallic",
-            0.0,
+            value,
             &format!("{prefix}_metallic"),
         )?;
     }
     if let Some(slot) = &textures.normal {
-        let normal_linked = group
+        let normal_linked = graph
             .links
             .iter()
             .any(|link| link.to_node == principled && link.to_socket == "Normal");
@@ -1074,6 +1067,7 @@ fn overlay_authored(
             )?;
         }
     }
+    clamp_texture_nodes(&mut graph, &prefix);
     Ok(Some(graph))
 }
 
@@ -1093,23 +1087,18 @@ fn fresh_prefix(group: &NodeGroup, base: &str) -> String {
     candidate
 }
 
-/// Multiplies a Principled scalar input by the Red channel of `slot`'s texture, as the evaluator does. `name` is the
-/// overlay's own node-name stem.
+/// Multiplies a Principled scalar input by the Red channel of `slot`'s texture, as the evaluator reads a native scalar
+/// field: `value` (an authored link, else the authored default) times the texel's Red. `name` stems the generated nodes.
 fn overlay_scalar(
     graph: &mut NodeGroup,
-    group: &NodeGroup,
     principled: &Id,
     slot: &SlotTexture,
     socket: &str,
-    default: f64,
+    value: f64,
     name: &str,
 ) -> Result<()> {
-    let texel = texture_node(graph, name, slot)?;
-    let split = format!("{name}_split");
-    insert(graph, &split, GraphNode::new("ShaderNodeSeparateColor"))?;
-    connect(graph, &texel, "Color", &split, "Color")?;
+    let split = texture_red(graph, name, slot)?;
     let source = take_input_link(graph, principled, socket);
-    let value = input_scalar(group, principled, socket, default);
     multiply_input(
         graph,
         source,
@@ -1171,19 +1160,11 @@ fn connect_link(graph: &mut NodeGroup, link: &GraphLink, to: &str, to_socket: &s
     )
 }
 
-/// An input's authored default, or `default` when the input has none.
-fn input_value(group: &NodeGroup, node: &Id, socket: &str, default: Value) -> Value {
-    group
-        .nodes
-        .get(node)
-        .and_then(|node| node.inputs.get(socket))
-        .cloned()
-        .unwrap_or(default)
-}
-
-fn input_scalar(group: &NodeGroup, node: &Id, socket: &str, default: f64) -> f64 {
-    input_value(group, node, socket, json!(default))
-        .as_f64()
+/// An authored input's default as a number, or `default` when the input is absent or not a number.
+fn input_scalar(inputs: &BTreeMap<String, Value>, socket: &str, default: f64) -> f64 {
+    inputs
+        .get(socket)
+        .and_then(Value::as_f64)
         .unwrap_or(default)
 }
 
@@ -1209,34 +1190,33 @@ fn multiply_input(
     connect(graph, &math, "Value", to.0, to.1)
 }
 
+/// The Red channel of `slot`'s texture, as a Separate Color named `{name}_split` whose `Red` output is the value a
+/// native scalar field reads. Returns the Separate Color node's name.
+fn texture_red(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result<String> {
+    let color = texture_node(graph, name, slot)?;
+    let split = format!("{name}_split");
+    insert(graph, &split, GraphNode::new("ShaderNodeSeparateColor"))?;
+    connect(graph, &color, "Color", &split, "Color")?;
+    Ok(split)
+}
+
 /// Links the Red channel of `slot`'s texture into the Principled BSDF `to_socket`, multiplied by `factor`: a native
 /// scalar field is its factor times the texture's Red channel, as Potter's evaluator reads it.
 fn channel_texture(
     graph: &mut NodeGroup,
     name: &str,
     slot: &SlotTexture,
-    channel: &str,
     factor: f64,
     to_socket: &str,
 ) -> Result<()> {
-    let color = texture_node(graph, name, slot)?;
-    let split = format!("{name}_split");
-    insert(graph, &split, GraphNode::new("ShaderNodeSeparateColor"))?;
-    connect(graph, &color, "Color", &split, "Color")?;
-    multiply_channel(
-        graph,
-        &split,
-        channel,
-        name,
-        factor,
-        "principled",
-        to_socket,
-    )
+    let split = texture_red(graph, name, slot)?;
+    multiply_channel(graph, &split, "Red", name, factor, "principled", to_socket)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DataBlock, Node};
 
     #[test]
     fn insert_refuses_a_node_name_that_is_already_used() {
@@ -1284,6 +1264,153 @@ mod tests {
         );
         assert_eq!(normal_map_properties(None)?, (None, Some(json!(true))));
         assert_eq!(normal_map_properties(Some(""))?, (None, Some(json!(true))));
+        Ok(())
+    }
+
+    fn texture(image: &str, uv_layer: Option<&str>) -> Result<TextureRef> {
+        Ok(TextureRef {
+            image: Id::new(image)?,
+            uv_layer: uv_layer.map(str::to_owned),
+            interpolation: ImageInterpolation::Linear,
+        })
+    }
+
+    /// The default graph of a simple material, as `is_generated_simple_material_graph` recognises it.
+    fn default_graph() -> Result<NodeGroup> {
+        let mut group = NodeGroup::new("Default", GraphKind::Shader);
+        let mut principled = GraphNode::new("ShaderNodeBsdfPrincipled");
+        principled
+            .properties
+            .insert("potter_simple_material".to_owned(), json!(true));
+        insert(&mut group, "principled", principled)?;
+        insert(&mut group, "output", GraphNode::new("OutputMaterial"))?;
+        connect(&mut group, "principled", "BSDF", "output", "Surface")?;
+        Ok(group)
+    }
+
+    /// A mesh whose UV store names `layers`, the first of them active and rendering.
+    fn mesh_with_layers(layers: &[&str]) -> Mesh {
+        let mut mesh = Mesh::default();
+        let first = layers.first().map(|name| (*name).to_owned());
+        let store = UvStore {
+            layers: layers
+                .iter()
+                .map(|name| uv_layers::UvLayer::new(*name, Vec::new()))
+                .collect(),
+            active: first.clone(),
+            render: first,
+        };
+        uv_layers::write(&mut mesh, &store);
+        mesh
+    }
+
+    #[test]
+    fn blend_plan_reports_a_graph_without_a_principled_bsdf_and_an_unresolved_uv_layer()
+    -> Result<()> {
+        let mut doc = SceneDoc::new("plan".to_owned());
+        let mut output_only = NodeGroup::new("Output only", GraphKind::Shader);
+        let mut output = GraphNode::new("OutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        insert(&mut output_only, "output", output)?;
+        doc.node_groups.insert(Id::new("output_only")?, output_only);
+        doc.materials.insert(
+            Id::new("no_principled")?,
+            Material {
+                name: "No Principled".to_owned(),
+                base_color_texture: Some(texture("paint", Some("Lightmap"))?),
+                node_tree: Some(Id::new("output_only")?),
+                ..Material::default()
+            },
+        );
+        doc.materials.insert(
+            Id::new("shared")?,
+            Material {
+                name: "Shared".to_owned(),
+                base_color_texture: Some(texture("paint", Some("Lightmap"))?),
+                ..Material::default()
+            },
+        );
+        // One user mesh has the Lightmap layer and the other does not, so that mesh samples its render layer.
+        for (node, layers) in [
+            ("with_lightmap", &["UVMap", "Lightmap"][..]),
+            ("without_lightmap", &["UVMap"][..]),
+        ] {
+            let data = Id::new(format!("{node}_data"))?;
+            doc.data_blocks.insert(
+                data.clone(),
+                DataBlock {
+                    data_type: "mesh".to_owned(),
+                    mesh: Some(mesh_with_layers(layers)),
+                    ..DataBlock::default()
+                },
+            );
+            doc.nodes.insert(
+                Id::new(node)?,
+                Node {
+                    name: node.to_owned(),
+                    kind: "mesh".to_owned(),
+                    data: Some(data),
+                    materials: vec![Id::new("shared")?],
+                    ..Node::default()
+                },
+            );
+        }
+        let (losses, _) = plan_blend_textures(&doc)?;
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == feature_id::MATERIAL_TEXTURES
+                    && loss.data_id.as_deref() == Some("no_principled")),
+            "{losses:?}"
+        );
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == feature_id::UV_LAYER_MISSING
+                    && loss.data_id.as_deref() == Some("shared")),
+            "{losses:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blend_plan_keeps_a_default_graph_that_a_textureless_material_still_uses() -> Result<()> {
+        let mut doc = SceneDoc::new("plan".to_owned());
+        doc.node_groups
+            .insert(Id::new("default_graph")?, default_graph()?);
+        doc.materials.insert(
+            Id::new("fields")?,
+            Material {
+                name: "Fields".to_owned(),
+                base_color_texture: Some(texture("paint", None)?),
+                node_tree: Some(Id::new("default_graph")?),
+                ..Material::default()
+            },
+        );
+        doc.materials.insert(
+            Id::new("plain")?,
+            Material {
+                name: "Plain".to_owned(),
+                node_tree: Some(Id::new("default_graph")?),
+                ..Material::default()
+            },
+        );
+        let (losses, edits) = plan_blend_textures(&doc)?;
+        assert!(losses.is_empty(), "{losses:?}");
+        assert!(
+            edits.removed_graphs.is_empty(),
+            "a default graph another material uses must stay"
+        );
+        let plain = doc
+            .materials
+            .get_mut(&Id::new("plain")?)
+            .ok_or_else(|| graph_error("plain material is missing"))?;
+        plain.roughness_texture = Some(texture("paint", None)?);
+        let (losses, edits) = plan_blend_textures(&doc)?;
+        assert!(losses.is_empty(), "{losses:?}");
+        assert_eq!(edits.removed_graphs, vec![Id::new("default_graph")?]);
         Ok(())
     }
 }

@@ -197,7 +197,8 @@ pub(crate) mod feature_id {
     pub(crate) const VOLUME: &str = "material.shader_graph.volume";
     /// Loss: sampler state glTF cannot express exactly (Cubic/Smart interpolation, CLIP extension).
     pub(crate) const SAMPLER: &str = "material.shader_graph.sampler";
-    /// Loss: Potter material texture references on a graph material (the graph is authoritative).
+    /// Loss: a material's texture fields that the output cannot hold. glTF: the graph is authoritative and ignores them.
+    /// `.blend`: the authored graph does not drive its output from a Principled BSDF, or a linked Normal input takes a normal texture.
     pub(crate) const MATERIAL_TEXTURES: &str = "material.shader_graph.material_textures";
     /// Loss: a mesh UV layer the format cannot hold, or a texture set that samples layers that
     /// cannot share one `texCoord` (a packed texture, or a material shared by meshes that order
@@ -207,8 +208,6 @@ pub(crate) mod feature_id {
     pub(crate) const UV_LAYER_MISSING: &str = "uv.layer_missing";
     /// Loss: a VRM 0.x `MToon` texture samples a non-zero UV layer; VRM 0.x has no `texCoord`, so it exports from `TEXCOORD_0`.
     pub(crate) const VRM_V0_MTOON_UV_LAYER: &str = "vrm.v0.mtoon_uv_layer";
-    /// Loss: a material's texture fields cannot be written to .blend: its shader graph is authoritative, or a data map is also a color map.
-    pub(crate) const MATERIAL_TEXTURES: &str = "material.shader_graph.material_textures";
 }
 
 /// Whether any node of `doc` references the material in its slot array.
