@@ -7778,21 +7778,38 @@ mod tests {
         let normal_image_id = Id::new("normal_image")?;
         let emissive_image_id = Id::new("emissive_image")?;
         let material_id = Id::new("normal_mat")?;
-        let initial = SceneDoc::new(uuid::Uuid::new_v4().to_string());
-        let applied = crate::ops::apply_batch(
-            &initial,
-            &json!({
-                "schema_version": 1,
-                "base_revision": 0,
-                "operations": [
-                    {"op": "material.create", "id": "normal_mat", "name": "Normal and Emission",
-                     "emission_color": [0.5, 0.5, 0.5], "emission_strength": 0.75},
-                    {"op": "node.create", "id": "body", "kind": "box",
-                     "params": {"size": 1.0}, "material": "normal_mat"}
-                ]
-            }),
-        )?;
-        let mut doc = applied.doc;
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Normal and Emission".to_owned(),
+                emission_color: [0.5; 3],
+                emission_strength: 0.75,
+                ..Material::default()
+            },
+        );
+        let data_id = Id::new("normal_mesh")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                descriptor: None,
+                mesh: Some(box_with_attributes(Vec::new())?),
+                camera: None,
+                light: None,
+                grease_pencil: None,
+                ..DataBlock::default()
+            },
+        );
+        let node_id = Id::new("body")?;
+        let mut body = test_node("Body", data_id.as_str(), None, None)?;
+        body.materials = vec![material_id.clone()];
+        doc.nodes.insert(node_id.clone(), body);
+        doc.collections
+            .get_mut(&Id::new("collection_root")?)
+            .ok_or_else(|| invalid_intermediate("root collection is missing"))?
+            .objects
+            .push(node_id);
         doc.images.insert(
             normal_image_id.clone(),
             Image {
