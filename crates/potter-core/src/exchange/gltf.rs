@@ -6313,7 +6313,7 @@ pub(crate) fn import_indexed(
             .iter()
             .flat_map(|primitive| primitive["attributes"].as_object().into_iter().flatten())
             .filter_map(|(name, _)| name.strip_prefix("TEXCOORD_")?.parse::<usize>().ok())
-            .map(|set| set + 1)
+            .map(|set| set.saturating_add(1))
             .max()
             .unwrap_or(0)
             .min(uv_layers::MAX_LAYERS);
@@ -11702,6 +11702,43 @@ mod tests {
                 .sum::<usize>()
         );
         assert!(corner_count > 0, "fixture must exercise real UV corners");
+        Ok(())
+    }
+
+    #[test]
+    fn maximum_texcoord_index_imports_with_layer_limit_loss() -> TestResult {
+        let doc = scene(&json!([
+            {"op":"node.create","id":"plane","kind":"plane","params":{"size":2.0}},
+            {"op":"uv.unwrap","target":{"id":"plane"},"method":"smart"}
+        ]))?;
+        let imported = import_edited(&doc, |root, _| {
+            let uv_accessor = root["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_0"]
+                .as_u64()
+                .ok_or("TEXCOORD_0 accessor is missing")?;
+            let name = format!("TEXCOORD_{}", usize::MAX);
+            root["meshes"][0]["primitives"][0]["attributes"][name.as_str()] = json!(uv_accessor);
+            Ok(())
+        })??;
+
+        assert!(
+            imported
+                .losses
+                .iter()
+                .any(|loss| loss.feature_id == super::feature_id::MESH_UV_LAYER),
+            "out-of-limit TEXCOORD set should report a layer-limit loss: {:?}",
+            imported.losses
+        );
+        let mesh = first_mesh(&imported.doc)?;
+        assert!(
+            !mesh.faces.is_empty(),
+            "mesh should remain usable after importing an out-of-limit TEXCOORD set"
+        );
+        assert!(
+            uv_layers::read_layers(mesh)
+                .iter()
+                .any(|layer| layer.name == "UVMap"),
+            "lower TEXCOORD layer should remain present"
+        );
         Ok(())
     }
 
