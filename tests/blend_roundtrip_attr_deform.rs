@@ -17,6 +17,10 @@ mod blender_script_guarded;
 #[path = "common/process.rs"]
 mod process;
 #[path = "common/exchange_normals.rs"]
+#[expect(
+    dead_code,
+    reason = "this test binary uses only the quantized normal tolerance from the shared helper"
+)]
 mod exchange_normals;
 
 use blender_checked::blender_executable;

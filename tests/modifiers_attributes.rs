@@ -18,6 +18,10 @@ use tempfile::tempdir;
 #[path = "common/blender_file.rs"]
 mod blender_file;
 #[path = "common/exchange_normals.rs"]
+#[expect(
+    dead_code,
+    reason = "this test binary uses only the quantized normal tolerance from the shared helper"
+)]
 mod exchange_normals;
 
 use blender_file::blender_executable;
@@ -2978,7 +2982,7 @@ fn evaluated_face_normals(mesh: &Mesh, face: &str) -> Result<Value, Box<dyn Erro
         if format!("f{}", mesh_face.id) == face {
             let corners: Vec<[f64; 3]> = normals[base..base + count]
                 .iter()
-                .map(|normal| normal.to_array())
+                .map(DVec3::to_array)
                 .collect();
             return Ok(json!(corners));
         }
