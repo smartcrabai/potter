@@ -1296,23 +1296,19 @@ mod tests {
         .map_err(|error| format!("{error:?}"))
     }
 
-    /// The per-corner vectors of `mesh`'s custom-normal codes; `None` is Auto.
-    fn authored_normals(mesh: &Mesh) -> Result<Vec<Option<DVec3>>, String> {
+    /// The evaluated per-corner normals of `mesh`: authored codes and the Auto fan alike. A corner whose
+    /// authored vector equals its fan normal is stored as Auto, so the evaluated view is the comparable one.
+    fn authored_normals(mesh: &Mesh) -> Result<Vec<DVec3>, String> {
         let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
-        crate::geom::clnor::corner_custom_normals(
-            mesh,
-            &positions,
-            crate::geom::clnor::NormalCodeOptions::default(),
-        )
-        .map_err(|error| format!("{error:?}"))?
-        .ok_or_else(|| "custom normals are missing".to_owned())
+        crate::geom::normals::corner_normals(mesh, &positions).map_err(|error| format!("{error:?}"))
     }
 
-    /// Fails unless `normal` is authored and points along `expected` to within code precision.
-    fn assert_near(normal: Option<DVec3>, expected: DVec3) -> TestResult {
-        match normal {
-            Some(normal) if (normal - expected).length() < 1e-3 => Ok(()),
-            other => Err(format!("normal {other:?} is not {expected:?}")),
+    /// Fails unless `normal` points along `expected` to within code precision.
+    fn assert_near(normal: DVec3, expected: DVec3) -> TestResult {
+        if (normal - expected).length() < 1e-3 {
+            Ok(())
+        } else {
+            Err(format!("normal {normal:?} is not {expected:?}"))
         }
     }
 
