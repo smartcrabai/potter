@@ -1036,10 +1036,17 @@ fn run_case(
                 "--overwrite",
                 "--json",
             ])?;
+            let losses = refusal["error"]["details"]["result"]["losses"].as_array();
             ensure(
-                refusal["error"]["code"] == "UNSUPPORTED_FEATURE"
-                    && refusal["error"]["details"]["feature_id"] == "uv.layer_missing",
-                format!("a textured member without UVs must be refused: {refusal}"),
+                refusal["error"]["code"] == "UNREPRESENTABLE_FEATURE"
+                    && losses.is_some_and(|losses| {
+                        losses
+                            .iter()
+                            .any(|loss| loss["feature_id"] == "uv.layer_missing")
+                    }),
+                format!(
+                    "a textured member without UVs must be refused for its missing-UV loss: {refusal}"
+                ),
             )?;
             ensure(
                 !potter_glb.exists(),
@@ -1071,6 +1078,19 @@ fn run_case(
                         && primitive.texcoord_sets == 0
                 }),
                 "lossy export must preserve UV absence on the textured primitive",
+            )?;
+            let (gltf, _) = read_glb(&potter_glb)?;
+            let textured_material = gltf["materials"]
+                .as_array()
+                .and_then(|materials| {
+                    materials
+                        .iter()
+                        .find(|material| material["name"] == "textured")
+                })
+                .ok_or("lossy export must include the textured material")?;
+            ensure(
+                textured_material["pbrMetallicRoughness"]["baseColorTexture"].is_null(),
+                "lossy export must omit the unsupported texture",
             )?;
             return Ok(());
         }

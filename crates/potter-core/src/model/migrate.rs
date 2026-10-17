@@ -40,18 +40,35 @@ pub struct ParsedScene {
     /// Whether the bytes were schema version 1. Their original bytes must be kept before the first
     /// version-2 write replaces them.
     pub legacy: bool,
+    /// Canonical hash of the original schema-1 scene, before migration changes its schema version.
+    pub legacy_hash: Option<String>,
 }
 
 /// Parses a scene document, upgrading schema version 1 first.
 pub fn parse_scene(bytes: &[u8]) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, false)
+}
+
+/// Parses a project scene while retaining its pre-migration hash for project metadata.
+pub(crate) fn parse_scene_with_original_hash(bytes: &[u8]) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, true)
+}
+
+fn parse_scene_inner(bytes: &[u8], retain_original_hash: bool) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
     let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1);
+    let legacy_hash = if legacy && retain_original_hash {
+        Some(crate::hash::sha256(&crate::hash::canonicalize(&value)?))
+    } else {
+        None
+    };
     let warnings = upgrade_scene(&mut value)?;
     let doc: SceneDoc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     Ok(ParsedScene {
         doc,
         warnings,
         legacy,
+        legacy_hash,
     })
 }
 

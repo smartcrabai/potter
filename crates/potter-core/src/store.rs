@@ -46,6 +46,8 @@ pub struct Project {
     /// Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
     /// schema-2 write replaces them.
     legacy_digest: Option<String>,
+    /// Hash reported for the untouched schema-1 scene before migration changes its schema version.
+    legacy_hash: Option<String>,
 }
 
 impl Project {
@@ -77,6 +79,7 @@ impl Project {
             doc,
             load_warnings: Vec::new(),
             legacy_digest: None,
+            legacy_hash: None,
         };
         project.save_initial()?;
         Ok(project)
@@ -109,7 +112,7 @@ impl Project {
         } else {
             None
         };
-        let (doc, load_warnings, legacy_digest) = Self::read_snapshot(&canonical)?;
+        let (doc, load_warnings, legacy_digest, legacy_hash) = Self::read_snapshot(&canonical)?;
         Ok(Self {
             path: canonical,
             cache_directory,
@@ -117,14 +120,17 @@ impl Project {
             doc,
             load_warnings,
             legacy_digest,
+            legacy_hash,
         })
     }
 
     /// Reads and upgrades `scene.json`. The diagnostics name the original bytes they describe. The
-    /// digest is returned only for schema version 1.
-    fn read_snapshot(path: &Path) -> Result<(SceneDoc, Vec<Value>, Option<String>)> {
+    /// digest and compatibility hash are returned only for schema version 1.
+    fn read_snapshot(
+        path: &Path,
+    ) -> Result<(SceneDoc, Vec<Value>, Option<String>, Option<String>)> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
-        let parsed = crate::model::migrate::parse_scene(&bytes)?;
+        let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes)?;
         parsed.doc.validate()?;
         let digest = hash::sha256(&bytes);
         let mut warnings = parsed.warnings;
@@ -134,7 +140,7 @@ impl Project {
             &digest,
         );
         let legacy_digest = parsed.legacy.then_some(digest);
-        Ok((parsed.doc, warnings, legacy_digest))
+        Ok((parsed.doc, warnings, legacy_digest, parsed.legacy_hash))
     }
 
     /// Keeps the bytes of a schema-1 `scene.json` before a schema-2 write replaces them, under the
@@ -221,12 +227,19 @@ impl Project {
     }
 
     pub fn info(&self) -> Result<SceneInfo> {
-        let value = serde_json::to_value(&self.doc).map_err(|error| internal_json(&error))?;
+        let scene_hash = match &self.legacy_hash {
+            Some(hash) => hash.clone(),
+            None => {
+                let value =
+                    serde_json::to_value(&self.doc).map_err(|error| internal_json(&error))?;
+                hash::sha256(&hash::canonicalize(&value)?)
+            }
+        };
         Ok(SceneInfo {
             id: self.doc.scene_id.clone(),
             path: self.path.to_string_lossy().into_owned(),
             revision: self.doc.revision,
-            hash: hash::sha256(&hash::canonicalize(&value)?),
+            hash: scene_hash,
         })
     }
 
@@ -432,6 +445,7 @@ impl Project {
         }
         write_scene_atomic(&self.path, &candidate)?;
         self.legacy_digest = None;
+        self.legacy_hash = None;
         self.doc = candidate;
         self.info()
     }
@@ -492,6 +506,7 @@ impl Project {
         candidate.validate()?;
         write_scene_atomic(&self.path, &candidate)?;
         self.legacy_digest = None;
+        self.legacy_hash = None;
         self.doc = candidate;
         self.info()
     }

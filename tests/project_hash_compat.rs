@@ -215,7 +215,9 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
         size: None,
         dry_run: false,
     })?;
-    assert_eq!(applied.ok_or("apply must commit")?.revision, 3);
+    let applied = applied.ok_or("apply must commit")?;
+    assert_eq!(applied.revision, 3);
+    assert_eq!(applied.hash, Project::open(&scene)?.info()?.hash);
     assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 1);
     assert_no_visibility_keys(&scene)?;
     assert_eq!(array_count(&scene)?, 4);
@@ -226,7 +228,9 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
         base_revision: 3,
         steps: 1,
     })?;
-    assert_eq!(undone.ok_or("undo must commit")?.revision, 4);
+    let undone = undone.ok_or("undo must commit")?;
+    assert_eq!(undone.revision, 4);
+    assert_eq!(undone.hash, Project::open(&scene)?.info()?.hash);
     assert_eq!(array_count(&scene)?, 3);
     assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 2);
 
@@ -235,7 +239,9 @@ fn apply_undo_redo_keep_old_project_hashes_verifiable() -> TestResult {
         base_revision: 4,
         steps: 1,
     })?;
-    assert_eq!(redone.ok_or("redo must commit")?.revision, 5);
+    let redone = redone.ok_or("redo must commit")?;
+    assert_eq!(redone.revision, 5);
+    assert_eq!(redone.hash, Project::open(&scene)?.info()?.hash);
     assert_eq!(array_count(&scene)?, 4);
     assert_eq!(verify_history_blobs(&scene)?, OLD_BLOB_COUNT + 3);
     assert_no_visibility_keys(&scene)?;

@@ -2973,7 +2973,8 @@ struct TexCoordVariant {
 #[derive(Clone, Debug)]
 struct SlotTexCoord {
     variant: TexCoordVariant,
-    has_uv_layers: bool,
+    /// Member-present UV layers, or `None` when the mesh layout is not member-local.
+    uv_available_mask: Option<u8>,
 }
 
 /// Empty `texCoord` map for a material no mesh uses: its references read `TEXCOORD_0`.
@@ -2998,11 +2999,11 @@ impl TexCoordPlan {
             .and_then(|slots| slots.get(&slot))
             .map(|(_, slot_coords)| &slot_coords.variant)
     }
-    fn slot_has_uv_layers(&self, node_id: &Id, slot: usize) -> Option<bool> {
+    fn slot_uv_available_mask(&self, node_id: &Id, slot: usize) -> Option<u8> {
         self.slot_coords
             .get(node_id)
             .and_then(|slots| slots.get(&slot))
-            .map(|(_, slot_coords)| slot_coords.has_uv_layers)
+            .and_then(|(_, slot_coords)| slot_coords.uv_available_mask)
     }
 }
 
@@ -3152,13 +3153,19 @@ pub(crate) fn tex_coord_plan(
                 )
             })?;
             let binding = snapshot.slot_binding(node_id, node, slot);
-            let has_uv_layers = binding.map_or(!layers.layers.is_empty(), |binding| {
-                binding.uv.available_mask != 0
-            });
+            let uv_available_mask = binding.map(|binding| binding.uv.available_mask);
             let mut coords = TexCoords::new();
             let mut omitted = BTreeSet::new();
             for reference in texture_refs {
                 let (index, missing) = binding_tex_coord(&layers, reference.as_deref(), binding);
+                let index = index.and_then(|index| {
+                    uv_available_mask.map_or(Some(index), |mask| {
+                        let bit = u32::try_from(index)
+                            .ok()
+                            .and_then(|index| 1_u8.checked_shl(index))?;
+                        (mask & bit != 0).then(|| (mask & (bit - 1)).count_ones() as usize)
+                    })
+                });
                 if missing
                     && reported.insert((
                         material_id.clone(),
@@ -3215,7 +3222,7 @@ pub(crate) fn tex_coord_plan(
                     material_id.clone(),
                     SlotTexCoord {
                         variant: TexCoordVariant { coords, omitted },
-                        has_uv_layers,
+                        uv_available_mask,
                     },
                 ),
             );
@@ -4193,15 +4200,35 @@ fn export_with_root_inner(
                     "mesh material slot exceeds platform range",
                 )
             })?;
-            let has_uv_layers = tex_coords
-                .slot_has_uv_layers(node_id, slot)
-                .unwrap_or(!uv_sets.is_empty());
-            if !has_uv_layers {
+            if let Some(uv_available_mask) = tex_coords.slot_uv_available_mask(node_id, slot) {
+                let source_attributes = attributes.as_object().ok_or_else(|| {
+                    PotError::new(ErrorCode::InternalError, "glTF mesh attributes are missing")
+                })?;
                 let primitive_attributes =
                     primitive["attributes"].as_object_mut().ok_or_else(|| {
                         PotError::new(ErrorCode::InternalError, "primitive attributes are missing")
                     })?;
                 primitive_attributes.retain(|name, _| !name.starts_with("TEXCOORD_"));
+                let mut target = 0;
+                for (source, _) in uv_sets.iter().enumerate() {
+                    if uv_available_mask & (1_u8 << source) == 0 {
+                        continue;
+                    }
+                    let source_name = format!("TEXCOORD_{source}");
+                    let target_name = format!("TEXCOORD_{target}");
+                    let accessor =
+                        source_attributes
+                            .get(&source_name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "glTF UV accessor is missing for a bound collection layer",
+                                )
+                            })?;
+                    primitive_attributes.insert(target_name, accessor);
+                    target += 1;
+                }
             }
             if let Some(material_id) = snapshot.slot_material(node_id, node, slot) {
                 let material_index = if let Some(variant) = tex_coords.for_slot(node_id, slot) {
@@ -11858,7 +11885,7 @@ mod tests {
             .as_object()
             .ok_or("UV-mapped member attributes are missing")?;
         assert!(mapped_attributes["TEXCOORD_0"].is_number());
-        assert!(mapped_attributes["TEXCOORD_1"].is_null());
+        assert!(!mapped_attributes.contains_key("TEXCOORD_1"));
         let mapped_material = usize::try_from(
             primitives[1]["material"]
                 .as_u64()
