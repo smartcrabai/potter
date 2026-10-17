@@ -569,8 +569,11 @@ pub(crate) fn export_with_root_allow_lossy(
         } else {
             writeln!(output, "\tC: \"OO\",{},0", object_ids.model).map_err(write_error)?;
         }
-        for slot in 0..snapshot.slot_count(node_id, node) {
-            let Some(material_id) = snapshot.slot_material(node_id, node, slot) else {
+        for (slot, material_id) in fbx_material_slots(doc, snapshot, node_id, node)
+            .iter()
+            .enumerate()
+        {
+            let Some(material_id) = material_id else {
                 continue;
             };
             let material_object_id =
@@ -739,14 +742,7 @@ fn export_mesh_for_node<'a>(
         .data
         .as_ref()
         .and_then(|data_id| doc.data_blocks.get(data_id));
-    let has_deformations = data_block.is_some_and(|data| {
-        data.shape_keys
-            .as_ref()
-            .is_some_and(|keys| !keys.keys.is_empty())
-            || !data.vertex_groups.is_empty()
-            || !data.vertex_weights.is_empty()
-    });
-    if has_deformations {
+    if writes_source_mesh(data_block) {
         data_block.and_then(|data| data.mesh.as_ref())
     } else {
         snapshot.meshes.get(node_id)
@@ -785,8 +781,11 @@ fn build_material_exports(
     let mut used_materials = BTreeSet::new();
     for (node_id, node) in &doc.nodes {
         let store = export_mesh_for_node(doc, snapshot, node_id, node).map(uv_layers::read);
-        for slot in 0..snapshot.slot_count(node_id, node) {
-            let Some(material_id) = snapshot.slot_material(node_id, node, slot) else {
+        for (slot, material_id) in fbx_material_slots(doc, snapshot, node_id, node)
+            .iter()
+            .enumerate()
+        {
+            let Some(material_id) = material_id else {
                 continue;
             };
             let material = doc.materials.get(material_id).ok_or_else(|| {
