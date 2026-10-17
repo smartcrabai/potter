@@ -184,9 +184,15 @@ fn build_graph(
         "Transmission Weight".to_owned(),
         json!(material.transmission),
     );
-    principled
-        .inputs
-        .insert("Emission Color".to_owned(), json!(material.emission_color));
+    principled.inputs.insert(
+        "Emission Color".to_owned(),
+        json!([
+            material.emission_color[0],
+            material.emission_color[1],
+            material.emission_color[2],
+            1.0,
+        ]),
+    );
     principled.inputs.insert(
         "Emission Strength".to_owned(),
         json!(material.emission_strength),
