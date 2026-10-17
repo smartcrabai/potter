@@ -39,6 +39,7 @@ pub mod modifiers;
 pub(crate) mod normals;
 pub mod pointcloud;
 pub(crate) mod provenance;
+pub(crate) mod spatial;
 pub mod remesh;
 pub mod sculpt;
 pub mod text;
