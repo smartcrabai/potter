@@ -8544,7 +8544,7 @@ mod tests {
         let metal = |hit: usize| metal_red[pixel_of_hit[hit]];
         let alpha = |hit: usize| shared_alpha[pixel_of_hit[hit]];
         // (label, material, base, roughness, metallic, alpha), each per hit.
-        let cases: Vec<(&str, &Id, [[f64; 3]; 3], [f64; 3], [f64; 3], [f64; 3])> = vec![
+        let cases = [
             (
                 "field",
                 &field_id,
@@ -8604,9 +8604,9 @@ mod tests {
                         .with_images(&reopened_image_data)
                         .with_uv_layers(layers),
                 )?;
-                for channel in 0..3 {
+                for (channel, expected) in base[index].into_iter().enumerate() {
                     assert!(
-                        close(source.base_color[channel], base[index][channel]),
+                        close(source.base_color[channel], expected),
                         "{label} hit {index} source base channel {channel} is {}",
                         source.base_color[channel]
                     );
