@@ -339,6 +339,7 @@ fn warp_bone_scene(object_from: &str, bone_from: Option<&str>) -> SceneDoc {
             {"op":"node.create","id":"rig","kind":"armature","transform":{"translation":[1.0,0.0,0.0]}},
             {"op":"bone.create","target":{"id":"rig"},"id":"bone_a","name":"Arm.L",
              "head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]},
+            {"op":"pose.set","target":{"id":"rig"},"bone_id":"bone_a","set":{"translation":[0.0,0.5,0.25]}},
             {"op":"node.create","id":"wf","kind":"empty","transform":{"translation":[1.0,0.0,0.0]}},
             {"op":"node.create","id":"wt","kind":"empty",
              "transform":{"translation":[0.0,2.0,1.0],"rotation_deg":[40.0,0.0,0.0]}},
@@ -355,22 +356,40 @@ fn warp_positions(doc: &SceneDoc) -> Vec<DVec3> {
         .collect()
 }
 
-fn assert_same_positions(actual: &[DVec3], expected: &[DVec3]) {
+fn max_distance(actual: &[DVec3], expected: &[DVec3]) -> f64 {
     assert_eq!(actual.len(), expected.len());
-    for (vertex, want) in actual.iter().zip(expected) {
-        assert!(
-            vertex.distance(*want) < TOLERANCE,
-            "{vertex:?} differs from {want:?}"
-        );
-    }
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(vertex, want)| vertex.distance(*want))
+        .fold(0.0, f64::max)
+}
+
+fn assert_same_positions(actual: &[DVec3], expected: &[DVec3]) {
+    let distance = max_distance(actual, expected);
+    assert!(distance < TOLERANCE, "positions differ by {distance}");
+}
+
+fn assert_differs_from(actual: &[DVec3], other: &[DVec3]) {
+    let distance = max_distance(actual, other);
+    assert!(
+        distance > 1.0e-3,
+        "posed bone matches the object fallback ({distance})"
+    );
 }
 
 #[test]
-fn warp_bone_name_resolves_the_same_pose_bone_as_its_id() {
-    assert_same_positions(
-        &warp_positions(&warp_bone_scene("rig", Some("Arm.L"))),
-        &warp_positions(&warp_bone_scene("rig", Some("bone_a"))),
-    );
+fn warp_posed_bone_resolves_by_name_and_id_to_the_same_output() {
+    let by_name = warp_positions(&warp_bone_scene("rig", Some("Arm.L")));
+    let by_id = warp_positions(&warp_bone_scene("rig", Some("bone_a")));
+    assert_same_positions(&by_name, &by_id);
+}
+
+#[test]
+fn warp_posed_bone_differs_from_the_object_matrix_fallback() {
+    let posed = warp_positions(&warp_bone_scene("rig", Some("Arm.L")));
+    let object = warp_positions(&warp_bone_scene("rig", None));
+    assert_differs_from(&posed, &object);
 }
 
 #[test]
