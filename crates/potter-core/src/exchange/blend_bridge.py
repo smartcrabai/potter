@@ -3446,7 +3446,15 @@ def _ensure_multires_sculpt_layers(obj):
             view_layer.objects.active = obj
             if obj.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
+            if requested_mask_level is not None:
+                # Blender allocates per-grid GridPaintMask only through a sculpt operator, and
+                # headless Blender aborts in its undo push unless an undo step exists first. The
+                # flood fill sets uniform values; export's MDisps-style patch then writes the
+                # real per-grid values in place, and fails loudly if that patch cannot run.
+                bpy.ops.ed.undo_push(message="Potter multires mask allocation")
             bpy.ops.object.mode_set(mode="SCULPT")
+            if requested_mask_level is not None:
+                bpy.ops.paint.mask_flood_fill(mode="VALUE", value=0.0)
             bpy.context.view_layer.update()
             bpy.ops.object.mode_set(mode="OBJECT")
     finally:
