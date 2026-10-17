@@ -42,7 +42,7 @@
 //!   ring copies only when every corner matches. An interpolated corner that lies on a source vertex
 //!   takes that vertex's value exactly, so both give the same values.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use glam::{DMat3, DMat4, DVec3, Mat4};
@@ -50,7 +50,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{PotError, Result};
 use crate::geom::{
-    Face, Mesh, Vertex, clnor::{self, NormalCodeOptions}, edge_key,
+    Edge, Face, IdCounters, Mesh, Vertex, clnor::{self, NormalCodeOptions}, edge_key,
     normals::{face_normal, normal_matrix, vector3},
     provenance::{Origin, default_value, mean_value_corners, remap_attributes},
     uv_layers,
@@ -92,6 +92,7 @@ pub(crate) fn polys_to_mesh(
     let layout = Layout::new(operands);
     let mut joined = join(operands, &layout)?;
     joined.mesh.attributes = join_attributes(operands, &layout)?;
+    encode_joined_custom_normals(&mut joined.mesh)?;
     uv_layers::write(&mut joined.mesh, &joined_uv_store(operands));
     let (arena_ids, planned) = plan(polys, &layout)?;
 
@@ -132,7 +133,7 @@ pub(crate) fn polys_to_mesh(
         corners: Some(corner_sources(&joined, &planned, &positions)),
     };
     remap_attributes(&joined.mesh, &mut mesh, &origin)?;
-    negate_flipped_custom_normals(&mut mesh, &flipped);
+    negate_flipped_custom_normals(&mut mesh, &flipped)?;
 
     let sources = edge_sources(&mesh, polys, &planned, &vertex_ids);
     let crease = keyed_edge_attribute(operands, &layout, &mesh, &sources, "crease_edge");
@@ -142,7 +143,6 @@ pub(crate) fn polys_to_mesh(
     insert_if(&mut mesh.attributes, "sharp", sharp);
     insert_if(&mut mesh.attributes, "blender_edge_flags", flags);
     merge_blender_attributes(&mut mesh, operands, &layout, &sources);
-    encode_joined_custom_normals(&mut mesh)?;
 
     mesh.validate().map_err(|error| {
         PotError::invalid_argument(format!("boolean output is invalid: {error}"))
@@ -242,20 +242,47 @@ fn join(operands: &[Operand<'_>], layout: &Layout) -> Result<Joined> {
             rings.push(ring);
         }
     }
-    Ok(Joined {
-        mesh: Mesh {
-            vertices,
-            faces,
-            ..Mesh::default()
-        },
-        rings,
-    })
+    let next_id = IdCounters {
+        vertex: joined_id(vertices.len())?,
+        edge: 0,
+        face: joined_id(faces.len())?,
+    };
+    let mut mesh = Mesh {
+        vertices,
+        faces,
+        next_id,
+        ..Mesh::default()
+    };
+    add_boundary_edges(&mut mesh)?;
+    Ok(Joined { mesh, rings })
 }
 
 fn joined_id(index: usize) -> Result<u32> {
     u32::try_from(index).map_err(|_| {
         PotError::invalid_argument("boolean output exceeds the supported element count")
     })
+}
+
+/// Adds one edge per distinct face-boundary vertex pair, so the joined mesh has the complete topology
+/// its normal codes are evaluated on. Edge IDs follow first-seen order over the faces.
+fn add_boundary_edges(mesh: &mut Mesh) -> Result<()> {
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    let mut edges = Vec::new();
+    for face in &mesh.faces {
+        let count = face.vertices.len();
+        for corner in 0..count {
+            let (first, second) = (face.vertices[corner], face.vertices[(corner + 1) % count]);
+            if seen.insert(edge_key(first, second)) {
+                edges.push(Edge {
+                    id: joined_id(edges.len())?,
+                    vertices: [first, second],
+                });
+            }
+        }
+    }
+    mesh.next_id.edge = joined_id(edges.len())?;
+    mesh.edges = edges;
+    Ok(())
 }
 
 /// Operand vertices in the joined space, as `meshes_to_imesh` computes them: rounded to `f32`,
@@ -457,34 +484,29 @@ fn ring_normal(points: &[DVec3]) -> DVec3 {
 }
 
 /// Blender negates the interpolated `custom_normal` corners of flipped faces. A flipped face never
-/// copies its source corners (its ring runs the other way), so every corner of one is negated here.
-fn negate_flipped_custom_normals(mesh: &mut Mesh, flipped: &[bool]) {
-    let Some(values) = mesh
-        .attributes
-        .get_mut("custom_normal")
-        .and_then(|attribute| attribute.get_mut("values"))
-        .and_then(Value::as_object_mut)
+/// copies its source corners (its ring runs the other way), so every authored corner of one is
+/// negated. The output's codes decode to vectors on its own fans, negate, and re-encode. Auto
+/// corners stay Auto.
+fn negate_flipped_custom_normals(mesh: &mut Mesh, flipped: &[bool]) -> Result<()> {
+    if !flipped.iter().any(|&flip| flip) {
+        return Ok(());
+    }
+    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    let Some(mut vectors) =
+        clnor::corner_custom_normals(mesh, &positions, NormalCodeOptions::default())?
     else {
-        return;
+        return Ok(());
     };
-    for (face, _) in mesh
-        .faces
-        .iter()
-        .zip(flipped)
-        .filter(|(_, flipped)| **flipped)
-    {
-        let Some(rows) = values
-            .get_mut(&format!("f{}", face.id))
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        for row in rows.iter_mut() {
-            if let Some(normal) = vector3(row) {
-                *row = json!((-normal).to_array());
+    let mut corner = 0;
+    for (face, &flip) in mesh.faces.iter().zip(flipped) {
+        for _ in 0..face.vertices.len() {
+            if flip && let Some(normal) = vectors[corner] {
+                vectors[corner] = Some(-normal);
             }
+            corner += 1;
         }
     }
+    clnor::encode_vectors(mesh, Some(&vectors), NormalCodeOptions::default())
 }
 
 /// Global edge index each output edge takes its attributes from (Blender `dst_to_src_edge`). The
@@ -1013,10 +1035,9 @@ fn joined_custom_normals(operands: &[Operand<'_>], layout: &Layout) -> Result<Op
     ))
 }
 
-/// Stores the joined rows as the output's native normal codes. A row is an authored vector on an
-/// output corner, and a `null` row stays Auto. Codes derive from the output's own fans, so this runs
-/// once topology and shading exist. The attribute is removed first so no operand order or
-/// `corner_order` leaks into the output.
+/// Encodes the joined vector rows as the joined mesh's native normal codes, on its own fans. The
+/// remap then rebuilds the output codes from these source codes (`rebuild_custom_normals`), so no
+/// float3 store reaches `clnor::corner_codes`. A `null` row stays Auto.
 fn encode_joined_custom_normals(mesh: &mut Mesh) -> Result<()> {
     let Some(attribute) = mesh.attributes.remove("custom_normal") else {
         return Ok(());
