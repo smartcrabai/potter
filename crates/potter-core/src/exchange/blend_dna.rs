@@ -1596,7 +1596,7 @@ impl<'a> BlendFile<'a> {
                         self.bytes,
                         external_struct,
                         external_offset,
-                        &["filepath"],
+                        &["filename"],
                     )?
                 };
                 let layers = self.read_struct_array(layers_pointer, layer_count, layer_struct)?;
