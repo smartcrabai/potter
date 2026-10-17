@@ -463,32 +463,29 @@ pub fn mismatches(actual: &Canonical, expected: &Canonical) -> Vec<String> {
         ));
     }
     if let (Some(actual_faces), Some(expected_faces)) = (&actual.faces, &expected.faces) {
-        if actual_faces.len() != expected_faces.len() {
+        if actual_faces.len() == expected_faces.len() {
+            // Expectations are rounded to 1e-6 and then quantized to 1e-5, so a value on a rounding
+            // boundary can land one quantum away. Faces match when every corner is within one quantum.
+            let mut unmatched: Vec<&CanonicalFace> = actual_faces.iter().collect();
+            for (index, expected_face) in expected_faces.iter().enumerate() {
+                if let Some(position) = unmatched
+                    .iter()
+                    .position(|candidate| faces_match(candidate, expected_face))
+                {
+                    unmatched.swap_remove(position);
+                } else {
+                    differences.push(format!(
+                        "face {index} differs: no Potter face matches Blender {expected_face:?}"
+                    ));
+                    break;
+                }
+            }
+        } else {
             differences.push(format!(
                 "face count {} differs from Blender {}",
                 actual_faces.len(),
                 expected_faces.len()
             ));
-        } else {
-            // Expectations are rounded to 1e-6 and then quantized to 1e-5, so a value on a rounding
-            // boundary can land one quantum away. Faces match when every corner is within one quantum.
-            let mut unmatched: Vec<&CanonicalFace> = actual_faces.iter().collect();
-            for (index, expected_face) in expected_faces.iter().enumerate() {
-                match unmatched
-                    .iter()
-                    .position(|candidate| faces_match(candidate, expected_face))
-                {
-                    Some(position) => {
-                        unmatched.swap_remove(position);
-                    }
-                    None => {
-                        differences.push(format!(
-                            "face {index} differs: no Potter face matches Blender {expected_face:?}"
-                        ));
-                        break;
-                    }
-                }
-            }
         }
     }
     if actual.vertex_groups != expected.vertex_groups {
