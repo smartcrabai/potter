@@ -473,6 +473,18 @@ pub fn assert_floats(actual: &[f64], expected: &[f64], tolerance: f64, label: &s
     }
 }
 
+/// `ulps` units in the last place of f32 at `value`'s magnitude: `ulps * 2^(e - 23)` with
+/// `e = floor(log2 |value|)`. A value stored as f32 is exact to half an ulp, so a comparison that
+/// crosses f32 storage and a transfer function (decode, store, encode) is bounded in ulps, not in
+/// absolute terms: an absolute bound that is right near 0 is far too strict near 1. The 8-bit
+/// samples used here decode to f32 values in [0.5, 1) for the upper half of the byte range, where
+/// one ulp is 2^-24 (about 6e-8); the sRGB encode has slope about 0.6 there, so one ulp of linear
+/// storage moves the encoded value by about 0.3 ulp of the encoded value.
+pub fn f32_ulp_tolerance(value: f64, ulps: f64) -> f64 {
+    let magnitude = value.abs().max(f64::from(f32::MIN_POSITIVE));
+    ulps * f64::from(f32::EPSILON) * magnitude.log2().floor().exp2()
+}
+
 /// Whether two unit-length-ish vectors agree within `tolerance` in every component.
 pub fn vectors_close(actual: [f64; 3], expected: [f64; 3], tolerance: f64) -> bool {
     (0..3).all(|axis| (actual[axis] - expected[axis]).abs() <= tolerance)

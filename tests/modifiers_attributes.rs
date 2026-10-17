@@ -2814,24 +2814,6 @@ fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
     Ok(mesh)
 }
 
-fn corner_normals(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
-    let values = mesh
-        .attributes
-        .get("custom_normal")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object)
-        .ok_or("custom corner normals missing")?;
-    let mut result = Vec::new();
-    for face in &mesh.faces {
-        let corners = values
-            .get(&format!("f{}", face.id))
-            .and_then(Value::as_array)
-            .ok_or("custom face corner normals missing")?;
-        result.extend(corners.iter().cloned());
-    }
-    Ok(Value::Array(result))
-}
-
 /// The evaluated corner vectors of `mesh` in flattened face order, as JSON. The stored custom normals are
 /// `normal_code` pairs, which are not vectors, so they decode through the public evaluator first.
 fn corner_normal_vectors_json(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
@@ -2990,7 +2972,7 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         "crease":crease,
         "uv":uv,
         "color":corner_values("color")?,
-        "normal":corner_normals(mesh)?,
+        "normal":corner_normal_vectors_json(mesh)?,
         "smooth":face_values("smooth")?,
         "freestyle":face_values("freestyle_face")?
     }))

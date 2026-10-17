@@ -24,8 +24,8 @@ mod process;
 
 use native_oracle::{
     FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats, blender,
-    build_oracle, dump_blend, dumped_object, export, import_blend, losses, node_id, number,
-    read_scene, render_texture, run_blender, vec3, write_script,
+    build_oracle, dump_blend, dumped_object, export, f32_ulp_tolerance, import_blend, losses,
+    node_id, number, read_scene, render_texture, run_blender, vec3, write_script,
 };
 use serde_json::{Value, json};
 use std::{fs, path::Path};
@@ -57,6 +57,37 @@ fn assert_grid(actual: &Value, wanted: &Value, tolerance: f64, label: &str) -> T
         assert_eq!(actual_row.len(), wanted_row.len(), "{label}: row {y} width");
         for (x, (a, w)) in actual_row.iter().zip(wanted_row).enumerate() {
             assert_floats(a, w, tolerance, &format!("{label} pixel ({x}, {y})"));
+        }
+    }
+    Ok(())
+}
+
+/// Stored f32 pixels that Potter's encoded export must match, in f32 ulps of each expected value.
+///
+/// The bound covers the chain, not the observed error. The expected value is f32(200/255), off by
+/// at most half an ulp. Potter's linear value is stored as f32 (half an ulp at 0.58 is about 3e-8)
+/// and the sRGB encode has slope about 0.6 there, so the encoded value moves by about 0.3 ulp at 0.78.
+/// Together that is at most about one ulp, so 2 leaves margin for one more rounding. The current
+/// export differs by about 20 ulps (1.2e-6 at 0.78). That is outside this bound and must not be
+/// absorbed by raising it: the excess is unexplained and is a product or store issue.
+const STORED_PIXEL_ULPS: f64 = 2.0;
+
+/// Compares each channel of `actual` with `wanted` within `ulps` f32 ulps of the wanted value.
+fn assert_stored_grid(actual: &Value, wanted: &Value, ulps: f64, label: &str) -> TestResult {
+    let actual = rows(actual)?;
+    let wanted = rows(wanted)?;
+    assert_eq!(actual.len(), wanted.len(), "{label}: row count");
+    for (y, (actual_row, wanted_row)) in actual.iter().zip(&wanted).enumerate() {
+        assert_eq!(actual_row.len(), wanted_row.len(), "{label}: row {y} width");
+        for (x, (a, w)) in actual_row.iter().zip(wanted_row).enumerate() {
+            for (channel, (a, w)) in a.iter().zip(w).enumerate() {
+                assert_close(
+                    *a,
+                    *w,
+                    f32_ulp_tolerance(*w, ulps),
+                    &format!("{label} pixel ({x}, {y}) channel {channel}"),
+                );
+            }
         }
     }
     Ok(())
@@ -106,12 +137,21 @@ fn check_render(result: &Value, expected: &Value, label: &str, potter_linear: bo
     } else {
         result["image_pixels_bottom_up"].clone()
     };
-    assert_grid(
-        &stored,
-        &texture["blender_pixels_bottom_up"],
-        FLOAT_TOLERANCE,
-        &format!("{label} image pixels"),
-    )?;
+    if potter_linear {
+        assert_stored_grid(
+            &stored,
+            &texture["blender_pixels_bottom_up"],
+            STORED_PIXEL_ULPS,
+            &format!("{label} image pixels"),
+        )?;
+    } else {
+        assert_grid(
+            &stored,
+            &texture["blender_pixels_bottom_up"],
+            FLOAT_TOLERANCE,
+            &format!("{label} image pixels"),
+        )?;
+    }
     // The render: one texel per pixel, Base flipped.
     let rendered = rows(&result["render_bottom_up"])?;
     assert_grid(

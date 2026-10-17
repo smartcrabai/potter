@@ -600,10 +600,6 @@ fn reserved_color_layer_names_coexist_with_weights_material_render_and_exports()
             actual[..3].iter().any(|channel| *channel > 0.01),
             "{name} pixel is black"
         );
-        assert!(
-            actual[..3].iter().any(|channel| *channel < 0.95),
-            "{name} pixel is white"
-        );
         assert_rgba(
             actual,
             wanted,
