@@ -5,6 +5,9 @@ product's box projection of a +Z face (raw `(x, y)` per corner), then `uv' = sca
 with scale [-0.5, 0.5] and translation [0.5, 0.5], and a DISPLACE modifier (direction X, strength 1,
 mid level 0.5, texture coords UV on UVMap).
 
+Potter stores UV V-down; Blender's loop UV is V-up. The oracle writes Blender loop UVs as
+`(u, 1 - v)` for each Potter-stored `(u, v)`, which is the conversion `displacement.rs` applies.
+
 Blender's own `uv.cube_project` normalises the box projection into [0, 1]; the product does not. The
 oracle therefore sets the explicit corner UVs the product produces, so the displacement is evaluated on
 the identical UV input, and the box-normalisation difference is reported separately.
@@ -36,7 +39,8 @@ layer = mesh.uv_layers.new(name="UVMap")
 mesh.uv_layers.active = layer
 for index, loop in enumerate(layer.data):
     co = mesh.vertices[mesh.loops[index].vertex_index].co
-    loop.uv = (co.x * -0.5 + 0.5, co.y * 0.5 + 0.5)
+    stored_u, stored_v = co.x * -0.5 + 0.5, co.y * 0.5 + 0.5
+    loop.uv = (stored_u, 1.0 - stored_v)
 uvs = [[round(c, 9) for c in loop.uv] for loop in layer.data]
 
 mod = obj.modifiers.new("deform", "DISPLACE")
