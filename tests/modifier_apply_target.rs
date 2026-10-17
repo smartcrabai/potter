@@ -1207,31 +1207,47 @@ fn lattice_apply_uses_the_simulated_subject_transform_and_persists() -> TestResu
 
 #[test]
 fn array_geometry_operand_propagates_unsupported_source_stack_errors() -> TestResult<()> {
-    let mut extra = unsupported_bevel_source(&json!({"translation": [3.0, 0.0, 0.0]}))
-        .into_iter()
-        .collect::<Vec<_>>();
-    extra.push(modifier(
-        "array",
-        "array",
+    // The operand's corrective smooth is in BIND rest mode but was never bound, so the operand's own
+    // evaluation fails with DependencyMissing. Apply must propagate that error, not use an empty operand.
+    let extra = vec![
         json!({
-            "count": 1,
-            "fit_type": "FIXED_COUNT",
-            "use_relative_offset": false,
-            "use_constant_offset": false,
-            "start_cap": OPERAND,
+            "op": "node.create",
+            "id": OPERAND,
+            "kind": "box",
+            "params": {"size": 2.0},
+            "transform": {"translation": [3.0, 0.0, 0.0]},
         }),
-        false,
-        false,
-    ));
-    let mut doc = build(&extra)?;
-    add_unsupported_bevel_uv(&mut doc)?;
+        json!({
+            "op": "modifier.create",
+            "target": {"id": OPERAND},
+            "id": "unbound_smooth",
+            "type": "corrective_smooth",
+            "show_viewport": true,
+            "show_render": true,
+            "params": {"rest_source": "BIND"},
+        }),
+        modifier(
+            "array",
+            "array",
+            json!({
+                "count": 1,
+                "fit_type": "FIXED_COUNT",
+                "use_relative_offset": false,
+                "use_constant_offset": false,
+                "start_cap": OPERAND,
+            }),
+            false,
+            false,
+        ),
+    ];
+    let doc = build(&extra)?;
 
     let error = run(&doc, &apply_op("array"))
         .err()
-        .ok_or("unsupported geometry operand must block apply")?;
+        .ok_or("unbound BIND operand must block apply")?;
     ensure_eq(
         &error.code,
-        &ErrorCode::UnsupportedFeature,
+        &ErrorCode::DependencyMissing,
         "operand error code",
     )
 }
