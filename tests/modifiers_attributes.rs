@@ -2402,7 +2402,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         DQuat::IDENTITY,
         DVec3::new(2.0, -1.0, 0.0),
     );
-    let proximity_target_world = DMat4::from_translation(DVec3::new(3.5, -1.0, 0.0));
     let mut proximity_operands = BTreeMap::new();
     proximity_operands.insert(
         "target".to_owned(),
@@ -2705,7 +2704,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-4,
     )?;
 
-    let directional_target = DMat4::from_translation(DVec3::new(2.0, -1.0, 0.0));
     let mut directional_operands = BTreeMap::new();
     directional_operands.insert(
         "target".to_owned(),

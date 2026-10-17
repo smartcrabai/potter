@@ -3750,7 +3750,7 @@ mod tests {
                 size,
                 attributes,
                 Encoding::FAST_LOSSLESS,
-                SpecificChannels::rgba(move |position| {
+                SpecificChannels::rgba(move |position: Vec2<usize>| {
                     let rgba = if position.1 == 0 { top } else { bottom };
                     (rgba[0], rgba[1], rgba[2], rgba[3])
                 }),

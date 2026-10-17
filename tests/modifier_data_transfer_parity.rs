@@ -294,6 +294,34 @@ fn domain_attribute_values(mesh: &Mesh, name: &str) -> Value {
     )
 }
 
+fn color_values(mesh: &Mesh, name: &str) -> Value {
+    let Some(attribute) = mesh.attributes.get(name) else {
+        return json!([]);
+    };
+    let Some(values) = attribute.get("values").and_then(Value::as_object) else {
+        return json!([]);
+    };
+    if attribute.get("domain").and_then(Value::as_str) == Some("point") {
+        Value::Array(
+            mesh.vertices
+                .iter()
+                .filter_map(|vertex| values.get(&format!("v{}", vertex.id)).cloned())
+                .collect(),
+        )
+    } else {
+        let mut colors = Vec::new();
+        for face in &mesh.faces {
+            if let Some(row) = values
+                .get(&format!("f{}", face.id))
+                .and_then(Value::as_array)
+            {
+                colors.extend(row.iter().cloned());
+            }
+        }
+        Value::Array(colors)
+    }
+}
+
 fn set_custom_normal_codes(mesh: &mut Mesh, raw_codes: &Value) -> Result<(), Box<dyn Error>> {
     let codes = raw_codes
         .as_array()
@@ -727,13 +755,13 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     let mut destination = quad()?;
     set_group(&mut destination, "D0", &[0.2; 4]);
     set_group(&mut destination, "D1", &[0.3; 4]);
-    let modifier = modifier(
+    let active_modifier = modifier(
         "data_transfer",
         json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ACTIVE","layers_vgroup_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0}),
     )?;
     let actual = evaluate_with_context(
         &destination,
-        &modifier,
+        &active_modifier,
         &operands,
         None,
         DMat4::IDENTITY,
@@ -1256,6 +1284,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         ],
     )?;
     let mut source_operand = operand(source.clone(), DMat4::IDENTITY, &[], None);
+    let mut operands = BTreeMap::new();
     operands.insert("object".to_owned(), vec![source_operand]);
     let transfer = modifier(
         "data_transfer",
@@ -1398,33 +1427,6 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         )
         .is_err()
     );
-    let color_values = |mesh: &Mesh, name: &str| -> Value {
-        let Some(attribute) = mesh.attributes.get(name) else {
-            return json!([]);
-        };
-        let Some(values) = attribute.get("values").and_then(Value::as_object) else {
-            return json!([]);
-        };
-        if attribute.get("domain").and_then(Value::as_str) == Some("point") {
-            Value::Array(
-                mesh.vertices
-                    .iter()
-                    .filter_map(|vertex| values.get(&format!("v{}", vertex.id)).cloned())
-                    .collect(),
-            )
-        } else {
-            let mut colors = Vec::new();
-            for face in &mesh.faces {
-                if let Some(row) = values
-                    .get(&format!("f{}", face.id))
-                    .and_then(Value::as_array)
-                {
-                    colors.extend(row.iter().cloned());
-                }
-            }
-            Value::Array(colors)
-        }
-    };
     let mut point_destination = destination.clone();
     set_color_layer(
         &mut point_destination,
@@ -1886,7 +1888,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
     )?;
     assert_eq!(
         domain_attribute_values(&no_active_actual, "ActiveColor"),
-        json!(colors(&expected["destination"])),
+        json!(colors(&expected["destination"])?),
         "ACTIVE destination selection must no-op when the ColorStore has no active layer",
     );
     let mut no_active_source = source.clone();
@@ -1909,7 +1911,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
     )?;
     assert_eq!(
         domain_attribute_values(&no_active_source_actual, "ActiveColor"),
-        json!(colors(&expected["destination"])),
+        json!(colors(&expected["destination"])?),
         "ACTIVE source selection must no-op when the ColorStore has no active layer",
     );
     Ok(())
@@ -2049,6 +2051,7 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
             &AttributeLayerSelection::default(),
         )?;
         let values = uv_layer_values(&actual, "UVMap");
+        let key = if precision == 0.0 { "0" } else { "1" };
         let error = max_error(&values, &expected[key])?;
         assert!(
             error < 2.0e-4,
@@ -2831,9 +2834,9 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
             &AttributeLayerSelection::default(),
         )?;
         let actual_values = match data_type {
-            "SHARP_EDGE" => edge_flag_values(&actual, "sharp"),
-            "SEAM" => edge_flag_values(&actual, "seam"),
-            "SMOOTH" => face_flag_values(&actual, "shade_smooth"),
+            "SHARP_EDGE" => domain_attribute_values(&actual, "sharp"),
+            "SEAM" => domain_attribute_values(&actual, "seam"),
+            "SMOOTH" => domain_attribute_values(&actual, "shade_smooth"),
             "BEVEL_WEIGHT_VERT" => domain_attribute_values(&actual, "bevel_weight_vert"),
             "CREASE" => domain_attribute_values(&actual, "crease_edge"),
             "BEVEL_WEIGHT_EDGE" => domain_attribute_values(&actual, "bevel_weight_edge"),
