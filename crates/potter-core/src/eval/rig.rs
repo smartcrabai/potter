@@ -626,7 +626,7 @@ fn evaluate_armature_bone_world_matrices_with_meshes(
         )
     })?;
     let mut pose = crate::eval::animation::animated_pose_bones(node, doc, frame)?;
-    apply_pose_drivers(armature_node_id, &mut pose, driver_values)?;
+    apply_pose_drivers(armature_node_id, armature, &mut pose, driver_values)?;
     apply_spline_ik(
         armature_node_id,
         armature,
@@ -2627,7 +2627,7 @@ pub(crate) fn apply_armature_modifier_with_drivers(
         )
     })?;
     let mut pose = crate::eval::animation::animated_pose_bones(armature_node, doc, frame)?;
-    apply_pose_drivers(&armature_id, &mut pose, driver_values)?;
+    apply_pose_drivers(&armature_id, armature, &mut pose, driver_values)?;
     apply_spline_ik(
         &armature_id,
         armature,
@@ -7127,6 +7127,7 @@ fn animated_pose_channel(
 
 fn apply_pose_drivers(
     node_id: &Id,
+    armature: &ArmatureData,
     pose_bones: &mut BTreeMap<Id, PoseBone>,
     drivers: &BTreeMap<(Id, String, u32), f64>,
 ) -> Result<()> {
@@ -7134,15 +7135,17 @@ fn apply_pose_drivers(
         if target_id != node_id {
             continue;
         }
-        let Some((bone_id, channel)) = pose_channel_path(path) else {
+        let Some((bone_key, channel)) = pose_channel_path(path) else {
             continue;
         };
-        let pose = pose_bones.get_mut(&bone_id).ok_or_else(|| {
-            evaluation_error_with(
-                "pose driver targets an unknown bone",
-                json!({ "node": node_id, "bone_id": bone_id }),
-            )
-        })?;
+        let pose = pose_driver_bone_id(armature, &bone_key)
+            .and_then(|bone_id| pose_bones.get_mut(&bone_id))
+            .ok_or_else(|| {
+                evaluation_error_with(
+                    "pose driver targets an unknown bone",
+                    json!({ "node": node_id, "bone_id": bone_key }),
+                )
+            })?;
         let values = match channel {
             "location" | "translation" => &mut pose.translation[..],
             "rotation" => &mut pose.rotation[..],
@@ -7152,12 +7155,25 @@ fn apply_pose_drivers(
         if !value.is_finite() {
             return Err(evaluation_error_with(
                 "pose driver value is non-finite",
-                json!({ "node": node_id, "bone_id": bone_id, "path": path }),
+                json!({ "node": node_id, "bone_id": bone_key, "path": path }),
             ));
         }
         set_component(values, *index, *value, path)?;
     }
     Ok(())
+}
+
+/// Resolves a pose driver's bone reference like a constraint subtarget: the bone ID first, then
+/// the bone name that Blender's `pose.bones["name"]` paths use.
+fn pose_driver_bone_id(armature: &ArmatureData, key: &Id) -> Option<Id> {
+    if armature.bones.contains_key(key) {
+        return Some(key.clone());
+    }
+    armature
+        .bones
+        .iter()
+        .find(|(_, bone)| bone.name == key.as_str())
+        .map(|(bone_id, _)| bone_id.clone())
 }
 
 fn pose_channel(pose_bones: &BTreeMap<Id, PoseBone>, path: &str, index: u32) -> Option<f64> {
