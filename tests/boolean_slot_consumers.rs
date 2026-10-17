@@ -97,7 +97,7 @@ fn boolean_operand_with_transfer_pool_keeps_its_evaluated_materials() -> TestRes
         json!({"op":"node.create","id":"inner","kind":"box","params":{"size":2.0},"material":"m_a"}),
         json!({"op":"node.create","id":"cutter","kind":"box","params":{"size":1.0},"transform":{"translation":[1.5,0.0,0.0]},"material":"m_c"}),
         json!({"op":"modifier.create","target":{"id":"inner"},"id":"inner_bool","type":"boolean","params":{"object":"cutter","operation":"UNION","solver":"EXACT","material_mode":"TRANSFER"}}),
-        json!({"op":"node.create","id":"outer","kind":"box","params":{"size":3.0},"transform":{"translation":[0.0,0.0,4.0]},"material":"m_d"}),
+        json!({"op":"node.create","id":"outer","kind":"box","params":{"size":3.0},"transform":{"translation":[0.0,0.0,0.5]},"material":"m_d"}),
         json!({"op":"modifier.create","target":{"id":"outer"},"id":"outer_bool","type":"boolean","params":{"object":"inner","operation":"DIFFERENCE","solver":"EXACT","material_mode":"TRANSFER"}}),
     ])?;
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
