@@ -321,6 +321,15 @@ pub(crate) fn is_color_attribute(entry: &Value) -> bool {
     )
 }
 
+/// Whether a mesh attribute key stores one of the mesh's native colour layers. The writer exports
+/// those as `COLOR_n`, so the key is neither a loss nor an unsupported attribute.
+fn color_layer_storage_key(mesh: &Mesh, key: &str) -> bool {
+    color_layers::read(mesh)
+        .layers
+        .iter()
+        .any(|layer| attribute_keys::storage_key(&layer.name).as_ref() == key)
+}
+
 /// A derived glTF image: its pixels plus the Potter images it was packed from.
 struct PackedImage {
     name: String,
@@ -1735,6 +1744,7 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             | "seam"
             | "shade_smooth"
             | "sharp"
+            | "color_layers"
             | "custom_normal" => true,
             "blender_metadata" => value["custom_properties"]
                 .as_object()
@@ -1747,6 +1757,7 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             "vertex_groups" => {
                 data_block.is_none_or(|block| valid_vertex_groups_attribute(value, block))
             }
+            _ if color_layer_storage_key(mesh, name) => true,
             _ => false,
         };
         if !supported {
@@ -3430,8 +3441,10 @@ pub(crate) fn unwritten_attribute_losses(mesh: &Mesh, owner: &str) -> Vec<Loss> 
                             | "custom_normal"
                             | "shade_smooth"
                             | "sharp"
+                            | "seam"
                             | "vertex_groups"
-                    ) {
+                    ) || color_layer_storage_key(mesh, key)
+                    {
                         continue;
                     }
                     losses.push(export_loss(
