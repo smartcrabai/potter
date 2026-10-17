@@ -1258,7 +1258,7 @@ fn assert_positions(result: &Mesh, expected: &[[f64; 3]; 8]) {
     }
 }
 
-/// Simple Deform TWIST along Z (oracle case sd_TWIST_Z_origin).
+/// Simple Deform TWIST along Z (oracle case `sd_TWIST_Z_origin`).
 #[test]
 fn simple_deform_twist_z_origin_matches_blender() {
     let mesh = subject();
@@ -1283,7 +1283,7 @@ fn simple_deform_twist_z_origin_matches_blender() {
     assert_positions(&result, &EXPECTED_SD_TWIST_Z_ORIGIN);
 }
 
-/// Simple Deform BEND along X (oracle case sd_BEND_X_origin).
+/// Simple Deform BEND along X (oracle case `sd_BEND_X_origin`).
 #[test]
 fn simple_deform_bend_x_origin_matches_blender() {
     let mesh = subject();
@@ -1305,7 +1305,7 @@ fn simple_deform_bend_x_origin_matches_blender() {
     assert_positions(&result, &EXPECTED_SD_BEND_X_ORIGIN);
 }
 
-/// Simple Deform TAPER along Y (oracle case sd_TAPER_Y_lock).
+/// Simple Deform TAPER along Y (oracle case `sd_TAPER_Y_lock`).
 #[test]
 fn simple_deform_taper_y_lock_matches_blender() {
     let mesh = subject();
@@ -1330,7 +1330,7 @@ fn simple_deform_taper_y_lock_matches_blender() {
     assert_positions(&result, &EXPECTED_SD_TAPER_Y_LOCK);
 }
 
-/// Simple Deform STRETCH along X (oracle case sd_STRETCH_X_vginv).
+/// Simple Deform STRETCH along X (oracle case `sd_STRETCH_X_vginv`).
 #[test]
 fn simple_deform_stretch_x_vginv_matches_blender() {
     let mesh = weighted_subject();
@@ -1357,7 +1357,7 @@ fn simple_deform_stretch_x_vginv_matches_blender() {
     assert_positions(&result, &EXPECTED_SD_STRETCH_X_VGINV);
 }
 
-/// Simple Deform TWIST along Y (oracle case sd_TWIST_Y_lim).
+/// Simple Deform TWIST along Y (oracle case `sd_TWIST_Y_lim`).
 #[test]
 fn simple_deform_twist_y_lim_matches_blender() {
     let mesh = subject();
@@ -1382,7 +1382,7 @@ fn simple_deform_twist_y_lim_matches_blender() {
     assert_positions(&result, &EXPECTED_SD_TWIST_Y_LIM);
 }
 
-/// Simple Deform BEND along Z (oracle case sd_BEND_Z_vg).
+/// Simple Deform BEND along Z (oracle case `sd_BEND_Z_vg`).
 #[test]
 fn simple_deform_bend_z_vg_matches_blender() {
     let mesh = weighted_subject();
@@ -1406,7 +1406,7 @@ fn simple_deform_bend_z_vg_matches_blender() {
     assert_positions(&result, &EXPECTED_SD_BEND_Z_VG);
 }
 
-/// Cast SPHERE (oracle case cast_SPHERE_auto).
+/// Cast SPHERE (oracle case `cast_SPHERE_auto`).
 #[test]
 fn cast_sphere_auto_matches_blender() {
     let mesh = subject();
@@ -1433,7 +1433,7 @@ fn cast_sphere_auto_matches_blender() {
     assert_positions(&result, &EXPECTED_CAST_SPHERE_AUTO);
 }
 
-/// Cast SPHERE (oracle case cast_SPHERE_obj_tr_radius).
+/// Cast SPHERE (oracle case `cast_SPHERE_obj_tr_radius`).
 #[test]
 fn cast_sphere_obj_tr_radius_matches_blender() {
     let mesh = subject();
@@ -1460,7 +1460,7 @@ fn cast_sphere_obj_tr_radius_matches_blender() {
     assert_positions(&result, &EXPECTED_CAST_SPHERE_OBJ_TR_RADIUS);
 }
 
-/// Cast CYLINDER (oracle case cast_CYLINDER_obj).
+/// Cast CYLINDER (oracle case `cast_CYLINDER_obj`).
 #[test]
 fn cast_cylinder_obj_matches_blender() {
     let mesh = subject();
@@ -1487,7 +1487,7 @@ fn cast_cylinder_obj_matches_blender() {
     assert_positions(&result, &EXPECTED_CAST_CYLINDER_OBJ);
 }
 
-/// Cast CUBOID (oracle case cast_CUBOID_obj_tr).
+/// Cast CUBOID (oracle case `cast_CUBOID_obj_tr`).
 #[test]
 fn cast_cuboid_obj_tr_matches_blender() {
     let mesh = subject();
@@ -1586,7 +1586,7 @@ fn cast_cuboid_auto_size_with_object_transform_matches_blender() -> Result<(), B
     Ok(())
 }
 
-/// Cast CYLINDER (oracle case cast_CYLINDER_axes_xy).
+/// Cast CYLINDER (oracle case `cast_CYLINDER_axes_xy`).
 #[test]
 fn cast_cylinder_axes_xy_matches_blender() {
     let mesh = subject();
@@ -1613,7 +1613,7 @@ fn cast_cylinder_axes_xy_matches_blender() {
     assert_positions(&result, &EXPECTED_CAST_CYLINDER_AXES_XY);
 }
 
-/// Cast SPHERE (oracle case cast_SPHERE_vginv).
+/// Cast SPHERE (oracle case `cast_SPHERE_vginv`).
 #[test]
 fn cast_sphere_vginv_matches_blender() {
     let mesh = weighted_subject();
@@ -1642,7 +1642,7 @@ fn cast_sphere_vginv_matches_blender() {
     assert_positions(&result, &EXPECTED_CAST_SPHERE_VGINV);
 }
 
-/// Cast CUBOID (oracle case cast_CUBOID_vg).
+/// Cast CUBOID (oracle case `cast_CUBOID_vg`).
 #[test]
 fn cast_cuboid_vg_matches_blender() {
     let mesh = weighted_subject();
@@ -1691,7 +1691,7 @@ fn translated_index_hook_with_values(indices: Value) -> Modifier {
     )
 }
 
-/// Hook SPHERE (oracle case hook_SPHERE).
+/// Hook SPHERE (oracle case `hook_SPHERE`).
 #[test]
 fn hook_sphere_matches_blender() {
     let mesh = subject();
@@ -1716,7 +1716,7 @@ fn hook_sphere_matches_blender() {
     assert_positions(&result, &EXPECTED_HOOK_SPHERE);
 }
 
-/// Hook SPHERE (oracle case hook_indices_falloff).
+/// Hook SPHERE (oracle case `hook_indices_falloff`).
 #[test]
 fn hook_indices_falloff_matches_blender() {
     let mesh = subject();
@@ -1865,7 +1865,7 @@ fn hook_uses_bevel_example_indices() {
     );
 }
 
-/// Decimate's BMesh keeps `v_other` even when it is not the first weighted source.
+/// Decimate's `BMesh` keeps `v_other` even when it is not the first weighted source.
 #[test]
 fn hook_uses_decimate_destination_survivor() {
     let mut mesh = Mesh::new();
@@ -2040,7 +2040,7 @@ fn hook_skips_geometry_nodes_generated_points() {
     }
 }
 
-/// Hook LINEAR (oracle case hook_LINEAR_uniform_big).
+/// Hook LINEAR (oracle case `hook_LINEAR_uniform_big`).
 #[test]
 fn hook_linear_uniform_big_matches_blender() {
     let mesh = subject();
@@ -2065,7 +2065,7 @@ fn hook_linear_uniform_big_matches_blender() {
     assert_positions(&result, &EXPECTED_HOOK_LINEAR_UNIFORM_BIG);
 }
 
-/// Hook LINEAR (oracle case hook_vg_inv).
+/// Hook LINEAR (oracle case `hook_vg_inv`).
 #[test]
 fn hook_vg_inv_matches_blender() {
     let mesh = weighted_subject();
@@ -2091,7 +2091,7 @@ fn hook_vg_inv_matches_blender() {
     assert_positions(&result, &EXPECTED_HOOK_VG_INV);
 }
 
-/// Hook NONE (oracle case hook_indices_vg_inv).
+/// Hook NONE (oracle case `hook_indices_vg_inv`).
 #[test]
 fn hook_indices_vg_inv_matches_blender() {
     let mesh = weighted_subject();
@@ -2118,7 +2118,7 @@ fn hook_indices_vg_inv_matches_blender() {
     assert_positions(&result, &EXPECTED_HOOK_INDICES_VG_INV);
 }
 
-/// Hook CURVE (oracle case hook_curve_3pt).
+/// Hook CURVE (oracle case `hook_curve_3pt`).
 #[test]
 fn hook_curve_3pt_matches_blender() {
     let mesh = subject();
@@ -2144,7 +2144,7 @@ fn hook_curve_3pt_matches_blender() {
     assert_positions(&result, &EXPECTED_HOOK_CURVE_3PT);
 }
 
-/// Hook CURVE (oracle case hook_curve_4pt).
+/// Hook CURVE (oracle case `hook_curve_4pt`).
 #[test]
 fn hook_curve_4pt_matches_blender() {
     let mesh = subject();
@@ -2319,7 +2319,7 @@ fn curve_missing_group_evaluates_as_no_group() {
     assert_positions(&result, &EXPECTED_CURVE_MISSING_GROUP);
 }
 
-/// Curve deform along a bent three-dimensional path (POS_X).
+/// Curve deform along a bent three-dimensional path (`POS_X`).
 #[test]
 fn curve_bent_path_pos_x_matches_blender() {
     let mesh = subject();
@@ -2340,7 +2340,7 @@ fn curve_bent_path_pos_x_matches_blender() {
     assert_positions(&result, &EXPECTED_CURVE_BENT_PATH_POS_X);
 }
 
-/// Curve deform along a bent path (NEG_Y) weighted by a vertex group.
+/// Curve deform along a bent path (`NEG_Y`) weighted by a vertex group.
 #[test]
 fn curve_bent_path_neg_y_group_matches_blender() {
     let mesh = weighted_subject();
@@ -2383,7 +2383,7 @@ fn curve_scaled_object_pos_x_matches_blender() {
     assert_positions(&result, &EXPECTED_CURVE_SCALED_OBJECT_POS_X);
 }
 
-/// Curve deform (POS_Z) with an inverted vertex group.
+/// Curve deform (`POS_Z`) with an inverted vertex group.
 #[test]
 fn curve_bent_path_pos_z_inverted_group_matches_blender() {
     let mesh = weighted_subject();

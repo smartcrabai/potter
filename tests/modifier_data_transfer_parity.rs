@@ -386,7 +386,7 @@ fn rgba_values(values: &Value) -> Result<Vec<[f64; 4]>, Box<dyn Error>> {
         .collect()
 }
 
-const BLENDER_VERTEX_MAPPING_SCRIPT: &str = r#"
+const BLENDER_VERTEX_MAPPING_SCRIPT: &str = r"
 import bpy, json, os, sys
 from mathutils import Matrix, Vector
 root = os.path.realpath(sys.argv[sys.argv.index('--') + 1])
@@ -427,7 +427,7 @@ run('TOPOLOGY', [(0.0,0.0,0.0),(2.0,0.0,0.0),(2.0,1.0,0.0),(0.0,1.0,0.0)], [(0,1
 run('DISTANCE_CUTOFF',[(20,20,20),(21,20,20),(20,21,20)],[(0,1,2)],'NEAREST',0.1)
 run('NO_OBJECT_TRANSFORM',tri,[(0,1,2)],'NEAREST',10.0,False)
 with open(os.path.join(root, 'vertex-mapping-oracle.json'), 'w') as f: json.dump(result, f)
-"#;
+";
 
 #[test]
 fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<(), Box<dyn Error>>
@@ -631,7 +631,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     Ok(())
 }
 
-const BLENDER_MIX_SCRIPT: &str = r#"
+const BLENDER_MIX_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def mesh(name):
@@ -667,7 +667,7 @@ mod=inverted.modifiers.new('Inverted','DATA_TRANSFER'); mod.object=src; mod.use_
 mod.layers_vgroup_select_src='ALL'; mod.layers_vgroup_select_dst='INDEX'; mod.mix_mode='REPLACE'; mod.mix_factor=0.4; mod.vertex_group='Mask'; mod.invert_vertex_group=True
 bpy.context.view_layer.update(); result['INVERT_MASK']={'D0':weights(inverted,'D0'),'D1':weights(inverted,'D1')}
 with open(os.path.join(root,'mix-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>> {
@@ -1126,7 +1126,7 @@ fn cli_applies_null_source_transfer_without_changing_persisted_mesh() -> Result<
     Ok(())
 }
 
-const BLENDER_UV_LAYER_SCRIPT: &str = r#"
+const BLENDER_UV_LAYER_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def make(name):
@@ -1179,7 +1179,7 @@ bpy.context.view_layer.update(); evaluated=corner_dest.evaluated_get(bpy.context
 result['CORNER_COLOR']={name:[list(item.color) for item in mesh.color_attributes[name].data] for name in ('Dest0','Dest1')}
 evaluated.to_mesh_clear()
 with open(os.path.join(root,'uv-layers-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(), Box<dyn Error>> {
@@ -1525,7 +1525,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
     Ok(())
 }
 
-const BLENDER_CUSTOM_NORMAL_TRANSFER_SCRIPT: &str = r#"
+const BLENDER_CUSTOM_NORMAL_TRANSFER_SCRIPT: &str = r"
 import bpy, json, os, sys
 from mathutils import Vector
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
@@ -1553,7 +1553,7 @@ with open(os.path.join(root,'custom-normal-oracle.json'),'w') as f:
     json.dump({'source_codes':source_codes,'destination_codes':destination_codes,
                'output_normals':[list(loop.normal) for loop in output.loops]},f)
 evaluated.to_mesh_clear()
-"#;
+";
 
 #[test]
 fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box<dyn Error>> {
@@ -1617,7 +1617,7 @@ fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box
     )?;
     let actual_values = actual_normals
         .iter()
-        .map(|normal| normal.to_array())
+        .map(glam::DVec3::to_array)
         .collect::<Vec<_>>();
     let error = max_error(&json!(actual_values), &expected["output_normals"])?;
     assert!(error < 2.0e-4, "CUSTOM_NORMAL max error {error}");
@@ -1625,7 +1625,7 @@ fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box
     Ok(())
 }
 
-const BLENDER_COLOR_MIX_SCRIPT: &str = r#"
+const BLENDER_COLOR_MIX_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def mesh(name):
@@ -1660,7 +1660,7 @@ for mode in ('REPLACE','ABOVE_THRESHOLD','BELOW_THRESHOLD','MIX','ADD','SUB','MU
     evaluated.to_mesh_clear()
 with open(os.path.join(root,'color-mix-oracle.json'),'w') as f:
     json.dump({'source':source_input,'destination':destination_input,'outputs':result},f)
-"#;
+";
 
 #[test]
 fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> {
@@ -1742,7 +1742,7 @@ fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-const BLENDER_ACTIVE_COLOR_SCRIPT: &str = r#"
+const BLENDER_ACTIVE_COLOR_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def mesh(name):
@@ -1765,7 +1765,7 @@ with open(os.path.join(root,'active-color-oracle.json'),'w') as f:
                'destination':[list(item.color) for item in destination_layer.data],
                'output':[list(item.color) for item in output.color_attributes['ActiveColor'].data]},f)
 evaluated.to_mesh_clear()
-"#;
+";
 
 #[test]
 fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<dyn Error>> {
@@ -1917,7 +1917,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
     Ok(())
 }
 
-const BLENDER_UV_ISLAND_SCRIPT: &str = r#"
+const BLENDER_UV_ISLAND_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def mesh(name, verts, faces):
@@ -1946,7 +1946,7 @@ for precision in (0.0,1.0):
     result[str(int(precision))]=[list(item.uv) for item in output.uv_layers['UVMap'].data]
     evaluated.to_mesh_clear()
 with open(os.path.join(root,'uv-island-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error>> {
@@ -2069,7 +2069,7 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
     Ok(())
 }
 
-const BLENDER_LOOP_MAPPING_SCRIPT: &str = r#"
+const BLENDER_LOOP_MAPPING_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def obj(name,verts,faces):
@@ -2096,7 +2096,7 @@ for mapping in ('NEAREST_NORMAL','NEAREST_POLYNOR','NEAREST_POLY','POLYINTERP_NE
     result[mapping]=[list(item.uv) for item in me.uv_layers['UVMap'].data]
     ev.to_mesh_clear()
 with open(os.path.join(root,'loop-mapping-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn loop_mapping_families_match_blender_with_corner_association() -> Result<(), Box<dyn Error>> {
@@ -2185,7 +2185,7 @@ fn loop_mapping_families_match_blender_with_corner_association() -> Result<(), B
     Ok(())
 }
 
-const BLENDER_DOMAIN_MAPPING_SCRIPT: &str = r#"
+const BLENDER_DOMAIN_MAPPING_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 def make(name,verts,faces):
@@ -2255,7 +2255,7 @@ for label,selected in (('PNORPROJ_OBLIQUE_HIT',19),('PNORPROJ_OBLIQUE_MISS',0)):
     bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
     face_result[label]=[me.attributes['freestyle_face'].data[i].value for i in range(len(me.polygons))]; ev.to_mesh_clear()
 with open(os.path.join(root,'domain-mapping-oracle.json'),'w') as f: json.dump({'edge':edge_result,'face':face_result},f)
-"#;
+";
 
 fn set_blender_attribute(
     mesh: &mut Mesh,
@@ -2641,7 +2641,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
     Ok(())
 }
 
-const BLENDER_ATTRIBUTE_DOMAINS_SCRIPT: &str = r#"
+const BLENDER_ATTRIBUTE_DOMAINS_SCRIPT: &str = r"
 import bpy, json, os, sys
 root=os.path.realpath(sys.argv[sys.argv.index('--')+1])
 verts=[(0,0,0),(1,0,0),(1,1,0),(0,1,0)]
@@ -2696,7 +2696,7 @@ for data_type,domain in (
     result[data_type]=values
     evaluated.to_mesh_clear()
 with open(os.path.join(root,'attribute-domains-oracle.json'),'w') as f: json.dump(result,f)
-"#;
+";
 
 #[test]
 fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn Error>> {
@@ -2855,7 +2855,7 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
     }
     Ok(())
 }
-const BLENDER_SHARP_NORMAL_TRANSFER_SCRIPT: &str = r#"
+const BLENDER_SHARP_NORMAL_TRANSFER_SCRIPT: &str = r"
 import bpy, json
 positions=[(0,0,0),(1,0,0),(0,1,0),(0,0,1)]
 faces=[(0,1,2),(1,0,3)]
@@ -2880,7 +2880,7 @@ json.dump({
     'corner_normals':[list(corner.vector) for corner in mesh.corner_normals],
 },open('sharp-normal-oracle.json','w'))
 evaluated.to_mesh_clear()
-"#;
+";
 
 #[test]
 fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<dyn Error>> {

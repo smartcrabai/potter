@@ -1011,5 +1011,5 @@ fn modifier_apply_evaluates_adjacent_skin_branch_hulls() {
     assert!(node.modifiers.is_empty(), "{:?}", node.modifiers);
     let data_id = node.data.as_ref().unwrap();
     let mesh = document.data_blocks[data_id].mesh.as_ref().unwrap();
-    assert!(!mesh.faces.is_empty());
+    assert_ne!(mesh.faces, [] as [potter_core::geom::Face; 0]);
 }

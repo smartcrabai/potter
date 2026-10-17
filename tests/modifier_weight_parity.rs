@@ -1787,8 +1787,8 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
     for mapping in mappings {
         for channel in channels {
             let object_id = format!("mask_{}_{}", mapping.to_lowercase(), channel.to_lowercase());
-            let group_id = format!("group_{}", object_id);
-            let modifier_id = format!("modifier_{}", object_id);
+            let group_id = format!("group_{object_id}");
+            let modifier_id = format!("modifier_{object_id}");
             let mut node =
                 json!({"op":"node.create","id":object_id,"kind":"plane","params":{"size":1.0}});
             if matches!(

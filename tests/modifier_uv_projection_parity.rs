@@ -22,7 +22,7 @@ mod blender_script;
 use blender_file::blender_executable;
 use blender_script::run_blender_script;
 
-const UV_PROJECTION_ORACLE: &str = r#"
+const UV_PROJECTION_ORACLE: &str = r"
 import bpy, json, math, sys
 from mathutils import Matrix
 root = sys.argv[-1]
@@ -128,9 +128,9 @@ result = {
 }
 with open(root + '/expected_uv_project.json','w') as file:
     json.dump(result,file)
-"#;
+";
 
-const UV_WARP_ORACLE: &str = r#"
+const UV_WARP_ORACLE: &str = r"
 import bpy, json, math, sys
 from mathutils import Matrix
 root = sys.argv[-1]
@@ -283,7 +283,7 @@ result = {
 }
 with open(root + '/expected_uv_warp.json','w') as file:
     json.dump(result,file)
-"#;
+";
 
 fn test_modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {

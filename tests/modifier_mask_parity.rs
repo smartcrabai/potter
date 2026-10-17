@@ -17,7 +17,7 @@ mod blender_script;
 use blender_file::blender_executable;
 use blender_script::run_blender_script;
 
-const BLENDER_MASK_ORACLE: &str = r#"
+const BLENDER_MASK_ORACLE: &str = r"
 import bpy, json, sys
 root = sys.argv[-1]
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -116,7 +116,7 @@ result['armature_none_inverted'] = arm_case('none_inverted',[],invert=True)
 result['armature_missing_object'] = arm_case('missing_object',['B1'],armature=False)
 with open(root + '/expected_mask.json','w') as file:
     json.dump(result,file)
-"#;
+";
 
 fn mask_modifier(params: Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
@@ -220,7 +220,7 @@ fn assert_geometry_parity(
             a.x.total_cmp(&b.x)
                 .then_with(|| a.y.total_cmp(&b.y))
                 .then_with(|| a.z.total_cmp(&b.z))
-        })
+        });
     };
     sort_points(&mut actual_vertices);
     sort_points(&mut expected_vertices);

@@ -30,7 +30,7 @@ const VERTICES: [[f64; 3]; 9] = [
     [2.9, 2.0, 0.6],
 ];
 
-const BLENDER_NORMAL_PROBE: &str = r#"
+const BLENDER_NORMAL_PROBE: &str = r"
 import bpy, json, os, sys
 root = os.path.realpath(sys.argv[sys.argv.index('--') + 1])
 cases = json.load(open(os.path.join(root, 'cases.json'), encoding='utf-8'))
@@ -118,7 +118,7 @@ for case in cases:
     results[case['name']] = faces
 json.dump(results, open(os.path.join(root, 'results.json'), 'w'), separators=(',', ':'))
 print('NORMAL_PROBE_DONE', len(results))
-"#;
+";
 
 fn parameter_case(
     name: &str,

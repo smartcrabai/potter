@@ -43,7 +43,7 @@ const AUTHORING_REFERENCE_SCRIPT: &str =
 
 /// Attaches UV layers, two color layers, and generic corner/face attributes to `Regress`, keeping its
 /// custom normals. Values are written to the file and read back by Blender, never by Potter.
-const ATTACH_LAYERS_SCRIPT: &str = r##"""Attaches native corner and face data to the oracle's Regress object (Blender 5.2.2).
+const ATTACH_LAYERS_SCRIPT: &str = r#"""Attaches native corner and face data to the oracle's Regress object (Blender 5.2.2).
 
 Usage: Blender -b oracle.blend --python attach_layers.py -- OUT.blend
 """
@@ -106,11 +106,11 @@ for poly in mesh.polygons:
     island.data[poly.index].value = poly.index % 4
 
 bpy.ops.wm.save_as_mainfile(filepath=OUT)
-"##;
+"#;
 
 /// Blender's own Subdivision (levels 1, Use Custom Normals on) evaluation of `Regress`, read back
 /// per corner and per face. Corner identity is the position plus the face center.
-const SUBDIVISION_DATA_REFERENCE_SCRIPT: &str = r##"""Blender's evaluated corner and face data of the Subdivision result of `Regress` (5.2.2).
+const SUBDIVISION_DATA_REFERENCE_SCRIPT: &str = r#"""Blender's evaluated corner and face data of the Subdivision result of `Regress` (5.2.2).
 
 Usage: Blender -b attached.blend --python subdivision_data_reference.py -- OUT.json
 
@@ -169,7 +169,7 @@ if any(entry is None for entry in loops):
     raise SystemExit("some loops belong to no polygon")
 with open(OUT, "w", encoding="utf-8") as handle:
     json.dump({"blender": bpy.app.version_string, "loops": loops, "faces": faces}, handle)
-"##;
+"#;
 
 /// One corner of a dumped mesh in Blender's loop order: position, face center, normal, raw code.
 struct BlenderLoops {

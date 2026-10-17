@@ -433,10 +433,7 @@ fn add_sequence_resource(
     let mut sequence_frames = serde_json::Map::new();
     let mut frame = first_frame;
     loop {
-        let source = fixture_dir.join(format!(
-            "{prefix}{frame:0width$}{suffix}",
-            width = frame_width
-        ));
+        let source = fixture_dir.join(format!("{prefix}{frame:0frame_width$}{suffix}"));
         if !source.is_file() {
             break;
         }
@@ -901,7 +898,7 @@ fn assert_oracle_mesh(
                     "material_index" | "sharp_edge" | "sharp_face"
                 )
         })
-        .map(|(name, _)| name.to_string())
+        .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     actual_attribute_names.sort();
     expected_attribute_names.sort();

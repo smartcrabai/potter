@@ -702,8 +702,8 @@ fn mesh_cache_mdd_accepts_empty_mesh_with_empty_sample_payload() -> Result<(), B
     )?;
     let mut mesh = Mesh::from_positions_and_faces(vec![], vec![])?;
     let warnings = evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
-    assert!(warnings.is_empty());
-    assert!(mesh.vertices.is_empty());
+    assert_eq!(warnings, [] as [potter_core::error::PotError; 0]);
+    assert_eq!(mesh.vertices, [] as [potter_core::geom::Vertex; 0]);
     Ok(())
 }
 
@@ -972,7 +972,7 @@ fn mesh_cache_integrate_processes_one_corner_faces() -> Result<(), Box<dyn Error
             .co
             .to_array()
             .into_iter()
-            .any(|component| component.is_nan())
+            .any(f64::is_nan)
     );
     assert_eq!(current.vertices[1].co, DVec3::ZERO);
     Ok(())
