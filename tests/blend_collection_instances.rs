@@ -52,6 +52,7 @@ enum Check {
     GeometryAndAttributes,
     /// Blender-authored members joined with a Potter `uv.unwrap` member. Blender's members match
     /// Blender's export; the Potter member matches its own standalone export.
+    MixedWithPotterUnwrap,
     /// A textured member without UVs is refused strictly and emits no TEXCOORD sets when lossy.
     TexturedWithoutUv,
     /// A user metadata conflict fails only the instance that owns it.
