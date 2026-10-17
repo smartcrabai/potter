@@ -3768,17 +3768,16 @@ fn boolean_operand<'d>(
     })?;
     // Blender's f32 product `world_to_object(subject) * object_to_world(operand)`; the f64
     // fallback applies when either object has no exact replica.
-    let to_subject = match crate::geom::blender_matrix::operand_to_subject(
+    let to_subject = if let Some(exact) = crate::geom::blender_matrix::operand_to_subject(
         doc,
         subject_id,
         object_id,
         world_matrices,
     ) {
-        Some(exact) => exact,
-        None => {
-            let to_subject = subject_inverse * world_matrix_f32(object_world);
-            DMat4::from_cols_array(&to_subject.to_cols_array().map(f64::from))
-        }
+        exact
+    } else {
+        let to_subject = subject_inverse * world_matrix_f32(object_world);
+        DMat4::from_cols_array(&to_subject.to_cols_array().map(f64::from))
     };
     let operand = crate::geom::boolean::BooleanOperand {
         mesh,
