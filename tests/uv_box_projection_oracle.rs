@@ -85,8 +85,9 @@ with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(result, handle)
 "#;
 
-/// The source document: a size-2 cube and a size-4 plane moved off the origin, both box-unwrapped.
-/// The plane's offset is an object transform, so its local UVs must not depend on it.
+/// The source document: a size-2 cube at the origin and a size-4 plane whose mesh vertices are translated off
+/// the origin, both box-unwrapped. The plane keeps an object transform as well. The mesh's own centre is off the
+/// origin, so a box projection that used the wrong centre would fail the oracle.
 fn scene() -> TestResult<SceneDoc> {
     let empty = SceneDoc::new(SCENE_ID.to_owned());
     let batch = json!({
@@ -101,6 +102,14 @@ fn scene() -> TestResult<SceneDoc> {
                 "kind": "plane",
                 "params": {"size": 4.0},
                 "transform": {"translation": [3.0, 0.0, 0.0]}
+            },
+            {
+                "op": "mesh.transform_elements",
+                "target": {
+                    "id": "plane",
+                    "elements": {"domain": "vertex", "ids": ["v0", "v1", "v2", "v3"]}
+                },
+                "translation": [3.0, 1.0, 0.5]
             },
             {"op": "uv.unwrap", "target": {"id": "plane"}, "method": "box"}
         ]
