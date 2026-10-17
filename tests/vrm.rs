@@ -1954,18 +1954,13 @@ fn vrm_expressions_target_every_material_uv_variant() -> TestResult<()> {
         imported_transform_binds[0]["material"],
         imported_transform_binds[1]["material"]
     );
-    let exported_st = material_values
-        .iter()
-        .filter(|value| value["propertyName"] == "_MainTex_ST")
-        .map(|value| (&value["materialName"], &value["targetValue"]))
-        .collect::<Vec<_>>();
-    eprintln!(
-        "VRM0 texture transform round trip: input={:?}, exported_st={exported_st:?}, imported={imported_transform_binds:?}",
-        avatar_settings(options)["expressions"]["happy"]["texture_transform_binds"]
-    );
-    assert!(imported_transform_binds
-        .iter()
-        .all(|bind| bind["scale"] == json!([1.25, 0.75]) && bind["offset"] == json!([0.1, 0.2])));
+    // VRM 0 encodes Y as `1 - offset_y - scale_y`; its inverse incurs two ULPs here.
+    assert!(imported_transform_binds.iter().all(|bind| {
+        let offset_y = bind["offset"][1].as_f64();
+        bind["scale"] == json!([1.25, 0.75])
+            && bind["offset"][0] == json!(0.1)
+            && offset_y.is_some_and(|value| value.to_bits().abs_diff(0.2_f64.to_bits()) <= 2)
+    }));
     Ok(())
 }
 
