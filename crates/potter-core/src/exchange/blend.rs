@@ -7862,6 +7862,8 @@ mod tests {
             &crate::exchange::material_graph::GraphTextures {
                 base_color: None,
                 metallic_roughness: None,
+                roughness: None,
+                metallic: None,
                 normal: Some(crate::exchange::material_graph::SlotTexture {
                     texture: texture(&normal_image_id, "Detail"),
                     transform: None,

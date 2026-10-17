@@ -396,19 +396,16 @@ fn build_graph(
 /// layer (no name) through Texture Coordinate `UV`.
 fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result<String> {
     let tex = format!("{name}_tex");
-    let mut source = match &slot.texture.uv_layer {
-        Some(layer) => {
-            let uv_node = format!("{name}_uv");
-            let mut node = GraphNode::new("ShaderNodeUVMap");
-            node.properties.insert("uv_map".to_owned(), json!(layer));
-            insert(graph, &uv_node, node)?;
-            (uv_node, "UV".to_owned())
-        }
-        None => {
-            let coord = format!("{name}_coord");
-            insert(graph, &coord, GraphNode::new("ShaderNodeTexCoord"))?;
-            (coord, "UV".to_owned())
-        }
+    let mut source = if let Some(layer) = &slot.texture.uv_layer {
+        let uv_node = format!("{name}_uv");
+        let mut node = GraphNode::new("ShaderNodeUVMap");
+        node.properties.insert("uv_map".to_owned(), json!(layer));
+        insert(graph, &uv_node, node)?;
+        (uv_node, "UV".to_owned())
+    } else {
+        let coord = format!("{name}_coord");
+        insert(graph, &coord, GraphNode::new("ShaderNodeTexCoord"))?;
+        (coord, "UV".to_owned())
     };
     if let Some(transform) = &slot.transform {
         let map = format!("{name}_map");
@@ -445,7 +442,7 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
 }
 
 /// Multiplies a Color input into `to`: `first` (an authored link, else the `value` default) times the `second` Color
-/// output, through a MixRGB MULTIPLY named `{name}_mix`.
+/// output, through a `MixRGB` MULTIPLY named `{name}_mix`.
 fn multiply_color(
     graph: &mut NodeGroup,
     name: &str,
@@ -732,21 +729,21 @@ pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTex
                     .node_groups
                     .get(authored)
                     .ok_or_else(|| graph_error(format!("shader graph `{authored}` is missing")))?;
-                match overlay_authored(group, material_id, material, &textures, &mut losses)? {
-                    Some(graph) => (graph, generated_graph_id("blend-overlay", material_id)?),
-                    None => {
-                        losses.push(Loss {
-                            feature_id: feature_id::MATERIAL_TEXTURES.to_owned(),
-                            data_id: Some(material_id.as_str().to_owned()),
-                            reason: "the material's shader graph does not drive its active output from a Principled BSDF, so its texture fields cannot be written to .blend"
-                                .to_owned(),
-                            suggestion: Some(
-                                "drive the active output from a Principled BSDF".to_owned(),
-                            ),
-                        });
-                        continue;
-                    }
-                }
+                let Some(graph) =
+                    overlay_authored(group, material_id, material, &textures, &mut losses)?
+                else {
+                    losses.push(Loss {
+                        feature_id: feature_id::MATERIAL_TEXTURES.to_owned(),
+                        data_id: Some(material_id.as_str().to_owned()),
+                        reason: "the material's shader graph does not drive its active output from a Principled BSDF, so its texture fields cannot be written to .blend"
+                            .to_owned(),
+                        suggestion: Some(
+                            "drive the active output from a Principled BSDF".to_owned(),
+                        ),
+                    });
+                    continue;
+                };
+                (graph, generated_graph_id("blend-overlay", material_id)?)
             }
             previous => {
                 if let Some(previous) = previous {
