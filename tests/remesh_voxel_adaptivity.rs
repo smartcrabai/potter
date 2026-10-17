@@ -144,6 +144,8 @@ fn remesh_modifier(params: Value) -> Result<Modifier, Box<dyn Error>> {
         modifier_type: "remesh".to_owned(),
         name: "remesh".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: serde_json::from_value(params)?,
         binding_data: None,
         runtime: ModifierRuntime::default(),

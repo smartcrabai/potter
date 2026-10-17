@@ -338,10 +338,9 @@ fn duplicate_subdivision_doc() -> TestResult<SceneDoc> {
     )
 }
 
-fn potter_modifier_rows(
-    doc: &SceneDoc,
-    object_id: &str,
-) -> TestResult<Vec<(String, String, bool, bool, bool, bool, Value)>> {
+type ModifierRow = (String, String, bool, bool, bool, bool, Value);
+
+fn potter_modifier_rows(doc: &SceneDoc, object_id: &str) -> TestResult<Vec<ModifierRow>> {
     let node = doc
         .nodes
         .get(&Id::new(object_id.to_owned())?)

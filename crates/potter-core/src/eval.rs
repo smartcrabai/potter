@@ -69,6 +69,7 @@ pub enum EvaluationPurpose {
     Render,
 }
 
+
 /// Scene context used to produce one immutable evaluated snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1999,7 +2000,6 @@ impl ModifierGate<'_> {
         linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
     }
 }
-
 /// Read and verify a cache resource from the scene's asset registry.
 ///
 /// # Errors

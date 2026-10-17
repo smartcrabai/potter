@@ -726,7 +726,7 @@ pub(crate) fn evaluate(
             .iter()
             .any(|(property, modifier_type)| {
                 node.properties.contains_key(*property)
-                    && gate.is_property_active(id, node, *property, *modifier_type)
+                    && gate.is_property_active(id, node, property, modifier_type)
             })
         })
     });
