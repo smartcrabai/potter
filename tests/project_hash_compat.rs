@@ -160,7 +160,7 @@ fn old_project_loads_with_its_recorded_hashes() -> TestResult {
     assert_eq!(info.revision, OLD_REVISION);
     assert_eq!(info.hash, OLD_HASH);
 
-    let records = project.history_records()?;
+    let (records, _) = project.history_records()?;
     assert_eq!(records.len(), OLD_BLOB_COUNT);
     assert_eq!(records[0].0, OLD_HEAD_ID);
     assert_eq!(records[0].1.scene_hash, OLD_HEAD_SCENE_HASH);
