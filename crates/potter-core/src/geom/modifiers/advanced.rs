@@ -566,6 +566,7 @@ fn group_weight(weights: Option<&[f64]>, index: usize) -> f64 {
 }
 
 /// Blender's automatic cuboid half-extent per axis: the larger of the absolute extremes of the points.
+/// Blender `cuboid_do` takes the points as the centre plus the local coordinates relative to it.
 fn cast_auto_half_extent(points: impl Iterator<Item = DVec3>) -> DVec3 {
     let mut lo = DVec3::splat(f64::INFINITY);
     let mut hi = DVec3::splat(f64::NEG_INFINITY);
@@ -628,11 +629,10 @@ pub(super) fn cast(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         } else if !use_radius_as_size && size > 0.0 {
             DVec3::splat(size)
         } else {
-            cast_auto_half_extent(
-                mesh.vertices
-                    .iter()
-                    .map(|vertex| forward.transform_point3(vertex.co)),
-            )
+            // Blender `cuboid_do` bounds the centre and the local coordinates relative to it, whatever
+            // `use_transform` is; the transform applies only to each vertex's projection.
+            let relative = mesh.vertices.iter().map(|vertex| vertex.co - center);
+            cast_auto_half_extent(std::iter::once(center).chain(relative))
         };
         for (index, vertex) in result.vertices.iter_mut().enumerate() {
             let weight = group_weight(weights.as_deref(), index);
@@ -2112,34 +2112,10 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     };
     let hook_matrix = object * parent_inverse;
     let uniform_matrix = DMat3::from_mat4(parent_inverse);
-    let original_indices = mesh.original_indices.as_ref();
-    let source_vertex_count =
-        original_indices.map_or(mesh.vertices.len(), |indices| indices.source_vertex_count);
-    let mut selected = vec![false; source_vertex_count];
-    // Blender 5.2.2 validates each listed value but enables the bitmap at its list position.
-    for (position, &index) in indices.iter().enumerate() {
-        if index < source_vertex_count && position < selected.len() {
-            selected[position] = true;
-        }
-    }
     let use_falloff = falloff != HookFalloff::NoFalloff && radius > 0.0;
-    let mut result = mesh.clone();
-    for (index, vertex) in result.vertices.iter_mut().enumerate() {
-        let source_index = original_indices.map_or(Some(index), |indices| {
-            indices
-                .vertices
-                .get(index)
-                .copied()
-                .and_then(|source| usize::try_from(source).ok())
-        });
-        if listed
-            && !source_index
-                .and_then(|source| selected.get(source).copied())
-                .unwrap_or(false)
-        {
-            continue;
-        }
-        let offset = vertex.co - center;
+    // Blender `hook_co_apply`: the falloff is measured from the current coordinate, then scaled by the group weight.
+    let hook_co = |co: DVec3, index: usize| -> Option<DVec3> {
+        let offset = co - center;
         let distance_sq = if uniform {
             (uniform_matrix * offset).length_squared()
         } else {
@@ -2151,11 +2127,47 @@ pub(super) fn hook(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             1.0
         };
         let fac = strength * shape * group_weight(weights.as_deref(), index);
-        if fac == 0.0 {
-            continue;
+        (fac != 0.0).then(|| co.lerp(hook_matrix.transform_point3(co), fac))
+    };
+    let hook_index = |result: &mut Mesh, index: usize| {
+        let co = result.vertices[index].co;
+        if let Some(hooked) = hook_co(co, index) {
+            result.vertices[index].co = hooked;
         }
-        let hooked = hook_matrix.transform_point3(vertex.co);
-        vertex.co = vertex.co.lerp(hooked, fac);
+    };
+    let mut result = mesh.clone();
+    let vertex_count = mesh.vertices.len();
+    if !listed {
+        for index in 0..vertex_count {
+            hook_index(&mut result, index);
+        }
+    } else if let Some(original) = mesh.original_indices.as_ref() {
+        // Blender `MOD_hook.cc` ORIGINDEX branch: the selection bitmap is filled by list position,
+        // then each vertex is tested by its original index.
+        let mut selected = vec![false; original.source_vertex_count];
+        for (position, &index) in indices.iter().enumerate() {
+            if index < original.source_vertex_count && position < selected.len() {
+                selected[position] = true;
+            }
+        }
+        for index in 0..vertex_count {
+            let source = original
+                .vertices
+                .get(index)
+                .copied()
+                .and_then(|source| usize::try_from(source).ok());
+            if source.is_some_and(|source| selected.get(source) == Some(&true)) {
+                hook_index(&mut result, index);
+            }
+        }
+    } else {
+        // Blender's list-value branch (no CD_ORIGINDEX): each listed value below the vertex count hooks
+        // that vertex in list order, so a repeated value hooks it again.
+        for &index in &indices {
+            if index < vertex_count {
+                hook_index(&mut result, index);
+            }
+        }
     }
     validated(&result)?;
     Ok(result)

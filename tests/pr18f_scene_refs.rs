@@ -722,9 +722,13 @@ fn displace_blend_texture_uses_mapping_object_coordinates() {
     );
 }
 
+fn vertex_positions(mesh: &Mesh) -> Vec<DVec3> {
+    mesh.vertices.iter().map(|vertex| vertex.co).collect()
+}
+
 #[test]
 fn array_fit_curve_evaluates_the_curve_path_in_preview() {
-    let doc = apply(
+    let staged = apply(
         &base_scene(),
         &json!([
             {"op":"curve.create","id":"path","dimensions":"three_d","transform":{"scale":[2.0,2.0,2.0]},
@@ -736,7 +740,17 @@ fn array_fit_curve_evaluates_the_curve_path_in_preview() {
                        "relative_offset_displace":[1.0,0.0,0.0],"use_constant_offset":false}}
         ]),
     );
-    // Two copies of the eight box corners. Preview needs the curve path length, which the
-    // evaluation pass records before the array runs.
-    assert_eq!(evaluated_mesh(&doc, "subj", None).vertices.len(), 16);
+    let preview = vertex_positions(&evaluated_mesh(&staged, "subj", None));
+    // The preview must be non-trivial: the array repeats the source box.
+    assert!(
+        preview.len() > source_mesh(&staged, "subj").vertices.len(),
+        "preview did not run the array modifier"
+    );
+    // Applying the same array must produce exactly the geometry the preview showed.
+    let applied_doc = apply(
+        &staged,
+        &json!([{"op":"modifier.apply","target":{"id":"subj"},"modifier_id":"array"}]),
+    );
+    let applied = vertex_positions(source_mesh(&applied_doc, "subj"));
+    assert_same_positions(&preview, &applied);
 }

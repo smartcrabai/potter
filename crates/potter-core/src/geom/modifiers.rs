@@ -217,14 +217,47 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "modifier evaluation frame must be finite",
         ));
     }
-    let needs_original_indices = modifiers.iter().enumerate().any(|(index, modifier)| {
-        is_active(index, modifier)
-            && modifier.modifier_type == "hook"
+    // Blender creates CD_ORIGINDEX (an identity map) before the first constructive modifier when a later
+    // Hook with a vertex list reads it (mesh_data_update.cc). Deform-only modifiers ahead of that point see
+    // no layer, so their Hooks hook by listed value (MOD_hook.cc). Injecting here is exact unless a listed
+    // Hook also precedes the first constructive modifier: that Hook then sees the layer early.
+    let is_deform_only = |modifier: &Modifier| {
+        matches!(
+            modifier.modifier_type.as_str(),
+            "armature"
+                | "cast"
+                | "corrective_smooth"
+                | "curve"
+                | "displace"
+                | "hook"
+                | "laplacian_deform"
+                | "laplacian_smooth"
+                | "lattice"
+                | "mesh_deform"
+                | "shrinkwrap"
+                | "simple_deform"
+                | "smooth"
+                | "warp"
+                | "wave"
+        )
+    };
+    let is_listed_hook = |modifier: &Modifier| {
+        modifier.modifier_type == "hook"
             && modifier
                 .params
                 .get("vertex_indices")
                 .and_then(Value::as_array)
                 .is_some_and(|indices| !indices.is_empty())
+    };
+    let first_constructive = modifiers
+        .iter()
+        .enumerate()
+        .find(|&(index, modifier)| is_active(index, modifier) && !is_deform_only(modifier))
+        .map(|(index, _)| index);
+    let needs_original_indices = first_constructive.is_some_and(|first| {
+        modifiers.iter().enumerate().any(|(index, modifier)| {
+            index > first && is_active(index, modifier) && is_listed_hook(modifier)
+        })
     });
     if needs_original_indices && evaluated.original_indices.is_none() {
         let source_vertex_count = evaluated.vertices.len();

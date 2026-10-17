@@ -6,7 +6,7 @@
 use glam::DQuat;
 
 use super::{
-    DVec3, ErrorCode, HashSet, Mesh, Modifier, Origin, Polygon, PotError, Result, Value,
+    DVec3, ErrorCode, HashMap, HashSet, Mesh, Modifier, Origin, Polygon, PotError, Result, Value,
     bool_param, build_mesh, id_indices, invalid_parameter, number_param, positions, validated,
 };
 
@@ -461,12 +461,14 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .filter_map(|(frame, (detached, inside))| detached.then_some((frame, inside)))
         .collect();
     branch_faces = merge_triangle_faces(&points, branch_faces, symmetry_axes);
+    let mut welded = Vec::new();
     repair_detached_branch_frames(
         &mut points,
         &mut origins,
         &mut frame_vertex_ids,
         &mut branch_faces,
         &detached_frames,
+        &mut welded,
     )?;
     smooth_branch_hull_points(
         &mut points,
@@ -537,6 +539,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .into_iter()
         .map(|face| (face, 0))
         .collect();
+    let (points, origins, faces) = drop_welded_points(points, origins, faces, &welded);
     let origin = Origin {
         vertices: origins,
         // Skin's fresh BMesh has no point CD_ORIGINDEX layer.
@@ -749,6 +752,7 @@ fn repair_detached_branch_frames(
     frame_vertex_ids: &mut [[usize; 4]],
     faces: &mut Vec<Vec<usize>>,
     detached_frames: &[(usize, [bool; 4])],
+    welded: &mut Vec<usize>,
 ) -> Result<()> {
     for &(frame_index, inside) in detached_frames {
         let frame = frame_vertex_ids.get(frame_index).copied().ok_or_else(|| {
@@ -776,38 +780,22 @@ fn repair_detached_branch_frames(
 
         if let Some(target) = target
             && !has_degenerate_coincidence
+            && skin_fix_hole_no_good_verts(
+                points,
+                origins,
+                faces,
+                target,
+                frame_vertex_ids[frame_index],
+                welded,
+            )?
         {
-            if faces[target].len() == 3 {
-                subdivide_skin_target_face(points, origins, faces, target)?;
-            }
-            if faces[target].len() == 4 {
-                let target_ring = faces[target].clone();
-                let frame = frame_vertex_ids[frame_index];
-                let order = skin_choose_quad_bridge_order(points, target_ring.as_slice(), frame);
-                for corner in 0..4 {
-                    let next = (corner + 1) % 4;
-                    append_welded_face(
-                        faces,
-                        [
-                            target_ring[next],
-                            frame[order[next]],
-                            frame[order[corner]],
-                            target_ring[corner],
-                        ],
-                    );
-                }
-                continue;
-            }
+            continue;
         }
         faces.push(frame_vertex_ids[frame_index].to_vec());
     }
     Ok(())
 }
 
-#[expect(
-    clippy::manual_midpoint,
-    reason = "matches Blender's float evaluation order for parity"
-)]
 fn subdivide_skin_target_face(
     points: &mut Vec<DVec3>,
     origins: &mut Vec<Vec<(usize, f64)>>,
@@ -842,11 +830,7 @@ fn subdivide_skin_target_face(
     })?;
     let a = points[first];
     let b = points[second];
-    let midpoint = DVec3::new(
-        ((a.x as f32 + b.x as f32) * 0.5) as f64,
-        ((a.y as f32 + b.y as f32) * 0.5) as f64,
-        ((a.z as f32 + b.z as f32) * 0.5) as f64,
-    );
+    let midpoint = skin_float_midpoint(a, b);
     let mut midpoint_origin = std::collections::BTreeMap::<usize, f64>::new();
     for &(source, weight) in &origins[first] {
         *midpoint_origin.entry(source).or_default() += weight * 0.5;
@@ -884,25 +868,163 @@ fn subdivide_skin_target_face(
     Ok(())
 }
 
-fn append_welded_face(faces: &mut Vec<Vec<usize>>, corners: [usize; 4]) {
-    let mut face = Vec::with_capacity(4);
-    for vertex in corners {
-        if face.last() != Some(&vertex) {
-            face.push(vertex);
+/// Blender's `skin_fix_hole_no_good_verts`: `target` is extruded, which deletes it and leaves a copy
+/// with new vertices plus one side wall per edge. A triangular copy is split on its longest edge, and
+/// its four corners are welded onto `frame` in the nearest order, so the side walls join the frame.
+/// Returns `false` when the copy is not a quad; the copy then stays and the caller caps the frame.
+fn skin_fix_hole_no_good_verts(
+    points: &mut Vec<DVec3>,
+    origins: &mut Vec<Vec<(usize, f64)>>,
+    faces: &mut Vec<Vec<usize>>,
+    target: usize,
+    frame: [usize; 4],
+    welded: &mut Vec<usize>,
+) -> Result<bool> {
+    let ring = faces.get(target).cloned().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "Skin target face index is out of range",
+        )
+    })?;
+    let mut copy = Vec::with_capacity(ring.len());
+    for &vertex in &ring {
+        let position = points[vertex];
+        let source = origins[vertex].clone();
+        copy.push(points.len());
+        points.push(position);
+        origins.push(source);
+    }
+    for (corner, &vertex) in ring.iter().enumerate() {
+        let next = (corner + 1) % ring.len();
+        faces.push(vec![ring[next], copy[next], copy[corner], vertex]);
+    }
+    faces[target] = copy;
+    if faces[target].len() == 3 {
+        subdivide_skin_target_face(points, origins, faces, target)?;
+    }
+    if faces[target].len() > 4 {
+        collapse_skin_face_corners(points, faces, target, welded);
+    }
+    if faces[target].len() != 4 {
+        return Ok(false);
+    }
+    let quad = faces[target].clone();
+    let order = skin_choose_quad_bridge_order(points, &quad, frame);
+    let mapping: Vec<(usize, usize)> = quad
+        .iter()
+        .copied()
+        .zip(order.map(|corner| frame[corner]))
+        .collect();
+    welded.extend(quad);
+    faces.remove(target);
+    weld_skin_vertices(faces, &mapping);
+    Ok(true)
+}
+
+/// Blender's `collapse_face_corners`: while `target` has more than four corners, its shortest edge
+/// merges into the edge's first corner, which moves to the edge midpoint.
+fn collapse_skin_face_corners(
+    points: &mut [DVec3],
+    faces: &mut [Vec<usize>],
+    target: usize,
+    welded: &mut Vec<usize>,
+) {
+    while faces[target].len() > 4 {
+        let face = faces[target].clone();
+        let mut shortest = 0;
+        let mut shortest_length = f32::MAX;
+        for (corner, &first) in face.iter().enumerate() {
+            let second = face[(corner + 1) % face.len()];
+            let length = skin_float_distance_squared(points[first], points[second]);
+            if length < shortest_length {
+                shortest_length = length;
+                shortest = corner;
+            }
+        }
+        let keep = face[shortest];
+        let merge = face[(shortest + 1) % face.len()];
+        points[keep] = skin_float_midpoint(points[keep], points[merge]);
+        welded.push(merge);
+        for other in &mut *faces {
+            for vertex in &mut *other {
+                if *vertex == merge {
+                    *vertex = keep;
+                }
+            }
+            dedupe_cyclic(other);
         }
     }
-    if face.first() == face.last() {
+}
+
+/// Blender's `weld_verts` for a target map: each mapped corner takes its target, corners that become
+/// adjacent collapse, and faces left with fewer than three corners are dropped.
+fn weld_skin_vertices(faces: &mut Vec<Vec<usize>>, mapping: &[(usize, usize)]) {
+    for face in &mut *faces {
+        for vertex in &mut *face {
+            if let Some(&(_, to)) = mapping.iter().find(|&&(from, _)| from == *vertex) {
+                *vertex = to;
+            }
+        }
+        dedupe_cyclic(face);
+    }
+    faces.retain(|face| face.len() >= 3);
+}
+
+/// Drops repeated corners of a polygon, including a repeat across its closing edge.
+fn dedupe_cyclic(face: &mut Vec<usize>) {
+    face.dedup();
+    if face.len() > 1 && face.first() == face.last() {
         face.pop();
     }
-    if face.len() < 3
-        || face
-            .iter()
-            .enumerate()
-            .any(|(index, vertex)| face[..index].contains(vertex))
-    {
-        return;
+}
+
+/// Blender's weld removes the vertices it merges away. Drops the `welded` points, renumbering the rest
+/// and every face that uses them.
+fn drop_welded_points(
+    points: Vec<DVec3>,
+    origins: Vec<Vec<(usize, f64)>>,
+    faces: Vec<Polygon>,
+    welded: &[usize],
+) -> (Vec<DVec3>, Vec<Vec<(usize, f64)>>, Vec<Polygon>) {
+    let mut dropped = vec![false; points.len()];
+    for &index in welded {
+        if let Some(flag) = dropped.get_mut(index) {
+            *flag = true;
+        }
     }
-    faces.push(face);
+    let mut renumbered = vec![0_usize; points.len()];
+    let mut kept_points = Vec::with_capacity(points.len());
+    let mut kept_origins = Vec::with_capacity(origins.len());
+    for (index, (point, origin)) in points.into_iter().zip(origins).enumerate() {
+        if dropped[index] {
+            continue;
+        }
+        renumbered[index] = kept_points.len();
+        kept_points.push(point);
+        kept_origins.push(origin);
+    }
+    let faces = faces
+        .into_iter()
+        .map(|(face, material)| {
+            (
+                face.into_iter().map(|vertex| renumbered[vertex]).collect(),
+                material,
+            )
+        })
+        .collect();
+    (kept_points, kept_origins, faces)
+}
+
+#[expect(
+    clippy::manual_midpoint,
+    reason = "matches Blender's float evaluation order for parity"
+)]
+fn skin_float_midpoint(first: DVec3, second: DVec3) -> DVec3 {
+    DVec3::new(
+        ((first.x as f32 + second.x as f32) * 0.5) as f64,
+        ((first.y as f32 + second.y as f32) * 0.5) as f64,
+        ((first.z as f32 + second.z as f32) * 0.5) as f64,
+    )
 }
 
 fn skin_hole_target_face(
@@ -1103,12 +1225,21 @@ fn triangle_area(points: &[DVec3], triangle: [usize; 3]) -> f64 {
         * 0.5
 }
 
-/// Blender's heap-based merge pass over adjacent triangle faces.
+/// Blender's `hull_merge_triangles`: an edge used by exactly two triangles offers a quad, and quads
+/// are taken greedily by score. A candidate is skipped when its edge no longer has exactly two faces
+/// (`BM_edge_face_pair`) or when its triangles share a neighbouring face. The mesh seen by those
+/// checks keeps merged triangles and earlier quads, as Blender's BMesh does until the final delete.
 fn merge_triangle_faces(
     points: &[DVec3],
     faces: Vec<Vec<usize>>,
     symmetry_axes: [bool; 3],
 ) -> Vec<Vec<usize>> {
+    let mut edge_faces: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (face_index, face) in faces.iter().enumerate() {
+        for edge in face_edges(face) {
+            edge_faces.entry(edge).or_default().push(face_index);
+        }
+    }
     let mut triangle_faces = Vec::new();
     let mut triangles = Vec::new();
     for (face_index, face) in faces.iter().enumerate() {
@@ -1117,7 +1248,7 @@ fn merge_triangle_faces(
             triangles.push([face[0], face[1], face[2]]);
         }
     }
-    let mut candidates = Vec::<(f64, usize, usize, [usize; 4])>::new();
+    let mut candidates = Vec::<(f64, usize, usize, [usize; 4], (usize, usize))>::new();
     for first in 0..triangles.len() {
         for second in first + 1..triangles.len() {
             let shared: Vec<usize> = triangles[first]
@@ -1126,6 +1257,10 @@ fn merge_triangle_faces(
                 .filter(|vertex| triangles[second].contains(vertex))
                 .collect();
             if shared.len() != 2 {
+                continue;
+            }
+            let shared_edge = ordered_edge(shared[0], shared[1]);
+            if edge_faces.get(&shared_edge).map_or(0, Vec::len) != 2 {
                 continue;
             }
             let Some(quad) =
@@ -1145,32 +1280,70 @@ fn merge_triangle_faces(
                 }
             }
             if quad_is_convex(points, quad) {
-                candidates.push((score, first, second, quad));
+                candidates.push((
+                    score,
+                    triangle_faces[first],
+                    triangle_faces[second],
+                    quad,
+                    shared_edge,
+                ));
             }
         }
     }
     candidates.sort_by(|first, second| second.0.total_cmp(&first.0));
-    let mut merged_triangles = vec![false; triangles.len()];
-    let mut merged_faces = vec![false; faces.len()];
-    let mut quads = Vec::new();
-    for (_, first, second, quad) in candidates {
-        if merged_triangles[first] || merged_triangles[second] {
+    let mut all_faces = faces;
+    let mut consumed = vec![false; all_faces.len()];
+    for (_, first, second, quad, shared_edge) in candidates {
+        if consumed[first] || consumed[second] {
             continue;
         }
-        merged_triangles[first] = true;
-        merged_triangles[second] = true;
-        merged_faces[triangle_faces[first]] = true;
-        merged_faces[triangle_faces[second]] = true;
-        quads.push(quad.to_vec());
+        if edge_faces.get(&shared_edge).map_or(0, Vec::len) != 2
+            || share_neighbouring_face(&all_faces, &edge_faces, first, second)
+        {
+            continue;
+        }
+        consumed[first] = true;
+        consumed[second] = true;
+        let quad_face = all_faces.len();
+        for edge in face_edges(&quad) {
+            edge_faces.entry(edge).or_default().push(quad_face);
+        }
+        all_faces.push(quad.to_vec());
+        consumed.push(false);
     }
-    let mut output: Vec<Vec<usize>> = faces
+    all_faces
         .into_iter()
-        .enumerate()
-        .filter_map(|(index, face)| (!merged_faces[index]).then_some(face))
-        .collect();
-    output.extend(quads);
-    output
+        .zip(consumed)
+        .filter_map(|(face, merged)| (!merged).then_some(face))
+        .collect()
 }
+
+/// Blender's `BM_face_share_face_check`: whether a third face shares an edge with both faces.
+fn share_neighbouring_face(
+    faces: &[Vec<usize>],
+    edge_faces: &HashMap<(usize, usize), Vec<usize>>,
+    first: usize,
+    second: usize,
+) -> bool {
+    let neighbours = |face: usize| -> HashSet<usize> {
+        face_edges(&faces[face])
+            .filter_map(|edge| edge_faces.get(&edge))
+            .flatten()
+            .copied()
+            .filter(|other| *other != face)
+            .collect()
+    };
+    let first_neighbours = neighbours(first);
+    neighbours(second)
+        .iter()
+        .any(|other| first_neighbours.contains(other))
+}
+
+/// The undirected edges of a polygon, as ordered vertex pairs.
+fn face_edges(face: &[usize]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    (0..face.len()).map(|corner| ordered_edge(face[corner], face[(corner + 1) % face.len()]))
+}
+
 fn quad_from_triangles(
     first: [usize; 3],
     second: [usize; 3],

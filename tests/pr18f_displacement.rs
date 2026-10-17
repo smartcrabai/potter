@@ -552,7 +552,7 @@ fn scene_subject(
         .arg("--json")
         .output()?;
     if !init.status.success() {
-        return Err(String::from_utf8_lossy(&init.stderr).into_owned().into());
+        return Err(pot_failure(&init));
     }
     std::fs::write(
         &batch,
@@ -570,15 +570,18 @@ fn scene_subject(
         .arg("--json")
         .output()?;
     if !applied.status.success() {
-        return Err(String::from_utf8_lossy(&applied.stderr).into_owned().into());
+        return Err(pot_failure(&applied));
     }
     let document: potter_core::model::SceneDoc =
         serde_json::from_slice(&std::fs::read(scene.join("scene.json"))?)?;
+    let subject = Id::new("subject".to_owned())?;
     let node = document
         .nodes
-        .get(&Id::new("subject".to_owned())?)
+        .get(&subject)
         .ok_or("subject node is missing")?;
-    let data_id = node.data.as_ref().ok_or("subject mesh data is missing")?;
+    if node.data.is_none() {
+        return Err("subject mesh data is missing".into());
+    }
     let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
         &document,
         &potter_core::eval::EvaluationContext {
@@ -590,9 +593,21 @@ fn scene_subject(
     )?;
     snapshot
         .meshes
-        .get(data_id)
+        .get(&subject)
         .cloned()
         .ok_or_else(|| "subject mesh was not evaluated".into())
+}
+
+/// The message of a failed `pot --json` run. Failure envelopes are printed on stdout, not stderr.
+fn pot_failure(output: &std::process::Output) -> Box<dyn std::error::Error> {
+    let detail = serde_json::from_slice::<Value>(&output.stdout)
+        .ok()
+        .and_then(|envelope| envelope.get("error").cloned())
+        .map_or_else(
+            || String::from_utf8_lossy(&output.stderr).into_owned(),
+            |error| error.to_string(),
+        );
+    format!("pot exited with {}: {detail}", output.status).into()
 }
 
 fn plane_ops(transform: &Value, deform: Value) -> Vec<Value> {

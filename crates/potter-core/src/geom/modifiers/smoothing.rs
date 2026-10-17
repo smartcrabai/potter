@@ -437,10 +437,12 @@ impl SparseLaplacianSolver {
         let mut previous_rho = 1.0;
         let mut alpha = 1.0;
         let mut omega = 1.0;
+        // A breakdown is an inner product that vanished. These products shrink with the residual
+        // squared, so an absolute epsilon would abort a converging solve before `tolerance`.
         let max_iterations = self.solution.len().saturating_mul(4).max(32);
         for iteration in 0..max_iterations {
             let rho = sparse_dot(&self.shadow_residual, &self.residual);
-            if rho.abs() <= f64::EPSILON {
+            if rho.abs() <= f64::MIN_POSITIVE {
                 return false;
             }
             if iteration == 0 {
@@ -454,7 +456,7 @@ impl SparseLaplacianSolver {
             }
             sparse_matrix_vector(&self.rows, &self.direction, &mut self.product);
             let divisor = sparse_dot(&self.shadow_residual, &self.product);
-            if divisor.abs() <= f64::EPSILON {
+            if divisor.abs() <= f64::MIN_POSITIVE {
                 return false;
             }
             alpha = rho / divisor;
@@ -469,11 +471,11 @@ impl SparseLaplacianSolver {
             }
             sparse_matrix_vector(&self.rows, &self.intermediate, &mut self.second_product);
             let denominator = sparse_dot(&self.second_product, &self.second_product);
-            if denominator <= f64::EPSILON {
+            if denominator <= f64::MIN_POSITIVE {
                 return false;
             }
             omega = sparse_dot(&self.second_product, &self.intermediate) / denominator;
-            if omega.abs() <= f64::EPSILON {
+            if omega.abs() <= f64::MIN_POSITIVE {
                 return false;
             }
             for index in 0..self.solution.len() {

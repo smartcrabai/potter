@@ -2713,7 +2713,7 @@ fn hash_value(index: usize) -> usize {
 fn noise_hash(x: i32, y: i32, z: i32) -> usize {
     let zi = (z & 255) as usize;
     let yi = (hash_value(zi).wrapping_add(y as usize)) & 255;
-    (hash_value(yi).wrapping_add(x as usize)) & 255
+    hash_value((hash_value(yi).wrapping_add(x as usize)) & 255)
 }
 
 fn hash_point(x: i32, y: i32, z: i32) -> [f32; 3] {
