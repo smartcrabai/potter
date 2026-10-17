@@ -563,8 +563,11 @@ fn blender_remesh_supported_modes_match_exact_geometry_and_voxel_adaptivity_is_g
         "mode":"VOXEL","voxel_size":0.3,"adaptivity":0.1,
         "use_smooth_shade":false,"use_remove_disconnected":false,"threshold":0.15
     });
-    let voxel_adaptive_mesh =
-        evaluate_modifiers(&source, &[modifier("remesh", voxel_adaptivity_params)?], "Input")?;
+    let voxel_adaptive_mesh = evaluate_modifiers(
+        &source,
+        &[modifier("remesh", voxel_adaptivity_params)?],
+        "Input",
+    )?;
     assert!(
         !voxel_adaptive_mesh.faces.is_empty(),
         "nonzero VOXEL adaptivity must produce a remeshed surface"
@@ -1164,15 +1167,19 @@ fn ocean_fft_is_seeded_and_choppiness_changes_the_surface() -> Result<(), Box<dy
             .sqrt()
     };
     assert!(rms_height(&first) > 1.0e-10);
-    let generated = evaluate_modifiers(&source, &[modifier(
-        "ocean",
-        json!({
-            "geometry_mode":"GENERATE","resolution":4,"viewport_resolution":4,
-            "spatial_size":8,"random_seed":17,"time":1.5,"wave_scale":1.0,
-            "wave_direction":-0.3,"wave_alignment":0.65,"repeat_x":2,"repeat_y":1,
-            "use_normals":true,"use_foam":true,"foam_layer_name":"foam","choppiness":0.0
-        }),
-    )?], "OceanGrid")?;
+    let generated = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "ocean",
+            json!({
+                "geometry_mode":"GENERATE","resolution":4,"viewport_resolution":4,
+                "spatial_size":8,"random_seed":17,"time":1.5,"wave_scale":1.0,
+                "wave_direction":-0.3,"wave_alignment":0.65,"repeat_x":2,"repeat_y":1,
+                "use_normals":true,"use_foam":true,"foam_layer_name":"foam","choppiness":0.0
+            }),
+        )?],
+        "OceanGrid",
+    )?;
     assert_eq!(generated.vertices.len(), 33 * 17);
     assert_eq!(generated.faces.len(), 32 * 16);
     assert!((generated.vertices[0].co.x + 8.0).abs() < 1.0e-9);
@@ -2395,15 +2402,19 @@ with open(sys.argv[-1], 'w', encoding='utf-8') as output:
     let references = blender_script_json(&blender, directory.path(), &script)?;
     for (voxel_size, smooth_shade) in [(0.1_f64, false), (0.05, true)] {
         let key = voxel_size.to_string();
-        let native = evaluate_modifiers(&source, &[modifier(
-            "remesh",
-            json!({
-                "mode":"VOXEL",
-                "voxel_size":voxel_size,
-                "adaptivity":0.0,
-                "use_smooth_shade":smooth_shade
-            }),
-        )?], "VoxelInput")?;
+        let native = evaluate_modifiers(
+            &source,
+            &[modifier(
+                "remesh",
+                json!({
+                    "mode":"VOXEL",
+                    "voxel_size":voxel_size,
+                    "adaptivity":0.0,
+                    "use_smooth_shade":smooth_shade
+                }),
+            )?],
+            "VoxelInput",
+        )?;
         assert_voxel_remesh_geometry(
             &native,
             &references[&key],

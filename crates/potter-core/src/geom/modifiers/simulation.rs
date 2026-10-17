@@ -525,21 +525,13 @@ pub fn displace_volume(
     params: &Map<String, Value>,
     texture: Option<crate::geom::legacy_texture::TextureSource<'_>>,
     rng: &mut crate::blender_rng::BlenderRng,
-    volume_world: DMat4,
-    texture_map_object_world: Option<DMat4>,
+    texture_mapping: Option<crate::model::TextureCoordinateMapping>,
 ) -> Result<VolumeData> {
     let strength = number_param("volume_displace", params, "strength")?;
     let Some(texture) = texture.filter(|_| strength != 0.0) else {
         return Ok(volume.clone());
     };
-    let mut texture = VolumeDisplacement::new(
-        params,
-        texture,
-        rng,
-        strength,
-        volume_world,
-        texture_map_object_world,
-    )?;
+    let mut texture = VolumeDisplacement::new(params, texture, rng, strength, texture_mapping)?;
     match &volume.source {
         VolumeSource::Generated(_) => {
             let mut displaced = volume.clone();
@@ -566,10 +558,18 @@ pub fn displace_volume(
     }
 }
 
+#[derive(Clone, Copy)]
+enum VolumeTextureMapMode {
+    Local,
+    Global,
+    Object,
+}
+
 struct VolumeDisplacement<'a> {
     texture: crate::geom::legacy_texture::TextureSource<'a>,
     rng: &'a mut crate::blender_rng::BlenderRng,
-    mapping: DMat4,
+    mapping: crate::model::TextureCoordinateMapping,
+    mapping_mode: VolumeTextureMapMode,
     strength: f64,
     mid_level: [f64; 3],
     sample_radius: f64,
@@ -581,8 +581,7 @@ impl<'a> VolumeDisplacement<'a> {
         texture: crate::geom::legacy_texture::TextureSource<'a>,
         rng: &'a mut crate::blender_rng::BlenderRng,
         strength: f64,
-        volume_world: DMat4,
-        texture_map_object_world: Option<DMat4>,
+        mapping: Option<crate::model::TextureCoordinateMapping>,
     ) -> Result<Self> {
         let sample_radius = number_param("volume_displace", params, "texture_sample_radius")?;
         if sample_radius < 0.0 {
@@ -593,27 +592,18 @@ impl<'a> VolumeDisplacement<'a> {
                 "texture_sample_radius exceeds the 16-voxel output padding limit",
             ));
         }
-        let mode = string_param("volume_displace", params, "texture_map_mode")?;
-        let mapping = match mode {
-            "LOCAL" => DMat4::IDENTITY,
-            "GLOBAL" => volume_world,
-            "OBJECT" => match texture_map_object_world {
-                Some(object_world) => invert_transform(object_world)? * volume_world,
-                None => DMat4::IDENTITY,
-            },
-            _ => {
-                return Err(invalid("texture_map_mode must be LOCAL, GLOBAL, or OBJECT"));
-            }
+        let mapping_mode = match string_param("volume_displace", params, "texture_map_mode")? {
+            "LOCAL" => VolumeTextureMapMode::Local,
+            "GLOBAL" => VolumeTextureMapMode::Global,
+            "OBJECT" => VolumeTextureMapMode::Object,
+            _ => return Err(invalid("texture_map_mode must be LOCAL, GLOBAL, or OBJECT")),
         };
-        if !mapping.is_finite() || mapping.determinant().abs() <= 1.0e-15 {
-            return Err(invalid(
-                "volume texture coordinate transform must be finite and invertible",
-            ));
-        }
+        let mapping = mapping.ok_or_else(|| invalid("volume texture mapping was not resolved"))?;
         Ok(Self {
             texture,
             rng,
             mapping,
+            mapping_mode,
             strength,
             mid_level: vector_param("volume_displace", params, "texture_mid_level")?,
             sample_radius,
@@ -621,7 +611,11 @@ impl<'a> VolumeDisplacement<'a> {
     }
 
     fn displacement_at(&mut self, local_position: DVec3) -> Result<DVec3> {
-        let texture_position = self.mapping.transform_point3(local_position);
+        let texture_position = match self.mapping_mode {
+            VolumeTextureMapMode::Local => local_position,
+            VolumeTextureMapMode::Global => self.mapping.global_coordinate(local_position),
+            VolumeTextureMapMode::Object => self.mapping.object_coordinate(local_position),
+        };
         if !texture_position.is_finite() {
             return Err(invalid("volume texture coordinates are not finite"));
         }
@@ -727,8 +721,7 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<
                 );
                 let source_coordinate = if output_transform.is_some() {
                     let displacement = texture.displacement_at(local_position)?;
-                    (output_index - DVec3::splat(padding as f64)
-                        - displacement / grid.voxel_size)
+                    (output_index - DVec3::splat(padding as f64) - displacement / grid.voxel_size)
                         .to_array()
                 } else {
                     let displacement = texture.displacement_at(local_position)?;
@@ -834,8 +827,7 @@ fn displace_vdb_volume(
         f64::from(output_minimum[1]),
         f64::from(output_minimum[2]),
     );
-    let output_index_to_local =
-        index_to_world * DMat4::from_translation(output_offset);
+    let output_index_to_local = index_to_world * DMat4::from_translation(output_offset);
     let output_origin = output_index_to_local.transform_point3(DVec3::ZERO);
     let mut values = Vec::with_capacity(sample_count);
     for z in 0..dimensions[2] {
@@ -1081,15 +1073,6 @@ fn nearest_particle(point: DVec3, particles: &[(DVec3, f64)]) -> usize {
     nearest
 }
 
-fn invert_transform(matrix: DMat4) -> Result<DMat4> {
-    if !matrix.is_finite() || matrix.determinant().abs() <= 1.0e-15 {
-        return Err(invalid(
-            "texture mapping object transform must be finite and invertible",
-        ));
-    }
-    Ok(matrix.inverse())
-}
-
 fn invert(matrix: DMat4) -> Result<DMat4> {
     if !matrix.is_finite() || matrix.determinant().abs() <= 1.0e-15 {
         return Err(invalid(
@@ -1310,8 +1293,7 @@ mod tests {
             ..VolumeData::default()
         };
         let mut rng = crate::blender_rng::BlenderRng::seed(0);
-        let unchanged =
-            displace_volume(&volume, &Map::new(), None, &mut rng, DMat4::IDENTITY, None)?;
+        let unchanged = displace_volume(&volume, &Map::new(), None, &mut rng, None)?;
         assert_eq!(
             unchanged.grids[0].values.as_deref(),
             Some(&[0.0_f32, 1.0, 0.0][..])
@@ -1334,8 +1316,9 @@ mod tests {
             ]),
             Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
             &mut rng,
-            DMat4::IDENTITY,
-            None,
+            Some(crate::model::TextureCoordinateMapping::for_subject_world(
+                DMat4::IDENTITY,
+            )),
         )?;
         assert_eq!(
             displaced.grids[0].values.as_deref(),
@@ -1375,16 +1358,18 @@ mod tests {
             &settings("LOCAL"),
             Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
             &mut rng,
-            DMat4::from_translation(DVec3::new(2.0, 3.0, 4.0)),
-            None,
+            Some(crate::model::TextureCoordinateMapping::for_subject_world(
+                DMat4::from_translation(DVec3::new(2.0, 3.0, 4.0)),
+            )),
         )?;
         let object_without_target = displace_volume(
             &volume,
             &settings("OBJECT"),
             Some(crate::geom::legacy_texture::TextureSource::Image(&image)),
             &mut rng,
-            DMat4::from_translation(DVec3::new(2.0, 3.0, 4.0)),
-            None,
+            Some(crate::model::TextureCoordinateMapping::for_subject_world(
+                DMat4::from_translation(DVec3::new(2.0, 3.0, 4.0)),
+            )),
         )?;
         assert_eq!(object_without_target, local);
         Ok(())

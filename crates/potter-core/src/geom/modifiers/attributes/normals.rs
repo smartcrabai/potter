@@ -63,7 +63,11 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
         .and_then(|attribute| attribute.get("values"))
         .and_then(Value::as_object);
     let face_influence = use_face_influence && face_strengths.is_some();
-    let positions = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let positions = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let total_corners = mesh
         .faces
         .iter()
@@ -87,7 +91,9 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
         face_normals.push(blender_face_normal(&points));
         face_areas.push(blender_face_area(&points));
         if mode != "FACE_AREA" {
-            corner_angles.extend((0..face.vertices.len()).map(|corner| blender_corner_angle(&points, corner)));
+            corner_angles.extend(
+                (0..face.vertices.len()).map(|corner| blender_corner_angle(&points, corner)),
+            );
         }
         corner_offset += face.vertices.len();
     }
@@ -108,7 +114,10 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
             } else {
                 ((second, first), false)
             };
-            edge_uses.entry(key).or_default().push((face_index, direction));
+            edge_uses
+                .entry(key)
+                .or_default()
+                .push((face_index, direction));
         }
     }
     let sharp_edge_keys = mesh
@@ -258,8 +267,7 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
         let loops_num = usize::try_from(item.loops_num).unwrap_or(usize::MAX);
         let inverse_weight = if loops_num < cached_inverse_powers.len() {
             if cached_inverse_powers[loops_num] == 0.0 {
-                cached_inverse_powers[loops_num] =
-                    1.0 / weight.powf(item.loops_num as f32);
+                cached_inverse_powers[loops_num] = 1.0 / weight.powf(item.loops_num as f32);
             }
             cached_inverse_powers[loops_num]
         } else {
@@ -429,8 +437,12 @@ fn blender_normalize(vector: Vec3) -> Vec3 {
 
 fn blender_face_normal(points: &[Vec3]) -> Vec3 {
     let normal = match points {
-        [first, second, third] => blender_normalize(blender_cross(*first - *second, *second - *third)),
-        [first, second, third, fourth] => blender_normalize(blender_cross(*first - *third, *second - *fourth)),
+        [first, second, third] => {
+            blender_normalize(blender_cross(*first - *second, *second - *third))
+        }
+        [first, second, third, fourth] => {
+            blender_normalize(blender_cross(*first - *third, *second - *fourth))
+        }
         _ => {
             let mut normal = Vec3::ZERO;
             let mut previous = points[points.len() - 1];
@@ -443,7 +455,11 @@ fn blender_face_normal(points: &[Vec3]) -> Vec3 {
             blender_normalize(normal)
         }
     };
-    if normal == Vec3::ZERO { Vec3::Z } else { normal }
+    if normal == Vec3::ZERO {
+        Vec3::Z
+    } else {
+        normal
+    }
 }
 
 fn blender_face_area(points: &[Vec3]) -> f32 {
@@ -473,7 +489,6 @@ fn blender_corner_angle(points: &[Vec3], corner: usize) -> f32 {
     let edge_angle = blender_dot(previous, next).clamp(-1.0, 1.0).acos();
     std::f32::consts::PI - edge_angle
 }
-
 
 fn vertex_group_exists(mesh: &Mesh, group: &str) -> bool {
     mesh.attributes
@@ -560,8 +575,12 @@ fn faces_share_smooth_edge_at_vertex(
             return false;
         };
         uses.len() == 2
-            && uses.iter().any(|(face_index, _)| *face_index == first_index)
-            && uses.iter().any(|(face_index, _)| *face_index == second_index)
+            && uses
+                .iter()
+                .any(|(face_index, _)| *face_index == first_index)
+            && uses
+                .iter()
+                .any(|(face_index, _)| *face_index == second_index)
             && uses[0].1 != uses[1].1
     })
 }
@@ -642,8 +661,7 @@ pub(super) fn normal_edit(
                     "Normal Edit target Blender transform is missing",
                 )
             })?;
-        crate::geom::modifiers::blender_transform_point_f32(local_to_subject, Vec3::ZERO)
-            .as_dvec3()
+        crate::geom::modifiers::blender_transform_point_f32(local_to_subject, Vec3::ZERO).as_dvec3()
     } else {
         DVec3::ZERO
     };
@@ -651,7 +669,11 @@ pub(super) fn normal_edit(
         && factor == 1.0
         && group.is_none_or(str::is_empty)
         && limit as f32 == std::f32::consts::PI);
-    let positions = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let positions = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let current_normals = if use_current_normals {
         Some(evaluated_corner_normals(mesh, &positions)?)
     } else {
@@ -663,7 +685,11 @@ pub(super) fn normal_edit(
         DVec3::ONE
     };
     let target_direction = (target_origin - offset).normalize_or_zero();
-    let radial_center = if target.is_none() { offset } else { target_origin };
+    let radial_center = if target.is_none() {
+        offset
+    } else {
+        target_origin
+    };
     let mut face_corner_start = 0;
     let mut normals = Vec::with_capacity(mesh.faces.iter().map(|face| face.vertices.len()).sum());
     for face in &mesh.faces {
@@ -706,7 +732,6 @@ pub(super) fn normal_edit(
         face_corner_start += face.vertices.len();
     }
 
-
     let mut flips = vec![false; mesh.faces.len()];
     if !no_polynors_fix {
         let mut corner = 0;
@@ -717,9 +742,7 @@ pub(super) fn normal_edit(
                 .copied()
                 .fold(DVec3::ZERO, |sum, normal| sum + normal);
             let average = sum.normalize_or_zero();
-            if average.length_squared() > 0.0
-                && face_normal(mesh, face)?.dot(average) < 0.0
-            {
+            if average.length_squared() > 0.0 && face_normal(mesh, face)?.dot(average) < 0.0 {
                 flips[face_index] = true;
                 normals[corner + 1..end].reverse();
             }
@@ -748,19 +771,18 @@ pub(super) fn normal_edit(
     Ok(result)
 }
 
-
 fn radial_size(mesh: &Mesh, target: Option<&SceneOperand>) -> DVec3 {
     let size = target.map_or_else(
         || {
             let Some(first) = mesh.vertices.first() else {
                 return DVec3::ONE;
             };
-            let (minimum, maximum) = mesh.vertices.iter().fold(
-                (first.co, first.co),
-                |(minimum, maximum), vertex| {
+            let (minimum, maximum) = mesh
+                .vertices
+                .iter()
+                .fold((first.co, first.co), |(minimum, maximum), vertex| {
                     (minimum.min(vertex.co), maximum.max(vertex.co))
-                },
-            );
+                });
             maximum - minimum
         },
         |target| target.object_scale.abs(),
@@ -811,8 +833,7 @@ fn slerp(from: DVec3, to: DVec3, factor: f64) -> DVec3 {
     if cosine.abs() < 1.0 - 1.0e-4 {
         let omega = cosine.acos();
         let sine = omega.sin();
-        from * (((1.0 - factor) * omega).sin() / sine)
-            + to * ((factor * omega).sin() / sine)
+        from * (((1.0 - factor) * omega).sin() / sine) + to * ((factor * omega).sin() / sine)
     } else {
         from * (1.0 - factor) + to * factor
     }

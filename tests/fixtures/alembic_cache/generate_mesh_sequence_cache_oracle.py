@@ -274,7 +274,7 @@ def add_reordered_topology_nodes(obj):
 
 
 def export_selected(obj, path, start, end, *, uvs=False):
-    # Preserve committed cache fixtures and create only files that are still missing.
+    # shortcut: existing payloads stay unchanged; remove one deliberately when its Blender input changes.
     if os.path.isfile(path):
         return
     # The exporter samples the current frame for single-frame ranges, so start there explicitly.

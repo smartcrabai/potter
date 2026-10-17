@@ -311,7 +311,9 @@ fn corrective_smooth_bind_errors_are_typed() {
         "corrective_smooth",
         json!({"factor": 0.5, "iterations": 2, "rest_source": "BIND"}),
     );
-    let error = evaluate_modifiers(&mesh, &[unbound], SUBJECT_NAME).err().unwrap();
+    let error = evaluate_modifiers(&mesh, &[unbound], SUBJECT_NAME)
+        .err()
+        .unwrap();
     assert!(matches!(error.code, ErrorCode::DependencyMissing));
 
     let short_coords: Vec<Value> = oracle["flat"].as_array().unwrap()[..23].to_vec();
@@ -322,7 +324,9 @@ fn corrective_smooth_bind_errors_are_typed() {
         ),
         &Value::Array(short_coords),
     );
-    let error = evaluate_modifiers(&mesh, &[mismatched], SUBJECT_NAME).err().unwrap();
+    let error = evaluate_modifiers(&mesh, &[mismatched], SUBJECT_NAME)
+        .err()
+        .unwrap();
     assert!(matches!(error.code, ErrorCode::InvalidArgument));
 }
 

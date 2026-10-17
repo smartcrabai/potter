@@ -6,7 +6,9 @@ use potter_core::{
     geom::{
         Mesh,
         modifiers::{
-            attributes::{AttributeLayerSelection, SceneOperand, evaluate_mesh_cache, evaluate_with_context},
+            attributes::{
+                AttributeLayerSelection, SceneOperand, evaluate_mesh_cache, evaluate_with_context,
+            },
             evaluate_modifiers,
         },
     },
@@ -74,8 +76,8 @@ fn scene_operand(mesh: Mesh, world: DMat4, camera: Option<CameraData>) -> SceneO
         object_scale: glam::DVec3::ONE,
         selected_bones: std::collections::BTreeSet::new(),
         deforming_bones: std::collections::BTreeSet::new(),
-        layer_selection:
-            potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(),
+        layer_selection: potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(
+        ),
     }
 }
 
@@ -100,8 +102,8 @@ fn scene_operand_with_space(
         object_scale: glam::DVec3::ONE,
         selected_bones: std::collections::BTreeSet::new(),
         deforming_bones: std::collections::BTreeSet::new(),
-        layer_selection:
-            potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(),
+        layer_selection: potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(
+        ),
     }
 }
 
@@ -116,18 +118,22 @@ fn scene_operand_with_identity_space(mesh: Mesh, camera: Option<CameraData>) -> 
 fn vertex_weight_mix_applies_blender_operation_to_selected_vertices() -> Result<(), Box<dyn Error>>
 {
     let mesh = weighted_line()?;
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "vertex_weight_mix",
-        json!({
-            "vertex_group_a":"A",
-            "vertex_group_b":"B",
-            "mix_mode":"ADD",
-            "mix_set":"ALL",
-            "default_weight_a":0.0,
-            "default_weight_b":0.0,
-            "normalize":false
-        }),
-    )?], "WeightedLine")?;
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "vertex_weight_mix",
+            json!({
+                "vertex_group_a":"A",
+                "vertex_group_b":"B",
+                "mix_mode":"ADD",
+                "mix_set":"ALL",
+                "default_weight_a":0.0,
+                "default_weight_b":0.0,
+                "normalize":false
+            }),
+        )?],
+        "WeightedLine",
+    )?;
     assert_eq!(weights(&result, "A")?, [0.75, 1.0]);
     Ok(())
 }
@@ -139,19 +145,23 @@ fn vertex_weight_edit_supports_curve_mapping_and_threshold_removal() -> Result<(
         .as_object()
         .ok_or("vertex group table missing")?;
     assert!(groups.contains_key("A"));
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "vertex_weight_edit",
-        json!({
-            "vertex_group":"A",
-            "falloff_type":"CURVE",
-            "map_curve":[[0.0,0.0],[1.0,1.0]],
-            "use_add":false,
-            "use_remove":true,
-            "remove_threshold":0.5,
-            "default_weight":0.0,
-            "normalize":false
-        }),
-    )?], "WeightedLine")?;
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A",
+                "falloff_type":"CURVE",
+                "map_curve":[[0.0,0.0],[1.0,1.0]],
+                "use_add":false,
+                "use_remove":true,
+                "remove_threshold":0.5,
+                "default_weight":0.0,
+                "normalize":false
+            }),
+        )?],
+        "WeightedLine",
+    )?;
     assert_eq!(weights(&result, "A")?, [0.0, 0.75]);
     Ok(())
 }
@@ -160,14 +170,22 @@ fn vertex_weight_edit_supports_curve_mapping_and_threshold_removal() -> Result<(
 fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
     let mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "weighted_normal",
-        json!({"mode":"FACE_AREA","weight":50}),
-    )?], "WeightedNormalTriangle")?;
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "weighted_normal",
+            json!({"mode":"FACE_AREA","weight":50}),
+        )?],
+        "WeightedNormalTriangle",
+    )?;
     if let Some(custom) = result.attributes.get("custom_normal") {
         assert_eq!(custom["type"], "normal_code");
     }
-    let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let positions = result
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
     assert_eq!(normals.len(), 3);
     for normal in normals {
@@ -189,18 +207,22 @@ fn uv_warp_preserves_unknown_attributes_and_updates_named_uv_layer() -> Result<(
         }),
     );
     mesh.attributes.insert("marker".to_owned(), json!(true));
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "uv_warp",
-        json!({
-            "center":[0.0,0.0],
-            "axis_u":"X",
-            "axis_v":"Y",
-            "offset":[0.25,-0.5],
-            "scale":[1.0,1.0],
-            "rotation":0.0,
-            "uv_layer":"UVMap"
-        }),
-    )?], "UVWarpTriangle")?;
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "uv_warp",
+            json!({
+                "center":[0.0,0.0],
+                "axis_u":"X",
+                "axis_v":"Y",
+                "offset":[0.25,-0.5],
+                "scale":[1.0,1.0],
+                "rotation":0.0,
+                "uv_layer":"UVMap"
+            }),
+        )?],
+        "UVWarpTriangle",
+    )?;
     assert_eq!(result.attributes["marker"], json!(true));
     assert_eq!(
         result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
@@ -224,10 +246,14 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
             "render": "UVMap"
         }),
     );
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "uv_warp",
-        json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
-    )?], "UVWarpMultipleLayers")?;
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "uv_warp",
+            json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
+        )?],
+        "UVWarpMultipleLayers",
+    )?;
     let layers = &result.attributes["uv_layers"]["layers"];
     assert_eq!(
         layers[0]["faces"][0]["uv"],
@@ -244,10 +270,14 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
 fn uv_warp_without_uv_layers_leaves_mesh_unchanged() -> Result<(), Box<dyn Error>> {
     let mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "uv_warp",
-        json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
-    )?], "UVWarpWithoutLayers")?;
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "uv_warp",
+            json!({"center":[0.0,0.0],"offset":[0.25,-0.5],"uv_layer":""}),
+        )?],
+        "UVWarpWithoutLayers",
+    )?;
     assert_eq!(result, mesh);
     Ok(())
 }
@@ -265,7 +295,11 @@ fn uv_warp_named_layer_missing_uses_active() -> Result<(), Box<dyn Error>> {
         }),
     );
     let expected_uv = mesh.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"].clone();
-    let result = evaluate_modifiers(&mesh, &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?], "UVWarpNamedLayer")?;
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?],
+        "UVWarpNamedLayer",
+    )?;
     assert_eq!(
         result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
         expected_uv
@@ -277,10 +311,14 @@ fn uv_warp_named_layer_missing_uses_active() -> Result<(), Box<dyn Error>> {
 fn attribute_modifiers_do_not_mutate_the_source_mesh() -> Result<(), Box<dyn Error>> {
     let source = weighted_line()?;
     let original = source.clone();
-    let result = evaluate_modifiers(&source, &[modifier(
-        "vertex_weight_mix",
-        json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"SUB","normalize":false}),
-    )?], "WeightedLine")?;
+    let result = evaluate_modifiers(
+        &source,
+        &[modifier(
+            "vertex_weight_mix",
+            json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"SUB","normalize":false}),
+        )?],
+        "WeightedLine",
+    )?;
     assert_ne!(result, source);
     assert_eq!(source, original);
     Ok(())
@@ -310,7 +348,15 @@ fn proximity_modifier_uses_target_object_distance_and_assigns_vertex_weights()
             "normalize":false
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &proximity, &operands, None, DMat4::IDENTITY, "WeightedLine", &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(
+        &mesh,
+        &proximity,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "WeightedLine",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_eq!(weights(&result, "A")?, [0.5, 0.5]);
     Ok(())
 }
@@ -324,9 +370,15 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
         "target".to_owned(),
         vec![scene_operand_with_space(
             Mesh::default(),
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0,
+            ],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0,
+            ],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0,
+            ],
             None,
         )],
     );
@@ -340,8 +392,20 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
             "mix_limit":std::f64::consts::PI
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY, "NormalEditTriangle", &AttributeLayerSelection::default())?;
-    let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let result = evaluate_with_context(
+        &mesh,
+        &edit,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "NormalEditTriangle",
+        &AttributeLayerSelection::default(),
+    )?;
+    let positions = result
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
     let normal = normals.first().ok_or("custom normal missing")?;
     assert!((normal.x + 1.0).abs() < 1.0e-12);
@@ -384,7 +448,15 @@ fn uv_project_uses_camera_projection_and_writes_corner_uvs() -> Result<(), Box<d
             "uv_layer":"UVMap"
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &projection, &operands, None, DMat4::IDENTITY, "UVProjectQuad", &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(
+        &mesh,
+        &projection,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "UVProjectQuad",
+        &AttributeLayerSelection::default(),
+    )?;
     let uv = result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"][0]
         .as_array()
         .ok_or("projected UV missing")?;
@@ -418,7 +490,15 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
             "mix_factor":1.0
         }),
     )?;
-    let result = evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY, "TransferDestination", &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(
+        &destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "TransferDestination",
+        &AttributeLayerSelection::default(),
+    )?;
     let transferred = weights(&result, "A")?;
     assert!((transferred[0] - 0.9).abs() < 1.0e-12);
     assert!((transferred[1] - 0.1).abs() < 1.0e-12);
@@ -451,11 +531,531 @@ fn mesh_cache_mdd_interpolates_resource_frames() -> Result<(), Box<dyn Error>> {
             "factor":1.0
         }),
     )?;
-    evaluate_mesh_cache(&mut mesh, &cache, 1.0, 24, 1.0, &bytes)?;
+    evaluate_mesh_cache(&mut mesh, None, &cache, 1.0, 24, 1.0, &bytes)?;
     assert!((mesh.vertices[0].co.x - 1.0).abs() < 1.0e-12);
     Ok(())
 }
 
+#[test]
+fn mesh_cache_frame_mode_uses_positional_indices_and_linear_snap() -> Result<(), Box<dyn Error>> {
+    let samples = [[DVec3::ZERO; 4], [DVec3::new(2.0, 0.0, 0.0); 4]];
+    let mut bytes = pc2_cache(&samples);
+    bytes[20..24].copy_from_slice(&100.0_f32.to_le_bytes());
+    bytes[12..16].copy_from_slice(&7_i32.to_le_bytes());
+    let scene_modifier = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"SCENE",
+            "time_mode":"FRAME","frame_start":0.25,"frame_scale":1.5,
+            "interpolation":"LINEAR","deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut scene_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(&mut scene_mesh, None, &scene_modifier, 0.5, 24, 1.0, &bytes)?;
+    assert!((scene_mesh.vertices[0].co.x - 1.0).abs() < 1.0e-12);
+
+    let nearest_modifier = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.75,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut nearest_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(
+        &mut nearest_mesh,
+        None,
+        &nearest_modifier,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert!((nearest_mesh.vertices[0].co.x - 2.0).abs() < 1.0e-12);
+
+    let snap_modifier = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.000100000000001,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut snap_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(&mut snap_mesh, None, &snap_modifier, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(snap_mesh.vertices[0].co, DVec3::ZERO);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_mdd_time_interpolates_nonuniform_timestamps() -> Result<(), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&3_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    for time in [0.0_f32, 1.0, 4.0] {
+        bytes.extend_from_slice(&time.to_be_bytes());
+    }
+    for x in [0.0_f32, 10.0, 40.0] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    }
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"TIME","eval_time":2.5,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!((mesh.vertices[0].co.x - 25.0).abs() < 1.0e-12);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_mdd_time_snaps_terminal_duplicates_and_small_intervals() -> Result<(), Box<dyn Error>>
+{
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&4_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    for time in [0.0_f32, 1.0, 2.0, 2.0] {
+        bytes.extend_from_slice(&time.to_be_bytes());
+    }
+    for x in [0.0_f32, 10.0, 20.0, 30.0] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    }
+    let terminal_cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"TIME","eval_time":2.0,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut terminal_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    evaluate_mesh_cache(
+        &mut terminal_mesh,
+        None,
+        &terminal_cache,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert_eq!(terminal_mesh.vertices[0].co.x, 20.0);
+
+    let mut narrow_interval = bytes;
+    narrow_interval[16..20].copy_from_slice(&1.00005_f32.to_be_bytes());
+    narrow_interval[20..24].copy_from_slice(&4.0_f32.to_be_bytes());
+    let narrow_cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"TIME","eval_time":1.000025,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut narrow_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    evaluate_mesh_cache(
+        &mut narrow_mesh,
+        None,
+        &narrow_cache,
+        0.0,
+        24,
+        1.0,
+        &narrow_interval,
+    )?;
+    assert_eq!(narrow_mesh.vertices[0].co.x, 20.0);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_mdd_accepts_empty_mesh_with_empty_sample_payload() -> Result<(), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&2_i32.to_be_bytes());
+    bytes.extend_from_slice(&0_i32.to_be_bytes());
+    bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    bytes.extend_from_slice(&1.0_f32.to_be_bytes());
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","factor":1.0
+        }),
+    )?;
+    let mut mesh = Mesh::from_positions_and_faces(vec![], vec![])?;
+    let warnings = evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!(warnings.is_empty());
+    assert!(mesh.vertices.is_empty());
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_linear_interpolation_uses_blender_f32_order() -> Result<(), Box<dyn Error>> {
+    let samples = [[DVec3::X; 4], [DVec3::new(2.0, 0.0, 0.0); 4]];
+    let expected_x = f64::from(f32::from_bits(0x3f99_999a));
+    for (format, bytes) in [("PC2", pc2_cache(&samples)), ("MDD", mdd_cache(&samples))] {
+        let cache = modifier(
+            "mesh_cache",
+            json!({
+                "resource":"cache","cache_format":format,"play_mode":"CUSTOM",
+                "time_mode":"FRAME","eval_frame":0.2,"interpolation":"LINEAR",
+                "deform_mode":"OVERWRITE","factor":1.0,
+                "forward_axis":"POS_Y","up_axis":"POS_Z"
+            }),
+        )?;
+        let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+        evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+        assert_eq!(mesh.vertices[0].co.x, expected_x, "{format}");
+        assert_ne!(mesh.vertices[0].co.x, 1.2_f64, "{format}");
+    }
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_factor_and_inverted_group_use_blender_f32_blends() -> Result<(), Box<dyn Error>> {
+    let samples = [[DVec3::new(2.0, 0.0, 0.0); 4]; 2];
+    let bytes = pc2_cache(&samples);
+    let factor_cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","factor":0.2,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut factor_mesh = Mesh::from_positions_and_faces(vec![DVec3::X; 4], vec![])?;
+    evaluate_mesh_cache(&mut factor_mesh, None, &factor_cache, 0.0, 24, 1.0, &bytes)?;
+    let expected_factor_x = f64::from(f32::from_bits(0x3f99_999a));
+    assert_eq!(factor_mesh.vertices[0].co.x, expected_factor_x);
+    assert_ne!(factor_mesh.vertices[0].co.x, 1.2_f64);
+
+    let group_cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","vertex_group":"A",
+            "invert_vertex_group":true,"factor":0.8,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut group_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    group_mesh
+        .attributes
+        .insert("vertex_groups".to_owned(), json!({"A":{"v0":0.1}}));
+    evaluate_mesh_cache(&mut group_mesh, None, &group_cache, 0.0, 24, 1.0, &bytes)?;
+    let expected_inverted_x = f64::from(f32::from_bits(0x3f38_51ec));
+    assert_eq!(group_mesh.vertices[0].co.x, expected_inverted_x);
+    assert_ne!(group_mesh.vertices[0].co.x, 0.72_f64);
+    assert_ne!(
+        group_mesh.vertices[0].co.x,
+        f64::from(f32::from_bits(0x3f38_51eb))
+    );
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_mdd_reads_only_selected_point_frames() -> Result<(), Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&3_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    for time in [0.0_f32, 1.0, 4.0] {
+        bytes.extend_from_slice(&time.to_be_bytes());
+    }
+    for x in [f32::NAN, 10.0, 40.0] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_be_bytes());
+    }
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"MDD","play_mode":"CUSTOM",
+            "time_mode":"TIME","eval_time":2.5,"interpolation":"LINEAR",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    evaluate_mesh_cache(&mut mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!((mesh.vertices[0].co.x - 25.0).abs() < 1.0e-12);
+
+    let mut selected_bad_bytes = bytes;
+    selected_bad_bytes[32..36].copy_from_slice(&f32::NAN.to_be_bytes());
+    let mut malformed_mesh = Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?;
+    assert!(
+        evaluate_mesh_cache(
+            &mut malformed_mesh,
+            None,
+            &cache,
+            0.0,
+            24,
+            1.0,
+            &selected_bad_bytes,
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_integrate_uses_original_mesh_and_current_positions() -> Result<(), Box<dyn Error>> {
+    let source = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    let samples = [[
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(1.0, 0.0, 1.0),
+        DVec3::new(1.0, 1.0, 1.0),
+        DVec3::new(0.0, 1.0, 1.0),
+    ]; 2];
+    let bytes = pc2_cache(&samples);
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"INTEGRATE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut current = source.clone();
+    current.vertices[0].co.z = 2.0;
+    evaluate_mesh_cache(&mut current, Some(&source), &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!((current.vertices[0].co.z - 3.0).abs() < 1.0e-12);
+    assert!((current.vertices[1].co.z - 1.0).abs() < 1.0e-12);
+
+    let scaled_sample = [
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(2.0, 0.0, 1.0),
+        DVec3::new(2.0, 2.0, 1.0),
+        DVec3::new(0.0, 2.0, 1.0),
+    ];
+    let scaled_bytes = pc2_cache(&[scaled_sample; 2]);
+    let mut shaped = source.clone();
+    shaped.vertices[0].co = DVec3::new(0.25, 0.25, 2.0);
+    evaluate_mesh_cache(
+        &mut shaped,
+        Some(&source),
+        &cache,
+        0.0,
+        24,
+        1.0,
+        &scaled_bytes,
+    )?;
+    assert!((shaped.vertices[0].co.x - 0.5).abs() < 1.0e-12);
+    assert!((shaped.vertices[0].co.y - 0.5).abs() < 1.0e-12);
+    assert!((shaped.vertices[0].co.z - 5.0).abs() < 1.0e-12);
+
+    let mut non_mesh = source.clone();
+    non_mesh.vertices[0].co.z = 2.0;
+    let warnings = evaluate_mesh_cache(&mut non_mesh, None, &cache, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(
+        warnings[0].message,
+        "'Integrate' only valid for Mesh objects"
+    );
+    assert!((non_mesh.vertices[0].co.z - 1.0).abs() < 1.0e-12);
+
+    let no_faces = Mesh::from_positions_and_faces(
+        source.vertices.iter().map(|vertex| vertex.co).collect(),
+        vec![],
+    )?;
+    let mut skipped = source.clone();
+    skipped.vertices[0].co.z = 2.0;
+    let warnings =
+        evaluate_mesh_cache(&mut skipped, Some(&no_faces), &cache, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "'Integrate' requires faces");
+    assert!((skipped.vertices[0].co.z - 1.0).abs() < 1.0e-12);
+
+    let mismatched_source =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
+    let mut mismatched = source.clone();
+    mismatched.vertices[0].co.z = 2.0;
+    let warnings = evaluate_mesh_cache(
+        &mut mismatched,
+        Some(&mismatched_source),
+        &cache,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(
+        warnings[0].message,
+        "'Integrate' original mesh vertex mismatch"
+    );
+    assert!((mismatched.vertices[0].co.z - 1.0).abs() < 1.0e-12);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_integrate_uses_blender_small_normal_threshold() -> Result<(), Box<dyn Error>> {
+    let side = 1.0e-10;
+    let source = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::ZERO,
+            DVec3::new(side, 0.0, 0.0),
+            DVec3::new(0.0, side, 0.0),
+            DVec3::ZERO,
+        ],
+        vec![vec![0, 1, 2]],
+    )?;
+    let samples = [
+        DVec3::new(2.0, 3.0, 4.0),
+        DVec3::new(3.0, 3.0, 4.0),
+        DVec3::new(2.0, 4.0, 4.0),
+        DVec3::new(5.0, 6.0, 7.0),
+    ];
+    let bytes = pc2_cache(&[samples; 2]);
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"INTEGRATE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut current = source.clone();
+    current.vertices[0].co.z = side;
+    evaluate_mesh_cache(&mut current, Some(&source), &cache, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(current.vertices[0].co, samples[0]);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_integrate_processes_one_corner_faces() -> Result<(), Box<dyn Error>> {
+    let mut source = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    // Short faces cannot be constructed through the validated mesh constructor.
+    source.faces.push(potter_core::geom::Face {
+        id: 0,
+        vertices: vec![0],
+        material_index: 0,
+    });
+    let bytes = pc2_cache(&[[DVec3::ZERO; 4]; 2]);
+    let cache = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"INTEGRATE","factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut current = source.clone();
+    evaluate_mesh_cache(&mut current, Some(&source), &cache, 0.0, 24, 1.0, &bytes)?;
+    assert!(
+        current.vertices[0]
+            .co
+            .to_array()
+            .into_iter()
+            .any(|component| component.is_nan())
+    );
+    assert_eq!(current.vertices[1].co, DVec3::ZERO);
+    Ok(())
+}
+
+#[test]
+fn mesh_cache_group_fallback_and_degenerate_axis_conversion_match_blender()
+-> Result<(), Box<dyn Error>> {
+    let sample = DVec3::new(1.0, 2.0, 3.0);
+    let bytes = pc2_cache(&[[sample; 4]; 2]);
+    let no_weights = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","vertex_group":"A",
+            "invert_vertex_group":true,"factor":1.0,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut unchanged = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    unchanged
+        .attributes
+        .insert("vertex_groups".to_owned(), json!({"A":{}}));
+    evaluate_mesh_cache(&mut unchanged, None, &no_weights, 0.0, 24, 1.0, &bytes)?;
+    assert!(
+        unchanged
+            .vertices
+            .iter()
+            .all(|vertex| vertex.co == DVec3::ZERO)
+    );
+    let mut empty_group_with_deform_data =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    empty_group_with_deform_data
+        .attributes
+        .insert("vertex_groups".to_owned(), json!({"A":{},"B":{"v0":0.25}}));
+    evaluate_mesh_cache(
+        &mut empty_group_with_deform_data,
+        None,
+        &no_weights,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert!(
+        empty_group_with_deform_data
+            .vertices
+            .iter()
+            .all(|vertex| vertex.co == sample)
+    );
+
+    let unknown_group = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","vertex_group":"missing","factor":0.5,
+            "forward_axis":"POS_Y","up_axis":"POS_Z"
+        }),
+    )?;
+    let mut global_factor = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(
+        &mut global_factor,
+        None,
+        &unknown_group,
+        0.0,
+        24,
+        1.0,
+        &bytes,
+    )?;
+    assert_eq!(global_factor.vertices[0].co, sample * 0.5);
+
+    let degenerate_axes = modifier(
+        "mesh_cache",
+        json!({
+            "resource":"cache","cache_format":"PC2","play_mode":"CUSTOM",
+            "time_mode":"FRAME","eval_frame":0.0,"interpolation":"NONE",
+            "deform_mode":"OVERWRITE","factor":1.0,
+            "forward_axis":"POS_X","up_axis":"NEG_X",
+            "flip_axis":[true,false,false]
+        }),
+    )?;
+    let mut flipped = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 4], vec![])?;
+    evaluate_mesh_cache(&mut flipped, None, &degenerate_axes, 0.0, 24, 1.0, &bytes)?;
+    assert_eq!(flipped.vertices[0].co, DVec3::new(-1.0, 2.0, 3.0));
+    Ok(())
+}
 
 #[test]
 #[expect(
@@ -545,8 +1145,21 @@ fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
                 {"op":"modifier.create","target":{"id":"body"},"id":"cache_modifier","type":"mesh_cache","params":{
                     "resource":"plane_cache","cache_format":"PC2","play_mode":"SCENE",
                     "time_mode":"FRAME","frame_start":0.0,"frame_scale":1.0,
-                    "interpolation":"LINEAR","deform_mode":"OVERWRITE","factor":1.0
-                }}
+                    "interpolation":"LINEAR","deform_mode":"INTEGRATE","factor":1.0
+                }},
+                {"op":"modifier.create","target":{"id":"body"},"id":"empty_cache","type":"mesh_cache","params":{
+                    "cache_format":"PC2","play_mode":"SCENE","time_mode":"FRAME",
+                    "frame_start":0.0,"frame_scale":1.0,"interpolation":"LINEAR",
+                    "deform_mode":"OVERWRITE","factor":1.0
+                }},
+                {"op":"modifier.create","target":{"id":"body"},"id":"disabled_cache","type":"mesh_cache","params":{
+                    "resource":"missing_cache","cache_format":"PC2","play_mode":"SCENE",
+                    "time_mode":"FRAME","frame_start":0.0,"frame_scale":1.0,
+                    "interpolation":"LINEAR","deform_mode":"OVERWRITE","factor":0.0
+                }},
+                {"op":"modifier.create","target":{"id":"body"},"id":"empty_sequence","type":"mesh_sequence_cache","params":{
+                    "resource":"missing_sequence","object_path":""
+                }},
             ]
         }))?,
     )?;
@@ -593,11 +1206,44 @@ fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
             assert!((actual - expected).abs() < 1.0e-5);
         }
     }
+    let mut unknown_resource: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    unknown_resource["nodes"]["body"]["modifiers"][2]["params"]["factor"] = json!(1.0);
+    let unknown_resource: SceneDoc = serde_json::from_value(unknown_resource)?;
+    let error = Snapshot::evaluate_with_cache(
+        &unknown_resource,
+        &EvaluationContext::default(),
+        Some(&scene),
+        None,
+    )
+    .err()
+    .ok_or("enabled unknown Mesh Cache resource unexpectedly resolved")?;
+    assert_eq!(error.code, potter_core::error::ErrorCode::DependencyMissing);
+    let mut empty_uri: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    empty_uri["resources"]["plane_cache"]["uri"] = json!("");
+    let empty_uri: SceneDoc = serde_json::from_value(empty_uri)?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &empty_uri,
+        &EvaluationContext::default(),
+        Some(&scene),
+        None,
+    )?;
+    let actual = json!(
+        snapshot.meshes[&potter_core::model::Id::new("body")?]
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co.to_array())
+            .collect::<Vec<_>>()
+    );
+    assert_parity(
+        "empty Mesh Cache URI",
+        &actual,
+        &Value::Array(positions.clone()),
+        1.0e-12,
+    )?;
     Ok(())
 }
 #[test]
-fn cli_applies_image_texture_mask_and_unknown_texture_fails()
--> Result<(), Box<dyn Error>> {
+fn cli_applies_image_texture_mask_and_unknown_texture_fails() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
     let operations_path = directory.path().join("mask-operations.json");
@@ -662,10 +1308,7 @@ fn cli_applies_image_texture_mask_and_unknown_texture_fails()
     )
     .err()
     .ok_or("unknown texture ID unexpectedly resolved")?;
-    assert_eq!(
-        error.code,
-        potter_core::error::ErrorCode::TargetNotFound
-    );
+    assert_eq!(error.code, potter_core::error::ErrorCode::TargetNotFound);
     Ok(())
 }
 
@@ -1642,10 +2285,14 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     let expected: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
 
     let line = weighted_line()?;
-    let edited = evaluate_modifiers(&line, &[modifier(
-        "vertex_weight_edit",
-        json!({"vertex_group":"A","falloff_type":"SHARP","normalize":false}),
-    )?], "Edit")?;
+    let edited = evaluate_modifiers(
+        &line,
+        &[modifier(
+            "vertex_weight_edit",
+            json!({"vertex_group":"A","falloff_type":"SHARP","normalize":false}),
+        )?],
+        "Edit",
+    )?;
     assert_material_change(
         "vertex_weight_edit",
         &expected["baseline_vertex_weight_edit"],
@@ -1659,10 +2306,14 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-5,
     )?;
 
-    let mixed = evaluate_modifiers(&line, &[modifier(
-        "vertex_weight_mix",
-        json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"ADD","mix_set":"ALL","normalize":false}),
-    )?], "Mix")?;
+    let mixed = evaluate_modifiers(
+        &line,
+        &[modifier(
+            "vertex_weight_mix",
+            json!({"vertex_group_a":"A","vertex_group_b":"B","mix_mode":"ADD","mix_set":"ALL","normalize":false}),
+        )?],
+        "Mix",
+    )?;
     assert_material_change(
         "vertex_weight_mix",
         &expected["baseline_vertex_weight_mix"],
@@ -1685,10 +2336,14 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "STEP",
         "SHARP",
     ] {
-        let falloff_result = evaluate_modifiers(&falloff_mesh, &[modifier(
-            "vertex_weight_edit",
-            json!({"vertex_group":"A","falloff_type":falloff,"normalize":false}),
-        )?], &format!("EditFalloff{falloff}"))?;
+        let falloff_result = evaluate_modifiers(
+            &falloff_mesh,
+            &[modifier(
+                "vertex_weight_edit",
+                json!({"vertex_group":"A","falloff_type":falloff,"normalize":false}),
+            )?],
+            &format!("EditFalloff{falloff}"),
+        )?;
         let actual = json!(vertex_weights(&falloff_result, "A")?);
         if falloff != "LINEAR" {
             assert_material_change(
@@ -1710,13 +2365,17 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     for mix_mode in [
         "SET", "ADD", "SUB", "MUL", "DIV", "DIF", "AVG", "MIN", "MAX",
     ] {
-        let mix_result = evaluate_modifiers(&mix_modes_mesh, &[modifier(
-            "vertex_weight_mix",
-            json!({
-                "vertex_group_a":"A","vertex_group_b":"B",
-                "mix_mode":mix_mode,"mix_set":"ALL","normalize":false
-            }),
-        )?], &format!("MixMode{mix_mode}"))?;
+        let mix_result = evaluate_modifiers(
+            &mix_modes_mesh,
+            &[modifier(
+                "vertex_weight_mix",
+                json!({
+                    "vertex_group_a":"A","vertex_group_b":"B",
+                    "mix_mode":mix_mode,"mix_set":"ALL","normalize":false
+                }),
+            )?],
+            &format!("MixMode{mix_mode}"),
+        )?;
         let actual = json!(vertex_weights(&mix_result, "A")?);
         assert_material_change(
             &format!("vertex_weight_mix {mix_mode}"),
@@ -1748,13 +2407,16 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             blender_matrices_f32: Some(
                 potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
                     world: Some([
-                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 3.5, -1.0, 0.0, 1.0,
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 3.5, -1.0, 0.0,
+                        1.0,
                     ]),
                     local_to_subject: Some([
-                        0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.75, 0.0, 0.0, 1.0,
+                        0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.75, 0.0, 0.0,
+                        1.0,
                     ]),
                     subject_to_local: Some([
-                        2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.5, 0.0, 0.0, 1.0,
+                        2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.5, 0.0, 0.0,
+                        1.0,
                     ]),
                 },
             ),
@@ -1771,7 +2433,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "vertex_weight_proximity",
         json!({"target":"target","vertex_group":"A","proximity_mode":"OBJECT","proximity_geometry":["VERTEX"],"min_dist":0.0,"max_dist":3.0,"normalize":false}),
     )?;
-    let proximity_result = evaluate_with_context(&line, &proximity, &proximity_operands, None, proximity_subject_world, "Proximity", &AttributeLayerSelection::default())?;
+    let proximity_result = evaluate_with_context(
+        &line,
+        &proximity,
+        &proximity_operands,
+        None,
+        proximity_subject_world,
+        "Proximity",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_material_change(
         "vertex_weight_proximity OBJECT",
         &expected["baseline_vertex_weight_proximity"],
@@ -1796,9 +2466,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "target".to_owned(),
         vec![scene_operand_with_space(
             Mesh::from_positions_and_faces(vec![DVec3::ZERO], vec![])?,
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
             None,
         )],
     );
@@ -1806,7 +2482,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "vertex_weight_proximity",
         json!({"target":"target","vertex_group":"A","proximity_mode":"GEOMETRY","proximity_geometry":["VERTEX"],"min_dist":0.0,"max_dist":1.0,"normalize":false}),
     )?;
-    let geometry_result = evaluate_with_context(&line, &geometry_modifier, &geometry_operands, None, DMat4::IDENTITY, "Proximity", &AttributeLayerSelection::default())?;
+    let geometry_result = evaluate_with_context(
+        &line,
+        &geometry_modifier,
+        &geometry_operands,
+        None,
+        DMat4::IDENTITY,
+        "Proximity",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_material_change(
         "vertex_weight_proximity GEOMETRY/VERTEX",
         &expected["baseline_vertex_weight_proximity_geometry"],
@@ -1846,8 +2530,12 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "target".to_owned(),
         vec![scene_operand_with_space(
             proximity_surface_mesh,
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
             None,
         )],
     );
@@ -1860,15 +2548,23 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             "STEP",
             "SHARP",
         ] {
-            let result_mesh = evaluate_with_context(&proximity_geometry_subject, &modifier(
-                "vertex_weight_proximity",
-                json!({
-                    "target":"target","vertex_group":"A",
-                    "proximity_mode":"GEOMETRY","proximity_geometry":[geometry],
-                    "min_dist":0.0,"max_dist":1.5,"falloff_type":falloff,
-                    "normalize":false
-                }),
-            )?, &proximity_surface_operands, None, DMat4::IDENTITY, &format!("Proximity{geometry}{falloff}"), &AttributeLayerSelection::default())?;
+            let result_mesh = evaluate_with_context(
+                &proximity_geometry_subject,
+                &modifier(
+                    "vertex_weight_proximity",
+                    json!({
+                        "target":"target","vertex_group":"A",
+                        "proximity_mode":"GEOMETRY","proximity_geometry":[geometry],
+                        "min_dist":0.0,"max_dist":1.5,"falloff_type":falloff,
+                        "normalize":false
+                    }),
+                )?,
+                &proximity_surface_operands,
+                None,
+                DMat4::IDENTITY,
+                &format!("Proximity{geometry}{falloff}"),
+                &AttributeLayerSelection::default(),
+            )?;
             let key = format!("{geometry}_{falloff}");
             let label = format!("vertex_weight_proximity GEOMETRY/{geometry} {falloff}");
             assert_material_change(
@@ -1887,10 +2583,14 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     }
 
     let weighted_mesh = weighted_normal_mesh(false)?;
-    let weighted = evaluate_modifiers(&weighted_mesh, &[modifier(
-        "weighted_normal",
-        json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false}),
-    )?], "Weighted")?;
+    let weighted = evaluate_modifiers(
+        &weighted_mesh,
+        &[modifier(
+            "weighted_normal",
+            json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false}),
+        )?],
+        "Weighted",
+    )?;
     let weighted_corners = blender_quantize_loop_normals(
         &blender,
         &root,
@@ -1911,10 +2611,14 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
     )?;
 
     let sharp_mesh = weighted_normal_mesh(true)?;
-    let weighted_sharp = evaluate_modifiers(&sharp_mesh, &[modifier(
-        "weighted_normal",
-        json!({"mode":"FACE_AREA","weight":50,"keep_sharp":true}),
-    )?], "WeightedSharp")?;
+    let weighted_sharp = evaluate_modifiers(
+        &sharp_mesh,
+        &[modifier(
+            "weighted_normal",
+            json!({"mode":"FACE_AREA","weight":50,"keep_sharp":true}),
+        )?],
+        "WeightedSharp",
+    )?;
     assert_normal_stimulus(
         "weighted_normal keep_sharp",
         &expected["baseline_weighted_normal_sharp"],
@@ -1938,10 +2642,14 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "__mod_weightednormals_faceweight".to_owned(),
         json!({"domain":"face","type":"int","values":{"f0":0,"f1":1,"f2":2}}),
     );
-    let weighted_face = evaluate_modifiers(&weighted_face_mesh, &[modifier(
-        "weighted_normal",
-        json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false,"use_face_influence":true}),
-    )?], "WeightedFaceInfluence")?;
+    let weighted_face = evaluate_modifiers(
+        &weighted_face_mesh,
+        &[modifier(
+            "weighted_normal",
+            json!({"mode":"FACE_AREA","weight":50,"keep_sharp":false,"use_face_influence":true}),
+        )?],
+        "WeightedFaceInfluence",
+    )?;
     assert_normal_stimulus(
         "weighted_normal use_face_influence",
         &expected["baseline_weighted_normal_face_influence"],
@@ -1965,8 +2673,12 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "target".to_owned(),
         vec![scene_operand_with_space(
             Mesh::default(),
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0,
+            ],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 0.0, 0.0, 1.0,
+            ],
             None,
         )],
     );
@@ -1974,8 +2686,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "normal_edit",
         json!({"mode":"RADIAL","target":"target","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"use_direction_parallel":false}),
     )?;
-    let normals =
-        evaluate_with_context(&quad, &normal_edit, &normal_operands, None, DMat4::IDENTITY, "Normal", &AttributeLayerSelection::default())?;
+    let normals = evaluate_with_context(
+        &quad,
+        &normal_edit,
+        &normal_operands,
+        None,
+        DMat4::IDENTITY,
+        "Normal",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_normal_stimulus(
         "normal_edit RADIAL/COPY",
         &expected["baseline_normal_edit"],
@@ -1995,8 +2714,12 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "target".to_owned(),
         vec![scene_operand_with_space(
             Mesh::default(),
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, -1.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 1.0, 0.0, 1.0],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, -1.0, 0.0, 1.0,
+            ],
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -2.0, 1.0, 0.0, 1.0,
+            ],
             None,
         )],
     );
@@ -2004,7 +2727,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "normal_edit",
         json!({"mode":"DIRECTIONAL","target":"target","offset":[0.5,0.1,0.0],"mix_mode":"ADD","mix_factor":0.65,"mix_limit":std::f64::consts::PI,"use_direction_parallel":true}),
     )?;
-    let directional_result = evaluate_with_context(&quad, &directional, &directional_operands, None, DMat4::IDENTITY, "DirectionalNormal", &AttributeLayerSelection::default())?;
+    let directional_result = evaluate_with_context(
+        &quad,
+        &directional,
+        &directional_operands,
+        None,
+        DMat4::IDENTITY,
+        "DirectionalNormal",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_normal_stimulus(
         "normal_edit DIRECTIONAL/ADD",
         &expected["baseline_normal_edit_directional"],
@@ -2040,10 +2771,18 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
             ),
         ],
     )]);
-    let projected = evaluate_with_context(&project_mesh, &modifier(
-        "uv_project",
-        json!({"projectors":["camera_z","camera_x"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
-    )?, &projectors, None, DMat4::IDENTITY, "Project", &AttributeLayerSelection::default())?;
+    let projected = evaluate_with_context(
+        &project_mesh,
+        &modifier(
+            "uv_project",
+            json!({"projectors":["camera_z","camera_x"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
+        )?,
+        &projectors,
+        None,
+        DMat4::IDENTITY,
+        "Project",
+        &AttributeLayerSelection::default(),
+    )?;
     let projected_uvs = json!([
         flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
         flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
@@ -2067,26 +2806,34 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-5,
     )?;
 
-    let orthographic = evaluate_with_context(&project_mesh, &modifier(
-        "uv_project",
-        json!({
-            "projectors":["orthographic"],
-            "uv_layer":"UVMap",
-            "aspect_x":1.4,"aspect_y":1.2,
-            "scale_x":0.8,"scale_y":1.3
-        }),
-    )?, &BTreeMap::from([(
-        "projectors".to_owned(),
-        vec![scene_operand(
-            Mesh::default(),
-            DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
-            Some(CameraData {
-                projection: potter_core::model::CameraProjection::Orthographic,
-                ortho_scale: 3.5,
-                ..CameraData::default()
+    let orthographic = evaluate_with_context(
+        &project_mesh,
+        &modifier(
+            "uv_project",
+            json!({
+                "projectors":["orthographic"],
+                "uv_layer":"UVMap",
+                "aspect_x":1.4,"aspect_y":1.2,
+                "scale_x":0.8,"scale_y":1.3
             }),
-        )],
-    )]), None, DMat4::IDENTITY, "ProjectOrtho", &AttributeLayerSelection::default())?;
+        )?,
+        &BTreeMap::from([(
+            "projectors".to_owned(),
+            vec![scene_operand(
+                Mesh::default(),
+                DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
+                Some(CameraData {
+                    projection: potter_core::model::CameraProjection::Orthographic,
+                    ortho_scale: 3.5,
+                    ..CameraData::default()
+                }),
+            )],
+        )]),
+        None,
+        DMat4::IDENTITY,
+        "ProjectOrtho",
+        &AttributeLayerSelection::default(),
+    )?;
     let orthographic_uvs = json!([
         flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
         flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
@@ -2104,26 +2851,34 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-5,
     )?;
 
-    let orthographic_clamped = evaluate_with_context(&project_mesh, &modifier(
-        "uv_project",
-        json!({
-            "projectors":["orthographic"],
-            "uv_layer":"UVMap",
-            "aspect_x":1.4,"aspect_y":0.7,
-            "scale_x":0.8,"scale_y":1.3
-        }),
-    )?, &BTreeMap::from([(
-        "projectors".to_owned(),
-        vec![scene_operand(
-            Mesh::default(),
-            DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
-            Some(CameraData {
-                projection: potter_core::model::CameraProjection::Orthographic,
-                ortho_scale: 3.5,
-                ..CameraData::default()
+    let orthographic_clamped = evaluate_with_context(
+        &project_mesh,
+        &modifier(
+            "uv_project",
+            json!({
+                "projectors":["orthographic"],
+                "uv_layer":"UVMap",
+                "aspect_x":1.4,"aspect_y":0.7,
+                "scale_x":0.8,"scale_y":1.3
             }),
-        )],
-    )]), None, DMat4::IDENTITY, "ProjectOrthoClamped", &AttributeLayerSelection::default())?;
+        )?,
+        &BTreeMap::from([(
+            "projectors".to_owned(),
+            vec![scene_operand(
+                Mesh::default(),
+                DMat4::from_translation(DVec3::new(0.25, 0.4, 3.0)),
+                Some(CameraData {
+                    projection: potter_core::model::CameraProjection::Orthographic,
+                    ortho_scale: 3.5,
+                    ..CameraData::default()
+                }),
+            )],
+        )]),
+        None,
+        DMat4::IDENTITY,
+        "ProjectOrthoClamped",
+        &AttributeLayerSelection::default(),
+    )?;
     let orthographic_clamped_uvs = json!([
         flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
         flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][1]["uv"])
@@ -2141,10 +2896,14 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         1.0e-5,
     )?;
 
-    let warped = evaluate_modifiers(&quad, &[modifier(
-        "uv_warp",
-        json!({"center":[0.5,0.5],"axis_u":"X","axis_v":"Y","offset":[0.25,-0.5],"scale":[1.25,0.75],"rotation":0.35,"uv_layer":"UVMap"}),
-    )?], "Warp")?;
+    let warped = evaluate_modifiers(
+        &quad,
+        &[modifier(
+            "uv_warp",
+            json!({"center":[0.5,0.5],"axis_u":"X","axis_v":"Y","offset":[0.25,-0.5],"scale":[1.25,0.75],"rotation":0.35,"uv_layer":"UVMap"}),
+        )?],
+        "Warp",
+    )?;
     assert_material_change(
         "uv_warp scale/rotation",
         &expected["baseline_uv_warp"],
@@ -2157,7 +2916,6 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         &expected["uv_warp"],
         1.0e-5,
     )?;
-
 
     let mut source = quad.clone();
     source.attributes.insert(
@@ -2174,10 +2932,18 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         "object".to_owned(),
         vec![scene_operand_with_identity_space(source, None)],
     );
-    let transferred = evaluate_with_context(&destination, &modifier(
-        "data_transfer",
-        json!({"object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0}),
-    )?, &source_operands, None, DMat4::IDENTITY, "TransferDest", &AttributeLayerSelection::default())?;
+    let transferred = evaluate_with_context(
+        &destination,
+        &modifier(
+            "data_transfer",
+            json!({"object":"source","use_object_transform":true,"use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","mix_mode":"REPLACE","mix_factor":1.0}),
+        )?,
+        &source_operands,
+        None,
+        DMat4::IDENTITY,
+        "TransferDest",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_material_change(
         "data_transfer VGROUP_WEIGHTS/TOPOLOGY",
         &expected["baseline_data_transfer"],
@@ -2215,16 +2981,27 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         let mut point_operands = BTreeMap::new();
         point_operands.insert(
             "object".to_owned(),
-            vec![scene_operand_with_identity_space(interpolation_source.clone(), None)],
+            vec![scene_operand_with_identity_space(
+                interpolation_source.clone(),
+                None,
+            )],
         );
-        let transferred = evaluate_with_context(&point_destination, &modifier(
-            "data_transfer",
-            json!({
-                "object":"source","use_object_transform":true,
-                "use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
-                "vert_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0
-            }),
-        )?, &point_operands, None, DMat4::IDENTITY, &format!("Point{key}"), &AttributeLayerSelection::default())?;
+        let transferred = evaluate_with_context(
+            &point_destination,
+            &modifier(
+                "data_transfer",
+                json!({
+                    "object":"source","use_object_transform":true,
+                    "use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],
+                    "vert_mapping":mapping,"mix_mode":"REPLACE","mix_factor":1.0
+                }),
+            )?,
+            &point_operands,
+            None,
+            DMat4::IDENTITY,
+            &format!("Point{key}"),
+            &AttributeLayerSelection::default(),
+        )?;
         assert_material_change(
             &format!("data_transfer VGROUP_WEIGHTS/{mapping}"),
             &expected[&format!("baseline_{key}")],
@@ -2296,7 +3073,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         }),
     )?;
     let domain_destination = transfer_domain_destination_mesh()?;
-    let domains = evaluate_with_context(&domain_destination, &domain_transfer, &domain_operands, None, DMat4::IDENTITY, "DomainDest", &AttributeLayerSelection::default())?;
+    let domains = evaluate_with_context(
+        &domain_destination,
+        &domain_transfer,
+        &domain_operands,
+        None,
+        DMat4::IDENTITY,
+        "DomainDest",
+        &AttributeLayerSelection::default(),
+    )?;
     let domain_values = transfer_domain_values(&domains)?;
     assert_material_change(
         "data_transfer nonmatching edge/loop/polygon topology",
@@ -2338,6 +3123,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
         )?;
         evaluate_mesh_cache(
             &mut pc2_mesh,
+            None,
             &pc2_modifier,
             evaluation_frame,
             24,
@@ -2389,7 +3175,7 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
                 "factor":1.0
             }),
         )?;
-        evaluate_mesh_cache(&mut mdd_mesh, &mdd_modifier, 1.0, 24, 1.0, &mdd)?;
+        evaluate_mesh_cache(&mut mdd_mesh, None, &mdd_modifier, 1.0, 24, 1.0, &mdd)?;
         let key = format!("{evaluation_time:.2}");
         let expected_positions = expected["mesh_cache_mdd"]
             .get(&key)
@@ -2446,7 +3232,15 @@ fn blender_parity_covers_owned_modifier_types() -> Result<(), Box<dyn Error>> {
                 "up_axis":"POS_Z"
             }),
         )?;
-        evaluate_mesh_cache(&mut integrated_mesh, &cache_modifier, 1.0, 24, 1.0, bytes)?;
+        evaluate_mesh_cache(
+            &mut integrated_mesh,
+            Some(&quad),
+            &cache_modifier,
+            1.0,
+            24,
+            1.0,
+            bytes,
+        )?;
         let actual = json!(
             integrated_mesh
                 .vertices
@@ -2595,7 +3389,11 @@ fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
 }
 
 fn corner_normals(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
-    let positions = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let positions = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(mesh, &positions)?;
     Ok(Value::Array(
         normals

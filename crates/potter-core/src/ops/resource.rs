@@ -445,8 +445,8 @@ fn unpack_sequence(
                 ),
             ));
         }
-        let frame_path =
-            crate::cache_sequence::cache_sequence_output_path(&pattern, frame)?.ok_or_else(|| {
+        let frame_path = crate::cache_sequence::cache_sequence_output_path(&pattern, frame)?
+            .ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::InvalidArgument,
                     "sequence unpack path must include a frame-number pattern",

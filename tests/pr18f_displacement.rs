@@ -756,12 +756,7 @@ const WARP_CURVE_VERTICES: [[f64; 3]; 4] = [
 const WARP_CURVE_FROM: [f64; 3] = [-0.8, -0.4, 0.0];
 const WARP_CURVE_TO: [f64; 3] = [0.0, 0.0, 2.0];
 const WARP_CURVE_RADIUS: f64 = 2.7;
-const WARP_CURVE_POINTS: [[f64; 2]; 4] = [
-    [0.0, 0.0],
-    [0.3, 0.9],
-    [0.65, 0.15],
-    [1.0, 1.0],
-];
+const WARP_CURVE_POINTS: [[f64; 2]; 4] = [[0.0, 0.0], [0.3, 0.9], [0.65, 0.15], [1.0, 1.0]];
 const WARP_CURVE_RAW_POINTS: [[f64; 2]; 5] = [
     [-0.2, -0.2],
     [0.7, 0.9],
@@ -769,6 +764,17 @@ const WARP_CURVE_RAW_POINTS: [[f64; 2]; 5] = [
     [0.35, 0.1],
     [1.25, 1.2],
 ];
+const WARP_CURVE_HANDLE_POINTS: [[f64; 2]; 5] = [
+    [0.0, 0.0],
+    [0.2, 0.1],
+    [0.68, 0.95],
+    [0.72, 0.05],
+    [1.0, 1.0],
+];
+
+fn warp_curve_handles(handle: &str) -> Value {
+    json!(WARP_CURVE_HANDLE_POINTS.map(|point| [point[0], point[1], handle]))
+}
 
 fn blender_5_2() -> Option<PathBuf> {
     let blender = blender_file::blender_executable()?;
@@ -825,9 +831,24 @@ while len(curve.points) > 2:
 for point in data["curve"][1:-1]:
     curve.points.new(float(point[0]), float(point[1]))
 for point, coordinates in zip(curve.points, data["curve"]):
-    point.location = tuple(coordinates)
+    point.location = tuple(coordinates[:2])
+    if len(coordinates) == 3:
+        point.handle_type = str(coordinates[2])
 if data["update_curve"]:
     warp.falloff_curve.update()
+if data.get("curve_settings") is not None:
+    settings = data["curve_settings"]
+    mapping = warp.falloff_curve
+    if "use_clip" in settings:
+        mapping.use_clip = bool(settings["use_clip"])
+    if "clip_bounds" in settings:
+        mapping.clip_min_x = settings["clip_bounds"][0]
+        mapping.clip_min_y = settings["clip_bounds"][1]
+        mapping.clip_max_x = settings["clip_bounds"][2]
+        mapping.clip_max_y = settings["clip_bounds"][3]
+    if "extend" in settings:
+        mapping.extend = settings["extend"]
+    mapping.update()
 
 depsgraph = bpy.context.evaluated_depsgraph_get()
 evaluated = subject.evaluated_get(depsgraph)
@@ -838,30 +859,29 @@ print("POTTER_WARP_CURVE=" + json.dumps(coordinates))
 "#;
 
 fn assert_warp_curve_matches_blender_522(
-    curve_points: &[[f64; 2]],
+    curve_points: &Value,
     update_curve: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    curve_settings: Option<&Value>,
+) -> Result<Option<Mesh>, Box<dyn std::error::Error>> {
     let Some(blender) = blender_5_2() else {
-        return Ok(());
+        return Ok(None);
     };
+    let mut modifier_params = json!({
+        "object_from":"from",
+        "object_to":"to",
+        "falloff_type":"CURVE",
+        "falloff_radius":WARP_CURVE_RADIUS,
+        "strength":1.0,
+        "falloff_curve":curve_points.clone()
+    });
+    if let Some(settings) = curve_settings {
+        modifier_params["falloff_curve_settings"] = settings.clone();
+    }
     let operations = [
         json!({"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}}),
         json!({"op":"node.create","id":"from","kind":"empty","transform":{"translation":WARP_CURVE_FROM}}),
         json!({"op":"node.create","id":"to","kind":"empty","transform":{"translation":WARP_CURVE_TO}}),
-        json!({
-            "op":"modifier.create",
-            "target":{"id":"subject"},
-            "id":"deform",
-            "type":"warp",
-            "params":{
-                "object_from":"from",
-                "object_to":"to",
-                "falloff_type":"CURVE",
-                "falloff_radius":WARP_CURVE_RADIUS,
-                "strength":1.0,
-                "falloff_curve":curve_points
-            }
-        }),
+        json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"warp","params":modifier_params}),
     ];
     let actual = scene_subject(&operations, None)?;
     let directory = tempfile::tempdir()?;
@@ -875,8 +895,9 @@ fn assert_warp_curve_matches_blender_522(
             "from": WARP_CURVE_FROM,
             "to": WARP_CURVE_TO,
             "radius": WARP_CURVE_RADIUS,
-            "curve": curve_points,
+            "curve": curve_points.clone(),
             "update_curve": update_curve,
+            "curve_settings": curve_settings.cloned(),
         }))?,
     )?;
     std::fs::write(&script_path, WARP_CURVE_ORACLE)?;
@@ -903,26 +924,262 @@ fn assert_warp_curve_matches_blender_522(
         .find_map(|line| line.strip_prefix("POTTER_WARP_CURVE="))
         .expect("Blender Warp curve oracle emitted a result line");
     let coordinates: Vec<[f64; 3]> = serde_json::from_str(result)?;
-    assert_eq!(actual.vertices.len(), coordinates.len(), "Warp curve vertex count");
+    assert_eq!(
+        actual.vertices.len(),
+        coordinates.len(),
+        "Warp curve vertex count"
+    );
     for (index, (vertex, expected)) in actual.vertices.iter().zip(&coordinates).enumerate() {
-        let error = (vertex.co - DVec3::from_array(*expected)).abs().max_element();
+        let error = (vertex.co - DVec3::from_array(*expected))
+            .abs()
+            .max_element();
         assert!(
             error < TOLERANCE,
             "Warp curve vertex {index} is {:?}, Blender gives {expected:?}",
             vertex.co
         );
     }
-    Ok(())
+    Ok(Some(actual))
 }
 
 #[test]
 fn warp_curve_falloff_matches_blender_522() -> Result<(), Box<dyn std::error::Error>> {
-    assert_warp_curve_matches_blender_522(&WARP_CURVE_POINTS, true)
+    let _ = assert_warp_curve_matches_blender_522(&json!(WARP_CURVE_POINTS), true, None)?;
+    Ok(())
 }
 
 #[test]
 fn warp_curve_raw_controls_match_blender_522() -> Result<(), Box<dyn std::error::Error>> {
-    assert_warp_curve_matches_blender_522(&WARP_CURVE_RAW_POINTS, false)
+    let _ = assert_warp_curve_matches_blender_522(&json!(WARP_CURVE_RAW_POINTS), false, None)?;
+    Ok(())
+}
+
+#[test]
+fn warp_curve_handle_modes_match_blender_522() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(auto) =
+        assert_warp_curve_matches_blender_522(&json!(WARP_CURVE_HANDLE_POINTS), true, None)?
+    else {
+        return Ok(());
+    };
+    for handle in ["AUTO_CLAMPED", "VECTOR"] {
+        let actual =
+            assert_warp_curve_matches_blender_522(&warp_curve_handles(handle), true, None)?
+                .expect("Blender availability is unchanged within the test");
+        let max_difference = auto
+            .vertices
+            .iter()
+            .zip(&actual.vertices)
+            .map(|(auto, handled)| (auto.co - handled.co).abs().max_element())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_difference > TOLERANCE,
+            "Warp {handle} handles did not change evaluated vertices"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn warp_curve_extension_modes_match_blender_522() -> Result<(), Box<dyn std::error::Error>> {
+    let points = json!([[0.2, 0.2], [0.8, 0.8]]);
+    let horizontal_settings = json!({"extend":"HORIZONTAL"});
+    let extrapolated_settings = json!({"extend":"EXTRAPOLATED"});
+    let Some(horizontal) =
+        assert_warp_curve_matches_blender_522(&points, true, Some(&horizontal_settings))?
+    else {
+        return Ok(());
+    };
+    let extrapolated =
+        assert_warp_curve_matches_blender_522(&points, true, Some(&extrapolated_settings))?
+            .expect("Blender availability is unchanged within the test");
+    let max_difference = horizontal
+        .vertices
+        .iter()
+        .zip(&extrapolated.vertices)
+        .map(|(horizontal, extrapolated)| (horizontal.co - extrapolated.co).abs().max_element())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_difference > TOLERANCE,
+        "Warp HORIZONTAL and EXTRAPOLATED extension did not change evaluated vertices"
+    );
+    Ok(())
+}
+
+const HOOK_CURVE_VERTICES: [[f64; 3]; 7] = [
+    [0.1, 0.0, 0.0],
+    [0.23, 0.0, 0.0],
+    [0.4, 0.0, 0.0],
+    [0.6, 0.0, 0.0],
+    [0.7, 0.0, 0.0],
+    [0.85, 0.0, 0.0],
+    [0.95, 0.0, 0.0],
+];
+const HOOK_TARGET_MATRIX: [f64; 16] = [
+    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.8, 1.0,
+];
+
+const HOOK_CURVE_ORACLE: &str = r#"
+import bpy
+import json
+import sys
+from mathutils import Matrix
+
+with open(sys.argv[sys.argv.index("--") + 1], encoding="utf-8") as source:
+    data = json.load(source)
+
+bpy.ops.wm.read_factory_settings(use_empty=True)
+results = {}
+for case in data["cases"]:
+    mesh = bpy.data.meshes.new("Hook Curve Oracle Mesh")
+    mesh.from_pydata(data["vertices"], [], [])
+    mesh.update()
+    subject = bpy.data.objects.new("Hook Curve Oracle", mesh)
+    bpy.context.scene.collection.objects.link(subject)
+    target = bpy.data.objects.new("Hook Curve Target", None)
+    target.location = data["target"]
+    bpy.context.scene.collection.objects.link(target)
+
+    hook = subject.modifiers.new("Hook Curve Oracle", "HOOK")
+    hook.object = target
+    hook.matrix_inverse = Matrix.Identity(4)
+    hook.vertex_indices_set(list(range(len(data["vertices"]))))
+    hook.falloff_type = "CURVE"
+    hook.falloff_radius = data["radius"]
+    hook.strength = data["strength"]
+    hook.center = (0.0, 0.0, 0.0)
+    hook.use_falloff_uniform = False
+    curve = hook.falloff_curve.curves[0]
+    while len(curve.points) > 2:
+        curve.points.remove(curve.points[-1])
+    for point in case["curve"][1:-1]:
+        curve.points.new(float(point[0]), float(point[1]))
+    for point, coordinates in zip(curve.points, case["curve"]):
+        point.location = tuple(coordinates[:2])
+        if len(coordinates) == 3:
+            point.handle_type = str(coordinates[2])
+    hook.falloff_curve.update()
+
+    evaluated = subject.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    evaluated_mesh = evaluated.to_mesh()
+    results[case["name"]] = [
+        [float(component) for component in vertex.co] for vertex in evaluated_mesh.vertices
+    ]
+    evaluated.to_mesh_clear()
+
+print("POTTER_HOOK_CURVE=" + json.dumps(results))
+"#;
+
+fn evaluate_hook_curve(curve: Value) -> Result<Mesh, Box<dyn std::error::Error>> {
+    let mesh = Mesh::from_positions_and_faces(
+        HOOK_CURVE_VERTICES
+            .iter()
+            .map(|point| DVec3::from_array(*point))
+            .collect(),
+        vec![],
+    )?;
+    let mut hook = modifier(
+        "hook",
+        json!({
+            "falloff_type":"CURVE",
+            "falloff_radius":1.0,
+            "strength":0.8,
+            "center":[0.0,0.0,0.0],
+            "use_falloff_uniform":false,
+            "falloff_curve":curve,
+            "vertex_indices":[0,1,2,3,4,5,6],
+            "matrix_inverse":[1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0]
+        }),
+    );
+    hook.runtime.object_matrix = Some(HOOK_TARGET_MATRIX);
+    Ok(evaluate_modifiers(&mesh, &[hook], SUBJECT_NAME)?)
+}
+
+#[test]
+fn hook_curve_handle_modes_match_blender_522() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(blender) = blender_5_2() else {
+        return Ok(());
+    };
+    let curves = [
+        ("AUTO", json!(WARP_CURVE_HANDLE_POINTS)),
+        ("AUTO_CLAMPED", warp_curve_handles("AUTO_CLAMPED")),
+        ("VECTOR", warp_curve_handles("VECTOR")),
+    ];
+    let cases: Vec<Value> = curves
+        .iter()
+        .map(|(name, curve)| json!({"name":name,"curve":curve}))
+        .collect();
+    let directory = tempfile::tempdir()?;
+    let input_path = directory.path().join("hook_curve_input.json");
+    let script_path = directory.path().join("hook_curve_oracle.py");
+    std::fs::write(
+        &input_path,
+        serde_json::to_vec(&json!({
+            "vertices":HOOK_CURVE_VERTICES,
+            "target":[0.0,0.0,0.8],
+            "radius":1.0,
+            "strength":0.8,
+            "cases":cases,
+        }))?,
+    )?;
+    std::fs::write(&script_path, HOOK_CURVE_ORACLE)?;
+    let output = Command::new(blender)
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(&script_path)
+        .arg("--")
+        .arg(&input_path)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Blender Hook curve oracle failed:\n{stdout}\n{stderr}"
+    );
+    let result = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("POTTER_HOOK_CURVE="))
+        .expect("Blender Hook curve oracle emitted a result line");
+    let expected: Value = serde_json::from_str(result)?;
+
+    let mut auto_positions: Option<Vec<DVec3>> = None;
+    for (name, curve) in &curves {
+        let actual = evaluate_hook_curve(curve.clone())?;
+        let expected_positions: Vec<[f64; 3]> = serde_json::from_value(expected[*name].clone())?;
+        assert_eq!(
+            actual.vertices.len(),
+            expected_positions.len(),
+            "Hook {name} vertex count"
+        );
+        for (index, (vertex, point)) in actual.vertices.iter().zip(&expected_positions).enumerate()
+        {
+            let error = (vertex.co - DVec3::from_array(*point)).abs().max_element();
+            assert!(
+                error < TOLERANCE,
+                "Hook {name} vertex {index} is {:?}, Blender gives {point:?}",
+                vertex.co
+            );
+        }
+        if *name == "AUTO" {
+            auto_positions = Some(actual.vertices.iter().map(|vertex| vertex.co).collect());
+        } else {
+            let auto = auto_positions.as_ref().expect("AUTO case runs first");
+            let max_difference = auto
+                .iter()
+                .zip(&actual.vertices)
+                .map(|(auto, handled)| (*auto - handled.co).abs().max_element())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_difference > TOLERANCE,
+                "Hook {name} handles did not change evaluated vertices"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]

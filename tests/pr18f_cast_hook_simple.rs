@@ -13,8 +13,12 @@ use std::{error::Error, fs};
 use glam::{DMat4, DVec3};
 use potter_core::{
     error::ErrorCode,
-    geom::{Mesh, modifiers::evaluate_modifiers},
-    model::{Id, Modifier, ModifierRuntime},
+    geom::{
+        BoxParams, Mesh,
+        modifiers::{evaluate_modifiers, evaluate_modifiers_with_groups},
+    },
+    graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
+    model::{Id, Modifier, ModifierRuntime, Registry},
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -1256,19 +1260,23 @@ fn assert_positions(result: &Mesh, expected: &[[f64; 3]; 8]) {
 #[test]
 fn simple_deform_twist_z_origin_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "simple_deform",
-        json!({
-            "deform_method": "TWIST",
-            "deform_axis": "Z",
-            "angle": 1.1,
-            "limits": [0.15, 0.85],
-            "lock_x": false,
-            "lock_y": false,
-            "lock_z": false,
-        }),
-        Some(SD_TWIST_Z_ORIGIN_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "simple_deform",
+            json!({
+                "deform_method": "TWIST",
+                "deform_axis": "Z",
+                "angle": 1.1,
+                "limits": [0.15, 0.85],
+                "lock_x": false,
+                "lock_y": false,
+                "lock_z": false,
+            }),
+            Some(SD_TWIST_Z_ORIGIN_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_SD_TWIST_Z_ORIGIN);
 }
@@ -1277,16 +1285,20 @@ fn simple_deform_twist_z_origin_matches_blender() {
 #[test]
 fn simple_deform_bend_x_origin_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "simple_deform",
-        json!({
-            "deform_method": "BEND",
-            "deform_axis": "X",
-            "angle": 1.1,
-            "limits": [0.15, 0.85],
-        }),
-        Some(SD_BEND_X_ORIGIN_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "simple_deform",
+            json!({
+                "deform_method": "BEND",
+                "deform_axis": "X",
+                "angle": 1.1,
+                "limits": [0.15, 0.85],
+            }),
+            Some(SD_BEND_X_ORIGIN_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_SD_BEND_X_ORIGIN);
 }
@@ -1295,19 +1307,23 @@ fn simple_deform_bend_x_origin_matches_blender() {
 #[test]
 fn simple_deform_taper_y_lock_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "simple_deform",
-        json!({
-            "deform_method": "TAPER",
-            "deform_axis": "Y",
-            "factor": 0.7,
-            "limits": [0.0, 1.0],
-            "lock_x": true,
-            "lock_y": true,
-            "lock_z": true,
-        }),
-        Some(SD_TAPER_Y_LOCK_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "simple_deform",
+            json!({
+                "deform_method": "TAPER",
+                "deform_axis": "Y",
+                "factor": 0.7,
+                "limits": [0.0, 1.0],
+                "lock_x": true,
+                "lock_y": true,
+                "lock_z": true,
+            }),
+            Some(SD_TAPER_Y_LOCK_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_SD_TAPER_Y_LOCK);
 }
@@ -1316,21 +1332,25 @@ fn simple_deform_taper_y_lock_matches_blender() {
 #[test]
 fn simple_deform_stretch_x_vginv_matches_blender() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "simple_deform",
-        json!({
-            "deform_method": "STRETCH",
-            "deform_axis": "X",
-            "factor": 0.9,
-            "limits": [0.1, 0.9],
-            "lock_x": false,
-            "lock_y": false,
-            "lock_z": false,
-            "vertex_group": "G",
-            "invert_vertex_group": true,
-        }),
-        Some(SD_STRETCH_X_VGINV_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "simple_deform",
+            json!({
+                "deform_method": "STRETCH",
+                "deform_axis": "X",
+                "factor": 0.9,
+                "limits": [0.1, 0.9],
+                "lock_x": false,
+                "lock_y": false,
+                "lock_z": false,
+                "vertex_group": "G",
+                "invert_vertex_group": true,
+            }),
+            Some(SD_STRETCH_X_VGINV_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_SD_STRETCH_X_VGINV);
 }
@@ -1339,19 +1359,23 @@ fn simple_deform_stretch_x_vginv_matches_blender() {
 #[test]
 fn simple_deform_twist_y_lim_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "simple_deform",
-        json!({
-            "deform_method": "TWIST",
-            "deform_axis": "Y",
-            "angle": 1.3,
-            "limits": [0.2, 0.7],
-            "lock_x": false,
-            "lock_y": false,
-            "lock_z": false,
-        }),
-        None,
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "simple_deform",
+            json!({
+                "deform_method": "TWIST",
+                "deform_axis": "Y",
+                "angle": 1.3,
+                "limits": [0.2, 0.7],
+                "lock_x": false,
+                "lock_y": false,
+                "lock_z": false,
+            }),
+            None,
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_SD_TWIST_Y_LIM);
 }
@@ -1360,18 +1384,22 @@ fn simple_deform_twist_y_lim_matches_blender() {
 #[test]
 fn simple_deform_bend_z_vg_matches_blender() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "simple_deform",
-        json!({
-            "deform_method": "BEND",
-            "deform_axis": "Z",
-            "angle": 1.0,
-            "limits": [0.0, 1.0],
-            "vertex_group": "G",
-            "invert_vertex_group": false,
-        }),
-        Some(SD_BEND_Z_VG_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "simple_deform",
+            json!({
+                "deform_method": "BEND",
+                "deform_axis": "Z",
+                "angle": 1.0,
+                "limits": [0.0, 1.0],
+                "vertex_group": "G",
+                "invert_vertex_group": false,
+            }),
+            Some(SD_BEND_Z_VG_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_SD_BEND_Z_VG);
 }
@@ -1380,21 +1408,25 @@ fn simple_deform_bend_z_vg_matches_blender() {
 #[test]
 fn cast_sphere_auto_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "cast",
-        json!({
-            "cast_type": "SPHERE",
-            "factor": 0.5,
-            "radius": 0.0,
-            "size": 0.0,
-            "use_radius_as_size": true,
-            "use_x": true,
-            "use_y": true,
-            "use_z": true,
-            "use_transform": false,
-        }),
-        None,
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "cast",
+            json!({
+                "cast_type": "SPHERE",
+                "factor": 0.5,
+                "radius": 0.0,
+                "size": 0.0,
+                "use_radius_as_size": true,
+                "use_x": true,
+                "use_y": true,
+                "use_z": true,
+                "use_transform": false,
+            }),
+            None,
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CAST_SPHERE_AUTO);
 }
@@ -1403,21 +1435,25 @@ fn cast_sphere_auto_matches_blender() {
 #[test]
 fn cast_sphere_obj_tr_radius_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "cast",
-        json!({
-            "cast_type": "SPHERE",
-            "factor": 0.5,
-            "radius": 1.8,
-            "size": 0.0,
-            "use_radius_as_size": true,
-            "use_x": true,
-            "use_y": false,
-            "use_z": true,
-            "use_transform": true,
-        }),
-        Some(CAST_SPHERE_OBJ_TR_RADIUS_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "cast",
+            json!({
+                "cast_type": "SPHERE",
+                "factor": 0.5,
+                "radius": 1.8,
+                "size": 0.0,
+                "use_radius_as_size": true,
+                "use_x": true,
+                "use_y": false,
+                "use_z": true,
+                "use_transform": true,
+            }),
+            Some(CAST_SPHERE_OBJ_TR_RADIUS_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CAST_SPHERE_OBJ_TR_RADIUS);
 }
@@ -1426,21 +1462,25 @@ fn cast_sphere_obj_tr_radius_matches_blender() {
 #[test]
 fn cast_cylinder_obj_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "cast",
-        json!({
-            "cast_type": "CYLINDER",
-            "factor": 0.6,
-            "radius": 2.5,
-            "size": 0.0,
-            "use_radius_as_size": true,
-            "use_x": true,
-            "use_y": true,
-            "use_z": true,
-            "use_transform": false,
-        }),
-        Some(CAST_CYLINDER_OBJ_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "cast",
+            json!({
+                "cast_type": "CYLINDER",
+                "factor": 0.6,
+                "radius": 2.5,
+                "size": 0.0,
+                "use_radius_as_size": true,
+                "use_x": true,
+                "use_y": true,
+                "use_z": true,
+                "use_transform": false,
+            }),
+            Some(CAST_CYLINDER_OBJ_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CAST_CYLINDER_OBJ);
 }
@@ -1449,21 +1489,25 @@ fn cast_cylinder_obj_matches_blender() {
 #[test]
 fn cast_cuboid_obj_tr_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "cast",
-        json!({
-            "cast_type": "CUBOID",
-            "factor": 0.6,
-            "radius": 0.0,
-            "size": 1.1,
-            "use_radius_as_size": false,
-            "use_x": true,
-            "use_y": true,
-            "use_z": true,
-            "use_transform": true,
-        }),
-        Some(CAST_CUBOID_OBJ_TR_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "cast",
+            json!({
+                "cast_type": "CUBOID",
+                "factor": 0.6,
+                "radius": 0.0,
+                "size": 1.1,
+                "use_radius_as_size": false,
+                "use_x": true,
+                "use_y": true,
+                "use_z": true,
+                "use_transform": true,
+            }),
+            Some(CAST_CUBOID_OBJ_TR_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CAST_CUBOID_OBJ_TR);
 }
@@ -1491,8 +1535,7 @@ fn cast_cuboid_auto_size_with_object_transform_matches_blender() -> Result<(), B
         root,
         "Blender AUTO CUBOID fixture failed",
     )?;
-    let expected: Value =
-        serde_json::from_slice(&fs::read(root.join("cast_auto_expected.json"))?)?;
+    let expected: Value = serde_json::from_slice(&fs::read(root.join("cast_auto_expected.json"))?)?;
     let expected_positions = expected["positions"]
         .as_array()
         .ok_or("Blender AUTO CUBOID positions are missing")?;
@@ -1545,21 +1588,25 @@ fn cast_cuboid_auto_size_with_object_transform_matches_blender() -> Result<(), B
 #[test]
 fn cast_cylinder_axes_xy_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "cast",
-        json!({
-            "cast_type": "CYLINDER",
-            "factor": 0.8,
-            "radius": 0.0,
-            "size": 1.0,
-            "use_radius_as_size": false,
-            "use_x": true,
-            "use_y": true,
-            "use_z": false,
-            "use_transform": false,
-        }),
-        None,
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "cast",
+            json!({
+                "cast_type": "CYLINDER",
+                "factor": 0.8,
+                "radius": 0.0,
+                "size": 1.0,
+                "use_radius_as_size": false,
+                "use_x": true,
+                "use_y": true,
+                "use_z": false,
+                "use_transform": false,
+            }),
+            None,
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CAST_CYLINDER_AXES_XY);
 }
@@ -1568,23 +1615,27 @@ fn cast_cylinder_axes_xy_matches_blender() {
 #[test]
 fn cast_sphere_vginv_matches_blender() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "cast",
-        json!({
-            "cast_type": "SPHERE",
-            "factor": 0.9,
-            "radius": 1.5,
-            "size": 0.0,
-            "use_radius_as_size": true,
-            "use_x": true,
-            "use_y": true,
-            "use_z": true,
-            "use_transform": false,
-            "vertex_group": "G",
-            "invert_vertex_group": true,
-        }),
-        Some(CAST_SPHERE_VGINV_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "cast",
+            json!({
+                "cast_type": "SPHERE",
+                "factor": 0.9,
+                "radius": 1.5,
+                "size": 0.0,
+                "use_radius_as_size": true,
+                "use_x": true,
+                "use_y": true,
+                "use_z": true,
+                "use_transform": false,
+                "vertex_group": "G",
+                "invert_vertex_group": true,
+            }),
+            Some(CAST_SPHERE_VGINV_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CAST_SPHERE_VGINV);
 }
@@ -1593,44 +1644,72 @@ fn cast_sphere_vginv_matches_blender() {
 #[test]
 fn cast_cuboid_vg_matches_blender() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "cast",
-        json!({
-            "cast_type": "CUBOID",
-            "factor": 0.9,
-            "radius": 0.0,
-            "size": 1.0,
-            "use_radius_as_size": false,
-            "use_x": true,
-            "use_y": true,
-            "use_z": true,
-            "use_transform": true,
-            "vertex_group": "G",
-            "invert_vertex_group": false,
-        }),
-        Some(CAST_CUBOID_VG_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "cast",
+            json!({
+                "cast_type": "CUBOID",
+                "factor": 0.9,
+                "radius": 0.0,
+                "size": 1.0,
+                "use_radius_as_size": false,
+                "use_x": true,
+                "use_y": true,
+                "use_z": true,
+                "use_transform": true,
+                "vertex_group": "G",
+                "invert_vertex_group": false,
+            }),
+            Some(CAST_CUBOID_VG_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CAST_CUBOID_VG);
+}
+
+fn translated_index_hook(indices: &[usize]) -> Modifier {
+    translated_index_hook_with_values(json!(indices))
+}
+
+fn translated_index_hook_with_values(indices: Value) -> Modifier {
+    modifier(
+        "hook",
+        json!({
+            "falloff_type": "NONE",
+            "falloff_radius": 0.0,
+            "strength": 1.0,
+            "center": [0.0, 0.0, 0.0],
+            "use_falloff_uniform": false,
+            "vertex_indices": indices,
+            "matrix_inverse": DMat4::IDENTITY.to_cols_array(),
+        }),
+        Some(DMat4::from_translation(DVec3::X).to_cols_array()),
+    )
 }
 
 /// Hook SPHERE (oracle case hook_SPHERE).
 #[test]
 fn hook_sphere_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "SPHERE",
-            "falloff_radius": 1.5,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "use_falloff_uniform": false,
-            "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
-            "matrix_inverse": HOOK_SPHERE_PARENTINV,
-        }),
-        Some(HOOK_SPHERE_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "SPHERE",
+                "falloff_radius": 1.5,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": false,
+                "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+                "matrix_inverse": HOOK_SPHERE_PARENTINV,
+            }),
+            Some(HOOK_SPHERE_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_HOOK_SPHERE);
 }
@@ -1639,40 +1718,347 @@ fn hook_sphere_matches_blender() {
 #[test]
 fn hook_indices_falloff_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "SPHERE",
-            "falloff_radius": 2.0,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "use_falloff_uniform": false,
-            "vertex_indices": [0, 2, 5, 7],
-            "matrix_inverse": HOOK_INDICES_FALLOFF_PARENTINV,
-        }),
-        Some(HOOK_INDICES_FALLOFF_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "SPHERE",
+                "falloff_radius": 2.0,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": false,
+                "vertex_indices": [0, 2, 5, 7],
+                "matrix_inverse": HOOK_INDICES_FALLOFF_PARENTINV,
+            }),
+            Some(HOOK_INDICES_FALLOFF_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_HOOK_INDICES_FALLOFF);
+}
+
+/// Array copies retain source indices so an indexed Hook affects every copy of that source vertex.
+#[test]
+fn hook_array_selects_all_original_copies() {
+    let mesh = subject();
+    let array = modifier(
+        "array",
+        json!({
+            "count": 2,
+            "fit_type": "FIXED_COUNT",
+            "use_relative_offset": true,
+            "relative_offset_displace": [1.0, 0.0, 0.0],
+            "use_constant_offset": false,
+            "use_object_offset": false,
+            "use_merge_vertices": false,
+        }),
+        None,
+    );
+    let array_result = evaluate_modifiers(&mesh, &[array.clone()], SUBJECT_NAME).unwrap();
+    let result =
+        evaluate_modifiers(&mesh, &[array, translated_index_hook(&[0])], SUBJECT_NAME).unwrap();
+
+    assert_eq!(result.vertices.len(), array_result.vertices.len());
+    for (index, (before, after)) in array_result
+        .vertices
+        .iter()
+        .zip(&result.vertices)
+        .enumerate()
+    {
+        let expected = if index % mesh.vertices.len() == 0 {
+            DVec3::X
+        } else {
+            DVec3::ZERO
+        };
+        assert!(after.co.distance(before.co + expected) < TOLERANCE);
+    }
+}
+
+/// Blender 5.2.2 validates each index value but sets the selection bitmap at its list position.
+#[test]
+fn hook_indices_use_blender_list_position_bitmap() {
+    let mesh = subject();
+    let result = evaluate_modifiers(&mesh, &[translated_index_hook(&[2])], SUBJECT_NAME).unwrap();
+
+    assert!(
+        result.vertices[0]
+            .co
+            .distance(mesh.vertices[0].co + DVec3::X)
+            < TOLERANCE
+    );
+    assert_eq!(result.vertices[2].co, mesh.vertices[2].co);
+}
+
+/// Subdivision copies keep their ORIGINDEX while generated edge and face points remain unmapped.
+#[test]
+fn hook_skips_subdivision_generated_vertices() {
+    let mesh =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
+            .unwrap();
+    let subdivision = modifier(
+        "subdivision",
+        json!({"levels": 1, "subdivision_type": "SIMPLE"}),
+        None,
+    );
+    let subdivided = evaluate_modifiers(&mesh, &[subdivision.clone()], SUBJECT_NAME).unwrap();
+    let result = evaluate_modifiers(
+        &mesh,
+        &[subdivision, translated_index_hook(&[0])],
+        SUBJECT_NAME,
+    )
+    .unwrap();
+
+    assert!(
+        result.vertices[0]
+            .co
+            .distance(subdivided.vertices[0].co + DVec3::X)
+            < TOLERANCE
+    );
+    for index in mesh.vertices.len()..result.vertices.len() {
+        assert_eq!(result.vertices[index].co, subdivided.vertices[index].co);
+    }
+    let serialized = serde_json::to_value(&result).unwrap();
+    assert!(serialized.get("original_indices").is_none());
+    assert!(!result.attributes.contains_key("original_indices"));
+}
+
+/// Bevel's BMesh-generated vertices inherit the original `bv->v` custom-data index.
+#[test]
+fn hook_uses_bevel_example_indices() {
+    let mesh = Mesh::box_mesh(BoxParams {
+        size: DVec3::splat(2.0),
+    })
+    .unwrap();
+    let bevel = modifier(
+        "bevel",
+        json!({
+            "width": 0.1,
+            "segments": 2,
+            "affect": "EDGES",
+            "limit_method": "NONE",
+        }),
+        None,
+    );
+    let before = evaluate_modifiers(&mesh, &[bevel.clone()], SUBJECT_NAME).unwrap();
+    let after =
+        evaluate_modifiers(&mesh, &[bevel, translated_index_hook(&[0])], SUBJECT_NAME).unwrap();
+    assert_eq!(before.vertices.len(), after.vertices.len());
+    let mut moved = 0;
+    let mut stationary = 0;
+    for (before, after) in before.vertices.iter().zip(&after.vertices) {
+        let delta = after.co - before.co;
+        if delta.length() > TOLERANCE {
+            moved += 1;
+            assert!(delta.distance(DVec3::X) < TOLERANCE);
+        } else {
+            stationary += 1;
+        }
+    }
+    assert!(moved > 1, "expected every source-zero bevel point to move");
+    assert!(
+        stationary > 1,
+        "bevel points from other source vertices must remain still"
+    );
+}
+
+/// Decimate's BMesh keeps `v_other` even when it is not the first weighted source.
+#[test]
+fn hook_uses_decimate_destination_survivor() {
+    let mut mesh = Mesh::new();
+    let positions = [
+        DVec3::Z,
+        DVec3::X,
+        DVec3::Y,
+        DVec3::NEG_X,
+        DVec3::NEG_Y,
+        DVec3::NEG_Z,
+    ];
+    let vertices: Vec<_> = positions
+        .into_iter()
+        .map(|position| mesh.insert_vertex(position).unwrap())
+        .collect();
+    mesh.insert_edge([vertices[2], vertices[1]]).unwrap();
+    for face in [
+        vec![vertices[0], vertices[1], vertices[2]],
+        vec![vertices[0], vertices[2], vertices[3]],
+        vec![vertices[0], vertices[3], vertices[4]],
+        vec![vertices[0], vertices[4], vertices[1]],
+        vec![vertices[5], vertices[2], vertices[1]],
+        vec![vertices[5], vertices[3], vertices[2]],
+        vec![vertices[5], vertices[4], vertices[3]],
+        vec![vertices[5], vertices[1], vertices[4]],
+    ] {
+        mesh.insert_face(face, 0).unwrap();
+    }
+    mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({"Collapse": {"v1": 1.0, "v2": 1.0}}),
+    );
+    let decimate = modifier(
+        "decimate",
+        json!({
+            "decimate_type": "COLLAPSE",
+            "ratio": 0.75,
+            "vertex_group": "Collapse",
+            "vertex_group_factor": 1.0,
+            "use_collapse_triangulate": false,
+        }),
+        None,
+    );
+    let decimated = evaluate_modifiers(&mesh, &[decimate.clone()], SUBJECT_NAME).unwrap();
+    assert_eq!(decimated.vertices.len(), 5);
+
+    // Values equal to the original vertex count skip positions 0 and 1; the final valid value sets bit 2.
+    let hooked = evaluate_modifiers(
+        &mesh,
+        &[
+            decimate,
+            translated_index_hook_with_values(json!([6, 6, 0])),
+        ],
+        SUBJECT_NAME,
+    )
+    .unwrap();
+    assert!(
+        hooked.vertices[1]
+            .co
+            .distance(decimated.vertices[1].co + DVec3::X)
+            < TOLERANCE
+    );
+    for index in 0..hooked.vertices.len() {
+        if index != 1 {
+            assert_eq!(hooked.vertices[index].co, decimated.vertices[index].co);
+        }
+    }
+}
+
+/// Joining two pass-through graph branches keeps both copies' source indices for the following Hook.
+#[test]
+fn hook_graph_join_preserves_copied_indices() {
+    let mesh = subject();
+    let mut group = NodeGroup::new("Two Copies", GraphKind::Geometry);
+    let first = Id::new("first_transform").unwrap();
+    let second = Id::new("second_transform").unwrap();
+    let join = Id::new("join").unwrap();
+    let output = Id::new("output").unwrap();
+    group
+        .nodes
+        .insert(first.clone(), GraphNode::new("GeometryNodeTransform"));
+    group
+        .nodes
+        .insert(second.clone(), GraphNode::new("GeometryNodeTransform"));
+    group
+        .nodes
+        .insert(join.clone(), GraphNode::new("GeometryNodeJoinGeometry"));
+    group
+        .nodes
+        .insert(output.clone(), GraphNode::new("NodeGroupOutput"));
+    group.links = vec![
+        GraphLink {
+            from_node: first,
+            from_socket: "Geometry".to_owned(),
+            to_node: join.clone(),
+            to_socket: "Geometry".to_owned(),
+        },
+        GraphLink {
+            from_node: second,
+            from_socket: "Geometry".to_owned(),
+            to_node: join.clone(),
+            to_socket: "Geometry".to_owned(),
+        },
+        GraphLink {
+            from_node: join,
+            from_socket: "Geometry".to_owned(),
+            to_node: output,
+            to_socket: "Geometry".to_owned(),
+        },
+    ];
+    let group_id = Id::new("geometry_group").unwrap();
+    let groups = Registry::from([(group_id.clone(), group)]);
+    let nodes = modifier("nodes", json!({"node_group": group_id, "inputs": {}}), None);
+    let result = evaluate_modifiers_with_groups(
+        &mesh,
+        &[nodes, translated_index_hook(&[0])],
+        &groups,
+        SUBJECT_NAME,
+    )
+    .unwrap()
+    .mesh;
+
+    assert_eq!(result.vertices.len(), mesh.vertices.len() * 2);
+    for (index, vertex) in result.vertices.iter().enumerate() {
+        let source = &mesh.vertices[index % mesh.vertices.len()];
+        let expected = if index % mesh.vertices.len() == 0 {
+            DVec3::X
+        } else {
+            DVec3::ZERO
+        };
+        assert!(vertex.co.distance(source.co + expected) < TOLERANCE);
+    }
+}
+
+/// Blender keeps generated Geometry Nodes meshes in the layer but marks their points unmapped.
+#[test]
+fn hook_skips_geometry_nodes_generated_points() {
+    let mesh = subject();
+    let mut group = NodeGroup::new("Generated Cube", GraphKind::Geometry);
+    let cube = Id::new("generated_cube").unwrap();
+    let output = Id::new("output").unwrap();
+    group
+        .nodes
+        .insert(cube.clone(), GraphNode::new("GeometryNodeMeshCube"));
+    group
+        .nodes
+        .insert(output.clone(), GraphNode::new("NodeGroupOutput"));
+    group.links = vec![GraphLink {
+        from_node: cube,
+        from_socket: "Mesh".to_owned(),
+        to_node: output,
+        to_socket: "Geometry".to_owned(),
+    }];
+    let group_id = Id::new("generated_group").unwrap();
+    let groups = Registry::from([(group_id.clone(), group)]);
+    let nodes = modifier("nodes", json!({"node_group": group_id, "inputs": {}}), None);
+    let before =
+        evaluate_modifiers_with_groups(&mesh, std::slice::from_ref(&nodes), &groups, SUBJECT_NAME)
+            .unwrap()
+            .mesh;
+    let after = evaluate_modifiers_with_groups(
+        &mesh,
+        &[nodes, translated_index_hook(&[0])],
+        &groups,
+        SUBJECT_NAME,
+    )
+    .unwrap()
+    .mesh;
+    assert_eq!(before.vertices.len(), after.vertices.len());
+    for (before, after) in before.vertices.iter().zip(&after.vertices) {
+        assert_eq!(after.co, before.co);
+    }
 }
 
 /// Hook LINEAR (oracle case hook_LINEAR_uniform_big).
 #[test]
 fn hook_linear_uniform_big_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "LINEAR",
-            "falloff_radius": 2.6,
-            "strength": 1.0,
-            "center": [0.2, -0.3, 0.4],
-            "use_falloff_uniform": true,
-            "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
-            "matrix_inverse": HOOK_LINEAR_UNIFORM_BIG_PARENTINV,
-        }),
-        Some(HOOK_LINEAR_UNIFORM_BIG_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "LINEAR",
+                "falloff_radius": 2.6,
+                "strength": 1.0,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": true,
+                "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+                "matrix_inverse": HOOK_LINEAR_UNIFORM_BIG_PARENTINV,
+            }),
+            Some(HOOK_LINEAR_UNIFORM_BIG_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_HOOK_LINEAR_UNIFORM_BIG);
 }
@@ -1681,20 +2067,24 @@ fn hook_linear_uniform_big_matches_blender() {
 #[test]
 fn hook_vg_inv_matches_blender() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "LINEAR",
-            "falloff_radius": 2.0,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "use_falloff_uniform": false,
-            "vertex_group": "G",
-            "invert_vertex_group": true,
-            "matrix_inverse": HOOK_VG_INV_PARENTINV,
-        }),
-        Some(HOOK_VG_INV_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "LINEAR",
+                "falloff_radius": 2.0,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": false,
+                "vertex_group": "G",
+                "invert_vertex_group": true,
+                "matrix_inverse": HOOK_VG_INV_PARENTINV,
+            }),
+            Some(HOOK_VG_INV_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_HOOK_VG_INV);
 }
@@ -1703,21 +2093,25 @@ fn hook_vg_inv_matches_blender() {
 #[test]
 fn hook_indices_vg_inv_matches_blender() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "NONE",
-            "falloff_radius": 0.0,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "use_falloff_uniform": false,
-            "vertex_indices": [1, 2, 3, 4, 5, 6, 7],
-            "vertex_group": "G",
-            "invert_vertex_group": true,
-            "matrix_inverse": HOOK_INDICES_VG_INV_PARENTINV,
-        }),
-        Some(HOOK_INDICES_VG_INV_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "NONE",
+                "falloff_radius": 0.0,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": false,
+                "vertex_indices": [1, 2, 3, 4, 5, 6, 7],
+                "vertex_group": "G",
+                "invert_vertex_group": true,
+                "matrix_inverse": HOOK_INDICES_VG_INV_PARENTINV,
+            }),
+            Some(HOOK_INDICES_VG_INV_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_HOOK_INDICES_VG_INV);
 }
@@ -1726,20 +2120,24 @@ fn hook_indices_vg_inv_matches_blender() {
 #[test]
 fn hook_curve_3pt_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "CURVE",
-            "falloff_radius": 2.0,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "use_falloff_uniform": false,
-            "falloff_curve": [[0, 0], [0.3, 0.7], [1, 1]],
-            "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
-            "matrix_inverse": HOOK_CURVE_3PT_PARENTINV,
-        }),
-        Some(HOOK_CURVE_3PT_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "CURVE",
+                "falloff_radius": 2.0,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": false,
+                "falloff_curve": [[0, 0], [0.3, 0.7], [1, 1]],
+                "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+                "matrix_inverse": HOOK_CURVE_3PT_PARENTINV,
+            }),
+            Some(HOOK_CURVE_3PT_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_HOOK_CURVE_3PT);
 }
@@ -1748,20 +2146,24 @@ fn hook_curve_3pt_matches_blender() {
 #[test]
 fn hook_curve_4pt_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "CURVE",
-            "falloff_radius": 2.0,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "use_falloff_uniform": false,
-            "falloff_curve": [[0, 0.2], [0.25, 0.8], [0.6, 0.3], [1, 0.9]],
-            "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
-            "matrix_inverse": HOOK_CURVE_4PT_PARENTINV,
-        }),
-        Some(HOOK_CURVE_4PT_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "CURVE",
+                "falloff_radius": 2.0,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": false,
+                "falloff_curve": [[0, 0.2], [0.25, 0.8], [0.6, 0.3], [1, 0.9]],
+                "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+                "matrix_inverse": HOOK_CURVE_4PT_PARENTINV,
+            }),
+            Some(HOOK_CURVE_4PT_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_HOOK_CURVE_4PT);
 }
@@ -1770,17 +2172,21 @@ fn hook_curve_4pt_matches_blender() {
 #[test]
 fn hook_without_listed_vertices_or_group_is_a_no_op() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "SMOOTH",
-            "falloff_radius": 1.5,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "matrix_inverse": HOOK_NOOP_PARENTINV,
-        }),
-        Some(HOOK_NOOP_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "SMOOTH",
+                "falloff_radius": 1.5,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "matrix_inverse": HOOK_NOOP_PARENTINV,
+            }),
+            Some(HOOK_NOOP_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &SUBJECT);
 }
@@ -1789,23 +2195,27 @@ fn hook_without_listed_vertices_or_group_is_a_no_op() {
 #[test]
 fn cast_missing_group_evaluates_as_no_group() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "cast",
-        json!({
-            "cast_type": "SPHERE",
-            "factor": 0.5,
-            "radius": 0.0,
-            "size": 0.0,
-            "use_radius_as_size": true,
-            "use_x": true,
-            "use_y": true,
-            "use_z": true,
-            "use_transform": false,
-            "vertex_group": "missing",
-            "invert_vertex_group": true,
-        }),
-        None,
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "cast",
+            json!({
+                "cast_type": "SPHERE",
+                "factor": 0.5,
+                "radius": 0.0,
+                "size": 0.0,
+                "use_radius_as_size": true,
+                "use_x": true,
+                "use_y": true,
+                "use_z": true,
+                "use_transform": false,
+                "vertex_group": "missing",
+                "invert_vertex_group": true,
+            }),
+            None,
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CAST_MISSING_GROUP);
 }
@@ -1814,21 +2224,25 @@ fn cast_missing_group_evaluates_as_no_group() {
 #[test]
 fn simple_deform_missing_group_evaluates_as_no_group() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "simple_deform",
-        json!({
-            "deform_method": "TWIST",
-            "deform_axis": "Z",
-            "angle": 0.9,
-            "limits": [0.0, 1.0],
-            "lock_x": false,
-            "lock_y": false,
-            "lock_z": false,
-            "vertex_group": "missing",
-            "invert_vertex_group": true,
-        }),
-        Some(SD_MISSING_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "simple_deform",
+            json!({
+                "deform_method": "TWIST",
+                "deform_axis": "Z",
+                "angle": 0.9,
+                "limits": [0.0, 1.0],
+                "lock_x": false,
+                "lock_y": false,
+                "lock_z": false,
+                "vertex_group": "missing",
+                "invert_vertex_group": true,
+            }),
+            Some(SD_MISSING_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_SD_MISSING_GROUP);
 }
@@ -1837,21 +2251,25 @@ fn simple_deform_missing_group_evaluates_as_no_group() {
 #[test]
 fn hook_missing_group_with_listed_vertices_evaluates_as_no_group() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "SMOOTH",
-            "falloff_radius": 1.5,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "use_falloff_uniform": false,
-            "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
-            "vertex_group": "missing",
-            "invert_vertex_group": true,
-            "matrix_inverse": HOOK_MISSING_PARENTINV,
-        }),
-        Some(HOOK_MISSING_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "SMOOTH",
+                "falloff_radius": 1.5,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "use_falloff_uniform": false,
+                "vertex_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+                "vertex_group": "missing",
+                "invert_vertex_group": true,
+                "matrix_inverse": HOOK_MISSING_PARENTINV,
+            }),
+            Some(HOOK_MISSING_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_HOOK_MISSING_GROUP);
 }
@@ -1860,18 +2278,22 @@ fn hook_missing_group_with_listed_vertices_evaluates_as_no_group() {
 #[test]
 fn hook_missing_group_without_listed_vertices_is_a_no_op() {
     let mesh = weighted_subject();
-    let result = evaluate_modifiers(&mesh, &[modifier(
-        "hook",
-        json!({
-            "falloff_type": "SMOOTH",
-            "falloff_radius": 1.5,
-            "strength": 0.8,
-            "center": [0.2, -0.3, 0.4],
-            "vertex_group": "missing",
-            "matrix_inverse": HOOK_MISSING_PARENTINV,
-        }),
-        Some(HOOK_MISSING_OBJECT),
-    )], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "hook",
+            json!({
+                "falloff_type": "SMOOTH",
+                "falloff_radius": 1.5,
+                "strength": 0.8,
+                "center": [0.2, -0.3, 0.4],
+                "vertex_group": "missing",
+                "matrix_inverse": HOOK_MISSING_PARENTINV,
+            }),
+            Some(HOOK_MISSING_OBJECT),
+        )],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &SUBJECT);
 }
@@ -2032,45 +2454,49 @@ fn curve_without_object_transform_is_a_typed_error() {
 #[test]
 fn chained_simple_deform_cast_hook_matches_blender() {
     let mesh = subject();
-    let result = evaluate_modifiers(&mesh, &[
-        modifier(
-            "simple_deform",
-            json!({
-                "deform_method": "TWIST",
-                "deform_axis": "Z",
-                "angle": 1.2,
-                "limits": [0.1, 0.9],
-            }),
-            Some(CHAIN_SD_OBJECT),
-        ),
-        modifier(
-            "cast",
-            json!({
-                "cast_type": "SPHERE",
-                "factor": 0.6,
-                "radius": 0.0,
-                "size": 1.4,
-                "use_radius_as_size": false,
-                "use_x": true,
-                "use_y": true,
-                "use_z": false,
-                "use_transform": true,
-            }),
-            Some(CHAIN_CAST_OBJECT),
-        ),
-        modifier(
-            "hook",
-            json!({
-                "falloff_type": "SMOOTH",
-                "falloff_radius": 2.5,
-                "strength": 0.9,
-                "center": [0.1, 0.2, -0.3],
-                "vertex_indices": [1, 3, 4, 6],
-                "matrix_inverse": CHAIN_HOOK_PARENTINV,
-            }),
-            Some(CHAIN_HOOK_OBJECT),
-        ),
-    ], SUBJECT_NAME)
+    let result = evaluate_modifiers(
+        &mesh,
+        &[
+            modifier(
+                "simple_deform",
+                json!({
+                    "deform_method": "TWIST",
+                    "deform_axis": "Z",
+                    "angle": 1.2,
+                    "limits": [0.1, 0.9],
+                }),
+                Some(CHAIN_SD_OBJECT),
+            ),
+            modifier(
+                "cast",
+                json!({
+                    "cast_type": "SPHERE",
+                    "factor": 0.6,
+                    "radius": 0.0,
+                    "size": 1.4,
+                    "use_radius_as_size": false,
+                    "use_x": true,
+                    "use_y": true,
+                    "use_z": false,
+                    "use_transform": true,
+                }),
+                Some(CHAIN_CAST_OBJECT),
+            ),
+            modifier(
+                "hook",
+                json!({
+                    "falloff_type": "SMOOTH",
+                    "falloff_radius": 2.5,
+                    "strength": 0.9,
+                    "center": [0.1, 0.2, -0.3],
+                    "vertex_indices": [1, 3, 4, 6],
+                    "matrix_inverse": CHAIN_HOOK_PARENTINV,
+                }),
+                Some(CHAIN_HOOK_OBJECT),
+            ),
+        ],
+        SUBJECT_NAME,
+    )
     .unwrap();
     assert_positions(&result, &EXPECTED_CHAIN);
 }

@@ -1167,19 +1167,18 @@ fn evaluate_modifier_output(
         } else {
             let frame = engine.evaluation_frame;
             let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
-            let operand_snapshot =
-                crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
-                    engine.doc,
-                    &crate::eval::EvaluationContext {
-                        frame: Some(frame),
-                        ..crate::eval::EvaluationContext::default()
-                    },
-                    engine.asset_root,
-                    engine.cache_directory,
-                    target,
-                    modifier_id,
-                    &driver_values,
-                )?;
+            let operand_snapshot = crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
+                engine.doc,
+                &crate::eval::EvaluationContext {
+                    frame: Some(frame),
+                    ..crate::eval::EvaluationContext::default()
+                },
+                engine.asset_root,
+                engine.cache_directory,
+                target,
+                modifier_id,
+                &driver_values,
+            )?;
             let evaluated_operand_meshes = &operand_snapshot.meshes;
             let mut world_matrices = operand_snapshot
                 .nodes
@@ -1622,7 +1621,99 @@ fn validate_parameter_map(
         );
         engine.error(ErrorCode::InvalidArgument, error.message, &pointer)
     })?;
+    let settings_parameter = match (family, kind) {
+        (ParameterFamily::Modifier, "hook" | "warp") => Some("falloff_curve_settings"),
+        (ParameterFamily::Modifier, "vertex_weight_edit" | "vertex_weight_proximity") => {
+            Some("map_curve_settings")
+        }
+        _ => None,
+    };
+    if let Some(field) = settings_parameter
+        && let Some(value) = params.get(field)
+        && !valid_curve_mapping_settings(value)
+    {
+        let pointer = operation_pointer(
+            engine.operation_index,
+            &format!("{}/{field}", base_pointer.trim_start_matches('/')),
+        );
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            format!("{field} must contain valid use_clip, clip_bounds, and extend settings"),
+            &pointer,
+        ));
+    }
+    if matches!(family, ParameterFamily::Modifier)
+        && matches!(kind, "hook" | "warp")
+        && let Some(value) = params.get("falloff_curve")
+        && !valid_curve_mapping_points(value)
+    {
+        let pointer = operation_pointer(
+            engine.operation_index,
+            &format!("{}/falloff_curve", base_pointer.trim_start_matches('/')),
+        );
+        return Err(engine.error(
+            ErrorCode::InvalidArgument,
+            "falloff_curve must contain at least two finite [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
+            &pointer,
+        ));
+    }
     Ok(())
+}
+
+fn valid_curve_mapping_settings(value: &Value) -> bool {
+    let Some(settings) = value.as_object() else {
+        return false;
+    };
+    let clip_bounds_valid = settings.get("clip_bounds").is_none_or(|value| {
+        let Some(bounds) = value.as_array() else {
+            return false;
+        };
+        let [min_x, min_y, max_x, max_y] = bounds.as_slice() else {
+            return false;
+        };
+        let Some(min_x) = min_x.as_f64() else {
+            return false;
+        };
+        let Some(min_y) = min_y.as_f64() else {
+            return false;
+        };
+        let Some(max_x) = max_x.as_f64() else {
+            return false;
+        };
+        let Some(max_y) = max_y.as_f64() else {
+            return false;
+        };
+        [min_x, min_y, max_x, max_y]
+            .iter()
+            .all(|bound| bound.is_finite() && (-100.0..=100.0).contains(bound))
+            && min_x <= max_x
+            && min_y <= max_y
+    });
+    settings.get("use_clip").is_none_or(Value::is_boolean)
+        && clip_bounds_valid
+        && settings
+            .get("extend")
+            .is_none_or(|value| matches!(value.as_str(), Some("HORIZONTAL" | "EXTRAPOLATED")))
+}
+
+fn valid_curve_mapping_points(value: &Value) -> bool {
+    value.as_array().is_some_and(|points| {
+        points.len() >= 2
+            && points.iter().all(|point| {
+                let Some(coordinates) = point.as_array() else {
+                    return false;
+                };
+                (2..=3).contains(&coordinates.len())
+                    && coordinates[..2].iter().all(|coordinate| {
+                        coordinate.as_f64().is_some_and(|number| {
+                            number.is_finite() && number.abs() <= f64::from(f32::MAX)
+                        })
+                    })
+                    && coordinates.get(2).is_none_or(|handle| {
+                        matches!(handle.as_str(), Some("AUTO" | "AUTO_CLAMPED" | "VECTOR"))
+                    })
+            })
+    })
 }
 fn validate_modifier_resource(
     engine: &Engine<'_>,
@@ -1630,11 +1721,28 @@ fn validate_modifier_resource(
     params: &Map<String, Value>,
     base_pointer: &str,
 ) -> Result<()> {
+    let is_disabled = match modifier_type {
+        "mesh_cache" => params
+            .get("factor")
+            .and_then(Value::as_f64)
+            .is_some_and(|factor| factor <= 0.0),
+        "mesh_sequence_cache" => params
+            .get("object_path")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty),
+        _ => false,
+    };
+    if is_disabled {
+        return Ok(());
+    }
     let has_resource_parameter = params::type_spec(ParameterFamily::Modifier, modifier_type)
         .and_then(|specification| specification.get("properties"))
         .and_then(Value::as_object)
         .is_some_and(|properties| properties.contains_key("resource"));
-    if !has_resource_parameter {
+    if !has_resource_parameter
+        || ((modifier_type == "mesh_cache" || modifier_type == "mesh_sequence_cache")
+            && !params.contains_key("resource"))
+    {
         return Ok(());
     }
     let resource_pointer = operation_pointer(
@@ -1651,6 +1759,9 @@ fn validate_modifier_resource(
                 &resource_pointer,
             )
         })?;
+    if modifier_type == "mesh_sequence_cache" && resource_text.is_empty() {
+        return Ok(());
+    }
     let resource_id = Id::new(resource_text.to_owned()).map_err(|_| {
         engine.error(
             ErrorCode::InvalidArgument,
@@ -1669,13 +1780,14 @@ fn validate_modifier_resource(
         let valid_path = params
             .get("object_path")
             .and_then(Value::as_str)
-            .is_some_and(|path| {
-                path.strip_prefix('/').is_some_and(|tail| {
-                    !tail.is_empty()
-                        && tail
-                            .split('/')
-                            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
-                })
+            .is_none_or(|path| {
+                path.is_empty()
+                    || path.strip_prefix('/').is_some_and(|tail| {
+                        !tail.is_empty()
+                            && tail.split('/').all(|segment| {
+                                !segment.is_empty() && segment != "." && segment != ".."
+                            })
+                    })
             });
         if !valid_path {
             return Err(engine.error(
@@ -2094,30 +2206,15 @@ fn validate_attribute_modifier_params_inner(
             })?;
         }
     }
-    if let Some(value) = params.get("map_curve") {
-        let points = value.as_array().ok_or_else(|| {
-            invalid_attribute_modifier_parameter(
-                modifier_type,
-                "map_curve",
-                "an array of [x,y] points",
-            )
-        })?;
-        if points.len() < 2
-            || points.iter().any(|point| {
-                point.as_array().is_none_or(|pair| {
-                    pair.len() != 2
-                        || pair.iter().any(|value| {
-                            value.as_f64().is_none_or(|value| !value.is_finite())
-                        })
-                })
-            })
-        {
-            return Err(invalid_attribute_modifier_parameter(
-                modifier_type,
-                "map_curve",
-                "at least two finite [x,y] points",
-            ));
-        }
+    if params
+        .get("map_curve")
+        .is_some_and(|value| !valid_curve_mapping_points(value))
+    {
+        return Err(invalid_attribute_modifier_parameter(
+            modifier_type,
+            "map_curve",
+            "at least two finite float32 [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
+        ));
     }
     Ok(())
 }

@@ -2,14 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use glam::{DMat3, DMat4, DVec2, DVec3};
+use glam::{DMat3, DMat4, DVec2, DVec3, Vec2, Vec3};
 use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{
-        Edge, Face, Mesh, Vertex,
-    },
+    geom::{Edge, Face, Mesh, Vertex},
     model::{CameraData, Modifier},
 };
 
@@ -20,10 +18,13 @@ mod weights;
 
 use normals::{normal_edit, weighted_normal};
 use transfer::data_transfer;
-use uv_projection::{uv_project, uv_warp};
 pub(crate) use uv_projection::build_uv_warp_matrix_f32;
-use weights::{texture_mask_weights, vertex_weight_edit, vertex_weight_mix, vertex_weight_proximity};
+use uv_projection::{uv_project, uv_warp};
+use weights::{
+    texture_mask_weights, vertex_weight_edit, vertex_weight_mix, vertex_weight_proximity,
+};
 
+use super::advanced::{CurveMappingTable, curve_map_table, curve_mapping_points};
 use super::{
     bool_param as boolean, closest_point_triangle, invalid_parameter as invalid,
     number_param as number, schema_value, string_param as string,
@@ -74,11 +75,7 @@ pub struct SceneOperand {
 ///
 /// Returns an invalid-parameter or evaluation error when a requested group, UV layer,
 /// or attribute is missing or malformed.
-pub(super) fn evaluate(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    subject_name: &str,
-) -> Result<Mesh> {
+pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier, subject_name: &str) -> Result<Mesh> {
     evaluate_with_context(
         mesh,
         modifier,
@@ -157,9 +154,7 @@ pub(crate) fn evaluate_with_texture_context(
         "normal_edit" => normal_edit(mesh, modifier, operands),
         "uv_project" => uv_project(mesh, modifier, operands, subject_world),
         "uv_warp" => uv_warp(mesh, modifier, operands),
-        "data_transfer" => {
-            data_transfer(mesh, modifier, operands, subject_layer_selection)
-        }
+        "data_transfer" => data_transfer(mesh, modifier, operands, subject_layer_selection),
         "mask" => super::advanced::mask(mesh, modifier, operands),
         "weighted_normal" => weighted_normal(mesh, modifier),
         "mesh_cache" => Err(invalid(
@@ -171,22 +166,23 @@ pub(crate) fn evaluate_with_texture_context(
     }
 }
 
-
-
 /// Evaluate a PC2 or MDD Mesh Cache resource at one scene frame.
 ///
 /// # Errors
 ///
 /// Returns an invalid-argument error for malformed cache headers, incompatible topology,
 /// or unsupported cache settings.
+///
+/// Returns non-fatal diagnostics when Blender's INTEGRATE source-mesh checks fail.
 pub fn evaluate_mesh_cache(
     mesh: &mut Mesh,
+    source_mesh: Option<&Mesh>,
     modifier: &Modifier,
     frame: f64,
     fps: u32,
     fps_base: f64,
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<Vec<PotError>> {
     if !frame.is_finite() || fps == 0 || !fps_base.is_finite() || fps_base <= 0.0 {
         return Err(invalid(
             modifier,
@@ -194,21 +190,22 @@ pub fn evaluate_mesh_cache(
             "a finite scene frame and positive frame rate",
         ));
     }
-    let format = string(modifier, "cache_format")?;
     let samples = match format {
-        "PC2" => read_pc2(bytes, modifier)?,
-        "MDD" => read_mdd(bytes, modifier)?,
+        "PC2" => read_pc2_metadata(bytes, modifier)?,
+        "MDD" => read_mdd_metadata(bytes, modifier)?,
         _ => return Err(invalid(modifier, "cache_format", "PC2 or MDD")),
     };
-    if samples.points.first().map_or(0, Vec::len) != mesh.vertices.len() {
+    if samples.vertex_count != mesh.vertices.len() {
         return Err(invalid(
             modifier,
             "resource",
             "a cache with matching vertex count",
         ));
     }
-    let frame_start = number(modifier, "frame_start")?;
-    let frame_scale = number(modifier, "frame_scale")?;
+    let frame_start = cache_float(number(modifier, "frame_start")?);
+    let frame_scale = cache_float(number(modifier, "frame_scale")?);
+    let frame = cache_float(frame);
+    let fps = cache_float(f64::from(fps)) / cache_float(fps_base);
     let play_mode = string(modifier, "play_mode")?;
     if !matches!(play_mode, "SCENE" | "CUSTOM") {
         return Err(invalid(modifier, "play_mode", "SCENE or CUSTOM"));
@@ -225,52 +222,60 @@ pub fn evaluate_mesh_cache(
     let interpolate = interpolation == "LINEAR";
     let (first, second, factor) = match time_mode {
         "FRAME" => {
-            let evaluation_frame = if custom {
-                number(modifier, "eval_frame")?
+            let cache_frame = if custom {
+                cache_float(number(modifier, "eval_frame")?)
             } else {
-                frame
+                frame_scale * frame - frame_start
             };
-            let cache_frame = frame_start + evaluation_frame * frame_scale;
-            let cache_time = if format == "MDD" {
-                cache_frame * fps_base / f64::from(fps)
-            } else {
-                cache_frame
-            };
-            select_cache_samples(&samples.times, cache_time, interpolate)
+            select_cache_frame(cache_frame, samples.frame_count, interpolate)
         }
         "TIME" => {
             let evaluation_time = if custom {
-                number(modifier, "eval_time")?
+                cache_float(number(modifier, "eval_time")?)
             } else {
-                frame * fps_base / f64::from(fps) * frame_scale - frame_start
+                frame_scale * (frame / fps) - frame_start
             };
-            if format == "PC2" {
-                let start = samples
-                    .pc2_time_start
-                    .ok_or_else(|| invalid(modifier, "resource", "PC2 time metadata"))?;
-                let sampling = samples
-                    .pc2_sampling
-                    .ok_or_else(|| invalid(modifier, "resource", "PC2 sampling metadata"))?;
-                let cache_frame = (evaluation_time / f64::from(fps) - start) / sampling;
-                select_cache_frame(cache_frame, samples.points.len(), interpolate)
-            } else {
-                select_cache_samples(&samples.times, evaluation_time, interpolate)
+            match samples.format {
+                CacheFormat::Pc2 {
+                    time_start,
+                    sampling,
+                } => {
+                    let cache_frame = (evaluation_time / fps - time_start) / sampling;
+                    select_cache_frame(cache_frame, samples.frame_count, interpolate)
+                }
+                CacheFormat::Mdd { times_offset } => {
+                    let cache_frame = cache_frame_at_time(
+                        bytes,
+                        times_offset,
+                        samples.frame_count,
+                        evaluation_time,
+                        modifier,
+                    )?;
+                    select_cache_frame(cache_frame, samples.frame_count, interpolate)
+                }
             }
         }
         _ => {
             let evaluation_factor = if custom {
-                number(modifier, "eval_factor")?
+                cache_float(number(modifier, "eval_factor")?)
             } else {
-                frame * fps_base / f64::from(fps) * frame_scale - frame_start
+                frame_scale * (frame / fps) - frame_start
             };
-            let frame_count = cache_frame_count(samples.points.len(), modifier)?;
+            let frame_count = cache_frame_count(samples.frame_count, modifier)?;
             select_cache_frame(
                 evaluation_factor.clamp(0.0, 1.0) * frame_count,
-                samples.points.len(),
+                samples.frame_count,
                 interpolate,
             )
         }
     };
+    let mut sampled = samples.read_frame(bytes, first, modifier)?;
+    if first != second {
+        let second_points = samples.read_frame(bytes, second, modifier)?;
+        for (point, second_point) in sampled.iter_mut().zip(second_points) {
+            *point = cache_lerp(*point, second_point, factor);
+        }
+    }
     let forward = string(modifier, "forward_axis")?;
     let up = string(modifier, "up_axis")?;
     let flip = modifier
@@ -283,277 +288,425 @@ pub fn evaluate_mesh_cache(
     if !matches!(deform_mode, "OVERWRITE" | "INTEGRATE") {
         return Err(invalid(modifier, "deform_mode", "OVERWRITE or INTEGRATE"));
     }
-    let amount = number(modifier, "factor")?.clamp(0.0, 1.0);
+    let amount = cache_float(number(modifier, "factor")?).clamp(0.0, 1.0);
     let group = optional_string(modifier, "vertex_group")?;
     let weights = group
         .map(|name| get_group_weights(mesh, name))
-        .transpose()?;
+        .transpose()?
+        .flatten();
     let invert_group = boolean(modifier, "invert_vertex_group")?;
-    let basis = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co)
-        .collect::<Vec<_>>();
-    let sampled = samples.points[first]
-        .iter()
-        .enumerate()
-        .map(|(index, point)| {
-            if first == second {
-                *point
-            } else {
-                point.lerp(samples.points[second][index], factor)
+    let mut warnings = Vec::new();
+    let mut desired = sampled;
+    if deform_mode == "INTEGRATE" {
+        match source_mesh {
+            None => warnings.push(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "'Integrate' only valid for Mesh objects",
+                json!({"modifier_id":modifier.id}),
+            )),
+            Some(source) if source.vertices.len() != mesh.vertices.len() => {
+                warnings.push(PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "'Integrate' original mesh vertex mismatch",
+                    json!({"modifier_id":modifier.id,"source_vertices":source.vertices.len(),"current_vertices":mesh.vertices.len()}),
+                ));
             }
-        })
-        .collect::<Vec<_>>();
-    let mut desired = if deform_mode == "INTEGRATE" {
-        integrate_cache_samples(mesh, &basis, &sampled)
-    } else {
-        sampled
-    };
+            Some(source) if source.faces.is_empty() => warnings.push(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "'Integrate' requires faces",
+                json!({"modifier_id":modifier.id}),
+            )),
+            Some(source) => {
+                let current = mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| vertex.co)
+                    .collect::<Vec<_>>();
+                integrate_cache_samples(source, &current, &mut desired, modifier)?;
+            }
+        }
+    }
     for point in &mut desired {
         *point = apply_cache_axes(*point, forward, up, flip, modifier)?;
     }
     for (index, vertex) in mesh.vertices.iter_mut().enumerate() {
-        let mut influence = amount;
-        if let Some(weights) = &weights {
-            let weight = weights.get(&vertex.id).copied().unwrap_or(0.0);
-            influence *= if invert_group { 1.0 - weight } else { weight };
-        }
-        vertex.co = basis[index].lerp(desired[index], influence);
+        let influence = if let Some(weights) = &weights {
+            if !weights.has_deform_weights {
+                continue;
+            }
+            let weight = weights.values.get(&vertex.id).copied().unwrap_or(0.0);
+            let global_factor = if invert_group { -amount } else { amount };
+            let global_offset = if invert_group { amount } else { 0.0 };
+            global_offset + weight * global_factor
+        } else {
+            amount
+        };
+        vertex.co = cache_lerp(vertex.co, desired[index], influence);
     }
-    Ok(())
+    Ok(warnings)
 }
 
-fn integrate_cache_samples(mesh: &Mesh, basis: &[DVec3], samples: &[DVec3]) -> Vec<DVec3> {
-    let vertex_indices = mesh
+#[derive(Clone, Debug)]
+struct CacheVertexGroupWeights {
+    values: BTreeMap<u32, f32>,
+    has_deform_weights: bool,
+}
+
+fn integrate_cache_samples(
+    source_mesh: &Mesh,
+    current: &[DVec3],
+    samples: &mut [DVec3],
+    modifier: &Modifier,
+) -> Result<()> {
+    if source_mesh.vertices.len() != current.len() || samples.len() != current.len() {
+        return Err(invalid(
+            modifier,
+            "deform_mode",
+            "matching source, current, and cache vertex counts",
+        ));
+    }
+    if source_mesh.faces.is_empty() {
+        return Err(invalid(modifier, "deform_mode", "a source mesh with faces"));
+    }
+    let vertex_indices = source_mesh
         .vertices
         .iter()
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect::<HashMap<_, _>>();
-    let mut positions = vec![DVec3::ZERO; basis.len()];
-    let mut counts = vec![0_u32; basis.len()];
-    for face in &mesh.faces {
+    let mut positions = vec![Vec3::ZERO; current.len()];
+    let mut counts = vec![0_i32; current.len()];
+    for face in &source_mesh.faces {
         let count = face.vertices.len();
-        if count < 3 {
-            continue;
-        }
         for (corner, current_id) in face.vertices.iter().enumerate() {
             let previous_id = face.vertices[(corner + count - 1) % count];
             let next_id = face.vertices[(corner + 1) % count];
-            let (Some(&previous), Some(&current), Some(&next)) = (
+            let (Some(&previous), Some(&current_index), Some(&next)) = (
                 vertex_indices.get(&previous_id),
                 vertex_indices.get(current_id),
                 vertex_indices.get(&next_id),
             ) else {
-                continue;
+                return Err(invalid(
+                    modifier,
+                    "deform_mode",
+                    "source faces referencing existing vertices",
+                ));
             };
-            let source = [basis[previous], basis[current], basis[next]];
-            let target = [samples[previous], samples[current], samples[next]];
-            positions[current] += transform_cache_point_by_triangle(basis[current], source, target);
-            counts[current] = counts[current].saturating_add(1);
+            let source = [
+                source_mesh.vertices[previous].co,
+                source_mesh.vertices[current_index].co,
+                source_mesh.vertices[next].co,
+            ];
+            let target = [samples[previous], samples[current_index], samples[next]];
+            positions[current_index] +=
+                transform_point_by_triangle(current[current_index], source, target);
+            counts[current_index] += 1;
         }
     }
-    for (index, position) in positions.iter_mut().enumerate() {
-        if counts[index] == 0 {
-            *position = samples[index];
+    for (index, position) in positions.into_iter().enumerate() {
+        let position = if counts[index] == 0 {
+            samples[index].as_vec3()
         } else {
-            *position /= f64::from(counts[index]);
-        }
+            position / cache_float(f64::from(counts[index]))
+        };
+        samples[index] = DVec3::new(
+            f64::from(position.x),
+            f64::from(position.y),
+            f64::from(position.z),
+        );
     }
-    positions
+    Ok(())
 }
 
-fn transform_cache_point_by_triangle(
-    point: DVec3,
-    source: [DVec3; 3],
-    target: [DVec3; 3],
-) -> DVec3 {
-    let first = source[1] - source[0];
-    let second = source[2] - source[0];
-    let offset = point - source[0];
-    let first_squared = first.length_squared();
-    let second_squared = second.length_squared();
-    let cross = first.dot(second);
-    let denominator = first_squared * second_squared - cross * cross;
-    if denominator.abs() <= f64::EPSILON {
-        return target[1];
-    }
-    let first_factor =
-        (second_squared * offset.dot(first) - cross * offset.dot(second)) / denominator;
-    let second_factor =
-        (first_squared * offset.dot(second) - cross * offset.dot(first)) / denominator;
-    let factors = [
-        1.0 - first_factor - second_factor,
-        first_factor,
-        second_factor,
+fn transform_point_by_triangle(point: DVec3, source: [DVec3; 3], target: [DVec3; 3]) -> Vec3 {
+    let point = point.as_vec3();
+    let source = source.map(DVec3::as_vec3);
+    let target = target.map(DVec3::as_vec3);
+    let source_cross = (source[1] - source[0]).cross(source[2] - source[0]);
+    let source_normal_length_squared = source_cross.dot(source_cross);
+    let source_normal = if source_normal_length_squared > 1.0e-35_f32 {
+        source_cross * source_normal_length_squared.sqrt().recip()
+    } else {
+        Vec3::ZERO
+    };
+    let xy_length_squared = source_normal.x * source_normal.x + source_normal.y * source_normal.y;
+    let (basis_x, basis_y) = if xy_length_squared > f32::EPSILON {
+        let inverse_length = xy_length_squared.sqrt().recip();
+        let basis_x = Vec3::new(
+            source_normal.y * inverse_length,
+            -source_normal.x * inverse_length,
+            0.0,
+        );
+        let basis_y = Vec3::new(
+            -source_normal.z * basis_x.y,
+            source_normal.z * basis_x.x,
+            source_normal.x * basis_x.y - source_normal.y * basis_x.x,
+        );
+        (basis_x, basis_y)
+    } else {
+        (
+            Vec3::new(if source_normal.z < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0),
+            Vec3::Y,
+        )
+    };
+    let project = |position: Vec3| {
+        Vec3::new(
+            basis_x.dot(position),
+            basis_y.dot(position),
+            source_normal.dot(position),
+        )
+    };
+    let point_projected = project(point);
+    let source_projected = source.map(project);
+    let cross_2d = |first: Vec2, second: Vec2, third: Vec2| {
+        (first.x - second.x) * (second.y - third.y) - (first.y - second.y) * (second.x - third.x)
+    };
+    let projected_2d = source_projected.map(|position| Vec2::new(position.x, position.y));
+    let point_2d = Vec2::new(point_projected.x, point_projected.y);
+    let mut weights = [
+        cross_2d(projected_2d[1], projected_2d[2], point_2d),
+        cross_2d(projected_2d[2], projected_2d[0], point_2d),
+        cross_2d(projected_2d[0], projected_2d[1], point_2d),
     ];
-    let mut transformed = target[0] * factors[0] + target[1] * factors[1] + target[2] * factors[2];
-
-    let source_normal = first.cross(second);
-    let target_normal = (target[1] - target[0]).cross(target[2] - target[0]);
-    let source_area = source_normal.length();
-    let target_area = target_normal.length();
-    if source_area > f64::EPSILON && target_area > f64::EPSILON {
-        let height = offset.dot(source_normal / source_area);
-        transformed += target_normal / target_area * height * (target_area / source_area).sqrt();
+    let total_weight = weights[0] + weights[1] + weights[2];
+    if total_weight != 0.0 {
+        let inverse_total = total_weight.recip();
+        weights
+            .iter_mut()
+            .for_each(|weight| *weight *= inverse_total);
+        if !weights.iter().all(|weight| weight.is_finite()) {
+            weights = [1.0 / 3.0; 3];
+        }
+    } else {
+        weights = [1.0 / 3.0; 3];
     }
+    let mut transformed = target[0] * weights[0] + target[1] * weights[1] + target[2] * weights[2];
+    let target_cross = (target[1] - target[0]).cross(target[2] - target[0]);
+    let target_normal_length_squared = target_cross.dot(target_cross);
+    let target_normal = if target_normal_length_squared > 1.0e-35_f32 {
+        target_cross * target_normal_length_squared.sqrt().recip()
+    } else {
+        Vec3::ZERO
+    };
+    let target_area = (target_cross.length() * 0.5).sqrt();
+    let projected_source_cross = cross_2d(projected_2d[0], projected_2d[1], projected_2d[2]);
+    let source_area = (projected_source_cross.abs() * 0.5).sqrt();
+    let source_height = point_projected.z - source_projected[0].z;
+    transformed += target_normal * ((source_height / source_area) * target_area);
     transformed
 }
 
-struct CacheSamples {
-    times: Vec<f64>,
-    points: Vec<Vec<DVec3>>,
-    pc2_time_start: Option<f64>,
-    pc2_sampling: Option<f64>,
+#[derive(Clone, Copy)]
+enum CacheFormat {
+    Pc2 { time_start: f32, sampling: f32 },
+    Mdd { times_offset: usize },
 }
 
-fn read_pc2(bytes: &[u8], modifier: &Modifier) -> Result<CacheSamples> {
+struct CacheMetadata {
+    format: CacheFormat,
+    vertex_count: usize,
+    frame_count: usize,
+    data_offset: usize,
+}
+
+impl CacheMetadata {
+    fn read_frame(
+        &self,
+        bytes: &[u8],
+        frame_index: usize,
+        modifier: &Modifier,
+    ) -> Result<Vec<DVec3>> {
+        let (sample_requirement, finite_requirement) = match self.format {
+            CacheFormat::Pc2 { .. } => ("valid PC2 point samples", "finite PC2 point samples"),
+            CacheFormat::Mdd { .. } => ("valid MDD point samples", "finite MDD point samples"),
+        };
+        let read_f32: fn(&[u8], usize) -> Option<f32> = match self.format {
+            CacheFormat::Pc2 { .. } => le_f32,
+            CacheFormat::Mdd { .. } => be_f32,
+        };
+        if frame_index >= self.frame_count {
+            return Err(invalid(modifier, "resource", sample_requirement));
+        }
+        let Some(frame_bytes) = self.vertex_count.checked_mul(12) else {
+            return Err(invalid(modifier, "resource", sample_requirement));
+        };
+        let frame_offset = frame_index
+            .checked_mul(frame_bytes)
+            .and_then(|offset| self.data_offset.checked_add(offset));
+        let Some(frame_offset) = frame_offset else {
+            return Err(invalid(modifier, "resource", sample_requirement));
+        };
+        let Some(frame_end) = frame_offset.checked_add(frame_bytes) else {
+            return Err(invalid(modifier, "resource", sample_requirement));
+        };
+        if frame_end > bytes.len() {
+            return Err(invalid(modifier, "resource", sample_requirement));
+        }
+        let mut points = Vec::with_capacity(self.vertex_count);
+        for point_index in 0..self.vertex_count {
+            let offset = point_index
+                .checked_mul(12)
+                .and_then(|offset| frame_offset.checked_add(offset));
+            let Some(offset) = offset else {
+                return Err(invalid(modifier, "resource", sample_requirement));
+            };
+            let x = read_f32(bytes, offset);
+            let y = offset
+                .checked_add(4)
+                .and_then(|offset| read_f32(bytes, offset));
+            let z = offset
+                .checked_add(8)
+                .and_then(|offset| read_f32(bytes, offset));
+            let (Some(x), Some(y), Some(z)) = (x, y, z) else {
+                return Err(invalid(modifier, "resource", sample_requirement));
+            };
+            let point = DVec3::new(f64::from(x), f64::from(y), f64::from(z));
+            if !point.is_finite() {
+                return Err(invalid(modifier, "resource", finite_requirement));
+            }
+            points.push(point);
+        }
+        Ok(points)
+    }
+}
+
+fn read_pc2_metadata(bytes: &[u8], modifier: &Modifier) -> Result<CacheMetadata> {
     if bytes.len() < 32 || &bytes[..12] != b"POINTCACHE2\0" {
         return Err(invalid(modifier, "resource", "a valid PC2 file"));
     }
-    let version =
-        le_i32(bytes, 12).ok_or_else(|| invalid(modifier, "resource", "a valid PC2 header"))?;
     let count = le_i32(bytes, 16).and_then(|value| usize::try_from(value).ok());
-    let start = le_f32(bytes, 20).map(f64::from);
-    let rate = le_f32(bytes, 24).map(f64::from);
+    let time_start = le_f32(bytes, 20);
+    let sampling = le_f32(bytes, 24);
     let frames = le_i32(bytes, 28).and_then(|value| usize::try_from(value).ok());
-    let (Some(count), Some(start), Some(rate), Some(frames)) = (count, start, rate, frames) else {
+    let (Some(vertex_count), Some(time_start), Some(sampling), Some(frame_count)) =
+        (count, time_start, sampling, frames)
+    else {
         return Err(invalid(modifier, "resource", "a valid PC2 header"));
     };
-    let size = count
-        .checked_mul(frames)
+    let size = vertex_count
+        .checked_mul(frame_count)
         .and_then(|value| value.checked_mul(12))
         .and_then(|value| value.checked_add(32));
-    if version != 1 || !rate.is_finite() || rate <= 0.0 || size != Some(bytes.len()) {
-        return Err(invalid(
-            modifier,
-            "resource",
-            "a valid PC2 version 1 point cache",
-        ));
+    if frame_count == 0 || !sampling.is_finite() || sampling <= 0.0 || size != Some(bytes.len()) {
+        return Err(invalid(modifier, "resource", "a valid PC2 point cache"));
     }
-    let mut points = Vec::with_capacity(frames);
-    for frame_index in 0..frames {
-        let mut frame = Vec::with_capacity(count);
-        for point_index in 0..count {
-            let offset = 32 + (frame_index * count + point_index) * 12;
-            let x = le_f32(bytes, offset).map(f64::from);
-            let y = le_f32(bytes, offset + 4).map(f64::from);
-            let z = le_f32(bytes, offset + 8).map(f64::from);
-            let (Some(x), Some(y), Some(z)) = (x, y, z) else {
-                return Err(invalid(modifier, "resource", "valid PC2 point samples"));
-            };
-            let point = DVec3::new(x, y, z);
-            if !point.is_finite() {
-                return Err(invalid(modifier, "resource", "finite PC2 point samples"));
-            }
-            frame.push(point);
-        }
-        points.push(frame);
-    }
-    Ok(CacheSamples {
-        times: (0..frames)
-            .map(|index| start + f64::from(u32::try_from(index).unwrap_or(u32::MAX)) * rate)
-            .collect(),
-        points,
-        pc2_time_start: Some(start),
-        pc2_sampling: Some(rate),
+    Ok(CacheMetadata {
+        format: CacheFormat::Pc2 {
+            time_start,
+            sampling,
+        },
+        vertex_count,
+        frame_count,
+        data_offset: 32,
     })
 }
 
-fn read_mdd(bytes: &[u8], modifier: &Modifier) -> Result<CacheSamples> {
+fn read_mdd_metadata(bytes: &[u8], modifier: &Modifier) -> Result<CacheMetadata> {
     if bytes.len() < 8 {
         return Err(invalid(modifier, "resource", "a valid MDD file"));
     }
     let frames = be_i32(bytes, 0).and_then(|value| usize::try_from(value).ok());
     let count = be_i32(bytes, 4).and_then(|value| usize::try_from(value).ok());
-    let (Some(frames), Some(count)) = (frames, count) else {
+    let (Some(frame_count), Some(vertex_count)) = (frames, count) else {
         return Err(invalid(modifier, "resource", "a valid MDD header"));
     };
-    let sample_bytes = frames
-        .checked_mul(count)
+    let time_bytes = frame_count.checked_mul(4);
+    let sample_bytes = frame_count
+        .checked_mul(vertex_count)
         .and_then(|value| value.checked_mul(12));
-    let time_bytes = frames.checked_mul(4);
-    if frames == 0
-        || count == 0
-        || time_bytes.and_then(|time| time.checked_add(sample_bytes?)) != Some(bytes.len() - 8)
-    {
+    let data_offset = time_bytes.and_then(|time| 8_usize.checked_add(time));
+    let size =
+        data_offset.and_then(|offset| sample_bytes.and_then(|samples| offset.checked_add(samples)));
+    if frame_count == 0 || size != Some(bytes.len()) {
         return Err(invalid(
             modifier,
             "resource",
             "a valid MDD frame and point table",
         ));
     }
-    let mut times = Vec::with_capacity(frames);
-    for index in 0..frames {
-        let time = be_f32(bytes, 8 + index * 4).map(f64::from);
-        let Some(time) = time.filter(|time| time.is_finite()) else {
-            return Err(invalid(modifier, "resource", "finite MDD frame times"));
-        };
-        times.push(time);
-    }
-    if times.windows(2).any(|pair| pair[1] < pair[0]) {
-        return Err(invalid(modifier, "resource", "ordered MDD frame times"));
-    }
-    let data_start = 8 + frames * 4;
-    let mut points = Vec::with_capacity(frames);
-    for frame_index in 0..frames {
-        let mut frame = Vec::with_capacity(count);
-        for point_index in 0..count {
-            let offset = data_start + (frame_index * count + point_index) * 12;
-            let x = be_f32(bytes, offset).map(f64::from);
-            let y = be_f32(bytes, offset + 4).map(f64::from);
-            let z = be_f32(bytes, offset + 8).map(f64::from);
-            let (Some(x), Some(y), Some(z)) = (x, y, z) else {
-                return Err(invalid(modifier, "resource", "valid MDD point samples"));
-            };
-            let point = DVec3::new(x, y, z);
-            if !point.is_finite() {
-                return Err(invalid(modifier, "resource", "finite MDD point samples"));
-            }
-            frame.push(point);
-        }
-        points.push(frame);
-    }
-    Ok(CacheSamples {
-        times,
-        points,
-        pc2_time_start: None,
-        pc2_sampling: None,
+    let Some(data_offset) = data_offset else {
+        return Err(invalid(
+            modifier,
+            "resource",
+            "a valid MDD frame and point table",
+        ));
+    };
+    Ok(CacheMetadata {
+        format: CacheFormat::Mdd { times_offset: 8 },
+        vertex_count,
+        frame_count,
+        data_offset,
     })
 }
 
-fn select_cache_samples(times: &[f64], time: f64, interpolate: bool) -> (usize, usize, f64) {
-    if time <= times[0] {
-        return (0, 0, 0.0);
-    }
-    let last = times.len() - 1;
-    if time >= times[last] {
-        return (last, last, 0.0);
-    }
-    let upper = times.partition_point(|sample| *sample < time);
-    let lower = upper - 1;
-    if !interpolate {
-        return (lower, lower, 0.0);
-    }
-    let width = times[upper] - times[lower];
-    let factor = if width > 0.0 {
-        (time - times[lower]) / width
-    } else {
-        0.0
+fn cache_frame_at_time(
+    bytes: &[u8],
+    times_offset: usize,
+    count: usize,
+    time: f32,
+    modifier: &Modifier,
+) -> Result<f32> {
+    let Some(last) = count.checked_sub(1) else {
+        return Err(invalid(modifier, "resource", "valid MDD frame times"));
     };
-    (lower, upper, factor)
+    let mut first_time = None;
+    let mut last_time = 0.0_f32;
+    let mut previous_time = None;
+    let mut upper = None;
+    for index in 0..count {
+        let offset = index
+            .checked_mul(4)
+            .and_then(|offset| times_offset.checked_add(offset));
+        let time_sample = offset
+            .and_then(|offset| be_f32(bytes, offset))
+            .filter(|time| time.is_finite())
+            .ok_or_else(|| invalid(modifier, "resource", "finite MDD frame times"))?;
+        if previous_time.is_some_and(|previous| time_sample < previous) {
+            return Err(invalid(modifier, "resource", "ordered MDD frame times"));
+        }
+        first_time.get_or_insert(time_sample);
+        if upper.is_none() && !(time_sample < time) {
+            upper = Some((index, time_sample, previous_time.unwrap_or(time_sample)));
+        }
+        previous_time = Some(time_sample);
+        last_time = time_sample;
+    }
+    let first_time = first_time.unwrap_or(last_time);
+    if time <= first_time {
+        return Ok(0.0);
+    }
+    let last_frame = cache_float(f64::from(u32::try_from(last).unwrap_or(u32::MAX)));
+    let Some((upper_index, upper_time, lower_time)) = upper else {
+        return Ok(last_frame);
+    };
+    if upper_index == 0 {
+        return Ok(0.0);
+    }
+    let lower = upper_index - 1;
+    let width = upper_time - lower_time;
+    if width <= 0.0001_f32 {
+        return Ok(cache_float(f64::from(
+            u32::try_from(upper_index).unwrap_or(u32::MAX),
+        )));
+    }
+    let fraction = (time - lower_time) / width;
+    Ok(cache_float(f64::from(u32::try_from(lower).unwrap_or(u32::MAX))) + fraction)
 }
 
-fn select_cache_frame(frame: f64, count: usize, interpolate: bool) -> (usize, usize, f64) {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender stores Mesh Cache times and selection factors as f32"
+)]
+fn cache_float(value: f64) -> f32 {
+    value as f32
+}
+
+fn select_cache_frame(frame: f32, count: usize, interpolate: bool) -> (usize, usize, f32) {
     let last_index = count.saturating_sub(1);
-    let last_frame = f64::from(u32::try_from(last_index).unwrap_or(u32::MAX));
+    let last_frame = cache_float(f64::from(u32::try_from(last_index).unwrap_or(u32::MAX)));
     let frame = frame.clamp(0.0, last_frame);
-    let index_frame = if interpolate {
-        frame.floor()
-    } else {
-        frame.round()
-    };
+    let floor = frame.floor();
+    let index_frame = if interpolate { floor } else { frame.round() };
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -563,13 +716,26 @@ fn select_cache_frame(frame: f64, count: usize, interpolate: bool) -> (usize, us
     if !interpolate || first == last_index {
         return (first, first, 0.0);
     }
-    (first, first + 1, frame.fract())
+    let fraction = frame - floor;
+    if fraction <= 0.0001_f32 {
+        return (first, first, 0.0);
+    }
+    (first, first + 1, fraction)
 }
 
-fn cache_frame_count(count: usize, modifier: &Modifier) -> Result<f64> {
+fn cache_lerp(from: DVec3, to: DVec3, factor: f32) -> DVec3 {
+    let inverse_factor = 1.0_f32 - factor;
+    DVec3::new(
+        f64::from(cache_float(from.x) * inverse_factor + cache_float(to.x) * factor),
+        f64::from(cache_float(from.y) * inverse_factor + cache_float(to.y) * factor),
+        f64::from(cache_float(from.z) * inverse_factor + cache_float(to.z) * factor),
+    )
+}
+
+fn cache_frame_count(count: usize, modifier: &Modifier) -> Result<f32> {
     let count = u32::try_from(count)
         .map_err(|_| invalid(modifier, "resource", "a bounded cache frame count"))?;
-    Ok(f64::from(count))
+    Ok(cache_float(f64::from(count)))
 }
 
 fn apply_cache_axes(
@@ -583,23 +749,21 @@ fn apply_cache_axes(
         .ok_or_else(|| invalid(modifier, "forward_axis", "a signed Blender axis identifier"))?;
     let up_axis = axis_vector(up)
         .ok_or_else(|| invalid(modifier, "up_axis", "a signed Blender axis identifier"))?;
-    if forward_axis.dot(up_axis).abs() > f64::EPSILON {
-        return Err(invalid(
-            modifier,
-            "up_axis",
-            "an axis perpendicular to forward_axis",
-        ));
-    }
-    let source_right = forward_axis.cross(up_axis).normalize();
-    let source_point = source_right * point.x + forward_axis * point.y + up_axis * point.z;
-    let target_forward = DVec3::Y;
-    let target_up = DVec3::Z;
-    let target_right = target_forward.cross(target_up);
-    let mut mapped = DVec3::new(
-        source_point.dot(target_right),
-        source_point.dot(target_forward),
-        source_point.dot(target_up),
-    );
+    let axis_dot = forward_axis.dot(up_axis);
+    let mut mapped = if axis_dot.abs() > f64::EPSILON {
+        point
+    } else {
+        let source_right = forward_axis.cross(up_axis).normalize();
+        let source_point = source_right * point.x + forward_axis * point.y + up_axis * point.z;
+        let target_forward = DVec3::Y;
+        let target_up = DVec3::Z;
+        let target_right = target_forward.cross(target_up);
+        DVec3::new(
+            source_point.dot(target_right),
+            source_point.dot(target_forward),
+            source_point.dot(target_up),
+        )
+    };
     if flip[0] {
         mapped.x = -mapped.x;
     }
@@ -611,7 +775,6 @@ fn apply_cache_axes(
     }
     Ok(mapped)
 }
-
 
 fn face_points(mesh: &Mesh, ids: &[u32]) -> Result<Vec<DVec3>> {
     ids.iter()
@@ -672,29 +835,31 @@ fn corner_angle(mesh: &Mesh, face: &Face, vertex_id: u32) -> Result<f64> {
     Ok(previous.angle_between(next))
 }
 
-
-fn get_group_weights(mesh: &Mesh, group: &str) -> Result<BTreeMap<u32, f64>> {
-    let groups = mesh
-        .attributes
-        .get("vertex_groups")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::InvalidArgument,
-                format!("vertex group `{group}` is missing"),
-                json!({"vertex_group":group}),
-            )
-        })?;
-    let values = groups
-        .get(group)
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::InvalidArgument,
-                format!("vertex group `{group}` is missing"),
-                json!({"vertex_group":group}),
-            )
-        })?;
+fn get_group_weights(mesh: &Mesh, group: &str) -> Result<Option<CacheVertexGroupWeights>> {
+    let Some(group_values) = mesh.attributes.get("vertex_groups") else {
+        return Ok(None);
+    };
+    let groups = group_values.as_object().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "vertex group weights are malformed",
+            json!({"vertex_group":group}),
+        )
+    })?;
+    let Some(group_values) = groups.get(group) else {
+        return Ok(None);
+    };
+    let values = group_values.as_object().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            format!("vertex group `{group}` has invalid weights"),
+            json!({"vertex_group":group}),
+        )
+    })?;
+    let has_deform_weights = groups
+        .values()
+        .filter_map(Value::as_object)
+        .any(|weights| !weights.is_empty());
     let mut result = BTreeMap::new();
     for (key, value) in values {
         let Some(id) = key
@@ -713,11 +878,13 @@ fn get_group_weights(mesh: &Mesh, group: &str) -> Result<BTreeMap<u32, f64>> {
                 json!({"vertex_group":group,"vertex":key}),
             ));
         };
-        result.insert(id, weight);
+        result.insert(id, cache_float(weight));
     }
-    Ok(result)
+    Ok(Some(CacheVertexGroupWeights {
+        values: result,
+        has_deform_weights,
+    }))
 }
-
 
 fn falloff_type(modifier: &Modifier) -> Result<&str> {
     let falloff = string(modifier, "falloff_type")?;
@@ -735,67 +902,32 @@ fn falloff_type(modifier: &Modifier) -> Result<&str> {
     }
 }
 
-fn curve_points(modifier: &Modifier) -> Result<Option<Vec<DVec2>>> {
+fn curve_points(modifier: &Modifier) -> Result<Option<CurveMappingTable>> {
     let Some(value) = modifier.params.get("map_curve") else {
         return Ok(None);
     };
-    let points = value.as_array().ok_or_else(|| {
+    let points = curve_mapping_points(value).ok_or_else(|| {
         invalid(
             modifier,
             "map_curve",
-            "an array of [x,y] curve mapping points",
+            "at least two finite float32 [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
         )
     })?;
-    let mut result = Vec::with_capacity(points.len());
-    for point in points {
-        let point = value2(point)
-            .ok_or_else(|| invalid(modifier, "map_curve", "finite [x,y] curve mapping points"))?;
-        if !(0.0..=1.0).contains(&point.x) || !(0.0..=1.0).contains(&point.y) {
-            return Err(invalid(
+    let settings =
+        curve_mapping_settings(modifier.params.get("map_curve_settings")).ok_or_else(|| {
+            invalid(
                 modifier,
-                "map_curve",
-                "curve points in the unit square",
-            ));
-        }
-        result.push(point);
-    }
-    result.sort_by(|first, second| first.x.total_cmp(&second.x));
-    if result.len() < 2 || result.windows(2).any(|pair| pair[1].x <= pair[0].x) {
-        return Err(invalid(
+                "map_curve_settings",
+                "use_clip, finite ordered clip_bounds, and HORIZONTAL or EXTRAPOLATED extend",
+            )
+        })?;
+    curve_map_table(&points, settings).map(Some).ok_or_else(|| {
+        invalid(
             modifier,
             "map_curve",
-            "at least two points with strictly increasing x",
-        ));
-    }
-    Ok(Some(result))
-}
-
-fn apply_falloff(value: f64, falloff: &str, curve: Option<&[DVec2]>, seed: u64) -> f64 {
-    let value = value.clamp(0.0, 1.0);
-    match falloff {
-        "CURVE" => curve.map_or(value, |points| {
-            let upper = points
-                .partition_point(|point| point.x < value)
-                .clamp(1, points.len() - 1);
-            let first = points[upper - 1];
-            let second = points[upper];
-            first.y + (second.y - first.y) * ((value - first.x) / (second.x - first.x))
-        }),
-        "SHARP" => value * value,
-        "SMOOTH" => value * value * (3.0 - 2.0 * value),
-        "ROOT" => value.sqrt(),
-        "ICON_SPHERECURVE" => (1.0 - (1.0 - value).powi(2)).sqrt(),
-        "RANDOM" => stable_random(seed),
-        "STEP" => f64::from(value >= 0.5),
-        _ => value,
-    }
-}
-
-fn stable_random(seed: u64) -> f64 {
-    let mut value = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    ((value ^ (value >> 31)) >> 11) as f64 / ((1_u64 << 53) as f64)
+            "curve controls with evaluable endpoint handles",
+        )
+    })
 }
 
 fn one_operand<'a>(
@@ -905,21 +1037,21 @@ fn selected_axis(axis: &str, modifier: &Modifier, parameter: &str) -> Result<DVe
 
 fn le_i32(bytes: &[u8], offset: usize) -> Option<i32> {
     Some(i32::from_le_bytes(
-        bytes.get(offset..offset + 4)?.try_into().ok()?,
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
     ))
 }
 fn le_f32(bytes: &[u8], offset: usize) -> Option<f32> {
     Some(f32::from_le_bytes(
-        bytes.get(offset..offset + 4)?.try_into().ok()?,
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
     ))
 }
 fn be_i32(bytes: &[u8], offset: usize) -> Option<i32> {
     Some(i32::from_be_bytes(
-        bytes.get(offset..offset + 4)?.try_into().ok()?,
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
     ))
 }
 fn be_f32(bytes: &[u8], offset: usize) -> Option<f32> {
     Some(f32::from_be_bytes(
-        bytes.get(offset..offset + 4)?.try_into().ok()?,
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
     ))
 }

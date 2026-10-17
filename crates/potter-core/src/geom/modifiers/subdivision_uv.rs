@@ -1510,6 +1510,11 @@ pub(super) fn subdivided_mesh(
     }));
     let origin = Origin {
         vertices: vertex_origins,
+        source_vertices: mesh.original_indices.as_ref().map(|_| {
+            (0..points.len())
+                .map(|index| (index < mesh.vertices.len()).then_some(index))
+                .collect()
+        }),
         faces: source_polygons
             .iter()
             .enumerate()

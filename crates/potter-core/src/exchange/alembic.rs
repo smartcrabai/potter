@@ -2356,11 +2356,18 @@ fn import_polymesh(
         let positions = decode_vec3_sample(
             bytes,
             positions_prop,
-            sample_slot(positions_prop, sample_index),
+            value_sample_index(positions_prop, sample_index),
         )?;
-        let counts = decode_i32_sample(bytes, counts_prop, sample_slot(counts_prop, sample_index))?;
-        let indices =
-            decode_i32_sample(bytes, indices_prop, sample_slot(indices_prop, sample_index))?;
+        let counts = decode_i32_sample(
+            bytes,
+            counts_prop,
+            value_sample_index(counts_prop, sample_index),
+        )?;
+        let indices = decode_i32_sample(
+            bytes,
+            indices_prop,
+            value_sample_index(indices_prop, sample_index),
+        )?;
         let faces = decode_faces(&positions, &counts, &indices)?;
         mesh_samples.push(MeshSample {
             positions,
@@ -2417,7 +2424,7 @@ fn import_polymesh(
         .map(|index| {
             sample_frame(
                 time_property,
-                sample_slot(time_property, index),
+                value_sample_index(time_property, index),
                 time_samplings,
                 fps,
                 fps_base,
@@ -2437,7 +2444,7 @@ fn import_polymesh(
                         parameter,
                         sample,
                         3,
-                        sample_slot(values, sample_index),
+                        value_sample_index(values, sample_index),
                     )?;
                     let corners = normal_corners(&sample.faces, &scope, &values)?;
                     Ok(reverse_corner_runs(&sample.faces, corners)?
@@ -2474,7 +2481,7 @@ fn import_polymesh(
                         parameter,
                         sample,
                         2,
-                        sample_slot(values, sample_index),
+                        value_sample_index(values, sample_index),
                     )?;
                     Ok(cache_uv_faces(&sample.faces, &scope, &tuples)?
                         .into_iter()
@@ -2543,12 +2550,21 @@ fn import_polymesh(
     Ok(mesh)
 }
 
-/// One decoded named color parameter in a Blender Alembic mesh sample.
+/// One named color GeomParam of a Blender Alembic mesh sample, as Blender's reader sees it: raw
+/// float samples in file order and raw `.indices`, before any scope expansion.
 #[derive(Clone, Debug)]
 pub(crate) struct MeshCacheColor {
     pub name: String,
+    /// Normalized scope: `vertex`, `varying`, `facevarying`, `uniform`, or `constant`.
     pub scope: String,
-    pub values: Vec<Vec<f64>>,
+    /// Components per sample: 3 for `rgb`, 4 for `rgba`.
+    pub extent: usize,
+    /// Flat raw samples in file order, `extent` components each.
+    pub values: Vec<f64>,
+    /// Raw `.indices` in file order. `None` for an unindexed parameter, whose indices Alembic
+    /// synthesizes as the identity over its values; `Some` for an explicit `.indices` property,
+    /// which may be empty.
+    pub indices: Option<Vec<usize>>,
 }
 
 /// Decoded time sample used by Blender's Alembic mesh cache modifier.
@@ -2557,8 +2573,8 @@ pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
-    /// Whether face counts or indices have multiple nonconstant Alembic samples.
-    pub connectivity_is_animated: bool,
+    /// Whether face counts or indices have multiple logical Alembic samples.
+    pub has_multiple_topology_samples: bool,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
     /// Canonical `.geom/uv` layer; Blender leaves it unchanged for UV-only reads without POLY.
@@ -2577,10 +2593,8 @@ pub(crate) struct MeshCacheSample {
 /// # Errors
 ///
 /// Returns import errors for malformed archives or paths without a `PolyMesh`.
-fn cache_connectivity_is_animated(counts: &ParsedProperty, indices: &ParsedProperty) -> bool {
-    [counts, indices]
-        .into_iter()
-        .any(|property| property.sample_count > 1 && !property.constant)
+fn cache_has_multiple_topology_samples(counts: &ParsedProperty, indices: &ParsedProperty) -> bool {
+    counts.sample_count > 1 || indices.sample_count > 1
 }
 
 #[expect(
@@ -2631,7 +2645,7 @@ pub(crate) fn read_mesh_cache(
         .ok_or_else(|| import_error("Alembic PolyMesh .faceCounts array is missing"))?;
     let indices = property(&geom.children, ".faceIndices")
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
-    let connectivity_is_animated = cache_connectivity_is_animated(counts, indices);
+    let has_multiple_topology_samples = cache_has_multiple_topology_samples(counts, indices);
     let uv = if read_uv {
         uv_geom_parameters(geom)
     } else {
@@ -2659,16 +2673,7 @@ pub(crate) fn read_mesh_cache(
                 properties
                     .children
                     .iter()
-                    .filter(|property| {
-                        property
-                            .metadata
-                            .get("isGeomParam")
-                            .is_some_and(|value| value == "true")
-                            && matches!(
-                                property.metadata.get("interpretation").map(String::as_str),
-                                Some("rgb" | "rgba")
-                            )
-                    })
+                    .filter(|property| is_blender_color_geomparam(property))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
@@ -2731,9 +2736,9 @@ pub(crate) fn read_mesh_cache(
     }
     let mut result = Vec::with_capacity(sample_count);
     for sample_index in 0..sample_count {
-        let point_sample = sample_slot(positions, sample_index);
-        let face_sample = sample_slot(counts, sample_index);
-        let index_sample = sample_slot(indices, sample_index);
+        let point_sample = value_sample_index(positions, sample_index);
+        let face_sample = value_sample_index(counts, sample_index);
+        let index_sample = value_sample_index(indices, sample_index);
         let points = decode_vec3_sample(bytes, positions, point_sample)?
             .into_iter()
             .map(potter_vector)
@@ -2769,7 +2774,7 @@ pub(crate) fn read_mesh_cache(
                                     parameter,
                                     &geometry_sample,
                                     2,
-                                    sample_slot(values, sample_index),
+                                    value_sample_index(values, sample_index),
                                 )?;
                                 cache_uv_faces(&file_faces, &scope, &tuples)?
                                     .into_iter()
@@ -2800,7 +2805,7 @@ pub(crate) fn read_mesh_cache(
                     parameter,
                     &geometry_sample,
                     extent,
-                    sample_slot(values, sample_index),
+                    value_sample_index(values, sample_index),
                 )?;
                 let corners = normal_corners(&file_faces, &scope, &tuples)?;
                 reverse_corner_runs(&file_faces, corners).map(|corners| {
@@ -2813,30 +2818,7 @@ pub(crate) fn read_mesh_cache(
             .transpose()?;
         let colors = color_params
             .iter()
-            .map(|parameter| {
-                let values = geomparam_values_property(parameter)?;
-                validate_cache_parameter_samples(values, sample_count)?;
-                let extent = usize::from(values.extent);
-                if !matches!(extent, 3 | 4) {
-                    return Err(unsupported(
-                        "alembic.color_extent",
-                        format!("Alembic color extent {extent} is unsupported"),
-                    ));
-                }
-                let (scope, tuples) = geomparam_values(
-                    bytes,
-                    parameter,
-                    &geometry_sample,
-                    extent,
-                    sample_slot(values, sample_index),
-                )?;
-                let values = potter_scoped_values(&file_faces, &scope, tuples)?;
-                Ok(MeshCacheColor {
-                    name: parameter.name.clone(),
-                    scope,
-                    values,
-                })
-            })
+            .map(|parameter| color_cache_color(bytes, parameter, sample_count, sample_index))
             .collect::<Result<Vec<_>>>()?;
         let velocities = velocity
             .map(|parameter| {
@@ -2853,7 +2835,7 @@ pub(crate) fn read_mesh_cache(
                     parameter,
                     &geometry_sample,
                     3,
-                    sample_slot(values, sample_index),
+                    value_sample_index(values, sample_index),
                 )?;
                 let tuples = tuples
                     .into_iter()
@@ -2865,11 +2847,11 @@ pub(crate) fn read_mesh_cache(
             .transpose()?;
         let sample_time = sample_seconds(
             time_property,
-            sample_slot(time_property, sample_index),
+            value_sample_index(time_property, sample_index),
             &archive.time_samplings,
         )?;
         result.push(MeshCacheSample {
-            connectivity_is_animated,
+            has_multiple_topology_samples,
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,
@@ -3007,9 +2989,9 @@ fn sample_xform_object(
     }
     let mut samples = Vec::with_capacity(values.sample_count);
     for index in 0..values.sample_count {
-        let channels = decode_numeric_sample(bytes, values, sample_slot(values, index))?;
+        let channels = decode_numeric_sample(bytes, values, value_sample_index(values, index))?;
         let matrix = xform_matrix(&ops, &channels)?;
-        let time = sample_seconds(values, sample_slot(values, index), samplings)?;
+        let time = sample_seconds(values, value_sample_index(values, index), samplings)?;
         if samples
             .last()
             .is_some_and(|(previous, _): &(f64, [f64; 16])| *previous > time)
@@ -3318,24 +3300,7 @@ fn geomparam_values(
         .map(<[f64]>::to_vec)
         .collect::<Vec<_>>();
     let corner_count = sample.faces.iter().map(Vec::len).sum::<usize>();
-    let stored_scope = geomparam
-        .metadata
-        .get("geoScope")
-        .map_or("vertex", String::as_str);
-    let scope = match stored_scope {
-        "vertex" | "vtx" => "vertex",
-        "varying" | "vry" => "varying",
-        "facevarying" | "fvr" => "facevarying",
-        "uniform" | "uni" => "uniform",
-        "constant" | "con" => "constant",
-        scope => {
-            return Err(unsupported(
-                "alembic.geom_scope",
-                format!("Alembic geometry scope `{scope}` is unsupported"),
-            ));
-        }
-    }
-    .to_owned();
+    let scope = geomparam_scope(geomparam)?.to_owned();
     let output_count = match scope.as_str() {
         "vertex" | "varying" => sample.positions.len(),
         "facevarying" => corner_count,
@@ -3347,7 +3312,11 @@ fn geomparam_values(
         .then(|| property(&geomparam.children, ".indices"))
         .flatten()
     {
-        let indices = decode_indices(bytes, indices_prop, sample_slot(indices_prop, sample_index))?;
+        let indices = decode_indices(
+            bytes,
+            indices_prop,
+            value_sample_index(indices_prop, sample_index),
+        )?;
         if indices.len() != output_count {
             return Err(import_error(
                 "Alembic geom parameter index count is invalid",
@@ -3373,11 +3342,109 @@ fn geomparam_values(
     }
 }
 
-fn sample_slot(property: &ParsedProperty, sample_index: usize) -> usize {
+/// Scope of a GeomParam from its `geoScope` metadata, which Alembic stores on the parameter and
+/// which Blender reads as the sample scope.
+fn geomparam_scope(geomparam: &ParsedProperty) -> Result<&'static str> {
+    match geomparam
+        .metadata
+        .get("geoScope")
+        .map_or("vertex", String::as_str)
+    {
+        "vertex" | "vtx" => Ok("vertex"),
+        "varying" | "vry" => Ok("varying"),
+        "facevarying" | "fvr" => Ok("facevarying"),
+        "uniform" | "uni" => Ok("uniform"),
+        "constant" | "con" => Ok("constant"),
+        scope => Err(unsupported(
+            "alembic.geom_scope",
+            format!("Alembic geometry scope `{scope}` is unsupported"),
+        )),
+    }
+}
+
+/// Whether `property` is a color GeomParam that Blender's reader matches: float32 `rgb` with three
+/// components or `rgba` with four, as `IC3fGeomParam` and `IC4fGeomParam` match. Any other GeomParam
+/// is not read as a color.
+fn is_blender_color_geomparam(property: &ParsedProperty) -> bool {
+    if property.metadata.get("isGeomParam").map(String::as_str) != Some("true") {
+        return false;
+    }
+    let Ok(values) = geomparam_values_property(property) else {
+        return false;
+    };
+    values.pod == 10
+        && match property.metadata.get("interpretation").map(String::as_str) {
+            Some("rgb") => values.extent == 3,
+            Some("rgba") => values.extent == 4,
+            _ => false,
+        }
+}
+
+/// Reads one color GeomParam sample as Blender's reader does: raw float tuples in file order and
+/// the raw `.indices`, unexpanded. The mesh cache applies the scope and index rules, since it owns
+/// the corner order.
+fn color_cache_color(
+    bytes: &[u8],
+    parameter: &ParsedProperty,
+    sample_count: usize,
+    sample_index: usize,
+) -> Result<MeshCacheColor> {
+    let values_property = geomparam_values_property(parameter)?;
+    validate_cache_parameter_samples(values_property, sample_count)?;
+    let scope = geomparam_scope(parameter)?;
+    // One flat buffer: `decode_float_sample` already checks it holds whole `extent`-wide samples.
+    let values = decode_float_sample(
+        bytes,
+        values_property,
+        value_sample_index(values_property, sample_index),
+    )?;
+    let indices = match (parameter.property_type == 0)
+        .then(|| property(&parameter.children, ".indices"))
+        .flatten()
+    {
+        Some(indices_property) => {
+            validate_cache_parameter_samples(indices_property, sample_count)?;
+            Some(decode_indices(
+                bytes,
+                indices_property,
+                value_sample_index(indices_property, sample_index),
+            )?)
+        }
+        None => None,
+    };
+    Ok(MeshCacheColor {
+        name: parameter.name.clone(),
+        scope: scope.to_owned(),
+        extent: usize::from(values_property.extent),
+        values,
+        indices,
+    })
+}
+
+/// The logical sample a raw read uses for mesh sample `sample_index`. A single-sample property is
+/// held for every mesh sample. Callers pass logical indices: `raw_sample` maps them to stored slots,
+/// so a stored slot would map twice.
+fn value_sample_index(property: &ParsedProperty, sample_index: usize) -> usize {
     if property.sample_count == 1 {
         0
     } else {
         sample_index
+    }
+}
+
+fn stored_sample_index(property: &ParsedProperty, logical_index: usize) -> usize {
+    // A property with one physical sample has only slot 0, whatever its changed range says.
+    if property.constant || property.samples.len() == 1 || logical_index < property.first_changed {
+        0
+    } else if logical_index >= property.last_changed {
+        property
+            .last_changed
+            .saturating_sub(property.first_changed)
+            .saturating_add(1)
+    } else {
+        logical_index
+            .saturating_sub(property.first_changed)
+            .saturating_add(1)
     }
 }
 
@@ -3581,18 +3648,7 @@ fn raw_sample<'a>(
     if logical_index >= property.sample_count {
         return Err(import_error("Alembic sample index is out of range"));
     }
-    let stored_index = if property.constant || logical_index < property.first_changed {
-        0
-    } else if logical_index >= property.last_changed {
-        property
-            .last_changed
-            .saturating_sub(property.first_changed)
-            .saturating_add(1)
-    } else {
-        logical_index
-            .saturating_sub(property.first_changed)
-            .saturating_add(1)
-    };
+    let stored_index = stored_sample_index(property, logical_index);
     let reference = property
         .samples
         .get(stored_index)
@@ -4518,7 +4574,7 @@ mod tests {
     }
 
     #[test]
-    fn constant_topology_properties_keep_the_static_reader_shortcut() {
+    fn logical_topology_sample_counts_control_connectivity_checks() {
         let property = |name: &str, sample_count, constant| ParsedProperty {
             name: name.to_owned(),
             property_type: 2,
@@ -4526,35 +4582,154 @@ mod tests {
             extent: 1,
             sample_count,
             first_changed: if constant { 0 } else { 1 },
-            last_changed: if constant { 0 } else { sample_count.saturating_sub(1) },
+            last_changed: if constant {
+                0
+            } else {
+                sample_count.saturating_sub(1)
+            },
             constant,
             time_sampling_index: 0,
             metadata: BTreeMap::new(),
             children: Vec::new(),
             samples: Vec::new(),
         };
-        let constant_counts = property(".faceCounts", 4, true);
-        let constant_indices = property(".faceIndices", 4, true);
-        assert!(!cache_connectivity_is_animated(
-            &constant_counts,
-            &constant_indices
-        ));
-
-        let changing_indices = property(".faceIndices", 4, false);
-        assert!(cache_connectivity_is_animated(
-            &constant_counts,
-            &changing_indices
-        ));
-        let changing_counts = property(".faceCounts", 4, false);
-        assert!(cache_connectivity_is_animated(
-            &changing_counts,
-            &constant_indices
-        ));
-
+        let multiple_sample_counts = property(".faceCounts", 4, true);
+        let multiple_sample_indices = property(".faceIndices", 4, true);
+        let single_sample_counts = property(".faceCounts", 1, true);
         let single_sample_indices = property(".faceIndices", 1, true);
-        assert!(!cache_connectivity_is_animated(
-            &constant_counts,
+
+        assert!(cache_has_multiple_topology_samples(
+            &multiple_sample_counts,
             &single_sample_indices
         ));
+        assert!(cache_has_multiple_topology_samples(
+            &single_sample_counts,
+            &multiple_sample_indices
+        ));
+        assert!(!cache_has_multiple_topology_samples(
+            &single_sample_counts,
+            &single_sample_indices
+        ));
+    }
+
+    #[test]
+    fn stored_sample_index_maps_each_logical_sample_once() {
+        let property = |sample_count, first_changed, last_changed, constant| ParsedProperty {
+            name: "samples".to_owned(),
+            property_type: 2,
+            pod: 6,
+            extent: 1,
+            sample_count,
+            first_changed,
+            last_changed,
+            constant,
+            time_sampling_index: 0,
+            metadata: BTreeMap::new(),
+            children: Vec::new(),
+            samples: Vec::new(),
+        };
+        let constant = property(4, 0, 0, true);
+        assert_eq!(stored_sample_index(&constant, 0), 0);
+        assert_eq!(stored_sample_index(&constant, 3), 0);
+
+        let changed_range = property(6, 2, 4, false);
+        let slots = (0..6)
+            .map(|index| stored_sample_index(&changed_range, index))
+            .collect::<Vec<_>>();
+        assert_eq!(slots, [0, 0, 1, 2, 3, 3]);
+
+        // Decoders take logical indices and map them once in `raw_sample`.
+        let single = property(1, 0, 0, true);
+        assert_eq!(value_sample_index(&single, 5), 0);
+        assert_eq!(value_sample_index(&changed_range, 4), 4);
+
+        // Standard changed range: stored sample 0 is logical 0, then logical 1..n-1 map to themselves.
+        let standard = property(5, 1, 4, false);
+        let standard_slots = (0..5)
+            .map(|index| stored_sample_index(&standard, index))
+            .collect::<Vec<_>>();
+        assert_eq!(standard_slots, [0, 1, 2, 3, 4]);
+
+        // A constant property with several logical samples reads its one stored sample at every
+        // logical index, and each logical index is passed to `raw_sample` exactly once.
+        let constant_many = property(4, 0, 0, true);
+        for index in 0..4 {
+            assert_eq!(value_sample_index(&constant_many, index), index);
+            assert_eq!(stored_sample_index(&constant_many, index), 0);
+        }
+    }
+
+    #[test]
+    fn single_physical_sample_maps_to_slot_zero() {
+        let mut single = ParsedProperty {
+            name: "samples".to_owned(),
+            property_type: 2,
+            pod: 6,
+            extent: 1,
+            sample_count: 1,
+            first_changed: 0,
+            last_changed: 0,
+            constant: false,
+            time_sampling_index: 0,
+            metadata: BTreeMap::new(),
+            children: Vec::new(),
+            samples: vec![OgawaRef {
+                offset: 0,
+                is_data: true,
+            }],
+        };
+        // One physical sample is slot 0 even though the changed range says last = 0.
+        assert_eq!(value_sample_index(&single, 0), 0);
+        assert_eq!(stored_sample_index(&single, 0), 0);
+
+        // Two physical samples for the same header keep logical 0 at slot 1, as `sample_storage_count`
+        // allocates them: slot 0 is the leading sample and slot 1 the changed range.
+        single.samples.push(OgawaRef {
+            offset: 8,
+            is_data: true,
+        });
+        assert_eq!(stored_sample_index(&single, 0), 1);
+        assert!(stored_sample_index(&single, 0) < single.samples.len());
+    }
+
+    #[test]
+    fn color_geomparams_match_only_float32_rgb_and_rgba() {
+        let array = |pod: u8, extent: u8| ParsedProperty {
+            name: ".vals".to_owned(),
+            property_type: 2,
+            pod,
+            extent,
+            sample_count: 1,
+            first_changed: 0,
+            last_changed: 0,
+            constant: true,
+            time_sampling_index: 0,
+            metadata: BTreeMap::new(),
+            children: Vec::new(),
+            samples: Vec::new(),
+        };
+        let geomparam = |interpretation: &str, pod: u8, extent: u8| ParsedProperty {
+            name: "Cd".to_owned(),
+            property_type: 0,
+            pod: 0,
+            extent: 1,
+            sample_count: 1,
+            first_changed: 0,
+            last_changed: 0,
+            constant: true,
+            time_sampling_index: 0,
+            metadata: metadata_map(&[("isGeomParam", "true"), ("interpretation", interpretation)]),
+            children: vec![array(pod, extent)],
+            samples: Vec::new(),
+        };
+        assert!(is_blender_color_geomparam(&geomparam("rgb", 10, 3)));
+        assert!(is_blender_color_geomparam(&geomparam("rgba", 10, 4)));
+        assert!(!is_blender_color_geomparam(&geomparam("rgb", 11, 3)));
+        assert!(!is_blender_color_geomparam(&geomparam("rgb", 10, 4)));
+        assert!(!is_blender_color_geomparam(&geomparam("rgba", 10, 3)));
+        assert!(!is_blender_color_geomparam(&geomparam("vector", 10, 3)));
+        let mut plain = geomparam("rgb", 10, 3);
+        plain.metadata.remove("isGeomParam");
+        assert!(!is_blender_color_geomparam(&plain));
     }
 }

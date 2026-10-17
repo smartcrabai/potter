@@ -43,8 +43,8 @@ pub struct Project {
     doc: SceneDoc,
     /// Diagnostics from upgrading the loaded scene document.
     load_warnings: Vec<Value>,
-    /// Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
-    /// schema-3 write replaces them.
+    // Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
+    // schema-3 write replaces them.
     legacy_digest: Option<String>,
 }
 
@@ -497,7 +497,7 @@ impl Project {
     /// Reads every record from the head back to the first commit, with the diagnostics of their
     /// upgrades.
     pub fn history_records(&self) -> Result<HistoryRecordsAndWarnings> {
-        let mut records = Vec::new();
+        let mut records: Vec<(String, HistoryRecord)> = Vec::new();
         let mut warnings = Vec::new();
         let mut next: Option<String> = self.doc.history.head.clone();
         while let Some(record_hash) = next.take() {

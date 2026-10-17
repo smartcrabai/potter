@@ -37,13 +37,11 @@ pub use scene::{
     GreasePencilFrame, GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, HairCurve,
     HairCurvesData, HistoryState, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
     Interpolation, Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty,
-    LibraryStatus, LightData, LightType, MAX_REVISION, Material, Modifier, ModifierRuntime,
-    MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node,
     PlaneHomography, PlaneTrack, PrimitiveDescriptor, Profile, ReconstructedPoint, Reconstruction,
     RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc,
-    SolvedCamera, SurfaceData, SurfacePoint, TextObjectData, TextureRef, TimelineMarker,
-    TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack, UnitSettings, ViewLayer,
-    World,
+    SolvedCamera, SurfaceData, SurfacePoint, TextObjectData, TextureCoordinateMapping, TextureRef,
+    TimelineMarker, TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack,
+    UnitSettings, ViewLayer, World,
 };
 pub use transform::{Transform, canonicalize_quaternion, normalize_rotation};
 

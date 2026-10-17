@@ -3112,7 +3112,8 @@ mod tests {
     }
 
     #[test]
-    fn laplacian_concave_ngons_use_blender_polygon_fill() -> Result<(), Box<dyn std::error::Error>> {
+    fn laplacian_concave_ngons_use_blender_polygon_fill() -> Result<(), Box<dyn std::error::Error>>
+    {
         let points = vec![
             DVec3::new(0.0, 0.0, 0.0),
             DVec3::new(3.0, 0.0, 0.0),
@@ -3127,7 +3128,11 @@ mod tests {
             points.clone(),
             vec![(0..points.len()).collect::<Vec<_>>()],
         )?;
-        let coordinates = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+        let coordinates = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
         let actual = mesh_triangles(&mesh, &coordinates)?;
         let corners = points
             .iter()

@@ -384,7 +384,9 @@ fn voxel_remesh_without_a_surface_passes_the_input_through() -> Result<(), Box<d
             "mode":"VOXEL","voxel_size":entry["voxel_size"],"adaptivity":entry["adaptivity"],
             "use_smooth_shade":false,"use_remove_disconnected":false,"threshold":0.15
         });
-        let subject_name = entry["kind"].as_str().ok_or("passthrough case kind is missing")?;
+        let subject_name = entry["kind"]
+            .as_str()
+            .ok_or("passthrough case kind is missing")?;
         let native = evaluate_modifiers(&source, &[remesh_modifier(params)?], subject_name)?;
         assert!(
             native.faces.is_empty(),

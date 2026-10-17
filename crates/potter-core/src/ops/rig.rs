@@ -1989,9 +1989,10 @@ fn vertex_group_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) 
     let data_id = mesh_data_id(engine, &node_id)?;
     let id = read_id(engine, operation, "id")?;
     let name = read_string(engine, operation, "name")?;
-    let data = engine.doc.data_blocks.get(&data_id).ok_or_else(|| {
-        PotError::new(ErrorCode::InternalError, "mesh data block disappeared")
-    })?;
+    let data =
+        engine.doc.data_blocks.get(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "mesh data block disappeared")
+        })?;
     if data.vertex_groups.iter().any(|group| group.id == id) {
         return Err(engine.error(
             ErrorCode::IdExists,
@@ -2000,9 +2001,10 @@ fn vertex_group_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) 
         ));
     }
     let active_index = data.vertex_groups.len();
-    let data = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
-        PotError::new(ErrorCode::InternalError, "mesh data block disappeared")
-    })?;
+    let data =
+        engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "mesh data block disappeared")
+        })?;
     data.vertex_groups.push(VertexGroup { id, name });
     engine
         .doc

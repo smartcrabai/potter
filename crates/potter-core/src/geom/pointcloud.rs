@@ -175,6 +175,7 @@ pub fn to_mesh(cloud: &PointCloudData) -> Result<Mesh> {
             edge: 0,
             face: 0,
         },
+        original_indices: None,
     };
     let mut point_radii = Map::new();
     for point in &cloud.points {
@@ -366,6 +367,7 @@ pub fn points_to_mesh(cloud: &PointCloudData, segments: u32, rings: u32) -> Resu
             face: u32::try_from(face_count)
                 .map_err(|_| limit_exceeded("generated face ID count exceeds u32"))?,
         },
+        original_indices: None,
     };
     for (name, attribute) in &cloud.attributes {
         let mut values = Map::new();

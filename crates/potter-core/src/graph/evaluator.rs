@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     sync::{LazyLock, Mutex},
 };
 
@@ -8,7 +9,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{GridParams, IcosphereParams, Mesh, MeshError, modifiers::evaluate_modifiers},
+    geom::{
+        GridParams, IcosphereParams, Mesh, MeshError, ORIGINDEX_NONE, OriginalIndices,
+        modifiers::evaluate_modifiers,
+    },
     model::{Id, Modifier},
 };
 
@@ -169,7 +173,17 @@ pub fn evaluate_at_frame(
                     )
                 })
                 .and_then(|value| {
-                    crate::hash::canonicalize(&value).map(|bytes| crate::hash::sha256(&bytes))
+                    crate::hash::canonicalize(&value).map(|bytes| {
+                        let mut signature = crate::hash::sha256(&bytes);
+                        if let Some(indices) = input.and_then(|mesh| mesh.original_indices.as_ref())
+                        {
+                            let mut hasher = DefaultHasher::new();
+                            indices.vertices.hash(&mut hasher);
+                            indices.source_vertex_count.hash(&mut hasher);
+                            signature.push_str(&format!("-{:016x}", hasher.finish()));
+                        }
+                        signature
+                    })
                 })
         })
         .transpose()?;
@@ -345,7 +359,16 @@ impl Evaluator<'_> {
         })?;
         let result = self.evaluate_node(id, &node, socket);
         self.active.remove(id);
-        let value = result?;
+        let mut value = result?;
+        if let EvalValue::Geometry(geometry) = &mut value
+            && geometry.mesh.original_indices.is_none()
+            && let Some(indices) = self.input.and_then(|mesh| mesh.original_indices.as_ref())
+        {
+            geometry.mesh.original_indices = Some(OriginalIndices {
+                vertices: vec![ORIGINDEX_NONE; geometry.mesh.vertices.len()],
+                source_vertex_count: indices.source_vertex_count,
+            });
+        }
         self.cache.insert(key, value.clone());
         Ok(value)
     }
@@ -1246,6 +1269,27 @@ impl Evaluator<'_> {
             EvalValue::Scalar(json!(0.05)),
         )?);
         let mut points = Mesh::new();
+        let mut source_vertices = geometry.mesh.original_indices.as_ref().map(|_| Vec::new());
+        let corner_vertices = if domain == "CORNER" && source_vertices.is_some() {
+            let vertex_index: HashMap<u32, usize> = geometry
+                .mesh
+                .vertices
+                .iter()
+                .enumerate()
+                .map(|(index, vertex)| (vertex.id, index))
+                .collect();
+            Some(
+                geometry
+                    .mesh
+                    .faces
+                    .iter()
+                    .flat_map(|face| face.vertices.iter())
+                    .map(|id| vertex_index.get(id).copied())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
         let mut radii = Vec::new();
         for index in 0..count {
             if field_bool(&selection, &geometry.mesh, index, domain, false)? {
@@ -1260,11 +1304,40 @@ impl Evaluator<'_> {
                     .insert_vertex(position)
                     .map_err(|error| mesh_evaluation_error(&error))?;
                 radii.push(json!(radius));
+                if let Some(source_vertices) = &mut source_vertices {
+                    let source_vertex = match domain {
+                        "POINT" | "POINTS" => Some(index),
+                        "CORNER" => corner_vertices
+                            .as_ref()
+                            .and_then(|vertices| vertices.get(index).copied().flatten()),
+                        _ => None,
+                    };
+                    let original_index = source_vertex
+                        .and_then(|source| {
+                            geometry
+                                .mesh
+                                .original_indices
+                                .as_ref()?
+                                .vertices
+                                .get(source)
+                                .copied()
+                        })
+                        .unwrap_or(ORIGINDEX_NONE);
+                    source_vertices.push(original_index);
+                }
             }
         }
         points
             .attributes
             .insert("radius".to_owned(), json!({"domain":"POINT","data":radii}));
+        if let (Some(indices), Some(vertices)) =
+            (geometry.mesh.original_indices.as_ref(), source_vertices)
+        {
+            points.original_indices = Some(OriginalIndices {
+                vertices,
+                source_vertex_count: indices.source_vertex_count,
+            });
+        }
         Ok(EvalValue::Geometry(GeometryValue {
             mesh: points,
             instance_paths: geometry.instance_paths,
@@ -3055,8 +3128,33 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
             "joined geometry exceeds vertex ID range",
         ));
     }
+    let source_vertex_count = meshes.iter().find_map(|mesh| {
+        mesh.original_indices
+            .as_ref()
+            .map(|indices| indices.source_vertex_count)
+    });
+    if let Some(source_vertex_count) = source_vertex_count {
+        for mesh in meshes {
+            if let Some(indices) = &mesh.original_indices
+                && (indices.source_vertex_count != source_vertex_count
+                    || indices.vertices.len() != mesh.vertices.len())
+            {
+                return Err(evaluation(
+                    "joined geometry has incompatible original-index sidecars",
+                ));
+            }
+        }
+    }
+    let mut original_vertices = source_vertex_count.map(|_| Vec::with_capacity(vertex_count));
     let mut result = Mesh::new();
     for mesh in meshes {
+        if let Some(output_indices) = &mut original_vertices {
+            if let Some(indices) = &mesh.original_indices {
+                output_indices.extend_from_slice(&indices.vertices);
+            } else {
+                output_indices.extend(std::iter::repeat_n(ORIGINDEX_NONE, mesh.vertices.len()));
+            }
+        }
         let mut mapping = HashMap::with_capacity(mesh.vertices.len());
         for vertex in &mesh.vertices {
             let id = result
@@ -3098,6 +3196,13 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
             }
         }
     }
+    result.original_indices =
+        source_vertex_count
+            .zip(original_vertices)
+            .map(|(source_vertex_count, vertices)| OriginalIndices {
+                vertices,
+                source_vertex_count,
+            });
     Ok(result)
 }
 

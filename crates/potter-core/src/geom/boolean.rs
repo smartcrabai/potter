@@ -402,10 +402,12 @@ pub fn boolean_mesh(source: &Mesh, operand: &Mesh, operation: &str) -> Result<Me
         PotError::invalid_argument(format!("invalid boolean operand mesh: {error}"))
     })?;
     let operation = Operation::parse(operation)?;
+    // Blender's exact Boolean path omits point CD_ORIGINDEX from its output, including shortcuts.
     if source.faces.is_empty() {
         return if operation == Operation::Union {
             let mut result = operand.clone();
             clear_element_keyed_attributes(&mut result);
+            result.original_indices = None;
             Ok(result)
         } else {
             Ok(Mesh::new())
@@ -415,7 +417,9 @@ pub fn boolean_mesh(source: &Mesh, operand: &Mesh, operation: &str) -> Result<Me
         return if operation == Operation::Intersect {
             Ok(Mesh::new())
         } else {
-            Ok(source.clone())
+            let mut result = source.clone();
+            result.original_indices = None;
+            Ok(result)
         };
     }
     validate_closed_mesh(source, "source")?;
@@ -829,7 +833,7 @@ fn polygons_to_mesh(polygons: Vec<Polygon>, template: &Mesh, epsilon: f64) -> Re
     );
     let origin = Origin {
         corners: Some(corners),
-        ..Origin::copies(compact_vertex_origins, output_face_origins)
+        ..Origin::copies(compact_vertex_origins, output_face_origins, false)
     };
     remap_attributes(template, &mut mesh, &origin)?;
     mesh.validate().map_err(|error| {
@@ -1100,5 +1104,61 @@ fn coord(point: DVec3) -> Coord3D<f64> {
         x: point.x,
         y: point.y,
         z: point.z,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "small Boolean fixtures")]
+
+    use glam::DVec3;
+
+    use crate::geom::{BoxParams, Mesh, OriginalIndices};
+
+    use super::boolean_mesh;
+
+    #[test]
+    fn exact_boolean_drops_original_index_layer() {
+        let mut source = Mesh::box_mesh(BoxParams {
+            size: DVec3::splat(2.0),
+        })
+        .unwrap();
+        let source_vertex_count = source.vertices.len();
+        source.original_indices = Some(OriginalIndices {
+            vertices: vec![0; source_vertex_count],
+            source_vertex_count,
+        });
+        let mut operand = Mesh::box_mesh(BoxParams {
+            size: DVec3::splat(2.0),
+        })
+        .unwrap();
+        for vertex in &mut operand.vertices {
+            vertex.co += DVec3::X * 0.5;
+        }
+
+        let result = boolean_mesh(&source, &operand, "UNION").unwrap();
+        assert!(!result.faces.is_empty());
+        assert!(result.original_indices.is_none());
+        let mut empty_source = Mesh::new();
+        empty_source.original_indices = Some(OriginalIndices {
+            vertices: Vec::new(),
+            source_vertex_count,
+        });
+        let mut mapped_operand = operand.clone();
+        let operand_vertex_count = mapped_operand.vertices.len();
+        mapped_operand.original_indices = Some(OriginalIndices {
+            vertices: vec![0; operand_vertex_count],
+            source_vertex_count: operand_vertex_count,
+        });
+        let empty_source_union = boolean_mesh(&empty_source, &mapped_operand, "UNION").unwrap();
+        assert!(empty_source_union.original_indices.is_none());
+
+        let mut empty_operand = Mesh::new();
+        empty_operand.original_indices = Some(OriginalIndices {
+            vertices: Vec::new(),
+            source_vertex_count: 0,
+        });
+        let empty_operand_difference = boolean_mesh(&source, &empty_operand, "DIFFERENCE").unwrap();
+        assert!(empty_operand_difference.original_indices.is_none());
     }
 }

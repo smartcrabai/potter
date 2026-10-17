@@ -534,6 +534,8 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         .collect();
     let origin = Origin {
         vertices: origins,
+        // Skin's fresh BMesh has no point CD_ORIGINDEX layer.
+        source_vertices: None,
         faces: vec![None; faces.len()],
         corners: None,
     };

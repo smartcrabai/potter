@@ -360,6 +360,38 @@ fn line_skin_matches_blender() {
 }
 
 #[test]
+fn hook_uses_current_indices_after_skin_drops_origindex() {
+    let mesh = skeleton(&LINE_INPUT_VERTICES, &LINE_EDGES, Some(&LINE_SKIN));
+    let skin = skin_modifier(json!({}));
+    let hook = Modifier {
+        id: Id::new("hook_after_skin").unwrap(),
+        modifier_type: "hook".to_owned(),
+        name: "Hook after Skin".to_owned(),
+        enabled: true,
+        params: serde_json::from_value(json!({
+            "vertex_indices": [0],
+            "matrix_inverse": glam::DMat4::IDENTITY.to_cols_array()
+        }))
+        .unwrap(),
+        binding_data: None,
+        runtime: ModifierRuntime {
+            object_matrix: Some(glam::DMat4::from_translation(DVec3::X).to_cols_array()),
+            ..ModifierRuntime::default()
+        },
+    };
+    let skinned = evaluate_modifiers(&mesh, &[skin.clone()], SUBJECT_NAME).unwrap();
+    let hooked = evaluate_modifiers(&mesh, &[skin, hook], SUBJECT_NAME).unwrap();
+    assert_eq!(skinned.vertices.len(), hooked.vertices.len());
+    for (index, (before, after)) in skinned.vertices.iter().zip(&hooked.vertices).enumerate() {
+        let expected_delta = if index == 0 { DVec3::X } else { DVec3::ZERO };
+        assert!(
+            (after.co - before.co).distance(expected_delta) < 1.0e-6,
+            "Skin output vertex {index} did not use Blender's missing-ORIGINDEX fallback"
+        );
+    }
+}
+
+#[test]
 fn line_without_skin_layer_uses_blender_default_root() {
     // Blender adds a skin layer (radius 0.25, root on vertex 0) when the mesh has none.
     let mesh = skeleton(&LINE_INPUT_VERTICES, &LINE_EDGES, None);
@@ -370,8 +402,12 @@ fn line_without_skin_layer_uses_blender_default_root() {
 #[test]
 fn line_use_smooth_shade_marks_every_face_smooth() {
     let mesh = skeleton(&LINE_INPUT_VERTICES, &LINE_EDGES, Some(&LINE_SKIN));
-    let result =
-        evaluate_modifiers(&mesh, &[skin_modifier(json!({"use_smooth_shade": true}))], SUBJECT_NAME).unwrap();
+    let result = evaluate_modifiers(
+        &mesh,
+        &[skin_modifier(json!({"use_smooth_shade": true}))],
+        SUBJECT_NAME,
+    )
+    .unwrap();
     assert_blender_geometry(&result, &LINE_VERTICES, &LINE_FACES);
     assert_eq!(smooth_face_count(&result), 18);
 }
@@ -410,8 +446,12 @@ fn branch_smoothing_and_symmetry_leave_chains_unchanged() {
 #[test]
 fn bent_chain_use_smooth_shade_marks_every_face_smooth() {
     let mesh = skeleton(&BENT_INPUT_VERTICES, &BENT_EDGES, Some(&BENT_SKIN));
-    let result =
-        evaluate_modifiers(&mesh, &[skin_modifier(json!({"use_smooth_shade": true}))], SUBJECT_NAME).unwrap();
+    let result = evaluate_modifiers(
+        &mesh,
+        &[skin_modifier(json!({"use_smooth_shade": true}))],
+        SUBJECT_NAME,
+    )
+    .unwrap();
     assert_blender_geometry(&result, &BENT_VERTICES, &BENT_FACES);
     assert_eq!(smooth_face_count(&result), 30);
 }
@@ -419,8 +459,12 @@ fn bent_chain_use_smooth_shade_marks_every_face_smooth() {
 #[test]
 fn branch_smoothing_outside_zero_to_one_is_invalid() {
     let mesh = skeleton(&BENT_INPUT_VERTICES, &BENT_EDGES, Some(&BENT_SKIN));
-    let error =
-        evaluate_modifiers(&mesh, &[skin_modifier(json!({"branch_smoothing": 1.5}))], SUBJECT_NAME).unwrap_err();
+    let error = evaluate_modifiers(
+        &mesh,
+        &[skin_modifier(json!({"branch_smoothing": 1.5}))],
+        SUBJECT_NAME,
+    )
+    .unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidArgument);
 }
 
@@ -449,15 +493,23 @@ fn branch_x_symmetry_changes_hull_triangle_merging() {
         &SYMMETRY_EDGES,
         Some(&SYMMETRY_SKIN),
     );
-    let symmetric =
-        evaluate_modifiers(&mesh, &[skin_modifier(json!({"use_x_symmetry": true}))], SUBJECT_NAME).unwrap();
+    let symmetric = evaluate_modifiers(
+        &mesh,
+        &[skin_modifier(json!({"use_x_symmetry": true}))],
+        SUBJECT_NAME,
+    )
+    .unwrap();
     assert_blender_geometry(
         &symmetric,
         &SYMMETRY_BRANCH_VERTICES,
         &SYMMETRY_BRANCH_ON_FACES,
     );
-    let asymmetric =
-        evaluate_modifiers(&mesh, &[skin_modifier(json!({"use_x_symmetry": false}))], SUBJECT_NAME).unwrap();
+    let asymmetric = evaluate_modifiers(
+        &mesh,
+        &[skin_modifier(json!({"use_x_symmetry": false}))],
+        SUBJECT_NAME,
+    )
+    .unwrap();
     assert_blender_geometry(
         &asymmetric,
         &SYMMETRY_BRANCH_VERTICES,
@@ -535,8 +587,12 @@ fn branch_z_symmetry_changes_hull_triangle_merging() {
 #[test]
 fn y_branch_smoothing_matches_blender_coordinates() {
     let mesh = skeleton(&Y_INPUT_VERTICES, &Y_EDGES, Some(&Y_SKIN));
-    let result =
-        evaluate_modifiers(&mesh, &[skin_modifier(json!({"branch_smoothing": 1.0}))], SUBJECT_NAME).unwrap();
+    let result = evaluate_modifiers(
+        &mesh,
+        &[skin_modifier(json!({"branch_smoothing": 1.0}))],
+        SUBJECT_NAME,
+    )
+    .unwrap();
     assert_blender_geometry(&result, &Y_BRANCH_SMOOTH_VERTICES, &Y_BRANCH_FACES);
 }
 
@@ -721,8 +777,12 @@ fn middle_root_seam_frames_match_blender() {
 #[test]
 fn isolated_skin_vertex_builds_blender_box() {
     let verts = [[0.0, 0.0, 0.0]];
-    let result =
-        evaluate_modifiers(&skeleton(&verts, &[], None), &[skin_modifier(json!({}))], SUBJECT_NAME).unwrap();
+    let result = evaluate_modifiers(
+        &skeleton(&verts, &[], None),
+        &[skin_modifier(json!({}))],
+        SUBJECT_NAME,
+    )
+    .unwrap();
     assert_blender_geometry(&result, &ISOLATED_VERTICES, &ISOLATED_FACES);
 }
 

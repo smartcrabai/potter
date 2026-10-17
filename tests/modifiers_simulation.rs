@@ -13,7 +13,20 @@ mod blender_file;
 
 use blender_file::blender_executable;
 
+fn texture_mapping(
+    subject_world: DMat4,
+    mapping_world: Option<DMat4>,
+) -> potter_core::model::TextureCoordinateMapping {
+    potter_core::model::TextureCoordinateMapping {
+        subject_to_world_f32: subject_world.to_cols_array().map(|value| value as f32),
+        world_to_mapping_f32: mapping_world
+            .map(|world| world.inverse().to_cols_array().map(|value| value as f32)),
+    }
+}
+
 const MODIFIER_POSITION_TOLERANCE: f64 = 1.0e-4;
+// VDB affine map coefficients are stored as f64; allowance covers Python basis reconstruction only.
+const VDB_TRANSFORM_TOLERANCE: f64 = 1.0e-12;
 const FACE_DISTRIBUTION_TOLERANCE: f64 = 0.03;
 const VELOCITY_STATISTIC_TOLERANCE: f64 = 0.25;
 const SUBDIVISION_POSITION_TOLERANCE: f64 = 0.005;
@@ -2460,7 +2473,7 @@ baseline_evaluated.to_mesh_clear()
     let input_index_to_world = input_grid.transform.index_to_world;
     let input_voxel_side = input_grid.voxel_size().max_element();
     assert!(
-        (input_voxel_side - blender_voxel_side).abs() <= MODIFIER_POSITION_TOLERANCE,
+        (input_voxel_side - blender_voxel_side).abs() <= VDB_TRANSFORM_TOLERANCE,
         "decoded VDB voxel side must match Blender's affine transform",
     );
     for (component, (actual, expected)) in input_index_to_world
@@ -2470,7 +2483,7 @@ baseline_evaluated.to_mesh_clear()
         .enumerate()
     {
         assert!(
-            (actual - expected).abs() <= MODIFIER_POSITION_TOLERANCE,
+            (actual - expected).abs() <= VDB_TRANSFORM_TOLERANCE,
             "input index-to-local matrix component {component}: Potter={actual}, Blender={expected}",
         );
     }
@@ -2507,10 +2520,11 @@ baseline_evaluated.to_mesh_clear()
     let displaced = potter_core::geom::modifiers::simulation::displace_volume(
         &volume,
         &volume_params,
-        Some(potter_core::geom::legacy_texture::TextureSource::Image(&image)),
+        Some(potter_core::geom::legacy_texture::TextureSource::Image(
+            &image,
+        )),
         &mut rng,
-        DMat4::IDENTITY,
-        Some(mapping_world),
+        texture_mapping(DMat4::IDENTITY, Some(mapping_world)),
     )?;
     let expected_samples: Vec<f64> =
         serde_json::from_value(blender_expected["vdb_samples"].clone())?;
@@ -2565,8 +2579,7 @@ baseline_evaluated.to_mesh_clear()
         f64::from(output_minimum[1]),
         f64::from(output_minimum[2]),
     );
-    let expected_output_matrix =
-        input_index_to_world * DMat4::from_translation(output_offset);
+    let expected_output_matrix = input_index_to_world * DMat4::from_translation(output_offset);
     let output_columns = vdb_grid
         .index_to_local
         .ok_or("displaced VDB index-to-local transform is missing")?;
@@ -2582,7 +2595,7 @@ baseline_evaluated.to_mesh_clear()
         .enumerate()
     {
         assert!(
-            (actual - expected).abs() <= MODIFIER_POSITION_TOLERANCE,
+            (actual - expected).abs() <= VDB_TRANSFORM_TOLERANCE,
             "output index-to-local matrix component {component}: Potter={actual}, Blender={expected}",
         );
     }
@@ -2627,10 +2640,11 @@ baseline_evaluated.to_mesh_clear()
     let inline_displaced = potter_core::geom::modifiers::simulation::displace_volume(
         &inline_volume,
         &volume_params,
-        Some(potter_core::geom::legacy_texture::TextureSource::Image(&image)),
+        Some(potter_core::geom::legacy_texture::TextureSource::Image(
+            &image,
+        )),
         &mut inline_rng,
-        DMat4::IDENTITY,
-        Some(mapping_world),
+        texture_mapping(DMat4::IDENTITY, Some(mapping_world)),
     )?;
     let inline_grid = inline_displaced
         .grids
@@ -2701,12 +2715,9 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
     assert_eq!(affine_roundtrip, volume);
     let legacy_json = serde_json::to_value(potter_core::geom::volume::VolumeGrid::default())?;
     assert!(legacy_json.get("index_to_local").is_none());
-    let legacy_grid: potter_core::geom::volume::VolumeGrid =
-        serde_json::from_value(legacy_json)?;
+    let legacy_grid: potter_core::geom::volume::VolumeGrid = serde_json::from_value(legacy_json)?;
     assert_eq!(legacy_grid.index_to_local, None);
-    let mut invalid_matrices = vec![
-        DMat4::from_scale(DVec3::new(1.0, 0.0, 1.0)).to_cols_array(),
-    ];
+    let mut invalid_matrices = vec![DMat4::from_scale(DVec3::new(1.0, 0.0, 1.0)).to_cols_array()];
     let mut nonfinite_matrix = DMat4::IDENTITY.to_cols_array();
     nonfinite_matrix[0] = f64::NAN;
     invalid_matrices.push(nonfinite_matrix);
@@ -2745,20 +2756,23 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
             &image,
         )),
         &mut rng,
-        DMat4::IDENTITY,
-        None,
+        texture_mapping(DMat4::IDENTITY, None),
     )?;
-    let grid = displaced.grids.first().ok_or("affine displaced grid is missing")?;
+    let grid = displaced
+        .grids
+        .first()
+        .ok_or("affine displaced grid is missing")?;
     assert_eq!(grid.dims, [4, 4, 4]);
-    let expected_index_to_local =
-        index_to_local * DMat4::from_translation(-DVec3::ONE);
-    assert_eq!(grid.index_to_local, Some(expected_index_to_local.to_cols_array()));
+    let expected_index_to_local = index_to_local * DMat4::from_translation(-DVec3::ONE);
+    assert_eq!(
+        grid.index_to_local,
+        Some(expected_index_to_local.to_cols_array())
+    );
     assert_eq!(
         grid.origin,
         expected_index_to_local.transform_point3(DVec3::ZERO),
     );
-    let sample_position =
-        expected_index_to_local.transform_point3(DVec3::new(2.0, 1.0, 1.0));
+    let sample_position = expected_index_to_local.transform_point3(DVec3::new(2.0, 1.0, 1.0));
     assert_eq!(
         potter_core::geom::volume::sample_density_checked(sample_position, &displaced)?,
         0.75,
@@ -2771,8 +2785,7 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
             &image,
         )),
         &mut repeated_rng,
-        DMat4::IDENTITY,
-        None,
+        texture_mapping(DMat4::IDENTITY, None),
     )?;
     let repeated_grid = repeated
         .grids

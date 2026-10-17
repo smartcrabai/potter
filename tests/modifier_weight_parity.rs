@@ -1,9 +1,20 @@
-use std::{collections::{BTreeMap, BTreeSet}, error::Error, fs, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fs,
+    path::Path,
+    process::Command,
+};
 
 use glam::{DMat4, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
-    geom::{Mesh, modifiers::attributes::{AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32, evaluate_with_context}},
+    geom::{
+        Mesh,
+        modifiers::attributes::{
+            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32, evaluate_with_context,
+        },
+    },
     model::{Id, Modifier, ModifierRuntime, SceneDoc},
 };
 use serde_json::{Value, json};
@@ -34,6 +45,8 @@ MIX_MODES = ["SET", "ADD", "SUB", "MUL", "DIV", "DIF", "AVG", "MIN", "MAX"]
 MIX_SETS = ["ALL", "A", "B", "OR", "AND"]
 CURVE_POINTS = [(0.0, 0.0), (0.27, 0.72), (0.61, 0.38), (1.0, 1.0)]
 WEIGHT_EDIT_CURVE_POINTS = [(0.0, 0.0), (0.5, 0.2), (1.0, 1.0)]
+WEIGHT_HANDLE_POINTS = [(0.0, 0.0), (0.2, 0.1), (0.68, 0.95), (0.72, 0.05), (1.0, 1.0)]
+WEIGHT_RAW_CURVE_POINTS = [(0.0, 0.125), (1.5, 0.75), (-0.25, 0.875), (0.5, -0.25)]
 
 
 def make_object(name, vertices, faces=(), location=(0, 0, 0), scale=(1, 1, 1)):
@@ -75,11 +88,25 @@ def configure_curve(modifier, points=CURVE_POINTS):
     curve = modifier.map_curve.curves[0]
     while len(curve.points) > 2:
         curve.points.remove(curve.points[-1])
-    curve.points[0].location = points[0]
-    curve.points[1].location = points[-1]
+    curve.points[0].location = tuple(points[0][:2])
+    curve.points[1].location = tuple(points[-1][:2])
     for point in points[1:-1]:
-        curve.points.new(*point)
+        curve.points.new(*point[:2])
+    for point, coordinates in zip(curve.points, points):
+        point.location = tuple(coordinates[:2])
+        if len(coordinates) == 3:
+            point.handle_type = str(coordinates[2])
     modifier.map_curve.update()
+
+
+def configure_raw_curve(modifier, points=WEIGHT_RAW_CURVE_POINTS):
+    curve = modifier.map_curve.curves[0]
+    while len(curve.points) > 2:
+        curve.points.remove(curve.points[-1])
+    for index in range(len(points) - 2):
+        curve.points.new(float(index + 2), 0.5)
+    for point, coordinates in zip(curve.points, points):
+        point.location = tuple(coordinates[:2])
 
 curve_mesh = make_object(
     "Weight Edit Nonlinear Curve",
@@ -98,6 +125,38 @@ curve_modifier.invert_mask_vertex_group = False
 curve_modifier.normalize = False
 configure_curve(curve_modifier, WEIGHT_EDIT_CURVE_POINTS)
 result["edit_nonlinear_curve"] = read_group(curve_mesh, "A")
+
+def edit_handle_curve_case(name, handle):
+    obj = make_object(name, EDIT_POSITIONS)
+    add_group(obj, "A", WEIGHTS_A)
+    modifier = obj.modifiers.new("weights", "VERTEX_WEIGHT_EDIT")
+    modifier.vertex_group = "A"
+    modifier.falloff_type = "CURVE"
+    modifier.default_weight = 0.0
+    modifier.use_add = False
+    modifier.use_remove = False
+    modifier.normalize = False
+    points = WEIGHT_HANDLE_POINTS if handle == "AUTO" else [(*point, handle) for point in WEIGHT_HANDLE_POINTS]
+    configure_curve(modifier, points)
+    return read_group(obj, "A")
+
+result["edit_handle_curves"] = {
+    handle: edit_handle_curve_case("Weight Edit Handle " + handle, handle)
+    for handle in ["AUTO", "AUTO_CLAMPED", "VECTOR"]
+}
+
+raw_curve_obj = make_object("Weight Edit Raw Curve", EDIT_POSITIONS)
+add_group(raw_curve_obj, "A", WEIGHTS_A)
+raw_curve_modifier = raw_curve_obj.modifiers.new("weights", "VERTEX_WEIGHT_EDIT")
+raw_curve_modifier.vertex_group = "A"
+raw_curve_modifier.falloff_type = "CURVE"
+raw_curve_modifier.invert_falloff = False
+raw_curve_modifier.default_weight = 0.0
+raw_curve_modifier.use_add = False
+raw_curve_modifier.use_remove = False
+raw_curve_modifier.normalize = False
+configure_raw_curve(raw_curve_modifier)
+result["edit_raw_curve"] = read_group(raw_curve_obj, "A")
 
 def weight_object(name):
     obj = make_object(name, EDIT_POSITIONS)
@@ -362,6 +421,15 @@ with open(os.path.join(root, "weight-oracle.json"), "w", encoding="utf-8") as ha
     json.dump(result, handle, sort_keys=True)
 print("WEIGHT_ORACLE_WRITTEN")
 "#;
+const WEIGHT_HANDLE_POINTS: [[f64; 2]; 5] = [
+    [0.0, 0.0],
+    [0.2, 0.1],
+    [0.68, 0.95],
+    [0.72, 0.05],
+    [1.0, 1.0],
+];
+const WEIGHT_RAW_CURVE_POINTS: [[f64; 2]; 4] =
+    [[0.0, 0.125], [1.5, 0.75], [-0.25, 0.875], [0.5, -0.25]];
 const WEIGHT_TEXTURE_ORACLE: &str = r#"
 import bpy
 import json
@@ -469,7 +537,10 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
-        params: params.as_object().ok_or("modifier parameters must be an object")?.clone(),
+        params: params
+            .as_object()
+            .ok_or("modifier parameters must be an object")?
+            .clone(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
@@ -500,7 +571,12 @@ fn source_mesh() -> Result<Mesh, Box<dyn Error>> {
 
 fn target_mesh() -> Result<Mesh, Box<dyn Error>> {
     Mesh::from_positions_and_faces(
-        vec![DVec3::ZERO, DVec3::new(2.0, 0.0, 0.0), DVec3::new(2.0, 1.5, 0.0), DVec3::new(0.0, 1.5, 0.0)],
+        vec![
+            DVec3::ZERO,
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(2.0, 1.5, 0.0),
+            DVec3::new(0.0, 1.5, 0.0),
+        ],
         vec![vec![0, 1, 2, 3]],
     )
 }
@@ -531,7 +607,12 @@ fn members(mesh: &Mesh, group: &str) -> Result<Vec<bool>, Box<dyn Error>> {
         .collect())
 }
 
-fn assert_weights(label: &str, actual: &[f64], expected: &Value, tolerance: f64) -> Result<(), Box<dyn Error>> {
+fn assert_weights(
+    label: &str,
+    actual: &[f64],
+    expected: &Value,
+    tolerance: f64,
+) -> Result<(), Box<dyn Error>> {
     let expected = expected
         .as_array()
         .ok_or("oracle weight vector must be an array")?
@@ -545,7 +626,10 @@ fn assert_weights(label: &str, actual: &[f64], expected: &Value, tolerance: f64)
         .map(|(actual, expected)| (actual - expected).abs())
         .fold(0.0_f64, f64::max);
     eprintln!("Blender weight parity {label}: max absolute error {error:.8e}");
-    assert!(error <= tolerance, "{label} max error {error} exceeds {tolerance}; actual={actual:?} expected={expected:?}");
+    assert!(
+        error <= tolerance,
+        "{label} max error {error} exceeds {tolerance}; actual={actual:?} expected={expected:?}"
+    );
     Ok(())
 }
 
@@ -571,7 +655,9 @@ fn oracle(root: &Path) -> Result<Option<Value>, Box<dyn Error>> {
         root,
         "Blender weight modifier oracle failed",
     )?;
-    Ok(Some(serde_json::from_slice(&fs::read(root.join("weight-oracle.json"))?)?))
+    Ok(Some(serde_json::from_slice(&fs::read(
+        root.join("weight-oracle.json"),
+    )?)?))
 }
 
 fn texture_oracle(root: &Path) -> Result<Option<Value>, Box<dyn Error>> {
@@ -585,7 +671,9 @@ fn texture_oracle(root: &Path) -> Result<Option<Value>, Box<dyn Error>> {
         root,
         "Blender weight texture oracle failed",
     )?;
-    Ok(Some(serde_json::from_slice(&fs::read(root.join("weight-texture-oracle.json"))?)?))
+    Ok(Some(serde_json::from_slice(&fs::read(
+        root.join("weight-texture-oracle.json"),
+    )?)?))
 }
 
 fn operand(
@@ -594,8 +682,8 @@ fn operand(
     local_to_subject_f32: Option<[f32; 16]>,
     subject_to_local_f32: Option<[f32; 16]>,
 ) -> SceneOperand {
-    let local_to_subject = local_to_subject_f32
-        .map(|matrix| DMat4::from_cols_array(&matrix.map(f64::from)));
+    let local_to_subject =
+        local_to_subject_f32.map(|matrix| DMat4::from_cols_array(&matrix.map(f64::from)));
     SceneOperand {
         mesh,
         local_to_subject,
@@ -624,7 +712,9 @@ fn blender_matrix_f32(value: &Value) -> Result<[f32; 16], Box<dyn Error>> {
     }
     let mut matrix = [0.0; 16];
     for (slot, value) in matrix.iter_mut().zip(values) {
-        *slot = value.as_f64().ok_or("oracle matrix component must be numeric")? as f32;
+        *slot = value
+            .as_f64()
+            .ok_or("oracle matrix component must be numeric")? as f32;
     }
     Ok(matrix)
 }
@@ -638,7 +728,15 @@ fn assert_case(
     subject_name: &str,
     expected: &Value,
 ) -> Result<Mesh, Box<dyn Error>> {
-    let result = evaluate_with_context(mesh, modifier, operands, None, subject_world, subject_name, &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(
+        mesh,
+        modifier,
+        operands,
+        None,
+        subject_world,
+        subject_name,
+        &AttributeLayerSelection::default(),
+    )?;
     assert_weights(label, &weights(&result, "A")?, &expected["weights"], 2.0e-5)?;
     assert_members(label, &members(&result, "A")?, &expected["members"])?;
     Ok(result)
@@ -660,10 +758,8 @@ fn weight_edit_custom_curve_matches_blender_evaluated_weight() -> Result<(), Box
         ],
         vec![vec![0, 1, 2]],
     )?;
-    mesh.attributes.insert(
-        "vertex_groups".to_owned(),
-        json!({"A":{"v0":0.25}}),
-    );
+    mesh.attributes
+        .insert("vertex_groups".to_owned(), json!({"A":{"v0":0.25}}));
     let modifier = modifier(
         "vertex_weight_edit",
         json!({
@@ -700,6 +796,112 @@ fn weight_edit_custom_curve_matches_blender_evaluated_weight() -> Result<(), Box
 }
 
 #[test]
+fn weight_edit_curve_handles_and_raw_controls_match_blender_runtime() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempdir()?;
+    let Some(expected) = oracle(directory.path())? else {
+        eprintln!("skipping weight edit curve mapping parity test: Blender is unavailable");
+        return Ok(());
+    };
+    let mesh = source_mesh()?;
+    let curves = [
+        ("AUTO", json!(WEIGHT_HANDLE_POINTS)),
+        (
+            "AUTO_CLAMPED",
+            json!(WEIGHT_HANDLE_POINTS.map(|point| [point[0], point[1], "AUTO_CLAMPED"])),
+        ),
+        (
+            "VECTOR",
+            json!(WEIGHT_HANDLE_POINTS.map(|point| [point[0], point[1], "VECTOR"])),
+        ),
+    ];
+    let mut auto_weights = None;
+    for (handle, curve) in &curves {
+        let modifier = modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A",
+                "falloff_type":"CURVE",
+                "map_curve":curve,
+                "default_weight":0.0,
+                "use_add":false,
+                "use_remove":false,
+                "normalize":false
+            }),
+        )?;
+        let result = evaluate_with_context(
+            &mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            DMat4::IDENTITY,
+            "Weight Edit Handle Curve",
+            &AttributeLayerSelection::default(),
+        )?;
+        let actual = weights(&result, "A")?;
+        let expected_case = &expected["edit_handle_curves"][*handle];
+        assert_weights(
+            &format!("weight edit {handle} handles"),
+            &actual,
+            &expected_case["weights"],
+            2.0e-5,
+        )?;
+        assert_members(
+            &format!("weight edit {handle} handles"),
+            &members(&result, "A")?,
+            &expected_case["members"],
+        )?;
+        if *handle == "AUTO" {
+            auto_weights = Some(actual);
+        } else {
+            let auto = auto_weights.as_ref().expect("AUTO case runs first");
+            let max_difference = auto
+                .iter()
+                .zip(&actual)
+                .map(|(auto, handled)| (auto - handled).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_difference > 2.0e-5,
+                "Weight Edit {handle} handles did not change evaluated weights"
+            );
+        }
+    }
+    let raw_modifier = modifier(
+        "vertex_weight_edit",
+        json!({
+            "vertex_group":"A",
+            "falloff_type":"CURVE",
+            "map_curve":WEIGHT_RAW_CURVE_POINTS,
+            "default_weight":0.0,
+            "use_add":false,
+            "use_remove":false,
+            "normalize":false
+        }),
+    )?;
+    let raw_result = evaluate_with_context(
+        &mesh,
+        &raw_modifier,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Weight Edit Raw Curve",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight edit raw curve",
+        &weights(&raw_result, "A")?,
+        &expected["edit_raw_curve"]["weights"],
+        2.0e-5,
+    )?;
+    assert_members(
+        "weight edit raw curve",
+        &members(&raw_result, "A")?,
+        &expected["edit_raw_curve"]["members"],
+    )?;
+    Ok(())
+}
+
+#[test]
 fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let Some(expected) = oracle(directory.path())? else {
@@ -708,7 +910,14 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
     };
     let mesh = source_mesh()?;
     let falloffs = [
-        "LINEAR", "CURVE", "SHARP", "SMOOTH", "ROOT", "ICON_SPHERECURVE", "RANDOM", "STEP",
+        "LINEAR",
+        "CURVE",
+        "SHARP",
+        "SMOOTH",
+        "ROOT",
+        "ICON_SPHERECURVE",
+        "RANDOM",
+        "STEP",
     ];
     for falloff in falloffs {
         let mut params = json!({
@@ -718,10 +927,18 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "normalize":false
         });
         if falloff == "CURVE" {
-            params["map_curve"] = json!([[0.0,0.0],[0.27,0.72],[0.61,0.38],[1.0,1.0]]);
+            params["map_curve"] = json!([[0.0, 0.0], [0.27, 0.72], [0.61, 0.38], [1.0, 1.0]]);
         }
         let modifier = modifier("vertex_weight_edit", params)?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle", &AttributeLayerSelection::default())?;
+        let result = evaluate_with_context(
+            &mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            DMat4::IDENTITY,
+            "Weight Edit Oracle",
+            &AttributeLayerSelection::default(),
+        )?;
         assert_weights(
             &format!("weight edit {falloff}"),
             &weights(&result, "A")?,
@@ -743,13 +960,32 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "default_weight":0.23,"normalize":false
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &curve_invert, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle", &AttributeLayerSelection::default())?;
-    assert_weights("weight edit inverted curve", &weights(&result, "A")?, &expected["edit_invert_curve"]["weights"], 2.0e-5)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &curve_invert,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Weight Edit Oracle",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight edit inverted curve",
+        &weights(&result, "A")?,
+        &expected["edit_invert_curve"]["weights"],
+        2.0e-5,
+    )?;
 
     for (label, mask_name, inverted, constant, oracle_key) in [
         ("mask", "Mask", false, 0.75, "edit_mask"),
         ("inverted mask", "Mask", true, 0.75, "edit_mask_invert"),
-        ("missing mask", "Missing Mask", false, 0.5, "edit_missing_mask"),
+        (
+            "missing mask",
+            "Missing Mask",
+            false,
+            0.5,
+            "edit_missing_mask",
+        ),
     ] {
         let modifier = modifier(
             "vertex_weight_edit",
@@ -758,13 +994,34 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "invert_mask_vertex_group":inverted,"mask_constant":constant,"default_weight":0.23
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle", &AttributeLayerSelection::default())?;
-        assert_weights(label, &weights(&result, "A")?, &expected[oracle_key]["weights"], 2.0e-5)?;
+        let result = evaluate_with_context(
+            &mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            DMat4::IDENTITY,
+            "Weight Edit Oracle",
+            &AttributeLayerSelection::default(),
+        )?;
+        assert_weights(
+            label,
+            &weights(&result, "A")?,
+            &expected[oracle_key]["weights"],
+            2.0e-5,
+        )?;
     }
 
     for (label, constant, oracle_key) in [
-        ("weight edit negative mask constant", -0.5, "edit_mask_negative_constant"),
-        ("weight edit mask constant above one", 1.5, "edit_mask_unclamped_constant"),
+        (
+            "weight edit negative mask constant",
+            -0.5,
+            "edit_mask_negative_constant",
+        ),
+        (
+            "weight edit mask constant above one",
+            1.5,
+            "edit_mask_unclamped_constant",
+        ),
     ] {
         let modifier = modifier(
             "vertex_weight_edit",
@@ -773,16 +1030,46 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "mask_constant":constant,"default_weight":0.23
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Oracle", &AttributeLayerSelection::default())?;
-        assert_weights(label, &weights(&result, "A")?, &expected[oracle_key]["weights"], 2.0e-5)?;
+        let result = evaluate_with_context(
+            &mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            DMat4::IDENTITY,
+            "Weight Edit Oracle",
+            &AttributeLayerSelection::default(),
+        )?;
+        assert_weights(
+            label,
+            &weights(&result, "A")?,
+            &expected[oracle_key]["weights"],
+            2.0e-5,
+        )?;
     }
     let missing_edit_group = modifier(
         "vertex_weight_edit",
         json!({"vertex_group":"Missing","falloff_type":"SHARP"}),
     )?;
-    let result = evaluate_with_context(&mesh, &missing_edit_group, &BTreeMap::new(), None, DMat4::IDENTITY, "Missing Edit Group", &AttributeLayerSelection::default())?;
-    assert_weights("missing edit group pass-through", &weights(&result, "A")?, &expected["edit_missing_group"]["weights"], 2.0e-5)?;
-    assert_members("missing edit group pass-through", &members(&result, "A")?, &expected["edit_missing_group"]["members"])?;
+    let result = evaluate_with_context(
+        &mesh,
+        &missing_edit_group,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Missing Edit Group",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "missing edit group pass-through",
+        &weights(&result, "A")?,
+        &expected["edit_missing_group"]["weights"],
+        2.0e-5,
+    )?;
+    assert_members(
+        "missing edit group pass-through",
+        &members(&result, "A")?,
+        &expected["edit_missing_group"]["members"],
+    )?;
 
     let add_remove = modifier(
         "vertex_weight_edit",
@@ -791,9 +1078,26 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "use_add":true,"add_threshold":0.4,"use_remove":true,"remove_threshold":0.2
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &add_remove, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Controls", &AttributeLayerSelection::default())?;
-    assert_weights("weight edit add and remove", &weights(&result, "A")?, &expected["edit_add_remove"]["weights"], 2.0e-5)?;
-    assert_members("weight edit add and remove", &members(&result, "A")?, &expected["edit_add_remove"]["members"])?;
+    let result = evaluate_with_context(
+        &mesh,
+        &add_remove,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Weight Edit Controls",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight edit add and remove",
+        &weights(&result, "A")?,
+        &expected["edit_add_remove"]["weights"],
+        2.0e-5,
+    )?;
+    assert_members(
+        "weight edit add and remove",
+        &members(&result, "A")?,
+        &expected["edit_add_remove"]["members"],
+    )?;
     let inclusive_thresholds = modifier(
         "vertex_weight_edit",
         json!({
@@ -801,18 +1105,50 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "use_add":true,"add_threshold":0.23,"use_remove":true,"remove_threshold":0.15
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &inclusive_thresholds, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Inclusive Thresholds", &AttributeLayerSelection::default())?;
-    assert_weights("weight edit inclusive thresholds", &weights(&result, "A")?, &expected["edit_inclusive_thresholds"]["weights"], 2.0e-5)?;
-    assert_members("weight edit inclusive thresholds", &members(&result, "A")?, &expected["edit_inclusive_thresholds"]["members"])?;
+    let result = evaluate_with_context(
+        &mesh,
+        &inclusive_thresholds,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Weight Edit Inclusive Thresholds",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight edit inclusive thresholds",
+        &weights(&result, "A")?,
+        &expected["edit_inclusive_thresholds"]["weights"],
+        2.0e-5,
+    )?;
+    assert_members(
+        "weight edit inclusive thresholds",
+        &members(&result, "A")?,
+        &expected["edit_inclusive_thresholds"]["members"],
+    )?;
 
     let normalize = modifier(
         "vertex_weight_edit",
         json!({"vertex_group":"A","falloff_type":"LINEAR","default_weight":0.23,"normalize":true}),
     )?;
-    let result = evaluate_with_context(&mesh, &normalize, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Edit Controls", &AttributeLayerSelection::default())?;
-    assert_weights("weight edit normalize", &weights(&result, "A")?, &expected["edit_normalize"]["weights"], 2.0e-5)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &normalize,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Weight Edit Controls",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight edit normalize",
+        &weights(&result, "A")?,
+        &expected["edit_normalize"]["weights"],
+        2.0e-5,
+    )?;
 
-    for mix_mode in ["SET", "ADD", "SUB", "MUL", "DIV", "DIF", "AVG", "MIN", "MAX"] {
+    for mix_mode in [
+        "SET", "ADD", "SUB", "MUL", "DIV", "DIF", "AVG", "MIN", "MAX",
+    ] {
         let modifier = modifier(
             "vertex_weight_mix",
             json!({
@@ -820,9 +1156,26 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "default_weight_a":0.23,"default_weight_b":0.31,"invert_vertex_group_a":true
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
-        assert_weights(&format!("weight mix {mix_mode}"), &weights(&result, "A")?, &expected["mix_modes"][mix_mode]["weights"], 2.0e-5)?;
-        assert_members(&format!("weight mix {mix_mode}"), &members(&result, "A")?, &expected["mix_modes"][mix_mode]["members"])?;
+        let result = evaluate_with_context(
+            &mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            DMat4::IDENTITY,
+            "Weight Mix",
+            &AttributeLayerSelection::default(),
+        )?;
+        assert_weights(
+            &format!("weight mix {mix_mode}"),
+            &weights(&result, "A")?,
+            &expected["mix_modes"][mix_mode]["weights"],
+            2.0e-5,
+        )?;
+        assert_members(
+            &format!("weight mix {mix_mode}"),
+            &members(&result, "A")?,
+            &expected["mix_modes"][mix_mode]["members"],
+        )?;
     }
     for mix_set in ["ALL", "A", "B", "OR", "AND"] {
         let modifier = modifier(
@@ -832,23 +1185,70 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "default_weight_a":0.23,"default_weight_b":0.31,"invert_vertex_group_b":true
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
-        assert_weights(&format!("weight mix set {mix_set}"), &weights(&result, "A")?, &expected["mix_sets"][mix_set]["weights"], 2.0e-5)?;
-        assert_members(&format!("weight mix set {mix_set}"), &members(&result, "A")?, &expected["mix_sets"][mix_set]["members"])?;
+        let result = evaluate_with_context(
+            &mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            DMat4::IDENTITY,
+            "Weight Mix",
+            &AttributeLayerSelection::default(),
+        )?;
+        assert_weights(
+            &format!("weight mix set {mix_set}"),
+            &weights(&result, "A")?,
+            &expected["mix_sets"][mix_set]["weights"],
+            2.0e-5,
+        )?;
+        assert_members(
+            &format!("weight mix set {mix_set}"),
+            &members(&result, "A")?,
+            &expected["mix_sets"][mix_set]["members"],
+        )?;
     }
     let divide_zero = modifier(
         "vertex_weight_mix",
         json!({"vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"DIV","default_weight_b":0.0}),
     )?;
-    let result = evaluate_with_context(&mesh, &divide_zero, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
-    assert_weights("weight mix division by zero", &weights(&result, "A")?, &expected["mix_divide_zero"]["weights"], 2.0e-5)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &divide_zero,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Weight Mix",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight mix division by zero",
+        &weights(&result, "A")?,
+        &expected["mix_divide_zero"]["weights"],
+        2.0e-5,
+    )?;
     let mix_zero = modifier(
         "vertex_weight_mix",
         json!({"vertex_group_a":"A","vertex_group_b":"B","mix_set":"ALL","mix_mode":"SET","default_weight_b":0.0}),
     )?;
-    let result = evaluate_with_context(&mesh, &mix_zero, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
-    assert_weights("weight mix selected zero", &weights(&result, "A")?, &expected["mix_set_zero"]["weights"], 2.0e-5)?;
-    assert_members("weight mix selected zero", &members(&result, "A")?, &expected["mix_set_zero"]["members"])?;
+    let result = evaluate_with_context(
+        &mesh,
+        &mix_zero,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Weight Mix",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight mix selected zero",
+        &weights(&result, "A")?,
+        &expected["mix_set_zero"]["weights"],
+        2.0e-5,
+    )?;
+    assert_members(
+        "weight mix selected zero",
+        &members(&result, "A")?,
+        &expected["mix_set_zero"]["members"],
+    )?;
     for (label, inverted, oracle_key) in [
         ("weight mix mask", false, "mix_mask"),
         ("weight mix inverted mask", true, "mix_mask_invert"),
@@ -860,8 +1260,21 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
                 "mask_vertex_group":"Mask","mask_constant":0.75,"invert_mask_vertex_group":inverted
             }),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Weight Mix", &AttributeLayerSelection::default())?;
-        assert_weights(label, &weights(&result, "A")?, &expected[oracle_key]["weights"], 2.0e-5)?;
+        let result = evaluate_with_context(
+            &mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            DMat4::IDENTITY,
+            "Weight Mix",
+            &AttributeLayerSelection::default(),
+        )?;
+        assert_weights(
+            label,
+            &weights(&result, "A")?,
+            &expected[oracle_key]["weights"],
+            2.0e-5,
+        )?;
     }
     for (group_a, group_b, oracle_key) in [
         ("A", "Missing", "mix_missing_group_b"),
@@ -871,9 +1284,26 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "vertex_weight_mix",
             json!({"vertex_group_a":group_a,"vertex_group_b":group_b,"mix_set":"ALL","mix_mode":"ADD"}),
         )?;
-        let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "Missing Mix Group", &AttributeLayerSelection::default())?;
-        assert_weights("missing mix group pass-through", &weights(&result, "A")?, &expected[oracle_key]["weights"], 2.0e-5)?;
-        assert_members("missing mix group pass-through", &members(&result, "A")?, &expected[oracle_key]["members"])?;
+        let result = evaluate_with_context(
+            &mesh,
+            &modifier,
+            &BTreeMap::new(),
+            None,
+            DMat4::IDENTITY,
+            "Missing Mix Group",
+            &AttributeLayerSelection::default(),
+        )?;
+        assert_weights(
+            "missing mix group pass-through",
+            &weights(&result, "A")?,
+            &expected[oracle_key]["weights"],
+            2.0e-5,
+        )?;
+        assert_members(
+            "missing mix group pass-through",
+            &members(&result, "A")?,
+            &expected[oracle_key]["members"],
+        )?;
     }
     let mix_normalize = modifier(
         "vertex_weight_mix",
@@ -882,9 +1312,26 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "default_weight_a":0.23,"default_weight_b":0.31,"normalize":true
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &mix_normalize, &BTreeMap::new(), None, DMat4::IDENTITY, "Mix Normalize", &AttributeLayerSelection::default())?;
-    assert_weights("weight mix normalize", &weights(&result, "A")?, &expected["mix_normalize"]["weights"], 2.0e-5)?;
-    assert_members("weight mix normalize", &members(&result, "A")?, &expected["mix_normalize"]["members"])?;
+    let result = evaluate_with_context(
+        &mesh,
+        &mix_normalize,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Mix Normalize",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight mix normalize",
+        &weights(&result, "A")?,
+        &expected["mix_normalize"]["weights"],
+        2.0e-5,
+    )?;
+    assert_members(
+        "weight mix normalize",
+        &members(&result, "A")?,
+        &expected["mix_normalize"]["members"],
+    )?;
     let mix_empty_b = modifier(
         "vertex_weight_mix",
         json!({
@@ -892,8 +1339,21 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "default_weight_b":0.25
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &mix_empty_b, &BTreeMap::new(), None, DMat4::IDENTITY, "Mix Empty B", &AttributeLayerSelection::default())?;
-    assert_weights("weight mix empty B", &weights(&result, "A")?, &expected["mix_empty_group_b"]["weights"], 2.0e-5)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &mix_empty_b,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Mix Empty B",
+        &AttributeLayerSelection::default(),
+    )?;
+    assert_weights(
+        "weight mix empty B",
+        &weights(&result, "A")?,
+        &expected["mix_empty_group_b"]["weights"],
+        2.0e-5,
+    )?;
 
     let matrices = &expected["proximity_matrices"];
     let subject_world_f32 = blender_matrix_f32(&matrices["subject_world"])?;
@@ -1028,7 +1488,15 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "vertex_weight_proximity",
         json!({"vertex_group":"Missing","target":"target","proximity_mode":"OBJECT","min_dist":0.0,"max_dist":5.0}),
     )?;
-    let result = evaluate_with_context(&mesh, &missing_proximity_group, &object_operands, None, subject_transform, "Proximity Missing Group", &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(
+        &mesh,
+        &missing_proximity_group,
+        &object_operands,
+        None,
+        subject_transform,
+        "Proximity Missing Group",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_weights(
         "missing proximity group pass-through",
         &weights(&result, "A")?,
@@ -1044,7 +1512,15 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
         "vertex_weight_proximity",
         json!({"vertex_group":"A","target":null,"proximity_mode":"OBJECT"}),
     )?;
-    let result = evaluate_with_context(&mesh, &null_target_proximity, &BTreeMap::new(), None, DMat4::IDENTITY, "Proximity Null Target", &AttributeLayerSelection::default())?;
+    let result = evaluate_with_context(
+        &mesh,
+        &null_target_proximity,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "Proximity Null Target",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_weights(
         "null proximity target pass-through",
         &weights(&result, "A")?,
@@ -1063,7 +1539,7 @@ fn weight_modifiers_match_blender_falloff_mix_masks_and_proximity() -> Result<()
             "falloff_type":falloff
         });
         if falloff == "CURVE" {
-            params["map_curve"] = json!([[0.0,0.0],[0.27,0.72],[0.61,0.38],[1.0,1.0]]);
+            params["map_curve"] = json!([[0.0, 0.0], [0.27, 0.72], [0.61, 0.38], [1.0, 1.0]]);
         }
         let modifier = modifier("vertex_weight_proximity", params)?;
         let name = format!("Proximity Falloff {falloff}");
@@ -1104,7 +1580,11 @@ fn cli_applies_and_inspects_all_vertex_weight_modifiers() -> Result<(), Box<dyn 
         .arg(&scene)
         .arg("--json")
         .output()?;
-    assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stdout));
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
     fs::write(
         &operations,
         serde_json::to_vec(&json!({
@@ -1135,25 +1615,45 @@ fn cli_applies_and_inspects_all_vertex_weight_modifiers() -> Result<(), Box<dyn 
         .arg(&operations)
         .arg("--json")
         .output()?;
-    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stdout));
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
     let inspected = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["inspect"])
         .arg(&scene)
         .args(["--id", "body", "--json"])
         .output()?;
-    assert!(inspected.status.success(), "{}", String::from_utf8_lossy(&inspected.stdout));
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
     let inspection: Value = serde_json::from_slice(&inspected.stdout)?;
     assert!(inspection["result"]["items"][0]["evaluated_geometry"]["positions"].is_array());
 
     let document: SceneDoc = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let snapshot = Snapshot::evaluate_with_cache(&document, &EvaluationContext::default(), Some(&scene))?;
-    let body = snapshot.meshes.get(&Id::new("body")?).ok_or("evaluated body mesh missing")?;
+    let snapshot =
+        Snapshot::evaluate_with_cache(&document, &EvaluationContext::default(), Some(&scene))?;
+    let body = snapshot
+        .meshes
+        .get(&Id::new("body")?)
+        .ok_or("evaluated body mesh missing")?;
     let weights = weights(body, "A")?;
     assert_eq!(weights.len(), 4);
     assert!(weights.iter().all(|weight| (0.0..=1.0).contains(weight)));
-    let body_node = document.nodes.get(&Id::new("body")?).ok_or("body node missing")?;
+    let body_node = document
+        .nodes
+        .get(&Id::new("body")?)
+        .ok_or("body node missing")?;
     for id in ["edit", "mix", "proximity"] {
-        assert!(body_node.modifiers.iter().any(|modifier| modifier.id.as_str() == id));
+        assert!(
+            body_node
+                .modifiers
+                .iter()
+                .any(|modifier| modifier.id.as_str() == id)
+        );
     }
     Ok(())
 }
@@ -1169,7 +1669,11 @@ fn cli_null_target_proximity_preserves_input_weights() -> Result<(), Box<dyn Err
         .arg(&scene)
         .arg("--json")
         .output()?;
-    assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stdout));
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
     fs::write(
         &operations_path,
         serde_json::to_vec(&json!({
@@ -1192,24 +1696,37 @@ fn cli_null_target_proximity_preserves_input_weights() -> Result<(), Box<dyn Err
         .arg(&operations_path)
         .arg("--json")
         .output()?;
-    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stdout));
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
     let inspected = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["inspect"])
         .arg(&scene)
         .args(["--id", "body", "--json"])
         .output()?;
-    assert!(inspected.status.success(), "{}", String::from_utf8_lossy(&inspected.stdout));
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
     let inspection: Value = serde_json::from_slice(&inspected.stdout)?;
     assert!(inspection["result"]["items"][0]["evaluated_geometry"]["positions"].is_array());
     let document: SceneDoc = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let snapshot = Snapshot::evaluate_with_cache(&document, &EvaluationContext::default(), Some(&scene))?;
-    let body = snapshot.meshes.get(&Id::new("body")?).ok_or("evaluated body mesh missing")?;
+    let snapshot =
+        Snapshot::evaluate_with_cache(&document, &EvaluationContext::default(), Some(&scene))?;
+    let body = snapshot
+        .meshes
+        .get(&Id::new("body")?)
+        .ok_or("evaluated body mesh missing")?;
     assert_eq!(weights(body, "A")?, [0.2, 0.4, 0.6, 0.8]);
     Ok(())
 }
 
 #[test]
-fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Result<(), Box<dyn Error>> {
+fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
+-> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let root = directory.path();
     let Some(expected) = texture_oracle(root)? else {
@@ -1223,13 +1740,17 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Resu
         .arg(&scene)
         .arg("--json")
         .output()?;
-    assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stdout));
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
 
     let pixels = json!([
-        [0.05,0.15,0.8,0.2],
-        [0.35,0.6,0.1,0.4],
-        [0.9,0.25,0.45,0.7],
-        [0.65,0.85,0.3,1.0]
+        [0.05, 0.15, 0.8, 0.2],
+        [0.35, 0.6, 0.1, 0.4],
+        [0.9, 0.25, 0.45, 0.7],
+        [0.65, 0.85, 0.3, 1.0]
     ]);
     let mut operations = vec![
         json!({"op":"image.create","id":"mask","name":"MaskImage","width":2,"height":2,"colorspace":"linear","fill_color":[0.0,0.0,0.0,1.0]}),
@@ -1239,17 +1760,30 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Resu
         json!({"op":"bone.create","target":{"id":"texture_rig"},"id":"mask_bone","name":"MaskBone","head":[0.0,0.0,0.0],"tail":[0.0,0.0,1.0]}),
         json!({"op":"pose.set","target":{"id":"texture_rig"},"bone_id":"mask_bone","set":{"translation":[0.2,0.3,0.0],"rotation":[0.0,0.0,0.2279775235351884,0.9736663950053749]}}),
     ];
-    let mappings = ["LOCAL", "GLOBAL", "OBJECT", "OBJECT_NULL", "UV", "UV_FALLBACK", "BONE", "BONE_MISSING"];
+    let mappings = [
+        "LOCAL",
+        "GLOBAL",
+        "OBJECT",
+        "OBJECT_NULL",
+        "UV",
+        "UV_FALLBACK",
+        "BONE",
+        "BONE_MISSING",
+    ];
     let channels = ["INT", "RED", "GREEN", "BLUE", "HUE", "SAT", "VAL", "ALPHA"];
     // The canonical store is V-down; the Blender oracle fixture uses its native V-up UVs.
-    let uv_values = json!([[0.15,0.8],[0.8,0.9],[0.7,0.15],[0.25,0.25]]);
+    let uv_values = json!([[0.15, 0.8], [0.8, 0.9], [0.7, 0.15], [0.25, 0.25]]);
     for mapping in mappings {
         for channel in channels {
             let object_id = format!("mask_{}_{}", mapping.to_lowercase(), channel.to_lowercase());
             let group_id = format!("group_{}", object_id);
             let modifier_id = format!("modifier_{}", object_id);
-            let mut node = json!({"op":"node.create","id":object_id,"kind":"plane","params":{"size":1.0}});
-            if matches!(mapping, "GLOBAL" | "OBJECT" | "OBJECT_NULL" | "BONE" | "BONE_MISSING") {
+            let mut node =
+                json!({"op":"node.create","id":object_id,"kind":"plane","params":{"size":1.0}});
+            if matches!(
+                mapping,
+                "GLOBAL" | "OBJECT" | "OBJECT_NULL" | "BONE" | "BONE_MISSING"
+            ) {
                 node["transform"] = json!({
                     "translation":[0.35,-0.2,0.15],
                     "scale":[1.4,0.65,1.0]
@@ -1261,7 +1795,11 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Resu
                 {"vertex_id":0,"weight":0.2},{"vertex_id":1,"weight":0.4},
                 {"vertex_id":2,"weight":0.6},{"vertex_id":3,"weight":0.8}
             ]}));
-            let texture_mapping = if matches!(mapping, "BONE" | "BONE_MISSING" | "OBJECT_NULL") { "OBJECT" } else { mapping };
+            let texture_mapping = if matches!(mapping, "BONE" | "BONE_MISSING" | "OBJECT_NULL") {
+                "OBJECT"
+            } else {
+                mapping
+            };
             let mut params = json!({
                 "vertex_group":"A","falloff_type":"SHARP","normalize":false,
                 "mask_texture":"mask","mask_tex_use_channel":channel,
@@ -1271,9 +1809,17 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Resu
                 params["mask_tex_map_object"] = json!("texture_frame");
             } else if matches!(mapping, "BONE" | "BONE_MISSING") {
                 params["mask_tex_map_object"] = json!("texture_rig");
-                params["mask_tex_map_bone"] = json!(if mapping == "BONE" { "MaskBone" } else { "MissingBone" });
+                params["mask_tex_map_bone"] = json!(if mapping == "BONE" {
+                    "MaskBone"
+                } else {
+                    "MissingBone"
+                });
             } else if matches!(mapping, "UV" | "UV_FALLBACK") {
-                params["mask_tex_uv_layer"] = json!(if mapping == "UV" { "UVMask" } else { "MissingUV" });
+                params["mask_tex_uv_layer"] = json!(if mapping == "UV" {
+                    "UVMask"
+                } else {
+                    "MissingUV"
+                });
             }
             operations.push(json!({
                 "op":"modifier.create","target":{"id":object_id},"id":modifier_id,
@@ -1294,12 +1840,20 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Resu
         .arg(&operations_path)
         .arg("--json")
         .output()?;
-    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stdout));
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
 
     let mut document: SceneDoc = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     for mapping in ["UV", "UV_FALLBACK"] {
         for channel in channels {
-            let node_id = Id::new(format!("mask_{}_{}", mapping.to_lowercase(), channel.to_lowercase()))?;
+            let node_id = Id::new(format!(
+                "mask_{}_{}",
+                mapping.to_lowercase(),
+                channel.to_lowercase()
+            ))?;
             let data_id = document
                 .nodes
                 .get(&node_id)
@@ -1311,7 +1865,10 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Resu
                 .get_mut(&data_id)
                 .and_then(|data| data.mesh.as_mut())
                 .ok_or("UV texture test node mesh is missing")?;
-            let face = mesh.faces.first().ok_or("UV texture test mesh has no face")?;
+            let face = mesh
+                .faces
+                .first()
+                .ok_or("UV texture test mesh has no face")?;
             mesh.attributes.insert(
                 "uv_layers".to_owned(),
                 json!({
@@ -1322,17 +1879,26 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Resu
             );
         }
     }
-    let snapshot = Snapshot::evaluate_with_cache(
-        &document,
-        &EvaluationContext::default(),
-        Some(&scene),
-    )?;
+    let snapshot =
+        Snapshot::evaluate_with_cache(&document, &EvaluationContext::default(), Some(&scene))?;
     for mapping in mappings {
         for channel in channels {
-            let object_id = Id::new(format!("mask_{}_{}", mapping.to_lowercase(), channel.to_lowercase()))?;
-            let mesh = snapshot.meshes.get(&object_id).ok_or("evaluated texture mask mesh is missing")?;
+            let object_id = Id::new(format!(
+                "mask_{}_{}",
+                mapping.to_lowercase(),
+                channel.to_lowercase()
+            ))?;
+            let mesh = snapshot
+                .meshes
+                .get(&object_id)
+                .ok_or("evaluated texture mask mesh is missing")?;
             let label = format!("texture mask {mapping}/{channel}");
-            assert_weights(&label, &weights(mesh, "A")?, &expected[&format!("{mapping}_{channel}")], 3.0e-5)?;
+            assert_weights(
+                &label,
+                &weights(mesh, "A")?,
+                &expected[&format!("{mapping}_{channel}")],
+                3.0e-5,
+            )?;
         }
     }
     let local_red = snapshot
@@ -1350,9 +1916,16 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space() -> Resu
     let local_weights = weights(local_red, "A")?;
     let uv_weights = weights(uv_red, "A")?;
     assert!(
-        local_weights.iter().zip(&uv_weights).any(|(local, uv)| (local - uv).abs() > 1.0e-4),
+        local_weights
+            .iter()
+            .zip(&uv_weights)
+            .any(|(local, uv)| (local - uv).abs() > 1.0e-4),
         "UV texture mapping fell back to LOCAL coordinates",
     );
-    assert_eq!(uv_weights, weights(uv_fallback_red, "A")?, "missing UV layer must use the active layer");
+    assert_eq!(
+        uv_weights,
+        weights(uv_fallback_red, "A")?,
+        "missing UV layer must use the active layer"
+    );
     Ok(())
 }

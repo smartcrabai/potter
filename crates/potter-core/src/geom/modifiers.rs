@@ -24,7 +24,7 @@ use super::attribute_keys;
 use super::clnor::{self, CornerNormalCode, NormalCodeOptions, settle_custom_normals};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
-    Edge, Face, Mesh, MeshError, Vertex, edge_key,
+    Edge, Face, Mesh, MeshError, ORIGINDEX_NONE, OriginalIndices, Vertex, edge_key,
     normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
     provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
     uv_layers,
@@ -76,10 +76,7 @@ const MAX_SUBDIVISION_TRIANGLES: u128 = 100_000_000;
 const MAX_SUBDIVISION_MEMORY_BYTES: u128 = 8 * 1024 * 1024 * 1024;
 
 /// Build Blender's `SpaceTransform` pair from original world matrices in f32 operation order.
-pub(crate) fn blender_space_transform_f32(
-    local: DMat4,
-    target: DMat4,
-) -> ([f32; 16], [f32; 16]) {
+pub(crate) fn blender_space_transform_f32(local: DMat4, target: DMat4) -> ([f32; 16], [f32; 16]) {
     let local = local.to_cols_array().map(|value| value as f32);
     let target = target.to_cols_array().map(|value| value as f32);
     let inverse_target = blender_inverse_m4(target);
@@ -145,11 +142,7 @@ pub struct ModifierEvaluation {
 ///
 /// Returns `UNSUPPORTED_FEATURE` for an unsupported modifier type, or `INVALID_ARGUMENT`
 /// when a supported modifier has invalid parameters or input.
-pub fn evaluate_modifiers(
-    mesh: &Mesh,
-    modifiers: &[Modifier],
-    subject_name: &str,
-) -> Result<Mesh> {
+pub fn evaluate_modifiers(mesh: &Mesh, modifiers: &[Modifier], subject_name: &str) -> Result<Mesh> {
     Ok(evaluate_modifiers_with_groups(mesh, modifiers, &BTreeMap::new(), subject_name)?.mesh)
 }
 
@@ -257,6 +250,33 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "modifier evaluation frame must be finite",
         ));
     }
+    let needs_original_indices = modifiers.iter().enumerate().any(|(index, modifier)| {
+        is_active(index, modifier)
+            && modifier.modifier_type == "hook"
+            && modifier
+                .params
+                .get("vertex_indices")
+                .and_then(Value::as_array)
+                .is_some_and(|indices| !indices.is_empty())
+    });
+    if needs_original_indices && evaluated.original_indices.is_none() {
+        let source_vertex_count = evaluated.vertices.len();
+        if source_vertex_count > i32::MAX as usize {
+            return Err(PotError::new(
+                ErrorCode::LimitExceeded,
+                "Hook original vertex count exceeds Blender's signed 32-bit range",
+            ));
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the source vertex count was checked against Blender's i32 bitmap limit"
+        )]
+        let vertices = (0..source_vertex_count).map(|index| index as i32).collect();
+        evaluated.original_indices = Some(super::OriginalIndices {
+            vertices,
+            source_vertex_count,
+        });
+    }
     let stack_input = modifiers
         .iter()
         .enumerate()
@@ -349,7 +369,10 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 .is_some_and(|value| !value.is_null()))
             || (modifier.modifier_type == "mask"
                 && modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
-                && modifier.params.get("armature").is_some_and(Value::is_string));
+                && modifier
+                    .params
+                    .get("armature")
+                    .is_some_and(Value::is_string));
         if modifier.modifier_type == "armature"
             || modifier.modifier_type == "lattice"
             || matches!(
@@ -1194,6 +1217,7 @@ fn mirror_copy_normals(
         (0..polygons.len())
             .map(|polygon| Some(polygon % source_count))
             .collect(),
+        false,
     );
     let mut copies = build_mesh(
         points.to_vec(),
@@ -1436,6 +1460,13 @@ fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .iter()
             .map(|members| mean_origin(members.iter().map(|&point| Some(point % vertex_count))))
             .collect(),
+        source_vertices: mesh.original_indices.as_ref().map(|_| {
+            merged
+                .point_members
+                .iter()
+                .map(|members| members.first().map(|&point| point % vertex_count))
+                .collect()
+        }),
         faces: merged
             .polygon_sources
             .iter()
@@ -1806,6 +1837,16 @@ fn array(
                 _ => Vec::new(),
             })
             .collect(),
+        source_vertices: mesh.original_indices.as_ref().map(|_| {
+            merged
+                .point_members
+                .iter()
+                .map(|members| match members.first() {
+                    Some(&point) if point < copy_vertex_count => Some(point % source_points.len()),
+                    _ => None,
+                })
+                .collect()
+        }),
         faces: merged
             .polygon_sources
             .iter()
@@ -2008,6 +2049,9 @@ fn array_provenance_source(mesh: &Mesh, caps: &[&Mesh]) -> Result<Mesh> {
             let id = take_element_id(&mut vertex_next)?;
             vertex_ids.insert(vertex.id, id);
             source.vertices.push(Vertex { id, co: vertex.co });
+            if let Some(indices) = &mut source.original_indices {
+                indices.vertices.push(ORIGINDEX_NONE);
+            }
         }
         let vertex_of = |id: u32| {
             vertex_ids.get(&id).copied().ok_or_else(|| {
@@ -3241,6 +3285,7 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .iter()
             .map(|triangle| Some(triangle.face))
             .collect(),
+        mesh.original_indices.is_some(),
     );
     let mut result = build_mesh(
         positions(mesh),
@@ -3457,7 +3502,11 @@ fn solidify(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             Some([duplicate_indices[*first]?, duplicate_indices[*second]?])
         }));
     }
-    let origin = Origin::copies(point_sources.into_iter().map(Some), face_sources);
+    let origin = Origin::copies(
+        point_sources.into_iter().map(Some),
+        face_sources,
+        mesh.original_indices.is_some(),
+    );
     let mut result = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
     clnor::transfer_custom_normals(
         mesh,
@@ -4053,6 +4102,7 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let profile_coordinates = bevel_profile_coordinates(segments, exponent);
     let mut points = Vec::new();
     let mut point_vertices = Vec::new();
+    let mut source_vertices = mesh.original_indices.as_ref().map(|_| Vec::new());
     let mut face_corner = HashMap::new();
     let mut corner_width = HashMap::new();
     for (face_index, (face, _)) in source_polygons.iter().enumerate() {
@@ -4117,6 +4167,9 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             points.push(point);
             // shortcut: corner vertices take one source vertex; Blender blends the bevel stencil of several corners, upgrade with those coefficients
             point_vertices.push(vertex);
+            if let Some(source_vertices) = &mut source_vertices {
+                source_vertices.push(Some(vertex));
+            }
             face_corner.insert((face_index, vertex), index);
         }
     }
@@ -4202,6 +4255,9 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                     let index = points.len();
                     points.push(bevel_profile_point(points[a], points[b], middle, x, y));
                     point_vertices.push(vertex);
+                    if let Some(source_vertices) = &mut source_vertices {
+                        source_vertices.push(Some(vertex));
+                    }
                     profile_points.insert((*edge, vertex, segment), index);
                     profile_uv_points.insert(index, middle);
                 }
@@ -4350,6 +4406,9 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         // shortcut: corner vertices take one source vertex; Blender blends the bevel stencil of several corners, upgrade with those coefficients
         points.push(corner_center);
         point_vertices.push(vertex);
+        if let Some(source_vertices) = &mut source_vertices {
+            source_vertices.push(Some(vertex));
+        }
         for (face_index, corner, material) in faces {
             let face = &source_polygons[*face_index].0;
             let previous = face[(*corner + face.len() - 1) % face.len()];
@@ -4418,10 +4477,13 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .zip(&uv_sources)
             .map(|(ids, source)| (ids.as_slice(), *source)),
     );
-    let origin = Origin {
-        corners: Some(corners),
-        ..Origin::copies(point_vertices.iter().copied().map(Some), shade_sources)
-    };
+    let mut origin = Origin::copies(
+        point_vertices.iter().copied().map(Some),
+        shade_sources,
+        false,
+    );
+    origin.source_vertices = source_vertices;
+    origin.corners = Some(corners);
     let source_count = source_polygons.len();
     let kinds: Vec<bevel_shading::Kind> = (0..output_polygons.len())
         .map(|polygon| {
@@ -4549,6 +4611,11 @@ fn bevel_vertices(
     let mut point_origins: Vec<Vec<(usize, f64)>> = (0..source_points.len())
         .map(|vertex| vec![(vertex, 1.0)])
         .collect();
+    let mut source_vertices = mesh.original_indices.as_ref().map(|_| {
+        (0..source_points.len())
+            .map(Some)
+            .collect::<Vec<Option<usize>>>()
+    });
     let mut edge_points = HashMap::new();
     let mut patch_graph = vec![HashMap::<usize, Vec<usize>>::new(); source_points.len()];
     let mut corner_sectors = vec![Vec::new(); source_points.len()];
@@ -4581,6 +4648,9 @@ fn bevel_vertices(
                     );
                     let index = points.len();
                     points.push(point);
+                    if let Some(source_vertices) = &mut source_vertices {
+                        source_vertices.push(Some(vertex));
+                    }
                     let bounded = fraction.clamp(0.0, 1.0);
                     point_origins.push(blend_weights([
                         (vertex, 1.0 - bounded),
@@ -4617,6 +4687,9 @@ fn bevel_vertices(
                 };
                 let index = points.len();
                 points.push(arc_center + direction * radius);
+                if let Some(source_vertices) = &mut source_vertices {
+                    source_vertices.push(Some(vertex));
+                }
                 let origin = blend_weights(
                     point_origins[incoming]
                         .iter()
@@ -4710,6 +4783,9 @@ fn bevel_vertices(
         let center = source_points[vertex] - normal_sum * (amount * fullness * 0.301_073_345);
         let center_index = points.len();
         points.push(center);
+        if let Some(source_vertices) = &mut source_vertices {
+            source_vertices.push(Some(vertex));
+        }
         point_origins.push(vec![(vertex, 1.0)]);
         for (incoming, arc_points, outgoing, material, source) in &corner_sectors[vertex] {
             if segments == 2 {
@@ -4770,6 +4846,15 @@ fn bevel_vertices(
         }
         query_polygons.push(ids);
     }
+    let mut source_vertices = source_vertices.map(|mut source_vertices| {
+        let mut index = 0;
+        source_vertices.retain(|_| {
+            let keep = used.get(index).copied().unwrap_or(false);
+            index += 1;
+            keep
+        });
+        source_vertices
+    });
     let mut remap = vec![0; points.len()];
     let mut compact_points = Vec::with_capacity(points.len());
     let mut compact_origins = Vec::with_capacity(points.len());
@@ -4808,6 +4893,7 @@ fn bevel_vertices(
     );
     let origin = Origin {
         vertices: compact_origins,
+        source_vertices,
         faces: face_sources,
         corners: Some(corners),
     };
@@ -4890,6 +4976,15 @@ fn decimate_compact(
         used[*first] = true;
         used[*second] = true;
     }
+    let mut source_vertices = origin.source_vertices;
+    if let Some(source_vertices) = &mut source_vertices {
+        let mut index = 0;
+        source_vertices.retain(|_| {
+            let keep = used.get(index).copied().unwrap_or(false);
+            index += 1;
+            keep
+        });
+    }
     let mut remap = vec![0; points.len()];
     let mut compact_points = Vec::with_capacity(points.len());
     let mut compact_origin = Vec::with_capacity(points.len());
@@ -4911,6 +5006,7 @@ fn decimate_compact(
     }
     let origin = Origin {
         vertices: compact_origin,
+        source_vertices,
         faces: origin.faces,
         corners: origin.corners,
     };
@@ -4975,6 +5071,13 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .iter()
             .map(|members| mean_origin(members.iter().map(|&vertex| Some(vertex))))
             .collect(),
+        source_vertices: mesh.original_indices.as_ref().map(|_| {
+            merged
+                .point_members
+                .iter()
+                .map(|members| members.first().copied())
+                .collect()
+        }),
         faces: merged
             .polygon_sources
             .iter()
@@ -5294,14 +5397,16 @@ mod tests {
             size: DVec3::splat(2.0),
         })
         .unwrap();
-        let evaluated = evaluate_modifiers(&mesh, &[modifier(false, "unknown")], "TestObject").unwrap();
+        let evaluated =
+            evaluate_modifiers(&mesh, &[modifier(false, "unknown")], "TestObject").unwrap();
         assert_eq!(evaluated, mesh);
     }
 
     #[test]
     fn unknown_enabled_modifiers_report_the_feature_id() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let error = evaluate_modifiers(&mesh, &[modifier(true, "unknown")], "TestObject").unwrap_err();
+        let error =
+            evaluate_modifiers(&mesh, &[modifier(true, "unknown")], "TestObject").unwrap_err();
         assert_eq!(error.code, ErrorCode::UnsupportedFeature);
         assert_eq!(error.details["feature_id"], "modifier.unknown");
     }
@@ -5450,10 +5555,14 @@ mod tests {
     #[test]
     fn mirror_merges_coincident_geometry() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let result = evaluate_modifiers(&mesh, &[with_params(
-            "mirror",
-            json!({"use_axis": [true, false, false], "use_mirror_merge": true}),
-        )], "TestObject")
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "mirror",
+                json!({"use_axis": [true, false, false], "use_mirror_merge": true}),
+            )],
+            "TestObject",
+        )
         .unwrap();
         assert_eq!(result.vertices.len(), 8);
         assert_eq!(result.faces.len(), 6);
@@ -5464,10 +5573,14 @@ mod tests {
             vec![vec![0, 1, 2]],
         )
         .unwrap();
-        let mirrored = evaluate_modifiers(&plane_mesh, &[with_params(
-            "mirror",
-            json!({"use_axis": [true, false, false], "use_mirror_merge": true}),
-        )], "TestObject")
+        let mirrored = evaluate_modifiers(
+            &plane_mesh,
+            &[with_params(
+                "mirror",
+                json!({"use_axis": [true, false, false], "use_mirror_merge": true}),
+            )],
+            "TestObject",
+        )
         .unwrap();
         assert_eq!(mirrored.vertices.len(), 3);
         assert_eq!(mirrored.faces.len(), 1);
@@ -5535,7 +5648,12 @@ mod tests {
         )
         .unwrap();
 
-        let result = evaluate_modifiers(&mesh, &[with_params("triangulate", json!({}))], "TestObject").unwrap();
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params("triangulate", json!({}))],
+            "TestObject",
+        )
+        .unwrap();
         let points = positions_by_id(&result);
         let sharp = crate::geom::normals::sharp_edge_flags(&result).unwrap();
         let bottom_edges = result
@@ -5635,10 +5753,14 @@ mod tests {
             .filter(|id| base.faces[second].vertices.contains(id))
             .collect();
 
-        let result = evaluate_modifiers(&mesh, &[with_params(
-            "mirror",
-            json!({"use_axis": [true, false, false], "use_mirror_merge": false}),
-        )], "TestObject")
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "mirror",
+                json!({"use_axis": [true, false, false], "use_mirror_merge": false}),
+            )],
+            "TestObject",
+        )
         .unwrap();
         let result_points = positions_by_id(&result);
         let sharp = crate::geom::normals::sharp_edge_flags(&result).unwrap();
@@ -5693,16 +5815,24 @@ mod tests {
     fn triangulate_keep_without_custom_normals_stores_pre_split_normals() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
         crate::geom::normals::shade_faces_smooth(&mut mesh);
-        let result = evaluate_modifiers(&mesh, &[with_params(
-            "triangulate",
-            json!({"keep_custom_normals": true}),
-        )], "TestObject")
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "triangulate",
+                json!({"keep_custom_normals": true}),
+            )],
+            "TestObject",
+        )
         .unwrap();
         assert!(result.attributes.contains_key("custom_normal"));
-        let without = evaluate_modifiers(&mesh, &[with_params(
-            "triangulate",
-            json!({"keep_custom_normals": false}),
-        )], "TestObject")
+        let without = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "triangulate",
+                json!({"keep_custom_normals": false}),
+            )],
+            "TestObject",
+        )
         .unwrap();
         assert!(!without.attributes.contains_key("custom_normal"));
     }
@@ -5741,13 +5871,22 @@ mod tests {
         };
         // Three steps close the full turn into three distinct rings.
         let plain = normals_by_corners(
-            &evaluate_modifiers(&mesh, &[with_params("screw", json!({"steps": 3}))], "TestObject").unwrap(),
+            &evaluate_modifiers(
+                &mesh,
+                &[with_params("screw", json!({"steps": 3}))],
+                "TestObject",
+            )
+            .unwrap(),
         );
         let flipped = normals_by_corners(
-            &evaluate_modifiers(&mesh, &[with_params(
-                "screw",
-                json!({"steps": 3, "use_normal_flip": true}),
-            )], "TestObject")
+            &evaluate_modifiers(
+                &mesh,
+                &[with_params(
+                    "screw",
+                    json!({"steps": 3, "use_normal_flip": true}),
+                )],
+                "TestObject",
+            )
             .unwrap(),
         );
         assert_eq!(plain.len(), 12);
@@ -5777,16 +5916,24 @@ mod tests {
     fn shading_refusals_name_their_feature_only_where_blender_acts() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
 
-        let error = evaluate_modifiers(&mesh, &[with_params(
-            "mirror",
-            json!({"use_axis": [true, false, false], "use_bisect_axis": [true, false, false]}),
-        )], "TestObject")
+        let error = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "mirror",
+                json!({"use_axis": [true, false, false], "use_bisect_axis": [true, false, false]}),
+            )],
+            "TestObject",
+        )
         .unwrap_err();
         assert_eq!(refused_feature(&error), Some("modifier.mirror.bisect"));
-        evaluate_modifiers(&mesh, &[with_params(
-            "mirror",
-            json!({"use_axis": [true, false, false], "use_bisect_axis": [false, true, false]}),
-        )], "TestObject")
+        evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "mirror",
+                json!({"use_axis": [true, false, false], "use_bisect_axis": [false, true, false]}),
+            )],
+            "TestObject",
+        )
         .unwrap();
 
         let mut seamed = mesh.clone();
@@ -5797,31 +5944,47 @@ mod tests {
             "seam".to_owned(),
             json!({"domain": "edge", "type": "bool", "values": seam_values}),
         );
-        let error = evaluate_modifiers(&seamed, &[with_params(
-            "bevel",
-            json!({"width": 0.1, "mark_seam": true}),
-        )], "TestObject")
+        let error = evaluate_modifiers(
+            &seamed,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "mark_seam": true}),
+            )],
+            "TestObject",
+        )
         .unwrap_err();
         assert_eq!(refused_feature(&error), Some("modifier.bevel.mark_seam"));
-        evaluate_modifiers(&mesh, &[with_params(
-            "bevel",
-            json!({"width": 0.1, "mark_seam": true}),
-        )], "TestObject")
+        evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "mark_seam": true}),
+            )],
+            "TestObject",
+        )
         .unwrap();
 
-        let error = evaluate_modifiers(&mesh, &[with_params(
-            "bevel",
-            json!({"width": 0.1, "segments": 2, "harden_normals": true}),
-        )], "TestObject")
+        let error = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "segments": 2, "harden_normals": true}),
+            )],
+            "TestObject",
+        )
         .unwrap_err();
         assert_eq!(
             refused_feature(&error),
             Some("modifier.bevel.shading_segments")
         );
-        evaluate_modifiers(&mesh, &[with_params(
-            "bevel",
-            json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
-        )], "TestObject")
+        evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
+            )],
+            "TestObject",
+        )
         .unwrap();
 
         let mut sharp = mesh.clone();
@@ -5830,10 +5993,14 @@ mod tests {
             "sharp".to_owned(),
             json!({"domain": "edge", "type": "bool", "values": {key: true}}),
         );
-        let error = evaluate_modifiers(&sharp, &[with_params(
-            "bevel",
-            json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
-        )], "TestObject")
+        let error = evaluate_modifiers(
+            &sharp,
+            &[with_params(
+                "bevel",
+                json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
+            )],
+            "TestObject",
+        )
         .unwrap_err();
         assert_eq!(
             refused_feature(&error),
@@ -5844,8 +6011,12 @@ mod tests {
     #[test]
     fn bevel_creates_inset_faces_and_valid_chamfer_topology() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let result =
-            evaluate_modifiers(&mesh, &[with_params("bevel", json!({"width": 0.1}))], "TestObject").unwrap();
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params("bevel", json!({"width": 0.1}))],
+            "TestObject",
+        )
+        .unwrap();
         assert_eq!(result.faces.len(), 26);
         assert_eq!(result.vertices.len(), 24);
         assert!(result.validate().is_ok());
@@ -5894,16 +6065,24 @@ mod tests {
             })
             .collect();
         uv_layers::write_layers(&mut mesh, &layers);
-        let error = evaluate_modifiers(&mesh, &[with_params("subdivision", json!({"levels": 5}))], "TestObject")
-            .unwrap_err();
+        let error = evaluate_modifiers(
+            &mesh,
+            &[with_params("subdivision", json!({"levels": 5}))],
+            "TestObject",
+        )
+        .unwrap_err();
         assert_eq!(error.code, ErrorCode::LimitExceeded);
     }
 
     #[test]
     fn subdivision_refines_topology_with_catmull_clark_quads() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let result =
-            evaluate_modifiers(&mesh, &[with_params("subdivision", json!({"levels": 1}))], "TestObject").unwrap();
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params("subdivision", json!({"levels": 1}))],
+            "TestObject",
+        )
+        .unwrap();
         assert_eq!(result.vertices.len(), 26);
         assert_eq!(result.faces.len(), 24);
         assert!(result.faces.iter().all(|face| face.vertices.len() == 4));
@@ -5934,8 +6113,10 @@ mod tests {
                 json!({"use_axis":[true,false,false],"use_mirror_merge":false}),
             )
         };
-        let array_then_mirror = evaluate_modifiers(&mesh, &[array(), mirror()], "TestObject").unwrap();
-        let mirror_then_array = evaluate_modifiers(&mesh, &[mirror(), array()], "TestObject").unwrap();
+        let array_then_mirror =
+            evaluate_modifiers(&mesh, &[array(), mirror()], "TestObject").unwrap();
+        let mirror_then_array =
+            evaluate_modifiers(&mesh, &[mirror(), array()], "TestObject").unwrap();
 
         assert_eq!(array_then_mirror.vertices.len(), 12);
         assert_eq!(array_then_mirror.faces.len(), 4);

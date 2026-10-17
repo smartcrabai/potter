@@ -1,13 +1,13 @@
 //! Data transfer modifier: per-domain mapping, layer selection, and mixing.
 
 use super::*;
+use crate::geom::color_layers::{self, ColorDomain};
+use crate::geom::spatial::BoundsBvh;
+use crate::geom::uv_layers::{UvLayer, read as read_uv_store, read_layers, write_layers};
 use glam::{DVec2, DVec3};
 use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use crate::geom::color_layers::{self, ColorDomain};
-use crate::geom::spatial::BoundsBvh;
-use crate::geom::uv_layers::{read as read_uv_store, read_layers, write_layers, UvLayer};
 
 pub(super) fn data_transfer(
     mesh: &Mesh,
@@ -23,15 +23,16 @@ pub(super) fn data_transfer(
     };
     let use_transform = boolean(modifier, "use_object_transform")?;
     let (source_to_destination_f32, destination_to_source_f32) = if use_transform {
-        let matrices = source.blender_matrices_f32.as_ref().ok_or_else(|| {
-            invalid(modifier, "object", "source Blender f32 transform matrices")
-        })?;
-        let local_to_subject = matrices.local_to_subject.ok_or_else(|| {
-            invalid(modifier, "object", "source local-to-subject f32 transform")
-        })?;
-        let subject_to_local = matrices.subject_to_local.ok_or_else(|| {
-            invalid(modifier, "object", "source subject-to-local f32 transform")
-        })?;
+        let matrices = source
+            .blender_matrices_f32
+            .as_ref()
+            .ok_or_else(|| invalid(modifier, "object", "source Blender f32 transform matrices"))?;
+        let local_to_subject = matrices
+            .local_to_subject
+            .ok_or_else(|| invalid(modifier, "object", "source local-to-subject f32 transform"))?;
+        let subject_to_local = matrices
+            .subject_to_local
+            .ok_or_else(|| invalid(modifier, "object", "source subject-to-local f32 transform"))?;
         (local_to_subject, subject_to_local)
     } else {
         let identity = glam::Mat4::IDENTITY.to_cols_array();
@@ -105,18 +106,15 @@ pub(super) fn data_transfer(
             || matches!(loop_mapping, "NEAREST_NORMAL" | "POLYINTERP_LNORPROJ"));
     let needs_vertex_normals = (use_vertices && vertex_mapping == "POLYINTERP_VNORPROJ")
         || (use_edges && edge_mapping == "EDGEINTERP_VNORPROJ");
-    let needs_source_face_graph =
-        (use_vertices
-            && !data_types_verts.is_empty()
-            && matches!(
-                vertex_mapping,
-                "POLY_NEAREST" | "POLYINTERP_NEAREST" | "POLYINTERP_VNORPROJ"
-            ))
-            || (use_edges
-                && !data_types_edges.is_empty()
-                && edge_mapping == "POLY_NEAREST")
-            || (use_loops && !data_types_loops.is_empty() && loop_mapping != "TOPOLOGY")
-            || (use_polygons && !data_types_polys.is_empty() && polygon_mapping != "TOPOLOGY");
+    let needs_source_face_graph = (use_vertices
+        && !data_types_verts.is_empty()
+        && matches!(
+            vertex_mapping,
+            "POLY_NEAREST" | "POLYINTERP_NEAREST" | "POLYINTERP_VNORPROJ"
+        ))
+        || (use_edges && !data_types_edges.is_empty() && edge_mapping == "POLY_NEAREST")
+        || (use_loops && !data_types_loops.is_empty() && loop_mapping != "TOPOLOGY")
+        || (use_polygons && !data_types_polys.is_empty() && polygon_mapping != "TOPOLOGY");
     let mapping_context = TransferMapContext::new(
         &source.mesh,
         mesh,
@@ -408,7 +406,13 @@ fn transfer_vertex_groups(
         .attributes
         .get("vertex_groups")
         .and_then(Value::as_object)
-        .ok_or_else(|| invalid(modifier, "data_types_verts", "a source mesh with vertex groups"))?;
+        .ok_or_else(|| {
+            invalid(
+                modifier,
+                "data_types_verts",
+                "a source mesh with vertex groups",
+            )
+        })?;
     let mut groups = destination
         .attributes
         .get("vertex_groups")
@@ -454,7 +458,11 @@ fn transfer_vertex_groups(
                 .iter()
                 .find(|name| name.as_str() == source_selection)
             else {
-                return Err(invalid(modifier, "layers_vgroup_select_src", "ALL or a valid source group"));
+                return Err(invalid(
+                    modifier,
+                    "layers_vgroup_select_src",
+                    "ALL or a valid source group",
+                ));
             };
             vec![name.clone()]
         }
@@ -500,7 +508,13 @@ fn transfer_vertex_groups(
         let source_weights = source_groups
             .get(&source_name)
             .and_then(Value::as_object)
-            .ok_or_else(|| invalid(modifier, "data_types_verts", "valid source vertex-group weights"))?;
+            .ok_or_else(|| {
+                invalid(
+                    modifier,
+                    "data_types_verts",
+                    "valid source vertex-group weights",
+                )
+            })?;
         let mut destination_weights = groups
             .get(&destination_name)
             .and_then(Value::as_object)
@@ -524,7 +538,10 @@ fn transfer_vertex_groups(
                 })
                 .sum::<f64>();
             let key = format!("v{}", vertex.id);
-            let prior = destination_weights.get(&key).and_then(Value::as_f64).unwrap_or(0.0);
+            let prior = destination_weights
+                .get(&key)
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
             let mut mask = mask_weights.map_or(1.0, |weights| {
                 weights.get(&vertex.id).copied().unwrap_or(0.0)
             });
@@ -536,7 +553,9 @@ fn transfer_vertex_groups(
         }
         groups.insert(destination_name, Value::Object(destination_weights));
     }
-    destination.attributes.insert("vertex_groups".to_owned(), Value::Object(groups));
+    destination
+        .attributes
+        .insert("vertex_groups".to_owned(), Value::Object(groups));
     Ok(())
 }
 
@@ -582,7 +601,8 @@ fn transfer_vertex_attribute(
             .cloned()
             .unwrap_or_default();
         for (index, vertex) in destination.vertices.iter().enumerate() {
-            let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping) else {
+            let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping)
+            else {
                 continue;
             };
             let Some(source_value) = weighted_vertex_value(source, source_values, &mapped) else {
@@ -596,7 +616,13 @@ fn transfer_vertex_attribute(
                 let mask = transfer_mask_weight(mask_weights, vertex.id, invert_mask);
                 output.insert(
                     key,
-                    json!(blend_attribute(prior, source_value, factor * mask, mix_mode, modifier)?),
+                    json!(blend_attribute(
+                        prior,
+                        source_value,
+                        factor * mask,
+                        mix_mode,
+                        modifier
+                    )?),
                 );
             } else {
                 output.insert(key, source_value);
@@ -605,15 +631,26 @@ fn transfer_vertex_attribute(
         if let Some(source_fields) = source_attribute.as_object()
             && source_fields.contains_key("values")
         {
-            let mut fields = destination_attribute.as_object().cloned().unwrap_or_default();
+            let mut fields = destination_attribute
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
             fields.insert("values".to_owned(), Value::Object(output));
-            destination.attributes.insert(name.to_owned(), Value::Object(fields));
+            destination
+                .attributes
+                .insert(name.to_owned(), Value::Object(fields));
         } else {
-            destination.attributes.insert(name.to_owned(), Value::Object(output));
+            destination
+                .attributes
+                .insert(name.to_owned(), Value::Object(output));
         }
         return Ok(());
     }
-    let Some(source_layers) = source.attributes.get("blender_attributes").and_then(Value::as_array) else {
+    let Some(source_layers) = source
+        .attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)
+    else {
         return Ok(());
     };
     let Some(source_index) = source_layers.iter().position(|attribute| {
@@ -646,7 +683,8 @@ fn transfer_vertex_attribute(
         .ok_or_else(|| invalid(modifier, name, "destination point-attribute values"))?;
     let mut output = destination_values;
     for (index, vertex) in destination.vertices.iter().enumerate() {
-        let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping) else {
+        let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping)
+        else {
             continue;
         };
         let samples = mapped
@@ -661,11 +699,8 @@ fn transfer_vertex_attribute(
                 && let Some(source_value) = value.as_f64()
             {
                 let prior = output.get(index).and_then(Value::as_f64).unwrap_or(0.0);
-                let mask = transfer_mask_weight(
-                    mask_weights,
-                    destination.vertices[index].id,
-                    invert_mask,
-                );
+                let mask =
+                    transfer_mask_weight(mask_weights, destination.vertices[index].id, invert_mask);
                 output[index] = json!(blend_attribute(
                     prior,
                     source_value,
@@ -789,7 +824,13 @@ fn transfer_edge_attribute(
                 .or_else(|| output.get(&key).and_then(Value::as_f64))
                 .unwrap_or(0.0);
             let mask = transfer_edge_mask_weight(edge, mask_weights, invert_mask);
-            json!(blend_attribute(prior, scalar_source, factor * mask, mix_mode, modifier)?)
+            json!(blend_attribute(
+                prior,
+                scalar_source,
+                factor * mask,
+                mix_mode,
+                modifier
+            )?)
         } else {
             Value::Bool(bool_source)
         };
@@ -833,9 +874,9 @@ fn transfer_edge_mask_weight(
         return 1.0;
     };
     let [first, second] = edge.vertices;
-    let weight =
-        (weights.get(&first).copied().unwrap_or(0.0) + weights.get(&second).copied().unwrap_or(0.0))
-            * 0.5;
+    let weight = (weights.get(&first).copied().unwrap_or(0.0)
+        + weights.get(&second).copied().unwrap_or(0.0))
+        * 0.5;
     if invert { 1.0 - weight } else { weight }
 }
 fn transfer_uv(
@@ -858,9 +899,15 @@ fn transfer_uv(
         return Ok(());
     }
     if !matches!(source_selection, "ACTIVE" | "ALL")
-        && !source_layers.iter().any(|layer| layer.name == source_selection)
+        && !source_layers
+            .iter()
+            .any(|layer| layer.name == source_selection)
     {
-        return Err(invalid(modifier, "layers_uv_select_src", "ALL or an existing source UV layer"));
+        return Err(invalid(
+            modifier,
+            "layers_uv_select_src",
+            "ALL or an existing source UV layer",
+        ));
     }
     let source_names = select_uv_layers(source, &source_layers, source_selection);
     let destination_names = destination_layers
@@ -868,7 +915,10 @@ fn transfer_uv(
         .map(|layer| layer.name.clone())
         .collect::<Vec<_>>();
     for source_name in source_names {
-        let Some(source_index) = source_layers.iter().position(|layer| layer.name == source_name) else {
+        let Some(source_index) = source_layers
+            .iter()
+            .position(|layer| layer.name == source_name)
+        else {
             continue;
         };
         let destination_name = match destination_selection {
@@ -921,17 +971,18 @@ fn transfer_uv(
                     .0
                     .iter()
                     .filter_map(|(loop_index, weight)| {
-                        Some((layer_uv_at_loop(source, source_layer, *loop_index)?, *weight))
+                        Some((
+                            layer_uv_at_loop(source, source_layer, *loop_index)?,
+                            *weight,
+                        ))
                     })
                     .collect::<Vec<_>>();
                 if samples.is_empty() {
                     continue;
                 }
-                let target = samples
-                    .iter()
-                    .fold(DVec2::ZERO, |sum, (uv, weight)| {
-                        sum + DVec2::from_array(*uv) * *weight
-                    });
+                let target = samples.iter().fold(DVec2::ZERO, |sum, (uv, weight)| {
+                    sum + DVec2::from_array(*uv) * *weight
+                });
                 let mut mask = mask_weights.map_or(1.0, |weights| {
                     weights.get(vertex_id).copied().unwrap_or(0.0)
                 });
@@ -984,14 +1035,22 @@ fn transfer_custom_normals(
                 };
                 source_normal += *normal * weight;
             }
-            source_normal = mapping_context.normal_to_destination(source_normal.normalize_or_zero());
+            source_normal =
+                mapping_context.normal_to_destination(source_normal.normalize_or_zero());
             let mask = transfer_mask_weight(mask_weights, *vertex_id, invert_mask);
-            destination_normals[loop_index] =
-                blend_normal(destination_normals[loop_index], source_normal, factor * mask, mix_mode);
+            destination_normals[loop_index] = blend_normal(
+                destination_normals[loop_index],
+                source_normal,
+                factor * mask,
+                mix_mode,
+            );
             loop_index += 1;
         }
     }
-    let custom_vectors = destination_normals.into_iter().map(Some).collect::<Vec<_>>();
+    let custom_vectors = destination_normals
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
     crate::geom::clnor::encode_vectors(
         destination,
         Some(&custom_vectors),
@@ -1021,7 +1080,11 @@ fn transfer_typed_attribute(
             .unwrap_or("face")
     };
     if domain != "face" {
-        return Err(invalid(modifier, source_name, "a face-domain source attribute"));
+        return Err(invalid(
+            modifier,
+            source_name,
+            "a face-domain source attribute",
+        ));
     }
     let blender_index = destination
         .attributes
@@ -1057,7 +1120,8 @@ fn transfer_typed_attribute(
             .cloned()
     });
     for (face_index, face) in destination.faces.iter().enumerate() {
-        let Some(mapped) = mapped_face_sources(mapping_context, destination, face_index, mapping) else {
+        let Some(mapped) = mapped_face_sources(mapping_context, destination, face_index, mapping)
+        else {
             continue;
         };
         let samples = mapped
@@ -1065,7 +1129,10 @@ fn transfer_typed_attribute(
             .iter()
             .filter_map(|(source_index, weight)| {
                 let source_face = source.faces.get(*source_index)?;
-                Some((source_face_value(source, source_name, *source_index, source_face.id)?, *weight))
+                Some((
+                    source_face_value(source, source_name, *source_index, source_face.id)?,
+                    *weight,
+                ))
             })
             .collect::<Vec<_>>();
         let Some(value) = weighted_values(&samples) else {
@@ -1083,8 +1150,7 @@ fn transfer_typed_attribute(
             "shade_smooth".to_owned(),
             json!({"domain":"face","type":"bool","values":output}),
         );
-    }
-    else if let Some(index) = blender_index
+    } else if let Some(index) = blender_index
         && let Some(array) = array_output
         && let Some(layers) = destination
             .attributes
@@ -1108,11 +1174,7 @@ fn transfer_typed_attribute(
     Ok(())
 }
 
-fn face_center(
-    mesh: &Mesh,
-    face: &Face,
-    vertex_indices: &BTreeMap<u32, usize>,
-) -> DVec3 {
+fn face_center(mesh: &Mesh, face: &Face, vertex_indices: &BTreeMap<u32, usize>) -> DVec3 {
     let mut center = DVec3::ZERO;
     let mut count = 0_u32;
     for id in &face.vertices {
@@ -1129,7 +1191,6 @@ fn face_center(
         DVec3::ZERO
     }
 }
-
 
 fn blend_attribute(a: f64, b: f64, factor: f64, mode: &str, modifier: &Modifier) -> Result<f64> {
     match mode {
@@ -1301,11 +1362,7 @@ impl BlenderRng {
     }
 
     fn get_float(&mut self) -> f32 {
-        self.state = self
-            .state
-            .wrapping_mul(0x5deece66d)
-            .wrapping_add(0xb)
-            & 0x0000_ffff_ffff_ffff;
+        self.state = self.state.wrapping_mul(0x5deece66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
         (self.state >> 17) as u32 as f32 / 2_147_483_648.0
     }
 }
@@ -1357,16 +1414,27 @@ impl<'a> TransferMapContext<'a> {
         needs_vertex_normals: bool,
         needs_source_face_graph: bool,
     ) -> Result<Self> {
-        let source_positions = source.vertices.iter()
+        let source_positions = source
+            .vertices
+            .iter()
             .map(|vertex| vertex.co.as_vec3().as_dvec3())
             .collect::<Vec<_>>();
-        let source_vertex_indices = source.vertices.iter().enumerate()
+        let source_vertex_indices = source
+            .vertices
+            .iter()
+            .enumerate()
             .map(|(index, vertex)| (vertex.id, index))
             .collect::<BTreeMap<_, _>>();
-        let destination_vertex_indices = destination.vertices.iter().enumerate()
+        let destination_vertex_indices = destination
+            .vertices
+            .iter()
+            .enumerate()
             .map(|(index, vertex)| (vertex.id, index))
             .collect::<BTreeMap<_, _>>();
-        let source_edge_indices = source.edges.iter().enumerate()
+        let source_edge_indices = source
+            .edges
+            .iter()
+            .enumerate()
             .map(|(index, edge)| {
                 let [first, second] = edge.vertices;
                 ((first.min(second), first.max(second)), index)
@@ -1391,31 +1459,51 @@ impl<'a> TransferMapContext<'a> {
                 "ray_radius is outside Blender's finite f32 range",
             ));
         }
-        let vertex_bounds = source_positions.iter().map(|&point| (point, point)).collect::<Vec<_>>();
+        let vertex_bounds = source_positions
+            .iter()
+            .map(|&point| (point, point))
+            .collect::<Vec<_>>();
         let source_vertex_bvh = BoundsBvh::new(&vertex_bounds)?;
         let ray_padding = DVec3::splat(max_ray_radius);
-        let edge_bounds = source.edges.iter().map(|edge| {
-            let [first, second] = edge.vertices.map(|id| source_vertex_indices.get(&id).copied());
-            let [Some(first), Some(second)] = [first, second] else {
-                return Err(crate::error::PotError::invalid_argument(
-                    "source edge references a missing vertex",
-                ));
-            };
-            let first = source_positions[first];
-            let second = source_positions[second];
-            Ok((first.min(second) - ray_padding, first.max(second) + ray_padding))
-        }).collect::<Result<Vec<_>>>()?;
+        let edge_bounds = source
+            .edges
+            .iter()
+            .map(|edge| {
+                let [first, second] = edge
+                    .vertices
+                    .map(|id| source_vertex_indices.get(&id).copied());
+                let [Some(first), Some(second)] = [first, second] else {
+                    return Err(crate::error::PotError::invalid_argument(
+                        "source edge references a missing vertex",
+                    ));
+                };
+                let first = source_positions[first];
+                let second = source_positions[second];
+                Ok((
+                    first.min(second) - ray_padding,
+                    first.max(second) + ray_padding,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let source_edge_bvh = BoundsBvh::new(&edge_bounds)?;
         let source_corner_normals = if needs_loop_normals {
-            Some(crate::geom::normals::corner_normals(source, &source_positions)?)
+            Some(crate::geom::normals::corner_normals(
+                source,
+                &source_positions,
+            )?)
         } else {
             None
         };
-        let destination_positions = destination.vertices.iter()
+        let destination_positions = destination
+            .vertices
+            .iter()
             .map(|vertex| vertex.co.as_vec3().as_dvec3())
             .collect::<Vec<_>>();
         let destination_corner_normals = if needs_loop_normals {
-            Some(crate::geom::normals::corner_normals(destination, &destination_positions)?)
+            Some(crate::geom::normals::corner_normals(
+                destination,
+                &destination_positions,
+            )?)
         } else {
             None
         };
@@ -1484,13 +1572,22 @@ impl<'a> TransferMapContext<'a> {
     }
 
     fn source_corner_normal(&self, face_index: usize, corner: usize) -> Option<DVec3> {
-        let index = self.source_loop_starts.get(face_index)?.checked_add(corner)?;
+        let index = self
+            .source_loop_starts
+            .get(face_index)?
+            .checked_add(corner)?;
         self.source_corner_normals.as_ref()?.get(index).copied()
     }
 
     fn destination_corner_normal(&self, face_index: usize, corner: usize) -> Option<DVec3> {
-        let index = self.destination_loop_starts.get(face_index)?.checked_add(corner)?;
-        self.destination_corner_normals.as_ref()?.get(index).copied()
+        let index = self
+            .destination_loop_starts
+            .get(face_index)?
+            .checked_add(corner)?;
+        self.destination_corner_normals
+            .as_ref()?
+            .get(index)
+            .copied()
     }
 
     fn source_face_graph(&self) -> Option<&SourceFaceGraph> {
@@ -1519,7 +1616,10 @@ impl<'a> TransferMapContext<'a> {
         .as_dvec3()
     }
     fn destination_vertex_normal(&self, index: usize) -> Option<DVec3> {
-        self.destination_vertex_normals.as_ref()?.get(index).copied()
+        self.destination_vertex_normals
+            .as_ref()?
+            .get(index)
+            .copied()
     }
 }
 const POLY_UNSET: u8 = 0;
@@ -1665,7 +1765,11 @@ fn build_source_face_graph(
                     count += 1;
                 }
             }
-            if count == 0 { glam::Vec3::ZERO } else { center / count as f32 }
+            if count == 0 {
+                glam::Vec3::ZERO
+            } else {
+                center / count as f32
+            }
         })
         .collect::<Vec<_>>();
     let face_normals = source
@@ -1689,7 +1793,9 @@ fn build_source_face_graph(
             if !seam_edges[edge_index] {
                 continue;
             }
-            let count = boundary_counts.entry((island_index, edge_index)).or_default();
+            let count = boundary_counts
+                .entry((island_index, edge_index))
+                .or_default();
             if *count < 2 {
                 *count += 1;
                 if *count == 2 {
@@ -1807,8 +1913,7 @@ fn build_source_face_graph(
     let triangle_bounds = triangles
         .iter()
         .map(|triangle| {
-            let [first, second, third] =
-                triangle.vertices.map(|index| positions[index]);
+            let [first, second, third] = triangle.vertices.map(|index| positions[index]);
             (
                 first.min(second).min(third) - triangle_padding,
                 first.max(second).max(third) + triangle_padding,
@@ -1850,7 +1955,10 @@ fn astar_face_path(
     }
     workspace.prepare(island.faces.len());
     workspace.costs[start_local] = 0.0;
-    workspace.queue.insert(graph.face_centers[start].distance(graph.face_centers[destination]), start_local);
+    workspace.queue.insert(
+        graph.face_centers[start].distance(graph.face_centers[destination]),
+        start_local,
+    );
     while let Some(local_face) = workspace.queue.pop_min() {
         if workspace.done[local_face] {
             continue;
@@ -1892,7 +2000,8 @@ fn astar_face_path(
                 workspace.previous[next_local] = Some(local_face);
                 workspace.previous_cut[next_local] = link.is_cut;
                 workspace.queue.insert(
-                    candidate_cost + graph.face_centers[link.face].distance(graph.face_centers[destination]),
+                    candidate_cost
+                        + graph.face_centers[link.face].distance(graph.face_centers[destination]),
                     next_local,
                 );
             }
@@ -1916,9 +2025,10 @@ fn mapped_vertex_sources(
         "EDGE_NEAREST" | "EDGEINTERP_NEAREST" => {
             let (edge_index, closest, _) = nearest_edge(context, point)?;
             let edge = context.source.edges.get(edge_index)?;
-            let [Some(first), Some(second)] = edge.vertices.map(|id| {
-                context.source_vertex_indices.get(&id).copied()
-            }) else {
+            let [Some(first), Some(second)] = edge
+                .vertices
+                .map(|id| context.source_vertex_indices.get(&id).copied())
+            else {
                 return None;
             };
             if mapping == "EDGE_NEAREST" {
@@ -1931,7 +2041,11 @@ fn mapped_vertex_sources(
                 };
                 Some(MappedSources(vec![(source_index, 1.0)]))
             } else {
-                let factor = segment_factor(closest, context.source_positions[first], context.source_positions[second]);
+                let factor = segment_factor(
+                    closest,
+                    context.source_positions[first],
+                    context.source_positions[second],
+                );
                 Some(MappedSources(vec![(first, 1.0 - factor), (second, factor)]))
             }
         }
@@ -1974,20 +2088,30 @@ fn mapped_edge_sources(
 ) -> Option<MappedSources> {
     let edge = destination.edges.get(destination_edge_index)?;
     let [first_id, second_id] = edge.vertices;
-    let first_destination = context.destination_vertex_indices.get(&first_id)
-        .and_then(|&index| destination.vertices.get(index))?.co;
-    let second_destination = context.destination_vertex_indices.get(&second_id)
-        .and_then(|&index| destination.vertices.get(index))?.co;
+    let first_destination = context
+        .destination_vertex_indices
+        .get(&first_id)
+        .and_then(|&index| destination.vertices.get(index))?
+        .co;
+    let second_destination = context
+        .destination_vertex_indices
+        .get(&second_id)
+        .and_then(|&index| destination.vertices.get(index))?
+        .co;
     let first = context.point_to_source(first_destination);
     let second = context.point_to_source(second_destination);
     let midpoint = (first + second) * 0.5;
     match mapping {
         "TOPOLOGY" => (context.source.edges.len() == destination.edges.len())
             .then(|| MappedSources(vec![(destination_edge_index, 1.0)])),
-        "NEAREST" => nearest_edge(context, midpoint)
-            .map(|(index, _, _)| MappedSources(vec![(index, 1.0)])),
+        "NEAREST" => {
+            nearest_edge(context, midpoint).map(|(index, _, _)| MappedSources(vec![(index, 1.0)]))
+        }
         "VERT_NEAREST" => {
-            let source_vertex = [nearest_vertex(context, first)?, nearest_vertex(context, second)?];
+            let source_vertex = [
+                nearest_vertex(context, first)?,
+                nearest_vertex(context, second)?,
+            ];
             let first_distance = context.source_positions[source_vertex[0]].distance(first);
             let second_distance = context.source_positions[source_vertex[1]].distance(second);
             let mut best: Option<(usize, f64)> = None;
@@ -1999,9 +2123,10 @@ fn mapped_edge_sources(
                     let Some(candidate) = context.source.edges.get(edge_index) else {
                         continue;
                     };
-                    let [Some(first_source), Some(second_source)] = candidate.vertices.map(|id| {
-                        context.source_vertex_indices.get(&id).copied()
-                    }) else {
+                    let [Some(first_source), Some(second_source)] = candidate
+                        .vertices
+                        .map(|id| context.source_vertex_indices.get(&id).copied())
+                    else {
                         continue;
                     };
                     let other_source = if first_source == source_index {
@@ -2033,9 +2158,10 @@ fn mapped_edge_sources(
                     continue;
                 };
                 let candidate = &context.source.edges[edge_index];
-                let [Some(a), Some(b)] = candidate.vertices.map(|id| {
-                    context.source_vertex_indices.get(&id).copied()
-                }) else {
+                let [Some(a), Some(b)] = candidate
+                    .vertices
+                    .map(|id| context.source_vertex_indices.get(&id).copied())
+                else {
                     continue;
                 };
                 let center = (context.source_positions[a] + context.source_positions[b]) * 0.5;
@@ -2059,13 +2185,26 @@ fn mapped_loop_sources(
     mapping: &str,
 ) -> Option<MappedSources> {
     if mapping == "TOPOLOGY" {
-        let destination_total = destination.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
-        let source_total = context.source.faces.iter().map(|face| face.vertices.len()).sum::<usize>();
+        let destination_total = destination
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
+        let source_total = context
+            .source
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
         if destination_total != source_total {
             return None;
         }
         return Some(MappedSources(vec![(
-            context.destination_loop_starts.get(destination_face_index).copied()?.checked_add(destination_corner)?,
+            context
+                .destination_loop_starts
+                .get(destination_face_index)
+                .copied()?
+                .checked_add(destination_corner)?,
             1.0,
         )]));
     }
@@ -2076,11 +2215,17 @@ fn mapped_loop_sources(
     let point = context.point_to_source(vertex.co);
     let destination_normal = context
         .destination_corner_normal(destination_face_index, destination_corner)
-        .unwrap_or_else(|| destination_face_normal(destination, face, &context.destination_vertex_indices));
+        .unwrap_or_else(|| {
+            destination_face_normal(destination, face, &context.destination_vertex_indices)
+        });
     if matches!(mapping, "NEAREST_NORMAL" | "NEAREST_POLYNOR") {
         let nearest = nearest_vertex(context, point)?;
         let use_loop_normal = mapping == "NEAREST_NORMAL";
-        let destination_center = context.point_to_source(face_center(destination, face, &context.destination_vertex_indices));
+        let destination_center = context.point_to_source(face_center(
+            destination,
+            face,
+            &context.destination_vertex_indices,
+        ));
         let destination_normal = context.normal_to_source(destination_normal);
         let mut best: Option<(usize, f64, f64)> = None;
         let graph = context.source_face_graph()?;
@@ -2089,14 +2234,17 @@ fn mapped_loop_sources(
             let loop_start = *context.source_loop_starts.get(source_face_index)?;
             let source_normal = graph.face_normals[source_face_index];
             let center_distance = f64::from(
-                graph.face_centers[source_face_index].distance_squared(destination_center.as_vec3()),
+                graph.face_centers[source_face_index]
+                    .distance_squared(destination_center.as_vec3()),
             );
             for (corner, source_id) in source_face.vertices.iter().enumerate() {
                 if context.source_vertex_indices.get(source_id).copied() != Some(nearest) {
                     continue;
                 }
                 let normal = if use_loop_normal {
-                    context.source_corner_normal(source_face_index, corner).unwrap_or(source_normal)
+                    context
+                        .source_corner_normal(source_face_index, corner)
+                        .unwrap_or(source_normal)
                 } else {
                     source_normal
                 };
@@ -2144,7 +2292,11 @@ fn mapped_loop_sources(
             .iter()
             .enumerate()
             .filter_map(|(corner, id)| {
-                context.source_vertex_indices.get(id).copied().map(|index| (corner, index))
+                context
+                    .source_vertex_indices
+                    .get(id)
+                    .copied()
+                    .map(|index| (corner, index))
             })
             .min_by(|(_, first), (_, second)| {
                 context.source_positions[*first]
@@ -2170,7 +2322,13 @@ fn uv_loop_mapping_for_face(
     if mapping == "TOPOLOGY" {
         return (0..destination_face.vertices.len())
             .map(|corner| {
-                mapped_loop_sources(context, destination, destination_face_index, corner, mapping)
+                mapped_loop_sources(
+                    context,
+                    destination,
+                    destination_face_index,
+                    corner,
+                    mapping,
+                )
             })
             .collect();
     }
@@ -2194,7 +2352,11 @@ fn uv_loop_mapping_for_face(
                 )
             })
             .collect::<Vec<_>>();
-        let factor = candidates.iter().flatten().map(|candidate| candidate.factor).sum::<f64>()
+        let factor = candidates
+            .iter()
+            .flatten()
+            .map(|candidate| candidate.factor)
+            .sum::<f64>()
             / destination_face.vertices.len().max(1) as f64;
         if factor > best_factor {
             best_factor = factor;
@@ -2256,8 +2418,10 @@ fn uv_loop_mapping_for_face(
                             nearest_point_on_source_face(context, &graph, corrected_face, point)
                         {
                             if let Some(face) = context.source.faces.get(corrected_face)
-                                && let Some(loop_start) = context.source_loop_starts.get(corrected_face).copied()
-                                && let Some(sources) = polygon_loop_weights(context, face, hit, loop_start)
+                                && let Some(loop_start) =
+                                    context.source_loop_starts.get(corrected_face).copied()
+                                && let Some(sources) =
+                                    polygon_loop_weights(context, face, hit, loop_start)
                             {
                                 candidate.sources = sources;
                                 candidate.source_face = corrected_face;
@@ -2288,7 +2452,13 @@ fn loop_candidate_for_island(
     let destination_vertex = destination.vertices.get(vertex_index)?;
     let destination_normal = context
         .destination_corner_normal(destination_face_index, destination_corner)
-        .unwrap_or_else(|| destination_face_normal(destination, destination_face, &context.destination_vertex_indices));
+        .unwrap_or_else(|| {
+            destination_face_normal(
+                destination,
+                destination_face,
+                &context.destination_vertex_indices,
+            )
+        });
     if matches!(mapping, "NEAREST_NORMAL" | "NEAREST_POLYNOR") {
         let island = graph.islands.get(island_index)?;
         let nearest_vertex = island
@@ -2305,7 +2475,13 @@ fn loop_candidate_for_island(
                     .total_cmp(&context.source_positions[second].distance_squared(point))
             })?;
         let destination_normal = context.normal_to_source(destination_normal);
-        let destination_center = context.point_to_source(face_center(destination, destination_face, &context.destination_vertex_indices)).as_vec3();
+        let destination_center = context
+            .point_to_source(face_center(
+                destination,
+                destination_face,
+                &context.destination_vertex_indices,
+            ))
+            .as_vec3();
         let use_loop_normal = mapping == "NEAREST_NORMAL";
         let mut best: Option<(usize, usize, f64, f64)> = None;
         for &source_face_index in &graph.vertex_faces[nearest_vertex] {
@@ -2319,13 +2495,16 @@ fn loop_candidate_for_island(
                     continue;
                 }
                 let normal = if use_loop_normal {
-                    context.source_corner_normal(source_face_index, corner).unwrap_or(face_normal)
+                    context
+                        .source_corner_normal(source_face_index, corner)
+                        .unwrap_or(face_normal)
                 } else {
                     face_normal
                 };
                 let score = normal.dot(destination_normal);
-                let center_distance =
-                    f64::from(graph.face_centers[source_face_index].distance_squared(destination_center));
+                let center_distance = f64::from(
+                    graph.face_centers[source_face_index].distance_squared(destination_center),
+                );
                 if best.is_none_or(|(_, _, prior_score, prior_distance)| {
                     score > prior_score - 1e-6
                         && (score > prior_score + 1e-6 || center_distance < prior_distance)
@@ -2342,7 +2521,14 @@ fn loop_candidate_for_island(
             1e18
         };
         return Some(LoopCandidate {
-            sources: MappedSources(vec![(context.source_loop_starts.get(source_face).copied()?.checked_add(corner)?, 1.0)]),
+            sources: MappedSources(vec![(
+                context
+                    .source_loop_starts
+                    .get(source_face)
+                    .copied()?
+                    .checked_add(corner)?,
+                1.0,
+            )]),
             source_face,
             factor,
             from_vertex: true,
@@ -2368,7 +2554,16 @@ fn loop_candidate_for_island(
             weight /= 5.0;
         }
         if let Some((face, hit, distance, weight)) = ray_hit {
-            (face, hit, distance, if distance > 0.0 { weight / distance } else { 1e18 * weight })
+            (
+                face,
+                hit,
+                distance,
+                if distance > 0.0 {
+                    weight / distance
+                } else {
+                    1e18 * weight
+                },
+            )
         } else {
             let (face, hit, distance_squared) =
                 nearest_surface_in_island(context, point, Some(island_index))?;
@@ -2378,7 +2573,12 @@ fn loop_candidate_for_island(
         let (face, hit, distance_squared) =
             nearest_surface_in_island(context, point, Some(island_index))?;
         let distance = distance_squared.sqrt();
-        (face, hit, distance, if distance > 0.0 { 1.0 / distance } else { 1e18 })
+        (
+            face,
+            hit,
+            distance,
+            if distance > 0.0 { 1.0 / distance } else { 1e18 },
+        )
     };
     let face = context.source.faces.get(source_face)?;
     let sources = if mapping == "NEAREST_POLY" {
@@ -2396,11 +2596,28 @@ fn loop_candidate_for_island(
                     .total_cmp(&context.source_positions[*second].distance_squared(hit))
             })?
             .0;
-        MappedSources(vec![(context.source_loop_starts.get(source_face).copied()?.checked_add(corner)?, 1.0)])
+        MappedSources(vec![(
+            context
+                .source_loop_starts
+                .get(source_face)
+                .copied()?
+                .checked_add(corner)?,
+            1.0,
+        )])
     } else {
-        polygon_loop_weights(context, face, hit, context.source_loop_starts.get(source_face).copied()?)?
+        polygon_loop_weights(
+            context,
+            face,
+            hit,
+            context.source_loop_starts.get(source_face).copied()?,
+        )?
     };
-    Some(LoopCandidate { sources, source_face, factor, from_vertex: false })
+    Some(LoopCandidate {
+        sources,
+        source_face,
+        factor,
+        from_vertex: false,
+    })
 }
 
 fn nearest_source_loop_on_face(
@@ -2414,7 +2631,14 @@ fn nearest_source_loop_on_face(
         .enumerate()
         .filter_map(|(corner, vertex_id)| {
             let vertex_index = context.source_vertex_indices.get(vertex_id).copied()?;
-            Some((context.source_loop_starts.get(face_index).copied()?.checked_add(corner)?, vertex_index))
+            Some((
+                context
+                    .source_loop_starts
+                    .get(face_index)
+                    .copied()?
+                    .checked_add(corner)?,
+                vertex_index,
+            ))
         })
         .min_by(|(_, first), (_, second)| {
             context.source_positions[*first]
@@ -2436,12 +2660,15 @@ fn nearest_point_on_source_face(
         .iter()
         .filter(|triangle| triangle.face == face_index)
         .map(|triangle| {
-            let [a, b, c] =
-                triangle.vertices.map(|index| context.source_positions[index].as_vec3());
+            let [a, b, c] = triangle
+                .vertices
+                .map(|index| context.source_positions[index].as_vec3());
             closest_point_triangle_blender(point, a, b, c).as_dvec3()
         })
         .min_by(|first, second| {
-            first.as_vec3().distance_squared(point)
+            first
+                .as_vec3()
+                .distance_squared(point)
                 .total_cmp(&second.as_vec3().distance_squared(point))
         })
 }
@@ -2460,14 +2687,23 @@ fn mapped_face_sources(
         return cached.clone();
     }
     let face = destination.faces.get(destination_face_index)?;
-    let point = context.point_to_source(face_center(destination, face, &context.destination_vertex_indices));
+    let point = context.point_to_source(face_center(
+        destination,
+        face,
+        &context.destination_vertex_indices,
+    ));
     let result = match mapping {
         "TOPOLOGY" => (context.source.faces.len() == destination.faces.len())
             .then(|| MappedSources(vec![(destination_face_index, 1.0)])),
-        "NEAREST" => nearest_surface(context, point)
-            .map(|(index, _, _)| MappedSources(vec![(index, 1.0)])),
+        "NEAREST" => {
+            nearest_surface(context, point).map(|(index, _, _)| MappedSources(vec![(index, 1.0)]))
+        }
         "NORMAL" => {
-            let normal = context.normal_to_source(destination_face_normal(destination, face, &context.destination_vertex_indices));
+            let normal = context.normal_to_source(destination_face_normal(
+                destination,
+                face,
+                &context.destination_vertex_indices,
+            ));
             raycast_surface(context, point, normal)
                 .map(|(index, _, _)| MappedSources(vec![(index, 1.0)]))
         }
@@ -2495,13 +2731,21 @@ fn projected_polygon_sources(
             let index = *context.destination_vertex_indices.get(id)?;
             let vertex = destination.vertices.get(index)?;
             let point = context.point_to_source(vertex.co);
-            Some(glam::Vec3::new(point.x as f32, point.y as f32, point.z as f32))
+            Some(glam::Vec3::new(
+                point.x as f32,
+                point.y as f32,
+                point.z as f32,
+            ))
         })
         .collect::<Option<Vec<_>>>()?;
     if positions.len() < 3 {
         return None;
     }
-    let transformed_normal = context.normal_to_source(destination_face_normal(destination, face, &context.destination_vertex_indices));
+    let transformed_normal = context.normal_to_source(destination_face_normal(
+        destination,
+        face,
+        &context.destination_vertex_indices,
+    ));
     let normal = glam::Vec3::new(
         transformed_normal.x as f32,
         transformed_normal.y as f32,
@@ -2547,7 +2791,10 @@ fn projected_polygon_sources(
         4
     };
     let total_samples = (side * side) as usize;
-    let face_positions = positions.iter().map(|point| point.to_array()).collect::<Vec<_>>();
+    let face_positions = positions
+        .iter()
+        .map(|point| point.to_array())
+        .collect::<Vec<_>>();
     let triangles = crate::geom::triangulate::triangulate_mesh(
         &[face_positions],
         crate::geom::triangulate::QuadMethod::Fixed,
@@ -2557,7 +2804,13 @@ fn projected_polygon_sources(
     let triangle_corners = triangles
         .iter()
         .filter(|triangle| triangle.face == 0 && triangle.corners.len() == 3)
-        .map(|triangle| [triangle.corners[0], triangle.corners[1], triangle.corners[2]])
+        .map(|triangle| {
+            [
+                triangle.corners[0],
+                triangle.corners[1],
+                triangle.corners[2],
+            ]
+        })
         .collect::<Vec<_>>();
     if triangle_corners.is_empty() {
         return None;
@@ -2566,8 +2819,7 @@ fn projected_polygon_sources(
         let first = projected[triangle[0]];
         let second = projected[triangle[1]];
         let third = projected[triangle[2]];
-        ((first.x - second.x) * (second.y - third.y)
-            + (first.y - second.y) * (third.x - second.x))
+        ((first.x - second.x) * (second.y - third.y) + (first.y - second.y) * (third.x - second.x))
             .abs()
             * 0.5
     };
@@ -2581,7 +2833,9 @@ fn projected_polygon_sources(
     let polygon_area_inverse = 1.0 / polygon_area.max(1e-9);
     let mut rng = context.poly_rng.borrow_mut();
     let mut weight_workspace = context.poly_projection.borrow_mut();
-    weight_workspace.weights.resize(context.source.faces.len(), 0.0);
+    weight_workspace
+        .weights
+        .resize(context.source.faces.len(), 0.0);
     weight_workspace.touched.clear();
     let mut done_area = 0.0_f32;
     let mut done_samples = 0_usize;
@@ -2601,11 +2855,9 @@ fn projected_polygon_sources(
                 u = 1.0 - u;
                 v = 1.0 - v;
             }
-            let sample_2d = first_2d
-                + (second_2d - first_2d) * u
-                + (third_2d - first_2d) * v;
-            let sample = (basis_x * sample_2d.x + basis_y * sample_2d.y + normal * center_z)
-                .as_dvec3();
+            let sample_2d = first_2d + (second_2d - first_2d) * u + (third_2d - first_2d) * v;
+            let sample =
+                (basis_x * sample_2d.x + basis_y * sample_2d.y + normal * center_z).as_dvec3();
             let attempts = if ray_radius > 0.0 { 3 } else { 1 };
             let mut approximate_weight = 1.0_f32;
             for _ in 0..attempts {
@@ -2630,7 +2882,9 @@ fn projected_polygon_sources(
             }
         }
     }
-    let total_weight = weight_workspace.touched.iter()
+    let total_weight = weight_workspace
+        .touched
+        .iter()
         .map(|&source_face| weight_workspace.weights[source_face])
         .sum::<f32>();
     if total_weight <= 0.0 {
@@ -2752,44 +3006,40 @@ fn nearest_vertex_in_island(
         .map(|(index, _, ())| index)
 }
 
-fn nearest_edge(
-    context: &TransferMapContext<'_>,
-    point: DVec3,
-) -> Option<(usize, DVec3, f64)> {
+fn nearest_edge(context: &TransferMapContext<'_>, point: DVec3) -> Option<(usize, DVec3, f64)> {
     let point_f32 = point.as_vec3();
     let max_distance_squared = blender_max_distance_squared(context.max_distance);
-    let (index, distance, closest) =
-        context
-            .source_edge_bvh
-            .nearest(point_f32.as_dvec3(), max_distance_squared, |index, _| {
-                let edge = context.source.edges.get(index)?;
-                let [a, b] =
-                    edge.vertices.map(|id| context.source_vertex_indices.get(&id).copied());
-                let [Some(a), Some(b)] = [a, b] else {
-                    return None;
-                };
-                let first = context.source_positions.get(a)?.as_vec3();
-                let second = context.source_positions.get(b)?.as_vec3();
-                let edge_direction = second - first;
-                let length_squared = edge_direction.length_squared();
-                let factor = if length_squared == 0.0 {
-                    0.0
-                } else {
-                    ((point_f32 - first).dot(edge_direction) / length_squared).clamp(0.0, 1.0)
-                };
-                let closest = first + edge_direction * factor;
-                Some((
-                    f64::from(closest.distance_squared(point_f32)),
-                    closest.as_dvec3(),
-                ))
-            })?;
+    let (index, distance, closest) = context.source_edge_bvh.nearest(
+        point_f32.as_dvec3(),
+        max_distance_squared,
+        |index, _| {
+            let edge = context.source.edges.get(index)?;
+            let [a, b] = edge
+                .vertices
+                .map(|id| context.source_vertex_indices.get(&id).copied());
+            let [Some(a), Some(b)] = [a, b] else {
+                return None;
+            };
+            let first = context.source_positions.get(a)?.as_vec3();
+            let second = context.source_positions.get(b)?.as_vec3();
+            let edge_direction = second - first;
+            let length_squared = edge_direction.length_squared();
+            let factor = if length_squared == 0.0 {
+                0.0
+            } else {
+                ((point_f32 - first).dot(edge_direction) / length_squared).clamp(0.0, 1.0)
+            };
+            let closest = first + edge_direction * factor;
+            Some((
+                f64::from(closest.distance_squared(point_f32)),
+                closest.as_dvec3(),
+            ))
+        },
+    )?;
     Some((index, closest, distance))
 }
 
-fn nearest_surface(
-    context: &TransferMapContext<'_>,
-    point: DVec3,
-) -> Option<(usize, DVec3, f64)> {
+fn nearest_surface(context: &TransferMapContext<'_>, point: DVec3) -> Option<(usize, DVec3, f64)> {
     nearest_surface_in_island(context, point, None)
 }
 
@@ -2808,8 +3058,9 @@ fn nearest_surface_in_island(
             if island.is_some_and(|index| graph.face_islands[triangle.face] != index) {
                 return None;
             }
-            let [first, second, third] =
-                triangle.vertices.map(|index| context.source_positions[index].as_vec3());
+            let [first, second, third] = triangle
+                .vertices
+                .map(|index| context.source_positions[index].as_vec3());
             let closest = closest_point_triangle_blender(point_f32, first, second, third);
             Some((
                 f64::from(closest.distance_squared(point_f32)),
@@ -2853,36 +3104,41 @@ fn raycast_surface_in_island(
     let max_distance = context.max_distance.min(f64::from(f32::MAX));
     let mut best: Option<(usize, DVec3, f64)> = None;
     for direction in [normal, -normal] {
-        let hit = graph.triangle_bvh.raycast(origin, direction, 0.0, max_distance, |index, min, max| {
-            let triangle = graph.triangles.get(index)?;
-            if island.is_some_and(|value| graph.face_islands[triangle.face] != value) {
-                return None;
-            }
-            let [a, b, c] = triangle.vertices.map(|vertex| context.source_positions[vertex].as_vec3());
-            let origin_f32 = origin.as_vec3();
-            let direction_f32 = direction.as_vec3();
-            let hit = if radius > 0.0 {
-                sphere_ray_triangle(
-                    origin_f32,
-                    direction_f32,
-                    max as f32,
-                    radius as f32,
-                    a,
-                    b,
-                    c,
-                )
-                .map(|distance| {
-                    (
-                        (origin_f32 + direction_f32 * distance).as_dvec3(),
-                        f64::from(distance),
-                    )
-                })
-            } else {
-                ray_triangle(origin_f32, direction_f32, a, b, c)
-                    .map(|(distance, point)| (point.as_dvec3(), f64::from(distance)))
-            }?;
-            (hit.1 >= min && hit.1 < max).then_some((hit.1, hit.0))
-        });
+        let hit =
+            graph
+                .triangle_bvh
+                .raycast(origin, direction, 0.0, max_distance, |index, min, max| {
+                    let triangle = graph.triangles.get(index)?;
+                    if island.is_some_and(|value| graph.face_islands[triangle.face] != value) {
+                        return None;
+                    }
+                    let [a, b, c] = triangle
+                        .vertices
+                        .map(|vertex| context.source_positions[vertex].as_vec3());
+                    let origin_f32 = origin.as_vec3();
+                    let direction_f32 = direction.as_vec3();
+                    let hit = if radius > 0.0 {
+                        sphere_ray_triangle(
+                            origin_f32,
+                            direction_f32,
+                            max as f32,
+                            radius as f32,
+                            a,
+                            b,
+                            c,
+                        )
+                        .map(|distance| {
+                            (
+                                (origin_f32 + direction_f32 * distance).as_dvec3(),
+                                f64::from(distance),
+                            )
+                        })
+                    } else {
+                        ray_triangle(origin_f32, direction_f32, a, b, c)
+                            .map(|(distance, point)| (point.as_dvec3(), f64::from(distance)))
+                    }?;
+                    (hit.1 >= min && hit.1 < max).then_some((hit.1, hit.0))
+                });
         if let Some((triangle_index, distance, point)) = hit {
             let face = graph.triangles.get(triangle_index)?.face;
             if best.is_none_or(|(_, _, prior)| distance < prior) {
@@ -3084,8 +3340,14 @@ fn polygon_weights(
         .fold(0.0, f64::max);
     let epsilon = 16.0 * f64::from(f32::EPSILON) * max_value;
     let epsilon_squared = epsilon * epsilon;
-    let directions = positions.iter().map(|position| *position - point).collect::<Vec<_>>();
-    let lengths = directions.iter().map(|direction| direction.length()).collect::<Vec<_>>();
+    let directions = positions
+        .iter()
+        .map(|position| *position - point)
+        .collect::<Vec<_>>();
+    let lengths = directions
+        .iter()
+        .map(|direction| direction.length())
+        .collect::<Vec<_>>();
     let mut weights = vec![0.0; count];
     if let Some(index) = lengths.iter().position(|length| *length < epsilon) {
         weights[index] = 1.0;
@@ -3132,17 +3394,24 @@ fn projected_edge_sources(
     destination: &Mesh,
     edge: &Edge,
 ) -> Option<MappedSources> {
-    let [Some(first_index), Some(second_index)] = edge.vertices.map(|id| {
-        context.destination_vertex_indices.get(&id).copied()
-    }) else {
+    let [Some(first_index), Some(second_index)] = edge
+        .vertices
+        .map(|id| context.destination_vertex_indices.get(&id).copied())
+    else {
         return None;
     };
-    let first = context.point_to_source(destination.vertices.get(first_index)?.co).as_vec3();
-    let second = context.point_to_source(destination.vertices.get(second_index)?.co).as_vec3();
-    let first_normal =
-        context.normal_to_source(context.destination_vertex_normal(first_index)?).as_vec3();
-    let second_normal =
-        context.normal_to_source(context.destination_vertex_normal(second_index)?).as_vec3();
+    let first = context
+        .point_to_source(destination.vertices.get(first_index)?.co)
+        .as_vec3();
+    let second = context
+        .point_to_source(destination.vertices.get(second_index)?.co)
+        .as_vec3();
+    let first_normal = context
+        .normal_to_source(context.destination_vertex_normal(first_index)?)
+        .as_vec3();
+    let second_normal = context
+        .normal_to_source(context.destination_vertex_normal(second_index)?)
+        .as_vec3();
     let ray_radius = context.ray_radius as f32;
     let grid_size = if ray_radius > 0.0 {
         ((first.distance(second) / ray_radius + 0.5) as i32).clamp(5, 100) as usize
@@ -3218,9 +3487,10 @@ fn raycast_source_edge(
         .source_edge_bvh
         .raycast(origin, direction, 0.0, max_distance, |index, _, max| {
             let edge = context.source.edges.get(index)?;
-            let [Some(first), Some(second)] = edge.vertices.map(|id| {
-                context.source_vertex_indices.get(&id).copied()
-            }) else {
+            let [Some(first), Some(second)] = edge
+                .vertices
+                .map(|id| context.source_vertex_indices.get(&id).copied())
+            else {
                 return None;
             };
             let first = context.source_positions.get(first)?.as_vec3();
@@ -3308,8 +3578,7 @@ fn mesh_edge_spherecast(
     } else if edge_factor > 1.0 {
         edge_point = second;
     }
-    ((edge_point - ray_point).length_squared() <= radius * radius)
-        .then_some((distance, ray_point))
+    ((edge_point - ray_point).length_squared() <= radius * radius).then_some((distance, ray_point))
 }
 
 fn blender_slerp_safe_f32(first: glam::Vec3, second: glam::Vec3, factor: f32) -> glam::Vec3 {
@@ -3415,22 +3684,24 @@ fn face_normal_at(
     vertex_indices: &BTreeMap<u32, usize>,
 ) -> DVec3 {
     polygon_normal_from_face(face, |id| {
-        vertex_indices.get(&id).and_then(|&index| positions.get(index))
+        vertex_indices
+            .get(&id)
+            .and_then(|&index| positions.get(index))
             .map(|position| position.as_vec3())
     })
 }
 
-fn vertex_normals(
-    mesh: &Mesh,
-    vertex_indices: &BTreeMap<u32, usize>,
-) -> Vec<DVec3> {
+fn vertex_normals(mesh: &Mesh, vertex_indices: &BTreeMap<u32, usize>) -> Vec<DVec3> {
     let mut incident = vec![Vec::<(usize, usize)>::new(); mesh.vertices.len()];
     for (face_index, face) in mesh.faces.iter().enumerate() {
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
             let Some(&vertex_index) = vertex_indices.get(vertex_id) else {
                 continue;
             };
-            if incident[vertex_index].last().is_none_or(|(prior_face, _)| *prior_face != face_index) {
+            if incident[vertex_index]
+                .last()
+                .is_none_or(|(prior_face, _)| *prior_face != face_index)
+            {
                 incident[vertex_index].push((face_index, corner));
             }
         }
@@ -3459,22 +3730,32 @@ fn vertex_normals(
             let Some(next_index) = vertex_indices.get(&next_id).copied() else {
                 continue;
             };
-            let Some(previous) = mesh.vertices.get(previous_index).map(|vertex| vertex.co.as_vec3()) else {
+            let Some(previous) = mesh
+                .vertices
+                .get(previous_index)
+                .map(|vertex| vertex.co.as_vec3())
+            else {
                 continue;
             };
-            let Some(next) = mesh.vertices.get(next_index).map(|vertex| vertex.co.as_vec3()) else {
+            let Some(next) = mesh
+                .vertices
+                .get(next_index)
+                .map(|vertex| vertex.co.as_vec3())
+            else {
                 continue;
             };
             let direction_previous = (previous - position).normalize_or_zero();
             let direction_next = (next - position).normalize_or_zero();
-            let angle = direction_previous.dot(direction_next).clamp(-1.0, 1.0).acos();
+            let angle = direction_previous
+                .dot(direction_next)
+                .clamp(-1.0, 1.0)
+                .acos();
             normal += face_normals[face_index] * angle;
         }
         normals[vertex_index] = normal.normalize_or_zero();
     }
     normals.into_iter().map(glam::Vec3::as_dvec3).collect()
 }
-
 
 fn face_loop_starts(mesh: &Mesh) -> Vec<usize> {
     let mut starts = Vec::with_capacity(mesh.faces.len());
@@ -3541,11 +3822,9 @@ fn weighted_vertex_value(
 fn weighted_values(samples: &[(Value, f64)]) -> Option<Value> {
     let first = &samples.first()?.0;
     if first.is_boolean() {
-        return Some(Value::Bool(
-            samples
-                .iter()
-                .any(|(value, weight)| value.as_bool() == Some(true) && *weight > 0.0),
-        ));
+        return Some(Value::Bool(samples.iter().any(|(value, weight)| {
+            value.as_bool() == Some(true) && *weight > 0.0
+        })));
     }
     if first.as_f64().is_some() {
         return Some(json!(
@@ -3651,24 +3930,19 @@ fn mix_color(
             "ADD" | "SUB" | "MUL" => destination[3],
             _ => source[3],
         };
-    }
-    else if !matches!(mode, "MIX" | "ADD" | "SUB" | "MUL") {
+    } else if !matches!(mode, "MIX" | "ADD" | "SUB" | "MUL") {
         target = source;
     }
     std::array::from_fn(|index| destination[index] + (target[index] - destination[index]) * factor)
 }
 
-fn mix_byte_color(
-    destination: [f64; 4],
-    source: [f64; 4],
-    factor: f64,
-    mode: &str,
-) -> [f64; 4] {
+fn mix_byte_color(destination: [f64; 4], source: [f64; 4], factor: f64, mode: &str) -> [f64; 4] {
     let destination = linear_color_to_bytes(destination);
     let source = linear_color_to_bytes(source);
     if matches!(mode, "ABOVE_THRESHOLD" | "BELOW_THRESHOLD") {
-        let mean = (u16::from(destination[0]) + u16::from(destination[1]) + u16::from(destination[2]))
-            as f64
+        let mean = (u16::from(destination[0])
+            + u16::from(destination[1])
+            + u16::from(destination[2])) as f64
             / 3.0;
         let replace = if mode == "ABOVE_THRESHOLD" {
             mean >= factor
@@ -3686,8 +3960,9 @@ fn mix_byte_color(
                 let inverse = 255 - mix;
                 let total_alpha = inverse * i64::from(destination[3]) + mix * 255;
                 for channel in 0..3 {
-                    let numerator = inverse * i64::from(destination[channel]) * i64::from(destination[3])
-                        + mix * 255 * i64::from(source[channel]);
+                    let numerator =
+                        inverse * i64::from(destination[channel]) * i64::from(destination[3])
+                            + mix * 255 * i64::from(source[channel]);
                     target[channel] = divide_round_i(numerator, total_alpha).clamp(0, 255) as u8;
                 }
                 target[3] = divide_round_i(total_alpha, 255).clamp(0, 255) as u8;
@@ -3748,7 +4023,11 @@ fn linear_color_to_bytes(color: [f64; 4]) -> [u8; 4] {
         }
     };
     std::array::from_fn(|index| {
-        let value = if index == 3 { color[index] } else { srgb(color[index]) };
+        let value = if index == 3 {
+            color[index]
+        } else {
+            srgb(color[index])
+        };
         (value.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8
     })
 }
@@ -3809,7 +4088,11 @@ fn transfer_color_layers(
         return Err(invalid(modifier, source_selector, "ALL or ACTIVE"));
     }
     if !matches!(destination_selection, "ACTIVE" | "NAME" | "INDEX") {
-        return Err(invalid(modifier, destination_selector, "NAME, INDEX, or ACTIVE"));
+        return Err(invalid(
+            modifier,
+            destination_selector,
+            "NAME, INDEX, or ACTIVE",
+        ));
     }
     let source_store = color_layers::read(source);
     let mut destination_store = color_layers::read(destination);
@@ -3850,13 +4133,15 @@ fn transfer_color_layers(
             continue;
         }
         let destination_index = match destination_selection {
-            "NAME" => destination_indices.iter().copied().find(|&index| {
-                destination_store.layers[index].name == source_layer.name
-            }),
+            "NAME" => destination_indices
+                .iter()
+                .copied()
+                .find(|&index| destination_store.layers[index].name == source_layer.name),
             "ACTIVE" => destination_active.as_deref().and_then(|name| {
-                destination_indices.iter().copied().find(|&index| {
-                    destination_store.layers[index].name == name
-                })
+                destination_indices
+                    .iter()
+                    .copied()
+                    .find(|&index| destination_store.layers[index].name == name)
             }),
             "INDEX" => destination_indices.get(domain_index).copied(),
             _ => None,
@@ -3864,11 +4149,16 @@ fn transfer_color_layers(
         let Some(destination_index) = destination_index else {
             continue;
         };
-        let byte_color = color_layer_is_byte(destination, &destination_store.layers[destination_index].name);
+        let byte_color = color_layer_is_byte(
+            destination,
+            &destination_store.layers[destination_index].name,
+        );
         let destination_layer = &mut destination_store.layers[destination_index];
         if color_domain == ColorDomain::Point {
             for (index, vertex) in destination.vertices.iter().enumerate() {
-                let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping) else {
+                let Some(mapped) =
+                    mapped_vertex_sources(mapping_context, destination, index, mapping)
+                else {
                     continue;
                 };
                 let Some(target) = weighted_color(&source_layer.values, &mapped) else {
@@ -3885,17 +4175,19 @@ fn transfer_color_layers(
             let mut destination_loop = 0;
             for (face_index, face) in destination.faces.iter().enumerate() {
                 for corner in 0..face.vertices.len() {
-                    let mapped =
-                        mapped_loop_sources(mapping_context, destination, face_index, corner, mapping);
+                    let mapped = mapped_loop_sources(
+                        mapping_context,
+                        destination,
+                        face_index,
+                        corner,
+                        mapping,
+                    );
                     if let Some(mapped) = mapped
                         && let Some(target) = weighted_color(&source_layer.values, &mapped)
                         && let Some(old) = destination_layer.values.get(destination_loop).copied()
                     {
-                        let mask = transfer_mask_weight(
-                            mask_weights,
-                            face.vertices[corner],
-                            invert_mask,
-                        );
+                        let mask =
+                            transfer_mask_weight(mask_weights, face.vertices[corner], invert_mask);
                         destination_layer.values[destination_loop] =
                             mix_color(old, target, factor * mask, mix_mode, byte_color);
                     }
@@ -4093,7 +4385,8 @@ mod tests {
     };
 
     #[test]
-    fn transferred_sharp_edge_splits_smooth_corner_normals() -> Result<(), Box<dyn std::error::Error>> {
+    fn transferred_sharp_edge_splits_smooth_corner_normals()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut destination = Mesh::from_positions_and_faces(
             vec![
                 DVec3::new(0.0, 0.0, 0.0),

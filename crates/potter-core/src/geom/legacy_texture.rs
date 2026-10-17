@@ -24,7 +24,7 @@ use crate::{
         ImageData, ImageInterpolation,
         storage::{ImageUserSelection, load_image_data_for_legacy_texture},
     },
-    model::{migrate, Id, ImageAlphaMode, ImageColorspace, SceneDoc},
+    model::{Id, ImageAlphaMode, ImageColorspace, SceneDoc, migrate},
 };
 
 fn image_user_index(id: &str, settings: &Map<String, Value>, key: &str) -> Result<u16> {
@@ -1259,8 +1259,7 @@ pub fn resolve_texture(
             ImageUserSelection::default(),
         )?;
         settings.source_channels = source_channels;
-        settings.source_srgb_encoded =
-            color_pass && image.colorspace == ImageColorspace::Srgb;
+        settings.source_srgb_encoded = color_pass && image.colorspace == ImageColorspace::Srgb;
         let resolved = if settings == DEFAULT_IMAGE_SETTINGS {
             ResolvedTextureKind::Image(data)
         } else {
@@ -1332,8 +1331,7 @@ pub fn resolve_texture(
                 image_user,
             )?;
             sampler.source_channels = source_channels;
-            sampler.source_srgb_encoded =
-                color_pass && image.colorspace == ImageColorspace::Srgb;
+            sampler.source_srgb_encoded = color_pass && image.colorspace == ImageColorspace::Srgb;
             ResolvedTextureKind::ImageWithSettings {
                 image: data,
                 settings: sampler,
@@ -1572,9 +1570,7 @@ fn image_pixel(
         .copied()
         .ok_or_else(|| invalid_image_sample("image texture texel index is invalid"))?;
     let mut texel = pixel.map(|value| value as f32);
-    if !matches!(settings.source_channels, 3 | 4)
-        && settings.use_alpha
-        && !settings.calculate_alpha
+    if !matches!(settings.source_channels, 3 | 4) && settings.use_alpha && !settings.calculate_alpha
     {
         texel[..3].fill(1.0);
     }
@@ -1972,9 +1968,10 @@ fn sample_image(
             .ok_or_else(|| invalid_image_sample("UDIM V coordinate is out of range"))?;
         if fx >= 0.0 && fy >= 0.0 && fx < 10.0 {
             let tile_number = i64::from(1001_u32)
-                .checked_add(v.checked_mul(10).ok_or_else(|| {
-                    invalid_image_sample("UDIM tile number overflows")
-                })?)
+                .checked_add(
+                    v.checked_mul(10)
+                        .ok_or_else(|| invalid_image_sample("UDIM tile number overflows"))?,
+                )
                 .and_then(|number| number.checked_add(u))
                 .and_then(|number| u32::try_from(number).ok());
             if let Some(tile_number) = tile_number {
@@ -3639,6 +3636,10 @@ mod tests {
     use glam::DVec3;
     use serde_json::{Value, json};
 
+    use super::{
+        BlenderRng, DEFAULT_IMAGE_SETTINGS, ImageData, ImageInterpolation, LegacyTexture,
+        ResolvedTexture, TextureSource, cell_noise_v3, parse_record, record_value, sample,
+    };
     use crate::{
         hash,
         image::ImageTileData,
@@ -3646,10 +3647,6 @@ mod tests {
             Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Modifier, ModifierRuntime,
             SceneDoc,
         },
-    };
-    use super::{
-        BlenderRng, DEFAULT_IMAGE_SETTINGS, ImageData, ImageInterpolation, LegacyTexture,
-        ResolvedTexture, TextureSource, cell_noise_v3, parse_record, record_value, sample,
     };
 
     fn image_record(settings: Value) -> Value {
@@ -3731,19 +3728,16 @@ mod tests {
             binding_data: None,
             runtime: ModifierRuntime::default(),
         };
-        let resolved = crate::geom::modifiers::load_modifier_texture(
-            &modifier,
-            "texture",
-            doc,
-            Some(root),
-        )?
-        .ok_or_else(|| std::io::Error::other("image texture was not resolved"))?;
+        let resolved =
+            crate::geom::modifiers::load_modifier_texture(&modifier, "texture", doc, Some(root))?
+                .ok_or_else(|| std::io::Error::other("image texture was not resolved"))?;
         let mut rng = BlenderRng::seed(0);
         Ok(sample(resolved.source(), coords, &mut rng)?)
     }
 
     #[test]
-    fn legacy_image_user_selects_multilayer_exr_layer_pass_and_view() -> Result<(), Box<dyn Error>> {
+    fn legacy_image_user_selects_multilayer_exr_layer_pass_and_view() -> Result<(), Box<dyn Error>>
+    {
         use exr::prelude::{
             Encoding, Image as ExrImage, ImageAttributes, IntegerBounds, Layer, LayerAttributes,
             SpecificChannels, Vec2, WritableImage,
@@ -3761,13 +3755,7 @@ mod tests {
             Encoding::FAST_LOSSLESS,
             SpecificChannels::build()
                 .with_channel::<f32>("Z")
-                .with_pixels(|position| {
-                    if position.1 == 0 {
-                        0.75_f32
-                    } else {
-                        0.25_f32
-                    }
-                }),
+                .with_pixels(|position| if position.1 == 0 { 0.75_f32 } else { 0.25_f32 }),
         );
         let rgba_layer = |name: &str, view: &str, top: [f32; 4], bottom: [f32; 4]| {
             let mut attributes = LayerAttributes::named(name);

@@ -1,4 +1,10 @@
-use std::{borrow::Cow, collections::{BTreeMap, HashMap}, fs, io::Cursor, path::Path};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    fs,
+    io::Cursor,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -572,13 +578,7 @@ fn decode_exr_with_image_user(
     })?;
     let pixel_count = checked_pixel_count(width, height)?;
     let Some(pass) = select_exr_render_pass(&layers, selection) else {
-        return Ok((
-            width,
-            height,
-            vec![[0.0; 4]; pixel_count],
-            false,
-            0,
-        ));
+        return Ok((width, height, vec![[0.0; 4]; pixel_count], false, 0));
     };
 
     let (channel_slots, channel_ids) = exr_pass_channel_layout(pass);
@@ -604,10 +604,7 @@ fn decode_exr_with_image_user(
             let value = exr_sample(pass.channels[0].channel, index)?;
             [value; 4]
         };
-        if color_pass
-            && channel_count == 4
-            && alpha_mode == ImageAlphaMode::Premultiplied
-        {
+        if color_pass && channel_count == 4 && alpha_mode == ImageAlphaMode::Premultiplied {
             unpremultiply_exr_pixel(&mut pixel);
         }
         pixels.push(pixel);
@@ -620,19 +617,17 @@ fn decode_exr_with_image_user(
 }
 
 fn exr_has_legacy_flipped_rows(image: &ExrImageData) -> bool {
-    let is_legacy = |attributes: &HashMap<
-        exr::meta::attribute::Text,
-        exr::meta::attribute::AttributeValue,
-    >| {
-        attributes.iter().any(|(name, value)| {
-            name.to_string() == "BlenderMultiChannel"
-                && matches!(
-                    value,
-                    exr::meta::attribute::AttributeValue::Text(version)
-                        if version.to_string().starts_with("Blender V2.43")
-                )
-        })
-    };
+    let is_legacy =
+        |attributes: &HashMap<exr::meta::attribute::Text, exr::meta::attribute::AttributeValue>| {
+            attributes.iter().any(|(name, value)| {
+                name.to_string() == "BlenderMultiChannel"
+                    && matches!(
+                        value,
+                        exr::meta::attribute::AttributeValue::Text(version)
+                            if version.to_string().starts_with("Blender V2.43")
+                    )
+            })
+        };
     is_legacy(&image.attributes.other)
         || image
             .layer_data
@@ -641,10 +636,17 @@ fn exr_has_legacy_flipped_rows(image: &ExrImageData) -> bool {
 }
 
 fn flip_exr_rows(pixels: &mut [[f64; 4]], width: u32, height: u32) -> Result<()> {
-    let width = usize::try_from(width)
-        .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "EXR width exceeds platform limits"))?;
+    let width = usize::try_from(width).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "EXR width exceeds platform limits",
+        )
+    })?;
     let height = usize::try_from(height).map_err(|_| {
-        PotError::new(ErrorCode::LimitExceeded, "EXR height exceeds platform limits")
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "EXR height exceeds platform limits",
+        )
     })?;
     if width.checked_mul(height) != Some(pixels.len()) {
         return Err(PotError::new(
@@ -836,9 +838,11 @@ fn exr_is_multilayer(image: &ExrImageData) -> bool {
                 .multi_view_names
                 .as_ref()
                 .is_some_and(|views| !views.is_empty())
-                || layer.channel_data.list.iter().any(|channel| {
-                    channel.name.to_string().contains('.')
-                })
+                || layer
+                    .channel_data
+                    .list
+                    .iter()
+                    .any(|channel| channel.name.to_string().contains('.'))
         })
 }
 
@@ -873,10 +877,7 @@ fn push_exr_view(views: &mut Vec<String>, view: &str) {
     }
 }
 
-fn exr_render_layers<'a>(
-    image: &'a ExrImageData,
-    views: &[String],
-) -> Vec<ExrSelectionLayer<'a>> {
+fn exr_render_layers<'a>(image: &'a ExrImageData, views: &[String]) -> Vec<ExrSelectionLayer<'a>> {
     let mut raw_channels = Vec::new();
     for layer in &image.layer_data {
         let layer_views = layer
@@ -966,8 +967,10 @@ fn exr_render_layers<'a>(
             .iter_mut()
             .find(|pass| pass.name == pass_name && pass.view == channel.view)
         {
-            pass.channels
-                .push(ExrSelectionChannel { channel: channel.channel, id });
+            pass.channels.push(ExrSelectionChannel {
+                channel: channel.channel,
+                id,
+            });
         } else {
             layer.passes.push(ExrSelectionPass {
                 name: pass_name,
@@ -994,9 +997,11 @@ fn remove_exr_view_name(name: &str, views: &[String]) -> (String, String) {
         if prefix == view {
             return (channel.to_owned(), view.clone());
         }
-        if let Some(layer_pass) = prefix.strip_suffix(view).and_then(|rest| rest.strip_suffix('.')) {
-            let mut name_without_view =
-                String::with_capacity(layer_pass.len() + channel.len() + 1);
+        if let Some(layer_pass) = prefix
+            .strip_suffix(view)
+            .and_then(|rest| rest.strip_suffix('.'))
+        {
+            let mut name_without_view = String::with_capacity(layer_pass.len() + channel.len() + 1);
             if !layer_pass.is_empty() {
                 name_without_view.push_str(layer_pass);
                 name_without_view.push('.');
@@ -1008,25 +1013,23 @@ fn remove_exr_view_name(name: &str, views: &[String]) -> (String, String) {
     (name.to_owned(), String::new())
 }
 
-fn split_exr_channel_name(
-    name: &str,
-    has_xyz_channels: bool,
-) -> Option<(String, String, char)> {
+fn split_exr_channel_name(name: &str, has_xyz_channels: bool) -> Option<(String, String, char)> {
     let (prefix, channel_name) = name.rsplit_once('.').unwrap_or(("", name));
     if channel_name.is_empty() {
         return None;
     }
     let id = exr_channel_id(channel_name)?;
     if prefix.is_empty() {
-        let pass_name = if id == 'Z' && (!has_xyz_channels || channel_name.eq_ignore_ascii_case("depth")) {
-            "Depth"
-        } else if id == 'Y' && !has_xyz_channels {
-            channel_name
-        } else if matches!(id, 'R' | 'G' | 'B' | 'A' | 'V' | 'X' | 'Y' | 'Z') {
-            "Combined"
-        } else {
-            channel_name
-        };
+        let pass_name =
+            if id == 'Z' && (!has_xyz_channels || channel_name.eq_ignore_ascii_case("depth")) {
+                "Depth"
+            } else if id == 'Y' && !has_xyz_channels {
+                channel_name
+            } else if matches!(id, 'R' | 'G' | 'B' | 'A' | 'V' | 'X' | 'Y' | 'Z') {
+                "Combined"
+            } else {
+                channel_name
+            };
         return Some((String::new(), pass_name.to_owned(), id));
     }
     let (layer_name, pass_name) = prefix.rsplit_once('.').unwrap_or(("", prefix));
@@ -1043,11 +1046,13 @@ fn exr_channel_id(name: &str) -> Option<char> {
     }
     if name.len() == 2 {
         let second = name.chars().nth(1)?.to_ascii_uppercase();
-        return Some(if matches!(second, 'X' | 'Y' | 'Z' | 'R' | 'G' | 'B' | 'U' | 'V' | 'A') {
-            second
-        } else {
-            'X'
-        });
+        return Some(
+            if matches!(second, 'X' | 'Y' | 'Z' | 'R' | 'G' | 'B' | 'U' | 'V' | 'A') {
+                second
+            } else {
+                'X'
+            },
+        );
     }
     Some(if name.eq_ignore_ascii_case("red") {
         'R'
@@ -1064,7 +1069,10 @@ fn exr_channel_id(name: &str) -> Option<char> {
     })
 }
 
-fn compare_exr_passes(left: &ExrSelectionPass<'_>, right: &ExrSelectionPass<'_>) -> std::cmp::Ordering {
+fn compare_exr_passes(
+    left: &ExrSelectionPass<'_>,
+    right: &ExrSelectionPass<'_>,
+) -> std::cmp::Ordering {
     const PASS_ORDER: &[&str] = &[
         "Combined",
         "Depth",
@@ -1091,8 +1099,12 @@ fn compare_exr_passes(left: &ExrSelectionPass<'_>, right: &ExrSelectionPass<'_>)
         "Subsurface Indirect",
         "Subsurface Color",
     ];
-    let left_order = PASS_ORDER.iter().position(|name| *name == left.name.as_str());
-    let right_order = PASS_ORDER.iter().position(|name| *name == right.name.as_str());
+    let left_order = PASS_ORDER
+        .iter()
+        .position(|name| *name == left.name.as_str());
+    let right_order = PASS_ORDER
+        .iter()
+        .position(|name| *name == right.name.as_str());
     let pass_order = match (left_order, right_order) {
         (Some(left), Some(right)) => left.cmp(&right),
         (Some(_), None) => std::cmp::Ordering::Less,

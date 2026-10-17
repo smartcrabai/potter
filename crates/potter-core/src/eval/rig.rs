@@ -129,10 +129,12 @@ fn armature_bone_ids(armature: &ArmatureData) -> impl Iterator<Item = &Id> + '_ 
         .iter()
         .filter(|bone_id| armature.bones.contains_key(*bone_id))
         .chain(armature.bones.keys().filter(|bone_id| {
-            !armature.bone_order.iter().any(|ordered| ordered == *bone_id)
+            !armature
+                .bone_order
+                .iter()
+                .any(|ordered| ordered == *bone_id)
         }))
 }
-
 
 /// Evaluate each bone's rest, pose, and skin matrices in armature-local coordinates.
 ///
@@ -2566,7 +2568,9 @@ fn bbone_setting_number(
     let Some(value) = bone.bbone_settings.get(key) else {
         return Ok(default);
     };
-    let value = value.as_f64().filter(|value| value.is_finite())
+    let value = value
+        .as_f64()
+        .filter(|value| value.is_finite())
         .ok_or_else(|| bbone_setting_error(bone_id, key))?;
     Ok(value)
 }
@@ -2593,29 +2597,33 @@ fn bbone_setting_vec3(
     let Some(value) = bone.bbone_settings.get(key) else {
         return Ok(default);
     };
-    let values = value.as_array().filter(|values| values.len() == 3)
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 3)
         .ok_or_else(|| bbone_setting_error(bone_id, key))?;
     let mut result = [0.0; 3];
     for (target, value) in result.iter_mut().zip(values) {
-        *target = value.as_f64().filter(|value| value.is_finite())
+        *target = value
+            .as_f64()
+            .filter(|value| value.is_finite())
             .ok_or_else(|| bbone_setting_error(bone_id, key))?;
     }
     Ok(DVec3::from_array(result))
 }
 
-fn bbone_setting_bool3(
-    bone_id: &Id,
-    bone: &crate::model::Bone,
-    key: &str,
-) -> Result<[bool; 3]> {
+fn bbone_setting_bool3(bone_id: &Id, bone: &crate::model::Bone, key: &str) -> Result<[bool; 3]> {
     let Some(value) = bone.bbone_settings.get(key) else {
         return Ok([false; 3]);
     };
-    let values = value.as_array().filter(|values| values.len() == 3)
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 3)
         .ok_or_else(|| bbone_setting_error(bone_id, key))?;
     let mut result = [false; 3];
     for (target, value) in result.iter_mut().zip(values) {
-        *target = value.as_bool().ok_or_else(|| bbone_setting_error(bone_id, key))?;
+        *target = value
+            .as_bool()
+            .ok_or_else(|| bbone_setting_error(bone_id, key))?;
     }
     Ok(result)
 }
@@ -2637,7 +2645,9 @@ fn bbone_segments(bone_id: &Id, bone: &crate::model::Bone) -> Result<usize> {
     let Some(value) = bone.bbone_settings.get("bbone_segments") else {
         return Ok(1);
     };
-    let segments = value.as_u64().and_then(|value| usize::try_from(value).ok())
+    let segments = value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
         .filter(|segments| (1..=32).contains(segments))
         .ok_or_else(|| bbone_setting_error(bone_id, "bbone_segments"))?;
     Ok(segments)
@@ -2649,7 +2659,11 @@ fn bbone_handle(
     bone: &crate::model::Bone,
     start: bool,
 ) -> Result<(String, Option<Id>)> {
-    let type_key = if start { "bbone_handle_type_start" } else { "bbone_handle_type_end" };
+    let type_key = if start {
+        "bbone_handle_type_start"
+    } else {
+        "bbone_handle_type_end"
+    };
     let kind = bbone_setting_string(bone_id, bone, type_key, "AUTO")?.to_owned();
     let handle = match kind.as_str() {
         "AUTO" if start => bone.use_connect.then(|| bone.parent.clone()).flatten(),
@@ -2659,13 +2673,19 @@ fn bbone_handle(
                 .then(|| candidate_id.clone())
         }),
         "ABSOLUTE" | "RELATIVE" | "TANGENT" => {
-            let key = if start { "bbone_custom_handle_start" } else { "bbone_custom_handle_end" };
+            let key = if start {
+                "bbone_custom_handle_start"
+            } else {
+                "bbone_custom_handle_end"
+            };
             match bone.bbone_settings.get(key) {
                 None | Some(Value::Null) => None,
                 Some(Value::String(name)) => Some(
-                    armature.bones.iter().find_map(|(id, candidate)|
-                        (candidate.name == *name).then(|| id.clone()))
-                    .ok_or_else(|| bbone_setting_error(bone_id, key))?,
+                    armature
+                        .bones
+                        .iter()
+                        .find_map(|(id, candidate)| (candidate.name == *name).then(|| id.clone()))
+                        .ok_or_else(|| bbone_setting_error(bone_id, key))?,
                 ),
                 Some(_) => return Err(bbone_setting_error(bone_id, key)),
             }
@@ -2686,7 +2706,9 @@ fn matrix_axis_sizes(matrix: DMat4) -> DVec3 {
 fn normalize_matrix_axes(matrix: DMat4, what: &str) -> Result<DMat4> {
     let sizes = matrix_axis_sizes(matrix);
     if !sizes.is_finite() || sizes.min_element() <= 0.0 {
-        return Err(evaluation_error(format!("{what} has a zero or non-finite axis")));
+        return Err(evaluation_error(format!(
+            "{what} has a zero or non-finite axis"
+        )));
     }
     Ok(DMat4::from_cols(
         (matrix.x_axis.truncate() / sizes.x).extend(matrix.x_axis.w),
@@ -2705,20 +2727,27 @@ fn bbone_spline_parameters(
     rest: bool,
 ) -> Result<BboneSplineParameters> {
     let current = matrices.get(bone_id).ok_or_else(|| {
-        evaluation_error_with("B-Bone bone matrices are missing", json!({"bone_id":bone_id}))
+        evaluation_error_with(
+            "B-Bone bone matrices are missing",
+            json!({"bone_id":bone_id}),
+        )
     })?;
     let current_pose = pose.get(bone_id).copied().unwrap_or_default();
     let length = DVec3::from_array(bone.tail).distance(DVec3::from_array(bone.head));
     let pose_matrix = current.pose;
-    let scale = if rest { DVec3::ONE } else { matrix_axis_sizes(pose_matrix) };
+    let scale = if rest {
+        DVec3::ONE
+    } else {
+        matrix_axis_sizes(pose_matrix)
+    };
     if !length.is_finite() || length <= 0.0 || !scale.is_finite() {
         return Err(evaluation_error_with(
             "B-Bone rest or pose transform is invalid",
             json!({"bone_id":bone_id}),
         ));
     }
-    let do_scale = !rest
-        && ((scale.x - scale.y).abs() > 1.0e-6 || (scale.y - scale.z).abs() > 1.0e-6);
+    let do_scale =
+        !rest && ((scale.x - scale.y).abs() > 1.0e-6 || (scale.y - scale.z).abs() > 1.0e-6);
     let current_matrix = if rest {
         current.rest
     } else if do_scale {
@@ -2745,21 +2774,45 @@ fn bbone_spline_parameters(
         ease1: bbone_setting_number(bone_id, bone, "bbone_easein", 1.0)?
             + if rest { 0.0 } else { current_pose.bbone_easein },
         ease2: bbone_setting_number(bone_id, bone, "bbone_easeout", 1.0)?
-            + if rest { 0.0 } else { current_pose.bbone_easeout },
+            + if rest {
+                0.0
+            } else {
+                current_pose.bbone_easeout
+            },
         roll1: bbone_setting_number(bone_id, bone, "bbone_rollin", 0.0)?
             + if rest { 0.0 } else { current_pose.bbone_rollin },
         roll2: bbone_setting_number(bone_id, bone, "bbone_rollout", 0.0)?
-            + if rest { 0.0 } else { current_pose.bbone_rollout },
+            + if rest {
+                0.0
+            } else {
+                current_pose.bbone_rollout
+            },
         scale_in: bbone_setting_vec3(bone_id, bone, "bbone_scalein", DVec3::ONE)?,
         scale_out: bbone_setting_vec3(bone_id, bone, "bbone_scaleout", DVec3::ONE)?,
         curve_in_x: bbone_setting_number(bone_id, bone, "bbone_curveinx", 0.0)?
-            + if rest { 0.0 } else { current_pose.bbone_curveinx },
+            + if rest {
+                0.0
+            } else {
+                current_pose.bbone_curveinx
+            },
         curve_in_z: bbone_setting_number(bone_id, bone, "bbone_curveinz", 0.0)?
-            + if rest { 0.0 } else { current_pose.bbone_curveinz },
+            + if rest {
+                0.0
+            } else {
+                current_pose.bbone_curveinz
+            },
         curve_out_x: bbone_setting_number(bone_id, bone, "bbone_curveoutx", 0.0)?
-            + if rest { 0.0 } else { current_pose.bbone_curveoutx },
+            + if rest {
+                0.0
+            } else {
+                current_pose.bbone_curveoutx
+            },
         curve_out_z: bbone_setting_number(bone_id, bone, "bbone_curveoutz", 0.0)?
-            + if rest { 0.0 } else { current_pose.bbone_curveoutz },
+            + if rest {
+                0.0
+            } else {
+                current_pose.bbone_curveoutz
+            },
     };
     if !rest {
         result.scale_in *= DVec3::from_array(current_pose.bbone_scalein);
@@ -2767,10 +2820,20 @@ fn bbone_spline_parameters(
     }
 
     let fields = [
-        result.ease1, result.ease2, result.roll1, result.roll2,
-        result.scale_in.x, result.scale_in.y, result.scale_in.z,
-        result.scale_out.x, result.scale_out.y, result.scale_out.z,
-        result.curve_in_x, result.curve_in_z, result.curve_out_x, result.curve_out_z,
+        result.ease1,
+        result.ease2,
+        result.roll1,
+        result.roll2,
+        result.scale_in.x,
+        result.scale_in.y,
+        result.scale_in.z,
+        result.scale_out.x,
+        result.scale_out.y,
+        result.scale_out.z,
+        result.curve_in_x,
+        result.curve_in_z,
+        result.curve_out_x,
+        result.curve_out_z,
     ];
     if fields.iter().any(|value| !value.is_finite()) {
         return Err(evaluation_error_with(
@@ -2800,7 +2863,10 @@ fn bbone_spline_parameters(
             evaluation_error_with("B-Bone start handle is missing", json!({"bone_id":bone_id}))
         })?;
         let prev_matrices = matrices.get(&prev_id).ok_or_else(|| {
-            evaluation_error_with("B-Bone start handle matrices are missing", json!({"bone_id":bone_id,"handle":prev_id}))
+            evaluation_error_with(
+                "B-Bone start handle matrices are missing",
+                json!({"bone_id":bone_id,"handle":prev_id}),
+            )
         })?;
         let prev_pose = pose.get(&prev_id).copied().unwrap_or_default();
         let (current_head, _) = if rest {
@@ -2810,12 +2876,16 @@ fn bbone_spline_parameters(
         };
         let (prev_rest_head, prev_rest_tail) = (
             prev_matrices.rest.w_axis.truncate(),
-            prev_matrices.rest.transform_point3(DVec3::Y * DVec3::from_array(prev_bone.tail)
-                .distance(DVec3::from_array(prev_bone.head))),
+            prev_matrices.rest.transform_point3(
+                DVec3::Y
+                    * DVec3::from_array(prev_bone.tail).distance(DVec3::from_array(prev_bone.head)),
+            ),
         );
         let prev_pose_head = prev_matrices.pose.w_axis.truncate();
-        let prev_pose_tail = prev_matrices.pose.transform_point3(DVec3::Y * DVec3::from_array(prev_bone.tail)
-            .distance(DVec3::from_array(prev_bone.head)));
+        let prev_pose_tail = prev_matrices.pose.transform_point3(
+            DVec3::Y
+                * DVec3::from_array(prev_bone.tail).distance(DVec3::from_array(prev_bone.head)),
+        );
         let mut done = false;
         let mut handle_position = DVec3::ZERO;
         if prev_type == "RELATIVE" {
@@ -2827,7 +2897,8 @@ fn bbone_spline_parameters(
             }
         } else if prev_type == "TANGENT" {
             if rest {
-                handle_position = current.rest.w_axis.truncate() - (prev_rest_tail - prev_rest_head);
+                handle_position =
+                    current.rest.w_axis.truncate() - (prev_rest_tail - prev_rest_head);
             } else {
                 handle_position = current_head - (prev_pose_tail - prev_pose_head);
             }
@@ -2839,7 +2910,11 @@ fn bbone_spline_parameters(
             result.prev_h = inverse_current.transform_point3(handle_position);
         }
         if !result.prev_bbone {
-            let handle_matrix = if rest { prev_matrices.rest } else { prev_matrices.pose };
+            let handle_matrix = if rest {
+                prev_matrices.rest
+            } else {
+                prev_matrices.pose
+            };
             result.prev_mat = inverse_current * handle_matrix;
             if !rest && (prev_scale_flags.iter().any(|flag| *flag) || prev_ease_flag) {
                 let local = checked_inverse(prev_matrices.rest, "B-Bone start handle rest")?
@@ -2870,7 +2945,10 @@ fn bbone_spline_parameters(
             evaluation_error_with("B-Bone end handle is missing", json!({"bone_id":bone_id}))
         })?;
         let next_matrices = matrices.get(&next_id).ok_or_else(|| {
-            evaluation_error_with("B-Bone end handle matrices are missing", json!({"bone_id":bone_id,"handle":next_id}))
+            evaluation_error_with(
+                "B-Bone end handle matrices are missing",
+                json!({"bone_id":bone_id,"handle":next_id}),
+            )
         })?;
         let (current_head, current_tail) = if rest {
             let head = current.rest.w_axis.truncate();
@@ -2879,7 +2957,8 @@ fn bbone_spline_parameters(
             let head = current.pose.w_axis.truncate();
             (head, current.pose.transform_point3(DVec3::Y * length))
         };
-        let next_length = DVec3::from_array(next_bone.tail).distance(DVec3::from_array(next_bone.head));
+        let next_length =
+            DVec3::from_array(next_bone.tail).distance(DVec3::from_array(next_bone.head));
         let next_rest_head = next_matrices.rest.w_axis.truncate();
         let next_rest_tail = next_matrices.rest.transform_point3(DVec3::Y * next_length);
         let next_pose_head = next_matrices.pose.w_axis.truncate();
@@ -2906,10 +2985,15 @@ fn bbone_spline_parameters(
         if !done {
             result.next_h = inverse_current.transform_point3(handle_position);
         }
-        result.next_mat = inverse_current * if rest { next_matrices.rest } else { next_matrices.pose };
+        result.next_mat = inverse_current
+            * if rest {
+                next_matrices.rest
+            } else {
+                next_matrices.pose
+            };
         if !rest && (next_scale_flags.iter().any(|flag| *flag) || next_ease_flag) {
-            let local = checked_inverse(next_matrices.rest, "B-Bone end handle rest")?
-                * next_matrices.pose;
+            let local =
+                checked_inverse(next_matrices.rest, "B-Bone end handle rest")? * next_matrices.pose;
             let scale = matrix_axis_sizes(local);
             for axis in 0..3 {
                 if next_scale_flags[axis] {
@@ -2984,7 +3068,13 @@ fn bbone_handle_axes(param: &BboneSplineParameters) -> Result<(DVec3, f64, DVec3
     left.z += param.curve_in_z * z_scale;
     right.x += param.curve_out_x * x_scale;
     right.z += param.curve_out_z * z_scale;
-    Ok((left, roll1 + param.roll1, right, roll2 + param.roll2, length))
+    Ok((
+        left,
+        roll1 + param.roll1,
+        right,
+        roll2 + param.roll2,
+        length,
+    ))
 }
 
 fn bbone_roll_from_matrix(matrix: DMat4, axis: DVec3) -> Result<f64> {
@@ -3144,7 +3234,11 @@ fn bbone_spline_matrices(param: &BboneSplineParameters) -> Result<Vec<DMat4>> {
         parameter_points[index] = (segment as f64 - factor) / 32.0;
     }
     parameter_points[param.segments] = 1.0;
-    if parameter_points.iter().take(param.segments + 1).any(|value| !value.is_finite()) {
+    if parameter_points
+        .iter()
+        .take(param.segments + 1)
+        .any(|value| !value.is_finite())
+    {
         return Err(evaluation_error("B-Bone spline parameters are non-finite"));
     }
 
@@ -3159,7 +3253,12 @@ fn bbone_spline_matrices(param: &BboneSplineParameters) -> Result<Vec<DMat4>> {
     ];
     let first_axis = ease_bbone_handle_axis(first_derivative[0], second_derivative[0]);
     result.push(make_bbone_spline_matrix(
-        param, control[0], first_axis, roll_in, param.scale_in.x, param.scale_in.z,
+        param,
+        control[0],
+        first_axis,
+        roll_in,
+        param.scale_in.x,
+        param.scale_in.z,
     )?);
     for index in 1..param.segments {
         let factor = index as f64 / param.segments as f64;
@@ -3167,7 +3266,9 @@ fn bbone_spline_matrices(param: &BboneSplineParameters) -> Result<Vec<DMat4>> {
         let roll = roll_in + (roll_out - roll_in) * factor;
         let scale_x = param.scale_in.x + (param.scale_out.x - param.scale_in.x) * factor;
         let scale_z = param.scale_in.z + (param.scale_out.z - param.scale_in.z) * factor;
-        result.push(make_bbone_spline_matrix(param, position, axis, roll, scale_x, scale_z)?);
+        result.push(make_bbone_spline_matrix(
+            param, position, axis, roll, scale_x, scale_z,
+        )?);
     }
     let last_axis = ease_bbone_handle_axis(first_derivative[2], -second_derivative[1]);
     result.push(make_bbone_spline_matrix(
@@ -3210,13 +3311,17 @@ fn build_bbone_segment_matrices(
             armature, bone_id, bone, pose, bones, true,
         )?)?;
         let bone_matrices = bones.get(bone_id).ok_or_else(|| {
-            evaluation_error_with("B-Bone bone matrices are missing", json!({"bone_id":bone_id}))
+            evaluation_error_with(
+                "B-Bone bone matrices are missing",
+                json!({"bone_id":bone_id}),
+            )
         })?;
         let inverse_rest = checked_inverse(bone_matrices.rest, "B-Bone rest matrix")?;
         let mut deform = (!preserve_volume).then(|| Vec::with_capacity(segments + 1));
         let mut dual_quats = preserve_volume.then(|| Vec::with_capacity(segments + 1));
         for index in 0..=segments {
-            let inverse_segment_rest = checked_inverse(rest_matrices[index], "B-Bone segment rest")?;
+            let inverse_segment_rest =
+                checked_inverse(rest_matrices[index], "B-Bone segment rest")?;
             let deformation = bone_matrices.skin
                 * bone_matrices.rest
                 * matrices[index]
@@ -3266,13 +3371,17 @@ fn build_bbone_segment_matrices(
                     depth_scale: 0.0,
                 });
             }
-            let arc_length: f64 = boundaries.windows(2)
-                .map(|pair| pair[0].point.distance(pair[1].point)).sum();
+            let arc_length: f64 = boundaries
+                .windows(2)
+                .map(|pair| pair[0].point.distance(pair[1].point))
+                .sum();
             let straight_length = boundaries[0].point.distance(boundaries[segments].point);
             let bsp_depth = ((segments + 2) as f64).log2().ceil() as usize;
             let max_depth_scale = segments as f64 * (straight_length / arc_length) * 0.222;
-            if !arc_length.is_finite() || arc_length <= 0.0
-                || !max_depth_scale.is_finite() || max_depth_scale <= 0.0
+            if !arc_length.is_finite()
+                || arc_length <= 0.0
+                || !max_depth_scale.is_finite()
+                || max_depth_scale <= 0.0
             {
                 return Err(evaluation_error_with(
                     "B-Bone curved mapping arc length is invalid",
@@ -3286,16 +3395,19 @@ fn build_bbone_segment_matrices(
                 boundaries[index].depth_scale = boundaries[index - 1].depth_scale * scale_factor;
             }
         }
-        result.insert(bone_id.clone(), BboneSegmentMatrices {
-            segments,
-            length: DVec3::from_array(bone.tail).distance(DVec3::from_array(bone.head)),
-            inverse_rest,
-            deform,
-            dual_quats,
-            curved,
-            boundaries,
-            arc_length_reciprocal,
-        });
+        result.insert(
+            bone_id.clone(),
+            BboneSegmentMatrices {
+                segments,
+                length: DVec3::from_array(bone.tail).distance(DVec3::from_array(bone.head)),
+                inverse_rest,
+                deform,
+                dual_quats,
+                curved,
+                boundaries,
+                arc_length_reciprocal,
+            },
+        );
     }
     Ok(result)
 }
@@ -3331,13 +3443,17 @@ impl BboneSegmentMatrices {
             } else if start >= self.segments as isize {
                 1.0
             } else {
-                let start_index = usize::try_from(start).map_err(|_| evaluation_error("B-Bone mapping boundary index is invalid"))?;
-                let end_index = usize::try_from(end).map_err(|_| evaluation_error("B-Bone mapping boundary index is invalid"))?;
+                let start_index = usize::try_from(start)
+                    .map_err(|_| evaluation_error("B-Bone mapping boundary index is invalid"))?;
+                let end_index = usize::try_from(end)
+                    .map_err(|_| evaluation_error("B-Bone mapping boundary index is invalid"))?;
                 let first = boundary_dist[start_index].abs();
                 let second = boundary_dist[end_index].abs();
                 let denominator = first + second;
                 if denominator == 0.0 {
-                    return Err(evaluation_error("B-Bone mapping boundary distances are degenerate"));
+                    return Err(evaluation_error(
+                        "B-Bone mapping boundary distances are degenerate",
+                    ));
                 }
                 segment_size * (start as f64 + first / denominator)
             };
@@ -3450,7 +3566,12 @@ pub(crate) fn apply_armature_skinning(
     ));
     let bbone_matrices = if use_envelopes || group_weights.is_some() {
         build_bbone_segment_matrices(
-            armature, pose, bone_matrices, group_weights, use_envelopes, preserve_volume,
+            armature,
+            pose,
+            bone_matrices,
+            group_weights,
+            use_envelopes,
+            preserve_volume,
         )?
     } else {
         BTreeMap::new()
@@ -3475,9 +3596,7 @@ pub(crate) fn apply_armature_skinning(
                 json!({ "bone_id": bone_id }),
             ));
         }
-        let envelope_multiply = bbone_setting_bool(
-            bone_id, bone, "use_envelope_multiply", false,
-        )?;
+        let envelope_multiply = bbone_setting_bool(bone_id, bone, "use_envelope_multiply", false)?;
         if use_envelopes || envelope_multiply {
             validate_envelope(bone_id, bone, use_envelopes)?;
         }
@@ -3535,14 +3654,18 @@ pub(crate) fn apply_armature_skinning(
                     ));
                 }
                 if weight > 0.0 {
-                    let weight = weight * if bone.envelope_multiply {
-                        envelope_factor(bone.bone, source_armature)
-                    } else {
-                        1.0
-                    };
+                    let weight = weight
+                        * if bone.envelope_multiply {
+                            envelope_factor(bone.bone, source_armature)
+                        } else {
+                            1.0
+                        };
                     if weight > 0.0 {
                         append_skin_contributions(
-                            &mut contributions, bone, weight, source_armature,
+                            &mut contributions,
+                            bone,
+                            weight,
+                            source_armature,
                         )?;
                     }
                 }
@@ -3553,9 +3676,7 @@ pub(crate) fn apply_armature_skinning(
             for bone in &skin_bones {
                 let weight = envelope_weight(bone.bone, source_armature);
                 if weight > 0.0 {
-                    append_skin_contributions(
-                        &mut contributions, bone, weight, source_armature,
-                    )?;
+                    append_skin_contributions(&mut contributions, bone, weight, source_armature)?;
                 }
             }
         }
@@ -3653,7 +3774,6 @@ fn append_skin_contributions<'a>(
     Ok(())
 }
 
-
 fn validate_envelope(bone_id: &Id, bone: &crate::model::Bone, use_weight: bool) -> Result<()> {
     let values = [bone.envelope_distance, bone.head_radius, bone.tail_radius];
     if !DVec3::from_array(bone.head).is_finite()
@@ -3725,23 +3845,27 @@ fn mix_armature_point(
         let mut sum = DualQuatSum::default();
         for contribution in contributions {
             let dual_quat = match contribution.segment_index {
-                Some(index) => &contribution.bone.segments.unwrap().dual_quats.as_ref().unwrap()[index],
+                Some(index) => &contribution
+                    .bone
+                    .segments
+                    .unwrap()
+                    .dual_quats
+                    .as_ref()
+                    .unwrap()[index],
                 None => contribution.bone.dual_quat.as_ref().unwrap(),
             };
             sum.add(dual_quat, point, contribution.weight);
         }
         sum.transform(point, total)
     } else {
-        contributions
-            .iter()
-            .fold(DVec3::ZERO, |acc, contribution| {
-                let matrix = contribution.segment_index.map_or(
-                    contribution.bone.skin,
-                    |index| contribution.bone.segments.unwrap().deform.as_ref().unwrap()[index],
-                );
-                acc + matrix.transform_point3(point) * contribution.weight
-            })
-            / total
+        contributions.iter().fold(DVec3::ZERO, |acc, contribution| {
+            let matrix = contribution
+                .segment_index
+                .map_or(contribution.bone.skin, |index| {
+                    contribution.bone.segments.unwrap().deform.as_ref().unwrap()[index]
+                });
+            acc + matrix.transform_point3(point) * contribution.weight
+        }) / total
     }
 }
 

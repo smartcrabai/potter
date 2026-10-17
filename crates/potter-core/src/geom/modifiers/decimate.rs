@@ -2421,7 +2421,11 @@ impl BMesh {
             .filter(|edge| edge.alive && edge.l == NONE)
             .map(|edge| edge.v)
             .collect();
-        let mut origin = Origin::copies((0..points.len()).map(Some), face_origins);
+        let mut origin = Origin::copies(
+            (0..points.len()).map(Some),
+            face_origins,
+            source.original_indices.is_some(),
+        );
         origin.corners = Some(corners);
         let keep_vertices: Vec<bool> = self.verts.iter().map(|vert| vert.alive).collect();
         decimate_compact(points, polygons, loose, origin, source, &keep_vertices)

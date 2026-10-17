@@ -475,9 +475,7 @@
           "description": "Potter resource ID for the cache filepath."
         }
       },
-      "required": [
-        "resource"
-      ]
+      "required": []
     },
     "mesh_sequence_cache": {
       "properties": {
@@ -540,7 +538,7 @@
         },
         "resource": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "pattern": "^([a-z][a-z0-9_-]{0,63})?$",
           "description": "Potter resource ID for the cache filepath."
         },
         "frame_offset": {
@@ -549,7 +547,9 @@
         },
         "scale": {
           "type": "number",
-          "default": 1.0
+          "default": 1.0,
+          "minimum": 0.0001,
+          "maximum": 1000.0
         },
         "override_frame": {
           "type": [
@@ -557,12 +557,54 @@
             "null"
           ],
           "default": null
+        },
+        "cache_frame": {
+          "type": "number",
+          "default": 0.0,
+          "description": "CacheFile.frame retained while override_frame is disabled."
+        },
+        "is_sequence": {
+          "type": "boolean",
+          "default": false
+        },
+        "velocity_name": {
+          "type": "string",
+          "default": ".velocities"
+        },
+        "velocity_unit": {
+          "type": "string",
+          "enum": [
+            "SECOND",
+            "FRAME"
+          ],
+          "default": "SECOND"
+        },
+        "forward_axis": {
+          "type": "string",
+          "enum": [
+            "POS_X",
+            "POS_Y",
+            "POS_Z",
+            "NEG_X",
+            "NEG_Y",
+            "NEG_Z"
+          ],
+          "default": "POS_X"
+        },
+        "up_axis": {
+          "type": "string",
+          "enum": [
+            "POS_X",
+            "POS_Y",
+            "POS_Z",
+            "NEG_X",
+            "NEG_Y",
+            "NEG_Z"
+          ],
+          "default": "POS_X"
         }
       },
-      "required": [
-        "resource",
-        "object_path"
-      ]
+      "required": []
     },
     "normal_edit": {
       "properties": {
@@ -981,14 +1023,32 @@
           "type": "array",
           "items": {
             "type": "array",
-            "items": {
-              "type": "number"
-            },
+            "items": {"type": ["number", "string"]},
+            "prefixItems": [
+              {"type": "number"},
+              {"type": "number"},
+              {"type": "string", "enum": ["AUTO", "AUTO_CLAMPED", "VECTOR"]}
+            ],
             "minItems": 2,
-            "maxItems": 2
+            "maxItems": 3
           },
           "minItems": 2,
           "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
+        "map_curve_settings": {
+          "type": "object",
+          "properties": {
+            "use_clip": {"type": "boolean", "default": true},
+            "clip_bounds": {
+              "type": "array",
+              "items": {"type": "number", "minimum": -100.0, "maximum": 100.0},
+              "minItems": 4,
+              "maxItems": 4,
+              "default": [0.0, 0.0, 1.0, 1.0]
+            },
+            "extend": {"enum": ["HORIZONTAL", "EXTRAPOLATED"], "default": "EXTRAPOLATED"}
+          },
+          "default": {"use_clip": true, "clip_bounds": [0.0, 0.0, 1.0, 1.0], "extend": "EXTRAPOLATED"}
         },
         "normalize": {
           "type": "boolean",
@@ -1334,14 +1394,32 @@
           "type": "array",
           "items": {
             "type": "array",
-            "items": {
-              "type": "number"
-            },
+            "items": {"type": ["number", "string"]},
+            "prefixItems": [
+              {"type": "number"},
+              {"type": "number"},
+              {"type": "string", "enum": ["AUTO", "AUTO_CLAMPED", "VECTOR"]}
+            ],
             "minItems": 2,
-            "maxItems": 2
+            "maxItems": 3
           },
           "minItems": 2,
           "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
+        "map_curve_settings": {
+          "type": "object",
+          "properties": {
+            "use_clip": {"type": "boolean", "default": true},
+            "clip_bounds": {
+              "type": "array",
+              "items": {"type": "number", "minimum": -100.0, "maximum": 100.0},
+              "minItems": 4,
+              "maxItems": 4,
+              "default": [0.0, 0.0, 1.0, 1.0]
+            },
+            "extend": {"enum": ["HORIZONTAL", "EXTRAPOLATED"], "default": "EXTRAPOLATED"}
+          },
+          "default": {"use_clip": true, "clip_bounds": [0.0, 0.0, 1.0, 1.0], "extend": "EXTRAPOLATED"}
         },
         "normalize": {
           "type": "boolean",
@@ -3727,14 +3805,32 @@
           "type": "array",
           "items": {
             "type": "array",
-            "items": {
-              "type": "number"
-            },
+            "items": {"type": ["number", "string"]},
+            "prefixItems": [
+              {"type": "number"},
+              {"type": "number"},
+              {"type": "string", "enum": ["AUTO", "AUTO_CLAMPED", "VECTOR"]}
+            ],
             "minItems": 2,
-            "maxItems": 2
+            "maxItems": 3
           },
           "minItems": 2,
           "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
+        "falloff_curve_settings": {
+          "type": "object",
+          "properties": {
+            "use_clip": {"type": "boolean", "default": true},
+            "clip_bounds": {
+              "type": "array",
+              "items": {"type": "number", "minimum": -100.0, "maximum": 100.0},
+              "minItems": 4,
+              "maxItems": 4,
+              "default": [0.0, 0.0, 1.0, 1.0]
+            },
+            "extend": {"enum": ["HORIZONTAL", "EXTRAPOLATED"], "default": "EXTRAPOLATED"}
+          },
+          "default": {"use_clip": true, "clip_bounds": [0.0, 0.0, 1.0, 1.0], "extend": "EXTRAPOLATED"}
         },
         "use_falloff_uniform": {
           "type": "boolean",
@@ -4483,14 +4579,32 @@
           "type": "array",
           "items": {
             "type": "array",
-            "items": {
-              "type": "number"
-            },
+            "items": {"type": ["number", "string"]},
+            "prefixItems": [
+              {"type": "number"},
+              {"type": "number"},
+              {"type": "string", "enum": ["AUTO", "AUTO_CLAMPED", "VECTOR"]}
+            ],
             "minItems": 2,
-            "maxItems": 2
+            "maxItems": 3
           },
           "minItems": 2,
           "default": [[0.0, 0.0], [1.0, 1.0]]
+        },
+        "falloff_curve_settings": {
+          "type": "object",
+          "properties": {
+            "use_clip": {"type": "boolean", "default": true},
+            "clip_bounds": {
+              "type": "array",
+              "items": {"type": "number", "minimum": -100.0, "maximum": 100.0},
+              "minItems": 4,
+              "maxItems": 4,
+              "default": [0.0, 0.0, 1.0, 1.0]
+            },
+            "extend": {"enum": ["HORIZONTAL", "EXTRAPOLATED"], "default": "EXTRAPOLATED"}
+          },
+          "default": {"use_clip": true, "clip_bounds": [0.0, 0.0, 1.0, 1.0], "extend": "EXTRAPOLATED"}
         },
         "use_volume_preserve": {
           "type": "boolean",

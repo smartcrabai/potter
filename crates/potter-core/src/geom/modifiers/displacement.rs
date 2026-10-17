@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use glam::{DMat3, DQuat, Vec2};
+use glam::{DMat3, DQuat};
 
 use super::*;
 use crate::blender_rng::BlenderRng;
@@ -146,26 +146,33 @@ fn required_texture<'a>(
 
 /// Subject-local texture coordinates per vertex (`MOD_get_texture_coords`).
 ///
-/// `LOCAL` uses the current positions. `GLOBAL` and `OBJECT` apply the runtime texture matrix
-/// (subject-local to texture space). `OBJECT` without a map object is `LOCAL`. `UV` takes each
-/// vertex's UV from the first face that uses it, converts stored V-down to Blender's V-up, then
-/// remaps from `[0, 1]` to `[-1, 1]`; a mesh without UV layers falls back to `LOCAL`.
+/// `LOCAL` uses current positions. `GLOBAL` applies subject-to-world; `OBJECT` applies subject-to-world
+/// then world-to-mapping. `OBJECT` without a map object is `LOCAL`. `UV` takes each vertex's UV from
+/// the first face that uses it, converts stored V-down to Blender's V-up, then remaps from `[0, 1]`
+/// to `[-1, 1]`; a mesh without UV layers falls back to `LOCAL`.
 fn texture_coordinates(
     mesh: &Mesh,
     modifier: &Modifier,
     positions: &[DVec3],
-    matrix: Option<DMat4>,
+    mapping: Option<crate::model::TextureCoordinateMapping>,
 ) -> Result<Vec<DVec3>> {
     match string_param(modifier, "texture_coords")? {
         "LOCAL" => Ok(positions.to_vec()),
+        "GLOBAL" => {
+            let mapping = mapping.ok_or_else(|| dependency_missing(modifier, "texture_coords"))?;
+            Ok(positions
+                .iter()
+                .map(|position| mapping.global_coordinate(*position))
+                .collect())
+        }
         "OBJECT" if optional_string_param(modifier, "texture_coords_object")?.is_none() => {
             Ok(positions.to_vec())
         }
-        "GLOBAL" | "OBJECT" => {
-            let matrix = matrix.ok_or_else(|| dependency_missing(modifier, "texture_coords"))?;
+        "OBJECT" => {
+            let mapping = mapping.ok_or_else(|| dependency_missing(modifier, "texture_coords"))?;
             Ok(positions
                 .iter()
-                .map(|position| matrix.transform_point3(*position))
+                .map(|position| mapping.object_coordinate(*position))
                 .collect())
         }
         "UV" => match uv_texture_coordinates(mesh, modifier)? {
@@ -314,7 +321,7 @@ pub(crate) fn displace_textured(
             mesh,
             modifier,
             &positions,
-            runtime_matrix(modifier.runtime.texture_matrix),
+            modifier.runtime.texture_mapping,
         )?),
         None => None,
     };
@@ -476,7 +483,7 @@ pub(crate) fn wave_textured(
             mesh,
             modifier,
             &positions,
-            runtime_matrix(modifier.runtime.texture_matrix),
+            modifier.runtime.texture_mapping,
         )?),
         None => None,
     };
@@ -601,7 +608,7 @@ pub(crate) fn warp_textured(
             mesh,
             modifier,
             &positions,
-            runtime_matrix(modifier.runtime.texture_matrix),
+            modifier.runtime.texture_mapping,
         )?),
         None => None,
     };
@@ -667,37 +674,26 @@ pub(crate) fn warp_textured(
 }
 
 /// Warp `falloff_curve` controls in Blender's stored order and float precision.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "Blender CurveMapping stores control points as float"
-)]
 fn falloff_curve(modifier: &Modifier) -> Result<super::advanced::CurveMappingTable> {
     let invalid = || {
         invalid_parameter(
             modifier,
             "falloff_curve",
-            "at least two finite float32 [x, y] points with evaluable endpoints",
+            "at least two finite float32 [x, y] points with an optional AUTO, AUTO_CLAMPED, or VECTOR handle",
         )
     };
-    let mut points = Vec::new();
-    for point in schema_value(modifier, "falloff_curve")?
-        .as_array()
-        .ok_or_else(invalid)?
-    {
-        let coordinates = point.as_array().map_or(&[][..], Vec::as_slice);
-        let [x, y] = coordinates else {
-            return Err(invalid());
-        };
-        let (Some(x), Some(y)) = (x.as_f64(), y.as_f64()) else {
-            return Err(invalid());
-        };
-        if !x.is_finite() || !y.is_finite() {
-            return Err(invalid());
-        }
-        points.push(Vec2::new(x as f32, y as f32));
-    }
-    super::advanced::curve_map_table(&points).ok_or_else(invalid)
+    let points = super::advanced::curve_mapping_points(schema_value(modifier, "falloff_curve")?)
+        .ok_or_else(invalid)?;
+    let settings =
+        super::advanced::curve_mapping_settings(modifier.params.get("falloff_curve_settings"))
+            .ok_or_else(|| {
+                invalid_parameter(
+                    modifier,
+                    "falloff_curve_settings",
+                    "use_clip, finite ordered clip_bounds, and HORIZONTAL or EXTRAPOLATED extend",
+                )
+            })?;
+    super::advanced::curve_map_table(&points, settings).ok_or_else(invalid)
 }
 
 /// The falloff of a linear distance factor `linear` in `(0, 1]` for one warp falloff type.

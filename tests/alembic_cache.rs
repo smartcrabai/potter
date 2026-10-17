@@ -453,7 +453,10 @@ fn add_sequence_resource(
     let mut sequence_frames = serde_json::Map::new();
     let mut frame = first_frame;
     loop {
-        let source = fixture_dir.join(format!("{prefix}{frame:0width$}{suffix}", width = frame_width));
+        let source = fixture_dir.join(format!(
+            "{prefix}{frame:0width$}{suffix}",
+            width = frame_width
+        ));
         if !source.is_file() {
             break;
         }
@@ -1392,13 +1395,20 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
                 let uv_map = &expected["attributes"]["UVMap"];
                 assert_eq!(uv_map["domain"], "CORNER");
                 assert_eq!(uv_map["type"], "FLOAT2");
-                let values: Vec<[f64; 2]> =
-                    serde_json::from_value(uv_map["values"].clone())?;
+                let values: Vec<[f64; 2]> = serde_json::from_value(uv_map["values"].clone())?;
                 assert_eq!(values.len(), 11);
                 let input_uv: Vec<[f64; 2]> = serde_json::from_value(json!([
-                    [20.0, 10.0], [20.0, 11.0], [20.0, 12.0], [20.0, 13.0],
-                    [21.0, 10.0], [21.0, 11.0], [21.0, 12.0],
-                    [22.0, 10.0], [22.0, 11.0], [22.0, 12.0], [22.0, 13.0]
+                    [20.0, 10.0],
+                    [20.0, 11.0],
+                    [20.0, 12.0],
+                    [20.0, 13.0],
+                    [21.0, 10.0],
+                    [21.0, 11.0],
+                    [21.0, 12.0],
+                    [22.0, 10.0],
+                    [22.0, 11.0],
+                    [22.0, 12.0],
+                    [22.0, 13.0]
                 ]))?;
                 if expected["frame"].as_i64() == Some(1) {
                     assert_eq!(values, input_uv);

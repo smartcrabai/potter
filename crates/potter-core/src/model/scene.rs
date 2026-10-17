@@ -1498,6 +1498,14 @@ impl Modifier {
     }
 }
 
+/// Blender's ordered f32 texture-coordinate stages, retained without matrix composition.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextureCoordinateMapping {
+    pub subject_to_world_f32: [f32; 16],
+    pub world_to_mapping_f32: Option<[f32; 16]>,
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModifierRuntime {
@@ -1512,11 +1520,9 @@ pub struct ModifierRuntime {
     pub warp_from_matrix: Option<[f64; 16]>,
     /// `inv(subject_world) * destination_world` for generic Warp destination object or pose bone.
     pub warp_to_matrix: Option<[f64; 16]>,
-    /// Subject-local to texture space: LOCAL is identity, GLOBAL is `subject_world`, OBJECT is
-    /// `inv(texture_world) * subject_world` with a map object (otherwise LOCAL), and UV has no
-    /// matrix. A named bone's `texture_world` is `armature_world * pose_mat`; unknown names use
-    /// the map object's world matrix.
-    pub texture_matrix: Option<[f64; 16]>,
+    /// Raw subject-to-world and optional world-to-mapping matrices for ordered f32 texture mapping.
+    #[doc(hidden)]
+    pub texture_mapping: Option<TextureCoordinateMapping>,
     #[doc(hidden)]
     // Preserve Blender's original f32 local-to-target matrix instead of re-inverting its inverse.
     pub shrinkwrap_subject_to_target: Option<[f32; 16]>,

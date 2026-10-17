@@ -12,7 +12,10 @@ pub(super) fn texture_mask_weights(
 ) -> Result<Option<BTreeMap<u32, f64>>> {
     if modifier.modifier_type == "vertex_weight_proximity"
         && (optional_string(modifier, "target")?.is_none()
-            || operands.get("target").and_then(|objects| objects.first()).is_none())
+            || operands
+                .get("target")
+                .and_then(|objects| objects.first())
+                .is_none())
     {
         return Ok(None);
     }
@@ -54,12 +57,12 @@ pub(super) fn texture_mask_weights(
     } else {
         None
     };
-    let texture_matrix = modifier
-        .runtime
-        .texture_matrix
-        .map(|matrix| DMat4::from_cols_array(&matrix));
+    let texture_mapping = modifier.runtime.texture_mapping.or_else(|| {
+        (mapping == "GLOBAL")
+            .then(|| crate::model::TextureCoordinateMapping::for_subject_world(subject_world))
+    });
     let map_object = optional_string(modifier, "mask_tex_map_object")?;
-    if mapping == "OBJECT" && texture_matrix.is_none() && map_object.is_some() {
+    if mapping == "OBJECT" && texture_mapping.is_none() && map_object.is_some() {
         return Err(PotError::with_details(
             ErrorCode::DependencyMissing,
             "weight texture object coordinates were not resolved",
@@ -70,11 +73,19 @@ pub(super) fn texture_mask_weights(
     for vertex in &mesh.vertices {
         let coordinate = match mapping {
             "LOCAL" => vertex.co,
-            "GLOBAL" => texture_matrix
-                .unwrap_or(subject_world)
-                .transform_point3(vertex.co),
-            "OBJECT" => texture_matrix
-                .map_or(vertex.co, |matrix| matrix.transform_point3(vertex.co)),
+            "GLOBAL" => texture_mapping
+                .as_ref()
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::DependencyMissing,
+                        "weight texture global coordinates were not resolved",
+                        json!({"modifier_id":modifier.id,"parameter":"mask_tex_mapping"}),
+                    )
+                })?
+                .global_coordinate(vertex.co),
+            "OBJECT" => texture_mapping
+                .as_ref()
+                .map_or(vertex.co, |mapping| mapping.object_coordinate(vertex.co)),
             "UV" => uv_coordinates
                 .as_ref()
                 .and_then(|coordinates| coordinates.get(&vertex.id).copied())
@@ -129,7 +140,11 @@ fn vertex_uv_coordinates(
     for (face_index, face) in mesh.faces.iter().enumerate() {
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
             if !coordinates.contains_key(vertex_id) {
-                return Err(invalid(modifier, "mask_tex_uv_layer", "a mesh with valid face vertices"));
+                return Err(invalid(
+                    modifier,
+                    "mask_tex_uv_layer",
+                    "a mesh with valid face vertices",
+                ));
             }
             if !assigned.insert(*vertex_id) {
                 continue;
@@ -203,17 +218,16 @@ pub(super) fn vertex_weight_edit(
         .map(|name| existing_group_weights(mesh, name))
         .transpose()?
         .flatten();
-    let curve = curve_points(modifier)?;
+    let curve = if falloff == "CURVE" {
+        curve_points(modifier)?
+    } else {
+        None
+    };
     let mut random = BlenderRandom::for_object(subject_name);
     let mut values = Vec::with_capacity(mesh.vertices.len());
     for vertex in &mesh.vertices {
         let original = existing.get(&vertex.id).copied().unwrap_or(default);
-        let mut mapped = apply_falloff(
-            original,
-            falloff,
-            curve.as_deref(),
-            &mut random,
-        );
+        let mut mapped = apply_falloff(original, falloff, curve.as_ref(), &mut random);
         if invert_falloff {
             mapped = 1.0 - mapped;
         }
@@ -397,7 +411,11 @@ pub(super) fn vertex_weight_proximity(
     let maximum = number(modifier, "max_dist")?;
     let falloff = falloff_type(modifier)?;
     let invert_falloff = boolean(modifier, "invert_falloff")?;
-    let curve = curve_points(modifier)?;
+    let curve = if falloff == "CURVE" {
+        curve_points(modifier)?
+    } else {
+        None
+    };
     let mask_constant = number(modifier, "mask_constant")?;
     let mask_group = optional_string(modifier, "mask_vertex_group")?;
     let mask_invert = boolean(modifier, "invert_mask_vertex_group")?;
@@ -426,7 +444,11 @@ pub(super) fn vertex_weight_proximity(
             subject_world_f32[14],
         );
         let target_origin = glam::Vec3::new(target_world[12], target_world[13], target_world[14]);
-        Some((subject_world_f32, target_origin, f64::from((subject_origin - target_origin).length())))
+        Some((
+            subject_world_f32,
+            target_origin,
+            f64::from((subject_origin - target_origin).length()),
+        ))
     } else {
         None
     };
@@ -451,14 +473,13 @@ pub(super) fn vertex_weight_proximity(
             .mesh
             .triangulate()
             .map_err(|error| {
-                PotError::invalid_argument(format!("invalid proximity target triangulation: {error}"))
+                PotError::invalid_argument(format!(
+                    "invalid proximity target triangulation: {error}"
+                ))
             })?
             .into_iter()
             .filter_map(|triangle| {
-                Some([
-                    *positions.get(&triangle[0])?,
-                    *positions.get(&triangle[1])?,
-                ])
+                Some([*positions.get(&triangle[0])?, *positions.get(&triangle[1])?])
             })
             .collect::<Vec<_>>()
     } else {
@@ -476,8 +497,22 @@ pub(super) fn vertex_weight_proximity(
         .iter()
         .filter_map(|edge| {
             Some([
-                target.mesh.vertices.iter().find(|vertex| vertex.id == edge.vertices[0])?.co.as_vec3().as_dvec3(),
-                target.mesh.vertices.iter().find(|vertex| vertex.id == edge.vertices[1])?.co.as_vec3().as_dvec3(),
+                target
+                    .mesh
+                    .vertices
+                    .iter()
+                    .find(|vertex| vertex.id == edge.vertices[0])?
+                    .co
+                    .as_vec3()
+                    .as_dvec3(),
+                target
+                    .mesh
+                    .vertices
+                    .iter()
+                    .find(|vertex| vertex.id == edge.vertices[1])?
+                    .co
+                    .as_vec3()
+                    .as_dvec3(),
             ])
         })
         .collect::<Vec<_>>();
@@ -493,11 +528,20 @@ pub(super) fn vertex_weight_proximity(
             "OBJECT" => origin_distance
                 .as_ref()
                 .map(|(_, _, distance)| *distance)
-                .ok_or_else(|| PotError::new(ErrorCode::EvaluationFailed, "proximity object world matrices are missing"))?,
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "proximity object world matrices are missing",
+                    )
+                })?,
             "GEOMETRY" if geometry.is_empty() => {
-                let (subject_world_f32, target_origin, _) = origin_distance
-                    .as_ref()
-                    .ok_or_else(|| PotError::new(ErrorCode::EvaluationFailed, "proximity origin world matrices are missing"))?;
+                let (subject_world_f32, target_origin, _) =
+                    origin_distance.as_ref().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::EvaluationFailed,
+                            "proximity origin world matrices are missing",
+                        )
+                    })?;
                 f64::from(
                     crate::geom::modifiers::blender_transform_point_f32(
                         subject_world_f32,
@@ -529,7 +573,7 @@ pub(super) fn vertex_weight_proximity(
             _ => unreachable!("proximity mode was validated"),
         };
         let mut mapped = map_proximity_distance(distance, minimum, maximum);
-        mapped = apply_falloff(mapped, falloff, curve.as_deref(), &mut random);
+        mapped = apply_falloff(mapped, falloff, curve.as_ref(), &mut random);
         if invert_falloff {
             mapped = 1.0 - mapped;
         }
@@ -649,9 +693,9 @@ fn write_group_weights_preserving_zero(
         .attributes
         .entry("vertex_groups".to_owned())
         .or_insert_with(|| Value::Object(Map::new()));
-    let groups = groups
-        .as_object_mut()
-        .ok_or_else(|| PotError::invalid_argument("vertex_groups mesh attribute must be an object"))?;
+    let groups = groups.as_object_mut().ok_or_else(|| {
+        PotError::invalid_argument("vertex_groups mesh attribute must be an object")
+    })?;
     let mut values = Map::new();
     for (id, weight) in weights {
         values.insert(format!("v{id}"), json!(weight));
@@ -757,19 +801,20 @@ impl BlenderRandom {
     }
 
     fn next_float(&mut self) -> f64 {
-        self.state = self
-            .state
-            .wrapping_mul(0x5deece66d)
-            .wrapping_add(0xb)
-            & 0x0000_ffff_ffff_ffff;
+        self.state = self.state.wrapping_mul(0x5deece66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
         ((self.state >> 17) as f32 / 2_147_483_648.0_f32) as f64
     }
 }
 
-fn apply_falloff(value: f64, falloff: &str, curve: Option<&[DVec2]>, random: &mut BlenderRandom) -> f64 {
+fn apply_falloff(
+    value: f64,
+    falloff: &str,
+    curve: Option<&CurveMappingTable>,
+    random: &mut BlenderRandom,
+) -> f64 {
     let value = value.clamp(0.0, 1.0);
     match falloff {
-        "CURVE" => curve.map_or(value, |points| curve_mapping_value(points, value)),
+        "CURVE" => curve.map_or(value, |curve| curve.evaluate(value)),
         "SHARP" => value * value,
         "SMOOTH" => value * value * (3.0 - 2.0 * value),
         "ROOT" => value.sqrt(),
@@ -779,126 +824,6 @@ fn apply_falloff(value: f64, falloff: &str, curve: Option<&[DVec2]>, random: &mu
         _ => value,
     }
 }
-
-fn curve_mapping_value(points: &[DVec2], value: f64) -> f64 {
-    const RESOLUTION: usize = 32;
-    const TABLE_SIZE: usize = 256;
-    let mut handles = points
-        .iter()
-        .copied()
-        .map(|point| [point, point, point])
-        .collect::<Vec<_>>();
-    for index in 0..handles.len() {
-        let point = handles[index][1];
-        let previous = if index == 0 {
-            point * 2.0 - handles[index + 1][1]
-        } else {
-            handles[index - 1][1]
-        };
-        let next = if index + 1 == handles.len() {
-            point * 2.0 - handles[index - 1][1]
-        } else {
-            handles[index + 1][1]
-        };
-        let delta_a = point - previous;
-        let delta_b = next - point;
-        let mut length_a = delta_a.length();
-        let mut length_b = delta_b.length();
-        if length_a == 0.0 {
-            length_a = 1.0;
-        }
-        if length_b == 0.0 {
-            length_b = 1.0;
-        }
-        let tangent = delta_a / length_a + delta_b / length_b;
-        let tangent_length = tangent.length() * 2.5614;
-        if tangent_length != 0.0 {
-            handles[index][0] = point - tangent * (length_a / tangent_length);
-            handles[index][2] = point + tangent * (length_b / tangent_length);
-        }
-    }
-    if handles.len() > 2 {
-        let handle_len = handles[0][1].distance(handles[0][2]);
-        let mut vector = handles[1][0];
-        vector.x = vector.x.max(handles[0][1].x);
-        vector -= handles[0][1];
-        let length = vector.length();
-        if length > f64::EPSILON {
-            vector *= handle_len / length;
-            handles[0][2] = handles[0][1] + vector;
-            handles[0][0] = handles[0][1] - vector;
-        }
-        let last = handles.len() - 1;
-        let handle_len = handles[last][1].distance(handles[last][0]);
-        let mut vector = handles[last - 1][2];
-        vector.x = vector.x.min(handles[last][1].x);
-        vector -= handles[last][1];
-        let length = vector.length();
-        if length > f64::EPSILON {
-            vector *= handle_len / length;
-            handles[last][0] = handles[last][1] + vector;
-            handles[last][2] = handles[last][1] - vector;
-        }
-    }
-    let mut curve = Vec::with_capacity((handles.len() - 1) * RESOLUTION);
-    for segment in 0..handles.len() - 1 {
-        let mut start = handles[segment];
-        let mut end = handles[segment + 1];
-        let delta_a = start[1] - start[2];
-        let delta_b = end[1] - end[0];
-        let length_a = delta_a.x.abs();
-        let length_b = delta_b.x.abs();
-        let span = end[1].x - start[1].x;
-        if length_a + length_b > span && length_a + length_b > 0.0 {
-            let factor = span / (length_a + length_b);
-            start[2] = start[1] - delta_a * factor;
-            end[0] = end[1] - delta_b * factor;
-        }
-        for step in 0..RESOLUTION {
-            let t = step as f64 / (RESOLUTION - 1) as f64;
-            let inverse = 1.0 - t;
-            curve.push(
-                start[1] * inverse.powi(3)
-                    + start[2] * (3.0 * inverse.powi(2) * t)
-                    + end[0] * (3.0 * inverse * t.powi(2))
-                    + end[1] * t.powi(3),
-            );
-        }
-    }
-    let minimum_x = 0.0;
-    let maximum_x = 1.0;
-    let mut table = [0.0; TABLE_SIZE + 1];
-    for (index, output) in table.iter_mut().enumerate() {
-        let x = minimum_x + (maximum_x - minimum_x) * index as f64 / TABLE_SIZE as f64;
-        let mut upper = curve.partition_point(|point| point.x <= x);
-        if upper == 0 {
-            let first = curve[0];
-            let handle = handles[0][0];
-            let tangent = first - handle;
-            *output = first.y + tangent.y * (x - first.x) / tangent.x;
-        } else if upper >= curve.len() {
-            *output = curve[curve.len() - 1].y;
-        } else {
-            upper = upper.max(1);
-            let first = curve[upper - 1];
-            let second = curve[upper];
-            let span = second.x - first.x;
-            let factor = if span > f64::EPSILON {
-                (x - first.x) / span
-            } else {
-                0.0
-            };
-            *output = first.y + (second.y - first.y) * factor;
-        }
-    }
-    let position = (value - minimum_x) * TABLE_SIZE as f64 / (maximum_x - minimum_x);
-    if position >= TABLE_SIZE as f64 {
-        return table[TABLE_SIZE].clamp(0.0, 1.0);
-    }
-    let lower = position.max(0.0) as usize;
-    let fraction = position - lower as f64;
-    (table[lower] + (table[lower + 1] - table[lower]) * fraction).clamp(0.0, 1.0)
-}
 #[expect(
     clippy::cast_possible_truncation,
     reason = "Blender stores object world matrices and vertex positions in f32"
@@ -906,5 +831,3 @@ fn curve_mapping_value(points: &[DVec2], value: f64) -> f64 {
 fn weight_matrix_f32(matrix: DMat4) -> [f32; 16] {
     matrix.to_cols_array().map(|value| value as f32)
 }
-
-

@@ -19,9 +19,46 @@ use crate::{
         uv_layers::{self, UvLayer},
     },
     hash,
-    model::{ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, VertexGroup},
+    model::{
+        ConstraintType, DataBlock, Id, Modifier, Node, SceneDoc, TextureCoordinateMapping,
+        VertexGroup,
+    },
     params::{self, ParameterFamily},
 };
+
+impl TextureCoordinateMapping {
+    pub(crate) fn for_subject_world(subject_world: DMat4) -> Self {
+        Self {
+            subject_to_world_f32: subject_world.to_cols_array().map(|value| value as f32),
+            world_to_mapping_f32: None,
+        }
+    }
+
+    pub(crate) fn global_coordinate(&self, point: DVec3) -> DVec3 {
+        let world = crate::geom::modifiers::blender_transform_point_f32(
+            &self.subject_to_world_f32,
+            point.as_vec3(),
+        );
+        DVec3::new(f64::from(world.x), f64::from(world.y), f64::from(world.z))
+    }
+
+    pub(crate) fn object_coordinate(&self, point: DVec3) -> DVec3 {
+        let Some(world_to_mapping_f32) = &self.world_to_mapping_f32 else {
+            return point;
+        };
+        let world = crate::geom::modifiers::blender_transform_point_f32(
+            &self.subject_to_world_f32,
+            point.as_vec3(),
+        );
+        let mapped =
+            crate::geom::modifiers::blender_transform_point_f32(world_to_mapping_f32, world);
+        DVec3::new(
+            f64::from(mapped.x),
+            f64::from(mapped.y),
+            f64::from(mapped.z),
+        )
+    }
+}
 
 /// Blender's default for a `mesh_to_volume` parameter, read from the schema table.
 fn mesh_to_volume_default(parameter: &str) -> Result<&'static Value> {
@@ -560,7 +597,7 @@ impl Snapshot {
                     "node_id": prefix.node_id,
                     "keep": prefix.keep,
                 },
-            })))
+            }))?)
         } else {
             scene_hash.clone()
         };
@@ -648,8 +685,8 @@ impl Snapshot {
         let mesh_evaluation_order =
             object_mesh_evaluation_order(doc, selected_nodes, gate, mesh_dependencies)?;
         let evaluated_node_ids: BTreeSet<Id> = mesh_evaluation_order.iter().cloned().collect();
-        let uv_warp_pose_armatures =
-            uv_warp_pose_armatures(doc, &evaluated_node_ids, gate, target_modifier);
+        let modifier_pose_armatures =
+            modifier_pose_armatures(doc, &evaluated_node_ids, gate, target_modifier);
 
         let computed_driver_values;
         let driver_values = if let Some(driver_values) = driver_values {
@@ -783,7 +820,7 @@ impl Snapshot {
         let mut bone_pose_matrices = BTreeMap::new();
         for (id, node) in &doc.nodes {
             if node.kind == "armature"
-                && (evaluated_node_ids.contains(id) || uv_warp_pose_armatures.contains(id))
+                && (evaluated_node_ids.contains(id) || modifier_pose_armatures.contains(id))
             {
                 let armature_world = matrices.get(id).copied().ok_or_else(|| {
                     PotError::new(
@@ -791,7 +828,7 @@ impl Snapshot {
                         "evaluated armature world matrix is missing",
                     )
                 })?;
-                let (world, pose) = if uv_warp_pose_armatures.contains(id) {
+                let (world, pose) = if modifier_pose_armatures.contains(id) {
                     let evaluated =
                         rig::evaluate_armature_bone_world_and_pose_matrices_with_resources(
                             doc,
@@ -831,8 +868,7 @@ impl Snapshot {
                 if let Some(pose) = pose {
                     bone_pose_matrices.insert(
                         id.clone(),
-                        pose
-                            .into_iter()
+                        pose.into_iter()
                             .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
                             .collect(),
                     );
@@ -1069,12 +1105,18 @@ impl Snapshot {
                             ),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
+                                data_block
+                                    .mesh
+                                    .as_ref()
+                                    .filter(|_| data_block.data_type == "mesh"),
                                 modifier,
                                 doc,
+                                id,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
+                                modifier_warnings,
                             ),
                             "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
                             | "particle_system" => apply_stack_physics_modifier(
@@ -1365,12 +1407,18 @@ impl Snapshot {
                             ),
                             "mesh_cache" => apply_mesh_cache_modifier(
                                 mesh,
+                                data_block
+                                    .mesh
+                                    .as_ref()
+                                    .filter(|_| data_block.data_type == "mesh"),
                                 modifier,
                                 doc,
+                                id,
                                 modifier_context.project_root,
                                 frame,
                                 scene.fps,
                                 scene.fps_base,
+                                modifier_warnings,
                             ),
                             "cloth" | "soft_body" | "collision" | "dynamic_paint" | "fluid"
                             | "particle_system" => apply_stack_physics_modifier(
@@ -1579,6 +1627,7 @@ impl Snapshot {
                             gate,
                             &mut texture_rng,
                             &matrices,
+                            &bone_pose_matrices,
                             id,
                         )?);
                     }
@@ -1657,7 +1706,7 @@ impl Snapshot {
             bone_pose_matrices.clear();
             for (id, node) in &doc.nodes {
                 if node.kind == "armature"
-                    && (evaluated_node_ids.contains(id) || uv_warp_pose_armatures.contains(id))
+                    && (evaluated_node_ids.contains(id) || modifier_pose_armatures.contains(id))
                 {
                     let armature_world = matrices.get(id).copied().ok_or_else(|| {
                         PotError::new(
@@ -1665,7 +1714,7 @@ impl Snapshot {
                             "evaluated armature world matrix is missing",
                         )
                     })?;
-                    let (world, pose) = if uv_warp_pose_armatures.contains(id) {
+                    let (world, pose) = if modifier_pose_armatures.contains(id) {
                         let evaluated =
                             rig::evaluate_armature_bone_world_and_pose_matrices_with_evaluated_meshes(
                                 doc,
@@ -1707,8 +1756,7 @@ impl Snapshot {
                     if let Some(pose) = pose {
                         bone_pose_matrices.insert(
                             id.clone(),
-                            pose
-                                .into_iter()
+                            pose.into_iter()
                                 .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
                                 .collect(),
                         );
@@ -1768,6 +1816,11 @@ impl Snapshot {
             evaluated_node.bounds = bounds;
             evaluated_node.dimensions = bounds.map(|value| value.size().to_array());
         }
+        // ORIGINDEX is only needed until modifier and dependency evaluation completes.
+        // Do not retain transient lineage in the returned Snapshot or applied mesh data.
+        for mesh in meshes.values_mut() {
+            mesh.original_indices = None;
+        }
         let transform_world_matrices: BTreeMap<Id, DMat4> =
             world_matrix_ids.map_or_else(BTreeMap::new, |ids| {
                 ids.iter()
@@ -1821,13 +1874,8 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
         "warp" => &["object_from", "object_to", "texture_coords_object"],
         "shrinkwrap" => &["target", "auxiliary_target"],
         "normal_edit" => &["target"],
-        "vertex_weight_proximity" => &[
-            "target",
-            "mask_tex_map_object",
-        ],
-        "vertex_weight_edit" | "vertex_weight_mix" => &[
-            "mask_tex_map_object",
-        ],
+        "vertex_weight_proximity" => &["target", "mask_tex_map_object"],
+        "vertex_weight_edit" | "vertex_weight_mix" => &["mask_tex_map_object"],
         "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
             &["armature"]
         }
@@ -2033,7 +2081,6 @@ pub(crate) fn read_cache_resource(
     crate::cache_sequence::read_cache_resource_record(resource, resource_id.as_str(), project_root)
 }
 
-
 pub(crate) fn load_vdb_volume_data(
     doc: &SceneDoc,
     project_root: Option<&Path>,
@@ -2226,11 +2273,7 @@ fn object_mesh_dependencies(
                 {
                     continue;
                 }
-                add_mesh_operand_dependency(
-                    &mut dependencies.modifiers,
-                    owner_id,
-                    value,
-                );
+                add_mesh_operand_dependency(&mut dependencies.modifiers, owner_id, value);
             }
             if modifier.modifier_type == "mask"
                 && modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
@@ -2244,7 +2287,7 @@ fn object_mesh_dependencies(
             if modifier.modifier_type == "uv_warp"
                 && let Some(owner_dependencies) = dependencies.other.get_mut(owner_id)
             {
-                add_uv_warp_pose_armature_references(doc, modifier, owner_dependencies);
+                add_modifier_pose_armature_references(doc, modifier, owner_dependencies);
             }
             if modifier.modifier_type == "boolean"
                 && let Some(collection_text) = modifier
@@ -2420,7 +2463,8 @@ pub(crate) struct SceneReferences<'a> {
     pub(crate) world_matrices: &'a BTreeMap<Id, DMat4>,
     /// Pose-bone matrices in world space (`armature world * pose`), keyed by armature, then bone.
     pub(crate) bone_matrices: &'a BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
-    /// Armature-local pose matrices used by UV Warp, keyed by armature then bone.
+    /// Armature-local pose matrices used to build raw f32 bone reference worlds, keyed by armature
+    /// then bone.
     pub(crate) bone_pose_matrices: &'a BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
     /// Meshes evaluated before the referencing modifier.
     pub(crate) evaluated_meshes: &'a BTreeMap<Id, Mesh>,
@@ -2580,14 +2624,18 @@ fn reference_world_matrix(
         })
 }
 
-fn add_uv_warp_pose_armature_references(
+fn add_modifier_pose_armature_references(
     doc: &SceneDoc,
     modifier: &Modifier,
     result: &mut BTreeSet<Id>,
 ) {
-    for (object_parameter, bone_parameter) in
-        [("object_from", "bone_from"), ("object_to", "bone_to")]
-    {
+    for (object_parameter, bone_parameter) in [
+        ("object_from", "bone_from"),
+        ("object_to", "bone_to"),
+        ("texture_coords_object", "texture_coords_bone"),
+        ("mask_tex_map_object", "mask_tex_map_bone"),
+        ("texture_map_object", "texture_map_bone"),
+    ] {
         let Some(object_text) = modifier
             .params
             .get(object_parameter)
@@ -2616,13 +2664,17 @@ fn add_uv_warp_pose_armature_references(
         let Some(armature) = armature_data_for_modifier_operand(object, doc) else {
             continue;
         };
-        if armature.bones.values().any(|bone| bone.name == bone_name) {
+        if armature
+            .bones
+            .iter()
+            .any(|(bone_id, bone)| bone_id.as_str() == bone_name || bone.name == bone_name)
+        {
             result.insert(object_id);
         }
     }
 }
 
-fn uv_warp_pose_armatures(
+fn modifier_pose_armatures(
     doc: &SceneDoc,
     evaluated_node_ids: &BTreeSet<Id>,
     gate: ModifierGate<'_>,
@@ -2634,20 +2686,18 @@ fn uv_warp_pose_armatures(
             continue;
         };
         for (index, modifier) in owner.modifiers.iter().enumerate() {
-            if modifier.modifier_type == "uv_warp"
-                && gate.is_active_at(owner_id, index, modifier)
-            {
-                add_uv_warp_pose_armature_references(doc, modifier, &mut result);
+            if gate.is_active_at(owner_id, index, modifier) {
+                add_modifier_pose_armature_references(doc, modifier, &mut result);
             }
         }
     }
     if let Some((target_id, modifier_id)) = target_modifier
         && let Some(owner) = doc.nodes.get(target_id)
     {
-        for (index, modifier) in owner.modifiers.iter().enumerate() {
+        for modifier in &owner.modifiers {
             if &modifier.id == modifier_id {
-                if modifier.modifier_type == "uv_warp" && modifier.enabled {
-                    add_uv_warp_pose_armature_references(doc, modifier, &mut result);
+                if gate.is_active(target_id, modifier) {
+                    add_modifier_pose_armature_references(doc, modifier, &mut result);
                 }
                 break;
             }
@@ -2715,13 +2765,16 @@ pub(crate) fn resolve_modifier_object_operands(
         _ => &[],
     };
     let has_references = reference_parameters.iter().any(|parameter| {
-        modifier.params.get(*parameter).is_some_and(|value| match value {
-            Value::String(text) => !text.is_empty(),
-            Value::Array(values) if *parameter == "projectors" => {
-                values.iter().any(|value| !value.is_null())
-            }
-            value => !value.is_null(),
-        })
+        modifier
+            .params
+            .get(*parameter)
+            .is_some_and(|value| match value {
+                Value::String(text) => !text.is_empty(),
+                Value::Array(values) if *parameter == "projectors" => {
+                    values.iter().any(|value| !value.is_null())
+                }
+                value => !value.is_null(),
+            })
     });
     if !has_references {
         return Ok(BTreeMap::new());
@@ -2862,8 +2915,8 @@ pub(crate) fn resolve_modifier_object_operands(
             let is_normal_edit = modifier.modifier_type == "normal_edit";
             let is_geometry_proximity = modifier.modifier_type == "vertex_weight_proximity"
                 && proximity_mode_is_geometry(modifier);
-            let proximity_geometry_empty = is_geometry_proximity
-                && proximity_geometry_is_empty(modifier);
+            let proximity_geometry_empty =
+                is_geometry_proximity && proximity_geometry_is_empty(modifier);
             let needs_world_matrix = modifier.modifier_type == "uv_project"
                 || (modifier.modifier_type == "vertex_weight_proximity"
                     && (!is_geometry_proximity || proximity_geometry_empty));
@@ -2873,19 +2926,16 @@ pub(crate) fn resolve_modifier_object_operands(
                 || needs_world_matrix;
             let blender_matrices_f32 = needs_matrix_data.then(|| {
                 let (world, local_to_subject, subject_to_local) = if use_transfer_transform {
-                    let (forward, inverse) =
-                        crate::geom::modifiers::blender_space_transform_f32(
-                            object_world,
-                            subject_world,
-                        );
+                    let (forward, inverse) = crate::geom::modifiers::blender_space_transform_f32(
+                        object_world,
+                        subject_world,
+                    );
                     (None, Some(forward), Some(inverse))
                 } else if is_normal_edit {
-                    let subject_world_f32 =
-                        subject_world.to_cols_array().map(|value| value as f32);
+                    let subject_world_f32 = subject_world.to_cols_array().map(|value| value as f32);
                     let inverse_subject =
                         crate::geom::modifiers::blender_inverse_m4(subject_world_f32);
-                    let object_world_f32 =
-                        object_world.to_cols_array().map(|value| value as f32);
+                    let object_world_f32 = object_world.to_cols_array().map(|value| value as f32);
                     (
                         None,
                         Some(crate::geom::modifiers::blender_multiply_m4(
@@ -2895,10 +2945,8 @@ pub(crate) fn resolve_modifier_object_operands(
                         None,
                     )
                 } else if is_geometry_proximity && !proximity_geometry_empty {
-                    let subject_world_f32 =
-                        subject_world.to_cols_array().map(|value| value as f32);
-                    let object_world_f32 =
-                        object_world.to_cols_array().map(|value| value as f32);
+                    let subject_world_f32 = subject_world.to_cols_array().map(|value| value as f32);
+                    let object_world_f32 = object_world.to_cols_array().map(|value| value as f32);
                     let inverse_target =
                         crate::geom::modifiers::blender_inverse_m4(object_world_f32);
                     (
@@ -2966,6 +3014,21 @@ pub(crate) fn resolve_modifier_object_operands(
     Ok(resolved)
 }
 
+/// Converts a resolved object world and optional raw local pose using Blender's f32 multiply order.
+fn reference_object_or_bone_world_f32(
+    object_world: DMat4,
+    bone_pose_matrix: Option<&[f64; 16]>,
+) -> [f32; 16] {
+    let object_world_f32 = object_world.to_cols_array().map(|value| value as f32);
+    let Some(bone_pose_matrix) = bone_pose_matrix else {
+        return object_world_f32;
+    };
+    crate::geom::modifiers::blender_multiply_m4(
+        object_world_f32,
+        bone_pose_matrix.map(|value| value as f32),
+    )
+}
+
 fn resolve_uv_warp_reference_world_f32(
     modifier: &Modifier,
     object_parameter: &str,
@@ -3006,17 +3069,16 @@ fn resolve_uv_warp_reference_world_f32(
             json!({"modifier_id":modifier.id,"parameter":object_parameter,"object":object_id}),
         )
     })?;
-    let object_world_f32 = object_world.to_cols_array().map(|value| value as f32);
     let Some(bone_name) = modifier
         .params
         .get(bone_parameter)
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
     else {
-        return Ok(Some(object_world_f32));
+        return Ok(Some(reference_object_or_bone_world_f32(object_world, None)));
     };
     if object.kind != "armature" {
-        return Ok(Some(object_world_f32));
+        return Ok(Some(reference_object_or_bone_world_f32(object_world, None)));
     }
     let armature = object
         .data
@@ -3024,14 +3086,14 @@ fn resolve_uv_warp_reference_world_f32(
         .and_then(|data_id| doc.data_blocks.get(data_id))
         .and_then(|data| data.armature.as_ref());
     let Some(armature) = armature else {
-        return Ok(Some(object_world_f32));
+        return Ok(Some(reference_object_or_bone_world_f32(object_world, None)));
     };
     let Some((bone_id, _)) = armature
         .bones
         .iter()
         .find(|(_, bone)| bone.name == bone_name)
     else {
-        return Ok(Some(object_world_f32));
+        return Ok(Some(reference_object_or_bone_world_f32(object_world, None)));
     };
     let pose_matrix = bone_pose_matrices
         .get(&object_id)
@@ -3043,10 +3105,9 @@ fn resolve_uv_warp_reference_world_f32(
                 json!({"modifier_id":modifier.id,"parameter":bone_parameter,"object":object_id,"bone":bone_name}),
             )
         })?;
-    let pose_matrix_f32 = pose_matrix.map(|value| value as f32);
-    Ok(Some(crate::geom::modifiers::blender_multiply_m4(
-        object_world_f32,
-        pose_matrix_f32,
+    Ok(Some(reference_object_or_bone_world_f32(
+        object_world,
+        Some(pose_matrix),
     )))
 }
 
@@ -3098,7 +3159,9 @@ pub(crate) fn apply_scene_attribute_modifier(
         resolved.runtime.uv_warp_matrix = Some(matrix_f32_columns(matrix));
         uv_warp_modifier = Some(resolved);
     }
-    let modifier = uv_warp_modifier.as_ref().map_or(modifier, |resolved| resolved);
+    let modifier = uv_warp_modifier
+        .as_ref()
+        .map_or(modifier, |resolved| resolved);
     let operands = resolve_modifier_object_operands(
         modifier,
         subject_id,
@@ -3124,29 +3187,28 @@ pub(crate) fn apply_scene_attribute_modifier(
         .data
         .as_ref()
         .and_then(|data_id| doc.data_blocks.get(data_id));
-    let subject_layer_selection =
-        crate::geom::modifiers::attributes::AttributeLayerSelection {
-            vertex_group_names: subject_data.map_or_else(Vec::new, |data| {
-                data.vertex_groups
-                    .iter()
-                    .map(|group| group.name.clone())
-                    .collect()
-            }),
-            active_vertex_group_index: subject.active_vertex_group_index,
-            ..Default::default()
-        };
+    let subject_layer_selection = crate::geom::modifiers::attributes::AttributeLayerSelection {
+        vertex_group_names: subject_data.map_or_else(Vec::new, |data| {
+            data.vertex_groups
+                .iter()
+                .map(|group| group.name.clone())
+                .collect()
+        }),
+        active_vertex_group_index: subject.active_vertex_group_index,
+        ..Default::default()
+    };
     let mut resolved = modifier.clone();
     if texture.is_some() {
-        resolved.runtime.texture_matrix = texture_coordinate_matrix_with_parameters(
+        resolved.runtime.texture_mapping = texture_coordinate_mapping_with_parameters(
             modifier,
             subject_world,
             doc,
-            references,
+            references.world_matrices,
+            references.bone_pose_matrices,
             "mask_tex_mapping",
             "mask_tex_map_object",
             "mask_tex_map_bone",
-        )?
-        .map(|matrix| matrix.to_cols_array());
+        )?;
     }
     *mesh = crate::geom::modifiers::attributes::evaluate_with_texture_context(
         mesh,
@@ -3175,7 +3237,6 @@ fn scene_subject_name<'a>(doc: &'a SceneDoc, subject_id: &Id) -> Result<&'a str>
             )
         })
 }
-
 
 pub(crate) fn apply_scene_deform_modifier(
     mesh: &mut Mesh,
@@ -3238,24 +3299,36 @@ pub(crate) fn apply_scene_deform_modifier(
 
 fn apply_mesh_cache_modifier(
     mesh: &mut Mesh,
+    source_mesh: Option<&Mesh>,
     modifier: &Modifier,
     doc: &SceneDoc,
+    node_id: &Id,
     project_root: Option<&Path>,
     frame: f64,
     fps: u32,
     fps_base: f64,
+    modifier_warnings: &mut Vec<PotError>,
 ) -> Result<()> {
-    let resource_text = modifier
+    if modifier
         .params
-        .get("resource")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
+        .get("factor")
+        .and_then(Value::as_f64)
+        .is_some_and(|factor| factor <= 0.0)
+    {
+        return Ok(());
+    }
+    let resource_text = match modifier.params.get("resource") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::String(resource)) if resource.is_empty() => return Ok(()),
+        Some(Value::String(resource)) => resource.as_str(),
+        Some(_) => {
+            return Err(PotError::with_details(
                 ErrorCode::InvalidArgument,
                 "Mesh Cache resource must be a resource ID",
                 json!({"modifier_id":modifier.id,"parameter":"resource"}),
-            )
-        })?;
+            ));
+        }
+    };
     let resource_id = Id::new(resource_text.to_owned()).map_err(|error| {
         PotError::with_details(
             ErrorCode::InvalidArgument,
@@ -3263,10 +3336,30 @@ fn apply_mesh_cache_modifier(
             json!({"modifier_id":modifier.id,"resource":resource_text}),
         )
     })?;
+    if doc.resources.get(&resource_id).is_some_and(|resource| {
+        resource
+            .get("uri")
+            .and_then(Value::as_str)
+            .is_some_and(|uri| uri.trim().is_empty())
+    }) {
+        return Ok(());
+    }
     let (bytes, _) = read_cache_resource(doc, project_root, &resource_id)?;
-    crate::geom::modifiers::attributes::evaluate_mesh_cache(
-        mesh, modifier, frame, fps, fps_base, &bytes,
-    )
+    let cache_warnings = crate::geom::modifiers::attributes::evaluate_mesh_cache(
+        mesh,
+        source_mesh,
+        modifier,
+        frame,
+        fps,
+        fps_base,
+        &bytes,
+    )?;
+    modifier_warnings.extend(
+        cache_warnings
+            .into_iter()
+            .map(|warning| attach_node_owner(warning, node_id)),
+    );
+    Ok(())
 }
 
 fn apply_mesh_sequence_cache_modifier(
@@ -3280,17 +3373,30 @@ fn apply_mesh_sequence_cache_modifier(
     fps_base: f64,
     warnings: &mut Vec<PotError>,
 ) -> Result<()> {
-    let resource_text = modifier
-        .params
-        .get("resource")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
+    match modifier.params.get("object_path") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::String(object_path)) if object_path.is_empty() => return Ok(()),
+        Some(Value::String(_)) => {}
+        Some(_) => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "Mesh Sequence Cache object_path must be a string",
+                json!({"modifier_id":modifier.id,"parameter":"object_path"}),
+            ));
+        }
+    }
+    let resource_text = match modifier.params.get("resource") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::String(resource)) if resource.is_empty() => return Ok(()),
+        Some(Value::String(resource)) => resource.as_str(),
+        Some(_) => {
+            return Err(PotError::with_details(
                 ErrorCode::InvalidArgument,
                 "Mesh Sequence Cache resource must be a resource ID",
                 json!({"modifier_id":modifier.id,"parameter":"resource"}),
-            )
-        })?;
+            ));
+        }
+    };
     let resource_id = Id::new(resource_text).map_err(|error| {
         PotError::with_details(
             ErrorCode::InvalidArgument,
@@ -3589,7 +3695,6 @@ fn read_cache_sequence_resource(
         Err(error) => Err(error),
     }
 }
-
 
 const MAX_RENDERED_PARTICLES: usize = 100_000;
 
@@ -4142,6 +4247,7 @@ fn apply_volume_displace_modifier(
     gate: ModifierGate<'_>,
     rng: &mut crate::blender_rng::BlenderRng,
     world_matrices: &BTreeMap<Id, DMat4>,
+    bone_pose_matrices: &BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
     volume_id: &Id,
 ) -> Result<crate::geom::volume::VolumeData> {
     let params = &modifier.params;
@@ -4170,33 +4276,31 @@ fn apply_volume_displace_modifier(
             json!({"node_id":volume_id}),
         )
     })?;
-    let texture_map_object_world = params
-        .get("texture_map_object")
-        .and_then(serde_json::Value::as_str)
-        .map(|object_text| {
-            let object_id = Id::new(object_text.to_owned()).map_err(|error| {
-                PotError::with_details(
-                    ErrorCode::InvalidOperation,
-                    error.message,
-                    json!({"texture_map_object":object_text}),
-                )
-            })?;
-            world_matrices.get(&object_id).copied().ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::TargetNotFound,
-                    "Volume Displace texture map object was not found",
-                    json!({"texture_map_object":object_id}),
-                )
-            })
-        })
-        .transpose()?;
+    let texture_mapping = if texture_source.is_some()
+        && params
+            .get("strength")
+            .and_then(serde_json::Value::as_f64)
+            .is_none_or(|strength| strength != 0.0)
+    {
+        texture_coordinate_mapping_with_parameters(
+            modifier,
+            volume_world,
+            doc,
+            world_matrices,
+            bone_pose_matrices,
+            "texture_map_mode",
+            "texture_map_object",
+            "texture_map_bone",
+        )?
+    } else {
+        None
+    };
     crate::geom::modifiers::simulation::displace_volume(
         volume,
         params,
         texture_source,
         rng,
-        volume_world,
-        texture_map_object_world,
+        texture_mapping,
     )
 }
 
@@ -4435,8 +4539,7 @@ pub(crate) fn apply_scene_operand_modifier(
     }
     let world_matrices = references.world_matrices;
     let evaluated_meshes = references.evaluated_meshes;
-    if matches!(modifier.modifier_type.as_str(), "boolean" | "curve")
-    {
+    if matches!(modifier.modifier_type.as_str(), "boolean" | "curve") {
         return apply_generic_scene_mesh_operand_modifier(
             mesh,
             modifier,
@@ -4693,9 +4796,8 @@ pub(crate) fn apply_scene_displacement_modifier(
         references.project_root,
     )?;
     if texture.is_some() {
-        resolved.runtime.texture_matrix =
-            texture_coordinate_matrix(modifier, subject_world, doc, references)?
-                .map(|matrix| matrix.to_cols_array());
+        resolved.runtime.texture_mapping =
+            texture_coordinate_mapping(modifier, subject_world, doc, references)?;
     }
     let texture = texture.as_ref();
     let evaluated = match modifier.modifier_type.as_str() {
@@ -4721,55 +4823,60 @@ pub(crate) fn apply_scene_displacement_modifier(
     Ok(())
 }
 
-/// Blender's MOD_get_texture_coords as a subject-local to texture-space matrix. Displacement and
-/// weight masks share the coordinate rules but store their mapping fields under different names.
-fn texture_coordinate_matrix(
+/// Resolves Blender texture mapping as ordered subject-to-world and optional world-to-object stages.
+fn texture_coordinate_mapping(
     modifier: &Modifier,
     subject_world: DMat4,
     doc: &SceneDoc,
     references: &SceneReferences<'_>,
-) -> Result<Option<DMat4>> {
-    texture_coordinate_matrix_with_parameters(
+) -> Result<Option<TextureCoordinateMapping>> {
+    texture_coordinate_mapping_with_parameters(
         modifier,
         subject_world,
         doc,
-        references,
+        references.world_matrices,
+        references.bone_pose_matrices,
         "texture_coords",
         "texture_coords_object",
         "texture_coords_bone",
     )
 }
 
-pub(crate) fn texture_coordinate_matrix_with_parameters(
+pub(crate) fn texture_coordinate_mapping_with_parameters(
     modifier: &Modifier,
     subject_world: DMat4,
     doc: &SceneDoc,
-    references: &SceneReferences<'_>,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    bone_pose_matrices: &BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
     mapping_parameter: &str,
     object_parameter: &str,
     bone_parameter: &str,
-) -> Result<Option<DMat4>> {
+) -> Result<Option<TextureCoordinateMapping>> {
+    let mut mapping = TextureCoordinateMapping::for_subject_world(subject_world);
     match modifier_str_param(modifier, mapping_parameter)? {
-        "LOCAL" => Ok(Some(DMat4::IDENTITY)),
-        "GLOBAL" => Ok(Some(subject_world)),
+        "LOCAL" | "GLOBAL" => Ok(Some(mapping)),
         "OBJECT" => {
-            let Some(object_id) = reference_object_id(modifier, object_parameter, doc)? else {
-                return Ok(Some(DMat4::IDENTITY));
-            };
-            let mapping = reference_world_matrix_with_bone_fallback(
-                modifier,
-                &object_id,
-                bone_parameter,
-                doc,
-                references,
-            )?
-            .inverse();
-            if !mapping.is_finite() {
-                return Err(PotError::invalid_argument(
-                    "texture coordinate mapping transform must be invertible",
-                ));
+            if let Some(object_id) = reference_object_id(modifier, object_parameter, doc)? {
+                let mapping_world = reference_world_matrix_f32_with_bone_fallback(
+                    modifier,
+                    &object_id,
+                    bone_parameter,
+                    doc,
+                    world_matrices,
+                    bone_pose_matrices,
+                )?;
+                let world_to_mapping_f32 =
+                    crate::geom::modifiers::blender_inverse_m4(mapping_world);
+                if !world_to_mapping_f32.iter().all(|value| value.is_finite())
+                    || world_to_mapping_f32.iter().all(|value| *value == 0.0)
+                {
+                    return Err(PotError::invalid_argument(
+                        "texture coordinate mapping transform must be invertible",
+                    ));
+                }
+                mapping.world_to_mapping_f32 = Some(world_to_mapping_f32);
             }
-            Ok(Some(mapping * subject_world))
+            Ok(Some(mapping))
         }
         "UV" => Ok(None),
         _ => Err(invalid_reference(
@@ -4780,15 +4887,23 @@ pub(crate) fn texture_coordinate_matrix_with_parameters(
     }
 }
 
-/// Blender's mapping-object fallback for a missing bone. A named bone that exists in the armature
-/// must have an evaluated pose matrix; a name not found on the object uses the object world matrix.
-pub(crate) fn reference_world_matrix_with_bone_fallback(
+/// A missing bone name uses the object world matrix; a found bone multiplies its raw local pose by
+/// the evaluated armature world matrix in Blender's f32 order.
+fn reference_world_matrix_f32_with_bone_fallback(
     modifier: &Modifier,
     object_id: &Id,
     bone_parameter: &str,
     doc: &SceneDoc,
-    references: &SceneReferences<'_>,
-) -> Result<DMat4> {
+    world_matrices: &BTreeMap<Id, DMat4>,
+    bone_pose_matrices: &BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
+) -> Result<[f32; 16]> {
+    let object_world = world_matrices.get(object_id).copied().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            "referenced object transform is unavailable",
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
     let bone_name = modifier
         .params
         .get(bone_parameter)
@@ -4808,31 +4923,26 @@ pub(crate) fn reference_world_matrix_with_bone_fallback(
                     .map(|(bone_id, _)| bone_id)
             })
     });
-    if let Some(bone_id) = bone_id {
-        return references
-            .bone_matrices
-            .get(object_id)
-            .and_then(|bones| bones.get(bone_id))
-            .map(DMat4::from_cols_array)
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "referenced armature bone pose transform is unavailable",
-                    json!({"modifier_id":modifier.id,"object":object_id,"bone":bone_name}),
-                )
-            });
-    }
-    references
-        .world_matrices
-        .get(object_id)
-        .copied()
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::DependencyMissing,
-                "referenced object transform is unavailable",
-                json!({"modifier_id":modifier.id,"object":object_id}),
-            )
-        })
+    let pose_matrix = if let Some(bone_id) = bone_id {
+        Some(
+            bone_pose_matrices
+                .get(object_id)
+                .and_then(|bones| bones.get(bone_id))
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::DependencyMissing,
+                        "referenced armature bone pose transform is unavailable",
+                        json!({"modifier_id":modifier.id,"object":object_id,"bone":bone_name}),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    Ok(reference_object_or_bone_world_f32(
+        object_world,
+        pose_matrix,
+    ))
 }
 fn collect_modifier_collection_objects(
     doc: &SceneDoc,
@@ -6119,23 +6229,182 @@ mod tests {
 
     use std::collections::{BTreeMap, BTreeSet};
 
-    use glam::{DMat4, DVec3};
+    use glam::{DMat4, DQuat, DVec3, EulerRot};
     use serde_json::json;
 
     use crate::{
         geom::{
-            BoxParams, Mesh,
+            BoxParams, Mesh, OriginalIndices,
+            modifiers::{blender_inverse_m4, blender_transform_point_f32},
             uv_layers::{self, UvLayer, UvStore},
         },
         model::{
             Collection, DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer,
-            GreasePencilPoint, GreasePencilStroke, Id, Node, SceneDoc, Transform,
+            GreasePencilPoint, GreasePencilStroke, Id, Modifier, Node, SceneDoc, Transform,
         },
     };
 
     use super::{
-        EvaluationContext, SlotBinding, Snapshot, UvBinding, evaluate_collection_instance,
+        EvaluationContext, EvaluationPurpose, ModifierEvaluationContext, ModifierGate, SlotBinding,
+        Snapshot, UvBinding, evaluate_collection_instance, modifier_pose_armatures,
+        texture_coordinate_mapping_with_parameters,
     };
+
+    #[test]
+    fn evaluated_volume_owner_resolves_texture_map_bone_pose() {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let armature_id = Id::new("mapping_armature").unwrap();
+        let armature_data_id = Id::new("mapping_armature_data").unwrap();
+        let volume_id = Id::new("volume_owner").unwrap();
+        let volume_data_id = Id::new("volume_owner_data").unwrap();
+        doc.data_blocks.insert(
+            armature_data_id.clone(),
+            DataBlock {
+                data_type: "armature".to_owned(),
+                armature: Some(
+                    serde_json::from_value(json!({
+                        "bones": {
+                            "map_bone": {
+                                "name":"MapBone",
+                                "head":[0.0,0.0,0.0],
+                                "tail":[0.0,0.0,1.0]
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                ..DataBlock::default()
+            },
+        );
+        doc.data_blocks.insert(
+            volume_data_id.clone(),
+            DataBlock {
+                data_type: "volume".to_owned(),
+                volume: Some(crate::geom::volume::VolumeData::default()),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            armature_id.clone(),
+            Node {
+                name: "Mapping Armature".to_owned(),
+                kind: "armature".to_owned(),
+                data: Some(armature_data_id),
+                ..Node::default()
+            },
+        );
+        doc.nodes.insert(
+            volume_id.clone(),
+            Node {
+                name: "Volume Owner".to_owned(),
+                kind: "volume".to_owned(),
+                data: Some(volume_data_id),
+                modifiers: vec![Modifier {
+                    id: Id::new("volume_displace").unwrap(),
+                    modifier_type: "volume_displace".to_owned(),
+                    name: "Volume Displace".to_owned(),
+                    enabled: true,
+                    show_viewport: true,
+                    show_render: true,
+                    params: json!({
+                        "texture_map_mode":"OBJECT",
+                        "texture_map_object":"mapping_armature",
+                        "texture_map_bone":"MapBone"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    binding_data: None,
+                    runtime: Default::default(),
+                }],
+                ..Node::default()
+            },
+        );
+        let suppressed = BTreeSet::new();
+        let gate = ModifierGate {
+            context: ModifierEvaluationContext {
+                purpose: EvaluationPurpose::Preview,
+                project_root: None,
+                cache_directory: None,
+            },
+            suppressed: &suppressed,
+            modifier_prefix: None,
+        };
+        let evaluated_owner_ids = BTreeSet::from([volume_id.clone()]);
+        assert_eq!(
+            modifier_pose_armatures(&doc, &evaluated_owner_ids, gate, None),
+            BTreeSet::from([armature_id.clone()]),
+        );
+        assert!(modifier_pose_armatures(&doc, &BTreeSet::new(), gate, None).is_empty());
+        doc.nodes.get_mut(&volume_id).unwrap().modifiers[0].show_viewport = false;
+        assert!(modifier_pose_armatures(&doc, &evaluated_owner_ids, gate, None).is_empty());
+    }
+
+    #[test]
+    fn object_texture_mapping_applies_two_f32_point_transforms_in_order() {
+        let subject_world = DMat4::from_scale_rotation_translation(
+            DVec3::new(1.6, 0.55, 1.3),
+            DQuat::from_euler(EulerRot::XYZ, 0.21, -0.17, 0.31),
+            DVec3::new(2.4, -1.3, 0.7),
+        );
+        let mapping_world = DMat4::from_scale_rotation_translation(
+            DVec3::new(0.8, 1.4, 0.6),
+            DQuat::from_euler(EulerRot::XYZ, -0.13, 0.27, -0.22),
+            DVec3::new(-0.9, 0.4, 1.1),
+        );
+        let point = DVec3::new(0.37, -0.62, 1.3);
+        let mapping_id = Id::new("mapping").unwrap();
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.nodes.insert(
+            mapping_id.clone(),
+            Node {
+                name: "Mapping".to_owned(),
+                kind: "empty".to_owned(),
+                ..Node::default()
+            },
+        );
+        let modifier = Modifier {
+            id: Id::new("texture_modifier").unwrap(),
+            modifier_type: "displace".to_owned(),
+            name: "Texture Mapping".to_owned(),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params: json!({
+                "texture_coords":"OBJECT",
+                "texture_coords_object":"mapping"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            binding_data: None,
+            runtime: Default::default(),
+        };
+        let world_matrices = BTreeMap::from([(mapping_id.clone(), mapping_world)]);
+        let mapping = texture_coordinate_mapping_with_parameters(
+            &modifier,
+            subject_world,
+            &doc,
+            &world_matrices,
+            &BTreeMap::new(),
+            "texture_coords",
+            "texture_coords_object",
+            "texture_coords_bone",
+        )
+        .unwrap()
+        .unwrap();
+
+        let subject_to_world_f32 = subject_world.to_cols_array().map(|value| value as f32);
+        let world_to_mapping_f32 =
+            blender_inverse_m4(mapping_world.to_cols_array().map(|value| value as f32));
+        let world_point = blender_transform_point_f32(&subject_to_world_f32, point.as_vec3());
+        let expected = blender_transform_point_f32(&world_to_mapping_f32, world_point);
+        assert_eq!(mapping.object_coordinate(point).as_vec3(), expected);
+        assert_ne!(
+            mapping.object_coordinate(point),
+            (mapping_world.inverse() * subject_world).transform_point3(point),
+        );
+    }
 
     #[test]
     fn particle_render_limit_counts_all_systems_for_each_emitter() {
@@ -6449,10 +6718,17 @@ mod tests {
         let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         let data_id = Id::new("cube_mesh").unwrap();
         let node_id = Id::new("cube").unwrap();
-        let mesh = Mesh::box_mesh(BoxParams {
+        let mut mesh = Mesh::box_mesh(BoxParams {
             size: DVec3::splat(2.0),
         })
         .unwrap();
+        let source_vertex_count = mesh.vertices.len();
+        mesh.original_indices = Some(OriginalIndices {
+            vertices: (0..source_vertex_count)
+                .map(|index| i32::try_from(index).unwrap())
+                .collect(),
+            source_vertex_count,
+        });
         doc.data_blocks.insert(
             data_id.clone(),
             DataBlock {
@@ -6498,6 +6774,7 @@ mod tests {
         assert_eq!(bounds.max, DVec3::new(3.0, 3.0, 4.0));
         assert_eq!(evaluated.dimensions, Some([4.0, 2.0, 2.0]));
         let local_mesh = snapshot.meshes.get(&node_id).unwrap();
+        assert!(local_mesh.original_indices.is_none());
         let local_bounds = local_mesh.bounds().unwrap();
         assert_eq!(local_bounds.min, DVec3::splat(-1.0));
         assert_eq!(local_bounds.max, DVec3::splat(1.0));

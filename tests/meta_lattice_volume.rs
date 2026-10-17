@@ -119,7 +119,9 @@ fn mesh_volume_round_trip_stays_within_one_voxel_of_source_bounds() {
         binding_data: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     };
-    let modified = potter_core::geom::modifiers::evaluate_modifiers(&source, &[modifier], "VolumeSource").unwrap();
+    let modified =
+        potter_core::geom::modifiers::evaluate_modifiers(&source, &[modifier], "VolumeSource")
+            .unwrap();
     let modifier_bounds = modified.bounds().unwrap();
     for axis in 0..3 {
         assert!((result_bounds.min[axis] - source_bounds.min[axis]).abs() <= voxel_size);

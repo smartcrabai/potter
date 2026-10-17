@@ -19,7 +19,7 @@ use crate::error::{ErrorCode, PotError, Result};
 
 use super::clnor::{self, NormalCodeOptions};
 use super::uv_layers::{self, UvLayer};
-use super::{Mesh, edge_key};
+use super::{Mesh, ORIGINDEX_NONE, OriginalIndices, edge_key};
 
 /// Where each element of a rebuilt mesh came from, indexed by output storage order.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -27,6 +27,9 @@ pub(crate) struct Origin {
     /// Per output vertex: input vertex storage indices with weights summing to one.
     /// An empty list marks a new vertex without input data.
     pub vertices: Vec<Vec<(usize, f64)>>,
+    /// Per output vertex: exact input storage index or `None` for Blender ORIGINDEX_NONE.
+    /// The outer `None` means the output has no point ORIGINDEX layer.
+    /// It is independent of weighted attribute provenance.
     /// Per output polygon, in the order passed to `build_mesh`: the input polygon storage index,
     /// or `None` for a generated polygon.
     pub faces: Vec<Option<usize>>,
@@ -38,15 +41,31 @@ pub(crate) struct Origin {
 
 impl Origin {
     /// Origin where each output vertex copies one input vertex, or is new when `None`.
+    /// Selectors are retained only when `track_original_indices` is true.
     pub(crate) fn copies(
         vertices: impl IntoIterator<Item = Option<usize>>,
         faces: Vec<Option<usize>>,
+        track_original_indices: bool,
     ) -> Self {
-        Self {
-            vertices: vertices
-                .into_iter()
+        let vertices = vertices.into_iter();
+        let (vertices, source_vertices) = if track_original_indices {
+            let mut source_vertices = Vec::with_capacity(vertices.size_hint().0);
+            let vertices = vertices
+                .map(|source| {
+                    source_vertices.push(source);
+                    source.map(|index| vec![(index, 1.0)]).unwrap_or_default()
+                })
+                .collect();
+            (vertices, Some(source_vertices))
+        } else {
+            let vertices = vertices
                 .map(|source| source.map(|index| vec![(index, 1.0)]).unwrap_or_default())
-                .collect(),
+                .collect();
+            (vertices, None)
+        };
+        Self {
+            vertices,
+            source_vertices,
             faces,
             corners: None,
         }
@@ -86,12 +105,39 @@ pub(crate) fn remap_attributes_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
-    if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
+    if origin.vertices.len() != output.vertices.len()
+        || origin.faces.len() != output.faces.len()
+        || origin.source_vertices.as_ref().is_some_and(|vertices| {
+            vertices.len() != output.vertices.len()
+                || vertices
+                    .iter()
+                    .flatten()
+                    .any(|index| *index >= source.vertices.len())
+        })
+    {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "modifier provenance does not describe the rebuilt mesh",
         ));
     }
+    output.original_indices = source
+        .original_indices
+        .as_ref()
+        .zip(origin.source_vertices.as_ref())
+        .map(|(indices, selectors)| OriginalIndices {
+            vertices: selectors
+                .iter()
+                .map(|source| match source {
+                    Some(index) => indices
+                        .vertices
+                        .get(*index)
+                        .copied()
+                        .unwrap_or(ORIGINDEX_NONE),
+                    None => ORIGINDEX_NONE,
+                })
+                .collect(),
+            source_vertex_count: indices.source_vertex_count,
+        });
     if source.attributes.is_empty() {
         output.attributes.clear();
         return Ok(());
@@ -1033,6 +1079,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: None,
         };
@@ -1109,6 +1156,7 @@ mod tests {
                 vec![(3, 0.5), (0, 0.5)],
                 vec![(0, 0.25), (1, 0.25), (2, 0.25), (3, 0.25)],
             ],
+            source_vertices: None,
             faces: vec![Some(0); 4],
             corners: None,
         };
@@ -1155,6 +1203,7 @@ mod tests {
         output.insert_edge([near, far]).expect("edge");
         let origin = Origin {
             vertices: vec![vec![(0, 0.5), (2, 0.5)], vec![(1, 0.5), (3, 0.5)]],
+            source_vertices: None,
             faces: Vec::new(),
             corners: None,
         };
@@ -1196,6 +1245,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: None,
         };
@@ -1254,6 +1304,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: Some(vec![
                 vec![(0, 0.25), (1, 0.75)],
@@ -1265,5 +1316,28 @@ mod tests {
         let layers = uv_layers::read_layers(&output);
         assert_eq!(layers[0].faces[0].as_ref().map(Vec::len), Some(3));
         assert_eq!(layers[0].pinned[0], Some(vec![false, true, false]));
+    }
+
+    #[test]
+    fn original_index_presence_and_values_follow_discrete_selectors() {
+        let mut source = triangle();
+        source.original_indices = Some(OriginalIndices {
+            vertices: vec![1, ORIGINDEX_NONE, 2],
+            source_vertex_count: 3,
+        });
+
+        let mut output = triangle();
+        let untracked = Origin::copies([Some(0), Some(1), Some(2)], vec![Some(0)], false);
+        assert!(untracked.source_vertices.is_none());
+        remap_attributes(&source, &mut output, &untracked).expect("remap without output layer");
+        assert!(output.original_indices.is_none());
+
+        let mut output = triangle();
+        let tracked = Origin::copies([Some(2), None, Some(0)], vec![Some(0)], true);
+        remap_attributes(&source, &mut output, &tracked).expect("remap copied indices");
+        assert_eq!(
+            output.original_indices.expect("tracked layer").vertices,
+            [2, ORIGINDEX_NONE, 1]
+        );
     }
 }

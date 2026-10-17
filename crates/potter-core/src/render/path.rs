@@ -1160,7 +1160,7 @@ fn make_surface(
         render: element.map_or(object.uv_render, |element| element.uv_render),
         available_mask: element.and_then(|element| element.uv_available_mask),
     };
-    let mut tables = LayerTables::new();
+    let tables = LayerTables::new();
     let context = layered_context(
         doc,
         images,
@@ -1743,20 +1743,17 @@ fn collect_volumes<'a>(
                     grid.dims
                         .map(|dimension| f64::from(dimension.saturating_sub(1))),
                 );
-                let (bounds_min, bounds_max, local_to_index) =
-                    if grid.index_to_local.is_some() {
-                        let (bounds_min, bounds_max) =
-                            grid.local_bounds(DVec3::ZERO, maximum_index)?;
-                        let local_to_index = grid.checked_index_to_local_matrix()?.inverse();
-                        (bounds_min, bounds_max, Some(local_to_index))
-                    } else {
-                        let bounds_max = DVec3::from_array(
-                            grid.dims.map(|dimension| {
-                                f64::from(dimension.saturating_sub(1)) * grid.voxel_size
-                            }),
-                        ) + grid.origin;
-                        (grid.origin, bounds_max, None)
-                    };
+                let (bounds_min, bounds_max, local_to_index) = if grid.index_to_local.is_some() {
+                    let (bounds_min, bounds_max) = grid.local_bounds(DVec3::ZERO, maximum_index)?;
+                    let local_to_index = grid.checked_index_to_local_matrix()?.inverse();
+                    (bounds_min, bounds_max, Some(local_to_index))
+                } else {
+                    let bounds_max =
+                        DVec3::from_array(grid.dims.map(|dimension| {
+                            f64::from(dimension.saturating_sub(1)) * grid.voxel_size
+                        })) + grid.origin;
+                    (grid.origin, bounds_max, None)
+                };
                 let density_range = grid.values.as_ref().and_then(|values| {
                     let mut values = values.iter().copied();
                     let first = values.next()?;
@@ -2137,8 +2134,8 @@ fn march_volumes_with_budget(
             }
             continue;
         }
-        let step_world =
-            volume_sampling_step(instance, local_direction).max(segment_length / step_budget as f64);
+        let step_world = volume_sampling_step(instance, local_direction)
+            .max(segment_length / step_budget as f64);
         let steps = (segment_length / step_world)
             .ceil()
             .clamp(1.0, step_budget as f64) as usize;

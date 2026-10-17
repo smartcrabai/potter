@@ -95,14 +95,26 @@ if case == "target_shape":
     constraint.head_tail = 0.35
     constraint.use_bbone_shape = True
 elif case == "armature_modifier":
-    if mode not in ("curved_linear", "curved_preserve_volume", "straight_linear", "curved_envelopes"):
+    if mode not in (
+        "curved_linear", "curved_preserve_volume", "straight_linear", "curved_envelopes",
+        "straight_preserve_volume",
+        "curved_envelope_multiply",
+    ):
         raise ValueError("unknown B-Bone deformation mode: " + mode)
-    bone.bbone_mapping_mode = "STRAIGHT" if mode == "straight_linear" else "CURVED"
+    bone.bbone_mapping_mode = (
+        "STRAIGHT" if mode in ("straight_linear", "straight_preserve_volume") else "CURVED"
+    )
     if mode == "curved_envelopes":
         bone.head_radius = 0.5
         bone.tail_radius = 0.5
         bone.envelope_distance = 0.75
         bone.envelope_weight = 1.0
+    elif mode == "curved_envelope_multiply":
+        bone.head_radius = 0.24
+        bone.tail_radius = 0.36
+        bone.envelope_distance = 1.05
+        bone.envelope_weight = 0.73
+        bone.use_envelope_multiply = True
     rig.location = (0.31, -0.22, 0.18)
     rig.rotation_euler = (0.11, -0.16, 0.09)
     bendy_pose = rig.pose.bones["Bendy"]
@@ -145,8 +157,8 @@ elif case == "armature_modifier":
     modifier = owner.modifiers.new("WeightedBbone", "ARMATURE")
     modifier.object = rig
     modifier.use_vertex_groups = True
-    modifier.use_bone_envelopes = mode == "curved_envelopes"
-    modifier.use_deform_preserve_volume = mode == "curved_preserve_volume"
+    modifier.use_bone_envelopes = mode in ("curved_envelopes", "curved_envelope_multiply")
+    modifier.use_deform_preserve_volume = mode in ("curved_preserve_volume", "straight_preserve_volume")
     bpy.context.view_layer.update()
     evaluated = owner.evaluated_get(bpy.context.evaluated_depsgraph_get())
     evaluated_mesh = evaluated.to_mesh()
@@ -306,8 +318,7 @@ fn assert_positions_move(input: &Value, output: &Value, context: &str) {
     assert!(
         input.iter().zip(output).any(|(input, output)| {
             (0..3).any(|axis| {
-                (input[axis].as_f64().unwrap() - output[axis].as_f64().unwrap()).abs()
-                    > 1.0e-4
+                (input[axis].as_f64().unwrap() - output[axis].as_f64().unwrap()).abs() > 1.0e-4
             })
         }),
         "{context}: Blender fixture did not deform any vertex"
@@ -507,7 +518,14 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
     };
     let directory = tempdir()?;
 
-    for mode in ["curved_linear", "curved_preserve_volume", "straight_linear", "curved_envelopes"] {
+    for mode in [
+        "curved_linear",
+        "curved_preserve_volume",
+        "straight_linear",
+        "straight_preserve_volume",
+        "curved_envelopes",
+        "curved_envelope_multiply",
+    ] {
         let root = directory.path().join(mode);
         fs::create_dir(&root)?;
         run_blender(&blender, &root, "armature_modifier", Some(mode))?;
@@ -537,7 +555,11 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
             .as_str()
             .unwrap();
         let doc: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-        let mapping_mode = if mode == "straight_linear" { "STRAIGHT" } else { "CURVED" };
+        let mapping_mode = if mode == "straight_linear" || mode == "straight_preserve_volume" {
+            "STRAIGHT"
+        } else {
+            "CURVED"
+        };
         assert_imported_bbone_settings(&doc, mapping_mode);
 
         let inspected = pot_json(&["inspect", project.to_str().unwrap(), "--id", owner_id])?;
@@ -548,11 +570,7 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
             .find(|item| item["id"] == owner_id)
             .unwrap();
         let expected_positions = &oracle["positions"];
-        assert_positions_move(
-            &oracle["input_positions"],
-            expected_positions,
-            mode,
-        );
+        assert_positions_move(&oracle["input_positions"], expected_positions, mode);
         if mode == "curved_envelopes" {
             let input = oracle["input_positions"].as_array().unwrap();
             let output = expected_positions.as_array().unwrap();
@@ -564,12 +582,16 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
                 );
             }
             assert!(
-                input.iter().skip(1).zip(output.iter().skip(1)).any(|(input, output)| {
-                    (0..3).any(|axis| {
-                        (input[axis].as_f64().unwrap() - output[axis].as_f64().unwrap()).abs()
-                            > 1.0e-4
-                    })
-                }),
+                input
+                    .iter()
+                    .skip(1)
+                    .zip(output.iter().skip(1))
+                    .any(|(input, output)| {
+                        (0..3).any(|axis| {
+                            (input[axis].as_f64().unwrap() - output[axis].as_f64().unwrap()).abs()
+                                > 1.0e-4
+                        })
+                    }),
                 "curved_envelopes: vertices without a matching group were not envelope-deformed"
             );
         }

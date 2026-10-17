@@ -466,7 +466,9 @@ fn prepare_blend_export_resources(
                     .and_then(Value::as_str)
                     .and_then(|uri| Path::new(uri).file_name())
                     .and_then(|name| name.to_str())
-                    .filter(|name| Path::new(name).file_name().and_then(|part| part.to_str()) == Some(*name))
+                    .filter(|name| {
+                        Path::new(name).file_name().and_then(|part| part.to_str()) == Some(*name)
+                    })
                     .map(str::to_owned)
                     .ok_or_else(|| {
                         PotError::with_details(
@@ -4753,6 +4755,7 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         faces,
         attributes: Map::new(),
         next_id,
+        original_indices: None,
     };
     let face_keys: Vec<String> = mesh
         .faces
@@ -5719,28 +5722,45 @@ fn parse_mesh_sequence_cache_params(
     properties: &Map<String, Value>,
     resource_ids: &BTreeMap<String, String>,
 ) -> Result<Map<String, Value>> {
-    let path = properties
-        .get("cache_filepath")
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| invalid_intermediate("Mesh Sequence Cache has no cache filepath"))?;
-    let resource = resource_ids
-        .get(path)
-        .ok_or_else(|| invalid_intermediate("Mesh Sequence Cache filepath has no resource"))?;
+    let path = match properties.get("cache_filepath") {
+        Some(Value::String(path)) if !path.is_empty() => Some(path.as_str()),
+        None | Some(Value::Null | Value::String(_)) => None,
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "Mesh Sequence Cache cache filepath must be a string",
+            ));
+        }
+    };
+    let resource = path
+        .map(|path| {
+            resource_ids
+                .get(path)
+                .ok_or_else(|| invalid_intermediate("Mesh Sequence Cache filepath has no resource"))
+        })
+        .transpose()?;
     let cache_settings = properties
         .get("cache_file_settings")
         .and_then(Value::as_object);
-    let object_path = properties
-        .get("object_path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_intermediate("Mesh Sequence Cache has no object path"))?;
+    let object_path = match properties.get("object_path") {
+        Some(Value::String(path)) => path.as_str(),
+        None => "",
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "Mesh Sequence Cache object path must be a string",
+            ));
+        }
+    };
     let mut params = properties.clone();
     params.remove("cache_file");
     params.remove("cache_filepath");
     params.remove("cache_file_settings");
-    params.insert("resource".to_owned(), json!(resource));
+    if let Some(resource) = resource {
+        params.insert("resource".to_owned(), json!(resource));
+    } else {
+        params.remove("resource");
+    }
     params.insert("object_path".to_owned(), json!(object_path));
-    insert_cache_settings_params(&mut params, cache_settings);
+    insert_mesh_sequence_cache_settings_params(&mut params, cache_settings);
     Ok(params)
 }
 
@@ -5766,20 +5786,77 @@ fn insert_cache_settings_params(
                 .unwrap_or(1.0)
         ),
     );
+    let override_frame = settings
+        .and_then(|settings| settings.get("override_frame"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let frame = settings
+        .and_then(|settings| settings.get("frame"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     params.insert(
         "override_frame".to_owned(),
-        if settings
-            .and_then(|settings| settings.get("override_frame"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            settings
-                .and_then(|settings| settings.get("frame"))
-                .cloned()
-                .unwrap_or(Value::Null)
+        if override_frame {
+            json!(frame)
         } else {
             Value::Null
         },
+    );
+}
+
+fn insert_mesh_sequence_cache_settings_params(
+    params: &mut Map<String, Value>,
+    settings: Option<&Map<String, Value>>,
+) {
+    insert_cache_settings_params(params, settings);
+    let override_frame = settings
+        .and_then(|settings| settings.get("override_frame"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let frame = settings
+        .and_then(|settings| settings.get("frame"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    params.insert(
+        "cache_frame".to_owned(),
+        json!(if override_frame { 0.0 } else { frame }),
+    );
+    params.insert(
+        "is_sequence".to_owned(),
+        json!(
+            settings
+                .and_then(|settings| settings.get("is_sequence"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        ),
+    );
+    params.insert(
+        "velocity_name".to_owned(),
+        settings
+            .and_then(|settings| settings.get("velocity_name"))
+            .cloned()
+            .unwrap_or_else(|| json!(".velocities")),
+    );
+    params.insert(
+        "velocity_unit".to_owned(),
+        settings
+            .and_then(|settings| settings.get("velocity_unit"))
+            .cloned()
+            .unwrap_or_else(|| json!("SECOND")),
+    );
+    params.insert(
+        "forward_axis".to_owned(),
+        settings
+            .and_then(|settings| settings.get("forward_axis"))
+            .cloned()
+            .unwrap_or_else(|| json!("POS_X")),
+    );
+    params.insert(
+        "up_axis".to_owned(),
+        settings
+            .and_then(|settings| settings.get("up_axis"))
+            .cloned()
+            .unwrap_or_else(|| json!("POS_X")),
     );
 }
 
@@ -7395,6 +7472,42 @@ mod tests {
             assert!(known_modifier(blender), "{blender}");
             assert!(known_modifier(&potter.to_ascii_uppercase()), "{potter}");
         }
+    }
+
+    #[test]
+    fn mesh_sequence_cache_import_allows_disabled_file_and_object_paths() {
+        let resource_ids = BTreeMap::from([("/cache.abc".to_owned(), "cache_resource".to_owned())]);
+        for properties in [
+            json!({}),
+            json!({"cache_filepath": null}),
+            json!({"cache_filepath": ""}),
+        ] {
+            let params =
+                parse_mesh_sequence_cache_params(properties.as_object().unwrap(), &resource_ids)
+                    .unwrap();
+            assert!(!params.contains_key("resource"));
+            assert_eq!(params["object_path"], "");
+        }
+
+        let empty_object_path = parse_mesh_sequence_cache_params(
+            json!({"cache_filepath": "/cache.abc", "object_path": ""})
+                .as_object()
+                .unwrap(),
+            &resource_ids,
+        )
+        .unwrap();
+        assert_eq!(empty_object_path["resource"], "cache_resource");
+        assert_eq!(empty_object_path["object_path"], "");
+
+        assert!(
+            parse_mesh_sequence_cache_params(
+                json!({"cache_filepath": "/missing.abc"})
+                    .as_object()
+                    .unwrap(),
+                &resource_ids,
+            )
+            .is_err()
+        );
     }
 
     #[test]

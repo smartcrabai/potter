@@ -1142,13 +1142,12 @@ mod tests {
         resource_scene
             .resources
             .insert(noise_id.clone(), record.clone());
-        assert!(!crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(
-            &mut resource_scene
-        )
-        .expect("resource collision"));
+        assert!(
+            !crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut resource_scene)
+                .expect("resource collision")
+        );
         assert_eq!(
-            resource_scene.nodes[&crate::model::Id::new("volume").expect("node ID")]
-                .modifiers[0]
+            resource_scene.nodes[&crate::model::Id::new("volume").expect("node ID")].modifiers[0]
                 .params["texture"],
             json!("noise")
         );
@@ -1170,19 +1169,17 @@ mod tests {
                 alpha_mode: crate::model::ImageAlphaMode::Straight,
             },
         );
-        assert!(!crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(
-            &mut image_scene
-        )
-        .expect("image collision"));
+        assert!(
+            !crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut image_scene)
+                .expect("image collision")
+        );
         assert_eq!(
-            image_scene.nodes[&crate::model::Id::new("volume").expect("node ID")]
-                .modifiers[0]
+            image_scene.nodes[&crate::model::Id::new("volume").expect("node ID")].modifiers[0]
                 .params["texture"],
             json!("noise")
         );
         assert!(image_scene.resources.is_empty());
     }
-
 
     #[test]
     fn version_one_texture_refs_become_layer_references() {

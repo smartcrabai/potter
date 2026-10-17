@@ -504,8 +504,10 @@ def modifier_params(modifier):
     params = rna_props(modifier, omitted)
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         params["map_curve"] = _curve_mapping_points(modifier.map_curve)
+        params["map_curve_settings"] = _curve_mapping_settings(modifier.map_curve)
     if modifier.type in ("HOOK", "WARP"):
         params["falloff_curve"] = _curve_mapping_points(modifier.falloff_curve)
+        params["falloff_curve_settings"] = _curve_mapping_settings(modifier.falloff_curve)
     bound_property = "is_bound" if hasattr(modifier, "is_bound") else "is_bind"
     if hasattr(modifier, bound_property):
         params["is_bound"] = bool(getattr(modifier, bound_property))
@@ -526,16 +528,47 @@ def modifier_params(modifier):
 def _curve_mapping_points(mapping):
     if mapping is None or not mapping.curves:
         return []
-    return [
-        [float(point.location[0]), float(point.location[1])]
-        for point in mapping.curves[0].points
-    ]
+    points = []
+    for point in mapping.curves[0].points:
+        value = [float(point.location[0]), float(point.location[1])]
+        if point.handle_type != "AUTO":
+            value.append(point.handle_type)
+        points.append(value)
+    return points
+
+def _curve_mapping_settings(mapping):
+    if mapping is None:
+        return None
+    return {
+        "use_clip": bool(mapping.use_clip),
+        "clip_bounds": [
+            float(mapping.clip_min_x), float(mapping.clip_min_y),
+            float(mapping.clip_max_x), float(mapping.clip_max_y),
+        ],
+        "extend": mapping.extend,
+    }
 
 
-def _set_curve_mapping(mapping, values, owner):
+def _set_curve_mapping(mapping, values, owner, settings=None):
     if mapping is None or not mapping.curves or len(values) < 2:
         raise ValueError("%s needs at least two control points" % owner)
-    points = [(float(point[0]), float(point[1])) for point in values]
+    points = [
+        (float(point[0]), float(point[1]), point[2] if len(point) > 2 else "AUTO")
+        for point in values
+    ]
+    settings = settings or {}
+    clip_bounds = tuple(float(value) for value in settings.get(
+        "clip_bounds", (0.0, 0.0, 1.0, 1.0)))
+    mapping.use_clip = bool(settings.get("use_clip", True))
+    mapping.clip_min_x = min(mapping.clip_min_x, clip_bounds[0])
+    mapping.clip_max_x = max(mapping.clip_max_x, clip_bounds[2])
+    mapping.clip_min_y = min(mapping.clip_min_y, clip_bounds[1])
+    mapping.clip_max_y = max(mapping.clip_max_y, clip_bounds[3])
+    mapping.clip_min_x = clip_bounds[0]
+    mapping.clip_min_y = clip_bounds[1]
+    mapping.clip_max_x = clip_bounds[2]
+    mapping.clip_max_y = clip_bounds[3]
+    mapping.extend = settings.get("extend", "EXTRAPOLATED")
     curve = mapping.curves[0]
     for point in list(curve.points)[1:-1]:
         curve.points.remove(point)
@@ -543,9 +576,10 @@ def _set_curve_mapping(mapping, values, owner):
     curve.points[-1].location = (1.0, 0.0)
     for index in range(len(points) - 2):
         curve.points.new(float(index + 2), 0.0)
-    for point, location in zip(curve.points, points):
-        point.location = location
-
+    for point, (x, y, handle_type) in zip(curve.points, points):
+        point.location = (x, y)
+        point.handle_type = handle_type
+    mapping.update()
 
 
 
@@ -2836,8 +2870,15 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
             modifier, obj, settings["role"])
     rna_params = dict(params)
     for parameter in ("projectors", "resource", "is_bound", "cache_filepath",
-                      "map_curve", "falloff_curve"):
+                      "map_curve", "falloff_curve", "map_curve_settings",
+                      "falloff_curve_settings"):
         rna_params.pop(parameter, None)
+    if kind == "mesh_sequence_cache":
+        for parameter in (
+            "cache_frame", "frame_offset", "override_frame", "scale", "is_sequence",
+            "velocity_name", "velocity_unit", "forward_axis", "up_axis",
+        ):
+            rna_params.pop(parameter, None)
     texture_id = params.get("texture")
     texture_record = doc.get("resources", {}).get(texture_id, {})
     if (texture_record.get("storage") == "inline"
@@ -2849,10 +2890,12 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
     _restore_modifier_id_references(modifier, rna_params, id_lookup, texture_lookup)
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
         _set_curve_mapping(
-            modifier.map_curve, params["map_curve"], "modifier map_curve")
+            modifier.map_curve, params["map_curve"], "modifier map_curve",
+            params.get("map_curve_settings"))
     if kind in ("hook", "warp") and "falloff_curve" in params:
         _set_curve_mapping(
-            modifier.falloff_curve, params["falloff_curve"], "modifier falloff_curve")
+            modifier.falloff_curve, params["falloff_curve"], "modifier falloff_curve",
+            params.get("falloff_curve_settings"))
     if kind == "mesh_cache" and params.get("resource"):
         filepath = _resource_path(doc, params["resource"])
         if not filepath or not os.path.isfile(filepath):
@@ -4776,16 +4819,15 @@ def _cache_file_for_resource(doc, reference, target, params=None):
             cache_file.name = identity
         set_rna(cache_file, resource.get("cache_file", {}), {}, strict=True,
                 owner="Alembic CacheFile")
-    params = params or {}
-    if "frame_offset" in params:
-        cache_file.frame_offset = float(params["frame_offset"])
-    if "scale" in params:
-        cache_file.scale = float(params["scale"])
+    for key in ("frame_offset", "scale", "is_sequence", "velocity_name",
+                "velocity_unit", "forward_axis", "up_axis"):
+        if key in params:
+            setattr(cache_file, key, params[key])
     override_frame = params.get("override_frame")
     cache_file.override_frame = override_frame is not None
-    if override_frame is not None:
-        cache_file.frame = float(override_frame)
-    CACHE_FILES_BY_IDENTITY[cache_key] = cache_file
+    cache_file.frame = float(
+        override_frame if override_frame is not None
+        else params.get("cache_frame", cache_file.frame))
     return cache_file
 def _movie_clip_camera_values(clip, camera_source):
     property_names = {
@@ -6266,10 +6308,13 @@ def export_doc(doc, target, pack, scene_hash, context):
                 set_modifier_params(
                     modifier, rna_item, id_lookup, texture_map, doc, target, node_id, obj)
                 if modifier_item.get("type") == "mesh_sequence_cache":
-                    cache_file = _cache_file_for_resource(
-                        doc, params["resource"], target, params)
+                    resource_id = params.get("resource")
+                    cache_file = (
+                        _cache_file_for_resource(doc, resource_id, target, params)
+                        if resource_id else None
+                    )
                     modifier.cache_file = cache_file
-                    modifier.object_path = params["object_path"]
+                    modifier.object_path = params.get("object_path", "")
                 source_modifier = (
                     source_modifiers.get(modifier_item.get("id"))
                     or source_modifiers_by_rna_name.get(modifier_item.get("name"))

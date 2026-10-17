@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, error::Error, fs, path::Path, process::Command}
 
 use glam::{DMat4, DVec3};
 use potter_core::{
-    geom::{Mesh, modifiers::attributes::{AttributeLayerSelection, SceneOperand, evaluate_with_context}},
+    geom::{
+        Mesh,
+        modifiers::attributes::{AttributeLayerSelection, SceneOperand, evaluate_with_context},
+    },
     model::{Modifier, ModifierRuntime},
 };
 use serde_json::{Value, json};
@@ -258,7 +261,11 @@ fn normal_edit_cases() -> Vec<Value> {
         "rotation_euler":[0.31,-0.43,0.17],
         "scale":[1.3,0.7,1.6]
     });
-    for (mode, parallel) in [("RADIAL", false), ("DIRECTIONAL", false), ("DIRECTIONAL", true)] {
+    for (mode, parallel) in [
+        ("RADIAL", false),
+        ("DIRECTIONAL", false),
+        ("DIRECTIONAL", true),
+    ] {
         let mut case = parameter_case(
             &format!("f32_owner_target_{mode}_{parallel}"),
             "NORMAL_EDIT",
@@ -343,7 +350,7 @@ fn weighted_normal_cases() -> Result<Vec<Value>, Box<dyn Error>> {
         None,
         json!({}),
         None,
-        vec![[1,4],[4,7]],
+        vec![[1, 4], [4, 7]],
         smooth.clone(),
         None,
     ));
@@ -354,7 +361,7 @@ fn weighted_normal_cases() -> Result<Vec<Value>, Box<dyn Error>> {
         None,
         json!({}),
         None,
-        vec![[1,4],[4,7]],
+        vec![[1, 4], [4, 7]],
         smooth.clone(),
         None,
     ));
@@ -491,8 +498,16 @@ fn tied_area_mesh() -> Result<Mesh, Box<dyn Error>> {
 
 fn weighted_tied_area_case() -> Result<Value, Box<dyn Error>> {
     let mesh = tied_area_mesh()?;
-    let vertices = mesh.vertices.iter().map(|vertex| vertex.co.to_array()).collect::<Vec<_>>();
-    let faces = mesh.faces.iter().map(|face| face.vertices.clone()).collect::<Vec<_>>();
+    let vertices = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.to_array())
+        .collect::<Vec<_>>();
+    let faces = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.clone())
+        .collect::<Vec<_>>();
     Ok(json!({
         "name":"FACE_AREA_tied_qsort_stream",
         "vertices":vertices,
@@ -522,7 +537,9 @@ fn blender_probe(blender: &Path, root: &Path, cases: &[Value]) -> Result<Value, 
         root,
         "Blender normal modifier probe failed",
     )?;
-    Ok(serde_json::from_slice(&fs::read(root.join("results.json"))?)?)
+    Ok(serde_json::from_slice(&fs::read(
+        root.join("results.json"),
+    )?)?)
 }
 
 fn pot_mesh(case: &Value) -> Result<Mesh, Box<dyn Error>> {
@@ -531,7 +548,11 @@ fn pot_mesh(case: &Value) -> Result<Mesh, Box<dyn Error>> {
         .ok_or("case vertices are missing")?
         .iter()
         .map(|vertex| {
-            let [x, y, z] = vertex.as_array().ok_or("vertex is not a vector")?.as_slice() else {
+            let [x, y, z] = vertex
+                .as_array()
+                .ok_or("vertex is not a vector")?
+                .as_slice()
+            else {
                 return Err("vertex must have three components".into());
             };
             Ok(DVec3::new(
@@ -557,7 +578,9 @@ fn pot_mesh(case: &Value) -> Result<Mesh, Box<dyn Error>> {
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let mut mesh = Mesh::from_positions_and_faces(positions, faces)?;
-    let smooth = case["smooth"].as_array().ok_or("smooth flags are missing")?;
+    let smooth = case["smooth"]
+        .as_array()
+        .ok_or("smooth flags are missing")?;
     let smooth_values = mesh
         .faces
         .iter()
@@ -569,8 +592,15 @@ fn pot_mesh(case: &Value) -> Result<Mesh, Box<dyn Error>> {
         json!({"domain":"face","type":"bool","values":smooth_values}),
     );
     let mut sharp_values = serde_json::Map::new();
-    for sharp_edge in case["sharp_edges"].as_array().ok_or("sharp edges missing")? {
-        let [first, second] = sharp_edge.as_array().ok_or("sharp edge is malformed")?.as_slice() else {
+    for sharp_edge in case["sharp_edges"]
+        .as_array()
+        .ok_or("sharp edges missing")?
+    {
+        let [first, second] = sharp_edge
+            .as_array()
+            .ok_or("sharp edge is malformed")?
+            .as_slice()
+        else {
             return Err("sharp edge must have two endpoints".into());
         };
         let first = u32::try_from(first.as_u64().ok_or("sharp edge endpoint is malformed")?)?;
@@ -599,7 +629,8 @@ fn pot_mesh(case: &Value) -> Result<Mesh, Box<dyn Error>> {
                 .collect::<serde_json::Map<_, _>>();
             group_values.insert(name.clone(), Value::Object(potter_weights));
         }
-        mesh.attributes.insert("vertex_groups".to_owned(), Value::Object(group_values));
+        mesh.attributes
+            .insert("vertex_groups".to_owned(), Value::Object(group_values));
     }
     if let Some(strengths) = case["face_strength"].as_array() {
         let values = mesh
@@ -679,10 +710,16 @@ fn pot_mesh(case: &Value) -> Result<Mesh, Box<dyn Error>> {
 fn modifier(case: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
         id: potter_core::model::Id::new("normal_modifier")?,
-        modifier_type: case["modifier_type"].as_str().ok_or("modifier type missing")?.to_owned(),
+        modifier_type: case["modifier_type"]
+            .as_str()
+            .ok_or("modifier type missing")?
+            .to_owned(),
         name: "Normal modifier parity".to_owned(),
         enabled: true,
-        params: case["params"].as_object().ok_or("modifier params missing")?.clone(),
+        params: case["params"]
+            .as_object()
+            .ok_or("modifier params missing")?
+            .clone(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
@@ -692,7 +729,11 @@ fn evaluate_case(case: &Value, transform: Option<&Value>) -> Result<Mesh, Box<dy
     let mesh = pot_mesh(case)?;
     let mut operands = BTreeMap::new();
     if let Some(target) = case["target"].as_object() {
-        let [sx, sy, sz] = target["scale"].as_array().ok_or("target scale missing")?.as_slice() else {
+        let [sx, sy, sz] = target["scale"]
+            .as_array()
+            .ok_or("target scale missing")?
+            .as_slice()
+        else {
             return Err("target scale must be a vector".into());
         };
         let transform = transform.ok_or("Blender target transform matrix is missing")?;
@@ -723,37 +764,57 @@ fn evaluate_case(case: &Value, transform: Option<&Value>) -> Result<Mesh, Box<dy
             }],
         );
     }
-    Ok(evaluate_with_context(&mesh, &modifier(case)?, &operands, None, DMat4::IDENTITY, case["name"].as_str().ok_or("case name missing")?, &AttributeLayerSelection::default())?)
+    Ok(evaluate_with_context(
+        &mesh,
+        &modifier(case)?,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        case["name"].as_str().ok_or("case name missing")?,
+        &AttributeLayerSelection::default(),
+    )?)
 }
 
 fn f32_matrix(value: &Value) -> Result<[f32; 16], Box<dyn Error>> {
-    let columns = value.as_array().ok_or("transform matrix columns are missing")?;
+    let columns = value
+        .as_array()
+        .ok_or("transform matrix columns are missing")?;
     if columns.len() != 4 {
         return Err("transform matrix must have four columns".into());
     }
     let mut result = [0.0_f32; 16];
     for (column, values) in columns.iter().enumerate() {
-        let values = values.as_array().ok_or("transform matrix column is malformed")?;
+        let values = values
+            .as_array()
+            .ok_or("transform matrix column is malformed")?;
         if values.len() != 4 {
             return Err("transform matrix column must have four rows".into());
         }
         for (row, component) in values.iter().enumerate() {
             result[column * 4 + row] = component
                 .as_f64()
-                .ok_or("transform matrix component is not numeric")? as f32;
+                .ok_or("transform matrix component is not numeric")?
+                as f32;
         }
     }
     Ok(result)
 }
 
 fn result_faces(mesh: &Mesh) -> Result<Vec<Value>, Box<dyn Error>> {
-    let state = mesh.attributes.get("custom_normal").ok_or("canonical custom-normal state is missing")?;
+    let state = mesh
+        .attributes
+        .get("custom_normal")
+        .ok_or("canonical custom-normal state is missing")?;
     if state.get("type").and_then(Value::as_str) != Some("normal_code")
         || state.get("values").is_none()
     {
         return Err("modifier did not write allocated canonical custom-normal codes".into());
     }
-    let positions = mesh.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let positions = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(mesh, &positions)?;
     let tags = mesh
         .attributes
@@ -799,8 +860,15 @@ fn crate_uv_values(mesh: &Mesh) -> BTreeMap<String, Value> {
         .into_iter()
         .flatten()
     {
-        for entry in layer.get("faces").and_then(Value::as_array).into_iter().flatten() {
-            let Some(face_id) = entry.get("face_id").and_then(Value::as_u64) else { continue };
+        for entry in layer
+            .get("faces")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(face_id) = entry.get("face_id").and_then(Value::as_u64) else {
+                continue;
+            };
             if let Some(uv) = entry.get("uv") {
                 values.insert(format!("f{face_id}"), uv.clone());
             }
@@ -809,28 +877,61 @@ fn crate_uv_values(mesh: &Mesh) -> BTreeMap<String, Value> {
     values
 }
 
-fn assert_faces_match(case_name: &str, actual: &[Value], expected: &[Value]) -> Result<(), Box<dyn Error>> {
+fn assert_faces_match(
+    case_name: &str,
+    actual: &[Value],
+    expected: &[Value],
+) -> Result<(), Box<dyn Error>> {
     assert_eq!(actual.len(), expected.len(), "{case_name}: face count");
     let mut max_angle = 0.0_f64;
     for (face_index, (actual_face, expected_face)) in actual.iter().zip(expected).enumerate() {
-        assert_eq!(actual_face["vertices"], expected_face["vertices"], "{case_name}: face {face_index} corner order");
-        assert_eq!(actual_face["tags"], expected_face["tags"], "{case_name}: face {face_index} corner attributes");
-        assert_eq!(actual_face["colors"], expected_face["colors"], "{case_name}: face {face_index} color corner order");
-        assert_eq!(actual_face["uvs"], expected_face["uvs"], "{case_name}: face {face_index} UV corner order");
-        let actual_normals = actual_face["normals"].as_array().ok_or("actual normals are missing")?;
-        let expected_normals = expected_face["normals"].as_array().ok_or("oracle normals are missing")?;
-        assert_eq!(actual_normals.len(), expected_normals.len(), "{case_name}: face {face_index} normal count");
+        assert_eq!(
+            actual_face["vertices"], expected_face["vertices"],
+            "{case_name}: face {face_index} corner order"
+        );
+        assert_eq!(
+            actual_face["tags"], expected_face["tags"],
+            "{case_name}: face {face_index} corner attributes"
+        );
+        assert_eq!(
+            actual_face["colors"], expected_face["colors"],
+            "{case_name}: face {face_index} color corner order"
+        );
+        assert_eq!(
+            actual_face["uvs"], expected_face["uvs"],
+            "{case_name}: face {face_index} UV corner order"
+        );
+        let actual_normals = actual_face["normals"]
+            .as_array()
+            .ok_or("actual normals are missing")?;
+        let expected_normals = expected_face["normals"]
+            .as_array()
+            .ok_or("oracle normals are missing")?;
+        assert_eq!(
+            actual_normals.len(),
+            expected_normals.len(),
+            "{case_name}: face {face_index} normal count"
+        );
         for (actual, expected) in actual_normals.iter().zip(expected_normals) {
             let actual = vector(actual)?;
             let expected = vector(expected)?;
-            assert!((actual.length() - 1.0).abs() < 1.0e-3, "{case_name}: non-unit native normal {actual:?}");
-            assert!((expected.length() - 1.0).abs() < 1.0e-3, "{case_name}: non-unit Blender normal {expected:?}");
+            assert!(
+                (actual.length() - 1.0).abs() < 1.0e-3,
+                "{case_name}: non-unit native normal {actual:?}"
+            );
+            assert!(
+                (expected.length() - 1.0).abs() < 1.0e-3,
+                "{case_name}: non-unit Blender normal {expected:?}"
+            );
             let angle = actual.normalize().angle_between(expected.normalize());
             max_angle = max_angle.max(angle);
         }
     }
     eprintln!("Blender normal parity {case_name}: max corner-normal angle {max_angle:.8e} rad");
-    assert!(max_angle <= 2.0e-4, "{case_name}: maximum corner-normal angular error {max_angle}");
+    assert!(
+        max_angle <= 2.0e-4,
+        "{case_name}: maximum corner-normal angular error {max_angle}"
+    );
     Ok(())
 }
 
@@ -855,7 +956,10 @@ fn normal_modifiers_match_blender_522_per_corner_cases() -> Result<(), Box<dyn E
     let root = fs::canonicalize(temp.path())?;
     let cases = blender_cases()?;
     let oracle = blender_probe(&blender, &root, &cases)?;
-    assert_eq!(oracle.as_object().map(serde_json::Map::len), Some(cases.len() + 1));
+    assert_eq!(
+        oracle.as_object().map(serde_json::Map::len),
+        Some(cases.len() + 1)
+    );
     let transform_matrices = oracle
         .get("_transform_matrices")
         .and_then(Value::as_object)
@@ -874,7 +978,13 @@ fn normal_modifiers_match_blender_522_per_corner_cases() -> Result<(), Box<dyn E
 #[test]
 fn weighted_normal_uses_blenders_ranked_weight_curve() -> Result<(), Box<dyn Error>> {
     let mesh = Mesh::from_positions_and_faces(
-        vec![DVec3::ZERO, DVec3::new(2.0, 0.0, 0.0), DVec3::new(0.0, 2.0, 0.0), DVec3::new(0.0, 1.0, 0.0), DVec3::new(0.0, 0.0, 2.0)],
+        vec![
+            DVec3::ZERO,
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(0.0, 0.0, 2.0),
+        ],
         vec![vec![0, 1, 2], vec![0, 3, 4]],
     )?;
     let modifier = Modifier {
@@ -882,16 +992,34 @@ fn weighted_normal_uses_blenders_ranked_weight_curve() -> Result<(), Box<dyn Err
         modifier_type: "weighted_normal".to_owned(),
         name: "Ranked weight curve".to_owned(),
         enabled: true,
-        params: json!({"mode":"FACE_AREA","weight":80,"thresh":0.01}).as_object().ok_or("params missing")?.clone(),
+        params: json!({"mode":"FACE_AREA","weight":80,"thresh":0.01})
+            .as_object()
+            .ok_or("params missing")?
+            .clone(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
-    let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "RankedWeightCurve", &AttributeLayerSelection::default())?;
-    let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let result = evaluate_with_context(
+        &mesh,
+        &modifier,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "RankedWeightCurve",
+        &AttributeLayerSelection::default(),
+    )?;
+    let positions = result
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
     let actual = normals[0];
     let expected = DVec3::new(1.0 / 15.0, 0.0, 2.0).normalize();
-    assert!(actual.angle_between(expected) < 2.0e-4, "expected {expected:?}, got {actual:?}");
+    assert!(
+        actual.angle_between(expected) < 2.0e-4,
+        "expected {expected:?}, got {actual:?}"
+    );
     Ok(())
 }
 
@@ -914,12 +1042,27 @@ fn weighted_normal_threshold_includes_exact_compare_boundary() -> Result<(), Box
         modifier_type: "weighted_normal".to_owned(),
         name: "Inclusive threshold boundary".to_owned(),
         enabled: true,
-        params: json!({"mode":"FACE_AREA","weight":80,"thresh":0.25}).as_object().ok_or("params missing")?.clone(),
+        params: json!({"mode":"FACE_AREA","weight":80,"thresh":0.25})
+            .as_object()
+            .ok_or("params missing")?
+            .clone(),
         binding_data: None,
         runtime: ModifierRuntime::default(),
     };
-    let result = evaluate_with_context(&mesh, &modifier, &BTreeMap::new(), None, DMat4::IDENTITY, "WeightedThresholdBoundary", &AttributeLayerSelection::default())?;
-    let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    let result = evaluate_with_context(
+        &mesh,
+        &modifier,
+        &BTreeMap::new(),
+        None,
+        DMat4::IDENTITY,
+        "WeightedThresholdBoundary",
+        &AttributeLayerSelection::default(),
+    )?;
+    let positions = result
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let actual = potter_core::geom::normals::corner_normals(&result, &positions)?[0];
     let expected = DVec3::new(1.75, 0.1, 2.0).normalize();
     assert!(
@@ -929,13 +1072,10 @@ fn weighted_normal_threshold_includes_exact_compare_boundary() -> Result<(), Box
     Ok(())
 }
 
-
 #[test]
 fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>> {
-    let mesh = Mesh::from_positions_and_faces(
-        vec![DVec3::ZERO, DVec3::X, DVec3::Y],
-        vec![vec![0, 1, 2]],
-    )?;
+    let mesh =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     let modifier = Modifier {
         id: potter_core::model::Id::new("directional")?,
         modifier_type: "normal_edit".to_owned(),
@@ -952,28 +1092,46 @@ fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>
         .to_cols_array()
         .map(|value| value as f32);
     let mut operands = BTreeMap::new();
-    operands.insert("target".to_owned(), vec![SceneOperand {
-        mesh: Mesh::default(),
-        local_to_subject: None,
-        blender_matrices_f32: Some(
-            potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
-                world: None,
-                local_to_subject: Some(local_to_subject_f32),
-                subject_to_local: Some(subject_to_local_f32),
-            },
-        ),
-        camera: None,
-        armature: false,
-        object_scale: DVec3::ONE,
-        selected_bones: Default::default(),
-        deforming_bones: Default::default(),
-        layer_selection: Default::default(),
-    }]);
-    let result = evaluate_with_context(&mesh, &modifier, &operands, None, DMat4::IDENTITY, "DirectionalNormalSubject", &AttributeLayerSelection::default())?;
-    let positions = result.vertices.iter().map(|vertex| vertex.co).collect::<Vec<_>>();
+    operands.insert(
+        "target".to_owned(),
+        vec![SceneOperand {
+            mesh: Mesh::default(),
+            local_to_subject: None,
+            blender_matrices_f32: Some(
+                potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                    world: None,
+                    local_to_subject: Some(local_to_subject_f32),
+                    subject_to_local: Some(subject_to_local_f32),
+                },
+            ),
+            camera: None,
+            armature: false,
+            object_scale: DVec3::ONE,
+            selected_bones: Default::default(),
+            deforming_bones: Default::default(),
+            layer_selection: Default::default(),
+        }],
+    );
+    let result = evaluate_with_context(
+        &mesh,
+        &modifier,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+        "DirectionalNormalSubject",
+        &AttributeLayerSelection::default(),
+    )?;
+    let positions = result
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
     let normals = potter_core::geom::normals::corner_normals(&result, &positions)?;
     let normal = normals[0];
-    assert!(normal.z < -0.999_999, "direction must point from vertex toward target: {normal:?}");
+    assert!(
+        normal.z < -0.999_999,
+        "direction must point from vertex toward target: {normal:?}"
+    );
     Ok(())
 }
 
@@ -987,17 +1145,24 @@ fn cli_applies_and_inspects_both_normal_modifiers() -> Result<(), Box<dyn Error>
         .arg(&scene)
         .args(["--json"])
         .output()?;
-    assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stdout));
-    fs::write(&operations, serde_json::to_vec(&json!({
-        "schema_version":1,
-        "base_revision":0,
-        "operations":[
-            {"op":"node.create","id":"body","kind":"plane","params":{"size":2.0}},
-            {"op":"node.create","id":"target","kind":"empty","transform":{"translation":[0.0,0.0,-2.0],"scale":[2.0,0.5,1.5]}},
-            {"op":"modifier.create","target":{"id":"body"},"id":"weighted","type":"weighted_normal","params":{"mode":"FACE_AREA","weight":80,"keep_sharp":false,"use_face_influence":false}},
-            {"op":"modifier.create","target":{"id":"body"},"id":"normal_edit","type":"normal_edit","params":{"mode":"DIRECTIONAL","target":"target","mix_mode":"ADD","mix_factor":0.5,"mix_limit":1.0,"use_direction_parallel":false,"no_polynors_fix":true}}
-        ]
-    }))?)?;
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
+    fs::write(
+        &operations,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[
+                {"op":"node.create","id":"body","kind":"plane","params":{"size":2.0}},
+                {"op":"node.create","id":"target","kind":"empty","transform":{"translation":[0.0,0.0,-2.0],"scale":[2.0,0.5,1.5]}},
+                {"op":"modifier.create","target":{"id":"body"},"id":"weighted","type":"weighted_normal","params":{"mode":"FACE_AREA","weight":80,"keep_sharp":false,"use_face_influence":false}},
+                {"op":"modifier.create","target":{"id":"body"},"id":"normal_edit","type":"normal_edit","params":{"mode":"DIRECTIONAL","target":"target","mix_mode":"ADD","mix_factor":0.5,"mix_limit":1.0,"use_direction_parallel":false,"no_polynors_fix":true}}
+            ]
+        }))?,
+    )?;
     let applied = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["apply"])
         .arg(&scene)
@@ -1005,20 +1170,38 @@ fn cli_applies_and_inspects_both_normal_modifiers() -> Result<(), Box<dyn Error>
         .arg(&operations)
         .args(["--json"])
         .output()?;
-    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stdout));
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
     let inspected = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["inspect"])
         .arg(&scene)
         .args(["--id", "body", "--json"])
         .output()?;
-    assert!(inspected.status.success(), "{}", String::from_utf8_lossy(&inspected.stdout));
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
     let inspected: Value = serde_json::from_slice(&inspected.stdout)?;
     let item = &inspected["result"]["items"][0];
     let geometry = &item["evaluated_geometry"];
-    let modifiers = item["modifiers"].as_array().ok_or("inspected modifier stack missing")?;
+    let modifiers = item["modifiers"]
+        .as_array()
+        .ok_or("inspected modifier stack missing")?;
     assert_eq!(modifiers.len(), 2);
-    assert!(modifiers.iter().any(|modifier| modifier["id"] == "weighted"));
-    assert!(modifiers.iter().any(|modifier| modifier["id"] == "normal_edit"));
+    assert!(
+        modifiers
+            .iter()
+            .any(|modifier| modifier["id"] == "weighted")
+    );
+    assert!(
+        modifiers
+            .iter()
+            .any(|modifier| modifier["id"] == "normal_edit")
+    );
     assert_eq!(geometry["face_count"], 1);
     assert_eq!(geometry["vertex_count"], 4);
     Ok(())

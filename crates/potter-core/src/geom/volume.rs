@@ -141,9 +141,21 @@ impl VolumeGrid {
         let mut maximum = DVec3::splat(f64::NEG_INFINITY);
         for corner in 0..8 {
             let index = DVec3::new(
-                if corner & 1 == 0 { minimum_index.x } else { maximum_index.x },
-                if corner & 2 == 0 { minimum_index.y } else { maximum_index.y },
-                if corner & 4 == 0 { minimum_index.z } else { maximum_index.z },
+                if corner & 1 == 0 {
+                    minimum_index.x
+                } else {
+                    maximum_index.x
+                },
+                if corner & 2 == 0 {
+                    minimum_index.y
+                } else {
+                    maximum_index.y
+                },
+                if corner & 4 == 0 {
+                    minimum_index.z
+                } else {
+                    maximum_index.z
+                },
             );
             let local = index_to_local.transform_point3(index);
             if !local.is_finite() {
