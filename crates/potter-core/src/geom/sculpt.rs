@@ -1011,7 +1011,8 @@ fn vertex_normals(
 }
 
 fn read_scalar_attribute(mesh: &Mesh, name: &str) -> Result<std::collections::BTreeMap<u32, f64>> {
-    let Some(attribute) = mesh.attributes.get(name) else {
+    let storage = crate::geom::attribute_keys::storage_key(name);
+    let Some(attribute) = mesh.attributes.get(&*storage) else {
         return Ok(std::collections::BTreeMap::default());
     };
     let values = attribute

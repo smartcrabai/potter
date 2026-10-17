@@ -215,7 +215,7 @@ impl WorldEvaluator<'_> {
                     &format!("unknown Texture Coordinate output `{socket}`"),
                 )),
             },
-            "ShaderNodeMixRGB" | "ShaderNodeMix" => {
+            "ShaderNodeMixRGB" => {
                 let factor =
                     as_scalar(self.input(id, "Fac", WorldValue::Scalar(0.5))?).clamp(0.0, 1.0);
                 let first =
@@ -226,6 +226,62 @@ impl WorldEvaluator<'_> {
                     first[index] + (second[index] - first[index]) * factor
                 });
                 Ok(WorldValue::Color(result))
+            }
+            "ShaderNodeMix" => {
+                let data_type = node
+                    .properties
+                    .get("data_type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("FLOAT");
+                if data_type != "RGBA" {
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        format!("world ShaderNodeMix data type `{data_type}` is not supported"),
+                        json!({
+                            "feature_id": format!("world.node.ShaderNodeMix.data_type.{data_type}"),
+                            "node_id": id,
+                        }),
+                    ));
+                }
+                let blend_type = node
+                    .properties
+                    .get("blend_type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("MIX");
+                let factor = as_scalar(self.input(id, "Factor_Float", WorldValue::Scalar(0.5))?)
+                    .clamp(0.0, 1.0);
+                let first =
+                    as_color(self.input(id, "A_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
+                let second =
+                    as_color(self.input(id, "B_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
+                let blended = match blend_type {
+                    "MIX" => second,
+                    "ADD" => std::array::from_fn(|index| first[index] + second[index]),
+                    "MULTIPLY" => std::array::from_fn(|index| first[index] * second[index]),
+                    "SUBTRACT" => std::array::from_fn(|index| first[index] - second[index]),
+                    "DIVIDE" => std::array::from_fn(|index| {
+                        if second[index].abs() <= f64::EPSILON {
+                            first[index]
+                        } else {
+                            first[index] / second[index]
+                        }
+                    }),
+                    unsupported => {
+                        return Err(PotError::with_details(
+                            ErrorCode::UnsupportedFeature,
+                            format!(
+                                "world ShaderNodeMix blend type `{unsupported}` is not supported"
+                            ),
+                            json!({
+                                "feature_id": format!("world.node.ShaderNodeMix.blend_type.{unsupported}"),
+                                "node_id": id,
+                            }),
+                        ));
+                    }
+                };
+                Ok(WorldValue::Color(std::array::from_fn(|index| {
+                    first[index] + (blended[index] - first[index]) * factor
+                })))
             }
             "ShaderNodeMixShader" => {
                 let factor =
@@ -327,6 +383,9 @@ fn socket_matches(candidate: &str, requested: &str) -> bool {
         || (requested == "Color" && candidate == "A")
         || (requested == "Color1" && candidate == "A")
         || (requested == "Color2" && candidate == "B")
+        || (requested == "A_Color" && candidate == "A")
+        || (requested == "B_Color" && candidate == "B")
+        || (requested == "Factor_Float" && candidate == "Factor")
         || (requested == "Shader" && candidate == "Shader 1")
         || (requested == "Shader_001" && candidate == "Shader 2")
         || (requested == "Fac" && candidate == "Factor")
@@ -343,4 +402,94 @@ fn normalize_or(value: DVec3, fallback: DVec3) -> DVec3 {
 
 fn world_error(id: &Id, message: &str) -> PotError {
     PotError::with_details(ErrorCode::InvalidOperation, message, json!({"node_id": id}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{GraphKind, GraphLink};
+
+    fn evaluate_mix_graph(mix: GraphNode) -> Result<DVec3> {
+        let mix_output = if mix.node_type == "ShaderNodeMixRGB" {
+            "Color"
+        } else {
+            "Result_Color"
+        };
+        let mix_id = Id::new("mix").expect("valid test ID");
+        let background_id = Id::new("background").expect("valid test ID");
+        let output_id = Id::new("output").expect("valid test ID");
+        let world_id = Id::new("world").expect("valid test ID");
+        let mut group = NodeGroup::new("world", GraphKind::Shader);
+        group.nodes.insert(mix_id.clone(), mix);
+        group.nodes.insert(
+            background_id.clone(),
+            GraphNode::new("ShaderNodeBackground"),
+        );
+        group
+            .nodes
+            .insert(output_id.clone(), GraphNode::new("ShaderNodeOutputWorld"));
+        group.links.extend([
+            GraphLink {
+                from_node: mix_id,
+                from_socket: mix_output.to_owned(),
+                to_node: background_id.clone(),
+                to_socket: "Color".to_owned(),
+            },
+            GraphLink {
+                from_node: background_id,
+                from_socket: "Background".to_owned(),
+                to_node: output_id,
+                to_socket: "Surface".to_owned(),
+            },
+        ]);
+        let mut groups = Registry::new();
+        groups.insert(world_id.clone(), group);
+        let mut world = World::default();
+        world.node_tree = Some(world_id);
+        evaluate_world(
+            &world,
+            &groups,
+            &std::collections::BTreeMap::new(),
+            DVec3::Z,
+        )
+    }
+
+    #[test]
+    fn evaluates_rgba_generic_mix_sockets() {
+        let mut mix = GraphNode::new("ShaderNodeMix");
+        mix.properties.insert("data_type".to_owned(), json!("RGBA"));
+        mix.inputs.insert("Factor_Float".to_owned(), json!(0.25));
+        mix.inputs
+            .insert("A_Color".to_owned(), json!([1.0, 0.0, 0.0, 1.0]));
+        mix.inputs
+            .insert("B_Color".to_owned(), json!([0.0, 0.0, 1.0, 1.0]));
+
+        assert_eq!(
+            evaluate_mix_graph(mix).unwrap(),
+            DVec3::new(0.75, 0.0, 0.25)
+        );
+    }
+
+    #[test]
+    fn rejects_default_float_generic_mix() {
+        let error = evaluate_mix_graph(GraphNode::new("ShaderNodeMix")).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert!(error.message.contains("FLOAT"));
+    }
+
+    #[test]
+    fn keeps_legacy_mix_rgb_sockets() {
+        let mut mix = GraphNode::new("ShaderNodeMixRGB");
+        mix.inputs.insert("Fac".to_owned(), json!(0.25));
+        mix.inputs
+            .insert("Color1".to_owned(), json!([1.0, 0.0, 0.0, 1.0]));
+        mix.inputs
+            .insert("Color2".to_owned(), json!([0.0, 0.0, 1.0, 1.0]));
+
+        assert_eq!(
+            evaluate_mix_graph(mix).unwrap(),
+            DVec3::new(0.75, 0.0, 0.25)
+        );
+    }
 }

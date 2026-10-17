@@ -1024,6 +1024,52 @@ mod tests {
     }
 
     #[test]
+    fn history_blob_hashes_raw_legacy_bytes_before_snapshot_upgrade() {
+        let directory = tempdir().unwrap();
+        let snapshot =
+            serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string())).unwrap();
+        let mut record = json!({
+            "record_version": 1,
+            "parent": null,
+            "kind": "apply",
+            "revision": 0,
+            "scene_hash": "sha256:scene",
+            "operations": [],
+            "changes": {},
+            "target": null,
+            "snapshot": snapshot
+        });
+        record["snapshot"]["schema_version"] = json!(2);
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let digest = crate::hash::sha256(&bytes);
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        let path = directory
+            .path()
+            .join("history")
+            .join("sha256")
+            .join(hex)
+            .join("blob.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let (loaded, warnings) = super::read_history_blob(directory.path(), &digest).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(loaded.snapshot.schema_version, 3);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let mut corrupted = bytes;
+        corrupted.push(b'!');
+        fs::write(&path, &corrupted).unwrap();
+        let error = super::read_history_blob(directory.path(), &digest).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InternalError);
+        assert_eq!(
+            error.message,
+            "history record does not match its content hash"
+        );
+        assert_eq!(fs::read(path).unwrap(), corrupted);
+    }
+
+    #[test]
     fn dropping_project_releases_the_exclusive_writer_lock() {
         let directory = tempdir().unwrap();
         let scene = directory.path().join("scene");

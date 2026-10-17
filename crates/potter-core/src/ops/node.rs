@@ -749,11 +749,15 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             if let Some(transform) = &transform_update {
                 item_changed |= apply_transform_update(&mut node.transform, transform);
             }
-            if let Some(materials) = &materials
-                && node.materials.as_slice() != materials.as_slice()
-            {
-                node.materials.clone_from(materials);
-                item_changed = true;
+            if let Some(materials) = &materials {
+                if node.materials.as_slice() != materials.as_slice() {
+                    node.materials.clone_from(materials);
+                    item_changed = true;
+                }
+                if !node.material_links.is_empty() {
+                    node.material_links.clear();
+                    item_changed = true;
+                }
             }
             for (field, value) in [
                 ("visible", visible),
@@ -2189,4 +2193,39 @@ fn primitive_parameter_error(
         message,
         &operation_pointer(engine.operation_index, &suffix),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "fixed valid material IDs and parser fixtures"
+    )]
+    use super::*;
+    use crate::model::{Material, SceneDoc};
+    use crate::ops::ChangeSet;
+    use serde_json::json;
+
+    #[test]
+    fn material_array_parser_preserves_empty_slots() {
+        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let blue = Id::new("blue").unwrap();
+        doc.materials.insert(blue.clone(), Material::default());
+        let engine = Engine {
+            doc: &mut doc,
+            changes: ChangeSet::default(),
+            id_mappings: Map::new(),
+            operation_index: 0,
+            evaluation_frame: 1.0,
+            asset_root: None,
+            cache_directory: None,
+            pending_assets: std::collections::BTreeMap::default(),
+            warnings: Vec::new(),
+        };
+        let values = json!(["blue", null, "blue"]);
+        assert_eq!(
+            read_material_array(&engine, &values, "materials").unwrap(),
+            vec![Some(blue.clone()), None, Some(blue)]
+        );
+    }
 }

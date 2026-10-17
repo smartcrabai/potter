@@ -118,7 +118,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 2,
+            schema_version: 3,
             scene_id,
             revision: 0,
             active_scene,
@@ -145,7 +145,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 2 {
+        if self.schema_version != 3 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -178,6 +178,8 @@ impl SceneDoc {
         for block in self.data_blocks.values() {
             if let Some(mesh) = &block.mesh {
                 crate::geom::uv_layers::validate(mesh)?;
+                crate::geom::color_layers::validate(mesh)?;
+                crate::geom::clnor::validate(mesh)?;
             }
         }
         for (scene_id, scene) in &self.scenes {
@@ -1532,6 +1534,14 @@ pub struct Keyframe {
     pub handle_right: Option<[f64; 2]>,
 }
 
+/// Source of a node material slot, matching Blender's per-slot material link setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialLink {
+    Data,
+    Object,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
@@ -1552,7 +1562,11 @@ pub struct Node {
     /// Material slots in slot order. `null` is an empty slot: a face index on it has no material,
     /// as Blender's empty material slot does. Old files holding only ids still load unchanged.
     #[serde(default)]
+    /// Ordered OBJECT-linked material overrides; `None` preserves a raw empty override.
     pub materials: Vec<Option<Id>>,
+    /// Per-slot source; missing entries use legacy `OBJECT` for existing node slots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub material_links: Vec<MaterialLink>,
     #[serde(default)]
     pub modifiers: Vec<Modifier>,
     #[serde(default = "default_true")]
@@ -1595,6 +1609,7 @@ impl Default for Node {
             transform: Transform::default(),
             data: None,
             materials: Vec::new(),
+            material_links: Vec::new(),
             modifiers: Vec::new(),
             visible: true,
             render_visible: true,
@@ -1613,11 +1628,73 @@ impl Default for Node {
     }
 }
 
+/// Pinned Blender evaluated material count: max(Object.totcol, evaluated DATA length).
+pub(crate) fn material_slot_count(object_count: usize, data_count: usize) -> usize {
+    object_count.max(data_count)
+}
+
+/// Link state at one slot; legacy absent entries preserve old node-local object slots.
+pub(crate) fn material_link_at(
+    object_count: usize,
+    links: &[MaterialLink],
+    slot: usize,
+) -> MaterialLink {
+    links.get(slot).copied().unwrap_or_else(|| {
+        if slot < object_count {
+            MaterialLink::Object
+        } else {
+            MaterialLink::Data
+        }
+    })
+}
+
+/// Borrowed effective material lookup shared by model, evaluation, and material-aware callers.
+pub(crate) fn resolve_material_slot<'a>(
+    object_materials: &'a [Option<Id>],
+    data_materials: &'a [Option<Id>],
+    links: &[MaterialLink],
+    index: usize,
+) -> Option<&'a Id> {
+    let count = material_slot_count(object_materials.len(), data_materials.len());
+    let slot = index.min(count.checked_sub(1)?);
+    match material_link_at(object_materials.len(), links, slot) {
+        MaterialLink::Data => data_materials.get(slot).and_then(Option::as_ref),
+        MaterialLink::Object => object_materials
+            .get(slot)
+            .and_then(Option::as_ref)
+            .or_else(|| data_materials.get(slot).and_then(Option::as_ref)),
+    }
+}
+
 impl Node {
-    /// The material bound to a slot, or `None` for an empty or missing slot.
+    /// Link source for slot `index`, including the legacy default.
     #[must_use]
-    pub fn material_slot(&self, index: usize) -> Option<&Id> {
-        self.materials.get(index).and_then(Option::as_ref)
+    pub fn material_link(&self, index: usize) -> MaterialLink {
+        material_link_at(self.materials.len(), &self.material_links, index)
+    }
+
+    /// Evaluated material slot count before modifier-specific changes.
+    #[must_use]
+    pub fn material_slot_count(&self, data: Option<&DataBlock>) -> usize {
+        material_slot_count(
+            self.materials.len(),
+            data.map_or(0, |data| data.materials.len()),
+        )
+    }
+
+    /// Effective material for one indexed slot; out-of-range access clamps like Blender.
+    #[must_use]
+    pub fn material_slot<'a>(
+        &'a self,
+        data: Option<&'a DataBlock>,
+        index: usize,
+    ) -> Option<&'a Id> {
+        resolve_material_slot(
+            &self.materials,
+            data.map_or(&[][..], |data| data.materials.as_slice()),
+            &self.material_links,
+            index,
+        )
     }
 }
 fn default_true() -> bool {
@@ -1867,6 +1944,9 @@ pub struct DataBlock {
     pub descriptor: Option<PrimitiveDescriptor>,
     #[serde(default)]
     pub mesh: Option<Mesh>,
+    /// Ordered raw DATA-linked material slots for this Data-Block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub materials: Vec<Option<Id>>,
     #[serde(default)]
     pub camera: Option<CameraData>,
     #[serde(default)]
@@ -1905,6 +1985,7 @@ impl Default for DataBlock {
             data_type: "mesh".to_owned(),
             descriptor: None,
             mesh: Some(Mesh::default()),
+            materials: Vec::new(),
             camera: None,
             light: None,
             grease_pencil: None,
@@ -2034,7 +2115,7 @@ pub struct Material {
     pub metallic_texture: Option<TextureRef>,
     #[serde(default)]
     pub normal_texture: Option<TextureRef>,
-    #[serde(default)]
+    #[serde(default = "default_displacement_method")]
     pub displacement_method: String,
     #[serde(default = "default_displacement_scale")]
     pub displacement_scale: f64,
@@ -2066,7 +2147,7 @@ impl Default for Material {
             roughness_texture: None,
             metallic_texture: None,
             normal_texture: None,
-            displacement_method: "bump".to_owned(),
+            displacement_method: default_displacement_method(),
             displacement_scale: default_displacement_scale(),
             displacement_midlevel: default_displacement_midlevel(),
             volume_density: 0.0,
@@ -2095,6 +2176,10 @@ fn default_ior() -> f64 {
     1.45
 }
 
+fn default_displacement_method() -> String {
+    "bump".to_owned()
+}
+
 fn default_displacement_scale() -> f64 {
     1.0
 }
@@ -2118,8 +2203,8 @@ pub struct HistoryState {
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
     use super::{
-        Action, CameraData, Interpolation, LightData, MAX_REVISION, Modifier, SceneDoc,
-        revision_in_range,
+        Action, CameraData, Id, Interpolation, LightData, MAX_REVISION, Material, Modifier,
+        SceneDoc, revision_in_range,
     };
 
     #[test]
@@ -2200,6 +2285,30 @@ mod tests {
         let mut value = serde_json::to_value(SceneDoc::new(String::new())).unwrap();
         value["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<SceneDoc>(value).is_err());
+    }
+
+    #[test]
+    fn legacy_material_without_displacement_method_loads_as_bump() {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.materials.insert(
+            Id::new("mat_legacy").unwrap(),
+            Material {
+                name: "Legacy".to_owned(),
+                ..Material::default()
+            },
+        );
+        let mut value = serde_json::to_value(&doc).unwrap();
+        value["materials"]["mat_legacy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("displacement_method");
+        let loaded: SceneDoc = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            loaded.materials[&Id::new("mat_legacy").unwrap()].displacement_method,
+            "bump"
+        );
+        let bare: Material = serde_json::from_value(serde_json::json!({"name": "Bare"})).unwrap();
+        assert_eq!(bare.displacement_method, "bump");
     }
 }
 

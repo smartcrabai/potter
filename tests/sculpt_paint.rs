@@ -127,12 +127,25 @@ fn draw_respects_radius_and_mask_and_vertex_paint_updates_touched_corners()
         ]),
     )?;
     let painted = stored_mesh(&paint_scene)?;
-    let corner_colors = painted["attributes"]["color"]["values"]
-        .as_object()
-        .unwrap();
-    assert!(corner_colors
-        .iter()
-        .any(|(corner, color)| corner.ends_with(":v6") && color == &json!([0.1, 0.2, 0.3, 1.0])));
+    let color = &painted["attributes"]["color"];
+    assert_eq!(color["domain"], json!("corner"));
+    assert_eq!(color["type"], json!("color"));
+    assert_eq!(
+        painted["attributes"]["color_layers"],
+        json!({"layers": ["color"], "active": "color", "render": "color"})
+    );
+    let painted_at_v6 = painted["faces"].as_array().unwrap().iter().any(|face| {
+        let row = &color["values"][format!("f{}", face["id"]).as_str()];
+        face["v"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .any(|(corner, vertex)| {
+                *vertex == json!(6) && row[corner] == json!([0.1, 0.2, 0.3, 1.0])
+            })
+    });
+    assert!(painted_at_v6);
     assert_eq!(
         painted["attributes"]["weight:skin"]["values"]["v6"],
         json!(0.75)

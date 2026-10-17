@@ -8,16 +8,19 @@ use crate::{
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
-    shader::{BsdfParams, HitContext, HitUvLayers, evaluate_surface, height_gradient},
+    shader::{
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, evaluate_surface_with_workspace,
+        height_gradient,
+    },
 };
 
 use super::{
     bvh::{Bvh, BvhHit},
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, blend_uv, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
-    scene::{Geometry, ObjectRecord},
+    scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
 };
 
 const RAY_EPSILON: f64 = 1.0e-5;
@@ -349,6 +352,15 @@ pub(super) fn render(
             DVec3::from_array(world.color) * world.strength
         });
     let bvh = Bvh::build(&geometry.triangles)?;
+    let evaluator_capacity = geometry
+        .materials
+        .iter()
+        .filter_map(|material| material.node_tree.as_ref())
+        .filter_map(|graph| doc.node_groups.get(graph))
+        .map(|graph| graph.links.len())
+        .max()
+        .unwrap_or(0);
+    let mut evaluator_workspace = EvaluatorWorkspace::with_capacity(evaluator_capacity);
     let lights = collect_lights(doc, snapshot);
     let volumes = collect_volumes(
         doc,
@@ -418,6 +430,7 @@ pub(super) fn render(
                         environment,
                         max_bounces,
                         &mut left_rng,
+                        &mut evaluator_workspace,
                     )?;
                     let (right, right_alpha) = trace_path(
                         doc,
@@ -433,6 +446,7 @@ pub(super) fn render(
                         environment,
                         max_bounces,
                         &mut right_rng,
+                        &mut evaluator_workspace,
                     )?;
                     (
                         DVec3::new(left.x, right.y, right.z),
@@ -455,6 +469,7 @@ pub(super) fn render(
                         environment,
                         max_bounces,
                         &mut rng,
+                        &mut evaluator_workspace,
                     )?
                 };
                 sum += radiance;
@@ -494,6 +509,7 @@ pub(super) fn render(
         height,
         film_transparent,
         &mut output,
+        &mut evaluator_workspace,
     )?;
     overlay_rasterized_lines(
         geometry,
@@ -743,6 +759,7 @@ fn trace_path(
     environment: DVec3,
     max_bounces: u32,
     rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, f64)> {
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
@@ -783,6 +800,7 @@ fn trace_path(
                     direction,
                     environment,
                     rng,
+                    evaluator_workspace,
                 )?;
             if bounce == max_bounces {
                 break;
@@ -797,7 +815,16 @@ fn trace_path(
             radiance += throughput * environment * environment_weight;
             break;
         };
-        let surface = make_surface(doc, snapshot, geometry, hit, origin, direction, images)?;
+        let surface = make_surface(
+            doc,
+            snapshot,
+            geometry,
+            hit,
+            origin,
+            direction,
+            images,
+            evaluator_workspace,
+        )?;
         if surface.params.volume_density > 0.0
             && let Some(boundary) = closest_hit(
                 geometry,
@@ -847,13 +874,11 @@ fn trace_path(
             }
             continue;
         }
-        if bounce == 0 {
-            alpha = 1.0;
-        }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
+        alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
             * surface.params.emission_strength.max(0.0);
@@ -871,6 +896,7 @@ fn trace_path(
                 direction,
                 environment,
                 rng,
+                evaluator_workspace,
             )?;
         if bounce == max_bounces {
             break;
@@ -916,6 +942,7 @@ fn write_center_passes(
     height: u32,
     film_transparent: bool,
     output: &mut RasterOutput,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<()> {
     let camera_forward = (camera.target - camera.position).normalize_or_zero();
     for y in 0..height {
@@ -946,7 +973,16 @@ fn write_center_passes(
                 }
                 continue;
             };
-            let surface = make_surface(doc, snapshot, geometry, hit, origin, direction, images)?;
+            let surface = make_surface(
+                doc,
+                snapshot,
+                geometry,
+                hit,
+                origin,
+                direction,
+                images,
+                evaluator_workspace,
+            )?;
             if surface.params.alpha <= 0.0 {
                 continue;
             }
@@ -1107,6 +1143,7 @@ fn make_surface(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
     let triangle = geometry.triangles.get(hit.triangle_index).ok_or_else(|| {
         PotError::new(
@@ -1134,7 +1171,7 @@ fn make_surface(
             }
         }
     };
-    let uv = blend_uv(&triangle.uv, hit.barycentric);
+
     let object = object_for_index(&geometry.objects, triangle.object_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1150,28 +1187,12 @@ fn make_surface(
                 "triangle references an unmapped material",
             )
         })?;
-    let matrix = snapshot
-        .nodes
-        .get(&object.node_id)
-        .map_or(DMat4::IDENTITY, |node| {
-            DMat4::from_cols_array(&node.world_matrix)
-        });
-    let world_to_local = matrix.inverse();
-    let local_is_finite = world_to_local
-        .to_cols_array()
-        .iter()
-        .all(|value| value.is_finite());
-    let object_position = if local_is_finite {
-        world_to_local.transform_point3(point)
-    } else {
-        point
-    };
     let element = triangle
         .element_index
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
         .and_then(|index| geometry.elements.get(index));
-    let layers = HitUvLayers {
+    let uv_layers = HitUvLayers {
         names: &object.uv_layers,
         corners: &triangle.layer_uvs,
         positions: triangle.positions,
@@ -1179,17 +1200,25 @@ fn make_surface(
         render: element.map_or(object.uv_render, |element| element.uv_render),
         available_mask: element.and_then(|element| element.uv_available_mask),
     };
-    let mut context = HitContext::new(&doc.node_groups)
-        .with_images(images)
-        .with_uv_layers(layers)
-        .with_warnings(&geometry.shader_warnings);
-    context.uv = uv;
-    context.generated = object_position;
-    context.position = point;
-    context.object = object_position;
-    context.normal = normal;
-    context.view_direction = -direction;
-    let mut params = evaluate_surface(material, &context)?;
+    let mut tables = LayerTables::new();
+    let context = layered_context(
+        doc,
+        images,
+        &geometry.shader_warnings,
+        object,
+        triangle,
+        HitPose {
+            point,
+            object: object_space(snapshot, object, point),
+            normal,
+            view: -direction,
+            barycentric: hit.barycentric,
+        },
+        None,
+        uv_layers,
+        &mut tables,
+    )?;
+    let mut params = evaluate_surface_with_workspace(material, &context, evaluator_workspace)?;
     params.alpha = match material.alpha_mode.as_str() {
         "opaque" => 1.0,
         "clip" => {
@@ -1203,7 +1232,8 @@ fn make_surface(
     };
     if params.displacement_height != 0.0 && material.displacement_method != "displacement" {
         let gradient = height_gradient(&context, normal, |sample| {
-            evaluate_surface(material, sample).map(|surface| surface.displacement_height)
+            evaluate_surface_with_workspace(material, sample, evaluator_workspace)
+                .map(|surface| surface.displacement_height)
         })?;
         params.normal = normal - gradient;
     }
@@ -1227,7 +1257,10 @@ fn make_surface(
     })
 }
 
-fn object_for_index(objects: &[ObjectRecord], object_index: u32) -> Option<&ObjectRecord> {
+pub(super) fn object_for_index(
+    objects: &[ObjectRecord],
+    object_index: u32,
+) -> Option<&ObjectRecord> {
     object_index
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
@@ -1251,6 +1284,7 @@ fn direct_lighting(
     incoming_direction: DVec3,
     environment: DVec3,
     rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
     let normal = surface.normal;
     let geometric = surface.geometric_normal;
@@ -1276,6 +1310,7 @@ fn direct_lighting(
             sample.direction,
             sample.distance,
             rng,
+            evaluator_workspace,
         )?;
         if visibility <= 0.0 {
             continue;
@@ -1301,6 +1336,7 @@ fn direct_lighting(
             direction,
             f64::INFINITY,
             rng,
+            evaluator_workspace,
         )?;
         let environment_pdf = importance.map_or(0.0, |sampler| sampler.pdf(direction));
         let weight = importance.map_or(1.0, |_| power_heuristic(cosine_pdf, environment_pdf));
@@ -1326,6 +1362,7 @@ fn direct_lighting(
                 direction,
                 f64::INFINITY,
                 rng,
+                evaluator_workspace,
             )?;
             let cosine_pdf = cosine / std::f64::consts::PI;
             let weight = power_heuristic(environment_pdf, cosine_pdf);
@@ -1354,6 +1391,7 @@ fn direct_volume_lighting(
     incoming_direction: DVec3,
     environment: DVec3,
     rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
     let mut contribution = DVec3::ZERO;
     for light in lights {
@@ -1375,6 +1413,7 @@ fn direct_volume_lighting(
             sample.direction,
             sample.distance,
             rng,
+            evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(sample.direction), event.anisotropy);
         contribution += sample.radiance * (phase * visibility * VOLUME_DIRECT_LIGHT_SCALE);
@@ -1398,6 +1437,7 @@ fn direct_volume_lighting(
             direction,
             f64::INFINITY,
             rng,
+            evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(direction), event.anisotropy);
         contribution += incoming * (phase * visibility * 0.5 / pdf);
@@ -1437,6 +1477,7 @@ fn shadow_transmittance(
     direction: DVec3,
     distance: f64,
     rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
     let mut transmittance = 1.0;
     let mut origin = offset_origin(point, direction, normal);
@@ -1450,7 +1491,16 @@ fn shadow_transmittance(
         else {
             break;
         };
-        let surface = make_surface(doc, snapshot, geometry, hit, origin, direction, images)?;
+        let surface = make_surface(
+            doc,
+            snapshot,
+            geometry,
+            hit,
+            origin,
+            direction,
+            images,
+            evaluator_workspace,
+        )?;
         let alpha = surface.params.alpha.clamp(0.0, 1.0);
         let transmission = surface.params.transmission.clamp(0.0, 1.0);
         if alpha >= 1.0 && transmission <= 0.0 {
@@ -1708,6 +1758,7 @@ fn collect_volumes<'a>(
     warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<Vec<VolumeInstance<'a>>> {
     let mut volumes = Vec::new();
+    let mut evaluator_workspace = EvaluatorWorkspace::default();
     for (node_id, node) in &doc.nodes {
         if !node.visible || !node.render_visible {
             continue;
@@ -1771,9 +1822,7 @@ fn collect_volumes<'a>(
                 (grid.origin, bounds_max, grid.voxel_size, density_range)
             };
         let material = snapshot
-            .material_slots(node_id, node)
-            .first()
-            .and_then(Option::as_ref)
+            .slot_material(node_id, node, Some(data_block), 0)
             .and_then(|material_id| doc.materials.get(material_id));
         let evaluated_material = if let Some(material) = material {
             let local_center = (bounds_min + bounds_max) * 0.5;
@@ -1783,7 +1832,11 @@ fn collect_volumes<'a>(
             context.object = local_center;
             context.generated = local_center;
             context.position = matrix.transform_point3(local_center);
-            Some(evaluate_surface(material, &context)?)
+            Some(evaluate_surface_with_workspace(
+                material,
+                &context,
+                &mut evaluator_workspace,
+            )?)
         } else {
             None
         };

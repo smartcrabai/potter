@@ -5,7 +5,7 @@
 //! `schema_v1_project_layer_limit` hold legacy data the upgrade must skip or drop: a `uv_map` row for
 //! a deleted face, Blender layers left stale by an extrude, and nine candidate layers. Each case
 //! checks its warning codes and names, that reads leave every file unchanged, and that the original
-//! `scene.json` bytes stay recoverable under `compat/sha256/<hash>/scene.json` once a version-2 write
+//! `scene.json` bytes stay recoverable under `compat/sha256/<hash>/scene.json` once a schema-3 write
 //! happens.
 
 use std::{
@@ -105,7 +105,7 @@ fn mesh_attributes(scene: &Path) -> TestResult<Value> {
 }
 
 /// The first corner and pin flags of face 0 as stored on disk. Version 1 keeps them in `uv_map`
-/// (glTF convention); version 2 keeps them in the first layer of `uv_layers`.
+/// (glTF convention); version 3 keeps them in the first layer of `uv_layers`.
 fn face_zero(scene: &Path) -> TestResult<(Value, Value)> {
     let attributes = mesh_attributes(scene)?;
     let entry = if document(scene)?["schema_version"] == 1 {
@@ -167,7 +167,7 @@ fn schema_v1_project_keeps_revisions_uv_state_and_hashes_through_edit_history_an
     )?;
     assert_eq!(edited["ok"], true, "{edited}");
     assert_eq!(edited["scene"]["revision"], 3);
-    assert_eq!(document(&scene)?["schema_version"], 2);
+    assert_eq!(document(&scene)?["schema_version"], 3);
     let store = &mesh_attributes(&scene)?["uv_layers"];
     assert_eq!(store["layers"][0]["name"], "UVMap");
     assert_eq!(store["active"], "UVMap");
@@ -436,7 +436,7 @@ fn fixture_corner(case: &str, face_id: u64) -> TestResult<[f64; 2]> {
     corner_value(&entry["uv"][0])
 }
 
-/// The version-2 layer `name` of the project's mesh, as stored in `scene.json`.
+/// The schema-version-3 layer `name` of the project's mesh, as stored in `scene.json`.
 fn stored_layer(scene: &Path, name: &str) -> TestResult<Value> {
     let attributes = mesh_attributes(scene)?;
     attributes["uv_layers"]["layers"]
@@ -446,7 +446,7 @@ fn stored_layer(scene: &Path, name: &str) -> TestResult<Value> {
         .ok_or_else(|| format!("layer `{name}` is not stored").into())
 }
 
-/// The names of the version-2 layers of the project's mesh, in stored order.
+/// The names of the schema-version-3 layers of the project's mesh, in stored order.
 fn stored_layer_names(scene: &Path) -> TestResult<Vec<String>> {
     let attributes = mesh_attributes(scene)?;
     Ok(attributes["uv_layers"]["layers"]
@@ -457,7 +457,7 @@ fn stored_layer_names(scene: &Path) -> TestResult<Vec<String>> {
         .collect())
 }
 
-/// The face IDs that the version-2 layer `name` stores values for, in stored order.
+/// The face IDs that the schema-version-3 layer `name` stores values for, in stored order.
 fn stored_face_ids(scene: &Path, name: &str) -> TestResult<Vec<u64>> {
     let layer = stored_layer(scene, name)?;
     Ok(layer["faces"]
@@ -468,7 +468,7 @@ fn stored_face_ids(scene: &Path, name: &str) -> TestResult<Vec<u64>> {
         .collect())
 }
 
-/// Corner 0 of face `face_id` in the version-2 layer `name`.
+/// Corner 0 of face `face_id` in the schema-version-3 layer `name`.
 fn stored_corner(scene: &Path, name: &str, face_id: u64) -> TestResult<[f64; 2]> {
     let layer = stored_layer(scene, name)?;
     let face = layer["faces"]
@@ -547,7 +547,7 @@ fn schema_v1_deleted_face_row_is_reported_and_its_bytes_stay_recoverable() -> Te
         1,
         "{applied}"
     );
-    assert_eq!(document(&scene)?["schema_version"], 2);
+    assert_eq!(document(&scene)?["schema_version"], 3);
     assert_eq!(stored_face_ids(&scene, "UVMap")?, vec![1_u64, 2, 3, 4, 5]);
     assert_corner_close(
         stored_corner(&scene, "UVMap", 1)?,
@@ -662,7 +662,7 @@ fn schema_v1_extruded_blender_layers_are_skipped_with_warnings_and_stay_recovera
         2,
         "{applied}"
     );
-    assert_eq!(document(&scene)?["schema_version"], 2);
+    assert_eq!(document(&scene)?["schema_version"], 3);
     let attributes = mesh_attributes(&scene)?;
     assert!(
         attributes.get("uv_layers").is_none(),

@@ -624,12 +624,17 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 .iter()
                 .flatten()
                 .any(|material| material == id)
+        }) || engine.doc.data_blocks.values().any(|data| {
+            data.materials
+                .iter()
+                .flatten()
+                .any(|material| material == id)
         });
         if is_referenced && reassign.is_none() {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!(
-                    "material `{id}` is assigned to nodes; provide an explicit reassign policy"
+                    "material `{id}` is assigned to nodes or data blocks; provide an explicit reassign policy"
                 ),
                 &pointer,
             ));
@@ -648,6 +653,7 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     let mut changed_nodes = std::collections::BTreeSet::new();
+    let mut changed_data_blocks = std::collections::BTreeSet::new();
     for (node_id, node) in &mut engine.doc.nodes {
         let mut changed = false;
         match &reassign {
@@ -660,15 +666,51 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 }
             }
             Some(None) => {
-                let old_len = node.materials.len();
-                node.materials
-                    .retain(|material| !material.as_ref().is_some_and(|id| targets.contains(id)));
-                changed = node.materials.len() != old_len;
+                for material in &mut node.materials {
+                    if material
+                        .as_ref()
+                        .is_some_and(|material| targets.contains(material))
+                    {
+                        *material = None;
+                        changed = true;
+                    }
+                }
             }
             None => {}
         }
         if changed {
             changed_nodes.insert(node_id.clone());
+        }
+    }
+    for (data_id, data) in &mut engine.doc.data_blocks {
+        let mut changed = false;
+        match &reassign {
+            Some(Some(replacement)) => {
+                for material in &mut data.materials {
+                    if material
+                        .as_ref()
+                        .is_some_and(|material| targets.contains(material))
+                    {
+                        *material = Some(replacement.clone());
+                        changed = true;
+                    }
+                }
+            }
+            Some(None) => {
+                for material in &mut data.materials {
+                    if material
+                        .as_ref()
+                        .is_some_and(|material| targets.contains(material))
+                    {
+                        *material = None;
+                        changed = true;
+                    }
+                }
+            }
+            None => {}
+        }
+        if changed {
+            changed_data_blocks.insert(data_id.clone());
         }
     }
     for id in targets {
@@ -688,6 +730,9 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
     }
     for node_id in changed_nodes {
         engine.mark("nodes", &node_id, ChangeKind::Updated);
+    }
+    for data_id in changed_data_blocks {
+        engine.mark("data_blocks", &data_id, ChangeKind::Updated);
     }
     Ok(true)
 }
@@ -957,4 +1002,94 @@ fn read_unit_interval(engine: &Engine<'_>, value: &Value, field: &str) -> Result
         ));
     }
     Ok(number)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "fixed valid material IDs and operation fixtures"
+    )]
+    use super::*;
+    use crate::model::{DataBlock, MaterialLink, Node, SceneDoc};
+    use crate::ops::ChangeSet;
+    use serde_json::json;
+
+    #[test]
+    fn reassignment_updates_data_slots_without_touching_object_overrides() {
+        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let blue = Id::new("blue").unwrap();
+        let green = Id::new("green").unwrap();
+        let red = Id::new("red").unwrap();
+        for id in [&blue, &green, &red] {
+            doc.materials.insert(id.clone(), Material::default());
+        }
+        let data_id = Id::new("shared_data").unwrap();
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                materials: vec![Some(blue.clone()), None, Some(red.clone())],
+                ..DataBlock::default()
+            },
+        );
+        let data_user = Id::new("data_user").unwrap();
+        let object_user = Id::new("object_user").unwrap();
+        doc.nodes.insert(
+            data_user.clone(),
+            Node {
+                kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                materials: vec![Some(red.clone()), None],
+                material_links: vec![MaterialLink::Data, MaterialLink::Data],
+                ..Node::default()
+            },
+        );
+        doc.nodes.insert(
+            object_user.clone(),
+            Node {
+                kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                materials: vec![Some(red.clone()), None],
+                material_links: vec![MaterialLink::Object, MaterialLink::Object],
+                ..Node::default()
+            },
+        );
+        let operation = json!({
+            "op":"material.delete",
+            "target":"blue",
+            "reassign":"green"
+        });
+        let mut engine = Engine {
+            doc: &mut doc,
+            changes: ChangeSet::default(),
+            id_mappings: Map::new(),
+            operation_index: 0,
+            evaluation_frame: 1.0,
+            asset_root: None,
+            cache_directory: None,
+            pending_assets: std::collections::BTreeMap::default(),
+            warnings: Vec::new(),
+        };
+        assert!(delete(&mut engine, operation.as_object().unwrap()).unwrap());
+        assert_eq!(
+            engine.doc.data_blocks[&data_id].materials,
+            vec![Some(green), None, Some(red.clone())]
+        );
+        assert_eq!(
+            engine.doc.nodes[&data_user].materials,
+            vec![Some(red.clone()), None]
+        );
+        assert_eq!(
+            engine.doc.nodes[&object_user].materials,
+            vec![Some(red), None]
+        );
+        assert_eq!(
+            engine.doc.nodes[&data_user].material_links[0],
+            MaterialLink::Data
+        );
+        assert_eq!(
+            engine.doc.nodes[&object_user].material_links[0],
+            MaterialLink::Object
+        );
+    }
 }

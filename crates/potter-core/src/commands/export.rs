@@ -14,11 +14,7 @@ use crate::{
     },
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
-    exchange::{
-        self, ExportOptions, Loss,
-        gltf::is_color_attribute,
-        material_surface::{material_is_used, resolve_surface},
-    },
+    exchange::{self, ExportOptions, Loss, material_surface::resolve_surface},
     hash,
     model::{AvatarVersion, LightType, SceneDoc},
     response::SceneInfo,
@@ -123,6 +119,13 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
         let mut losses = export_losses(&doc, format, Some(&snapshot));
         losses.extend(exchange::shading::shading_losses(format, &meshes));
         losses.extend(exchange::uv_layer_losses(format, &meshes));
+        if matches!(
+            format,
+            "fbx" | "fbx-binary" | "alembic" | "obj" | "ply" | "stl"
+        ) || matches!(format, "usda" | "usdc" | "usd" | "usdz")
+        {
+            losses.extend(exchange::attribute_losses(format, &doc, &snapshot)?);
+        }
         let vrm = match (format, doc.avatar.as_ref()) {
             ("vrm", Some(avatar)) => Some((avatar, AvatarVersion::V1)),
             ("vrm0", Some(avatar)) => Some((avatar, AvatarVersion::V0)),
@@ -133,6 +136,7 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
                 exchange::gltf::uv_layer_diagnostics(&doc, &snapshot, vrm)?;
             losses.extend(uv_losses);
             warnings.extend(uv_warnings);
+            losses.extend(exchange::gltf::mesh_export_losses(&doc, &snapshot)?);
         }
         if matches!(format, "fbx" | "fbx-binary") {
             losses.extend(exchange::fbx::uv_texture_losses(&doc, &snapshot));
@@ -463,13 +467,21 @@ pub(crate) fn export_losses(
                     suggestion: Some("export as blend to preserve node visibility".to_owned()),
                 });
             }
-            if snapshot
-                .map_or(node.materials.as_slice(), |snapshot| {
-                    snapshot.material_slots(id, node)
-                })
-                .iter()
-                .any(Option::is_some)
-            {
+            let data_block = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id));
+            let has_material_binding = snapshot.map_or_else(
+                || {
+                    (0..node.material_slot_count(data_block))
+                        .any(|slot| node.material_slot(data_block, slot).is_some())
+                },
+                |snapshot| {
+                    (0..snapshot.slot_count(id, node, data_block))
+                        .any(|slot| snapshot.slot_material(id, node, data_block, slot).is_some())
+                },
+            );
+            if has_material_binding {
                 losses.push(Loss {
                     feature_id: "material.binding".to_owned(),
                     data_id: Some(id.to_string()),
@@ -578,8 +590,13 @@ pub(crate) fn export_losses(
         }
     }
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
-        losses.extend(material_losses(doc));
-        losses.extend(mesh_color_losses(doc));
+        losses.extend(material_losses(doc, snapshot));
+    }
+    if matches!(format, "fbx" | "fbx-binary")
+        && let Some(snapshot) = snapshot
+    {
+        losses.extend(exchange::fbx::material_slot_losses(doc, snapshot));
+        losses.extend(exchange::fbx::uv_texture_losses(doc, snapshot));
     }
     if let Some(loss) = avatar_settings_loss(doc, format) {
         losses.push(loss);
@@ -587,57 +604,32 @@ pub(crate) fn export_losses(
     losses
 }
 
-/// Blender color layers on meshes that nodes use. glTF export does not write them yet (`COLOR_0` is
-/// pending), so each layer is a reported loss rather than a silent drop.
-fn mesh_color_losses(doc: &SceneDoc) -> Vec<Loss> {
-    let data_ids = doc
-        .nodes
-        .values()
-        .filter_map(|node| node.data.as_ref())
-        .collect::<BTreeSet<_>>();
-    let mut losses = Vec::new();
-    for data_id in data_ids {
-        let Some(mesh) = doc
-            .data_blocks
-            .get(data_id)
-            .and_then(|data| data.mesh.as_ref())
-        else {
-            continue;
-        };
-        let Some(entries) = mesh
-            .attributes
-            .get("blender_attributes")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for entry in entries {
-            let is_color = is_color_attribute(entry);
-            let Some(name) = entry["name"].as_str().filter(|_| is_color) else {
-                continue;
-            };
-            losses.push(Loss {
-                feature_id: "mesh.color_attribute".to_owned(),
-                data_id: Some(data_id.to_string()),
-                reason: format!(
-                    "glTF export does not write the Blender color attribute `{name}` on mesh `{data_id}` (COLOR_0 export is not implemented)"
-                ),
-                suggestion: Some(
-                    "export with --allow-lossy to omit the color layer, or remove it before export"
-                        .to_owned(),
-                ),
-            });
-        }
-    }
-    losses
-}
-
 /// Material losses for glTF-family output: graph parts the resolver cannot represent. Texture
 /// samples on any UV layer export as their own `TEXCOORD_k`, so they need no loss here.
-fn material_losses(doc: &SceneDoc) -> Vec<Loss> {
+fn material_losses(doc: &SceneDoc, snapshot: Option<&Snapshot>) -> Vec<Loss> {
     let mut losses = Vec::new();
+    let used_materials = doc
+        .nodes
+        .iter()
+        .flat_map(|(node_id, node)| {
+            let data_block = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id));
+            let slot_count = snapshot.map_or_else(
+                || node.material_slot_count(data_block),
+                |snapshot| snapshot.slot_count(node_id, node, data_block),
+            );
+            (0..slot_count).filter_map(move |slot| {
+                snapshot.map_or_else(
+                    || node.material_slot(data_block, slot),
+                    |snapshot| snapshot.slot_material(node_id, node, data_block, slot),
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>();
     for id in doc.materials.keys() {
-        if !material_is_used(doc, id) {
+        if !used_materials.contains(&id) {
             continue;
         }
         // An unresolvable graph is reported by the export itself, so it adds no loss here.

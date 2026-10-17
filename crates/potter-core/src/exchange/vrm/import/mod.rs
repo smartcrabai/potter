@@ -189,18 +189,26 @@ fn apply_material_render_state(doc: &mut SceneDoc, index: &GltfIndex) {
         let Some(value) = materials.get(material_index) else {
             continue;
         };
-        let Some(material) = doc.materials.get_mut(id) else {
-            continue;
-        };
-        match value["alphaMode"].as_str() {
-            Some("MASK") => {
-                "clip".clone_into(&mut material.alpha_mode);
-                material.alpha_threshold = value["alphaCutoff"].as_f64().unwrap_or(0.5);
+        for id in std::iter::once(id).chain(
+            index
+                .color_material_variants
+                .get(id)
+                .into_iter()
+                .flat_map(|variants| variants.values()),
+        ) {
+            let Some(material) = doc.materials.get_mut(id) else {
+                continue;
+            };
+            match value["alphaMode"].as_str() {
+                Some("MASK") => {
+                    "clip".clone_into(&mut material.alpha_mode);
+                    material.alpha_threshold = value["alphaCutoff"].as_f64().unwrap_or(0.5);
+                }
+                Some("BLEND") => "blend".clone_into(&mut material.alpha_mode),
+                _ => "opaque".clone_into(&mut material.alpha_mode),
             }
-            Some("BLEND") => "blend".clone_into(&mut material.alpha_mode),
-            _ => "opaque".clone_into(&mut material.alpha_mode),
+            material.double_sided = value["doubleSided"].as_bool().unwrap_or(false);
         }
-        material.double_sided = value["doubleSided"].as_bool().unwrap_or(false);
     }
 }
 
@@ -307,6 +315,23 @@ impl<'a> Decoder<'a> {
             .get(index)
             .cloned()
             .ok_or_else(|| import_error("VRM references a missing glTF material"))
+    }
+
+    /// Original Potter material followed by its color-layer variants for a glTF material index.
+    pub(super) fn material_ids(&self, index: usize) -> Result<Vec<Id>> {
+        let original = self.material_id(index)?;
+        let mut materials = Vec::with_capacity(
+            1 + self
+                .index
+                .color_material_variants
+                .get(&original)
+                .map_or(0, BTreeMap::len),
+        );
+        materials.push(original.clone());
+        if let Some(variants) = self.index.color_material_variants.get(&original) {
+            materials.extend(variants.values().cloned());
+        }
+        Ok(materials)
     }
 
     /// Potter image for a glTF image index.
@@ -634,4 +659,236 @@ fn required_feature(error: &PotError) -> String {
             || "vrm.avatar".to_owned(),
             |component| format!("vrm.{component}"),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::{
+        graph::{GraphKind, GraphNode, NodeGroup},
+        image::ImageInterpolation,
+        model::{Material, TextureRef},
+    };
+
+    use super::*;
+
+    fn shared_material_fixture(root: Value) -> Result<(SceneDoc, GltfIndex, Id, Id)> {
+        let source = Id::new("shared")?;
+        let variant = Id::new("shared_color")?;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.materials.insert(
+            source.clone(),
+            Material {
+                name: "shared".to_owned(),
+                ..Material::default()
+            },
+        );
+        doc.materials.insert(
+            variant.clone(),
+            Material {
+                name: "shared".to_owned(),
+                ..Material::default()
+            },
+        );
+        let index = GltfIndex {
+            root,
+            basis: DMat4::IDENTITY,
+            node_ids: Vec::new(),
+            node_worlds: Vec::new(),
+            material_ids: vec![source.clone()],
+            color_material_variants: BTreeMap::from([(
+                source.clone(),
+                BTreeMap::from([("Paint".to_owned(), variant.clone())]),
+            )]),
+            image_ids: Vec::new(),
+            mesh_shape_key_ids: Vec::new(),
+            joint_bones: BTreeMap::new(),
+        };
+        Ok((doc, index, source, variant))
+    }
+
+    fn shared_material_root(mtoon: Value) -> Value {
+        json!({
+            "materials": [{
+                "name": "shared",
+                "alphaMode": "BLEND",
+                "doubleSided": true,
+                "extensions": {"VRMC_materials_mtoon": mtoon}
+            }],
+            "meshes": [{"primitives": [
+                {"material": 0, "attributes": {"COLOR_0": 1}},
+                {"material": 0, "attributes": {"POSITION": 0}}
+            ]}]
+        })
+    }
+
+    #[test]
+    fn vrm_v1_material_metadata_reaches_color_variants() -> Result<()> {
+        let root = shared_material_root(json!({}));
+        assert_eq!(root["meshes"][0]["primitives"][0]["material"], json!(0));
+        assert_eq!(root["meshes"][0]["primitives"][1]["material"], json!(0));
+        assert!(root["meshes"][0]["primitives"][0]["attributes"]["COLOR_0"].is_number());
+        assert!(root["meshes"][0]["primitives"][1]["attributes"]["COLOR_0"].is_null());
+        let (mut doc, index, source, variant) = shared_material_fixture(root)?;
+        let extension = json!({
+            "expressions": {
+                "custom": {"smile": {
+                    "materialColorBinds": [{
+                        "material": 0,
+                        "type": "shadeColor",
+                        "targetValue": [0.2, 0.3, 0.4, 1.0]
+                    }],
+                    "textureTransformBinds": [{
+                        "material": 0,
+                        "scale": [2.0, 3.0],
+                        "offset": [0.1, 0.2]
+                    }]
+                }}
+            }
+        });
+        apply_material_render_state(&mut doc, &index);
+        assert_eq!(doc.materials[&variant].alpha_mode, "blend");
+        assert_eq!(doc.materials[&variant].double_sided, true);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let mut decoder = Decoder::new(AvatarVersion::V1, &index, &doc, &snapshot, &extension);
+        assert_eq!(decoder.material_id(0)?, source);
+        assert_eq!(
+            decoder.material_ids(0)?,
+            vec![source.clone(), variant.clone()]
+        );
+        let mtoon = mtoon::decode(&mut decoder)?;
+        assert_eq!(mtoon[&source], mtoon[&variant]);
+        let expressions = expression::decode(&mut decoder, &mtoon)?;
+        let expression = &expressions["smile"];
+        assert_eq!(
+            expression
+                .material_color_binds
+                .iter()
+                .map(|bind| bind.material.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([source.clone(), variant.clone()])
+        );
+        assert_eq!(
+            expression
+                .texture_transform_binds
+                .iter()
+                .map(|bind| bind.material.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([source, variant])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vrm_v0_material_names_and_binds_use_originals_and_variants() -> Result<()> {
+        let root = shared_material_root(json!({}));
+        let (doc, index, source, variant) = shared_material_fixture(root)?;
+        let extension = json!({
+            "materialProperties": [{
+                "shader": "VRM/MToon",
+                "floatProperties": {},
+                "vectorProperties": {},
+                "textureProperties": {}
+            }],
+            "blendShapeMaster": {"blendShapeGroups": [{
+                "name": "smile",
+                "binds": [],
+                "materialValues": [
+                    {
+                        "propertyName": "_RimColor",
+                        "materialName": "shared",
+                        "targetValue": [0.2, 0.3, 0.4, 1.0]
+                    },
+                    {
+                        "propertyName": "_MainTex_ST",
+                        "materialName": "shared",
+                        "targetValue": [2.0, 3.0, 0.1, 0.2]
+                    }
+                ]
+            }]}
+        });
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let mut decoder = Decoder::new(AvatarVersion::V0, &index, &doc, &snapshot, &extension);
+        let mtoon = mtoon::decode(&mut decoder)?;
+        assert_eq!(mtoon[&source], mtoon[&variant]);
+        let expressions = expression::decode(&mut decoder, &mtoon)?;
+        let expression = &expressions["smile"];
+        assert_eq!(
+            expression
+                .material_color_binds
+                .iter()
+                .map(|bind| bind.material.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([source.clone(), variant.clone()])
+        );
+        assert_eq!(
+            expression
+                .texture_transform_binds
+                .iter()
+                .map(|bind| bind.material.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([source, variant])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vrm_v0_main_texture_transform_rebuilds_variant_graph() -> Result<()> {
+        let root = shared_material_root(json!({}));
+        let (mut doc, index, source, variant) = shared_material_fixture(root)?;
+        let image = Id::new("image")?;
+        doc.materials
+            .get_mut(&source)
+            .ok_or_else(|| import_error("source material fixture is missing"))?
+            .base_color_texture = Some(TextureRef {
+            image,
+            uv_layer: None,
+            interpolation: ImageInterpolation::Linear,
+        });
+        let variant_graph_id = Id::new("variant_graph")?;
+        let mut variant_graph = NodeGroup::new("variant", GraphKind::Shader);
+        variant_graph
+            .nodes
+            .insert(Id::new("bsdf")?, GraphNode::new("ShaderNodeBsdfPrincipled"));
+        doc.node_groups
+            .insert(variant_graph_id.clone(), variant_graph);
+        doc.materials
+            .get_mut(&variant)
+            .ok_or_else(|| import_error("color variant fixture is missing"))?
+            .node_tree = Some(variant_graph_id.clone());
+        let extension = json!({
+            "materialProperties": [{
+                "shader": "VRM/MToon",
+                "vectorProperties": {"_MainTex": [0.25, 0.5, 2.0, 3.0]}
+            }]
+        });
+        let moved = mtoon::move_main_texture_transforms(&mut doc, &index, &extension)?;
+        assert!(moved.contains(&source));
+        let source_graph_id = doc.materials[&source]
+            .node_tree
+            .as_ref()
+            .ok_or_else(|| import_error("source graph fixture is missing"))?;
+        let source_graph = &doc.node_groups[source_graph_id];
+        let variant_graph = &doc.node_groups[&variant_graph_id];
+        let source_mapping = source_graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeMapping")
+            .ok_or_else(|| import_error("transformed source graph has no Mapping node"))?;
+        let variant_mapping = variant_graph
+            .nodes
+            .values()
+            .find(|node| node.node_type == "ShaderNodeMapping")
+            .ok_or_else(|| import_error("variant graph did not receive the Mapping node"))?;
+        assert_eq!(source_mapping.inputs, variant_mapping.inputs);
+        let color_nodes = variant_graph
+            .nodes
+            .values()
+            .filter(|node| node.node_type == "ShaderNodeVertexColor")
+            .collect::<Vec<_>>();
+        assert_eq!(color_nodes.len(), 1);
+        assert_eq!(color_nodes[0].properties["layer_name"], json!("Paint"));
+        Ok(())
+    }
 }

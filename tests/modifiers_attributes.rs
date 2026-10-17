@@ -2387,6 +2387,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         json!({"domain":"corner","type":"color","values":{"f0":[[0.2,0.3,0.4,1.0],[0.3,0.3,0.4,1.0],[0.4,0.3,0.4,1.0],[0.5,0.3,0.4,1.0]]}}),
     );
     domain_source.attributes.insert(
+        "color_layers".to_owned(),
+        json!({"layers":["color"],"active":"color","render":"color"}),
+    );
+    domain_source.attributes.insert(
         "smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":true}}),
     );
@@ -2840,13 +2844,6 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         json!({"domain":"corner","type":"float3","values":{
             "f0":[[1,0,0],[1,0,0],[1,0,0]],
             "f1":[[1,0,0],[1,0,0],[1,0,0]]
-        }}),
-    );
-    mesh.attributes.insert(
-        "color".to_owned(),
-        json!({"domain":"corner","type":"color","values":{
-            "f0":[[0,0,0,1],[0,0,0,1],[0,0,0,1]],
-            "f1":[[0,0,0,1],[0,0,0,1],[0,0,0,1]]
         }}),
     );
     mesh.attributes.insert(

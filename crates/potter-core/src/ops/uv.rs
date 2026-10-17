@@ -733,9 +733,15 @@ fn reach<'a>(doc: &SceneDoc, nodes: impl IntoIterator<Item = &'a Id>) -> Reach {
     let mut pending: Vec<Id> = Vec::new();
     for node_id in nodes {
         if let Some(node) = doc.nodes.get(node_id) {
-            reached
-                .materials
-                .extend(node.materials.iter().flatten().cloned());
+            let data = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id));
+            for slot in 0..node.material_slot_count(data) {
+                if let Some(material) = node.material_slot(data, slot) {
+                    reached.materials.insert(material.clone());
+                }
+            }
             pending.extend(node.modifiers.iter().filter_map(modifier_node_group));
         }
     }
@@ -981,13 +987,13 @@ fn rename_layer_references(
                 changed = true;
             }
         }
+
         if changed {
             changes.node_groups.push(graph_id.clone());
         }
     }
     changes
 }
-
 fn edit_targets(
     engine: &mut Engine<'_>,
     targets: Vec<Id>,
@@ -2597,7 +2603,7 @@ mod tests {
             .insert("uv_layers".to_owned(), uv_layers_attribute(&entries));
         mesh.attributes.insert(
             "seam".to_owned(),
-            json!({"domain":"edge","values":seam_values}),
+            json!({"domain":"edge","type":"bool","values":seam_values}),
         );
         run_uv(
             &mut doc,

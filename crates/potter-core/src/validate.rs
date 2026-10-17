@@ -299,6 +299,22 @@ pub fn validate_with_context(
                 );
             }
         }
+        let data = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
+        let slot_count = node.material_slot_count(data);
+        if node.material_links.len() > slot_count {
+            issue(
+                &mut issues,
+                "error",
+                "INVALID_VALUE",
+                "Node material link table exceeds the material slot count.",
+                Some(id.to_string()),
+                Some(format!("/nodes/{id}/material_links")),
+                json!({"link_count":node.material_links.len(),"slot_count":slot_count}),
+            );
+        }
         if let Some(action) = &node.action
             && !doc.actions.contains_key(action)
         {
@@ -400,6 +416,20 @@ pub fn validate_with_context(
                 json!({"target":action}),
             );
         }
+        for material in data.materials.iter().flatten() {
+            if !doc.materials.contains_key(material) {
+                issue(
+                    &mut issues,
+                    "error",
+                    "MISSING_REFERENCE",
+                    "Data-Block material slot references a missing Material.",
+                    Some(data_id.to_string()),
+                    Some(format!("/data_blocks/{data_id}/materials")),
+                    json!({"target":material}),
+                );
+            }
+        }
+
         if let Some(mesh) = &data.mesh {
             inspect_mesh(mesh, data_id, &mut issues);
             for (node_id, node) in doc
@@ -407,21 +437,23 @@ pub fn validate_with_context(
                 .iter()
                 .filter(|(_, node)| node.data.as_ref() == Some(data_id))
             {
-                if !node.materials.is_empty() {
-                    for face in &mesh.faces {
-                        if usize::try_from(face.material_index)
-                            .map_or(true, |index| index >= node.materials.len())
-                        {
-                            issue(
-                                &mut issues,
-                                "error",
-                                "INVALID_INDEX",
-                                "Face material_index is outside the Object material slots.",
-                                Some(data_id.to_string()),
-                                Some(format!("/data_blocks/{data_id}/mesh/faces/{}", face.id)),
-                                json!({"node_id":node_id,"material_index":face.material_index,"slot_count":node.materials.len()}),
-                            );
-                        }
+                let slot_count = node.material_slot_count(Some(data));
+                if slot_count == 0 {
+                    continue;
+                }
+                for face in &mesh.faces {
+                    if usize::try_from(face.material_index)
+                        .map_or(true, |index| index >= slot_count)
+                    {
+                        issue(
+                            &mut issues,
+                            "error",
+                            "INVALID_INDEX",
+                            "Face material_index is outside the effective material slots.",
+                            Some(data_id.to_string()),
+                            Some(format!("/data_blocks/{data_id}/mesh/faces/{}", face.id)),
+                            json!({"node_id":node_id,"material_index":face.material_index,"slot_count":slot_count}),
+                        );
                     }
                 }
             }

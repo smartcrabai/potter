@@ -4106,3 +4106,215 @@ fn mirrored_vrm1_export_reimports_with_the_winding_its_normals_describe() -> Tes
     }
     Ok(())
 }
+
+#[test]
+fn vrm_preserves_selected_point_color_layer_through_import_and_reexport() -> TestResult {
+    const COLOR_LAYER: &str = "BodyPaint";
+    const BODY_COLORS: [[f64; 4]; 8] = [
+        [0.125, 0.25, 0.375, 0.5],
+        [0.25, 0.375, 0.5, 0.625],
+        [0.375, 0.5, 0.625, 0.75],
+        [0.5, 0.625, 0.75, 0.875],
+        [0.625, 0.75, 0.875, 1.0],
+        [0.75, 0.875, 1.0, 0.125],
+        [0.875, 1.0, 0.125, 0.25],
+        [1.0, 0.125, 0.25, 0.375],
+    ];
+
+    let (directory, project) = new_fixture(FixtureOptions::default())?;
+    let source_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let source_data = source_scene["nodes"]["body"]["data"]
+        .as_str()
+        .ok_or("fixture body has no mesh data")?;
+    let source_vertices = source_scene["data_blocks"][source_data]["mesh"]["vertices"]
+        .as_array()
+        .ok_or("fixture body mesh has no vertices")?;
+    assert_eq!(source_vertices.len(), BODY_COLORS.len());
+
+    let mut expected_by_vertex_id = std::collections::BTreeMap::new();
+    let mut operations = vec![json!({
+        "op": "mesh.attribute_create",
+        "target": {"id": "body"},
+        "scope": "single_user",
+        "name": COLOR_LAYER,
+        "domain": "point",
+        "type": "color",
+        "default": [0.0, 0.0, 0.0, 1.0],
+    })];
+    for (vertex, color) in source_vertices.iter().zip(BODY_COLORS) {
+        let vertex_id = vertex["id"]
+            .as_u64()
+            .ok_or("fixture body vertex has no ID")?;
+        expected_by_vertex_id.insert(vertex_id, color);
+        operations.push(json!({
+            "op": "mesh.attribute_update",
+            "target": {"id": "body"},
+            "elements": {"domain": "vertex", "ids": [format!("v{vertex_id}")]},
+            "name": COLOR_LAYER,
+            "value": color,
+        }));
+    }
+    operations.extend([
+        json!({
+            "op": "material.create",
+            "id": "body_vertex_color",
+            "name": "Body Vertex Color",
+            "graph": {
+                "kind": "shader",
+                "nodes": {
+                    "output": {"type": "OutputMaterial"},
+                    "principled": {"type": "ShaderNodeBsdfPrincipled"},
+                    "vertex_color": {
+                        "type": "ShaderNodeVertexColor",
+                        "properties": {"layer_name": COLOR_LAYER},
+                    },
+                },
+                "links": [
+                    {
+                        "from_node": "vertex_color",
+                        "from_socket": "Color",
+                        "to_node": "principled",
+                        "to_socket": "Base Color",
+                    },
+                    {
+                        "from_node": "principled",
+                        "from_socket": "BSDF",
+                        "to_node": "output",
+                        "to_socket": "Surface",
+                    },
+                ],
+            },
+        }),
+        json!({
+            "op": "node.update",
+            "target": {"id": "body"},
+            "set": {"materials": ["body_vertex_color"]},
+        }),
+    ]);
+    apply_success(&project, revision(&project)?, &operations)?;
+
+    let vrm_path = directory.path().join("body-point-colors.vrm");
+    export(&project, "vrm", &vrm_path)?;
+    let vrm = parse_glb(&vrm_path)?;
+    let body_node = gltf_node_index(&vrm.json, "body");
+    let body_mesh = &vrm.json["meshes"][usize_field(&vrm.json["nodes"][body_node]["mesh"])];
+    let vertex_ids = body_mesh["extras"]["potter"]["vertex_ids"]
+        .as_array()
+        .ok_or("exported body mesh has no Potter vertex IDs")?;
+    let primitives = body_mesh["primitives"]
+        .as_array()
+        .ok_or("exported body mesh has no primitives")?;
+    assert_eq!(primitives.len(), 1);
+    let primitive = &primitives[0];
+    let color_accessor = usize_field(&primitive["attributes"]["COLOR_0"]);
+    assert_eq!(vrm.json["accessors"][color_accessor]["componentType"], 5126);
+    assert_eq!(vrm.json["accessors"][color_accessor]["type"], "VEC4");
+    assert_eq!(primitive["extras"]["potter"]["color_layer"], COLOR_LAYER);
+    let exported_colors = accessor_matrix(&vrm, color_accessor)?;
+    assert_eq!(exported_colors.len(), vertex_ids.len(), "COLOR_0 is dense");
+    for (actual, vertex_id) in exported_colors.iter().zip(vertex_ids) {
+        let vertex_id = vertex_id
+            .as_u64()
+            .ok_or("exported body mesh vertex ID is invalid")?;
+        let source_color = expected_by_vertex_id
+            .get(&vertex_id)
+            .ok_or("exported body mesh references an unknown source vertex")?;
+        let expected = *source_color;
+        assert_eq!(actual.as_slice(), expected.as_slice(), "vertex {vertex_id}");
+    }
+
+    let (_fresh_directory, fresh_project) = init_project()?;
+    let fresh_revision = revision(&fresh_project)?;
+    let imported = pot()
+        .arg("import")
+        .arg(&fresh_project)
+        .arg("--file")
+        .arg(&vrm_path)
+        .args(["--format", "vrm", "--base-revision"])
+        .arg(fresh_revision.to_string())
+        .args(["--mode", "replace", "--json"])
+        .output()?;
+    assert!(
+        imported.status.success(),
+        "pot import failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&imported.stdout),
+        String::from_utf8_lossy(&imported.stderr)
+    );
+
+    let imported_scene: Value =
+        serde_json::from_slice(&fs::read(fresh_project.join("scene.json"))?)?;
+    let imported_data = imported_scene["nodes"]["body"]["data"]
+        .as_str()
+        .ok_or("imported body has no mesh data")?;
+    let imported_mesh = &imported_scene["data_blocks"][imported_data]["mesh"];
+    let color_store = &imported_mesh["attributes"]["color_layers"];
+    assert_eq!(color_store["layers"], json!([COLOR_LAYER]));
+    assert_eq!(color_store["active"], COLOR_LAYER);
+    assert_eq!(color_store["render"], COLOR_LAYER);
+    let color_attribute = &imported_mesh["attributes"][COLOR_LAYER];
+    assert_eq!(color_attribute["domain"], "point");
+    assert_eq!(color_attribute["type"], "color");
+    let imported_vertices = imported_mesh["vertices"]
+        .as_array()
+        .ok_or("imported body mesh has no vertices")?;
+    let mut source_vertex_order = Vec::new();
+    for vertex_id in vertex_ids {
+        let vertex_id = vertex_id
+            .as_u64()
+            .ok_or("exported body mesh vertex ID is invalid")?;
+        if !source_vertex_order.contains(&vertex_id) {
+            source_vertex_order.push(vertex_id);
+        }
+    }
+    assert_eq!(imported_vertices.len(), source_vertex_order.len());
+    for (vertex, source_vertex_id) in imported_vertices.iter().zip(source_vertex_order) {
+        let vertex_id = vertex["id"]
+            .as_u64()
+            .ok_or("imported body vertex has no ID")?;
+        let value_key = format!("v{vertex_id}");
+        let actual = color_attribute["values"]
+            .get(value_key.as_str())
+            .ok_or("imported body vertex color is missing")?;
+        let source_color = expected_by_vertex_id
+            .get(&source_vertex_id)
+            .ok_or("imported body references an unknown source vertex")?;
+        let expected = source_color.map(|channel| f64::from(channel as f32));
+        assert_eq!(
+            json_numbers::<4>(actual)?,
+            expected,
+            "imported vertex {vertex_id} from source vertex {source_vertex_id}"
+        );
+    }
+
+    let reexport_path = directory.path().join("body-point-colors-roundtrip.vrm");
+    export(&fresh_project, "vrm", &reexport_path)?;
+    let reexported = parse_glb(&reexport_path)?;
+    let reexport_node = gltf_node_index(&reexported.json, "body");
+    let reexport_mesh =
+        &reexported.json["meshes"][usize_field(&reexported.json["nodes"][reexport_node]["mesh"])];
+    let reexport_vertex_ids = reexport_mesh["extras"]["potter"]["vertex_ids"]
+        .as_array()
+        .ok_or("re-exported body mesh has no Potter vertex IDs")?;
+    let reexport_primitive = reexport_mesh["primitives"]
+        .as_array()
+        .and_then(|primitives| {
+            primitives
+                .iter()
+                .find(|primitive| primitive["attributes"]["COLOR_0"].is_u64())
+        })
+        .ok_or("re-exported body has no COLOR_0 accessor")?;
+    let reexport_accessor = usize_field(&reexport_primitive["attributes"]["COLOR_0"]);
+    let reexport_colors = accessor_matrix(&reexported, reexport_accessor)?;
+    assert_eq!(reexport_colors.len(), reexport_vertex_ids.len());
+    for (actual, vertex_id) in reexport_colors.iter().zip(reexport_vertex_ids) {
+        let vertex_id = vertex_id
+            .as_u64()
+            .ok_or("re-exported body mesh vertex ID is invalid")?;
+        let source_color = expected_by_vertex_id
+            .get(&vertex_id)
+            .ok_or("re-exported body mesh references an unknown source vertex")?;
+        let expected = *source_color;
+        assert_eq!(actual.as_slice(), expected.as_slice(), "vertex {vertex_id}");
+    }
+    Ok(())
+}

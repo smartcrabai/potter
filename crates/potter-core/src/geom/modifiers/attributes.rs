@@ -8,7 +8,10 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Edge, Face, Mesh, Vertex,
+        Edge, Face, Mesh, Vertex, attribute_keys,
+        clnor::{self, NormalCodeOptions, SetterInput},
+        color_layers::{self, ColorDomain, ColorLayer},
+        normals::corner_normals,
         uv_layers::{self, UvLayer, UvStore},
     },
     model::{CameraData, Modifier},
@@ -1077,9 +1080,8 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             incident.entry(*vertex_id).or_default().push(face_index);
         }
     }
-    let mut corner_values = Map::new();
+    let mut vectors: Vec<Option<DVec3>> = Vec::new();
     for (face_index, face) in mesh.faces.iter().enumerate() {
-        let mut corners = Vec::with_capacity(face.vertices.len());
         for vertex_id in &face.vertices {
             let current = normals[face_index];
             let incident_faces = incident.get(vertex_id).map_or(&[][..], Vec::as_slice);
@@ -1148,15 +1150,18 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 }
                 normal = current.lerp(normal, factor).normalize_or_zero();
             }
-            corners.push(json!(normal.to_array()));
+            vectors.push(Some(normal));
         }
-        corner_values.insert(format!("f{}", face.id), Value::Array(corners));
     }
     let mut result = mesh.clone();
-    result.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":corner_values}),
-    );
+    clnor::encode_vectors(
+        &mut result,
+        Some(&vectors),
+        NormalCodeOptions {
+            corner_order: None,
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )?;
     Ok(result)
 }
 
@@ -1249,10 +1254,9 @@ fn normal_edit(
     let invert_group = boolean(modifier, "invert_vertex_group")?;
     let target_origin = target.local_to_subject.transform_point3(DVec3::ZERO);
     let target_direction = (target_origin - offset).normalize_or_zero();
-    let mut values = Map::new();
+    let mut vectors: Vec<Option<DVec3>> = Vec::new();
     for face in &mesh.faces {
         let base = face_normal(mesh, face)?;
-        let mut corners = Vec::with_capacity(face.vertices.len());
         for vertex_id in &face.vertices {
             let vertex = mesh
                 .vertices
@@ -1284,15 +1288,18 @@ fn normal_edit(
                 }
             }
             let normal = base.slerp(mixed, blend_factor).normalize_or_zero();
-            corners.push(json!(normal.to_array()));
+            vectors.push(Some(normal));
         }
-        values.insert(format!("f{}", face.id), Value::Array(corners));
     }
     let mut result = mesh.clone();
-    result.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":values}),
-    );
+    clnor::encode_vectors(
+        &mut result,
+        Some(&vectors),
+        NormalCodeOptions {
+            corner_order: None,
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )?;
     Ok(result)
 }
 
@@ -1618,11 +1625,11 @@ fn data_transfer(
                     mask_weights.as_ref(),
                     invert_mask,
                 )?,
-                "COLOR_VERTEX" => transfer_vertex_attribute(
+                "COLOR_VERTEX" => transfer_color_layer(
                     &mut result,
                     &source.mesh,
+                    ColorDomain::Point,
                     modifier,
-                    "color",
                     vertex_mapping,
                     source_transform,
                     factor,
@@ -1703,16 +1710,17 @@ fn data_transfer(
                     source_transform,
                     factor,
                 )?,
-                "COLOR_CORNER" => transfer_typed_attribute(
+                "COLOR_CORNER" => transfer_color_layer(
                     &mut result,
                     &source.mesh,
+                    ColorDomain::Corner,
                     modifier,
-                    "color",
-                    "color",
                     loop_mapping,
                     source_transform,
                     factor,
                     mix_mode,
+                    mask_weights.as_ref(),
+                    invert_mask,
                 )?,
                 _ => {
                     return Err(invalid(
@@ -2056,7 +2064,8 @@ fn transfer_vertex_attribute(
     mask_weights: Option<&BTreeMap<u32, f64>>,
     invert_mask: bool,
 ) -> Result<()> {
-    let Some(source_attribute) = source.attributes.get(name) else {
+    let key = attribute_keys::storage_key(name).into_owned();
+    let Some(source_attribute) = source.attributes.get(&key) else {
         return Ok(());
     };
     let source_values = source_attribute
@@ -2064,7 +2073,7 @@ fn transfer_vertex_attribute(
         .and_then(Value::as_object)
         .or_else(|| source_attribute.as_object())
         .ok_or_else(|| invalid(modifier, name, "a vertex-ID keyed source attribute"))?;
-    let destination_attribute = destination.attributes.get(name);
+    let destination_attribute = destination.attributes.get(&key);
     let mut output = destination_attribute
         .and_then(|attribute| attribute.get("values"))
         .and_then(Value::as_object)
@@ -2118,11 +2127,9 @@ fn transfer_vertex_attribute(
         fields.insert("values".to_owned(), Value::Object(output));
         destination
             .attributes
-            .insert(name.to_owned(), Value::Object(fields));
+            .insert(key.clone(), Value::Object(fields));
     } else {
-        destination
-            .attributes
-            .insert(name.to_owned(), Value::Object(output));
+        destination.attributes.insert(key, Value::Object(output));
     }
     Ok(())
 }
@@ -2419,19 +2426,27 @@ fn transfer_custom_normals(
     source_transform: DMat4,
     factor: f64,
 ) -> Result<()> {
-    let source_values = source
-        .attributes
-        .get("custom_normal")
-        .and_then(|value| value.get("values"))
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid(modifier, "data_types_loops", "source custom normals"))?;
-    let mut values = destination
-        .attributes
-        .get("custom_normal")
-        .and_then(|value| value.get("values"))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    if clnor::corner_codes(source)?.is_none() {
+        return Err(invalid(
+            modifier,
+            "data_types_loops",
+            "source custom normals",
+        ));
+    }
+    // Blender transfers the final loop normals: authored vectors, and computed normals where automatic.
+    let source_final = corner_normals(source, &mesh_points(source))?;
+    let source_values = final_normal_rows(source, &source_final);
+    let destination_final = corner_normals(destination, &mesh_points(destination))?;
+    let destination_offsets: Vec<usize> = destination
+        .faces
+        .iter()
+        .scan(0, |total, face| {
+            let start = *total;
+            *total += face.vertices.len();
+            Some(start)
+        })
+        .collect();
+    let mut updates: Vec<(usize, Option<DVec3>)> = Vec::new();
     for (index, face) in destination.faces.iter().enumerate() {
         let source_face = if mapping == "TOPOLOGY" {
             source.faces.get(index)
@@ -2447,47 +2462,57 @@ fn transfer_custom_normals(
         else {
             continue;
         };
-        let normals = face
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(corner, vertex_id)| {
-                let source_normal = destination
-                    .vertices
-                    .iter()
-                    .find(|vertex| vertex.id == *vertex_id)
-                    .and_then(|vertex| {
-                        interpolate_face_corner_value(
-                            source,
-                            source_face,
-                            source_normals,
-                            source_transform,
-                            vertex.co,
-                        )
-                    })
-                    .as_ref()
-                    .and_then(value3)
-                    .unwrap_or(DVec3::Z);
-                let old = values
-                    .get(&format!("f{}", face.id))
-                    .and_then(Value::as_array)
-                    .and_then(|normals| normals.get(corner))
-                    .and_then(value3)
-                    .unwrap_or(DVec3::Z);
-                json!(
-                    old.lerp(source_normal, factor)
-                        .normalize_or_zero()
-                        .to_array()
-                )
-            })
-            .collect::<Vec<_>>();
-        values.insert(format!("f{}", face.id), Value::Array(normals));
+        for (corner, vertex_id) in face.vertices.iter().enumerate() {
+            let source_normal = destination
+                .vertices
+                .iter()
+                .find(|vertex| vertex.id == *vertex_id)
+                .and_then(|vertex| {
+                    interpolate_face_corner_value(
+                        source,
+                        source_face,
+                        source_normals,
+                        source_transform,
+                        vertex.co,
+                    )
+                })
+                .as_ref()
+                .and_then(value3)
+                .unwrap_or(DVec3::Z);
+            let old = destination_final[destination_offsets[index] + corner];
+            let blended = old.lerp(source_normal, factor).normalize_or_zero();
+            updates.push((destination_offsets[index] + corner, Some(blended)));
+        }
     }
-    destination.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":values}),
-    );
-    Ok(())
+    clnor::encode_vector_updates(
+        destination,
+        &updates,
+        NormalCodeOptions {
+            corner_order: None,
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )
+}
+
+/// The vertex coordinates of `mesh` in storage order, as the normal computation takes them.
+fn mesh_points(mesh: &Mesh) -> Vec<DVec3> {
+    mesh.vertices.iter().map(|vertex| vertex.co).collect()
+}
+
+/// Per face `f{id}` rows of the final corner normals of `mesh`, one per corner in face order.
+fn final_normal_rows(mesh: &Mesh, normals: &[DVec3]) -> Map<String, Value> {
+    let mut rows = Map::new();
+    let mut corner = 0;
+    for face in &mesh.faces {
+        let end = corner + face.vertices.len();
+        let row: Vec<Value> = normals[corner..end]
+            .iter()
+            .map(|normal| json!(normal.to_array()))
+            .collect();
+        rows.insert(format!("f{}", face.id), Value::Array(row));
+        corner = end;
+    }
+    rows
 }
 
 fn transfer_typed_attribute(
@@ -2501,7 +2526,9 @@ fn transfer_typed_attribute(
     factor: f64,
     mix_mode: &str,
 ) -> Result<()> {
-    let Some(source_value) = source.attributes.get(source_name) else {
+    let source_key = attribute_keys::storage_key(source_name).into_owned();
+    let destination_key = attribute_keys::storage_key(destination_name).into_owned();
+    let Some(source_value) = source.attributes.get(&source_key) else {
         return Ok(());
     };
     let Some(source_values) = source_value.get("values").and_then(Value::as_object) else {
@@ -2509,7 +2536,7 @@ fn transfer_typed_attribute(
     };
     let mut output = destination
         .attributes
-        .get(destination_name)
+        .get(&destination_key)
         .and_then(|value| value.get("values"))
         .and_then(Value::as_object)
         .cloned()
@@ -2570,10 +2597,123 @@ fn transfer_typed_attribute(
         .and_then(Value::as_str)
         .unwrap_or("float");
     destination.attributes.insert(
-        destination_name.to_owned(),
+        destination_key,
         json!({"domain":domain,"type":kind,"values":output}),
     );
     Ok(())
+}
+
+/// Transfers the render color layer of `source` onto the render color layer of `destination`, in the
+/// domain the transfer writes: point for `COLOR_VERTEX`, corner for `COLOR_CORNER`. A source layer of the
+/// other domain transfers nothing. The destination keeps its render layer when that layer has the same
+/// domain. Otherwise a new layer takes the source layer's name (suffixed when taken) and becomes the render
+/// layer. Values mix as the other transfers do, and the store is rewritten complete.
+fn transfer_color_layer(
+    destination: &mut Mesh,
+    source: &Mesh,
+    domain: ColorDomain,
+    modifier: &Modifier,
+    mapping: &str,
+    source_transform: DMat4,
+    factor: f64,
+    mix_mode: &str,
+    mask_weights: Option<&BTreeMap<u32, f64>>,
+    invert_mask: bool,
+) -> Result<()> {
+    let source_store = color_layers::read(source);
+    let Some(source_layer) = source_store
+        .resolve(None)
+        .0
+        .map(|index| &source_store.layers[index])
+    else {
+        return Ok(());
+    };
+    if source_layer.domain != domain {
+        return Ok(());
+    }
+    let Some(source_attribute) = source
+        .attributes
+        .get(attribute_keys::storage_key(&source_layer.name).as_ref())
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let source_name = source_layer.name.clone();
+    let mut store = color_layers::read(destination);
+    let name = match store.resolve(None).0 {
+        Some(index) if store.layers[index].domain == domain => store.layers[index].name.clone(),
+        _ => {
+            let name = free_attribute_name(destination, &source_name);
+            let count = match domain {
+                ColorDomain::Point => destination.vertices.len(),
+                ColorDomain::Corner => destination
+                    .faces
+                    .iter()
+                    .map(|face| face.vertices.len())
+                    .sum(),
+            };
+            store.layers.push(ColorLayer {
+                name: name.clone(),
+                domain,
+                values: vec![[0.0, 0.0, 0.0, 1.0]; count],
+            });
+            store.render = Some(name.clone());
+            name
+        }
+    };
+    color_layers::write(destination, &store);
+    // The transfers read the source by name, so the source layer is carried under the destination's name.
+    let mut renamed = source.clone();
+    renamed.attributes.insert(
+        attribute_keys::storage_key(&name).into_owned(),
+        source_attribute,
+    );
+    match domain {
+        ColorDomain::Point => transfer_vertex_attribute(
+            destination,
+            &renamed,
+            modifier,
+            &name,
+            mapping,
+            source_transform,
+            factor,
+            mix_mode,
+            mask_weights,
+            invert_mask,
+        )?,
+        ColorDomain::Corner => transfer_typed_attribute(
+            destination,
+            &renamed,
+            modifier,
+            &name,
+            &name,
+            mapping,
+            source_transform,
+            factor,
+            mix_mode,
+        )?,
+    }
+    let transferred = color_layers::read(destination);
+    color_layers::write(destination, &transferred);
+    Ok(())
+}
+
+/// `base`, or `base.001`, `base.002`, … when the mesh already has an attribute with that name.
+fn free_attribute_name(mesh: &Mesh, base: &str) -> String {
+    if !mesh
+        .attributes
+        .contains_key(attribute_keys::storage_key(base).as_ref())
+    {
+        return base.to_owned();
+    }
+    (1_usize..)
+        .map(|index| format!("{base}.{index:03}"))
+        .find(|name| {
+            !mesh
+                .attributes
+                .contains_key(attribute_keys::storage_key(name).as_ref())
+        })
+        .unwrap_or_else(|| base.to_owned())
 }
 
 fn source_vertex_for(

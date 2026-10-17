@@ -146,6 +146,13 @@ pub(crate) struct Anisotropy {
     pub(crate) rotation: f64,
 }
 
+/// The vertex color a base color multiplies in: the primitive's `COLOR_0`, read from the named color
+/// layer. `None` is the render layer, Blender's active color.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VertexColorRead {
+    pub(crate) layer: Option<String>,
+}
+
 /// The glTF material for one Potter material, independent of the writer.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ResolvedSurface {
@@ -154,7 +161,10 @@ pub(crate) struct ResolvedSurface {
     /// `KHR_materials_unlit`: the base color carries the emitted color.
     pub(crate) unlit: bool,
     /// `pbrMetallicRoughness.baseColorFactor` (RGBA, alpha factor included) and texture (RGBA).
+    /// glTF multiplies the vertex color read by `vertex_color` into this value.
     pub(crate) base_color: TexturedValue<[f64; 4]>,
+    /// The vertex color the base color multiplies (`COLOR_0`). `None` when the graph reads none.
+    pub(crate) vertex_color: Option<VertexColorRead>,
     pub(crate) metallic: f64,
     pub(crate) roughness: f64,
     /// glTF metallicRoughnessTexture: G = roughness, B = metallic.
@@ -189,7 +199,7 @@ pub(crate) mod feature_id {
     pub(crate) const NORMAL_MAP: &str = "material.shader_graph.normal_map";
     /// Loss: Mapping rotation about X/Y or a non-invertible TEXTURE mapping.
     pub(crate) const TRANSFORM: &str = "material.shader_graph.transform";
-    /// Loss: vertex color inputs (until `COLOR_0` export exists).
+    /// Loss: a vertex color read where glTF cannot take it (anything but the base color's `Color`).
     pub(crate) const VERTEX_COLOR: &str = "material.shader_graph.vertex_color";
     /// Loss: displacement output.
     pub(crate) const DISPLACEMENT: &str = "material.shader_graph.displacement";
@@ -210,11 +220,16 @@ pub(crate) mod feature_id {
     pub(crate) const VRM_V0_MTOON_UV_LAYER: &str = "vrm.v0.mtoon_uv_layer";
 }
 
-/// Whether any node of `doc` references the material in its slot array.
+/// Whether a material is assigned to any node's effective source-aware slot.
 pub(crate) fn material_is_used(doc: &crate::model::SceneDoc, material_id: &Id) -> bool {
-    doc.nodes
-        .values()
-        .any(|node| node.materials.iter().flatten().any(|id| id == material_id))
+    doc.nodes.values().any(|node| {
+        let data = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
+        (0..node.material_slot_count(data))
+            .any(|slot| node.material_slot(data, slot) == Some(material_id))
+    })
 }
 
 /// Resolves a Potter material to its glTF surface and the losses the conversion reports.
@@ -464,6 +479,7 @@ fn fields_surface(
         double_sided: material.double_sided,
         alpha_mode,
         unlit: false,
+        vertex_color: None,
         base_color,
         metallic: material.metallic,
         roughness: material.roughness,
@@ -519,6 +535,8 @@ struct Sample {
 struct ColorIn {
     factor: [f64; 3],
     tex: Option<Sample>,
+    /// Vertex color multiplied in (`COLOR_0`). Only a base color takes it; other sockets drop it.
+    vertex: Option<VertexColorRead>,
 }
 
 /// A scalar-valued socket: `factor` times the sampled channel (or the factor alone).
@@ -979,7 +997,11 @@ struct Predicate {
 
 impl ColorIn {
     fn constant(factor: [f64; 3]) -> Self {
-        Self { factor, tex: None }
+        Self {
+            factor,
+            tex: None,
+            vertex: None,
+        }
     }
 }
 
@@ -989,10 +1011,61 @@ impl ScalarIn {
     }
 }
 
-fn is_vertex_color(node: &GraphNode) -> bool {
-    node.node_type == "ShaderNodeVertexColor"
-        || (node.node_type == "ShaderNodeAttribute"
-            && prop_str(node, "attribute_type") == Some("COLOR"))
+/// Whether a node reads vertex colors on `output`: a Vertex Color node, or an Attribute node on the
+/// geometry whose `Color` or `Alpha` output reads a named attribute as a color (Blender's glTF
+/// exporter takes both as the color layer).
+fn is_vertex_color(node: &GraphNode, output: &str) -> bool {
+    match node.node_type.as_str() {
+        "ShaderNodeVertexColor" => true,
+        "ShaderNodeAttribute" => {
+            prop_str(node, "attribute_type") == Some("GEOMETRY")
+                && matches!(output, "Color" | "Alpha")
+        }
+        _ => false,
+    }
+}
+
+/// The vertex color a `Color` output reads, when glTF can take it. Only an unnamed Vertex Color
+/// selects the active/render layer; an empty geometry Attribute remains a missing named read.
+fn vertex_color_read(node: &GraphNode, output: &str) -> Option<VertexColorRead> {
+    if output != "Color" || !is_vertex_color(node, output) {
+        return None;
+    }
+    let layer = if node.node_type == "ShaderNodeVertexColor" {
+        prop_str(node, "layer_name")
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    } else {
+        Some(
+            prop_str(node, "attribute_name")
+                .or_else(|| prop_str(node, "name"))
+                .unwrap_or("")
+                .to_owned(),
+        )
+    };
+    Some(VertexColorRead { layer })
+}
+
+/// The product of two color inputs when glTF can hold it: factors multiply, with at most one
+/// texture and at most one vertex color between them.
+fn multiply(a: &ColorIn, b: &ColorIn) -> Option<ColorIn> {
+    let tex = match (&a.tex, &b.tex) {
+        (None, tex) | (tex, None) => tex.clone(),
+        _ => return None,
+    };
+    let vertex = match (&a.vertex, &b.vertex) {
+        (None, vertex) | (vertex, None) => vertex.clone(),
+        _ => return None,
+    };
+    Some(ColorIn {
+        factor: [
+            a.factor[0] * b.factor[0],
+            a.factor[1] * b.factor[1],
+            a.factor[2] * b.factor[2],
+        ],
+        tex,
+        vertex,
+    })
 }
 
 /// Maps a `SeparateColor` output name to its channel index and channel.
@@ -1027,6 +1100,26 @@ impl GraphReducer<'_> {
         }
     }
 
+    /// A color socket whose value a constant or texture carries. A vertex color read in it is a
+    /// loss: only the base color multiplies `COLOR_0`.
+    fn plain_color_input(
+        &mut self,
+        node_id: &Id,
+        socket: &str,
+        default: [f64; 3],
+        depth: usize,
+    ) -> crate::error::Result<ColorIn> {
+        let mut color = self.color_input(node_id, socket, default, depth)?;
+        if color.vertex.take().is_some() {
+            self.loss(
+                feature_id::VERTEX_COLOR,
+                format!("node `{node_id}` reads vertex color into socket `{socket}`; glTF multiplies vertex color only into the base color, so the vertex color is dropped"),
+                None,
+            );
+        }
+        Ok(color)
+    }
+
     fn color_from(
         &mut self,
         source: &Id,
@@ -1036,7 +1129,14 @@ impl GraphReducer<'_> {
     ) -> crate::error::Result<ColorIn> {
         let depth = self.deeper(source, depth)?;
         let node = self.node(source)?;
-        if is_vertex_color(node) {
+        if let Some(vertex_color) = vertex_color_read(node, output) {
+            return Ok(ColorIn {
+                factor: [1.0; 3],
+                tex: None,
+                vertex: Some(vertex_color),
+            });
+        }
+        if is_vertex_color(node, output) {
             self.vertex_color_loss(source, &node.node_type);
             return Ok(ColorIn::constant([1.0; 3]));
         }
@@ -1044,16 +1144,19 @@ impl GraphReducer<'_> {
             ("ShaderNodeTexImage", "Color") => Ok(ColorIn {
                 factor: [1.0; 3],
                 tex: Some(self.tex_sample(source, None, depth)?),
+                vertex: None,
             }),
             ("ShaderNodeTexImage", "Alpha") => Ok(ColorIn {
                 factor: [1.0; 3],
                 tex: Some(self.tex_sample(source, Some(TextureChannel::Alpha), depth)?),
+                vertex: None,
             }),
             ("ShaderNodeSeparateColor", _) => {
                 let scalar = self.separated(source, output, fallback[0], depth)?;
                 Ok(ColorIn {
                     factor: [scalar.factor; 3],
                     tex: scalar.tex,
+                    vertex: None,
                 })
             }
             ("ShaderNodeMix" | "ShaderNodeMixRGB", _) => self.mix_color(source, depth),
@@ -1067,7 +1170,7 @@ impl GraphReducer<'_> {
     fn vertex_color_loss(&mut self, node_id: &Id, node_type: &str) {
         self.loss(
             feature_id::VERTEX_COLOR,
-            format!("node `{node_id}` ({node_type}) supplies vertex color; COLOR_0 is not exported yet, so it is treated as white"),
+            format!("node `{node_id}` ({node_type}) reads vertex color where glTF takes none (only the base color multiplies COLOR_0); it is treated as white"),
             None,
         );
     }
@@ -1094,7 +1197,7 @@ impl GraphReducer<'_> {
             );
             return Ok(ScalarIn::constant(fallback));
         }
-        let color = self.color_input(source, "Color", [fallback; 3], depth)?;
+        let color = self.plain_color_input(source, "Color", [fallback; 3], depth)?;
         Ok(ScalarIn {
             factor: color.factor[index],
             tex: color.tex.map(|sample| Sample {
@@ -1138,7 +1241,8 @@ impl GraphReducer<'_> {
             );
             return Ok(a);
         }
-        if b.tex.is_none() {
+        // A constant `b` scales `a`; `a` keeps its texture and vertex color.
+        if b.tex.is_none() && b.vertex.is_none() {
             let scale = b.factor.map(|value| (1.0 - factor) + factor * value);
             return Ok(ColorIn {
                 factor: [
@@ -1147,21 +1251,17 @@ impl GraphReducer<'_> {
                     a.factor[2] * scale[2],
                 ],
                 tex: a.tex,
+                vertex: a.vertex,
             });
         }
-        if a.tex.is_none() && crate::float::equal_f64(factor, 1.0) {
-            return Ok(ColorIn {
-                factor: [
-                    a.factor[0] * b.factor[0],
-                    a.factor[1] * b.factor[1],
-                    a.factor[2] * b.factor[2],
-                ],
-                tex: b.tex,
-            });
+        if crate::float::equal_f64(factor, 1.0)
+            && let Some(product) = multiply(&a, &b)
+        {
+            return Ok(product);
         }
         self.loss(
             feature_id::UNSUPPORTED_NODE,
-            format!("mix `{node_id}` multiplies two textures (or a texture with a factor other than 1); its first input is used"),
+            format!("mix `{node_id}` multiplies two textures or vertex colors (or uses a factor other than 1); its first input is used"),
             None,
         );
         Ok(a)
@@ -1196,7 +1296,7 @@ impl GraphReducer<'_> {
     ) -> crate::error::Result<ScalarIn> {
         let depth = self.deeper(source, depth)?;
         let node = self.node(source)?;
-        if is_vertex_color(node) {
+        if is_vertex_color(node, output) {
             self.vertex_color_loss(source, &node.node_type);
             return Ok(ScalarIn::constant(1.0));
         }
@@ -1311,7 +1411,7 @@ impl GraphReducer<'_> {
     ) -> crate::error::Result<Alpha> {
         let depth = self.deeper(source, depth)?;
         let node = self.node(source)?;
-        if is_vertex_color(node) {
+        if is_vertex_color(node, output) {
             self.vertex_color_loss(source, &node.node_type);
             return Ok(Alpha::Const(1.0));
         }
@@ -1587,7 +1687,7 @@ impl GraphReducer<'_> {
         node: &GraphNode,
         depth: usize,
     ) -> crate::error::Result<Shade> {
-        let color = self.color_input(source, "Color", [1.0; 3], depth)?;
+        let color = self.plain_color_input(source, "Color", [1.0; 3], depth)?;
         let strength = self.constant_input(source, node, "Strength", 1.0, 1.0);
         Ok(Shade {
             emission: emission_value(&color, strength),
@@ -1619,6 +1719,7 @@ impl GraphReducer<'_> {
             unlit: Some(ColorIn {
                 factor,
                 tex: color.tex,
+                vertex: color.vertex,
             }),
             ..Shade::default()
         })
@@ -1919,7 +2020,7 @@ impl GraphReducer<'_> {
                 if self.link_into(source, "Color").is_none() {
                     return Ok(None);
                 }
-                let color = self.color_input(source, "Color", [0.5, 0.5, 1.0], depth)?;
+                let color = self.plain_color_input(source, "Color", [0.5, 0.5, 1.0], depth)?;
                 match color.tex {
                     Some(sample)
                         if crate::float::equal_f64_array(&color.factor, &[1.0; 3])
@@ -1999,7 +2100,7 @@ impl GraphReducer<'_> {
                 None,
             );
         }
-        let emission_color = self.color_input(node_id, "Emission Color", [1.0; 3], depth)?;
+        let emission_color = self.plain_color_input(node_id, "Emission Color", [1.0; 3], depth)?;
         let emission_strength = self.constant_input(node_id, node, "Emission Strength", 0.0, 1.0);
         let transmission =
             (transmission.factor != 0.0 || transmission.tex.is_some()).then(|| TexturedValue {
@@ -2046,7 +2147,7 @@ impl GraphReducer<'_> {
                 None,
             );
         }
-        let tint = self.color_input(node_id, "Coat Tint", [1.0; 3], depth)?;
+        let tint = self.plain_color_input(node_id, "Coat Tint", [1.0; 3], depth)?;
         if tint.tex.is_some() || !crate::float::equal_f64_array(&tint.factor, &[1.0; 3]) {
             self.loss(
                 feature_id::UNSUPPORTED_INPUT,
@@ -2085,7 +2186,7 @@ impl GraphReducer<'_> {
                 None,
             );
         }
-        let tint = self.color_input(node_id, "Sheen Tint", [1.0; 3], depth)?;
+        let tint = self.plain_color_input(node_id, "Sheen Tint", [1.0; 3], depth)?;
         let roughness = self.scalar_input(node_id, "Sheen Roughness", 0.5, depth)?;
         if weight.factor == 0.0 && tint.tex.is_none() && roughness.tex.is_none() {
             return Ok(None);
@@ -2106,7 +2207,7 @@ impl GraphReducer<'_> {
     /// texture A, as Blender's exporter does, and its doubling moves into the tint.
     fn specular(&mut self, node_id: &Id, depth: usize) -> crate::error::Result<Option<Specular>> {
         let level = self.scalar_input(node_id, "Specular IOR Level", 0.5, depth)?;
-        let tint = self.color_input(node_id, "Specular Tint", [1.0; 3], depth)?;
+        let tint = self.plain_color_input(node_id, "Specular Tint", [1.0; 3], depth)?;
         let doubled = 2.0 * level.factor;
         let factor = doubled.min(1.0);
         let color_factor = tint.factor.map(|channel| channel * doubled.max(1.0));
@@ -2465,6 +2566,7 @@ impl GraphReducer<'_> {
                 factor: [base.factor[0], base.factor[1], base.factor[2], alpha_factor],
                 texture: base_texture,
             },
+            vertex_color: base.vertex,
             metallic: metallic.factor,
             roughness: roughness.factor,
             metallic_roughness_texture,
@@ -2559,7 +2661,7 @@ mod tests {
     use super::*;
     use crate::{
         exchange::Loss,
-        model::{Image, ImageAlphaMode, ImageColorspace, ImageSource},
+        model::{DataBlock, Image, ImageAlphaMode, ImageColorspace, ImageSource, Node},
     };
 
     fn id(value: &str) -> Id {
@@ -2599,6 +2701,32 @@ mod tests {
         }
         doc.materials.insert(id("mat"), material);
         doc
+    }
+
+    #[test]
+    fn material_use_includes_data_linked_slots() {
+        let mut doc = SceneDoc::default();
+        let material_id = id("data_material");
+        let data_id = id("mesh_data");
+        doc.materials
+            .insert(material_id.clone(), Material::default());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                materials: vec![Some(material_id.clone())],
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            id("mesh"),
+            Node {
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+
+        assert!(material_is_used(&doc, &material_id));
     }
 
     fn add_node(
@@ -2856,6 +2984,37 @@ mod tests {
     }
 
     #[test]
+    fn native_scalar_fields_pack_red_into_glTF_channels() {
+        let texture = TextureRef {
+            image: id("img"),
+            uv_layer: None,
+            interpolation: ImageInterpolation::Closest,
+        };
+        let mut doc = document(None);
+        let material = doc.materials.get_mut(&id("mat")).expect("material");
+        material.roughness_texture = Some(texture.clone());
+        material.metallic_texture = Some(texture);
+        let (surface, losses) = resolved(&doc);
+        assert!(losses.is_empty(), "{losses:?}");
+        let packed = surface
+            .metallic_roughness_texture
+            .expect("native scalar textures pack");
+        assert_eq!(
+            packed.channels[1],
+            Some(ChannelSource {
+                image: id("img"),
+                channel: TextureChannel::Red,
+            })
+        );
+        assert_eq!(
+            packed.channels[2],
+            Some(ChannelSource {
+                image: id("img"),
+                channel: TextureChannel::Red,
+            })
+        );
+    }
+    #[test]
     fn separate_color_channels_pack_into_metallic_roughness() {
         let mut group = principled_graph(&json!({}));
         add_node(
@@ -2896,6 +3055,170 @@ mod tests {
             })
         );
         assert_eq!(packed.channels[3], None);
+    }
+
+    #[test]
+    fn vertex_color_multiplies_the_base_color_as_a_named_layer() {
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "paint",
+            "ShaderNodeVertexColor",
+            &json!({"layer_name": "Paint"}),
+            &json!({}),
+        );
+        link(&mut group, "paint", "Color", "bsdf", "Base Color");
+        let (surface, losses) = resolved(&document(Some(group)));
+        assert!(losses.is_empty(), "{losses:?}");
+        assert_eq!(
+            surface.vertex_color,
+            Some(VertexColorRead {
+                layer: Some("Paint".to_owned())
+            })
+        );
+        assert_eq!(surface.base_color.factor, [1.0; 4]);
+        assert!(surface.base_color.texture.is_none());
+    }
+
+    #[test]
+    fn empty_names_read_the_render_layer_and_geometry_attributes_read_their_name() {
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "paint",
+            "ShaderNodeVertexColor",
+            &json!({"layer_name": ""}),
+            &json!({}),
+        );
+        link(&mut group, "paint", "Color", "bsdf", "Base Color");
+        let (surface, _) = resolved(&document(Some(group)));
+        assert_eq!(surface.vertex_color, Some(VertexColorRead { layer: None }));
+
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "paint",
+            "ShaderNodeVertexColor",
+            &json!({}),
+            &json!({}),
+        );
+        link(&mut group, "paint", "Color", "bsdf", "Base Color");
+        let (surface, _) = resolved(&document(Some(group)));
+        assert_eq!(surface.vertex_color, Some(VertexColorRead { layer: None }));
+
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "wear",
+            "ShaderNodeAttribute",
+            &json!({"attribute_type": "GEOMETRY", "attribute_name": "Wear"}),
+            &json!({}),
+        );
+        link(&mut group, "wear", "Color", "bsdf", "Base Color");
+        let (surface, losses) = resolved(&document(Some(group)));
+        assert!(losses.is_empty(), "{losses:?}");
+        assert_eq!(
+            surface.vertex_color,
+            Some(VertexColorRead {
+                layer: Some("Wear".to_owned())
+            })
+        );
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "empty_attribute",
+            "ShaderNodeAttribute",
+            &json!({"attribute_type": "GEOMETRY", "attribute_name": ""}),
+            &json!({}),
+        );
+        link(&mut group, "empty_attribute", "Color", "bsdf", "Base Color");
+        let (surface, _) = resolved(&document(Some(group)));
+        assert_eq!(
+            surface.vertex_color,
+            Some(VertexColorRead {
+                layer: Some(String::new())
+            })
+        );
+    }
+
+    #[test]
+    fn vertex_color_times_texture_keeps_both_in_the_base_color() {
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "paint",
+            "ShaderNodeVertexColor",
+            &json!({"layer_name": "Paint"}),
+            &json!({}),
+        );
+        add_node(
+            &mut group,
+            "tex",
+            "ShaderNodeTexImage",
+            &json!({"image": "img"}),
+            &json!({}),
+        );
+        add_node(
+            &mut group,
+            "mix",
+            "ShaderNodeMix",
+            &json!({"blend_type": "MULTIPLY", "data_type": "RGBA"}),
+            &json!({"Factor_Float": 1.0}),
+        );
+        link(&mut group, "paint", "Color", "mix", "A_Color");
+        link(&mut group, "tex", "Color", "mix", "B_Color");
+        link(&mut group, "mix", "Result_Color", "bsdf", "Base Color");
+        let (surface, losses) = resolved(&document(Some(group)));
+        assert!(losses.is_empty(), "{losses:?}");
+        assert_eq!(
+            surface.vertex_color,
+            Some(VertexColorRead {
+                layer: Some("Paint".to_owned())
+            })
+        );
+        assert!(surface.base_color.texture.is_some());
+    }
+
+    #[test]
+    fn vertex_color_outside_the_base_color_is_a_loss() {
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "paint",
+            "ShaderNodeVertexColor",
+            &json!({"layer_name": "Paint"}),
+            &json!({}),
+        );
+        link(&mut group, "paint", "Color", "bsdf", "Emission Color");
+        let (surface, losses) = resolved(&document(Some(group)));
+        assert!(surface.vertex_color.is_none());
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == feature_id::VERTEX_COLOR),
+            "{losses:?}"
+        );
+    }
+
+    #[test]
+    fn vertex_alpha_is_a_loss() {
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "paint",
+            "ShaderNodeVertexColor",
+            &json!({"layer_name": "Paint"}),
+            &json!({}),
+        );
+        link(&mut group, "paint", "Alpha", "bsdf", "Alpha");
+        let (surface, losses) = resolved(&document(Some(group)));
+        assert!(surface.vertex_color.is_none());
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == feature_id::VERTEX_COLOR),
+            "{losses:?}"
+        );
     }
 
     #[test]

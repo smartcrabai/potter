@@ -815,15 +815,19 @@ fn has_texture_field(material: &Material) -> bool {
         || material.normal_texture.is_some()
 }
 
-/// The meshes of the objects that use `material_id` in a slot.
+/// The meshes of objects whose effective slots resolve to `material_id`.
 fn material_users<'a>(doc: &'a SceneDoc, material_id: &Id) -> Vec<&'a Mesh> {
     doc.nodes
         .values()
-        .filter(|node| node.materials.iter().flatten().any(|id| id == material_id))
         .filter_map(|node| {
-            node.data
+            let data = node
+                .data
                 .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .and_then(|data_id| doc.data_blocks.get(data_id))?;
+            let slot_count = node.material_slot_count(Some(data));
+            (0..slot_count)
+                .any(|slot| node.material_slot(Some(data), slot) == Some(material_id))
+                .then_some(data)
         })
         .filter_map(|data| data.mesh.as_ref())
         .collect()
@@ -1216,6 +1220,31 @@ fn channel_texture(
 mod tests {
     use super::*;
     use crate::model::{DataBlock, Node};
+
+    #[test]
+    fn material_users_includes_data_linked_meshes() {
+        let material_id = Id::new("data_material").unwrap();
+        let data_id = Id::new("mesh_data").unwrap();
+        let mut doc = SceneDoc::default();
+        doc.data_blocks.insert(
+            data_id.clone(),
+            crate::model::DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(Mesh::default()),
+                materials: vec![Some(material_id.clone())],
+                ..crate::model::DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            Id::new("mesh").unwrap(),
+            crate::model::Node {
+                data: Some(data_id),
+                ..crate::model::Node::default()
+            },
+        );
+
+        assert_eq!(material_users(&doc, &material_id).len(), 1);
+    }
 
     #[test]
     fn insert_refuses_a_node_name_that_is_already_used() {

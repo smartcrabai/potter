@@ -20,7 +20,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
-        clnor::transfer_custom_normals,
+        clnor::{self, NormalCodeOptions},
         normals::{corner_angle, corner_normals, face_normal, sharp_edge_flags},
         provenance::Origin,
         uv_layers,
@@ -1788,9 +1788,8 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let mut face_indices = Vec::with_capacity(mesh.faces.len());
     // Blender's vertex normals (Mesh::vert_normals) weight each corner's normal by its angle; with
     // custom normals the corner normals themselves are mixed.
-    let custom_corners = mesh
-        .attributes
-        .contains_key("custom_normal")
+    let custom_corners = clnor::corner_codes(mesh)?
+        .is_some()
         .then(|| corner_normals(mesh, &source_positions))
         .transpose()?;
     let mut corner_offset = 0;
@@ -2220,7 +2219,7 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // Each output corner copies the raw custom data of its source corner, which its new fan decodes
     // (BM_elem_attrs_copy in bmesh_wireframe.cc, read back through the output fans).
     let sources: Vec<Option<usize>> = source_corners.iter().map(|corner| Some(*corner)).collect();
-    transfer_custom_normals(mesh, &mut result, &sources)?;
+    clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     result.attributes.remove("wireframe_use_crease");
     result.attributes.remove("wireframe_crease_weight");
     if use_crease {
@@ -2596,7 +2595,6 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         vertices: origins,
         faces: vec![None; faces.len()],
         corners: None,
-        raw_normals: false,
     };
     let mut result = build_mesh(points, faces, Vec::new(), &origin, mesh)?;
     result.attributes.remove("blender_skin_vertices");
@@ -2624,9 +2622,14 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         });
     }
     drop_partial_vertex_groups(mesh, &origin, &mut result);
+    let smooth: serde_json::Map<String, serde_json::Value> = result
+        .faces
+        .iter()
+        .map(|face| (format!("f{}", face.id), serde_json::json!(smooth_shade)))
+        .collect();
     result.attributes.insert(
-        "blender_polygon_smooth".to_owned(),
-        serde_json::json!(vec![smooth_shade; result.faces.len()]),
+        "shade_smooth".to_owned(),
+        serde_json::json!({"domain": "face", "type": "bool", "values": smooth}),
     );
     validated(&result)?;
     Ok(result)
@@ -2860,8 +2863,11 @@ fn curve_axis_param(modifier: &Modifier, name: &str) -> Result<DVec3> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "geometry modifier unit tests")]
 mod tests {
-    use super::{curve, shrinkwrap};
-    use crate::geom::{Mesh, UvSphereParams};
+    use super::{build, curve, shrinkwrap};
+    use crate::geom::{
+        BoxParams, Mesh, UvSphereParams,
+        clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput},
+    };
     use serde_json::json;
 
     #[test]
@@ -2906,6 +2912,50 @@ mod tests {
         let result = curve(&source, &modifier).unwrap();
         assert!(result.vertex(first).unwrap().co.distance(glam::DVec3::ZERO) < 1.0e-12);
         assert!(result.vertex(second).unwrap().co.distance(glam::DVec3::Z) < 1.0e-12);
+    }
+    #[test]
+    fn build_subset_compacts_nonidentity_custom_normal_loop_order() {
+        let mut source = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let corner_count: usize = source.faces.iter().map(|face| face.vertices.len()).sum();
+        let codes: Vec<CornerNormalCode> = (0..corner_count)
+            .map(|corner| CornerNormalCode::Authored([i16::try_from(corner + 1).unwrap(), -1_000]))
+            .collect();
+        let mut loop_order: Vec<usize> = (0..corner_count).collect();
+        loop_order[..4].rotate_left(1);
+        clnor::write_codes(
+            &mut source,
+            Some(&codes),
+            NormalCodeOptions {
+                corner_order: Some(&loop_order),
+                setter_input: SetterInput::AlreadyNormalized,
+            },
+        )
+        .unwrap();
+
+        let modifier = modifier_with_target(
+            "build",
+            json!({
+                "frame_start": 0.0,
+                "frame_duration": 2.0,
+                "use_reverse": false,
+                "use_random_order": false,
+                "seed": 0
+            }),
+            Mesh::new(),
+        );
+        let output = build(&source, &modifier, 0.5).unwrap();
+
+        assert_eq!(output.faces.len(), 1);
+        assert_eq!(
+            clnor::corner_order(&output).unwrap(),
+            Some(vec![1, 2, 3, 0]),
+            "the subset basis is compacted from its source loop order"
+        );
+        assert_eq!(
+            clnor::corner_codes(&output).unwrap(),
+            Some(codes[..4].to_vec()),
+            "the subset retains the source codes for its copied loops"
+        );
     }
 
     #[test]

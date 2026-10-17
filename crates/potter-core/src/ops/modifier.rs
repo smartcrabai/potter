@@ -973,8 +973,16 @@ fn apply_modifier(
                 .data_blocks
                 .get(&data_id)
                 .is_some_and(|data| data.descriptor.is_some());
+        // Blender `BKE_object_material_from_eval_data` (blenkernel/intern/material.cc): the mesh's
+        // material array becomes the evaluated mesh's array; the object's slots then follow its length
+        // through `BKE_object_materials_sync_length` (`BKE_object_material_resize`). Slots that
+        // already existed keep their link; slots the sync adds have matbits 0, i.e. DATA links.
+        // `modifier_apply_obdata` (editors/object/object_modifier.cc) calls this before
+        // `BKE_mesh_nomain_to_mesh`.
+        let synced_len = material_slots.len();
         if let Some(data) = engine.doc.data_blocks.get_mut(&data_id) {
             data.mesh = Some(evaluated);
+            data.materials = material_slots;
             data.vertex_weights = persisted_weights;
             if mesh_changed {
                 data.descriptor = None;
@@ -982,7 +990,20 @@ fn apply_modifier(
         }
         if let Some(node) = engine.doc.nodes.get_mut(&target) {
             node.modifiers.retain(|modifier| modifier.id != modifier_id);
-            node.materials = material_slots;
+            let old_len = node.materials.len();
+            let old_links = (0..old_len)
+                .map(|slot| node.material_link(slot))
+                .collect::<Vec<_>>();
+            node.materials.resize(synced_len, None);
+            node.material_links = (0..synced_len)
+                .map(|slot| {
+                    if slot < old_len {
+                        old_links[slot]
+                    } else {
+                        crate::model::MaterialLink::Data
+                    }
+                })
+                .collect();
         }
         if mesh_changed {
             super::clear_primitive_metadata(engine, &data_id);
@@ -1043,10 +1064,9 @@ fn evaluate_modifier_output(
     let modifier_stack = std::slice::from_ref(target_modifier);
     let mut material_slots = engine
         .doc
-        .nodes
-        .get(target)
-        .map(|node| node.materials.clone())
-        .unwrap_or_default();
+        .data_blocks
+        .get(data_id)
+        .map_or_else(Vec::new, |data| data.materials.clone());
     let evaluated = {
         let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
             PotError::new(
