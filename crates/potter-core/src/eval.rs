@@ -5326,7 +5326,7 @@ fn lattice_vertex_group_weights(
     let Some(group) = source_data
         .vertex_groups
         .iter()
-        .find(|group| group.id.as_str() == name || group.name == name)
+        .find(|group| group.name == name)
     else {
         return Ok(None);
     };
