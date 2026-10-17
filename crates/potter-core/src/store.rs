@@ -1056,7 +1056,7 @@ mod tests {
         let path = super::blob_path(&scene, "history", &digest).unwrap();
         let raw = fs::read(&path).unwrap();
 
-        let loaded = super::read_history_blob(&scene, &digest).unwrap();
+        let (loaded, _) = super::read_history_blob(&scene, &digest).unwrap();
         let volume = &loaded.snapshot.nodes[&Id::from_static("volume")];
         let texture_id = Id::new(volume.modifiers[0].params["texture"].as_str().unwrap()).unwrap();
         assert_eq!(

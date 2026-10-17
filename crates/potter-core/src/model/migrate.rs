@@ -1499,8 +1499,10 @@ mod tests {
                     }]
                 }),
             )?;
-            let error = parse_scene(&serde_json::to_vec(&source)?)
-                .expect_err("malformed custom-normal codes must be rejected");
+            let error = match parse_scene(&serde_json::to_vec(&source)?) {
+                Err(error) => error,
+                Ok(_) => panic!("malformed custom-normal codes must be rejected"),
+            };
             assert_eq!(error.code, ErrorCode::SceneInvalid);
         }
         Ok(())

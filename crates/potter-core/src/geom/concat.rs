@@ -922,7 +922,7 @@ mod tests {
     use glam::{DMat4, DVec3};
     use serde_json::{Map, Value, json};
 
-    use super::{Part, concatenate};
+    use super::{Part, concatenate, uv_covered_faces};
     use crate::geom::normals::smooth_face_flags;
     use crate::geom::uv_layers::{self, UvLayer, UvStore};
     use crate::geom::{BoxParams, Mesh};
@@ -1154,7 +1154,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn uv_layers_join_by_name_and_preserve_pins_and_coverage() {
         let mut first = cube();
         set_uv_layers(&mut first, &[("Map", [0.1, 0.2], None)]);
@@ -1259,7 +1258,6 @@ mod tests {
             .unwrap();
         for (index, face) in joined.faces.iter().enumerate() {
             let source_face = &source.faces[index];
-            let uv_row = uv.faces[index].as_ref().unwrap();
             let rows = &custom[&format!("f{}", face.id)];
             let uv_face = uv.faces[index].as_ref().unwrap();
             let pinned = uv.pinned[index].as_ref().unwrap();

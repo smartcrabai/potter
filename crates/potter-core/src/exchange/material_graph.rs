@@ -821,6 +821,8 @@ mod tests {
         let textures = GraphTextures {
             base_color: None,
             metallic_roughness: None,
+            roughness: None,
+            metallic: None,
             normal: Some(SlotTexture {
                 texture: TextureRef {
                     image: Id::new("normal_image")?,

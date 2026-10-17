@@ -863,13 +863,14 @@ mod tests {
             size: DVec3::splat(2.0),
         })
         .unwrap();
-        let mut detail = UvLayer::new("Detail", vec![Some(vec![[0.3, 0.4]; 4]); mesh.faces.len()]);
+        let face_count = mesh.faces.len();
+        let mut detail = UvLayer::new("Detail", vec![Some(vec![[0.3, 0.4]; 4]); face_count]);
         detail.pinned = vec![Some(vec![true; 4]); mesh.faces.len()];
         uv_layers::write(
             &mut mesh,
             &UvStore {
                 layers: vec![
-                    UvLayer::new("Map", vec![Some(vec![[0.1, 0.2]; 4]); mesh.faces.len()]),
+                    UvLayer::new("Map", vec![Some(vec![[0.1, 0.2]; 4]); face_count]),
                     detail,
                 ],
                 active: Some("Map".to_owned()),

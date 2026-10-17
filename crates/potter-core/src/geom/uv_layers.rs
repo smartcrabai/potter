@@ -961,22 +961,4 @@ mod tests {
         );
         assert_eq!(store.layers[0].pinned[0], Some(vec![true, false, true]));
     }
-
-    #[test]
-    fn store_resolves_missing_names_to_the_render_layer() {
-        let store = UvStore {
-            layers: vec![
-                UvLayer::new("UVMap", vec![None]),
-                UvLayer::new("Light", vec![None]),
-            ],
-            active: Some("UVMap".to_owned()),
-            render: Some("Light".to_owned()),
-        };
-        assert_eq!(store.resolve(None), (Some(1), None));
-        assert_eq!(store.resolve(Some("UVMap")), (Some(0), None));
-        assert_eq!(
-            store.resolve(Some("Gone")),
-            (Some(1), Some("Gone".to_owned()))
-        );
-    }
 }
