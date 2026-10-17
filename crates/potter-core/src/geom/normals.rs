@@ -493,16 +493,16 @@ pub(crate) fn corner_normal_domain(mesh: &Mesh) -> Result<bool> {
             .as_object()
             .ok_or_else(|| PotError::invalid_argument("custom_normal must be an object"))?;
         if fields.contains_key("values") {
-            return match fields.get("domain").and_then(Value::as_str) {
-                Some("corner") => Ok(true),
-                Some("point" | "face") => Ok(false),
+            match fields.get("domain").and_then(Value::as_str) {
+                Some("corner") => return Ok(true),
+                Some("point" | "face") => return Ok(false),
                 Some("edge") => {}
                 _ => {
                     return Err(PotError::invalid_argument(
                         "custom_normal.domain is invalid",
                     ));
                 }
-            };
+            }
         }
     }
     let face_values = attribute_values(mesh, "sharp_face", "face", "bool")?;

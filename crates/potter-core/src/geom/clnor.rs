@@ -1702,72 +1702,42 @@ mod tests {
         );
     }
 }
-/// Stores `vectors`, one per corner in face order, as `mesh`'s `custom_normal` layer.
-pub(crate) fn store_custom_normals(mesh: &mut Mesh, vectors: &[DVec3]) {
-    let keep = vec![true; mesh.faces.len()];
-    match corner_normal_attribute(mesh, vectors, &keep) {
-        Some(value) => {
-            mesh.attributes.insert("custom_normal".to_owned(), value);
-        }
-        None => {
-            mesh.attributes.remove("custom_normal");
-        }
-    }
+/// Stores per-corner vectors in the canonical fan-code representation.
+pub(crate) fn store_custom_normals(mesh: &mut Mesh, vectors: &[DVec3]) -> Result<()> {
+    let vectors: Vec<Option<DVec3>> = vectors.iter().copied().map(Some).collect();
+    encode_vectors(mesh, Some(&vectors), NormalCodeOptions::default())
 }
 
-/// The normals Blender reads back when every fan of `mesh` stores the code of its mean vector. The
-/// code is encoded in the fan's space and decoded again, so every corner of a fan reads the same
-/// vector (`mesh_normals_corner_custom_set`, then `Mesh::corner_normals`).
-fn fan_custom_normals(mesh: &Mesh, vectors: &[DVec3], numbering: &[usize]) -> Result<Vec<DVec3>> {
-    let fans = mesh_fans(mesh, numbering)?;
-    let mut read = vec![DVec3::ZERO; vectors.len()];
-    for (fan, corners) in fans.corners.iter().enumerate() {
-        let space = &fans.spaces[fan];
-        let mut sum = Vec3::ZERO;
-        for &corner in corners {
-            sum += vectors[corner].as_vec3();
-        }
-        // Blender scales the sum by the reciprocal of the count (`mul_v3_fl`).
-        let average = sum * (1.0 / corners.len() as f32);
-        let normal = space.decode(space.encode(average)).as_dvec3();
-        for &corner in corners {
-            read[corner] = normal;
-        }
-    }
-    Ok(read)
-}
-
-/// The custom normals `mesh` reads back from its own `custom_normal` layer. `None` without one.
+/// The custom normals `mesh` reads back from its canonical code layer. `None` without one.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`mesh_fans`] when the mesh is invalid.
+/// Returns errors when the code state is malformed or the mesh cannot be evaluated.
 pub(crate) fn read_custom_normals(mesh: &Mesh) -> Result<Option<Vec<DVec3>>> {
-    let Some(authored) = authored_vectors(mesh) else {
+    let Some(codes) = corner_codes(mesh)? else {
         return Ok(None);
     };
-    let authored = normalize_authored(&authored);
-    fan_custom_normals(mesh, &authored, &stored_corner_order(mesh)).map(Some)
+    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    evaluate_code_buffer(mesh, &codes, &positions, None).map(Some)
 }
 
-/// Blender's `mesh_set_custom_normals_normalized`: stores `vectors` as the corners' custom normals.
-/// Fans whose vectors diverge get their smooth edges sharpened (`settle_custom_normals`), and every
-/// corner then holds the normal its fan reads back. `numbering` gives the corners' Blender numbers,
-/// which decide where a closed fan begins.
+/// Blender's already-normalized custom-normal setter, stored as canonical fan codes.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`settle_custom_normals`] and [`fan_custom_normals`].
+/// Returns errors from [`encode_vectors`].
 pub(crate) fn set_custom_normals(
     mesh: &mut Mesh,
     vectors: &[DVec3],
     numbering: &[usize],
 ) -> Result<()> {
-    store_custom_normals(mesh, vectors);
-    if let Some(settled) = settle_custom_normals_inner(mesh, numbering, false)? {
-        *mesh = settled;
-    }
-    let read = fan_custom_normals(mesh, vectors, numbering)?;
-    store_custom_normals(mesh, &read);
-    Ok(())
+    let vectors: Vec<Option<DVec3>> = vectors.iter().copied().map(Some).collect();
+    encode_vectors(
+        mesh,
+        Some(&vectors),
+        NormalCodeOptions {
+            corner_order: Some(numbering),
+            setter_input: SetterInput::AlreadyNormalized,
+        },
+    )
 }

@@ -545,6 +545,29 @@ struct Sources<'a> {
 }
 
 impl Sources<'_> {
+    /// Remaps a native shading flag through its declared element domain.
+    fn shade_smooth(&self, attribute: &Value) -> Value {
+        self.native_attribute(attribute)
+    }
+
+    /// Remaps native sharp-edge flags through their declared element domain.
+    fn sharp(&self, attribute: &Value) -> Value {
+        self.native_attribute(attribute)
+    }
+
+    /// Remaps positional polygon smooth flags; generated faces default to flat shading.
+    fn polygon_smooth(&self, flags: &[Value]) -> Vec<Value> {
+        self.origin
+            .faces
+            .iter()
+            .map(|source| {
+                source
+                    .and_then(|index| flags.get(index).cloned())
+                    .unwrap_or_else(|| default_value("BOOLEAN"))
+            })
+            .collect()
+    }
+
     /// Interpolated vertex-group weights keyed `v{output id}` under each group name.
     fn vertex_groups(&self, groups: &Map<String, Value>) -> Map<String, Value> {
         groups
@@ -962,6 +985,18 @@ impl Sources<'_> {
         }
         Some(with_values(attribute, Value::Object(output)))
     }
+}
+
+/// Reads a three-component vector from a JSON array.
+fn vector3(value: &Value) -> Option<DVec3> {
+    let components = value
+        .as_array()
+        .filter(|components| components.len() == 3)?;
+    Some(DVec3::new(
+        components[0].as_f64()?,
+        components[1].as_f64()?,
+        components[2].as_f64()?,
+    ))
 }
 
 /// Blend of the authored custom normals at `sources`, weights renormalised over the sources that

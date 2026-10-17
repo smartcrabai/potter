@@ -20,7 +20,9 @@ use crate::{
         normals::SHADING_ATTRIBUTES,
     },
     hash,
-    model::{ConstraintType, DataBlock, Id, Modifier, Node, Scene, SceneDoc, VertexGroup},
+    model::{
+        CameraData, ConstraintType, DataBlock, Id, Modifier, Node, Scene, SceneDoc, VertexGroup,
+    },
     params::{self, ParameterFamily},
 };
 
@@ -68,7 +70,6 @@ pub enum EvaluationPurpose {
     Preview,
     Render,
 }
-
 
 /// Scene context used to produce one immutable evaluated snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -660,8 +661,13 @@ impl Snapshot {
                     json!({"node_id":prefix.node_id}),
                 )
             })?;
+            let prefix_gate = ModifierGate {
+                context: modifier_context,
+                suppressed: &suppressed,
+                modifier_prefix,
+            };
             for modifier in target.modifiers.iter().take(prefix.keep) {
-                if !gate.is_active(prefix.node_id, modifier) {
+                if !prefix_gate.is_active(prefix.node_id, modifier) {
                     continue;
                 }
                 for reference_id in modifier_transform_references(modifier) {
@@ -695,21 +701,18 @@ impl Snapshot {
         }
         let selected_nodes = selected_nodes_with_prefix.as_ref().or(selected_nodes);
         let world_matrix_ids = world_matrix_ids.as_ref();
-        let simulation_scene_hash = modifier_prefix
-            .map(|prefix| {
-                hash::sha256(&hash::canonicalize(&json!({
-                    "scene_hash": scene_hash,
-                    "modifier_prefix": {"node_id":prefix.node_id,"keep":prefix.keep},
-                }))?)
-            })
-            .transpose()?;
-        let simulation_scene_hash = simulation_scene_hash
-            .as_deref()
-            .unwrap_or(scene_hash.as_str());
+        let simulation_scene_hash = if let Some(prefix) = modifier_prefix {
+            hash::sha256(&hash::canonicalize(&json!({
+                "scene_hash": scene_hash,
+                "modifier_prefix": {"node_id":prefix.node_id,"keep":prefix.keep},
+            }))?)
+        } else {
+            scene_hash.clone()
+        };
         Self::evaluate_gated(
             source,
             &scene_hash,
-            simulation_scene_hash,
+            &simulation_scene_hash,
             context,
             modifier_context,
             selected_nodes,

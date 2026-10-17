@@ -2612,6 +2612,8 @@ mod tests {
                 modifier_type: "uv_project".to_owned(),
                 name: "UV Project".to_owned(),
                 enabled: true,
+                show_viewport: true,
+                show_render: true,
                 params: serde_json::Map::from_iter([("uv_layer".to_owned(), json!("Mid"))]),
                 binding_data: None,
                 runtime: crate::model::ModifierRuntime::default(),

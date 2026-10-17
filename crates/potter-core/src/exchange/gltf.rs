@@ -1025,9 +1025,10 @@ impl ColorPlan {
 }
 
 fn color_plan(
+    node_id: &Id,
     node: &Node,
+    snapshot: &Snapshot,
     mesh: &Mesh,
-    instanced: bool,
     surfaces: &BTreeMap<Id, ResolvedSurface>,
 ) -> ColorPlan {
     let store = color_layers::read(mesh);
@@ -1038,25 +1039,19 @@ fn color_plan(
     plan.used_slots = mesh
         .faces
         .iter()
-        .map(|face| export_material_slot(face, instanced))
+        .map(|face| face.material_index)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
     for &slot in &plan.used_slots {
-        let surface = if node.materials.is_empty() {
-            None
-        } else {
-            usize::try_from(slot)
-                .ok()
-                .and_then(|index| node.materials.get(index))
-                .and_then(|id| surfaces.get(id))
-        };
-        let read = if node.materials.is_empty() {
-            Some(None)
-        } else {
-            surface
-                .and_then(|surface| surface.vertex_color.as_ref())
-                .map(|read| read.layer.clone())
+        let material_id = usize::try_from(slot)
+            .ok()
+            .and_then(|index| snapshot.slot_material(node_id, node, index));
+        let surface = material_id.and_then(|id| surfaces.get(id));
+        let read = match material_id {
+            None => Some(None),
+            Some(_) => surface
+                .and_then(|surface| surface.vertex_color.as_ref().map(|read| read.layer.clone())),
         };
         let Some(reference) = read else {
             continue;
@@ -1069,7 +1064,7 @@ fn color_plan(
                 }
             }
             // A primitive without a material reads nothing when the mesh has no layers.
-            (None, _) if node.materials.is_empty() => {}
+            (None, _) if material_id.is_none() => {}
             (None, _) => {
                 plan.missing.insert(slot, reference);
             }
@@ -1629,6 +1624,43 @@ fn used_material_bindings<'a>(
                 .map(|material| (material, uv.get(slot).copied().unwrap_or(false)))
         })
         .collect())
+}
+/// Rejects a textured material slot that resolves its UV reference to `TEXCOORD_0` without UV
+/// coverage. Missing named layers keep the normal render-layer fallback when one exists.
+fn validate_mesh_material_uv(
+    material_id: &Id,
+    surfaces: &BTreeMap<Id, ResolvedSurface>,
+    avatar: Option<&AvatarSettings>,
+    mesh: &Mesh,
+    has_uv: bool,
+) -> Result<()> {
+    let surface = surfaces.get(material_id).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "node material reference is missing",
+        )
+    })?;
+    let layers = uv_layers::read(mesh);
+    let samples_texcoord0 = surface_textures(surface).into_iter().any(|texture| {
+        let (index, _) = layers.resolve(texture.uv_layer.as_deref());
+        index.unwrap_or(0) == 0
+    }) || avatar
+        .and_then(|avatar| avatar.mtoon.get(material_id))
+        .is_some_and(|mtoon| {
+            super::vrm::uv_textures(mtoon).any(|texture| {
+                let (index, _) = layers.resolve(texture.uv_layer.as_deref());
+                index.unwrap_or(0) == 0
+            })
+        });
+    if samples_texcoord0 && !has_uv {
+        return Err(unsupported_export(
+            feature_id::MESH_UV_LAYER,
+            &format!(
+                "material `{material_id}` samples TEXCOORD_0, but its mesh slot has no UV coverage"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether a `vertex_groups` attribute is a structurally valid export of `data_block`'s groups:
@@ -3215,7 +3247,7 @@ pub(crate) fn tex_coord_plan(
         if evaluated.vertices.is_empty() {
             continue;
         }
-        let (mesh, instanced) = if let Some(data_id) = &node.data {
+        let mesh = if let Some(data_id) = &node.data {
             let Some(data_block) = doc
                 .data_blocks
                 .get(data_id)
@@ -3223,14 +3255,14 @@ pub(crate) fn tex_coord_plan(
             else {
                 continue;
             };
-            (source_mesh_for_export(node, data_block, evaluated)?, false)
+            source_mesh_for_export(node, data_block, evaluated, snapshot.purpose)?
         } else if instance_collection_target(node)?.is_some() {
-            (evaluated, true)
+            evaluated
         } else {
             continue;
         };
         let layers = uv_layers::read(mesh);
-        for material_id in used_material_ids(node, mesh, instanced)? {
+        for (material_id, has_uv) in used_material_bindings(node_id, node, snapshot, mesh)? {
             let texture_refs = references.get(material_id).ok_or_else(|| {
                 PotError::new(
                     ErrorCode::SceneInvalid,
@@ -3242,7 +3274,8 @@ pub(crate) fn tex_coord_plan(
                 let layer = reference
                     .as_deref()
                     .map_or_else(|| "the render layer".to_owned(), |name| format!("`{name}`"));
-                if (missing.is_some() || index.is_none())
+                let slot_uv_missing = index == Some(0) && !has_uv;
+                if (missing.is_some() || index.is_none() || slot_uv_missing)
                     && reported.insert((
                         material_id.clone(),
                         reference.clone(),
@@ -3253,9 +3286,15 @@ pub(crate) fn tex_coord_plan(
                     plan.losses.push(Loss {
                         feature_id: feature_id::UV_LAYER_MISSING.to_owned(),
                         data_id: Some(material_id.to_string()),
-                        reason: format!(
-                            "material `{material_id}` samples UV layer {layer}, which mesh `{node_id}` does not have; the texture exports at TEXCOORD_0"
-                        ),
+                        reason: if slot_uv_missing && missing.is_none() {
+                            format!(
+                                "material `{material_id}` has faces without UV values on mesh `{node_id}`; the texture exports at TEXCOORD_0"
+                            )
+                        } else {
+                            format!(
+                                "material `{material_id}` samples UV layer {layer}, which mesh `{node_id}` does not have; the texture exports at TEXCOORD_0"
+                            )
+                        },
                         suggestion: Some(
                             "name the layer on the mesh, or set the texture's UV layer to the render layer".to_owned(),
                         ),
@@ -3357,7 +3396,7 @@ pub(crate) fn mesh_export_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<
         if evaluated.vertices.is_empty() {
             continue;
         }
-        let (mesh, owner, instanced) = if let Some(data_id) = &node.data {
+        let (mesh, owner) = if let Some(data_id) = &node.data {
             let Some(data_block) = doc
                 .data_blocks
                 .get(data_id)
@@ -3366,19 +3405,20 @@ pub(crate) fn mesh_export_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<
                 continue;
             };
             (
-                source_mesh_for_export(node, data_block, evaluated)?,
+                source_mesh_for_export(node, data_block, evaluated, snapshot.purpose)?,
                 data_id.to_string(),
-                false,
             )
         } else if instance_collection_target(node)?.is_some() {
-            (evaluated, node_id.to_string(), true)
+            (evaluated, node_id.to_string())
         } else {
             continue;
         };
         let found = unwritten_attribute_losses(mesh, &owner)
             .into_iter()
             .chain(explicit_zero_normal_loss(mesh, &owner)?)
-            .chain(color_losses(node, mesh, &owner, instanced, &surfaces));
+            .chain(color_losses(
+                node_id, node, snapshot, mesh, &owner, &surfaces,
+            ));
         for loss in found {
             if reported.insert((owner.clone(), loss.reason.clone())) {
                 losses.push(loss);
@@ -3515,16 +3555,17 @@ pub(crate) fn unwritten_attribute_losses(mesh: &Mesh, owner: &str) -> Vec<Loss> 
 /// primitive has no `COLOR_n` for it. Each vertex-color read that names no layer of the mesh is
 /// reported too.
 fn color_losses(
+    node_id: &Id,
     node: &Node,
+    snapshot: &Snapshot,
     mesh: &Mesh,
     owner: &str,
-    instanced: bool,
     surfaces: &BTreeMap<Id, ResolvedSurface>,
 ) -> Vec<Loss> {
     const SUGGESTION: &str =
         "export with --allow-lossy, or export as blend to keep the color layers";
     let store = color_layers::read(mesh);
-    let plan = color_plan(node, mesh, instanced, surfaces);
+    let plan = color_plan(node_id, node, snapshot, mesh, surfaces);
     let mixed = plan.slot_layers.values().collect::<BTreeSet<_>>().len() > 1;
     let mut losses = Vec::new();
     for (index, layer) in store.layers.iter().enumerate() {
@@ -3681,6 +3722,7 @@ pub(crate) fn validate_vrm_mesh_references(
 ) -> Result<()> {
     validate_vrm_texture_images(doc, avatar)?;
     let visible = super::render_visible_nodes(doc, snapshot)?;
+    let surfaces = resolve_material_surfaces(doc)?;
     let mut rest_world_cache = BTreeMap::<Id, BTreeMap<Id, DMat4>>::new();
     let mut data_skin_bindings = BTreeMap::<Id, SkinBinding>::new();
     for (node_id, node) in &doc.nodes {
@@ -3952,7 +3994,7 @@ fn export_with_root_inner(
             },
             std::string::ToString::to_string,
         );
-        let colors = color_plan(node, mesh, data_block.is_none(), &surfaces);
+        let colors = color_plan(node_id, node, snapshot, mesh, &surfaces);
         let MeshExportLayout { layout, key_deltas } = mesh_export_layout(
             mesh,
             data_block,
@@ -9920,12 +9962,13 @@ mod tests {
         read_vertex_color(&mut doc, "second", "Second")?;
 
         let surfaces = super::resolve_material_surfaces(&doc)?;
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         let node = &doc.nodes[&node_id];
         let mesh = doc.data_blocks[&data_id]
             .mesh
             .as_ref()
             .ok_or("sheet mesh is missing")?;
-        let plan = super::color_plan(node, mesh, false, &surfaces);
+        let plan = super::color_plan(&node_id, node, &snapshot, mesh, &surfaces);
         for (slot, selected, other) in [(0, 0, 1), (1, 1, 0)] {
             let attributes = plan.attributes(slot);
             assert_eq!(attributes[0], (0, selected), "slot {slot} COLOR_0");
@@ -9945,7 +9988,6 @@ mod tests {
             );
         }
 
-        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         let losses = super::mesh_export_losses(&doc, &snapshot)?;
         let color_losses = losses
             .iter()

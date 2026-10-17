@@ -886,7 +886,7 @@ pub(super) fn grid_location_for_sample(
         ptex_face_index,
         u,
         v,
-        grid_side: location.grid_side,
+        grid_side: grid_side_for_loop(data, location.grid_index)?,
         tangent_corner: location.grid_corner,
     })
 }

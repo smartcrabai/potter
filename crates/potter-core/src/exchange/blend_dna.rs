@@ -4,6 +4,8 @@ use std::{
     mem::size_of,
 };
 
+use crate::geom::multires_external::grid_vector_count;
+
 use serde_json::{Map, Number, Value};
 
 const LEGACY_HEADER_LEN: usize = 12;

@@ -11,11 +11,11 @@ use super::{
     Mesh, MeshError,
     adaptive_dicing::DicedTopology,
     mesh_error,
-    provenance::{Origin, remap_attributes},
     subdivision_limit::{LimitSurface, Sample},
     subdivision_normals,
     subdivision_uv::{self, FvarLinear, UvLayerValues},
 };
+use crate::geom::provenance::{Origin, remap_attributes};
 
 /// Builds the render mesh and remaps source attributes through adaptive dicing samples.
 pub(super) fn assemble(
@@ -126,7 +126,8 @@ pub(super) fn assemble(
                     MeshError::InvalidTopology("adaptive mesh face references a missing vertex"),
                 )
             })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| mesh_error(&error))?;
         output_faces.push(Ok((ids, material_index)));
         origin.faces.push(Some(source_face));
         output_corner_count = output_corner_count

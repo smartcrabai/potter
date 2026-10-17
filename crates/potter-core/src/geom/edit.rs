@@ -2737,6 +2737,10 @@ fn apply_dissolve(mesh: &mut Mesh, selected: &Selection) -> Result<IdChanges> {
         if first_direction != (second_direction.1, second_direction.0) {
             return Err(invalid("adjacent faces have incompatible edge winding"));
         }
+        let mut first_path = boundary_path(first, first_direction.1, first_direction.0)
+            .ok_or_else(|| invalid("cannot build the first dissolve boundary"))?;
+        let second_path = boundary_path(second, second_direction.1, second_direction.0)
+            .ok_or_else(|| invalid("cannot build the second dissolve boundary"))?;
         let mut seed_sources = first_path
             .iter()
             .map(|vertex| {
@@ -7068,16 +7072,16 @@ fn apply_inner(
             number(args, "threshold", 1.0e-6)?,
         )?,
         "fill" => apply_fill(mesh, &required_selection(mesh, args)?)?,
-        "bisect" => apply_bisect(mesh, args, multires_data.as_deref_mut(), false)?,
+        "bisect" => apply_bisect(mesh, args, multires_data.as_mut(), false)?,
         "loop_cut" => apply_loop_cut(
             mesh,
             &required_selection(mesh, args)?,
             positive_count(args, "cuts", 1)?,
-            multires_data.as_deref_mut(),
+            multires_data.as_mut(),
         )?,
         "bridge" => apply_bridge(mesh, &required_selection(mesh, args)?)?,
         "knife" => apply_knife(mesh, args)?,
-        "symmetrize" => apply_symmetrize(mesh, args, multires_data.as_deref_mut())?,
+        "symmetrize" => apply_symmetrize(mesh, args, multires_data.as_mut())?,
         "remesh" => apply_remesh(mesh, args)?,
         "mirror" => apply_mirror(mesh, args)?,
         "flip_normals" => apply_flip_normals(mesh, &required_selection(mesh, args)?)?,

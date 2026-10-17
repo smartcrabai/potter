@@ -31,7 +31,7 @@ use crate::error::{ErrorCode, PotError, Result};
 
 use super::normals::{normal_matrix, sharp_edge_flags, smooth_face_flags};
 use super::provenance::{Origin, default_value, remap_attributes_skipping};
-use super::uv_layers::{UvLayer, read_layers, uv_map_entry_layer, write_layers};
+use super::uv_layers::{UvLayer, read_layers, write_layers};
 use super::{Edge, IdCounters, Mesh, MeshError, Vertex};
 
 /// One collection member: its evaluated mesh (borrowed for plain members, owned for nested joins),
@@ -370,6 +370,11 @@ fn blender_uv_map(source: &Mesh, placed: &Mesh) -> Vec<Value> {
                 .and_then(|id| placed_faces.get(&id))?;
             // Entries without a `layer` key are Potter's glTF-space default; the rest are Blender's.
             let flip = entry.get("layer").is_none();
+            let layer = match entry.get("layer") {
+                Some(Value::String(name)) if !name.is_empty() => name.as_str(),
+                Some(_) => return None,
+                None => "UVMap",
+            };
             let uv: Vec<Value> = entry
                 .get("uv")
                 .and_then(Value::as_array)?
@@ -378,7 +383,7 @@ fn blender_uv_map(source: &Mesh, placed: &Mesh) -> Vec<Value> {
                 .collect();
             Some(json!({
                 "face_id": *face,
-                "layer": uv_map_entry_layer(entry),
+                "layer": layer,
                 "uv": uv,
             }))
         })
@@ -432,6 +437,9 @@ fn mirror_corners(mesh: &mut Mesh, layers: &mut [UvLayer]) {
     }
     for layer in layers.iter_mut() {
         for row in layer.faces.iter_mut().flatten() {
+            row.reverse();
+        }
+        for row in layer.pinned.iter_mut().flatten() {
             row.reverse();
         }
     }
@@ -494,13 +502,24 @@ fn join_uv_layers(pieces: &mut [Piece]) -> Vec<UvLayer> {
                 .map(|layer| layer.name.clone())
                 .unwrap_or_default();
             let mut faces = Vec::new();
+            let mut pinned = Vec::new();
             for piece in pieces.iter_mut() {
                 match piece.uv_layers.get_mut(index) {
-                    Some(layer) => faces.append(&mut layer.faces),
-                    None => faces.extend(std::iter::repeat_n(None, piece.faces)),
+                    Some(layer) => {
+                        faces.append(&mut layer.faces);
+                        pinned.append(&mut layer.pinned);
+                    }
+                    None => {
+                        faces.extend(std::iter::repeat_n(None, piece.faces));
+                        pinned.extend(std::iter::repeat_n(None, piece.faces));
+                    }
                 }
             }
-            UvLayer { name, faces }
+            UvLayer {
+                name,
+                faces,
+                pinned,
+            }
         })
         .collect()
 }

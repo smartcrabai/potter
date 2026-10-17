@@ -12612,7 +12612,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
             (corner_count, z_sum, nonzero)
         }
 
-        let inline = import_blend(inline_path, Some(&blender))?;
+        let inline = import_blend(&inline_path, Some(&blender))?;
         let inline_record = record(&inline);
         assert!(inline_record.get("external").is_none());
         let (_, inline_z_sum, inline_nonzero) = check_grids(&inline_record);
@@ -12716,7 +12716,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
             let (_, _, nonzero) = check_grids(&roundtrip_record);
             assert!(nonzero, "{stem} MDisps grids became zero");
         }
-        let external = import_blend(external_path, Some(&blender))?;
+        let external = import_blend(&external_path, Some(&blender))?;
         let external_record = record(&external);
         let filepath = external_record
             .get("external")
@@ -12756,8 +12756,10 @@ print("UNSUPPORTED_POSE " + json.dumps({
             tempfile::tempdir().map_err(|error| PotError::io(&error))?;
         let missing_sidecar_blend = missing_sidecar_directory.path().join("external.blend");
         fs::copy(external_path, &missing_sidecar_blend).map_err(|error| PotError::io(&error))?;
-        let missing_sidecar_error =
-            import_blend(&missing_sidecar_blend, Some(&blender)).unwrap_err();
+        let missing_sidecar_error = match import_blend(&missing_sidecar_blend, Some(&blender)) {
+            Ok(_) => panic!("importing a blend with a missing multires sidecar should fail"),
+            Err(error) => error,
+        };
         assert_eq!(missing_sidecar_error.code, ErrorCode::FileNotFound);
         eprintln!(
             "multires oracle: inline corners=24 grid=9 z_sum={inline_z_sum}; external filepath={filepath}"

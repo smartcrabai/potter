@@ -15,10 +15,11 @@ use crate::{
     eval::ModifierEvaluationContext,
     graph::{self, NodeGroup},
     model::{CameraData, Id, Modifier, Registry, RenderSettings},
+    params::{self, ParameterFamily},
 };
 
 use super::attribute_keys;
-use super::clnor::{self, NormalCodeOptions, SetterInput, settle_custom_normals};
+use super::clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput, settle_custom_normals};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
@@ -26,7 +27,7 @@ use super::{
         corner_normal_domain, corner_normals, face_normal, safe_acos_approx, sharp_edge_flags,
     },
     provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
-    uv_layers::{self, uv_default, uv_map_entry_layer},
+    uv_layers,
 };
 
 mod adaptive_dicing;
@@ -2464,6 +2465,7 @@ fn adaptive_subdivision(
         &adaptive_dicing::AdaptiveDicingConfig {
             space,
             object_to_world: owner_world_matrix,
+            target_size,
             max_subdivisions: adaptive_render.settings.max_subdivisions,
             offscreen_scale: adaptive_render.settings.offscreen_dicing_scale,
             camera,
@@ -3124,7 +3126,7 @@ fn ensure_multires_paint_masks(
     data.paint_mask_level = Some(sculpt_levels);
     data.paint_mask_levels = Some(vec![sculpt_levels; corner_count]);
     data.paint_mask_grids = Some(grids);
-    Ok(())
+    Ok(true)
 }
 
 /// Populate the stroke mesh from Blender's per-corner CCG mask grids.
