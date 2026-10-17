@@ -43,9 +43,10 @@ if hidden is None:
 hidden.data[0].value = True
 bpy.context.view_layer.objects.active = obj
 obj.select_set(True)
-bpy.ops.object.mode_set(mode="SCULPT")
-bpy.ops.paint.mask_flood_fill(mode="VALUE", value=0.25)
-bpy.ops.object.mode_set(mode="OBJECT")
+# Same final mask as paint.mask_flood_fill(mode="VALUE", value=0.25): every vertex gets 0.25.
+# Written through the mesh API because the operator's undo push aborts headless Blender.
+for item in mask.data:
+    item.value = 0.25
 mask.data[0].value = 0.75
 bpy.ops.wm.save_as_mainfile(filepath=output)
 "#;
