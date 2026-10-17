@@ -4072,9 +4072,9 @@ mod tests {
 
     #[test]
     fn blender_522_cell_noise_v3_matches_hash_point_color() {
-        // Blender 5.2.2 BLI_noise_cell_v3(0, 0, 0), using its HASHPNT tables.
+        // Blender 5.2.2 Voronoi colours sampled near (1.1, 2.3, -1.9) equal BLI_noise_cell_v3 of cell (1, 2, -1).
         assert_eq!(
-            cell_noise_v3(0.0, 0.0, 0.0),
+            cell_noise_v3(1.0, 2.0, -1.0),
             [0.982_098, 0.161_631, 0.193_576]
         );
     }
