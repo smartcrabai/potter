@@ -3227,7 +3227,15 @@ fn multires_export_patches(
                         file.header.pointer_size,
                     )?;
                     if !external {
-                        patches.push(patch_float3_json_array(file, disps, raw_grid)?);
+                        if disps == 0 {
+                            if !json_value_is_zero(raw_grid) {
+                                return Err(format!(
+                                    "Blender mesh {mesh_name} loop {loop_index} has no allocated MDisps storage for nonzero displacement"
+                                ));
+                            }
+                        } else {
+                            patches.push(patch_float3_json_array(file, disps, raw_grid)?);
+                        }
                     }
                 }
                 if let Some(hidden) = raw_hidden {
@@ -3329,6 +3337,12 @@ fn multires_export_patches(
                             mask_offset,
                             "data",
                         )?);
+                    } else if data == 0 {
+                        if !json_values_are_zero(values) {
+                            return Err(format!(
+                                "Blender mesh {mesh_name} GridPaintMask loop {loop_index} has no allocated storage for nonzero values"
+                            ));
+                        }
                     } else {
                         patches.push(patch_float_json_array(file, data, values)?);
                     }
@@ -3342,6 +3356,18 @@ fn multires_export_patches(
         ));
     }
     Ok(patches)
+}
+
+fn json_value_is_zero(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().all(json_value_is_zero),
+        Value::Number(number) => number.as_f64() == Some(0.0),
+        _ => false,
+    }
+}
+
+fn json_values_are_zero(values: &[Value]) -> bool {
+    values.iter().all(json_value_is_zero)
 }
 
 fn patch_null_pointer_field(
