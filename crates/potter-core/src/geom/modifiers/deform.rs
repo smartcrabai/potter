@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::{FRAC_PI_2, PI};
 
 use glam::{DMat4, DVec2, DVec3};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -23,6 +23,8 @@ use super::{
     bool_param, id_indices as index_positions, invalid_parameter, number_param, uint_param,
     validated,
 };
+
+mod harmonic;
 
 /// Evaluates a bound Surface Deform from the bind-time polygon bindings; unbound leaves the mesh unchanged.
 pub(super) fn surface_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -52,6 +54,19 @@ fn is_native_bind(bind_data: &Value, modifier_type: &str) -> bool {
     bind_data.as_object().is_some_and(|object| {
         object.get("format").and_then(Value::as_str) == Some("blender_native_bind_v1")
             && object.get("type").and_then(Value::as_str) == Some(modifier_type)
+    })
+}
+
+/// Format tag for Mesh Deform binds computed by Potter. The fields use Blender's layout, so these
+/// binds evaluate through the same path as native binds.
+const MESH_DEFORM_BIND_FORMAT: &str = "blender_mesh_deform_bind_v1";
+
+fn is_mesh_deform_bind(bind_data: &Value) -> bool {
+    bind_data.as_object().is_some_and(|object| {
+        matches!(
+            object.get("format").and_then(Value::as_str),
+            Some("blender_native_bind_v1" | MESH_DEFORM_BIND_FORMAT)
+        ) && object.get("type").and_then(Value::as_str) == Some("mesh_deform")
     })
 }
 
@@ -382,160 +397,22 @@ fn native_polygon_normal(target: &Mesh, indices: &[Value], modifier: &Modifier) 
     })
 }
 
-/// Evaluates a bound Mesh Deform cage. Each cage vertex contributes its displacement measured in
-/// the bind frame, applied as an offset through the inverse linear part of the current cage
-/// transform, as Blender's `meshdeformModifier_do` does.
+/// Evaluates a bound Mesh Deform cage from its bind-time data, as Blender's `meshdeformModifier_do`
+/// does. Static binds apply the stored per-vertex cage weights; dynamic binds interpolate the stored
+/// bind grid at the current vertex positions. Evaluation never re-solves the bind against the
+/// current cage or subject.
 pub(super) fn mesh_deform(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let Some(bind_data) = modifier.binding_data.as_ref() else {
         return Ok(mesh.clone());
     };
-    if is_native_bind(bind_data, "mesh_deform") {
-        return native_mesh_deform(mesh, modifier, bind_data);
-    }
-    let bind_data = bind_data.as_object().ok_or_else(|| {
-        invalid_parameter(modifier, "binding_data", "stored harmonic cage weights")
-    })?;
-    let bind_weights = bind_data
-        .get("weights")
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid_parameter(modifier, "binding_data", "cage-coordinate rows"))?;
-    let bound_cage: Mesh =
-        serde_json::from_value(bind_data.get("cage_mesh").cloned().ok_or_else(|| {
-            invalid_parameter(
-                modifier,
-                "binding_data",
-                "the bind-time owner-space cage mesh",
-            )
-        })?)
-        .map_err(|_| invalid_parameter(modifier, "binding_data", "a valid bind-time cage mesh"))?;
-    let bound_cage_local: Mesh =
-        serde_json::from_value(bind_data.get("cage_local_mesh").cloned().ok_or_else(|| {
-            invalid_parameter(modifier, "binding_data", "the bind-time cage mesh")
-        })?)
-        .map_err(|_| invalid_parameter(modifier, "binding_data", "a valid bind-time cage mesh"))?;
-    let bind_matrix = native_matrix(bind_data, modifier)?;
-    let cage_owner = modifier
-        .runtime
-        .target_mesh
-        .as_ref()
-        .ok_or_else(|| invalid_parameter(modifier, "object", "a mesh cage object operand"))?;
-    let target_to_subject = modifier
-        .runtime
-        .target_to_subject
-        .map_or(DMat4::IDENTITY, |matrix| DMat4::from_cols_array(&matrix));
-    let subject_to_target = target_to_subject.inverse();
-    if !subject_to_target.is_finite() {
-        return Err(invalid_parameter(
-            modifier,
-            "object",
-            "an invertible cage transform",
-        ));
-    }
-    let mut cage = (*cage_owner).clone();
-    for vertex in &mut cage.vertices {
-        vertex.co = subject_to_target.transform_point3(vertex.co);
-    }
-    if !same_mesh_topology(&bound_cage_local, &cage) {
-        return Err(invalid_parameter(
-            modifier,
-            "bind_data",
-            "binding rows and cage topology matching the bound meshes",
-        ));
-    }
-    let inverse_deform_matrix = (bind_matrix * subject_to_target).inverse();
-    if !inverse_deform_matrix.is_finite() {
-        return Err(invalid_parameter(
-            modifier,
-            "object",
-            "an invertible cage transform",
-        ));
-    }
-    let precision = match bind_data.get("precision") {
-        Some(value) => value.as_u64().ok_or_else(|| {
-            invalid_parameter(modifier, "binding_data", "a valid bound grid precision")
-        })?,
-        None => uint_param(modifier, "precision")?,
-    };
-    if !(2..=10).contains(&precision) {
+    if !is_mesh_deform_bind(bind_data) {
         return Err(invalid_parameter(
             modifier,
             "binding_data",
-            "a bound grid precision from 2 to 10",
+            "a Mesh Deform bind in Blender layout",
         ));
     }
-    let precision = u32::try_from(precision)
-        .map_err(|_| invalid_parameter(modifier, "binding_data", "a bound grid precision"))?;
-    let dynamic = match bind_data.get("dynamic_bind").and_then(Value::as_bool) {
-        Some(dynamic) => dynamic,
-        None => bool_param(modifier, "use_dynamic_bind")?,
-    };
-    let group = group_weights(mesh, modifier)?;
-    let invert = bool_param(modifier, "invert_vertex_group")?;
-    if bind_weights.len() != mesh.vertices.len() {
-        return Err(invalid_parameter(
-            modifier,
-            "bind_data",
-            "one bind-weight row per source vertex",
-        ));
-    }
-    // Blender measures the cage in cage-local space, maps it into the bind frame, and subtracts
-    // the bind-time position; moving the cage or owner object alone therefore has no effect.
-    let cage_displacements = cage
-        .vertices
-        .iter()
-        .zip(&bound_cage.vertices)
-        .map(|(current, bound)| bind_matrix.transform_point3(current.co) - bound.co)
-        .collect::<Vec<_>>();
-    let dynamic_weights = if dynamic {
-        let mut source_cage_space = mesh.clone();
-        for vertex in &mut source_cage_space.vertices {
-            vertex.co = subject_to_target.transform_point3(vertex.co);
-        }
-        Some(harmonic_mesh_bind(&source_cage_space, &cage, precision)?)
-    } else {
-        None
-    };
-    let rows = dynamic_weights
-        .as_ref()
-        .and_then(Value::as_array)
-        .unwrap_or(bind_weights);
-    let mut result = mesh.clone();
-    for (vertex_index, vertex) in result.vertices.iter_mut().enumerate() {
-        let weights = rows[vertex_index]
-            .as_array()
-            .filter(|weights| weights.len() == cage.vertices.len())
-            .ok_or_else(|| {
-                invalid_parameter(
-                    modifier,
-                    "bind_data",
-                    "weights matching the cage vertex count",
-                )
-            })?;
-        let group_weight = group.as_ref().map_or(1.0, |weights| {
-            if invert {
-                1.0 - weights[vertex_index]
-            } else {
-                weights[vertex_index]
-            }
-        });
-        if group_weight <= 0.0 {
-            continue;
-        }
-        let mut total_weight = 0.0;
-        let mut deformation = DVec3::ZERO;
-        for (weight, displacement) in weights.iter().zip(&cage_displacements) {
-            let weight = finite_number(weight, modifier, "bind_data")?;
-            total_weight += weight;
-            deformation += *displacement * weight;
-        }
-        if total_weight <= 0.0 {
-            continue;
-        }
-        vertex.co +=
-            inverse_deform_matrix.transform_vector3(deformation / total_weight) * group_weight;
-    }
-    validated(&result)?;
-    Ok(result)
+    native_mesh_deform(mesh, modifier, bind_data)
 }
 
 fn native_mesh_deform(mesh: &Mesh, modifier: &Modifier, bind_data: &Value) -> Result<Mesh> {
@@ -968,18 +845,6 @@ fn native_flag(value: &Value) -> bool {
 )]
 fn native_grid_integer(value: f64) -> i32 {
     value.trunc() as i32
-}
-
-fn same_mesh_topology(left: &Mesh, right: &Mesh) -> bool {
-    left.vertices
-        .iter()
-        .map(|vertex| vertex.id)
-        .eq(right.vertices.iter().map(|vertex| vertex.id))
-        && left
-            .faces
-            .iter()
-            .map(|face| (face.id, &face.vertices))
-            .eq(right.faces.iter().map(|face| (face.id, &face.vertices)))
 }
 
 /// Extends hook-moved anchor displacement over the mesh with a discrete Laplace solve.
@@ -2270,7 +2135,9 @@ fn sort_polygon_from_index(corners: &[usize], start: usize) -> Vec<usize> {
 }
 
 /// Binds source vertices to Blender-style cage-local harmonic coordinates. `cage_to_owner` is
-/// the bind-time map from cage-local coordinates into subject-local coordinates.
+/// the bind-time map from cage-local coordinates into subject-local coordinates. The harmonic
+/// grid is solved once here and stored in Blender's Mesh Deform layout, so evaluation never
+/// re-solves against the current cage or subject.
 pub(crate) fn bind_mesh(
     mesh: &Mesh,
     cage: &Mesh,
@@ -2299,472 +2166,88 @@ pub(crate) fn bind_mesh(
     let precision = u32::try_from(precision)
         .map_err(|_| invalid_parameter(modifier, "precision", "an integer from 2 to 10"))?;
     let dynamic = bool_param(modifier, "use_dynamic_bind")?;
-    let mut source_cage_space = mesh.clone();
-    for vertex in &mut source_cage_space.vertices {
-        vertex.co = owner_to_cage.transform_point3(vertex.co);
-    }
-    let weights = harmonic_mesh_bind(&source_cage_space, cage, precision)?;
-    let mut cage_owner = cage.clone();
-    for vertex in &mut cage_owner.vertices {
-        vertex.co = cage_to_owner.transform_point3(vertex.co);
-    }
-    let mat: Vec<Vec<f64>> = cage_to_owner
+    let source_cage_space = mesh
+        .vertices
+        .iter()
+        .map(|vertex| owner_to_cage.transform_point3(vertex.co))
+        .collect::<Vec<_>>();
+    let grid = harmonic::bind_harmonic_grid(&source_cage_space, cage, precision, dynamic)?;
+    let cage_coordinates = cage
+        .vertices
+        .iter()
+        .flat_map(|vertex| cage_to_owner.transform_point3(vertex.co).to_array())
+        .collect::<Vec<f64>>();
+    let matrix = cage_to_owner
         .to_cols_array()
         .chunks(4)
         .map(<[f64]>::to_vec)
-        .collect();
-    Ok(json!({
-        "weights": weights,
-        "cage_mesh": cage_owner,
-        "cage_local_mesh": cage,
-        "dynamic_bind": dynamic,
-        "mat": mat,
-        "precision": precision
-    }))
+        .collect::<Vec<_>>();
+    let mut binding = Map::from_iter([
+        ("format".to_owned(), json!(MESH_DEFORM_BIND_FORMAT)),
+        ("type".to_owned(), json!("mesh_deform")),
+        ("verts_num".to_owned(), json!(mesh.vertices.len())),
+        ("cage_verts_num".to_owned(), json!(cage.vertices.len())),
+        ("dynamic_bind".to_owned(), json!(dynamic)),
+        ("bind_matrix".to_owned(), json!(matrix)),
+        ("bind_cage_coordinates".to_owned(), json!(cage_coordinates)),
+    ]);
+    for (key, value) in mesh_deform_grid_layout(&grid, dynamic) {
+        binding.insert(key.to_owned(), value);
+    }
+    Ok(Value::Object(binding))
 }
 
-#[derive(Clone, Copy)]
-struct BoundaryIntersection {
-    vertices: [usize; 3],
-    weights: [f64; 3],
-    distance: f64,
-}
-
-#[derive(Clone, Copy)]
-struct BoundaryWeights {
-    intersections: [Option<BoundaryIntersection>; 6],
-}
-
-fn harmonic_mesh_bind(source: &Mesh, cage: &Mesh, precision: u32) -> Result<Value> {
-    let triangles = cage_triangles(cage)?;
-    let bounds = cage
-        .bounds()
-        .ok_or_else(|| PotError::invalid_operation("mesh deform cage has no bounds"))?;
-    let extent = bounds.size();
-    if extent.min_element() <= f64::EPSILON {
-        return Err(PotError::invalid_operation(
-            "mesh deform cage must enclose a three-dimensional region",
-        ));
-    }
-    let precision_cells = 1_usize.checked_shl(precision).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "Mesh Deform precision exceeds grid limits",
-        )
-    })?;
-    let cells = precision_cells.checked_add(2).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "Mesh Deform precision exceeds grid limits",
-        )
-    })?;
-    let side = cells;
-    let node_count = side
-        .checked_mul(side)
-        .and_then(|count| count.checked_mul(side))
-        .ok_or_else(|| PotError::invalid_argument("mesh deform voxel grid exceeds limits"))?;
-    let weight_count = source
-        .vertices
-        .len()
-        .checked_mul(cage.vertices.len())
-        .ok_or_else(|| PotError::invalid_argument("mesh deform bind data exceeds limits"))?;
-    if node_count > 274_625 || weight_count > 10_000_000 {
-        return Err(PotError::new(
-            ErrorCode::LimitExceeded,
-            format!(
-                "Mesh Deform harmonic bind exceeds resource budget: {node_count} grid nodes, {weight_count} weights"
-            ),
-        ));
-    }
-    let sample_work = node_count
-        .checked_mul(triangles.len())
-        .and_then(|work| work.checked_mul(6))
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "Mesh Deform sampling work exceeds limits",
-            )
-        })?;
-    if sample_work > 50_000_000 {
-        return Err(PotError::new(
-            ErrorCode::LimitExceeded,
-            format!("Mesh Deform harmonic binding requires {sample_work} triangle checks"),
-        ));
-    }
-    let maximum_width = extent.max_element();
-    let center = (bounds.min + bounds.max) * 0.5;
-    let padding = maximum_width / (cells - 4) as f64 * 2.1;
-    let grid_min = center - DVec3::splat(maximum_width * 0.5 + padding);
-    let grid_extent = DVec3::splat(maximum_width + 2.0 * padding);
-    let spacing = grid_extent / cells as f64;
-    let mut boundary = vec![None; node_count];
-    for z in 0..cells {
-        for y in 0..cells {
-            for x in 0..cells {
-                let node = grid_index(x, y, z, side);
-                let start = grid_position(x, y, z, cells, grid_min, grid_extent);
-                let neighbors = [
-                    (x > 0).then(|| (x - 1, y, z)),
-                    (x + 1 < cells).then(|| (x + 1, y, z)),
-                    (y > 0).then(|| (x, y - 1, z)),
-                    (y + 1 < cells).then(|| (x, y + 1, z)),
-                    (z > 0).then(|| (x, y, z - 1)),
-                    (z + 1 < cells).then(|| (x, y, z + 1)),
-                ];
-                let mut intersections = [None; 6];
-                for (direction, neighbor) in neighbors.into_iter().enumerate() {
-                    let Some((neighbor_x, neighbor_y, neighbor_z)) = neighbor else {
-                        continue;
-                    };
-                    let end = grid_position(
-                        neighbor_x,
-                        neighbor_y,
-                        neighbor_z,
-                        cells,
-                        grid_min,
-                        grid_extent,
-                    );
-                    let mut nearest = None;
-                    for triangle in &triangles {
-                        let points = triangle.map(|index| cage.vertices[index].co);
-                        if let Some((fraction, weights)) =
-                            segment_triangle_intersection(start, end, points)
-                            && nearest
-                                .is_none_or(|(nearest_fraction, _, _)| fraction < nearest_fraction)
-                        {
-                            nearest = Some((fraction, *triangle, weights));
-                        }
-                    }
-                    if let Some((fraction, vertices, weights)) = nearest {
-                        intersections[direction] = Some(BoundaryIntersection {
-                            vertices,
-                            weights,
-                            distance: (end - start).length() * fraction,
-                        });
-                    }
-                }
-                if intersections.iter().any(Option::is_some) {
-                    boundary[node] = Some(BoundaryWeights { intersections });
-                }
-            }
-        }
-    }
-    let mut outside = vec![false; node_count];
-    let mut stack = vec![0];
-    outside[0] = true;
-    while let Some(node) = stack.pop() {
-        let x = node % side;
-        let y = (node / side) % side;
-        let z = node / (side * side);
-        let neighbors = [
-            (x > 0).then(|| (x - 1, y, z)),
-            (x + 1 < cells).then(|| (x + 1, y, z)),
-            (y > 0).then(|| (x, y - 1, z)),
-            (y + 1 < cells).then(|| (x, y + 1, z)),
-            (z > 0).then(|| (x, y, z - 1)),
-            (z + 1 < cells).then(|| (x, y, z + 1)),
-        ];
-        for (direction, neighbor) in neighbors.into_iter().enumerate() {
-            let Some((neighbor_x, neighbor_y, neighbor_z)) = neighbor else {
-                continue;
-            };
-            let neighbor_node = grid_index(neighbor_x, neighbor_y, neighbor_z, side);
-            let blocked =
-                boundary[node].is_some_and(|sample| sample.intersections[direction].is_some());
-            if !blocked && !outside[neighbor_node] {
-                outside[neighbor_node] = true;
-                stack.push(neighbor_node);
-            }
-        }
-    }
-    let mut inside = vec![false; node_count];
-    let mut inside_nodes = Vec::new();
-    for node in 0..node_count {
-        if !outside[node] {
-            inside[node] = true;
-            inside_nodes.push(node);
-        }
-    }
-    if inside_nodes.is_empty() {
-        return Err(PotError::invalid_operation(
-            "mesh deform voxel grid did not intersect its cage",
-        ));
-    }
-    let mut rows = Vec::with_capacity(source.vertices.len());
-    let mut inside_source_indices = Vec::new();
-    for (index, vertex) in source.vertices.iter().enumerate() {
-        if let Some(cage_index) = cage
-            .vertices
-            .iter()
-            .position(|cage_vertex| cage_vertex.co.distance_squared(vertex.co) <= f64::EPSILON)
-        {
-            let mut row = vec![0.0; cage.vertices.len()];
-            row[cage_index] = 1.0;
-            rows.push(row);
-        } else if point_inside_mesh(vertex.co, cage, &triangles) {
-            rows.push(vec![0.0; cage.vertices.len()]);
-            inside_source_indices.push(index);
-        } else {
-            rows.push(vec![0.0; cage.vertices.len()]);
-        }
-    }
-    let mut field = vec![0.0; node_count];
-    let iteration_limit = (cells * 12).clamp(120, 600);
-    for (cage_index, _) in cage.vertices.iter().enumerate() {
-        field.fill(0.0);
-        for _ in 0..iteration_limit {
-            let mut maximum_change: f64 = 0.0;
-            for node in &inside_nodes {
-                let x = node % side;
-                let y = (node / side) % side;
-                let z = node / (side * side);
-                let neighbors = [
-                    (x > 0).then(|| node - 1),
-                    (x + 1 < cells).then(|| node + 1),
-                    (y > 0).then(|| node - side),
-                    (y + 1 < cells).then(|| node + side),
-                    (z > 0).then(|| node - side * side),
-                    (z + 1 < cells).then(|| node + side * side),
-                ];
-                let mut total_weight = 0.0;
-                let mut value = 0.0;
-                for (direction, intersection) in boundary[*node]
-                    .map_or([None; 6], |sample| sample.intersections)
-                    .into_iter()
-                    .enumerate()
-                {
-                    if let Some(intersection) = intersection {
-                        let weight = 1.0 / intersection.distance.max(1.0e-4);
-                        let boundary_value = intersection
-                            .vertices
-                            .iter()
-                            .zip(intersection.weights)
-                            .filter(|(vertex, _)| **vertex == cage_index)
-                            .map(|(_, weight)| weight)
-                            .sum::<f64>();
-                        total_weight += weight;
-                        value += weight * boundary_value;
-                    } else {
-                        let weight = 1.0 / spacing.x;
-                        total_weight += weight;
-                        if let Some(neighbor) = neighbors[direction]
-                            && inside[neighbor]
-                        {
-                            value += weight * field[neighbor];
-                        }
-                    }
-                }
-                value /= total_weight;
-                let change = value - field[*node];
-                field[*node] += change * 1.35;
-                maximum_change = maximum_change.max(change.abs());
-            }
-            if maximum_change < 1.0e-7 {
-                break;
-            }
-        }
-        for source_index in &inside_source_indices {
-            rows[*source_index][cage_index] = sample_harmonic_field(
-                &field,
-                &inside,
-                source.vertices[*source_index].co,
-                cells,
-                side,
-                grid_min,
-                grid_extent,
+/// Blender's `harmonic_coordinates_bind` storage: sparse per-vertex cage weights for a static
+/// bind, or the normalized per-cell influence grid plus per-vertex inside flags for a dynamic
+/// bind. Field names match the native Mesh Deform layout read by `native_mesh_deform`.
+fn mesh_deform_grid_layout(
+    grid: &harmonic::HarmonicBindGrid,
+    dynamic: bool,
+) -> Vec<(&'static str, Value)> {
+    if dynamic {
+        let mut cells = Vec::with_capacity(grid.cells.len());
+        let mut influences = Vec::new();
+        for cell in &grid.cells {
+            cells.push(json!({"offset": influences.len(), "influences_num": cell.len()}));
+            influences.extend(
+                cell.iter()
+                    .map(|&(vertex, weight)| json!({"vertex": vertex, "weight": weight})),
             );
         }
-    }
-    for source_index in inside_source_indices {
-        let total = rows[source_index].iter().sum::<f64>();
-        if total > f64::EPSILON {
-            for weight in &mut rows[source_index] {
-                *weight /= total;
-            }
-        } else {
-            rows[source_index] = affine_weights(source.vertices[source_index].co, cage, precision)?;
+        vec![
+            ("dynamic_grid_size", json!(grid.size)),
+            ("dynamic_cell_min", json!(grid.cell_min.to_array())),
+            ("dynamic_cell_width", json!(grid.cell_width)),
+            ("dynamic_grid", Value::Array(cells)),
+            ("dynamic_influences", Value::Array(influences)),
+            (
+                "dynamic_vertices",
+                Value::Array(
+                    grid.inside
+                        .iter()
+                        .map(|&inside| json!(u8::from(inside)))
+                        .collect(),
+                ),
+            ),
+        ]
+    } else {
+        let mut offsets = Vec::with_capacity(grid.static_rows.len() + 1);
+        let mut influences = Vec::new();
+        offsets.push(json!(0));
+        for row in &grid.static_rows {
+            influences.extend(
+                row.iter()
+                    .map(|&(vertex, weight)| json!({"vertex": vertex, "weight": weight})),
+            );
+            offsets.push(json!(influences.len()));
         }
+        vec![
+            ("bind_offsets", Value::Array(offsets)),
+            ("bind_influences", Value::Array(influences)),
+        ]
     }
-    Ok(Value::Array(
-        rows.into_iter().map(|weights| json!(weights)).collect(),
-    ))
 }
 
-fn cage_triangles(cage: &Mesh) -> Result<Vec<[usize; 3]>> {
-    let indices = index_positions(cage);
-    let mut edges = HashMap::<(u32, u32), u32>::new();
-    let mut triangles = Vec::new();
-    for face in &cage.faces {
-        let vertices = face
-            .vertices
-            .iter()
-            .map(|vertex| indices.get(vertex).copied())
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                PotError::invalid_operation("mesh deform cage contains invalid face vertices")
-            })?;
-        for index in 0..face.vertices.len() {
-            let first = face.vertices[index];
-            let second = face.vertices[(index + 1) % face.vertices.len()];
-            *edges
-                .entry((first.min(second), first.max(second)))
-                .or_default() += 1;
-        }
-        for index in 1..vertices.len().saturating_sub(1) {
-            triangles.push([vertices[0], vertices[index], vertices[index + 1]]);
-        }
-    }
-    if triangles.is_empty() || edges.values().any(|uses| *uses != 2) {
-        return Err(PotError::invalid_operation(
-            "mesh deform harmonic binding requires a closed two-manifold cage",
-        ));
-    }
-    Ok(triangles)
-}
-
-pub(super) fn point_inside_mesh(point: DVec3, cage: &Mesh, triangles: &[[usize; 3]]) -> bool {
-    let direction = DVec3::new(1.0, 0.371, 0.217).normalize();
-    let mut intersections = 0;
-    for triangle in triangles {
-        let first = cage.vertices[triangle[0]].co;
-        let edge_one = cage.vertices[triangle[1]].co - first;
-        let edge_two = cage.vertices[triangle[2]].co - first;
-        let cross = direction.cross(edge_two);
-        let determinant = edge_one.dot(cross);
-        if determinant.abs() <= 1.0e-12 {
-            continue;
-        }
-        let inverse = 1.0 / determinant;
-        let offset = point - first;
-        let u = offset.dot(cross) * inverse;
-        if !(0.0..=1.0).contains(&u) {
-            continue;
-        }
-        let q = offset.cross(edge_one);
-        let v = direction.dot(q) * inverse;
-        if v < 0.0 || u + v > 1.0 {
-            continue;
-        }
-        let distance = edge_two.dot(q) * inverse;
-        if distance > 1.0e-10 {
-            intersections += 1;
-        }
-    }
-    intersections % 2 == 1
-}
-
-fn sample_harmonic_field(
-    field: &[f64],
-    inside: &[bool],
-    point: DVec3,
-    cells: usize,
-    side: usize,
-    minimum: DVec3,
-    extent: DVec3,
-) -> f64 {
-    let coordinates = (point - minimum) / extent * cells as f64 - DVec3::splat(0.5);
-    let lower = [
-        (coordinates.x.floor() as usize).min(cells - 1),
-        (coordinates.y.floor() as usize).min(cells - 1),
-        (coordinates.z.floor() as usize).min(cells - 1),
-    ];
-    let fractions = [
-        coordinates.x - lower[0] as f64,
-        coordinates.y - lower[1] as f64,
-        coordinates.z - lower[2] as f64,
-    ];
-    let mut result = 0.0;
-    for z in 0..=1 {
-        for y in 0..=1 {
-            for x in 0..=1 {
-                let index = grid_index(
-                    (lower[0] + x).min(cells - 1),
-                    (lower[1] + y).min(cells - 1),
-                    (lower[2] + z).min(cells - 1),
-                    side,
-                );
-                if !inside[index] {
-                    continue;
-                }
-                let wx = if x == 0 {
-                    1.0 - fractions[0]
-                } else {
-                    fractions[0]
-                };
-                let wy = if y == 0 {
-                    1.0 - fractions[1]
-                } else {
-                    fractions[1]
-                };
-                let wz = if z == 0 {
-                    1.0 - fractions[2]
-                } else {
-                    fractions[2]
-                };
-                result += field[index] * wx * wy * wz;
-            }
-        }
-    }
-    result
-}
-
-fn grid_index(x: usize, y: usize, z: usize, side: usize) -> usize {
-    z * side * side + y * side + x
-}
-
-fn grid_position(
-    x: usize,
-    y: usize,
-    z: usize,
-    cells: usize,
-    minimum: DVec3,
-    extent: DVec3,
-) -> DVec3 {
-    minimum
-        + extent
-            * DVec3::new(
-                (x as f64 + 0.5) / cells as f64,
-                (y as f64 + 0.5) / cells as f64,
-                (z as f64 + 0.5) / cells as f64,
-            )
-}
-fn segment_triangle_intersection(
-    start: DVec3,
-    end: DVec3,
-    [a, b, c]: [DVec3; 3],
-) -> Option<(f64, [f64; 3])> {
-    let direction = end - start;
-    let first_edge = b - a;
-    let second_edge = c - a;
-    let cross = direction.cross(second_edge);
-    let determinant = first_edge.dot(cross);
-    if determinant.abs() <= 1.0e-12 {
-        return None;
-    }
-    let inverse = determinant.recip();
-    let offset = start - a;
-    let first_weight = offset.dot(cross) * inverse;
-    if !(-1.0e-10..=1.0 + 1.0e-10).contains(&first_weight) {
-        return None;
-    }
-    let cross = offset.cross(first_edge);
-    let second_weight = direction.dot(cross) * inverse;
-    if second_weight < -1.0e-10 || first_weight + second_weight > 1.0 + 1.0e-10 {
-        return None;
-    }
-    let fraction = second_edge.dot(cross) * inverse;
-    if !(0.0..=1.0).contains(&fraction) {
-        return None;
-    }
-    Some((
-        fraction,
-        [
-            1.0 - first_weight - second_weight,
-            first_weight,
-            second_weight,
-        ],
-    ))
-}
 /// Stores source coordinates for a Laplacian Deform bind.
 pub(crate) fn bind_laplacian(mesh: &Mesh) -> Value {
     Value::Array(
@@ -2773,83 +2256,6 @@ pub(crate) fn bind_laplacian(mesh: &Mesh) -> Value {
             .map(|vertex| json!(vertex.co.to_array()))
             .collect(),
     )
-}
-
-fn affine_weights(point: DVec3, cage: &Mesh, precision: u32) -> Result<Vec<f64>> {
-    let mut weights = Vec::with_capacity(cage.vertices.len());
-    affine_weights_into(point, cage, precision, &mut weights)?;
-    Ok(weights)
-}
-
-fn affine_weights_into(
-    point: DVec3,
-    cage: &Mesh,
-    precision: u32,
-    weights: &mut Vec<f64>,
-) -> Result<()> {
-    weights.clear();
-    weights.resize(cage.vertices.len(), 0.0);
-    let mut normal = [[0.0; 4]; 4];
-    for (index, vertex) in cage.vertices.iter().enumerate() {
-        let delta = point.distance_squared(vertex.co);
-        if delta <= f64::EPSILON {
-            weights[index] = 1.0;
-            return Ok(());
-        }
-        let values = [1.0, vertex.co.x, vertex.co.y, vertex.co.z];
-        let kernel = 1.0 / delta;
-        for row in 0..4 {
-            for column in 0..4 {
-                normal[row][column] += kernel * values[row] * values[column];
-            }
-        }
-    }
-    let multipliers =
-        solve_four(normal, [1.0, point.x, point.y, point.z], precision).ok_or_else(|| {
-            PotError::invalid_operation("mesh deform cage must span three dimensions")
-        })?;
-    for (index, vertex) in cage.vertices.iter().enumerate() {
-        let delta = point.distance_squared(vertex.co);
-        let kernel = 1.0 / delta;
-        let values = [1.0, vertex.co.x, vertex.co.y, vertex.co.z];
-        weights[index] = kernel
-            * (0..4)
-                .map(|coordinate| values[coordinate] * multipliers[coordinate])
-                .sum::<f64>();
-    }
-    Ok(())
-}
-
-fn solve_four(mut matrix: [[f64; 4]; 4], mut rhs: [f64; 4], precision: u32) -> Option<[f64; 4]> {
-    for column in 0..4 {
-        let pivot = (column..4).max_by(|left, right| {
-            matrix[*left][column]
-                .abs()
-                .total_cmp(&matrix[*right][column].abs())
-        })?;
-        if matrix[pivot][column].abs() <= 10_f64.powi(-(precision as i32 + 4)) {
-            return None;
-        }
-        matrix.swap(column, pivot);
-        rhs.swap(column, pivot);
-        let diagonal = matrix[column][column];
-        for value in matrix[column].iter_mut().skip(column) {
-            *value /= diagonal;
-        }
-        rhs[column] /= diagonal;
-        let pivot_row = matrix[column];
-        for (row, matrix_row) in matrix.iter_mut().enumerate() {
-            if row == column {
-                continue;
-            }
-            let factor = matrix_row[column];
-            for (value, pivot_value) in matrix_row.iter_mut().zip(pivot_row).skip(column) {
-                *value -= factor * pivot_value;
-            }
-            rhs[row] -= factor * rhs[column];
-        }
-    }
-    rhs.iter().all(|value| value.is_finite()).then_some(rhs)
 }
 
 pub(super) fn closest_triangle_point(point: DVec3, triangle: [DVec3; 3]) -> (DVec3, [f64; 3]) {
@@ -3018,8 +2424,8 @@ fn group_weights(mesh: &Mesh, modifier: &Modifier) -> Result<Option<Vec<f64>>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        affine_weights, closest_triangle_point, laplacian_deform, mean_value_weights, mesh_deform,
-        mesh_triangles, surface_deform,
+        closest_triangle_point, laplacian_deform, mean_value_weights, mesh_deform, mesh_triangles,
+        surface_deform,
     };
     use crate::geom::triangulate::{NgonMethod, triangulate_ngon};
     use crate::{
@@ -3323,30 +2729,6 @@ mod tests {
         let evaluated = laplacian_deform(&mesh, &modifier)?;
         assert!(evaluated.vertices[0].co.distance(anchor_position) < 1.0e-9);
         assert!(evaluated.vertices[1].co.distance(mesh.vertices[1].co) > 1.0e-6);
-        Ok(())
-    }
-
-    #[test]
-    fn affine_cage_weights_reproduce_points_and_affine_transforms()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let cage = Mesh::box_mesh(BoxParams::default())?;
-        let point = DVec3::new(0.2, -0.1, 0.4);
-        let weights = affine_weights(point, &cage, 5)?;
-        let reconstructed = cage
-            .vertices
-            .iter()
-            .zip(&weights)
-            .map(|(vertex, weight)| vertex.co * *weight)
-            .sum::<DVec3>();
-        assert!(reconstructed.distance(point) < 1.0e-10);
-        let translation = DVec3::new(1.0, 2.0, -0.5);
-        let moved = cage
-            .vertices
-            .iter()
-            .zip(&weights)
-            .map(|(vertex, weight)| (vertex.co + translation) * *weight)
-            .sum::<DVec3>();
-        assert!(moved.distance(point + translation) < 1.0e-10);
         Ok(())
     }
 

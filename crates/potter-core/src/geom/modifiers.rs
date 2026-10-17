@@ -185,6 +185,26 @@ pub(crate) fn evaluate_modifiers_with_groups_and_custom_at_frame(
     )
 }
 
+/// Blender's identity `CD_ORIGINDEX` map (`mesh_data_update.cc`: `range_vn_i` over the current vertices).
+fn identity_original_indices(mesh: &Mesh) -> Result<super::OriginalIndices> {
+    let source_vertex_count = mesh.vertices.len();
+    if source_vertex_count > i32::MAX as usize {
+        return Err(PotError::new(
+            ErrorCode::LimitExceeded,
+            "Hook original vertex count exceeds Blender's signed 32-bit range",
+        ));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the source vertex count was checked against Blender's i32 bitmap limit"
+    )]
+    let vertices = (0..source_vertex_count).map(|index| index as i32).collect();
+    Ok(super::OriginalIndices {
+        vertices,
+        source_vertex_count,
+    })
+}
+
 pub(crate) fn evaluate_modifiers_with_scene_context(
     mut evaluated: Mesh,
     modifiers: &[Modifier],
@@ -217,15 +237,18 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "modifier evaluation frame must be finite",
         ));
     }
-    // Blender creates CD_ORIGINDEX (an identity map) before the first constructive modifier when a later
-    // Hook with a vertex list reads it (mesh_data_update.cc). Deform-only modifiers ahead of that point see
-    // no layer, so their Hooks hook by listed value (MOD_hook.cc). Injecting here is exact unless a listed
-    // Hook also precedes the first constructive modifier: that Hook then sees the layer early.
+    // Blender's `mesh_calc_modifiers` (mesh_data_update.cc) creates CD_ORIGINDEX as an identity map only when
+    // the first non-OnlyDeform modifier is about to run and the mask of the modifier after it (the union of
+    // all later masks, `BKE_modifier_calc_data_masks` in blenkernel_intern_modifier.cc) requests it.
+    // `MOD_hook.cc` `required_data_mask` requests it for a Hook with a vertex list. A listed Hook before that
+    // point hooks by listed value (`deformVerts_do`, no layer); one after it hooks by list position.
     let is_deform_only = |modifier: &Modifier| {
         matches!(
             modifier.modifier_type.as_str(),
             "armature"
                 | "cast"
+                | "cloth"
+                | "collision"
                 | "corrective_smooth"
                 | "curve"
                 | "displace"
@@ -233,10 +256,14 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
                 | "laplacian_deform"
                 | "laplacian_smooth"
                 | "lattice"
+                | "mesh_cache"
                 | "mesh_deform"
+                | "particle_system"
                 | "shrinkwrap"
                 | "simple_deform"
                 | "smooth"
+                | "soft_body"
+                | "surface_deform"
                 | "warp"
                 | "wave"
         )
@@ -254,29 +281,12 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         .enumerate()
         .find(|&(index, modifier)| is_active(index, modifier) && !is_deform_only(modifier))
         .map(|(index, _)| index);
-    let needs_original_indices = first_constructive.is_some_and(|first| {
+    // The index at which the identity map is injected, when a later listed Hook reads it.
+    let original_indices_at = first_constructive.filter(|&first| {
         modifiers.iter().enumerate().any(|(index, modifier)| {
             index > first && is_active(index, modifier) && is_listed_hook(modifier)
         })
     });
-    if needs_original_indices && evaluated.original_indices.is_none() {
-        let source_vertex_count = evaluated.vertices.len();
-        if source_vertex_count > i32::MAX as usize {
-            return Err(PotError::new(
-                ErrorCode::LimitExceeded,
-                "Hook original vertex count exceeds Blender's signed 32-bit range",
-            ));
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the source vertex count was checked against Blender's i32 bitmap limit"
-        )]
-        let vertices = (0..source_vertex_count).map(|index| index as i32).collect();
-        evaluated.original_indices = Some(super::OriginalIndices {
-            vertices,
-            source_vertex_count,
-        });
-    }
     let stack_input = modifiers
         .iter()
         .enumerate()
@@ -294,6 +304,9 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         .filter(|&(modifier_index, modifier)| is_active(modifier_index, modifier))
     {
         validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
+        if original_indices_at == Some(modifier_index) && evaluated.original_indices.is_none() {
+            evaluated.original_indices = Some(identity_original_indices(&evaluated)?);
+        }
         let uses_multi_armature = |modifier: &Modifier| {
             modifier.modifier_type == "armature"
                 && modifier
