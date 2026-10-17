@@ -4432,7 +4432,7 @@ mod tests {
     #[test]
     fn blender_constant_topology_fixture_retains_logical_sample_metadata() -> Result<()> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/mesh_cache_uv/constant_topology.abc");
+            .join("../../tests/fixtures/mesh_cache_uv/constant_topology.abc");
         let bytes = std::fs::read(path).map_err(|error| PotError::io(&error))?;
         let archive = parse_archive(&bytes)?;
         let object =
@@ -4480,7 +4480,7 @@ mod tests {
         assert_eq!(first.faces, second.faces);
         assert_ne!(first.positions, second.positions);
         let static_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/mesh_cache_uv/two_layers.abc");
+            .join("../../tests/fixtures/mesh_cache_uv/two_layers.abc");
         let static_bytes = std::fs::read(static_path).map_err(|error| PotError::io(&error))?;
         let static_archive = parse_archive(&static_bytes)?;
         let static_object = alembic_object_at_path(&static_archive.objects, "/Plane/Plane")?;
