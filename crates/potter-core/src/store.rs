@@ -29,6 +29,7 @@ pub struct HistoryRecord {
 }
 /// History records returned together with any upgrade diagnostics from their snapshots.
 pub type HistoryRecordsAndWarnings = (Vec<(String, HistoryRecord)>, Vec<Value>);
+type SnapshotRead = (SceneDoc, Vec<Value>, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryDirection {
@@ -126,9 +127,7 @@ impl Project {
 
     /// Reads and upgrades `scene.json`. The diagnostics name the original bytes they describe. The
     /// digest and compatibility hash are returned only for schema version 1.
-    fn read_snapshot(
-        path: &Path,
-    ) -> Result<(SceneDoc, Vec<Value>, Option<String>, Option<String>)> {
+    fn read_snapshot(path: &Path) -> Result<SnapshotRead> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
         let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes)?;
         parsed.doc.validate()?;
@@ -227,13 +226,11 @@ impl Project {
     }
 
     pub fn info(&self) -> Result<SceneInfo> {
-        let scene_hash = match &self.legacy_hash {
-            Some(hash) => hash.clone(),
-            None => {
-                let value =
-                    serde_json::to_value(&self.doc).map_err(|error| internal_json(&error))?;
-                hash::sha256(&hash::canonicalize(&value)?)
-            }
+        let scene_hash = if let Some(hash) = &self.legacy_hash {
+            hash.clone()
+        } else {
+            let value = serde_json::to_value(&self.doc).map_err(|error| internal_json(&error))?;
+            hash::sha256(&hash::canonicalize(&value)?)
         };
         Ok(SceneInfo {
             id: self.doc.scene_id.clone(),
