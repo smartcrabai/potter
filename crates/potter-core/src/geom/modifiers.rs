@@ -5307,6 +5307,14 @@ mod tests {
     }
 
     #[test]
+    fn modifier_evaluation_requires_the_subject_name() {
+        let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let error = evaluate_modifiers(&mesh, &[], "").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(error.message, "modifier evaluation requires a subject name");
+    }
+
+    #[test]
     fn array_offsets_instances_and_bounds() {
         let mesh = Mesh::box_mesh(BoxParams {
             size: DVec3::new(2.0, 4.0, 6.0),
