@@ -2310,7 +2310,9 @@ impl GraphReducer<'_> {
         }
     }
 
-    /// Material texture references and alpha mode are ignored for graph materials.
+    /// Native texture references are ignored for graph materials: the graph holds the textures and
+    /// is authoritative. `alpha_mode` is not a field here: it is Blender's render method (what
+    /// Potter's renderer uses), and glTF takes `alphaMode` from the graph's Alpha path.
     fn material_field_losses(&mut self, material: &Material) {
         let mut fields: Vec<String> = Vec::new();
         if material.base_color_texture.is_some() {
@@ -2324,9 +2326,6 @@ impl GraphReducer<'_> {
         }
         if material.normal_texture.is_some() {
             fields.push("normal_texture".to_owned());
-        }
-        if material.alpha_mode != "opaque" {
-            fields.push(format!("alpha_mode `{}`", material.alpha_mode));
         }
         if fields.is_empty() {
             return;

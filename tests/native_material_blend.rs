@@ -71,8 +71,24 @@ fn grid_distance(a: &Grid, b: &Grid) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// Checks one Blender render of the texture plane (`render_texture.py` output).
-fn check_render(result: &Value, expected: &Value, label: &str) -> TestResult {
+/// Encodes a grid of Potter's linear values with Potter's own sRGB transfer (`potter_core::color`
+/// `linear_to_srgb`), the stored value an sRGB-declared image holds. Potter writes its linear pixels
+/// into the Blender image unchanged, so Blender reads them back as stored values.
+fn encode_linear_rows(value: &Value) -> TestResult<Value> {
+    let encoded: Grid = rows(value)?
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|pixel| pixel.map(potter_core::color::linear_to_srgb))
+                .collect()
+        })
+        .collect();
+    Ok(json!(encoded))
+}
+
+/// Checks one Blender render of the texture plane (`render_texture.py` output). `potter_linear`
+/// marks Potter's export, whose image pixels are linear values written as stored values.
+fn check_render(result: &Value, expected: &Value, label: &str, potter_linear: bool) -> TestResult {
     let texture = &expected["texture"];
     assert_eq!(
         result["image_size"],
@@ -85,8 +101,13 @@ fn check_render(result: &Value, expected: &Value, label: &str) -> TestResult {
         "{label}: texture must sample the Base layer"
     );
     // The file's PNG, read by Blender (`image.pixels`, bottom row first): no flip anywhere.
+    let stored = if potter_linear {
+        encode_linear_rows(&result["image_pixels_bottom_up"])?
+    } else {
+        result["image_pixels_bottom_up"].clone()
+    };
     assert_grid(
-        &result["image_pixels_bottom_up"],
+        &stored,
         &texture["blender_pixels_bottom_up"],
         FLOAT_TOLERANCE,
         &format!("{label} image pixels"),
@@ -234,7 +255,7 @@ fn textured_plane_renders_the_base_layer_with_its_file_orientation() -> TestResu
         &oracle_dir.join("reference.blend"),
         "reference",
     )?;
-    check_render(&reference, &expected, "reference")?;
+    check_render(&reference, &expected, "reference", false)?;
 
     // Potter: import the oracle, author the field material, export, and render the export.
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
@@ -261,7 +282,7 @@ fn textured_plane_renders_the_base_layer_with_its_file_orientation() -> TestResu
     check_material_links(dumped_object(&dump, "TexturePlane")?)?;
 
     let potter = render_texture(&blender, root.path(), &exported_blend, "potter")?;
-    check_render(&potter, &expected, "potter")?;
+    check_render(&potter, &expected, "potter", true)?;
     Ok(())
 }
 

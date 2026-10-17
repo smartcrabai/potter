@@ -3225,16 +3225,24 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     )?;
     if keep_custom_normals {
         // MOD_triangulate.cc copies the evaluated corner normals (`mesh->corner_normals()`, which
-        // include custom normals) onto the triangulated loops and re-encodes them there, so every
-        // triangle corner gets the vector of the source corner it came from. The loops are rebuilt
-        // in storage order, so no loop basis carries over.
+        // include custom normals) onto the triangulated loops and writes them with
+        // `bke::mesh_set_custom_normals_normalized` (already-normalised input, no renormalisation),
+        // so every triangle corner gets the vector of the source corner it came from. The loops are
+        // rebuilt in storage order, so no loop basis carries over.
         result.attributes.remove("custom_normal");
         let computed = corner_normals(mesh, &positions(mesh))?;
         let vectors: Vec<Option<DVec3>> = sources
             .iter()
             .map(|source| source.map(|corner| computed[corner]))
             .collect();
-        clnor::encode_vectors(&mut result, Some(&vectors), NormalCodeOptions::default())?;
+        clnor::encode_vectors(
+            &mut result,
+            Some(&vectors),
+            NormalCodeOptions {
+                corner_order: None,
+                setter_input: clnor::SetterInput::AlreadyNormalized,
+            },
+        )?;
     } else if clnor::corner_codes(mesh)?.is_some() || clnor::corner_order(mesh)?.is_some() {
         clnor::transfer_custom_normals(mesh, &mut result, &sources, NormalCodeOptions::default())?;
     }

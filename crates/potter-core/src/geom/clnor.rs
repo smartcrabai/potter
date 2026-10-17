@@ -95,26 +95,20 @@ fn safe_acos(cosine: f32) -> f32 {
     if cosine < 0.0 { PI - acos } else { acos }
 }
 
-/// `face_normal_calc`: Blender's single-precision quad, triangle, or Newell face normal.
+/// `normals_calc_faces` → `normal_calc_ngon`: Blender's single-precision Newell normal for every face
+/// size (the quad and triangle helpers are not used for face normals). A zero-area face takes the
+/// unit Z normal, as `face_normal_calc` gives it.
 fn face_normal(points: &[Vec3], face: &[usize]) -> Vec3 {
-    let normal = match face {
-        [i0, i1, i2, i3] => {
-            normalize_reciprocal(cross(points[*i0] - points[*i2], points[*i1] - points[*i3]))
-        }
-        [i0, i1, i2] => normalize(cross(points[*i0] - points[*i1], points[*i1] - points[*i2])),
-        _ => {
-            let mut normal = Vec3::ZERO;
-            let mut previous = points[face[face.len() - 1]];
-            for &index in face {
-                let current = points[index];
-                normal.x += (previous.y - current.y) * (previous.z + current.z);
-                normal.y += (previous.z - current.z) * (previous.x + current.x);
-                normal.z += (previous.x - current.x) * (previous.y + current.y);
-                previous = current;
-            }
-            normalize_reciprocal(normal)
-        }
-    };
+    let mut normal = Vec3::ZERO;
+    let mut previous = points[face[face.len() - 1]];
+    for &index in face {
+        let current = points[index];
+        normal.x += (previous.y - current.y) * (previous.z + current.z);
+        normal.y += (previous.z - current.z) * (previous.x + current.x);
+        normal.z += (previous.x - current.x) * (previous.y + current.y);
+        previous = current;
+    }
+    let normal = normalize_reciprocal(normal);
     if normal == Vec3::ZERO {
         Vec3::Z
     } else {
@@ -1019,15 +1013,15 @@ fn write_sharp_edges(mesh: &mut Mesh, sharp: &[bool]) {
 }
 
 /// Marks the sharp edges where a checked fan's corner vectors disagree, as Blender's custom-normal
-/// setter does. `touched` limits the check to flagged fans (`None` checks all). Returns whether any
-/// edge changed.
+/// setter does. `touched` limits the check to flagged fans (`None` checks all). The vectors are
+/// not changed: the split they cause only affects the fans encoded afterwards.
 fn mark_custom_normal_edges(
     mesh: &mut Mesh,
     positions: &[DVec3],
     vectors: &[Vec3],
     numbering: &[usize],
     touched: Option<&[bool]>,
-) -> Result<bool> {
+) -> Result<()> {
     let fans = mesh_fans(mesh, positions, numbering)?;
     let (_, index_of, _) = topology(mesh, positions)?;
     let mut edge_lookup = HashMap::new();
@@ -1099,7 +1093,7 @@ fn mark_custom_normal_edges(
     if marked {
         write_sharp_edges(mesh, &sharp);
     }
-    Ok(marked)
+    Ok(())
 }
 
 /// Blender's custom-normal setter over the fans flagged in `touched` (every fan when `None`):
@@ -1142,15 +1136,12 @@ fn set_fan_codes(
         };
         filled.push(value);
     }
-    if mark_custom_normal_edges(mesh, &positions, &filled, numbering, touched)? {
-        // Marked edges change the fans, so automatic corners take their recomputed normal.
-        let computed = plain_corner_normals(mesh, &positions)?;
-        for (index, vector) in vectors.iter().enumerate() {
-            if vector.is_none() {
-                filled[index] = computed[index].as_vec3();
-            }
-        }
-    }
+    // Blender keeps the pre-split vectors (zero vectors replaced by the computed normals above) for
+    // the averages below. Marking sharp edges changes the fans, not these vectors: an automatic
+    // corner of a split fan keeps the normal it had before the split (mesh_normals.cc,
+    // mesh_normals_corner_custom_set: the marking loop reads r_custom_corner_normals, and only
+    // corner_normals is recomputed).
+    mark_custom_normal_edges(mesh, &positions, &filled, numbering, touched)?;
     let fans = mesh_fans(mesh, &positions, numbering)?;
     let mut codes = vec![CornerNormalCode::Auto; count];
     for (fan, corners) in fans.corners.iter().enumerate() {

@@ -872,8 +872,17 @@ fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame>
         Projection::Orthographic {
             height: view_height,
         } if view_height.is_finite() && view_height > 0.0 => {
-            let half_height = view_height * 0.5;
-            let half_width = half_height * (f64::from(view_width) / f64::from(height));
+            // Blender's AUTO sensor fit (intern/camera.cc, `BKE_camera_sensor_fit`: HOR when the
+            // render is at least as wide as tall) applies the orthographic scale to the larger
+            // dimension. `BKE_camera_params_compute_viewplane` then scales the other dimension by
+            // the aspect, so a landscape frame spans `scale` horizontally and a portrait frame
+            // spans `scale` vertically.
+            let half_scale = view_height * 0.5;
+            let (half_width, half_height) = if width >= height {
+                (half_scale, half_scale * (f64::from(height) / f64::from(width)))
+            } else {
+                (half_scale * (f64::from(view_width) / f64::from(height)), half_scale)
+            };
             if !half_height.is_finite() || !half_width.is_finite() || half_width <= 0.0 {
                 return Err(PotError::invalid_argument(
                     "orthographic projection dimensions are out of range",

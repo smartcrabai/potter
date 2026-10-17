@@ -4,7 +4,7 @@ use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh,
+        Mesh, edit,
         modifiers::{
             attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
             evaluate_modifiers,
@@ -1950,7 +1950,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "weighted_normal FACE_AREA",
         &weighted_corners,
         &expected["weighted_normal"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let sharp_mesh = weighted_normal_mesh(true)?;
@@ -1976,7 +1976,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &corner_normal_vectors_json(&weighted_sharp)?,
         )?,
         &expected["weighted_normal_sharp"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let mut weighted_face_mesh = weighted_mesh.clone();
@@ -2006,7 +2006,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &corner_normal_vectors_json(&weighted_face)?,
         )?,
         &expected["weighted_normal_face_influence"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let mut normal_operands = BTreeMap::new();
@@ -2393,10 +2393,14 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.75,"e1":0.0,"e2":0.0,"e3":0.0}}),
     );
-    domain_source.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}}),
-    );
+    edit::apply(
+        &mut domain_source,
+        "set_custom_normals",
+        &json!({
+            "elements":{"domain":"face","ids":["f0"]},
+            "normals":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}
+        }),
+    )?;
     domain_source.attributes.insert(
         "color".to_owned(),
         json!({"domain":"corner","type":"color","values":{"f0":[[0.2,0.3,0.4,1.0],[0.3,0.3,0.4,1.0],[0.4,0.3,0.4,1.0],[0.5,0.3,0.4,1.0]]}}),
@@ -2863,13 +2867,17 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.0,"e1":0.0,"e2":0.0,"e3":0.0,"e4":0.0}}),
     );
-    mesh.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":{
-            "f0":[[1,0,0],[1,0,0],[1,0,0]],
-            "f1":[[1,0,0],[1,0,0],[1,0,0]]
-        }}),
-    );
+    edit::apply(
+        &mut mesh,
+        "set_custom_normals",
+        &json!({
+            "elements":{"domain":"face","ids":["f0","f1"]},
+            "normals":{
+                "f0":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]],
+                "f1":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]]
+            }
+        }),
+    )?;
     mesh.attributes.insert(
         "smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),

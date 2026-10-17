@@ -7,7 +7,7 @@ use crate::{
     eval::Snapshot,
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
-    model::{Id, LightType, SceneDoc},
+    model::{Id, LightData, LightType, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, evaluate_surface_with_workspace,
         height_gradient,
@@ -39,6 +39,20 @@ struct PointLight {
     radius: f64,
     spot_size: f64,
     spot_blend: f64,
+    /// The emitting shape of an area light; `None` for every other light type.
+    area: Option<AreaShape>,
+}
+
+/// A Blender area light's emitting shape in world space: unit axes, half extents with the
+/// object scale applied, whether it is an ellipse, and its area.
+#[derive(Clone, Copy)]
+struct AreaShape {
+    axis_u: DVec3,
+    axis_v: DVec3,
+    half_u: f64,
+    half_v: f64,
+    ellipse: bool,
+    area: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1543,17 +1557,10 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
             radiance: light.color * light.energy,
         });
     }
-    let target = if light.kind == LightType::Area && light.radius > 0.0 {
-        let tangent = if light.direction.z.abs() < 0.9 {
-            light.direction.cross(DVec3::Z).normalize_or_zero()
-        } else {
-            light.direction.cross(DVec3::Y).normalize_or_zero()
-        };
-        let bitangent = light.direction.cross(tangent).normalize_or_zero();
-        let radius = light.radius * rng.next_f64().sqrt();
-        let angle = rng.next_f64() * std::f64::consts::TAU;
-        light.position + tangent * (radius * angle.cos()) + bitangent * (radius * angle.sin())
-    } else if light.kind == LightType::Point && light.radius > 0.0 {
+    if light.kind == LightType::Area {
+        return sample_area_light(light, point, rng);
+    }
+    let target = if light.kind == LightType::Point && light.radius > 0.0 {
         let z = 1.0 - 2.0 * rng.next_f64();
         let angle = rng.next_f64() * std::f64::consts::TAU;
         let radial = (1.0 - z * z).max(0.0).sqrt();
@@ -1588,6 +1595,81 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
         distance,
         radiance: light.color * (light.energy * attenuation),
     })
+}
+
+/// Samples a point uniformly over an area light and returns its direct-light estimator.
+///
+/// Blender's area light has radiance `L = strength * invarea / π`, with `invarea = 1 / area` for
+/// a non-normalised area (`intern/cycles/scene/light.cpp`, `AreaLight::copy_to_kernel`), and its
+/// kernel evaluates `eval_fac = M_1_PI_F * invarea` (`intern/cycles/kernel/light/area.h`,
+/// `area_light_eval`). The light emits from its front side only (`area_light_sample` rejects
+/// points behind the plane). Uniform area sampling has pdf `1 / area`, and converting to solid
+/// angle gives pdf `d² / (area · cos_light)`, so the estimator is `L · area · cos_light / d²`.
+fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<LightSample> {
+    let shape = light.area?;
+    if shape.area <= 0.0 {
+        return None;
+    }
+    let (local_u, local_v) = if shape.ellipse {
+        let radius = rng.next_f64().sqrt();
+        let angle = rng.next_f64() * std::f64::consts::TAU;
+        (radius * angle.cos(), radius * angle.sin())
+    } else {
+        (2.0 * rng.next_f64() - 1.0, 2.0 * rng.next_f64() - 1.0)
+    };
+    let target = light.position
+        + shape.axis_u * (shape.half_u * local_u)
+        + shape.axis_v * (shape.half_v * local_v);
+    let offset = target - point;
+    let distance_squared = offset.length_squared();
+    if distance_squared <= f64::EPSILON || !distance_squared.is_finite() {
+        return None;
+    }
+    let distance = distance_squared.sqrt();
+    let direction = offset / distance;
+    let cos_light = light.direction.dot(-direction);
+    if cos_light <= 0.0 {
+        return None;
+    }
+    let emitted = light.color * (light.energy / (std::f64::consts::PI * shape.area));
+    Some(LightSample {
+        direction,
+        distance,
+        radiance: emitted * (shape.area * cos_light / distance_squared),
+    })
+}
+
+/// The shape of a Blender area light in world space (`intern/cycles/blender/light.cpp`,
+/// `BlenderSync::sync_light`, and `intern/cycles/scene/light.cpp`, `AreaLight::copy_to_kernel`).
+///
+/// Both sides take `area_size`, except that RECTANGLE and ELLIPSE take `area_size_y` for the
+/// second. DISK and ELLIPSE are ellipses, whose area is `π/4` of the bounding rectangle
+/// (`AreaLight::area`). The object transform scales the extents.
+fn area_shape(data: &LightData, matrix: &DMat4) -> AreaShape {
+    let square_or_disk = matches!(data.area_shape.as_str(), "SQUARE" | "DISK");
+    let size_v = if square_or_disk {
+        data.area_size
+    } else {
+        data.area_size_y
+    };
+    let extent_u = matrix.transform_vector3(DVec3::X) * data.area_size;
+    let extent_v = matrix.transform_vector3(DVec3::Y) * size_v;
+    let half_u = extent_u.length() * 0.5;
+    let half_v = extent_v.length() * 0.5;
+    let ellipse = matches!(data.area_shape.as_str(), "DISK" | "ELLIPSE");
+    let rectangle_area = 4.0 * half_u * half_v;
+    AreaShape {
+        axis_u: extent_u.normalize_or_zero(),
+        axis_v: extent_v.normalize_or_zero(),
+        half_u,
+        half_v,
+        ellipse,
+        area: if ellipse {
+            rectangle_area * std::f64::consts::FRAC_PI_4
+        } else {
+            rectangle_area
+        },
+    }
 }
 
 fn sample_bsdf(params: &BsdfParams, view: DVec3, rng: &mut Pcg32) -> (DVec3, DVec3, bool) {
@@ -1748,6 +1830,7 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 radius: data.radius.max(0.0),
                 spot_size: data.spot_size,
                 spot_blend: data.spot_blend,
+                area: (data.light_type == LightType::Area).then(|| area_shape(data, &matrix)),
             })
         })
         .collect()

@@ -1943,7 +1943,9 @@ fn build_imported_graph(
         if let Some(image_model) = item.get("potter_image").filter(|value| value.is_object()) {
             let mut image: Image = serde_json::from_value(image_model.clone())
                 .map_err(|_| invalid_intermediate("image metadata is invalid"))?;
-            if image.source == ImageSource::Packed
+            // The Blender image carries its own packed pixels; they are the only asset that exists after reopen,
+            // so they replace the blob recorded for the source image (a generated image's stored pixels).
+            if image.source != ImageSource::File
                 && let Some(packed) =
                     imported_image_from_resource(item, &resource_ids, &resource_assets, &doc)?
             {
@@ -2929,7 +2931,13 @@ fn imported_image_from_resource(
     else {
         return Ok(None);
     };
-    let colorspace = match item
+    // The document's image record declares the colour space; Blender's name is the fallback for records without one.
+    // A reloaded packed EXR takes its colour space from the file header, which the record does not depend on.
+    let record_colorspace = item
+        .get("potter_image")
+        .and_then(|image| image.get("colorspace"))
+        .and_then(|value| serde_json::from_value::<ImageColorspace>(value.clone()).ok());
+    let colorspace = record_colorspace.or_else(|| match item
         .get("colorspace")
         .and_then(Value::as_str)
         .map(str::trim)
@@ -2942,7 +2950,7 @@ fn imported_image_from_resource(
         Some(name) if name.contains("linear") => Some(ImageColorspace::Linear),
         Some(_) => Some(ImageColorspace::Srgb),
         None => None,
-    };
+    });
     let (colorspace, width, height, _) =
         crate::image::storage::decode_pixels_with_default_colorspace(bytes, colorspace)?;
     Ok(Some(Image {

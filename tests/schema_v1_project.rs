@@ -275,7 +275,7 @@ fn schema_v1_active_blender_layer_survives_migration_and_omitted_selector_uv_tra
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
     assert_eq!(applied["scene"]["revision"], 3);
-    assert_eq!(document(&scene)?["schema_version"], 2);
+    assert_eq!(document(&scene)?["schema_version"], 3);
     let attributes = mesh_attributes(&scene)?;
     assert_eq!(attributes["uv_layers"]["active"], "Light");
     assert_eq!(attributes["uv_layers"]["render"], "UVMap");

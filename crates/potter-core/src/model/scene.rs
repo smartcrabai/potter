@@ -1126,7 +1126,7 @@ pub struct RenderSettings {
     pub passes: Vec<String>,
     /// Blender's view-layer cryptomatte accuracy setting (`ViewLayer.use_pass_cryptomatte_accurate`,
     /// `rna_scene.cc`). It changes how the cryptomatte pass is generated and is not a pass itself.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub cryptomatte_accurate: bool,
     #[serde(default)]
     pub motion_blur: bool,
@@ -1710,6 +1710,14 @@ fn default_true() -> bool {
 )]
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
