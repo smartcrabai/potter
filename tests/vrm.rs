@@ -1843,6 +1843,16 @@ fn vrm_expressions_target_every_material_uv_variant() -> TestResult<()> {
         assert_eq!(bind["offset"], json!([0.1, 0.2]));
     }
 
+    // VRM 0.x has no procedural expression overrides; retain the texture binds while making this export fixture valid.
+    let mut v0_expressions = avatar_settings(options)["expressions"].clone();
+    v0_expressions["happy"]["override_blink"] = json!("none");
+    v0_expressions["happy"]["override_mouth"] = json!("none");
+    apply_success(
+        &project,
+        revision(&project)?,
+        &[json!({"op": "avatar.update", "set": {"expressions": v0_expressions}})],
+    )?;
+
     let v0_path = directory.path().join("material-variants-v0.vrm");
     let v0_output = pot()
         .arg("export")
@@ -1947,6 +1957,30 @@ fn vrm_expressions_target_every_material_uv_variant() -> TestResult<()> {
     assert!(imported_transform_binds
         .iter()
         .all(|bind| bind["scale"] == json!([1.25, 0.75]) && bind["offset"] == json!([0.1, 0.2])));
+    Ok(())
+}
+
+#[test]
+fn vrm0_rejects_procedural_expression_overrides_even_when_lossy() -> TestResult<()> {
+    let (directory, project) = new_fixture(FixtureOptions {
+        expression_texture_transform: true,
+        ..FixtureOptions::default()
+    })?;
+    let output_path = directory.path().join("expression-overrides-v0.vrm");
+    let output = pot()
+        .arg("export")
+        .arg(&project)
+        .args(["--format", "vrm0", "--out"])
+        .arg(&output_path)
+        .args(["--allow-lossy", "--json"])
+        .output()?;
+    let failure = assert_failure(&output, "UNSUPPORTED_FEATURE")?;
+    assert_eq!(
+        failure["error"]["details"]["feature_id"],
+        "vrm.v0.expression_override"
+    );
+    assert_eq!(failure["error"]["details"]["status"], "not_supported");
+    assert!(!output_path.exists());
     Ok(())
 }
 

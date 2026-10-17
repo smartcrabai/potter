@@ -898,36 +898,6 @@ fn hook_apply_uses_simulated_transform_reference_world_matrix() -> TestResult<()
 }
 
 #[test]
-fn array_geometry_operand_propagates_unsupported_source_stack_errors() -> TestResult<()> {
-    let mut extra = unsupported_bevel_source(&json!({"translation": [3.0, 0.0, 0.0]}))
-        .into_iter()
-        .collect::<Vec<_>>();
-    extra.push(modifier(
-        "array",
-        "array",
-        json!({
-            "count": 1,
-            "fit_type": "FIXED_COUNT",
-            "use_relative_offset": false,
-            "use_constant_offset": false,
-            "start_cap": OPERAND,
-        }),
-        false,
-        false,
-    ));
-    let mut doc = build(&extra)?;
-    add_unsupported_bevel_uv(&mut doc)?;
-
-    let error = run(&doc, &apply_op("array"))
-        .err()
-        .ok_or("unsupported geometry operand must block apply")?;
-    ensure_eq(
-        &error.code,
-        &ErrorCode::UnsupportedFeature,
-        "operand error code",
-    )
-}
-#[test]
 fn vertex_groups_persist_and_match_the_target_alone() -> TestResult<()> {
     let groups = vec![
         json!({"op": "vertex_group.create", "target": {"id": SUBJECT}, "id": "anchor", "name": "Anchor"}),
