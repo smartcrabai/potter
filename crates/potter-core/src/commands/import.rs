@@ -1007,7 +1007,7 @@ mod tests {
         assert!(frame.get("bytes").is_none());
         assert_eq!(external.len(), 1);
         assert_eq!(external[0]["kind"], "alembic_cache");
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<serde_json::Value>::new());
         Ok(())
     }
 
@@ -1033,7 +1033,13 @@ mod tests {
         });
         doc.resources.insert(id.clone(), record.clone());
         let error = configure_blender_resources(&mut doc, &BTreeMap::new(), AssetPolicy::Copy)
-            .expect_err("incomplete packed sequences must fail");
+            .err()
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "incomplete packed sequences must fail",
+                )
+            })?;
         assert_eq!(error.code, ErrorCode::SceneInvalid);
         assert_eq!(doc.resources[&id], record);
         Ok(())

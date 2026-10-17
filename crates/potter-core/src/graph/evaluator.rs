@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    fmt::Write as _,
     hash::{Hash, Hasher},
     sync::{LazyLock, Mutex},
 };
@@ -180,7 +181,7 @@ pub fn evaluate_at_frame(
                             let mut hasher = DefaultHasher::new();
                             indices.vertices.hash(&mut hasher);
                             indices.source_vertex_count.hash(&mut hasher);
-                            signature.push_str(&format!("-{:016x}", hasher.finish()));
+                            let _ = write!(signature, "-{:016x}", hasher.finish());
                         }
                         signature
                     })

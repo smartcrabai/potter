@@ -284,7 +284,7 @@ struct AxisSamples {
     weights: [f64; 4],
 }
 
-/// Four clamped grid samples around the cell and their basis weights (BKE_lattice_deform_data_eval_co).
+/// Four clamped grid samples around the cell and their basis weights (`BKE_lattice_deform_data_eval_co`).
 fn axis_samples(coordinate: f64, count: usize, interpolation: LatticeInterpolation) -> AxisSamples {
     let lower = coordinate.floor();
     let fraction = coordinate - lower;
@@ -300,8 +300,8 @@ fn axis_samples(coordinate: f64, count: usize, interpolation: LatticeInterpolati
     }
 }
 
-/// Blender's `key_curve_position_weights`. Cardinal is KEY_CARDINAL (tension 0.71), Catmull-Rom
-/// is KEY_CATMULL_ROM (tension 0.5), and BSpline is KEY_BSPLINE; the fraction is never snapped.
+/// Blender's `key_curve_position_weights`. Cardinal is `KEY_CARDINAL` (tension 0.71), Catmull-Rom
+/// is `KEY_CATMULL_ROM` (tension 0.5), and `BSpline` is `KEY_BSPLINE`; the fraction is never snapped.
 fn basis_weights(t: f64, interpolation: LatticeInterpolation) -> [f64; 4] {
     let t2 = t * t;
     let t3 = t2 * t;
@@ -335,6 +335,10 @@ fn clamp_index(index: isize, count: usize) -> usize {
 
 /// Cell coordinate of a lattice-local value, held to `[-2, count]` as Blender's
 /// `lattice_deform_axis_clamp` does; beyond the grid the basis is evaluated, not snapped.
+#[expect(
+    clippy::neg_cmp_op_on_partial_ord,
+    reason = "NaN coordinates take the lower clamp, as Blender's negated comparison does"
+)]
 fn cage_coordinate(value: f64, min: f64, max: f64, count: usize) -> f64 {
     let coordinate = (value - min) / ((max - min) / (count - 1) as f64);
     if !(coordinate > -2.0) {

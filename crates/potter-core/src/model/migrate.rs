@@ -136,7 +136,7 @@ fn upgrade_v1(value: &mut Value) -> Result<Vec<Value>> {
     Ok(warnings)
 }
 
-/// Every material and MToon texture reference, for mutation.
+/// Every material and `MToon` texture reference, for mutation.
 fn texture_refs(value: &mut Value) -> Vec<&mut Value> {
     let mut refs = Vec::new();
     let Some(object) = value.as_object_mut() else {
@@ -491,13 +491,10 @@ fn upgrade_mesh_v2(mesh: &mut Value) -> Result<()> {
         upgrade_shading(attributes, &elements);
         (
             blender_custom_normal_codes(attributes, &elements)?,
-            attributes
-                .get("custom_normal")
-                .filter(|attribute| {
-                    attribute.get("domain").and_then(Value::as_str) == Some("corner")
-                        && attribute.get("type").and_then(Value::as_str) == Some("float3")
-                })
-                .is_some(),
+            attributes.get("custom_normal").is_some_and(|attribute| {
+                attribute.get("domain").and_then(Value::as_str) == Some("corner")
+                    && attribute.get("type").and_then(Value::as_str) == Some("float3")
+            }),
         )
     };
     let custom_normal_attribute = if let Some(codes) = custom_normal_codes {
@@ -1019,7 +1016,7 @@ fn unique_name(base: &str, attributes: &Map<String, Value>) -> String {
     if !attributes.contains_key(crate::geom::attribute_keys::storage_key(base).as_ref()) {
         return base.to_owned();
     }
-    (1_usize..)
+    (1_usize..=usize::MAX)
         .map(|index| format!("{base}.{index:03}"))
         .find(|name| {
             !attributes.contains_key(crate::geom::attribute_keys::storage_key(name).as_ref())
@@ -1056,12 +1053,10 @@ mod tests {
                 .expect("linked record"),
             None
         );
-        assert_eq!(
-            inline_resource_kind(&json!({"storage":"inline"}))
-                .unwrap_err()
-                .code,
-            ErrorCode::SceneInvalid
-        );
+        let Err(error) = inline_resource_kind(&json!({"storage":"inline"})) else {
+            panic!("inline record without a kind must be rejected");
+        };
+        assert_eq!(error.code, ErrorCode::SceneInvalid);
     }
 
     fn legacy_volume_noise_scene() -> SceneDoc {
@@ -1125,7 +1120,7 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&record).expect("history JSON");
         let (record, warnings) = parse_history_record(&bytes).expect("history migration");
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<Value>::new());
         assert_native_value_noise(&record.snapshot);
         assert_eq!(record.snapshot.resources.len(), 1);
     }
@@ -1550,9 +1545,8 @@ mod tests {
                     }]
                 }),
             )?;
-            let error = match parse_scene(&serde_json::to_vec(&source)?) {
-                Err(error) => error,
-                Ok(_) => panic!("malformed custom-normal codes must be rejected"),
+            let Err(error) = parse_scene(&serde_json::to_vec(&source)?) else {
+                panic!("malformed custom-normal codes must be rejected");
             };
             assert_eq!(error.code, ErrorCode::SceneInvalid);
         }
@@ -1699,7 +1693,10 @@ mod tests {
             migrated.attributes["user:color_layers"]["values"][vertex.as_str()],
             json!(0.25)
         );
-        assert!(crate::geom::color_layers::read(&migrated).layers.is_empty());
+        assert_eq!(
+            crate::geom::color_layers::read(&migrated).layers,
+            Vec::<crate::geom::color_layers::ColorLayer>::new()
+        );
         Ok(())
     }
 

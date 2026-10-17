@@ -59,7 +59,9 @@ pub fn run(args: AssetsArgs) -> Result<(Option<SceneInfo>, Value)> {
                     json!({"library_id":id,"resource_id":resource_id}),
                 )
             })?;
-            (!inline_resource_kind(resource)?.is_some()).then_some(resource)
+            inline_resource_kind(resource)?
+                .is_none()
+                .then_some(resource)
         } else {
             None
         };

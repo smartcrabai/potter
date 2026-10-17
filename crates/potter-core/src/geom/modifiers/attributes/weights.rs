@@ -1,6 +1,11 @@
 //! Vertex-weight edit/mix/proximity and their image/bone mask coordinates.
 
-use super::*;
+use super::{
+    BTreeMap, CurveMappingTable, DMat4, DVec2, DVec3, ErrorCode, Map, Mesh, Modifier, PotError,
+    Result, SceneOperand, Value, boolean, closest_point_triangle, curve_points, falloff_type,
+    get_group_weights, invalid, json, number, optional_string, string, string_set,
+};
+use std::collections::btree_map::Entry;
 
 pub(super) fn texture_mask_weights(
     mesh: &Mesh,
@@ -248,14 +253,19 @@ pub(super) fn vertex_weight_edit(
     }
     let mut updated = existing;
     for (vertex, weight) in mesh.vertices.iter().zip(values) {
-        if updated.contains_key(&vertex.id) {
-            if use_remove && weight <= remove_threshold {
-                updated.remove(&vertex.id);
-            } else {
-                updated.insert(vertex.id, weight);
+        match updated.entry(vertex.id) {
+            Entry::Occupied(entry) => {
+                if use_remove && weight <= remove_threshold {
+                    entry.remove();
+                } else {
+                    entry.insert(weight);
+                }
             }
-        } else if use_add && weight >= add_threshold {
-            updated.insert(vertex.id, weight);
+            Entry::Vacant(entry) => {
+                if use_add && weight >= add_threshold {
+                    entry.insert(weight);
+                }
+            }
         }
     }
     let mut result = mesh.clone();
@@ -352,7 +362,7 @@ fn mix_weights(a: f64, mut b: f64, mode: &str, modifier: &Modifier) -> Result<f6
         const ZERO_FLOOR: f64 = 1.0e-32;
         if b < 0.0 && b > -ZERO_FLOOR {
             b = -ZERO_FLOOR;
-        } else if b >= 0.0 && b < ZERO_FLOOR {
+        } else if (0.0..ZERO_FLOOR).contains(&b) {
             b = ZERO_FLOOR;
         }
     }
@@ -605,6 +615,10 @@ pub(super) fn vertex_weight_proximity(
     Ok(result)
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender branches on exact equality of the proximity range bounds"
+)]
 fn map_proximity_distance(distance: f64, minimum: f64, maximum: f64) -> f64 {
     if maximum == minimum {
         f64::from(distance >= maximum)
@@ -800,12 +814,13 @@ impl BlenderRandom {
     }
 
     fn next_uint(state: u64) -> u32 {
-        let state = state.wrapping_mul(0x5deece66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
+        let state = state.wrapping_mul(0x0005_deec_e66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
         (state >> 17) as u32
     }
 
     fn next_float(&mut self) -> f64 {
-        self.state = self.state.wrapping_mul(0x5deece66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
+        self.state =
+            self.state.wrapping_mul(0x0005_deec_e66d).wrapping_add(0xb) & 0x0000_ffff_ffff_ffff;
         ((self.state >> 17) as f32 / 2_147_483_648.0_f32) as f64
     }
 }

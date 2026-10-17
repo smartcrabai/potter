@@ -157,30 +157,25 @@ pub(super) fn preview_geometry_parameters(
         {
             continue;
         }
-        if !view_dependent {
-            if let Some(mesh) = snapshot.meshes.get(&node_id) {
-                for face in &mesh.faces {
-                    let Ok(slot) = usize::try_from(face.material_index) else {
-                        continue;
-                    };
-                    let Some(material_id) = snapshot.slot_material(&node_id, node, slot) else {
-                        continue;
-                    };
-                    if !checked_materials.insert(material_id.clone()) {
-                        continue;
-                    }
-                    let Some(material) = doc.materials.get(material_id) else {
-                        continue;
-                    };
-                    if material.displacement_method == "displacement"
-                        && crate::shader::displacement_uses_view_direction(
-                            material,
-                            &doc.node_groups,
-                        )
-                    {
-                        view_dependent = true;
-                        break;
-                    }
+        if !view_dependent && let Some(mesh) = snapshot.meshes.get(&node_id) {
+            for face in &mesh.faces {
+                let Ok(slot) = usize::try_from(face.material_index) else {
+                    continue;
+                };
+                let Some(material_id) = snapshot.slot_material(&node_id, node, slot) else {
+                    continue;
+                };
+                if !checked_materials.insert(material_id.clone()) {
+                    continue;
+                }
+                let Some(material) = doc.materials.get(material_id) else {
+                    continue;
+                };
+                if material.displacement_method == "displacement"
+                    && crate::shader::displacement_uses_view_direction(material, &doc.node_groups)
+                {
+                    view_dependent = true;
+                    break;
                 }
             }
         }
@@ -1592,12 +1587,11 @@ fn carried_color_layers(
         let position = carried
             .iter()
             .position(|&carried_index| carried_index == index);
-        match position {
-            Some(position) => position,
-            None => {
-                carried.push(index);
-                carried.len() - 1
-            }
+        if let Some(position) = position {
+            position
+        } else {
+            carried.push(index);
+            carried.len() - 1
         }
     });
     (carried, color_render)

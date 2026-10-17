@@ -3,7 +3,11 @@
 // Portions derived from Blender (https://www.blender.org):
 //   source/blender/modifiers/intern/MOD_laplaciansmooth.cc, source/blender/modifiers/intern/MOD_correctivesmooth.cc, SPDX-FileCopyrightText: 2005 Blender Authors, GPL-2.0-or-later.
 
-use super::*;
+use super::{
+    DVec3, ErrorCode, HashMap, Mesh, Modifier, PotError, Result, Value, bool_param, id_indices,
+    invalid_parameter, json, number_param, positions, safe_acos_approx, string_param_with_expected,
+    uint_param, validated,
+};
 
 /// Blender's `FLT_EPSILON`; both smoothers compare against it in single precision.
 const FLT_EPSILON: f64 = f32::EPSILON as f64;
@@ -594,7 +598,7 @@ impl CornerFrame {
         )
     }
 
-    fn from_local(self, local: DVec3) -> DVec3 {
+    fn to_world(self, local: DVec3) -> DVec3 {
         self.axes[0] * local.x + self.axes[1] * local.y + self.axes[2] * local.z
     }
 }
@@ -708,7 +712,7 @@ pub(super) fn corrective_smooth(
             let share = frame.weight / frames.vertex_weight[vertex];
             if share > 0.0 {
                 let local = rest_frame.to_local(rest[vertex] - rest_smoothed[vertex]);
-                result[vertex] += frame.from_local(local) * (share * scale);
+                result[vertex] += frame.to_world(local) * (share * scale);
             }
         }
     }

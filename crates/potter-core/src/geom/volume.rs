@@ -107,6 +107,10 @@ impl VolumeGrid {
                 * DMat4::from_scale(DVec3::splat(self.voxel_size)));
         };
         let matrix = DMat4::from_cols_array(&columns);
+        #[expect(
+            clippy::float_cmp,
+            reason = "affine matrices carry an exact 1.0 homogeneous corner"
+        )]
         let is_affine = matrix.x_axis.w == 0.0
             && matrix.y_axis.w == 0.0
             && matrix.z_axis.w == 0.0

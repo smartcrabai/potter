@@ -776,7 +776,8 @@ impl BMesh {
                     self.uv[new_loop * self.uv_stride + layer] =
                         self.uv[source * self.uv_stride + layer];
                 }
-                self.loops[new_loop].corner_data = self.loops[source].corner_data.clone();
+                let corner_data = self.loops[source].corner_data.clone();
+                self.loops[new_loop].corner_data = corner_data;
                 self.loops[new_loop].source_corner = self.loops[source].source_corner;
             }
             let mut it = first;
@@ -2675,6 +2676,7 @@ mod tests {
         assert!((linear - 0.215_860_530_734_062_2).abs() < 1.0e-6);
     }
     #[test]
+    #[expect(clippy::expect_used, reason = "small triangle fixture")]
     fn canonical_color_layers_keep_source_types_in_collapse_data() {
         let mut mesh = Mesh::from_positions_and_faces(
             vec![DVec3::ZERO, DVec3::X, DVec3::Y],

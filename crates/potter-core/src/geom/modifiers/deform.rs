@@ -1124,42 +1124,46 @@ pub(super) fn mesh_triangles(mesh: &Mesh, coordinates: &[DVec3]) -> Result<Vec<[
             .ok_or_else(|| {
                 PotError::invalid_operation("Laplacian mesh has invalid face vertices")
             })?;
-        if vertices.len() == 4 {
-            let [first, second, third, fourth] =
-                [vertices[0], vertices[1], vertices[2], vertices[3]];
-            let first = coordinates[first];
-            let second = coordinates[second];
-            let third = coordinates[third];
-            let fourth = coordinates[fourth];
-            let diagonal_flip = (second - first)
-                .cross(third - first)
-                .dot((fourth - first).cross(third - first))
-                > 0.0;
-            if diagonal_flip {
-                triangles.push([vertices[0], vertices[1], vertices[3]]);
-                triangles.push([vertices[1], vertices[2], vertices[3]]);
-            } else {
-                triangles.push([vertices[0], vertices[1], vertices[2]]);
-                triangles.push([vertices[0], vertices[2], vertices[3]]);
+        match vertices.len() {
+            4 => {
+                let [first, second, third, fourth] =
+                    [vertices[0], vertices[1], vertices[2], vertices[3]];
+                let first = coordinates[first];
+                let second = coordinates[second];
+                let third = coordinates[third];
+                let fourth = coordinates[fourth];
+                let diagonal_flip = (second - first)
+                    .cross(third - first)
+                    .dot((fourth - first).cross(third - first))
+                    > 0.0;
+                if diagonal_flip {
+                    triangles.push([vertices[0], vertices[1], vertices[3]]);
+                    triangles.push([vertices[1], vertices[2], vertices[3]]);
+                } else {
+                    triangles.push([vertices[0], vertices[1], vertices[2]]);
+                    triangles.push([vertices[0], vertices[2], vertices[3]]);
+                }
             }
-        } else if vertices.len() > 4 {
-            let face_positions = vertices
-                .iter()
-                .map(|index| coordinates[*index].as_vec3().to_array())
-                .collect::<Vec<_>>();
-            for triangle in crate::geom::triangulate::triangulate_ngon(
-                &face_positions,
-                crate::geom::triangulate::NgonMethod::Clip,
-            ) {
-                triangles.push([
-                    vertices[triangle[0]],
-                    vertices[triangle[1]],
-                    vertices[triangle[2]],
-                ]);
+            n if n > 4 => {
+                let face_positions = vertices
+                    .iter()
+                    .map(|index| coordinates[*index].as_vec3().to_array())
+                    .collect::<Vec<_>>();
+                for triangle in crate::geom::triangulate::triangulate_ngon(
+                    &face_positions,
+                    crate::geom::triangulate::NgonMethod::Clip,
+                ) {
+                    triangles.push([
+                        vertices[triangle[0]],
+                        vertices[triangle[1]],
+                        vertices[triangle[2]],
+                    ]);
+                }
             }
-        } else {
-            for index in 1..vertices.len().saturating_sub(1) {
-                triangles.push([vertices[0], vertices[index], vertices[index + 1]]);
+            _ => {
+                for index in 1..vertices.len().saturating_sub(1) {
+                    triangles.push([vertices[0], vertices[index], vertices[index + 1]]);
+                }
             }
         }
     }
@@ -1571,15 +1575,14 @@ impl SurfaceBindTarget {
                 let first = corners[corner];
                 let second = corners[(corner + 1) % corners.len()];
                 let key = (first.min(second), first.max(second));
-                let edge = match edge_ids.get(&key) {
-                    Some(edge) => *edge,
-                    None => {
-                        let edge = edge_vertices.len();
-                        edge_ids.insert(key, edge);
-                        edge_vertices.push([first, second]);
-                        edge_faces.push(Vec::new());
-                        edge
-                    }
+                let edge = if let Some(edge) = edge_ids.get(&key) {
+                    *edge
+                } else {
+                    let edge = edge_vertices.len();
+                    edge_ids.insert(key, edge);
+                    edge_vertices.push([first, second]);
+                    edge_faces.push(Vec::new());
+                    edge
                 };
                 edge_faces[edge].push(face_index);
                 if edge_faces[edge].len() > 2 {
@@ -1782,11 +1785,11 @@ impl SurfaceBindTarget {
         }
         let mut binds = Vec::new();
         for polygon in &polygons {
-            if !(polygon.weight >= SURFACE_BIND_EPSILON) {
+            if polygon.weight.is_nan() || polygon.weight < SURFACE_BIND_EPSILON {
                 continue;
             }
             if polygon.inside {
-                binds.push(self.ngon_bind(polygon, point)?);
+                binds.push(Self::ngon_bind(polygon, point)?);
                 continue;
             }
             if 1.0 - polygon.dominant_angle_weight >= SURFACE_BIND_EPSILON {
@@ -1933,7 +1936,7 @@ impl SurfaceBindTarget {
     }
 
     /// Blender's `MOD_SDEF_MODE_NGONS` term for a point inside its polygon.
-    fn ngon_bind(&self, polygon: &SurfaceBindPolygon, point: DVec3) -> Result<SurfaceBind> {
+    fn ngon_bind(polygon: &SurfaceBindPolygon, point: DVec3) -> Result<SurfaceBind> {
         let weights = mean_value_weights(polygon.point_v2, &polygon.coords_v2)
             .ok_or_else(invalid_polygons)?;
         let projected = polygon

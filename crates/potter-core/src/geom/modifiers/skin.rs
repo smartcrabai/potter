@@ -5,7 +5,10 @@
 
 use glam::DQuat;
 
-use super::*;
+use super::{
+    DVec3, ErrorCode, HashSet, Mesh, Modifier, Origin, Polygon, PotError, Result, Value,
+    bool_param, build_mesh, id_indices, invalid_parameter, number_param, positions, validated,
+};
 
 use std::ptr::NonNull;
 
@@ -53,7 +56,7 @@ fn bullet_hull_faces(points: &[DVec3], input: &[usize]) -> Result<Vec<Vec<usize>
 
     let mut raw_hull = std::ptr::null_mut();
     let status =
-        unsafe { potter_skin_hull_compute(coordinates.as_ptr(), input.len(), &mut raw_hull) };
+        unsafe { potter_skin_hull_compute(coordinates.as_ptr(), input.len(), &raw mut raw_hull) };
     if status != 0 {
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
@@ -89,7 +92,9 @@ fn bullet_hull_faces(points: &[DVec3], input: &[usize]) -> Result<Vec<Vec<usize>
     }
 
     triangle_indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|triangle| {
             triangle
                 .iter()
@@ -106,10 +111,6 @@ fn bullet_hull_faces(points: &[DVec3], input: &[usize]) -> Result<Vec<Vec<usize>
         .collect()
 }
 
-#[expect(
-    clippy::manual_midpoint,
-    reason = "matches Blender's float evaluation order for parity"
-)]
 pub(super) fn skin_with_warnings(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -130,6 +131,10 @@ pub(super) fn skin_with_warnings(
     }
 }
 
+#[expect(
+    clippy::manual_midpoint,
+    reason = "matches Blender's float evaluation order for parity"
+)]
 pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let source_positions = positions(mesh);
     let source_indices = id_indices(mesh);
@@ -592,8 +597,7 @@ fn merge_branch_frame_corners(
                 if merges[first_frame][first_corner].is_some() {
                     continue;
                 }
-                for second in first + 1..rings.len() {
-                    let second_frame = rings[second];
+                for &second_frame in &rings[first + 1..] {
                     let threshold = first_side.min(frame_side_length(frames[second_frame])) * 0.5;
                     for second_corner in 0..4 {
                         if merges[second_frame][second_corner].is_some()
@@ -621,6 +625,10 @@ fn merge_branch_frame_corners(
     merges
 }
 
+#[expect(
+    clippy::manual_midpoint,
+    reason = "matches Blender's float evaluation order for parity"
+)]
 fn frame_side_length(frame: [DVec3; 4]) -> f64 {
     (frame[0].distance(frame[1]) + frame[1].distance(frame[2])) * 0.5
 }
@@ -796,6 +804,10 @@ fn repair_detached_branch_frames(
     Ok(())
 }
 
+#[expect(
+    clippy::manual_midpoint,
+    reason = "matches Blender's float evaluation order for parity"
+)]
 fn subdivide_skin_target_face(
     points: &mut Vec<DVec3>,
     origins: &mut Vec<Vec<(usize, f64)>>,
@@ -966,8 +978,8 @@ fn skin_choose_quad_bridge_order(
     for reversed in 0..2 {
         for rotation in 0..4 {
             let mut order = [0; 4];
-            for corner in 0..4 {
-                order[corner] = if reversed == 0 {
+            for (corner, slot) in order.iter_mut().enumerate() {
+                *slot = if reversed == 0 {
                     (corner + rotation) % 4
                 } else {
                     3 - ((corner + rotation) % 4)
@@ -1292,7 +1304,7 @@ fn smooth_branch_hull_points(
         points[index] = source[index].lerp(average, weight);
     }
 }
-/// Blender's build_edge_mats: every root's edges go onto one stack, and each edge takes the frame
+/// Blender's `build_edge_mats`: every root's edges go onto one stack, and each edge takes the frame
 /// of the side that reaches it first. Returns (origin vertex, [x, y, z]) per edge.
 fn edge_matrices(
     modifier: &Modifier,
@@ -1338,7 +1350,7 @@ fn edge_matrices(
     })
 }
 
-/// Blender's calc_edge_mat: a root's frame, with world Z as the up reference; an edge along Z uses
+/// Blender's `calc_edge_mat`: a root's frame, with world Z as the up reference; an edge along Z uses
 /// the fixed X/Y frame.
 fn calc_edge_mat(x_axis: DVec3) -> [DVec3; 3] {
     let dot = x_axis.dot(DVec3::Z);
@@ -1350,7 +1362,7 @@ fn calc_edge_mat(x_axis: DVec3) -> [DVec3; 3] {
     }
 }
 
-/// Blender's build_emats_stack: an edge's frame is its parent edge's frame rotated onto its direction.
+/// Blender's `build_emats_stack`: an edge's frame is its parent edge's frame rotated onto its direction.
 fn propagate_frame(parent: [DVec3; 3], x_axis: DVec3) -> [DVec3; 3] {
     let dot = parent[0].dot(x_axis).clamp(-1.0, 1.0);
     let rotation = DQuat::from_axis_angle(parent[0].cross(x_axis).normalize_or_zero(), dot.acos());
@@ -1361,7 +1373,7 @@ fn propagate_frame(parent: [DVec3; 3], x_axis: DVec3) -> [DVec3; 3] {
     ]
 }
 
-/// Blender's connection_node_mat: the y and z axes halfway between a chain node's incoming frame
+/// Blender's `connection_node_mat`: the y and z axes halfway between a chain node's incoming frame
 /// and the outgoing edge direction.
 fn bisector_yz(incoming: [DVec3; 3], outgoing_x: DVec3) -> [DVec3; 2] {
     let angle = incoming[0].dot(outgoing_x).clamp(-1.0, 1.0).acos() / 2.0;
@@ -1369,7 +1381,7 @@ fn bisector_yz(incoming: [DVec3; 3], outgoing_x: DVec3) -> [DVec3; 2] {
     [rotation * incoming[1], rotation * incoming[2]]
 }
 
-/// Blender's create_frame: the four corners of a cross-section, offset along the edge direction.
+/// Blender's `create_frame`: the four corners of a cross-section, offset along the edge direction.
 fn frame_corners(
     center: DVec3,
     radius: [f64; 2],
@@ -1388,7 +1400,7 @@ fn frame_corners(
     .map(|corner| corner + offset)
 }
 
-/// Blender's skin_choose_quad_bridge_order: the rotation or reversal of `second` whose corners lie
+/// Blender's `skin_choose_quad_bridge_order`: the rotation or reversal of `second` whose corners lie
 /// nearest `first`; the earliest candidate wins ties.
 fn bridge_order(points: &[DVec3], first: [usize; 4], second: [usize; 4]) -> [usize; 4] {
     let mut best = [0_usize; 4];
@@ -1414,7 +1426,7 @@ fn bridge_order(points: &[DVec3], first: [usize; 4], second: [usize; 4]) -> [usi
     best.map(|index| second[index])
 }
 
-/// Blender's connect_frames: four quads between two frames, reversed as a whole when they face the
+/// Blender's `connect_frames`: four quads between two frames, reversed as a whole when they face the
 /// centre of the band.
 fn connect_frames(
     points: &[DVec3],

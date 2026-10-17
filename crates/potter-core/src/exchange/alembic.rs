@@ -2550,7 +2550,7 @@ fn import_polymesh(
     Ok(mesh)
 }
 
-/// One named color GeomParam of a Blender Alembic mesh sample, as Blender's reader sees it: raw
+/// One named color `GeomParam` of a Blender Alembic mesh sample, as Blender's reader sees it: raw
 /// float samples in file order and raw `.indices`, before any scope expansion.
 #[derive(Clone, Debug)]
 pub(crate) struct MeshCacheColor {
@@ -3343,7 +3343,7 @@ fn geomparam_values(
     }
 }
 
-/// Scope of a GeomParam from its `geoScope` metadata, which Alembic stores on the parameter and
+/// Scope of a `GeomParam` from its `geoScope` metadata, which Alembic stores on the parameter and
 /// which Blender reads as the sample scope.
 fn geomparam_scope(geomparam: &ParsedProperty) -> Result<&'static str> {
     match geomparam
@@ -3363,8 +3363,8 @@ fn geomparam_scope(geomparam: &ParsedProperty) -> Result<&'static str> {
     }
 }
 
-/// Whether `property` is a color GeomParam that Blender's reader matches: float32 `rgb` with three
-/// components or `rgba` with four, as `IC3fGeomParam` and `IC4fGeomParam` match. Any other GeomParam
+/// Whether `property` is a color `GeomParam` that Blender's reader matches: float32 `rgb` with three
+/// components or `rgba` with four, as `IC3fGeomParam` and `IC4fGeomParam` match. Any other `GeomParam`
 /// is not read as a color.
 fn is_blender_color_geomparam(property: &ParsedProperty) -> bool {
     if property.metadata.get("isGeomParam").map(String::as_str) != Some("true") {
@@ -3381,7 +3381,7 @@ fn is_blender_color_geomparam(property: &ParsedProperty) -> bool {
         }
 }
 
-/// Reads one color GeomParam sample as Blender's reader does: raw float tuples in file order and
+/// Reads one color `GeomParam` sample as Blender's reader does: raw float tuples in file order and
 /// the raw `.indices`, unexpanded. The mesh cache applies the scope and index rules, since it owns
 /// the corner order.
 fn color_cache_color(
@@ -4582,7 +4582,7 @@ mod tests {
             pod: 6,
             extent: 1,
             sample_count,
-            first_changed: if constant { 0 } else { 1 },
+            first_changed: usize::from(!constant),
             last_changed: if constant {
                 0
             } else {

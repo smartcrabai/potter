@@ -466,7 +466,7 @@ pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         return Ok(mesh.clone());
     }
     let mut result = mesh.clone();
-    let triangles = target_triangles(&target)?;
+    let triangles = target_triangles(target)?;
     for vertex in &mut result.vertices {
         let (point, normal) = match method.as_str() {
             "NEAREST_VERTEX" => {
@@ -1269,10 +1269,9 @@ pub(super) fn mask(
             continue;
         }
 
-        let start = face_selected
-            .iter()
-            .position(|value| !value)
-            .expect("a partially selected face has an unselected corner");
+        let Some(start) = face_selected.iter().position(|value| !value) else {
+            continue;
+        };
         let mut fragment = Vec::<(usize, Vec<(usize, f64)>)>::new();
         for step in 1..=indices.len() {
             let previous = (start + step - 1) % indices.len();
@@ -2303,7 +2302,6 @@ impl Default for CurveMappingSettings {
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
     reason = "Blender stores CurveMapping clip bounds as float"
 )]
 pub(super) fn curve_mapping_settings(value: Option<&Value>) -> Option<CurveMappingSettings> {
@@ -2353,7 +2351,6 @@ pub(super) fn curve_mapping_settings(value: Option<&Value>) -> Option<CurveMappi
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
     reason = "Blender CurveMapping stores point coordinates as float"
 )]
 pub(super) fn curve_mapping_points(value: &Value) -> Option<Vec<CurveMappingPoint>> {
@@ -2391,7 +2388,7 @@ pub(super) fn curve_mapping_points(value: &Value) -> Option<Vec<CurveMappingPoin
         .collect()
 }
 
-/// Hook falloff controls and optional CurveMapping settings in Blender's stored order and precision.
+/// Hook falloff controls and optional `CurveMapping` settings in Blender's stored order and precision.
 fn hook_curve_table(modifier: &Modifier) -> Result<CurveMappingTable> {
     let invalid_points = || {
         invalid_parameter(
@@ -2863,12 +2860,11 @@ mod tests {
             runtime: crate::model::ModifierRuntime::default(),
         };
         let result = mask(&source, &modifier, &std::collections::BTreeMap::new()).unwrap();
-        assert!(result.vertices.is_empty());
-        let indices = result
-            .original_indices
-            .as_ref()
-            .expect("empty layer remains present");
-        assert!(indices.vertices.is_empty());
+        assert_eq!(result.vertices.len(), 0);
+        let Some(indices) = result.original_indices.as_ref() else {
+            panic!("empty layer remains present");
+        };
+        assert_eq!(indices.vertices.len(), 0);
         assert_eq!(indices.source_vertex_count, 3);
     }
 

@@ -2324,13 +2324,10 @@ mod tests {
 
         assert!(!super::displacement_uses_view_direction(&material, &groups));
 
-        link(
-            groups.get_mut(&graph_id).expect("shader group"),
-            "fresnel",
-            "Fac",
-            "math",
-            "Value",
-        );
+        let Some(graph) = groups.get_mut(&graph_id) else {
+            panic!("shader group");
+        };
+        link(graph, "fresnel", "Fac", "math", "Value");
         assert!(super::displacement_uses_view_direction(&material, &groups));
     }
 

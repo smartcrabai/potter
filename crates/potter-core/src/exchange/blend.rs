@@ -4855,24 +4855,24 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
             },
         )?;
     }
-    if item.get("custom_normal_codes").is_none() {
-        if let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null()) {
-            let normals = raw
-                .as_array()
-                .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
-                .iter()
-                .map(|normal| {
-                    parse_vec3_value(normal)
-                        .map(glam::DVec3::from_array)
-                        .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let exact = super::shading::ExactShading {
-                smooth,
-                sharp: Vec::new(),
-            };
-            super::shading::import_shading_flags(&mut mesh, &normals, Some(&exact))?;
-        }
+    if item.get("custom_normal_codes").is_none()
+        && let Some(raw) = item.get("corner_normals").filter(|value| !value.is_null())
+    {
+        let normals = raw
+            .as_array()
+            .ok_or_else(|| invalid_intermediate("mesh corner normals are invalid"))?
+            .iter()
+            .map(|normal| {
+                parse_vec3_value(normal)
+                    .map(glam::DVec3::from_array)
+                    .ok_or_else(|| invalid_intermediate("mesh corner normal is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let exact = super::shading::ExactShading {
+            smooth,
+            sharp: Vec::new(),
+        };
+        super::shading::import_shading_flags(&mut mesh, &normals, Some(&exact))?;
     }
     let store = ColorStore {
         layers: color_list,
@@ -6900,10 +6900,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 }
             }
             if let Ok(Some(codes)) = clnor::corner_codes(mesh) {
-                if codes
-                    .iter()
-                    .any(|code| *code == clnor::CornerNormalCode::ExplicitZero)
-                {
+                if codes.contains(&clnor::CornerNormalCode::ExplicitZero) {
                     losses.push(loss(
                         "blender.mesh.custom_normal_explicit_zero",
                         Some(data_id.as_str()),
@@ -7475,16 +7472,19 @@ mod tests {
     }
 
     #[test]
-    fn mesh_sequence_cache_import_allows_disabled_file_and_object_paths() {
+    fn mesh_sequence_cache_import_allows_disabled_file_and_object_paths() -> Result<()> {
         let resource_ids = BTreeMap::from([("/cache.abc".to_owned(), "cache_resource".to_owned())]);
         for properties in [
             json!({}),
             json!({"cache_filepath": null}),
             json!({"cache_filepath": ""}),
         ] {
-            let params =
-                parse_mesh_sequence_cache_params(properties.as_object().unwrap(), &resource_ids)
-                    .unwrap();
+            let params = parse_mesh_sequence_cache_params(
+                properties
+                    .as_object()
+                    .ok_or_else(|| invalid_intermediate("test properties are not an object"))?,
+                &resource_ids,
+            )?;
             assert!(!params.contains_key("resource"));
             assert_eq!(params["object_path"], "");
         }
@@ -7492,10 +7492,9 @@ mod tests {
         let empty_object_path = parse_mesh_sequence_cache_params(
             json!({"cache_filepath": "/cache.abc", "object_path": ""})
                 .as_object()
-                .unwrap(),
+                .ok_or_else(|| invalid_intermediate("test properties are not an object"))?,
             &resource_ids,
-        )
-        .unwrap();
+        )?;
         assert_eq!(empty_object_path["resource"], "cache_resource");
         assert_eq!(empty_object_path["object_path"], "");
 
@@ -7503,11 +7502,12 @@ mod tests {
             parse_mesh_sequence_cache_params(
                 json!({"cache_filepath": "/missing.abc"})
                     .as_object()
-                    .unwrap(),
+                    .ok_or_else(|| invalid_intermediate("test properties are not an object"))?,
                 &resource_ids,
             )
             .is_err()
         );
+        Ok(())
     }
 
     #[test]
@@ -7817,7 +7817,7 @@ mod tests {
     }
 
     #[test]
-    fn blend_refuses_only_attributes_it_cannot_recreate() {
+    fn blend_refuses_only_attributes_it_cannot_recreate() -> Result<()> {
         let colors = BTreeSet::from(["Tint".to_owned()]);
         let generic = json!({"domain": "point", "type": "float", "values": {}});
         let color = json!({"domain": "point", "type": "color", "values": {}});
@@ -7828,8 +7828,10 @@ mod tests {
             ("alembic_velocity", "velocity"),
             ("alembic_normals", "imported mesh normals"),
         ] {
-            let (feature, detail) = blend_attribute_refusal(key, &generic, &colors)
-                .expect("the bridge has no writer for Alembic mesh data");
+            let (feature, detail) =
+                blend_attribute_refusal(key, &generic, &colors).ok_or_else(|| {
+                    invalid_intermediate("the bridge has no writer for Alembic mesh data")
+                })?;
             assert_eq!(feature, "mesh.attribute");
             assert!(detail.contains(key), "{detail}");
             assert!(detail.contains(reason), "{detail}");
@@ -7837,13 +7839,14 @@ mod tests {
         }
         assert!(blend_attribute_refusal("vertex_groups", &generic, &colors).is_some());
         let (feature, reason) = blend_attribute_refusal("position", &generic, &colors)
-            .expect("a Blender-managed name is refused");
+            .ok_or_else(|| invalid_intermediate("a Blender-managed name is refused"))?;
         assert_eq!(feature, "mesh.attribute");
         assert!(reason.contains("`position`"), "{reason}");
         let (feature, _) = blend_attribute_refusal("Loose", &color, &colors)
-            .expect("a color layer outside the registry is refused");
+            .ok_or_else(|| invalid_intermediate("a color layer outside the registry is refused"))?;
         assert_eq!(feature, "mesh.color_attribute");
         assert!(blend_attribute_refusal(".select_vert", &generic, &colors).is_some());
+        Ok(())
     }
 
     #[test]

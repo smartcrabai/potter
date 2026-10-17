@@ -94,7 +94,7 @@ pub(crate) fn blender_transform_point_f32(matrix: &[f32; 16], point: glam::Vec3)
     )
 }
 
-/// Blender `mul_m4_m4m4` grouping: SIMD on x86_64/ARM64, scalar on other targets.
+/// Blender `mul_m4_m4m4` grouping: SIMD on `x86_64/ARM64`, scalar on other targets.
 pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
     let mut result = [0.0; 16];
     for row in 0..4 {

@@ -409,6 +409,7 @@ mod tests {
     use super::*;
     use crate::graph::{GraphKind, GraphLink};
 
+    #[expect(clippy::expect_used, reason = "test IDs are literal valid identifiers")]
     fn evaluate_mix_graph(mix: GraphNode) -> Result<DVec3> {
         let mix_output = if mix.node_type == "ShaderNodeMixRGB" {
             "Color"
@@ -444,8 +445,10 @@ mod tests {
         ]);
         let mut groups = Registry::new();
         groups.insert(world_id.clone(), group);
-        let mut world = World::default();
-        world.node_tree = Some(world_id);
+        let world = World {
+            node_tree: Some(world_id),
+            ..World::default()
+        };
         evaluate_world(
             &world,
             &groups,
@@ -454,6 +457,10 @@ mod tests {
         )
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "unit test asserts on a successful evaluation"
+    )]
     #[test]
     fn evaluates_rgba_generic_mix_sockets() {
         let mut mix = GraphNode::new("ShaderNodeMix");
@@ -470,6 +477,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "unit test asserts on a rejected evaluation"
+    )]
     #[test]
     fn rejects_default_float_generic_mix() {
         let error = evaluate_mix_graph(GraphNode::new("ShaderNodeMix")).unwrap_err();
@@ -478,6 +489,10 @@ mod tests {
         assert!(error.message.contains("FLOAT"));
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "unit test asserts on a successful evaluation"
+    )]
     #[test]
     fn keeps_legacy_mix_rgb_sockets() {
         let mut mix = GraphNode::new("ShaderNodeMixRGB");

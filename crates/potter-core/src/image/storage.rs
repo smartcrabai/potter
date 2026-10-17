@@ -81,7 +81,7 @@ pub fn load_image_data_with_staged(
         .map(|(image, _, _)| image)
 }
 
-/// Loads an image using the selection captured by a legacy Image Texture's ImageUser.
+/// Loads an image using the selection captured by a legacy Image Texture's `ImageUser`.
 pub(crate) fn load_image_data_for_legacy_texture(
     image: &Image,
     root: &Path,
@@ -154,12 +154,14 @@ fn load_image_data_with_staged_and_user(
     ))
 }
 
+type DecodedImageUserPixels = (u32, u32, Vec<[f64; 4]>, bool, usize);
+
 fn decode_pixels_with_image_user(
     bytes: &[u8],
     colorspace: ImageColorspace,
     alpha_mode: crate::model::ImageAlphaMode,
     selection: ImageUserSelection,
-) -> Result<(u32, u32, Vec<[f64; 4]>, bool, usize)> {
+) -> Result<DecodedImageUserPixels> {
     if bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
         let (width, height, mut pixels, color_pass, source_channels) =
             decode_exr_with_image_user(bytes, selection, alpha_mode)?;
@@ -545,7 +547,7 @@ fn decode_exr_with_image_user(
     bytes: &[u8],
     selection: ImageUserSelection,
     alpha_mode: ImageAlphaMode,
-) -> Result<(u32, u32, Vec<[f64; 4]>, bool, usize)> {
+) -> Result<DecodedImageUserPixels> {
     let image = read_exr_data(bytes)?;
     let multilayer = exr_is_multilayer(&image);
     if !multilayer {
@@ -620,7 +622,7 @@ fn exr_has_legacy_flipped_rows(image: &ExrImageData) -> bool {
     let is_legacy =
         |attributes: &HashMap<exr::meta::attribute::Text, exr::meta::attribute::AttributeValue>| {
             attributes.iter().any(|(name, value)| {
-                name.to_string() == "BlenderMultiChannel"
+                name == "BlenderMultiChannel"
                     && matches!(
                         value,
                         exr::meta::attribute::AttributeValue::Text(version)
@@ -898,8 +900,9 @@ fn exr_render_layers<'a>(image: &'a ExrImageData, views: &[String]) -> Vec<ExrSe
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        if layer_views.is_none() && !part_view.is_empty() {
-            if let Some(prefix) = part_name
+        if layer_views.is_none()
+            && !part_view.is_empty()
+            && let Some(prefix) = part_name
                 .strip_suffix(&part_view)
                 .and_then(|name| name.strip_suffix('.'))
                 .or_else(|| {
@@ -907,9 +910,8 @@ fn exr_render_layers<'a>(image: &'a ExrImageData, views: &[String]) -> Vec<ExrSe
                         .strip_suffix(&part_view)
                         .and_then(|name| name.strip_suffix('-'))
                 })
-            {
-                part_name = prefix.to_owned();
-            }
+        {
+            part_name = prefix.to_owned();
         }
 
         for channel in &layer.channel_data.list {

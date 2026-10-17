@@ -234,7 +234,7 @@ pub(crate) struct CacheSequenceManifest {
     pub files: BTreeMap<i32, PathBuf>,
 }
 
-/// Resolve one frame from a CacheFile sequence, rejecting a symlink outside its pattern directory.
+/// Resolve one frame from a `CacheFile` sequence, rejecting a symlink outside its pattern directory.
 pub(crate) fn cache_sequence_frame_path(path: &Path, frame: i32) -> Result<Option<PathBuf>> {
     let Some(pattern) = cache_sequence_pattern(path) else {
         return Ok(None);
@@ -270,7 +270,7 @@ pub(crate) fn cache_sequence_frame_path(path: &Path, frame: i32) -> Result<Optio
     Ok(Some(canonical))
 }
 
-/// Resolve an output filename from a numbered CacheFile path, rejecting symlink destinations.
+/// Resolve an output filename from a numbered `CacheFile` path, rejecting symlink destinations.
 pub(crate) fn cache_sequence_output_path(path: &Path, frame: i32) -> Result<Option<PathBuf>> {
     let Some(pattern) = cache_sequence_pattern(path) else {
         return Ok(None);

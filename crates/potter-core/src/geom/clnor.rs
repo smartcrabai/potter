@@ -14,7 +14,7 @@
 //! `corner_space_custom_normal_to_data`, and `corner_space_custom_data_to_normal`.
 
 use std::collections::{HashMap, HashSet};
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use glam::{DVec3, Vec3};
 use serde_json::{Map, Value, json};
@@ -86,8 +86,8 @@ fn safe_acos(cosine: f32) -> f32 {
         1.0
     };
     let acos = (1.0 - clamped).sqrt()
-        * (1.5707963267
-            + clamped * (-0.213300989 + clamped * (0.077980478 + clamped * -0.02164095)));
+        * (FRAC_PI_2
+            + clamped * (-0.213_300_99 + clamped * (0.077_980_48 + clamped * -0.021_640_95)));
     if cosine < 0.0 { PI - acos } else { acos }
 }
 
@@ -167,7 +167,7 @@ impl Space {
             return Self::default();
         }
         let ref_alpha = if edges.is_empty() {
-            (safe_acos(dtp_ref) + safe_acos(dtp_other)) / 2.0
+            f32::midpoint(safe_acos(dtp_ref), safe_acos(dtp_other))
         } else {
             let mut alpha = 0.0;
             for &edge in edges {
@@ -830,7 +830,7 @@ fn is_identity(order: &[usize]) -> bool {
 }
 
 /// One row per face in `mesh.faces` order, keyed `f<id>`, cut from values in corner order.
-fn face_rows(mesh: &Mesh, flat: Vec<Value>) -> Map<String, Value> {
+fn face_rows(mesh: &Mesh, flat: &[Value]) -> Map<String, Value> {
     let mut rows = Map::new();
     let mut start = 0;
     for face in &mesh.faces {
@@ -872,13 +872,13 @@ fn store_state(
     attribute.insert("type".to_owned(), json!("normal_code"));
     if let Some(codes) = codes {
         let flat: Vec<Value> = codes.iter().copied().map(code_value).collect();
-        attribute.insert("values".to_owned(), Value::Object(face_rows(mesh, flat)));
+        attribute.insert("values".to_owned(), Value::Object(face_rows(mesh, &flat)));
     }
     if let Some(order) = order {
         let flat: Vec<Value> = order.iter().map(|&ordinal| Value::from(ordinal)).collect();
         attribute.insert(
             "corner_order".to_owned(),
-            Value::Object(face_rows(mesh, flat)),
+            Value::Object(face_rows(mesh, &flat)),
         );
     }
     mesh.attributes
@@ -1193,21 +1193,20 @@ pub(crate) fn transfer_custom_normals(
     options: NormalCodeOptions<'_>,
 ) -> Result<()> {
     let output_count = corner_count(output);
-    let order: Vec<usize> = match options.corner_order {
-        Some(order) => order.to_vec(),
-        None => {
-            let identity = sources.len() == output_count
-                && sources
-                    .iter()
-                    .enumerate()
-                    .all(|(corner, mapped)| *mapped == Some(corner));
-            let persisted = if identity {
-                corner_order(source)?
-            } else {
-                None
-            };
-            persisted.unwrap_or_else(|| (0..output_count).collect())
-        }
+    let order: Vec<usize> = if let Some(order) = options.corner_order {
+        order.to_vec()
+    } else {
+        let identity = sources.len() == output_count
+            && sources
+                .iter()
+                .enumerate()
+                .all(|(corner, mapped)| *mapped == Some(corner));
+        let persisted = if identity {
+            corner_order(source)?
+        } else {
+            None
+        };
+        persisted.unwrap_or_else(|| (0..output_count).collect())
     };
     let codes = rebuild_custom_normals(
         source,

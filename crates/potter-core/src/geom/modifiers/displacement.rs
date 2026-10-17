@@ -12,7 +12,12 @@ use std::path::Path;
 
 use glam::{DMat3, DQuat};
 
-use super::*;
+use super::{
+    DMat4, DVec3, ErrorCode, Id, Mesh, Modifier, PotError, Result, Value, bool_param,
+    corner_normals, id_indices, invalid_parameter, json, number_param, optional_string_param,
+    polygons, positions, safe_acos_approx, schema_value, string_param, string_param_with_expected,
+    uv_layers, validated, vertex_normals,
+};
 use crate::blender_rng::BlenderRng;
 use crate::geom::legacy_texture::{self, ResolvedTexture};
 use crate::model::SceneDoc;
@@ -656,6 +661,10 @@ pub(crate) fn warp_textured(
             continue;
         }
         let local = from_inverse.transform_point3(co);
+        #[expect(
+            clippy::float_cmp,
+            reason = "Blender takes the full-transform branch only for an exact factor of 1.0"
+        )]
         let moved = if factor == 1.0 {
             final_matrix.transform_point3(local)
         } else if volume_preserve {
@@ -721,7 +730,7 @@ fn blend_with_identity(matrix: DMat4, weight: f64) -> DMat4 {
         matrix.z_axis.truncate(),
     ];
     let mut size = columns.map(DVec3::length);
-    let mut rotation = columns.map(|column| column.normalize_or_zero());
+    let mut rotation = columns.map(DVec3::normalize_or_zero);
     if DMat3::from_cols(rotation[0], rotation[1], rotation[2]).determinant() < 0.0 {
         rotation = rotation.map(|column| -column);
         size = size.map(|value| -value);
@@ -765,6 +774,10 @@ fn blend_with_identity(matrix: DMat4, weight: f64) -> DMat4 {
 
 /// Blender's `mat3_normalized_to_quat_fast` for a normalized rotation: `m(column, row)` reads
 /// Blender's `mat[column][row]`. Returns `[w, x, y, z]`.
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender's mat3_normalized_to_quat_fast tests trace == 1.0 exactly"
+)]
 fn normalized_matrix_to_quat(m: impl Fn(usize, usize) -> f64) -> [f64; 4] {
     let mut q = [0.0_f64; 4];
     if m(2, 2) < 0.0 {

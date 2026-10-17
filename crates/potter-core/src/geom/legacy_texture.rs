@@ -12,7 +12,7 @@
 //! UV). The result follows Blender's `BKE_texture_get_value`: `intensity` is the texture's `tin`,
 //! and `rgb` is the colour for RGB results or the intensity replicated otherwise.
 
-use std::{f64::consts::PI, path::Path};
+use std::{collections::BTreeMap, f64::consts::PI, path::Path};
 
 use crate::blender_rng::BlenderRng;
 use glam::DVec3;
@@ -103,6 +103,10 @@ pub(crate) struct BlendTexture {
 
 /// A Blender legacy texture held inline in `doc.resources`.
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "image sampler settings stay inline; boxing adds an allocation per texture"
+)]
 pub(crate) enum LegacyTexture {
     Blend(BlendTexture),
     ImageRecord {
@@ -420,7 +424,6 @@ fn texture_settings_keys(texture_type: &str) -> &'static [&'static str] {
             "noise_type",
             "stucci_type",
         ],
-        "NOISE" => &[],
         "DISTORTED_NOISE" => &[
             "distortion",
             "noise_scale",
@@ -449,7 +452,6 @@ fn texture_settings_keys(texture_type: &str) -> &'static [&'static str] {
             "noise_scale",
             "noise_basis",
         ],
-        "NATIVE_VALUE_NOISE" => &[],
         "IMAGE" => &[
             "use_interpolation",
             "filter_size",
@@ -480,6 +482,7 @@ fn texture_settings_keys(texture_type: &str) -> &'static [&'static str] {
             "color_ramp",
             "image_user",
         ],
+        // NOISE and NATIVE_VALUE_NOISE have no settings.
         _ => &[],
     }
 }
@@ -559,7 +562,7 @@ fn validate_legacy_settings(
                 ));
             }
         } else if key == "noise_depth" {
-            if !value.as_u64().is_some_and(|depth| depth <= 30) {
+            if value.as_u64().is_none_or(|depth| depth > 30) {
                 return Err(record_error(
                     id,
                     "`noise_depth` must be an integer from 0 through 30",
@@ -647,7 +650,6 @@ fn image_number_in_range(value: &Value, minimum: f64, maximum: f64) -> bool {
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
     reason = "Blender stores ColorBand positions and colors as f32"
 )]
 fn parse_color_ramp(id: &str, object: &Map<String, Value>) -> Result<ColorRamp> {
@@ -1011,13 +1013,12 @@ pub(crate) fn validate_record_in_scene(doc: &SceneDoc, id: &Id, value: &Value) -
     if let LegacyTexture::ImageRecord {
         image: Some(image), ..
     } = parse_record(&id.to_string(), value)?
+        && !doc.images.contains_key(&image)
     {
-        if !doc.images.contains_key(&image) {
-            return Err(record_error(
-                &id.to_string(),
-                format!("IMAGE texture references missing image `{image}`"),
-            ));
-        }
+        return Err(record_error(
+            &id.to_string(),
+            format!("IMAGE texture references missing image `{image}`"),
+        ));
     }
     Ok(())
 }
@@ -1207,9 +1208,7 @@ pub(crate) fn merged_record(
         "settings": merged,
     });
     if texture_type == "IMAGE" {
-        record["image"] = image
-            .map(|image| json!(image.to_string()))
-            .unwrap_or(Value::Null);
+        record["image"] = image.map_or(Value::Null, |image| json!(image.to_string()));
     }
     let texture = parse_record(id, &record)?;
     Ok(record_value(&texture))
@@ -1281,7 +1280,7 @@ pub fn resolve_texture(
                             width: 0,
                             height: 0,
                             pixels: Vec::new(),
-                            tiles: Default::default(),
+                            tiles: BTreeMap::default(),
                             interpolation: ImageInterpolation::Linear,
                         },
                         settings: sampler,
@@ -1411,6 +1410,10 @@ fn hash_native_value_noise(point: [i64; 3], channel: usize) -> f64 {
 }
 
 /// Blender's `Blend` texture (`texture_procedural.cc`, `blend`), followed by `BRICONT`.
+#[expect(
+    clippy::manual_midpoint,
+    reason = "matches Blender's (1 + x) / 2 evaluation order"
+)]
 fn sample_blend(texture: BlendTexture, coords: DVec3) -> TextureResult {
     let (x, y) = if texture.flip_axis {
         (coords.y, coords.x)
@@ -1465,13 +1468,13 @@ fn sample_blend(texture: BlendTexture, coords: DVec3) -> TextureResult {
     reason = "the input is checked against Blender's signed integer texel range"
 )]
 fn floor_to_texture_i64(value: f32) -> Option<i64> {
-    let value = f64::from(value.floor());
     const UPPER: f64 = 9_223_372_036_854_775_808.0;
     const LOWER: f64 = -9_223_372_036_854_775_808.0;
-    if !(LOWER..UPPER).contains(&value) {
-        None
-    } else {
+    let value = f64::from(value.floor());
+    if (LOWER..UPPER).contains(&value) {
         Some(value as i64)
+    } else {
+        None
     }
 }
 
@@ -1531,7 +1534,6 @@ fn srgb_encoded_channel(linear: f32) -> f32 {
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
     reason = "ImageData channels are converted to Blender's float texel values"
 )]
 fn image_pixel(
@@ -1574,6 +1576,10 @@ struct ImageFilterRect {
     max_y: f32,
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender splits a wrapped filter rect only on an exact edge mismatch"
+)]
 fn wrap_filter_rects_x(rects: &mut [ImageFilterRect; 8], count: &mut usize, width: f32) {
     let initial_count = *count;
     for index in 0..initial_count {
@@ -1619,6 +1625,10 @@ fn wrap_filter_rects_x(rects: &mut [ImageFilterRect; 8], count: &mut usize, widt
     }
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender splits a wrapped filter rect only on an exact edge mismatch"
+)]
 fn wrap_filter_rects_y(rects: &mut [ImageFilterRect; 8], count: &mut usize, height: f32) {
     let initial_count = *count;
     for index in 0..initial_count {
@@ -1693,7 +1703,6 @@ fn clip_filter_rect_y(rect: &mut ImageFilterRect, minimum: f32, maximum: f32) ->
 }
 
 #[expect(
-    clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     reason = "Blender filters integer texel indices in float space"
 )]
@@ -1920,6 +1929,14 @@ fn filtered_image_pixels(
     clippy::cast_precision_loss,
     reason = "Blender evaluates texture coordinates and dimensions as f32"
 )]
+#[expect(
+    clippy::manual_midpoint,
+    reason = "Blender maps UV coordinates with (x + 1) / 2 in f32"
+)]
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender compares alpha and saturation against exact 1.0 defaults"
+)]
 fn sample_image(
     image: &ImageData,
     coords: DVec3,
@@ -1958,14 +1975,14 @@ fn sample_image(
                 )
                 .and_then(|number| number.checked_add(u))
                 .and_then(|number| u32::try_from(number).ok());
-            if let Some(tile_number) = tile_number {
-                if let Some(tile) = image.tiles.get(&tile_number) {
-                    width_px = tile.width;
-                    height_px = tile.height;
-                    pixels = tile.pixels.as_slice();
-                    fx -= u as f32;
-                    fy -= v as f32;
-                }
+            if let Some(tile_number) = tile_number
+                && let Some(tile) = image.tiles.get(&tile_number)
+            {
+                width_px = tile.width;
+                height_px = tile.height;
+                pixels = tile.pixels.as_slice();
+                fx -= u as f32;
+                fy -= v as f32;
             }
         }
     }
@@ -2100,6 +2117,10 @@ fn sample_image(
     })
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender's colour ramp treats equal stop positions as an exact case"
+)]
 fn evaluate_color_ramp(ramp: &ColorRamp, input: f32) -> [f32; 4] {
     let stops = &ramp.stops[..usize::from(ramp.stop_count)];
     if let Some(only) = stops.first().filter(|_| stops.len() == 1) {
@@ -2243,6 +2264,10 @@ fn lerp_rgba(first: [f32; 4], second: [f32; 4], factor: f32) -> [f32; 4] {
     std::array::from_fn(|index| first[index] + (second[index] - first[index]) * factor)
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender's hue interpolation tests equal hues exactly"
+)]
 fn interpolate_hue(first: f32, second: f32, factor: f32, mode: RampHueInterpolation) -> f32 {
     let first = first.rem_euclid(1.0);
     let second = second.rem_euclid(1.0);
@@ -2294,6 +2319,14 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
     ]
 }
 
+#[expect(
+    clippy::manual_midpoint,
+    reason = "Blender computes lightness as (max + min) / 2 in f32"
+)]
+#[expect(
+    clippy::float_cmp,
+    reason = "Blender's RGB to HSL tests exact channel equality"
+)]
 fn rgb_to_hsl(red: f32, green: f32, blue: f32) -> [f32; 3] {
     let maximum = red.max(green).max(blue);
     let minimum = red.min(green).min(blue);
@@ -2670,11 +2703,11 @@ const PERLIN_GRAD_HEX: &str = concat!(
 const PERLIN_GRAD: [u32; 1542] = decode_u32_table::<1542>(PERLIN_GRAD_HEX);
 
 fn table_float(table: &[u32], index: usize) -> f32 {
-    table.get(index).copied().map(f32::from_bits).unwrap_or(0.0)
+    table.get(index).copied().map_or(0.0, f32::from_bits)
 }
 
 fn hash_value(index: usize) -> usize {
-    HASH512.get(index).copied().map(usize::from).unwrap_or(0)
+    HASH512.get(index).copied().map_or(0, usize::from)
 }
 
 fn noise_hash(x: i32, y: i32, z: i32) -> usize {
@@ -2924,19 +2957,19 @@ fn voronoi4(x: f32, y: f32, z: f32, metric: u8, exponent: f32) -> ([f32; 4], [[f
 }
 
 fn cell_noise_u(x: f32, y: f32, z: f32) -> f32 {
-    let x = ((x + 0.000001) * 1.00001).floor() as i32;
-    let y = ((y + 0.000001) * 1.00001).floor() as i32;
-    let z = ((z + 0.000001) * 1.00001).floor() as i32;
+    let x = ((x + 0.000_001) * 1.00001).floor() as i32;
+    let y = ((y + 0.000_001) * 1.00001).floor() as i32;
+    let z = ((z + 0.000_001) * 1.00001).floor() as i32;
     let mut n = (x as u32)
         .wrapping_add((y as u32).wrapping_mul(1301))
-        .wrapping_add((z as u32).wrapping_mul(314159));
+        .wrapping_add((z as u32).wrapping_mul(314_159));
     n ^= n.wrapping_shl(13);
     let inner = n
         .wrapping_mul(n)
         .wrapping_mul(n)
         .wrapping_mul(15731)
-        .wrapping_add(n.wrapping_mul(789221))
-        .wrapping_add(1376312589);
+        .wrapping_add(n.wrapping_mul(789_221))
+        .wrapping_add(1_376_312_589);
     inner as f32 / 4_294_967_296.0
 }
 
@@ -2949,7 +2982,6 @@ fn cell_noise_v3(x: f32, y: f32, z: f32) -> [f32; 3] {
 
 fn noise_basis_unsigned(basis: u8, x: f32, y: f32, z: f32) -> f32 {
     match basis {
-        0 => org_blender_noise(x, y, z),
         1 => 0.5 + 0.5 * original_perlin(x, y, z),
         2 => 0.5 + 0.5 * improved_perlin(x, y, z),
         3..=8 => {
@@ -2966,6 +2998,7 @@ fn noise_basis_unsigned(basis: u8, x: f32, y: f32, z: f32) -> f32 {
             }
         }
         14 => cell_noise_u(x, y, z),
+        // Basis 0 and any unknown basis are Blender's original noise.
         _ => org_blender_noise(x, y, z),
     }
 }
@@ -3044,8 +3077,7 @@ fn setting_f32(settings: &Map<String, Value>, key: &str, default: f32) -> f32 {
     settings
         .get(key)
         .and_then(Value::as_f64)
-        .map(|value| value as f32)
-        .unwrap_or(default)
+        .map_or(default, |value| value as f32)
 }
 
 fn setting_text<'a>(settings: &'a Map<String, Value>, key: &str, default: &'a str) -> &'a str {
@@ -3379,10 +3411,10 @@ fn sample_voronoi(settings: &ProceduralSamplerSettings, p: [f32; 3]) -> Result<T
     let weights = settings.voronoi_weights;
     let absolute = weights.map(f32::abs);
     let total = absolute.iter().sum::<f32>();
-    let intensity_scale = if total != 0.0 {
-        settings.noise_intensity / total
-    } else {
+    let intensity_scale = if total == 0.0 {
         0.0
+    } else {
+        settings.noise_intensity / total
     };
     let intensity = intensity_scale
         * (weights[0] * distances[0]
@@ -3394,11 +3426,11 @@ fn sample_voronoi(settings: &ProceduralSamplerSettings, p: [f32; 3]) -> Result<T
         0 => Ok(scalar_result(intensity)),
         mode => {
             let mut color = [0.0_f32; 3];
-            for cell in 0..4 {
+            for (cell, &weight) in absolute.iter().enumerate() {
                 let point = points.get(cell).copied().unwrap_or([0.0; 3]);
                 let c = cell_noise_v3(point[0], point[1], point[2]);
                 for ch in 0..3 {
-                    color[ch] += absolute[cell] * c[ch];
+                    color[ch] += weight * c[ch];
                 }
             }
             let outline = ((distances[1] - distances[0]) * 10.0).min(1.0);
@@ -3615,7 +3647,7 @@ fn musgrave_ridged(
 }
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fs, path::Path};
+    use std::{collections::BTreeMap, error::Error, fs, path::Path};
 
     use glam::DVec3;
     use serde_json::{Value, json};
@@ -3633,6 +3665,10 @@ mod tests {
         },
     };
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "fixture takes owned settings to mirror the caller-built JSON it wraps"
+    )]
     fn image_record(settings: Value) -> Value {
         json!({
             "storage":"inline",
@@ -3648,7 +3684,7 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![[0.2, 0.4, 0.6, 1.0], [0.8, 0.7, 0.1, 1.0]],
-            tiles: Default::default(),
+            tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
         }
     }
@@ -3687,6 +3723,10 @@ mod tests {
         Ok(())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture JSON and parameters are valid"
+    )]
     fn sample_scene_image_record(
         doc: &mut SceneDoc,
         texture_id: &Id,
@@ -4039,6 +4079,10 @@ mod tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture records and samples are valid"
+    )]
     fn image_records_share_pixels_but_keep_independent_sampler_settings() {
         let first = parse_record(
             "texture_a",
@@ -4081,6 +4125,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture records and samples are valid"
+    )]
     fn image_color_ramp_samples_the_pre_color_adjustment_tint() {
         let texture = parse_record(
             "texture_ramp",
@@ -4101,7 +4149,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![[0.2, 0.4, 0.6, 0.5]],
-            tiles: Default::default(),
+            tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
         };
         let LegacyTexture::ImageRecord { sampler, .. } = texture else {
@@ -4119,6 +4167,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture records and samples are valid"
+    )]
     fn empty_image_texture_resolves_to_the_empty_image_sample() {
         let texture = parse_record(
             "empty_image",
@@ -4144,7 +4196,7 @@ mod tests {
             width: 0,
             height: 0,
             pixels: Vec::new(),
-            tiles: Default::default(),
+            tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
         };
         let mut rng = BlenderRng::seed(0);
@@ -4159,6 +4211,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture records and samples are valid"
+    )]
     fn noise_consumes_one_blender_rng_value_per_sample() {
         let noise = parse_record(
             "noise",
@@ -4178,6 +4234,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture records and samples are valid"
+    )]
     fn resolved_direct_image_uses_default_settings() {
         let image = image_data();
         let resolved = ResolvedTexture {
@@ -4190,6 +4250,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture records and samples are valid"
+    )]
     fn blender_522_byte_image_oracle_matches_srgb_reencoding() {
         // Texture.evaluate per-channel oracle; the Non-Color byte image avoids its extra conversion.
         // The same sRGB bytes were also sampled by Blender 5.2.2 Displace via BKE_texture_get_value_ex(false).
@@ -4208,7 +4272,7 @@ mod tests {
                 0.014_443_843_596_092_545,
                 1.0,
             ]],
-            tiles: Default::default(),
+            tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
         };
         let mut settings = DEFAULT_IMAGE_SETTINGS;
@@ -4230,6 +4294,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture records and samples are valid"
+    )]
     fn blender_522_oracle_matches_filter_boxes_spanning_multiple_periods() {
         // Captured with Blender 5.2.2 Texture.evaluate on byte pixels [black, white], filter_size=5,
         // REPEAT extension, and a Non-Color image to avoid scene color conversion.
@@ -4238,7 +4306,7 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
-            tiles: Default::default(),
+            tiles: BTreeMap::default(),
             interpolation: ImageInterpolation::Linear,
         };
         let mut settings = DEFAULT_IMAGE_SETTINGS;

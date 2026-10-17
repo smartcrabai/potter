@@ -1137,7 +1137,7 @@ mod tests {
         }
 
         let result = boolean_mesh(&source, &operand, "UNION").unwrap();
-        assert!(!result.faces.is_empty());
+        assert_ne!(result.faces.len(), 0);
         assert!(result.original_indices.is_none());
         let mut empty_source = Mesh::new();
         empty_source.original_indices = Some(OriginalIndices {

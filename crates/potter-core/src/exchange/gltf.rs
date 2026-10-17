@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
@@ -1028,12 +1029,10 @@ impl ColorPlan {
         if layer >= self.layer_count {
             return None;
         }
-        Some(if layer == selected {
-            0
-        } else if layer < selected {
-            layer + 1
-        } else {
-            layer
+        Some(match layer.cmp(&selected) {
+            Ordering::Equal => 0,
+            Ordering::Less => layer + 1,
+            Ordering::Greater => layer,
         })
     }
 }
@@ -6781,7 +6780,7 @@ pub(crate) fn import_indexed(
                 },
             );
         }
-        import_color_layers(&mut mesh, &polygons, &color_sets, &welded_of, &first)?;
+        import_color_layers(&mut mesh, &polygons, &color_sets, &welded_of, &first);
         let morph_normals_complete = !morph_deltas.is_empty() && !morph_normals_missing;
         // Morph deltas, like positions, come from each welded vertex's first copy.
         let welded_morphs = morph_deltas
@@ -7284,7 +7283,7 @@ fn import_color_layers(
     sets: &BTreeMap<usize, Vec<Option<[f64; 4]>>>,
     welded_of: &[usize],
     first: &[usize],
-) -> Result<()> {
+) {
     const DEFAULT: [f64; 4] = [1.0; 4];
     let mut layers = Vec::<ColorLayer>::new();
     for values in sets.values() {
@@ -7298,6 +7297,10 @@ fn import_color_layers(
             .collect::<Vec<_>>();
         let mut welded_values = vec![None::<[f64; 4]>; first.len()];
         let mut disagree = false;
+        #[expect(
+            clippy::float_cmp,
+            reason = "welded corners must match exactly; an epsilon would merge distinct glTF colors"
+        )]
         for (index, value) in polygons.iter().flatten().zip(&corner_values) {
             let welded = welded_of[*index];
             match welded_values[welded] {
@@ -7329,7 +7332,7 @@ fn import_color_layers(
         });
     }
     let Some(active) = layers.first().map(|layer| layer.name.clone()) else {
-        return Ok(());
+        return;
     };
     color_layers::write(
         mesh,
@@ -7339,7 +7342,6 @@ fn import_color_layers(
             render: Some(active),
         },
     );
-    Ok(())
 }
 
 /// Groups glTF vertices that are copies of one Potter vertex. Returns each glTF vertex's welded
@@ -9759,7 +9761,7 @@ mod tests {
             to_node: crate::model::Id::new("bsdf")?,
             to_socket: "Base Color".to_owned(),
         });
-        let graph = crate::model::Id::new(&format!("{material}_graph"))?;
+        let graph = crate::model::Id::new(format!("{material}_graph"))?;
         doc.node_groups.insert(graph.clone(), group);
         doc.materials
             .get_mut(&crate::model::Id::new(material)?)
@@ -10092,7 +10094,7 @@ mod tests {
             &sets,
             &[0, 1, 2, 3, 2],
             &[0, 1, 2, 3],
-        )?;
+        );
         Ok(crate::geom::color_layers::read(&mesh))
     }
 

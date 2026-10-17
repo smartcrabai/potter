@@ -326,13 +326,25 @@ fn default_true() -> bool {
     true
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes fields by reference"
+)]
 fn is_false(value: &bool) -> bool {
     !value
 }
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes fields by reference"
+)]
 fn is_zero_f64(value: &f64) -> bool {
     *value == 0.0
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "exact default check keeps untouched B-Bone scales out of serialized poses"
+)]
 fn is_one_vec3(value: &[f64; 3]) -> bool {
     *value == [1.0; 3]
 }

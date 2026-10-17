@@ -68,7 +68,7 @@ fn checked_inverse(matrix: DMat4, what: &str) -> Result<DMat4> {
     Ok(inverse)
 }
 
-fn pose_delta(pose: PoseBone, bone_id: &Id) -> Result<DMat4> {
+fn pose_delta(pose: &PoseBone, bone_id: &Id) -> Result<DMat4> {
     let translation = DVec3::from_array(pose.translation);
     let scale = DVec3::from_array(pose.scale);
     let rotation = DQuat::from_xyzw(
@@ -180,7 +180,7 @@ fn evaluate_bone_matrices_with_ik_overrides(
         if bone.use_connect {
             pose_value.translation = [0.0; 3];
         }
-        let delta = pose_delta(pose_value, id)?;
+        let delta = pose_delta(&pose_value, id)?;
         let evaluated = if let Some(parent_id) = &bone.parent {
             let parent_bone = armature.bones.get(parent_id).ok_or_else(|| {
                 evaluation_error_with(
@@ -3258,9 +3258,14 @@ fn bbone_spline_matrices(param: &BboneSplineParameters) -> Result<Vec<DMat4>> {
         param.scale_in.x,
         param.scale_in.z,
     )?);
-    for index in 1..param.segments {
+    for (index, &parameter_point) in parameter_points
+        .iter()
+        .enumerate()
+        .take(param.segments)
+        .skip(1)
+    {
         let factor = index as f64 / param.segments as f64;
-        let (position, axis) = evaluate_cubic_bezier(control, parameter_points[index]);
+        let (position, axis) = evaluate_cubic_bezier(control, parameter_point);
         let roll = roll_in + (roll_out - roll_in) * factor;
         let scale_x = param.scale_in.x + (param.scale_out.x - param.scale_in.x) * factor;
         let scale_z = param.scale_in.z + (param.scale_out.z - param.scale_in.z) * factor;
@@ -3280,11 +3285,13 @@ fn bbone_spline_matrices(param: &BboneSplineParameters) -> Result<Vec<DMat4>> {
     Ok(result)
 }
 
+type GroupWeights<'a> = Option<(&'a [VertexGroup], &'a [HashMap<u32, f64>])>;
+
 fn build_bbone_segment_matrices(
     armature: &ArmatureData,
     pose: &BTreeMap<Id, PoseBone>,
     bones: &BTreeMap<Id, BoneMatrices>,
-    group_weights: Option<(&[VertexGroup], &[HashMap<u32, f64>])>,
+    group_weights: GroupWeights<'_>,
     use_envelopes: bool,
     preserve_volume: bool,
 ) -> Result<BTreeMap<Id, BboneSegmentMatrices>> {
@@ -3496,6 +3503,10 @@ impl BboneSegmentMatrices {
 /// matrices. The vertex-group mask scales the displacement. With `multi_input` (the positions
 /// entering the preceding armature run, Blender's `vert_coords_prev`), the deformed input is
 /// mixed with the current positions by the mask instead.
+#[expect(
+    clippy::float_cmp,
+    reason = "exact previous-input weight 1.0 passes the vertex through unchanged, as in Blender"
+)]
 pub(crate) fn apply_armature_skinning(
     mesh: &mut Mesh,
     data_block: &DataBlock,
@@ -3680,8 +3691,16 @@ pub(crate) fn apply_armature_skinning(
         }
 
         let total: f64 = contributions.iter().map(|item| item.weight).sum();
-        let mixed = (total > ARMATURE_CONTRIBUTION_THRESHOLD)
-            .then(|| mix_armature_point(source_armature, &contributions, total, preserve_volume));
+        let mixed = if total > ARMATURE_CONTRIBUTION_THRESHOLD {
+            Some(mix_armature_point(
+                source_armature,
+                &contributions,
+                total,
+                preserve_volume,
+            )?)
+        } else {
+            None
+        };
         if multi_input.is_some() {
             let previous_weight = mask_weight(vertex.id)
                 .map_or(0.0, |mask| if invert_mask { mask } else { 1.0 - mask });
@@ -3806,10 +3825,10 @@ fn envelope_factor(bone: &crate::model::Bone, point: DVec3) -> f64 {
     } else if height > length {
         (point.distance_squared(tail), bone.tail_radius)
     } else {
-        let radius = if length != 0.0 {
-            bone.head_radius + (bone.tail_radius - bone.head_radius) * (height / length)
-        } else {
+        let radius = if length == 0.0 {
             bone.head_radius
+        } else {
+            bone.head_radius + (bone.tail_radius - bone.head_radius) * (height / length)
         };
         ((point - head).length_squared() - height * height, radius)
     };
@@ -3838,32 +3857,46 @@ fn mix_armature_point(
     contributions: &[SkinContribution<'_>],
     total: f64,
     preserve_volume: bool,
-) -> DVec3 {
+) -> Result<DVec3> {
     if preserve_volume {
         let mut sum = DualQuatSum::default();
         for contribution in contributions {
-            let dual_quat = match contribution.segment_index {
-                Some(index) => &contribution
-                    .bone
-                    .segments
-                    .unwrap()
-                    .dual_quats
-                    .as_ref()
-                    .unwrap()[index],
-                None => contribution.bone.dual_quat.as_ref().unwrap(),
-            };
+            let dual_quat =
+                match contribution.segment_index {
+                    Some(index) => {
+                        let segments = contribution.bone.segments.ok_or_else(|| {
+                            evaluation_error("armature B-Bone segment matrices are missing")
+                        })?;
+                        let dual_quats = segments.dual_quats.as_ref().ok_or_else(|| {
+                            evaluation_error("armature B-Bone dual quaternions are missing")
+                        })?;
+                        &dual_quats[index]
+                    }
+                    None => contribution.bone.dual_quat.as_ref().ok_or_else(|| {
+                        evaluation_error("armature bone dual quaternion is missing")
+                    })?,
+                };
             sum.add(dual_quat, point, contribution.weight);
         }
-        sum.transform(point, total)
+        Ok(sum.transform(point, total))
     } else {
-        contributions.iter().fold(DVec3::ZERO, |acc, contribution| {
-            let matrix = contribution
-                .segment_index
-                .map_or(contribution.bone.skin, |index| {
-                    contribution.bone.segments.unwrap().deform.as_ref().unwrap()[index]
-                });
-            acc + matrix.transform_point3(point) * contribution.weight
-        }) / total
+        let mut accumulated = DVec3::ZERO;
+        for contribution in contributions {
+            let matrix = match contribution.segment_index {
+                Some(index) => {
+                    let segments = contribution.bone.segments.ok_or_else(|| {
+                        evaluation_error("armature B-Bone segment matrices are missing")
+                    })?;
+                    let deform = segments.deform.as_ref().ok_or_else(|| {
+                        evaluation_error("armature B-Bone deform matrices are missing")
+                    })?;
+                    deform[index]
+                }
+                None => contribution.bone.skin,
+            };
+            accumulated += matrix.transform_point3(point) * contribution.weight;
+        }
+        Ok(accumulated / total)
     }
 }
 
@@ -3879,6 +3912,10 @@ struct BoneDualQuat {
 
 impl BoneDualQuat {
     /// Blender `mat4_to_dquat(arm_mat, chan_mat)` for one deform bone.
+    #[expect(
+        clippy::manual_midpoint,
+        reason = "matches Blender's mat4_to_dquat float evaluation order for parity"
+    )]
     fn new(rest: DMat4, skin: DMat4) -> Self {
         let posed = skin * rest;
         let sizes = DVec3::new(

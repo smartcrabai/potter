@@ -1,6 +1,9 @@
 //! UV project and UV warp modifiers, including projector cameras and bone references.
 
-use super::*;
+use super::{
+    BTreeMap, DMat4, DVec2, ErrorCode, Mesh, Modifier, PotError, Result, SceneOperand, Value,
+    boolean, get_group_weights, invalid, json, number, optional_string, string, vector2,
+};
 use glam::{Vec2, Vec3};
 
 fn active_uv_layer_index(store: &crate::geom::uv_layers::UvStore) -> Option<usize> {
@@ -134,10 +137,10 @@ fn face_normal_f32(mesh: &Mesh, indices: &[usize]) -> Vec3 {
     let normal = match indices {
         [a, b, c, d] => (point(*a) - point(*c)).cross(point(*b) - point(*d)),
         [a, b, c] => (point(*a) - point(*b)).cross(point(*b) - point(*c)),
-        values if values.len() > 4 => {
+        [.., last] if indices.len() > 4 => {
             let mut normal = Vec3::ZERO;
-            let mut previous = point(*values.last().expect("non-empty face"));
-            for &index in values {
+            let mut previous = point(*last);
+            for &index in indices {
                 let current = point(index);
                 normal.x += (previous.y - current.y) * (previous.z + current.z);
                 normal.y += (previous.z - current.z) * (previous.x + current.x);
@@ -557,8 +560,7 @@ pub(super) fn uv_warp(
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
             let base_down = base_values
                 .and_then(|values| values.get(corner))
-                .map(|value| DVec2::from_array(*value))
-                .unwrap_or(DVec2::ZERO);
+                .map_or(DVec2::ZERO, |value| DVec2::from_array(*value));
             // Canonical mesh UVs are V-down; Blender UV Warp works in V-up coordinates.
             let base = Vec3::new(base_down.x as f32, (1.0 - base_down.y) as f32, 0.0);
             let mut weight = weights.as_ref().map_or(1.0_f32, |values| {

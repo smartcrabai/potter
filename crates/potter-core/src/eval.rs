@@ -744,9 +744,7 @@ impl Snapshot {
                 let Ok(curve_id) = Id::new(curve_reference) else {
                     continue;
                 };
-                if curve_path_lengths.contains_key(&curve_id) {
-                    continue;
-                }
+                let _ = curve_path_lengths.contains_key(&curve_id);
             }
         }
         let simulation = crate::sim::evaluate(
@@ -1865,9 +1863,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
-        "armature" | "lattice" | "volume_to_mesh" => &["object"],
-        "hook" => &["object"],
-        "cast" => &["object"],
+        "armature" | "lattice" | "volume_to_mesh" | "hook" | "cast" => &["object"],
         "simple_deform" => &["origin"],
         "uv_project" => &["projectors"],
         "uv_warp" => &["object_from", "object_to"],
@@ -2060,7 +2056,7 @@ impl ModifierGate<'_> {
                         == Some(modifier.id.as_str())
             })
         };
-        linked_modifier.map_or(true, |modifier| self.is_active(node_id, modifier))
+        linked_modifier.is_none_or(|modifier| self.is_active(node_id, modifier))
     }
 }
 /// Read and verify a cache resource from the scene's asset registry.
@@ -2770,9 +2766,7 @@ pub(crate) fn resolve_modifier_object_operands(
         "uv_project" => &["projectors"],
         "warp" => &["object_from", "object_to"],
         "shrinkwrap" => &["target", "auxiliary_target"],
-        "vertex_weight_edit" | "vertex_weight_mix" => &[],
-        "vertex_weight_proximity" => &["target"],
-        "normal_edit" | "surface_deform" => &["target"],
+        "normal_edit" | "surface_deform" | "vertex_weight_proximity" => &["target"],
         "mask" if modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE") => {
             &["armature"]
         }
@@ -2994,7 +2988,6 @@ pub(crate) fn resolve_modifier_object_operands(
                         .collect()
                 }),
                 active_vertex_group_index: object.active_vertex_group_index,
-                ..Default::default()
             };
             operands.push(crate::geom::modifiers::attributes::SceneOperand {
                 mesh: operand_mesh,
@@ -3209,7 +3202,6 @@ pub(crate) fn apply_scene_attribute_modifier(
                 .collect()
         }),
         active_vertex_group_index: subject.active_vertex_group_index,
-        ..Default::default()
     };
     let mut resolved = modifier.clone();
     if texture.is_some() {
@@ -3795,7 +3787,7 @@ fn render_simulated_particles(
             ));
         }
         for (system_index, visible_states) in visible_states_by_system {
-            let has_stack_system = usize::try_from(system_index).ok().is_some_and(|index| {
+            let has_stack_system = usize::try_from(system_index).is_ok_and(|index| {
                 node.modifiers
                     .iter()
                     .filter(|modifier| modifier.modifier_type == "particle_system")
@@ -5214,7 +5206,7 @@ fn volume_bounds(volume: &crate::geom::volume::VolumeData, matrix: DMat4) -> Res
 }
 
 /// Blender's Lattice: each vertex moves by `strength * weight` times the lattice displacement
-/// sampled at its position in the lattice grid (MOD_lattice.cc, BKE_lattice_deform_coords).
+/// sampled at its position in the lattice grid (`MOD_lattice.cc`, `BKE_lattice_deform_coords`).
 pub(crate) fn apply_lattice_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -5560,7 +5552,7 @@ fn color_layer_names(mesh: &Mesh) -> Vec<String> {
 
 fn all_color_layers_mask(layer_count: usize) -> Arc<[u64]> {
     let mut mask = vec![u64::MAX; layer_count.div_ceil(64)];
-    if layer_count % 64 != 0
+    if !layer_count.is_multiple_of(64)
         && let Some(last) = mask.last_mut()
     {
         *last = (1_u64 << (layer_count % 64)) - 1;
@@ -5661,12 +5653,14 @@ fn remap_coverage(coverage: &[u8], layer_map: &[Option<usize>]) -> Vec<u8> {
         .collect()
 }
 
+type ColorMaskCache = HashMap<*const [u64], (Arc<[u64]>, Arc<[u64]>)>;
+
 fn remap_slot_binding(
     mut binding: SlotBinding,
     uv_map: &[Option<usize>],
     color_map: &[Option<usize>],
     color_count: usize,
-    color_masks: &mut HashMap<*const [u64], (Arc<[u64]>, Arc<[u64]>)>,
+    color_masks: &mut ColorMaskCache,
 ) -> SlotBinding {
     binding.uv.render_index = binding
         .uv
@@ -6301,7 +6295,8 @@ mod tests {
         },
         model::{
             Collection, DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer,
-            GreasePencilPoint, GreasePencilStroke, Id, Modifier, Node, SceneDoc, Transform,
+            GreasePencilPoint, GreasePencilStroke, Id, Modifier, ModifierRuntime, Node, SceneDoc,
+            Transform,
         },
     };
 
@@ -6376,7 +6371,7 @@ mod tests {
                     .unwrap()
                     .clone(),
                     binding_data: None,
-                    runtime: Default::default(),
+                    runtime: ModifierRuntime::default(),
                 }],
                 ..Node::default()
             },
@@ -6439,7 +6434,7 @@ mod tests {
             .unwrap()
             .clone(),
             binding_data: None,
-            runtime: Default::default(),
+            runtime: ModifierRuntime::default(),
         };
         let world_matrices = BTreeMap::from([(mapping_id.clone(), mapping_world)]);
         let mapping = texture_coordinate_mapping_with_parameters(
@@ -6500,7 +6495,7 @@ mod tests {
             modifier_prefix: None,
         };
         let evaluated_nodes = std::collections::BTreeSet::from([emitter_id.clone()]);
-        let error = super::render_simulated_particles(
+        let Err(error) = super::render_simulated_particles(
             &doc,
             gate,
             &particles,
@@ -6508,8 +6503,9 @@ mod tests {
             &mut std::collections::BTreeMap::new(),
             &mut std::collections::BTreeMap::new(),
             &evaluated_nodes,
-        )
-        .expect_err("combined visible systems must exceed the per-emitter limit");
+        ) else {
+            panic!("combined visible systems must exceed the per-emitter limit");
+        };
         assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
         assert_eq!(error.details["count"], serde_json::json!(120_002));
     }

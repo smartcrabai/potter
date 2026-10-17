@@ -125,7 +125,7 @@ fn shading_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Shading> {
             setter_input: SetterInput::NormalizeInput,
         },
     )?;
-    shade(mesh, positions, custom)
+    shade(mesh, positions, custom.as_deref())
 }
 
 /// Corner normals of `mesh` ignoring its custom-normal layer: the shading of the geometry alone.
@@ -135,7 +135,7 @@ pub(crate) fn plain_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<V
 }
 
 /// Shading from the geometry and the decoded custom-normal view, where `None` means no layer.
-fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -> Result<Shading> {
+fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<&[Option<DVec3>]>) -> Result<Shading> {
     let index_by_id: HashMap<u32, usize> = mesh
         .vertices
         .iter()
@@ -223,7 +223,7 @@ fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -
     let mut face_smooth = Vec::with_capacity(mesh.faces.len());
     for (face_index, face) in mesh.faces.iter().enumerate() {
         let start = offsets[face_index];
-        let has_authored = custom.as_ref().is_some_and(|authored| {
+        let has_authored = custom.is_some_and(|authored| {
             authored[start..start + face.vertices.len()]
                 .iter()
                 .any(Option::is_some)
@@ -238,7 +238,6 @@ fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -
             };
             corners.push(
                 custom
-                    .as_ref()
                     .and_then(|authored| authored[index])
                     .unwrap_or(computed),
             );

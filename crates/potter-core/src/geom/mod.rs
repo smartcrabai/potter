@@ -122,7 +122,7 @@ pub struct Mesh {
     pub attributes: Map<String, Value>,
     /// Independent persistent-ID allocation counters.
     pub next_id: IdCounters,
-    /// Transient point CD_ORIGINDEX layer; `None` means absent. Never serialized.
+    /// Transient point `CD_ORIGINDEX` layer; `None` means absent. Never serialized.
     #[serde(skip)]
     pub(crate) original_indices: Option<OriginalIndices>,
 }

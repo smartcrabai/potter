@@ -939,7 +939,9 @@ mod tests {
         }
     }
 
-    fn set_uv_layers(mesh: &mut Mesh, layers: &[(&str, [f64; 2], Option<[bool; 4]>)]) {
+    type UvLayerSpec<'a> = (&'a str, [f64; 2], Option<[bool; 4]>);
+
+    fn set_uv_layers(mesh: &mut Mesh, layers: &[UvLayerSpec<'_>]) {
         let layers = layers
             .iter()
             .map(|(name, uv, pins)| {
@@ -1247,7 +1249,7 @@ mod tests {
                     .transform_point3(source.vertex(source_face.vertices[original]).unwrap().co);
                 assert!((joined.vertex(*vertex).unwrap().co - expected).length() < 1e-9);
                 assert_eq!(uv_face[corner], [index as f64, original as f64]);
-                assert_eq!(pinned[corner], original % 2 == 0);
+                assert_eq!(pinned[corner], original.is_multiple_of(2));
                 let normal = if original == 0 {
                     json!([-1.0, 0.0, 0.0])
                 } else {

@@ -53,7 +53,7 @@ pub struct SceneOperandMatricesF32 {
 pub struct SceneOperand {
     /// Object-local evaluated mesh data.
     pub mesh: Mesh,
-    /// f64 object-to-subject transform for native scene modifier paths that operate on DVec3.
+    /// f64 object-to-subject transform for native scene modifier paths that operate on `DVec3`.
     pub local_to_subject: Option<DMat4>,
     /// Exact f32 matrices, resolved only for modifiers that consume them.
     pub blender_matrices_f32: Option<SceneOperandMatricesF32>,
@@ -472,16 +472,16 @@ fn transform_point_by_triangle(point: DVec3, source: [DVec3; 3], target: [DVec3;
         cross_2d(projected_2d[0], projected_2d[1], point_2d),
     ];
     let total_weight = weights[0] + weights[1] + weights[2];
-    if total_weight != 0.0 {
+    if total_weight == 0.0 {
+        weights = [1.0 / 3.0; 3];
+    } else {
         let inverse_total = total_weight.recip();
-        weights
-            .iter_mut()
-            .for_each(|weight| *weight *= inverse_total);
+        for weight in &mut weights {
+            *weight *= inverse_total;
+        }
         if !weights.iter().all(|weight| weight.is_finite()) {
             weights = [1.0 / 3.0; 3];
         }
-    } else {
-        weights = [1.0 / 3.0; 3];
     }
     let mut transformed = target[0] * weights[0] + target[1] * weights[1] + target[2] * weights[2];
     let target_cross = (target[1] - target[0]).cross(target[2] - target[0]);
@@ -668,6 +668,10 @@ fn cache_frame_at_time(
             return Err(invalid(modifier, "resource", "ordered MDD frame times"));
         }
         first_time.get_or_insert(time_sample);
+        #[expect(
+            clippy::neg_cmp_op_on_partial_ord,
+            reason = "!(a < b) also holds for NaN frame times, unlike a >= b"
+        )]
         if upper.is_none() && !(time_sample < time) {
             upper = Some((index, time_sample, previous_time.unwrap_or(time_sample)));
         }

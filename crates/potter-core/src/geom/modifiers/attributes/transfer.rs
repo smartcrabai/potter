@@ -1,6 +1,9 @@
 //! Data transfer modifier: per-domain mapping, layer selection, and mixing.
 
-use super::*;
+use super::{
+    AttributeLayerSelection, Edge, Face, Mesh, Modifier, Result, SceneOperand, boolean,
+    get_group_weights, invalid, number, optional_string, string, string_set,
+};
 use crate::blender_rng::BlenderRng;
 use crate::geom::color_layers::{self, ColorDomain};
 use crate::geom::spatial::BoundsBvh;
@@ -875,6 +878,10 @@ fn transfer_edge_mask_weight(
         return 1.0;
     };
     let [first, second] = edge.vertices;
+    #[expect(
+        clippy::manual_midpoint,
+        reason = "mirrors Blender's (a + b) * 0.5; f64::midpoint would change overflow results"
+    )]
     let weight = (weights.get(&first).copied().unwrap_or(0.0)
         + weights.get(&second).copied().unwrap_or(0.0))
         * 0.5;
@@ -1002,7 +1009,7 @@ fn transfer_uv(
 
 fn transfer_custom_normals(
     destination: &mut Mesh,
-    _modifier: &Modifier,
+    modifier: &Modifier,
     mapping: &str,
     factor: f64,
     mix_mode: &str,
@@ -1013,12 +1020,11 @@ fn transfer_custom_normals(
     let source_normals = mapping_context
         .source_corner_normals
         .as_deref()
-        .ok_or_else(|| invalid(_modifier, "data_types_loops", "source corner normals"))?;
+        .ok_or_else(|| invalid(modifier, "data_types_loops", "source corner normals"))?;
     let mut destination_normals = mapping_context
         .destination_corner_normals
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| invalid(_modifier, "data_types_loops", "destination corner normals"))?;
+        .clone()
+        .ok_or_else(|| invalid(modifier, "data_types_loops", "destination corner normals"))?;
     let mut loop_index = 0;
     for (face_index, face) in destination.faces.iter().enumerate() {
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
@@ -1198,6 +1204,10 @@ fn blend_attribute(a: f64, b: f64, factor: f64, mode: &str, modifier: &Modifier)
         "ABOVE_THRESHOLD" => Ok(if a < factor { a } else { b }),
         "BELOW_THRESHOLD" => Ok(if a > factor { a } else { b }),
         "MIX" => {
+            #[expect(
+                clippy::manual_midpoint,
+                reason = "mirrors Blender's (a + b) * 0.5; f64::midpoint would change overflow results"
+            )]
             let target = (a + b) * 0.5;
             Ok(a + (target - a) * factor)
         }
@@ -1426,10 +1436,10 @@ impl<'a> TransferMapContext<'a> {
         let mut source_vertex_edges = vec![Vec::new(); source.vertices.len()];
         for (edge_index, edge) in source.edges.iter().enumerate() {
             for vertex_id in edge.vertices {
-                if let Some(&vertex_index) = source_vertex_indices.get(&vertex_id) {
-                    if source_vertex_edges[vertex_index].last() != Some(&edge_index) {
-                        source_vertex_edges[vertex_index].push(edge_index);
-                    }
+                if let Some(&vertex_index) = source_vertex_indices.get(&vertex_id)
+                    && source_vertex_edges[vertex_index].last() != Some(&edge_index)
+                {
+                    source_vertex_edges[vertex_index].push(edge_index);
                 }
             }
         }
@@ -1672,10 +1682,10 @@ fn build_source_face_graph(
     let mut vertex_faces = vec![Vec::new(); source.vertices.len()];
     for (face_index, face) in source.faces.iter().enumerate() {
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
-            if let Some(&vertex_index) = vertex_indices.get(vertex_id) {
-                if vertex_faces[vertex_index].last() != Some(&face_index) {
-                    vertex_faces[vertex_index].push(face_index);
-                }
+            if let Some(&vertex_index) = vertex_indices.get(vertex_id)
+                && vertex_faces[vertex_index].last() != Some(&face_index)
+            {
+                vertex_faces[vertex_index].push(face_index);
             }
             if let Some(&next_id) = face.vertices.get((corner + 1) % face.vertices.len()) {
                 let key = ((*vertex_id).min(next_id), (*vertex_id).max(next_id));
@@ -1907,8 +1917,8 @@ fn build_source_face_graph(
     Ok(SourceFaceGraph {
         face_islands,
         islands,
-        face_normals,
         face_centers,
+        face_normals,
         face_local_indices,
         vertex_faces,
         links,
@@ -2053,8 +2063,7 @@ fn mapped_vertex_sources(
         "POLYINTERP_VNORPROJ" => {
             let normal = context
                 .destination_vertex_normal(destination_index)
-                .map(|normal| context.normal_to_source(normal))
-                .unwrap_or(DVec3::Z);
+                .map_or(DVec3::Z, |normal| context.normal_to_source(normal));
             let (face_index, hit, _) = raycast_surface(context, point, normal)?;
             let face = context.source.faces.get(face_index)?;
             Some(polygon_vertex_weights(context, face, hit)?)
@@ -2330,7 +2339,7 @@ fn uv_loop_mapping_for_face(
                     corner,
                     mapping,
                     island_index,
-                    &graph,
+                    graph,
                 )
             })
             .collect::<Vec<_>>();
@@ -2370,7 +2379,7 @@ fn uv_loop_mapping_for_face(
         {
             let mut workspace = context.astar_workspace.borrow_mut();
             if astar_face_path(
-                &graph,
+                graph,
                 best_island_index,
                 previous,
                 candidate.source_face,
@@ -2397,17 +2406,15 @@ fn uv_loop_mapping_for_face(
                                 candidate.source_face = corrected_face;
                             }
                         } else if let Some(hit) =
-                            nearest_point_on_source_face(context, &graph, corrected_face, point)
+                            nearest_point_on_source_face(context, graph, corrected_face, point)
+                            && let Some(face) = context.source.faces.get(corrected_face)
+                            && let Some(loop_start) =
+                                context.source_loop_starts.get(corrected_face).copied()
+                            && let Some(sources) =
+                                polygon_loop_weights(context, face, hit, loop_start)
                         {
-                            if let Some(face) = context.source.faces.get(corrected_face)
-                                && let Some(loop_start) =
-                                    context.source_loop_starts.get(corrected_face).copied()
-                                && let Some(sources) =
-                                    polygon_loop_weights(context, face, hit, loop_start)
-                            {
-                                candidate.sources = sources;
-                                candidate.source_face = corrected_face;
-                            }
+                            candidate.sources = sources;
+                            candidate.source_face = corrected_face;
                         }
                     }
                 }
@@ -2498,6 +2505,10 @@ fn loop_candidate_for_island(
         }
         let (source_face, corner, score, _) = best?;
         let distance = context.source_positions[nearest_vertex].distance(point);
+        #[expect(
+            clippy::manual_midpoint,
+            reason = "mirrors Blender's (score + 1) * 0.5; f64::midpoint would change overflow results"
+        )]
         let factor = if distance > 0.0 {
             ((score + 1.0) * 0.5) / distance
         } else {
@@ -2776,7 +2787,7 @@ fn projected_polygon_sources(
     let total_samples = (side * side) as usize;
     let face_positions = positions
         .iter()
-        .map(|point| point.to_array())
+        .map(glam::Vec3::to_array)
         .collect::<Vec<_>>();
     let triangles = crate::geom::triangulate::triangulate_mesh(
         &[face_positions],
@@ -3127,7 +3138,7 @@ fn sphere_ray_triangle(
     let plane_distance = origin.dot(normal) - v0.dot(normal);
     let normal_velocity = normal.dot(velocity);
     let radius_squared = radius * radius;
-    if normal_velocity.abs() < 0.000001 {
+    if normal_velocity.abs() < 0.000_001 {
         if plane_distance.abs() >= radius {
             return None;
         }
@@ -4220,7 +4231,6 @@ fn blend_normal(first: DVec3, second: DVec3, factor: f64, mode: &str) -> DVec3 {
         return second.normalize_or_zero();
     }
     let target = match mode {
-        "REPLACE" => second,
         "MIX" | "ADD" => first + second,
         "SUB" => first - second,
         "MUL" => first * second,
@@ -4399,8 +4409,8 @@ mod tests {
             camera: None,
             armature: false,
             object_scale: DVec3::ONE,
-            selected_bones: Default::default(),
-            deforming_bones: Default::default(),
+            selected_bones: std::collections::BTreeSet::default(),
+            deforming_bones: std::collections::BTreeSet::default(),
             layer_selection: AttributeLayerSelection::default(),
         };
         let operands = BTreeMap::from([("object".to_owned(), vec![source_operand])]);
