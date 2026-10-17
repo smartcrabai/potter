@@ -53,7 +53,7 @@ use crate::geom::{
     Face, Mesh, Vertex, edge_key,
     normals::{face_normal, normal_matrix, vector3},
     provenance::{Origin, default_value, mean_value_corners, remap_attributes},
-    uv_layers::uv_default,
+    uv_layers,
 };
 
 use super::dissolve::Poly;
@@ -92,6 +92,7 @@ pub(crate) fn polys_to_mesh(
     let layout = Layout::new(operands);
     let mut joined = join(operands, &layout)?;
     joined.mesh.attributes = join_attributes(operands, &layout);
+    uv_layers::write(&mut joined.mesh, &joined_uv_store(operands));
     let (arena_ids, planned) = plan(polys, &layout)?;
 
     let positions: Vec<DVec3> = arena_ids
@@ -526,8 +527,7 @@ fn is_structured_key(key: &str) -> bool {
     matches!(
         key,
         "vertex_groups"
-            | "blender_uv_layers"
-            | "uv_map"
+            | uv_layers::ATTRIBUTE
             | "blender_attributes"
             | "skin_radii"
             | "skin_roots"
@@ -561,7 +561,6 @@ fn join_attributes(operands: &[Operand<'_>], layout: &Layout) -> Map<String, Val
         .map(|operand| local_index(operand.mesh.faces.iter().map(|face| face.id)))
         .collect();
     let vertex_counts = per_operand(operands, |mesh| mesh.vertices.len());
-    let corner_counts = per_operand(operands, corner_count);
     let face_counts = per_operand(operands, |mesh| mesh.faces.len());
     insert_if(
         &mut attributes,
@@ -601,16 +600,6 @@ fn join_attributes(operands: &[Operand<'_>], layout: &Layout) -> Map<String, Val
         joined_array(operands, "blender_skin_vertices", &vertex_counts, || {
             json!({})
         }),
-    );
-    insert_if(
-        &mut attributes,
-        "uv_map",
-        joined_uv_map(operands, layout, &face_ids),
-    );
-    insert_if(
-        &mut attributes,
-        "blender_uv_layers",
-        joined_uv_layers(operands, &corner_counts),
     );
     insert_if(
         &mut attributes,
@@ -693,84 +682,57 @@ fn joined_vertex_object(operands: &[Operand<'_>], layout: &Layout, key: &str) ->
     Some(Value::Object(joined))
 }
 
-/// `uv_map` entries with each face ID moved to its joined face ID. Entries of unknown faces are
-/// dropped, as `remap_attributes` would ignore them.
-fn joined_uv_map(
-    operands: &[Operand<'_>],
-    layout: &Layout,
-    face_ids: &[HashMap<u32, usize>],
-) -> Option<Value> {
-    let sources = arrays_of(operands, "uv_map");
-    if sources.is_empty() {
-        return None;
-    }
-    let mut entries = Vec::new();
-    for (operand, list) in sources {
-        for entry in list {
-            let Some(local) = entry
-                .get("face_id")
-                .and_then(Value::as_u64)
-                .and_then(|id| u32::try_from(id).ok())
-                .and_then(|id| face_ids[operand].get(&id))
-            else {
-                continue;
-            };
-            let mut entry = entry.clone();
-            if let Some(object) = entry.as_object_mut() {
-                object.insert(
-                    "face_id".to_owned(),
-                    json!(layout.faces[operand].start + local),
-                );
-            }
-            entries.push(entry);
-        }
-    }
-    Some(Value::Array(entries))
-}
-
-/// `blender_uv_layers`: one layer per name over every operand, with per-corner values concatenated
-/// in operand order. A corner of an operand without that layer takes the UV default.
-fn joined_uv_layers(operands: &[Operand<'_>], counts: &[usize]) -> Option<Value> {
-    let sources = arrays_of(operands, "blender_uv_layers");
-    if sources.is_empty() {
-        return None;
-    }
+/// The joined `uv_layers` store: one layer per name over every operand, faces in joined order.
+/// A face of an operand without that layer has no entry, so its corners take the canonical UV on
+/// remap. The active and render names come from the subject, operand A.
+fn joined_uv_store(operands: &[Operand<'_>]) -> uv_layers::UvStore {
+    let stores: Vec<uv_layers::UvStore> = operands
+        .iter()
+        .map(|operand| uv_layers::read(operand.mesh))
+        .collect();
     let mut names: Vec<&str> = Vec::new();
-    for (_, layers) in &sources {
-        for layer in *layers {
-            let name = text_field(layer, "name");
-            if !names.contains(&name) {
-                names.push(name);
+    for store in &stores {
+        for layer in &store.layers {
+            if !names.contains(&layer.name.as_str()) {
+                names.push(layer.name.as_str());
             }
         }
     }
-    let mut joined = Vec::with_capacity(names.len());
-    for name in names {
-        let Some(template) = sources.iter().find_map(|(_, layers)| {
-            layers
-                .iter()
-                .find(|layer| text_field(layer, "name") == name)
-        }) else {
-            continue;
-        };
-        let values: Vec<Option<&[Value]>> = operands
-            .iter()
-            .map(|operand| {
-                array_of(operand.mesh, "blender_uv_layers")
-                    .and_then(|layers| {
-                        layers
-                            .iter()
-                            .find(|layer| text_field(layer, "name") == name)
-                    })
-                    .and_then(entry_values)
-            })
-            .collect();
-        joined.push(with_values(
-            template,
-            Value::Array(concat_elements(&values, counts, uv_default)),
-        ));
+    let layers = names
+        .into_iter()
+        .map(|name| {
+            let mut faces = Vec::new();
+            let mut pinned = Vec::new();
+            for (operand, store) in operands.iter().zip(&stores) {
+                let source = store.layers.iter().find(|layer| layer.name == name);
+                for face in 0..operand.mesh.faces.len() {
+                    faces.push(
+                        source
+                            .and_then(|layer| layer.faces.get(face))
+                            .cloned()
+                            .flatten(),
+                    );
+                    pinned.push(
+                        source
+                            .and_then(|layer| layer.pinned.get(face))
+                            .cloned()
+                            .flatten(),
+                    );
+                }
+            }
+            uv_layers::UvLayer {
+                name: name.to_owned(),
+                faces,
+                pinned,
+            }
+        })
+        .collect();
+    let subject = stores.first();
+    uv_layers::UvStore {
+        layers,
+        active: subject.and_then(|store| store.active.clone()),
+        render: subject.and_then(|store| store.render.clone()),
     }
-    Some(Value::Array(joined))
 }
 
 /// The `blender_attributes` entries of `J`: POINT, FACE, and CORNER entries joined per element,
@@ -1209,14 +1171,6 @@ fn object_of<'a>(mesh: &'a Mesh, key: &str) -> Option<&'a Map<String, Value>> {
     mesh.attributes.get(key)?.as_object()
 }
 
-/// The array under `key` of each operand that has one, with the operand's index.
-fn arrays_of<'a>(operands: &[Operand<'a>], key: &str) -> Vec<(usize, &'a [Value])> {
-    operands
-        .iter()
-        .enumerate()
-        .filter_map(|(index, operand)| Some((index, array_of(operand.mesh, key)?)))
-        .collect()
-}
 
 /// The object under `key` of each operand that has one, with the operand's index.
 fn objects_of<'a>(operands: &[Operand<'a>], key: &str) -> Vec<(usize, &'a Map<String, Value>)> {
@@ -1233,7 +1187,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{OutputMaterials, polys_to_mesh};
-    use crate::geom::Mesh;
+    use crate::geom::{Mesh, uv_layers};
     use crate::geom::boolean::{
         dissolve::Poly,
         imesh::{Arena, NO_INDEX},
@@ -1462,10 +1416,12 @@ mod tests {
             ],
             vec![vec![0, 1, 2]],
         )?;
-        set_attribute(
+        uv_layers::write_layers(
             &mut a,
-            "blender_uv_layers",
-            json!([{"name": "UVMap", "values": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]}]),
+            &[uv_layers::UvLayer::new(
+                "UVMap",
+                vec![Some(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])],
+            )],
         );
         let mut arena = Arena::new();
         let ids = arena_vertices(&mut arena, &a)?;
@@ -1473,16 +1429,12 @@ mod tests {
         let cut_b = arena.add_or_find_dvec(DVec3::new(0.0, 1.0, 0.0), NO_INDEX);
         let polys = [poly(ids.clone(), 0), poly(vec![ids[0], cut_a, cut_b], 0)];
         let mesh = build(&polys, &arena, &[operand(&a)], &[])?;
-        let uv: Vec<[f64; 2]> = attribute(&mesh, "blender_uv_layers")[0]["values"]
-            .as_array()
-            .into_iter()
+        let uv: Vec<[f64; 2]> = uv_layers::read(&mesh).layers[0]
+            .faces
+            .iter()
             .flatten()
-            .map(|pair| {
-                [
-                    pair[0].as_f64().unwrap_or(f64::NAN),
-                    pair[1].as_f64().unwrap_or(f64::NAN),
-                ]
-            })
+            .flatten()
+            .copied()
             .collect();
         let expected = [
             [0.0, 0.0],
