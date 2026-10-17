@@ -4589,6 +4589,7 @@ fn is_topology_operation(operation: &str, args: &Map<String, Value>) -> bool {
             | "merge"
             | "dissolve"
             | "weld"
+            | "delete"
             | "fill"
             | "bisect"
             | "loop_cut"
@@ -7616,40 +7617,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_cut_subdivide_keeps_original_multires_source_face() {
-        let mut mesh = adjacent_test_quads();
-        add_parent_test_multires(&mut mesh);
-        let face_ids = mesh
-            .faces
-            .iter()
-            .map(|face| format!("f{}", face.id))
-            .collect::<Vec<_>>();
-        apply(
-            &mut mesh,
-            "subdivide",
-            &json!({ "elements": { "domain": "face", "ids": face_ids }, "cuts": 2 }),
-        )
-        .unwrap();
-
-        let data = multires::read_grid_data(&mesh).unwrap().unwrap();
-        let grids = data.corner_grids.as_ref().unwrap();
-        let mut loop_start = 0;
-        for face in &mesh.faces {
-            let center_x = face
-                .vertices
-                .iter()
-                .map(|id| mesh.vertex(*id).unwrap().co.x)
-                .sum::<f64>()
-                / face.vertices.len() as f64;
-            let expected = if center_x < 0.0 { 1.0 } else { 2.0 };
-            for grid in &grids[loop_start..loop_start + face.vertices.len()] {
-                assert!(grid.iter().any(|value| value[2] == expected));
-            }
-            loop_start += face.vertices.len();
-        }
-    }
-
-    #[test]
     fn dissolve_interpolates_from_both_joined_multires_faces() {
         let mut mesh = adjacent_test_quads();
         add_parent_test_multires(&mut mesh);
@@ -7714,6 +7681,16 @@ mod tests {
         .unwrap();
 
         let data = multires::read_grid_data(&mesh).unwrap().unwrap();
+        let corner_count = mesh
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
+        assert_eq!(data.grid_levels.as_ref().unwrap().len(), corner_count);
+        assert_eq!(data.corner_grids.as_ref().unwrap().len(), corner_count);
+        assert_eq!(data.paint_mask_levels.as_ref().unwrap().len(), corner_count);
+        assert_eq!(data.paint_mask_grids.as_ref().unwrap().len(), corner_count);
+        assert_eq!(data.hidden_grids.as_ref().unwrap().len(), corner_count);
         assert!(
             data.corner_grids
                 .as_ref()

@@ -1465,28 +1465,35 @@ mod tests {
 
     #[test]
     fn external_capacity_accepts_level_eleven_within_the_budget() {
-        let json_bytes = |level| {
-            u64::try_from(crate::geom::multires_external::grid_vector_count(level).unwrap() * 16)
-                .unwrap()
-                * 80
+        let corner_count = 4;
+        let json_sidecar_bytes = |level| {
+            let samples =
+                crate::geom::multires_external::grid_vector_count(level).unwrap() * corner_count;
+            u64::try_from(
+                u128::try_from(samples).unwrap()
+                    * 5
+                    * std::mem::size_of::<serde_json::Value>() as u128,
+            )
+            .unwrap()
         };
-        let accepted_size =
-            crate::geom::multires_external::expected_external_file_size(11, 16).unwrap();
+        let additional_bytes = |level| {
+            crate::geom::multires_external::expected_external_file_size(level, corner_count)
+                .unwrap()
+                + json_sidecar_bytes(level)
+        };
         assert!(
             crate::geom::modifiers::check_multires_grid_capacity(
-                16,
+                corner_count,
                 11,
-                accepted_size + json_bytes(11),
+                additional_bytes(11),
             )
             .is_ok()
         );
-        let rejected_size =
-            crate::geom::multires_external::expected_external_file_size(12, 16).unwrap();
         assert_eq!(
             crate::geom::modifiers::check_multires_grid_capacity(
-                16,
+                corner_count,
                 12,
-                rejected_size + json_bytes(12),
+                additional_bytes(12),
             )
             .unwrap_err()
             .code,
@@ -1701,21 +1708,26 @@ mod tests {
     #[test]
     fn mixed_sharp_input_uses_corner_normals_but_all_sharp_is_face_domain() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let mut edge_flags = (0..mesh.edges.len())
-            .map(|_| json!({"sharp": false, "seam": false}))
-            .collect::<Vec<_>>();
-        edge_flags[0] = json!({"sharp": true, "seam": false});
-        mesh.attributes
-            .insert("blender_edge_flags".to_owned(), json!(edge_flags));
+        let sharp_edge_id = mesh.edges[0].id;
+        let edge_values = mesh
+            .edges
+            .iter()
+            .map(|edge| (format!("e{}", edge.id), json!(edge.id == sharp_edge_id)))
+            .collect::<Map<_, _>>();
+        mesh.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": edge_values}),
+        );
         assert!(corner_normal_domain(&mesh).unwrap());
 
+        let edge_values = mesh
+            .edges
+            .iter()
+            .map(|edge| (format!("e{}", edge.id), json!(true)))
+            .collect::<Map<_, _>>();
         mesh.attributes.insert(
-            "blender_edge_flags".to_owned(),
-            json!(
-                (0..mesh.edges.len())
-                    .map(|_| json!({"sharp": true, "seam": false}))
-                    .collect::<Vec<_>>()
-            ),
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": edge_values}),
         );
         assert!(!corner_normal_domain(&mesh).unwrap());
     }
@@ -1729,9 +1741,11 @@ mod tests {
         .unwrap();
         let mut corners = vec![vec![[0.0_f32; 3]; 4]; 3];
         corners[0][3] = [1.0, 2.0, 3.0];
+        let mut values = Map::new();
+        values.insert(format!("f{}", mesh.faces[0].id), json!(corners));
         mesh.attributes.insert(
             "multires_displacement".to_owned(),
-            json!({"total_levels": 1, "values": {"f1": corners}}),
+            json!({"total_levels": 1, "values": values}),
         );
         let data = read(&mesh).unwrap().unwrap();
         let location = grid_sample_location(&mesh, &data, 0, 3).unwrap();

@@ -857,7 +857,7 @@ fn multires_grids_for_export(
         ));
     }
     let corner_count = faces.iter().try_fold(0_usize, |count, face| {
-        count.checked_add(face.get("vertices")?.as_array()?.len())
+        count.checked_add(face.get("v")?.as_array()?.len())
     });
     let corner_count = corner_count.ok_or_else(|| {
         PotError::new(
@@ -961,12 +961,9 @@ fn multires_grids_for_export(
             let face_id = face.get("id").and_then(Value::as_u64).ok_or_else(|| {
                 PotError::new(ErrorCode::SceneInvalid, "multires face ID is invalid")
             })?;
-            let face_corners = face
-                .get("vertices")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    PotError::new(ErrorCode::SceneInvalid, "multires face corners are invalid")
-                })?;
+            let face_corners = face.get("v").and_then(Value::as_array).ok_or_else(|| {
+                PotError::new(ErrorCode::SceneInvalid, "multires face corners are invalid")
+            })?;
             let ordinals = order
                 .get(&format!("f{face_id}"))
                 .and_then(Value::as_array)
@@ -1018,12 +1015,9 @@ fn multires_grids_for_export(
             .get("id")
             .and_then(Value::as_u64)
             .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "multires face ID is invalid"))?;
-        let face_corners = face
-            .get("vertices")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                PotError::new(ErrorCode::SceneInvalid, "multires face corners are invalid")
-            })?;
+        let face_corners = face.get("v").and_then(Value::as_array).ok_or_else(|| {
+            PotError::new(ErrorCode::SceneInvalid, "multires face corners are invalid")
+        })?;
         let face_values = values
             .get(&format!("f{face_id}"))
             .and_then(Value::as_array)
@@ -1412,7 +1406,20 @@ pub fn import_blend(file: &Path, blender: Option<&Path>) -> Result<ImportedGraph
     let output = temporary_path("blend-import-output.json")?;
     let operation = (|| {
         write_new(&script, BRIDGE.as_bytes())?;
-        let child = run_bridge(&blender, &script, "import", file, &output, true)?;
+        let child = match run_bridge(&blender, &script, "import", file, &output, true) {
+            Ok(child) => child,
+            Err(error) if error.code == ErrorCode::ImportFailed => {
+                let missing_sidecar = fs::read(file)
+                    .ok()
+                    .and_then(|bytes| super::blend_dna::read_multires_displacements(&bytes).ok())
+                    .and_then(|native_multires| {
+                        missing_adjacent_multires_sidecar(file, &native_multires)
+                    });
+                return Err(missing_sidecar.unwrap_or(error));
+            }
+            Err(error) => return Err(error),
+        };
+
         let bytes = match fs::read(&output) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1627,6 +1634,21 @@ fn load_external_multires(
                 "native multires total_levels must be between 1 and 13",
             ));
         }
+        let metadata = match fs::metadata(&external_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PotError::with_details(
+                    ErrorCode::FileNotFound,
+                    "Blender multires external grid file is missing",
+                    json!({
+                        "mesh": name,
+                        "filepath": filepath,
+                        "resolved_path": external_path.display().to_string(),
+                    }),
+                ));
+            }
+            Err(error) => return Err(PotError::io(&error)),
+        };
         let polygons = mesh
             .get("polygons")
             .and_then(Value::as_array)
@@ -1699,21 +1721,6 @@ fn load_external_multires(
             None,
             additional_bytes,
         )?;
-        let metadata = match fs::metadata(&external_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(PotError::with_details(
-                    ErrorCode::FileNotFound,
-                    "Blender multires external grid file is missing",
-                    json!({
-                        "mesh": name,
-                        "filepath": filepath,
-                        "resolved_path": external_path.display().to_string(),
-                    }),
-                ));
-            }
-            Err(error) => return Err(PotError::io(&error)),
-        };
         if metadata.len() != expected_file_size {
             return Err(PotError::with_details(
                 ErrorCode::ImportFailed,
@@ -1787,6 +1794,40 @@ fn load_external_multires(
             .or_insert_with(|| json!(grid_levels));
     }
     Ok(())
+}
+
+fn missing_adjacent_multires_sidecar(
+    blend_file: &Path,
+    native_multires: &BTreeMap<String, Value>,
+) -> Option<PotError> {
+    let no_resources = json!({"resources": []});
+    for (mesh, record) in native_multires {
+        let Some(filepath) = record
+            .get("external")
+            .and_then(|external| external.get("filepath"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(external_path) = resolve_blender_external_path(filepath, blend_file, &no_resources)
+        else {
+            continue;
+        };
+        if let Err(error) = fs::metadata(&external_path)
+            && error.kind() == std::io::ErrorKind::NotFound
+        {
+            return Some(PotError::with_details(
+                ErrorCode::FileNotFound,
+                "Blender multires external grid file is missing",
+                json!({
+                    "mesh": mesh,
+                    "filepath": filepath,
+                    "resolved_path": external_path.display().to_string(),
+                }),
+            ));
+        }
+    }
+    None
 }
 
 fn normalize_blend_path(path: &Path) -> PathBuf {
@@ -12449,7 +12490,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
     #[test]
     fn multires_grids_follow_custom_loop_order() -> Result<()> {
         let mesh = json!({
-            "faces": [{"id": 1, "vertices": [0, 1, 2]}],
+            "faces": [{"id": 1, "v": [0, 1, 2]}],
             "attributes": {
                 "custom_normal": {"corner_order": {"f1": [2, 0, 1]}},
             },
@@ -12510,6 +12551,39 @@ print("UNSUPPORTED_POSE " + json.dumps({
             &json!({"resources":[]}),
         );
         assert_eq!(traversal.unwrap_err().code, ErrorCode::DependencyMissing);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_multires_preflight_only_classifies_trusted_adjacent_files() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let source_directory = directory.path().join("source");
+        let outside_directory = directory.path().join("outside");
+        fs::create_dir(&source_directory).map_err(|error| PotError::io(&error))?;
+        fs::create_dir(&outside_directory).map_err(|error| PotError::io(&error))?;
+        let blend_file = source_directory.join("scene.blend");
+        fs::write(&blend_file, b"blend").map_err(|error| PotError::io(&error))?;
+        let adjacent = BTreeMap::from([(
+            "Mesh".to_owned(),
+            json!({"external":{"filepath":"//missing.btx"}}),
+        )]);
+        let error = missing_adjacent_multires_sidecar(&blend_file, &adjacent)
+            .expect("missing adjacent MDisps sidecar should be reported");
+        assert_eq!(error.code, ErrorCode::FileNotFound);
+
+        fs::write(source_directory.join("present.btx"), b"sidecar")
+            .map_err(|error| PotError::io(&error))?;
+        let present = BTreeMap::from([(
+            "Mesh".to_owned(),
+            json!({"external":{"filepath":"//present.btx"}}),
+        )]);
+        assert!(missing_adjacent_multires_sidecar(&blend_file, &present).is_none());
+
+        let outside = BTreeMap::from([(
+            "Mesh".to_owned(),
+            json!({"external":{"filepath":outside_directory.join("missing.btx").to_string_lossy().into_owned()}}),
+        )]);
+        assert!(missing_adjacent_multires_sidecar(&blend_file, &outside).is_none());
         Ok(())
     }
 
