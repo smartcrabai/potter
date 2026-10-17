@@ -1112,7 +1112,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "uv.projected_mapping",
-            "Box, smart, and cube face UV projection",
+            "Box and cube (Blender cube projection, normalised to the cube bounds) and smart face UV projection",
             "UVMap",
             &["uv.unwrap"],
             [false, true, true, false, false, false, false],
