@@ -7782,25 +7782,10 @@ mod tests {
             return Ok(());
         };
         let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
-        let encode_image = |name: &str, pixel: [u8; 4]| -> Result<(PathBuf, Vec<u8>)> {
-            let path = directory.path().join(name);
-            let mut bytes = Vec::new();
-            {
-                let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
-                encoder.set_color(png::ColorType::Rgba);
-                encoder.set_depth(png::BitDepth::Eight);
-                let mut writer = encoder
-                    .write_header()
-                    .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
-                writer
-                    .write_image_data(&pixel)
-                    .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
-            }
-            fs::write(&path, &bytes).map_err(|error| PotError::io(&error))?;
-            Ok((path, bytes))
-        };
-        let (normal_path, normal_bytes) = encode_image("normal.png", [128, 192, 230, 255])?;
-        let (emissive_path, emissive_bytes) = encode_image("emissive.png", [64, 128, 255, 255])?;
+        let (normal_path, normal_bytes) =
+            write_png(directory.path(), "normal.png", &[[128, 192, 230, 255]])?;
+        let (emissive_path, emissive_bytes) =
+            write_png(directory.path(), "emissive.png", &[[64, 128, 255, 255]])?;
         let normal_image_id = Id::new("normal_image")?;
         let emissive_image_id = Id::new("emissive_image")?;
         let material_id = Id::new("normal_mat")?;
@@ -8561,7 +8546,7 @@ mod tests {
             (
                 "field",
                 &field_id,
-                hits.map(|hit| texel(hit)),
+                hits.map(texel),
                 hits.map(|hit| 0.5 * texel(hit)[0]),
                 hits.map(|hit| 0.75 * metal(hit)),
                 hits.map(|hit| 0.5 * alpha(hit)),
@@ -8649,16 +8634,19 @@ mod tests {
                     "{label} hit {index} reopened metallic is {}",
                     reopened.metallic
                 );
-                assert!(
-                    close(source.alpha, expected_alpha[index]),
-                    "{label} hit {index} source alpha is {}",
-                    source.alpha
-                );
-                assert!(
-                    close(reopened.alpha, source.alpha),
-                    "{label} hit {index} reopened alpha is {}",
-                    reopened.alpha
-                );
+                // The renderer ignores alpha on an opaque material, so alpha is only compared for a non-opaque one.
+                if source_material.alpha_mode != "opaque" {
+                    assert!(
+                        close(source.alpha, expected_alpha[index]),
+                        "{label} hit {index} source alpha is {}",
+                        source.alpha
+                    );
+                    assert!(
+                        close(reopened.alpha, source.alpha),
+                        "{label} hit {index} reopened alpha is {}",
+                        reopened.alpha
+                    );
+                }
                 assert!(
                     (reopened.normal - source.normal).length() < 1.0e-3,
                     "{label} hit {index} normal changed across .blend: source {:?} reopened {:?}",

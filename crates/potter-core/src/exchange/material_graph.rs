@@ -979,6 +979,8 @@ fn overlay_authored(
         graph.links.retain(|link| link.to_node != principled);
         if let Some(node) = graph.nodes.get_mut(&principled) {
             node.properties.remove("potter_simple_material");
+            // Stale inputs (for example a Coat Weight or an old Emission key) would revive once the marker is gone.
+            node.inputs.clear();
             write_principled_inputs(node, material);
         }
     }
