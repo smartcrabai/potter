@@ -116,6 +116,9 @@ pub fn export_blend(
     check_blender_version(&blender)?;
     let mut losses = export_losses(doc);
     losses.extend(native_bind_export_losses(doc, project));
+    let (texture_losses, texture_edits) =
+        crate::exchange::material_graph::plan_blend_textures(doc)?;
+    losses.extend(texture_losses);
     if !losses.is_empty() && !opts.allow_lossy {
         return Err(PotError::with_details(
             ErrorCode::UnrepresentableFeature,
@@ -131,6 +134,7 @@ pub fn export_blend(
     let mut document = serde_json::to_value(doc).map_err(PotError::internal_json)?;
     let scene_hash = crate::hash::sha256(&crate::hash::canonicalize(&document)?);
     add_blender_uv_fields(doc, &mut document);
+    texture_edits.apply(&mut document)?;
     let (document, asset_files) = prepare_blend_export_resources(document, project, out)?;
     let input = temporary_path("blend-export-input.json")?;
     let script = temporary_path("blend-bridge.py")?;
@@ -8068,6 +8072,998 @@ mod tests {
         assert!(
             source_normal.distance(roundtrip_normal) <= 1.0e-12,
             "normal direction changed across .blend round-trip: {source_normal:?} != {roundtrip_normal:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_samples_explicit_texture_layer_and_normal_frame() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        // The render layer `UVMap` and the texture layer `Lightmap` sample different corners at each hit.
+        const UV_MAP: [[f64; 2]; 4] = [[0.9, 0.0], [0.1, 0.0], [0.9, 0.0], [0.1, 0.0]];
+        const LIGHTMAP: [[f64; 2]; 4] = [[0.1, 0.5], [0.9, 0.5], [0.1, 0.5], [0.9, 0.5]];
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let encode_image =
+            |name: &str, width: u32, pixels: &[[u8; 4]]| -> Result<(PathBuf, Vec<u8>)> {
+                let path = directory.path().join(name);
+                let flat = pixels.iter().flatten().copied().collect::<Vec<u8>>();
+                let mut bytes = Vec::new();
+                {
+                    let mut encoder = png::Encoder::new(&mut bytes, width, 1);
+                    encoder.set_color(png::ColorType::Rgba);
+                    encoder.set_depth(png::BitDepth::Eight);
+                    let mut writer = encoder.write_header().map_err(|error| {
+                        PotError::new(ErrorCode::ExportFailed, error.to_string())
+                    })?;
+                    writer.write_image_data(&flat).map_err(|error| {
+                        PotError::new(ErrorCode::ExportFailed, error.to_string())
+                    })?;
+                }
+                fs::write(&path, &bytes).map_err(|error| PotError::io(&error))?;
+                Ok((path, bytes))
+            };
+        let (base_path, base_bytes) =
+            encode_image("base.png", 2, &[[255, 0, 0, 255], [0, 0, 255, 255]])?;
+        let (roughness_path, roughness_bytes) =
+            encode_image("roughness.png", 1, &[[128, 0, 0, 255]])?;
+        let (metallic_path, metallic_bytes) = encode_image("metallic.png", 1, &[[64, 0, 0, 255]])?;
+        // An asymmetric green channel: a flipped tangent frame flips the sign of the mapped Y.
+        let (normal_path, normal_bytes) = encode_image("normal.png", 1, &[[192, 64, 230, 255]])?;
+        let image =
+            |name: &str, colorspace: ImageColorspace, width: u32, path: &PathBuf, bytes: &[u8]| {
+                Image {
+                    name: name.to_owned(),
+                    source: ImageSource::File,
+                    colorspace,
+                    width,
+                    height: 1,
+                    tiles: Vec::new(),
+                    blob: None,
+                    source_path: Some(path.to_string_lossy().into_owned()),
+                    source_hash: Some(crate::hash::sha256(bytes)),
+                    alpha_mode: ImageAlphaMode::Straight,
+                }
+            };
+        let base_id = Id::new("lightmap_base")?;
+        let roughness_id = Id::new("lightmap_roughness")?;
+        let metallic_id = Id::new("lightmap_metallic")?;
+        let normal_id = Id::new("lightmap_normal")?;
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.images.insert(
+            base_id.clone(),
+            image(
+                "Base Texture",
+                ImageColorspace::Srgb,
+                2,
+                &base_path,
+                &base_bytes,
+            ),
+        );
+        doc.images.insert(
+            roughness_id.clone(),
+            image(
+                "Roughness Texture",
+                ImageColorspace::NonColor,
+                1,
+                &roughness_path,
+                &roughness_bytes,
+            ),
+        );
+        doc.images.insert(
+            metallic_id.clone(),
+            image(
+                "Metallic Texture",
+                ImageColorspace::NonColor,
+                1,
+                &metallic_path,
+                &metallic_bytes,
+            ),
+        );
+        doc.images.insert(
+            normal_id.clone(),
+            image(
+                "Normal Texture",
+                ImageColorspace::NonColor,
+                1,
+                &normal_path,
+                &normal_bytes,
+            ),
+        );
+        let texture = |image: &Id, interpolation: crate::image::ImageInterpolation| {
+            crate::model::TextureRef {
+                image: image.clone(),
+                uv_layer: Some("Lightmap".to_owned()),
+                interpolation,
+            }
+        };
+        let material_id = Id::new("lightmap_mat")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Lightmap Material".to_owned(),
+                base_color: [1.0; 4],
+                roughness: 0.5,
+                metallic: 0.75,
+                base_color_texture: Some(texture(
+                    &base_id,
+                    crate::image::ImageInterpolation::Closest,
+                )),
+                roughness_texture: Some(texture(
+                    &roughness_id,
+                    crate::image::ImageInterpolation::Linear,
+                )),
+                metallic_texture: Some(texture(
+                    &metallic_id,
+                    crate::image::ImageInterpolation::Linear,
+                )),
+                normal_texture: Some(texture(
+                    &normal_id,
+                    crate::image::ImageInterpolation::Linear,
+                )),
+                ..Material::default()
+            },
+        );
+        let mut mesh = box_with_attributes(Vec::new())?;
+        let uv_map_faces = mesh
+            .faces
+            .iter()
+            .map(|face| {
+                Some(
+                    (0..face.vertices.len())
+                        .map(|corner| UV_MAP[corner % 4])
+                        .collect::<Vec<[f64; 2]>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let lightmap_faces = mesh
+            .faces
+            .iter()
+            .map(|face| {
+                Some(
+                    (0..face.vertices.len())
+                        .map(|corner| LIGHTMAP[corner % 4])
+                        .collect::<Vec<[f64; 2]>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        crate::geom::uv_layers::write(
+            &mut mesh,
+            &crate::geom::uv_layers::UvStore {
+                layers: vec![
+                    crate::geom::uv_layers::UvLayer::new("UVMap", uv_map_faces),
+                    crate::geom::uv_layers::UvLayer::new("Lightmap", lightmap_faces),
+                ],
+                active: Some("Lightmap".to_owned()),
+                render: Some("UVMap".to_owned()),
+            },
+        );
+        let data_id = Id::new("lightmap_mesh")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        let node_id = Id::new("lightmap_body")?;
+        let mut body = test_node("Body", data_id.as_str(), None, None)?;
+        body.materials = vec![material_id.clone()];
+        doc.nodes.insert(node_id.clone(), body);
+        doc.collections
+            .get_mut(&Id::new("collection_root")?)
+            .ok_or_else(|| invalid_intermediate("root collection is missing"))?
+            .objects
+            .push(node_id);
+
+        let project = Project::init(directory.path().join("project"))?;
+        let output = directory.path().join("lightmap-texture.blend");
+        let context = crate::eval::EvaluationContext::default();
+        export_blend(
+            &doc,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let imported = import_blend(&output, Some(&blender))?;
+        assert!(
+            imported.losses.is_empty(),
+            "lightmap texture round-trip reported losses: {:?}",
+            imported.losses
+        );
+
+        let reopened_mesh = imported
+            .doc
+            .data_blocks
+            .values()
+            .find_map(|data| data.mesh.as_ref())
+            .ok_or_else(|| invalid_intermediate("round-trip mesh is missing"))?;
+        let store = crate::geom::uv_layers::read(reopened_mesh);
+        assert_eq!(
+            store
+                .layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["UVMap", "Lightmap"]
+        );
+        assert_eq!(store.render.as_deref(), Some("UVMap"));
+        assert_eq!(store.active.as_deref(), Some("Lightmap"));
+        let lightmap = store
+            .index_of("Lightmap")
+            .ok_or_else(|| invalid_intermediate("round-trip Lightmap layer is missing"))?;
+        assert!(
+            store.layers[lightmap]
+                .faces
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|uv| LIGHTMAP.contains(uv)),
+            "round-trip Lightmap corners changed"
+        );
+
+        let reopened_material = imported
+            .doc
+            .materials
+            .get(&material_id)
+            .ok_or_else(|| invalid_intermediate("round-trip material is missing"))?;
+        let graph_id = reopened_material
+            .node_tree
+            .as_ref()
+            .ok_or_else(|| invalid_intermediate("round-trip shader graph is missing"))?;
+        let graph = imported
+            .doc
+            .node_groups
+            .get(graph_id)
+            .ok_or_else(|| invalid_intermediate("round-trip shader graph is missing"))?;
+        let base_texture = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.node_type == "ShaderNodeTexImage"
+                    && node.properties.get("image").and_then(Value::as_str)
+                        == Some(base_id.as_str())
+            })
+            .map(|(id, _)| id)
+            .ok_or_else(|| invalid_intermediate("base Image Texture was not reopened"))?;
+        let vector = graph
+            .links
+            .iter()
+            .find(|link| link.to_node == *base_texture && link.to_socket == "Vector")
+            .ok_or_else(|| invalid_intermediate("base Image Texture has no Vector link"))?;
+        let uv_node = graph
+            .nodes
+            .get(&vector.from_node)
+            .ok_or_else(|| invalid_intermediate("base Image Texture UV node is missing"))?;
+        assert_eq!(uv_node.node_type, "ShaderNodeUVMap");
+        assert_eq!(uv_node.properties.get("uv_map"), Some(&json!("Lightmap")));
+
+        let source_material = doc
+            .materials
+            .get(&material_id)
+            .ok_or_else(|| invalid_intermediate("source material is missing"))?;
+        let layer_names = ["UVMap".to_owned(), "Lightmap".to_owned()];
+        let layer_corners = [
+            [UV_MAP[0], UV_MAP[1], UV_MAP[2]],
+            [LIGHTMAP[0], LIGHTMAP[1], LIGHTMAP[2]],
+        ];
+        let image_data = BTreeMap::from([
+            (
+                base_id.as_str().to_owned(),
+                crate::image::ImageData {
+                    width: 2,
+                    height: 1,
+                    pixels: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+                    tiles: BTreeMap::new(),
+                    interpolation: crate::image::ImageInterpolation::Closest,
+                },
+            ),
+            (
+                roughness_id.as_str().to_owned(),
+                crate::image::ImageData {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![[128.0 / 255.0, 0.0, 0.0, 1.0]],
+                    tiles: BTreeMap::new(),
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                },
+            ),
+            (
+                metallic_id.as_str().to_owned(),
+                crate::image::ImageData {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![[64.0 / 255.0, 0.0, 0.0, 1.0]],
+                    tiles: BTreeMap::new(),
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                },
+            ),
+            (
+                normal_id.as_str().to_owned(),
+                crate::image::ImageData {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![[192.0 / 255.0, 64.0 / 255.0, 230.0 / 255.0, 1.0]],
+                    tiles: BTreeMap::new(),
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                },
+            ),
+        ]);
+        let close = |left: f64, right: f64| (left - right).abs() < 1.0e-3;
+        // Hit 0 samples Lightmap red and UVMap blue; hit 1 the reverse. Each hit reads the Lightmap layer.
+        let expected_base = [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        for (index, barycentric) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].into_iter().enumerate() {
+            let layers = crate::shader::HitUvLayers {
+                names: &layer_names,
+                corners: &layer_corners,
+                positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+                barycentric,
+                render: Some(0),
+                available_mask: None,
+            };
+            let source = crate::shader::evaluate_surface(
+                source_material,
+                &crate::shader::HitContext::new(&doc.node_groups)
+                    .with_images(&image_data)
+                    .with_uv_layers(layers),
+            )?;
+            let reopened = crate::shader::evaluate_surface(
+                reopened_material,
+                &crate::shader::HitContext::new(&imported.doc.node_groups)
+                    .with_images(&image_data)
+                    .with_uv_layers(layers),
+            )?;
+            for channel in 0..3 {
+                assert!(
+                    close(source.base_color[channel], expected_base[index][channel]),
+                    "hit {index} source base color channel {channel} is {}",
+                    source.base_color[channel]
+                );
+                assert!(
+                    close(reopened.base_color[channel], source.base_color[channel]),
+                    "hit {index} reopened base color channel {channel} is {}",
+                    reopened.base_color[channel]
+                );
+            }
+            assert!(close(source.roughness, 0.5 * 128.0 / 255.0));
+            assert!(close(reopened.roughness, source.roughness));
+            assert!(close(source.metallic, 0.75 * 64.0 / 255.0));
+            assert!(close(reopened.metallic, source.metallic));
+            assert!(
+                (reopened.normal - source.normal).length() < 1.0e-3,
+                "hit {index} normal changed across .blend: source {:?} reopened {:?}",
+                source.normal,
+                reopened.normal
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_roundtrip_samples_srgb_shared_texture_and_authored_overlay() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        // The render layer `UVMap` and the texture layer `Lightmap` sample different corners at each hit.
+        const UV_MAP: [[f64; 2]; 4] = [[0.9, 0.0], [0.1, 0.0], [0.9, 0.0], [0.1, 0.0]];
+        const LIGHTMAP: [[f64; 2]; 4] = [[0.1, 0.5], [0.9, 0.5], [0.1, 0.5], [0.9, 0.5]];
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let encode_image =
+            |name: &str, width: u32, pixels: &[[u8; 4]]| -> Result<(PathBuf, Vec<u8>)> {
+                let path = directory.path().join(name);
+                let flat = pixels.iter().flatten().copied().collect::<Vec<u8>>();
+                let mut bytes = Vec::new();
+                {
+                    let mut encoder = png::Encoder::new(&mut bytes, width, 1);
+                    encoder.set_color(png::ColorType::Rgba);
+                    encoder.set_depth(png::BitDepth::Eight);
+                    let mut writer = encoder.write_header().map_err(|error| {
+                        PotError::new(ErrorCode::ExportFailed, error.to_string())
+                    })?;
+                    writer.write_image_data(&flat).map_err(|error| {
+                        PotError::new(ErrorCode::ExportFailed, error.to_string())
+                    })?;
+                }
+                fs::write(&path, &bytes).map_err(|error| PotError::io(&error))?;
+                Ok((path, bytes))
+            };
+        // Mid-range sRGB values: a missing or doubled decode moves them far outside the tolerance.
+        let (shared_path, shared_bytes) =
+            encode_image("shared.png", 2, &[[128, 40, 0, 255], [64, 0, 255, 255]])?;
+        let (metallic_path, metallic_bytes) = encode_image("metallic.png", 1, &[[128, 0, 0, 255]])?;
+        // An asymmetric green channel: a flipped tangent frame flips the sign of the mapped Y.
+        let (normal_path, normal_bytes) = encode_image("normal.png", 1, &[[192, 64, 230, 255]])?;
+        let image =
+            |name: &str, colorspace: ImageColorspace, width: u32, path: &PathBuf, bytes: &[u8]| {
+                Image {
+                    name: name.to_owned(),
+                    source: ImageSource::File,
+                    colorspace,
+                    width,
+                    height: 1,
+                    tiles: Vec::new(),
+                    blob: None,
+                    source_path: Some(path.to_string_lossy().into_owned()),
+                    source_hash: Some(crate::hash::sha256(bytes)),
+                    alpha_mode: ImageAlphaMode::Straight,
+                }
+            };
+        let shared_id = Id::new("shared_texture")?;
+        let metallic_id = Id::new("metallic_texture")?;
+        let normal_id = Id::new("normal_texture_image")?;
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.images.insert(
+            shared_id.clone(),
+            image(
+                "Shared Texture",
+                ImageColorspace::Srgb,
+                2,
+                &shared_path,
+                &shared_bytes,
+            ),
+        );
+        doc.images.insert(
+            metallic_id.clone(),
+            image(
+                "Metallic Texture",
+                ImageColorspace::Srgb,
+                1,
+                &metallic_path,
+                &metallic_bytes,
+            ),
+        );
+        doc.images.insert(
+            normal_id.clone(),
+            image(
+                "Normal Texture",
+                ImageColorspace::NonColor,
+                1,
+                &normal_path,
+                &normal_bytes,
+            ),
+        );
+        let texture = |image: &Id, interpolation: crate::image::ImageInterpolation| {
+            crate::model::TextureRef {
+                image: image.clone(),
+                uv_layer: Some("Lightmap".to_owned()),
+                interpolation,
+            }
+        };
+        // An authored graph: a Principled BSDF with a default Base Color, a Roughness linked from a Math node.
+        let authored_graph_id = Id::new("authored_graph")?;
+        let mut authored =
+            crate::graph::NodeGroup::new("Authored Shader", crate::graph::GraphKind::Shader);
+        let mut principled = crate::graph::GraphNode::new("ShaderNodeBsdfPrincipled");
+        principled
+            .inputs
+            .insert("Base Color".to_owned(), json!([0.5, 0.25, 0.125, 1.0]));
+        let mut output = crate::graph::GraphNode::new("OutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        let mut roughness_source = crate::graph::GraphNode::new("ShaderNodeMath");
+        roughness_source
+            .properties
+            .insert("operation".to_owned(), json!("ADD"));
+        roughness_source
+            .inputs
+            .insert("Value".to_owned(), json!(0.25));
+        roughness_source
+            .inputs
+            .insert("Value_001".to_owned(), json!(0.0));
+        authored.nodes.insert(Id::new("principled")?, principled);
+        authored.nodes.insert(Id::new("output")?, output);
+        authored
+            .nodes
+            .insert(Id::new("roughness_source")?, roughness_source);
+        authored.links.push(crate::graph::GraphLink {
+            from_node: Id::new("principled")?,
+            from_socket: "BSDF".to_owned(),
+            to_node: Id::new("output")?,
+            to_socket: "Surface".to_owned(),
+        });
+        authored.links.push(crate::graph::GraphLink {
+            from_node: Id::new("roughness_source")?,
+            from_socket: "Value".to_owned(),
+            to_node: Id::new("principled")?,
+            to_socket: "Roughness".to_owned(),
+        });
+        doc.node_groups.insert(authored_graph_id.clone(), authored);
+        // The field material shares one sRGB image between its base color and its roughness.
+        let field_id = Id::new("field_mat")?;
+        doc.materials.insert(
+            field_id.clone(),
+            Material {
+                name: "Field Material".to_owned(),
+                base_color: [1.0; 4],
+                roughness: 0.5,
+                metallic: 0.75,
+                base_color_texture: Some(texture(
+                    &shared_id,
+                    crate::image::ImageInterpolation::Closest,
+                )),
+                roughness_texture: Some(texture(
+                    &shared_id,
+                    crate::image::ImageInterpolation::Linear,
+                )),
+                metallic_texture: Some(texture(
+                    &metallic_id,
+                    crate::image::ImageInterpolation::Linear,
+                )),
+                normal_texture: Some(texture(
+                    &normal_id,
+                    crate::image::ImageInterpolation::Linear,
+                )),
+                ..Material::default()
+            },
+        );
+        let authored_id = Id::new("authored_mat")?;
+        doc.materials.insert(
+            authored_id.clone(),
+            Material {
+                name: "Authored Material".to_owned(),
+                base_color: [1.0; 4],
+                base_color_texture: Some(texture(
+                    &shared_id,
+                    crate::image::ImageInterpolation::Closest,
+                )),
+                roughness_texture: Some(texture(
+                    &shared_id,
+                    crate::image::ImageInterpolation::Linear,
+                )),
+                normal_texture: Some(texture(
+                    &normal_id,
+                    crate::image::ImageInterpolation::Linear,
+                )),
+                node_tree: Some(authored_graph_id),
+                ..Material::default()
+            },
+        );
+        let uv_faces = |mesh: &crate::geom::Mesh, pattern: [[f64; 2]; 4]| {
+            mesh.faces
+                .iter()
+                .map(|face| {
+                    Some(
+                        (0..face.vertices.len())
+                            .map(|corner| pattern[corner % 4])
+                            .collect::<Vec<[f64; 2]>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut mesh = box_with_attributes(Vec::new())?;
+        let uv_map_faces = uv_faces(&mesh, UV_MAP);
+        let lightmap_faces = uv_faces(&mesh, LIGHTMAP);
+        crate::geom::uv_layers::write(
+            &mut mesh,
+            &crate::geom::uv_layers::UvStore {
+                layers: vec![
+                    crate::geom::uv_layers::UvLayer::new("UVMap", uv_map_faces),
+                    crate::geom::uv_layers::UvLayer::new("Lightmap", lightmap_faces),
+                ],
+                active: Some("Lightmap".to_owned()),
+                render: Some("UVMap".to_owned()),
+            },
+        );
+        let data_id = Id::new("lightmap_mesh")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        for (node_id, name, material_id) in [
+            ("field_body", "Field Body", &field_id),
+            ("authored_body", "Authored Body", &authored_id),
+        ] {
+            let node_id = Id::new(node_id)?;
+            let mut body = test_node(name, data_id.as_str(), None, None)?;
+            body.materials = vec![material_id.clone()];
+            doc.nodes.insert(node_id.clone(), body);
+            doc.collections
+                .get_mut(&Id::new("collection_root")?)
+                .ok_or_else(|| invalid_intermediate("root collection is missing"))?
+                .objects
+                .push(node_id);
+        }
+
+        let project = Project::init(directory.path().join("project"))?;
+        let output = directory.path().join("srgb-authored-overlay.blend");
+        let context = crate::eval::EvaluationContext::default();
+        export_blend(
+            &doc,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let imported = import_blend(&output, Some(&blender))?;
+        assert!(
+            imported.losses.is_empty(),
+            "texture overlay round-trip reported losses: {:?}",
+            imported.losses
+        );
+
+        let srgb_to_linear = |value: f64| {
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let decode =
+            |bytes: &[u8], colorspace: ImageColorspace| -> Result<crate::image::ImageData> {
+                let (_, width, height, pixels) =
+                    crate::image::storage::decode_pixels_with_default_colorspace(
+                        bytes,
+                        Some(colorspace),
+                    )?;
+                Ok(crate::image::ImageData {
+                    width,
+                    height,
+                    pixels,
+                    tiles: BTreeMap::new(),
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                })
+            };
+        let mut image_data = BTreeMap::new();
+        for (image_id, bytes) in [
+            (&shared_id, shared_bytes.as_slice()),
+            (&metallic_id, metallic_bytes.as_slice()),
+            (&normal_id, normal_bytes.as_slice()),
+        ] {
+            let colorspace = doc
+                .images
+                .get(image_id)
+                .ok_or_else(|| invalid_intermediate("source image is missing"))?
+                .colorspace;
+            image_data.insert(image_id.as_str().to_owned(), decode(bytes, colorspace)?);
+        }
+        // The reopened images decode their own bytes, in the colorspace they reopen with.
+        let mut reopened_image_data = BTreeMap::new();
+        for (image_id, reopened_image) in &imported.doc.images {
+            let source_image = doc
+                .images
+                .get(image_id)
+                .ok_or_else(|| invalid_intermediate("round-trip image is not in the source"))?;
+            if reopened_image.colorspace != source_image.colorspace {
+                return Err(invalid_intermediate("round-trip image changed colorspace"));
+            }
+            let hash = reopened_image
+                .source_hash
+                .as_deref()
+                .ok_or_else(|| invalid_intermediate("round-trip image has no source hash"))?;
+            let bytes = imported
+                .assets
+                .iter()
+                .find(|(digest, _)| digest.as_str() == hash)
+                .map(|(_, bytes)| bytes.as_slice())
+                .ok_or_else(|| invalid_intermediate("round-trip image bytes are missing"))?;
+            reopened_image_data.insert(
+                image_id.as_str().to_owned(),
+                decode(bytes, reopened_image.colorspace)?,
+            );
+        }
+
+        let reopened_mesh = imported
+            .doc
+            .data_blocks
+            .values()
+            .find_map(|data| data.mesh.as_ref())
+            .ok_or_else(|| invalid_intermediate("round-trip mesh is missing"))?;
+        let store = crate::geom::uv_layers::read(reopened_mesh);
+        assert_eq!(
+            store
+                .layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["UVMap", "Lightmap"]
+        );
+        assert_eq!(store.render.as_deref(), Some("UVMap"));
+        assert_eq!(store.active.as_deref(), Some("Lightmap"));
+        for material_id in [&field_id, &authored_id] {
+            let reopened_material = imported
+                .doc
+                .materials
+                .get(material_id)
+                .ok_or_else(|| invalid_intermediate("round-trip material is missing"))?;
+            let graph_id = reopened_material
+                .node_tree
+                .as_ref()
+                .ok_or_else(|| invalid_intermediate("round-trip shader graph is missing"))?;
+            let graph = imported
+                .doc
+                .node_groups
+                .get(graph_id)
+                .ok_or_else(|| invalid_intermediate("round-trip shader graph is missing"))?;
+            let mut checked = 0;
+            for (texture_id, node) in &graph.nodes {
+                if node.node_type != "ShaderNodeTexImage"
+                    || node.properties.get("image").and_then(Value::as_str)
+                        != Some(shared_id.as_str())
+                {
+                    continue;
+                }
+                let vector = graph
+                    .links
+                    .iter()
+                    .find(|link| link.to_node == *texture_id && link.to_socket == "Vector")
+                    .ok_or_else(|| {
+                        invalid_intermediate("shared Image Texture has no Vector link")
+                    })?;
+                let uv = graph.nodes.get(&vector.from_node).ok_or_else(|| {
+                    invalid_intermediate("shared Image Texture UV node is missing")
+                })?;
+                assert_eq!(uv.node_type, "ShaderNodeUVMap");
+                assert_eq!(uv.properties.get("uv_map"), Some(&json!("Lightmap")));
+                checked += 1;
+            }
+            assert!(
+                checked >= 2,
+                "expected base and roughness Image Textures, found {checked}"
+            );
+        }
+
+        let source_layers = ["UVMap".to_owned(), "Lightmap".to_owned()];
+        let layer_corners = [
+            [UV_MAP[0], UV_MAP[1], UV_MAP[2]],
+            [LIGHTMAP[0], LIGHTMAP[1], LIGHTMAP[2]],
+        ];
+        let close = |left: f64, right: f64| (left - right).abs() < 1.0e-3;
+        // Mid-range sRGB decodes: the texel at hit 0 is pixel 0 (Lightmap u 0.1), at hit 1 pixel 1 (u 0.9).
+        let red = [srgb_to_linear(128.0 / 255.0), srgb_to_linear(64.0 / 255.0)];
+        let green = [srgb_to_linear(40.0 / 255.0), 0.0];
+        let blue = [0.0, 1.0];
+        let metal = 0.75 * srgb_to_linear(128.0 / 255.0);
+        // Field: base = texel, roughness = 0.5 x red, metallic = 0.75 x red. Authored: base = default x texel,
+        // roughness = linked 0.25 x red, metallic = unlinked default 0.
+        let cases = [
+            (
+                "field",
+                &field_id,
+                [[red[0], green[0], blue[0]], [red[1], green[1], blue[1]]],
+                [0.5 * red[0], 0.5 * red[1]],
+                metal,
+            ),
+            (
+                "authored",
+                &authored_id,
+                [
+                    [0.5 * red[0], 0.25 * green[0], 0.125 * blue[0]],
+                    [0.5 * red[1], 0.25 * green[1], 0.125 * blue[1]],
+                ],
+                [0.25 * red[0], 0.25 * red[1]],
+                0.0,
+            ),
+        ];
+        for (label, material_id, base_expected, roughness_expected, metallic_expected) in cases {
+            let source_material = doc
+                .materials
+                .get(material_id)
+                .ok_or_else(|| invalid_intermediate("source material is missing"))?;
+            let reopened_material = imported
+                .doc
+                .materials
+                .get(material_id)
+                .ok_or_else(|| invalid_intermediate("round-trip material is missing"))?;
+            for (index, barycentric) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].into_iter().enumerate() {
+                let layers = crate::shader::HitUvLayers {
+                    names: &source_layers,
+                    corners: &layer_corners,
+                    positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+                    barycentric,
+                    render: Some(0),
+                    available_mask: None,
+                };
+                let source = crate::shader::evaluate_surface(
+                    source_material,
+                    &crate::shader::HitContext::new(&doc.node_groups)
+                        .with_images(&image_data)
+                        .with_uv_layers(layers),
+                )?;
+                let reopened = crate::shader::evaluate_surface(
+                    reopened_material,
+                    &crate::shader::HitContext::new(&imported.doc.node_groups)
+                        .with_images(&reopened_image_data)
+                        .with_uv_layers(layers),
+                )?;
+                for channel in 0..3 {
+                    assert!(
+                        close(source.base_color[channel], base_expected[index][channel]),
+                        "{label} hit {index} source base channel {channel} is {}",
+                        source.base_color[channel]
+                    );
+                    assert!(
+                        close(reopened.base_color[channel], source.base_color[channel]),
+                        "{label} hit {index} reopened base channel {channel} is {}",
+                        reopened.base_color[channel]
+                    );
+                }
+                assert!(
+                    close(source.roughness, roughness_expected[index]),
+                    "{label} hit {index} source roughness is {}",
+                    source.roughness
+                );
+                assert!(
+                    close(reopened.roughness, source.roughness),
+                    "{label} hit {index} reopened roughness is {}",
+                    reopened.roughness
+                );
+                assert!(
+                    close(source.metallic, metallic_expected),
+                    "{label} hit {index} source metallic is {}",
+                    source.metallic
+                );
+                assert!(
+                    close(reopened.metallic, source.metallic),
+                    "{label} hit {index} reopened metallic is {}",
+                    reopened.metallic
+                );
+                assert!(
+                    (reopened.normal - source.normal).length() < 1.0e-3,
+                    "{label} hit {index} normal changed across .blend: source {:?} reopened {:?}",
+                    source.normal,
+                    reopened.normal
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blender_export_reports_linked_normal_with_native_normal_texture() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let normal_path = directory.path().join("linked-normal.png");
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder
+                .write_header()
+                .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
+            writer
+                .write_image_data(&[192, 64, 230, 255])
+                .map_err(|error| PotError::new(ErrorCode::ExportFailed, error.to_string()))?;
+        }
+        fs::write(&normal_path, &bytes).map_err(|error| PotError::io(&error))?;
+        let normal_id = Id::new("linked_normal_image")?;
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.images.insert(
+            normal_id.clone(),
+            Image {
+                name: "Linked Normal Texture".to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::NonColor,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(normal_path.to_string_lossy().into_owned()),
+                source_hash: Some(crate::hash::sha256(&bytes)),
+                alpha_mode: ImageAlphaMode::Straight,
+            },
+        );
+        // An authored Normal link: the native normal perturbs this vector, so the export must refuse it.
+        let mut authored =
+            crate::graph::NodeGroup::new("Linked Normal Shader", crate::graph::GraphKind::Shader);
+        let mut principled = crate::graph::GraphNode::new("ShaderNodeBsdfPrincipled");
+        principled
+            .inputs
+            .insert("Base Color".to_owned(), json!([0.5, 0.25, 0.125, 1.0]));
+        let mut output = crate::graph::GraphNode::new("OutputMaterial");
+        output
+            .properties
+            .insert("is_active_output".to_owned(), json!(true));
+        let mut normal_source = crate::graph::GraphNode::new("ShaderNodeVectorMath");
+        normal_source
+            .properties
+            .insert("operation".to_owned(), json!("NORMALIZE"));
+        normal_source
+            .inputs
+            .insert("Vector".to_owned(), json!([0.0, 0.0, 1.0]));
+        authored.nodes.insert(Id::new("principled")?, principled);
+        authored.nodes.insert(Id::new("output")?, output);
+        authored
+            .nodes
+            .insert(Id::new("normal_source")?, normal_source);
+        authored.links.push(crate::graph::GraphLink {
+            from_node: Id::new("principled")?,
+            from_socket: "BSDF".to_owned(),
+            to_node: Id::new("output")?,
+            to_socket: "Surface".to_owned(),
+        });
+        authored.links.push(crate::graph::GraphLink {
+            from_node: Id::new("normal_source")?,
+            from_socket: "Vector".to_owned(),
+            to_node: Id::new("principled")?,
+            to_socket: "Normal".to_owned(),
+        });
+        let graph_id = Id::new("linked_normal_graph")?;
+        doc.node_groups.insert(graph_id.clone(), authored);
+        let material_id = Id::new("linked_normal_mat")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Linked Normal Material".to_owned(),
+                normal_texture: Some(crate::model::TextureRef {
+                    image: normal_id,
+                    uv_layer: None,
+                    interpolation: crate::image::ImageInterpolation::Linear,
+                }),
+                node_tree: Some(graph_id),
+                ..Material::default()
+            },
+        );
+        let project = Project::init(directory.path().join("project"))?;
+        let context = crate::eval::EvaluationContext::default();
+        let strict_output = directory.path().join("linked-normal-strict.blend");
+        let Err(strict_error) = export_blend(
+            &doc,
+            &project,
+            &strict_output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        ) else {
+            return Err(invalid_intermediate(
+                "strict export accepted a linked Normal with a native normal texture",
+            ));
+        };
+        assert_eq!(strict_error.code, ErrorCode::UnrepresentableFeature);
+        assert_eq!(
+            strict_error.details["losses"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            strict_error.details["losses"][0]["feature_id"],
+            json!("material.shader_graph.material_textures")
+        );
+        let lossy_output = directory.path().join("linked-normal-lossy.blend");
+        let report = export_blend(
+            &doc,
+            &project,
+            &lossy_output,
+            &ExportOptions {
+                allow_lossy: true,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        assert_eq!(
+            report.losses.len(),
+            1,
+            "unexpected losses: {:?}",
+            report.losses
+        );
+        assert_eq!(
+            report.losses[0].feature_id,
+            "material.shader_graph.material_textures"
+        );
+        assert_eq!(
+            report.losses[0].data_id.as_deref(),
+            Some(material_id.as_str())
         );
         Ok(())
     }

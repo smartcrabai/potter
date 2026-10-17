@@ -1,4 +1,4 @@
-//! Material node graphs for glTF textures that Potter's texture fields cannot hold.
+//! Material node graphs for glTF textures and Potter texture fields that the graph must hold, including the texture fields written to .blend.
 //!
 //! Blender's glTF importer builds a node graph for every material with a transformed texture, an
 //! emissive texture, an occlusion texture, or a normal map scale. This module builds the same shapes:
@@ -12,11 +12,17 @@
 //! - occlusion through a Separate Color (Red) into the `glTF Material Output` group, which PR10's
 //!   resolver reads back as glTF occlusion.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    exchange::material_surface::TextureTransform,
+    exchange::{
+        Loss, is_default_material_graph,
+        material_surface::{TextureTransform, feature_id},
+    },
+    geom::{Mesh, uv_layers},
     graph::{GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
     image::ImageInterpolation,
     model::{Id, Material, SceneDoc, TextureRef},
@@ -40,6 +46,9 @@ pub(crate) struct GraphTextures {
     pub(crate) base_color: Option<SlotTexture>,
     /// Packed glTF metallic (B) and roughness (G).
     pub(crate) metallic_roughness: Option<SlotTexture>,
+    /// Separate roughness and metallic textures of a Potter material, each read through its Red channel.
+    pub(crate) roughness: Option<SlotTexture>,
+    pub(crate) metallic: Option<SlotTexture>,
     pub(crate) normal: Option<SlotTexture>,
     /// `normalTexture.scale`, the Normal Map Strength.
     pub(crate) normal_scale: f64,
@@ -69,7 +78,34 @@ impl GraphTextures {
                     transform: base_transform,
                 }),
             metallic_roughness: plain(&material.metallic_texture),
+            roughness: None,
+            metallic: None,
             normal: plain(&material.normal_texture),
+            normal_scale: 1.0,
+            emissive: None,
+            occlusion: None,
+        }
+    }
+
+    /// The native texture fields of a Potter material, each read through its Red channel as the field is, including when two fields reference one image.
+    pub(crate) fn from_field_refs(
+        base_color: Option<TextureRef>,
+        roughness: Option<TextureRef>,
+        metallic: Option<TextureRef>,
+        normal: Option<TextureRef>,
+    ) -> Self {
+        let plain = |texture: Option<TextureRef>| {
+            texture.map(|texture| SlotTexture {
+                texture,
+                transform: None,
+            })
+        };
+        Self {
+            base_color: plain(base_color),
+            metallic_roughness: None,
+            roughness: plain(roughness),
+            metallic: plain(metallic),
+            normal: plain(normal),
             normal_scale: 1.0,
             emissive: None,
             occlusion: None,
@@ -137,10 +173,7 @@ pub(crate) fn move_textures_to_graph(
         None
     };
     let graph = build_graph(&material, textures, output_group.is_some())?;
-    let graph_id = Id::new(format!(
-        "shader_{}",
-        &crate::hash::sha256(format!("texture-graph:{material_id}").as_bytes())[7..31]
-    ))?;
+    let graph_id = texture_graph_id(material_id)?;
     doc.node_groups.insert(graph_id.clone(), graph);
     let target = doc
         .materials
@@ -217,7 +250,6 @@ fn build_graph(
         .insert("is_active_output".to_owned(), json!(true));
     insert(&mut graph, "output", output)?;
     connect(&mut graph, "principled", "BSDF", "output", "Surface")?;
-    insert(&mut graph, "coord", GraphNode::new("ShaderNodeTexCoord"))?;
 
     if let Some(slot) = &textures.base_color {
         let color = texture_node(&mut graph, "base", slot)?;
@@ -237,8 +269,24 @@ fn build_graph(
             )?;
         }
         if material.alpha_mode != "opaque" {
-            connect(&mut graph, &color, "Alpha", "principled", "Alpha")?;
+            multiply_channel(
+                &mut graph,
+                &color,
+                "Alpha",
+                "base_alpha",
+                material.base_color[3],
+                "principled",
+                "Alpha",
+            )?;
         }
+    }
+
+    if textures.metallic_roughness.is_some()
+        && (textures.roughness.is_some() || textures.metallic.is_some())
+    {
+        return Err(graph_error(
+            "a packed metallicRoughness texture cannot be combined with separate roughness or metallic textures",
+        ));
     }
 
     if let Some(slot) = &textures.metallic_roughness {
@@ -269,31 +317,34 @@ fn build_graph(
         )?;
     }
 
+    if let Some(slot) = &textures.roughness {
+        channel_texture(
+            &mut graph,
+            "roughness",
+            slot,
+            "Red",
+            material.roughness,
+            "Roughness",
+        )?;
+    }
+    if let Some(slot) = &textures.metallic {
+        channel_texture(
+            &mut graph,
+            "metallic",
+            slot,
+            "Red",
+            material.metallic,
+            "Metallic",
+        )?;
+    }
+
     if let Some(slot) = &textures.normal {
         let color = texture_node(&mut graph, "normal", slot)?;
-        let mut normal_map = GraphNode::new("ShaderNodeNormalMap");
-        normal_map
-            .properties
-            .insert("space".to_owned(), json!("TANGENT"));
-        normal_map
-            .properties
-            .insert("potter_gltf_imported_normal_map".to_owned(), json!(true));
-        // The node reads the normal texture's layer, as Blender's importer sets it; the render
-        // layer (no name, or an empty one) is the node default.
-        if let Some(layer) = slot
-            .texture
-            .uv_layer
-            .as_deref()
-            .filter(|layer| !layer.is_empty())
-        {
-            normal_map
-                .properties
-                .insert("uv_map".to_owned(), json!(layer));
-        }
-        normal_map
-            .inputs
-            .insert("Strength".to_owned(), json!(textures.normal_scale));
-        insert(&mut graph, "normal_strength", normal_map)?;
+        insert(
+            &mut graph,
+            "normal_strength",
+            normal_map_node(slot, textures.normal_scale),
+        )?;
         connect(&mut graph, &color, "Color", "normal_strength", "Color")?;
         connect(
             &mut graph,
@@ -369,7 +420,11 @@ fn texture_node(graph: &mut NodeGroup, name: &str, slot: &SlotTexture) -> Result
             insert(graph, &uv_node, node)?;
             (uv_node, "UV".to_owned())
         }
-        None => ("coord".to_owned(), "UV".to_owned()),
+        None => {
+            let coord = format!("{name}_coord");
+            insert(graph, &coord, GraphNode::new("ShaderNodeTexCoord"))?;
+            (coord, "UV".to_owned())
+        }
     };
     if let Some(transform) = &slot.transform {
         let map = format!("{name}_map");
@@ -430,8 +485,8 @@ fn multiply_color(
     connect(graph, &mix, "Color", to, to_socket)
 }
 
-/// Links `channel` of the Separate Color `split` into `to_socket`, multiplied by `factor` (a Math node
-/// unless the factor is one).
+/// Links `channel` of a `split` output (a Separate Color channel, or a texture's Alpha) into `to_socket`,
+/// multiplied by `factor` (a Math node unless the factor is one).
 fn multiply_channel(
     graph: &mut NodeGroup,
     split: &str,
@@ -627,6 +682,558 @@ fn is_vector_math(node: &GraphNode, operation: &str, second: [f64; 3]) -> bool {
             })
 }
 
+/// Material texture work of a .blend export: the shader graphs that the export writes in place of each material's
+/// graph, the default graphs they replace, and the losses for shapes no graph can hold. The source document is not
+/// changed; the export document takes the edits.
+#[derive(Default)]
+pub(crate) struct BlendTextureEdits {
+    /// Material, its export graph's ID, and the graph. Each becomes the material's `node_tree` in the export.
+    graphs: Vec<(Id, Id, NodeGroup)>,
+    /// Default graphs that generated graphs replace and that no other material uses.
+    removed_graphs: Vec<Id>,
+}
+
+/// The texture fields of a material, which the export document clears once a graph holds them.
+const TEXTURE_FIELDS: [&str; 4] = [
+    "base_color_texture",
+    "roughness_texture",
+    "metallic_texture",
+    "normal_texture",
+];
+
+/// Plans the .blend texture export of every material with texture fields.
+///
+/// A material with no custom graph gets the graph its fields describe. A material with an authored graph keeps that
+/// graph: the export writes a copy of it with the fields overlaid on its Principled BSDF (`overlay_authored`). A graph
+/// shape that takes no overlay is a loss. Each field reads its own UV layer; each image keeps its declared colorspace.
+pub(crate) fn plan_blend_textures(doc: &SceneDoc) -> Result<(Vec<Loss>, BlendTextureEdits)> {
+    let mut losses = Vec::new();
+    let mut plans = Vec::<(&Id, &Material, GraphTextures)>::new();
+    for (material_id, material) in &doc.materials {
+        if !has_texture_field(material) {
+            continue;
+        }
+        let users = material_users(doc, material_id);
+        let [base, roughness, metallic, normal] = [
+            ("base color", &material.base_color_texture),
+            ("roughness", &material.roughness_texture),
+            ("metallic", &material.metallic_texture),
+            ("normal", &material.normal_texture),
+        ]
+        .map(|(role, field)| {
+            field.as_ref().map(|reference| {
+                export_reference(&users, material_id, role, reference, &mut losses)
+            })
+        });
+        plans.push((
+            material_id,
+            material,
+            GraphTextures::from_field_refs(base, roughness, metallic, normal),
+        ));
+    }
+    let planned = plans
+        .iter()
+        .map(|(material_id, _, _)| *material_id)
+        .collect::<BTreeSet<&Id>>();
+    let mut graphs = Vec::with_capacity(plans.len());
+    let mut replaced = Vec::<Id>::new();
+    for (material_id, material, textures) in plans {
+        let (graph, graph_id) = match material.node_tree.as_ref() {
+            Some(authored) if !is_default_material_graph(doc, authored) => {
+                let group = doc
+                    .node_groups
+                    .get(authored)
+                    .ok_or_else(|| graph_error(format!("shader graph `{authored}` is missing")))?;
+                match overlay_authored(group, material_id, material, &textures, &mut losses)? {
+                    Some(graph) => (graph, export_graph_id("texture-overlay", material_id)?),
+                    None => {
+                        losses.push(Loss {
+                            feature_id: feature_id::MATERIAL_TEXTURES.to_owned(),
+                            data_id: Some(material_id.as_str().to_owned()),
+                            reason: "the material's shader graph does not drive its active output from a Principled BSDF, so its texture fields cannot be written to .blend"
+                                .to_owned(),
+                            suggestion: Some(
+                                "drive the active output from a Principled BSDF"
+                                    .to_owned(),
+                            ),
+                        });
+                        continue;
+                    }
+                }
+            }
+            previous => {
+                if let Some(previous) = previous {
+                    replaced.push(previous.clone());
+                }
+                (
+                    build_graph(material, &textures, false)?,
+                    texture_graph_id(material_id)?,
+                )
+            }
+        };
+        if material.node_tree.as_ref() != Some(&graph_id) && doc.node_groups.contains_key(&graph_id)
+        {
+            return Err(graph_error(format!(
+                "generated shader graph `{graph_id}` collides with an existing graph"
+            )));
+        }
+        graphs.push((material_id.clone(), graph_id, graph));
+    }
+    let removed_graphs = replaced
+        .into_iter()
+        .filter(|graph_id| {
+            !graphs.iter().any(|(_, id, _)| id == graph_id)
+                && !graph_used_outside(doc, &planned, graph_id)
+        })
+        .collect();
+    Ok((
+        losses,
+        BlendTextureEdits {
+            graphs,
+            removed_graphs,
+        },
+    ))
+}
+
+impl BlendTextureEdits {
+    /// Writes the graphs and removals into the serialized export document, which the bridge reads.
+    pub(crate) fn apply(self, document: &mut Value) -> Result<()> {
+        for (material_id, graph_id, graph) in self.graphs {
+            let group = serde_json::to_value(&graph).map_err(PotError::internal_json)?;
+            object_entry(document, "node_groups")?.insert(graph_id.as_str().to_owned(), group);
+            let material = object_entry(document, "materials")?
+                .get_mut(material_id.as_str())
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    graph_error(format!(
+                        "material `{material_id}` is missing from the export document"
+                    ))
+                })?;
+            material.insert("node_tree".to_owned(), json!(graph_id.as_str()));
+            for field in TEXTURE_FIELDS {
+                material.insert(field.to_owned(), Value::Null);
+            }
+        }
+        for graph_id in &self.removed_graphs {
+            object_entry(document, "node_groups")?.remove(graph_id.as_str());
+        }
+        Ok(())
+    }
+}
+
+fn object_entry<'a>(
+    document: &'a mut Value,
+    key: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>> {
+    document
+        .as_object_mut()
+        .and_then(|root| root.entry(key).or_insert_with(|| json!({})).as_object_mut())
+        .ok_or_else(|| graph_error(format!("export document field `{key}` is not an object")))
+}
+
+fn has_texture_field(material: &Material) -> bool {
+    material.base_color_texture.is_some()
+        || material.roughness_texture.is_some()
+        || material.metallic_texture.is_some()
+        || material.normal_texture.is_some()
+}
+
+/// The meshes of the objects that use `material_id` in a slot.
+fn material_users<'a>(doc: &'a SceneDoc, material_id: &Id) -> Vec<&'a Mesh> {
+    doc.nodes
+        .values()
+        .filter(|node| node.materials.contains(material_id))
+        .filter_map(|node| {
+            node.data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+        })
+        .filter_map(|data| data.mesh.as_ref())
+        .collect()
+}
+
+/// A texture reference with the layer Blender should sample. A named layer stays. The render layer (no name) becomes
+/// the layer the users' meshes render with when they agree. When they differ it stays unnamed, and Texture Coordinate
+/// `UV` samples each object's own render layer. A name that a user mesh lacks is a loss, as Potter's resolver reports it.
+fn export_reference(
+    users: &[&Mesh],
+    material_id: &Id,
+    role: &str,
+    reference: &TextureRef,
+    losses: &mut Vec<Loss>,
+) -> TextureRef {
+    let mut names = BTreeSet::<Option<String>>::new();
+    let mut missing = false;
+    for mesh in users {
+        let store = uv_layers::read(mesh);
+        let (index, unknown) = store.resolve(reference.uv_layer.as_deref());
+        missing |= unknown.is_some();
+        names.insert(
+            index
+                .and_then(|index| store.layers.get(index))
+                .map(|layer| layer.name.clone()),
+        );
+    }
+    if missing {
+        losses.push(Loss {
+            feature_id: feature_id::UV_LAYER_MISSING.to_owned(),
+            data_id: Some(material_id.as_str().to_owned()),
+            reason: format!(
+                "the {role} texture names a UV layer that a mesh using the material does not have; that mesh samples its render layer"
+            ),
+            suggestion: None,
+        });
+    }
+    let uv_layer = if names.len() <= 1 {
+        names
+            .into_iter()
+            .next()
+            .flatten()
+            .or_else(|| reference.uv_layer.clone())
+    } else if reference.uv_layer.is_some() {
+        losses.push(Loss {
+            feature_id: feature_id::MESH_UV_LAYER.to_owned(),
+            data_id: Some(material_id.as_str().to_owned()),
+            reason: format!(
+                "meshes using the material resolve the {role} texture to different UV layers; the texture names one layer"
+            ),
+            suggestion: None,
+        });
+        reference.uv_layer.clone()
+    } else {
+        None
+    };
+    TextureRef {
+        uv_layer,
+        ..reference.clone()
+    }
+}
+
+/// Whether a material outside `planned` still uses the graph `graph_id`.
+fn graph_used_outside(doc: &SceneDoc, planned: &BTreeSet<&Id>, graph_id: &Id) -> bool {
+    for (material_id, material) in &doc.materials {
+        if !planned.contains(material_id) && material.node_tree.as_ref() == Some(graph_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The ID of a graph the export generates for a material, from its purpose.
+fn export_graph_id(purpose: &str, material_id: &Id) -> Result<Id> {
+    Id::new(format!(
+        "shader_{}",
+        &crate::hash::sha256(format!("{purpose}:{material_id}").as_bytes())[7..31]
+    ))
+}
+
+/// The ID of the graph generated for a material's texture fields.
+fn texture_graph_id(material_id: &Id) -> Result<Id> {
+    export_graph_id("texture-graph", material_id)
+}
+
+/// The Normal Map node of a normal texture. It carries the importer's marker, so the bridge writes Blender's V-up
+/// green flip and the evaluator reads the canonical frame that native normal textures use. The node reads the
+/// texture's layer; the render layer (no name, or an empty one) is the node default.
+fn normal_map_node(slot: &SlotTexture, strength: f64) -> GraphNode {
+    let mut normal_map = GraphNode::new("ShaderNodeNormalMap");
+    normal_map
+        .properties
+        .insert("space".to_owned(), json!("TANGENT"));
+    normal_map
+        .properties
+        .insert("potter_gltf_imported_normal_map".to_owned(), json!(true));
+    if let Some(layer) = slot
+        .texture
+        .uv_layer
+        .as_deref()
+        .filter(|layer| !layer.is_empty())
+    {
+        normal_map
+            .properties
+            .insert("uv_map".to_owned(), json!(layer));
+    }
+    normal_map
+        .inputs
+        .insert("Strength".to_owned(), json!(strength));
+    normal_map
+}
+
+/// The authored graph of a material with native texture fields, copied for export with the fields overlaid on its
+/// Principled BSDF as Potter's evaluator applies them after the graph. Base Color multiplies its RGB, Roughness and
+/// Metallic multiply their Red channel, and Alpha multiplies its alpha on a non-opaque material (the renderer ignores
+/// alpha on an opaque one). A normal texture drives an unlinked Normal input through a Normal Map node. A linked Normal
+/// input stays as authored, and its normal texture is a loss: the native normal perturbs the linked vector, which no
+/// Blender node reproduces. Every generated node ID starts with a prefix that no authored node ID starts with. Returns
+/// `None` when the active output is not driven by a Principled BSDF.
+fn overlay_authored(
+    group: &NodeGroup,
+    material_id: &Id,
+    material: &Material,
+    textures: &GraphTextures,
+    losses: &mut Vec<Loss>,
+) -> Result<Option<NodeGroup>> {
+    let Some(principled) = surface_principled(group) else {
+        return Ok(None);
+    };
+    let prefix = fresh_prefix(group, "potter_texture");
+    let mut graph = group.clone();
+    if let Some(slot) = &textures.base_color {
+        let base = format!("{prefix}_base");
+        let texel = texture_node(&mut graph, &base, slot)?;
+        let source = take_input_link(&mut graph, &principled, "Base Color");
+        let mix_name = format!("{prefix}_base_mix");
+        let mut mix = GraphNode::new("ShaderNodeMixRGB");
+        mix.properties
+            .insert("blend_type".to_owned(), json!("MULTIPLY"));
+        mix.inputs.insert("Fac".to_owned(), json!(1.0));
+        insert(&mut graph, &mix_name, mix)?;
+        match source {
+            Some(link) => connect_link(&mut graph, &link, &mix_name, "Color1")?,
+            None => set_input(
+                &mut graph,
+                &mix_name,
+                "Color1",
+                input_value(
+                    group,
+                    &principled,
+                    "Base Color",
+                    json!([0.8, 0.8, 0.8, 1.0]),
+                ),
+            )?,
+        }
+        connect(&mut graph, &texel, "Color", &mix_name, "Color2")?;
+        connect(
+            &mut graph,
+            &mix_name,
+            "Color",
+            principled.as_str(),
+            "Base Color",
+        )?;
+        if material.alpha_mode != "opaque" {
+            let source = take_input_link(&mut graph, &principled, "Alpha");
+            let value = input_scalar(group, &principled, "Alpha", 1.0);
+            multiply_input(
+                &mut graph,
+                source,
+                value,
+                (texel.as_str(), "Alpha"),
+                &format!("{prefix}_alpha"),
+                (principled.as_str(), "Alpha"),
+            )?;
+        }
+    }
+    if let Some(slot) = &textures.roughness {
+        overlay_scalar(
+            &mut graph,
+            group,
+            &principled,
+            slot,
+            "Roughness",
+            0.5,
+            &format!("{prefix}_roughness"),
+        )?;
+    }
+    if let Some(slot) = &textures.metallic {
+        overlay_scalar(
+            &mut graph,
+            group,
+            &principled,
+            slot,
+            "Metallic",
+            0.0,
+            &format!("{prefix}_metallic"),
+        )?;
+    }
+    if let Some(slot) = &textures.normal {
+        let normal_linked = group
+            .links
+            .iter()
+            .any(|link| link.to_node == principled && link.to_socket == "Normal");
+        if normal_linked {
+            losses.push(Loss {
+                feature_id: feature_id::MATERIAL_TEXTURES.to_owned(),
+                data_id: Some(material_id.as_str().to_owned()),
+                reason: "the material's Principled Normal input is linked, and its normal texture perturbs that linked vector, which no Blender node reproduces; the normal texture is not written to .blend"
+                    .to_owned(),
+                suggestion: Some(
+                    "leave the Normal input unlinked so the normal texture drives it".to_owned(),
+                ),
+            });
+        } else {
+            let color = texture_node(&mut graph, &format!("{prefix}_normal"), slot)?;
+            let map_name = format!("{prefix}_normal_map");
+            insert(&mut graph, &map_name, normal_map_node(slot, 1.0))?;
+            connect(&mut graph, &color, "Color", &map_name, "Color")?;
+            connect(
+                &mut graph,
+                &map_name,
+                "Normal",
+                principled.as_str(),
+                "Normal",
+            )?;
+        }
+    }
+    Ok(Some(graph))
+}
+
+/// A name prefix that no node ID of `group` starts with: `base`, else `base_2`, `base_3`, and so on. The overlay's
+/// generated IDs all extend it, so none can equal an authored ID (the suffix convention of `unique_shape_key_id`).
+fn fresh_prefix(group: &NodeGroup, base: &str) -> String {
+    let mut candidate = base.to_owned();
+    let mut suffix = 2_u32;
+    while group
+        .nodes
+        .keys()
+        .any(|id| id.as_str().starts_with(candidate.as_str()))
+    {
+        candidate = format!("{base}_{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+/// Multiplies a Principled scalar input by the Red channel of `slot`'s texture, as the evaluator does. `name` is the
+/// overlay's own node-name stem.
+fn overlay_scalar(
+    graph: &mut NodeGroup,
+    group: &NodeGroup,
+    principled: &Id,
+    slot: &SlotTexture,
+    socket: &str,
+    default: f64,
+    name: &str,
+) -> Result<()> {
+    let texel = texture_node(graph, name, slot)?;
+    let split = format!("{name}_split");
+    insert(graph, &split, GraphNode::new("ShaderNodeSeparateColor"))?;
+    connect(graph, &texel, "Color", &split, "Color")?;
+    let source = take_input_link(graph, principled, socket);
+    let value = input_scalar(group, principled, socket, default);
+    multiply_input(
+        graph,
+        source,
+        value,
+        (split.as_str(), "Red"),
+        name,
+        (principled.as_str(), socket),
+    )
+}
+
+/// The Principled BSDF that drives the active output's Surface, when the output is one.
+fn surface_principled(group: &NodeGroup) -> Option<Id> {
+    let outputs = group
+        .nodes
+        .iter()
+        .filter(|(_, node)| {
+            matches!(
+                node.node_type.as_str(),
+                "OutputMaterial" | "ShaderNodeOutputMaterial"
+            )
+        })
+        .collect::<Vec<_>>();
+    let output = outputs
+        .iter()
+        .find(|(_, node)| {
+            node.properties
+                .get("is_active_output")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .or_else(|| outputs.first())?
+        .0
+        .clone();
+    let link = group
+        .links
+        .iter()
+        .find(|link| link.to_node == output && link.to_socket == "Surface")?;
+    let node = group.nodes.get(&link.from_node)?;
+    (node.node_type == "ShaderNodeBsdfPrincipled" && link.from_socket == "BSDF")
+        .then(|| link.from_node.clone())
+}
+
+/// Removes and returns the link into `node`'s input `socket`, if one exists.
+fn take_input_link(graph: &mut NodeGroup, node: &Id, socket: &str) -> Option<GraphLink> {
+    let index = graph
+        .links
+        .iter()
+        .position(|link| link.to_node == *node && link.to_socket == socket)?;
+    Some(graph.links.remove(index))
+}
+
+fn connect_link(graph: &mut NodeGroup, link: &GraphLink, to: &str, to_socket: &str) -> Result<()> {
+    connect(
+        graph,
+        link.from_node.as_str(),
+        &link.from_socket,
+        to,
+        to_socket,
+    )
+}
+
+/// An input's authored default, or `default` when the input has none.
+fn input_value(group: &NodeGroup, node: &Id, socket: &str, default: Value) -> Value {
+    group
+        .nodes
+        .get(node)
+        .and_then(|node| node.inputs.get(socket))
+        .cloned()
+        .unwrap_or(default)
+}
+
+fn input_scalar(group: &NodeGroup, node: &Id, socket: &str, default: f64) -> f64 {
+    input_value(group, node, socket, json!(default))
+        .as_f64()
+        .unwrap_or(default)
+}
+
+/// Writes a Math MULTIPLY into `to`: `source` (a link, else `value`) times the `texel` output.
+fn multiply_input(
+    graph: &mut NodeGroup,
+    source: Option<GraphLink>,
+    value: f64,
+    texel: (&str, &str),
+    name: &str,
+    to: (&str, &str),
+) -> Result<()> {
+    let math = format!("{name}_factor");
+    let mut node = GraphNode::new("ShaderNodeMath");
+    node.properties
+        .insert("operation".to_owned(), json!("MULTIPLY"));
+    insert(graph, &math, node)?;
+    match source {
+        Some(link) => connect_link(graph, &link, &math, "Value")?,
+        None => set_input(graph, &math, "Value", json!(value))?,
+    }
+    connect(graph, texel.0, texel.1, &math, "Value_001")?;
+    connect(graph, &math, "Value", to.0, to.1)
+}
+
+/// Links the Red channel of `slot`'s texture into the Principled BSDF `to_socket`, multiplied by `factor`: a native
+/// scalar field is its factor times the texture's Red channel, as Potter's evaluator reads it.
+fn channel_texture(
+    graph: &mut NodeGroup,
+    name: &str,
+    slot: &SlotTexture,
+    channel: &str,
+    factor: f64,
+    to_socket: &str,
+) -> Result<()> {
+    let color = texture_node(graph, name, slot)?;
+    let split = format!("{name}_split");
+    insert(graph, &split, GraphNode::new("ShaderNodeSeparateColor"))?;
+    connect(graph, &color, "Color", &split, "Color")?;
+    multiply_channel(
+        graph,
+        &split,
+        channel,
+        name,
+        factor,
+        "principled",
+        to_socket,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +1250,8 @@ mod tests {
         let textures = GraphTextures {
             base_color: None,
             metallic_roughness: None,
+            roughness: None,
+            metallic: None,
             normal: Some(SlotTexture {
                 texture: TextureRef {
                     image: Id::new("normal_image")?,

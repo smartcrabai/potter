@@ -207,6 +207,8 @@ pub(crate) mod feature_id {
     pub(crate) const UV_LAYER_MISSING: &str = "uv.layer_missing";
     /// Loss: a VRM 0.x `MToon` texture samples a non-zero UV layer; VRM 0.x has no `texCoord`, so it exports from `TEXCOORD_0`.
     pub(crate) const VRM_V0_MTOON_UV_LAYER: &str = "vrm.v0.mtoon_uv_layer";
+    /// Loss: a material's texture fields cannot be written to .blend: its shader graph is authoritative, or a data map is also a color map.
+    pub(crate) const MATERIAL_TEXTURES: &str = "material.shader_graph.material_textures";
 }
 
 /// Whether any node of `doc` references the material in its slot array.

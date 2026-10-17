@@ -5289,6 +5289,8 @@ fn material_textures(
     Ok(material_graph::GraphTextures {
         base_color: slot(&pbr["baseColorTexture"])?,
         metallic_roughness: slot(&pbr["metallicRoughnessTexture"])?,
+        roughness: None,
+        metallic: None,
         normal: slot(&material["normalTexture"])?,
         normal_scale: material["normalTexture"]["scale"].as_f64().unwrap_or(1.0),
         emissive: slot(&material["emissiveTexture"])?,
