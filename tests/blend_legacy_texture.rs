@@ -248,6 +248,130 @@ with open(os.path.join(root, "native_noise.json"), "w", encoding="utf-8") as han
                     if item.get("potter.id") == "native_value_noise"), None)}, handle)
 "#;
 
+const DISPLACE_CASE_PRELUDE: &str = r#"
+import bpy
+import json
+import os
+import sys
+
+root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
+scene = bpy.context.scene
+for obj in list(bpy.data.objects):
+    bpy.data.objects.remove(obj, do_unlink=True)
+
+GRID_V = [0.25, 0.75]
+
+def load_image(path, name):
+    image = bpy.data.images.load(path, check_existing=False)
+    image.name = name
+    image.colorspace_settings.name = "Non-Color"
+    return image
+
+def grid_object(name, grid_u):
+    coords = [(u, v) for v in GRID_V for u in grid_u]
+    columns = len(grid_u)
+    faces = [(j * columns + i, j * columns + i + 1,
+              (j + 1) * columns + i + 1, (j + 1) * columns + i)
+             for j in range(len(GRID_V) - 1) for i in range(columns - 1)]
+    mesh = bpy.data.meshes.new(name + " Mesh")
+    mesh.from_pydata([(u - 0.5, v - 0.5, 0.0) for u, v in coords], [], faces)
+    mesh.update()
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for index, loop in enumerate(mesh.loops):
+        uv_layer.data[index].uv = coords[loop.vertex_index]
+    obj = bpy.data.objects.new(name, mesh)
+    scene.collection.objects.link(obj)
+    return obj
+
+def add_displace(obj, texture):
+    modifier = obj.modifiers.new("Displace", "DISPLACE")
+    modifier.texture = texture
+    modifier.texture_coords = "UV"
+    modifier.uv_layer = "UVMap"
+    modifier.direction = "X"
+    modifier.space = "LOCAL"
+    modifier.strength = 1.0
+    modifier.mid_level = 0.0
+
+def evaluated_positions(obj):
+    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    mesh = evaluated.to_mesh()
+    try:
+        return [[float(component) for component in vertex.co] for vertex in mesh.vertices]
+    finally:
+        evaluated.to_mesh_clear()
+
+def write_case(subjects):
+    expected = {obj.name: evaluated_positions(obj) for obj in subjects}
+    with open(os.path.join(root, "expected.json"), "w", encoding="utf-8") as handle:
+        json.dump(expected, handle, sort_keys=True)
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "displace-case.blend"),
+                                relative_remap=False)
+"#;
+
+const MULTILAYER_CASE_SCRIPT: &str = r#"
+exr = load_image(os.path.join(root, "multilayer.exr"), "Multilayer Image")
+cases = [
+    ("Multilayer Default", 0, 0, 0),
+    ("Multilayer Layer 1 Pass 1 View 0", 1, 1, 0),
+    ("Multilayer Layer 0 Pass 1 View 1", 0, 1, 1),
+    ("Multilayer Layer 1 Pass 0 View 1", 1, 0, 1),
+]
+subjects = []
+for name, layer, pass_index, view in cases:
+    texture = bpy.data.textures.new(name + " Legacy", type="IMAGE")
+    texture.image = exr
+    texture.use_interpolation = False
+    texture.image_user.multilayer_layer = layer
+    texture.image_user.multilayer_pass = pass_index
+    texture.image_user.multilayer_view = view
+    obj = grid_object(name, [0.2, 0.5, 0.8])
+    add_displace(obj, texture)
+    subjects.append(obj)
+write_case(subjects)
+"#;
+
+const UDIM_CASE_SCRIPT: &str = r#"
+udim = load_image(os.path.join(root, "udim.1001.png"), "UDIM Image")
+udim.source = "TILED"
+udim.filepath = os.path.join(root, "udim.<UDIM>.png")
+udim.reload()
+tile_numbers = sorted(tile.number for tile in udim.tiles)
+if tile_numbers != [1001, 1002]:
+    raise RuntimeError("UDIM tiles are %r" % (tile_numbers,))
+if VARIANT == "packed":
+    udim.pack()
+plain = bpy.data.textures.new("UDIM Plain Legacy", type="IMAGE")
+plain.image = udim
+plain.use_interpolation = False
+repeat_crop = bpy.data.textures.new("UDIM Repeat Crop Legacy", type="IMAGE")
+repeat_crop.image = udim
+repeat_crop.use_interpolation = False
+repeat_crop.repeat_x = 2
+repeat_crop.crop_min_x = 0.0
+repeat_crop.crop_max_x = 1.5
+subjects = []
+for name, texture in [("UDIM Plain", plain), ("UDIM Repeat Crop", repeat_crop)]:
+    obj = grid_object(name, [0.2, 0.6, 1.25, 1.6])
+    add_displace(obj, texture)
+    subjects.append(obj)
+write_case(subjects)
+if VARIANT == "packed":
+    # Packed tiles must be the only source Potter can read, so the external PNGs are removed.
+    for number in (1001, 1002):
+        os.remove(os.path.join(root, "udim.%d.png" % number))
+"#;
+
+const PNG_CASE_SCRIPT: &str = r#"
+image = load_image(os.path.join(root, "orientation.png"), "Orientation Image")
+texture = bpy.data.textures.new("Orientation Legacy", type="IMAGE")
+texture.image = image
+texture.use_interpolation = False
+obj = grid_object("PNG Orientation", [0.2, 0.5, 0.8])
+add_displace(obj, texture)
+write_case([obj])
+"#;
+
 fn run_ok(command: Command, operation: &str) -> Result<Output, Box<dyn Error>> {
     let output = process::run_guarded(command)?;
     assert!(
@@ -392,6 +516,273 @@ fn assert_scene_textures(document: &Value, expected: &Value) {
             .iter()
             .any(|block| { block["type"] == "textures" })
     );
+}
+
+const MULTILAYER_LAYER_NAMES: [&str; 2] = ["LayerA", "LayerB"];
+const MULTILAYER_PASS_NAMES: [&str; 2] = ["Combined", "Diffuse"];
+const MULTILAYER_VIEW_NAMES: [&str; 2] = ["left", "right"];
+
+/// Alpha-1 top and bottom rows for multilayer index `index = layer * 4 + pass * 2 + view`.
+fn multilayer_pixels(index: usize) -> ([f32; 4], [f32; 4]) {
+    let base = (index as f32 + 1.0) / 10.0;
+    (
+        [base, 0.9 - base, 0.2 + 0.5 * base, 1.0],
+        [0.9 - base, base + 0.05, 0.6 - 0.4 * base, 1.0],
+    )
+}
+
+/// Writes a 1x2 multilayer EXR with 2 layers x 2 passes x 2 views, all alpha 1.
+/// Row 0 is the top row (`position.1 == 0`), matching the builder in `geom/legacy_texture.rs`.
+fn write_multilayer_exr(path: &Path) -> Result<(), Box<dyn Error>> {
+    use exr::prelude::{
+        Encoding, Image as ExrImage, ImageAttributes, IntegerBounds, Layer, LayerAttributes,
+        SpecificChannels, Vec2, WritableImage,
+    };
+    let size = Vec2(1_usize, 2_usize);
+    let layer = |index: usize| {
+        let layer_name = MULTILAYER_LAYER_NAMES[index / 4];
+        let pass_name = MULTILAYER_PASS_NAMES[(index / 2) % 2];
+        let view_name = MULTILAYER_VIEW_NAMES[index % 2];
+        let (top, bottom) = multilayer_pixels(index);
+        let mut attributes =
+            LayerAttributes::named(format!("{layer_name}.{pass_name}-{view_name}").as_str());
+        attributes.view_name = Some(view_name.into());
+        Layer::new(
+            size,
+            attributes,
+            Encoding::FAST_LOSSLESS,
+            SpecificChannels::rgba(move |position: Vec2<usize>| {
+                let rgba = if position.1 == 0 { top } else { bottom };
+                (rgba[0], rgba[1], rgba[2], rgba[3])
+            }),
+        )
+    };
+    ExrImage::empty(ImageAttributes::new(IntegerBounds::from_dimensions(size)))
+        .with_layer(layer(0))
+        .with_layer(layer(1))
+        .with_layer(layer(2))
+        .with_layer(layer(3))
+        .with_layer(layer(4))
+        .with_layer(layer(5))
+        .with_layer(layer(6))
+        .with_layer(layer(7))
+        .write()
+        .to_file(path)?;
+    Ok(())
+}
+
+/// Writes an 8-bit RGBA PNG with one pixel per row; `rows[0]` is the file's top row.
+fn write_png(path: &Path, width: u32, rows: &[[u8; 4]]) -> Result<(), Box<dyn Error>> {
+    let pixels: Vec<u8> = rows.iter().flatten().copied().collect();
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, rows.len() as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&pixels)?;
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn node_id_named<'a>(
+    doc: &'a potter_core::model::SceneDoc,
+    name: &str,
+) -> Result<&'a potter_core::model::Id, Box<dyn Error>> {
+    doc.nodes
+        .iter()
+        .find(|(_, node)| node.name == name)
+        .map(|(id, _)| id)
+        .ok_or_else(|| format!("imported Blender object {name} is missing").into())
+}
+
+/// Runs one Blender displacement fixture, imports its `.blend` into a fresh project, and checks
+/// Potter's evaluated vertices against Blender's own evaluated vertices. Returns Blender's JSON.
+fn run_displace_case(
+    blender: &Path,
+    root: &Path,
+    case_name: &str,
+    case_script: &str,
+) -> Result<(Value, std::path::PathBuf), Box<dyn Error>> {
+    let script = [DISPLACE_CASE_PRELUDE, case_script].concat();
+    run_blender_script(
+        blender,
+        &root.join(format!("{case_name}.py")),
+        &script,
+        None,
+        &[root],
+    )?;
+    let expected: Value = serde_json::from_slice(&fs::read(root.join("expected.json"))?)?;
+    let project = root.join(format!("{case_name}-project"));
+    let mut init = Command::new(env!("CARGO_BIN_EXE_pot"));
+    init.args(["init"]).arg(&project).arg("--json");
+    run_ok(init, "displacement scene initialization")?;
+    import_blend(&project, &root.join("displace-case.blend"), blender)?;
+    Ok((expected, project))
+}
+
+fn assert_potter_matches_blender_positions(
+    project: &Path,
+    expected: &Value,
+) -> Result<(), Box<dyn Error>> {
+    let opened = potter_core::store::Project::open(project)?;
+    let doc = opened.doc();
+    let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
+        doc,
+        &potter_core::eval::EvaluationContext::default(),
+        Some(opened.path()),
+        Some(opened.cache_directory()),
+    )?;
+    for (name, expected_positions) in expected
+        .as_object()
+        .ok_or("Blender positions are not an object")?
+    {
+        let id = node_id_named(doc, name)?;
+        let mesh = snapshot
+            .meshes
+            .get(id)
+            .ok_or_else(|| format!("Potter evaluated mesh {name} is missing"))?;
+        let actual: Vec<[f64; 3]> = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co.to_array())
+            .collect();
+        let expected_positions = expected_positions
+            .as_array()
+            .ok_or("Blender vertex list is not an array")?;
+        assert_eq!(actual.len(), expected_positions.len(), "{name}: vertex count");
+        for (index, (actual, expected)) in actual.iter().zip(expected_positions).enumerate() {
+            for axis in 0..3 {
+                let expected_value = expected[axis]
+                    .as_f64()
+                    .ok_or("Blender coordinate is not a number")?;
+                assert!(
+                    (actual[axis] - expected_value).abs() <= 1.0e-5,
+                    "{name} vertex {index} axis {axis}: Potter {} vs Blender {expected_value}",
+                    actual[axis]
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn max_position_difference(left: &Value, right: &Value) -> f64 {
+    left.as_array()
+        .unwrap()
+        .iter()
+        .zip(right.as_array().unwrap())
+        .flat_map(|(a, b)| (0..3).map(move |axis| (a[axis].as_f64().unwrap() - b[axis].as_f64().unwrap()).abs()))
+        .fold(0.0, f64::max)
+}
+
+fn assert_subjects_differ(expected: &Value) {
+    let subjects: Vec<(&String, &Value)> = expected.as_object().unwrap().iter().collect();
+    for (index, (left_name, left)) in subjects.iter().enumerate() {
+        for (right_name, right) in &subjects[index + 1..] {
+            assert!(
+                max_position_difference(left, right) > 1.0e-5,
+                "{left_name} and {right_name} evaluate identically in Blender"
+            );
+        }
+    }
+}
+
+/// The imported UDIM image must carry tile 1002 as an `ImageTile` whose blob is content-addressed.
+fn assert_imported_udim_tile(project: &Path) -> Result<(), Box<dyn Error>> {
+    let opened = potter_core::store::Project::open(project)?;
+    let image = opened
+        .doc()
+        .images
+        .values()
+        .find(|image| image.name == "UDIM Image")
+        .ok_or("imported UDIM image is missing")?;
+    let tile = image
+        .tiles
+        .iter()
+        .find(|tile| tile.number == 1002)
+        .ok_or("imported UDIM image has no tile 1002")?;
+    assert_eq!((tile.width, tile.height), (1, 2), "tile 1002 dimensions");
+    assert!(
+        tile.blob.starts_with("sha256:"),
+        "tile 1002 blob is not content-addressed"
+    );
+    Ok(())
+}
+
+#[test]
+fn blender_legacy_image_user_multilayer_selection_matches_potter_displacement()
+-> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping Blender legacy ImageUser multilayer displacement: Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    write_multilayer_exr(&root.join("multilayer.exr"))?;
+    let (expected, project) = run_displace_case(&blender, root, "multilayer", MULTILAYER_CASE_SCRIPT)?;
+    assert_potter_matches_blender_positions(&project, &expected)?;
+    assert_subjects_differ(&expected);
+    Ok(())
+}
+
+#[test]
+fn blender_legacy_udim_tiles_repeat_crop_match_potter_displacement() -> Result<(), Box<dyn Error>>
+{
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping Blender legacy UDIM displacement: Blender is unavailable");
+        return Ok(());
+    };
+    for variant in ["external", "packed"] {
+        let directory = tempdir()?;
+        let root = directory.path();
+        write_png(
+            &root.join("udim.1001.png"),
+            1,
+            &[[40, 200, 120, 255], [220, 60, 30, 255]],
+        )?;
+        write_png(
+            &root.join("udim.1002.png"),
+            1,
+            &[[250, 250, 10, 255], [10, 30, 240, 255]],
+        )?;
+        let script = format!("VARIANT = {variant:?}\n{UDIM_CASE_SCRIPT}");
+        let (expected, project) = run_displace_case(&blender, root, "udim", &script)?;
+        assert_imported_udim_tile(&project)?;
+        assert_potter_matches_blender_positions(&project, &expected)?;
+        assert_subjects_differ(&expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn blender_legacy_png_row_orientation_matches_potter_displacement() -> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping Blender legacy PNG orientation displacement: Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    write_png(
+        &root.join("orientation.png"),
+        1,
+        &[[200, 100, 50, 255], [30, 220, 90, 255]],
+    )?;
+    let (expected, project) = run_displace_case(&blender, root, "png", PNG_CASE_SCRIPT)?;
+    assert_potter_matches_blender_positions(&project, &expected)?;
+    // Grid rows are v=0.25 (vertices 0..3) and v=0.75 (vertices 3..6); each column's
+    // rest x is identical across rows, so a differing x means the two PNG rows sample differently.
+    let positions = expected["PNG Orientation"].as_array().unwrap();
+    for column in 0..3 {
+        let lower = positions[column][0].as_f64().unwrap();
+        let upper = positions[column + 3][0].as_f64().unwrap();
+        assert!(
+            (lower - upper).abs() > 1.0e-5,
+            "PNG rows sample identically in Blender at column {column}"
+        );
+    }
+    Ok(())
 }
 
 #[test]

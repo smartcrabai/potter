@@ -285,7 +285,7 @@ unsafe extern "C" {
 /// Blender `invert_m4_m4` (`math_matrix_c.cc:1150`) through `EIG_invert_m4_m4`
 /// (`intern/eigen/intern/matrix.cc:29`): the native Eigen `Matrix4f` inverse of
 /// `native/blender_inverse_m4.cc`, built for the target so its packets match Blender's build on that
-/// target. `None` when the determinant is zero or not normal.
+/// target. `None` when Eigen's threshold-zero invertibility test fails.
 pub(crate) fn blender_invert_m4(matrix: &[[f32; 4]; 4]) -> Option<[[f32; 4]; 4]> {
     let mut inverse = [[0.0; 4]; 4];
     // SAFETY: both pointers address 16 contiguous `f32`s in column-major order, the layout of
