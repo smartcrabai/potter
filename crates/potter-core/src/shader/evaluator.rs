@@ -70,7 +70,7 @@ pub struct BsdfParams {
 }
 
 impl BsdfParams {
-    fn from_material(material: &Material, normal: DVec3) -> Self {
+    pub(crate) fn from_material(material: &Material, normal: DVec3) -> Self {
         Self {
             base_color: material.base_color,
             metallic: material.metallic,
