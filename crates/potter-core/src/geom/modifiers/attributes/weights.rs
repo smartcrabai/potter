@@ -779,7 +779,7 @@ fn apply_falloff(
         "SMOOTH" => value * value * (3.0 - 2.0 * value),
         "ROOT" => value.sqrt(),
         "ICON_SPHERECURVE" => (2.0 * value - value * value).sqrt(),
-        "RANDOM" => value * f64::from(random.get_float()),
+        "RANDOM" => f64::from(random.get_float() * value as f32),
         "STEP" => f64::from(value >= 0.5),
         _ => value,
     }
