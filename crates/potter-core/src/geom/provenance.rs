@@ -1140,7 +1140,7 @@ impl Sources<'_> {
         }
     }
     /// One UV layer rebuilt for the output faces. Each output corner blends the UVs of its source
-    /// corners by weight. A source corner whose face has no entry reads as `[0, 0]` and keeps its
+    /// corners by weight. A source corner whose face has no entry reads as `[0, 1]` and keeps its
     /// weight (no renormalisation). An output face gets an entry when any of its corners has a source
     /// with an entry, so a modifier that leaves face sources empty (screw) keeps its UVs. A corner's
     /// pin is the pin of its heaviest source corner (see [`heaviest_source`]); `pinned` is omitted
@@ -1156,7 +1156,7 @@ impl Sources<'_> {
             .iter()
             .map(|face| face.vertices.len())
             .sum();
-        let mut flat = vec![[0.0, 0.0]; source_corners];
+        let mut flat = vec![[0.0, 1.0]; source_corners];
         // Pin per source corner; `None` where the source face has no `pinned` array.
         let mut flat_pinned: Vec<Option<bool>> = vec![None; source_corners];
         // Source corners whose face has an entry for this layer.
@@ -1374,7 +1374,8 @@ fn blend_indexed(values: &[Value], sources: &[(usize, f64)], data_type: &str) ->
 }
 
 /// The weighted sum of the UVs at `sources`. Indices past the end of `uvs` are skipped, so a corner
-/// with no usable source is `[0, 0]`, Blender's loop default.
+/// with no usable source is `[0, 1]`: Blender's zero loop default `(0, 0)` in its V-up space, which
+/// is `(0, 1)` in this store's V-down convention (see `blender_uv_loops` in `exchange/blend.rs`).
 fn blend_uv(uvs: &[[f64; 2]], sources: &[(usize, f64)]) -> [f64; 2] {
     let mut uv = [0.0; 2];
     let mut found = false;
@@ -1385,7 +1386,7 @@ fn blend_uv(uvs: &[[f64; 2]], sources: &[(usize, f64)]) -> [f64; 2] {
             uv[1] += weight * v;
         }
     }
-    if found { uv } else { [0.0, 0.0] }
+    if found { uv } else { [0.0, 1.0] }
 }
 
 /// Blend canonical RGBA colors; an output without source values takes the opaque-black default.
@@ -1930,10 +1931,10 @@ mod tests {
     }
 
     /// Screw can create a face with no source face while carrying corner provenance from a partial
-    /// UV layer; missing and source-less corners take `[0, 0]`, Blender's loop default, without
-    /// changing populated sums.
+    /// UV layer; missing and source-less corners take `[0, 1]`, Blender's zero loop default
+    /// `(0, 0)` flipped into this store's V-down convention, without changing populated sums.
     #[test]
-    fn screw_partial_uv_provenance_defaults_missing_corners_to_zero_uv() {
+    fn screw_partial_uv_provenance_defaults_missing_corners_to_canonical_uv() {
         let mut source = Mesh::from_positions_and_faces(
             vec![
                 DVec3::ZERO,
@@ -1985,7 +1986,7 @@ mod tests {
 
         assert_eq!(
             uv_layers::read_layers(&output)[0].faces[0],
-            Some(vec![[2.0, 4.0], [0.0, 0.0], [2.0, 3.0], [0.0, 0.0]])
+            Some(vec![[2.0, 4.0], [0.0, 1.0], [2.0, 3.5], [0.0, 1.0]])
         );
     }
 
