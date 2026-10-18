@@ -17,6 +17,7 @@ mod dissolve;
 mod exact;
 mod float;
 mod float_connect;
+mod float_split_net;
 mod imesh;
 mod input;
 mod intersect;

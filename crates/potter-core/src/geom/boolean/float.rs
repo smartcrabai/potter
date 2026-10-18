@@ -3124,52 +3124,53 @@ fn split_input_edges(state: &mut State) {
     }
 }
 
-fn ring_edges(verts: &[usize]) -> Vec<EdgeKey> {
-    (0..verts.len())
-        .map(|i| edge_key_usize(verts[i], verts[(i + 1) % verts.len()]))
-        .collect()
-}
-
 fn split_faces(state: &mut State) {
     let old_faces = std::mem::take(&mut state.faces);
     let old_cuts = std::mem::take(&mut state.face_cuts);
     let positions: Vec<P3> = state.verts.iter().map(|vertex| vertex.co).collect();
-    let mut new_faces = Vec::new();
-    // Blender keeps an edge with no loop as wire: the net edges that no output ring loops.
-    let mut net_edges: HashSet<EdgeKey> = HashSet::new();
-    let mut looped_edges: HashSet<EdgeKey> = HashSet::new();
-    for (index, face) in old_faces.into_iter().enumerate() {
+    let mut new_faces: Vec<Face> = Vec::new();
+    let mut dangling: HashSet<EdgeKey> = HashSet::new();
+    for (index, face) in old_faces.iter().enumerate() {
         let Some(cuts) = old_cuts.get(&index) else {
-            looped_edges.extend(ring_edges(&face.verts));
-            new_faces.push(face);
+            new_faces.push(face.clone());
             continue;
         };
-        // Blender's edge net: the cut edges in stored order (most recent first), then the loop.
-        let net: Vec<EdgeKey> = cuts.iter().rev().copied().collect();
-        let ring: Vec<(usize, usize)> = (0..face.verts.len())
+        // Blender's edge net: the cut edges in stored order (most recent first), then the connect
+        // edges that `BM_face_split_edgenet_connect_islands` appends.
+        let net: Vec<(usize, usize)> = cuts.iter().rev().copied().collect();
+        let loop_edges: Vec<(usize, usize)> = (0..face.verts.len())
             .map(|i| (face.verts[i], face.verts[(i + 1) % face.verts.len()]))
             .collect();
         let points: Vec<P3> = face.verts.iter().map(|&v| state.verts[v].co).collect();
+        let normal = normal_poly(&points);
         let connects = super::float_connect::connect_islands(
             face.verts[0],
-            normal_poly(&points),
-            &ring,
+            normal,
+            &loop_edges,
             &net,
             &positions,
         );
-        let mut edges: HashSet<EdgeKey> = net.iter().copied().collect();
-        for &(a, b) in &connects {
-            edges.insert(edge_key_usize(a, b));
-        }
-        net_edges.extend(edges.iter().copied());
-        edges.extend(ring_edges(&face.verts));
-        let cycles = planar_cycles(&face.verts, &edges, &state.verts);
-        if cycles.is_empty() {
-            looped_edges.extend(ring_edges(&face.verts));
-            new_faces.push(face);
+        let mut edge_net = net;
+        edge_net.extend(connects);
+        // The mesh's other faces: the originals not yet split, then the faces already emitted.
+        let mut mesh_faces: Vec<Vec<usize>> = old_faces[index + 1..]
+            .iter()
+            .map(|other| other.verts.clone())
+            .collect();
+        mesh_faces.extend(new_faces.iter().map(|other| other.verts.clone()));
+        let split = super::float_split_net::face_split_edgenet_with_mesh(
+            &face.verts,
+            &edge_net,
+            &positions,
+            normal,
+            &mesh_faces,
+        );
+        if split.faces.is_empty() {
+            dangling.extend(edge_net.iter().map(|&(a, b)| edge_key_usize(a, b)));
+            new_faces.push(face.clone());
         } else {
-            for ring in cycles {
-                looped_edges.extend(ring_edges(&ring));
+            dangling.extend(split.dangling.iter().map(|&(a, b)| edge_key_usize(a, b)));
+            for ring in split.faces {
                 new_faces.push(Face {
                     verts: ring,
                     side: face.side,
@@ -3179,91 +3180,7 @@ fn split_faces(state: &mut State) {
         }
     }
     state.faces = new_faces;
-    state.dangling_edges = net_edges.difference(&looped_edges).copied().collect();
-}
-
-#[expect(
-    clippy::float_cmp,
-    reason = "exact f32 orientation test mirrors the Blender port's bit-exact sign check"
-)]
-fn planar_cycles(
-    boundary: &[usize],
-    edges: &HashSet<EdgeKey>,
-    verts: &[Vertex],
-) -> Vec<Vec<usize>> {
-    if edges.is_empty() {
-        return Vec::new();
-    }
-    let fake = Face {
-        verts: boundary.to_vec(),
-        side: 0,
-        source: 0,
-    };
-    let (u, v) = face_basis(&fake, verts);
-    let original_area = polygon_area2(boundary, verts, u, v);
-    let sign = original_area.signum();
-    let mut adjacent: HashMap<usize, Vec<usize>> = HashMap::new();
-    for &(a, b) in edges {
-        if a == b {
-            continue;
-        }
-        adjacent.entry(a).or_default().push(b);
-        adjacent.entry(b).or_default().push(a);
-    }
-    for (&center, neighbors) in &mut adjacent {
-        neighbors.sort_by(|&a, &b| {
-            let pa = project(sub(verts[a].co, verts[center].co), u, v);
-            let pb = project(sub(verts[b].co, verts[center].co), u, v);
-            pa[1].atan2(pa[0]).total_cmp(&pb[1].atan2(pb[0]))
-        });
-        neighbors.dedup();
-    }
-    let mut visited: HashSet<EdgeKey> = HashSet::new();
-    let mut cycles = Vec::new();
-    for &(a, b) in edges {
-        for (start_a, start_b) in [(a, b), (b, a)] {
-            if visited.contains(&(start_a, start_b)) {
-                continue;
-            }
-            let mut ring = Vec::new();
-            let (mut from, mut to) = (start_a, start_b);
-            for _ in 0..edges.len().saturating_mul(2).max(2) {
-                if !visited.insert((from, to)) {
-                    break;
-                }
-                ring.push(from);
-                let Some(neighbors) = adjacent.get(&to) else {
-                    break;
-                };
-                let Some(index) = neighbors.iter().position(|&v| v == from) else {
-                    break;
-                };
-                let next = neighbors[(index + neighbors.len() - 1) % neighbors.len()];
-                from = to;
-                to = next;
-                if from == start_a && to == start_b {
-                    break;
-                }
-            }
-            if ring.len() < 3 || ring.iter().copied().collect::<HashSet<_>>().len() != ring.len() {
-                continue;
-            }
-            let area = polygon_area2(&ring, verts, u, v);
-            if area == 0.0 || (sign != 0.0 && area.signum() != sign) {
-                continue;
-            }
-            let mut canonical = ring.clone();
-            rotate_to_smallest(&mut canonical);
-            if !cycles.iter().any(|other: &Vec<usize>| {
-                let mut x = other.clone();
-                rotate_to_smallest(&mut x);
-                x == canonical
-            }) {
-                cycles.push(ring);
-            }
-        }
-    }
-    cycles
+    state.dangling_edges = dangling;
 }
 
 fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &Bvh) {
@@ -3899,36 +3816,6 @@ fn normal_poly(points: &[P3]) -> P3 {
         normal[2] += (a[0] - b[0]) * (a[1] + b[1]);
     }
     normalize(normal)
-}
-
-fn face_basis(face: &Face, verts: &[Vertex]) -> (P3, P3) {
-    let points: Vec<P3> = face.verts.iter().map(|&v| verts[v].co).collect();
-    let normal = match points.as_slice() {
-        [a, b, c] => normal_tri(*a, *b, *c),
-        [a, b, c, d] => normalize(cross(sub(*a, *c), sub(*b, *d))),
-        _ => normal_poly(&points),
-    };
-    orthogonal_basis(normal)
-}
-
-fn project(point: P3, u: P3, v: P3) -> [f32; 2] {
-    [dot(point, u), dot(point, v)]
-}
-
-fn polygon_area2(ring: &[usize], verts: &[Vertex], u: P3, v: P3) -> f32 {
-    let mut area = 0.0;
-    for i in 0..ring.len() {
-        let a = project(verts[ring[i]].co, u, v);
-        let b = project(verts[ring[(i + 1) % ring.len()]].co, u, v);
-        area += a[0] * b[1] - a[1] * b[0];
-    }
-    area
-}
-
-fn rotate_to_smallest(ring: &mut [usize]) {
-    if let Some((index, _)) = ring.iter().enumerate().min_by_key(|(_, vertex)| **vertex) {
-        ring.rotate_left(index);
-    }
 }
 
 fn scaled_triangle(state: &State, tri: [usize; 3], eps2x: f32) -> [P3; 3] {

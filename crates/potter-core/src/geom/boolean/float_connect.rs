@@ -8,11 +8,13 @@
 //!
 //! Arithmetic is f32 in Blender's operand order, with the same 2D frame (`ortho_basis_v3v3_v3` of
 //! `f->no`), the same origin (`BM_FACE_FIRST_LOOP(f)->v`), and the same endpoint bias (`1e-4`).
-//! Departures from the C code, neither of which changes the recorded Blender results:
-//! - The BVH ray casts are linear scans over the same edge list with the same predicates. Blender's
-//!   BVH breaks exact distance ties by traversal order; this port breaks them by edge order.
-//! - Islands come from union-find rather than the disk-cycle DFS. Island and vertex order only break
-//!   exact projection ties, which here take the first vertex in edge order.
+//!
+//! Blender's data structures are reproduced where their order is observable:
+//! - Islands come from Blender's group loop, a depth-first walk over each vertex's disk cycle
+//!   (`BM_DISK_EDGE_NEXT`), scanning `edge_arr` backwards. The disk order is modelled by [`DiskNet`].
+//! - Ray and vertex-visibility casts go through a port of Blender's `BLI_kdopbvh` tree ([`Bvh`]): the
+//!   8-ary implicit tree of `BLI_bvhtree_balance`, and the `dfs_raycast` traversal order. When two edges
+//!   are at exactly the same distance, the one the traversal reaches first wins, as in Blender.
 //!
 //! Blender's arm64 FMA contraction is not reproduced; the FLOAT path rounds each operation separately.
 
@@ -21,11 +23,29 @@ use std::collections::HashMap;
 
 type P2 = [f32; 2];
 type P3 = [f32; 3];
+/// Slab bounds of one box: `[min_x, max_x, min_y, max_y, min_z, max_z]`, Blender `bv` for the first three axes.
+type Bounds = [f32; 6];
 
 /// Blender `BVH_RAYCAST_DIST_MAX`.
 const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
 /// Blender `edge_isect_verts_point_2d` endpoint bias.
 const ENDPOINT_BIAS: f32 = 1.0e-4;
+/// Blender `BLI_bvhtree_new` epsilon (`1e-4f`, above `FLT_EPSILON`), inflating every leaf box.
+const BVH_EPSILON: f32 = 1.0e-4;
+/// Blender `BLI_bvhtree_new` `tree_type`: children per node of the implicit tree.
+const BVH_TREE_TYPE: usize = 8;
+/// Blender `bvhtree_kdop_axes[0..3]`. `BLI_bvhtree_new(…, axis = 8)` also stores `x + y + z`, but the
+/// ray test and the split axis only read these three slabs, so that slab is not kept.
+const BVH_AXES: [P3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+/// Blender `node_minmax_init`.
+const EMPTY_BOUNDS: Bounds = [
+    f32::MAX,
+    -f32::MAX,
+    f32::MAX,
+    -f32::MAX,
+    f32::MAX,
+    -f32::MAX,
+];
 
 /// Returns the connection edges Blender creates for one face, in creation order, as `(origin, end)`.
 ///
@@ -62,8 +82,10 @@ pub(super) fn connect_islands(
     let n = vert_ids.len();
     let co: Vec<P3> = vert_ids.iter().map(|&v| positions[v]).collect();
 
-    let islands = edge_islands(n, &edges);
-    if islands.len() < 2 {
+    // The face loop exists before its cut net is built, so loop edges attach to their vertices first.
+    let disk = DiskNet::new(n, &edges, (net.len()..edges.len()).chain(0..net.len()));
+    let groups = disk.groups();
+    if groups.len() < 2 {
         return Vec::new();
     }
 
@@ -71,16 +93,16 @@ pub(super) fn connect_islands(
     let (n1, n2) = ortho_basis(normal);
     // Island spans use raw coordinates, as in Blender's group setup.
     let raw: Vec<P2> = co.iter().map(|&c| [dot3(n1, c), dot3(n2, c)]).collect();
-    let mut spans: Vec<Island> = islands
+    let mut spans: Vec<Island> = groups
         .into_iter()
-        .map(|vertices| Island::new(vertices, &raw))
+        .map(|group| Island::new(group, &raw))
         .collect();
     spans.sort_by(|a, b| {
         axis_pt_cmp(a.min_axis, b.min_axis).then_with(|| axis_pt_cmp(a.max_axis, b.max_axis))
     });
     let mut group = vec![0; n];
     for (rank, island) in spans.iter().enumerate() {
-        for &v in &island.vertices {
+        for &v in &island.members {
             group[v] = rank;
         }
     }
@@ -94,6 +116,12 @@ pub(super) fn connect_islands(
             [dot3(n1, d), dot3(n2, d)]
         })
         .collect();
+    let bvh = Bvh::new(
+        edges
+            .iter()
+            .map(|&(a, b)| leaf_bounds(rel[a], rel[b]))
+            .collect(),
+    );
 
     let mut state = Islands {
         edges,
@@ -101,6 +129,7 @@ pub(super) fn connect_islands(
         group,
         valid: vec![true; n],
         added: Vec::new(),
+        bvh,
     };
     let mut has_prev = vec![false; spans.len()];
     for g in 1..spans.len() {
@@ -130,9 +159,127 @@ fn intern(v: usize, vert_ids: &mut Vec<usize>, local: &mut HashMap<usize, usize>
     })
 }
 
+/// The edges of one face's net as Blender's `BMesh` holds them: one entry per `BMEdge`, and the disk
+/// cycle (`v->e`) of every vertex.
+///
+/// Disk order model. `bmesh_disk_edge_append` links a new edge at the tail of the cycle whose head is
+/// `v->e` (`bmesh_structure.cc`), and `bm_edge_create` appends to both endpoints (`bmesh_core.cc`). The
+/// head therefore stays the first edge attached to the vertex, and `BM_DISK_EDGE_NEXT` visits the edges
+/// in attachment order. The model attaches the face loop first (in loop order, since the face's boundary
+/// exists before its cut net is built) and then the cut net (in `edge_net_init` order). Connection edges
+/// are created after the groups are formed, so they never reach the walk. Two `edge_arr` positions with
+/// the same unordered vertex pair are one `BMEdge`, which keeps its first attachment and its stored
+/// orientation.
+///
+/// Evidence: the cycle order is read from `bmesh_structure.cc` and `bmesh_core.cc`. The model's
+/// attachment order is not recorded in the Blender records. The walk only changes the result through span
+/// ties between distinct vertices of one island that share a projection. In the 24 fixture records no
+/// island has such a tie (checked on the face-frame projection), so those records do not exercise it.
+struct DiskNet {
+    /// Unique edge of each `edge_arr` position.
+    of_position: Vec<usize>,
+    /// Stored `(v1, v2)` of each unique edge, taken from its first position.
+    edges: Vec<(usize, usize)>,
+    /// Unique edges of each vertex, in disk cycle order from `v->e`.
+    disk: Vec<Vec<usize>>,
+}
+
+/// One island of the group loop: its vertices in pop order and its edges in `edge_links` order.
+struct Group {
+    /// Blender `unique_verts_in_group`, in the order the walk popped them.
+    members: Vec<usize>,
+    /// Blender `edge_links`: the list head first, which is the most recently discovered edge.
+    edge_links: Vec<(usize, usize)>,
+}
+
+impl DiskNet {
+    /// `creation` lists every `edge_arr` position once, in the order its `BMEdge` was attached.
+    fn new(
+        vertex_count: usize,
+        edges: &[(usize, usize)],
+        creation: impl Iterator<Item = usize>,
+    ) -> Self {
+        let mut of_position = vec![usize::MAX; edges.len()];
+        let mut unique: Vec<(usize, usize)> = Vec::new();
+        let mut disk: Vec<Vec<usize>> = vec![Vec::new(); vertex_count];
+        let mut by_pair: HashMap<(usize, usize), usize> = HashMap::new();
+        for position in creation {
+            let (a, b) = edges[position];
+            let key = (a.min(b), a.max(b));
+            let id = if let Some(&id) = by_pair.get(&key) {
+                id
+            } else {
+                let id = unique.len();
+                unique.push((a, b));
+                disk[a].push(id);
+                disk[b].push(id);
+                by_pair.insert(key, id);
+                id
+            };
+            of_position[position] = id;
+        }
+        Self {
+            of_position,
+            edges: unique,
+            disk,
+        }
+    }
+
+    /// Blender's group loop in `BM_face_split_edgenet_connect_islands`. Each island is a depth-first walk
+    /// over the disk cycles from the first unused position, scanning `edge_arr` backwards so the outer
+    /// boundary is handled first.
+    fn groups(&self) -> Vec<Group> {
+        // `EDGE_NOT_IN_STACK` and `VERT_NOT_IN_STACK`: true until the walk reaches the element.
+        let mut edge_free = vec![true; self.edges.len()];
+        let mut vert_free = vec![true; self.disk.len()];
+        let mut groups = Vec::new();
+        let mut used = 0;
+        let mut position = self.of_position.len() - 1;
+        loop {
+            let start = self.edges[self.of_position[position]].0;
+            vert_free[start] = false;
+            let mut stack = vec![start];
+            let mut members = Vec::new();
+            let mut found = Vec::new();
+            while let Some(v) = stack.pop() {
+                members.push(v);
+                for &e in &self.disk[v] {
+                    if !edge_free[e] {
+                        continue;
+                    }
+                    edge_free[e] = false;
+                    found.push(e);
+                    let (a, b) = self.edges[e];
+                    let other = if a == v { b } else { a };
+                    if vert_free[other] {
+                        vert_free[other] = false;
+                        stack.push(other);
+                    }
+                }
+            }
+            used += found.len();
+            // Blender prepends each edge to `edge_links`, so the list reads newest first.
+            let edge_links: Vec<(usize, usize)> =
+                found.iter().rev().map(|&e| self.edges[e]).collect();
+            groups.push(Group {
+                members,
+                edge_links,
+            });
+            if used == self.edges.len() {
+                return groups;
+            }
+            // Skip positions whose edge already belongs to a group.
+            while !edge_free[self.of_position[position]] {
+                position -= 1;
+            }
+        }
+    }
+}
+
 /// Blender `EdgeGroupIsland` before sorting: the member vertices and their projection span.
 struct Island {
-    vertices: Vec<usize>,
+    /// Member vertices, in the walk's pop order.
+    members: Vec<usize>,
     /// Lowest vertex by raw projection (`vert_span.min`).
     min: usize,
     /// Highest vertex by raw projection (`vert_span.max`).
@@ -142,56 +289,38 @@ struct Island {
 }
 
 impl Island {
-    fn new(vertices: Vec<usize>, raw: &[P2]) -> Self {
-        let mut min = vertices[0];
-        let mut max = vertices[0];
-        for &v in &vertices[1..] {
-            if axis_pt_cmp(raw[v], raw[min]) == Ordering::Less {
-                min = v;
-            }
-            if axis_pt_cmp(raw[v], raw[max]) == Ordering::Greater {
-                max = v;
+    /// Blender's span setup in `BM_face_split_edgenet_connect_islands`. The scan follows `edge_links`
+    /// order, and the first vertex to reach each extreme keeps it on ties.
+    fn new(group: Group, raw: &[P2]) -> Self {
+        let Group {
+            members,
+            edge_links,
+        } = group;
+        let (head_min, head_max) = edge_links[0];
+        let mut min = head_min;
+        let mut max = head_max;
+        let mut min_axis = [f32::MAX, f32::MAX];
+        let mut max_axis = [-f32::MAX, -f32::MAX];
+        for &(a, b) in &edge_links {
+            for v in [a, b] {
+                if axis_pt_cmp(raw[v], min_axis) == Ordering::Less {
+                    min = v;
+                    min_axis = raw[v];
+                }
+                if axis_pt_cmp(raw[v], max_axis) == Ordering::Greater {
+                    max = v;
+                    max_axis = raw[v];
+                }
             }
         }
         Self {
+            members,
             min,
             max,
-            min_axis: raw[min],
-            max_axis: raw[max],
-            vertices,
+            min_axis,
+            max_axis,
         }
     }
-}
-
-/// Connected components of the edge graph, in order of first vertex.
-fn edge_islands(vertex_count: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
-    let mut parent: Vec<usize> = (0..vertex_count).collect();
-    for &(a, b) in edges {
-        let ra = find(&mut parent, a);
-        let rb = find(&mut parent, b);
-        if ra != rb {
-            parent[ra] = rb;
-        }
-    }
-    let mut slot = vec![usize::MAX; vertex_count];
-    let mut islands: Vec<Vec<usize>> = Vec::new();
-    for v in 0..vertex_count {
-        let root = find(&mut parent, v);
-        if slot[root] == usize::MAX {
-            slot[root] = islands.len();
-            islands.push(Vec::new());
-        }
-        islands[slot[root]].push(v);
-    }
-    islands
-}
-
-fn find(parent: &mut [usize], mut x: usize) -> usize {
-    while parent[x] != x {
-        parent[x] = parent[parent[x]];
-        x = parent[x];
-    }
-    x
 }
 
 /// Blender `Islands` state of one `BM_face_split_edgenet_connect_islands` call.
@@ -206,6 +335,8 @@ struct Islands {
     valid: Vec<bool>,
     /// Blender `edge_arr_new`: connections created so far, duplicates included.
     added: Vec<(usize, usize)>,
+    /// Blender `edge_arr` BVH: leaf `i` is `edges[i]`.
+    bvh: Bvh,
 }
 
 impl Islands {
@@ -255,24 +386,32 @@ impl Islands {
     fn ray_hit(&self, origin: usize, sign: bool, island: usize) -> Option<(usize, usize)> {
         let o = self.rel[origin];
         let dir: P2 = [if sign { 1.0 } else { -1.0 }, 0.0];
-        let mut best = RAYCAST_DIST_MAX;
-        let mut hit = None;
-        for &e in &self.edges {
-            let Some(dist) = isect_ray_seg(o, dir, self.rel[e.0], self.rel[e.1]) else {
-                continue;
-            };
-            if dist < best
-                && dist > 0.0
-                && e.0 != origin
-                && e.1 != origin
-                && self.group[e.0] != island
-            {
-                best = dist;
-                hit = Some(e);
-            }
-        }
+        let mut hit = RayHit {
+            index: None,
+            dist: RAYCAST_DIST_MAX,
+        };
+        self.bvh.ray_cast(
+            [o[0], o[1], 0.0],
+            [dir[0], dir[1], 0.0],
+            &mut hit,
+            &mut |id: usize, best: &mut RayHit| {
+                let e = self.edges[id];
+                if let Some(dist) = isect_ray_seg(o, dir, self.rel[e.0], self.rel[e.1])
+                    && dist < best.dist
+                    && dist > 0.0
+                    && e.0 != origin
+                    && e.1 != origin
+                    && self.group[e.0] != island
+                {
+                    best.dist = dist;
+                    best.index = Some(id);
+                }
+            },
+        );
         // Blender checks the new edges only when the BVH found a hit.
-        hit?;
+        let id = hit.index?;
+        let mut best = hit.dist;
+        let mut e_hit = self.edges[id];
         for &e in &self.added {
             if let Some(dist) = isect_ray_seg(o, dir, self.rel[e.0], self.rel[e.1])
                 && e.0 != origin
@@ -280,10 +419,10 @@ impl Islands {
                 && dist < best
             {
                 best = dist;
-                hit = Some(e);
+                e_hit = e;
             }
         }
-        hit
+        Some(e_hit)
     }
 
     /// Blender `test_edges_isect_2d_vert`: the edge that blocks the segment `origin -> other`.
@@ -292,32 +431,41 @@ impl Islands {
         let b = self.rel[other];
         let mut dir = sub2(b, a);
         let dist_orig = normalize2(&mut dir);
-        let mut best = dist_orig;
-        let mut hit = None;
-        for &e in &self.edges {
-            let Some(co) = self.vert_edge_isect(e, origin, other) else {
-                continue;
-            };
-            let dist_new = dist_orig * line_point_factor(co, a, b);
-            if dist_new < best && dist_new > 0.0 && self.group[e.0] != island {
-                best = dist_new;
-                hit = Some(e);
-            }
+        let mut hit = RayHit {
+            index: None,
+            dist: dist_orig,
+        };
+        self.bvh.ray_cast(
+            [a[0], a[1], 0.0],
+            [dir[0], dir[1], 0.0],
+            &mut hit,
+            &mut |id: usize, best: &mut RayHit| {
+                let e = self.edges[id];
+                if let Some(co) = self.vert_edge_isect(e, origin, other) {
+                    let dist_new = dist_orig * line_point_factor(co, a, b);
+                    if dist_new < best.dist && dist_new > 0.0 && self.group[e.0] != island {
+                        best.dist = dist_new;
+                        best.index = Some(id);
+                    }
+                }
+            },
+        );
+        if let Some(id) = hit.index {
+            return Some(self.edges[id]);
         }
-        if hit.is_some() {
-            return hit;
-        }
+        // Blender checks the new edges only when the BVH found no blocker.
         let mut t_best = 1.0;
+        let mut found = None;
         for &e in &self.added {
             if let Some(co) = self.vert_edge_isect(e, origin, other) {
                 let t = line_point_factor(co, a, b);
                 if t < t_best {
                     t_best = t;
-                    hit = Some(e);
+                    found = Some(e);
                 }
             }
         }
-        hit
+        found
     }
 
     /// Blender `edge_isect_verts_point_2d`.
@@ -332,6 +480,426 @@ impl Islands {
             self.rel[edge.1],
             ENDPOINT_BIAS,
         )
+    }
+}
+
+/// Blender `BVHRayCastData::hit`: `index` stays `None` (Blender `-1`) until a callback accepts an edge.
+struct RayHit {
+    index: Option<usize>,
+    dist: f32,
+}
+
+/// Blender `BVHNode`'s child link: a leaf (edge index) or a branch (branch index).
+#[derive(Clone, Copy)]
+enum Child {
+    Leaf(usize),
+    Branch(usize),
+}
+
+/// Blender `BVHNode` for a branch: its box, its split axis (a slab index), and its `node_num` children.
+#[derive(Clone, Default)]
+struct BvhBranch {
+    bounds: Bounds,
+    /// Blender `main_axis`: the slab (0, 1, 2) of the split axis.
+    main_axis: usize,
+    children: Vec<Child>,
+}
+
+/// Blender `BVHTree` over the edge list: `BLI_bvhtree_insert` for each edge in `edge_arr` order, then
+/// `BLI_bvhtree_balance`. Leaf `i` is edge `i`.
+struct Bvh {
+    leaves: Vec<Bounds>,
+    /// Branch `j` is stored at index `j`, Blender's implicit numbering. The root is branch 1.
+    branches: Vec<BvhBranch>,
+}
+
+/// Blender `BVHBuildHelper`: the layout of `leafs_num` leaves in an implicit `BVH_TREE_TYPE`-ary tree.
+struct Implicit {
+    leafs_num: usize,
+    leafs_per_child: [usize; 32],
+    branches_on_level: [usize; 32],
+    remain_leafs: usize,
+}
+
+impl Implicit {
+    /// Blender `build_implicit_tree_helper`.
+    fn new(leafs_num: usize) -> Self {
+        let mut leafs_per_child = [0usize; 32];
+        let mut branches_on_level = [0usize; 32];
+        leafs_per_child[0] = 1;
+        while leafs_per_child[0] < leafs_num {
+            leafs_per_child[0] *= BVH_TREE_TYPE;
+        }
+        branches_on_level[0] = 1;
+        let mut depth = 1;
+        while depth < 32 && leafs_per_child[depth - 1] != 0 {
+            branches_on_level[depth] = branches_on_level[depth - 1] * BVH_TREE_TYPE;
+            leafs_per_child[depth] = leafs_per_child[depth - 1] / BVH_TREE_TYPE;
+            depth += 1;
+        }
+        let remain = leafs_num - leafs_per_child[1];
+        let nnodes = (remain + BVH_TREE_TYPE - 2) / (BVH_TREE_TYPE - 1);
+        Self {
+            leafs_num,
+            leafs_per_child,
+            branches_on_level,
+            remain_leafs: remain + nnodes,
+        }
+    }
+
+    /// Blender `implicit_leafs_index`: the first leaf-array position under the branch `child_index` of
+    /// the level above `depth`.
+    fn leafs_index(&self, depth: usize, child_index: usize) -> usize {
+        let min_leaf_index = child_index * self.leafs_per_child[depth - 1];
+        if min_leaf_index <= self.remain_leafs {
+            return min_leaf_index;
+        }
+        if self.leafs_per_child[depth] != 0 {
+            return self.leafs_num
+                - (self.branches_on_level[depth - 1] - child_index) * self.leafs_per_child[depth];
+        }
+        self.remain_leafs
+    }
+}
+
+/// One level of the implicit tree while it is divided.
+#[derive(Clone, Copy)]
+struct Level {
+    /// Index of the first branch on this level.
+    start: usize,
+    /// Index of the first branch on the next level (Blender `first_of_next_level`).
+    next: usize,
+    /// Blender `depth`.
+    depth: usize,
+}
+
+/// Blender `i * tree_type + tree_offset + k`, with `tree_offset = 2 - tree_type`.
+fn child_index(parent: usize, k: usize) -> usize {
+    parent * BVH_TREE_TYPE + k + 2 - BVH_TREE_TYPE
+}
+
+/// Blender `create_kdop_hull` and `bvhtree_node_inflate` for one edge's two points (`z = 0`).
+fn leaf_bounds(a: P2, b: P2) -> Bounds {
+    let mut bounds = EMPTY_BOUNDS;
+    extend_bounds(&mut bounds, [a[0], a[1], 0.0]);
+    extend_bounds(&mut bounds, [b[0], b[1], 0.0]);
+    for axis in 0..3 {
+        bounds[2 * axis] -= BVH_EPSILON;
+        bounds[2 * axis + 1] += BVH_EPSILON;
+    }
+    bounds
+}
+
+/// Blender `create_kdop_hull` for one point.
+fn extend_bounds(bounds: &mut Bounds, p: P3) {
+    for (axis, &axis_dir) in BVH_AXES.iter().enumerate() {
+        let d = dot3(p, axis_dir);
+        bounds[2 * axis] = d.min(bounds[2 * axis]);
+        bounds[2 * axis + 1] = d.max(bounds[2 * axis + 1]);
+    }
+}
+
+/// Blender `refit_kdop_hull`: the union of the boxes of `ids`.
+fn refit(leaves: &[Bounds], ids: &[usize]) -> Bounds {
+    let mut bounds = EMPTY_BOUNDS;
+    for &id in ids {
+        for axis in 0..3 {
+            bounds[2 * axis] = leaves[id][2 * axis].min(bounds[2 * axis]);
+            bounds[2 * axis + 1] = leaves[id][2 * axis + 1].max(bounds[2 * axis + 1]);
+        }
+    }
+    bounds
+}
+
+/// Blender `get_largest_axis`: the largest-extent axis, as its max slab index (1, 3 or 5).
+fn largest_axis(bv: &Bounds) -> usize {
+    let m0 = bv[1] - bv[0];
+    let m1 = bv[3] - bv[2];
+    let m2 = bv[5] - bv[4];
+    if m0 > m1 {
+        if m0 > m2 { 1 } else { 5 }
+    } else if m1 > m2 {
+        3
+    } else {
+        5
+    }
+}
+
+/// Blender `bvh_medianof3`: the median of three leaves by their max slab on `axis`.
+fn median_of3(
+    a: &[usize],
+    lo: usize,
+    mid: usize,
+    hi: usize,
+    axis: usize,
+    leaves: &[Bounds],
+) -> usize {
+    let key = |id: usize| leaves[id][axis];
+    if key(a[mid]) < key(a[lo]) {
+        if key(a[hi]) < key(a[mid]) {
+            return a[mid];
+        }
+        if key(a[hi]) < key(a[lo]) {
+            return a[hi];
+        }
+        return a[lo];
+    }
+    if key(a[hi]) < key(a[mid]) {
+        if key(a[hi]) < key(a[lo]) {
+            return a[lo];
+        }
+        return a[hi];
+    }
+    a[mid]
+}
+
+/// Blender `bvh_partition`: Hoare partition of `a[lo..hi]` around the pivot key.
+fn partition(
+    a: &mut [usize],
+    lo: usize,
+    hi: usize,
+    pivot_key: f32,
+    axis: usize,
+    leaves: &[Bounds],
+) -> usize {
+    let key = |id: usize| leaves[id][axis];
+    let mut i = lo;
+    let mut j = hi;
+    loop {
+        while key(a[i]) < pivot_key {
+            i += 1;
+        }
+        j -= 1;
+        while pivot_key < key(a[j]) {
+            j -= 1;
+        }
+        if i >= j {
+            return i;
+        }
+        a.swap(i, j);
+        i += 1;
+    }
+}
+
+/// Blender `bvh_insertionsort`.
+fn insertion_sort(a: &mut [usize], lo: usize, hi: usize, axis: usize, leaves: &[Bounds]) {
+    for i in lo..hi {
+        let mut j = i;
+        let t = a[i];
+        while j != lo && leaves[t][axis] < leaves[a[j - 1]][axis] {
+            a[j] = a[j - 1];
+            j -= 1;
+        }
+        a[j] = t;
+    }
+}
+
+/// Blender `partition_nth_element`: after it, every leaf left of `n` is at most the leaf at `n`.
+fn partition_nth_element(
+    a: &mut [usize],
+    mut begin: usize,
+    mut end: usize,
+    n: usize,
+    axis: usize,
+    leaves: &[Bounds],
+) {
+    while end - begin > 3 {
+        let pivot = median_of3(a, begin, usize::midpoint(begin, end), end - 1, axis, leaves);
+        let cut = partition(a, begin, end, leaves[pivot][axis], axis, leaves);
+        if cut <= n {
+            begin = cut;
+        } else {
+            end = cut;
+        }
+    }
+    insertion_sort(a, begin, end, axis, leaves);
+}
+
+/// Blender `split_leafs`: each child range gets the leaves it would get from a full sort on `axis`.
+fn split_leafs(order: &mut [usize], nth: &[usize], axis: usize, leaves: &[Bounds]) {
+    for i in 0..BVH_TREE_TYPE - 1 {
+        if nth[i] >= nth[BVH_TREE_TYPE] {
+            break;
+        }
+        partition_nth_element(order, nth[i], nth[BVH_TREE_TYPE], nth[i + 1], axis, leaves);
+    }
+}
+
+/// Blender `non_recursive_bvh_div_nodes_task_cb`: fits branch `j`, splits its leaves along its largest
+/// axis, and links its children.
+fn divide(
+    branches: &mut [BvhBranch],
+    order: &mut [usize],
+    leaves: &[Bounds],
+    implicit: &Implicit,
+    level: Level,
+    j: usize,
+) {
+    let parent_level_index = j - level.start;
+    let begin = implicit.leafs_index(level.depth, parent_level_index);
+    let end = implicit.leafs_index(level.depth, parent_level_index + 1);
+    let bounds = refit(leaves, &order[begin..end]);
+    let split_axis = largest_axis(&bounds);
+
+    let mut nth = [0usize; BVH_TREE_TYPE + 1];
+    nth[0] = begin;
+    nth[BVH_TREE_TYPE] = end;
+    for (k, slot) in nth.iter_mut().enumerate().take(BVH_TREE_TYPE).skip(1) {
+        let child_level_index = child_index(j, k) - level.next;
+        *slot = implicit.leafs_index(level.depth + 1, child_level_index);
+    }
+    split_leafs(order, &nth, split_axis, leaves);
+
+    let mut children = Vec::with_capacity(BVH_TREE_TYPE);
+    for k in 0..BVH_TREE_TYPE {
+        let index = child_index(j, k);
+        let child_level_index = index - level.next;
+        let first = implicit.leafs_index(level.depth + 1, child_level_index);
+        let last = implicit.leafs_index(level.depth + 1, child_level_index + 1);
+        match last.cmp(&(first + 1)) {
+            Ordering::Greater => children.push(Child::Branch(index)),
+            Ordering::Equal => children.push(Child::Leaf(order[first])),
+            Ordering::Less => break,
+        }
+    }
+    branches[j] = BvhBranch {
+        bounds,
+        main_axis: split_axis / 2,
+        children,
+    };
+}
+
+/// Blender `RayPrecalc` fields of `bvhtree_ray_cast_data_precalc`, for the three slabs.
+struct RayPrecalc {
+    /// Blender `ray_dot_axis`: the ray's dot product with each slab direction, zeroed when tiny.
+    dot: [f32; 3],
+    /// Blender `idot_axis`.
+    idot: [f32; 3],
+    /// Blender `index`: the bounds index of the near and far plane of each slab.
+    index: [usize; 6],
+}
+
+impl RayPrecalc {
+    fn new(dir: P3) -> Self {
+        let mut pre = Self {
+            dot: [0.0; 3],
+            idot: [0.0; 3],
+            index: [0; 6],
+        };
+        for (axis, &axis_dir) in BVH_AXES.iter().enumerate() {
+            let d = dot3(dir, axis_dir);
+            if d.abs() < f32::EPSILON {
+                pre.dot[axis] = 0.0;
+                // The sign does not matter here, because `index` is adjusted below anyway.
+                pre.idot[axis] = f32::MAX;
+            } else {
+                pre.dot[axis] = d;
+                pre.idot[axis] = 1.0 / d;
+            }
+            let near = usize::from(pre.idot[axis] < 0.0);
+            pre.index[2 * axis] = near + 2 * axis;
+            pre.index[2 * axis + 1] = (1 - near) + 2 * axis;
+        }
+        pre
+    }
+}
+
+/// Blender `fast_ray_nearest_hit` with zero radius: the slab entry distance of `bv`, or `f32::MAX` on a
+/// miss or when the box lies beyond `hit_dist`.
+fn fast_ray_nearest_hit(bv: &Bounds, origin: P3, pre: &RayPrecalc, hit_dist: f32) -> f32 {
+    let t1x = (bv[pre.index[0]] - origin[0]) * pre.idot[0];
+    let t2x = (bv[pre.index[1]] - origin[0]) * pre.idot[0];
+    let t1y = (bv[pre.index[2]] - origin[1]) * pre.idot[1];
+    let t2y = (bv[pre.index[3]] - origin[1]) * pre.idot[1];
+    let t1z = (bv[pre.index[4]] - origin[2]) * pre.idot[2];
+    let t2z = (bv[pre.index[5]] - origin[2]) * pre.idot[2];
+
+    if (t1x > t2y || t2x < t1y || t1x > t2z || t2x < t1z || t1y > t2z || t2y < t1z)
+        || (t2x < 0.0 || t2y < 0.0 || t2z < 0.0)
+        || (t1x > hit_dist || t1y > hit_dist || t1z > hit_dist)
+    {
+        return f32::MAX;
+    }
+    t1x.max(t1y).max(t1z)
+}
+
+impl Bvh {
+    /// Blender `BLI_bvhtree_balance` (`non_recursive_bvh_div_nodes`) over the leaf boxes, in insertion order.
+    fn new(leaves: Vec<Bounds>) -> Self {
+        let leafs_num = leaves.len();
+        let branches_num = ((leafs_num + BVH_TREE_TYPE - 3) / (BVH_TREE_TYPE - 1)).max(1);
+        let mut branches = vec![BvhBranch::default(); branches_num + 1];
+        if leafs_num == 1 {
+            branches[1] = BvhBranch {
+                bounds: leaves[0],
+                main_axis: largest_axis(&leaves[0]) / 2,
+                children: vec![Child::Leaf(0)],
+            };
+            return Self { leaves, branches };
+        }
+
+        let implicit = Implicit::new(leafs_num);
+        let mut order: Vec<usize> = (0..leafs_num).collect();
+        let mut start = 1;
+        let mut depth = 1;
+        while start <= branches_num {
+            let next = child_index(start, 0);
+            let stop = next.min(branches_num + 1);
+            let level = Level { start, next, depth };
+            for j in start..stop {
+                divide(&mut branches, &mut order, &leaves, &implicit, level, j);
+            }
+            start = next;
+            depth += 1;
+        }
+        Self { leaves, branches }
+    }
+
+    /// Blender `BLI_bvhtree_ray_cast_ex` with zero radius: `dfs_raycast` from the root. `callback` is
+    /// called for each leaf whose box can still hold a closer hit, and may update `hit`.
+    fn ray_cast(
+        &self,
+        origin: P3,
+        dir: P3,
+        hit: &mut RayHit,
+        callback: &mut dyn FnMut(usize, &mut RayHit),
+    ) {
+        let pre = RayPrecalc::new(dir);
+        self.dfs(Child::Branch(1), origin, &pre, hit, callback);
+    }
+
+    fn dfs(
+        &self,
+        child: Child,
+        origin: P3,
+        pre: &RayPrecalc,
+        hit: &mut RayHit,
+        callback: &mut dyn FnMut(usize, &mut RayHit),
+    ) {
+        match child {
+            Child::Leaf(id) => {
+                if fast_ray_nearest_hit(&self.leaves[id], origin, pre, hit.dist) >= hit.dist {
+                    return;
+                }
+                callback(id, hit);
+            }
+            Child::Branch(j) => {
+                let node = &self.branches[j];
+                if fast_ray_nearest_hit(&node.bounds, origin, pre, hit.dist) >= hit.dist {
+                    return;
+                }
+                // Dive in the direction of the ray along the split axis.
+                if pre.dot[node.main_axis] > 0.0 {
+                    for &next in &node.children {
+                        self.dfs(next, origin, pre, hit, callback);
+                    }
+                } else {
+                    for &next in node.children.iter().rev() {
+                        self.dfs(next, origin, pre, hit, callback);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -499,7 +1067,10 @@ fn isect_seg_seg_point(v0: P2, v1: P2, v2: P2, v3: P2, bias: f32) -> Option<P2> 
 
 #[cfg(test)]
 mod tests {
-    use super::connect_islands;
+    use super::{
+        Bvh, Child, DiskNet, Island, P2, RAYCAST_DIST_MAX, RayHit, connect_islands, isect_ray_seg,
+        leaf_bounds,
+    };
     use serde_json::Value;
 
     const FIXTURE: &str = include_str!(
@@ -532,12 +1103,16 @@ mod tests {
         let Some(cases) = root["cases"].as_object() else {
             panic!("connect_islands fixture has a cases object");
         };
+        let mut checked = 0;
         let mut connected = 0;
         for (name, records) in cases {
             let Some(records) = records.as_array() else {
                 panic!("{name}: records must be an array");
             };
             for (number, record) in records.iter().enumerate() {
+                if record["ok"].as_bool() != Some(true) {
+                    continue;
+                }
                 let positions: Vec<[f32; 3]> = record["positions"]
                     .as_array()
                     .map(|rows| rows.iter().map(bits3).collect())
@@ -555,9 +1130,11 @@ mod tests {
                     edges.iter().map(|&(a, b)| (a.min(b), a.max(b))).collect()
                 };
                 assert_eq!(unordered(&actual), unordered(&expected), "{name}[{number}]");
+                checked += 1;
                 connected += usize::from(!expected.is_empty());
             }
         }
+        assert_eq!(checked, 24, "fixture holds 24 ok records");
         assert!(connected > 0, "fixture exercises at least one connection");
     }
 
@@ -572,5 +1149,149 @@ mod tests {
         let loop_edges = [(0, 1), (1, 2), (2, 3), (3, 0)];
         let connects = connect_islands(0, [0.0, 0.0, 1.0], &loop_edges, &[], &square);
         assert_eq!(connects, Vec::<(usize, usize)>::new());
+    }
+
+    /// Edge positions 0..: net `(1,3)`, loop `(0,1), (1,2), (2,0)`. Creation order is loop then net.
+    /// Unique ids follow creation: `(0,1)=0`, `(1,2)=1`, `(2,0)=2`, `(1,3)=3`.
+    fn triangle_with_spur() -> DiskNet {
+        let edges = [(1, 3), (0, 1), (1, 2), (2, 0)];
+        DiskNet::new(4, &edges, (1..4).chain(0..1))
+    }
+
+    #[test]
+    fn connect_disk_order_creation_is_loop_then_net() {
+        // Net (4,5) is position 0; the loop square 0-1-2-3-0 is positions 1..=4.
+        let edges = [(4, 5), (0, 1), (1, 2), (2, 3), (3, 0)];
+        let disk = DiskNet::new(6, &edges, (1..5).chain(0..1));
+        assert_eq!(disk.of_position, vec![4, 0, 1, 2, 3]);
+        // Vertex 0 is attached to (0,1) first, then (3,0). The net edge comes last on vertex 4.
+        assert_eq!(disk.disk[0], vec![0, 3]);
+        assert_eq!(disk.disk[1], vec![0, 1]);
+        assert_eq!(disk.disk[4], vec![4]);
+    }
+
+    #[test]
+    fn connect_disk_order_walk_matches_blender_dfs() {
+        let groups = triangle_with_spur().groups();
+        assert_eq!(groups.len(), 1);
+        // Start at position 3, edge (2,0). Walk: pop 2 (edges (1,2), (2,0)), then pop 0 (edge (0,1)),
+        // then pop 1 (edge (1,3)), then pop 3.
+        assert_eq!(groups[0].members, vec![2, 0, 1, 3]);
+        // Discovery order is (1,2), (2,0), (0,1), (1,3); `edge_links` is newest first.
+        assert_eq!(groups[0].edge_links, vec![(1, 3), (0, 1), (2, 0), (1, 2)]);
+    }
+
+    #[test]
+    fn connect_disk_order_walk_scans_edge_arr_backwards() {
+        // Net (3,4) is position 0, the loop triangle is positions 1..=3, so the first walk starts on
+        // the triangle and the second on the spur at position 0.
+        let edges = [(3, 4), (0, 1), (1, 2), (2, 0)];
+        let groups = DiskNet::new(5, &edges, (1..4).chain(0..1)).groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].members, vec![2, 0, 1]);
+        assert_eq!(groups[0].edge_links, vec![(0, 1), (2, 0), (1, 2)]);
+        assert_eq!(groups[1].members, vec![3, 4]);
+        assert_eq!(groups[1].edge_links, vec![(3, 4)]);
+    }
+
+    #[test]
+    fn connect_disk_order_span_tie_takes_first_visit() {
+        // Vertices 0 and 3 share a projection. The walk visits 3 before 0 (edge (1,3) heads
+        // `edge_links`), so Blender's strict span scan keeps 3 as the minimum.
+        let group = triangle_with_spur().groups().remove(0);
+        let raw: [P2; 4] = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [0.0, 0.0]];
+        let island = Island::new(group, &raw);
+        assert_eq!((island.min, island.max), (3, 2));
+    }
+
+    /// Nearest hit along a ray over `segments`, with the connect predicates (`0 < dist < best`).
+    fn cast(segments: &[(P2, P2)], origin: P2, dir: P2) -> Option<usize> {
+        let bvh = Bvh::new(segments.iter().map(|&(a, b)| leaf_bounds(a, b)).collect());
+        let mut hit = RayHit {
+            index: None,
+            dist: RAYCAST_DIST_MAX,
+        };
+        bvh.ray_cast(
+            [origin[0], origin[1], 0.0],
+            [dir[0], dir[1], 0.0],
+            &mut hit,
+            &mut |id: usize, best: &mut RayHit| {
+                let (a, b) = segments[id];
+                if let Some(dist) = isect_ray_seg(origin, dir, a, b)
+                    && dist < best.dist
+                    && dist > 0.0
+                {
+                    best.dist = dist;
+                    best.index = Some(id);
+                }
+            },
+        );
+        hit.index
+    }
+
+    /// Both segments cross the ray at exactly t = 1. The root is split on x (its largest extent), and
+    /// both leaves have the same max-x key, so the stable sort keeps leaf order `[0, 1]`. A ray with
+    /// positive x direction dives into the children in that order, so leaf 0 is reached first and keeps
+    /// the tie.
+    #[test]
+    fn connect_bvh_tie_forward_first_child_wins() {
+        let segments = [([0.25, -0.5], [1.75, 0.5]), ([0.25, 0.5], [1.75, -0.5])];
+        assert_eq!(cast(&segments, [0.0, 0.0], [1.0, 0.0]), Some(0));
+    }
+
+    /// The same two segments, cast along -x from the other side. The ray's dot with the split axis is
+    /// negative, so the children are visited in reverse order and leaf 1 is reached first.
+    #[test]
+    fn connect_bvh_tie_reverse_last_child_wins() {
+        let segments = [([0.25, -0.5], [1.75, 0.5]), ([0.25, 0.5], [1.75, -0.5])];
+        assert_eq!(cast(&segments, [2.0, 0.0], [-1.0, 0.0]), Some(1));
+    }
+
+    fn leaves_under(bvh: &Bvh, child: Child, out: &mut Vec<usize>) {
+        match child {
+            Child::Leaf(id) => out.push(id),
+            Child::Branch(j) => {
+                for &next in &bvh.branches[j].children {
+                    leaves_under(bvh, next, out);
+                }
+            }
+        }
+    }
+
+    /// The implicit 8-ary tree reaches every leaf exactly once, and the nearest hit matches a brute-force
+    /// scan on tie-free random rays.
+    #[test]
+    fn connect_bvh_tree_matches_brute_force() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 16_777_216.0 * 10.0 - 5.0
+        };
+        let segments: Vec<(P2, P2)> = (0..40)
+            .map(|_| ([next(), next()], [next(), next()]))
+            .collect();
+
+        let bvh = Bvh::new(segments.iter().map(|&(a, b)| leaf_bounds(a, b)).collect());
+        let mut reached = Vec::new();
+        leaves_under(&bvh, Child::Branch(1), &mut reached);
+        reached.sort_unstable();
+        assert_eq!(reached, (0..segments.len()).collect::<Vec<_>>());
+
+        for _ in 0..200 {
+            let origin = [next(), next()];
+            let raw = [next(), next()];
+            let len = (raw[0] * raw[0] + raw[1] * raw[1]).sqrt();
+            let dir = [raw[0] / len, raw[1] / len];
+            let mut expected: Option<(usize, f32)> = None;
+            for (id, &(a, b)) in segments.iter().enumerate() {
+                if let Some(dist) = isect_ray_seg(origin, dir, a, b)
+                    && dist > 0.0
+                    && expected.is_none_or(|(_, best)| dist < best)
+                {
+                    expected = Some((id, dist));
+                }
+            }
+            assert_eq!(cast(&segments, origin, dir), expected.map(|(id, _)| id));
+        }
     }
 }
