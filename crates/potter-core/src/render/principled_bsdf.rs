@@ -227,10 +227,7 @@ fn specular_layer(params: &BsdfParams) -> Option<SpecularLayer> {
     )
     .max(DVec3::ZERO);
     let f0_tinted = (tint * f0_scalar).clamp(DVec3::ZERO, DVec3::ONE);
-    Some(SpecularLayer {
-        eta,
-        f0_tinted,
-    })
+    Some(SpecularLayer { eta, f0_tinted })
 }
 
 /// Energy-compensation darkening, `1 + Fms * (1 - E) / E` (Cycles `microfacet_ggx_preserve_energy`).

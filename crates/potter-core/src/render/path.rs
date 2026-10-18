@@ -9,11 +9,12 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers,
-        evaluate_surface_with_workspace, height_gradient,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, evaluate_surface_with_workspace,
+        height_gradient,
     },
 };
 
+use super::principled_bsdf::{continuous_density, evaluate as evaluate_bsdf, lobe_probabilities};
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
@@ -24,9 +25,6 @@ use super::{
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
     scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
-};
-use super::principled_bsdf::{
-    continuous_density, evaluate as evaluate_bsdf, lobe_probabilities,
 };
 
 const RAY_EPSILON: f64 = 1.0e-5;

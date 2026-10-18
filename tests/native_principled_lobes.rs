@@ -331,7 +331,10 @@ fn principled_world_metal1_matches_cycles() -> TestResult {
 #[test]
 fn principled_oracle_fixture_covers_ten_variants_over_eight_seeds() -> TestResult {
     let oracle: Value = serde_json::from_str(ORACLE)?;
-    assert_eq!(oracle["provenance"]["seeds"], json!([0, 1, 2, 3, 4, 5, 6, 7]));
+    assert_eq!(
+        oracle["provenance"]["seeds"],
+        json!([0, 1, 2, 3, 4, 5, 6, 7])
+    );
     let variants = oracle["variants"]
         .as_object()
         .ok_or("the oracle has no variants object")?;

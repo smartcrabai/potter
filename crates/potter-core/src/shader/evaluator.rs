@@ -2576,7 +2576,10 @@ mod tests {
         assert_eq!(count("Graph", "Transmission Weight"), 1);
         let native_warning = warnings.iter().find(|w| w["material"] == "Native").unwrap();
         assert!(native_warning.get("node_id").is_none());
-        let coat_warning = warnings.iter().find(|w| w["input"] == "Coat Weight").unwrap();
+        let coat_warning = warnings
+            .iter()
+            .find(|w| w["input"] == "Coat Weight")
+            .unwrap();
         assert_eq!(coat_warning["node_id"], "principled");
     }
 

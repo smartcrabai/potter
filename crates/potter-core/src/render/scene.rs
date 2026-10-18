@@ -19,8 +19,8 @@ use crate::{
     model::{Id, Material, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, dielectric_f0,
-        record_unevaluated_inputs,
         evaluate_displacement_with_workspace, evaluate_surface_with_workspace, fill_color_layers,
+        record_unevaluated_inputs,
     },
 };
 
@@ -523,12 +523,7 @@ pub(super) fn extract_geometry(
                     {
                         base_color
                     } else {
-                        let params = shading_params(
-                            material,
-                            base_color,
-                            normal,
-                            &shader_warnings,
-                        );
+                        let params = shading_params(material, base_color, normal, &shader_warnings);
                         shade(
                             doc, snapshot, center, center, normal, normal, &params, mode, None,
                             images,
