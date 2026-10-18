@@ -306,9 +306,10 @@ fn sample_image(
 
 /// Samples an image using separate UVs for UDIM routing and pixel lookup, as an Image Texture node reads it.
 ///
-/// `routing_uv` selects the UDIM tile. `pixel_uv` is the full-image UV for tile zero and the
-/// tile-local V-down UV for positive base tiles. `alpha_linked` is whether the node's Alpha output is linked, which
-/// is when Cycles unassociates the colour (see [`ImageStorage`]).
+/// `routing_uv` selects the UDIM tile, and for tile zero it is the Blender coordinate: a closest lookup reads its texel from
+/// it as Cycles does (see [`sample_closest_cycles`]). `pixel_uv` is the full-image V-down UV for tile zero and the
+/// tile-local V-down UV for positive base tiles. `alpha_linked` is whether the node's Alpha output is linked, which is when
+/// Cycles unassociates the colour (see [`ImageStorage`]).
 #[must_use]
 pub fn sample_with_extension_alpha(
     data: &ImageData,
@@ -356,6 +357,9 @@ pub fn sample_with_extension_alpha(
             extension,
             texels,
         ),
+        ImageInterpolation::Closest if tile == 0 => {
+            sample_closest_cycles(values, width, height, routing_uv, extension, texels)
+        }
         ImageInterpolation::Closest => sample_closest_with_extension(
             values,
             width,
@@ -554,6 +558,61 @@ fn sample_closest_with_extension(
             pixel_with_extension(pixels, width, height, x, y, extension),
             texels,
         ),
+        texels,
+    )
+}
+
+/// Cycles' `frac` index of a coordinate (`kernel/device/cpu/image.h`): the integer part, truncated, and one less when the
+/// coordinate is negative. That is `floor` for every coordinate except an exact negative integer, which Cycles reads one
+/// texel lower (`floor(x) - 1`), so `-12.0` gives `-13`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the truncated input is checked against exclusive i64 conversion bounds"
+)]
+fn cycles_frac_index(value: f64) -> Option<i64> {
+    let truncated = value.trunc();
+    if !(I64_LOWER_INCLUSIVE..I64_UPPER_EXCLUSIVE).contains(&truncated) {
+        return None;
+    }
+    let index = truncated as i64;
+    if value < 0.0 {
+        index.checked_sub(1)
+    } else {
+        Some(index)
+    }
+}
+
+/// The closest texel of a full-image lookup, as Cycles' `interp_closest` reads it (`kernel/device/cpu/image.h`). The texel
+/// is Cycles' `frac` of the Blender coordinate scaled by the image size, with no offset, then the extension maps it.
+/// Blender's rows run bottom-up and the storage runs top-down, so the storage row is the mirror of the wrapped row. For a
+/// non-integer coordinate this is the floor of the coordinate, as before. At an exact integer the top-down flip used to
+/// pick the neighbouring texel, and at an exact negative integer Cycles reads one texel lower.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "validated u32 image dimensions are exactly representable as f64"
+)]
+fn sample_closest_cycles(
+    pixels: &[[f64; 4]],
+    width: usize,
+    height: usize,
+    routing_uv: [f64; 2],
+    extension: ImageExtension,
+    texels: Texels,
+) -> [f64; 4] {
+    let (Some(column), Some(row)) = (
+        cycles_frac_index(routing_uv[0] * width as f64),
+        cycles_frac_index(routing_uv[1] * height as f64),
+    ) else {
+        return TRANSPARENT_BLACK;
+    };
+    let (Some(x), Some(y)) = (
+        extension_index(column, width, extension),
+        extension_index(row, height, extension),
+    ) else {
+        return TRANSPARENT_BLACK;
+    };
+    finish(
+        stored_texel(pixel(pixels, width, x, height - 1 - y), texels),
         texels,
     )
 }
@@ -1254,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn clip_closest_at_one_selects_the_last_texel() {
+    fn clip_closest_at_one_is_outside_the_image_as_cycles_reads_it() {
         let image = data(
             2,
             1,
@@ -1272,7 +1331,7 @@ mod tests {
                 ImageExtension::Clip,
                 false,
             ),
-            [0.0, 1.0, 0.0, 1.0],
+            [0.0; 4],
         );
     }
 
@@ -1540,6 +1599,100 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 60, "every committed oracle case must be checked");
+        Ok(())
+    }
+
+    #[test]
+    fn cycles_frac_index_is_floor_except_at_exact_negative_integers() {
+        assert_eq!(cycles_frac_index(2.5), Some(2));
+        assert_eq!(cycles_frac_index(0.0), Some(0));
+        assert_eq!(cycles_frac_index(-0.5), Some(-1));
+        assert_eq!(cycles_frac_index(-12.0), Some(-13));
+    }
+
+    /// Blender 5.2.2 at exact integer UVs (`tests/fixtures/repeat_edge`, `generate_repeat_edge_oracle.py`). Each pixel
+    /// centre has an integer UV with u and v in {-3, -1, 1, 3} on a 4 x 4 texture, with Repeat. Closest reads the texel
+    /// Cycles reads, including the exact negative integers that Cycles' `frac` reads one texel lower. Linear averages the
+    /// same texels in both. The fixture rounds colours to six decimals, so the tolerance is 1e-6.
+    #[test]
+    fn repeat_edge_samples_match_blenders_render() -> Result<(), Box<dyn std::error::Error>> {
+        const TOLERANCE: f64 = 1.0e-6;
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/repeat_edge");
+        for (file, interpolation) in [
+            (
+                "blender_repeat_edge_closest.json",
+                ImageInterpolation::Closest,
+            ),
+            (
+                "blender_repeat_edge_linear.json",
+                ImageInterpolation::Linear,
+            ),
+        ] {
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join(file))?)?;
+            let width = u32::try_from(document["width"].as_u64().ok_or("width is missing")?)?;
+            let height = u32::try_from(document["height"].as_u64().ok_or("height is missing")?)?;
+            let (w, h) = (usize::try_from(width)?, usize::try_from(height)?);
+            let blender = document["texels_blender_rows"]
+                .as_array()
+                .ok_or("texels are missing")?
+                .iter()
+                .map(|texel| -> Result<[f64; 4], Box<dyn std::error::Error>> {
+                    let channel =
+                        |index: usize| texel[index].as_f64().ok_or("texel is not a number");
+                    Ok([channel(0)?, channel(1)?, channel(2)?, channel(3)?])
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Blender's rows run bottom-up; the stored rows run top-down.
+            let mut pixels = vec![[0.0; 4]; w * h];
+            for row in 0..h {
+                for x in 0..w {
+                    pixels[row * w + x] = blender[(h - 1 - row) * w + x];
+                }
+            }
+            let image = ImageData {
+                width,
+                height,
+                pixels,
+                tiles: BTreeMap::new(),
+                interpolation,
+                srgb: false,
+                storage: ImageStorage {
+                    data: true,
+                    straight_alpha: false,
+                    ignore_alpha: false,
+                    precision: Precision::Float,
+                },
+                colour: ColourCache::default(),
+            };
+            let mut worst = 0.0_f64;
+            for record in document["records"]
+                .as_array()
+                .ok_or("records are missing")?
+            {
+                let value =
+                    |index: usize| record[index].as_f64().ok_or("record value is not a number");
+                let (sample_u, sample_v) = (value(5)?, value(6)?);
+                let expected = [value(2)?, value(3)?, value(4)?];
+                let actual = sample_with_extension_alpha(
+                    &image,
+                    [sample_u, sample_v],
+                    [sample_u, 1.0 - sample_v],
+                    0,
+                    interpolation,
+                    ImageExtension::Repeat,
+                    false,
+                );
+                for channel in 0..3 {
+                    worst = worst.max((actual[channel] - expected[channel]).abs());
+                }
+            }
+            assert!(
+                worst <= TOLERANCE,
+                "{file}: worst residual {worst:e} exceeds {TOLERANCE:e}"
+            );
+        }
         Ok(())
     }
 }
