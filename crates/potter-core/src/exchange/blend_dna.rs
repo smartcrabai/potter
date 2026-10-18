@@ -17,22 +17,6 @@ const MAX_MODIFIERS_PER_OBJECT: usize = 100_000;
 const MAX_BOUND_MODIFIERS: usize = 100_000;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
-fn multires_grid_len(total_levels: u32) -> Result<usize, String> {
-    if total_levels == 0 {
-        return Err("Blender multires total level must be nonzero".into());
-    }
-    let intervals = 1_usize
-        .checked_shl(total_levels - 1)
-        .ok_or_else(|| "Blender multires total level exceeds the grid limit".to_owned())?;
-    let side = intervals
-        .checked_add(1)
-        .ok_or_else(|| "Blender multires grid side overflow".to_owned())?;
-    let samples = side
-        .checked_mul(side)
-        .ok_or_else(|| "Blender multires grid size overflow".to_owned())?;
-    Ok(samples)
-}
-
 fn multires_auxiliary_peak_bytes(mask_samples: u128, hidden_samples: u128) -> Result<u64, String> {
     let json_bytes_per_sample = (size_of::<Value>() as u128)
         .checked_mul(4)
@@ -1763,7 +1747,7 @@ impl<'a> BlendFile<'a> {
                     "Mesh {mesh_name} corner {corner_index} has an invalid MDisps level"
                 ));
             }
-            let grid_len = multires_grid_len(level)?;
+            let grid_len = grid_vector_count(level).map_err(|error| error.message.to_string())?;
             if totdisp != 0 && totdisp != grid_len {
                 return Err(format!(
                     "Mesh {mesh_name} corner {corner_index} has {totdisp} MDisps samples; level {level} requires {grid_len}"
@@ -2043,7 +2027,7 @@ impl<'a> BlendFile<'a> {
             let sample_count = if level == 0 {
                 0
             } else {
-                multires_grid_len(level)?
+                grid_vector_count(level).map_err(|error| error.message.to_string())?
             };
             max_level = max_level.max(level);
             total_samples = total_samples

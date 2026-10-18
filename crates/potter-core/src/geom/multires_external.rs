@@ -18,8 +18,12 @@
 //! - Layer type: bytes 40..44 contain 19 (`CD_MDISPS`).
 //! - Layer name: bytes 44..108 are empty in Blender's probe file.
 //! - Layer-header padding: bytes 108..112 are zero.
-//! - Layer data: each loop's row-major `[f32; 3]` MDisps vectors are concatenated in loop order.
-//!   Per-loop lengths and levels are stored in the `.blend` MDisps structs, not the BCDF payload.
+//! - Layer data: each corner's row-major `[f32; 3]` MDisps vectors are concatenated in corner order.
+//!
+//! Blender 5.2.2 reads every corner of this layer at the modifier's top level
+//! (`multires_ensure_external_read`), so a file holds exactly `grid_vector_count(total_levels)`
+//! vectors per corner. A coarser corner has no external form. The probe that pins this is
+//! `tests/fixtures/multires/gen_external_level_probe.py`.
 
 use crate::error::{ErrorCode, PotError, Result};
 
@@ -32,102 +36,84 @@ const FILE_TYPE_MESH: u32 = 1;
 const LAYER_TYPE_MDISPS: u32 = 19;
 const LAYER_DATATYPE_FLOAT: u32 = 0;
 
-pub(crate) fn expected_external_file_size(total_levels: u32, corner_count: usize) -> Result<u64> {
-    expected_external_sizes(total_levels, corner_count).map(|(_, file_size)| file_size)
+/// Number of `[f32; 3]` vectors in one corner grid at `total_levels`: `(2^(L-1) + 1)^2`.
+pub(crate) fn grid_vector_count(total_levels: u32) -> Result<usize> {
+    let invalid = || {
+        PotError::new(
+            ErrorCode::InvalidArgument,
+            "multires total_levels must produce a representable grid side",
+        )
+    };
+    let shift = total_levels.checked_sub(1).ok_or_else(invalid)?;
+    let side = 1_usize
+        .checked_shl(shift)
+        .and_then(|side| side.checked_add(1))
+        .ok_or_else(invalid)?;
+    side.checked_mul(side).ok_or_else(invalid)
 }
 
-pub(crate) fn expected_external_file_size_for_levels(levels: &[u32]) -> Result<u64> {
-    let grid_lengths = levels
+/// File size of the sidecar for `corner_count` corners at `total_levels`. Export and import both
+/// size the file with this helper, and `read_external_grids` checks the same size.
+pub(crate) fn expected_external_file_size(total_levels: u32, corner_count: usize) -> Result<u64> {
+    let (_, file_size) = expected_external_sizes(total_levels, corner_count)?;
+    Ok(file_size)
+}
+
+/// Rejects a corner whose level differs from `total_levels`. Blender cannot read such a corner
+/// from an external sidecar, so the caller gets `code` instead of a file Blender would misread.
+pub(crate) fn require_top_level_corners(
+    levels: &[u32],
+    total_levels: u32,
+    code: ErrorCode,
+) -> Result<()> {
+    match levels
         .iter()
-        .map(|&level| grid_vector_count(level))
-        .collect::<Result<Vec<_>>>()?;
-    expected_external_sizes_for_grid_lengths(&grid_lengths).map(|(_, file_size)| file_size)
+        .enumerate()
+        .find(|(_, level)| **level != total_levels)
+    {
+        None => Ok(()),
+        Some((corner, level)) => Err(PotError::new(
+            code,
+            format!(
+                "multires corner {corner} is at level {level}; Blender's external sidecar stores every corner at total level {total_levels}"
+            ),
+        )),
+    }
 }
 
 fn expected_external_sizes(total_levels: u32, corner_count: usize) -> Result<(u64, u64)> {
-    let sample_count = corner_count
-        .checked_mul(grid_vector_count(total_levels)?)
-        .ok_or_else(|| PotError::new(ErrorCode::InvalidArgument, "BCDF sample count overflows"))?;
-    expected_external_sizes_for_sample_count(sample_count)
-}
-
-fn expected_external_sizes_for_grid_lengths(grid_lengths: &[usize]) -> Result<(u64, u64)> {
-    let sample_count = grid_lengths
-        .iter()
-        .try_fold(0_usize, |total, &length| total.checked_add(length))
-        .ok_or_else(|| PotError::new(ErrorCode::InvalidArgument, "BCDF sample count overflows"))?;
-    expected_external_sizes_for_sample_count(sample_count)
-}
-
-fn expected_external_sizes_for_sample_count(sample_count: usize) -> Result<(u64, u64)> {
-    let data_size = sample_count
-        .checked_mul(12)
+    let grid_len = grid_vector_count(total_levels)?;
+    let data_size = corner_count
+        .checked_mul(grid_len)
+        .and_then(|samples| samples.checked_mul(12))
+        .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| PotError::new(ErrorCode::InvalidArgument, "BCDF data size overflows"))?;
-    let data_size = u64::try_from(data_size).map_err(|_| {
-        PotError::new(
-            ErrorCode::InvalidArgument,
-            "BCDF data size exceeds the layer size field",
-        )
-    })?;
-    let file_size = usize::try_from(data_size)
+    let file_size = u64::try_from(DATA_OFFSET)
         .ok()
-        .and_then(|size| DATA_OFFSET.checked_add(size))
-        .and_then(|size| u64::try_from(size).ok())
+        .and_then(|header| header.checked_add(data_size))
         .ok_or_else(|| PotError::new(ErrorCode::InvalidArgument, "BCDF file size overflows"))?;
     Ok((data_size, file_size))
 }
 
-#[cfg(test)]
-/// Decode a fixed-level Blender sidecar into one grid per corner.
+/// Decode a sidecar for `corner_count` corners at `total_levels` into one grid per corner.
 pub(crate) fn read_external_grids(
     bytes: &[u8],
     total_levels: u32,
     corner_count: usize,
 ) -> Result<Vec<Vec<[f32; 3]>>> {
+    let (expected_data_size, expected_file_size) = expected_external_sizes(total_levels, corner_count)
+        .map_err(|error| {
+            import_error(format!(
+                "invalid Blender multires external grid size: {}",
+                error.message
+            ))
+        })?;
     let grid_len = grid_vector_count(total_levels).map_err(|error| {
         import_error(format!(
             "invalid Blender multires external grid level: {}",
             error.message
         ))
     })?;
-    read_external_grids_for_grid_lengths(bytes, &vec![grid_len; corner_count])
-}
-
-pub(crate) fn read_external_grids_for_levels(
-    bytes: &[u8],
-    levels: &[u32],
-) -> Result<Vec<Vec<[f32; 3]>>> {
-    let grid_lengths = levels
-        .iter()
-        .map(|&level| {
-            grid_vector_count(level).map_err(|error| {
-                import_error(format!(
-                    "invalid Blender multires external grid level: {}",
-                    error.message
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    read_external_grids_for_grid_lengths(bytes, &grid_lengths)
-}
-
-fn read_external_grids_for_grid_lengths(
-    bytes: &[u8],
-    grid_lengths: &[usize],
-) -> Result<Vec<Vec<[f32; 3]>>> {
-    let (expected_data_size_u64, expected_file_size_u64) =
-        expected_external_sizes_for_grid_lengths(grid_lengths).map_err(|error| {
-            import_error(format!(
-                "invalid Blender multires external grid size: {}",
-                error.message
-            ))
-        })?;
-    let expected_file_size = usize::try_from(expected_file_size_u64)
-        .map_err(|_| import_error("external file size exceeds this platform's address space"))?;
-    let sample_count = grid_lengths
-        .iter()
-        .try_fold(0_usize, |count, &length| count.checked_add(length))
-        .ok_or_else(|| import_error("external grid sample count overflows"))?;
 
     if bytes.len() < DATA_OFFSET {
         return Err(import_error("file is truncated before the layer data"));
@@ -166,9 +152,9 @@ fn read_external_grids_for_grid_lengths(
             "BCDF displacement layer datatype is not float",
         ));
     }
-    if read_u64(bytes, layer + 8)? != expected_data_size_u64 {
+    if read_u64(bytes, layer + 8)? != expected_data_size {
         return Err(import_error(format!(
-            "BCDF displacement data size does not match {sample_count} MDisps samples"
+            "BCDF displacement data size does not match {corner_count} corners at total level {total_levels}"
         )));
     }
     if read_u32(bytes, layer + 16)? != LAYER_TYPE_MDISPS {
@@ -180,16 +166,16 @@ fn read_external_grids_for_grid_lengths(
     if bytes.get(layer + 84..layer + LAYER_HEADER_SIZE) != Some(&[0; 4]) {
         return Err(import_error("invalid BCDF layer-header padding"));
     }
-    if bytes.len() != expected_file_size {
+    if u64::try_from(bytes.len()).ok() != Some(expected_file_size) {
         return Err(import_error(format!(
             "BCDF file length is {}, expected {expected_file_size}",
             bytes.len()
         )));
     }
 
-    let mut grids = Vec::with_capacity(grid_lengths.len());
+    let mut grids = Vec::with_capacity(corner_count);
     let mut offset = DATA_OFFSET;
-    for &grid_len in grid_lengths {
+    for _ in 0..corner_count {
         let mut grid = Vec::with_capacity(grid_len);
         for _ in 0..grid_len {
             let x = read_f32(bytes, offset)?;
@@ -203,46 +189,17 @@ fn read_external_grids_for_grid_lengths(
     Ok(grids)
 }
 
-#[cfg(test)]
-/// Encode a fixed-level row-major displacement grid for each corner.
+/// Encode one grid per corner in corner order. Every grid must hold `grid_vector_count(total_levels)`
+/// finite vectors.
 pub(crate) fn write_external_grids(grids: &[Vec<[f32; 3]>], total_levels: u32) -> Result<Vec<u8>> {
-    let levels = vec![total_levels; grids.len()];
-    write_external_grids_for_levels(grids, &levels)
-}
-
-pub(crate) fn write_external_grids_for_levels(
-    grids: &[Vec<[f32; 3]>],
-    levels: &[u32],
-) -> Result<Vec<u8>> {
-    if grids.len() != levels.len() {
-        return Err(PotError::new(
-            ErrorCode::InvalidArgument,
-            "multires grid levels do not match the grid count",
-        ));
-    }
-    let grid_lengths = levels
-        .iter()
-        .map(|&level| grid_vector_count(level))
-        .collect::<Result<Vec<_>>>()?;
-    write_external_grids_for_grid_lengths(grids, &grid_lengths)
-}
-
-fn write_external_grids_for_grid_lengths(
-    grids: &[Vec<[f32; 3]>],
-    grid_lengths: &[usize],
-) -> Result<Vec<u8>> {
-    if grids.len() != grid_lengths.len() {
-        return Err(PotError::new(
-            ErrorCode::InvalidArgument,
-            "multires grid sizes do not match the grid count",
-        ));
-    }
-    for (corner, (grid, expected)) in grids.iter().zip(grid_lengths).enumerate() {
-        if grid.len() != *expected {
+    let grid_len = grid_vector_count(total_levels)?;
+    let (data_size, file_size) = expected_external_sizes(total_levels, grids.len())?;
+    for (corner, grid) in grids.iter().enumerate() {
+        if grid.len() != grid_len {
             return Err(PotError::new(
                 ErrorCode::InvalidArgument,
                 format!(
-                    "multires corner {corner} has {} vectors; its MDisps grid requires {expected}",
+                    "multires corner {corner} has {} vectors; total level {total_levels} requires {grid_len}",
                     grid.len()
                 ),
             ));
@@ -259,21 +216,13 @@ fn write_external_grids_for_grid_lengths(
         }
     }
 
-    let (data_size_u64, file_size_u64) = expected_external_sizes_for_grid_lengths(grid_lengths)?;
-    let data_size = usize::try_from(data_size_u64).map_err(|_| {
-        PotError::new(
-            ErrorCode::InvalidArgument,
-            "BCDF data size exceeds this platform's address space",
-        )
-    })?;
-    let file_size = usize::try_from(file_size_u64).map_err(|_| {
+    let file_capacity = usize::try_from(file_size).map_err(|_| {
         PotError::new(
             ErrorCode::InvalidArgument,
             "BCDF file size exceeds this platform's address space",
         )
     })?;
-
-    let mut bytes = Vec::with_capacity(file_size);
+    let mut bytes = Vec::with_capacity(file_capacity);
     bytes.extend_from_slice(FILE_MAGIC);
     bytes.extend_from_slice(&[0; 4]);
     push_u32(&mut bytes, FILE_HEADER_SIZE as u32);
@@ -282,7 +231,7 @@ fn write_external_grids_for_grid_lengths(
     push_u32(&mut bytes, MESH_HEADER_SIZE as u32);
     push_u32(&mut bytes, LAYER_HEADER_SIZE as u32);
     push_u32(&mut bytes, LAYER_DATATYPE_FLOAT);
-    bytes.extend_from_slice(&data_size_u64.to_le_bytes());
+    bytes.extend_from_slice(&data_size.to_le_bytes());
     push_u32(&mut bytes, LAYER_TYPE_MDISPS);
     bytes.extend_from_slice(&[0; 68]);
     for grid in grids {
@@ -292,47 +241,8 @@ fn write_external_grids_for_grid_lengths(
             }
         }
     }
-    debug_assert_eq!(bytes.len(), DATA_OFFSET + data_size);
+    debug_assert_eq!(u64::try_from(bytes.len()).ok(), Some(file_size));
     Ok(bytes)
-}
-
-pub(crate) fn write_external_zero_grids(total_levels: u32, corner_count: usize) -> Result<Vec<u8>> {
-    let (data_size_u64, file_size_u64) = expected_external_sizes(total_levels, corner_count)?;
-    let file_size = usize::try_from(file_size_u64).map_err(|_| {
-        PotError::new(
-            ErrorCode::InvalidArgument,
-            "BCDF file size exceeds this platform's address space",
-        )
-    })?;
-    let mut bytes = Vec::with_capacity(file_size);
-    bytes.extend_from_slice(FILE_MAGIC);
-    bytes.extend_from_slice(&[0; 4]);
-    push_u32(&mut bytes, FILE_HEADER_SIZE as u32);
-    push_u32(&mut bytes, FILE_TYPE_MESH);
-    push_u32(&mut bytes, 1);
-    push_u32(&mut bytes, MESH_HEADER_SIZE as u32);
-    push_u32(&mut bytes, LAYER_HEADER_SIZE as u32);
-    push_u32(&mut bytes, LAYER_DATATYPE_FLOAT);
-    bytes.extend_from_slice(&data_size_u64.to_le_bytes());
-    push_u32(&mut bytes, LAYER_TYPE_MDISPS);
-    bytes.extend_from_slice(&[0; 68]);
-    bytes.resize(file_size, 0);
-    Ok(bytes)
-}
-
-pub(crate) fn grid_vector_count(total_levels: u32) -> Result<usize> {
-    let invalid = || {
-        PotError::new(
-            ErrorCode::InvalidArgument,
-            "multires total_levels must produce a representable grid side",
-        )
-    };
-    let shift = total_levels.checked_sub(1).ok_or_else(invalid)?;
-    let side = 1_usize
-        .checked_shl(shift)
-        .and_then(|side| side.checked_add(1))
-        .ok_or_else(invalid)?;
-    side.checked_mul(side).ok_or_else(invalid)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -385,13 +295,24 @@ mod tests {
     )]
 
     use super::{
-        DATA_OFFSET, expected_external_file_size_for_levels, grid_vector_count,
-        read_external_grids, read_external_grids_for_levels, write_external_grids,
-        write_external_grids_for_levels,
+        DATA_OFFSET, expected_external_file_size, grid_vector_count, read_external_grids,
+        require_top_level_corners, write_external_grids,
     };
     use crate::error::ErrorCode;
 
-    const PROBE: &[u8] = include_bytes!("../../tests/fixtures/multires/ext_probe.btx");
+    const PROBE: &[u8] = include_bytes!("../../../../tests/fixtures/multires/ext_probe.btx");
+    const BLENDER_UNIFORM_LEVEL2: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/multires/probe_uniform_level2.btx"
+    ));
+    const PYTHON_UNIFORM_LEVEL1: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/multires/probe_uniform_level1_total2.btx"
+    ));
+    const PYTHON_MIXED_LEVELS: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/multires/probe_mixed_levels_total2.btx"
+    ));
 
     #[test]
     fn probe_roundtrips_exactly_and_decodes_24_nine_vector_grids() {
@@ -399,6 +320,33 @@ mod tests {
         assert_eq!(grids.len(), 24);
         assert!(grids.iter().all(|grid| grid.len() == 9));
         assert_eq!(write_external_grids(&grids, 2).unwrap(), PROBE);
+    }
+
+    #[test]
+    fn blender_written_top_level_probe_has_the_pinned_layout() {
+        assert_eq!(BLENDER_UNIFORM_LEVEL2.len(), 2704);
+        assert_eq!(
+            u64::try_from(BLENDER_UNIFORM_LEVEL2.len()).unwrap(),
+            expected_external_file_size(2, 24).unwrap()
+        );
+        let grids = read_external_grids(BLENDER_UNIFORM_LEVEL2, 2, 24).unwrap();
+        assert_eq!(write_external_grids(&grids, 2).unwrap(), BLENDER_UNIFORM_LEVEL2);
+        // Blender reads corner i at DATA_OFFSET + 108 * i, i.e. 12 * 9 bytes per corner.
+        assert_eq!(DATA_OFFSET + 108 * 23, 2596);
+    }
+
+    #[test]
+    fn non_top_level_probes_are_rejected_at_the_decoder() {
+        // Blender fails with "failed to read multires displacement" on both files; the decoder
+        // rejects them on the size check before reading any corner.
+        assert_eq!(PYTHON_UNIFORM_LEVEL1.len(), 1264);
+        assert_eq!(PYTHON_MIXED_LEVELS.len(), 1984);
+        for bytes in [PYTHON_UNIFORM_LEVEL1, PYTHON_MIXED_LEVELS] {
+            assert_eq!(
+                read_external_grids(bytes, 2, 24).unwrap_err().code,
+                ErrorCode::ImportFailed
+            );
+        }
     }
 
     #[test]
@@ -438,25 +386,27 @@ mod tests {
     }
 
     #[test]
-    fn variable_corner_levels_roundtrip_as_mdisps_concatenation() {
-        let levels = [1, 2, 1];
-        let grids = levels
-            .iter()
-            .enumerate()
-            .map(|(corner, level)| {
-                (0..grid_vector_count(*level).unwrap())
-                    .map(|sample| [corner as f32, sample as f32, -(sample as f32)])
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let bytes = write_external_grids_for_levels(&grids, &levels).unwrap();
+    fn writer_rejects_a_coarser_corner_grid() {
+        let mut grids = vec![vec![[0.0; 3]; 9]; 24];
+        grids[1] = vec![[0.0; 3]; grid_vector_count(1).unwrap()];
         assert_eq!(
-            u64::try_from(bytes.len()).unwrap(),
-            expected_external_file_size_for_levels(&levels).unwrap()
+            write_external_grids(&grids, 2).unwrap_err().code,
+            ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn mixed_corner_levels_are_refused_before_any_bytes_are_written() {
+        assert!(require_top_level_corners(&[2, 2, 2], 2, ErrorCode::UnrepresentableFeature).is_ok());
+        let error = require_top_level_corners(&[2, 1, 2], 2, ErrorCode::UnrepresentableFeature)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnrepresentableFeature);
+        assert!(error.message.contains("corner 1 is at level 1"));
         assert_eq!(
-            read_external_grids_for_levels(&bytes, &levels).unwrap(),
-            grids
+            require_top_level_corners(&[1, 1], 2, ErrorCode::ImportFailed)
+                .unwrap_err()
+                .code,
+            ErrorCode::ImportFailed
         );
     }
 

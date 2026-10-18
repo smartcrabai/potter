@@ -166,7 +166,7 @@ pub fn export_blend(
         )?;
         write_new(&script, BRIDGE.as_bytes())?;
         let exported = run_bridge(&blender, &script, "export", &input, &blend_temp, false)?;
-        patch_exported_multires(&input, &blend_temp, opts.pack, &created_multires_sidecars)?;
+        patch_exported_multires(&input, &blend_temp)?;
         let validation_child =
             match run_bridge(&blender, &script, "import", &blend_temp, &validation, true) {
                 Ok(output) => output,
@@ -905,18 +905,12 @@ fn prepare_multires_external_sidecars_inner(
                 // Packed exports embed these grids in the .blend; no sidecar is written.
                 continue;
             }
-            let variable_levels = loop_levels.iter().any(|level| *level != total_levels);
-            let bytes = if variable_levels {
-                crate::geom::multires_external::write_external_zero_grids(
-                    total_levels,
-                    grids.len(),
-                )?
-            } else {
-                crate::geom::multires_external::write_external_grids_for_levels(
-                    &grids,
-                    &loop_levels,
-                )?
-            };
+            crate::geom::multires_external::require_top_level_corners(
+                &loop_levels,
+                total_levels,
+                ErrorCode::UnrepresentableFeature,
+            )?;
+            let bytes = crate::geom::multires_external::write_external_grids(&grids, total_levels)?;
             let filename = record
                 .get("external")
                 .and_then(|external| external.get("filepath"))
@@ -935,14 +929,7 @@ fn prepare_multires_external_sidecars_inner(
                 .unwrap_or("multires.btx")
                 .to_owned();
             let digest = crate::hash::sha256(&bytes);
-            exports.push((
-                data_id.clone(),
-                total_levels,
-                filename,
-                bytes,
-                digest,
-                variable_levels,
-            ));
+            exports.push((data_id.clone(), total_levels, filename, bytes, digest));
         }
     }
     if exports.is_empty() {
@@ -953,12 +940,8 @@ fn prepare_multires_external_sidecars_inner(
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    for (data_id, total_levels, filename, bytes, digest, variable_levels) in exports {
-        let destination = if variable_levels {
-            unique_multires_sidecar_path(sidecar, &filename)?
-        } else {
-            sidecar_destination(sidecar, &filename, &digest, &bytes)?
-        };
+    for (data_id, total_levels, filename, bytes, digest) in exports {
+        let destination = sidecar_destination(sidecar, &filename, &digest, &bytes)?;
         let created = !destination.is_file();
         if created {
             write_asset_sidecar(&destination, &bytes)?;
@@ -1095,11 +1078,8 @@ fn multires_grids_for_export(
         .iter()
         .map(|&level| crate::geom::multires_external::grid_vector_count(level))
         .collect::<Result<Vec<_>>>()?;
-    let variable_external_size =
-        crate::geom::multires_external::expected_external_file_size_for_levels(&levels)?;
-    let bridge_external_size =
+    let external_size =
         crate::geom::multires_external::expected_external_file_size(total_levels, corner_count)?;
-    let external_size = variable_external_size.max(bridge_external_size);
     let samples = grid_vectors
         .iter()
         .try_fold(0_u128, |count, &length| {
@@ -1312,18 +1292,6 @@ fn reorder_multires_loop_values(
     ))
 }
 
-fn output_external_sidecar_path(blend_file: &Path, filepath: &str) -> PathBuf {
-    let stored_path = Path::new(filepath.strip_prefix("//").unwrap_or(filepath));
-    if stored_path.is_absolute() {
-        stored_path.to_path_buf()
-    } else {
-        blend_file
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(stored_path)
-    }
-}
-
 /// Blender mesh datablock name the bridge gives a Potter mesh, mirroring
 /// `compatibility_name` in blend_bridge.py: the `Mesh:<name>` compatibility mapping whose
 /// value is the data ID, otherwise the data ID itself.
@@ -1346,8 +1314,6 @@ fn blender_mesh_name(doc: &Value, data_id: &str) -> String {
 fn patch_exported_multires(
     input: &Path,
     blend_file: &Path,
-    pack: bool,
-    created_sidecars: &[PathBuf],
 ) -> Result<()> {
     let payload: Value =
         serde_json::from_reader(fs::File::open(input).map_err(|error| PotError::io(&error))?)
@@ -1422,22 +1388,6 @@ fn patch_exported_multires(
             record.get("grid_levels"),
             auxiliary_bytes,
         )?;
-        let variable_levels = grid_levels.iter().any(|level| *level != total_levels);
-        if !pack && variable_levels {
-            let filepath = record
-                .get("external")
-                .and_then(|external| external.get("filepath"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    invalid_intermediate("variable multires grids have no external filepath")
-                })?;
-            let external_path = output_external_sidecar_path(blend_file, filepath);
-            let bytes = crate::geom::multires_external::write_external_grids_for_levels(
-                &grids,
-                &grid_levels,
-            )?;
-            replace_created_multires_sidecar(&external_path, &bytes, created_sidecars)?;
-        }
         let mesh_name = blender_mesh_name(doc, &data_id);
         let mut patch = Map::new();
         patch.insert("total_levels".to_owned(), Value::from(total_levels));
@@ -1560,33 +1510,6 @@ fn resolve_export_resource_path(project: &Project, uri: &str) -> Option<PathBuf>
     } else {
         project.path().join(path)
     })
-}
-
-fn unique_multires_sidecar_path(sidecar: &Path, filename: &str) -> Result<PathBuf> {
-    let path = Path::new(filename);
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("multires");
-    let extension = path.extension().and_then(|value| value.to_str());
-    for _ in 0..100 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let suffix = format!("_bridge_{}_{}", std::process::id(), sequence);
-        let name = extension.map_or_else(
-            || format!("{stem}{suffix}"),
-            |extension| format!("{stem}{suffix}.{extension}"),
-        );
-        let candidate = sidecar.join(name);
-        match fs::symlink_metadata(&candidate) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
-            Ok(_) => {}
-            Err(error) => return Err(PotError::io(&error)),
-        }
-    }
-    Err(PotError::new(
-        ErrorCode::LimitExceeded,
-        "multires temporary sidecar filename limit reached",
-    ))
 }
 
 fn sidecar_destination(
@@ -1943,17 +1866,17 @@ fn load_external_multires(
             }
             None => vec![total_levels; corner_count],
         };
+        crate::geom::multires_external::require_top_level_corners(
+            &grid_levels,
+            total_levels,
+            ErrorCode::ImportFailed,
+        )?;
         let grid_vectors = grid_levels
             .iter()
             .map(|&level| crate::geom::multires_external::grid_vector_count(level))
             .collect::<Result<Vec<_>>>()?;
-        let variable_file_size =
-            crate::geom::multires_external::expected_external_file_size_for_levels(&grid_levels)?;
-        let bridge_file_size = crate::geom::multires_external::expected_external_file_size(
-            total_levels,
-            corner_count,
-        )?;
-        let expected_file_size = variable_file_size.max(bridge_file_size);
+        let expected_file_size =
+            crate::geom::multires_external::expected_external_file_size(total_levels, corner_count)?;
         let source_bytes = fs::metadata(blend_file)
             .map_err(|error| PotError::io(&error))?
             .len();
@@ -2006,7 +1929,7 @@ fn load_external_multires(
             ));
         }
         let grids =
-            crate::geom::multires_external::read_external_grids_for_levels(&bytes, &grid_levels)?;
+            crate::geom::multires_external::read_external_grids(&bytes, total_levels, corner_count)?;
         let mut values = Map::new();
         let mut first_corner = 0_usize;
         for (face_index, face_corner_count) in face_corner_counts.into_iter().enumerate() {
@@ -2336,13 +2259,8 @@ fn check_multires_export_memory(doc: &SceneDoc, additional_output_bytes: u64) ->
                 "multires JSON output size overflows",
             )
         })?;
-        let variable_sidecar_bytes =
-            crate::geom::multires_external::expected_external_file_size_for_levels(&grid_levels)?;
-        let bridge_sidecar_bytes = crate::geom::multires_external::expected_external_file_size(
-            total_levels,
-            corner_count,
-        )?;
-        let sidecar_bytes = variable_sidecar_bytes.max(bridge_sidecar_bytes);
+        let sidecar_bytes =
+            crate::geom::multires_external::expected_external_file_size(total_levels, corner_count)?;
         let auxiliary_bytes = multires_auxiliary_memory_bytes(record)?;
         additional_bytes = additional_bytes
             .checked_add(u128::from(sidecar_bytes))
@@ -2566,50 +2484,6 @@ fn write_asset_sidecar(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(PotError::io(&error));
     }
     Ok(())
-}
-
-fn replace_created_multires_sidecar(
-    path: &Path,
-    bytes: &[u8],
-    created_files: &[PathBuf],
-) -> Result<()> {
-    let canonical_path = fs::canonicalize(path).map_err(|error| PotError::io(&error))?;
-    let metadata = fs::symlink_metadata(path).map_err(|error| PotError::io(&error))?;
-    if !metadata.file_type().is_file() {
-        return Err(PotError::new(
-            ErrorCode::ExportFailed,
-            "refusing to replace a non-regular multires sidecar",
-        ));
-    }
-    let is_owned = created_files.iter().any(|created| {
-        fs::canonicalize(created).is_ok_and(|candidate| candidate == canonical_path)
-    });
-    if !is_owned {
-        if fs::read(path).map_err(|error| PotError::io(&error))? == bytes {
-            return Ok(());
-        }
-        return Err(PotError::new(
-            ErrorCode::ExportFailed,
-            "refusing to replace a multires sidecar not created by this export",
-        ));
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|error| PotError::io(&error))?;
-    if !metadata.file_type().is_file() {
-        return Err(PotError::new(
-            ErrorCode::ExportFailed,
-            "refusing to replace a non-regular multires sidecar",
-        ));
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temporary = temporary_path_in(parent, "multires-sidecar-rewrite")?;
-    let result = (|| {
-        write_new(&temporary, bytes)?;
-        fs::rename(&temporary, path).map_err(|error| PotError::io(&error))
-    })();
-    if result.is_err() {
-        cleanup(&[temporary]);
-    }
-    result
 }
 
 fn cleanup(paths: &[PathBuf]) {
@@ -15892,6 +15766,44 @@ print("UNSUPPORTED_POSE " + json.dumps({
     }
 
     #[test]
+    fn external_export_refuses_mixed_corner_levels_without_writing_a_sidecar() -> Result<()> {
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let output = directory.path().join("mixed.blend");
+        let sidecar = directory.path().join("mixed_assets");
+        fs::create_dir(&sidecar).map_err(|error| PotError::io(&error))?;
+        let level_two = vec![[0.0_f32; 3]; 9];
+        let level_one = vec![[0.0_f32; 3]; 4];
+        let mut document = json!({
+            "data_blocks": {"data": {"mesh": {
+                "faces": [{"id": 1, "v": [0, 1, 2]}],
+                "attributes": {"multires_displacement": {
+                    "total_levels": 2,
+                    "grid_levels": [2, 1, 2],
+                    "values": {"f1": [level_two.clone(), level_one, level_two]},
+                }},
+            }}},
+            "nodes": {"object": {"data": "data", "modifiers": [{"type": "multires", "params": {}}]}},
+        });
+        let mut files = Vec::new();
+        let mut multires_sidecars = Vec::new();
+        let mut created_multires_sidecars = Vec::new();
+        let error = prepare_multires_external_sidecars(
+            &mut document,
+            &output,
+            &sidecar,
+            &mut files,
+            &mut multires_sidecars,
+            &mut created_multires_sidecars,
+            false,
+        )
+        .expect_err("mixed corner levels cannot be stored in an external sidecar");
+        assert_eq!(error.code, ErrorCode::UnrepresentableFeature);
+        assert!(error.message.contains("corner 1 is at level 1"));
+        assert!(fs::read_dir(&sidecar).map_err(|error| PotError::io(&error))?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
     fn external_multires_reuse_does_not_delete_identical_preexisting_sidecar() -> Result<()> {
         let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
         let output = directory.path().join("packed.blend");
@@ -15922,55 +15834,6 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert_eq!(
             fs::read(sidecar_file).map_err(|error| PotError::io(&error))?,
             bytes
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn identical_unowned_multires_sidecar_is_reused_without_writing() -> Result<()> {
-        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
-        let reused = directory.path().join("reused.btx");
-        fs::write(&reused, b"existing exact payload").map_err(|error| PotError::io(&error))?;
-        replace_created_multires_sidecar(&reused, b"existing exact payload", &[])?;
-        assert_eq!(
-            fs::read(&reused).map_err(|error| PotError::io(&error))?,
-            b"existing exact payload"
-        );
-        assert_eq!(
-            replace_created_multires_sidecar(&reused, b"different payload", &[])
-                .unwrap_err()
-                .code,
-            ErrorCode::ExportFailed
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn variable_sidecar_rewrite_never_replaces_unowned_files() -> Result<()> {
-        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
-        let reused = directory.path().join("reused.btx");
-        fs::write(&reused, b"preexisting").map_err(|error| PotError::io(&error))?;
-        assert_eq!(
-            replace_created_multires_sidecar(&reused, b"replacement", &[])
-                .unwrap_err()
-                .code,
-            ErrorCode::ExportFailed
-        );
-        assert_eq!(
-            fs::read(&reused).map_err(|error| PotError::io(&error))?,
-            b"preexisting"
-        );
-
-        let created = directory.path().join("created.btx");
-        write_asset_sidecar(&created, b"bridge placeholder")?;
-        replace_created_multires_sidecar(
-            &created,
-            b"variable grid payload",
-            std::slice::from_ref(&created),
-        )?;
-        assert_eq!(
-            fs::read(created).map_err(|error| PotError::io(&error))?,
-            b"variable grid payload"
         );
         Ok(())
     }
