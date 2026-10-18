@@ -103,7 +103,10 @@ def canonical(co):
 def attribute_value(item, data_type):
     if data_type == "QUATERNION":
         value = item.value
-        return [float(value.x), float(value.y), float(value.z), float(value.w)]
+        if hasattr(value, "x"):
+            return [float(value.x), float(value.y), float(value.z), float(value.w)]
+        # Blender 5.2 returns a plain (w, x, y, z) array for quaternion attributes.
+        return [float(value[1]), float(value[2]), float(value[3]), float(value[0])]
     if data_type == "FLOAT4X4":
         return [[float(component) for component in row] for row in item.value]
     if data_type in ("FLOAT_COLOR", "BYTE_COLOR"):
@@ -112,7 +115,9 @@ def attribute_value(item, data_type):
         value = item.vector
     else:
         value = item.value
-    if isinstance(value, (tuple, list)) or hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, (tuple, list)) or hasattr(value, "__iter__") and not isinstance(value, str):
         return list(value)
     return value
 
