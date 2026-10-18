@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
 pub(crate) mod attribute_keys;
+pub(crate) mod blender_matrix;
 pub mod boolean;
 pub(crate) mod clnor;
 pub(crate) mod color_layers;
@@ -45,6 +46,19 @@ pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
 pub mod vdb;
 pub mod volume;
+
+/// Evaluated per-corner normals of `mesh`, in flattened `mesh.faces` corner order. Authored
+/// custom-normal codes decode on their current fans; Auto corners and meshes without custom normals
+/// take the computed shading. This is the evaluator the renderer and exporters read, not a second
+/// implementation.
+///
+/// # Errors
+///
+/// Returns the errors of the shared corner-normal evaluator for malformed custom-normal state.
+pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
+    let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
+    normals::corner_normals(mesh, &positions)
+}
 
 #[cfg(test)]
 mod shading_oracle;

@@ -634,10 +634,11 @@ fn report_all_shading_fixtures() -> TestResult {
 fn exact_shading_fixtures_match_blender() -> TestResult {
     let mut failures = Vec::new();
     for name in EXACT {
-        match evaluate_fixture(name)? {
-            Some(report) if report.exact() => {}
-            Some(report) => failures.push(format!("{name}: {report:?}")),
-            None => failures.push(format!("{name}: fixture refused by Blender")),
+        match evaluate_fixture(name) {
+            Ok(Some(report)) if report.exact() => {}
+            Ok(Some(report)) => failures.push(format!("{name}: {report:?}")),
+            Ok(None) => failures.push(format!("{name}: fixture refused by Blender")),
+            Err(error) => failures.push(format!("{name}: {error}")),
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

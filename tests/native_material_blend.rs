@@ -23,8 +23,8 @@ mod native_oracle;
 mod process;
 
 use native_oracle::{
-    FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats, blender,
-    build_oracle, dump_blend, dumped_object, export, import_blend, losses, node_id, number,
+    FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, assert_floats, build_oracle,
+    dump_blend, dumped_object, export, f32_ulp_tolerance, import_blend, losses, node_id, number,
     read_scene, render_texture, run_blender, vec3, write_script,
 };
 use serde_json::{Value, json};
@@ -62,6 +62,36 @@ fn assert_grid(actual: &Value, wanted: &Value, tolerance: f64, label: &str) -> T
     Ok(())
 }
 
+/// Stored f32 pixels that Potter's export must match, in f32 ulps of each expected value.
+///
+/// The chain is: decode the 8-bit byte to linear in f64 (`color::srgb_to_linear`), re-encode in f64
+/// (`linear_to_srgb_unclamped`, `exchange/blend.rs`), store as f32 in Blender's float buffer. The f64
+/// round trip is exact to about 1e-8, and the f32 store adds at most half an ulp, so the stored value
+/// is within one ulp of f32(200/255). Two ulps leaves margin for one more rounding. A larger
+/// difference is a product or store defect, not a tolerance to widen.
+const STORED_PIXEL_ULPS: f64 = 2.0;
+
+/// Compares each channel of `actual` with `wanted` within `ulps` f32 ulps of the wanted value.
+fn assert_stored_grid(actual: &Value, wanted: &Value, ulps: f64, label: &str) -> TestResult {
+    let actual = rows(actual)?;
+    let wanted = rows(wanted)?;
+    assert_eq!(actual.len(), wanted.len(), "{label}: row count");
+    for (y, (actual_row, wanted_row)) in actual.iter().zip(&wanted).enumerate() {
+        assert_eq!(actual_row.len(), wanted_row.len(), "{label}: row {y} width");
+        for (x, (a, w)) in actual_row.iter().zip(wanted_row).enumerate() {
+            for (channel, (a, w)) in a.iter().zip(w).enumerate() {
+                assert_close(
+                    *a,
+                    *w,
+                    f32_ulp_tolerance(*w, ulps),
+                    &format!("{label} pixel ({x}, {y}) channel {channel}"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The largest per-channel difference between two grids of the same size.
 fn grid_distance(a: &Grid, b: &Grid) -> f64 {
     a.iter()
@@ -71,8 +101,11 @@ fn grid_distance(a: &Grid, b: &Grid) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// Checks one Blender render of the texture plane (`render_texture.py` output).
-fn check_render(result: &Value, expected: &Value, label: &str) -> TestResult {
+/// Checks one Blender render of the texture plane (`render_texture.py` output). `potter_export`
+/// marks Potter's export, whose packed PNG reopens as a FILE image with its raw encoded bytes, so
+/// `image.pixels` holds the stored sRGB values unconverted. Those are compared directly within f32
+/// ulps (`STORED_PIXEL_ULPS`). The Blender reference is compared raw at `FLOAT_TOLERANCE`.
+fn check_render(result: &Value, expected: &Value, label: &str, potter_export: bool) -> TestResult {
     let texture = &expected["texture"];
     assert_eq!(
         result["image_size"],
@@ -85,12 +118,21 @@ fn check_render(result: &Value, expected: &Value, label: &str) -> TestResult {
         "{label}: texture must sample the Base layer"
     );
     // The file's PNG, read by Blender (`image.pixels`, bottom row first): no flip anywhere.
-    assert_grid(
-        &result["image_pixels_bottom_up"],
-        &texture["blender_pixels_bottom_up"],
-        FLOAT_TOLERANCE,
-        &format!("{label} image pixels"),
-    )?;
+    if potter_export {
+        assert_stored_grid(
+            &result["image_pixels_bottom_up"],
+            &texture["blender_pixels_bottom_up"],
+            STORED_PIXEL_ULPS,
+            &format!("{label} image pixels"),
+        )?;
+    } else {
+        assert_grid(
+            &result["image_pixels_bottom_up"],
+            &texture["blender_pixels_bottom_up"],
+            FLOAT_TOLERANCE,
+            &format!("{label} image pixels"),
+        )?;
+    }
     // The render: one texel per pixel, Base flipped.
     let rendered = rows(&result["render_bottom_up"])?;
     assert_grid(
@@ -107,9 +149,9 @@ fn check_render(result: &Value, expected: &Value, label: &str) -> TestResult {
     Ok(())
 }
 
-/// The node that feeds `to_socket` of the node named `to_node`, from a dumped material.
-fn feeding<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResult<&'a Value> {
-    let link = material["links"]
+/// The link that feeds `to_socket` of the node named `to_node`, from a dumped material.
+fn link_into<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResult<&'a Value> {
+    material["links"]
         .as_array()
         .ok_or("dumped links are missing")?
         .iter()
@@ -117,7 +159,12 @@ fn feeding<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResul
             link["to_node"].as_str() == Some(to_node)
                 && link["to_socket"].as_str() == Some(to_socket)
         })
-        .ok_or_else(|| format!("nothing feeds {to_node}.{to_socket}"))?;
+        .ok_or_else(|| format!("nothing feeds {to_node}.{to_socket}").into())
+}
+
+/// The node that feeds `to_socket` of the node named `to_node`, from a dumped material.
+fn feeding<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResult<&'a Value> {
+    let link = link_into(material, to_node, to_socket)?;
     let source = link["from_node"].as_str().ok_or("link has no source")?;
     material["nodes"]
         .as_array()
@@ -127,8 +174,12 @@ fn feeding<'a>(material: &'a Value, to_node: &str, to_socket: &str) -> TestResul
         .ok_or_else(|| format!("node {source} is missing").into())
 }
 
-/// The Blender-side structure of the field material: the base texture reads `Base` into Base
-/// Color, and the roughness texture reads the render layer `Light` into Roughness.
+/// The Blender-side structure of the field material. The field keeps Potter's default factors (base
+/// color 0.6, roughness 0.8), which multiply the texture as Blender's glTF importer builds them
+/// (`material_graph.rs` `multiply_color`, `multiply_channel`). The base texture reads `Base` into a
+/// `MixRGB` MULTIPLY whose Color2 is the texture, feeding Base Color. The roughness texture reads the
+/// render layer `Light` through its Red channel and a Math MULTIPLY, feeding Roughness. Factors are
+/// unlinked constants, which the dump does not record; the links prove the chains.
 fn check_material_links(object: &Value) -> TestResult {
     let material = object["materials"]
         .as_array()
@@ -144,11 +195,17 @@ fn check_material_links(object: &Value) -> TestResult {
         .ok_or("node has no name")?
         .to_owned();
 
-    let base = feeding(material, &principled, "Base Color")?;
+    let base_mix = feeding(material, &principled, "Base Color")?;
     assert_eq!(
-        base["type"], "ShaderNodeTexImage",
-        "base color is a texture"
+        base_mix["type"], "ShaderNodeMixRGB",
+        "base color is the texture times its factor"
     );
+    let base = feeding(
+        material,
+        base_mix["name"].as_str().unwrap_or_default(),
+        "Color2",
+    )?;
+    assert_eq!(base["type"], "ShaderNodeTexImage", "base texture");
     assert_eq!(base["interpolation"], "Closest", "base color interpolation");
     let base_uv = feeding(
         material,
@@ -161,7 +218,35 @@ fn check_material_links(object: &Value) -> TestResult {
     );
     assert_eq!(base_uv["uv_map"], "Base", "base texture layer selection");
 
-    let rough = feeding(material, &principled, "Roughness")?;
+    // Potter's scalar fields read the texture's Red channel (`material_graph.rs` `channel_texture`).
+    let rough_factor = feeding(material, &principled, "Roughness")?;
+    assert_eq!(
+        rough_factor["type"], "ShaderNodeMath",
+        "roughness is the channel times its factor"
+    );
+    let rough_split = feeding(
+        material,
+        rough_factor["name"].as_str().unwrap_or_default(),
+        "Value",
+    )?;
+    assert_eq!(
+        rough_split["type"], "ShaderNodeSeparateColor",
+        "roughness is a separated texture channel"
+    );
+    let rough_link = link_into(
+        material,
+        rough_factor["name"].as_str().unwrap_or_default(),
+        "Value",
+    )?;
+    assert_eq!(
+        rough_link["from_socket"], "Red",
+        "roughness reads the texture's Red channel"
+    );
+    let rough = feeding(
+        material,
+        rough_split["name"].as_str().unwrap_or_default(),
+        "Color",
+    )?;
     assert_eq!(
         rough["type"], "ShaderNodeTexImage",
         "roughness is a texture"
@@ -180,7 +265,7 @@ fn check_material_links(object: &Value) -> TestResult {
 
 #[test]
 fn textured_plane_renders_the_base_layer_with_its_file_orientation() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -194,7 +279,7 @@ fn textured_plane_renders_the_base_layer_with_its_file_orientation() -> TestResu
         &oracle_dir.join("reference.blend"),
         "reference",
     )?;
-    check_render(&reference, &expected, "reference")?;
+    check_render(&reference, &expected, "reference", false)?;
 
     // Potter: import the oracle, author the field material, export, and render the export.
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
@@ -221,7 +306,7 @@ fn textured_plane_renders_the_base_layer_with_its_file_orientation() -> TestResu
     check_material_links(dumped_object(&dump, "TexturePlane")?)?;
 
     let potter = render_texture(&blender, root.path(), &exported_blend, "potter")?;
-    check_render(&potter, &expected, "potter")?;
+    check_render(&potter, &expected, "potter", true)?;
     Ok(())
 }
 
@@ -258,7 +343,7 @@ fn potter_material<'a>(scene: &'a Value, name: &str) -> TestResult<&'a Value> {
 
 #[test]
 fn alpha_mode_and_threshold_survive_authoring_through_blend() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -394,7 +479,7 @@ fn alpha_mode_and_threshold_survive_authoring_through_blend() -> TestResult {
 
 #[test]
 fn blender_authored_materials_infer_alpha_mode_from_render_state() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;

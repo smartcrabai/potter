@@ -149,7 +149,9 @@ fn decode_v1(decoder: &mut Decoder<'_>) -> Result<BTreeMap<Id, AvatarMtoon>> {
         }
         let material_id = decoder.material_id(material_index)?;
         let value = decode_v1_material(decoder, &material_id, extension)?;
-        mtoon.insert(material_id, value);
+        for material_id in decoder.material_ids(material_index)? {
+            mtoon.insert(material_id, value.clone());
+        }
     }
     Ok(mtoon)
 }
@@ -378,7 +380,9 @@ fn decode_v0(decoder: &mut Decoder<'_>) -> Result<BTreeMap<Id, AvatarMtoon>> {
             continue;
         }
         let value = decode_v0_material(decoder, &material, property)?;
-        mtoon.insert(material, value);
+        for material_id in decoder.material_ids(material_index)? {
+            mtoon.insert(material_id, value.clone());
+        }
     }
     Ok(mtoon)
 }
@@ -934,6 +938,37 @@ pub(super) fn move_main_texture_transforms(
             _ => continue,
         };
         move_textures_to_graph(doc, material_id, &textures)?;
+        if let Some(variants) = index.color_material_variants.get(material_id) {
+            let source_graph_id = doc
+                .materials
+                .get(material_id)
+                .and_then(|material| material.node_tree.as_ref())
+                .cloned()
+                .ok_or_else(|| import_error("VRM 0.x main texture graph is missing"))?;
+            let source_graph = doc
+                .node_groups
+                .get(&source_graph_id)
+                .cloned()
+                .ok_or_else(|| import_error("VRM 0.x main texture shader graph is missing"))?;
+            for (layer, variant_id) in variants {
+                let variant_material = doc
+                    .materials
+                    .get(variant_id)
+                    .cloned()
+                    .ok_or_else(|| import_error("glTF color material variant is missing"))?;
+                let variant_graph_id = variant_material
+                    .node_tree
+                    .clone()
+                    .ok_or_else(|| import_error("glTF color material graph is missing"))?;
+                let mut graph = source_graph.clone();
+                crate::exchange::gltf::bind_imported_vertex_color(
+                    &mut graph,
+                    layer,
+                    &variant_material,
+                )?;
+                doc.node_groups.insert(variant_graph_id, graph);
+            }
+        }
         moved.insert(material_id.clone());
     }
     Ok(moved)

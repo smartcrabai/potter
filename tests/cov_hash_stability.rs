@@ -134,7 +134,7 @@ fn import_undo_and_redo_store_hashes_match_reopened_projects() -> Result<(), Box
     let imported_info = project.commit_import(imported, json!([]), json!({}))?;
     assert_eq!(imported_info.hash, Project::open(&path)?.info()?.hash);
 
-    let (undo_snapshot, undo_target) = project.history_target(HistoryDirection::Undo, 1)?;
+    let (undo_snapshot, undo_target, _) = project.history_target(HistoryDirection::Undo, 1)?;
     let undone_info = project.commit_history(
         HistoryDirection::Undo,
         undo_snapshot,
@@ -144,7 +144,7 @@ fn import_undo_and_redo_store_hashes_match_reopened_projects() -> Result<(), Box
     )?;
     assert_eq!(undone_info.hash, Project::open(&path)?.info()?.hash);
 
-    let (redo_snapshot, redo_target) = project.history_target(HistoryDirection::Redo, 1)?;
+    let (redo_snapshot, redo_target, _) = project.history_target(HistoryDirection::Redo, 1)?;
     let redone_info = project.commit_history(
         HistoryDirection::Redo,
         redo_snapshot,

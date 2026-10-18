@@ -2512,6 +2512,7 @@ fn apply_delete(mesh: &mut Mesh, selected: &Selection) -> IdChanges {
             });
         }
     }
+    uv_layers::prune_missing_faces(mesh);
     changes
 }
 
@@ -3671,36 +3672,33 @@ fn validate_attribute_value(attribute_type: &str, value: &Value) -> Result<Value
                 "{attribute_type} attribute values need {components} components"
             ))
         })?;
-    match attribute_type {
-        "quaternion" => {
-            let mut components = [0.0; 4];
-            for (index, component) in values.iter().enumerate() {
-                components[index] = component
-                    .as_f64()
-                    .filter(|value| value.is_finite())
-                    .ok_or_else(|| invalid("quaternion components must be finite numbers"))?;
-            }
-            let norm = components
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt();
-            if norm <= f64::EPSILON {
-                return Err(invalid("quaternion attribute values must be non-zero"));
-            }
-            Ok(json!(components.map(|component| component / norm)))
+    if attribute_type == "quaternion" {
+        let mut components = [0.0; 4];
+        for (index, component) in values.iter().enumerate() {
+            components[index] = component
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| invalid("quaternion components must be finite numbers"))?;
         }
-        _ => {
-            if values
-                .iter()
-                .any(|component| !component.as_f64().is_some_and(f64::is_finite))
-            {
-                return Err(invalid(format!(
-                    "{attribute_type} components must be finite numbers"
-                )));
-            }
-            Ok(value.clone())
+        let norm = components
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        if norm <= f64::EPSILON {
+            return Err(invalid("quaternion attribute values must be non-zero"));
         }
+        Ok(json!(components.map(|component| component / norm)))
+    } else {
+        if values
+            .iter()
+            .any(|component| !component.as_f64().is_some_and(f64::is_finite))
+        {
+            return Err(invalid(format!(
+                "{attribute_type} components must be finite numbers"
+            )));
+        }
+        Ok(value.clone())
     }
 }
 
@@ -3765,12 +3763,22 @@ fn create_color_layer(
     Ok(())
 }
 
+/// `uv_layers` is the UV layer store, not a user attribute: create, update, and delete reject it.
+fn reject_reserved_attribute(name: &str) -> Result<()> {
+    if name == uv_layers::ATTRIBUTE {
+        return Err(invalid(format!(
+            "mesh attribute `{name}` is reserved for UV layers"
+        )));
+    }
+    Ok(())
+}
 fn apply_attribute_create(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
     let name = args
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_create requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     if mesh.attributes.contains_key(&*storage_key(name)) {
         return Err(invalid(format!("mesh attribute `{name}` already exists")));
     }
@@ -3835,6 +3843,7 @@ fn apply_attribute_update(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_update requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     let storage = storage_key(name);
     let key: &str = &storage;
     let attribute = mesh
@@ -3893,6 +3902,7 @@ fn apply_attribute_delete(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("attribute_delete requires a non-empty name"))?;
+    reject_reserved_attribute(name)?;
     let storage = storage_key(name);
     let key: &str = &storage;
     if !mesh.attributes.contains_key(key) {
@@ -4371,6 +4381,10 @@ fn interpolate_uv_layers(source: &Mesh, target: &mut Mesh) -> Result<()> {
 
 fn interpolate_attributes(source: &Mesh, target: &mut Mesh) -> Result<()> {
     for (name, source_attribute) in &source.attributes {
+        // `custom_normal` is a `normal_code` store; `carry_custom_normals` rebuilds it from vectors.
+        if name.as_str() == "custom_normal" {
+            continue;
+        }
         let Some(source_fields) = source_attribute.as_object() else {
             continue;
         };
@@ -4569,11 +4583,51 @@ fn interpolate_attributes(source: &Mesh, target: &mut Mesh) -> Result<()> {
 
 fn has_interpolatable_attributes(mesh: &Mesh) -> bool {
     mesh.attributes.contains_key(uv_layers::ATTRIBUTE)
-        || mesh.attributes.values().any(|attribute| {
-            attribute.as_object().is_some_and(|fields| {
-                fields.contains_key("domain") && fields.contains_key("values")
-            })
+        || mesh.attributes.iter().any(|(name, attribute)| {
+            name.as_str() != "custom_normal"
+                && attribute.as_object().is_some_and(|fields| {
+                    fields.contains_key("domain") && fields.contains_key("values")
+                })
         })
+}
+
+/// Carries `custom_normal` across an edit that changes faces. Codes are relative to their fan, so
+/// the source's evaluated corner vectors are decoded before the edit, keyed by face ID, and encoded
+/// again on the edited mesh. A face that keeps its ID and corner count keeps its vectors; new or
+/// resized faces are automatic. The edited mesh takes its storage order as its loop basis.
+fn carry_custom_normals(source: &Mesh, target: &mut Mesh) -> Result<()> {
+    // Remesh replaces the mesh without a custom-normal layer, and that absence is kept.
+    if !target.attributes.contains_key("custom_normal") {
+        return Ok(());
+    }
+    let positions: Vec<DVec3> = source.vertices.iter().map(|vertex| vertex.co).collect();
+    let vectors = clnor::corner_custom_normals(source, &positions, NormalCodeOptions::default())?;
+    // The stale layer goes first: its rows are keyed by faces the edit may have removed, and the
+    // setter reads it.
+    target.attributes.remove("custom_normal");
+    let Some(vectors) = vectors else {
+        return Ok(());
+    };
+    let mut source_corners = HashMap::with_capacity(source.faces.len());
+    let mut start = 0;
+    for face in &source.faces {
+        let end = start + face.vertices.len();
+        source_corners.insert(face.id, &vectors[start..end]);
+        start = end;
+    }
+    let carried: Vec<Option<DVec3>> = target
+        .faces
+        .iter()
+        .flat_map(|face| match source_corners.get(&face.id) {
+            Some(corners) if corners.len() == face.vertices.len() => corners.to_vec(),
+            _ => vec![None; face.vertices.len()],
+        })
+        .collect();
+    clnor::encode_vectors(
+        target,
+        Some(carried.as_slice()),
+        NormalCodeOptions::default(),
+    )
 }
 
 fn is_topology_operation(operation: &str, args: &Map<String, Value>) -> bool {
@@ -5586,12 +5640,10 @@ fn apply_set_attribute(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdC
                 return Err(invalid("crease must be a finite number from zero to one"));
             }
         }
-        "shade_smooth" => {
-            if selected.domain != Domain::Face || !value.is_boolean() {
-                return Err(invalid(
-                    "shade_smooth requires face elements and a boolean value",
-                ));
-            }
+        "shade_smooth" if selected.domain != Domain::Face || !value.is_boolean() => {
+            return Err(invalid(
+                "shade_smooth requires face elements and a boolean value",
+            ));
         }
         _ => {}
     }
@@ -7009,18 +7061,23 @@ fn apply_inner(
         }
     };
     reject_unknown_fields(args, allowed_fields, "operation")?;
-    let topology_edit = is_topology_operation(operation, args);
-    let multires_edit = topology_edit || operation == "flip_normals";
-    let attribute_source_needed = topology_edit && has_interpolatable_attributes(mesh);
+    let topology = is_topology_operation(operation, args);
+    let multires_edit = topology || operation == "flip_normals";
+    let attribute_source_needed = topology && has_interpolatable_attributes(mesh);
+    // Deleting faces also invalidates custom normals, so they are rebuilt as for topology edits.
+    let normal_source_needed = topology && mesh.attributes.contains_key("custom_normal");
     let multires_source_needed = multires_edit
         && operation != "remesh"
         && mesh.attributes.contains_key("multires_displacement");
     let mut owned_source = None;
-    if source_mesh.is_none() && (attribute_source_needed || multires_source_needed) {
+    if source_mesh.is_none()
+        && (attribute_source_needed || normal_source_needed || multires_source_needed)
+    {
         owned_source = Some(mesh.clone());
     }
     let source = source_mesh.or(owned_source.as_ref());
     let attribute_source = attribute_source_needed.then_some(source).flatten();
+    let normal_source = normal_source_needed.then_some(source).flatten();
     let mut multires_data = if multires_source_needed {
         multires::read_grid_data(
             source.ok_or_else(|| invalid("multires topology edit has no source mesh"))?,
@@ -7121,6 +7178,9 @@ fn apply_inner(
             rebase_multires(source, mesh, data, operation, &changes.mdisp_sources)?;
         }
         multires::write_grid_data(mesh, data)?;
+    }
+    if let Some(source) = normal_source {
+        carry_custom_normals(source, mesh)?;
     }
     mesh.validate().map_err(|error| mesh_error(&error))?;
     Ok(json!({
@@ -8234,7 +8294,7 @@ mod tests {
         );
     }
 
-    fn create_color(mesh: &mut Mesh, name: &str, domain: &str, default: serde_json::Value) {
+    fn create_color(mesh: &mut Mesh, name: &str, domain: &str, default: &serde_json::Value) {
         apply(
             mesh,
             "attribute_create",
@@ -8246,7 +8306,7 @@ mod tests {
     #[test]
     fn attribute_create_color_registers_a_point_layer_that_reads_back() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        create_color(&mut mesh, "Tint", "point", json!([0.5, 0.25, 0.0, 1.0]));
+        create_color(&mut mesh, "Tint", "point", &json!([0.5, 0.25, 0.0, 1.0]));
 
         let store = color_layers::read(&mesh);
         assert_eq!(store.layers.len(), 1);
@@ -8269,7 +8329,7 @@ mod tests {
     #[test]
     fn attribute_create_color_corner_layer_has_one_value_per_corner() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        create_color(&mut mesh, "Paint", "corner", json!([1.0, 1.0, 1.0, 1.0]));
+        create_color(&mut mesh, "Paint", "corner", &json!([1.0, 1.0, 1.0, 1.0]));
 
         let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
         let store = color_layers::read(&mesh);
@@ -8281,8 +8341,8 @@ mod tests {
     #[test]
     fn attribute_create_color_appends_and_keeps_existing_designations() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        create_color(&mut mesh, "First", "point", json!([1.0, 0.0, 0.0, 1.0]));
-        create_color(&mut mesh, "Second", "corner", json!([0.0, 1.0, 0.0, 1.0]));
+        create_color(&mut mesh, "First", "point", &json!([1.0, 0.0, 0.0, 1.0]));
+        create_color(&mut mesh, "Second", "corner", &json!([0.0, 1.0, 0.0, 1.0]));
 
         let store = color_layers::read(&mesh);
         let names: Vec<&str> = store
@@ -8307,7 +8367,7 @@ mod tests {
         .unwrap();
 
         assert!(!mesh.attributes.contains_key(color_layers::ATTRIBUTE));
-        assert!(color_layers::read(&mesh).layers.is_empty());
+        assert_eq!(color_layers::read(&mesh).layers.len(), 0);
     }
 
     #[test]
@@ -8332,7 +8392,7 @@ mod tests {
     #[test]
     fn user_attribute_named_like_the_color_store_is_escaped_and_leaves_the_store_alone() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        create_color(&mut mesh, "Tint", "point", json!([0.0, 0.0, 0.0, 1.0]));
+        create_color(&mut mesh, "Tint", "point", &json!([0.0, 0.0, 0.0, 1.0]));
         let registry = mesh.attributes[color_layers::ATTRIBUTE].clone();
         let vertex = format!("v{}", mesh.vertices[0].id);
         apply(
@@ -8370,8 +8430,8 @@ mod tests {
     #[test]
     fn attribute_update_writes_color_values_and_keeps_the_registry() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        create_color(&mut mesh, "Tint", "point", json!([0.0, 0.0, 0.0, 1.0]));
-        create_color(&mut mesh, "Paint", "corner", json!([0.0, 0.0, 0.0, 1.0]));
+        create_color(&mut mesh, "Tint", "point", &json!([0.0, 0.0, 0.0, 1.0]));
+        create_color(&mut mesh, "Paint", "corner", &json!([0.0, 0.0, 0.0, 1.0]));
         let vertex = format!("v{}", mesh.vertices[0].id);
         apply(
             &mut mesh,
@@ -8412,8 +8472,8 @@ mod tests {
     #[test]
     fn attribute_delete_drops_a_color_layer_from_the_registry() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        create_color(&mut mesh, "First", "point", json!([1.0, 0.0, 0.0, 1.0]));
-        create_color(&mut mesh, "Second", "corner", json!([0.0, 1.0, 0.0, 1.0]));
+        create_color(&mut mesh, "First", "point", &json!([1.0, 0.0, 0.0, 1.0]));
+        create_color(&mut mesh, "Second", "corner", &json!([0.0, 1.0, 0.0, 1.0]));
 
         apply(&mut mesh, "attribute_delete", &json!({ "name": "First" })).unwrap();
         let store = color_layers::read(&mesh);
@@ -8437,8 +8497,8 @@ mod tests {
     #[test]
     fn attribute_delete_of_selected_color_elements_resets_them_to_opaque_black() {
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        create_color(&mut mesh, "Tint", "point", json!([1.0, 1.0, 1.0, 1.0]));
-        create_color(&mut mesh, "Paint", "corner", json!([1.0, 1.0, 1.0, 1.0]));
+        create_color(&mut mesh, "Tint", "point", &json!([1.0, 1.0, 1.0, 1.0]));
+        create_color(&mut mesh, "Paint", "corner", &json!([1.0, 1.0, 1.0, 1.0]));
         let vertex = format!("v{}", mesh.vertices[0].id);
         apply(
             &mut mesh,

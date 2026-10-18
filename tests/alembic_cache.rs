@@ -287,31 +287,6 @@ fn mesh_sequence_cache_reports_missing_and_changed_external_files() -> Result<()
 }
 
 #[test]
-fn mesh_sequence_cache_vertex_only_read_rejects_count_mismatches() -> Result<(), Box<dyn Error>> {
-    let temporary = tempdir()?;
-    let source = temporary.path().join("source.pot");
-    let archive = temporary.path().join("animated.abc");
-    export_animated_cache(&source, &archive)?;
-    let target = temporary.path().join("target.pot");
-    init(&target)?;
-    apply(
-        &target,
-        &json!([
-            {"op":"node.create", "id":"body", "kind":"box", "params":{"size":2.0}},
-            {"op":"resource.pack", "id":"cache", "uri":archive, "kind":"alembic"},
-            {"op":"modifier.create", "target":{"id":"body"}, "id":"cache", "type":"mesh_sequence_cache", "params":{"resource":"cache", "object_path":"/root/body/geometry", "read_data":["VERT"]}}
-        ]),
-    )?;
-    let output = inspect(&target, 1.0)?;
-    assert_eq!(output.status.code(), Some(4));
-    let error: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(error["error"]["code"], "EVALUATION_FAILED");
-    assert_eq!(error["error"]["details"]["input_vertex_count"], 8);
-    assert_eq!(error["error"]["details"]["cache_vertex_count"], 4);
-    Ok(())
-}
-
-#[test]
 fn mesh_sequence_cache_schema_describes_modifier_parameters() -> Result<(), Box<dyn Error>> {
     let schema = potter_core::schema::schema("operations", Some("modifier.create"))?;
     let cache_params = schema

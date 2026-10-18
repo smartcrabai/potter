@@ -27,6 +27,9 @@ pub struct HistoryRecord {
     pub target: Option<String>,
     pub snapshot: SceneDoc,
 }
+/// History records returned together with any upgrade diagnostics from their snapshots.
+pub type HistoryRecordsAndWarnings = (Vec<(String, HistoryRecord)>, Vec<Value>);
+type SnapshotRead = (SceneDoc, Vec<Value>, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryDirection {
@@ -39,6 +42,13 @@ pub struct Project {
     cache_directory: PathBuf,
     lock: Option<File>,
     doc: SceneDoc,
+    /// Diagnostics from upgrading the loaded scene document.
+    load_warnings: Vec<Value>,
+    /// Digest of the schema-1 `scene.json` this project opened. Its bytes are kept before the first
+    /// schema-2 write replaces them.
+    legacy_digest: Option<String>,
+    /// Hash reported for the untouched schema-1 scene before migration changes its schema version.
+    legacy_hash: Option<String>,
 }
 
 impl Project {
@@ -68,6 +78,9 @@ impl Project {
             cache_directory,
             lock,
             doc,
+            load_warnings: Vec::new(),
+            legacy_digest: None,
+            legacy_hash: None,
         };
         project.save_initial()?;
         Ok(project)
@@ -100,20 +113,52 @@ impl Project {
         } else {
             None
         };
-        let doc = Self::read_snapshot(&canonical)?;
+        let (doc, load_warnings, legacy_digest, legacy_hash) = Self::read_snapshot(&canonical)?;
         Ok(Self {
             path: canonical,
             cache_directory,
             lock,
             doc,
+            load_warnings,
+            legacy_digest,
+            legacy_hash,
         })
     }
 
-    fn read_snapshot(path: &Path) -> Result<SceneDoc> {
+    /// Reads and upgrades `scene.json`. The diagnostics name the original bytes they describe. The
+    /// digest and compatibility hash are returned only for schema version 1.
+    fn read_snapshot(path: &Path) -> Result<SnapshotRead> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
-        let doc = crate::model::migrate::parse_scene(&bytes)?;
-        doc.validate()?;
-        Ok(doc)
+        let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes)?;
+        parsed.doc.validate()?;
+        let digest = hash::sha256(&bytes);
+        let mut warnings = parsed.warnings;
+        tag_originals(
+            &mut warnings,
+            &content_path("compat", "scene.json", &digest),
+            &digest,
+        );
+        let legacy_digest = parsed.legacy.then_some(digest);
+        Ok((parsed.doc, warnings, legacy_digest, parsed.legacy_hash))
+    }
+
+    /// Keeps the bytes of a schema-1 `scene.json` before a schema-2 write replaces them, under the
+    /// content-addressed path that the diagnostics name. The file must still hold the bytes this
+    /// project opened.
+    fn preserve_legacy_scene(&self) -> Result<()> {
+        let Some(digest) = self.legacy_digest.as_deref() else {
+            return Ok(());
+        };
+        let bytes = fs::read(self.path.join("scene.json")).map_err(|error| PotError::io(&error))?;
+        if hash::sha256(&bytes) != digest {
+            return Err(PotError::with_details(
+                ErrorCode::InternalError,
+                "scene.json changed after the project was opened",
+                json!({ "opened": digest }),
+            ));
+        }
+        self.write_compat_blob("scene.json", &bytes)?;
+        Ok(())
     }
 
     fn lock_file(path: &Path) -> Result<File> {
@@ -173,13 +218,25 @@ impl Project {
         &self.cache_directory
     }
 
+    /// Diagnostics from upgrading the loaded scene document: legacy UV data that was skipped or
+    /// dropped. Each names its mesh or layer and the original bytes it came from.
+    #[must_use]
+    pub fn warnings(&self) -> &[Value] {
+        &self.load_warnings
+    }
+
     pub fn info(&self) -> Result<SceneInfo> {
-        let value = serde_json::to_value(&self.doc).map_err(|error| internal_json(&error))?;
+        let scene_hash = if let Some(hash) = &self.legacy_hash {
+            hash.clone()
+        } else {
+            let value = serde_json::to_value(&self.doc).map_err(|error| internal_json(&error))?;
+            hash::sha256(&hash::canonicalize(&value)?)
+        };
         Ok(SceneInfo {
             id: self.doc.scene_id.clone(),
             path: self.path.to_string_lossy().into_owned(),
             revision: self.doc.revision,
-            hash: hash::sha256(&hash::canonicalize(&value)?),
+            hash: scene_hash,
         })
     }
 
@@ -375,6 +432,7 @@ impl Project {
         record: &HistoryRecord,
     ) -> Result<SceneInfo> {
         let expected_head = candidate.history.head.clone();
+        self.preserve_legacy_scene()?;
         let record_hash = write_history_blob(&self.path, record)?;
         if expected_head.as_deref() != Some(record_hash.as_str()) {
             return Err(PotError::new(
@@ -383,6 +441,8 @@ impl Project {
             ));
         }
         write_scene_atomic(&self.path, &candidate)?;
+        self.legacy_digest = None;
+        self.legacy_hash = None;
         self.doc = candidate;
         self.info()
     }
@@ -437,30 +497,37 @@ impl Project {
             target: Some(target),
             snapshot,
         };
+        self.preserve_legacy_scene()?;
         let record_hash = write_history_blob(&self.path, &record)?;
         candidate.history.head = Some(record_hash);
         candidate.validate()?;
         write_scene_atomic(&self.path, &candidate)?;
+        self.legacy_digest = None;
+        self.legacy_hash = None;
         self.doc = candidate;
         self.info()
     }
 
-    pub fn history_records(&self) -> Result<Vec<(String, HistoryRecord)>> {
+    /// Reads every record from the head back to the first commit, with the diagnostics of their
+    /// upgrades.
+    pub fn history_records(&self) -> Result<HistoryRecordsAndWarnings> {
         let mut records = Vec::new();
+        let mut warnings = Vec::new();
         let mut next = self.doc.history.head.clone();
         while let Some(record_hash) = next.take() {
-            let record = read_history_blob(&self.path, &record_hash)?;
+            let (record, record_warnings) = read_history_blob(&self.path, &record_hash)?;
+            warnings.extend(record_warnings);
             next.clone_from(&record.parent);
             records.push((record_hash, record));
         }
-        Ok(records)
+        Ok((records, warnings))
     }
 
     pub fn history_target(
         &self,
         direction: HistoryDirection,
         steps: usize,
-    ) -> Result<(SceneDoc, String)> {
+    ) -> Result<(SceneDoc, String, Vec<Value>)> {
         let history = match direction {
             HistoryDirection::Undo => &self.doc.history.undo,
             HistoryDirection::Redo => &self.doc.history.redo,
@@ -473,8 +540,8 @@ impl Project {
             return Err(PotError::new(ErrorCode::TargetNotFound, message));
         }
         let target = history[history.len() - steps].clone();
-        let record = read_history_blob(&self.path, &target)?;
-        Ok((record.snapshot, target))
+        let (record, warnings) = read_history_blob(&self.path, &target)?;
+        Ok((record.snapshot, target, warnings))
     }
 
     pub fn commit_history(
@@ -578,7 +645,7 @@ fn write_history_blob(root: &Path, record: &HistoryRecord) -> Result<String> {
     Ok(digest)
 }
 
-fn read_history_blob(root: &Path, digest: &str) -> Result<HistoryRecord> {
+fn read_history_blob(root: &Path, digest: &str) -> Result<(HistoryRecord, Vec<Value>)> {
     let path = blob_path(root, "history", digest)?;
     let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
     // The digest addresses the record as written, so the stored bytes are checked before any upgrade.
@@ -588,7 +655,30 @@ fn read_history_blob(root: &Path, digest: &str) -> Result<HistoryRecord> {
             "history record does not match its content hash",
         ));
     }
-    crate::model::migrate::parse_history_record(&bytes)
+    let (record, mut warnings) = crate::model::migrate::parse_history_record(&bytes)?;
+    tag_originals(
+        &mut warnings,
+        &content_path("history", "blob.json", digest),
+        digest,
+    );
+    Ok((record, warnings))
+}
+
+/// Names the original bytes of each diagnostic: `original` is the content-addressed path that holds
+/// them, and `original_hash` is their digest.
+fn tag_originals(warnings: &mut [Value], original: &str, digest: &str) {
+    for warning in warnings {
+        if let Some(fields) = warning.as_object_mut() {
+            fields.insert("original".to_owned(), json!(original));
+            fields.insert("original_hash".to_owned(), json!(digest));
+        }
+    }
+}
+
+/// Relative path of a content-addressed blob: `<category>/sha256/<hex>/<name>`.
+fn content_path(category: &str, name: &str, digest: &str) -> String {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    format!("{category}/sha256/{hex}/{name}")
 }
 
 fn write_blob_atomic(root: &Path, destination: &Path, bytes: &[u8]) -> Result<()> {
@@ -894,7 +984,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let scene = directory.path().join("scene");
         let mut project = Project::init(&scene).unwrap();
-        let initial_hash = project.history_records().unwrap()[0].1.scene_hash.clone();
+        let initial_hash = project.history_records().unwrap().0[0].1.scene_hash.clone();
         let mut candidate = project.doc().clone();
         candidate
             .scenes
@@ -906,7 +996,8 @@ mod tests {
             .commit_import(candidate, json!([]), json!({}))
             .unwrap();
 
-        let records = project.history_records().unwrap();
+        let (records, warnings) = project.history_records().unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(records.len(), 2);
         assert_ne!(records[0].1.scene_hash, initial_hash);
     }
@@ -930,6 +1021,52 @@ mod tests {
         let error = opened.history_records().unwrap_err();
 
         assert_eq!(error.code, ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn history_blob_hashes_raw_legacy_bytes_before_snapshot_upgrade() {
+        let directory = tempdir().unwrap();
+        let snapshot =
+            serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string())).unwrap();
+        let mut record = json!({
+            "record_version": 1,
+            "parent": null,
+            "kind": "apply",
+            "revision": 0,
+            "scene_hash": "sha256:scene",
+            "operations": [],
+            "changes": {},
+            "target": null,
+            "snapshot": snapshot
+        });
+        record["snapshot"]["schema_version"] = json!(2);
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let digest = crate::hash::sha256(&bytes);
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        let path = directory
+            .path()
+            .join("history")
+            .join("sha256")
+            .join(hex)
+            .join("blob.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let (loaded, warnings) = super::read_history_blob(directory.path(), &digest).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(loaded.snapshot.schema_version, 3);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let mut corrupted = bytes;
+        corrupted.push(b'!');
+        fs::write(&path, &corrupted).unwrap();
+        let error = super::read_history_blob(directory.path(), &digest).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InternalError);
+        assert_eq!(
+            error.message,
+            "history record does not match its content hash"
+        );
+        assert_eq!(fs::read(path).unwrap(), corrupted);
     }
 
     #[test]

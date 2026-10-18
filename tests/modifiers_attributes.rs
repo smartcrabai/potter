@@ -4,7 +4,7 @@ use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh,
+        Mesh, edit,
         modifiers::{
             attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
             evaluate_modifiers,
@@ -17,6 +17,12 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_file.rs"]
 mod blender_file;
+#[path = "common/exchange_normals.rs"]
+#[expect(
+    dead_code,
+    reason = "this test binary uses only the quantized normal tolerance from the shared helper"
+)]
+mod exchange_normals;
 
 use blender_file::blender_executable;
 
@@ -131,7 +137,8 @@ fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
             json!({"mode":"FACE_AREA","weight":50}),
         )?],
     )?;
-    let normals = result.attributes["custom_normal"]["values"]["f0"]
+    let evaluated = evaluated_face_normals(&result, "f0")?;
+    let normals = evaluated
         .as_array()
         .ok_or("custom corner normals missing")?;
     assert_eq!(normals.len(), 3);
@@ -331,11 +338,11 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
         }),
     )?;
     let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
-    let normal = result.attributes["custom_normal"]["values"]["f0"][0]
-        .as_array()
-        .ok_or("custom normal missing")?;
-    assert!((normal[0].as_f64().ok_or("normal x missing")? + 1.0).abs() < 1.0e-12);
-    assert!(normal[1].as_f64().ok_or("normal y missing")?.abs() < 1.0e-12);
+    let evaluated = evaluated_face_normals(&result, "f0")?;
+    let normal = evaluated[0].as_array().ok_or("custom normal missing")?;
+    let tolerance = exchange_normals::normal_tolerance(true);
+    assert!((normal[0].as_f64().ok_or("normal x missing")? + 1.0).abs() < tolerance);
+    assert!(normal[1].as_f64().ok_or("normal y missing")?.abs() < tolerance);
     Ok(())
 }
 
@@ -1591,7 +1598,13 @@ fn blender_quantize_loop_normals(
     let script_path = root.join("normal_quantization.py");
     fs::write(&script_path, BLENDER_LOOP_NORMAL_QUANTIZATION_SCRIPT)?;
     let output = Command::new(blender)
-        .args(["--background", "--factory-startup", "--python"])
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
         .arg(script_path)
         .args(["--"])
         .arg(root)
@@ -1923,7 +1936,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &blender,
         &root,
         &weighted_mesh,
-        &corner_normals(&weighted)?,
+        &corner_normal_vectors_json(&weighted)?,
     )?;
     assert_normal_stimulus(
         "weighted_normal FACE_AREA",
@@ -1935,7 +1948,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "weighted_normal FACE_AREA",
         &weighted_corners,
         &expected["weighted_normal"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let sharp_mesh = weighted_normal_mesh(true)?;
@@ -1958,10 +1971,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &blender,
             &root,
             &sharp_mesh,
-            &corner_normals(&weighted_sharp)?,
+            &corner_normal_vectors_json(&weighted_sharp)?,
         )?,
         &expected["weighted_normal_sharp"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let mut weighted_face_mesh = weighted_mesh.clone();
@@ -1988,10 +2001,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &blender,
             &root,
             &weighted_face_mesh,
-            &corner_normals(&weighted_face)?,
+            &corner_normal_vectors_json(&weighted_face)?,
         )?,
         &expected["weighted_normal_face_influence"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let mut normal_operands = BTreeMap::new();
@@ -2017,7 +2030,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_normal_parity(
         "normal_edit RADIAL/COPY",
-        &normals.attributes["custom_normal"]["values"]["f0"],
+        &evaluated_face_normals(&normals, "f0")?,
         &expected["normal_edit"],
         1.0e-4,
     )?;
@@ -2047,7 +2060,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_normal_parity(
         "normal_edit DIRECTIONAL/ADD",
-        &directional_result.attributes["custom_normal"]["values"]["f0"],
+        &evaluated_face_normals(&directional_result, "f0")?,
         &expected["normal_edit_directional"],
         1.0e-4,
     )?;
@@ -2378,10 +2391,14 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.75,"e1":0.0,"e2":0.0,"e3":0.0}}),
     );
-    domain_source.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}}),
-    );
+    edit::apply(
+        &mut domain_source,
+        "set_custom_normals",
+        &json!({
+            "elements":{"domain":"face","ids":["f0"]},
+            "normals":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}
+        }),
+    )?;
     domain_source.attributes.insert(
         "color".to_owned(),
         json!({"domain":"corner","type":"color","values":{"f0":[[0.2,0.3,0.4,1.0],[0.3,0.3,0.4,1.0],[0.4,0.3,0.4,1.0],[0.5,0.3,0.4,1.0]]}}),
@@ -2467,11 +2484,12 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     for mapping in ["LOCAL", "GLOBAL", "OBJECT", "UV"] {
         let mut mask_mesh = quad.clone();
         if mapping == "UV" {
+            // Blender's V-up values, stored V-down.
             mask_mesh.attributes.insert(
                 "uv_layers".to_owned(),
                 uv_layers_attribute(&json!([{
                     "face_id":0,
-                    "uv":[[0.13,0.17],[0.73,0.24],[0.84,0.81],[0.2,0.69]]
+                    "uv":flip_v(&json!([[0.13,0.17],[0.73,0.24],[0.84,0.81],[0.2,0.69]]))
                 }])),
             );
         }
@@ -2794,22 +2812,16 @@ fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
     Ok(mesh)
 }
 
-fn corner_normals(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
-    let values = mesh
-        .attributes
-        .get("custom_normal")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object)
-        .ok_or("custom corner normals missing")?;
-    let mut result = Vec::new();
-    for face in &mesh.faces {
-        let corners = values
-            .get(&format!("f{}", face.id))
-            .and_then(Value::as_array)
-            .ok_or("custom face corner normals missing")?;
-        result.extend(corners.iter().cloned());
-    }
-    Ok(Value::Array(result))
+/// The evaluated corner vectors of `mesh` in flattened face order, as JSON. The stored custom normals are
+/// `normal_code` pairs, which are not vectors, so they decode through the public evaluator first.
+fn corner_normal_vectors_json(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
+    let normals = potter_core::geom::corner_normal_vectors(mesh)?;
+    Ok(Value::Array(
+        normals
+            .iter()
+            .map(|normal| json!(normal.to_array()))
+            .collect(),
+    ))
 }
 
 fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
@@ -2838,13 +2850,17 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.0,"e1":0.0,"e2":0.0,"e3":0.0,"e4":0.0}}),
     );
-    mesh.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":{
-            "f0":[[1,0,0],[1,0,0],[1,0,0]],
-            "f1":[[1,0,0],[1,0,0],[1,0,0]]
-        }}),
-    );
+    edit::apply(
+        &mut mesh,
+        "set_custom_normals",
+        &json!({
+            "elements":{"domain":"face","ids":["f0","f1"]},
+            "normals":{
+                "f0":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]],
+                "f1":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]]
+            }
+        }),
+    )?;
     mesh.attributes.insert(
         "smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),
@@ -2957,10 +2973,28 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         "crease":crease,
         "uv":uv,
         "color":corner_values("color")?,
-        "normal":corner_normals(mesh)?,
+        "normal":corner_normal_vectors_json(mesh)?,
         "smooth":face_values("smooth")?,
         "freestyle":face_values("freestyle_face")?
     }))
+}
+
+/// The evaluated corner normals of face `face` (`f<id>`) as JSON vectors, through the public evaluator.
+fn evaluated_face_normals(mesh: &Mesh, face: &str) -> Result<Value, Box<dyn Error>> {
+    let normals = potter_core::geom::corner_normal_vectors(mesh)?;
+    let mut base = 0;
+    for mesh_face in &mesh.faces {
+        let count = mesh_face.vertices.len();
+        if format!("f{}", mesh_face.id) == face {
+            let corners: Vec<[f64; 3]> = normals[base..base + count]
+                .iter()
+                .map(DVec3::to_array)
+                .collect();
+            return Ok(json!(corners));
+        }
+        base += count;
+    }
+    Err(format!("face {face} is missing").into())
 }
 
 fn assert_normal_parity(
@@ -2998,5 +3032,198 @@ fn assert_normal_parity(
         max_angle <= tolerance,
         "{label} normal angle {max_angle}; actual={worst_actual:?}, expected={worst_expected:?}"
     );
+    Ok(())
+}
+
+/// Blender's UV values of the UV Data Transfer probe, per corner in V-up.
+const TRANSFER_SOURCE: [[f64; 2]; 4] = [[0.3, 0.7], [0.6, 0.2], [0.9, 0.4], [0.1, 0.8]];
+const TRANSFER_DESTINATION: [[f64; 2]; 4] = [[0.2, 0.2], [0.4, 0.6], [0.7, 0.1], [0.5, 0.9]];
+/// Blender's factor 0.5 result over `TRANSFER_DESTINATION`: the midpoint of destination and source.
+const TRANSFER_HALF: [[f64; 2]; 4] = [[0.25, 0.45], [0.5, 0.4], [0.8, 0.25], [0.3, 0.85]];
+/// Blender's factor 0.5 result into a layer the destination lacks, which starts at zero in V-up.
+const TRANSFER_GENERATED_HALF: [[f64; 2]; 4] = [[0.15, 0.35], [0.3, 0.1], [0.45, 0.2], [0.05, 0.4]];
+
+/// A `uv_layers` attribute with one layer `name` on face 0, holding Blender V-up `values`, stored V-down.
+fn named_uv_layers(name: &str, values: [[f64; 2]; 4]) -> Value {
+    json!({
+        "layers": [{"name": name, "faces": [{"face_id": 0, "uv": flip_v(&json!(values))}]}],
+        "active": name,
+        "render": name
+    })
+}
+
+/// A quad carrying one UV layer `name` with Blender V-up `values`.
+fn uv_layer_quad(name: &str, values: [[f64; 2]; 4]) -> Result<Mesh, Box<dyn Error>> {
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    mesh.attributes
+        .insert("uv_layers".to_owned(), named_uv_layers(name, values));
+    Ok(mesh)
+}
+
+/// Blender V-up corner values of layer `name` on face 0 of `mesh`.
+fn transferred_uv(mesh: &Mesh, name: &str) -> Result<Vec<[f64; 2]>, Box<dyn Error>> {
+    let store = mesh
+        .attributes
+        .get("uv_layers")
+        .ok_or("uv_layers missing")?;
+    let layer = store["layers"]
+        .as_array()
+        .ok_or("uv_layers layers missing")?
+        .iter()
+        .find(|layer| layer["name"] == name)
+        .ok_or_else(|| format!("no `{name}` layer"))?;
+    layer["faces"][0]["uv"]
+        .as_array()
+        .ok_or("uv row missing")?
+        .iter()
+        .map(|corner| -> Result<[f64; 2], Box<dyn Error>> {
+            Ok([
+                corner[0].as_f64().ok_or("U must be a number")?,
+                1.0 - corner[1].as_f64().ok_or("V must be a number")?,
+            ])
+        })
+        .collect()
+}
+
+fn assert_uv_close(actual: &[[f64; 2]], expected: &[[f64; 2]]) {
+    assert_eq!(actual.len(), expected.len(), "corner count");
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual[0] - expected[0]).abs() < 1.0e-9 && (actual[1] - expected[1]).abs() < 1.0e-9,
+            "UV {actual:?} differs from Blender {expected:?}"
+        );
+    }
+}
+
+/// Runs a TOPOLOGY UV Data Transfer of `source` onto `destination`.
+fn run_uv_transfer(
+    destination: &Mesh,
+    source: &Mesh,
+    mix_mode: &str,
+    factor: f64,
+) -> Result<Mesh, Box<dyn Error>> {
+    let transfer = modifier(
+        "data_transfer",
+        json!({
+            "object": "source",
+            "use_loop_data": true,
+            "data_types_loops": ["UV"],
+            "loop_mapping": "TOPOLOGY",
+            "layers_uv_select_src": "ALL",
+            "layers_uv_select_dst": "NAME",
+            "mix_mode": mix_mode,
+            "mix_factor": factor
+        }),
+    )?;
+    let mut operands = BTreeMap::new();
+    operands.insert(
+        "object".to_owned(),
+        vec![scene_operand(source.clone(), DMat4::IDENTITY, None)],
+    );
+    Ok(evaluate_with_context(
+        destination,
+        &transfer,
+        &operands,
+        None,
+        DMat4::IDENTITY,
+    )?)
+}
+
+#[test]
+fn data_transfer_uv_mixes_by_factor_and_ignores_add_sub_mul_like_blender()
+-> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a UV transfer gives the REPLACE result for ADD, SUB, and MUL alike, lerped
+    // from destination to source by factor. Blender's RNA offers only REPLACE for UV alone; the probe
+    // selected a color loop type too, and the UV result was the same.
+    let source = uv_layer_quad("Src", TRANSFER_SOURCE)?;
+    let destination = uv_layer_quad("Src", TRANSFER_DESTINATION)?;
+    for (mode, factor, expected) in [
+        ("ADD", 1.0, TRANSFER_SOURCE),
+        ("SUB", 1.0, TRANSFER_SOURCE),
+        ("MUL", 1.0, TRANSFER_SOURCE),
+        ("ADD", 0.5, TRANSFER_HALF),
+        ("SUB", 0.5, TRANSFER_HALF),
+        ("MUL", 0.5, TRANSFER_HALF),
+    ] {
+        let result = run_uv_transfer(&destination, &source, mode, factor)?;
+        assert_uv_close(&transferred_uv(&result, "Src")?, &expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn data_transfer_uv_into_missing_layer_starts_at_blender_zero() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a layer generated for the transfer is zero in V-up, so a factor 0.5 transfer
+    // gives half the source, and a factor 1 transfer gives the source.
+    let source = uv_layer_quad("Src", TRANSFER_SOURCE)?;
+    let destination = uv_layer_quad("UVMap", TRANSFER_DESTINATION)?;
+    let half = run_uv_transfer(&destination, &source, "REPLACE", 0.5)?;
+    assert_uv_close(&transferred_uv(&half, "Src")?, &TRANSFER_GENERATED_HALF);
+    let full = run_uv_transfer(&destination, &source, "ADD", 1.0)?;
+    assert_uv_close(&transferred_uv(&full, "Src")?, &TRANSFER_SOURCE);
+    Ok(())
+}
+
+#[test]
+fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe: a 1x4 Non-Color image, rows 0.1, 0.3, 0.6, 0.9 from bottom to top, with
+    // Closest sampling. UV mapping at V-up (0.13, 0.12), (0.73, 0.38), (0.84, 0.62), (0.2, 0.88) gives
+    // mask weights 0.1, 0.3, 0.6, 0.9. Each row is picked by its V-up coordinate, not its stored one.
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        named_uv_layers(
+            "UVMap",
+            [[0.13, 0.12], [0.73, 0.38], [0.84, 0.62], [0.2, 0.88]],
+        ),
+    );
+    mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({
+            "A": {"v0": 0.0, "v1": 0.0, "v2": 0.0, "v3": 0.0},
+            "B": {"v0": 1.0, "v1": 1.0, "v2": 1.0, "v3": 1.0}
+        }),
+    );
+    let image = ImageData {
+        width: 1,
+        height: 4,
+        pixels: vec![
+            [0.1, 0.1, 0.1, 1.0],
+            [0.3, 0.3, 0.3, 1.0],
+            [0.6, 0.6, 0.6, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+        ],
+        tiles: BTreeMap::new(),
+        interpolation: ImageInterpolation::Closest,
+    };
+    let mix = modifier(
+        "vertex_weight_mix",
+        json!({
+            "vertex_group_a": "A",
+            "vertex_group_b": "B",
+            "mix_mode": "SET",
+            "mix_set": "ALL",
+            "mask_texture": "image_mask",
+            "mask_tex_use_channel": "RED",
+            "mask_tex_mapping": "UV",
+            "mask_tex_uv_layer": "UVMap"
+        }),
+    )?;
+    let result =
+        evaluate_with_context(&mesh, &mix, &BTreeMap::new(), Some(&image), DMat4::IDENTITY)?;
+    let weights = vertex_weights(&result, "A")?;
+    assert_eq!(weights.len(), 4);
+    for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {
+        assert!(
+            (weight - expected).abs() < 1.0e-9,
+            "mask weight {weight} differs from Blender {expected}"
+        );
+    }
     Ok(())
 }

@@ -9,7 +9,9 @@ use crate::{
         Edge, Face, Mesh, Vertex,
         uv_layers::{self, UvLayer},
     },
-    model::{DataBlock, Id, Node, ShapeKey, ShapeKeyData, VertexGroup},
+    model::{
+        DataBlock, Id, MaterialLink, Node, ShapeKey, ShapeKeyData, VertexGroup, material_link_at,
+    },
 };
 
 use super::{ChangeKind, Engine, check_fields, operation_pointer, parse_id, resolve_node_targets};
@@ -18,8 +20,29 @@ struct JoinInput {
     node_id: Id,
     node: Node,
     data_id: Id,
+    slot_materials: Vec<Option<Id>>,
     data: DataBlock,
     world: DMat4,
+}
+
+struct SlotSources<'a> {
+    data: &'a [Option<Id>],
+    object: &'a [Option<Id>],
+    links: &'a [MaterialLink],
+}
+
+impl SlotSources<'_> {
+    fn link(&self, slot: usize) -> MaterialLink {
+        material_link_at(self.object.len(), self.links, slot)
+    }
+}
+
+fn slot_sources(input: &JoinInput) -> SlotSources<'_> {
+    SlotSources {
+        data: &input.data.materials,
+        object: &input.node.materials,
+        links: &input.node.material_links,
+    }
 }
 
 #[derive(Default)]
@@ -105,8 +128,30 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
             node,
             data_id,
             data,
+            slot_materials: Vec::new(),
             world,
         });
+    }
+    let slot_node_ids: BTreeSet<_> = inputs.iter().map(|input| input.node_id.clone()).collect();
+    let slot_snapshot = crate::eval::Snapshot::evaluate_nodes_with_cache(
+        engine.doc,
+        &crate::eval::EvaluationContext {
+            frame: Some(engine.evaluation_frame),
+            ..crate::eval::EvaluationContext::default()
+        },
+        engine.asset_root,
+        engine.cache_directory,
+        &slot_node_ids,
+    )?;
+    for input in &mut inputs {
+        let slot_count = slot_snapshot.slot_count(&input.node_id, &input.node, Some(&input.data));
+        input.slot_materials = (0..slot_count)
+            .map(|slot| {
+                slot_snapshot
+                    .slot_material(&input.node_id, &input.node, Some(&input.data), slot)
+                    .cloned()
+            })
+            .collect();
     }
 
     let source_ids: BTreeSet<_> = targets.iter().skip(1).cloned().collect();
@@ -173,9 +218,18 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         ));
     }
     let destination_inverse = destination.world.inverse();
-    let mut merged_materials = destination.node.materials.clone();
+    let destination_slot_count = destination.slot_materials.len();
+    let destination_slots = slot_sources(destination);
+    let mut merged_materials = destination_slots.object.to_vec();
+    merged_materials.resize(destination_slot_count, None);
+    let mut merged_material_links = (0..destination_slot_count)
+        .map(|slot| destination_slots.link(slot))
+        .collect::<Vec<_>>();
+    let mut merged_effective_materials = destination.slot_materials.clone();
     validate_material_indices(engine, destination, destination_mesh)?;
     let mut merged_data = destination.data.clone();
+    merged_data.materials = destination_slots.data.to_vec();
+    merged_data.materials.resize(destination_slot_count, None);
     let mut output_shape_keys = merged_data.shape_keys.take();
     let mut output_groups = merged_data.vertex_groups.clone();
     let mut output_weights = merged_data.vertex_weights.clone();
@@ -203,13 +257,18 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
             ));
         }
 
+        let source_slots = slot_sources(source);
         let mapping = append_mesh(
             engine,
             &mut merged_mesh,
             source_mesh,
             source_to_destination,
             &mut merged_materials,
-            &source.node.materials,
+            &mut merged_material_links,
+            &mut merged_data.materials,
+            &mut merged_effective_materials,
+            source,
+            &source_slots,
         )?;
         mesh_mappings.insert(source.node_id.to_string(), mapping.to_value());
         let group_mapping = merge_vertex_groups(
@@ -253,11 +312,13 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
 
     let mut target_node = destination.node.clone();
     target_node.materials = merged_materials;
-    let data_changed = merged_data.mesh != destination.data.mesh
+    target_node.material_links = merged_material_links;
+    let geometry_changed = merged_data.mesh != destination.data.mesh
         || merged_data.shape_keys != destination.data.shape_keys
         || merged_data.vertex_groups != destination.data.vertex_groups
         || merged_data.vertex_weights != destination.data.vertex_weights;
-    if data_changed {
+    let data_changed = geometry_changed || merged_data.materials != destination.data.materials;
+    if geometry_changed {
         target_node.primitive = None;
     }
     let output_data_id = if data_changed && super::data_user_count(engine, &destination.data_id) > 1
@@ -267,6 +328,7 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         destination.data_id.clone()
     };
     let node_changed = target_node.materials != destination.node.materials
+        || target_node.material_links != destination.node.material_links
         || target_node.primitive != destination.node.primitive
         || output_data_id != destination.data_id;
     if data_changed {
@@ -415,8 +477,12 @@ fn append_mesh(
     destination: &mut Mesh,
     source: &Mesh,
     transform: DMat4,
-    destination_materials: &mut Vec<Id>,
-    source_materials: &[Id],
+    destination_materials: &mut Vec<Option<Id>>,
+    destination_links: &mut Vec<MaterialLink>,
+    destination_data_materials: &mut Vec<Option<Id>>,
+    destination_effective_materials: &mut Vec<Option<Id>>,
+    source_slots: &JoinInput,
+    source_material_state: &SlotSources<'_>,
 ) -> Result<ElementMapping> {
     let mut mapping = ElementMapping::default();
     // Source face `i` lands at storage index `face_offset + i` once appended.
@@ -470,7 +536,14 @@ fn append_mesh(
         mapping.edges.insert(edge.id, id);
         destination.edges.push(Edge { id, vertices });
     }
-    let material_remap = merge_material_slots(destination_materials, source_materials);
+    let material_remap = merge_material_slots(
+        destination_materials,
+        destination_links,
+        destination_data_materials,
+        destination_effective_materials,
+        source_slots,
+        source_material_state,
+    );
     for face in &source.faces {
         let id = remap_element_id(
             engine,
@@ -500,7 +573,7 @@ fn append_mesh(
                     &operation_pointer(engine.operation_index, "target"),
                 )
             })?,
-            None if source_materials.is_empty() && face.material_index == 0 => 0,
+            None if source_slots.slot_materials.is_empty() && face.material_index == 0 => 0,
             None => {
                 return Err(engine.error(
                     ErrorCode::SceneInvalid,
@@ -562,29 +635,50 @@ fn remap_element_id(
     Ok(id)
 }
 
-fn merge_material_slots(destination: &mut Vec<Id>, source: &[Id]) -> Vec<usize> {
+fn merge_material_slots(
+    destination_materials: &mut Vec<Option<Id>>,
+    destination_links: &mut Vec<MaterialLink>,
+    destination_data_materials: &mut Vec<Option<Id>>,
+    destination_effective_materials: &mut Vec<Option<Id>>,
+    source: &JoinInput,
+    source_state: &SlotSources<'_>,
+) -> Vec<usize> {
     source
+        .slot_materials
         .iter()
-        .map(|material| {
-            if let Some(index) = destination
-                .iter()
-                .position(|candidate| candidate == material)
+        .enumerate()
+        .map(|(slot, effective)| {
+            let object_material = source_state.object.get(slot).cloned().unwrap_or(None);
+            let data_material = source_state.data.get(slot).cloned().unwrap_or(None);
+            let link = source_state.link(slot);
+            if effective.is_some()
+                && let Some(index) = destination_effective_materials.iter().enumerate().find_map(
+                    |(index, candidate)| {
+                        (candidate == effective
+                            && destination_materials.get(index) == Some(&object_material)
+                            && destination_links.get(index) == Some(&link)
+                            && destination_data_materials.get(index) == Some(&data_material))
+                        .then_some(index)
+                    },
+                )
             {
-                index
-            } else {
-                destination.push(material.clone());
-                destination.len() - 1
+                return index;
             }
+            destination_materials.push(object_material);
+            destination_links.push(link);
+            destination_data_materials.push(data_material);
+            destination_effective_materials.push(effective.clone());
+            destination_effective_materials.len() - 1
         })
         .collect()
 }
 
 fn validate_material_indices(engine: &Engine<'_>, input: &JoinInput, mesh: &Mesh) -> Result<()> {
     for face in &mesh.faces {
-        let valid = if input.node.materials.is_empty() {
+        let valid = if input.slot_materials.is_empty() {
             face.material_index == 0
         } else {
-            (face.material_index as usize) < input.node.materials.len()
+            (face.material_index as usize) < input.slot_materials.len()
         };
         if !valid {
             return Err(engine.error(
@@ -1180,10 +1274,14 @@ mod tests {
             },
         );
     }
+    fn add_material(doc: &mut SceneDoc, id: &str) {
+        let id = Id::new(id).unwrap();
+        doc.materials.insert(id, crate::model::Material::default());
+    }
 
     #[test]
     fn joins_transformed_meshes_remaps_colliding_ids_and_tracks_deletion() {
-        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         add_mesh(
             &mut doc,
             "target",
@@ -1228,16 +1326,18 @@ mod tests {
                 "render": "UVMap"
             }),
         );
+        add_material(&mut doc, "target_material");
+        add_material(&mut doc, "source_material");
         doc.nodes
             .get_mut(&Id::new("target").unwrap())
             .unwrap()
             .materials
-            .push(Id::new("target_material").unwrap());
+            .push(Some(Id::new("target_material").unwrap()));
         doc.nodes
             .get_mut(&Id::new("source").unwrap())
             .unwrap()
             .materials
-            .push(Id::new("source_material").unwrap());
+            .push(Some(Id::new("source_material").unwrap()));
         let root_collection = doc
             .collections
             .get_mut(&Id::new("collection_root").unwrap())
@@ -1275,7 +1375,7 @@ mod tests {
         );
         assert_eq!(
             engine.doc.nodes[&target].materials[1],
-            Id::new("source_material").unwrap()
+            Some(Id::new("source_material").unwrap())
         );
         assert_eq!(joined.faces[1].material_index, 1);
         assert!(!engine.doc.nodes.contains_key(&source));
@@ -1299,7 +1399,7 @@ mod tests {
 
     #[test]
     fn joining_shared_destination_data_makes_only_the_destination_single_user() {
-        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         add_mesh(
             &mut doc,
             "target",
@@ -1365,8 +1465,120 @@ mod tests {
     }
 
     #[test]
+    fn join_preserves_data_object_links_and_empty_slot_indices() {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        add_mesh(
+            &mut doc,
+            "target",
+            "target_data",
+            mesh(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], 0),
+            [0.0; 3],
+        );
+        add_mesh(
+            &mut doc,
+            "source",
+            "source_data",
+            mesh(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], 0),
+            [1.0, 0.0, 0.0],
+        );
+        let material_ids = [
+            "data_blue",
+            "data_gold",
+            "source_data_gold",
+            "source_data_fallback",
+            "target_hidden_object",
+            "target_red",
+            "source_hidden_object",
+        ];
+        for id in material_ids {
+            add_material(&mut doc, id);
+        }
+        let id = |text| Id::new(text).unwrap();
+        let target_data = doc.data_blocks.get_mut(&id("target_data")).unwrap();
+        target_data.materials = vec![Some(id("data_blue")), None, Some(id("data_gold"))];
+        let source_data = doc.data_blocks.get_mut(&id("source_data")).unwrap();
+        source_data.materials = vec![
+            Some(id("source_data_gold")),
+            Some(id("source_data_fallback")),
+        ];
+        let target = doc.nodes.get_mut(&id("target")).unwrap();
+        target.materials = vec![Some(id("target_hidden_object")), Some(id("target_red"))];
+        target.material_links = vec![MaterialLink::Data, MaterialLink::Object];
+        let source = doc.nodes.get_mut(&id("source")).unwrap();
+        source.materials = vec![Some(id("source_hidden_object")), None];
+        source.material_links = vec![MaterialLink::Data, MaterialLink::Object];
+        doc.data_blocks
+            .get_mut(&id("source_data"))
+            .unwrap()
+            .mesh
+            .as_mut()
+            .unwrap()
+            .faces[0]
+            .material_index = 1;
+        doc.collections
+            .get_mut(&id("collection_root"))
+            .unwrap()
+            .objects = vec![id("target"), id("source")];
+
+        let operation = json!({"op":"node.join","targets":["target","source"]});
+        let mut engine = Engine {
+            doc: &mut doc,
+            changes: ChangeSet::default(),
+            id_mappings: Map::new(),
+            operation_index: 0,
+            evaluation_frame: 1.0,
+            asset_root: None,
+            cache_directory: None,
+            pending_assets: BTreeMap::default(),
+            warnings: Vec::new(),
+        };
+        assert!(apply(&mut engine, operation.as_object().unwrap()).unwrap());
+
+        let target = &engine.doc.nodes[&id("target")];
+        let data_id = target.data.as_ref().unwrap();
+        let data = &engine.doc.data_blocks[data_id];
+        assert_eq!(
+            data.materials,
+            vec![
+                Some(id("data_blue")),
+                None,
+                Some(id("data_gold")),
+                Some(id("source_data_gold")),
+                Some(id("source_data_fallback")),
+            ]
+        );
+        assert_eq!(
+            target.materials,
+            vec![
+                Some(id("target_hidden_object")),
+                Some(id("target_red")),
+                None,
+                Some(id("source_hidden_object")),
+                None,
+            ]
+        );
+        assert_eq!(
+            target.material_links,
+            vec![
+                MaterialLink::Data,
+                MaterialLink::Object,
+                MaterialLink::Data,
+                MaterialLink::Data,
+                MaterialLink::Object,
+            ]
+        );
+        assert_eq!(target.material_slot(Some(data), 0), Some(&id("data_blue")));
+        assert_eq!(target.material_slot(Some(data), 1), Some(&id("target_red")));
+        assert_eq!(
+            target.material_slot(Some(data), 4),
+            Some(&id("source_data_fallback"))
+        );
+        assert_eq!(data.mesh.as_ref().unwrap().faces[1].material_index, 4);
+    }
+
+    #[test]
     fn rejects_joining_source_with_surviving_children_without_mutating() {
-        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
         add_mesh(
             &mut doc,
             "target",

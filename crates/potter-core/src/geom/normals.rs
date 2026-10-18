@@ -4,9 +4,8 @@
 //! and no custom normal exists, each vertex gets one angle-weighted normal over all of its
 //! faces (POINT). Otherwise corners form fans that stop at sharp, boundary and non-manifold
 //! edges and at flipped-winding neighbours (CORNER). Flat faces use their Newell normal.
-//! An authored custom-normal corner (see `clnor`) replaces the computed normal, with its vector
-//! derived from the stored code state at the current positions. An automatic corner takes the
-//! computed normal, and an explicit zero is authored.
+//! Custom-normal codes (see `clnor`) are evaluated against the current fan at the current positions:
+//! Auto uses the shared Blender fan result, authored codes replace it, and explicit zero is literal.
 //!
 //! Degenerate geometry is never an error, matching Blender: a zero-area face takes the unit Z
 //! normal, a corner whose fan cancels gets the zero vector, and a zero-length edge contributes a
@@ -17,7 +16,7 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use glam::{DMat3, DMat4, DVec3};
 use serde_json::{Map, Value, json};
 
-use super::clnor::{self, NormalCodeOptions, SetterInput};
+use super::clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput};
 use super::{Mesh, MeshError, edge_key};
 use crate::error::{ErrorCode, PotError, Result};
 
@@ -117,25 +116,41 @@ fn check_shading_input(mesh: &Mesh, positions: &[DVec3]) -> Result<()> {
 
 fn shading_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Shading> {
     check_shading_input(mesh, positions)?;
-    let custom = clnor::corner_custom_normals(
-        mesh,
-        positions,
-        NormalCodeOptions {
-            corner_order: None,
-            setter_input: SetterInput::NormalizeInput,
-        },
-    )?;
-    shade(mesh, positions, custom)
+    let codes = clnor::corner_codes(mesh)?;
+    let resolved = codes
+        .as_deref()
+        .map(|codes| {
+            clnor::evaluate_codes(
+                mesh,
+                codes,
+                positions,
+                NormalCodeOptions {
+                    corner_order: None,
+                    setter_input: SetterInput::NormalizeInput,
+                },
+            )
+        })
+        .transpose()?;
+    shade(mesh, positions, codes.as_deref(), resolved.as_deref(), true)
 }
 
-/// Corner normals of `mesh` ignoring its custom-normal layer: the shading of the geometry alone.
-pub(crate) fn plain_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
+/// Corner normals of `mesh` in the corner (fan) domain, ignoring its custom-normal layer. This is the
+/// base the custom-normal setter replaces zero inputs with: Blender's `mesh_normals_corner_custom_set`
+/// takes it from `normals_calc_corners`, which always builds fans, never the POINT vertex normal.
+pub(crate) fn setter_corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
     check_shading_input(mesh, positions)?;
-    Ok(shade(mesh, positions, None)?.corners)
+    Ok(shade(mesh, positions, None, None, false)?.corners)
 }
 
-/// Shading from the geometry and the decoded custom-normal view, where `None` means no layer.
-fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -> Result<Shading> {
+/// Shading from geometry plus typed custom-normal codes and their shared, current-fan evaluation.
+/// `point_domain_allowed` is false for the custom-normal setter, whose corner normals are always fans.
+fn shade(
+    mesh: &Mesh,
+    positions: &[DVec3],
+    custom_codes: Option<&[CornerNormalCode]>,
+    custom_normals: Option<&[DVec3]>,
+    point_domain_allowed: bool,
+) -> Result<Shading> {
     let index_by_id: HashMap<u32, usize> = mesh
         .vertices
         .iter()
@@ -149,17 +164,20 @@ fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -
     let mut corner_total = 0_usize;
     for face in &mesh.faces {
         offsets.push(corner_total);
+
         corner_total += face.vertices.len();
     }
-    // Blender's POINT domain: all faces smooth, no sharp edge, no custom normal.
-    let point_domain =
-        custom.is_none() && sharp_edges.is_empty() && smooth.iter().all(|smooth| *smooth);
+    // Blender's POINT domain: all faces smooth, no sharp edge, no custom-normal layer. The custom-normal
+    // setter never uses it: its corner normals come from `normals_calc_corners` (fans) on every mesh.
+    let point_domain = point_domain_allowed
+        && custom_codes.is_none()
+        && sharp_edges.is_empty()
+        && smooth.iter().all(|smooth| *smooth);
 
     // Face normals, corner angles, and the angle-weighted sum of every face at each vertex.
     // Blender's vertex normal sums all faces and ignores shading flags.
     let mut face_normals = Vec::with_capacity(mesh.faces.len());
     let mut corner_angles = vec![0.0_f64; corner_total];
-    let mut corner_vertices = Vec::with_capacity(corner_total);
     let mut geometric_sums = vec![DVec3::ZERO; mesh.vertices.len()];
     for (face_index, face) in mesh.faces.iter().enumerate() {
         let indices = face
@@ -184,9 +202,7 @@ fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -
             corner_angles[offsets[face_index] + corner] = angle;
             geometric_sums[*index] += normal * angle;
         }
-        corner_vertices.extend(indices);
     }
-
     let mut parent: Vec<usize> = (0..corner_total).collect();
     if point_domain {
         let mut first_corner_at = HashMap::<u32, usize>::new();
@@ -204,7 +220,6 @@ fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -
     } else {
         join_smooth_fans(mesh, &offsets, &sharp_edges, &smooth, &mut parent);
     }
-
     let roots: Vec<usize> = (0..corner_total)
         .map(|corner| find(&mut parent, corner))
         .collect();
@@ -223,10 +238,10 @@ fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -
     let mut face_smooth = Vec::with_capacity(mesh.faces.len());
     for (face_index, face) in mesh.faces.iter().enumerate() {
         let start = offsets[face_index];
-        let has_authored = custom.as_ref().is_some_and(|authored| {
-            authored[start..start + face.vertices.len()]
+        let has_authored = custom_codes.is_some_and(|codes| {
+            codes[start..start + face.vertices.len()]
                 .iter()
-                .any(Option::is_some)
+                .any(|code| *code != CornerNormalCode::Auto)
         });
         face_smooth.push(smooth[face_index] || has_authored);
         for corner in 0..face.vertices.len() {
@@ -236,24 +251,19 @@ fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -
             } else {
                 face_normals[face_index]
             };
-            corners.push(
-                custom
-                    .as_ref()
-                    .and_then(|authored| authored[index])
-                    .unwrap_or(computed),
-            );
+            corners.push(custom_normals.map_or(computed, |normals| normals[index]));
         }
     }
 
-    // Blender averages corner normals when custom normals exist; otherwise it uses the sums above.
-    let vertices = if custom.is_some() {
-        let mut sums = vec![DVec3::ZERO; mesh.vertices.len()];
-        for (corner, index) in corner_vertices.iter().enumerate() {
-            sums[*index] += corners[corner];
-        }
-        sums
+    // Blender uses its corner-to-vertex mixer for an allocated custom-normal layer; meshes without
+    // that layer keep the geometric angle-weighted sums above.
+    let vertices = if custom_codes.is_some() {
+        clnor::mix_corner_normals_to_vertices(mesh, positions, &corners)?
     } else {
         geometric_sums
+            .into_iter()
+            .map(DVec3::normalize_or_zero)
+            .collect()
     };
     let data_smooth = mesh
         .faces
@@ -269,7 +279,7 @@ fn shade(mesh: &Mesh, positions: &[DVec3], custom: Option<Vec<Option<DVec3>>>) -
         corners,
         smooth: face_smooth,
         data_smooth,
-        vertices: vertices.into_iter().map(DVec3::normalize_or_zero).collect(),
+        vertices,
     })
 }
 
@@ -535,6 +545,14 @@ fn find(parent: &mut [usize], mut index: usize) -> usize {
     index
 }
 
+pub(crate) fn vector3(value: &Value) -> Option<DVec3> {
+    let [x, y, z] = value.as_array()?.as_slice() else {
+        return None;
+    };
+    let vector = DVec3::new(x.as_f64()?, y.as_f64()?, z.as_f64()?);
+    vector.is_finite().then_some(vector)
+}
+
 fn mesh_error(error: &MeshError) -> PotError {
     PotError::with_details(
         ErrorCode::InvalidArgument,
@@ -723,6 +741,74 @@ mod tests {
         for corner in &normals[0..4] {
             assert_close(*corner, DVec3::Y, CODEC_TOLERANCE);
         }
+    }
+
+    #[test]
+    fn allocated_auto_layer_uses_shared_code_fan_evaluation() {
+        let mut mesh = fold();
+        set_faces_attribute(&mut mesh, "shade_smooth", &[(0, true), (1, true)]);
+        let positions = positions(&mesh);
+        let codes = vec![clnor::CornerNormalCode::Auto; 8];
+        clnor::write_codes(&mut mesh, Some(&codes), NormalCodeOptions::default())
+            .expect("write allocated automatic codes");
+        let expected =
+            clnor::evaluate_codes(&mesh, &codes, &positions, NormalCodeOptions::default())
+                .expect("evaluate shared fan codes");
+        assert_eq!(
+            corner_normals(&mesh, &positions).expect("render corners"),
+            expected,
+            "allocated Auto codes use the same Blender fan evaluator as authored codes"
+        );
+    }
+
+    #[test]
+    fn custom_vertex_normals_use_corner_angles_and_loose_position_fallback() {
+        let positions = vec![
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::new(1.0, 1.0, 1.0),
+            DVec3::new(2.0, 0.0, 0.0),
+        ];
+        let mut mesh =
+            Mesh::from_positions_and_faces(positions.clone(), vec![vec![0, 1, 2], vec![0, 2, 3]])
+                .expect("adjacent faces with one loose vertex");
+        let face_ids = mesh.faces.iter().map(|face| face.id).collect::<Vec<_>>();
+        set_faces_attribute(
+            &mut mesh,
+            "shade_smooth",
+            &[(face_ids[0], true), (face_ids[1], true)],
+        );
+        let mut vectors = vec![Some(DVec3::Z); 6];
+        vectors[3..].fill(Some(DVec3::X));
+        set_custom_vectors(&mut mesh, &vectors);
+
+        let shading = export_normals(&mesh, &positions).expect("custom vertex normals");
+        let angle = |previous: DVec3, center: DVec3, next: DVec3| {
+            (previous - center)
+                .normalize()
+                .dot((next - center).normalize())
+                .clamp(-1.0, 1.0)
+                .acos()
+        };
+        let first_angle = angle(positions[2], positions[0], positions[1]);
+        let second_angle = angle(positions[3], positions[0], positions[2]);
+        let weighted =
+            (shading.corners[0] * first_angle + shading.corners[3] * second_angle).normalize();
+        let unweighted = (shading.corners[0] + shading.corners[3]).normalize();
+        assert!(
+            weighted.distance(unweighted) > 0.05,
+            "fixture distinguishes angle weighting from uniform averaging"
+        );
+        assert!(
+            shading.vertices[0].abs_diff_eq(weighted, 2.0e-5),
+            "shared vertex normal must use Blender's corner-angle weights: {:?} vs {weighted:?}",
+            shading.vertices[0]
+        );
+        assert!(
+            shading.vertices[4].abs_diff_eq(DVec3::X, 1.0e-6),
+            "a loose vertex uses its normalized position"
+        );
     }
 
     #[test]

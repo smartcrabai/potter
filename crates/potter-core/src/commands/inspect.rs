@@ -13,7 +13,7 @@ use crate::{
     store::Project,
 };
 
-use super::util::parse_id;
+use super::util::{parse_id, with_load_warnings};
 pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
     let project = Project::open(args.scene)?;
     let doc = project.doc();
@@ -103,6 +103,7 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
                 .is_some_and(|node_id| item_ids.contains(node_id))
         });
     }
+    let warnings = with_load_warnings(&warnings, &project)?;
     let scene = project.info()?;
     Ok((
         Some(scene),
@@ -435,6 +436,13 @@ fn node_item(
         .iter()
         .map(modifier_item)
         .collect::<Result<Vec<_>>>()?;
+    let data_block = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
+    let materials = (0..snapshot.slot_count(id, node, data_block))
+        .map(|slot| snapshot.slot_material(id, node, data_block, slot))
+        .collect::<Vec<_>>();
     Ok(json!({
         "type": "node",
         "id": id,
@@ -462,7 +470,7 @@ fn node_item(
         "rigid_body": node.rigid_body,
         "force_field": node.force_field,
         "sharing": { "users": users, "count": users.len(), "shared": users.len() > 1 },
-        "materials": node.materials,
+        "materials": materials,
         "modifiers": modifiers,
         "visible": node.visible,
         "render_visible": node.render_visible,

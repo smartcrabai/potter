@@ -4,8 +4,8 @@ use crate::{cli::ScenePath, error::Result, response::SceneInfo, store::Project};
 
 pub fn run(args: ScenePath) -> Result<(Option<SceneInfo>, Value)> {
     let project = Project::open(args.scene)?;
-    let records = project
-        .history_records()?
+    let (history, history_warnings) = project.history_records()?;
+    let records = history
         .into_iter()
         .map(|(id, record)| {
             json!({
@@ -20,5 +20,10 @@ pub fn run(args: ScenePath) -> Result<(Option<SceneInfo>, Value)> {
             })
         })
         .collect::<Vec<_>>();
-    Ok((Some(project.info()?), json!({ "entries": records })))
+    let mut warnings = project.warnings().to_vec();
+    warnings.extend(history_warnings);
+    Ok((
+        Some(project.info()?),
+        json!({ "entries": records, "warnings": warnings }),
+    ))
 }

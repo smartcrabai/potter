@@ -7,8 +7,8 @@ use crate::{
     error::{ErrorCode, Result},
     geom::{self, Mesh as GeomMesh},
     model::{
-        ArmatureData, CameraData, DataBlock, GreasePencilData, Id, LightData, Node, ParentType,
-        PrimitiveDescriptor, Transform, canonicalize_quaternion, normalize_rotation,
+        ArmatureData, CameraData, DataBlock, GreasePencilData, Id, LightData, MaterialLink, Node,
+        ParentType, PrimitiveDescriptor, Transform, canonicalize_quaternion, normalize_rotation,
     },
 };
 
@@ -752,6 +752,21 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             if let Some(materials) = &materials
                 && node.materials.as_slice() != materials.as_slice()
             {
+                // Untouched slots keep their link; a slot newly given a material is OBJECT-linked.
+                let mut links: Vec<MaterialLink> = (0..node.materials.len().max(materials.len()))
+                    .map(|slot| node.material_link(slot))
+                    .collect();
+                for (slot, material) in materials.iter().enumerate() {
+                    if material.is_some() && node.materials.get(slot) != Some(material) {
+                        links[slot] = MaterialLink::Object;
+                    }
+                }
+                links.truncate(materials.len());
+                node.material_links = if links.iter().all(|link| *link == MaterialLink::Object) {
+                    Vec::new()
+                } else {
+                    links
+                };
                 node.materials.clone_from(materials);
                 item_changed = true;
             }
@@ -1613,7 +1628,10 @@ fn generated_data_id(engine: &Engine<'_>, node_id: &Id, suffix: &str) -> Result<
     )
 }
 
-fn read_material_slots(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result<Vec<Id>> {
+fn read_material_slots(
+    engine: &Engine<'_>,
+    operation: &Map<String, Value>,
+) -> Result<Vec<Option<Id>>> {
     if operation.contains_key("material") && operation.contains_key("materials") {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -1641,7 +1659,7 @@ fn read_material_slots(engine: &Engine<'_>, operation: &Map<String, Value>) -> R
                 &operation_pointer(engine.operation_index, "material"),
             ));
         }
-        return Ok(vec![id]);
+        return Ok(vec![Some(id)]);
     }
     if let Some(value) = operation.get("materials") {
         return read_material_array(engine, value, "materials");
@@ -1649,20 +1667,25 @@ fn read_material_slots(engine: &Engine<'_>, operation: &Map<String, Value>) -> R
     Ok(Vec::new())
 }
 
-fn read_material_array(engine: &Engine<'_>, value: &Value, field: &str) -> Result<Vec<Id>> {
+/// Reads a material slot array: each item is a material ID, or `null` for an empty slot.
+fn read_material_array(engine: &Engine<'_>, value: &Value, field: &str) -> Result<Vec<Option<Id>>> {
     let Some(values) = value.as_array() else {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
-            "materials must be an array of material IDs",
+            "materials must be an array of material IDs or nulls",
             &operation_pointer(engine.operation_index, field),
         ));
     };
-    let mut ids = Vec::with_capacity(values.len());
+    let mut slots = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
+        if value.is_null() {
+            slots.push(None);
+            continue;
+        }
         let Some(text) = value.as_str() else {
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
-                "material IDs must be strings",
+                "material IDs must be strings or null",
                 &operation_pointer(engine.operation_index, &format!("{field}/{index}")),
             ));
         };
@@ -1678,9 +1701,9 @@ fn read_material_array(engine: &Engine<'_>, value: &Value, field: &str) -> Resul
                 &operation_pointer(engine.operation_index, &format!("{field}/{index}")),
             ));
         }
-        ids.push(id);
+        slots.push(Some(id));
     }
-    Ok(ids)
+    Ok(slots)
 }
 
 fn read_matrix(engine: &Engine<'_>, value: &Value, pointer: &str) -> Result<[f64; 16]> {
@@ -2181,4 +2204,39 @@ fn primitive_parameter_error(
         message,
         &operation_pointer(engine.operation_index, &suffix),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "fixed valid material IDs and parser fixtures"
+    )]
+    use super::*;
+    use crate::model::{Material, SceneDoc};
+    use crate::ops::ChangeSet;
+    use serde_json::json;
+
+    #[test]
+    fn material_array_parser_preserves_empty_slots() {
+        let mut doc = SceneDoc::new("scene-test".to_owned());
+        let blue = Id::new("blue").unwrap();
+        doc.materials.insert(blue.clone(), Material::default());
+        let engine = Engine {
+            doc: &mut doc,
+            changes: ChangeSet::default(),
+            id_mappings: Map::new(),
+            operation_index: 0,
+            evaluation_frame: 1.0,
+            asset_root: None,
+            cache_directory: None,
+            pending_assets: std::collections::BTreeMap::default(),
+            warnings: Vec::new(),
+        };
+        let values = json!(["blue", null, "blue"]);
+        assert_eq!(
+            read_material_array(&engine, &values, "materials").unwrap(),
+            vec![Some(blue.clone()), None, Some(blue)]
+        );
+    }
 }

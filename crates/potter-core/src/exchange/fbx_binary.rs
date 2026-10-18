@@ -38,10 +38,14 @@ struct Node {
     children: Vec<Node>,
 }
 
-/// Export an FBX 7.4 binary file. Color layers and generic attributes are reported as losses by
-/// `exchange::attribute_losses`, not written.
-pub(crate) fn export(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<u8>> {
-    let ascii = super::fbx::export(doc, snapshot)?;
+/// Export an FBX 7.4 binary file, optionally dropping attributes reported by the lossy-export gate.
+pub(crate) fn export_allow_lossy(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    allow_lossy: bool,
+) -> Result<Vec<u8>> {
+    let ascii =
+        super::fbx::export_with_root_allow_lossy(doc, snapshot, Path::new("."), allow_lossy)?;
     let text = std::str::from_utf8(&ascii)
         .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
     let roots = parse_ascii(text)?;

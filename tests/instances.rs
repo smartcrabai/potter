@@ -11,6 +11,13 @@ use potter_core::{
     ops::apply_batch,
 };
 
+#[path = "common/exchange_normals.rs"]
+#[expect(
+    dead_code,
+    reason = "this test binary uses only the quantized normal tolerance from the shared helper"
+)]
+mod exchange_normals;
+
 fn apply(doc: &SceneDoc, operations: &Value) -> potter_core::error::Result<SceneDoc> {
     let batch = json!({
         "schema_version": 1,
@@ -191,19 +198,34 @@ fn instanced_custom_normals_rotate_with_the_instance_transform() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let mesh = &snapshot.meshes[&"instance".parse::<Id>().unwrap()];
-    let custom = mesh.attributes["custom_normal"]["values"]
+    // The stored custom normals are Blender code pairs: `null` is Auto, so only a non-null entry is authored.
+    let codes = mesh.attributes["custom_normal"]["values"]
         .as_object()
         .unwrap();
+    let normals = potter_core::geom::corner_normal_vectors(mesh).unwrap();
+    let mut authored_faces = Vec::new();
+    let mut corner_base = 0;
+    for face in &mesh.faces {
+        let count = face.vertices.len();
+        let row = codes[&format!("f{}", face.id)].as_array().unwrap();
+        if row.iter().any(|code| !code.is_null()) {
+            authored_faces.push((face.id, corner_base));
+        }
+        corner_base += count;
+    }
     assert_eq!(
-        custom.len(),
+        authored_faces.len(),
         1,
         "only the authored face carries a custom normal"
     );
     // A 90 degree turn about Z maps the authored +X normal to +Y.
-    for corner in custom.values().next().unwrap().as_array().unwrap() {
-        let [x, y, z] = [0, 1, 2].map(|axis| corner[axis].as_f64().unwrap());
+    let tolerance = exchange_normals::normal_tolerance(true);
+    let (_, base) = authored_faces[0];
+    for corner in &normals[base..base + 4] {
         assert!(
-            (x).abs() < 1.0e-12 && (y - 1.0).abs() < 1.0e-12 && z.abs() < 1.0e-12,
+            corner.x.abs() < tolerance
+                && (corner.y - 1.0).abs() < tolerance
+                && corner.z.abs() < tolerance,
             "{corner:?}"
         );
     }
@@ -232,7 +254,7 @@ fn collection_instance_keeps_each_members_material_slots() {
     let jacket = Id::new("jacket").unwrap();
     let skin = Id::new("skin").unwrap();
     // Each member's slots follow it: box_a's jacket and skin, then box_b's skin.
-    let bindings = &snapshot.instance_bindings[&instance];
+    let bindings = &snapshot.slot_bindings[&instance];
     assert_eq!(
         bindings
             .iter()
@@ -241,7 +263,10 @@ fn collection_instance_keeps_each_members_material_slots() {
         vec![Some(jacket), Some(skin.clone()), Some(skin)]
     );
     assert_eq!(
-        bindings.iter().map(|slot| slot.uv).collect::<Vec<_>>(),
+        bindings
+            .iter()
+            .map(|slot| slot.uv.texcoord0_covered)
+            .collect::<Vec<_>>(),
         vec![true, true, false]
     );
     let slots: Vec<u32> = snapshot.meshes[&instance]
@@ -271,17 +296,28 @@ fn collection_instance_keeps_each_members_uvs_after_face_gaps() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let mesh = &snapshot.meshes[&Id::new("instance").unwrap()];
-    // The joined UVs live in one `blender_uv_layers` store with one value per corner.
+    // The joined canonical store has one real row per surviving face and corner.
     assert!(!mesh.attributes.contains_key("uv_map"));
     assert_eq!(mesh.faces.len(), 11);
-    let layers = mesh.attributes["blender_uv_layers"].as_array().unwrap();
+    let layers = mesh.attributes["uv_layers"]["layers"].as_array().unwrap();
     assert_eq!(layers.len(), 1);
+    let rows = layers[0]["faces"].as_array().unwrap();
+    assert_eq!(rows.len(), mesh.faces.len());
     let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
-    assert_eq!(layers[0]["values"].as_array().unwrap().len(), corners);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["uv"].as_array().unwrap().len())
+            .sum::<usize>(),
+        corners
+    );
+    for (face, row) in mesh.faces.iter().zip(rows) {
+        assert_eq!(row["face_id"], json!(face.id));
+        assert_eq!(row["uv"].as_array().unwrap().len(), face.vertices.len());
+    }
     // Both members have a UV value on every face, so both slots are covered.
-    let bindings = &snapshot.instance_bindings[&Id::new("instance").unwrap()];
+    let bindings = &snapshot.slot_bindings[&Id::new("instance").unwrap()];
     assert_eq!(bindings.len(), 2);
-    assert!(bindings.iter().all(|slot| slot.uv));
+    assert!(bindings.iter().all(|slot| slot.uv.texcoord0_covered));
 }
 
 #[test]
@@ -303,7 +339,7 @@ fn nested_collection_instances_carry_member_materials_upward() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let outer = Id::new("outer").unwrap();
-    let table: Vec<Option<Id>> = snapshot.instance_bindings[&outer]
+    let table: Vec<Option<Id>> = snapshot.slot_bindings[&outer]
         .iter()
         .map(|slot| slot.material.clone())
         .collect();

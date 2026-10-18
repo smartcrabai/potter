@@ -2600,6 +2600,9 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     result.attributes.remove("blender_skin_vertices");
     result.attributes.remove("skin_radii");
     result.attributes.remove("skin_roots");
+    if smooth_shade {
+        crate::geom::normals::shade_faces_smooth(&mut result);
+    }
     // Blender's Skin output has no UV layers, so the store is dropped (reported as attribute loss).
     let uv_names: Vec<String> = uv_layers::read_layers(&result)
         .into_iter()

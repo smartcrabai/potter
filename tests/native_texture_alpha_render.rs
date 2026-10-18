@@ -1,6 +1,6 @@
 //! Blender-gated oracle for image alpha multiplied by a field material's base alpha.
 //!
-//! The test renders the imported TexturePlane through Potter's CLI with transparent film, reads the
+//! The test renders the imported `TexturePlane` through Potter's CLI with transparent film, reads the
 //! EXR back through Potter's image loader, and checks that .blend export/import retains the field
 //! texture and alpha state. Blender's reopened node graph is checked for the same numeric product.
 
@@ -18,7 +18,7 @@ mod process;
 use std::{error::Error, fs, path::Path};
 
 use native_oracle::{
-    FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, blender, build_oracle, export,
+    FLOAT_TOLERANCE, TestResult, apply_operations, assert_close, build_oracle, export,
     import_blend, losses, node_id, number, pot, read_scene, run_blender, write_script,
 };
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
@@ -88,7 +88,7 @@ fn center_pixel(project: &Path, image_id: &str) -> Result<[f64; 4], Box<dyn Erro
     reason = "one end-to-end oracle covers Potter rendering and the .blend field round trip"
 )]
 fn field_image_alpha_times_base_alpha_renders_and_round_trips_through_blend() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         eprintln!("skipping texture alpha render oracle: Blender is unavailable");
         return Ok(());
     };
@@ -261,21 +261,104 @@ fn field_image_alpha_times_base_alpha_renders_and_round_trips_through_blend() ->
         FLOAT_TOLERANCE,
         "reimported base alpha",
     );
-    let texture_id = field["base_color_texture"]["image"]
-        .as_str()
-        .ok_or("reimported texture reference is missing")?;
-    assert_eq!(texture_id, "alpha_texture");
+    // Reimport keeps the texture as a linked graph node, not as a `base_color_texture` field, so the
+    // alpha texture is found through the image texture node that reads it.
+    let graph = field_graph(&reimported_scene, field)?;
+    let (texture_node, texture) = image_texture(graph, "alpha_texture")?;
     assert!(
-        reimported_scene["images"].get(texture_id).is_some(),
+        reimported_scene["images"].get("alpha_texture").is_some(),
         "reimported texture image is absent"
     );
     assert_close(
-        center_pixel(&reimported, texture_id)?[3],
+        center_pixel(&reimported, "alpha_texture")?[3],
         IMAGE_ALPHA,
         FLOAT_TOLERANCE,
         "reimported image alpha",
     );
-    assert_eq!(field["base_color_texture"]["uv_layer"], "Base");
-    assert_eq!(field["base_color_texture"]["interpolation"], "closest");
+    assert_eq!(texture["properties"]["interpolation"], "Closest");
+    let uv_link = graph["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|link| link["to_node"] == texture_node && link["to_socket"] == "Vector")
+        .ok_or("reimported texture Vector input is not linked")?;
+    let uv_node = &graph["nodes"][uv_link["from_node"].as_str().unwrap_or_default()];
+    assert_eq!(uv_node["type"], "ShaderNodeUVMap");
+    assert_eq!(uv_node["properties"]["uv_map"], "Base");
+    let (principled_node, _) = node_of_type(graph, "ShaderNodeBsdfPrincipled")?;
+    assert!(
+        feeds(graph, texture_node, "Color", principled_node, "Base Color"),
+        "reimported texture colour does not reach Base Color"
+    );
+    assert!(
+        feeds(graph, texture_node, "Alpha", principled_node, "Alpha"),
+        "reimported texture alpha does not reach Principled Alpha"
+    );
     Ok(())
+}
+
+/// The shader graph of the reopened material `field`, from the scene's `node_groups`.
+fn field_graph<'a>(scene: &'a Value, field: &Value) -> TestResult<&'a Value> {
+    let graph_id = field["node_tree"]
+        .as_str()
+        .ok_or("reimported field material has no shader graph")?;
+    Ok(&scene["node_groups"][graph_id])
+}
+
+/// The first node of `graph` with type `node_type`, and its ID.
+fn node_of_type<'a>(graph: &'a Value, node_type: &str) -> TestResult<(&'a str, &'a Value)> {
+    graph["nodes"]
+        .as_object()
+        .and_then(|nodes| nodes.iter().find(|(_, node)| node["type"] == node_type))
+        .map(|(id, node)| (id.as_str(), node))
+        .ok_or_else(|| format!("no {node_type} node").into())
+}
+
+/// The image texture node of `graph` that reads the image `image`, and its ID.
+fn image_texture<'a>(graph: &'a Value, image: &str) -> TestResult<(&'a str, &'a Value)> {
+    graph["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes.iter().find(|(_, node)| {
+                node["type"] == "ShaderNodeTexImage" && node["properties"]["image"] == image
+            })
+        })
+        .map(|(id, node)| (id.as_str(), node))
+        .ok_or_else(|| format!("no image texture node reads {image}").into())
+}
+
+/// Whether `source`'s `source_socket` feeds `target`'s `target_socket`, following links upstream
+/// through any intermediate nodes.
+fn feeds(
+    graph: &Value,
+    source: &str,
+    source_socket: &str,
+    target: &str,
+    target_socket: &str,
+) -> bool {
+    let links = graph["links"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut pending = vec![(target.to_owned(), Some(target_socket.to_owned()))];
+    let mut visited: Vec<String> = Vec::new();
+    while let Some((node, socket)) = pending.pop() {
+        if socket.is_none() {
+            if visited.contains(&node) {
+                continue;
+            }
+            visited.push(node.clone());
+        }
+        for link in links.iter().filter(|link| {
+            link["to_node"] == node.as_str()
+                && socket
+                    .as_deref()
+                    .is_none_or(|name| link["to_socket"] == name)
+        }) {
+            let from = link["from_node"].as_str().unwrap_or_default();
+            let from_socket = link["from_socket"].as_str().unwrap_or_default();
+            if from == source && from_socket == source_socket {
+                return true;
+            }
+            pending.push((from.to_owned(), None));
+        }
+    }
+    false
 }

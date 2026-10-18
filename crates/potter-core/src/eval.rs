@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::Path,
+    sync::Arc,
 };
 
 use glam::{DMat4, DQuat, DVec3};
@@ -13,9 +14,10 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Aabb, CylinderParams, IcosphereParams, Mesh,
-        concat::{Part, concatenate, concatenate_with_normals, uv_covered_faces},
+        concat::{Part, concatenate, concatenate_with_normals},
         modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
         normals::SHADING_ATTRIBUTES,
+        uv_layers::{self, UvLayer},
     },
     hash,
     model::{
@@ -181,6 +183,11 @@ pub struct EvaluatedNode {
     pub bounds: Option<Aabb>,
     /// World-space bounds size, or null for geometry-free nodes.
     pub dimensions: Option<[f64; 3]>,
+    /// Effective material slots after the node's modifier stack: each slot resolved under its OBJECT
+    /// or DATA link, or replaced by a Boolean TRANSFER pool. This is the only evaluated slot table;
+    /// face material indices refer to it. Null entries are empty slots. Not serialized.
+    #[serde(skip)]
+    pub materials: Vec<Option<Id>>,
 }
 
 /// Evaluated world-space Grease Pencil stroke used by vector exporters and preview.
@@ -192,13 +199,28 @@ pub struct EvaluatedStroke {
     pub cyclic: bool,
 }
 
-/// Material and UV coverage of one slot of an evaluated collection instance's table.
+/// Per-member UV selection and availability in the joined layer-name order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UvBinding {
+    /// Joined layer index of this member's source render layer, when present.
+    pub render_index: Option<u8>,
+    /// Bit `n` is set when this member supplied joined UV layer `n`.
+    pub available_mask: u8,
+    /// Whether every face using this slot has a real row in joined layer zero.
+    pub texcoord0_covered: bool,
+}
+
+/// Material and member-local attribute selection of one evaluated instance slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotBinding {
     /// Material the slot binds, or `None` for an empty slot.
     pub material: Option<Id>,
-    /// Whether every face using the slot has a UV entry in the layer exported as `TEXCOORD_0`.
-    pub uv: bool,
+    /// Member-local UV layer lookup in the joined name order.
+    pub uv: UvBinding,
+    /// Joined color-layer index named by this member's render-color designation.
+    pub color_render_layer: Option<usize>,
+    /// Dynamic bitset of color layers actually supplied by this member.
+    pub color_available_mask: Arc<[u64]>,
 }
 
 /// Stable evaluation of one scene document and its context.
@@ -231,10 +253,9 @@ pub struct Snapshot {
     /// Instance source paths recorded by geometry-node modifiers.
     #[serde(skip)]
     pub instance_paths: BTreeMap<Id, Vec<Vec<Id>>>,
-    /// Material slot table and UV coverage of each evaluated collection instance's mesh: every face
-    /// indexes its table, whose slots are each member's slots in member order.
+    /// Member material slots and UV/color layer bindings for evaluated collection instances.
     #[serde(skip)]
-    pub instance_bindings: BTreeMap<Id, Vec<SlotBinding>>,
+    pub slot_bindings: BTreeMap<Id, Vec<SlotBinding>>,
     /// World-space Grease Pencil strokes held at the selected frame.
     #[serde(skip)]
     pub strokes: BTreeMap<Id, Vec<EvaluatedStroke>>,
@@ -262,41 +283,58 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Material bound by a face slot on a node's evaluated mesh.
+    /// Member-local binding for an evaluated collection instance; out-of-range slots clamp to
+    /// its last entry. Empty binding tables return `None`.
+    #[must_use]
+    pub fn slot_binding<'a>(
+        &'a self,
+        node_id: &Id,
+        _node: &Node,
+        slot: usize,
+    ) -> Option<&'a SlotBinding> {
+        self.slot_bindings
+            .get(node_id)
+            .and_then(|table| table.get(slot.min(table.len().checked_sub(1)?)))
+    }
+
+    /// Material for a face slot; out-of-range indices clamp to the last available slot.
     #[must_use]
     pub fn slot_material<'a>(
         &'a self,
         node_id: &Id,
         node: &'a Node,
+        data: Option<&'a DataBlock>,
         slot: usize,
     ) -> Option<&'a Id> {
-        match self.instance_bindings.get(node_id) {
-            Some(table) => table
-                .get(slot)
-                .and_then(|binding| binding.material.as_ref()),
-            None => node.material_slot(slot),
+        if self.slot_bindings.contains_key(node_id) {
+            return self
+                .slot_binding(node_id, node, slot)
+                .and_then(|binding| binding.material.as_ref());
+        }
+        match self.nodes.get(node_id) {
+            Some(evaluated) => {
+                let table = evaluated.materials.as_slice();
+                table.get(slot.min(table.len().checked_sub(1)?))?.as_ref()
+            }
+            None => crate::model::resolve_material_slot(
+                node.materials.as_slice(),
+                data.map_or(&[][..], |data| data.materials.as_slice()),
+                node.material_links.as_slice(),
+                slot,
+            ),
         }
     }
 
-    /// Number of material slots a face may index; an empty material list still allows slot zero.
+    /// Number of effective material slots: the evaluated table's length, or the authoring count
+    /// for a node without an evaluated entry.
     #[must_use]
-    pub fn slot_count(&self, node_id: &Id, node: &Node) -> usize {
-        self.instance_bindings
-            .get(node_id)
-            .map_or(node.materials.len(), Vec::len)
-    }
-
-    /// Per slot, whether the slot's faces have UVs for export. Two rules, one per node kind:
-    /// - Instance: an instance's table carries, per used slot, whether every face indexing it is
-    ///   covered by its member's first UV layer (`concat::uv_covered_faces`); a corner without a value
-    ///   joins as `[0, 0]`, so coverage is per face rather than whole-mesh.
-    /// - Plain node: every slot is the exporter's rule (`exports_texcoord0`): set 0 exists, since the
-    ///   exporter writes `TEXCOORD_0` for the whole mesh and fills missing face values with `[0, 0]`.
-    #[must_use]
-    pub fn slot_uv_table(&self, node_id: &Id, node: &Node, mesh: &Mesh) -> Vec<bool> {
-        match self.instance_bindings.get(node_id) {
-            Some(table) => table.iter().map(|binding| binding.uv).collect(),
-            None => vec![crate::exchange::gltf::exports_texcoord0(mesh); node.materials.len()],
+    pub fn slot_count(&self, node_id: &Id, node: &Node, data: Option<&DataBlock>) -> usize {
+        if let Some(bindings) = self.slot_bindings.get(node_id) {
+            bindings.len()
+        } else if let Some(evaluated) = self.nodes.get(node_id) {
+            evaluated.materials.len()
+        } else {
+            node.material_slot_count(data)
         }
     }
 }
@@ -543,7 +581,7 @@ impl Snapshot {
                     for node_id in node_errors.keys() {
                         snapshot.meshes.remove(node_id);
                         snapshot.instance_paths.remove(node_id);
-                        snapshot.instance_bindings.remove(node_id);
+                        snapshot.slot_bindings.remove(node_id);
                         snapshot.adaptive_normals.remove(node_id);
                         snapshot.strokes.remove(node_id);
                     }
@@ -951,13 +989,20 @@ impl Snapshot {
         let mut meshes = BTreeMap::new();
         let mut adaptive_normals = BTreeMap::new();
         let mut instance_paths = BTreeMap::new();
-        let mut instance_bindings = BTreeMap::new();
+        let mut slot_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
         let mut modifier_warnings = Vec::new();
         for id in &mesh_evaluation_order {
             let node = doc.nodes.get(id).ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "mesh evaluation node is missing")
             })?;
+            let node_data = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id));
+            // The mesh's own material array (DATA). Modifiers replace it (the Boolean TRANSFER pool);
+            // the evaluated table is resolved from it once the stack has run.
+            let mut node_materials = node_data.map_or_else(Vec::new, |data| data.materials.clone());
             let matrix = matrices.get(id).copied().ok_or_else(|| {
                 PotError::new(
                     ErrorCode::InternalError,
@@ -1097,7 +1142,14 @@ impl Snapshot {
                                 ),
                                 "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
                                     apply_scene_operand_modifier(
-                                        mesh, modifier, id, doc, &matrices, &meshes,
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &matrices,
+                                        &meshes,
+                                        &nodes,
+                                        &mut node_materials,
                                     )
                                 }
                                 "vertex_weight_edit"
@@ -1132,7 +1184,8 @@ impl Snapshot {
                                     frame,
                                     scene.fps,
                                     scene.fps_base,
-                                ),
+                                )
+                                .map(|warnings| modifier_warnings.extend(warnings)),
                                 "mesh_cache" => apply_mesh_cache_modifier(
                                     mesh,
                                     modifier,
@@ -1382,7 +1435,14 @@ impl Snapshot {
                                 ),
                                 "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
                                     apply_scene_operand_modifier(
-                                        mesh, modifier, id, doc, &matrices, &meshes,
+                                        mesh,
+                                        modifier,
+                                        id,
+                                        doc,
+                                        &matrices,
+                                        &meshes,
+                                        &nodes,
+                                        &mut node_materials,
                                     )
                                 }
                                 "vertex_weight_edit"
@@ -1417,7 +1477,8 @@ impl Snapshot {
                                     frame,
                                     scene.fps,
                                     scene.fps_base,
-                                ),
+                                )
+                                .map(|warnings| modifier_warnings.extend(warnings)),
                                 "mesh_cache" => apply_mesh_cache_modifier(
                                     mesh,
                                     modifier,
@@ -1657,6 +1718,7 @@ impl Snapshot {
                     world_matrix: matrix.to_cols_array(),
                     bounds,
                     dimensions,
+                    materials: effective_material_slots(node, &node_materials),
                 },
             );
         }
@@ -1750,17 +1812,24 @@ impl Snapshot {
                     "evaluated collection instance world matrix is missing",
                 )
             })?;
-            let (mesh, paths, bindings, member_normals) = evaluate_collection_instance(
+            let CollectionEvaluation {
+                mesh,
+                paths,
+                bindings,
+                adaptive_normals: member_normals,
+                ..
+            } = evaluate_collection_instance(
                 doc,
                 id,
                 &matrices,
                 &meshes,
+                &nodes,
                 &adaptive_normals,
                 &mut BTreeSet::new(),
             )?;
             let bounds = mesh_bounds(&mesh, matrix)?;
             if !mesh.vertices.is_empty() {
-                instance_bindings.insert(id.clone(), bindings);
+                slot_bindings.insert(id.clone(), bindings);
                 meshes.insert(id.clone(), mesh);
                 if let Some(normals) = member_normals {
                     adaptive_normals.insert(id.clone(), normals);
@@ -1795,7 +1864,7 @@ impl Snapshot {
             nodes,
             transform_world_matrices,
             instance_paths,
-            instance_bindings,
+            slot_bindings,
             meshes,
             adaptive_normals,
             strokes,
@@ -1810,6 +1879,29 @@ impl Snapshot {
             warnings: modifier_warnings,
         })
     }
+}
+
+/// The effective material slots of one node: each slot resolved under its OBJECT or DATA link by the
+/// model's `resolve_material_slot`, matching Blender `BKE_object_material_get_eval`
+/// (blenkernel/intern/material.cc:772): an object slot whose matbit is set and holds a material wins,
+/// otherwise the DATA slot. `mesh_materials` is the mesh's material array after the modifier stack:
+/// its DATA table, or the Boolean TRANSFER pool that replaced it. This is the evaluated table.
+pub(crate) fn effective_material_slots(
+    node: &Node,
+    mesh_materials: &[Option<Id>],
+) -> Vec<Option<Id>> {
+    let count = crate::model::material_slot_count(node.materials.len(), mesh_materials.len());
+    (0..count)
+        .map(|slot| {
+            crate::model::resolve_material_slot(
+                &node.materials,
+                mesh_materials,
+                &node.material_links,
+                slot,
+            )
+            .cloned()
+        })
+        .collect()
 }
 
 fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
@@ -2246,6 +2338,49 @@ fn add_mesh_operand_dependency(
     }
 }
 
+/// Adds a Boolean's operand objects as dependencies of `owner_id`: its `object`, and every object
+/// of its `collection`. The subject is never its own operand (`apply_boolean_operands_modifier`
+/// drops it), so a self reference is skipped rather than reported as a dependency cycle.
+fn add_boolean_operand_dependencies(
+    dependencies: &mut BTreeMap<Id, BTreeSet<Id>>,
+    owner_id: &Id,
+    modifier: &Modifier,
+    doc: &SceneDoc,
+) -> Result<()> {
+    let mut operand_ids = BTreeSet::new();
+    if let Some(object_id) = modifier
+        .params
+        .get("object")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| Id::new(text).ok())
+    {
+        operand_ids.insert(object_id);
+    }
+    if let Some(collection_id) = modifier
+        .params
+        .get("collection")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| Id::new(text).ok())
+        && doc.collections.contains_key(&collection_id)
+    {
+        collect_modifier_collection_objects(
+            doc,
+            &collection_id,
+            &mut BTreeSet::new(),
+            &mut operand_ids,
+        )?;
+    }
+    for target_id in operand_ids {
+        if target_id != *owner_id
+            && dependencies.contains_key(&target_id)
+            && let Some(owner_dependencies) = dependencies.get_mut(owner_id)
+        {
+            owner_dependencies.insert(target_id);
+        }
+    }
+    Ok(())
+}
+
 struct ObjectMeshDependencies {
     modifiers: BTreeMap<Id, BTreeSet<Id>>,
     other: BTreeMap<Id, BTreeSet<Id>>,
@@ -2277,10 +2412,17 @@ fn object_mesh_dependencies(
                 gate.is_active(owner_id, modifier)
             }
         }) {
+            if modifier.modifier_type == "boolean" {
+                add_boolean_operand_dependencies(
+                    &mut dependencies.modifiers,
+                    owner_id,
+                    modifier,
+                    doc,
+                )?;
+                continue;
+            }
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
-                "boolean" | "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => {
-                    &["object"]
-                }
+                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => &["object"],
                 "shrinkwrap" => {
                     if modifier
                         .params
@@ -2302,29 +2444,6 @@ fn object_mesh_dependencies(
                     owner_id,
                     modifier.params.get(*parameter),
                 );
-            }
-            if modifier.modifier_type == "boolean"
-                && let Some(collection_text) = modifier
-                    .params
-                    .get("collection")
-                    .and_then(serde_json::Value::as_str)
-                && let Ok(collection_id) = Id::new(collection_text.to_owned())
-                && doc.collections.contains_key(&collection_id)
-            {
-                let mut object_ids = BTreeSet::new();
-                collect_modifier_collection_objects(
-                    doc,
-                    &collection_id,
-                    &mut BTreeSet::new(),
-                    &mut object_ids,
-                )?;
-                for target_id in object_ids {
-                    if dependencies.modifiers.contains_key(&target_id)
-                        && let Some(owner_dependencies) = dependencies.modifiers.get_mut(owner_id)
-                    {
-                        owner_dependencies.insert(target_id);
-                    }
-                }
             }
         }
         if let Some(collection_id) = instance_collection_target(node)? {
@@ -2776,7 +2895,7 @@ fn apply_mesh_sequence_cache_modifier(
     frame: f64,
     fps: u32,
     fps_base: f64,
-) -> Result<()> {
+) -> Result<Vec<PotError>> {
     let resource_text = modifier
         .params
         .get("resource")
@@ -2796,7 +2915,23 @@ fn apply_mesh_sequence_cache_modifier(
         )
     })?;
     let (bytes, actual_hash) = read_cache_resource(doc, project_root, &resource_id)?;
-    crate::geom::mesh_cache::evaluate(mesh, modifier, frame, fps, fps_base, &actual_hash, &bytes)
+    let is_sequence = doc
+        .resources
+        .get(&resource_id)
+        .and_then(|resource| resource.get("cache_file"))
+        .and_then(|settings| settings.get("is_sequence"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    crate::geom::mesh_cache::evaluate(
+        mesh,
+        modifier,
+        frame,
+        fps,
+        fps_base,
+        &actual_hash,
+        &bytes,
+        is_sequence,
+    )
 }
 
 const MAX_RENDERED_PARTICLES: usize = 100_000;
@@ -3489,12 +3624,36 @@ pub(crate) fn apply_scene_operand_modifier(
     doc: &SceneDoc,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
+    evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
+    material_slots: &mut Vec<Option<Id>>,
 ) -> Result<()> {
     if modifier.modifier_type == "warp" {
         return apply_scene_warp_modifier(mesh, modifier, subject_id, doc, world_matrices);
     }
     if modifier.modifier_type == "hook" {
         return apply_scene_hook_modifier(mesh, modifier, subject_id, doc, world_matrices);
+    }
+    if modifier.modifier_type == "boolean"
+        && crate::geom::modifiers::BooleanSettings::parse(modifier)?.solver
+            != crate::geom::modifiers::BooleanSolver::Float
+    {
+        *material_slots = apply_boolean_operands_modifier(
+            mesh,
+            modifier,
+            subject_id,
+            doc,
+            world_matrices,
+            evaluated_meshes,
+            evaluated_nodes,
+            material_slots.as_slice(),
+        )?;
+        return Ok(());
+    }
+    // Blender's FLOAT Boolean never takes its own object as an operand: a self operand leaves the subject as it is.
+    if modifier.modifier_type == "boolean"
+        && modifier.params.get("object").and_then(Value::as_str) == Some(subject_id.as_str())
+    {
+        return Ok(());
     }
     if matches!(
         modifier.modifier_type.as_str(),
@@ -3561,6 +3720,10 @@ pub(crate) fn apply_scene_operand_modifier(
             &mut BTreeSet::new(),
             &mut object_ids,
         )?;
+    }
+    if modifier.modifier_type == "boolean" && object_ids.remove(subject_id) && object_ids.is_empty()
+    {
+        return Ok(());
     }
     if object_ids.is_empty() {
         return Err(PotError::with_details(
@@ -3799,6 +3962,71 @@ fn apply_scene_hook_modifier(
     *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
     Ok(())
 }
+/// Object IDs that a Boolean modifier takes as operands for `operand_type`: the `object` parameter,
+/// or, for COLLECTION, every object of the `collection` parameter in collection order. A missing or
+/// null parameter has no operands; a named object that does not exist is an error when it is read.
+fn boolean_operand_object_ids(
+    modifier: &Modifier,
+    doc: &SceneDoc,
+    operand_type: crate::geom::modifiers::BooleanOperandType,
+) -> Result<Vec<Id>> {
+    use crate::geom::modifiers::BooleanOperandType;
+    let (parameter, kind) = match operand_type {
+        BooleanOperandType::Object => ("object", "object"),
+        BooleanOperandType::Collection => ("collection", "collection"),
+    };
+    let text = match modifier.params.get(parameter) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_str().ok_or_else(|| {
+            PotError::invalid_argument(format!(
+                "modifier `{}` `{parameter}` must be a {kind} ID",
+                modifier.modifier_type
+            ))
+        })?,
+    };
+    let id = Id::new(text).map_err(|_| {
+        PotError::invalid_argument(format!(
+            "modifier `{}` `{parameter}` must be a valid {kind} ID",
+            modifier.modifier_type
+        ))
+    })?;
+    if operand_type == BooleanOperandType::Object {
+        return Ok(vec![id]);
+    }
+    let mut object_ids = Vec::new();
+    collect_collection_objects_in_order(doc, &id, &mut BTreeSet::new(), &mut object_ids)?;
+    Ok(object_ids)
+}
+
+/// Blender `FOREACH_COLLECTION_OBJECT_RECURSIVE` order: a collection's objects, then its child
+/// collections, each object once.
+fn collect_collection_objects_in_order(
+    doc: &SceneDoc,
+    collection_id: &Id,
+    visited: &mut BTreeSet<Id>,
+    object_ids: &mut Vec<Id>,
+) -> Result<()> {
+    if !visited.insert(collection_id.clone()) {
+        return Ok(());
+    }
+    let collection = doc.collections.get(collection_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier operand collection `{collection_id}` was not found"),
+            json!({"collection":collection_id}),
+        )
+    })?;
+    for object_id in &collection.objects {
+        if !object_ids.contains(object_id) {
+            object_ids.push(object_id.clone());
+        }
+    }
+    for child in &collection.children {
+        collect_collection_objects_in_order(doc, child, visited, object_ids)?;
+    }
+    Ok(())
+}
+
 fn collect_modifier_collection_objects(
     doc: &SceneDoc,
     collection_id: &Id,
@@ -3821,7 +4049,183 @@ fn collect_modifier_collection_objects(
     }
     Ok(())
 }
+
+/// The f64 fallback of the Boolean operand transform: the world matrix quantized to f32 before the
+/// product (`world_to_object * object_world` in `non_float_boolean_mesh`). The exact f32 path is
+/// `geom::blender_matrix::operand_to_subject`.
+fn world_matrix_f32(matrix: DMat4) -> glam::Mat4 {
+    glam::Mat4::from_cols_array(&matrix.to_cols_array().map(|value| value as f32))
+}
+
+/// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
+/// its vertex groups) and its transform into the subject's space: Blender's f32 product from
+/// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its material slots.
+fn boolean_operand(
+    modifier: &Modifier,
+    doc: &SceneDoc,
+    object_id: &Id,
+    subject_inverse: glam::Mat4,
+    subject_id: &Id,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+    evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
+) -> Result<(crate::geom::boolean::BooleanOperand, Vec<Option<Id>>)> {
+    let object = doc.nodes.get(object_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier operand object `{object_id}` was not found"),
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    let data_id = object.data.as_ref().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            format!("modifier operand object `{object_id}` has no geometry"),
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    let data = doc.data_blocks.get(data_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier operand data `{data_id}` was not found"),
+            json!({"modifier_id":modifier.id,"data":data_id}),
+        )
+    })?;
+    if data.data_type != "mesh" {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Boolean operands must be mesh objects",
+            json!({"feature_id":"modifier.boolean","modifier_id":modifier.id,"object":object_id}),
+        ));
+    }
+    let mesh = if let Some(evaluated) = evaluated_meshes.get(object_id) {
+        evaluated.clone()
+    } else {
+        let mut base = data.mesh.clone().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "mesh modifier operand has no mesh payload",
+                json!({"modifier_id":modifier.id,"object":object_id}),
+            )
+        })?;
+        attach_vertex_group_weights(&mut base, data);
+        base
+    };
+    let object_world = world_matrices.get(object_id).copied().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "modifier operand world matrix is missing",
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    // Blender's f32 product `world_to_object(subject) * object_to_world(operand)`; the f64
+    // fallback applies when either object has no exact replica.
+    let to_subject = if let Some(exact) =
+        crate::geom::blender_matrix::operand_to_subject(doc, subject_id, object_id, world_matrices)
+    {
+        exact
+    } else {
+        let to_subject = subject_inverse * world_matrix_f32(object_world);
+        DMat4::from_cols_array(&to_subject.to_cols_array().map(f64::from))
+    };
+    let operand = crate::geom::boolean::BooleanOperand {
+        mesh,
+        to_subject,
+        material_remap: Vec::new(),
+    };
+    // An evaluated operand contributes its evaluated table (after its own modifiers, e.g. a TRANSFER
+    // pool); an operand without one contributes its effective authoring slots.
+    let slots = match evaluated_meshes.get(object_id) {
+        Some(_) => evaluated_nodes.get(object_id).map_or_else(
+            || effective_material_slots(object, &data.materials),
+            |node| node.materials.clone(),
+        ),
+        None => effective_material_slots(object, &data.materials),
+    };
+    Ok((operand, slots))
+}
+
+/// The Boolean operands of an EXACT (or MANIFOLD, refused by the modifier) solver. The subject is
+/// operand 0 and is not listed; each operand object keeps its own mesh and transform, and the
+/// modifier combines them in one N-ary call, so a collection is never folded pairwise. Returns the
+/// output material slots: the subject's own slots for INDEX, or the pool for TRANSFER.
+fn apply_boolean_operands_modifier(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+    evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
+    subject_slots: &[Option<Id>],
+) -> Result<Vec<Option<Id>>> {
+    let settings = crate::geom::modifiers::BooleanSettings::parse(modifier)?;
+    let object_ids = boolean_operand_object_ids(modifier, doc, settings.operand_type)?;
+    // Blender `non_float_boolean_mesh` returns the mesh unchanged for an OBJECT operand that is
+    // unset (MOD_boolean.cc:406), so neither geometry nor material slots change.
+    if settings.operand_type == crate::geom::modifiers::BooleanOperandType::Object
+        && object_ids.is_empty()
+    {
+        return Ok(subject_slots.to_vec());
+    }
+    let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "modifier subject world matrix is missing",
+        )
+    })?;
+    // The f64 fallback inverse; operands with an exact f32 replica skip it (`geom::blender_matrix`).
+    let subject_inverse = world_matrix_f32(subject_world).inverse();
+    if !subject_inverse.is_finite() {
+        return Err(PotError::invalid_argument(
+            "modifier subject transform must be invertible",
+        ));
+    }
+    let mut operands = Vec::new();
+    let mut operand_slots = Vec::new();
+    for object_id in object_ids
+        .iter()
+        .filter(|object_id| *object_id != subject_id)
+    {
+        let (operand, slots) = boolean_operand(
+            modifier,
+            doc,
+            object_id,
+            subject_inverse,
+            subject_id,
+            world_matrices,
+            evaluated_meshes,
+            evaluated_nodes,
+        )?;
+        operands.push(operand);
+        operand_slots.push(slots);
+    }
+    // Blender `non_float_boolean_mesh` (source/blender/modifiers/intern/MOD_boolean.cc, v5.2.2):
+    // the TRANSFER pool starts from the subject mesh's own material array (`mesh->mat`, the DATA
+    // slots, here `subject_slots`), and each operand's slots come from `get_material_remap_transfer`,
+    // which reads `BKE_object_material_get_eval` (blenkernel/intern/material.cc:772), i.e. the
+    // effective slots `operand_slots` holds. The subject keeps its own indices in both modes.
+    let subject_refs: Vec<Option<&Id>> = subject_slots.iter().map(Option::as_ref).collect();
+    let operand_refs: Vec<Vec<Option<&Id>>> = operand_slots
+        .iter()
+        .map(|slots| slots.iter().map(Option::as_ref).collect())
+        .collect();
+    let (remaps, pool) =
+        crate::geom::boolean::material_remaps(settings.material_mode, &subject_refs, &operand_refs);
+    for (operand, remap) in operands.iter_mut().zip(remaps.into_iter().skip(1)) {
+        operand.material_remap = remap;
+    }
+    let mut resolved = modifier.clone();
+    for parameter in ["object", "collection", "target"] {
+        resolved.params.remove(parameter);
+    }
+    resolved.runtime.boolean_operands = operands;
+    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    Ok(pool)
+}
+
 fn combine_scene_operand_meshes(first: &Mesh, second: &Mesh, modifier_type: &str) -> Result<Mesh> {
+    // shortcut: FLOAT folds collection members pairwise until PR17b; EXACT never reaches here.
     if modifier_type == "boolean" {
         return crate::geom::boolean::boolean_mesh(first, second, "UNION");
     }
@@ -4300,45 +4704,124 @@ fn instance_collection_target(node: &Node) -> Result<Option<Id>> {
 /// that instance alone.
 const INSTANCE_JOIN_FAILURE: &str = "collection_instance_join_failed";
 
-/// A collection member placed in its instance: its mesh (borrowed from the evaluated meshes when it
-/// is a plain object), its world matrix, and the material slot table its faces index.
+/// A collection member before joining: its mesh and member-local UV/color bindings.
 struct CollectionMember<'a> {
     mesh: Cow<'a, Mesh>,
     matrix: DMat4,
-    slots: Vec<Option<Id>>,
+    slots: Vec<SlotBinding>,
     adaptive_normals: Option<Cow<'a, [Option<DVec3>]>>,
+    uv_names: Vec<String>,
+    uv_coverage: Vec<u8>,
+    color_names: Vec<String>,
 }
 
+/// A joined collection instance and the source bindings/coverage to propagate through nesting.
+struct CollectionEvaluation {
+    mesh: Mesh,
+    paths: Vec<Vec<Id>>,
+    bindings: Vec<SlotBinding>,
+    uv_coverage: Vec<u8>,
+    adaptive_normals: Option<Vec<Option<DVec3>>>,
+}
+
+struct JoinedMemberBindings {
+    slots: Vec<SlotBinding>,
+    uv_names: Vec<String>,
+    uv_coverage: Vec<u8>,
+    color_names: Vec<String>,
+    slot_base: usize,
+}
+type ColorMaskRemapCache = HashMap<*const [u64], (Arc<[u64]>, Arc<[u64]>)>;
+
 /// A plain member's slot table: its material list, or one empty slot when it has none.
-fn member_slots(node: &Node) -> Vec<Option<Id>> {
-    if node.materials.is_empty() {
+fn member_slots(materials: &[Option<Id>]) -> Vec<Option<Id>> {
+    if materials.is_empty() {
         vec![None]
     } else {
-        node.materials.iter().cloned().map(Some).collect()
+        materials.to_vec()
     }
 }
 
-/// A collection instance's joined mesh, its slot bindings (each member's slots in member order, with
-/// UV coverage), and each member's source path.
-type CollectionEvaluation = (
-    Mesh,
-    Vec<Vec<Id>>,
-    Vec<SlotBinding>,
-    Option<Vec<Option<DVec3>>>,
-);
+/// Source-face coverage by UV layer, before concatenation fills absent rows with defaults.
+fn uv_face_coverage(layers: &[UvLayer], face_count: usize) -> Vec<u8> {
+    let mut coverage = vec![0; face_count];
+    for (layer_index, layer) in layers.iter().take(uv_layers::MAX_LAYERS).enumerate() {
+        let bit = 1_u8 << layer_index;
+        for (face_index, row) in layer.faces.iter().enumerate().take(face_count) {
+            if row.is_some() {
+                coverage[face_index] |= bit;
+            }
+        }
+    }
+    coverage
+}
 
-/// Per slot of a `slot_count`-entry table: whether every face indexing the slot is covered. Unused
-/// slots are `false`; a face past the table is ignored, since export rejects it.
-fn fold_slot_coverage(mesh: &Mesh, covered: &[bool], slot_count: usize) -> Vec<bool> {
+fn color_layer_names(mesh: &Mesh) -> Vec<String> {
+    mesh.attributes
+        .get("color_layers")
+        .and_then(|value| value.get("layers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn all_color_layers_mask(layer_count: usize) -> Arc<[u64]> {
+    let mut mask = vec![u64::MAX; layer_count.div_ceil(64)];
+    if !layer_count.is_multiple_of(64)
+        && let Some(last) = mask.last_mut()
+    {
+        *last = (1_u64 << (layer_count % 64)) - 1;
+    }
+    mask.into()
+}
+
+fn member_slot_bindings(
+    materials: &[Option<Id>],
+    mesh: &Mesh,
+    uv_store: &uv_layers::UvStore,
+    color_names: &[String],
+) -> Vec<SlotBinding> {
+    let render_index = uv_store
+        .render_index()
+        .and_then(|index| u8::try_from(index).ok());
+    let available_mask = (0..uv_store.layers.len().min(uv_layers::MAX_LAYERS))
+        .fold(0_u8, |mask, index| mask | (1_u8 << index));
+    let color_render_layer = mesh
+        .attributes
+        .get("color_layers")
+        .and_then(|value| value.get("render"))
+        .and_then(Value::as_str)
+        .and_then(|name| color_names.iter().position(|layer| layer == name));
+    let color_available_mask = all_color_layers_mask(color_names.len());
+    member_slots(materials)
+        .into_iter()
+        .map(|material| SlotBinding {
+            material,
+            uv: UvBinding {
+                render_index,
+                available_mask,
+                texcoord0_covered: false,
+            },
+            color_render_layer,
+            color_available_mask: Arc::clone(&color_available_mask),
+        })
+        .collect()
+}
+
+/// Whether every face indexing a joined slot has real data for joined UV layer zero.
+fn fold_slot_coverage(mesh: &Mesh, covered: &[u8], slot_count: usize) -> Vec<bool> {
     let mut slots = vec![None::<bool>; slot_count];
-    for (face, &face_covered) in mesh.faces.iter().zip(covered) {
+    for (face, &face_coverage) in mesh.faces.iter().zip(covered) {
         let Some(entry) = usize::try_from(face.material_index)
             .ok()
             .and_then(|slot| slots.get_mut(slot))
         else {
             continue;
         };
-        *entry = Some(entry.unwrap_or(true) && face_covered);
+        *entry = Some(entry.unwrap_or(true) && face_coverage & 1 != 0);
     }
     slots
         .into_iter()
@@ -4346,33 +4829,78 @@ fn fold_slot_coverage(mesh: &Mesh, covered: &[bool], slot_count: usize) -> Vec<b
         .collect()
 }
 
-/// Binds each slot of a joined mesh's table to its material and to whether its faces are covered.
-fn slot_bindings(mesh: &Mesh, covered: &[bool], slots: Vec<Option<Id>>) -> Vec<SlotBinding> {
-    let uv = fold_slot_coverage(mesh, covered, slots.len());
-    slots
-        .into_iter()
-        .zip(uv)
-        .map(|(material, uv)| SlotBinding { material, uv })
+fn layer_index_map(source: &[String], joined: &[String]) -> Vec<Option<usize>> {
+    source
+        .iter()
+        .map(|name| joined.iter().position(|candidate| candidate == name))
         .collect()
 }
 
-/// Tags a join failure with the collection instance that owns it.
-fn instance_join_error(mut error: PotError, instance_id: &Id) -> PotError {
-    let mut details = match std::mem::take(&mut error.details) {
-        Value::Object(details) => details,
-        _ => Map::new(),
-    };
-    details.insert("node_id".to_owned(), json!(instance_id));
-    details.insert(INSTANCE_JOIN_FAILURE.to_owned(), json!(true));
-    error.details = Value::Object(details);
-    error
+fn remap_uv_mask(mask: u8, layer_map: &[Option<usize>]) -> u8 {
+    layer_map
+        .iter()
+        .enumerate()
+        .fold(0, |joined, (source, destination)| {
+            if mask & (1_u8 << source) == 0 {
+                return joined;
+            }
+            destination
+                .and_then(|index| u8::try_from(index).ok())
+                .map_or(joined, |index| joined | (1_u8 << index))
+        })
 }
 
-/// Whether evaluation isolates `error`'s owner: an unsupported feature, or a collection instance
-/// join failure tagged by [`instance_join_error`].
-fn is_isolated_failure(error: &PotError) -> bool {
-    error.code == ErrorCode::UnsupportedFeature
-        || error.details.get(INSTANCE_JOIN_FAILURE).is_some()
+fn remap_color_mask(mask: &[u64], layer_map: &[Option<usize>], joined_count: usize) -> Arc<[u64]> {
+    let mut joined = vec![0; joined_count.div_ceil(64)];
+    for (source, destination) in layer_map.iter().enumerate() {
+        if mask
+            .get(source / 64)
+            .is_some_and(|word| word & (1_u64 << (source % 64)) != 0)
+            && let Some(destination) = destination
+        {
+            joined[destination / 64] |= 1_u64 << (destination % 64);
+        }
+    }
+    joined.into()
+}
+
+fn remap_coverage(coverage: &[u8], layer_map: &[Option<usize>]) -> Vec<u8> {
+    coverage
+        .iter()
+        .map(|&mask| remap_uv_mask(mask, layer_map))
+        .collect()
+}
+
+fn remap_slot_binding(
+    mut binding: SlotBinding,
+    uv_map: &[Option<usize>],
+    color_map: &[Option<usize>],
+    color_count: usize,
+    color_masks: &mut ColorMaskRemapCache,
+) -> SlotBinding {
+    binding.uv.render_index = binding
+        .uv
+        .render_index
+        .and_then(|index| uv_map.get(usize::from(index)).copied().flatten())
+        .and_then(|index| u8::try_from(index).ok());
+    binding.uv.available_mask = remap_uv_mask(binding.uv.available_mask, uv_map);
+    binding.uv.texcoord0_covered = false;
+    binding.color_render_layer = binding
+        .color_render_layer
+        .and_then(|index| color_map.get(index).copied().flatten());
+    let pointer = Arc::as_ptr(&binding.color_available_mask);
+    let mapped_mask = Arc::clone(
+        &color_masks
+            .entry(pointer)
+            .or_insert_with(|| {
+                let source_mask = Arc::clone(&binding.color_available_mask);
+                let mapped = remap_color_mask(&source_mask, color_map, color_count);
+                (source_mask, mapped)
+            })
+            .1,
+    );
+    binding.color_available_mask = mapped_mask;
+    binding
 }
 
 /// Joins a collection instance's members and nested instances into one mesh.
@@ -4381,6 +4909,7 @@ fn evaluate_collection_instance<'a>(
     instance_id: &Id,
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &'a BTreeMap<Id, Mesh>,
+    nodes: &BTreeMap<Id, EvaluatedNode>,
     adaptive_normals: &'a BTreeMap<Id, Vec<Option<DVec3>>>,
     active_instances: &mut BTreeSet<Id>,
 ) -> Result<CollectionEvaluation> {
@@ -4412,6 +4941,7 @@ fn evaluate_collection_instance<'a>(
         matrices,
         meshes,
         adaptive_normals,
+        nodes,
         active_instances,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
@@ -4419,10 +4949,11 @@ fn evaluate_collection_instance<'a>(
         &mut paths,
     )?;
     active_instances.remove(instance_id);
-    let mut slots = Vec::new();
     let mut parts = Vec::with_capacity(members.len());
+    let mut member_bindings = Vec::with_capacity(members.len());
+    let mut slot_base = 0;
     for member in members {
-        let material_offset = u32::try_from(slots.len()).map_err(|_| {
+        let material_offset = u32::try_from(slot_base).map_err(|_| {
             PotError::new(
                 ErrorCode::LimitExceeded,
                 "collection instance has too many material slots",
@@ -4436,11 +4967,20 @@ fn evaluate_collection_instance<'a>(
             slot_count,
             adaptive_normals: member.adaptive_normals,
         });
-        slots.extend(member.slots);
+        member_bindings.push(JoinedMemberBindings {
+            slots: member.slots,
+            uv_names: member.uv_names,
+            uv_coverage: member.uv_coverage,
+            color_names: member.color_names,
+            slot_base,
+        });
+        slot_base = slot_base.checked_add(slot_count).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "collection instance has too many material slots",
+            )
+        })?;
     }
-    // Per joined face: whether its member has a value on every corner of its first UV layer. Read
-    // before `concatenate` consumes the members; a joined corner without a value is `[0, 0]`.
-    let covered = uv_covered_faces(&parts);
     let include_normals = parts.iter().any(|part| part.adaptive_normals.is_some());
     let (mesh, adaptive_normals) = if include_normals {
         concatenate_with_normals(parts)
@@ -4448,14 +4988,75 @@ fn evaluate_collection_instance<'a>(
         concatenate(parts).map(|mesh| (mesh, None))
     }
     .map_err(|error| instance_join_error(error, instance_id))?;
-    if covered.len() != mesh.faces.len() {
+    let joined_uv_names = uv_layers::read_layers(&mesh)
+        .into_iter()
+        .map(|layer| layer.name)
+        .collect::<Vec<_>>();
+    let joined_color_names = color_layer_names(&mesh);
+    let uv_maps = member_bindings
+        .iter()
+        .map(|member| layer_index_map(&member.uv_names, &joined_uv_names))
+        .collect::<Vec<_>>();
+    let color_maps = member_bindings
+        .iter()
+        .map(|member| layer_index_map(&member.color_names, &joined_color_names))
+        .collect::<Vec<_>>();
+    let mut uv_coverage = Vec::with_capacity(mesh.faces.len());
+    for (member, layer_map) in member_bindings.iter().zip(&uv_maps) {
+        uv_coverage.extend(remap_coverage(&member.uv_coverage, layer_map));
+    }
+    if uv_coverage.len() != mesh.faces.len() {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "collection instance UV coverage does not match its faces",
         ));
     }
-    let bindings = slot_bindings(&mesh, &covered, slots);
-    Ok((mesh, paths, bindings, adaptive_normals))
+    let slot_coverage = fold_slot_coverage(&mesh, &uv_coverage, slot_base);
+    let mut color_masks = ColorMaskRemapCache::new();
+    let mut bindings = Vec::with_capacity(slot_base);
+    for ((member, uv_map), color_map) in member_bindings.into_iter().zip(&uv_maps).zip(&color_maps)
+    {
+        for (local_slot, binding) in member.slots.into_iter().enumerate() {
+            let mut binding = remap_slot_binding(
+                binding,
+                uv_map,
+                color_map,
+                joined_color_names.len(),
+                &mut color_masks,
+            );
+            binding.uv.texcoord0_covered = slot_coverage
+                .get(member.slot_base + local_slot)
+                .copied()
+                .unwrap_or(false);
+            bindings.push(binding);
+        }
+    }
+    Ok(CollectionEvaluation {
+        mesh,
+        paths,
+        bindings,
+        uv_coverage,
+        adaptive_normals,
+    })
+}
+
+/// Tags a join failure with the collection instance that owns it.
+fn instance_join_error(mut error: PotError, instance_id: &Id) -> PotError {
+    let mut details = match std::mem::take(&mut error.details) {
+        Value::Object(details) => details,
+        _ => Map::new(),
+    };
+    details.insert("node_id".to_owned(), json!(instance_id));
+    details.insert(INSTANCE_JOIN_FAILURE.to_owned(), json!(true));
+    error.details = Value::Object(details);
+    error
+}
+
+/// Whether evaluation isolates `error`'s owner: an unsupported feature, or a collection instance
+/// join failure tagged by [`instance_join_error`].
+fn is_isolated_failure(error: &PotError) -> bool {
+    error.code == ErrorCode::UnsupportedFeature
+        || error.details.get(INSTANCE_JOIN_FAILURE).is_some()
 }
 
 #[expect(
@@ -4469,6 +5070,7 @@ fn append_collection_geometry<'a>(
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &'a BTreeMap<Id, Mesh>,
     adaptive_normals: &'a BTreeMap<Id, Vec<Option<DVec3>>>,
+    nodes: &BTreeMap<Id, EvaluatedNode>,
     active_instances: &mut BTreeSet<Id>,
     visited_collections: &mut BTreeSet<Id>,
     collection_stack: &mut BTreeSet<Id>,
@@ -4505,32 +5107,76 @@ fn append_collection_geometry<'a>(
             continue;
         }
         let member = if instance_collection_target(source_node)?.is_some() {
-            let (mesh, paths, bindings, normals) = evaluate_collection_instance(
+            let nested = evaluate_collection_instance(
                 doc,
                 object_id,
                 matrices,
                 meshes,
+                nodes,
                 adaptive_normals,
                 active_instances,
             )?;
-            let slots: Vec<Option<Id>> = bindings
+            let uv_names = uv_layers::read_layers(&nested.mesh)
                 .into_iter()
-                .map(|binding| binding.material)
+                .map(|layer| layer.name)
                 .collect();
-            Some((Cow::Owned(mesh), paths, slots, normals.map(Cow::Owned)))
+            let color_names = color_layer_names(&nested.mesh);
+            Some((
+                Cow::Owned(nested.mesh),
+                nested.paths,
+                nested.bindings,
+                nested.adaptive_normals.map(Cow::Owned),
+                uv_names,
+                nested.uv_coverage,
+                color_names,
+            ))
         } else {
             meshes.get(object_id).map(|source_mesh| {
+                let uv_store = uv_layers::read(source_mesh);
+                let uv_names = uv_store
+                    .layers
+                    .iter()
+                    .map(|layer| layer.name.clone())
+                    .collect();
+                let uv_coverage = uv_face_coverage(&uv_store.layers, source_mesh.faces.len());
+                let color_names = color_layer_names(source_mesh);
+                let source_data = source_node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id));
+                let materials = nodes.get(object_id).map_or_else(
+                    || {
+                        effective_material_slots(
+                            source_node,
+                            source_data.map_or(&[][..], |data| data.materials.as_slice()),
+                        )
+                    },
+                    |evaluated| evaluated.materials.clone(),
+                );
+                let slots = member_slot_bindings(&materials, source_mesh, &uv_store, &color_names);
                 (
                     Cow::Borrowed(source_mesh),
                     vec![vec![object_id.clone()]],
-                    member_slots(source_node),
+                    slots,
                     adaptive_normals
                         .get(object_id)
                         .map(|normals| Cow::Borrowed(normals.as_slice())),
+                    uv_names,
+                    uv_coverage,
+                    color_names,
                 )
             })
         };
-        let Some((nested_mesh, nested_paths, slots, member_normals)) = member else {
+        let Some((
+            nested_mesh,
+            nested_paths,
+            slots,
+            member_normals,
+            uv_names,
+            uv_coverage,
+            color_names,
+        )) = member
+        else {
             continue;
         };
         if !nested_mesh.vertices.is_empty() {
@@ -4545,6 +5191,9 @@ fn append_collection_geometry<'a>(
                 matrix: source_matrix,
                 slots,
                 adaptive_normals: member_normals,
+                uv_names,
+                uv_coverage,
+                color_names,
             });
             for path in nested_paths {
                 let mut full_path = Vec::with_capacity(path.len() + 1);
@@ -4562,6 +5211,7 @@ fn append_collection_geometry<'a>(
             matrices,
             meshes,
             adaptive_normals,
+            nodes,
             active_instances,
             visited_collections,
             collection_stack,
@@ -4588,6 +5238,7 @@ fn inject_dynamic_paint_colors(mesh: &mut Mesh, colors: &[[f64; 4]]) {
     crate::geom::color_layers::write(mesh, &store);
 }
 
+/// Instances copy each source's attributes, remapping the face- and edge-keyed shading ones.
 /// Particle copies: each template's attributes, with its face- and edge-keyed shading remapped.
 fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> Result<()> {
     if output.vertices.is_empty() {
@@ -4885,18 +5536,25 @@ pub(crate) fn mesh_vertex_weights(
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
 
-    use glam::DVec3;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use glam::{DMat4, DVec3};
+    use serde_json::json;
 
     use crate::{
-        geom::{BoxParams, Mesh},
+        geom::{
+            BoxParams, Mesh,
+            uv_layers::{self, UvLayer, UvStore},
+        },
         model::{
-            DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
-            GreasePencilStroke, Id, Node, SceneDoc, Transform,
+            Collection, DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer,
+            GreasePencilPoint, GreasePencilStroke, Id, MaterialLink, Node, SceneDoc, Transform,
         },
     };
 
-    use super::{EvaluationContext, Snapshot};
+    use super::{
+        EvaluationContext, SlotBinding, Snapshot, UvBinding, evaluate_collection_instance,
+    };
 
     #[test]
     fn particle_render_limit_counts_all_systems_for_each_emitter() {
@@ -5337,5 +5995,400 @@ mod tests {
             serde_json::json!("point")
         );
         assert!(color_layers::validate(&mesh).is_ok());
+    }
+
+    fn member_mesh(layers: &[(&str, [f64; 2], Option<usize>)], render: &str, color: &str) -> Mesh {
+        let mut mesh = Mesh::box_mesh(BoxParams {
+            size: DVec3::splat(2.0),
+        })
+        .unwrap();
+        let uv_layers = layers
+            .iter()
+            .map(|(name, uv, missing_face)| {
+                UvLayer::new(
+                    *name,
+                    mesh.faces
+                        .iter()
+                        .enumerate()
+                        .map(|(index, face)| {
+                            (*missing_face != Some(index)).then(|| vec![*uv; face.vertices.len()])
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        uv_layers::write(
+            &mut mesh,
+            &UvStore {
+                layers: uv_layers,
+                active: Some(render.to_owned()),
+                render: Some(render.to_owned()),
+            },
+        );
+        mesh.attributes.insert(
+            "color_layers".to_owned(),
+            json!({"layers":[color],"active":color,"render":color}),
+        );
+        let color_values = mesh
+            .faces
+            .iter()
+            .map(|face| {
+                (
+                    format!("f{}", face.id),
+                    json!(vec![[0.2, 0.4, 0.8, 0.35]; face.vertices.len()]),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        mesh.attributes.insert(
+            color.to_owned(),
+            json!({"domain":"corner","type":"color","values":color_values}),
+        );
+        mesh
+    }
+
+    fn collection_instance(name: &str, collection: &Id) -> Node {
+        let mut properties = serde_json::Map::new();
+        properties.insert("instance_collection".to_owned(), json!(collection));
+        Node {
+            name: name.to_owned(),
+            kind: "collection_instance".to_owned(),
+            properties,
+            ..Node::default()
+        }
+    }
+
+    #[test]
+    fn nested_collection_bindings_remap_member_layers_and_keep_real_face_coverage() {
+        let outer_id = Id::new("outer").unwrap();
+        let inner_id = Id::new("inner").unwrap();
+        let outer_instance_id = Id::new("outer_instance").unwrap();
+        let inner_instance_id = Id::new("inner_instance").unwrap();
+        let prefix_id = Id::new("prefix").unwrap();
+        let first_id = Id::new("first").unwrap();
+        let second_id = Id::new("second").unwrap();
+        let prefix_material = Id::new("prefix_material").unwrap();
+        let shared_material = Id::new("shared_material").unwrap();
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.collections.insert(
+            outer_id.clone(),
+            Collection {
+                name: "Outer".to_owned(),
+                children: Vec::new(),
+                objects: vec![prefix_id.clone(), inner_instance_id.clone()],
+            },
+        );
+        doc.collections.insert(
+            inner_id.clone(),
+            Collection {
+                name: "Inner".to_owned(),
+                children: Vec::new(),
+                objects: vec![first_id.clone(), second_id.clone()],
+            },
+        );
+        doc.nodes.insert(
+            outer_instance_id.clone(),
+            collection_instance("Outer instance", &outer_id),
+        );
+        doc.nodes.insert(
+            inner_instance_id.clone(),
+            collection_instance("Inner instance", &inner_id),
+        );
+        doc.nodes.insert(
+            prefix_id.clone(),
+            Node {
+                name: "Prefix".to_owned(),
+                kind: "mesh".to_owned(),
+                materials: vec![Some(prefix_material)],
+                ..Node::default()
+            },
+        );
+        doc.nodes.insert(
+            first_id.clone(),
+            Node {
+                name: "First".to_owned(),
+                kind: "mesh".to_owned(),
+                materials: vec![Some(shared_material.clone()), Some(shared_material.clone())],
+                ..Node::default()
+            },
+        );
+        doc.nodes.insert(
+            second_id.clone(),
+            Node {
+                name: "Second".to_owned(),
+                kind: "mesh".to_owned(),
+                materials: vec![Some(shared_material.clone())],
+                ..Node::default()
+            },
+        );
+        let prefix = member_mesh(&[("Other", [0.1, 0.2], None)], "Other", "Tint");
+        let mut first = member_mesh(
+            &[("Base", [0.3, 0.4], Some(0)), ("Detail", [0.5, 0.6], None)],
+            "Detail",
+            "Skin",
+        );
+        let second = member_mesh(
+            &[("Detail", [0.7, 0.8], None), ("Base", [0.9, 0.25], None)],
+            "Base",
+            "Skin",
+        );
+        first.faces[1].material_index = 1;
+        let mut meshes = BTreeMap::new();
+        meshes.insert(prefix_id.clone(), prefix);
+        meshes.insert(first_id.clone(), first);
+        meshes.insert(second_id.clone(), second);
+        let matrices = [
+            outer_instance_id.clone(),
+            inner_instance_id,
+            prefix_id,
+            first_id,
+            second_id,
+        ]
+        .into_iter()
+        .map(|id| (id, DMat4::IDENTITY))
+        .collect();
+
+        let evaluation = evaluate_collection_instance(
+            &doc,
+            &outer_instance_id,
+            &matrices,
+            &meshes,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(evaluation.mesh.vertices.len(), 24);
+        assert_eq!(evaluation.mesh.edges.len(), 36);
+        assert_eq!(evaluation.mesh.faces.len(), 18);
+        let corner_count = evaluation
+            .mesh
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
+        assert_eq!(corner_count, 72);
+
+        let uv = uv_layers::read(&evaluation.mesh);
+        assert_eq!(
+            uv.layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Other", "Base", "Detail"]
+        );
+        for layer in &uv.layers {
+            assert_eq!(layer.faces.len(), evaluation.mesh.faces.len());
+            for (face, row) in evaluation.mesh.faces.iter().zip(&layer.faces) {
+                assert_eq!(row.as_ref().unwrap().len(), face.vertices.len());
+            }
+        }
+        assert_eq!(
+            uv.layers[0].faces[6].as_ref().unwrap()[0],
+            [0.0, 1.0],
+            "each absent joined UV row uses canonical Blender UV(0, 0)"
+        );
+        assert_eq!(
+            uv.layers[1].faces[6].as_ref().unwrap()[0],
+            [0.0, 1.0],
+            "an originally absent row stays uncovered after its default is materialized"
+        );
+        assert_eq!(uv.layers[1].faces[7].as_ref().unwrap()[0], [0.3, 0.4]);
+        assert_eq!(uv.layers[2].faces[6].as_ref().unwrap()[0], [0.5, 0.6]);
+        assert_eq!(uv.layers[1].faces[12].as_ref().unwrap()[0], [0.9, 0.25]);
+        assert_eq!(uv.layers[2].faces[12].as_ref().unwrap()[0], [0.7, 0.8]);
+        assert_eq!(&evaluation.uv_coverage[..6], &[1, 1, 1, 1, 1, 1]);
+        assert_eq!(&evaluation.uv_coverage[6..12], &[4, 6, 6, 6, 6, 6]);
+        assert_eq!(&evaluation.uv_coverage[12..], &[6, 6, 6, 6, 6, 6]);
+
+        assert_eq!(evaluation.bindings.len(), 4);
+        assert_eq!(evaluation.bindings[0].uv.render_index, Some(0));
+        assert_eq!(evaluation.bindings[0].uv.available_mask, 1);
+        assert!(evaluation.bindings[0].uv.texcoord0_covered);
+        assert_eq!(evaluation.bindings[1].uv.render_index, Some(2));
+        assert_eq!(evaluation.bindings[1].uv.available_mask, 6);
+        assert!(!evaluation.bindings[1].uv.texcoord0_covered);
+        assert_eq!(evaluation.bindings[2].uv, evaluation.bindings[1].uv);
+        assert_eq!(evaluation.bindings[3].uv.render_index, Some(1));
+        assert_eq!(evaluation.bindings[3].uv.available_mask, 6);
+        assert!(!evaluation.bindings[3].uv.texcoord0_covered);
+        assert_eq!(
+            evaluation.bindings[1].material,
+            evaluation.bindings[2].material
+        );
+        assert_eq!(evaluation.bindings[1].color_render_layer, Some(1));
+        assert_eq!(&*evaluation.bindings[1].color_available_mask, &[2]);
+        assert!(std::sync::Arc::ptr_eq(
+            &evaluation.bindings[1].color_available_mask,
+            &evaluation.bindings[2].color_available_mask
+        ));
+        let positions_by_id = evaluation
+            .mesh
+            .vertices
+            .iter()
+            .map(|vertex| (vertex.id, vertex.co))
+            .collect::<BTreeMap<_, _>>();
+        let positions = evaluation
+            .mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let normals = crate::geom::normals::corner_normals(&evaluation.mesh, &positions).unwrap();
+        assert_eq!(normals.len(), corner_count);
+        let mut corner_base = 0;
+        for face in &evaluation.mesh.faces {
+            let first = positions_by_id[&face.vertices[0]];
+            let expected = (positions_by_id[&face.vertices[1]] - first)
+                .cross(positions_by_id[&face.vertices[2]] - first)
+                .normalize();
+            let corner_end = corner_base + face.vertices.len();
+            for actual in &normals[corner_base..corner_end] {
+                assert!(
+                    (*actual - expected).length() <= 1.0e-12,
+                    "expected {expected}, got {actual}"
+                );
+            }
+            corner_base = corner_end;
+        }
+    }
+
+    #[test]
+    fn slot_material_and_binding_clamp_to_the_last_slot() {
+        let mut snapshot = Snapshot::evaluate(
+            &SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned()),
+            &EvaluationContext::default(),
+        )
+        .unwrap();
+        let first = Id::new("first_material").unwrap();
+        let last = Id::new("last_material").unwrap();
+        let ordinary_id = Id::new("ordinary").unwrap();
+        let ordinary = Node {
+            materials: vec![Some(first), Some(last.clone())],
+            ..Node::default()
+        };
+        assert_eq!(
+            snapshot.slot_material(&ordinary_id, &ordinary, None, usize::MAX),
+            Some(&last)
+        );
+        assert!(
+            snapshot
+                .slot_material(&ordinary_id, &Node::default(), None, 0)
+                .is_none()
+        );
+
+        let instance_id = Id::new("instance").unwrap();
+        let instance = Node::default();
+        snapshot.slot_bindings.insert(
+            instance_id.clone(),
+            vec![
+                SlotBinding {
+                    material: None,
+                    uv: UvBinding::default(),
+                    color_render_layer: None,
+                    color_available_mask: Vec::<u64>::new().into(),
+                },
+                SlotBinding {
+                    material: Some(last.clone()),
+                    uv: UvBinding::default(),
+                    color_render_layer: None,
+                    color_available_mask: Vec::<u64>::new().into(),
+                },
+            ],
+        );
+        assert!(
+            snapshot
+                .slot_binding(&instance_id, &instance, 0)
+                .unwrap()
+                .material
+                .is_none()
+        );
+        assert!(
+            snapshot
+                .slot_material(&instance_id, &instance, None, 0)
+                .is_none()
+        );
+        assert_eq!(
+            snapshot
+                .slot_binding(&instance_id, &instance, usize::MAX)
+                .unwrap()
+                .material
+                .as_ref(),
+            Some(&last)
+        );
+        assert_eq!(
+            snapshot.slot_material(&instance_id, &instance, None, usize::MAX),
+            Some(&last)
+        );
+        let empty_id = Id::new("empty_instance").unwrap();
+        snapshot.slot_bindings.insert(empty_id.clone(), Vec::new());
+        assert!(
+            snapshot
+                .slot_binding(&empty_id, &instance, usize::MAX)
+                .is_none()
+        );
+        assert!(
+            snapshot
+                .slot_material(&empty_id, &instance, None, usize::MAX)
+                .is_none()
+        );
+    }
+    #[test]
+    fn material_slots_resolve_object_data_links_and_null_fallback() {
+        let snapshot = Snapshot::evaluate(
+            &SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned()),
+            &EvaluationContext::default(),
+        )
+        .unwrap();
+        let data_first = Id::new("data_first").unwrap();
+        let object_override = Id::new("object_override").unwrap();
+        let data_last = Id::new("data_last").unwrap();
+        let data = DataBlock {
+            materials: vec![Some(data_first.clone()), None, Some(data_last.clone())],
+            ..DataBlock::default()
+        };
+        let node_id = Id::new("mixed_links").unwrap();
+        let node = Node {
+            materials: vec![None, Some(object_override.clone()), None],
+            material_links: vec![
+                MaterialLink::Object,
+                MaterialLink::Data,
+                MaterialLink::Object,
+            ],
+            ..Node::default()
+        };
+
+        assert_eq!(node.material_slot_count(Some(&data)), 3);
+        assert_eq!(node.material_slot(Some(&data), 0), Some(&data_first));
+        assert_eq!(node.material_slot(Some(&data), 1), None);
+        assert_eq!(node.material_slot(Some(&data), 2), Some(&data_last));
+        assert_eq!(
+            snapshot.slot_material(&node_id, &node, Some(&data), 0),
+            Some(&data_first),
+            "a null OBJECT slot falls back to the DATA material at the same index"
+        );
+        assert_eq!(
+            snapshot.slot_material(&node_id, &node, Some(&data), 2),
+            Some(&data_last)
+        );
+        assert_eq!(
+            snapshot.slot_material(&node_id, &node, Some(&data), 1),
+            None,
+            "a DATA-linked empty middle slot keeps its numeric index"
+        );
+        assert_eq!(
+            snapshot.slot_material(&node_id, &node, Some(&data), usize::MAX),
+            Some(&data_last),
+            "out-of-range access clamps to the last evaluated slot"
+        );
+
+        let legacy = Node {
+            materials: vec![Some(object_override.clone())],
+            ..Node::default()
+        };
+        assert_eq!(legacy.material_link(0), MaterialLink::Object);
+        assert_eq!(legacy.material_link(1), MaterialLink::Data);
+        assert_eq!(legacy.material_slot(Some(&data), 0), Some(&object_override));
+        assert_eq!(legacy.material_slot(Some(&data), 1), None);
+        assert_eq!(legacy.material_slot(Some(&data), 2), Some(&data_last));
     }
 }

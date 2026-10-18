@@ -59,7 +59,9 @@ pub(crate) fn linked_library_hash(uri: &str) -> Result<String> {
     Ok(hash::sha256(&bytes))
 }
 
-pub(crate) fn load_project(uri: &str) -> Result<(PathBuf, SceneDoc, String)> {
+/// Reads a linked project's scene. The warnings describe version-1 data that the upgrade skipped
+/// or dropped.
+pub(crate) fn load_project(uri: &str) -> Result<(PathBuf, SceneDoc, String, Vec<Value>)> {
     let (project, scene_path) = project_paths(uri);
     if !scene_path.is_file() {
         return Err(PotError::with_details(
@@ -69,9 +71,24 @@ pub(crate) fn load_project(uri: &str) -> Result<(PathBuf, SceneDoc, String)> {
         ));
     }
     let bytes = fs::read(&scene_path).map_err(|error| PotError::io(&error))?;
-    let doc = crate::model::parse_scene(&bytes)?;
-    doc.validate()?;
-    Ok((project, doc, hash::sha256(&bytes)))
+    let parsed = crate::model::parse_scene(&bytes)?;
+    parsed.doc.validate()?;
+    Ok((project, parsed.doc, hash::sha256(&bytes), parsed.warnings))
+}
+
+/// The outcome warnings for a linked project's version-1 data. The upgrade's own record, with its
+/// code, is kept in `details`, since those codes are not [`ErrorCode`] values.
+pub(crate) fn legacy_warnings(warnings: &[Value]) -> Vec<PotError> {
+    warnings
+        .iter()
+        .map(|warning| {
+            let message = warning
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("linked project data was upgraded from schema version 1");
+            PotError::with_details(ErrorCode::UnrepresentableFeature, message, warning.clone())
+        })
+        .collect()
 }
 
 pub fn validate_linked_assets(doc: &SceneDoc, project_root: Option<&Path>) -> Result<()> {

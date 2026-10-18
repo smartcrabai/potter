@@ -167,6 +167,7 @@ pub(super) fn assemble(
                         &layer.map,
                         &topology.samples,
                     ),
+                    vec![None; result.faces.len()],
                 )
             })
             .collect();

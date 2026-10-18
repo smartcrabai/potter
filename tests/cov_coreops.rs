@@ -605,7 +605,7 @@ fn validation_reports_all_check_statuses_issue_severities_and_format_losses() {
         kind: "mesh".to_owned(),
         parent: Some(Id::new("child").unwrap()),
         data: Some(Id::new("camera_data").unwrap()),
-        materials: vec![missing.clone()],
+        materials: vec![Some(missing.clone())],
         action: Some(missing.clone()),
         tags: vec!["Bad_Tag".to_owned()],
         ..Node::default()

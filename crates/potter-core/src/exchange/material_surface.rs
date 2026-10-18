@@ -165,6 +165,9 @@ pub(crate) struct ResolvedSurface {
     pub(crate) base_color: TexturedValue<[f64; 4]>,
     /// The vertex color the base color multiplies (`COLOR_0`). `None` when the graph reads none.
     pub(crate) vertex_color: Option<VertexColorRead>,
+    /// A vertex color the graph reads where glTF cannot multiply it (a `VERTEX_COLOR` loss). The
+    /// layer is still written as `COLOR_0` so its data is kept; `vertex_color` takes precedence.
+    pub(crate) unmultiplied_vertex_color: Option<VertexColorRead>,
     pub(crate) metallic: f64,
     pub(crate) roughness: f64,
     /// glTF metallicRoughnessTexture: G = roughness, B = metallic.
@@ -207,7 +210,8 @@ pub(crate) mod feature_id {
     pub(crate) const VOLUME: &str = "material.shader_graph.volume";
     /// Loss: sampler state glTF cannot express exactly (Cubic/Smart interpolation, CLIP extension).
     pub(crate) const SAMPLER: &str = "material.shader_graph.sampler";
-    /// Loss: Potter material texture references on a graph material (the graph is authoritative).
+    /// Loss: a material's texture fields that the output cannot hold. glTF: the graph is authoritative and ignores them.
+    /// `.blend`: the authored graph does not drive its output from a Principled BSDF, or a linked Normal input takes a normal texture.
     pub(crate) const MATERIAL_TEXTURES: &str = "material.shader_graph.material_textures";
     /// Loss: a mesh UV layer the format cannot hold, or a texture set that samples layers that
     /// cannot share one `texCoord` (a packed texture, or a material shared by meshes that order
@@ -219,11 +223,16 @@ pub(crate) mod feature_id {
     pub(crate) const VRM_V0_MTOON_UV_LAYER: &str = "vrm.v0.mtoon_uv_layer";
 }
 
-/// Whether any node of `doc` references the material in its slot array.
+/// Whether a material is assigned to any node's effective source-aware slot.
 pub(crate) fn material_is_used(doc: &crate::model::SceneDoc, material_id: &Id) -> bool {
-    doc.nodes
-        .values()
-        .any(|node| node.materials.iter().any(|id| id == material_id))
+    doc.nodes.values().any(|node| {
+        let data = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
+        (0..node.material_slot_count(data))
+            .any(|slot| node.material_slot(data, slot) == Some(material_id))
+    })
 }
 
 /// Resolves a Potter material to its glTF surface and the losses the conversion reports.
@@ -372,9 +381,11 @@ fn sampled_from_ref(
     }
 }
 
-/// The metallicRoughness texture of a material's explicit fields: G from the roughness
-/// texture, B from the metallic texture. Each channel reads its own image; the texture's
-/// sampling state comes from the roughness reference when present.
+/// The metallicRoughness texture of a material's explicit fields: G from the roughness texture's
+/// Red channel, B from the metallic texture's Red channel. A native scalar field is read through
+/// its Red channel (`material_graph::GraphTextures::from_field_refs`), so each field packs its Red
+/// into its glTF channel. Each channel reads its own image; the texture's sampling state comes
+/// from the roughness reference when present.
 fn metallic_roughness_from_refs(
     material_id: &Id,
     roughness: Option<&TextureRef>,
@@ -406,15 +417,18 @@ fn metallic_roughness_from_refs(
             );
         }
     }
-    let green = roughness.map(|rough| ChannelSource {
+    let roughness_source = roughness.map(|rough| ChannelSource {
         image: rough.image.clone(),
-        channel: TextureChannel::Green,
+        channel: TextureChannel::Red,
     });
-    let blue = metallic.map(|metal| ChannelSource {
+    let metallic_source = metallic.map(|metal| ChannelSource {
         image: metal.image.clone(),
-        channel: TextureChannel::Blue,
+        channel: TextureChannel::Red,
     });
-    Some(sampled_from_ref(base, [None, green, blue, None]))
+    Some(sampled_from_ref(
+        base,
+        [None, roughness_source, metallic_source, None],
+    ))
 }
 
 /// Resolves the explicit fields of a material. Used for materials without a custom graph.
@@ -474,6 +488,7 @@ fn fields_surface(
         alpha_mode,
         unlit: false,
         vertex_color: None,
+        unmultiplied_vertex_color: None,
         base_color,
         metallic: material.metallic,
         roughness: material.roughness,
@@ -714,6 +729,8 @@ struct GraphReducer<'a> {
     material_id: &'a Id,
     group: &'a NodeGroup,
     losses: Vec<super::Loss>,
+    /// The first vertex color a non-base socket dropped (see `plain_color_input`).
+    dropped_vertex: Option<VertexColorRead>,
 }
 
 impl<'a> GraphReducer<'a> {
@@ -1019,20 +1036,24 @@ fn is_vertex_color(node: &GraphNode, output: &str) -> bool {
     }
 }
 
-/// The vertex color a `Color` output reads, when glTF can take it: a Vertex Color or geometry
-/// Attribute node. An empty layer name is Blender's active (render) color, `None` here.
+/// The vertex color a `Color` output reads, when glTF can take it. Only an unnamed Vertex Color
+/// selects the active/render layer; an empty geometry Attribute remains a missing named read.
 fn vertex_color_read(node: &GraphNode, output: &str) -> Option<VertexColorRead> {
     if output != "Color" || !is_vertex_color(node, output) {
         return None;
     }
-    let key = if node.node_type == "ShaderNodeVertexColor" {
-        "layer_name"
+    let layer = if node.node_type == "ShaderNodeVertexColor" {
+        prop_str(node, "layer_name")
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
     } else {
-        "attribute_name"
+        Some(
+            prop_str(node, "attribute_name")
+                .or_else(|| prop_str(node, "name"))
+                .unwrap_or("")
+                .to_owned(),
+        )
     };
-    let layer = prop_str(node, key)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned);
     Some(VertexColorRead { layer })
 }
 
@@ -1091,7 +1112,8 @@ impl GraphReducer<'_> {
     }
 
     /// A color socket whose value a constant or texture carries. A vertex color read in it is a
-    /// loss: only the base color multiplies `COLOR_0`.
+    /// loss: only the base color multiplies `COLOR_0`. The read's layer is still kept as the
+    /// material's `COLOR_0` (`unmultiplied_vertex_color`), so the color data is exported.
     fn plain_color_input(
         &mut self,
         node_id: &Id,
@@ -1100,12 +1122,13 @@ impl GraphReducer<'_> {
         depth: usize,
     ) -> crate::error::Result<ColorIn> {
         let mut color = self.color_input(node_id, socket, default, depth)?;
-        if color.vertex.take().is_some() {
+        if let Some(read) = color.vertex.take() {
             self.loss(
                 feature_id::VERTEX_COLOR,
-                format!("node `{node_id}` reads vertex color into socket `{socket}`; glTF multiplies vertex color only into the base color, so the vertex color is dropped"),
+                format!("node `{node_id}` reads vertex color into socket `{socket}`; glTF multiplies vertex color only into the base color, so this read is not expressed; its layer is still written as COLOR_0"),
                 None,
             );
+            self.dropped_vertex = self.dropped_vertex.take().or(Some(read));
         }
         Ok(color)
     }
@@ -2287,7 +2310,9 @@ impl GraphReducer<'_> {
         }
     }
 
-    /// Material texture references and alpha mode are ignored for graph materials.
+    /// Native texture references are ignored for graph materials: the graph holds the textures and
+    /// is authoritative. `alpha_mode` is not a field here: it is Blender's render method (what
+    /// Potter's renderer uses), and glTF takes `alphaMode` from the graph's Alpha path.
     fn material_field_losses(&mut self, material: &Material) {
         let mut fields: Vec<String> = Vec::new();
         if material.base_color_texture.is_some() {
@@ -2301,9 +2326,6 @@ impl GraphReducer<'_> {
         }
         if material.normal_texture.is_some() {
             fields.push("normal_texture".to_owned());
-        }
-        if material.alpha_mode != "opaque" {
-            fields.push(format!("alpha_mode `{}`", material.alpha_mode));
         }
         if fields.is_empty() {
             return;
@@ -2557,6 +2579,7 @@ impl GraphReducer<'_> {
                 texture: base_texture,
             },
             vertex_color: base.vertex,
+            unmultiplied_vertex_color: self.dropped_vertex.take(),
             metallic: metallic.factor,
             roughness: roughness.factor,
             metallic_roughness_texture,
@@ -2609,6 +2632,7 @@ fn graph_surface(
         material_id,
         group,
         losses: Vec::new(),
+        dropped_vertex: None,
     };
     reducer.material_field_losses(material);
     let shade = if let Some(link) = reducer.link_into(output, "Surface") {
@@ -2645,13 +2669,14 @@ fn graph_surface(
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
+    #![expect(clippy::expect_used, reason = "tests")]
 
     use serde_json::{Value, json};
 
     use super::*;
     use crate::{
         exchange::Loss,
-        model::{Image, ImageAlphaMode, ImageColorspace, ImageSource},
+        model::{DataBlock, Image, ImageAlphaMode, ImageColorspace, ImageSource, Node},
     };
 
     fn id(value: &str) -> Id {
@@ -2691,6 +2716,32 @@ mod tests {
         }
         doc.materials.insert(id("mat"), material);
         doc
+    }
+
+    #[test]
+    fn material_use_includes_data_linked_slots() {
+        let mut doc = SceneDoc::default();
+        let material_id = id("data_material");
+        let data_id = id("mesh_data");
+        doc.materials
+            .insert(material_id.clone(), Material::default());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                materials: vec![Some(material_id.clone())],
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            id("mesh"),
+            Node {
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+
+        assert!(material_is_used(&doc, &material_id));
     }
 
     fn add_node(
@@ -2948,6 +2999,37 @@ mod tests {
     }
 
     #[test]
+    fn native_scalar_fields_pack_red_into_gltf_channels() {
+        let texture = TextureRef {
+            image: id("img"),
+            uv_layer: None,
+            interpolation: ImageInterpolation::Closest,
+        };
+        let mut doc = document(None);
+        let material = doc.materials.get_mut(&id("mat")).expect("material");
+        material.roughness_texture = Some(texture.clone());
+        material.metallic_texture = Some(texture);
+        let (surface, losses) = resolved(&doc);
+        assert!(losses.is_empty(), "{losses:?}");
+        let packed = surface
+            .metallic_roughness_texture
+            .expect("native scalar textures pack");
+        assert_eq!(
+            packed.channels[1],
+            Some(ChannelSource {
+                image: id("img"),
+                channel: TextureChannel::Red,
+            })
+        );
+        assert_eq!(
+            packed.channels[2],
+            Some(ChannelSource {
+                image: id("img"),
+                channel: TextureChannel::Red,
+            })
+        );
+    }
+    #[test]
     fn separate_color_channels_pack_into_metallic_roughness() {
         let mut group = principled_graph(&json!({}));
         add_node(
@@ -3030,6 +3112,18 @@ mod tests {
         let mut group = principled_graph(&json!({}));
         add_node(
             &mut group,
+            "paint",
+            "ShaderNodeVertexColor",
+            &json!({}),
+            &json!({}),
+        );
+        link(&mut group, "paint", "Color", "bsdf", "Base Color");
+        let (surface, _) = resolved(&document(Some(group)));
+        assert_eq!(surface.vertex_color, Some(VertexColorRead { layer: None }));
+
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
             "wear",
             "ShaderNodeAttribute",
             &json!({"attribute_type": "GEOMETRY", "attribute_name": "Wear"}),
@@ -3042,6 +3136,22 @@ mod tests {
             surface.vertex_color,
             Some(VertexColorRead {
                 layer: Some("Wear".to_owned())
+            })
+        );
+        let mut group = principled_graph(&json!({}));
+        add_node(
+            &mut group,
+            "empty_attribute",
+            "ShaderNodeAttribute",
+            &json!({"attribute_type": "GEOMETRY", "attribute_name": ""}),
+            &json!({}),
+        );
+        link(&mut group, "empty_attribute", "Color", "bsdf", "Base Color");
+        let (surface, _) = resolved(&document(Some(group)));
+        assert_eq!(
+            surface.vertex_color,
+            Some(VertexColorRead {
+                layer: Some(String::new())
             })
         );
     }

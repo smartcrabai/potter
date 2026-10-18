@@ -15,8 +15,6 @@ use std::{
 
 use serde_json::Value;
 
-use super::blender_checked::blender_executable;
-
 pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// Float32 storage in Blender and Potter's f64 store: values agree to this bound.
@@ -24,16 +22,13 @@ pub const FLOAT_TOLERANCE: f64 = 1.0e-6;
 /// `BYTE_COLOR` layers: Blender stores bytes, so one step is the bound.
 pub const BYTE_TOLERANCE: f64 = 1.0 / 255.0;
 /// Blender quantizes custom normals to 16-bit codes; the oracle's own check uses 1e-3.
+/// Same value as `exchange_normals::BLENDER_NORMAL_TOLERANCE`; the native and exchange test roots
+/// share no module, so the number is repeated here.
 pub const NORMAL_TOLERANCE: f64 = 2.0e-4;
 
 const BUILD_SCRIPT: &str = include_str!("../fixtures/native_oracle/build_oracle.py");
 const DUMP_SCRIPT: &str = include_str!("../fixtures/native_oracle/dump_blend.py");
 const RENDER_SCRIPT: &str = include_str!("../fixtures/native_oracle/render_texture.py");
-
-/// Returns the Blender executable, or `None` (skip) when Blender is absent and not required.
-pub fn blender() -> Option<PathBuf> {
-    blender_executable()
-}
 
 pub fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -282,6 +277,20 @@ pub fn code_pair(value: &Value) -> TestResult<[i64; 2]> {
     Ok([code_component(&items[0])?, code_component(&items[1])?])
 }
 
+/// Whether a stored corner matches Blender's within one code unit per component. Used only by the
+/// nonmanifold subdivision check (loop 28). The cause is f64 subdivision positions in Potter versus
+/// Blender's f32 arithmetic: the positions agree to about 1e-7, and the fan frame amplifies that at the
+/// quantisation boundary. Switching subdivision to f32 arithmetic is PR16 (subdivision accuracy); PR-B
+/// keeps the f64 arithmetic and this window.
+pub fn code_within_one_unit(actual: &StoredCorner, expected: &StoredCorner) -> bool {
+    match (actual, expected) {
+        (StoredCorner::Code(a), StoredCorner::Code(e)) => {
+            (a[0] - e[0]).abs() <= 1 && (a[1] - e[1]).abs() <= 1
+        }
+        _ => actual == expected,
+    }
+}
+
 fn code_component(value: &Value) -> TestResult<i64> {
     let number = value
         .as_i64()
@@ -473,6 +482,18 @@ pub fn assert_floats(actual: &[f64], expected: &[f64], tolerance: f64, label: &s
     }
 }
 
+/// `ulps` units in the last place of f32 at `value`'s magnitude: `ulps * 2^(e - 23)` with
+/// `e = floor(log2 |value|)`. A value stored as f32 is exact to half an ulp, so a comparison that
+/// crosses f32 storage and a transfer function (decode, store, encode) is bounded in ulps, not in
+/// absolute terms: an absolute bound that is right near 0 is far too strict near 1. The 8-bit
+/// samples used here decode to f32 values in [0.5, 1) for the upper half of the byte range, where
+/// one ulp is 2^-24 (about 6e-8); the sRGB encode has slope about 0.6 there, so one ulp of linear
+/// storage moves the encoded value by about 0.3 ulp of the encoded value.
+pub fn f32_ulp_tolerance(value: f64, ulps: f64) -> f64 {
+    let magnitude = value.abs().max(f64::from(f32::MIN_POSITIVE));
+    ulps * f64::from(f32::EPSILON) * magnitude.log2().floor().exp2()
+}
+
 /// Whether two unit-length-ish vectors agree within `tolerance` in every component.
 pub fn vectors_close(actual: [f64; 3], expected: [f64; 3], tolerance: f64) -> bool {
     (0..3).all(|axis| (actual[axis] - expected[axis]).abs() <= tolerance)
@@ -503,6 +524,10 @@ pub fn face_loop_starts(face_sizes: &[usize]) -> Vec<usize> {
 
 /// Applies `operations` to the project at its current revision and returns the apply envelope.
 /// `root` holds the operations file.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "callers pass literal operation arrays; changing 49 call sites adds no safety"
+)]
 pub fn apply_operations(project: &Path, root: &Path, operations: Value) -> TestResult<Value> {
     let inspected = pot_json(|command| {
         command.arg("inspect").arg(project);

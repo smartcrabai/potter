@@ -1,0 +1,20 @@
+{
+ "case": "sphere_closed64_hole_tolerant_on",
+ "regression": "i",
+ "counts": {
+  "vertices": 1921,
+  "edges": 3872,
+  "faces": 1953
+ },
+ "face_sizes": {
+  "3": 132,
+  "4": 1809,
+  "5": 4,
+  "6": 4,
+  "17": 4
+ },
+ "volume": 3.6627089529932597,
+ "vertex_groups": {},
+ "blender_version": "5.2.2 LTS",
+ "kind": "evaluated"
+}

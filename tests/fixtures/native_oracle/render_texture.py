@@ -34,7 +34,16 @@ base_link = next(
     for link in tree.links
     if link.to_node.type == "BSDF_PRINCIPLED" and link.to_socket.name == "Base Color"
 )
-texture = base_link.from_node
+colour_source = base_link.from_node
+texture = colour_source
+if texture.type == "MIX_RGB":
+    # Potter's base color factor multiplies the texture through a MixRGB whose Color2 is the texture.
+    texture_link = next(
+        link
+        for link in tree.links
+        if link.to_node == texture and link.to_socket.name == "Color2"
+    )
+    texture = texture_link.from_node
 if texture.type != "TEX_IMAGE" or texture.image is None:
     raise SystemExit("Base Color is not fed by an image texture")
 uv_source = None
@@ -46,7 +55,7 @@ for link in list(output.inputs["Surface"].links):
     tree.links.remove(link)
 emission = tree.nodes.new("ShaderNodeEmission")
 emission.inputs["Strength"].default_value = 1.0
-tree.links.new(texture.outputs["Color"], emission.inputs["Color"])
+tree.links.new(base_link.from_socket, emission.inputs["Color"])
 tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
 
 

@@ -970,7 +970,7 @@ fn apply_modifier(
             continue;
         }
         let target_modifier = modifier_to_apply(engine, &target, &modifier_id)?;
-        let evaluated = evaluate_modifier_output(
+        let (evaluated, material_slots) = evaluate_modifier_output(
             engine,
             &target,
             &data_id,
@@ -999,8 +999,16 @@ fn apply_modifier(
                 .data_blocks
                 .get(&data_id)
                 .is_some_and(|data| data.descriptor.is_some());
+        // Blender `BKE_object_material_from_eval_data` (blenkernel/intern/material.cc): the mesh's
+        // material array becomes the evaluated mesh's array; the object's slots then follow its length
+        // through `BKE_object_materials_sync_length` (`BKE_object_material_resize`). Slots that
+        // already existed keep their link; slots the sync adds have matbits 0, i.e. DATA links.
+        // `modifier_apply_obdata` (editors/object/object_modifier.cc) calls this before
+        // `BKE_mesh_nomain_to_mesh`.
+        let synced_len = material_slots.len();
         if let Some(data) = engine.doc.data_blocks.get_mut(&data_id) {
             data.mesh = Some(evaluated);
+            data.materials = material_slots;
             data.vertex_weights = persisted_weights;
             if mesh_changed {
                 data.descriptor = None;
@@ -1008,6 +1016,20 @@ fn apply_modifier(
         }
         if let Some(node) = engine.doc.nodes.get_mut(&target) {
             node.modifiers.retain(|modifier| modifier.id != modifier_id);
+            let old_len = node.materials.len();
+            let old_links = (0..old_len)
+                .map(|slot| node.material_link(slot))
+                .collect::<Vec<_>>();
+            node.materials.resize(synced_len, None);
+            node.material_links = (0..synced_len)
+                .map(|slot| {
+                    if slot < old_len {
+                        old_links[slot]
+                    } else {
+                        crate::model::MaterialLink::Data
+                    }
+                })
+                .collect();
         }
         if mesh_changed {
             super::clear_primitive_metadata(engine, &data_id);
@@ -1063,9 +1085,14 @@ fn evaluate_modifier_output(
     data_id: &Id,
     target_modifier: &Modifier,
     allow_shape_keys: bool,
-) -> Result<crate::geom::Mesh> {
+) -> Result<(crate::geom::Mesh, Vec<Option<Id>>)> {
     let modifier_id = &target_modifier.id;
     let modifier_stack = std::slice::from_ref(target_modifier);
+    let mut material_slots = engine
+        .doc
+        .data_blocks
+        .get(data_id)
+        .map_or_else(Vec::new, |data| data.materials.clone());
     let evaluated = {
         let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
             PotError::new(
@@ -1095,7 +1122,17 @@ fn evaluate_modifier_output(
                 return false;
             }
             match modifier.modifier_type.as_str() {
-                "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform" => {
+                "boolean" => {
+                    // Every EXACT Boolean takes the scene path, which owns its material slots.
+                    let exact = crate::geom::modifiers::BooleanSettings::parse(modifier).is_ok_and(
+                        |settings| settings.solver != crate::geom::modifiers::BooleanSolver::Float,
+                    );
+                    exact
+                        || ["object", "collection", "target"]
+                            .iter()
+                            .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
+                }
+                "shrinkwrap" | "surface_deform" | "mesh_deform" => {
                     ["object", "collection", "target"]
                         .iter()
                         .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
@@ -1193,6 +1230,10 @@ fn evaluate_modifier_output(
             let evaluated_operand_meshes = operand_snapshot
                 .as_ref()
                 .map_or(&empty_meshes, |snapshot| &snapshot.meshes);
+            let empty_nodes = BTreeMap::new();
+            let evaluated_operand_nodes = operand_snapshot
+                .as_ref()
+                .map_or(&empty_nodes, |snapshot| &snapshot.nodes);
             let driver_values = if operand_snapshot.is_none() {
                 crate::eval::rig::evaluate_drivers(engine.doc, frame)?
             } else {
@@ -1331,6 +1372,8 @@ fn evaluate_modifier_output(
                             engine.doc,
                             &world_matrices,
                             evaluated_operand_meshes,
+                            evaluated_operand_nodes,
+                            &mut material_slots,
                         )
                     }
                     "vertex_weight_edit"
@@ -1369,7 +1412,7 @@ fn evaluate_modifier_output(
             evaluation.mesh
         }
     };
-    Ok(evaluated)
+    Ok((evaluated, material_slots))
 }
 fn apply_modifier_as_shape_key(
     engine: &mut Engine<'_>,
@@ -1462,7 +1505,7 @@ fn apply_modifier_as_shape_key(
                 evaluated.clone()
             } else {
                 let target_modifier = modifier_to_apply(engine, &target, &modifier_id)?;
-                let evaluated = evaluate_modifier_output(
+                let (evaluated, _) = evaluate_modifier_output(
                     engine,
                     &target,
                     &original_data_id,

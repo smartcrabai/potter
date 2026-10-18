@@ -79,6 +79,10 @@ pub(crate) fn export(
         ));
     }
     for (id, node) in &doc.nodes {
+        let data_block = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
         if node
             .parent
             .as_ref()
@@ -110,7 +114,10 @@ pub(crate) fn export(
                 format!("Alembic export does not represent visibility or selectability on `{id}`"),
             ));
         }
-        if !allow_lossy && !node.materials.is_empty() {
+        if !allow_lossy
+            && (0..snapshot.slot_count(id, node, data_block))
+                .any(|slot| snapshot.slot_material(id, node, data_block, slot).is_some())
+        {
             return Err(unsupported(
                 "material.binding",
                 format!("Alembic export does not represent material bindings on `{id}`"),
@@ -2486,11 +2493,7 @@ fn import_polymesh(
                         .collect::<Vec<_>>())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let name = parameter
-                .metadata
-                .get("sourceName")
-                .cloned()
-                .unwrap_or_else(|| parameter.name.clone());
+            let name = uv_source_name(parameter);
             Ok((name, samples))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2554,7 +2557,11 @@ pub(crate) struct MeshCacheSample {
     pub time_seconds: f64,
     pub positions: Vec<[f64; 3]>,
     pub faces: Vec<Vec<usize>>,
-    pub uv_faces: Option<Vec<Vec<[f64; 2]>>>,
+    /// Whether face counts or indices have multiple logical Alembic samples. Constant values still
+    /// have multiple logical samples even though their stored payload is read from sample zero.
+    pub has_multiple_topology_samples: bool,
+    /// Named UV parameters in file order, with rows still in Alembic face winding.
+    pub uv_layers: Option<Vec<ExchangeUvLayer>>,
     pub colors: Option<(String, Vec<Vec<f64>>)>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
 }
@@ -2563,10 +2570,17 @@ pub(crate) struct MeshCacheSample {
 ///
 /// The object path is an Alembic path, including the archive's virtual `root` segment.
 /// `read_uv` and `read_color` avoid decoding unrequested geometric parameters.
+/// Each UV `GeomParam` becomes one layer, named by its `sourceName` or its own name.
 ///
 /// # Errors
 ///
 /// Returns import errors for malformed archives or paths without a `PolyMesh`.
+fn cache_has_multiple_topology_samples(counts: &ParsedProperty, indices: &ParsedProperty) -> bool {
+    [counts, indices]
+        .into_iter()
+        .any(|property| property.sample_count > 1)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "decoding one cache sample set needs coordinated topology, geom-parameter, and time-sampling validation"
@@ -2614,9 +2628,13 @@ pub(crate) fn read_mesh_cache(
         .ok_or_else(|| import_error("Alembic PolyMesh .faceCounts array is missing"))?;
     let indices = property(&geom.children, ".faceIndices")
         .ok_or_else(|| import_error("Alembic PolyMesh .faceIndices array is missing"))?;
-    let uv = read_uv
-        .then(|| uv_geom_parameters(geom).into_iter().next())
-        .flatten();
+    let has_multiple_topology_samples = cache_has_multiple_topology_samples(counts, indices);
+    let uv = if read_uv {
+        uv_geom_parameters(geom)
+    } else {
+        Vec::new()
+    };
+    let uv_names = uv_layer_names(&uv);
     let color = read_color
         .then(|| property(&geom.children, "color").or_else(|| property(&geom.children, "Cs")))
         .flatten();
@@ -2632,7 +2650,7 @@ pub(crate) fn read_mesh_cache(
         .into_iter()
         .max_by_key(|parameter| parameter.sample_count)
         .ok_or_else(|| import_error("Alembic PolyMesh has no time-sampled properties"))?;
-    for parameter in [uv, color, velocity].into_iter().flatten() {
+    for parameter in uv.iter().copied().chain(color).chain(velocity) {
         let values = geomparam_values_property(parameter)?;
         sample_count = sample_count.max(values.sample_count);
         if values.sample_count != 1 && values.sample_count != sample_count {
@@ -2668,7 +2686,7 @@ pub(crate) fn read_mesh_cache(
             .collect::<Vec<_>>();
         let face_counts = decode_i32_sample(bytes, counts, face_sample)?;
         let face_indices = decode_i32_sample(bytes, indices, index_sample)?;
-        // Per-corner values arrive in file winding, so they are indexed by file faces and reversed.
+        // Keep cache UVs in file-corner order; the cache modifier reverses them only with polygons.
         let file_faces = decode_faces(&points, &face_counts, &face_indices)?;
         let geometry_sample = MeshSample {
             positions: points.clone(),
@@ -2676,26 +2694,31 @@ pub(crate) fn read_mesh_cache(
             uv_layers: Vec::new(),
             normals: Vec::new(),
         };
-        let uv_faces = uv
-            .map(|parameter| {
-                let values = geomparam_values_property(parameter)?;
-                validate_cache_parameter_samples(values, sample_count)?;
-                let (scope, tuples) = geomparam_values(
-                    bytes,
-                    parameter,
-                    &geometry_sample,
-                    2,
-                    sample_slot(values, sample_index),
-                )?;
-                cache_uv_faces(&file_faces, &scope, &tuples).map(|faces| {
-                    faces
-                        .into_iter()
-                        .map(|mut corners| {
-                            corners.reverse();
-                            uv_to_storage(corners)
+        let uv_layers = read_uv
+            .then(|| {
+                uv.iter()
+                    .copied()
+                    .zip(&uv_names)
+                    .map(|(parameter, name)| {
+                        let values = geomparam_values_property(parameter)?;
+                        validate_cache_parameter_samples(values, sample_count)?;
+                        let (scope, tuples) = geomparam_values(
+                            bytes,
+                            parameter,
+                            &geometry_sample,
+                            2,
+                            sample_slot(values, sample_index),
+                        )?;
+                        let corners = cache_uv_faces(&file_faces, &scope, &tuples)?
+                            .into_iter()
+                            .map(uv_to_storage)
+                            .collect();
+                        Ok(ExchangeUvLayer {
+                            name: name.clone(),
+                            corners,
                         })
-                        .collect::<Vec<_>>()
-                })
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
         let colors = color
@@ -2752,9 +2775,10 @@ pub(crate) fn read_mesh_cache(
         )?;
         result.push(MeshCacheSample {
             time_seconds: sample_time,
+            has_multiple_topology_samples,
             positions: points,
             faces: reversed_faces(&file_faces),
-            uv_faces,
+            uv_layers,
             colors,
             velocities,
         });
@@ -3123,11 +3147,32 @@ fn uv_geom_parameters(geom: &ParsedProperty) -> Vec<&ParsedProperty> {
     parameters
 }
 
+/// The name a UV parameter's layer carries: its `sourceName`, or its own name without one.
+fn uv_source_name(parameter: &ParsedProperty) -> String {
+    parameter
+        .metadata
+        .get("sourceName")
+        .cloned()
+        .unwrap_or_else(|| parameter.name.clone())
+}
+
+/// The layer names of the UV parameters, in file order, made unique as the importer makes them.
+fn uv_layer_names(parameters: &[&ParsedProperty]) -> Vec<String> {
+    let mut layers = Vec::<ExchangeUvLayer>::new();
+    for parameter in parameters {
+        let name = unique_uv_name(&uv_source_name(parameter), &layers);
+        layers.push(ExchangeUvLayer {
+            name,
+            corners: Vec::new(),
+        });
+    }
+    layers.into_iter().map(|layer| layer.name).collect()
+}
+
 /// Alembic stores V up, as Blender does; Potter stores V down, so the conversion flips V.
 fn uv_to_storage(corners: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
     corners.into_iter().map(|[u, v]| [u, 1.0 - v]).collect()
 }
-
 fn geomparam_values_property(parameter: &ParsedProperty) -> Result<&ParsedProperty> {
     let values = match parameter.property_type {
         0 => property(&parameter.children, ".vals")
@@ -4359,6 +4404,128 @@ mod tests {
             losses
                 .iter()
                 .all(|loss| !loss.reason.contains("alembic_normals"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn constant_topology_properties_keep_storage_but_require_multisample_checks() {
+        let property = |name: &str, sample_count, constant: bool| ParsedProperty {
+            name: name.to_owned(),
+            property_type: 2,
+            pod: 6,
+            extent: 1,
+            sample_count,
+            first_changed: usize::from(!constant),
+            last_changed: if constant {
+                0
+            } else {
+                sample_count.saturating_sub(1)
+            },
+            constant,
+            time_sampling_index: 0,
+            metadata: BTreeMap::new(),
+            children: Vec::new(),
+            samples: Vec::new(),
+        };
+        let one_sample_counts = property(".faceCounts", 1, true);
+        let one_sample_indices = property(".faceIndices", 1, true);
+        assert!(!cache_has_multiple_topology_samples(
+            &one_sample_counts,
+            &one_sample_indices
+        ));
+
+        let constant_counts = property(".faceCounts", 4, true);
+        let constant_indices = property(".faceIndices", 4, true);
+        assert!(cache_has_multiple_topology_samples(
+            &constant_counts,
+            &constant_indices
+        ));
+        assert_eq!(sample_storage_count(&constant_counts), 1);
+        assert_eq!(sample_storage_count(&constant_indices), 1);
+
+        let changing_indices = property(".faceIndices", 4, false);
+        assert!(cache_has_multiple_topology_samples(
+            &constant_counts,
+            &changing_indices
+        ));
+        let changing_counts = property(".faceCounts", 4, false);
+        assert!(cache_has_multiple_topology_samples(
+            &changing_counts,
+            &constant_indices
+        ));
+    }
+
+    #[test]
+    fn blender_constant_topology_fixture_retains_logical_sample_metadata() -> Result<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mesh_cache_uv/constant_topology.abc");
+        let bytes = std::fs::read(path).map_err(|error| PotError::io(&error))?;
+        let archive = parse_archive(&bytes)?;
+        let object =
+            alembic_object_at_path(&archive.objects, "/ConstantTopology/ConstantTopology")?;
+        let geom = property(&object.properties, ".geom")
+            .ok_or_else(|| import_error("fixture PolyMesh .geom is missing"))?;
+        let face_counts = property(&geom.children, ".faceCounts")
+            .ok_or_else(|| import_error("fixture PolyMesh .faceCounts is missing"))?;
+        let face_indices = property(&geom.children, ".faceIndices")
+            .ok_or_else(|| import_error("fixture PolyMesh .faceIndices is missing"))?;
+        for property in [face_counts, face_indices] {
+            assert!(
+                property.constant,
+                "topology property should store one constant value"
+            );
+            assert!(
+                property.sample_count > 1,
+                "topology property needs multiple logical samples"
+            );
+            assert_eq!(sample_storage_count(property), 1);
+        }
+
+        let samples = read_mesh_cache(
+            &bytes,
+            "/ConstantTopology/ConstantTopology",
+            true,
+            false,
+            false,
+        )?;
+        assert!(
+            samples.len() > 1,
+            "animated points should have multiple cache samples"
+        );
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample.has_multiple_topology_samples)
+        );
+        let first = samples
+            .first()
+            .ok_or_else(|| import_error("cache sample is missing"))?;
+        let second = samples
+            .get(1)
+            .ok_or_else(|| import_error("second cache sample is missing"))?;
+        assert_eq!(first.faces, second.faces);
+        assert_ne!(first.positions, second.positions);
+        let static_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mesh_cache_uv/two_layers.abc");
+        let static_bytes = std::fs::read(static_path).map_err(|error| PotError::io(&error))?;
+        let static_archive = parse_archive(&static_bytes)?;
+        let static_object = alembic_object_at_path(&static_archive.objects, "/Plane/Plane")?;
+        let static_geom = property(&static_object.properties, ".geom")
+            .ok_or_else(|| import_error("static fixture PolyMesh .geom is missing"))?;
+        for name in [".faceCounts", ".faceIndices"] {
+            let property = property(&static_geom.children, name)
+                .ok_or_else(|| import_error("static fixture topology property is missing"))?;
+            assert_eq!(property.sample_count, 1);
+            assert!(property.constant);
+            assert_eq!(sample_storage_count(property), 1);
+        }
+        let static_samples = read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false)?;
+        assert_eq!(static_samples.len(), 1);
+        assert!(
+            static_samples
+                .iter()
+                .all(|sample| !sample.has_multiple_topology_samples)
         );
         Ok(())
     }

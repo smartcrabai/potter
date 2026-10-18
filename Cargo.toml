@@ -65,9 +65,11 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
   "webp",
 ] }
-jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "0c5968d138b1d94e7182aebe08d0860ba4ae2638" }
+jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "7782e3413f9788a3d122761290f2e5fa6431eaf7" }
 jsonschema = "=0.58.6"
 lz4_flex = "0.14"
+num-rational = "0.4.2"
+num-traits = "0.2.19"
 png = "0.18"
 potter-core = { path = "crates/potter-core" }
 potter-workflow = { path = "crates/potter-workflow" }

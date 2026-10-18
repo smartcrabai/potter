@@ -15,6 +15,7 @@ use crate::{
     model::Modifier,
 };
 
+use super::subdivision_uv::carried_pins;
 use super::{
     Mesh, Polygon, bool_param, cyclic_pairs, decimate_compact, edge_key, id_indices,
     invalid_parameter, number_param, positions, schema_value,
@@ -73,12 +74,14 @@ fn collapse_write_uv(mesh: &mut Mesh, names: &[String], corner_uv: &[CornerUv]) 
             "decimate UV values do not match the rebuilt mesh",
         ));
     }
+    // The rebuild through provenance carried each corner's pin; the new values keep those pins.
+    let carried = uv_layers::read_layers(mesh);
     let layers: Vec<uv_layers::UvLayer> = names
         .iter()
         .enumerate()
         .map(|(l, name)| {
             let mut corner = 0;
-            let faces = mesh
+            let faces: Vec<Option<Vec<[f64; 2]>>> = mesh
                 .faces
                 .iter()
                 .map(|face| {
@@ -89,7 +92,10 @@ fn collapse_write_uv(mesh: &mut Mesh, names: &[String], corner_uv: &[CornerUv]) 
                     Some(row)
                 })
                 .collect();
-            uv_layers::UvLayer::new(name.clone(), faces)
+            let pinned = carried_pins(&carried, name, &faces);
+            let mut layer = uv_layers::UvLayer::new(name.clone(), faces);
+            layer.pinned = pinned;
+            layer
         })
         .collect();
     uv_layers::write_layers(mesh, &layers);

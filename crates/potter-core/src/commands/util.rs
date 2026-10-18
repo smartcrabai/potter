@@ -174,7 +174,9 @@ pub(super) fn run_history(
     }
     let base_revision = project.doc().revision;
     let before = project.doc().clone();
-    let (candidate, target) = project.history_target(direction, args.steps)?;
+    let (candidate, target, target_warnings) = project.history_target(direction, args.steps)?;
+    let mut warnings = project.warnings().to_vec();
+    warnings.extend(target_warnings);
     let changes = scene_changes(&before, &candidate)?;
     let scene = project.commit_history(
         direction,
@@ -195,6 +197,17 @@ pub(super) fn run_history(
             "id_mappings": {},
             "previews": [],
             "history_id": target,
+            "warnings": warnings,
         }),
     ))
+}
+
+/// The warnings of a command result: the evaluation's warnings, then the diagnostics of the loaded
+/// scene document, such as legacy UV data that its upgrade skipped or dropped.
+pub(super) fn with_load_warnings(warnings: &[PotError], project: &Project) -> Result<Value> {
+    let mut all = serde_json::to_value(warnings).map_err(PotError::internal_json)?;
+    if let Some(list) = all.as_array_mut() {
+        list.extend(project.warnings().iter().cloned());
+    }
+    Ok(all)
 }

@@ -1,0 +1,18 @@
+{
+ "case": "collection_intersect_exact_no_self",
+ "research_section": "3.7",
+ "solver": "EXACT",
+ "operation": "INTERSECT",
+ "use_self": false,
+ "material_mode": "INDEX",
+ "counts": {
+  "vertices": 0,
+  "edges": 0,
+  "faces": 0
+ },
+ "face_sizes": {},
+ "volume": 0.0,
+ "faces": [],
+ "vertex_groups": {},
+ "blender_version": "5.2.2 LTS"
+}

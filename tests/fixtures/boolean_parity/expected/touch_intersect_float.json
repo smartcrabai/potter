@@ -1,0 +1,61 @@
+{
+ "case": "touch_intersect_float",
+ "research_section": "3.4",
+ "solver": "FLOAT",
+ "operation": "INTERSECT",
+ "use_self": false,
+ "material_mode": "INDEX",
+ "counts": {
+  "vertices": 4,
+  "edges": 5,
+  "faces": 2
+ },
+ "face_sizes": {
+  "3": 2
+ },
+ "volume": -1.3333333333333333,
+ "faces": [
+  {
+   "ring": [
+    [
+     1.0,
+     -1.0,
+     -1.0
+    ],
+    [
+     1.0,
+     -1.0,
+     1.0
+    ],
+    [
+     1.0,
+     1.0,
+     -1.0
+    ]
+   ],
+   "material_index": 0
+  },
+  {
+   "ring": [
+    [
+     1.0,
+     -1.0,
+     1.0
+    ],
+    [
+     1.0,
+     1.0,
+     1.0
+    ],
+    [
+     1.0,
+     1.0,
+     -1.0
+    ]
+   ],
+   "material_index": 0
+  }
+ ],
+ "vertex_groups": {},
+ "blender_version": "5.2.2 LTS"
+}

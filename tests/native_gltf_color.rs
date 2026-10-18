@@ -21,8 +21,8 @@ mod process;
 use std::{collections::BTreeSet, fs};
 
 use native_oracle::{
-    TestResult, attribute, blender, build_oracle, export_raw, import_blend, loss_features,
-    mesh_of_node, pot, read_scene, value_at, vec3, vec4,
+    TestResult, attribute, build_oracle, export_raw, import_blend, loss_features, mesh_of_node,
+    pot, read_scene, value_at, vec3, vec4,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -94,22 +94,36 @@ fn accessor_bits(glb: &Glb, index: u64, width: usize) -> TestResult<Vec<Vec<u32>
                 .get(offset..offset + 4)
                 .ok_or("accessor reads past the BIN chunk")?
                 .try_into()?;
-            row.push(u32::from_le_bytes(raw));
+            row.push(f32_word(f32::from_le_bytes(raw)));
         }
         rows.push(row);
     }
     Ok(rows)
 }
 
-fn bits(values: &[f64]) -> Vec<u32> {
-    values
-        .iter()
-        .map(|value| (*value as f32).to_bits())
-        .collect()
+/// A float32 accessor word, with -0.0 read as +0.0: an axis flip turns a zero coordinate into
+/// either sign, and the two are the same coordinate or color.
+fn f32_word(value: f32) -> u32 {
+    let word = value.to_bits();
+    if value == 0.0 { 0 } else { word }
 }
 
-/// Per-corner tuples of a stored mesh: position, then each named layer's value at that corner.
-fn expanded_corners(mesh: &Value, layers: &[&str]) -> TestResult<BTreeSet<Vec<u32>>> {
+fn bits(values: &[f64]) -> Vec<u32> {
+    values.iter().map(|value| f32_word(*value as f32)).collect()
+}
+
+/// Potter's Z-up world `(x, y, z)` in glTF's Y-up axes `(x, z, -y)`, as spec.md specifies.
+fn gltf_point(point: [f64; 3]) -> [f64; 3] {
+    [point[0], point[2], -point[1]]
+}
+
+/// Per-corner tuples of a stored mesh: position in the space `to_space` maps to, then each named
+/// layer's value at that corner.
+fn expanded_corners(
+    mesh: &Value,
+    layers: &[&str],
+    to_space: fn([f64; 3]) -> [f64; 3],
+) -> TestResult<BTreeSet<Vec<u32>>> {
     let vertices = mesh["vertices"]
         .as_array()
         .ok_or("mesh vertices are missing")?;
@@ -119,7 +133,11 @@ fn expanded_corners(mesh: &Value, layers: &[&str]) -> TestResult<BTreeSet<Vec<u3
         let refs = face["v"].as_array().ok_or("face vertices are missing")?;
         for (corner, vertex_ref) in refs.iter().enumerate() {
             let vertex_id = vertex_ref.as_u64().ok_or("vertex reference is missing")?;
-            let position = vec3(&vertices[usize::try_from(vertex_id)?]["co"])?;
+            let vertex = vertices
+                .iter()
+                .find(|vertex| vertex["id"].as_u64() == Some(vertex_id))
+                .ok_or("face vertex is missing from the mesh")?;
+            let position = to_space(vec3(&vertex["co"])?);
             let mut key = bits(&position);
             for layer in layers {
                 let attr = attribute(mesh, layer)?;
@@ -200,7 +218,7 @@ fn color_columns(mesh: &Value) -> TestResult<Vec<String>> {
 #[test]
 fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_generics() -> TestResult
 {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
@@ -239,27 +257,42 @@ fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_gener
             .any(|feature| feature == "mesh.color_attribute"),
         "color layers are representable in glTF: {features:?}"
     );
+    // The emitter's emission reads Ink, which glTF cannot take: exactly one vertex-color loss, on
+    // `material_ink`. Ink itself is still written as COLOR_0, so no mesh loss names it.
+    let losses = report["result"]["losses"]
+        .as_array()
+        .ok_or("export losses are missing")?;
+    let vertex_color: Vec<&Value> = losses
+        .iter()
+        .filter(|loss| loss["feature_id"] == "material.shader_graph.vertex_color")
+        .collect();
+    assert_eq!(
+        vertex_color.len(),
+        1,
+        "only the emitter's Ink read is a vertex color loss: {vertex_color:?}"
+    );
+    assert_eq!(vertex_color[0]["data_id"], "material_ink");
     assert!(
-        !features
-            .iter()
-            .any(|feature| feature == "material.shader_graph.vertex_color"),
-        "the multiplied Vertex Color is representable: {features:?}"
+        losses.iter().all(|loss| !loss["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("`Ink`"))),
+        "Ink must not be reported as a lost mesh attribute"
     );
 
     let glb = parse_glb(&fs::read(&out)?)?;
     let oracle = mesh_of_node(&scene, "Oracle")?;
     assert_eq!(color_columns(oracle)?, ORACLE_COLUMNS, "stored color order");
-    let expected = expanded_corners(oracle, &ORACLE_COLUMNS)?;
+    let expected = expanded_corners(oracle, &ORACLE_COLUMNS, gltf_point)?;
     let primitives = glb_primitives(&glb)?;
     assert!(
-        primitives.iter().any(|set| *set == expected),
+        primitives.contains(&expected),
         "no primitive holds the Oracle corners with COLOR_0..COLOR_3 = {ORACLE_COLUMNS:?}"
     );
 
     let emitter = mesh_of_node(&scene, "Emitter")?;
-    let emitter_expected = expanded_corners(emitter, &["Ink"])?;
+    let emitter_expected = expanded_corners(emitter, &["Ink"], gltf_point)?;
     assert!(
-        primitives.iter().any(|set| *set == emitter_expected),
+        primitives.contains(&emitter_expected),
         "the emitter's material reads Ink, which must be its COLOR_0"
     );
     Ok(())
@@ -267,14 +300,16 @@ fn glb_color_accessors_hold_stored_linear_values_and_strict_export_reports_gener
 
 #[test]
 fn glb_colors_import_back_into_color_layers_per_corner() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = tempdir()?;
     let (blend, _) = build_oracle(&blender, root.path())?;
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let scene = read_scene(&project)?;
-    let expected = expanded_corners(mesh_of_node(&scene, "Oracle")?, &ORACLE_COLUMNS)?;
+    let expected = expanded_corners(mesh_of_node(&scene, "Oracle")?, &ORACLE_COLUMNS, |point| {
+        point
+    })?;
 
     let out = root.path().join("oracle.glb");
     export_raw(&blender, &project, "glb", &out, true)?;
@@ -313,7 +348,7 @@ fn glb_colors_import_back_into_color_layers_per_corner() -> TestResult {
     assert_eq!(names.len(), ORACLE_COLUMNS.len(), "imported layer count");
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     assert_eq!(
-        expanded_corners(mesh, &refs)?,
+        expanded_corners(mesh, &refs, |point| point)?,
         expected,
         "imported corners must match the exported per-corner colors"
     );

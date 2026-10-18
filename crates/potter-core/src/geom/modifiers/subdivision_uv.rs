@@ -8,19 +8,22 @@
 //! vertices: a position vertex splits wherever its UVs differ between faces. Each layer's limit is
 //! evaluated by `subdivision_limit::face_varying`, on the leaves of the position limit surface.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use glam::{DVec2, DVec3};
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use super::{
     NonManifold, Polygon, blender_edge_crease_sharpness, build_mesh, positions, usize_as_f64,
 };
 use crate::{
+    color::{linear_to_srgb, srgb_to_linear},
     error::Result,
     geom::{
-        Mesh, edge_key,
-        provenance::Origin,
+        Mesh,
+        color_layers::{self, ColorDomain},
+        edge_key,
+        provenance::{Origin, corner_sources},
         uv_layers::{self, UvLayer},
     },
 };
@@ -43,9 +46,10 @@ pub(super) enum FvarLinear {
 }
 
 impl FvarLinear {
-    /// The option for a validated `uv_smooth` value.
-    pub(super) fn from_uv_smooth(uv_smooth: &str) -> Self {
+    /// The option for a validated `uv_smooth` value; SIMPLE subdivision is always linear.
+    pub(super) fn from_uv_smooth(uv_smooth: &str, simple: bool) -> Self {
         match uv_smooth {
+            _ if simple => Self::All,
             "NONE" => Self::All,
             "SMOOTH_ALL" => Self::SmoothAll,
             "PRESERVE_CORNERS" => Self::CornersOnly,
@@ -67,10 +71,12 @@ pub(super) struct ValueMap {
     pub(super) uvs: Vec<DVec2>,
 }
 
-/// A UV layer's name and value map.
+/// A UV layer's name, value map, and level-0 pins.
 pub(super) struct UvLayerValues {
     pub(super) name: String,
     pub(super) map: ValueMap,
+    /// The pin flags of each base face, kept only where they cover the face's corners.
+    pub(super) pins: Vec<Option<Vec<bool>>>,
 }
 
 /// Position topology of one level, shared by geometry and all face-varying layers.
@@ -278,19 +284,93 @@ fn corner_uvs(position: &Position, layer: &UvLayer) -> Vec<DVec2> {
 pub(super) fn value_maps(mesh: &Mesh, position: &Position) -> Vec<UvLayerValues> {
     uv_layers::read_layers(mesh)
         .into_iter()
-        .map(|layer| UvLayerValues {
-            map: value_map(position, &corner_uvs(position, &layer)),
-            name: layer.name,
+        .map(|layer| {
+            let map = value_map(position, &corner_uvs(position, &layer));
+            let pins = map
+                .corners
+                .iter()
+                .enumerate()
+                .map(|(face, corners)| {
+                    layer
+                        .pinned
+                        .get(face)
+                        .cloned()
+                        .flatten()
+                        .filter(|pins| pins.len() == corners.len())
+                })
+                .collect();
+            UvLayerValues {
+                name: layer.name,
+                map,
+                pins,
+            }
+        })
+        .collect()
+}
+
+/// Refines loop pins like Blender's boolean corner interpolation: any pinned source with a
+/// positive contribution pins the child corner.
+pub(super) fn refine_pins(
+    pins: Vec<Option<Vec<bool>>>,
+    starts: &[usize],
+) -> Vec<Option<Vec<bool>>> {
+    let mut child = Vec::with_capacity(starts.last().copied().unwrap_or_default());
+    for (face, row) in pins.into_iter().enumerate() {
+        let (start, end) = (starts[face], starts[face + 1]);
+        let Some(row) = row else {
+            child.extend(std::iter::repeat_n(None, end - start));
+            continue;
+        };
+        let face_pin = row.iter().any(|pinned| *pinned);
+        for corner in 0..end - start {
+            let next = (corner + 1) % (end - start);
+            let previous = if corner == 0 {
+                end - start - 1
+            } else {
+                corner - 1
+            };
+            child.push(Some(vec![
+                row[corner],
+                row[corner] || row[next],
+                face_pin,
+                row[previous] || row[corner],
+            ]));
+        }
+    }
+    child
+}
+
+/// The pins of layer `name` that the rebuild carried onto `faces`. A face keeps its pins when they
+/// cover its corners; otherwise it has none.
+pub(super) fn carried_pins(
+    carried: &[UvLayer],
+    name: &str,
+    faces: &[Option<Vec<[f64; 2]>>],
+) -> Vec<Option<Vec<bool>>> {
+    let known = carried.iter().find(|layer| layer.name == name);
+    faces
+        .iter()
+        .enumerate()
+        .map(|(face, uv)| {
+            let corners = uv.as_ref()?.len();
+            known?
+                .pinned
+                .get(face)?
+                .clone()
+                .filter(|pins| pins.len() == corners)
         })
         .collect()
 }
 
 /// Writes one UV layer per entry on the output mesh. Each `loops` lists the UV of every output loop,
-/// in face and corner order.
-pub(super) fn write_loop_uvs(mesh: &mut Mesh, layers: Vec<(String, Vec<DVec2>)>) {
+/// in face and corner order, and each `pins` lists the pin flags of every output face.
+pub(super) fn write_loop_uvs(
+    mesh: &mut Mesh,
+    layers: Vec<(String, Vec<DVec2>, Vec<Option<Vec<bool>>>)>,
+) {
     let layers: Vec<UvLayer> = layers
         .into_iter()
-        .map(|(name, loops)| {
+        .map(|(name, loops, pins)| {
             let mut rest = loops.as_slice();
             let faces = mesh
                 .faces
@@ -301,7 +381,9 @@ pub(super) fn write_loop_uvs(mesh: &mut Mesh, layers: Vec<(String, Vec<DVec2>)>)
                     Some(own.iter().map(|uv| [uv.x, uv.y]).collect())
                 })
                 .collect();
-            UvLayer::new(name, faces)
+            let mut layer = UvLayer::new(name, faces);
+            layer.pinned = pins;
+            layer
         })
         .collect();
     uv_layers::write_layers(mesh, &layers);
@@ -458,6 +540,7 @@ pub(super) fn subdivided_mesh(
         corners: None,
     };
     let mut output = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
+    encode_byte_colors(mesh, &origin, &mut output);
     if use_creases && mesh.attributes.contains_key("crease_edge") {
         let index_of: HashMap<u32, usize> = output
             .vertices
@@ -478,4 +561,92 @@ pub(super) fn subdivided_mesh(
         );
     }
     Ok(output)
+}
+
+/// Blender interpolates a `BYTE_COLOR` layer in its stored bytes: RGB holds sRGB-encoded bytes and alpha is
+/// linear. Each subdivided value mixes its sources' bytes and truncates the sum to a byte, so the result is
+/// not a linear mix. Potter's colour store is linear, so every byte-typed layer is re-blended here from the
+/// same origins the attribute remap used, and float layers keep the linear remap.
+fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
+    let Some(types) = source
+        .attributes
+        .get("blender_metadata")
+        .and_then(|metadata| metadata.get("color_data_types"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let byte_layers: BTreeSet<&str> = types
+        .iter()
+        .filter(|(_, data_type)| data_type.as_str() == Some("BYTE_COLOR"))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if byte_layers.is_empty() {
+        return;
+    }
+    let source_store = color_layers::read(source);
+    let mut store = color_layers::read(output);
+    let output_vertex_index: HashMap<u32, usize> = output
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let corners = corner_sources(source, origin, output, &output_vertex_index);
+    for layer in &mut store.layers {
+        if !byte_layers.contains(layer.name.as_str()) {
+            continue;
+        }
+        let Some(source_layer) = source_store
+            .layers
+            .iter()
+            .find(|candidate| candidate.name == layer.name)
+        else {
+            continue;
+        };
+        let sources = match layer.domain {
+            ColorDomain::Point => origin.vertices.as_slice(),
+            ColorDomain::Corner => corners.as_slice(),
+        };
+        layer.values = sources
+            .iter()
+            .map(|sources| mix_byte_color(&source_layer.values, sources))
+            .collect();
+    }
+    color_layers::write(output, &store);
+}
+
+/// One output value of a `BYTE_COLOR` layer: each source's stored byte times its origin weight, summed and
+/// truncated to a byte per channel, then decoded back to linear. A value with no source is opaque black, as
+/// the attribute remap's default.
+fn mix_byte_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [f64; 4] {
+    let mut bytes = [0.0_f64; 4];
+    let mut found = false;
+    for (index, weight) in sources {
+        let Some(value) = values.get(*index) else {
+            continue;
+        };
+        found = true;
+        for (channel, component) in value.iter().enumerate() {
+            let encoded = if channel < 3 {
+                linear_to_srgb(*component)
+            } else {
+                *component
+            };
+            bytes[channel] += weight * (encoded * 255.0).round();
+        }
+    }
+    if !found {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let mut color = [0.0; 4];
+    for (channel, &byte) in bytes.iter().enumerate() {
+        let unit = (byte + 1.0e-9).floor().clamp(0.0, 255.0) / 255.0;
+        color[channel] = if channel < 3 {
+            srgb_to_linear(unit)
+        } else {
+            unit
+        };
+    }
+    color
 }

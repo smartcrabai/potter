@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Edge, Face, Mesh, Vertex},
+    geom::{Edge, Face, Mesh, Vertex, uv_layers},
     model::{DataBlock, Id, Node},
 };
 
@@ -581,6 +581,7 @@ fn filter_mesh_attributes(
                 .is_some_and(|id| ids.contains(&id))
         });
     }
+    uv_layers::prune_missing_faces(mesh);
 }
 
 fn filter_data_block_attributes(data: &mut DataBlock, mesh: &Mesh) {

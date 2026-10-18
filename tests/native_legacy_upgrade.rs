@@ -21,23 +21,24 @@ mod native_oracle;
 mod process;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
 
 use native_oracle::{
-    FLOAT_TOLERANCE, StoredCorner, TestResult, apply_operations, attribute, blender, build_oracle,
-    import_blend, node_id, normal_code_rows, pot, pot_json, read_scene, value_at,
+    FLOAT_TOLERANCE, StoredCorner, TestResult, apply_operations, attribute, build_oracle,
+    import_blend, mesh_of_node, node_id, normal_code_rows, pot, pot_json, read_scene, value_at,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-/// Authored normals of the legacy scene: faces `0..LEGACY_NORMAL_FACES` carry a vector per corner.
-const LEGACY_NORMAL_FACES: usize = 6;
-/// The one legacy corner whose vector is a literal zero; it must upgrade to `explicit_zero`.
-const LEGACY_EXPLICIT_ZERO: (usize, usize) = (2, 1);
+/// The legacy scene's authored normals: every corner of every face carries its fan's vector, so the
+/// vectors agree within each smooth fan (see `fan_roots`).
+/// The one legacy corner whose vector is a literal zero; it must upgrade to `explicit_zero`. It lies on
+/// flat face 0, a fan of its own, so the zero agrees with no neighbour.
+const LEGACY_EXPLICIT_ZERO: (usize, usize) = (0, 0);
 
 fn fixture_v1() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema_v1_project")
@@ -108,19 +109,110 @@ fn json_close(actual: &Value, expected: &Value, label: &str) {
     }
 }
 
-fn corner_vector(face: usize, corner: usize) -> [f64; 3] {
-    let index = (face * 4 + corner) as f64;
+/// Blender's loop-normal fans of the oracle: one root per corner, indexed `starts[face] + corner` with
+/// the corners in `faces` order. Corners join across every edge that is not sharp when both faces are
+/// smooth; a flat face's corners stand alone. Blender v5.2.2 `source/blender/blenkernel/intern/
+/// mesh_normals.cc`: the custom-normal setter marks an edge sharp where one fan's vectors disagree
+/// (`LNOR_SPACE_TRIGO_THRESHOLD`, line 591; the in-fan comparison and marking at lines 1505-1515; the
+/// closing comparison at lines 1532-1538). The authored vectors must therefore agree within each fan,
+/// or the upgrade adds sharp edges the document never stored.
+fn fan_roots(expected: &Value) -> TestResult<Vec<usize>> {
+    let oracle = &expected["oracle"];
+    let faces = oracle["faces"].as_array().ok_or("faces are missing")?;
+    let mut sharp = BTreeMap::new();
+    for edge in oracle["edges"].as_array().ok_or("edges are missing")? {
+        sharp.insert(
+            vertex_pair(&edge["v"])?,
+            edge["sharp"].as_bool() == Some(true),
+        );
+    }
+    let mut starts = Vec::with_capacity(faces.len());
+    let mut total = 0;
+    for face in faces {
+        starts.push(total);
+        total += vertex_list(&face["v"])?.len();
+    }
+    // The faces using each undirected edge.
+    let mut users: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    for (index, face) in faces.iter().enumerate() {
+        let vertices = vertex_list(&face["v"])?;
+        for position in 0..vertices.len() {
+            let next = vertices[(position + 1) % vertices.len()];
+            users
+                .entry(edge_key(vertices[position], next))
+                .or_default()
+                .push(index);
+        }
+    }
+    let corner_at = |face: usize, vertex: u64| -> TestResult<usize> {
+        let vertices = vertex_list(&faces[face]["v"])?;
+        let position = vertices
+            .iter()
+            .position(|&candidate| candidate == vertex)
+            .ok_or("face does not use the vertex")?;
+        Ok(starts[face] + position)
+    };
+    let mut parent: Vec<usize> = (0..total).collect();
+    for (key, using) in &users {
+        if sharp.get(key).copied().unwrap_or(false) || using.len() != 2 {
+            continue;
+        }
+        if !using
+            .iter()
+            .all(|&face| faces[face]["smooth"].as_bool() == Some(true))
+        {
+            continue;
+        }
+        for vertex in [key.0, key.1] {
+            let first = find(&mut parent, corner_at(using[0], vertex)?);
+            let second = find(&mut parent, corner_at(using[1], vertex)?);
+            parent[first] = second;
+        }
+    }
+    Ok((0..total).map(|corner| find(&mut parent, corner)).collect())
+}
+
+fn find(parent: &mut [usize], mut corner: usize) -> usize {
+    while parent[corner] != corner {
+        parent[corner] = parent[parent[corner]];
+        corner = parent[corner];
+    }
+    corner
+}
+
+fn vertex_list(value: &Value) -> TestResult<Vec<u64>> {
+    let items = value.as_array().ok_or("face vertices are missing")?;
+    Ok(items
+        .iter()
+        .map(|item| item.as_u64().ok_or("vertex ID is not a number"))
+        .collect::<Result<Vec<u64>, &str>>()?)
+}
+
+fn vertex_pair(value: &Value) -> TestResult<(u64, u64)> {
+    match vertex_list(value)?.as_slice() {
+        [first, second] => Ok(edge_key(*first, *second)),
+        _ => Err("edge is not a vertex pair".into()),
+    }
+}
+
+fn edge_key(first: u64, second: u64) -> (u64, u64) {
+    (first.min(second), first.max(second))
+}
+
+/// The authored vector of the fan with root `fan`: a unit vector, distinct for each fan.
+fn fan_vector(fan: usize) -> [f64; 3] {
+    let index = fan as f64;
     let raw = [0.3 + 0.05 * (index % 5.0), -0.2 + 0.03 * (index % 7.0), 0.9];
     let length = raw.iter().map(|c| c * c).sum::<f64>().sqrt();
     [raw[0] / length, raw[1] / length, raw[2] / length]
 }
 
-/// The legacy vector of one corner: a unit vector, or a literal zero at `LEGACY_EXPLICIT_ZERO`.
-fn legacy_vector(face: usize, corner: usize) -> [f64; 3] {
+/// The legacy vector of one corner: its fan's vector, or a literal zero at `LEGACY_EXPLICIT_ZERO`.
+fn legacy_vector(face: usize, corner: usize, fan: usize) -> [f64; 3] {
     if (face, corner) == LEGACY_EXPLICIT_ZERO {
         return [0.0; 3];
     }
-    corner_vector(face, corner)
+    fan_vector(fan)
 }
 
 fn paint_value(face: usize, corner: usize) -> [f64; 4] {
@@ -211,20 +303,22 @@ fn legacy_mesh(expected: &Value) -> TestResult<Value> {
     uv.insert("active".to_owned(), oracle["uv_layers"]["active"].clone());
     uv.insert("render".to_owned(), oracle["uv_layers"]["render"].clone());
 
+    let roots = fan_roots(expected)?;
     let mut normal_rows = Map::new();
-    for face in 0..LEGACY_NORMAL_FACES.min(faces.len()) {
-        let row: Vec<Value> = (0..face_sizes[face])
-            .map(|corner| json!(legacy_vector(face, corner)))
+    for (face, &face_size) in face_sizes.iter().enumerate() {
+        let row: Vec<Value> = (0..face_size)
+            .map(|corner| json!(legacy_vector(face, corner, roots[starts[face] + corner])))
             .collect();
         normal_rows.insert(format!("f{face}"), Value::Array(row));
     }
 
     let mut paint = Map::new();
     for (face, size) in face_sizes.iter().enumerate() {
-        for corner in 0..*size {
-            let vertex = faces[face]["v"][corner]
-                .as_u64()
-                .ok_or("face vertex is missing")?;
+        let vertices = faces[face]["v"]
+            .as_array()
+            .ok_or("face vertices are missing")?;
+        for (corner, vertex) in vertices.iter().take(*size).enumerate() {
+            let vertex = vertex.as_u64().ok_or("face vertex is missing")?;
             paint.insert(
                 format!("f{face}:v{vertex}"),
                 json!(paint_value(face, corner)),
@@ -317,10 +411,64 @@ fn stored_legacy_mesh(project: &Path) -> TestResult<Value> {
     Ok(scene["data_blocks"][data]["mesh"].clone())
 }
 
+/// The storage position of each persistent ID in one element list (`vertices`, `edges`, or `faces`).
+fn id_positions(mesh: &Value, list: &str) -> TestResult<BTreeMap<u64, usize>> {
+    mesh[list]
+        .as_array()
+        .ok_or_else(|| format!("mesh {list} are missing"))?
+        .iter()
+        .enumerate()
+        .map(|(index, element)| -> TestResult<(u64, usize)> {
+            let id = element["id"].as_u64().ok_or("mesh element has no id")?;
+            Ok((id, index))
+        })
+        .collect()
+}
+
+/// An attribute with its per-element values re-keyed by storage position: `f<id>` faces, `e<id>`
+/// edges, and `v<id>` vertices become `f<index>`, `e<index>`, and `v<index>`. The legacy document and
+/// the native `.blend` import number their elements differently (the importer is 1-based), so the two
+/// meshes are compared element by element, in the order the oracle lists them.
+fn positional_attribute(mesh: &Value, name: &str) -> TestResult<Value> {
+    let attribute = attribute(mesh, name)?;
+    let Some(values) = attribute["values"].as_object() else {
+        return Ok(attribute.clone());
+    };
+    let faces = id_positions(mesh, "faces")?;
+    let edges = id_positions(mesh, "edges")?;
+    let vertices = id_positions(mesh, "vertices")?;
+    let mut keyed = serde_json::Map::new();
+    for (key, value) in values {
+        let (prefix, table, id) = if let Some(id) = key.strip_prefix('f') {
+            ('f', &faces, id)
+        } else if let Some(id) = key.strip_prefix('e') {
+            ('e', &edges, id)
+        } else if let Some(id) = key.strip_prefix('v') {
+            ('v', &vertices, id)
+        } else {
+            return Err(format!("{name} key {key} is not an element ID").into());
+        };
+        let id: u64 = id
+            .parse()
+            .map_err(|_| format!("{name} key {key} is not an element ID"))?;
+        let index = table
+            .get(&id)
+            .ok_or_else(|| format!("{name} key {key} names no element"))?;
+        keyed.insert(format!("{prefix}{index}"), value.clone());
+    }
+    let mut positional = attribute.clone();
+    positional["values"] = Value::Object(keyed);
+    Ok(positional)
+}
+
 /// Checks the native store of a legacy-derived mesh against a native import of the oracle.
 fn assert_native_semantics(legacy: &Value, native: &Value) -> TestResult {
     for name in ["shade_smooth", "sharp", "seam"] {
-        json_close(attribute(legacy, name)?, attribute(native, name)?, name);
+        json_close(
+            &positional_attribute(legacy, name)?,
+            &positional_attribute(native, name)?,
+            name,
+        );
     }
     assert!(
         legacy["attributes"].get("blender_polygon_smooth").is_none(),
@@ -346,7 +494,11 @@ fn assert_native_semantics(legacy: &Value, native: &Value) -> TestResult {
     );
     for layer in native_layers {
         let name = layer.as_str().ok_or("layer name is not a string")?;
-        json_close(attribute(legacy, name)?, attribute(native, name)?, name);
+        json_close(
+            &positional_attribute(legacy, name)?,
+            &positional_attribute(native, name)?,
+            name,
+        );
     }
     // Only the Blender layers carry a source encoding; the legacy paint layer has none.
     let legacy_encodings = &attribute(legacy, "blender_metadata")?["color_data_types"];
@@ -358,20 +510,14 @@ fn assert_native_semantics(legacy: &Value, native: &Value) -> TestResult {
     Ok(())
 }
 
-/// The upgraded store must be a `normal_code` layer: every corner of a legacy face holds an
-/// authored code pair, the literal-zero legacy vector holds `explicit_zero`, and every other corner
-/// is Auto (`null`), never frozen.
+/// The upgraded store must be a `normal_code` layer: every corner holds an authored code pair, and the
+/// literal-zero legacy vector holds `explicit_zero`. An Auto (`null`) corner would mean an authored
+/// normal was lost on upgrade.
 fn assert_upgraded_normals(mesh: &Value) -> TestResult {
     let rows = normal_code_rows(mesh)?;
     for (face, row) in rows.iter().enumerate() {
         for (corner, stored) in row.iter().enumerate() {
-            if face >= LEGACY_NORMAL_FACES {
-                assert_eq!(
-                    *stored,
-                    StoredCorner::Auto,
-                    "face {face} corner {corner} was frozen on upgrade"
-                );
-            } else if (face, corner) == LEGACY_EXPLICIT_ZERO {
+            if (face, corner) == LEGACY_EXPLICIT_ZERO {
                 assert_eq!(
                     *stored,
                     StoredCorner::ExplicitZero,
@@ -435,7 +581,7 @@ fn schema_v1_fixture_upgrades_on_apply_without_retired_keys() -> TestResult {
     let applied = apply_operations(
         &scene,
         directory.path(),
-        json!([{"op": "node.update", "target": {"id": node}, "set": {"name": "Cube"}}]),
+        json!([{"op": "node.update", "target": {"id": node}, "set": {"name": "Cube renamed"}}]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
     let document = read_json(&scene.join("scene.json"))?;
@@ -467,14 +613,15 @@ fn stored_oracle_or_cube(document: &Value) -> TestResult<Value> {
         .ok_or_else(|| "the project has no mesh".into())
 }
 
+/// The stored mesh of the imported `Oracle` node. The scene holds other meshes (flat ones among
+/// them, which carry no `shade_smooth` key), so the node is looked up by name.
 fn stored_oracle(project: &Path) -> TestResult<Value> {
-    let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    stored_oracle_or_cube(&document)
+    Ok(mesh_of_node(&read_scene(project)?, "Oracle")?.clone())
 }
 
 #[test]
 fn schema_v2_scene_keeps_native_semantics_through_apply_undo_and_redo() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = TempDir::new()?;
@@ -528,7 +675,7 @@ fn schema_v2_scene_keeps_native_semantics_through_apply_undo_and_redo() -> TestR
 
 #[test]
 fn schema_v2_history_record_is_verified_before_it_is_upgraded() -> TestResult {
-    let Some(blender) = blender() else {
+    let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
     let root = TempDir::new()?;

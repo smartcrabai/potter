@@ -11,8 +11,8 @@ use crate::{
     graph::NodeGroup,
     hash,
     library::{
-        self, hash_matches, linked_key, load_project, namespaced_id, registry_entry,
-        remap_references,
+        self, hash_matches, legacy_warnings, linked_key, load_project, namespaced_id,
+        registry_entry, remap_references,
     },
     model::{
         Action, Collection, DataBlock, Id, Library, LibraryKind, LibraryOverride,
@@ -65,7 +65,8 @@ fn link(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
         ));
     }
     let uri = read_string(engine, operation, "uri")?;
-    let (project_path, source, source_hash) = load_project(&uri)?;
+    let (project_path, source, source_hash, legacy) = load_project(&uri)?;
+    engine.warnings.extend(legacy_warnings(&legacy));
     let items = parse_items(engine, operation)?;
     let (mappings, imported) =
         copy_items(engine, &source, &items, Some(library_id.as_str()), true)?;
@@ -370,10 +371,14 @@ fn append(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             )
         })?;
         let uri = record.uri.clone();
-        (load_project(&uri)?.1, uri)
+        let (_, source, _, legacy) = load_project(&uri)?;
+        engine.warnings.extend(legacy_warnings(&legacy));
+        (source, uri)
     } else {
         let uri = read_string(engine, operation, "uri")?;
-        (load_project(&uri)?.1, uri)
+        let (_, source, _, legacy) = load_project(&uri)?;
+        engine.warnings.extend(legacy_warnings(&legacy));
+        (source, uri)
     };
     let items = parse_items(engine, operation)?;
     let (mappings, imported) = copy_items(engine, &source, &items, None, false)?;
@@ -810,7 +815,8 @@ fn reload(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         return Ok(true);
     }
 
-    let (_path, source, digest) = load_project(&record.uri)?;
+    let (_path, source, digest, legacy) = load_project(&record.uri)?;
+    engine.warnings.extend(legacy_warnings(&legacy));
     let mut id_map = BTreeMap::new();
     let mut replacements = Vec::new();
     for (key, source_id) in &record.items {
@@ -887,7 +893,8 @@ fn relocate(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<b
         };
         (path.to_string_lossy().into_owned(), status)
     } else {
-        let (project_path, _, digest) = load_project(&uri)?;
+        let (project_path, _, digest, legacy) = load_project(&uri)?;
+        engine.warnings.extend(legacy_warnings(&legacy));
         let status = if hash_matches(&existing.hash, &digest) {
             LibraryStatus::Ok
         } else {
@@ -1042,6 +1049,13 @@ fn copy_items(
                         queue.push((registry_name.to_owned(), Id::new(reference)?));
                     }
                 }
+                if let Some(materials) = value.get("materials").and_then(Value::as_array) {
+                    for material in materials.iter().filter_map(Value::as_str) {
+                        queue.push(("materials".to_owned(), Id::new(material)?));
+                    }
+                }
+            }
+            "data_blocks" => {
                 if let Some(materials) = value.get("materials").and_then(Value::as_array) {
                     for material in materials.iter().filter_map(Value::as_str) {
                         queue.push(("materials".to_owned(), Id::new(material)?));
@@ -1452,5 +1466,65 @@ mod tests {
     fn namespace_never_exceeds_persistent_id_limit() {
         let id = Id::new("x".repeat(64)).unwrap();
         assert!(namespaced_id("library", &id).unwrap().as_str().len() <= 64);
+    }
+
+    #[test]
+    fn copying_data_blocks_copies_raw_material_references() {
+        let mut source = crate::model::SceneDoc::new("source-scene".to_owned());
+        let node_id = Id::new("mesh_node").unwrap();
+        let data_id = Id::new("mesh_data").unwrap();
+        let material_id = Id::new("data_material").unwrap();
+        source
+            .materials
+            .insert(material_id.clone(), Material::default());
+        source.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                materials: vec![Some(material_id.clone()), None],
+                ..DataBlock::default()
+            },
+        );
+        source.nodes.insert(
+            node_id.clone(),
+            Node {
+                kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                materials: vec![None, None],
+                ..Node::default()
+            },
+        );
+        let mut target = crate::model::SceneDoc::new("target-scene".to_owned());
+        let mut engine = Engine {
+            doc: &mut target,
+            changes: crate::ops::ChangeSet::default(),
+            id_mappings: Map::new(),
+            operation_index: 0,
+            evaluation_frame: 1.0,
+            asset_root: None,
+            cache_directory: None,
+            pending_assets: BTreeMap::default(),
+            warnings: Vec::new(),
+        };
+        let (mapping, copied) = copy_items(
+            &mut engine,
+            &source,
+            &[("nodes".to_owned(), node_id)],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(mapping.contains_key(&("materials".to_owned(), "data_material".to_owned())));
+        assert!(
+            copied
+                .iter()
+                .any(|(registry, id, _)| { registry == "materials" && id == &material_id })
+        );
+        let copied_data = &copied
+            .iter()
+            .find(|(registry, _, _)| registry == "data_blocks")
+            .unwrap()
+            .2;
+        let mapped_material = &mapping[&("materials".to_owned(), "data_material".to_owned())];
+        assert_eq!(copied_data["materials"], json!([mapped_material, null]));
     }
 }

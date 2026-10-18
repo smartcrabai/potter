@@ -101,10 +101,10 @@ fn v1_expression(
     }
     for bind in items(&value["materialColorBinds"]) {
         let color_type = bind["type"].as_str().and_then(color_type_v1);
-        let material = material_of(decoder, &bind["material"]);
-        let (Some(color_type), Some(material), Some(target)) = (
+        let materials = materials_of(decoder, &bind["material"]);
+        let (Some(color_type), Some(materials), Some(target)) = (
             color_type,
-            material,
+            materials,
             number_array::<4>(&bind["targetValue"]),
         ) else {
             decoder.loss(
@@ -114,14 +114,22 @@ fn v1_expression(
             );
             continue;
         };
+        let Some(material) = materials.first().cloned() else {
+            continue;
+        };
         if let Some(bind) = color_bind(decoder, &feature, mtoon, material, color_type, target) {
-            expression.material_color_binds.push(bind);
+            expression.material_color_binds.push(bind.clone());
+            for material in materials.into_iter().skip(1) {
+                let mut variant_bind = bind.clone();
+                variant_bind.material = material;
+                expression.material_color_binds.push(variant_bind);
+            }
         }
     }
     for bind in items(&value["textureTransformBinds"]) {
-        let material = material_of(decoder, &bind["material"]);
-        let (Some(material), Some(scale), Some(offset)) = (
-            material,
+        let materials = materials_of(decoder, &bind["material"]);
+        let (Some(materials), Some(scale), Some(offset)) = (
+            materials,
             number_array::<2>(&bind["scale"]),
             number_array::<2>(&bind["offset"]),
         ) else {
@@ -132,13 +140,15 @@ fn v1_expression(
             );
             continue;
         };
-        expression
-            .texture_transform_binds
-            .push(AvatarTextureTransformBind {
-                material,
-                scale,
-                offset,
-            });
+        for material in materials {
+            expression
+                .texture_transform_binds
+                .push(AvatarTextureTransformBind {
+                    material,
+                    scale,
+                    offset,
+                });
+        }
     }
     Ok(expression)
 }
@@ -221,25 +231,36 @@ fn decode_v0(
                 decoder.loss(&feature, "material value target is malformed", SUGGESTION);
                 continue;
             };
-            let Some(material) = legacy_material(decoder, &feature, value["materialName"].as_str())
+            let Some(materials) =
+                legacy_material(decoder, &feature, value["materialName"].as_str())
             else {
+                continue;
+            };
+            let Some(material) = materials.first().cloned() else {
                 continue;
             };
             if property == "_MainTex_ST" {
                 // Inverts `vrm0_expressions`: the stored offset y is `1 - offset_y - scale_y`.
                 let [scale_x, scale_y, offset_x, stored_y] = target;
-                expression
-                    .texture_transform_binds
-                    .push(AvatarTextureTransformBind {
-                        material,
-                        scale: [scale_x, scale_y],
-                        offset: [offset_x, 1.0 - stored_y - scale_y],
-                    });
+                for material in materials {
+                    expression
+                        .texture_transform_binds
+                        .push(AvatarTextureTransformBind {
+                            material,
+                            scale: [scale_x, scale_y],
+                            offset: [offset_x, 1.0 - stored_y - scale_y],
+                        });
+                }
             } else if let Some(color_type) = color_type_v0(property) {
                 if let Some(bind) =
                     color_bind(decoder, &feature, mtoon, material, color_type, target)
                 {
-                    expression.material_color_binds.push(bind);
+                    expression.material_color_binds.push(bind.clone());
+                    for material in materials.into_iter().skip(1) {
+                        let mut variant_bind = bind.clone();
+                        variant_bind.material = material;
+                        expression.material_color_binds.push(variant_bind);
+                    }
                 }
             } else {
                 decoder.loss(
@@ -329,21 +350,32 @@ fn color_bind(
     })
 }
 
-/// Resolves a VRM 0.x `materialName`, which must name exactly one material.
-fn legacy_material(decoder: &mut Decoder<'_>, feature: &str, name: Option<&str>) -> Option<Id> {
+/// Resolves a VRM 0.x `materialName` against original glTF materials only.
+fn legacy_material(
+    decoder: &mut Decoder<'_>,
+    feature: &str,
+    name: Option<&str>,
+) -> Option<Vec<Id>> {
     let Some(name) = name else {
         decoder.loss(feature, "material value has no materialName", SUGGESTION);
         return None;
     };
-    let doc = decoder.doc;
-    let matches: Vec<&Id> = doc
-        .materials
+    let matches: Vec<usize> = decoder
+        .index
+        .material_ids
         .iter()
-        .filter(|(_, material)| material.name == name)
-        .map(|(id, _)| id)
+        .enumerate()
+        .filter_map(|(index, id)| {
+            decoder
+                .doc
+                .materials
+                .get(id)
+                .filter(|material| material.name == name)
+                .map(|_| index)
+        })
         .collect();
     match matches.as_slice() {
-        [id] => Some((*id).clone()),
+        [index] => decoder.material_ids(*index).ok(),
         [] => {
             decoder.loss(
                 feature,
@@ -403,9 +435,9 @@ pub(super) fn node_id(decoder: &Decoder<'_>, node: usize) -> Option<Id> {
     decoder.index.node_ids.get(node).cloned()
 }
 
-/// The Potter material of a glTF material index JSON value.
-pub(super) fn material_of(decoder: &Decoder<'_>, value: &Value) -> Option<Id> {
-    index_of(value).and_then(|index| decoder.material_id(index).ok())
+/// The Potter materials of a glTF material index JSON value, original followed by color variants.
+fn materials_of(decoder: &Decoder<'_>, value: &Value) -> Option<Vec<Id>> {
+    index_of(value).and_then(|index| decoder.material_ids(index).ok())
 }
 
 /// The elements of a JSON array, or none when the value is absent or not an array.

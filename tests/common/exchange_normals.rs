@@ -25,10 +25,35 @@ pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// over all 72 corners, so the bound is 1e-4. A wrong axis or winding produces errors near 1.
 pub const NORMAL_TOLERANCE: f64 = 1.0e-4;
 
-/// Bound for values that Blender itself re-quantized: PLY per-vertex sums are built from Blender's
-/// int16-quantized corner normals, so they can differ from exact sums by more than
-/// `NORMAL_TOLERANCE`.
+/// Bound for values that Blender itself re-quantized: custom normals stored as int16 codes on both
+/// sides of a comparison, and PLY per-vertex sums built from Blender's int16-quantized corner
+/// normals. Those can differ from exact values by more than `NORMAL_TOLERANCE`.
 pub const BLENDER_NORMAL_TOLERANCE: f64 = 2.0e-4;
+
+/// Corners per face and faces per box in the reference order (`Mixed`, `Mirror`, `NonUni` by box).
+const CORNERS_PER_FACE: usize = 4;
+const FACES_PER_BOX: usize = 6;
+/// The face (`f2`) of each box that carries custom normals in this fixture.
+const CUSTOM_NORMAL_FACE: usize = 2;
+
+/// The one corner-normal bound for a comparison. `passes_custom_codes` is true when the compared
+/// value went through custom-normal codes where Blender also stores short2 custom normals (its
+/// exporters emit the code-decoded normal, its importers create custom normals). Those take
+/// `BLENDER_NORMAL_TOLERANCE`; everything else keeps `NORMAL_TOLERANCE`.
+pub fn normal_tolerance(passes_custom_codes: bool) -> f64 {
+    if passes_custom_codes {
+        BLENDER_NORMAL_TOLERANCE
+    } else {
+        NORMAL_TOLERANCE
+    }
+}
+
+/// The corner-normal bound for reference corner `index`: a corner of a custom-normal face passes through
+/// codes on both sides, every other corner is automatic or smooth.
+pub fn corner_normal_tolerance(index: usize) -> f64 {
+    let face = index / CORNERS_PER_FACE;
+    normal_tolerance(face % FACES_PER_BOX == CUSTOM_NORMAL_FACE)
+}
 
 /// Inverse of Potter's OBJ axes: a file line `(x, z, -y)` is Potter's `(x, y, z)`.
 pub fn obj_to_potter(value: [f64; 3]) -> [f64; 3] {
@@ -321,7 +346,7 @@ pub fn assert_matches_reference(observed: &[ObservedCorner]) -> TestResult<f64> 
         "corner count differs from the Blender reference"
     );
     let mut worst = 0.0_f64;
-    for expected in &reference {
+    for (index, expected) in reference.iter().enumerate() {
         let found = observed
             .iter()
             .filter(|corner| {
@@ -339,8 +364,9 @@ pub fn assert_matches_reference(observed: &[ObservedCorner]) -> TestResult<f64> 
         let error = (0..3)
             .map(|axis| (found[0].normal[axis] - expected.normal[axis]).abs())
             .fold(0.0_f64, f64::max);
+        let tolerance = corner_normal_tolerance(index);
         assert!(
-            error <= NORMAL_TOLERANCE,
+            error <= tolerance,
             "normal {:?} differs from Blender {:?} at corner {:?} (error {error})",
             found[0].normal,
             expected.normal,
