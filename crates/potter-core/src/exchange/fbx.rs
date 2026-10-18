@@ -3778,7 +3778,7 @@ mod tests {
             Mesh,
             uv_layers::{self, UvLayer, UvStore},
         },
-        image::ImageInterpolation,
+        image::{ImageExtension, ImageInterpolation},
         model::{
             DataBlock, Id, Image, ImageColorspace, ImageSource, Material, Node, SceneDoc,
             TextureRef,
@@ -3996,6 +3996,122 @@ mod tests {
         let no_slot_export =
             export_with_root_allow_lossy(&no_slot_doc, &no_slot_snapshot, Path::new("."), true)?;
         assert!(!String::from_utf8(no_slot_export)?.contains("LayerElementMaterial: 0"));
+        Ok(())
+    }
+
+    /// One triangle whose base colour texture has `extension`, exported as ASCII FBX.
+    fn textured_triangle_fbx(extension: ImageExtension, root: &Path) -> TestResult<Vec<u8>> {
+        let image_path = root.join("texture.pixels");
+        let pixels = crate::image::encode_pixels(1, 1, &[[1.0, 1.0, 1.0, 1.0]])?;
+        fs::write(&image_path, &pixels)?;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let image_id = Id::new("image")?;
+        doc.images.insert(
+            image_id.clone(),
+            Image {
+                name: "Image".to_owned(),
+                source: ImageSource::File,
+                colorspace: ImageColorspace::Srgb,
+                width: 1,
+                height: 1,
+                tiles: Vec::new(),
+                blob: None,
+                source_path: Some(image_path.to_string_lossy().into_owned()),
+                source_hash: Some(crate::hash::sha256(&pixels)),
+                alpha_mode: crate::model::ImageAlphaMode::default(),
+            },
+        );
+        let material_id = Id::new("textured")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                name: "Textured".to_owned(),
+                base_color: [1.0; 4],
+                base_color_texture: Some(TextureRef {
+                    image: image_id,
+                    uv_layer: None,
+                    interpolation: ImageInterpolation::Linear,
+                    extension,
+                }),
+                ..Material::default()
+            },
+        );
+        let data_id = Id::new("triangle_data")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(triangle()?),
+                materials: vec![Some(material_id)],
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            Id::new("sheet")?,
+            Node {
+                name: "Sheet".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        Ok(export_with_root_allow_lossy(&doc, &snapshot, root, true)?)
+    }
+
+    fn textured_extension(doc: &SceneDoc) -> TestResult<ImageExtension> {
+        doc.materials
+            .values()
+            .find_map(|material| material.base_color_texture.as_ref())
+            .map(|texture| texture.extension)
+            .ok_or_else(|| "FBX test texture is missing".into())
+    }
+
+    #[test]
+    fn texture_wrap_modes_export_as_blenders_exporter_writes_them() -> TestResult {
+        // Blender's exporter writes WrapModeU and WrapModeV as clamp (1) for any extension but REPEAT (0).
+        let root = tempfile::tempdir()?;
+        for (extension, expected) in [
+            (ImageExtension::Extend, 1),
+            (ImageExtension::Mirror, 1),
+            (ImageExtension::Repeat, 0),
+        ] {
+            let text = String::from_utf8(textured_triangle_fbx(extension, root.path())?)?;
+            assert!(
+                text.contains(&format!(
+                    "P: \"WrapModeU\", \"enum\", \"\", \"\", {expected}\n"
+                )),
+                "WrapModeU is {expected} for {extension:?}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "P: \"WrapModeV\", \"enum\", \"\", \"\", {expected}\n"
+                )),
+                "WrapModeV is {expected} for {extension:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn texture_wrap_modes_import_as_blenders_importer_reads_them() -> TestResult {
+        // Blender's importer sets EXTEND when either wrap mode is a clamp; REPEAT only when both are 0.
+        let root = tempfile::tempdir()?;
+        let scene_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        let clamp = textured_triangle_fbx(ImageExtension::Extend, root.path())?;
+        let imported = import_bytes(&clamp, scene_id.clone())?;
+        assert_eq!(textured_extension(&imported.doc)?, ImageExtension::Extend);
+
+        let clamp_on_v_only = String::from_utf8(clamp)?.replace(
+            "P: \"WrapModeU\", \"enum\", \"\", \"\", 1",
+            "P: \"WrapModeU\", \"enum\", \"\", \"\", 0",
+        );
+        let imported = import_bytes(clamp_on_v_only.as_bytes(), scene_id.clone())?;
+        assert_eq!(textured_extension(&imported.doc)?, ImageExtension::Extend);
+
+        let repeat = textured_triangle_fbx(ImageExtension::Repeat, root.path())?;
+        let imported = import_bytes(&repeat, scene_id)?;
+        assert_eq!(textured_extension(&imported.doc)?, ImageExtension::Repeat);
         Ok(())
     }
 
