@@ -33,7 +33,6 @@ use super::imesh::NO_INDEX;
 use super::{BooleanOperand, Operation};
 
 type P3 = [f32; 3];
-type P2 = [f32; 2];
 type EdgeKey = (usize, usize);
 
 const FLT_EPSILON: f32 = f32::EPSILON;
@@ -71,6 +70,8 @@ struct State {
     edge_splits: HashMap<EdgeKey, Vec<usize>>,
     face_cuts: HashMap<usize, Vec<EdgeKey>>,
     wire_edges: HashSet<EdgeKey>,
+    /// Split-net edges that no output face loops (Blender keeps an edge with no loops as wire).
+    dangling_edges: HashSet<EdgeKey>,
     dissolve_verts: Vec<usize>,
     edge_tri_cache: HashMap<[i32; 4], usize>,
 }
@@ -90,6 +91,7 @@ impl State {
             wire_edges: HashSet::new(),
             dissolve_verts: Vec::new(),
             edge_tri_cache: HashMap::new(),
+            dangling_edges: HashSet::new(),
         }
     }
 
@@ -391,12 +393,16 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             loose_edges.push((edge, usize::try_from(source).ok()));
         }
     }
-    // Cut edges no output face uses stay in the result as loose edges (Blender keeps the wire
-    // edges left by the splice step), in sorted order so the output is deterministic.
-    let mut leftover_wire: Vec<EdgeKey> = state
+    // Cut edges no output face uses, and split-net edges no output face loops, stay in the result
+    // as loose edges (Blender keeps an edge that never gets a loop), in sorted order.
+    let wire_candidates: HashSet<EdgeKey> = state
         .wire_edges
         .iter()
+        .chain(state.dangling_edges.iter())
         .copied()
+        .collect();
+    let mut leftover_wire: Vec<EdgeKey> = wire_candidates
+        .into_iter()
         .filter(|edge| !face_edges.contains(edge) && !loose_edges.iter().any(|(e, _)| e == edge))
         .collect();
     leftover_wire.sort_unstable();
@@ -3118,29 +3124,52 @@ fn split_input_edges(state: &mut State) {
     }
 }
 
+fn ring_edges(verts: &[usize]) -> Vec<EdgeKey> {
+    (0..verts.len())
+        .map(|i| edge_key_usize(verts[i], verts[(i + 1) % verts.len()]))
+        .collect()
+}
+
 fn split_faces(state: &mut State) {
     let old_faces = std::mem::take(&mut state.faces);
     let old_cuts = std::mem::take(&mut state.face_cuts);
+    let positions: Vec<P3> = state.verts.iter().map(|vertex| vertex.co).collect();
     let mut new_faces = Vec::new();
+    // Blender keeps an edge with no loop as wire: the net edges that no output ring loops.
+    let mut net_edges: HashSet<EdgeKey> = HashSet::new();
+    let mut looped_edges: HashSet<EdgeKey> = HashSet::new();
     for (index, face) in old_faces.into_iter().enumerate() {
         let Some(cuts) = old_cuts.get(&index) else {
+            looped_edges.extend(ring_edges(&face.verts));
             new_faces.push(face);
             continue;
         };
-        let mut ordered_edges: Vec<EdgeKey> = cuts.iter().rev().copied().collect();
-        let mut edges: HashSet<EdgeKey> = cuts.iter().copied().collect();
-        for i in 0..face.verts.len() {
-            let edge = edge_key_usize(face.verts[i], face.verts[(i + 1) % face.verts.len()]);
-            if edges.insert(edge) {
-                ordered_edges.push(edge);
-            }
+        // Blender's edge net: the cut edges in stored order (most recent first), then the loop.
+        let net: Vec<EdgeKey> = cuts.iter().rev().copied().collect();
+        let ring: Vec<(usize, usize)> = (0..face.verts.len())
+            .map(|i| (face.verts[i], face.verts[(i + 1) % face.verts.len()]))
+            .collect();
+        let points: Vec<P3> = face.verts.iter().map(|&v| state.verts[v].co).collect();
+        let connects = super::float_connect::connect_islands(
+            face.verts[0],
+            normal_poly(&points),
+            &ring,
+            &net,
+            &positions,
+        );
+        let mut edges: HashSet<EdgeKey> = net.iter().copied().collect();
+        for &(a, b) in &connects {
+            edges.insert(edge_key_usize(a, b));
         }
-        connect_isolated_cut_islands(&face, &mut edges, &mut ordered_edges, state);
+        net_edges.extend(edges.iter().copied());
+        edges.extend(ring_edges(&face.verts));
         let cycles = planar_cycles(&face.verts, &edges, &state.verts);
         if cycles.is_empty() {
+            looped_edges.extend(ring_edges(&face.verts));
             new_faces.push(face);
         } else {
             for ring in cycles {
+                looped_edges.extend(ring_edges(&ring));
                 new_faces.push(Face {
                     verts: ring,
                     side: face.side,
@@ -3150,590 +3179,7 @@ fn split_faces(state: &mut State) {
         }
     }
     state.faces = new_faces;
-}
-
-fn connect_isolated_cut_islands(
-    face: &Face,
-    edges: &mut HashSet<EdgeKey>,
-    ordered_edges: &mut Vec<EdgeKey>,
-    state: &State,
-) {
-    let components = edge_components(edges, ordered_edges);
-    if components.len() < 2 {
-        return;
-    }
-    let (axis_x, axis_y) = face_basis(face, &state.verts);
-    let reference = state.verts[face.verts[0]].co;
-    let mut groups: Vec<EdgeIsland> = components
-        .into_iter()
-        .map(|component| {
-            let mut vertices: Vec<usize> = component.iter().flat_map(|&(a, b)| [a, b]).collect();
-            vertices.sort_unstable();
-            vertices.dedup();
-            let mut ordered = vertices.clone();
-            ordered.sort_by(|&a, &b| {
-                let pa = project(sub(state.verts[a].co, reference), axis_x, axis_y);
-                let pb = project(sub(state.verts[b].co, reference), axis_x, axis_y);
-                pa[0]
-                    .total_cmp(&pb[0])
-                    .then_with(|| pa[1].total_cmp(&pb[1]))
-            });
-            let minimum = ordered[0];
-            let maximum = *ordered.last().unwrap_or(&minimum);
-            EdgeIsland {
-                vertices,
-                minimum,
-                maximum,
-                min_co: project(sub(state.verts[minimum].co, reference), axis_x, axis_y),
-                max_co: project(sub(state.verts[maximum].co, reference), axis_x, axis_y),
-                has_previous_link: false,
-            }
-        })
-        .collect();
-    groups.sort_by(|a, b| {
-        a.min_co[0]
-            .total_cmp(&b.min_co[0])
-            .then_with(|| a.min_co[1].total_cmp(&b.min_co[1]))
-            .then_with(|| a.max_co[0].total_cmp(&b.max_co[0]))
-            .then_with(|| a.max_co[1].total_cmp(&b.max_co[1]))
-    });
-
-    let mut vertex_group = HashMap::new();
-    for (group_index, group) in groups.iter().enumerate() {
-        for &vertex in &group.vertices {
-            vertex_group.insert(vertex, group_index);
-        }
-    }
-    let edge_bvh = FloatEdgeBvh::new(ordered_edges, state, reference, axis_x, axis_y);
-    let mut added_edges = Vec::with_capacity(groups.len().saturating_sub(1) * 2);
-    let mut ray_candidates = Vec::new();
-    let mut edge_candidates = Vec::new();
-    let mut vertex_search = Vec::new();
-    let mut vertex_blacklist = Vec::new();
-    let mut vertex_visited = vec![false; state.verts.len()];
-    for group_index in 1..groups.len() {
-        if !groups[group_index].has_previous_link {
-            let origin = groups[group_index].minimum;
-            if let Some(target) = find_island_connection(
-                origin,
-                -1.0,
-                group_index,
-                &vertex_group,
-                &edge_bvh,
-                &added_edges,
-                &mut ray_candidates,
-                &mut edge_candidates,
-                &mut vertex_search,
-                &mut vertex_blacklist,
-                &mut vertex_visited,
-                state,
-                reference,
-                axis_x,
-                axis_y,
-            ) {
-                let connection = edge_key_usize(origin, target);
-                if edges.insert(connection) {
-                    ordered_edges.push(connection);
-                    added_edges.push(connection);
-                }
-            }
-        }
-        let origin = groups[group_index].maximum;
-        if let Some(target) = find_island_connection(
-            origin,
-            1.0,
-            group_index,
-            &vertex_group,
-            &edge_bvh,
-            &added_edges,
-            &mut ray_candidates,
-            &mut edge_candidates,
-            &mut vertex_search,
-            &mut vertex_blacklist,
-            &mut vertex_visited,
-            state,
-            reference,
-            axis_x,
-            axis_y,
-        ) {
-            let connection = edge_key_usize(origin, target);
-            if edges.insert(connection) {
-                ordered_edges.push(connection);
-                added_edges.push(connection);
-            }
-            if let Some(&target_group) = vertex_group.get(&target) {
-                groups[target_group].has_previous_link = true;
-            }
-        }
-    }
-}
-
-struct EdgeIsland {
-    vertices: Vec<usize>,
-    minimum: usize,
-    maximum: usize,
-    min_co: [f32; 2],
-    max_co: [f32; 2],
-    has_previous_link: bool,
-}
-
-#[derive(Clone, Copy)]
-struct FloatEdgeSegment {
-    key: EdgeKey,
-    a: P2,
-    b: P2,
-    min: P2,
-    max: P2,
-}
-
-struct FloatEdgeBvhNode {
-    min: P2,
-    max: P2,
-    start: usize,
-    end: usize,
-    children: Option<(usize, usize)>,
-}
-
-struct FloatEdgeBvh {
-    segments: Vec<FloatEdgeSegment>,
-    order: Vec<usize>,
-    nodes: Vec<FloatEdgeBvhNode>,
-}
-
-impl FloatEdgeBvh {
-    fn new(edges: &[EdgeKey], state: &State, reference: P3, axis_x: P3, axis_y: P3) -> Self {
-        const BVH_PAD: f32 = 1.0e-4;
-        let segments: Vec<FloatEdgeSegment> = edges
-            .iter()
-            .copied()
-            .map(|key| {
-                let a = project(sub(state.verts[key.0].co, reference), axis_x, axis_y);
-                let b = project(sub(state.verts[key.1].co, reference), axis_x, axis_y);
-                FloatEdgeSegment {
-                    key,
-                    a,
-                    b,
-                    min: [a[0].min(b[0]) - BVH_PAD, a[1].min(b[1]) - BVH_PAD],
-                    max: [a[0].max(b[0]) + BVH_PAD, a[1].max(b[1]) + BVH_PAD],
-                }
-            })
-            .collect();
-        let mut result = Self {
-            order: (0..segments.len()).collect(),
-            nodes: Vec::with_capacity(segments.len().saturating_mul(2)),
-            segments,
-        };
-        if !result.order.is_empty() {
-            let end = result.order.len();
-            result.build_node(0, end);
-        }
-        result
-    }
-
-    fn build_node(&mut self, start: usize, end: usize) -> usize {
-        let mut min = [f32::INFINITY; 2];
-        let mut max = [f32::NEG_INFINITY; 2];
-        for &index in &self.order[start..end] {
-            let edge = self.segments[index];
-            for axis in 0..2 {
-                min[axis] = min[axis].min(edge.min[axis]);
-                max[axis] = max[axis].max(edge.max[axis]);
-            }
-        }
-        let node_index = self.nodes.len();
-        self.nodes.push(FloatEdgeBvhNode {
-            min,
-            max,
-            start,
-            end,
-            children: None,
-        });
-        if end - start > 8 {
-            let axis = usize::from(max[1] - min[1] > max[0] - min[0]);
-            let segments = &self.segments;
-            self.order[start..end].sort_unstable_by(|&left, &right| {
-                let a = segments[left];
-                let b = segments[right];
-                let center_a = a.min[axis] + a.max[axis];
-                let center_b = b.min[axis] + b.max[axis];
-                center_a
-                    .total_cmp(&center_b)
-                    .then_with(|| a.key.cmp(&b.key))
-            });
-            let middle = start + (end - start) / 2;
-            let left = self.build_node(start, middle);
-            let right = self.build_node(middle, end);
-            self.nodes[node_index].children = Some((left, right));
-        }
-        node_index
-    }
-
-    fn ray_candidates(&self, origin: P2, direction: f32, out: &mut Vec<usize>) {
-        out.clear();
-        if !self.nodes.is_empty() {
-            self.query_ray_node(0, origin, direction, out);
-        }
-    }
-
-    fn query_ray_node(&self, node_index: usize, origin: P2, direction: f32, out: &mut Vec<usize>) {
-        let node = &self.nodes[node_index];
-        if origin[1] < node.min[1]
-            || origin[1] > node.max[1]
-            || (direction > 0.0 && node.max[0] <= origin[0])
-            || (direction < 0.0 && node.min[0] >= origin[0])
-        {
-            return;
-        }
-        if let Some((left, right)) = node.children {
-            self.query_ray_node(left, origin, direction, out);
-            self.query_ray_node(right, origin, direction, out);
-        } else {
-            for &index in &self.order[node.start..node.end] {
-                let edge = self.segments[index];
-                if edge.min[1] <= origin[1]
-                    && origin[1] <= edge.max[1]
-                    && ((direction > 0.0 && edge.max[0] > origin[0])
-                        || (direction < 0.0 && edge.min[0] < origin[0]))
-                {
-                    out.push(index);
-                }
-            }
-        }
-    }
-
-    fn segment_candidates(&self, min: P2, max: P2, out: &mut Vec<usize>) {
-        out.clear();
-        if !self.nodes.is_empty() {
-            self.query_segment_node(0, min, max, out);
-        }
-    }
-
-    fn query_segment_node(&self, node_index: usize, min: P2, max: P2, out: &mut Vec<usize>) {
-        let node = &self.nodes[node_index];
-        if (0..2).any(|axis| min[axis] > node.max[axis] || node.min[axis] > max[axis]) {
-            return;
-        }
-        if let Some((left, right)) = node.children {
-            self.query_segment_node(left, min, max, out);
-            self.query_segment_node(right, min, max, out);
-        } else {
-            for &index in &self.order[node.start..node.end] {
-                let edge = self.segments[index];
-                if (0..2).all(|axis| min[axis] <= edge.max[axis] && edge.min[axis] <= max[axis]) {
-                    out.push(index);
-                }
-            }
-        }
-    }
-}
-
-fn find_island_connection(
-    origin: usize,
-    direction: f32,
-    origin_group: usize,
-    vertex_group: &HashMap<usize, usize>,
-    edge_bvh: &FloatEdgeBvh,
-    added_edges: &[EdgeKey],
-    ray_candidates: &mut Vec<usize>,
-    edge_candidates: &mut Vec<usize>,
-    vertex_search: &mut Vec<usize>,
-    vertex_blacklist: &mut Vec<usize>,
-    vertex_visited: &mut [bool],
-    state: &State,
-    reference: P3,
-    axis_x: P3,
-    axis_y: P3,
-) -> Option<usize> {
-    let origin_2d = project(sub(state.verts[origin].co, reference), axis_x, axis_y);
-    vertex_search.clear();
-    vertex_blacklist.clear();
-    edge_bvh.ray_candidates(origin_2d, direction, ray_candidates);
-    let mut hit: Option<(f32, EdgeKey)> = None;
-    for &index in ray_candidates.iter() {
-        let edge = edge_bvh.segments[index];
-        if edge.key.0 == origin
-            || edge.key.1 == origin
-            || vertex_group.get(&edge.key.0) == Some(&origin_group)
-        {
-            continue;
-        }
-        if let Some(distance) = island_ray_distance(origin_2d, direction, edge.a, edge.b)
-            && hit.is_none_or(|(best, _)| distance < best)
-        {
-            hit = Some((distance, edge.key));
-        }
-    }
-    let (mut hit_distance, mut hit_edge) = hit?;
-    for &edge in added_edges {
-        if edge.0 == origin || edge.1 == origin {
-            continue;
-        }
-        let a = project(sub(state.verts[edge.0].co, reference), axis_x, axis_y);
-        let b = project(sub(state.verts[edge.1].co, reference), axis_x, axis_y);
-        if let Some(distance) = island_ray_distance(origin_2d, direction, a, b)
-            && distance < hit_distance
-        {
-            hit_distance = distance;
-            hit_edge = edge;
-        }
-    }
-
-    let mut blocker = Some(hit_edge);
-    let mut candidate = None;
-    let mut fallback = None;
-    while let Some(edge) = blocker {
-        let edge0 = project(sub(state.verts[edge.0].co, reference), axis_x, axis_y);
-        let edge1 = project(sub(state.verts[edge.1].co, reference), axis_x, axis_y);
-        let distance0 = (edge0[0] - origin_2d[0]).powi(2) + (edge0[1] - origin_2d[1]).powi(2);
-        let distance1 = (edge1[0] - origin_2d[0]).powi(2) + (edge1[1] - origin_2d[1]).powi(2);
-        let endpoints = if distance0 > distance1 {
-            [edge.0, edge.1]
-        } else {
-            [edge.1, edge.0]
-        };
-        for endpoint in endpoints {
-            push_island_vertex(
-                endpoint,
-                origin_2d,
-                direction,
-                state,
-                vertex_visited,
-                vertex_search,
-                vertex_blacklist,
-                reference,
-                axis_x,
-                axis_y,
-            );
-        }
-        fallback = candidate;
-        candidate = vertex_search.pop();
-        let Some(target) = candidate else { break };
-        blocker = island_vertex_blocker(
-            origin,
-            target,
-            origin_group,
-            vertex_group,
-            edge_bvh,
-            added_edges,
-            edge_candidates,
-            state,
-            reference,
-            axis_x,
-            axis_y,
-        );
-        if blocker.is_none() {
-            fallback = candidate;
-            break;
-        }
-    }
-    let result = if blocker.is_none() {
-        candidate
-    } else {
-        fallback
-    };
-    for &vertex in vertex_blacklist.iter() {
-        vertex_visited[vertex] = false;
-    }
-    vertex_search.clear();
-    vertex_blacklist.clear();
-    result
-}
-
-fn island_ray_distance(origin: P2, direction: f32, a: P2, b: P2) -> Option<f32> {
-    let dy = b[1] - a[1];
-    if dy == 0.0 {
-        return None;
-    }
-    let factor = (origin[1] - a[1]) / dy;
-    if !(0.0..=1.0).contains(&factor) {
-        return None;
-    }
-    let hit_x = a[0] + (b[0] - a[0]) * factor;
-    let distance = (hit_x - origin[0]) * direction;
-    (distance > 0.0).then_some(distance)
-}
-
-fn push_island_vertex(
-    vertex: usize,
-    origin: P2,
-    direction: f32,
-    state: &State,
-    visited: &mut [bool],
-    search: &mut Vec<usize>,
-    blacklist: &mut Vec<usize>,
-    reference: P3,
-    axis_x: P3,
-    axis_y: P3,
-) {
-    let coordinate = project(sub(state.verts[vertex].co, reference), axis_x, axis_y);
-    if (coordinate[0] - origin[0]) * direction <= 0.0 || visited[vertex] {
-        return;
-    }
-    visited[vertex] = true;
-    search.push(vertex);
-    blacklist.push(vertex);
-}
-
-fn island_vertex_blocker(
-    origin: usize,
-    target: usize,
-    origin_group: usize,
-    vertex_group: &HashMap<usize, usize>,
-    edge_bvh: &FloatEdgeBvh,
-    added_edges: &[EdgeKey],
-    candidates: &mut Vec<usize>,
-    state: &State,
-    reference: P3,
-    axis_x: P3,
-    axis_y: P3,
-) -> Option<EdgeKey> {
-    let a = project(sub(state.verts[origin].co, reference), axis_x, axis_y);
-    let b = project(sub(state.verts[target].co, reference), axis_x, axis_y);
-    let min = [a[0].min(b[0]), a[1].min(b[1])];
-    let max = [a[0].max(b[0]), a[1].max(b[1])];
-    edge_bvh.segment_candidates(min, max, candidates);
-    let mut blocker = None;
-    let mut best_factor = 1.0_f32;
-    for &index in candidates.iter() {
-        let edge = edge_bvh.segments[index];
-        if edge.key.0 == origin
-            || edge.key.1 == origin
-            || edge.key.0 == target
-            || edge.key.1 == target
-        {
-            continue;
-        }
-        if vertex_group.get(&edge.key.0) == Some(&origin_group) {
-            continue;
-        }
-        if let Some(factor) = island_segment_intersection_factor(a, b, edge.a, edge.b)
-            && factor < best_factor
-        {
-            best_factor = factor;
-            blocker = Some(edge.key);
-        }
-    }
-    if blocker.is_some() {
-        return blocker;
-    }
-    for &edge in added_edges {
-        if edge.0 == origin || edge.1 == origin || edge.0 == target || edge.1 == target {
-            continue;
-        }
-        let c = project(sub(state.verts[edge.0].co, reference), axis_x, axis_y);
-        let d = project(sub(state.verts[edge.1].co, reference), axis_x, axis_y);
-        if let Some(factor) = island_segment_intersection_factor(a, b, c, d)
-            && factor < best_factor
-        {
-            best_factor = factor;
-            blocker = Some(edge);
-        }
-    }
-    blocker
-}
-
-#[expect(
-    clippy::float_cmp,
-    reason = "bit-exact degenerate-segment tests mirror Blender's f32 kernel; tolerances would change results"
-)]
-fn island_segment_intersection_factor(a: P2, b: P2, c: P2, d: P2) -> Option<f32> {
-    let cross = |u: P2, v: P2| u[0] * v[1] - u[1] * v[0];
-    let dot = |u: P2, v: P2| u[0] * v[0] + u[1] * v[1];
-    let a_degenerate = a == b;
-    let mut a0 = a;
-    let mut a1 = b;
-    let mut b0 = c;
-    let mut b1 = d;
-    let mut s10 = [a1[0] - a0[0], a1[1] - a0[1]];
-    let s32 = [b1[0] - b0[0], b1[1] - b0[1]];
-    let mut s30 = [b1[0] - a0[0], b1[1] - a0[1]];
-    let denominator = cross(s10, s32);
-    let endpoint_min = -1.0e-4_f32;
-    let endpoint_max = 1.0e-4_f32 + 1.0f32;
-
-    if denominator != 0.0 {
-        let factor = cross(s30, s32) / denominator;
-        let mut edge_factor = cross(s10, s30) / denominator;
-        if factor >= endpoint_min
-            && factor <= endpoint_max
-            && edge_factor >= endpoint_min
-            && edge_factor <= endpoint_max
-        {
-            let intersection = [a0[0] + s10[0] * factor, a0[1] + s10[1] * factor];
-            let intersection_from_edge = [intersection[0] - b0[0], intersection[1] - b0[1]];
-            edge_factor = dot(s32, intersection_from_edge) / dot(s32, s32);
-            if edge_factor >= endpoint_min && edge_factor <= endpoint_max {
-                return Some(line_factor_2d(intersection, a, b));
-            }
-        }
-        return None;
-    }
-
-    if cross(s10, s30) != 0.0 || cross(s32, s30) != 0.0 {
-        return None;
-    }
-    if a0 == a1 {
-        let b_len = [b1[0] - b0[0], b1[1] - b0[1]];
-        if dot(b_len, b_len) > 1.0e-12_f32 {
-            std::mem::swap(&mut a0, &mut b0);
-            std::mem::swap(&mut a1, &mut b1);
-            s10 = [a1[0] - a0[0], a1[1] - a0[1]];
-            s30 = [b1[0] - a0[0], b1[1] - a0[1]];
-        } else {
-            return (a0 == b0).then_some(0.0);
-        }
-    }
-
-    let s20 = [b0[0] - a0[0], b0[1] - a0[1]];
-    let mut factor_a = dot(s20, s10) / dot(s10, s10);
-    let mut factor_b = dot(s30, s10) / dot(s10, s10);
-    if factor_a > factor_b {
-        std::mem::swap(&mut factor_a, &mut factor_b);
-    }
-    if factor_a > endpoint_max || factor_b < endpoint_min {
-        return None;
-    }
-    (factor_a.max(0.0) == factor_b.min(1.0)).then_some(if a_degenerate {
-        0.0
-    } else {
-        factor_a.max(0.0)
-    })
-}
-
-fn edge_components(edges: &HashSet<EdgeKey>, ordered_edges: &[EdgeKey]) -> Vec<HashSet<EdgeKey>> {
-    let mut adjacency: HashMap<usize, Vec<EdgeKey>> = HashMap::new();
-    for &edge in ordered_edges {
-        if edges.contains(&edge) {
-            adjacency.entry(edge.0).or_default().push(edge);
-            adjacency.entry(edge.1).or_default().push(edge);
-        }
-    }
-    let mut visited = HashSet::new();
-    let mut components = Vec::new();
-    for &seed in ordered_edges.iter().rev() {
-        if !edges.contains(&seed) || !visited.insert(seed) {
-            continue;
-        }
-        let mut stack = vec![seed.0, seed.1];
-        let mut component = HashSet::from([seed]);
-        let mut visited_vertices = HashSet::from([seed.0, seed.1]);
-        while let Some(vertex) = stack.pop() {
-            if let Some(incident) = adjacency.get(&vertex) {
-                for &edge in incident {
-                    if !visited.insert(edge) {
-                        continue;
-                    }
-                    component.insert(edge);
-                    let other = if edge.0 == vertex { edge.1 } else { edge.0 };
-                    if visited_vertices.insert(other) {
-                        stack.push(other);
-                    }
-                }
-            }
-        }
-        components.push(component);
-    }
-    components
+    state.dangling_edges = net_edges.difference(&looped_edges).copied().collect();
 }
 
 #[expect(
@@ -4747,5 +4193,49 @@ fn reverse_segments(
                 values[start + 1..end].reverse();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dangling_edge_tests {
+    use super::*;
+
+    fn unit_square_with_centre() -> State {
+        let mut state = State::new();
+        for co in [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.5, 0.5, 0.0],
+        ] {
+            state.add_vertex(co, NO_INDEX);
+        }
+        state.faces.push(Face {
+            verts: vec![0, 1, 2, 3],
+            side: 0,
+            source: 0,
+        });
+        state
+    }
+
+    #[test]
+    fn spur_ending_inside_a_face_stays_loose() {
+        // The square keeps its ring; the spur to the centre closes no loop, so Blender keeps it as wire.
+        let mut state = unit_square_with_centre();
+        state.face_cuts.insert(0, vec![edge_key_usize(0, 4)]);
+        split_faces(&mut state);
+        assert_eq!(state.faces.len(), 1);
+        assert_eq!(state.dangling_edges, HashSet::from([edge_key_usize(0, 4)]));
+    }
+
+    #[test]
+    fn chord_that_closes_two_rings_is_not_dangling() {
+        // A diagonal splits the square into two loops, so no split-net edge is dangling.
+        let mut state = unit_square_with_centre();
+        state.face_cuts.insert(0, vec![edge_key_usize(0, 2)]);
+        split_faces(&mut state);
+        assert_eq!(state.faces.len(), 2);
+        assert!(state.dangling_edges.is_empty());
     }
 }

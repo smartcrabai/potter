@@ -13,6 +13,7 @@
 //!   BVH breaks exact distance ties by traversal order; this port breaks them by edge order.
 //! - Islands come from union-find rather than the disk-cycle DFS. Island and vertex order only break
 //!   exact projection ties, which here take the first vertex in edge order.
+//!
 //! Blender's arm64 FMA contraction is not reproduced; the FLOAT path rounds each operation separately.
 
 use std::cmp::Ordering;
@@ -30,8 +31,8 @@ const ENDPOINT_BIAS: f32 = 1.0e-4;
 ///
 /// - `reference`: `BM_FACE_FIRST_LOOP(f)->v`, the vertex the 2D frame is relative to.
 /// - `normal`: `f->no`.
-/// - `loop_edges`: the face's loop edges from `reference` onwards, as stored on the BMesh edges.
-/// - `net`: the cut-edge net in Blender's `edge_net_init` list order, as stored on the BMesh edges.
+/// - `loop_edges`: the face's loop edges from `reference` onwards, as stored on the `BMesh` edges.
+/// - `net`: the cut-edge net in Blender's `edge_net_init` list order, as stored on the `BMesh` edges.
 /// - `positions`: coordinates indexed by vertex id.
 ///
 /// A returned pair may repeat an earlier pair or an input edge: Blender's `BM_CREATE_NO_DOUBLE` hands
@@ -271,9 +272,7 @@ impl Islands {
             }
         }
         // Blender checks the new edges only when the BVH found a hit.
-        if hit.is_none() {
-            return None;
-        }
+        hit?;
         for &e in &self.added {
             if let Some(dist) = isect_ray_seg(o, dir, self.rel[e.0], self.rel[e.1])
                 && e.0 != origin
@@ -571,6 +570,7 @@ mod tests {
             [0.0, 1.0, 0.0],
         ];
         let loop_edges = [(0, 1), (1, 2), (2, 3), (3, 0)];
-        assert!(connect_islands(0, [0.0, 0.0, 1.0], &loop_edges, &[], &square).is_empty());
+        let connects = connect_islands(0, [0.0, 0.0, 1.0], &loop_edges, &[], &square);
+        assert_eq!(connects, Vec::<(usize, usize)>::new());
     }
 }
