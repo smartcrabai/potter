@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     color::{linear_to_srgb, srgb_to_linear},
-    error::Result,
+    error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
         color_layers::{self, ColorDomain},
