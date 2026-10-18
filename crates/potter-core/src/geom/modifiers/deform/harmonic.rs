@@ -1,8 +1,9 @@
 //! Blender's harmonic-coordinates bind for Mesh Deform, ported from `meshlaplacian.cc`:
 //!
-//! - cage ray tests and the inside rule: `harmonic_ray_callback`, `meshdeform_ray_tree_intersect`,
-//!   `meshdeform_inside_cage` (lines 939-1082); ray-triangle test `isect_ray_tri_watertight_v3`
-//!   (`math_geom.cc` 1897-1998); facing is `dot(n, dir) <= 0` on the polygon normal.
+//! - cage ray tests and the inside rule: `meshdeform_ray_tree_intersect`, `harmonic_ray_callback` and
+//!   `meshdeform_inside_cage` (meshlaplacian.cc:939-1082), run on the Blender cage tree in `cage_bvh`
+//!   (corner tris, binary k-DOP tree, watertight `dfs_raycast`, with the callback's normalised distance).
+//!   Facing is `dot(n, dir) <= 0` on the polygon normal.
 //! - boundary weights: `interp_weights_poly_v3` (`math_geom.cc` 4209-4292), used for the polygon of each hit.
 //! - cell tagging and flood fill: `meshdeform_add_intersections`, `meshdeform_bind_floodfill`,
 //!   `meshdeform_check_semibound` (lines 1119-1210, 1289-1303).
@@ -14,18 +15,17 @@
 //! same matrix as triplets and factors it with the same solver through the native shim
 //! `native/meshdeform_harmonic_solve.cc`, one factorization for all cage vertices' right-hand sides.
 //!
-//! Arithmetic is `f64` where Blender uses `f32`. Comparisons, branch structure, and accumulation order
-//! follow the source.
+//! The cage ray tests (`cage_bvh`) run in `f32` as Blender does, including the tree traversal, so culling
+//! matches. Elsewhere arithmetic is `f64` where Blender uses `f32`. Comparisons, branch structure, and
+//! accumulation order follow the source.
 
 use glam::DVec3;
 
 use super::super::id_indices;
+use super::cage_bvh::{CageRayCache, Vec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{
-        Mesh,
-        triangulate::{NgonMethod, triangulate_ngon},
-    },
+    geom::Mesh,
 };
 
 /// `MESHDEFORM_MIN_INFLUENCE` (meshlaplacian.cc:850).
@@ -68,14 +68,17 @@ pub(super) struct HarmonicBindGrid {
     pub(super) cells: Vec<Vec<(usize, f64)>>,
 }
 
-/// Cage geometry in the form Blender's cage mesh cache provides: positions, polygons, a
-/// triangulation for ray tests, and per-polygon normals.
+/// Cage geometry in the form Blender's cage mesh cache provides: positions and polygons for the boundary
+/// weights, and the cage ray structures (`cage_bvh`) for the inside test and the cell-edge rays.
 struct CageGeometry {
     points: Vec<DVec3>,
     faces: Vec<Vec<usize>>,
-    triangles: Vec<[usize; 3]>,
-    tri_face: Vec<usize>,
-    face_normals: Vec<DVec3>,
+    rays: CageRayCache,
+}
+
+/// Cage-space `f32` coordinates, as Blender's bind stores them.
+fn to_vec3(point: DVec3) -> Vec3 {
+    point.as_vec3().to_array()
 }
 
 /// Cell classification, `MESHDEFORM_TAG_*` (meshlaplacian.cc:842-845).
@@ -93,25 +96,6 @@ struct BoundaryHit {
     len: f64,
     /// Mean-value weights paired with the hit polygon's corner vertices, in polygon order.
     corners: Vec<(usize, f64)>,
-}
-
-/// Result of the closest-hit ray query (`MeshDeformIsect`, meshlaplacian.cc:922-930).
-struct RayHit {
-    triangle: usize,
-    /// Hit fraction along the segment (`isec->lambda`).
-    lambda: f64,
-    /// `dot(normal, dir) <= 0` (`isec->isect`).
-    facing: bool,
-}
-
-/// Blender's `IsectRayPrecalc` (`BLI_math_geom.h`): axis permutation and shear for the watertight test.
-struct RayFrame {
-    kx: usize,
-    ky: usize,
-    kz: usize,
-    sx: f64,
-    sy: f64,
-    sz: f64,
 }
 
 /// Padded grid: Blender's `mdb->min/max/width/halfwidth` and `mdb->size` (meshlaplacian.cc:1581-1639).
@@ -221,18 +205,12 @@ pub(super) fn bind_harmonic_grid(
     })
 }
 
-/// Cage positions, polygon corners, a triangulation for ray tests, and polygon normals. Mirrors Blender's
-/// `cagemesh_cache` (meshlaplacian.cc:1611-1619).
+/// Cage positions, polygon corners, and the cage ray structures. Mirrors Blender's `cagemesh_cache` and the
+/// cage tree (meshlaplacian.cc:1611-1619, bvhutils.cc), in `cage_bvh`.
 fn cage_geometry(cage: &Mesh) -> Result<CageGeometry> {
     let indices = id_indices(cage);
     let points: Vec<DVec3> = cage.vertices.iter().map(|vertex| vertex.co).collect();
-    let mut geometry = CageGeometry {
-        points,
-        faces: Vec::with_capacity(cage.faces.len()),
-        triangles: Vec::new(),
-        tri_face: Vec::new(),
-        face_normals: Vec::with_capacity(cage.faces.len()),
-    };
+    let mut faces = Vec::with_capacity(cage.faces.len());
     for face in &cage.faces {
         let corners: Vec<usize> = face
             .vertices
@@ -248,56 +226,20 @@ fn cage_geometry(cage: &Mesh) -> Result<CageGeometry> {
                 "mesh deform cage polygons need at least three vertices",
             ));
         }
-        let face_index = geometry.faces.len();
-        for local in face_triangles(&geometry.points, &corners) {
-            geometry.triangles.push(local.map(|corner| corners[corner]));
-            geometry.tri_face.push(face_index);
-        }
-        geometry
-            .face_normals
-            .push(face_normal(&geometry.points, &corners));
-        geometry.faces.push(corners);
+        faces.push(corners);
     }
-    if geometry.triangles.is_empty() {
+    if faces.is_empty() {
         return Err(PotError::invalid_operation(
             "mesh deform harmonic binding requires cage faces",
         ));
     }
-    Ok(geometry)
-}
-
-/// Triangulation of one polygon as indices into `corners`. Triangles pass through; larger polygons use
-/// Blender's polyfill (`triangulate_ngon`, `BLI_polyfill_calc_arena` without beautify).
-fn face_triangles(points: &[DVec3], corners: &[usize]) -> Vec<[usize; 3]> {
-    if corners.len() == 3 {
-        return vec![[0, 1, 2]];
-    }
-    let positions: Vec<[f32; 3]> = corners
-        .iter()
-        .map(|&corner| points[corner].as_vec3().to_array())
-        .collect();
-    triangulate_ngon(&positions, NgonMethod::Clip)
-}
-
-/// Polygon normal used for facing. Matches Blender's face normals: triangle and quad cross products, and
-/// Newell's method for larger polygons (`normal_tri_v3`, `normal_quad_v3`, `normal_poly_v3`).
-fn face_normal(points: &[DVec3], corners: &[usize]) -> DVec3 {
-    let positions: Vec<DVec3> = corners.iter().map(|&corner| points[corner]).collect();
-    let normal = match positions.len() {
-        3 => (positions[0] - positions[1]).cross(positions[1] - positions[2]),
-        4 => (positions[0] - positions[2]).cross(positions[1] - positions[3]),
-        count => {
-            let mut normal = DVec3::ZERO;
-            for (index, &current) in positions.iter().enumerate() {
-                let previous = positions[(index + count - 1) % count];
-                normal.x += (previous.y - current.y) * (previous.z + current.z);
-                normal.y += (previous.z - current.z) * (previous.x + current.x);
-                normal.z += (previous.x - current.x) * (previous.y + current.y);
-            }
-            normal
-        }
-    };
-    normal.normalize_or_zero()
+    let cage_points: Vec<Vec3> = points.iter().map(|&point| to_vec3(point)).collect();
+    let rays = CageRayCache::new(&cage_points, &faces);
+    Ok(CageGeometry {
+        points,
+        faces,
+        rays,
+    })
 }
 
 fn limit_error() -> PotError {
@@ -389,129 +331,19 @@ fn pad_axis(low: f64, high: f64, maxwidth: f64, size: f64) -> (f64, f64, f64) {
     (min, max, (max - min) / size)
 }
 
-/// Inside test (`meshdeform_inside_cage`, meshlaplacian.cc:1060-1082): cast six axis rays of length
-/// `max - min + 1` per axis; inside when any ray's closest hit faces away from the ray.
+/// Inside test (`meshdeform_inside_cage`, meshlaplacian.cc:1060-1082), on the cage ray structures.
 fn inside_cage(geometry: &CageGeometry, grid: &Grid, point: DVec3) -> bool {
-    let extent = grid.max - grid.min + DVec3::ONE;
-    OFFSET[1..].iter().any(|&offset| {
-        let outside = point + extent * offset_vector(offset);
-        matches!(
-            closest_hit(geometry, point, outside),
-            Some(hit) if !hit.facing
-        )
-    })
-}
-
-fn offset_vector(offset: [isize; 3]) -> DVec3 {
-    DVec3::new(offset[0] as f64, offset[1] as f64, offset[2] as f64)
-}
-
-impl RayFrame {
-    /// `isect_ray_tri_watertight_v3_precalc` (math_geom.cc:1897-1922).
-    fn new(direction: DVec3) -> Self {
-        let kz = axis_dominant(direction);
-        let mut kx = if kz == 2 { 0 } else { kz + 1 };
-        let mut ky = if kx == 2 { 0 } else { kx + 1 };
-        if direction[kz] < 0.0 {
-            std::mem::swap(&mut kx, &mut ky);
-        }
-        let inv_dir_z = 1.0 / direction[kz];
-        Self {
-            kx,
-            ky,
-            kz,
-            sx: direction[kx] * inv_dir_z,
-            sy: direction[ky] * inv_dir_z,
-            sz: inv_dir_z,
-        }
-    }
-}
-
-/// `axis_dominant_v3_single` (`BLI_math_geom_inline.cc:86`).
-fn axis_dominant(vector: DVec3) -> usize {
-    let x = vector.x.abs();
-    let y = vector.y.abs();
-    let z = vector.z.abs();
-    if x > y {
-        if x > z { 0 } else { 2 }
-    } else if y > z {
-        1
-    } else {
-        2
-    }
-}
-
-/// `isect_ray_tri_watertight_v3` (math_geom.cc:1924-1998). Returns the ray parameter of a front or back hit at
-/// `t >= 0` along the unit ray direction.
-fn watertight_t(frame: &RayFrame, origin: DVec3, vertices: [DVec3; 3]) -> Option<f64> {
-    let rel = vertices.map(|vertex| vertex - origin);
-    let shear = |p: DVec3| {
-        (
-            p[frame.kx] - frame.sx * p[frame.kz],
-            p[frame.ky] - frame.sy * p[frame.kz],
-        )
-    };
-    let (ax, ay) = shear(rel[0]);
-    let (bx, by) = shear(rel[1]);
-    let (cx, cy) = shear(rel[2]);
-    let u = cx * by - cy * bx;
-    let v = ax * cy - ay * cx;
-    let w = bx * ay - by * ax;
-    if (u < 0.0 || v < 0.0 || w < 0.0) && (u > 0.0 || v > 0.0 || w > 0.0) {
-        return None;
-    }
-    let det = u + v + w;
-    if det == 0.0 || !det.is_finite() {
-        return None;
-    }
-    let t = (u * rel[0][frame.kz] + v * rel[1][frame.kz] + w * rel[2][frame.kz]) * frame.sz;
-    let sign_t = if det.is_sign_negative() { -t } else { t };
-    if sign_t < 0.0 {
-        return None;
-    }
-    Some(t * (1.0 / det))
-}
-
-/// Closest hit on segment `start..end`: `harmonic_ray_callback` with the BVH replaced by a linear scan
-/// (meshlaplacian.cc:939-983). Ties keep the first triangle, as Blender's strict `<` does.
-fn closest_hit(geometry: &CageGeometry, start: DVec3, end: DVec3) -> Option<RayHit> {
-    let segment = end - start;
-    let length = segment.length();
-    if length == 0.0 || !length.is_finite() {
-        return None;
-    }
-    let direction = segment / length;
-    let frame = RayFrame::new(direction);
-    let mut best: Option<RayHit> = None;
-    let mut best_lambda = f64::INFINITY;
-    for (triangle, &corners) in geometry.triangles.iter().enumerate() {
-        let vertices = corners.map(|corner| geometry.points[corner]);
-        let Some(distance) = watertight_t(&frame, start, vertices) else {
-            continue;
-        };
-        if distance > length {
-            continue;
-        }
-        let lambda = distance / length;
-        if lambda < best_lambda {
-            best_lambda = lambda;
-            let normal = geometry.face_normals[geometry.tri_face[triangle]];
-            best = Some(RayHit {
-                triangle,
-                lambda,
-                facing: normal.dot(direction) <= 0.0,
-            });
-        }
-    }
-    best
+    geometry
+        .rays
+        .point_inside(to_vec3(point), to_vec3(grid.min), to_vec3(grid.max))
 }
 
 /// Boundary record for one cell-edge ray (`meshdeform_ray_tree_intersect`, meshlaplacian.cc:985-1058).
 fn boundary_hit(geometry: &CageGeometry, start: DVec3, end: DVec3) -> Option<BoundaryHit> {
-    let hit = closest_hit(geometry, start, end)?;
-    let point = start + (end - start) * hit.lambda;
+    let hit = geometry.rays.closest_hit(to_vec3(start), to_vec3(end))?;
+    let point = start + (end - start) * f64::from(hit.lambda);
     let len = start.distance(point).max(LEN_THRESHOLD);
-    let corners = &geometry.faces[geometry.tri_face[hit.triangle]];
+    let corners = &geometry.faces[geometry.rays.triangle_face(hit.triangle)];
     let positions: Vec<DVec3> = corners
         .iter()
         .map(|&corner| geometry.points[corner])

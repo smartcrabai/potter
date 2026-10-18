@@ -24,6 +24,7 @@ use super::{
     validated,
 };
 
+mod cage_bvh;
 mod harmonic;
 
 /// Evaluates a bound Surface Deform from the bind-time polygon bindings; unbound leaves the mesh unchanged.
