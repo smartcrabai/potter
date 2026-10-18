@@ -287,11 +287,11 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
                     let pins = face
                         .get("pinned")
                         .map(|pins| -> TestResult<Vec<bool>> {
-                            pins.as_array()
-                                .ok_or("output UV pin row missing")?
-                                .iter()
-                                .map(|value| value.as_bool().ok_or("output UV pin must be boolean"))
-                                .collect()
+                            let mut flags = Vec::new();
+                            for value in pins.as_array().ok_or("output UV pin row missing")? {
+                                flags.push(value.as_bool().ok_or("output UV pin must be boolean")?);
+                            }
+                            Ok(flags)
                         })
                         .transpose()?
                         .unwrap_or_else(|| vec![false; values.len()]);
@@ -804,7 +804,7 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
                     "vertex group {name} multiplicity differs at position {target}"
                 ));
             }
-            for (actual_weight, expected_weight) in actual_values.iter().zip(expected_values) {
+            for (actual_weight, expected_weight) in actual_values.iter().zip(expected_values.iter()) {
                 if (actual_weight - expected_weight).abs() > 1.0e-6 {
                     return Err(format!(
                         "vertex group {name} weight {actual_weight:.9} != Blender {expected_weight:.9}"
@@ -1090,6 +1090,7 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
     let mut custom_normal_settings = BTreeSet::new();
     let mut used_meshes = BTreeSet::new();
     let mut material_indices = BTreeSet::new();
+    let mut crease_values = BTreeSet::new();
     let mut default_uv_levels = BTreeSet::new();
     let mut cube_above_quality = false;
     for case in cases {
