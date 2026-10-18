@@ -27,6 +27,9 @@ struct Report {
     max_position_error: f64,
     unmatched_rings: usize,
     ring_start_mismatches: usize,
+    vertex_order_mismatches: usize,
+    face_order_mismatches: usize,
+    edge_order_mismatches: usize,
     max_uv_error: f64,
     max_weight_error: f64,
     max_attribute_error: f64,
@@ -43,6 +46,9 @@ impl Report {
             && self.face_count.0 == self.face_count.1
             && self.unmatched_rings == 0
             && self.ring_start_mismatches == 0
+            && self.vertex_order_mismatches == 0
+            && self.face_order_mismatches == 0
+            && self.edge_order_mismatches == 0
             && self.max_position_error <= TOLERANCE
             && self.max_uv_error <= TOLERANCE
             && self.max_weight_error <= TOLERANCE
@@ -453,6 +459,29 @@ fn compare(case: &Value) -> TestResult<Report> {
         .enumerate()
         .map(|(index, v)| (v.id, index))
         .collect();
+    // Vertices are checked in pool order for every mode. Edges and faces are checked in pool order for
+    // COLLAPSE only: DISSOLVE and UNSUBDIV do not replay Blender's pool slot reuse yet.
+    let exact_order = case["spec"]["modifier"]["decimate_type"] == "COLLAPSE";
+    report.vertex_order_mismatches = (0..matched.len())
+        .filter(|&index| matched[index] != Some(index))
+        .count();
+    if exact_order {
+        let blender_edges = blender["edges"].as_array().ok_or("edges missing")?;
+        report.edge_order_mismatches = blender_edges.len().abs_diff(output.edges.len());
+        for (index, edge) in output.edges.iter().enumerate() {
+            let ends = edge.vertices.map(|id| matched[potter_index[&id]]);
+            let same = match (ends, blender_edges.get(index)) {
+                ([Some(a), Some(b)], Some(pair)) => {
+                    let [x, y] = edge_pair(pair)?;
+                    edge_key(a, b) == edge_key(x, y)
+                }
+                _ => false,
+            };
+            if !same {
+                report.edge_order_mismatches += 1;
+            }
+        }
+    }
 
     // Potter corner offsets and rings in Blender vertex indices.
     let mut potter_corner_offsets = Vec::with_capacity(output.faces.len());
@@ -515,6 +544,14 @@ fn compare(case: &Value) -> TestResult<Report> {
             continue;
         }
         matched_faces[blender_face] = true;
+        if exact_order && blender_face != face_index {
+            report.face_order_mismatches += 1;
+            if report.problems.len() < 10 {
+                report.problems.push(format!(
+                    "output face {face_index} is Blender face {blender_face}"
+                ));
+            }
+        }
         let blender_material = *blender_materials
             .get(blender_face)
             .ok_or("material_index is shorter than the faces")?;

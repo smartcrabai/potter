@@ -194,6 +194,31 @@ struct Face {
     origin: usize,
     alive: bool,
     tag: bool,
+    /// `BLI_mempool` slot of this face (see [`FaceSlots`]).
+    slot: usize,
+}
+
+/// Blender's `BLI_mempool` slots for faces. `BLI_mempool_alloc` takes the head of the free list, which
+/// holds freed slots last-freed-first and then never-used slots in order, so a new face takes the most
+/// recently freed slot. `BM_mesh_bm_to_me` emits faces in slot order.
+#[derive(Default)]
+struct FaceSlots {
+    fresh: usize,
+    freed: Vec<usize>,
+}
+
+impl FaceSlots {
+    fn alloc(&mut self) -> usize {
+        if let Some(slot) = self.freed.pop() {
+            return slot;
+        }
+        self.fresh += 1;
+        self.fresh - 1
+    }
+
+    fn release(&mut self, slot: usize) {
+        self.freed.push(slot);
+    }
 }
 
 /// The BMesh-shaped topology the collapse works on. Elements live in arenas indexed by creation order;
@@ -208,6 +233,8 @@ struct BMesh {
     uv: Vec<[f32; 2]>,
     uv_stride: usize,
     totface: usize,
+    /// Blender's `BMFace` pool slots; live faces are output in slot order.
+    face_slots: FaceSlots,
     /// Data type of each POINT attribute, in the order of every vertex's `point` values.
     point_types: Vec<String>,
     /// Data type of each EDGE attribute, in the order of every edge's `attributes` values.
@@ -408,8 +435,14 @@ impl BMesh {
         self.edges[e].alive = false;
     }
 
-    /// `BM_face_kill`.
+    /// `BM_face_kill`: unlinks the face and releases its pool slot.
     fn face_kill(&mut self, f: usize) {
+        self.face_unlink(f);
+        self.face_slots.release(self.faces[f].slot);
+    }
+
+    /// The loop and radial part of `BM_face_kill`, leaving the pool slot to the caller.
+    fn face_unlink(&mut self, f: usize) {
         let first = self.faces[f].first;
         let mut l = first;
         loop {
@@ -486,6 +519,7 @@ impl BMesh {
             self.radial_append(edges[k], first + k);
         }
         self.uv.resize(self.loops.len() * self.uv_stride, [0.0; 2]);
+        let slot = self.face_slots.alloc();
         let source = &self.faces[example];
         let face = Face {
             first,
@@ -495,6 +529,7 @@ impl BMesh {
             origin: source.origin,
             alive: true,
             tag: false,
+            slot,
         };
         self.faces.push(face);
         self.totface += 1;
@@ -731,6 +766,7 @@ impl BMesh {
         };
         let mut new_faces = Vec::new();
         let mut new_edges = Vec::new();
+        let mut last_face = NONE;
         for (i, tri) in tris.iter().enumerate() {
             let ltri = [order[tri[0]], order[tri[1]], order[tri[2]]];
             let verts = [
@@ -739,6 +775,7 @@ impl BMesh {
                 self.loops[ltri[2]].v,
             ];
             let face = self.face_create_verts(&verts, f);
+            last_face = face;
             let first = self.faces[face].first;
             let first_next = self.loops[first].next;
             let first_prev = self.loops[first].prev;
@@ -792,7 +829,11 @@ impl BMesh {
             let points = self.face_points(face);
             self.faces[face].no = face_normal(&points);
         }
-        self.face_kill(f);
+        // Blender swaps the last triangle into `f`'s pool slot and frees the slot it was created in.
+        let released = self.faces[last_face].slot;
+        self.face_slots.release(released);
+        self.faces[last_face].slot = self.faces[f].slot;
+        self.face_unlink(f);
         !new_edges.is_empty()
     }
 
@@ -1377,6 +1418,7 @@ fn bmesh_from_mesh(
         uv: Vec::new(),
         uv_stride,
         totface: 0,
+        face_slots: FaceSlots::default(),
         point_types: point
             .iter()
             .map(|attribute| attribute.data_type.clone())
@@ -1430,6 +1472,7 @@ fn bmesh_from_mesh(
         }
         corner += n;
         let verts: Vec<[f32; 3]> = indices.iter().map(|&i| points[i]).collect();
+        let slot = bm.face_slots.alloc();
         bm.faces.push(Face {
             first,
             len: n,
@@ -1438,6 +1481,7 @@ fn bmesh_from_mesh(
             origin: face_index,
             alive: true,
             tag: false,
+            slot,
         });
         bm.totface += 1;
     }
@@ -2104,10 +2148,11 @@ impl Decimator {
         let mut faces_origin = Vec::new();
         let mut corner_uv: Vec<CornerUv> = Vec::new();
         let mut ring = Vec::new();
-        for f in 0..self.bm.faces.len() {
-            if !self.bm.faces[f].alive {
-                continue;
-            }
+        let mut order: Vec<usize> = (0..self.bm.faces.len())
+            .filter(|&f| self.bm.faces[f].alive)
+            .collect();
+        order.sort_by_key(|&f| self.bm.faces[f].slot);
+        for f in order {
             self.bm.face_loops(f, &mut ring);
             let verts = ring
                 .iter()
@@ -2162,7 +2207,18 @@ impl Decimator {
         } else {
             Vec::new()
         };
+        let edge_order = self
+            .bm
+            .edges
+            .iter()
+            .filter(|edge| edge.alive)
+            .map(|edge| {
+                let [first, second] = edge.v.map(|vertex| out_vertex[vertex]);
+                [first.min(second), first.max(second)]
+            })
+            .collect();
         Output {
+            edge_order,
             points,
             polygons,
             loose,
@@ -2190,6 +2246,8 @@ struct Output {
     edge_attributes: Vec<([usize; 2], Vec<Value>)>,
     /// Per output edge, sorted endpoint indices and Blender's seam/sharp flags when present.
     edge_flags: Vec<([usize; 2], EdgeFlags)>,
+    /// Alive edges as sorted output-vertex pairs, in Blender's edge-pool order.
+    edge_order: Vec<[usize; 2]>,
 }
 
 /// `Polygon` of `modifiers.rs`: vertex indices and material index.
@@ -2438,6 +2496,23 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
         mesh,
         &keep_vertices,
     )?;
+    // Blender's edges are in edge-pool order (mesh edges, then diagonals), not face order.
+    let rank: HashMap<[usize; 2], usize> = output
+        .edge_order
+        .iter()
+        .enumerate()
+        .map(|(rank, pair)| (*pair, rank))
+        .collect();
+    let index_of: HashMap<u32, usize> = out
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    out.edges.sort_by_key(|edge| {
+        let [a, b] = edge.vertices.map(|id| index_of[&id]);
+        rank[&[a.min(b), a.max(b)]]
+    });
     super::collapse_write_uv(&mut out, &layer_names, &output.corner_uv)?;
     collapse_write_point(&mut out, &point_attributes, &output.point)?;
     collapse_write_edge(&mut out, &edge_attributes, output.edge_attributes)?;
