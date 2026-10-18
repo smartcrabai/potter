@@ -500,6 +500,12 @@ fn operation_schema(name: &str) -> Value {
             {"if":{"required":["keep_world"]},"then":{"required":["reparent"]}}
         ]);
     }
+    if name == "resource.pack" {
+        result["allOf"] = json!([{
+            "if":{"required":["sequence"]},
+            "then":{"required":["kind"],"properties":{"kind":{"const":"alembic"}}}
+        }]);
+    }
     if name == "collection.link" || name == "collection.unlink" {
         result["oneOf"] = json!([{"required":["object"],"not":{"required":["child"]}},{"required":["child"],"not":{"required":["object"]}}]);
     }
@@ -1707,6 +1713,20 @@ fn operation_contract(name: &str) -> OperationContract {
             "none",
             json!({}),
         ),
+        "resource.pack" => (
+            vec!["id", "uri", "kind", "sequence"],
+            vec!["op", "id", "uri"],
+            "binary resource",
+            "none",
+            json!({"kind":"binary","sequence":"inclusive int32 range for Alembic file sequences"}),
+        ),
+        "resource.unpack" => (
+            vec!["id", "path"],
+            vec!["op", "id"],
+            "binary resource",
+            "none",
+            json!({}),
+        ),
         "avatar.clear" => (vec![], vec!["op"], "avatar settings", "none", json!({})),
         "avatar.update" => (
             vec!["set"],
@@ -1736,6 +1756,28 @@ fn operation_contract(name: &str) -> OperationContract {
 fn field_schema(operation: &str, field: &str) -> Value {
     if operation == "avatar.update" && field == "set" {
         return avatar_update_set_schema();
+    }
+    if operation == "resource.pack" {
+        return match field {
+            "uri" => json!({"type":"string"}),
+            "kind" => json!({"type":"string","minLength":1,"default":"binary"}),
+            "sequence" => json!({
+                "type":"object",
+                "required":["start","end"],
+                "properties":{
+                    "start":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},
+                    "end":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},
+                },
+                "additionalProperties":false,
+            }),
+            _ => common_field_schema(field),
+        };
+    }
+    if operation == "resource.unpack" {
+        return match field {
+            "path" => json!({"type":"string"}),
+            _ => common_field_schema(field),
+        };
     }
     if matches!(
         operation,
