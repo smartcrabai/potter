@@ -1,0 +1,343 @@
+{
+ "case": "cube_closed_extrude",
+ "purpose": "closed asymmetric cube, inward offset",
+ "material_slots": 1,
+ "material_slot_layout": [
+  true
+ ],
+ "modifier": {
+  "type": "solidify",
+  "params": {
+   "solidify_mode": "EXTRUDE",
+   "thickness": 0.05,
+   "thickness_clamp": 0.0,
+   "use_thickness_angle_clamp": false,
+   "thickness_vertex_group": 0.0,
+   "offset": -1.0,
+   "edge_crease_inner": 0.0,
+   "edge_crease_outer": 0.0,
+   "edge_crease_rim": 0.0,
+   "material_offset": 0,
+   "material_offset_rim": 0,
+   "vertex_group": "",
+   "shell_vertex_group": "",
+   "rim_vertex_group": "",
+   "use_rim": true,
+   "use_even_offset": false,
+   "use_quality_normals": false,
+   "invert_vertex_group": false,
+   "use_flat_faces": false,
+   "use_flip_normals": false,
+   "use_rim_only": false,
+   "nonmanifold_thickness_mode": "CONSTRAINTS",
+   "nonmanifold_boundary_mode": "NONE",
+   "nonmanifold_merge_threshold": 9.999999747378752e-05,
+   "bevel_convex": 0.0,
+   "use_pin_to_last": false,
+   "use_apply_on_spline": false
+  }
+ },
+ "mesh": {
+  "vertices": [
+   {
+    "id": 0,
+    "co": [
+     0.3,
+     -0.2,
+     0.1
+    ]
+   },
+   {
+    "id": 1,
+    "co": [
+     1.3,
+     -0.2,
+     0.1
+    ]
+   },
+   {
+    "id": 2,
+    "co": [
+     1.3,
+     0.39999999999999997,
+     0.1
+    ]
+   },
+   {
+    "id": 3,
+    "co": [
+     0.3,
+     0.39999999999999997,
+     0.1
+    ]
+   },
+   {
+    "id": 4,
+    "co": [
+     0.3,
+     -0.2,
+     1.5
+    ]
+   },
+   {
+    "id": 5,
+    "co": [
+     1.3,
+     -0.2,
+     1.5
+    ]
+   },
+   {
+    "id": 6,
+    "co": [
+     1.3,
+     0.39999999999999997,
+     1.5
+    ]
+   },
+   {
+    "id": 7,
+    "co": [
+     0.3,
+     0.39999999999999997,
+     1.5
+    ]
+   }
+  ],
+  "edges": [
+   {
+    "id": 0,
+    "v": [
+     0,
+     3
+    ]
+   },
+   {
+    "id": 1,
+    "v": [
+     2,
+     3
+    ]
+   },
+   {
+    "id": 2,
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "id": 3,
+    "v": [
+     0,
+     1
+    ]
+   },
+   {
+    "id": 4,
+    "v": [
+     4,
+     5
+    ]
+   },
+   {
+    "id": 5,
+    "v": [
+     5,
+     6
+    ]
+   },
+   {
+    "id": 6,
+    "v": [
+     6,
+     7
+    ]
+   },
+   {
+    "id": 7,
+    "v": [
+     4,
+     7
+    ]
+   },
+   {
+    "id": 8,
+    "v": [
+     1,
+     5
+    ]
+   },
+   {
+    "id": 9,
+    "v": [
+     0,
+     4
+    ]
+   },
+   {
+    "id": 10,
+    "v": [
+     3,
+     7
+    ]
+   },
+   {
+    "id": 11,
+    "v": [
+     2,
+     6
+    ]
+   }
+  ],
+  "faces": [
+   {
+    "id": 0,
+    "v": [
+     0,
+     3,
+     2,
+     1
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 1,
+    "v": [
+     4,
+     5,
+     6,
+     7
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 2,
+    "v": [
+     0,
+     1,
+     5,
+     4
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 3,
+    "v": [
+     3,
+     7,
+     6,
+     2
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 4,
+    "v": [
+     0,
+     4,
+     7,
+     3
+    ],
+    "material_index": 0
+   },
+   {
+    "id": 5,
+    "v": [
+     1,
+     2,
+     6,
+     5
+    ],
+    "material_index": 0
+   }
+  ],
+  "attributes": {
+   "shade_smooth": {
+    "domain": "face",
+    "type": "bool",
+    "values": {
+     "f0": false,
+     "f1": false,
+     "f2": false,
+     "f3": false,
+     "f4": false,
+     "f5": false
+    }
+   },
+   "sharp": {
+    "domain": "edge",
+    "type": "bool",
+    "values": {
+     "e0": false,
+     "e1": false,
+     "e2": false,
+     "e3": false,
+     "e4": false,
+     "e5": false,
+     "e6": false,
+     "e7": false,
+     "e8": false,
+     "e9": false,
+     "e10": false,
+     "e11": false
+    }
+   },
+   "blender_edge_flags": [
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    }
+   ]
+  },
+  "next_id": {
+   "vertex": 8,
+   "edge": 12,
+   "face": 6
+  }
+ }
+}

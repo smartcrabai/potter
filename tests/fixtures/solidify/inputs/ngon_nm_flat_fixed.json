@@ -1,0 +1,202 @@
+{
+ "case": "ngon_nm_flat_fixed",
+ "purpose": "concave n-gon in NON_MANIFOLD, FIXED, FLAT",
+ "material_slots": 1,
+ "material_slot_layout": [
+  true
+ ],
+ "modifier": {
+  "type": "solidify",
+  "params": {
+   "solidify_mode": "NON_MANIFOLD",
+   "thickness": 0.3,
+   "thickness_clamp": 0.0,
+   "use_thickness_angle_clamp": false,
+   "thickness_vertex_group": 0.0,
+   "offset": -1.0,
+   "edge_crease_inner": 0.0,
+   "edge_crease_outer": 0.0,
+   "edge_crease_rim": 0.0,
+   "material_offset": 0,
+   "material_offset_rim": 0,
+   "vertex_group": "",
+   "shell_vertex_group": "",
+   "rim_vertex_group": "",
+   "use_rim": true,
+   "use_even_offset": false,
+   "use_quality_normals": false,
+   "invert_vertex_group": false,
+   "use_flat_faces": false,
+   "use_flip_normals": false,
+   "use_rim_only": false,
+   "nonmanifold_thickness_mode": "FIXED",
+   "nonmanifold_boundary_mode": "FLAT",
+   "nonmanifold_merge_threshold": 9.999999747378752e-05,
+   "bevel_convex": 0.0,
+   "use_pin_to_last": false,
+   "use_apply_on_spline": false
+  }
+ },
+ "mesh": {
+  "vertices": [
+   {
+    "id": 0,
+    "co": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "id": 1,
+    "co": [
+     2.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "id": 2,
+    "co": [
+     2.0,
+     1.0,
+     0.2
+    ]
+   },
+   {
+    "id": 3,
+    "co": [
+     1.0,
+     1.0,
+     0.1
+    ]
+   },
+   {
+    "id": 4,
+    "co": [
+     1.0,
+     2.0,
+     0.4
+    ]
+   },
+   {
+    "id": 5,
+    "co": [
+     0.0,
+     2.0,
+     0.0
+    ]
+   }
+  ],
+  "edges": [
+   {
+    "id": 0,
+    "v": [
+     0,
+     1
+    ]
+   },
+   {
+    "id": 1,
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "id": 2,
+    "v": [
+     2,
+     3
+    ]
+   },
+   {
+    "id": 3,
+    "v": [
+     3,
+     4
+    ]
+   },
+   {
+    "id": 4,
+    "v": [
+     4,
+     5
+    ]
+   },
+   {
+    "id": 5,
+    "v": [
+     0,
+     5
+    ]
+   }
+  ],
+  "faces": [
+   {
+    "id": 0,
+    "v": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ],
+    "material_index": 0
+   }
+  ],
+  "attributes": {
+   "shade_smooth": {
+    "domain": "face",
+    "type": "bool",
+    "values": {
+     "f0": false
+    }
+   },
+   "sharp": {
+    "domain": "edge",
+    "type": "bool",
+    "values": {
+     "e0": false,
+     "e1": false,
+     "e2": false,
+     "e3": false,
+     "e4": false,
+     "e5": false
+    }
+   },
+   "blender_edge_flags": [
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    },
+    {
+     "sharp": false,
+     "seam": false
+    }
+   ]
+  },
+  "next_id": {
+   "vertex": 6,
+   "edge": 6,
+   "face": 1
+  }
+ }
+}

@@ -1,0 +1,863 @@
+{
+ "case": "grid_loose_edges",
+ "blender_version": "5.2.2",
+ "input_normal_codec_max_error": null,
+ "outcome": "ok",
+ "output": {
+  "vertices": [
+   [
+    -0.011049390770494938,
+    -0.004593410063534975,
+    0.07403925806283951
+   ],
+   [
+    0.9987162351608276,
+    0.06965232640504837,
+    0.315877765417099
+   ],
+   [
+    2.0138630867004395,
+    0.28648290038108826,
+    0.20229731500148773
+   ],
+   [
+    3.015850067138672,
+    0.6377994418144226,
+    -0.0990515649318695
+   ],
+   [
+    0.11487241834402084,
+    0.8978683352470398,
+    0.2358485609292984
+   ],
+   [
+    1.1258798837661743,
+    0.9727091789245605,
+    0.30204442143440247
+   ],
+   [
+    2.1346354484558105,
+    1.1868634223937988,
+    0.03380084037780762
+   ],
+   [
+    3.1302895545959473,
+    1.5350632667541504,
+    -0.17430469393730164
+   ],
+   [
+    0.24266712367534637,
+    1.801108717918396,
+    0.3213067948818207
+   ],
+   [
+    1.2520933151245117,
+    1.8754116296768188,
+    0.1806654930114746
+   ],
+   [
+    2.2514808177948,
+    2.0853633880615234,
+    -0.11527888476848602
+   ],
+   [
+    3.247246742248535,
+    2.433566093444824,
+    -0.1335030049085617
+   ],
+   [
+    0.546513020992279,
+    -0.6558156609535217,
+    0.21860522031784058
+   ],
+   [
+    1.5642071962356567,
+    -0.9385242462158203,
+    0.10428047925233841
+   ],
+   [
+    0.011049390770494938,
+    0.004593410063534975,
+    -0.07403925806283951
+   ],
+   [
+    1.0012837648391724,
+    0.07034767419099808,
+    0.1659013330936432
+   ],
+   [
+    1.9861369132995605,
+    0.27351710200309753,
+    0.05545337498188019
+   ],
+   [
+    2.984149932861328,
+    0.6222005486488342,
+    -0.24483150243759155
+   ],
+   [
+    0.12512756884098053,
+    0.9021316170692444,
+    0.08626027405261993
+   ],
+   [
+    1.1141201257705688,
+    0.9672908782958984,
+    0.15260428190231323
+   ],
+   [
+    2.1053643226623535,
+    1.1731364727020264,
+    -0.11267368495464325
+   ],
+   [
+    3.109710216522217,
+    1.5249366760253906,
+    -0.322540819644928
+   ],
+   [
+    0.23733286559581757,
+    1.7988911867141724,
+    0.17141807079315186
+   ],
+   [
+    1.2279067039489746,
+    1.8645883798599243,
+    0.03302445262670517
+   ],
+   [
+    2.2285192012786865,
+    2.074636459350586,
+    -0.2631223797798157
+   ],
+   [
+    3.232753276824951,
+    2.42643404006958,
+    -0.2826307415962219
+   ],
+   [
+    0.45348697900772095,
+    -0.5441843867301941,
+    0.1813947856426239
+   ],
+   [
+    1.4357928037643433,
+    -0.8614757061004639,
+    0.09571952372789383
+   ]
+  ],
+  "edges": [
+   {
+    "v": [
+     12,
+     13
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     0,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     0,
+     4
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     0,
+     1
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     1,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     4,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     1,
+     2
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     2,
+     6
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     5,
+     6
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     2,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     3,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     6,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     4,
+     8
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     5,
+     9
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     8,
+     9
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     6,
+     10
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     9,
+     10
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     7,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     10,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     26,
+     27
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     14,
+     19
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     14,
+     18
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     14,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     15,
+     19
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     18,
+     19
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     15,
+     16
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     16,
+     20
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     19,
+     20
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     16,
+     17
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     17,
+     21
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     20,
+     21
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     18,
+     22
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     19,
+     23
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     22,
+     23
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     20,
+     24
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     23,
+     24
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     21,
+     25
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     24,
+     25
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     0,
+     14
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     1,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     2,
+     16
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     3,
+     17
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     4,
+     18
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     7,
+     21
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     8,
+     22
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     9,
+     23
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     10,
+     24
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     11,
+     25
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   }
+  ],
+  "faces": [
+   {
+    "v": [
+     0,
+     1,
+     5,
+     4
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     1,
+     2,
+     6,
+     5
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     2,
+     3,
+     7,
+     6
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     4,
+     5,
+     9,
+     8
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     5,
+     6,
+     10,
+     9
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     6,
+     7,
+     11,
+     10
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     14,
+     18,
+     19,
+     15
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     15,
+     19,
+     20,
+     16
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     16,
+     20,
+     21,
+     17
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     18,
+     22,
+     23,
+     19
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     19,
+     23,
+     24,
+     20
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     20,
+     24,
+     25,
+     21
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     0,
+     4,
+     18,
+     14
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     1,
+     0,
+     14,
+     15
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     2,
+     1,
+     15,
+     16
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     3,
+     2,
+     16,
+     17
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     7,
+     3,
+     17,
+     21
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     4,
+     8,
+     22,
+     18
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     9,
+     23,
+     22
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     9,
+     10,
+     24,
+     23
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     11,
+     7,
+     21,
+     25
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     10,
+     11,
+     25,
+     24
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   }
+  ],
+  "vertex_groups": {},
+  "uv_layer_names": [],
+  "color_attribute_names": [],
+  "has_custom_normals": false,
+  "topology": {
+   "vertices": 28,
+   "edges": 48,
+   "faces": 22,
+   "loops": 88,
+   "loose_edges": 4
+  },
+  "canonical_hash": "dd708d73d223c0667a0f05306312f6e87f4b8737c9a2b6e2df4dff78283c0881"
+ },
+ "output_normal_codec_max_error": null
+}

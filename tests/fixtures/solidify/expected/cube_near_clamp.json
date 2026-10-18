@@ -1,0 +1,467 @@
+{
+ "case": "cube_near_clamp",
+ "blender_version": "5.2.2",
+ "input_normal_codec_max_error": null,
+ "outcome": "ok",
+ "output": {
+  "vertices": [
+   [
+    0.0834936648607254,
+    -0.4165063500404358,
+    -0.11650634557008743
+   ],
+   [
+    1.516506314277649,
+    -0.4165063500404358,
+    -0.11650634557008743
+   ],
+   [
+    1.516506314277649,
+    0.6165063381195068,
+    -0.11650634557008743
+   ],
+   [
+    0.0834936648607254,
+    0.6165063381195068,
+    -0.11650634557008743
+   ],
+   [
+    0.0834936648607254,
+    -0.4165063500404358,
+    1.7165063619613647
+   ],
+   [
+    1.516506314277649,
+    -0.4165063500404358,
+    1.7165063619613647
+   ],
+   [
+    1.516506314277649,
+    0.6165063381195068,
+    1.7165063619613647
+   ],
+   [
+    0.0834936648607254,
+    0.6165063381195068,
+    1.7165063619613647
+   ],
+   [
+    0.37216877937316895,
+    -0.12783122062683105,
+    0.1721687912940979
+   ],
+   [
+    1.2278311252593994,
+    -0.12783122062683105,
+    0.1721687912940979
+   ],
+   [
+    1.2278311252593994,
+    0.3278312087059021,
+    0.1721687912940979
+   ],
+   [
+    0.37216877937316895,
+    0.3278312087059021,
+    0.1721687912940979
+   ],
+   [
+    0.37216877937316895,
+    -0.12783122062683105,
+    1.4278311729431152
+   ],
+   [
+    1.2278311252593994,
+    -0.12783122062683105,
+    1.4278311729431152
+   ],
+   [
+    1.2278311252593994,
+    0.3278312087059021,
+    1.4278311729431152
+   ],
+   [
+    0.37216877937316895,
+    0.3278312087059021,
+    1.4278311729431152
+   ]
+  ],
+  "edges": [
+   {
+    "v": [
+     0,
+     1
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     0,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     2,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     1,
+     2
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     4,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     4,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     5,
+     6
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     6,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     0,
+     4
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     1,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     3,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     2,
+     6
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     8,
+     9
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     8,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     10,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     9,
+     10
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     12,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     12,
+     13
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     13,
+     14
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     14,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     8,
+     12
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     9,
+     13
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     11,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     10,
+     14
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   }
+  ],
+  "faces": [
+   {
+    "v": [
+     0,
+     3,
+     2,
+     1
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     4,
+     5,
+     6,
+     7
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     0,
+     1,
+     5,
+     4
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     3,
+     7,
+     6,
+     2
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     0,
+     4,
+     7,
+     3
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     1,
+     2,
+     6,
+     5
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     9,
+     10,
+     11
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     12,
+     15,
+     14,
+     13
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     12,
+     13,
+     9
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     11,
+     10,
+     14,
+     15
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     11,
+     15,
+     12
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     9,
+     13,
+     14,
+     10
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   }
+  ],
+  "vertex_groups": {},
+  "uv_layer_names": [],
+  "color_attribute_names": [],
+  "has_custom_normals": false,
+  "topology": {
+   "vertices": 16,
+   "edges": 24,
+   "faces": 12,
+   "loops": 48,
+   "loose_edges": 0
+  },
+  "canonical_hash": "04556ee8083999af21252e4d4d8f77706d343da4b8dd57af8dad141b78af8dd4"
+ },
+ "output_normal_codec_max_error": null
+}

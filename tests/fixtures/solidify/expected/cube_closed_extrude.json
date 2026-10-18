@@ -1,0 +1,467 @@
+{
+ "case": "cube_closed_extrude",
+ "blender_version": "5.2.2",
+ "input_normal_codec_max_error": null,
+ "outcome": "ok",
+ "output": {
+  "vertices": [
+   [
+    0.30000001192092896,
+    -0.20000000298023224,
+    0.10000000149011612
+   ],
+   [
+    1.2999999523162842,
+    -0.20000000298023224,
+    0.10000000149011612
+   ],
+   [
+    1.2999999523162842,
+    0.4000000059604645,
+    0.10000000149011612
+   ],
+   [
+    0.30000001192092896,
+    0.4000000059604645,
+    0.10000000149011612
+   ],
+   [
+    0.30000001192092896,
+    -0.20000000298023224,
+    1.5
+   ],
+   [
+    1.2999999523162842,
+    -0.20000000298023224,
+    1.5
+   ],
+   [
+    1.2999999523162842,
+    0.4000000059604645,
+    1.5
+   ],
+   [
+    0.30000001192092896,
+    0.4000000059604645,
+    1.5
+   ],
+   [
+    0.32886752486228943,
+    -0.17113249003887177,
+    0.128867506980896
+   ],
+   [
+    1.271132469177246,
+    -0.17113249003887177,
+    0.128867506980896
+   ],
+   [
+    1.271132469177246,
+    0.371132493019104,
+    0.128867506980896
+   ],
+   [
+    0.32886752486228943,
+    0.371132493019104,
+    0.128867506980896
+   ],
+   [
+    0.32886752486228943,
+    -0.17113249003887177,
+    1.471132516860962
+   ],
+   [
+    1.271132469177246,
+    -0.17113249003887177,
+    1.471132516860962
+   ],
+   [
+    1.271132469177246,
+    0.371132493019104,
+    1.471132516860962
+   ],
+   [
+    0.32886752486228943,
+    0.371132493019104,
+    1.471132516860962
+   ]
+  ],
+  "edges": [
+   {
+    "v": [
+     0,
+     1
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     0,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     2,
+     3
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     1,
+     2
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     4,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     4,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     5,
+     6
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     6,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     0,
+     4
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     1,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     3,
+     7
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     2,
+     6
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     8,
+     9
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     8,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     10,
+     11
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     9,
+     10
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     12,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     12,
+     13
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     13,
+     14
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     14,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     8,
+     12
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     9,
+     13
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     11,
+     15
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     10,
+     14
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   }
+  ],
+  "faces": [
+   {
+    "v": [
+     0,
+     3,
+     2,
+     1
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     4,
+     5,
+     6,
+     7
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     0,
+     1,
+     5,
+     4
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     3,
+     7,
+     6,
+     2
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     0,
+     4,
+     7,
+     3
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     1,
+     2,
+     6,
+     5
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     9,
+     10,
+     11
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     12,
+     15,
+     14,
+     13
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     12,
+     13,
+     9
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     11,
+     10,
+     14,
+     15
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     8,
+     11,
+     15,
+     12
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   },
+   {
+    "v": [
+     9,
+     13,
+     14,
+     10
+    ],
+    "material_index": 0,
+    "smooth": false,
+    "uv": {},
+    "colors": {}
+   }
+  ],
+  "vertex_groups": {},
+  "uv_layer_names": [],
+  "color_attribute_names": [],
+  "has_custom_normals": false,
+  "topology": {
+   "vertices": 16,
+   "edges": 24,
+   "faces": 12,
+   "loops": 48,
+   "loose_edges": 0
+  },
+  "canonical_hash": "2f58a629e6ca2f3db9086664067d99fe1e975158f509c17b4100ab01e6ae5e79"
+ },
+ "output_normal_codec_max_error": null
+}

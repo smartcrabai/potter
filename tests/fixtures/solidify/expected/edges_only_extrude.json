@@ -1,0 +1,92 @@
+{
+ "case": "edges_only_extrude",
+ "blender_version": "5.2.2",
+ "input_normal_codec_max_error": null,
+ "outcome": "ok",
+ "output": {
+  "vertices": [
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    1.0,
+    0.0,
+    0.0
+   ],
+   [
+    1.0,
+    1.0,
+    0.0
+   ],
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    0.800000011920929,
+    0.0,
+    0.0
+   ],
+   [
+    0.858578622341156,
+    0.858578622341156,
+    0.0
+   ]
+  ],
+  "edges": [
+   {
+    "v": [
+     0,
+     1
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     1,
+     2
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     3,
+     4
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   },
+   {
+    "v": [
+     4,
+     5
+    ],
+    "sharp": false,
+    "seam": false,
+    "crease": 0.0
+   }
+  ],
+  "faces": [],
+  "vertex_groups": {},
+  "uv_layer_names": [],
+  "color_attribute_names": [],
+  "has_custom_normals": false,
+  "topology": {
+   "vertices": 6,
+   "edges": 4,
+   "faces": 0,
+   "loops": 0,
+   "loose_edges": 4
+  },
+  "canonical_hash": "3b6cac787d21eb35171663dee3dac163b014d47972618c6956d8a4c390189b78"
+ },
+ "output_normal_codec_max_error": null
+}

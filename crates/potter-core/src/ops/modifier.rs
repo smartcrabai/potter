@@ -1287,6 +1287,11 @@ fn evaluate_modifier_output(
                     purpose: crate::eval::EvaluationPurpose::Preview,
                     project_root: engine.asset_root,
                     cache_directory: engine.cache_directory,
+                    material_slot_count: engine
+                        .doc
+                        .nodes
+                        .get(target)
+                        .map(|node| node.material_slot_count(Some(data_block))),
                 },
                 |_, modifier| modifier.enabled,
                 |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
