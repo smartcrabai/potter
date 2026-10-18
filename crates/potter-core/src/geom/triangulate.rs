@@ -183,7 +183,9 @@ fn project(normal: Vec3, point: Vec3) -> Vec2 {
     [dot3(n1, point), dot3(n2, point)]
 }
 
-/// Newell's method over the corners, as in `bm_face_calc_poly_normal`.
+/// Newell's method over the corners, as `mesh_calc_tessellation_for_face_impl` and
+/// `normal_calc_ngon` (`bke/mesh_normals.cc`). A zero sum (a face with no net area, such as a
+/// collinear or self-cancelling n-gon) falls back to +Z, which chooses the projection plane.
 fn face_normal(corners: &[Vec3]) -> Vec3 {
     let mut normal = [0.0_f32; 3];
     let Some(&last) = corners.last() else {
@@ -196,7 +198,8 @@ fn face_normal(corners: &[Vec3]) -> Vec3 {
         normal[2] += (prev[0] - curr[0]) * (prev[1] + curr[1]);
         prev = curr;
     }
-    normalize3(normal).0
+    let (unit, length) = normalize3(normal);
+    if length == 0.0 { [0.0, 0.0, 1.0] } else { unit }
 }
 
 /// `is_quad_flip_v3`: bit 0 when the 0-2 diagonal is concave, bit 1 for the 1-3 diagonal.

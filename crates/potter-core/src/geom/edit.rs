@@ -11,6 +11,7 @@ use crate::{
         clnor::{self, NormalCodeOptions, SetterInput},
         color_layers::{self, ColorDomain, ColorLayer},
         edge_key,
+        triangulate::{NgonMethod, QuadMethod, triangulate_mesh},
         uv_layers::{self, UvLayer, UvStore},
     },
 };
@@ -1626,34 +1627,24 @@ fn apply_triangulate(mesh: &mut Mesh, selected: &Selection) -> Result<IdChanges>
         .collect();
     let mut changes = IdChanges::default();
     for face in faces {
-        let positions: Vec<_> = face
+        let corners: Vec<[f32; 3]> = face
             .vertices
             .iter()
             .map(|id| {
                 mesh.vertex(*id)
-                    .map(|vertex| vertex.co)
+                    .map(|vertex| vertex.co.as_vec3().to_array())
                     .ok_or_else(|| invalid("face references a missing vertex"))
             })
             .collect::<Result<_>>()?;
-        let polygon: Vec<_> = (0..face.vertices.len()).collect();
-        let temporary = Mesh::from_positions_and_faces(positions, vec![polygon])
-            .map_err(|error| mesh_error(&error))?;
-        let triangles = temporary
-            .triangulate()
-            .map_err(|error| mesh_error(&error))?;
+        // Blender's Triangulate Faces runs `bmesh.ops.triangulate` with BEAUTY quads and n-gons.
+        let polygons = triangulate_mesh(&[corners], QuadMethod::Beauty, NgonMethod::Beauty, 3);
         remove_face(mesh, face.id, &mut changes);
-        for triangle in triangles {
-            let mut mapped = Vec::with_capacity(3);
-            for temporary_id in triangle {
-                let index = usize::try_from(temporary_id)
-                    .map_err(|_| invalid("temporary triangulation index is out of range"))?;
-                mapped.push(
-                    *face
-                        .vertices
-                        .get(index)
-                        .ok_or_else(|| invalid("temporary triangulation index is invalid"))?,
-                );
-            }
+        for polygon in polygons {
+            let mapped: Vec<u32> = polygon
+                .corners
+                .iter()
+                .map(|&index| face.vertices[index])
+                .collect();
             insert_face(mesh, mapped, face.material_index, &mut changes)?;
         }
     }
@@ -4743,7 +4734,7 @@ mod tests {
         )
         .unwrap();
 
-        let triangles = mesh.triangulate().unwrap();
+        let triangles = mesh.tessellate().unwrap();
         assert_eq!(triangles.len(), 2);
         assert_eq!(result["created"]["faces"].as_array().unwrap().len(), 2);
         assert_eq!(result["deleted"]["faces"], json!(["f0"]));
@@ -4773,7 +4764,7 @@ mod tests {
             (mesh.vertices.len(), mesh.edges.len(), mesh.faces.len()),
             (8, 12, 5)
         );
-        assert_eq!(mesh.triangulate().unwrap().len(), 10);
+        assert_eq!(mesh.tessellate().unwrap().len(), 10);
         assert_eq!(result["created"]["faces"].as_array().unwrap().len(), 5);
         assert_eq!(result["deleted"]["faces"], json!(["f0"]));
         assert!(

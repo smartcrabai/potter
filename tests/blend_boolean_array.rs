@@ -153,7 +153,7 @@ fn surface_from_mesh(mesh: &Mesh) -> TestResult<Surface> {
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
     let triangles = mesh
-        .triangulate()?
+        .tessellate()?
         .into_iter()
         .map(|triangle| {
             Ok([
