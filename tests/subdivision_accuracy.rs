@@ -15,7 +15,30 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type UvLayerRecord = (String, BTreeMap<u64, (Vec<[f64; 2]>, Vec<bool>)>);
 type EdgeRecords = BTreeMap<(usize, usize), Vec<(bool, bool, f64)>>;
 
+// Blender's custom-normal codes differ by one step across platforms (see the module doc).
+#[path = "common/blender_code_tolerance.rs"]
+mod blender_code_tolerance;
+use blender_code_tolerance::code_within_step;
+
 const ORACLE: &str = include_str!("fixtures/pr16_subdivision/oracle.json");
+/// One stored custom-normal code: `null` is Auto, otherwise an authored `[i64, i64]` pair. Auto
+/// matches only Auto, and an authored pair matches within one code step per component.
+fn codes_within_step(actual: &Value, expected: &Value) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let pair = |value: &Value| -> Option<[i64; 2]> {
+        let [first, second] = value.as_array()?.as_slice() else {
+            return None;
+        };
+        Some([first.as_i64()?, second.as_i64()?])
+    };
+    match (pair(actual), pair(expected)) {
+        (Some(a), Some(e)) => code_within_step(Some(a), Some(e)),
+        _ => false,
+    }
+}
+
 // Blender f32 output is rounded to seven fixture decimals; generation measured a maximum
 // serialization error of 5.000000003e-8. These bounds cover f32/OpenSubdiv arithmetic only.
 const POSITION_TOLERANCE: f64 = 3.0e-6;
@@ -896,9 +919,17 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
                 (Some(actual_codes), Some(expected_codes)) => {
                     let actual_codes = rotated(actual_codes, *actual_rotation);
                     let expected_codes = rotated(expected_codes, *expected_rotation);
-                    if actual_codes != expected_codes {
+                    // Blender 5.2.2 linux-x64 and macOS arm64 differ by one code step at 11 of 2,656
+                    // corners (second component only); OpenSubdiv contracts FMA on arm64, per
+                    // build_environment/cmake/options.cmake. Codes match within one step per component.
+                    let within_step = actual_codes.len() == expected_codes.len()
+                        && actual_codes
+                            .iter()
+                            .zip(&expected_codes)
+                            .all(|(actual, expected)| codes_within_step(actual, expected));
+                    if !within_step {
                         return Err(format!(
-                            "face {cycle:?} custom-normal code pairs differ: {actual_codes:?} != {expected_codes:?}"
+                            "face {cycle:?} custom-normal codes differ by more than one step: {actual_codes:?} != {expected_codes:?}"
                         ));
                     }
                 }

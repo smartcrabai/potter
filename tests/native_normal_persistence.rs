@@ -13,6 +13,8 @@
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
+#[path = "common/blender_code_tolerance.rs"]
+mod blender_code_tolerance;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
@@ -28,12 +30,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blender_code_tolerance::code_within_step;
 use native_oracle::{
     BYTE_TOLERANCE, FLOAT_TOLERANCE, NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations,
-    assert_close, assert_floats, attribute, build_oracle, code_pair, code_within_one_unit,
-    dump_blend, dumped_object, export, floats, import_blend, mesh_of_node, node_id,
-    normal_code_rows, number, read_scene, run_blender, run_blender_arguments, vec3, vectors_close,
-    write_script,
+    assert_close, assert_floats, attribute, build_oracle, code_pair, dump_blend, dumped_object,
+    export, floats, import_blend, mesh_of_node, node_id, normal_code_rows, number, read_scene,
+    run_blender, run_blender_arguments, vec3, vectors_close, write_script,
 };
 use serde_json::{Map, Value, json};
 use tempfile::tempdir;
@@ -992,10 +994,16 @@ fn nonmanifold_subdivision_auto_codes_match_blenders_evaluated_fan() -> TestResu
             } else {
                 StoredCorner::Code(code_pair(raw)?)
             };
+            let actual = &actual_rows[face_index][corner_index];
+            let within = match (actual, &expected_code) {
+                (StoredCorner::Code(a), StoredCorner::Code(e)) => {
+                    code_within_step(Some(*a), Some(*e))
+                }
+                (a, e) => a == e,
+            };
             assert!(
-                code_within_one_unit(&actual_rows[face_index][corner_index], &expected_code),
-                "Subsurf loop {source_loop} code within one unit of Blender: actual {:?}, expected {expected_code:?}",
-                actual_rows[face_index][corner_index]
+                within,
+                "Subsurf loop {source_loop} code is not within one step of Blender's: actual {actual:?}, expected {expected_code:?}"
             );
         }
     }
