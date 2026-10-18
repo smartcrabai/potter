@@ -15447,7 +15447,13 @@ mod tests {
                     let actual = base_colour(s_u, s_v)?;
                     let texel_x = texel_index(gltf_wrapped(wrap_s, s_u), width)?;
                     let texel_y = texel_index(gltf_wrapped(wrap_t, s_v), height)?;
-                    let expected = data.pixels[texel_y * width + texel_x];
+                    let encoded = [
+                        f64::from(texel(u32::try_from(texel_x)?)) / 255.0,
+                        f64::from(texel(u32::try_from(texel_y)?)) / 255.0,
+                        128.0 / 255.0,
+                    ];
+                    let expected = encoded
+                        .map(|value| f64::from(crate::color::cycles_srgb_to_linear(value as f32)));
                     for channel in 0..3 {
                         assert!(
                             (actual[channel] - expected[channel]).abs() < 1e-9,
