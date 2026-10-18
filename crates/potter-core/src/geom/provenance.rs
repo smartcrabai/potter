@@ -105,6 +105,50 @@ pub(crate) fn remap_attributes_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
+    remap_attributes_internal(source, output, origin, None, skipped, None)
+}
+
+/// [`remap_attributes_skipping`] whose custom-normal loop basis is `corner_order` (a Blender loop
+/// ordinal per output corner) when given. A modifier that renumbers loops itself, such as Array's
+/// copies, passes its numbering here; `None` keeps the basis the source implies.
+///
+/// # Errors
+///
+/// Returns `INTERNAL_ERROR` when `origin` does not describe `output`'s vertices and polygons.
+pub(crate) fn remap_attributes_with_basis(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    skipped: &[&str],
+    corner_order: Option<&[usize]>,
+) -> Result<()> {
+    remap_attributes_internal(source, output, origin, None, skipped, corner_order)
+}
+
+/// [`remap_attributes`] with each output edge's source edges given explicitly, in `output.edges`
+/// order. An empty entry is an edge with no source (a cut span or a chord) and takes the default for
+/// every edge attribute; [`remap_attributes`] derives the sources from the vertex origins instead.
+///
+/// # Errors
+///
+/// Returns `INTERNAL_ERROR` when `origin` or `edges` does not describe `output`.
+pub(crate) fn remap_attributes_with_edges(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    edges: Vec<Vec<(usize, f64)>>,
+) -> Result<()> {
+    remap_attributes_internal(source, output, origin, Some(edges), &[], None)
+}
+
+fn remap_attributes_internal(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    edges: Option<Vec<Vec<(usize, f64)>>>,
+    skipped: &[&str],
+    corner_order: Option<&[usize]>,
+) -> Result<()> {
     if origin.vertices.len() != output.vertices.len()
         || origin.faces.len() != output.faces.len()
         || origin.source_vertices.as_ref().is_some_and(|vertices| {
@@ -166,10 +210,16 @@ pub(crate) fn remap_attributes_skipping(
     } else {
         HashMap::new()
     };
-    let edge_origin = if needs_edges {
-        edge_sources(source, output, origin, &output_vertex_index)
-    } else {
-        Vec::new()
+    let edge_origin = match (needs_edges, edges) {
+        (false, _) => Vec::new(),
+        (true, Some(explicit)) if explicit.len() == output.edges.len() => explicit,
+        (true, Some(_)) => {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "modifier provenance does not describe the rebuilt edges",
+            ));
+        }
+        (true, None) => edge_sources(source, output, origin, &output_vertex_index),
     };
     let derived_corners;
     let corner_origin: &[Vec<(usize, f64)>] = match &origin.corners {
@@ -289,7 +339,15 @@ pub(crate) fn remap_attributes_skipping(
         uv_layers::write(output, &store);
     }
     if let Some(sources) = code_sources {
-        clnor::transfer_custom_normals(source, output, &sources, NormalCodeOptions::default())?;
+        clnor::transfer_custom_normals(
+            source,
+            output,
+            &sources,
+            NormalCodeOptions {
+                corner_order,
+                ..NormalCodeOptions::default()
+            },
+        )?;
     }
     Ok(())
 }

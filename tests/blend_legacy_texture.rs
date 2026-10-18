@@ -651,7 +651,11 @@ fn assert_potter_matches_blender_positions(
         let expected_positions = expected_positions
             .as_array()
             .ok_or("Blender vertex list is not an array")?;
-        assert_eq!(actual.len(), expected_positions.len(), "{name}: vertex count");
+        assert_eq!(
+            actual.len(),
+            expected_positions.len(),
+            "{name}: vertex count"
+        );
         for (index, (actual, expected)) in actual.iter().zip(expected_positions).enumerate() {
             for axis in 0..3 {
                 let expected_value = expected[axis]
@@ -673,7 +677,9 @@ fn max_position_difference(left: &Value, right: &Value) -> f64 {
         .unwrap()
         .iter()
         .zip(right.as_array().unwrap())
-        .flat_map(|(a, b)| (0..3).map(move |axis| (a[axis].as_f64().unwrap() - b[axis].as_f64().unwrap()).abs()))
+        .flat_map(|(a, b)| {
+            (0..3).map(move |axis| (a[axis].as_f64().unwrap() - b[axis].as_f64().unwrap()).abs())
+        })
         .fold(0.0, f64::max)
 }
 
@@ -715,21 +721,23 @@ fn assert_imported_udim_tile(project: &Path) -> Result<(), Box<dyn Error>> {
 fn blender_legacy_image_user_multilayer_selection_matches_potter_displacement()
 -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
-        eprintln!("skipping Blender legacy ImageUser multilayer displacement: Blender is unavailable");
+        eprintln!(
+            "skipping Blender legacy ImageUser multilayer displacement: Blender is unavailable"
+        );
         return Ok(());
     };
     let directory = tempdir()?;
     let root = directory.path();
     write_multilayer_exr(&root.join("multilayer.exr"))?;
-    let (expected, project) = run_displace_case(&blender, root, "multilayer", MULTILAYER_CASE_SCRIPT)?;
+    let (expected, project) =
+        run_displace_case(&blender, root, "multilayer", MULTILAYER_CASE_SCRIPT)?;
     assert_potter_matches_blender_positions(&project, &expected)?;
     assert_subjects_differ(&expected);
     Ok(())
 }
 
 #[test]
-fn blender_legacy_udim_tiles_repeat_crop_match_potter_displacement() -> Result<(), Box<dyn Error>>
-{
+fn blender_legacy_udim_tiles_repeat_crop_match_potter_displacement() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {
         eprintln!("skipping Blender legacy UDIM displacement: Blender is unavailable");
         return Ok(());

@@ -297,6 +297,7 @@ fn remesh_reports_dropped_vertex_groups_as_a_typed_warning() -> TestResult {
         &Registry::new(),
         1.0,
         "RemeshBox",
+        None,
     )?;
     assert!(
         evaluation.mesh.attributes.get("vertex_groups").is_none(),

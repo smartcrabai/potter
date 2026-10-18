@@ -481,13 +481,6 @@ pub fn feature_catalog() -> Value {
             &["modifier.create"],
             "harden_normals (any input) and mark_sharp on an input with sharp edges are evaluated only for one-segment EDGES bevels; other segment counts or VERTICES bevels with those settings are refused.",
         ),
-        unsupported(
-            "modifier.mirror.bisect",
-            "Mirror bisect on a mirrored axis",
-            "MIRROR",
-            &["modifier.create"],
-            "Blender cuts a mirrored axis at its plane when use_bisect_axis is set on that axis; Potter does not build the cut, so such a mirror is refused. Bisect on an unmirrored axis changes nothing in Blender and is evaluated.",
-        ),
         supported(
             "modifier.decimate",
             "Decimate modifier",

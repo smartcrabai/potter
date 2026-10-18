@@ -274,9 +274,16 @@ fn evaluate(mesh: &Mesh, modifiers: &[Modifier]) -> Mesh {
 }
 
 fn evaluate_at(mesh: &Mesh, modifiers: &[Modifier], frame: f64) -> Mesh {
-    evaluate_modifiers_with_groups_at_frame(mesh, modifiers, &BTreeMap::new(), frame, SUBJECT_NAME)
-        .unwrap()
-        .mesh
+    evaluate_modifiers_with_groups_at_frame(
+        mesh,
+        modifiers,
+        &BTreeMap::new(),
+        frame,
+        SUBJECT_NAME,
+        None,
+    )
+    .unwrap()
+    .mesh
 }
 
 #[test]
