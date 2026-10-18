@@ -66,7 +66,7 @@ fn main() -> io::Result<()> {
             &mut watched,
         )?;
     }
-    for name in ["build.rs", "Cargo.toml"] {
+    for name in ["build.rs", "Cargo.toml", "Cargo.lock"] {
         add_file(
             &manifest_dir.join(name),
             &format!("package/{name}"),
