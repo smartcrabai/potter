@@ -397,7 +397,13 @@ fn boolean_array_box_cutter_layouts_match_blender_for_exact_and_float() -> TestR
             for (id, node) in &mut boolean_only.nodes {
                 for modifier in &mut node.modifiers {
                     if modifier.modifier_type == "boolean" {
+                        // The fixture clears `show_viewport`/`show_render` on the EXACT hosts after
+                        // sampling Blender's expectation, so the target is restored to the state it was sampled in.
                         modifier.enabled = id == node_id;
+                        if id == node_id {
+                            modifier.show_viewport = true;
+                            modifier.show_render = true;
+                        }
                     }
                 }
             }
