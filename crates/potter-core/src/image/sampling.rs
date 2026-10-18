@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use crate::color::linear_to_srgb_unclamped;
 
@@ -43,7 +43,9 @@ pub struct ImageTileData {
 pub struct ImageData {
     pub width: u32,
     pub height: u32,
-    /// Linear light, for consumers that read pixels directly.
+    /// The values as loaded: straight colour for a straight image, premultiplied for a premultiplied one, and raw for
+    /// data. The image sampler applies the alpha rule from [`ImageStorage`]; direct readers call
+    /// [`ImageData::straight_pixels`].
     pub pixels: Vec<[f64; 4]>,
     pub tiles: BTreeMap<u32, ImageTileData>,
     pub interpolation: ImageInterpolation,
@@ -55,26 +57,66 @@ pub struct ImageData {
     pub storage: ImageStorage,
 }
 
-/// The precision a stored image was quantised to. Blender premultiplies straight alpha at load in the precision of the
-/// buffer it loads: bytes for 8-bit files, 16-bit integers, or floats.
+impl ImageData {
+    /// The colour as straight values, for readers that do not go through the sampler (export, compositing, simulation
+    /// textures, environment importance). A straight or data image is returned as stored. A premultiplied colour image
+    /// has its RGB divided by alpha, and zero where alpha is zero; that is the only conversion. Tiles are not converted.
+    #[must_use]
+    pub fn straight_pixels(&self) -> Cow<'_, [[f64; 4]]> {
+        if self.storage.ignore_alpha {
+            // Alpha ignored: the colour is as stored and every alpha is 1 (`ImageStorage::ignore_alpha`).
+            return Cow::Owned(
+                self.pixels
+                    .iter()
+                    .map(|pixel| [pixel[0], pixel[1], pixel[2], 1.0])
+                    .collect(),
+            );
+        }
+        if self.storage.straight_alpha || self.storage.data {
+            return Cow::Borrowed(&self.pixels);
+        }
+        Cow::Owned(
+            self.pixels
+                .iter()
+                .map(|pixel| {
+                    let alpha = pixel[3];
+                    if alpha == 0.0 {
+                        [0.0, 0.0, 0.0, alpha]
+                    } else {
+                        [pixel[0] / alpha, pixel[1] / alpha, pixel[2] / alpha, alpha]
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The precision a stored image was quantised to. Blender premultiplies straight alpha at load in the arithmetic of the
+/// buffer it loads (Cycles' `util_image_multiply_native`, `intern/cycles/util/image.h`): integer `c * a / max` for 8-bit
+/// and 16-bit buffers, which truncates; a half product rounded to half for half buffers; and a plain product for float.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Precision {
     Byte,
     Short,
+    Half,
     #[default]
     Float,
 }
 
 /// How Blender stores an image for Image Texture colour reads, from its colour space, alpha mode, and bit depth.
 /// Cycles' image manager premultiplies straight alpha for a non-data image when it loads it, so a colour read whose
-/// Alpha output is unlinked returns premultiplied values. Verified against Blender 5.2.2 renders of straight-alpha
-/// 8-bit sRGB and Non-Color images (`tests/fixtures/alpha_texture`).
+/// Alpha output is unlinked returns premultiplied values. Verified against the Blender 5.2.2 renders in
+/// `tests/fixtures/alpha_texture` for sRGB and Linear 8-bit, 16-bit, half and float EXR, TIFF, and Non-Color images.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImageStorage {
     /// A non-colour (data) image: values are read as stored, with no premultiply and no unassociate.
     pub data: bool,
     /// Straight alpha, which Blender premultiplies at load for a non-data image.
     pub straight_alpha: bool,
+    /// Alpha ignored (Blender's `IMA_ALPHA_IGNORE`, a `None` alpha mode): the loader sets alpha to 1 for an RGBA image
+    /// (`image_metadata.cpp`, `ignore_alpha`), no premultiply happens, and no colour is unassociated (`shader_nodes.cpp`
+    /// leaves IGNORE out of the unassociate flag). Every read returns alpha 1.
+    pub ignore_alpha: bool,
     /// The precision the premultiply rounds to.
     pub precision: Precision,
 }
@@ -113,6 +155,8 @@ struct Texels {
     premultiply: Option<Precision>,
     /// The mixed colour is divided by the mixed alpha, as Cycles unassociates a linked Alpha output.
     unassociate: bool,
+    /// Alpha is ignored: every read returns alpha 1 (`ImageStorage::ignore_alpha`).
+    ignore_alpha: bool,
 }
 
 impl Texels {
@@ -123,19 +167,19 @@ impl Texels {
             _ => Transfer::Linear,
         };
         let colour = matches!(read, Read::Colour { .. });
-        // Blender keeps 8-bit and 16-bit sRGB buffers at their precision; other colour spaces load as half float, which
-        // this model does not round to (the oracle set covers sRGB and Non-Color only).
-        let precision = if srgb {
-            storage.precision
-        } else {
-            Precision::Float
-        };
-        let premultiply = (colour && storage.straight_alpha && !storage.data).then_some(precision);
-        let unassociate = matches!(read, Read::Colour { alpha_linked: true }) && !storage.data;
+        // The premultiply happens in the buffer's precision whatever the colour space: 8-bit sRGB and 8-bit linear
+        // images stay bytes (`conform_pixels_to_metadata_type`), and only the non-linear, non-sRGB conversions go to half.
+        let premultiply =
+            (colour && storage.straight_alpha && !storage.data && !storage.ignore_alpha)
+                .then_some(storage.precision);
+        let unassociate = matches!(read, Read::Colour { alpha_linked: true })
+            && !storage.data
+            && !storage.ignore_alpha;
         Self {
             transfer,
             premultiply,
             unassociate,
+            ignore_alpha: storage.ignore_alpha,
         }
     }
 }
@@ -505,8 +549,8 @@ fn sample_linear_with_extension(
 }
 
 /// One texel as Blender's stored buffer holds it, before mixing. An sRGB image's texel is encoded, which is the value
-/// Cycles interpolates (`svm_image_texture`). Straight alpha is premultiplied when the image loaded, rounded to the
-/// precision of its buffer. The encode is the exact inverse of the load decode, so an unpremultiplied texel round-trips.
+/// Cycles interpolates (`svm_image_texture`). Straight alpha is premultiplied when the image loaded, in the arithmetic of
+/// the buffer's precision. The encode is the exact inverse of the load decode, so an unpremultiplied texel round-trips.
 fn stored_texel(linear: [f64; 4], texels: Texels) -> [f64; 4] {
     let mut rgb = [linear[0], linear[1], linear[2]];
     if texels.transfer != Transfer::Linear {
@@ -514,26 +558,54 @@ fn stored_texel(linear: [f64; 4], texels: Texels) -> [f64; 4] {
     }
     if let Some(precision) = texels.premultiply {
         let alpha = linear[3];
-        rgb = rgb.map(|value| quantize(value * alpha, precision));
+        rgb = rgb.map(|value| premultiply(value, alpha, precision));
     }
     [rgb[0], rgb[1], rgb[2], linear[3]]
 }
 
-/// Rounds a premultiplied value to the precision of the buffer it is stored in. Blender's byte buffers premultiply
-/// `c * a / 255` in integers, which is the same as rounding `value * 255` for `value = encoded * alpha`.
-fn quantize(value: f64, precision: Precision) -> f64 {
+/// Blender's premultiply at load for one component, in the arithmetic of the buffer it loads
+/// (`util_image_multiply_native`, `intern/cycles/util/image.h`). Byte and short buffers multiply the integers `c` and `a`
+/// and truncate `c * a / max`, which is what `((uint32_t)a * (uint32_t)b) / 255` does. Half buffers round the product to
+/// half, as `float_to_half` does. Float buffers multiply directly.
+fn premultiply(value: f64, alpha: f64, precision: Precision) -> f64 {
     match precision {
-        Precision::Byte => (value * 255.0).round() / 255.0,
-        Precision::Short => (value * 65535.0).round() / 65535.0,
-        Precision::Float => value,
+        Precision::Byte => integer_premultiply(value, alpha, 255.0),
+        Precision::Short => integer_premultiply(value, alpha, 65535.0),
+        Precision::Half => round_to_half(value * alpha),
+        Precision::Float => value * alpha,
     }
+}
+
+/// `floor(c * a / max) / max` for the integers `c = value * max` and `a = alpha * max`. A texel decoded from a buffer of
+/// this precision has exact integer `c` and `a`, so the product and quotient here are exact integer arithmetic.
+fn integer_premultiply(value: f64, alpha: f64, max: f64) -> f64 {
+    let colour = (value * max).round();
+    let coverage = (alpha * max).round();
+    ((colour * coverage) / max).floor() / max
+}
+
+/// Rounds to the nearest IEEE half-precision value, ties to even, as Cycles' `float_to_half` does. Normal halves keep
+/// 11 significant bits (a step of 2^(e - 10) at exponent e), and values below 2^-14 share the subnormal step 2^-24.
+/// Values at or above 65520 overflow to infinity, as they do in half.
+fn round_to_half(value: f64) -> f64 {
+    if !value.is_finite() || value.abs() < f64::MIN_POSITIVE {
+        return value;
+    }
+    let magnitude = value.abs();
+    if magnitude >= 65_520.0 {
+        return value.signum() * f64::INFINITY;
+    }
+    let exponent = i32::try_from((magnitude.to_bits() >> 52) & 0x7ff).unwrap_or(0) - 1023;
+    let step = 2.0_f64.powi(exponent.max(-14) - 10);
+    value.signum() * ((magnitude / step).round_ties_even() * step)
 }
 
 /// The colour a lookup returns from a mixed stored value. Cycles unassociates the colour when the Alpha output is
 /// linked (`svm_image_texture`, `NODE_IMAGE_ALPHA_UNASSOCIATE`, only for alpha strictly between 0 and 1), and then
 /// decodes an sRGB image to linear light (`color_srgb_to_linear_v4`). Alpha is unchanged.
 fn finish(mixed: [f64; 4], texels: Texels) -> [f64; 4] {
-    let alpha = mixed[3];
+    // Alpha ignored (`IMA_ALPHA_IGNORE`): the loader made alpha 1, so every read returns 1 (`image_metadata.cpp`).
+    let alpha = if texels.ignore_alpha { 1.0 } else { mixed[3] };
     let mut rgb = [mixed[0], mixed[1], mixed[2]];
     if texels.unassociate && alpha > 0.0 && alpha < 1.0 {
         rgb = rgb.map(|value| value / alpha);
@@ -615,8 +687,8 @@ fn mix(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
 mod tests {
     use super::{
         ImageData, ImageExtension, ImageInterpolation, ImageStorage, ImageTileData, Precision,
-        sample, sample_encoded, sample_with_extension, sample_with_extension_alpha,
-        sample_with_interpolation,
+        premultiply, round_to_half, sample, sample_encoded, sample_with_extension,
+        sample_with_extension_alpha, sample_with_interpolation,
     };
     use std::collections::BTreeMap;
 
@@ -697,6 +769,7 @@ mod tests {
             ImageStorage {
                 data: false,
                 straight_alpha: true,
+                ignore_alpha: false,
                 precision: Precision::Byte,
             },
         );
@@ -744,6 +817,147 @@ mod tests {
         );
     }
 
+    /// Blender's premultiply at load, byte precision: `floor(c * a / 255)` in integers. For c = a = 200, 200 * 200 / 255 is
+    /// 156.86, so truncation gives 156 where rounding gives 157. Oracle: `tests/fixtures/alpha_texture` floor8 cases.
+    #[test]
+    fn byte_premultiply_truncates_like_cycles_integer_arithmetic() {
+        let value = 200.0 / 255.0;
+        assert!((premultiply(value, value, Precision::Byte) - 156.0 / 255.0).abs() < 1.0e-15);
+        let short = 50_000.0 / 65_535.0;
+        assert!(
+            (premultiply(short, short, Precision::Short) - 38_147.0 / 65_535.0).abs() < 1.0e-15
+        );
+    }
+
+    /// Blender's premultiply of half buffers: the product is rounded to half, ties to even. Half(0.7) * half(0.6) is
+    /// 0.420185..., which rounds to 0.420166015625, not to the float product. Oracle: `tests/fixtures/alpha_texture` half cases.
+    #[test]
+    fn half_premultiply_rounds_the_product_to_half() {
+        let colour = 0.700_195_312_5;
+        let alpha = 0.600_097_656_25;
+        assert!((premultiply(colour, alpha, Precision::Half) - 0.420_166_015_625).abs() < 1.0e-15);
+        assert!((premultiply(colour, alpha, Precision::Float) - colour * alpha).abs() < 1.0e-15);
+    }
+
+    /// A floor texel through the sampler: pixel 0 is sRGB `[200, 100, 0]` with alpha 200. Unlinked, its red reads
+    /// `decode(156 / 255)`, the truncated premultiply. Linked, it is unassociated: `156 / 200 = 0.78`, then decoded.
+    #[test]
+    fn floor_texel_is_truncated_then_unassociated_when_linked() {
+        let decode = |byte: f64| crate::color::srgb_to_linear(byte / 255.0);
+        let image = ImageData {
+            width: 2,
+            height: 1,
+            pixels: vec![
+                [decode(200.0), decode(100.0), 0.0, 200.0 / 255.0],
+                [decode(64.0), 0.0, 1.0, 1.0],
+            ],
+            tiles: BTreeMap::new(),
+            interpolation: ImageInterpolation::Linear,
+            srgb: true,
+            storage: ImageStorage {
+                data: false,
+                straight_alpha: true,
+                ignore_alpha: false,
+                precision: Precision::Byte,
+            },
+        };
+        let read = |alpha_linked| {
+            sample_with_extension_alpha(
+                &image,
+                [0.1, 0.5],
+                [0.1, 0.5],
+                0,
+                ImageInterpolation::Closest,
+                ImageExtension::Repeat,
+                alpha_linked,
+            )
+        };
+        assert!((read(false)[0] - crate::color::srgb_to_linear(156.0 / 255.0)).abs() < 1.0e-5);
+        assert!((read(true)[0] - crate::color::srgb_to_linear(0.78)).abs() < 1.0e-5);
+    }
+
+    /// A Premultiplied image (Blender alpha mode PREMUL) keeps the file's values: an unlinked colour read returns them
+    /// decoded, and a linked read unassociates them, `c / a` (`straight_alpha` is false). Oracle: `_premul` cases.
+    #[test]
+    fn premultiplied_image_keeps_its_values_and_unassociates_when_linked() {
+        let image = alpha_texels(
+            true,
+            ImageStorage {
+                data: false,
+                straight_alpha: false,
+                ignore_alpha: false,
+                precision: Precision::Byte,
+            },
+        );
+        let unlinked = sample_with_extension_alpha(
+            &image,
+            [0.1, 0.5],
+            [0.1, 0.5],
+            0,
+            ImageInterpolation::Closest,
+            ImageExtension::Repeat,
+            false,
+        );
+        assert!((unlinked[0] - crate::color::srgb_to_linear(128.0 / 255.0)).abs() < 1.0e-5);
+        let linked = sample_with_extension_alpha(
+            &image,
+            [0.1, 0.5],
+            [0.1, 0.5],
+            0,
+            ImageInterpolation::Closest,
+            ImageExtension::Repeat,
+            true,
+        );
+        assert!(
+            (linked[0] - 1.0).abs() < 1.0e-5,
+            "linked red is {}",
+            linked[0]
+        );
+    }
+
+    /// Blender's `IMA_ALPHA_IGNORE` (alpha mode None): the loader makes alpha 1, no premultiply and no unassociate
+    /// happen, so a linked read returns the stored colour and alpha 1. Citations: `image_metadata.cpp` (`ignore_alpha`),
+    /// `shader_nodes.cpp` (IGNORE is left out of the unassociate flag).
+    #[test]
+    fn ignored_alpha_reads_one_and_keeps_the_stored_colour() {
+        let image = alpha_texels(
+            false,
+            ImageStorage {
+                data: false,
+                straight_alpha: false,
+                ignore_alpha: true,
+                precision: Precision::Byte,
+            },
+        );
+        let linked = sample_with_extension_alpha(
+            &image,
+            [0.1, 0.5],
+            [0.1, 0.5],
+            0,
+            ImageInterpolation::Closest,
+            ImageExtension::Repeat,
+            true,
+        );
+        assert!(
+            (linked[0] - 128.0 / 255.0).abs() < 1.0e-12,
+            "stored red is {}",
+            linked[0]
+        );
+        assert!(
+            (linked[3] - 1.0).abs() < 1.0e-12,
+            "ignored alpha is {}",
+            linked[3]
+        );
+    }
+
+    /// Round to half: a value of 1.0 is exact, and anything at or above 65520 overflows to infinity.
+    #[test]
+    fn round_to_half_is_ties_to_even_and_overflows_to_infinity() {
+        assert!((round_to_half(1.0) - 1.0).abs() < 1.0e-15);
+        assert!(round_to_half(65_520.0).is_infinite());
+        assert!(round_to_half(65_504.0).is_finite());
+    }
+
     /// A Non-Color image is read as stored, with neither a premultiply nor an unassociate, whichever Alpha link.
     #[test]
     fn non_colour_texels_are_read_as_stored_whatever_the_alpha_link() {
@@ -752,6 +966,7 @@ mod tests {
             ImageStorage {
                 data: true,
                 straight_alpha: true,
+                ignore_alpha: false,
                 precision: Precision::Byte,
             },
         );

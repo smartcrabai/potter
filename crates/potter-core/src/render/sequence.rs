@@ -1115,6 +1115,16 @@ fn resize_image_data(data: &ImageData, width: u32, height: u32) -> Result<RgbaFr
             "image strip source and output dimensions must be non-zero",
         ));
     }
+    // Resizing samples straight colour, so a premultiplied strip is unpremultiplied first (`straight_pixels`).
+    let straight = ImageData {
+        width: data.width,
+        height: data.height,
+        pixels: data.straight_pixels().into_owned(),
+        tiles: std::collections::BTreeMap::new(),
+        interpolation: data.interpolation,
+        srgb: data.srgb,
+        storage: crate::image::ImageStorage::default(),
+    };
     let count = usize::try_from(width)
         .ok()
         .and_then(|width| {
@@ -1132,7 +1142,7 @@ fn resize_image_data(data: &ImageData, width: u32, height: u32) -> Result<RgbaFr
     for y in 0..height {
         for x in 0..width {
             let sampled = sample(
-                data,
+                &straight,
                 [
                     (f64::from(x) + 0.5) / f64::from(width),
                     (f64::from(y) + 0.5) / f64::from(height),
@@ -1463,7 +1473,14 @@ fn write_exr(path: &Path, rgba: &[[f32; 4]], width: u32, height: u32) -> Result<
     }
     exr::prelude::write_rgba_file(path, width_usize, height_usize, |x, y| {
         let pixel = rgba[y * width_usize + x];
-        (pixel[0], pixel[1], pixel[2], pixel[3])
+        // EXR stores associated alpha: Blender reads an EXR as premultiplied (its default `alpha_mode` for a file
+        // without `oiio:UnassociatedAlpha`), so the colour is multiplied by alpha, as its OpenEXR writer expects.
+        (
+            pixel[0] * pixel[3],
+            pixel[1] * pixel[3],
+            pixel[2] * pixel[3],
+            pixel[3],
+        )
     })
     .map_err(|error| {
         PotError::new(

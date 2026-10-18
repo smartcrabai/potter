@@ -249,7 +249,7 @@ fn load(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
             blob,
             source_path: image_source_path,
             source_hash: registered_hash,
-            alpha_mode: ImageAlphaMode::Straight,
+            alpha_mode: crate::image::storage::default_alpha_mode(&bytes),
         },
     );
     engine.mark("images", &id, ChangeKind::Created);

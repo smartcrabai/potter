@@ -780,7 +780,14 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
             project.path(),
             crate::image::ImageInterpolation::Linear,
         )?;
+        // The stored values, with the alpha mode the Blender datablock gets: a premultiplied EXR stays associated, and a
+        // straight image is straight, so Blender's packed file and its alpha mode agree (`_pack_image`).
         image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+        image_json["alpha_mode"] = json!(match image.alpha_mode {
+            crate::model::ImageAlphaMode::Straight => "straight",
+            crate::model::ImageAlphaMode::Premultiplied => "premultiplied",
+            crate::model::ImageAlphaMode::None => "none",
+        });
         if let Some(png) = eight_bit_png_bytes(&image, project)? {
             image_json["png_bytes"] = json!(png);
         }

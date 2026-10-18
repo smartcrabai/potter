@@ -204,6 +204,7 @@ impl WorldImportanceSampler {
                 )
             })?;
         let mut total_weight = 0.0;
+        let environment_pixels = image.straight_pixels();
         for row in 0..height_usize {
             let latitude = std::f64::consts::PI
                 * (f64::from(u32::try_from(row).unwrap_or(u32::MAX)) + 0.5)
@@ -219,7 +220,7 @@ impl WorldImportanceSampler {
                             "environment pixel index overflows",
                         )
                     })?;
-                let pixel = image.pixels.get(pixel_index).ok_or_else(|| {
+                let pixel = environment_pixels.get(pixel_index).ok_or_else(|| {
                     PotError::new(
                         ErrorCode::EvaluationFailed,
                         "environment image pixel data is incomplete",
