@@ -24,7 +24,9 @@ use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
     Edge, Face, Mesh, MeshError, Vertex, edge_key,
     normals::{corner_normals, face_normal, safe_acos_approx, sharp_edge_flags},
-    provenance::{Origin, edge_flags, mean_value_corners, remap_attributes},
+    provenance::{
+        Origin, edge_flags, mean_value_corners, remap_attributes, remap_attributes_with_edges,
+    },
     uv_layers,
 };
 
@@ -906,6 +908,37 @@ fn build_mesh(
     origin: &Origin,
     source: &Mesh,
 ) -> Result<Mesh> {
+    build_mesh_inner(points, polygons, loose_edges, origin, source, None)
+}
+
+/// Rebuild with explicit edge sources; the index map and source slice share the caller's edge order.
+fn build_mesh_with_edge_sources(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    loose_edges: Vec<[usize; 2]>,
+    origin: &Origin,
+    source: &Mesh,
+    output_edge_indices: &HashMap<(usize, usize), usize>,
+    output_edge_sources: &[usize],
+) -> Result<Mesh> {
+    build_mesh_inner(
+        points,
+        polygons,
+        loose_edges,
+        origin,
+        source,
+        Some((output_edge_indices, output_edge_sources)),
+    )
+}
+
+fn build_mesh_inner(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    loose_edges: Vec<[usize; 2]>,
+    origin: &Origin,
+    source: &Mesh,
+    edge_sources: Option<(&HashMap<(usize, usize), usize>, &[usize])>,
+) -> Result<Mesh> {
     let mut result = Mesh::new();
     for point in points {
         result
@@ -957,7 +990,29 @@ fn build_mesh(
                 .map_err(|error| mesh_error(&error))?;
         }
     }
-    remap_attributes(source, &mut result, origin)?;
+    if let Some((output_edge_indices, output_edge_sources)) = edge_sources {
+        let output_indices = id_indices(&result);
+        let edge_origins = result
+            .edges
+            .iter()
+            .map(|edge| {
+                output_indices
+                    .get(&edge.vertices[0])
+                    .copied()
+                    .zip(output_indices.get(&edge.vertices[1]).copied())
+                    .and_then(|(first, second)| {
+                        output_edge_indices
+                            .get(&edge_key(first, second))
+                            .and_then(|&index| output_edge_sources.get(index))
+                    })
+                    .map(|&source| vec![(source, 1.0)])
+                    .unwrap_or_default()
+            })
+            .collect();
+        remap_attributes_with_edges(source, &mut result, origin, edge_origins)?;
+    } else {
+        remap_attributes(source, &mut result, origin)?;
+    }
     validated(&result)?;
     Ok(result)
 }
@@ -3265,11 +3320,8 @@ fn triangulate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-/// Vertex normals the solidify offset moves along. The default is Blender's `vert_normals_true`:
-/// face normals weighted by the approximate corner angle. With `use_quality_normals` it is Blender's
-/// `mesh_calc_hq_normal`: each edge adds the angle-weighted midpoint of its faces' normals (or its
-/// one face's normal), and a zero sum falls back to the default.
-fn vertex_normals(points: &[DVec3], polygons: &[Polygon], quality: bool) -> Vec<DVec3> {
+/// Blender's `vert_normals_true`: face normals weighted by the corner angle.
+fn vertex_normals(points: &[DVec3], polygons: &[Polygon]) -> Vec<DVec3> {
     let face_normals: Vec<DVec3> = polygons
         .iter()
         .map(|(face, _)| {
@@ -3287,51 +3339,10 @@ fn vertex_normals(points: &[DVec3], polygons: &[Polygon], quality: bool) -> Vec<
             angle_normals[vertex] += *normal * safe_acos_approx(previous.dot(next));
         }
     }
-    let angle_normals: Vec<DVec3> = angle_normals
+    angle_normals
         .into_iter()
         .map(DVec3::normalize_or_zero)
-        .collect();
-    if !quality {
-        return angle_normals;
-    }
-    let mut faces_by_edge: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
-    for (index, (face, _)) in polygons.iter().enumerate() {
-        for (first, second) in cyclic_pairs(face) {
-            faces_by_edge
-                .entry(edge_key(*first, *second))
-                .or_default()
-                .push(index);
-        }
-    }
-    let mut sums = vec![DVec3::ZERO; points.len()];
-    for (&(first, second), faces) in &faces_by_edge {
-        let edge_normal = match *faces.as_slice() {
-            [one] => face_normals[one],
-            [one, other] => angle_weighted_midpoint(face_normals[one], face_normals[other]),
-            _ => continue,
-        };
-        sums[first] += edge_normal;
-        sums[second] += edge_normal;
-    }
-    sums.into_iter()
-        .zip(angle_normals)
-        .map(|(sum, fallback)| {
-            let normal = sum.normalize_or_zero();
-            if normal == DVec3::ZERO {
-                fallback
-            } else {
-                normal
-            }
-        })
         .collect()
-}
-
-/// Blender's `mid_v3_v3v3_angle_weighted`: the midpoint direction of two unit normals, scaled by
-/// `4 / pi` times the arc of their angle.
-fn angle_weighted_midpoint(first: DVec3, second: DVec3) -> DVec3 {
-    let sum = first + second;
-    let length = sum.length();
-    sum.normalize_or_zero() * (4.0 / std::f64::consts::PI * (length / 2.0).min(1.0).acos())
 }
 
 /// The values of the element attribute `name` in storage order. A native point or edge attribute is read
@@ -4864,7 +4875,7 @@ fn displace(mesh: &Mesh, modifier: &Modifier, owner_world_matrix: DMat4) -> Resu
     let points = positions(mesh);
     // Blender's NORMAL direction is `mesh->vert_normals_true()` (MOD_displace.cc, NOR case): the
     // angle-weighted unit face normals of `normals_calc_verts` (mesh_normals.cc L194-224).
-    let normals = vertex_normals(&points, &polygons(mesh)?, false);
+    let normals = vertex_normals(&points, &polygons(mesh)?);
     let delta = ((1.0 - mid_level) * strength).clamp(-10_000.0, 10_000.0);
     let mut result = mesh.clone();
     for (index, vertex) in result.vertices.iter_mut().enumerate() {

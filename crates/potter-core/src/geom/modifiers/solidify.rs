@@ -8,7 +8,7 @@ mod nonmanifold;
 mod parity_tests;
 mod util;
 
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -19,6 +19,42 @@ use crate::{
 use super::{
     Mesh, bool_param, invalid_parameter, number_param, schema_value, string_param, validated,
 };
+pub(super) fn has_vertex_group(mesh: &Mesh, name: &str) -> bool {
+    !name.is_empty()
+        && mesh
+            .attributes
+            .get("vertex_groups")
+            .and_then(Value::as_object)
+            .is_some_and(|groups| groups.contains_key(name))
+}
+
+pub(super) fn has_deform_verts(mesh: &Mesh) -> bool {
+    mesh.attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .is_some_and(|groups| {
+            groups.values().any(|weights| {
+                weights
+                    .as_object()
+                    .is_some_and(|weights| !weights.is_empty())
+            })
+        })
+}
+
+pub(super) fn set_group_weight(mesh: &mut Mesh, group: &str, vertex_id: u32) {
+    let groups = mesh
+        .attributes
+        .entry("vertex_groups".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(weights) = groups.as_object_mut().and_then(|groups| {
+        groups
+            .entry(group.to_owned())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+    }) {
+        weights.insert(format!("v{vertex_id}"), json!(1.0));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {

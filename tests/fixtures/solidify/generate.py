@@ -53,6 +53,11 @@ Cases (purpose of each, also stored as `purpose` in its input file):
   ngon_nm_flat_fixed        concave n-gon in NON_MANIFOLD, FLAT, FIXED
   grid_nm_groups_mats_creases  NON_MANIFOLD with inverted thickness group, two material slots, creases
   edges_only_extrude        only loose edges (no faces): Blender duplicates the edges, no faces
+  grid_extrude_bevel_weights  EXTRUDE bevel_convex with nonzero input edge and vertex bevel weights
+  grid_nm_bevel_weights      NON_MANIFOLD bevel_convex with nonzero input edge and vertex bevel weights
+  collinear_triangle_nm_fixed_none  collinear triangle with FIXED thickness and NONE boundary
+  quad_nm_sharp_seam_boundary_connector  two-group boundary connectors copy edge flags
+  book4_nm_sharp_seam_boundary_closing  larger-group closing boundary edges copy edge flags
 """
 
 import hashlib
@@ -119,6 +124,11 @@ def ngon_base():
     return dict(verts=verts, faces=[[0, 1, 2, 3, 4, 5]], loose=[])
 
 
+def single_quad_base():
+    verts = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+    return dict(verts=verts, faces=[[0, 1, 2, 3]], loose=[])
+
+
 def book_base(pages):
     """Quads that all share the edge (0,0,0)-(0,0,1); each page is (direction x, direction y, length)."""
     verts = [(0, 0, 0), (0, 0, 1)]
@@ -155,6 +165,10 @@ def near_collinear_base():
     return dict(verts=verts, faces=faces, loose=[])
 
 
+def collinear_triangle_base():
+    return dict(verts=[(0, 0, 0), (1, 0, 0), (2, 0, 0)], faces=[[0, 1, 2]], loose=[])
+
+
 def edges_only_base():
     return dict(verts=[(0, 0, 0), (1, 0, 0), (1, 1, 0)], faces=[], loose=[(0, 1), (1, 2)])
 
@@ -164,10 +178,12 @@ BASES = {
     "grid_loose": grid_loose_base,
     "cube": cube_base,
     "ngon": ngon_base,
+    "single_quad": single_quad_base,
     "tee": tee_base,
     "book4": book4_base,
     "asym_fan": asym_fan_base,
     "near_collinear": near_collinear_base,
+    "collinear_triangle": collinear_triangle_base,
     "edges_only": edges_only_base,
 }
 
@@ -217,7 +233,7 @@ def uv_layer(verts, faces, offsets, layer):
 
 
 def decorate(base, smooth=False, sharp=(), seam=(), creases=(), materials=None, uv_layers=0,
-             custom=False, groups=(), colors=False):
+             custom=False, groups=(), colors=False, bevel_edges=None, bevel_vertices=None):
     """Input attributes for a base mesh. Every value is deterministic and stored in both files."""
     verts, faces, loose = base["verts"], base["faces"], base["loose"]
     edges = []
@@ -247,6 +263,17 @@ def decorate(base, smooth=False, sharp=(), seam=(), creases=(), materials=None, 
     for a, b, value in creases:
         assert edge_key(a, b) in edge_ids, f"crease edge {(a, b)} is not an edge"
         crease_map[edge_key(a, b)] = value
+    bevel_edge_values = None
+    if bevel_edges is not None:
+        bevel_edge_values = [0.0] * len(edges)
+        for a, b, value in bevel_edges:
+            key = edge_key(a, b)
+            assert key in edge_ids, f"bevel-weight edge {(a, b)} is not an edge"
+            bevel_edge_values[edge_ids[key]] = value
+    bevel_vertex_values = None
+    if bevel_vertices is not None:
+        assert len(bevel_vertices) == len(verts)
+        bevel_vertex_values = list(bevel_vertices)
     face_materials = list(materials) if materials is not None else [0] * len(faces)
     uvs = [uv_layer(verts, faces, offsets, layer) for layer in range(uv_layers)]
     normals = None
@@ -273,6 +300,7 @@ def decorate(base, smooth=False, sharp=(), seam=(), creases=(), materials=None, 
         group_values[name] = [((7 * i + 3) % 11) / 10.0 for i in range(len(verts))]
     return dict(verts=verts, faces=faces, edges=edges, edge_ids=edge_ids, offsets=offsets,
                 smooth=face_smooth, sharp=sharp_set, seam=seam_set, creases=crease_map,
+                bevel_edge_weights=bevel_edge_values, bevel_vertex_weights=bevel_vertex_values,
                 materials=face_materials, uvs=uvs, normals=normals, colors=color_values,
                 groups=group_values, loose=loose)
 
@@ -293,6 +321,16 @@ def potter_mesh(spec, output_groups=()):
         attributes["crease_edge"] = {"domain": "edge", "type": "float",
                                      "values": {f"e{i}": spec["creases"].get(edge, 0.0)
                                                 for i, edge in enumerate(spec["edges"])}}
+    if spec["bevel_edge_weights"] is not None:
+        attributes["bevel_weight_edge"] = {
+            "domain": "edge", "type": "float",
+            "values": {f"e{i}": weight for i, weight in enumerate(spec["bevel_edge_weights"])},
+        }
+    if spec["bevel_vertex_weights"] is not None:
+        attributes["bevel_weight_vert"] = {
+            "domain": "point", "type": "float",
+            "values": {f"v{i}": weight for i, weight in enumerate(spec["bevel_vertex_weights"])},
+        }
     if spec["normals"] is not None:
         values, loop = {}, 0
         for f, face in enumerate(spec["faces"]):
@@ -367,6 +405,15 @@ def build_object(name, spec, slots, params):
             crease.data[edge.index].value = spec["creases"].get(
                 edge_key(edge.vertices[0], edge.vertices[1]), 0.0
             )
+    if spec["bevel_edge_weights"] is not None:
+        bevel = me.attributes.new("bevel_weight_edge", "FLOAT", "EDGE")
+        for edge in me.edges:
+            key = edge_key(edge.vertices[0], edge.vertices[1])
+            bevel.data[edge.index].value = spec["bevel_edge_weights"][spec["edge_ids"][key]]
+    if spec["bevel_vertex_weights"] is not None:
+        bevel = me.attributes.new("bevel_weight_vert", "FLOAT", "POINT")
+        for index, value in enumerate(spec["bevel_vertex_weights"]):
+            bevel.data[index].value = value
     slot_table = [True] * slots if isinstance(slots, int) else slots
     for index, occupied in enumerate(slot_table):
         material = bpy.data.materials.new(f"{name}_slot{index}") if occupied else None
@@ -435,14 +482,20 @@ def canonical_hash(verts, faces):
 def record_output(ob, me_e):
     verts = [[float(c) for c in v.co] for v in me_e.vertices]
     crease_attr = me_e.attributes.get("crease_edge")
+    bevel_weight_edge = me_e.attributes.get("bevel_weight_edge")
     edges = []
     for edge in me_e.edges:
         crease = float(crease_attr.data[edge.index].value) if crease_attr is not None else 0.0
+        bevel_weight = (
+            float(bevel_weight_edge.data[edge.index].value)
+            if bevel_weight_edge is not None else 0.0
+        )
         edges.append({
             "v": [int(edge.vertices[0]), int(edge.vertices[1])],
             "sharp": bool(edge.use_edge_sharp),
             "seam": bool(edge.use_seam),
             "crease": crease,
+            "bevel_weight": bevel_weight,
         })
     uv_names = [layer.name for layer in me_e.uv_layers]
     custom = bool(me_e.has_custom_normals)
@@ -491,6 +544,7 @@ def record_output(ob, me_e):
         "uv_layer_names": uv_names,
         "color_attribute_names": color_names,
         "has_custom_normals": custom,
+        "has_bevel_weight_edge": bevel_weight_edge is not None,
         "topology": {"vertices": len(verts), "edges": len(edges), "faces": len(faces),
                      "loops": loops_total, "loose_edges": loose},
         "canonical_hash": canonical_hash(verts, [f["v"] for f in faces]),
@@ -509,11 +563,23 @@ GRID_SHARP = pairs((1, 5), (5, 6))
 GRID_SEAM = pairs((0, 4), (1, 5))
 GRID_CREASES = [(0, 1, 0.25), (4, 5, 0.5), (5, 6, 0.75)]
 
+GRID_BEVEL_EDGES = [(0, 1, 0.25), (4, 5, 0.75), (5, 6, 0.5)]
+GRID_BEVEL_VERTICES = [
+    0.25, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.75,
+]
+QUAD_EDGES = pairs((0, 1), (1, 2), (2, 3), (3, 0))
+BOOK4_EDGES = pairs((0, 1), (0, 2), (2, 3), (1, 3), (0, 4), (4, 5), (1, 5),
+                    (0, 6), (6, 7), (1, 7), (0, 8), (8, 9), (1, 9))
+
 # (case, base, decorate kwargs, material slot count, parameter overrides, purpose)
 CASES = [
     ("grid_extrude_default", "grid", {}, 1,
      dict(thickness=0.1, use_pin_to_last=True, use_apply_on_spline=True),
      "open grid, thickness only; use_pin_to_last/use_apply_on_spline set (Solidify ignores them)"),
+    ("grid_extrude_bevel_weights", "grid",
+     dict(bevel_edges=GRID_BEVEL_EDGES, bevel_vertices=GRID_BEVEL_VERTICES), 1,
+     dict(thickness=0.2, offset=0.0, bevel_convex=0.4),
+     "EXTRUDE bevel_convex with nonzero input edge and vertex bevel weights"),
     ("grid_offset_fraction", "grid", dict(smooth=GRID_SMOOTH, sharp=GRID_SHARP), 1,
      dict(thickness=0.25, offset=0.37, use_rim=False),
      "offset 0.37 (not 0 or +-1), rim off, smooth and sharp flags on the input"),
@@ -602,6 +668,29 @@ CASES = [
           nonmanifold_boundary_mode="NONE", thickness=0.2, offset=-0.3,
           nonmanifold_merge_threshold=0.001),
      "T-edge, NON_MANIFOLD, FIXED thickness, boundary NONE"),
+    ("grid_nm_bevel_weights", "grid",
+     dict(bevel_edges=GRID_BEVEL_EDGES, bevel_vertices=GRID_BEVEL_VERTICES), 1,
+     dict(solidify_mode="NON_MANIFOLD", nonmanifold_thickness_mode="FIXED",
+          nonmanifold_boundary_mode="NONE", thickness=0.2, offset=0.25,
+          bevel_convex=0.35, nonmanifold_merge_threshold=0.001),
+     "NON_MANIFOLD input edge and vertex bevel weights with bevel_convex"),
+    ("collinear_triangle_nm_fixed_none", "collinear_triangle", {}, 1,
+     dict(solidify_mode="NON_MANIFOLD", nonmanifold_thickness_mode="FIXED",
+          nonmanifold_boundary_mode="NONE", thickness=1.0, offset=0.0,
+          nonmanifold_merge_threshold=0.001),
+     "collinear triangle, FIXED thickness, NONE boundary"),
+    ("quad_nm_sharp_seam_boundary_connector", "single_quad",
+     dict(sharp=QUAD_EDGES, seam=QUAD_EDGES), 1,
+     dict(solidify_mode="NON_MANIFOLD", nonmanifold_thickness_mode="FIXED",
+          nonmanifold_boundary_mode="NONE", thickness=0.2, offset=0.0,
+          use_rim=True, use_rim_only=False, nonmanifold_merge_threshold=0.001),
+     "one-quad two-group boundary connectors copy sharp and seam from source edges"),
+    ("book4_nm_sharp_seam_boundary_closing", "book4",
+     dict(sharp=BOOK4_EDGES, seam=BOOK4_EDGES), 1,
+     dict(solidify_mode="NON_MANIFOLD", nonmanifold_thickness_mode="CONSTRAINTS",
+          nonmanifold_boundary_mode="FLAT", thickness=0.15, offset=0.0,
+          use_rim=True, use_rim_only=False, nonmanifold_merge_threshold=0.05),
+     "four page groups exercise closing boundary edges with sharp and seam provenance"),
     ("tee_nm_even_round", "tee", {}, 1,
      dict(solidify_mode="NON_MANIFOLD", nonmanifold_thickness_mode="EVEN",
           nonmanifold_boundary_mode="ROUND", thickness=0.25, offset=0.4,

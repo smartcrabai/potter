@@ -12,8 +12,10 @@ use std::collections::{HashMap, HashSet};
 use glam::DVec3;
 use serde_json::{Map, Value, json};
 
-use super::super::{Polygon, build_mesh, edge_pairs, id_indices, mesh_attribute_values, polygons};
-use super::{BoundaryMode, Params, ThicknessMode};
+use super::super::{
+    Polygon, build_mesh_with_edge_sources, edge_pairs, id_indices, mesh_attribute_values, polygons,
+};
+use super::{BoundaryMode, Params, ThicknessMode, has_vertex_group, set_group_weight};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{Mesh, edge_key, provenance::Origin},
@@ -1643,7 +1645,7 @@ fn split_long_groups(groups: &mut [EdgeGroup], nedges: &[NewEdge], count: usize)
     has_singularities
 }
 
-/// Blender `Solidify` face normal (`face_normals_true`): the normalized Newell normal, or zero for a
+/// Blender `Solidify` face normal (`face_normals_true`): normalized Newell normal, or +Z for a
 /// face without area.
 fn face_normal_true(points: &[V3]) -> V3 {
     let mut normal: V3 = [0.0; 3];
@@ -1655,18 +1657,10 @@ fn face_normal_true(points: &[V3]) -> V3 {
         normal[1] += (previous[2] - current[2]) * (previous[0] + current[0]);
         normal[2] += (previous[0] - current[0]) * (previous[1] + current[1]);
     }
-    normalize3(&mut normal);
+    if normalize3(&mut normal) == 0.0 {
+        normal = [0.0, 0.0, 1.0];
+    }
     normal
-}
-
-/// Blender `BKE_id_defgroup_name_index(...) != -1` for a mesh vertex group.
-fn has_vertex_group(mesh: &Mesh, name: &str) -> bool {
-    !name.is_empty()
-        && mesh
-            .attributes
-            .get("vertex_groups")
-            .and_then(Value::as_object)
-            .is_some_and(|groups| groups.contains_key(name))
 }
 
 /// Whether the mesh carries attribute `name`, as a top-level entry or a `blender_attributes` entry.
@@ -1754,22 +1748,6 @@ struct OutFace {
     sources: Vec<usize>,
     face: usize,
     material: i64,
-}
-
-/// Sets output vertex `vertex_id` to weight 1 in the existing group `name` (`BKE_defvert_ensure_index`).
-fn set_group_weight(mesh: &mut Mesh, name: &str, vertex_id: u32) {
-    let groups = mesh
-        .attributes
-        .entry("vertex_groups".to_owned())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let Some(weights) = groups.as_object_mut().and_then(|groups| {
-        groups
-            .entry(name.to_owned())
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-    }) {
-        weights.insert(format!("v{vertex_id}"), json!(1.0));
-    }
 }
 
 fn remove_blender_attribute(mesh: &mut Mesh, name: &str) {
@@ -1992,6 +1970,7 @@ pub(super) fn solidify_nonmanifold(
 
     // Correction for adjacent one-sided singularity groups: each unordered pair gets one edge.
     let mut singularity_edges: Vec<[usize; 2]> = Vec::new();
+    let mut singularity_edge_sources = Vec::new();
     if topo.has_singularities {
         for i in 0..edges_num {
             let Some(data) = topo.orig_edge_data[i] else {
@@ -2020,11 +1999,13 @@ pub(super) fn solidify_nonmanifold(
                     continue;
                 }
                 singularity_edges.push(pair);
+                singularity_edge_sources.push(new.old);
             }
         }
     }
     let has_singularities = !singularity_edges.is_empty();
     let mut output_edges = singularity_edges.clone();
+    let mut output_edge_sources = singularity_edge_sources;
     let mut edge_values_out = vec![0.0_f32; output_edges.len()];
     let mut bevel_values_out = vec![0.0_f32; output_edges.len()];
     let mut edge_mapping = vec![EMPTY; topo.nedges.len()];
@@ -2056,6 +2037,7 @@ pub(super) fn solidify_nonmanifold(
             } else {
                 let index = output_edges.len();
                 output_edges.push([v1, v2]);
+                output_edge_sources.push(i);
                 edge_values_out.push(orig_value(crease_src.as_deref().unwrap_or(&[]), i));
                 let mut bevel = orig_value(bweight_src.as_deref().unwrap_or(&[]), i);
                 if bevel_convex != 0.0 && new.faces[1] != EMPTY {
@@ -2073,6 +2055,7 @@ pub(super) fn solidify_nonmanifold(
                 index
             };
             if singular_pair {
+                output_edge_sources[insert] = i;
                 edge_values_out[insert] = orig_value(crease_src.as_deref().unwrap_or(&[]), i);
                 let mut bevel = orig_value(bweight_src.as_deref().unwrap_or(&[]), i);
                 if bevel_convex != 0.0 && new.faces[1] != EMPTY {
@@ -2112,6 +2095,7 @@ pub(super) fn solidify_nonmanifold(
     let mut boundary_edges: Vec<[usize; 2]> = Vec::new();
     let mut boundary_crease: Vec<f32> = Vec::new();
     let mut boundary_bevel: Vec<f32> = Vec::new();
+    let mut boundary_edge_sources: Vec<usize> = Vec::new();
     let mut rim_vertex_marks = HashSet::new();
     let mut shell_vertex_marks = HashSet::new();
     for vertex in 0..verts_num {
@@ -2167,6 +2151,7 @@ pub(super) fn solidify_nonmanifold(
                 }
                 if let Some(&last) = run_groups.last() {
                     boundary_edges.push([groups[last].new_vert, groups[g].new_vert]);
+                    boundary_edge_sources.push(topo.nedges[groups[last].edges[0]].old);
                     boundary_crease.push(max_ff(
                         orig_value(vertex_crease.as_deref().unwrap_or(&[]), vertex),
                         min_ff(last_crease, max_crease),
@@ -2188,6 +2173,7 @@ pub(super) fn solidify_nonmanifold(
                     let first = run_groups[0];
                     let last = run_groups[run_groups.len() - 1];
                     boundary_edges.push([groups[last].new_vert, groups[first].new_vert]);
+                    boundary_edge_sources.push(topo.nedges[groups[last].edges[0]].old);
                     boundary_crease.push(max_ff(
                         orig_value(vertex_crease.as_deref().unwrap_or(&[]), vertex),
                         min_ff(last_crease, first_crease),
@@ -2270,6 +2256,7 @@ pub(super) fn solidify_nonmanifold(
     // Boundary edges follow the original-edge-derived edges in Blender's edge domain.
     for (index, edge) in boundary_edges.into_iter().enumerate() {
         output_edges.push(edge);
+        output_edge_sources.push(boundary_edge_sources[index]);
         edge_values_out.push(boundary_crease[index]);
         bevel_values_out.push(boundary_bevel[index]);
     }
@@ -2469,7 +2456,24 @@ pub(super) fn solidify_nonmanifold(
             )
         })
         .collect();
-    let mut result = build_mesh(points, output_polygons, loose, &origin, mesh)?;
+    if output_edges.len() != output_edge_sources.len() {
+        return Err(invariant("solidify output edge provenance is incomplete"));
+    }
+    let mut output_edge_indices = HashMap::new();
+    for (index, edge) in output_edges.iter().enumerate() {
+        output_edge_indices
+            .entry(edge_key(edge[0], edge[1]))
+            .or_insert(index);
+    }
+    let mut result = build_mesh_with_edge_sources(
+        points,
+        output_polygons,
+        loose,
+        &origin,
+        mesh,
+        &output_edge_indices,
+        &output_edge_sources,
+    )?;
 
     // Blender removes vertex creases if a rim is enabled; other point attributes are remapped.
     if do_rim && vertex_crease.is_some() {
@@ -2490,14 +2494,6 @@ pub(super) fn solidify_nonmanifold(
         }
     }
 
-    // `build_mesh` derives edge order from polygons, so transfer edge attributes by vertex pair.
-    let mut edge_data: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
-    for (index, edge) in output_edges.iter().enumerate() {
-        edge_data.entry(edge_key(edge[0], edge[1])).or_insert((
-            edge_values_out.get(index).copied().unwrap_or(0.0),
-            bevel_values_out.get(index).copied().unwrap_or(0.0),
-        ));
-    }
     let output_indices = id_indices(&result);
     let mut crease_values = Map::new();
     let mut bevel_values = Map::new();
@@ -2510,10 +2506,15 @@ pub(super) fn solidify_nonmanifold(
             .get(&edge.vertices[1])
             .copied()
             .unwrap_or(EMPTY);
-        let (crease, bevel) = edge_data
-            .get(&edge_key(first, second))
+        let output_edge = output_edge_indices.get(&edge_key(first, second)).copied();
+        let crease = output_edge
+            .and_then(|index| edge_values_out.get(index))
             .copied()
-            .unwrap_or((0.0, 0.0));
+            .unwrap_or(0.0);
+        let bevel = output_edge
+            .and_then(|index| bevel_values_out.get(index))
+            .copied()
+            .unwrap_or(0.0);
         crease_values.insert(format!("e{}", edge.id), json!(f64::from(crease)));
         bevel_values.insert(format!("e{}", edge.id), json!(f64::from(bevel)));
     }

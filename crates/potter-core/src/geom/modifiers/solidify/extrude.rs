@@ -19,7 +19,7 @@ use super::super::{
     Polygon, build_mesh, cyclic_pairs, edge_pairs, id_indices, mesh_attribute_values, polygons,
     positions, vertex_normals,
 };
-use super::{Params, util};
+use super::{Params, has_deform_verts, has_vertex_group, set_group_weight, util};
 
 /// The input in Blender's array form: storage-order elements, and per-face corner data.
 struct Source {
@@ -81,7 +81,7 @@ impl Source {
                 face_normal(&corners).as_vec3()
             })
             .collect();
-        let vert_normals: Vec<Vec3> = vertex_normals(&points, &polys, false)
+        let vert_normals: Vec<Vec3> = vertex_normals(&points, &polys)
             .into_iter()
             .enumerate()
             .map(|(vertex, normal)| {
@@ -700,13 +700,16 @@ pub(super) fn solidify_extrude(mesh: &Mesh, _modifier: &Modifier, params: &Param
     // Blender only writes a group that exists on the mesh.
     if has_vertex_group(mesh, &params.shell_group) {
         for index in verts_num..result.vertices.len() {
-            set_group_weight(&mut result, &params.shell_group, index);
+            let id = result.vertices[index].id;
+            set_group_weight(&mut result, &params.shell_group, id);
         }
     }
     if has_vertex_group(mesh, &params.rim_group) {
         for &vertex in &layout.rim.verts {
-            set_group_weight(&mut result, &params.rim_group, vertex);
-            set_group_weight(&mut result, &params.rim_group, layout.copy_of(vertex));
+            let id = result.vertices[vertex].id;
+            set_group_weight(&mut result, &params.rim_group, id);
+            let copy_id = result.vertices[layout.copy_of(vertex)].id;
+            set_group_weight(&mut result, &params.rim_group, copy_id);
         }
     }
 
@@ -851,46 +854,6 @@ fn carried_edge_values(source: &[f32], layout: &Layout) -> Vec<f32> {
         values[layout.copy_edge(position)] = source[edge];
     }
     values
-}
-
-/// Whether the mesh has the vertex group `name`. An empty name never does.
-fn has_vertex_group(mesh: &Mesh, name: &str) -> bool {
-    !name.is_empty()
-        && mesh
-            .attributes
-            .get("vertex_groups")
-            .and_then(Value::as_object)
-            .is_some_and(|groups| groups.contains_key(name))
-}
-
-/// Whether any vertex has a weight in any group, which is when Blender's mesh has deform verts.
-fn has_deform_verts(mesh: &Mesh) -> bool {
-    mesh.attributes
-        .get("vertex_groups")
-        .and_then(Value::as_object)
-        .is_some_and(|groups| {
-            groups.values().any(|weights| {
-                weights
-                    .as_object()
-                    .is_some_and(|weights| !weights.is_empty())
-            })
-        })
-}
-
-/// Sets vertex `index` to weight 1 in the vertex group `group`.
-fn set_group_weight(mesh: &mut Mesh, group: &str, index: usize) {
-    let id = mesh.vertices[index].id;
-    let groups = mesh
-        .attributes
-        .entry("vertex_groups")
-        .or_insert_with(|| json!({}));
-    if let Some(weights) = groups
-        .as_object_mut()
-        .map(|groups| groups.entry(group).or_insert_with(|| json!({})))
-        .and_then(Value::as_object_mut)
-    {
-        weights.insert(format!("v{id}"), json!(1.0));
-    }
 }
 
 fn remove_blender_attribute(mesh: &mut Mesh, name: &str) {

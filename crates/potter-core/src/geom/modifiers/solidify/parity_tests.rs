@@ -6,13 +6,14 @@
 //! scene path the CLI uses, where the node's material list sets the evaluated slot count.
 //!
 //! Blender and Potter order vertices, edges, and faces differently, so elements are matched by
-//! position: vertices by position and vertex-group weights, edges by endpoint positions (either
-//! order) with sharp/seam flags and crease, faces by their oriented position ring (any rotation)
-//! with material, smooth flag, UV corners, named corner colors, and custom-normal corners. Counts are exact.
+//! position: vertices by position and vertex-group weights; edges by endpoint positions (either
+//! order), sharp/seam flags, crease, and bevel weight; faces by oriented position rings (any
+//! rotation), with material, smooth flag, UV corners, named corner colors, and custom-normal
+//! corners. Counts are exact.
 //!
-//! Tolerances. Positions and UVs are compared at 1e-6. Group weights, colors, and creases are compared
-//! after f32 rounding. For each case Blender measures the maximum component error from re-encoding
-//! its output corner normals; the test adds 1e-6 for evaluation rounding.
+//! Tolerances: positions and UVs are compared at 1e-6. Group weights, colors, creases, and bevel
+//! weights are compared after f32 rounding. Blender's recorded output-normal codec error gets an
+//! additional 1e-6 for evaluation rounding.
 //!
 //! Blender refused no case in the current corpus; a case recorded as `"outcome": "error"` must make
 //! Potter return an error.
@@ -237,6 +238,7 @@ struct Edge {
     sharp: bool,
     seam: bool,
     crease: f64,
+    bevel_weight: f64,
 }
 
 fn potter_corners(mesh: &Mesh) -> TestResult<Vec<Corners>> {
@@ -414,7 +416,7 @@ fn corners_same(potter: &Corners, expected: &Corners, normal_tolerance: f64) -> 
 
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "Blender stores these weights, colors, and creases as f32"
+    reason = "Blender stores group/bevel weights, colors, and creases as f32"
 )]
 fn same_f32(a: f64, b: f64) -> bool {
     (a as f32).to_bits() == (b as f32).to_bits()
@@ -434,7 +436,11 @@ fn signature_same(a: &[f64], b: &[f64]) -> bool {
 fn edge_same(a: &Edge, b: &Edge) -> bool {
     let forward = near(a.ends[0], b.ends[0]) && near(a.ends[1], b.ends[1]);
     let backward = near(a.ends[0], b.ends[1]) && near(a.ends[1], b.ends[0]);
-    a.sharp == b.sharp && a.seam == b.seam && same_f32(a.crease, b.crease) && (forward || backward)
+    a.sharp == b.sharp
+        && a.seam == b.seam
+        && same_f32(a.crease, b.crease)
+        && same_f32(a.bevel_weight, b.bevel_weight)
+        && (forward || backward)
 }
 
 /// Index of the first `left` item that cannot take a distinct `right` item, or `None` when every
@@ -546,6 +552,14 @@ fn compare(expected: &Value, mesh: &Mesh) -> TestResult<Vec<String>> {
         ));
     }
 
+    let has_bevel_weight_edge = mesh.attributes.contains_key("bevel_weight_edge");
+    if output["has_bevel_weight_edge"].as_bool() != Some(has_bevel_weight_edge) {
+        problems.push(format!(
+            "bevel_weight_edge attribute: Potter {has_bevel_weight_edge}, Blender {}",
+            output["has_bevel_weight_edge"]
+        ));
+    }
+
     if !problems.is_empty() {
         return Ok(problems);
     }
@@ -611,6 +625,9 @@ fn compare(expected: &Value, mesh: &Mesh) -> TestResult<Vec<String>> {
                 crease: keyed(mesh, "crease_edge", &format!("e{}", edge.id))
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0),
+                bevel_weight: keyed(mesh, "bevel_weight_edge", &format!("e{}", edge.id))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
@@ -629,14 +646,15 @@ fn compare(expected: &Value, mesh: &Mesh) -> TestResult<Vec<String>> {
                 sharp: edge["sharp"].as_bool().ok_or("sharp")?,
                 seam: edge["seam"].as_bool().ok_or("seam")?,
                 crease: number(&edge["crease"])?,
+                bevel_weight: number(&edge["bevel_weight"])?,
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
     if let Some(index) = first_unmatched(&potter_edges, &blender_edges, edge_same) {
         let edge = &potter_edges[index];
         problems.push(format!(
-            "edge {index} {:?}-{:?} (sharp {}, seam {}, crease {}) has no Blender counterpart",
-            edge.ends[0], edge.ends[1], edge.sharp, edge.seam, edge.crease
+            "edge {index} {:?}-{:?} (sharp {}, seam {}, crease {}, bevel weight {}) has no Blender counterpart",
+            edge.ends[0], edge.ends[1], edge.sharp, edge.seam, edge.crease, edge.bevel_weight
         ));
     }
 
