@@ -1268,10 +1268,16 @@ mod tests {
         assert_eq!(joined.faces[6].material_index, 1);
         joined.validate().unwrap();
 
-        // The first member's seam keeps its combined edge ID; the second member has none.
+        // The first member carries per-edge seam flags for its own edges, so the joined seam map holds
+        // those entries and keeps the first member's combined edge ID as true. The second member has no
+        // seam flags and contributes no entries.
         let seam = joined.attributes["seam"]["values"].as_object().unwrap();
-        assert_eq!(seam.len(), 1);
+        assert_eq!(seam.len(), first.edges.len());
         assert_eq!(seam[&format!("e{first_edge}")], json!(true));
+        assert_eq!(
+            seam.values().filter(|value| **value == json!(true)).count(),
+            1
+        );
 
         // Positional flags of the member without them default to flat.
         let smooth = joined.attributes["blender_polygon_smooth"]
