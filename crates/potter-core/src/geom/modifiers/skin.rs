@@ -455,14 +455,17 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             &mut branch_frame_states,
         )?;
     }
-    let detached_frames: Vec<(usize, [bool; 4])> = branch_frame_states
+    let mut detached_frames: Vec<(usize, [bool; 4])> = branch_frame_states
         .into_iter()
         .enumerate()
         .filter_map(|(frame, (detached, inside))| detached.then_some((frame, inside)))
         .collect();
+    // skin_fix_hull_topology walks skin nodes in index order and each node's frames in order
+    // (MOD_skin.cc:1676-1690), so repairs run in (node, frame) order rather than frame order.
+    detached_frames.sort_by_key(|&(frame, _)| (frame_nodes[frame], frame));
     branch_faces = merge_triangle_faces(&points, branch_faces, symmetry_axes);
     let mut welded = Vec::new();
-    let mut stale_edges = Vec::new();
+    let mut tagged_edges = TaggedEdges::default();
     repair_detached_branch_frames(
         &mut points,
         &mut origins,
@@ -470,7 +473,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         &mut branch_faces,
         &detached_frames,
         &mut welded,
-        &mut stale_edges,
+        &mut tagged_edges,
     )?;
     smooth_branch_hull_points(
         &mut points,
@@ -542,7 +545,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     // skin_fix_hole_no_good_verts.
     let faces: Vec<Polygon> = merge_triangle_faces(&points, polygons, symmetry_axes)
         .into_iter()
-        .filter(|face| !stale_edges.iter().any(|&edge| face_has_edge(face, edge)))
+        .filter(|face| !tagged_edges.0.iter().any(|&edge| face_has_edge(face, edge)))
         .map(|face| (face, 0))
         .collect();
     let (points, origins, faces) = drop_welded_points(points, origins, faces, &welded);
@@ -759,7 +762,7 @@ fn repair_detached_branch_frames(
     faces: &mut Vec<Vec<usize>>,
     detached_frames: &[(usize, [bool; 4])],
     welded: &mut Vec<usize>,
-    stale_edges: &mut Vec<(usize, usize)>,
+    tagged: &mut TaggedEdges,
 ) -> Result<()> {
     for &(frame_index, inside) in detached_frames {
         let frame = frame_vertex_ids.get(frame_index).copied().ok_or_else(|| {
@@ -794,7 +797,7 @@ fn repair_detached_branch_frames(
                 target,
                 frame_vertex_ids[frame_index],
                 welded,
-                stale_edges,
+                tagged,
             )?
         {
             continue;
@@ -887,7 +890,7 @@ fn skin_fix_hole_no_good_verts(
     target: usize,
     frame: [usize; 4],
     welded: &mut Vec<usize>,
-    stale_edges: &mut Vec<(usize, usize)>,
+    tagged: &mut TaggedEdges,
 ) -> Result<bool> {
     let ring = faces.get(target).cloned().ok_or_else(|| {
         PotError::new(
@@ -908,15 +911,16 @@ fn skin_fix_hole_no_good_verts(
         faces.push(vec![ring[next], copy[next], copy[corner], vertex]);
     }
     faces[target] = copy;
-    let mut split = None;
     if faces[target].len() == 3 {
-        // Blender's triangle branch clears every edge tag before tagging the split edge
-        // (MOD_skin.cc:1389-1390).
-        stale_edges.clear();
-        split = Some(subdivide_skin_target_face(points, origins, faces, target)?);
+        // Blender's triangle branch clears every edge tag, then tags the longest edge
+        // (MOD_skin.cc:1389-1390). BM_edge_split gives both halves the tag (bmesh_construct.cc).
+        tagged.0.clear();
+        let (first, midpoint, second) = subdivide_skin_target_face(points, origins, faces, target)?;
+        tagged.0.push(ordered_edge(first, midpoint));
+        tagged.0.push(ordered_edge(midpoint, second));
     }
     if faces[target].len() > 4 {
-        collapse_skin_face_corners(points, faces, target, welded);
+        collapse_skin_face_corners(points, faces, target, welded, tagged);
     }
     if faces[target].len() != 4 {
         return Ok(false);
@@ -930,33 +934,20 @@ fn skin_fix_hole_no_good_verts(
         .collect();
     welded.extend(quad);
     faces.remove(target);
+    tagged.weld(faces, &mapping);
     weld_skin_vertices(faces, &mapping);
-    if let Some((first, midpoint, second)) = split {
-        // Blender's BM_edge_split copies BM_ELEM_TAG to both halves (bmesh_construct.cc
-        // BM_elem_attrs_copy keeps non-select header flags), so both survive the weld tagged.
-        let mapped = |vertex: usize| {
-            mapping
-                .iter()
-                .find(|&&(from, _)| from == vertex)
-                .map_or(vertex, |&(_, to)| to)
-        };
-        for (a, b) in [(first, midpoint), (midpoint, second)] {
-            let (a, b) = (mapped(a), mapped(b));
-            if a != b {
-                stale_edges.push(ordered_edge(a, b));
-            }
-        }
-    }
     Ok(true)
 }
 
 /// Blender's `collapse_face_corners`: while `target` has more than four corners, its shortest edge
-/// merges into the edge's first corner, which moves to the edge midpoint.
+/// merges into the edge's first corner, which moves to the edge midpoint. That merge is a
+/// `weld_verts`, so tagged edges follow it (see `TaggedEdges::weld`).
 fn collapse_skin_face_corners(
     points: &mut [DVec3],
     faces: &mut [Vec<usize>],
     target: usize,
     welded: &mut Vec<usize>,
+    tagged: &mut TaggedEdges,
 ) {
     while faces[target].len() > 4 {
         let face = faces[target].clone();
@@ -974,6 +965,7 @@ fn collapse_skin_face_corners(
         let merge = face[(shortest + 1) % face.len()];
         points[keep] = skin_float_midpoint(points[keep], points[merge]);
         welded.push(merge);
+        tagged.weld(faces, &[(merge, keep)]);
         for other in &mut *faces {
             for vertex in &mut *other {
                 if *vertex == merge {
@@ -981,6 +973,50 @@ fn collapse_skin_face_corners(
                 }
             }
             dedupe_cyclic(other);
+        }
+    }
+}
+
+/// Blender's `BM_ELEM_TAG` on the hull edges repaired by `skin_fix_hole_no_good_verts`, as ordered
+/// point pairs. Only the triangle split tags edges, and nothing else in MOD_skin.cc clears them
+/// before the final `hull_merge_triangles`, whose `BM_mesh_delete_hflag_tagged` deletes tagged
+/// edges with every face around them (MOD_skin.cc:1632). Its face-tag reset is separate
+/// (MOD_skin.cc:1566).
+#[derive(Default)]
+struct TaggedEdges(Vec<(usize, usize)>);
+
+impl TaggedEdges {
+    /// `bmo_weld_verts_exec` (bmo_removedoubles.cc) for a target map. A tagged edge with a welded
+    /// corner moves onto the targets. A collapsed edge (both ends on one vertex) is deleted. When
+    /// the target pair already exists, that edge survives and keeps only its own tag, because
+    /// `BM_elem_flag_merge_ex` merges only BM_ELEM_HIDDEN, so the moved tag is lost. Otherwise
+    /// `BM_edge_create(.., e, BM_CREATE_NOP)` copies the header flags, so the new edge is tagged.
+    fn weld(&mut self, faces: &[Vec<usize>], mapping: &[(usize, usize)]) {
+        let is_welded = |vertex: usize| mapping.iter().any(|&(from, _)| from == vertex);
+        let target = |vertex: usize| {
+            mapping
+                .iter()
+                .find(|&&(from, _)| from == vertex)
+                .map_or(vertex, |&(_, to)| to)
+        };
+        let mut moved = Vec::new();
+        self.0.retain(|&(first, second)| {
+            if !is_welded(first) && !is_welded(second) {
+                return true;
+            }
+            moved.push(ordered_edge(target(first), target(second)));
+            false
+        });
+        for (first, second) in moved {
+            if first == second
+                || self.0.contains(&(first, second))
+                || faces
+                    .iter()
+                    .any(|face| face_has_edge(face, (first, second)))
+            {
+                continue;
+            }
+            self.0.push((first, second));
         }
     }
 }
@@ -1808,4 +1844,30 @@ fn skin_radius(
         ));
     }
     Ok([first, second])
+}
+
+#[cfg(test)]
+mod tagged_edge_tests {
+    use super::TaggedEdges;
+
+    #[test]
+    fn weld_moves_a_tag_onto_a_new_target_edge() {
+        let mut tags = TaggedEdges(vec![(4, 5)]);
+        tags.weld(&[vec![0, 1, 2]], &[(4, 1)]);
+        assert_eq!(tags.0, vec![(1, 5)]);
+    }
+
+    #[test]
+    fn weld_loses_a_tag_when_the_target_edge_already_exists() {
+        let mut tags = TaggedEdges(vec![(4, 5)]);
+        tags.weld(&[vec![1, 5, 2]], &[(4, 1)]);
+        assert!(tags.0.is_empty());
+    }
+
+    #[test]
+    fn weld_deletes_a_tagged_edge_that_collapses() {
+        let mut tags = TaggedEdges(vec![(4, 5)]);
+        tags.weld(&[], &[(4, 5)]);
+        assert!(tags.0.is_empty());
+    }
 }
