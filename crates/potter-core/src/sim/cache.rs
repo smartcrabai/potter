@@ -9,7 +9,7 @@ use std::{
 use glam::DMat4;
 use serde_json::json;
 
-use super::{SOLVER_VERSION, SimulationResult};
+use super::{PARTICLE_STATE_VERSION, SOLVER_VERSION, SimulationResult};
 use crate::geom::Mesh;
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -138,6 +138,7 @@ pub(super) fn cache_key(
 
     let input = json!({
         "solver_version": SOLVER_VERSION,
+        "particle_state_version": PARTICLE_STATE_VERSION,
         "scene_id": scene_id.as_str(),
         "frame": frame,
         "purpose": gate.context.purpose,

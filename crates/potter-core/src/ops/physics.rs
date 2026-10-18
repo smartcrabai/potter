@@ -1178,6 +1178,7 @@ fn validate_physics_settings(
         ],
         "particle_emitter" => &[
             "seed",
+            "child_seed",
             "count",
             "rate",
             "emission_rate",
@@ -1192,6 +1193,7 @@ fn validate_physics_settings(
             "velocity",
             "normal_velocity",
             "physics_type",
+            "type",
             "mass",
             "render_as",
             "render_type",
@@ -1199,9 +1201,15 @@ fn validate_physics_settings(
             "hair_length",
             "particle_size",
             "size_random",
-            "child_nbr",
+            "child_percent",
+            "rendered_child_count",
             "child_radius",
             "child_type",
+            "child_size",
+            "child_size_random",
+            "child_roundness",
+            "virtual_parents",
+            "use_emit_random",
             "start_frame",
             "end_frame",
             "frame_start",
@@ -1263,12 +1271,12 @@ fn validate_physics_settings(
                 .is_some_and(|number| number.is_finite() && number >= 0.0),
             "permeability" | "stickiness" | "damping_factor" | "damping_random"
             | "friction_factor" | "friction_random" | "lifetime_random" | "size_random"
-            | "restitution" => value
+            | "child_size_random" | "child_roundness" | "virtual_parents" | "restitution" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
             "use_particle_kill" | "collision_enabled" | "use_collision" | "use_self_collision"
-            | "use_culling" | "use_normal" => value.is_boolean(),
-            "seed" => value
+            | "use_culling" | "use_normal" | "use_emit_random" => value.is_boolean(),
+            "seed" | "child_seed" => value
                 .as_u64()
                 .is_some_and(|seed| u32::try_from(seed).is_ok()),
             "substeps" | "quality" | "collision_quality" => value
@@ -1280,7 +1288,10 @@ fn validate_physics_settings(
             "resolution" => value
                 .as_u64()
                 .is_some_and(|count| (1..=10).contains(&count)),
-            "count" | "child_nbr" => value.as_u64().is_some_and(|count| count <= 1_000_000),
+            "count" => value.as_u64().is_some_and(|count| count <= 1_000_000),
+            "child_percent" | "rendered_child_count" => {
+                value.as_u64().is_some_and(|count| count <= 100_000)
+            }
             "rate" | "emission_rate" => value
                 .as_f64()
                 .is_some_and(|rate| rate.is_finite() && (0.0..=1_000_000.0).contains(&rate)),
@@ -1291,7 +1302,7 @@ fn validate_physics_settings(
                 value.as_f64().is_some_and(f64::is_finite)
             }
             "particle_radius" | "smoothing_length" | "radius" | "hair_length" | "particle_size"
-            | "mass" => value
+            | "child_size" | "mass" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && number > 0.0),
             "stiffness"
@@ -1350,9 +1361,13 @@ fn validate_physics_settings(
             "child_type" => value
                 .as_str()
                 .is_some_and(|kind| matches!(kind, "NONE" | "SIMPLE" | "INTERPOLATED")),
-            "type" => value
-                .as_str()
-                .is_some_and(|kind| matches!(kind, "liquid" | "smoke" | "fire")),
+            "type" => value.as_str().is_some_and(|kind| {
+                if system == "particle_emitter" {
+                    matches!(kind, "EMITTER" | "HAIR")
+                } else {
+                    matches!(kind, "liquid" | "smoke" | "fire")
+                }
+            }),
             "role" => value
                 .as_str()
                 .is_some_and(|role| matches!(role, "canvas" | "brush")),

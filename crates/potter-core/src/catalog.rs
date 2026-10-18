@@ -951,13 +951,6 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
-            "modifier.particle_instance.use_path",
-            "Particle Instance along sampled particle paths",
-            "PARTICLE_INSTANCE",
-            &[],
-            "Blender samples cached particle path trajectories and incrementally transported orientation frames; the current particle-state model stores only birth and current states.",
-        ),
         supported(
             "modifier.explode",
             "Splits stack geometry into particle-driven disconnected face fragments",

@@ -938,8 +938,6 @@ impl Snapshot {
                                 id,
                                 doc,
                                 gate,
-                                frame,
-                                f64::from(scene.fps) / scene.fps_base,
                                 &matrices,
                                 &simulated_particles,
                             ),
@@ -1221,8 +1219,6 @@ impl Snapshot {
                                 id,
                                 doc,
                                 gate,
-                                frame,
-                                f64::from(scene.fps) / scene.fps_base,
                                 &matrices,
                                 &simulated_particles,
                             ),
@@ -2983,8 +2979,6 @@ fn apply_particle_instance_modifier(
     node_id: &Id,
     doc: &SceneDoc,
     gate: ModifierGate<'_>,
-    frame: f64,
-    fps: f64,
     matrices: &BTreeMap<Id, DMat4>,
     particles: &BTreeMap<Id, Vec<crate::sim::ParticleState>>,
 ) -> Result<()> {
@@ -3000,13 +2994,15 @@ fn apply_particle_instance_modifier(
             json!({"modifier_id":modifier.id,"object":object_text}),
         )
     })?;
+    if &object_id == node_id {
+        return Ok(());
+    }
     let index = particle_system_index(modifier)?;
-    let (system_modifier, _) = particle_system_for_index(doc, &object_id, index)?;
-    let particle_states = if gate.is_active(&object_id, system_modifier) {
-        select_particle_states(particles.get(&object_id), index)
-    } else {
-        Vec::new()
-    };
+    let (system_modifier, settings) = particle_system_for_index(doc, &object_id, index)?;
+    if !gate.is_active(&object_id, system_modifier) {
+        return Ok(());
+    }
+    let particle_states = select_particle_states(particles.get(&object_id), index);
     let source_world = matrices.get(&object_id).copied().ok_or_else(|| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -3014,21 +3010,18 @@ fn apply_particle_instance_modifier(
             json!({"modifier_id":modifier.id,"object":object_id}),
         )
     })?;
-    let target_world = matrices.get(node_id).copied().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "particle instance target transform is missing",
-            json!({"node_id":node_id}),
-        )
-    })?;
-    *mesh = crate::geom::modifiers::simulation::particle_instance(
+    let track_flag = doc
+        .nodes
+        .get(node_id)
+        .map(object_track_flag)
+        .unwrap_or_default();
+    *mesh = crate::geom::modifiers::particle_instance::particle_instance(
         mesh,
         &particle_states,
+        particle_system_seed(settings)?,
         source_world,
-        target_world,
+        track_flag,
         &modifier.params,
-        frame,
-        fps,
     )?;
     Ok(())
 }
@@ -3044,12 +3037,11 @@ fn apply_explode_modifier(
     particles: &BTreeMap<Id, Vec<crate::sim::ParticleState>>,
 ) -> Result<()> {
     let index = particle_system_index(modifier)?;
-    let (system_modifier, _) = particle_system_for_index(doc, node_id, index)?;
-    let particle_states = if gate.is_active(node_id, system_modifier) {
-        select_particle_states(particles.get(node_id), index)
-    } else {
-        Vec::new()
-    };
+    let (system_modifier, settings) = particle_system_for_index(doc, node_id, index)?;
+    if !gate.is_active(node_id, system_modifier) {
+        return Ok(());
+    }
+    let particle_states = select_particle_states(particles.get(node_id), index);
     let matrix = matrices.get(node_id).copied().ok_or_else(|| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -3057,15 +3049,51 @@ fn apply_explode_modifier(
             json!({"node_id":node_id}),
         )
     })?;
-    *mesh = crate::geom::modifiers::simulation::explode(
+    *mesh = crate::geom::modifiers::explode::explode(
         mesh,
         &particle_states,
+        particle_system_seed(settings)?,
         matrix,
         &modifier.params,
         frame,
-        50.0,
     )?;
     Ok(())
+}
+
+fn particle_system_seed(settings: &serde_json::Value) -> Result<u32> {
+    let seed = settings
+        .get("seed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    u32::try_from(seed).map_err(|_| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "particle system seed must fit in a 32-bit unsigned integer",
+            json!({"seed":seed}),
+        )
+    })
+}
+
+/// Maps Blender `Object.track_axis` enum values to the `trackflag` byte used by the modifier.
+fn object_track_flag(node: &Node) -> u32 {
+    let Some(track_axis) = node
+        .properties
+        .get("blender_object_metadata")
+        .and_then(|metadata| metadata.get("rna_properties"))
+        .and_then(|properties| properties.get("track_axis"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return 1; // Blender initializes new Objects with `OB_POSY`.
+    };
+    match track_axis {
+        "POS_X" => 0,
+        "POS_Y" => 1,
+        "POS_Z" => 2,
+        "NEG_X" => 3,
+        "NEG_Y" => 4,
+        "NEG_Z" => 5,
+        _ => 0,
+    }
 }
 
 fn particle_system_index(modifier: &Modifier) -> Result<u32> {

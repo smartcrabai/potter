@@ -240,6 +240,32 @@ fn injected_particles(
             let size = state["size"]
                 .as_f64()
                 .ok_or("Blender particle size is missing")?;
+            let path = state["path"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|key| {
+                    Ok(potter_core::sim::ParticlePathKey {
+                        time: key["time"]
+                            .as_f64()
+                            .ok_or("Blender path-key time is missing")?,
+                        position: serde_json::from_value(key["position"].clone())?,
+                        velocity: serde_json::from_value(key["velocity"].clone())?,
+                        rotation: serde_json::from_value(key["rotation"].clone())?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+            let system_index = state["system_index"].as_u64().unwrap_or(0) as u32;
+            let is_child = state["is_child"].as_bool().unwrap_or(false);
+            let parent_index = state["parent_index"]
+                .as_u64()
+                .map(u32::try_from)
+                .transpose()?;
+            let path_root_rotation = state
+                .get("path_root_rotation")
+                .filter(|rotation| !rotation.is_null())
+                .map(|rotation| serde_json::from_value::<[f64; 4]>(rotation.clone()))
+                .transpose()?;
             let life_state = match state["life_state"]
                 .as_str()
                 .ok_or("Blender particle life state is missing")?
@@ -248,6 +274,16 @@ fn injected_particles(
                 "DEAD" => potter_core::sim::ParticleLifeState::Dead,
                 "UNBORN" => potter_core::sim::ParticleLifeState::Unborn,
                 state => return Err(format!("unknown Blender particle state `{state}`").into()),
+            };
+            let path_interpolation = match state["path_interpolation"].as_str() {
+                Some("linear") => potter_core::sim::ParticlePathInterpolation::Linear,
+                Some("hair_cache") => potter_core::sim::ParticlePathInterpolation::HairCache,
+                Some("hair_cardinal") => potter_core::sim::ParticlePathInterpolation::HairCardinal,
+                Some("hair_bspline") => potter_core::sim::ParticlePathInterpolation::HairBspline,
+                Some("hermite") | None => potter_core::sim::ParticlePathInterpolation::Hermite,
+                Some(mode) => {
+                    return Err(format!("unknown particle path interpolation `{mode}`").into());
+                }
             };
             Ok(potter_core::sim::ParticleState {
                 position,
@@ -259,6 +295,12 @@ fn injected_particles(
                 birth_frame,
                 death_frame,
                 life_state,
+                system_index,
+                is_child,
+                parent_index,
+                path_root_rotation,
+                path,
+                path_interpolation,
                 size,
                 ..potter_core::sim::ParticleState::default()
             })
@@ -266,6 +308,355 @@ fn injected_particles(
         .collect()
 }
 
+fn add_corner_fixture_data(
+    mesh: &mut potter_core::geom::Mesh,
+    raw_codes: &Value,
+    include_fixture_color: bool,
+    include_hair_color: bool,
+) {
+    let raw_codes = raw_codes.as_array().expect("Blender INT16_2D corner codes");
+    let color_layer = if include_fixture_color {
+        Some(("FixtureCornerColor", "BYTE_COLOR"))
+    } else if include_hair_color {
+        Some(("HairCornerColor", "FLOAT_COLOR"))
+    } else {
+        None
+    };
+    let mut source_uv_faces = Vec::with_capacity(mesh.faces.len());
+    let mut particle_uv_faces = Vec::with_capacity(mesh.faces.len());
+    let mut normal_codes = serde_json::Map::new();
+    let mut color_codes = serde_json::Map::new();
+    let mut loop_index = 0;
+    for (face_index, face) in mesh.faces.iter_mut().enumerate() {
+        face.material_index = (face_index % 3) as u32;
+        let mut source_uvs = Vec::with_capacity(face.vertices.len());
+        let mut particle_uvs = Vec::with_capacity(face.vertices.len());
+        let mut color_row = Vec::with_capacity(face.vertices.len());
+        let mut code_row = Vec::with_capacity(face.vertices.len());
+        for corner in 0..face.vertices.len() {
+            let source_uv = [
+                0.1 + 0.17 * face_index as f64 + 0.11 * corner as f64,
+                0.2 + 0.13 * face_index as f64 + 0.07 * corner as f64,
+            ];
+            source_uvs.push(json!([source_uv[0], 1.0 - source_uv[1]]));
+            particle_uvs.push(json!([source_uv[0] + 0.031, 1.0 - (source_uv[1] + 0.047)]));
+            if include_fixture_color {
+                color_row.push(match corner % 4 {
+                    0 => json!([1.0, 0.0, 0.0, 1.0]),
+                    1 => json!([0.0, 1.0, 0.0, 1.0]),
+                    2 => json!([0.0, 0.0, 1.0, 1.0]),
+                    _ => json!([1.0, 1.0, 1.0, 1.0]),
+                });
+            } else if include_hair_color {
+                color_row.push(json!([
+                    0.12 + 0.11 * face_index as f64 + 0.07 * corner as f64,
+                    0.21 + 0.09 * face_index as f64 + 0.05 * corner as f64,
+                    0.31 + 0.07 * face_index as f64 + 0.03 * corner as f64,
+                    1.0
+                ]));
+            }
+            code_row.push(raw_codes[loop_index].clone());
+            loop_index += 1;
+        }
+        source_uv_faces.push(json!({"face_id":face.id,"uv":source_uvs}));
+        particle_uv_faces.push(json!({"face_id":face.id,"uv":particle_uvs}));
+        normal_codes.insert(format!("f{}", face.id), Value::Array(code_row));
+        if color_layer.is_some() {
+            color_codes.insert(format!("f{}", face.id), Value::Array(color_row));
+        }
+    }
+    assert_eq!(loop_index, raw_codes.len(), "Blender source code count");
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        json!({
+            "layers":[
+                {"name":"SourceUV","faces":source_uv_faces},
+                {"name":"ParticleUV","faces":particle_uv_faces}
+            ],
+            "active":"SourceUV",
+            "render":"SourceUV"
+        }),
+    );
+    mesh.attributes.insert(
+        "custom_normal".to_owned(),
+        json!({"domain":"corner", "type":"normal_code", "values":normal_codes}),
+    );
+    if let Some((name, data_type)) = color_layer {
+        let mut attribute = serde_json::Map::new();
+        attribute.insert("domain".to_owned(), json!("corner"));
+        attribute.insert("type".to_owned(), json!("color"));
+        attribute.insert("values".to_owned(), Value::Object(color_codes));
+        mesh.attributes
+            .insert(name.to_owned(), Value::Object(attribute));
+        mesh.attributes.insert(
+            "color_layers".to_owned(),
+            json!({"layers":[name],"active":name,"render":name}),
+        );
+        let mut data_types = serde_json::Map::new();
+        data_types.insert(name.to_owned(), json!(data_type));
+        mesh.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types":data_types}),
+        );
+    }
+}
+
+fn assert_numeric_rows(actual: &Value, expected: &Value, context: &str) {
+    let actual = actual.as_array().expect("actual numeric rows");
+    let expected = expected.as_array().expect("expected numeric rows");
+    assert_eq!(actual.len(), expected.len(), "{context}: row count");
+    for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        let actual = actual.as_array().expect("actual numeric row");
+        let expected = expected.as_array().expect("expected numeric row");
+        assert_eq!(actual.len(), expected.len(), "{context}: row {row} width");
+        for (axis, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let delta = actual.as_f64().expect("actual number")
+                - expected.as_f64().expect("expected number");
+            assert!(
+                delta.abs() <= MODIFIER_POSITION_TOLERANCE,
+                "{context}: row {row} component {axis} differs by {delta}",
+            );
+        }
+    }
+}
+
+fn assert_ordered_mesh_matches_blender(
+    mesh: &potter_core::geom::Mesh,
+    expected: &Value,
+    context: &str,
+) {
+    assert_numeric_rows(
+        &serde_json::to_value(
+            mesh.vertices
+                .iter()
+                .map(|vertex| vertex.co.to_array())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+        &expected["positions"],
+        &format!("{context} positions"),
+    );
+    let vertex_indices = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let faces = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| vertex_indices[id])
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let expected_faces: Vec<Vec<usize>> =
+        serde_json::from_value(expected["faces"].clone()).expect("Blender face loops");
+    assert_eq!(faces, expected_faces, "{context} ordered face loops");
+    let materials = mesh
+        .faces
+        .iter()
+        .map(|face| face.material_index)
+        .collect::<Vec<_>>();
+    let expected_materials: Vec<u32> =
+        serde_json::from_value(expected["materials"].clone()).expect("Blender material indices");
+    assert_eq!(materials, expected_materials, "{context} material indices");
+
+    for (name, expected_uvs) in expected["uv_layers"].as_object().unwrap() {
+        let layer = mesh
+            .attributes
+            .get("uv_layers")
+            .and_then(|store| store.get("layers"))
+            .and_then(Value::as_array)
+            .and_then(|layers| layers.iter().find(|layer| layer["name"] == *name))
+            .unwrap_or_else(|| panic!("{context}: missing UV layer {name}"));
+        let faces = layer["faces"]
+            .as_array()
+            .expect("canonical UV face entries");
+        let mut actual_uvs = Vec::new();
+        for face in &mesh.faces {
+            let row = faces
+                .iter()
+                .find(|entry| entry["face_id"].as_u64() == Some(u64::from(face.id)))
+                .and_then(|entry| entry["uv"].as_array())
+                .unwrap_or_else(|| {
+                    panic!("{context}: missing UVs for layer {name} face {}", face.id)
+                });
+            assert_eq!(
+                row.len(),
+                face.vertices.len(),
+                "{context} UV {name} face {}",
+                face.id
+            );
+            for uv in row {
+                let uv = uv.as_array().expect("canonical UV pair");
+                let u = uv[0].as_f64().expect("canonical UV u");
+                let v = uv[1].as_f64().expect("canonical UV v");
+                actual_uvs.push(json!([u, 1.0 - v]));
+            }
+        }
+        assert_numeric_rows(
+            &Value::Array(actual_uvs),
+            expected_uvs,
+            &format!("{context} UV {name}"),
+        );
+    }
+
+    let normal_state = mesh.attributes.get("custom_normal");
+    if let Some(expected_codes) = expected["custom_normal_codes"].as_array() {
+        let normal_state = normal_state.expect("canonical custom-normal state");
+        assert_eq!(normal_state["domain"], "corner", "{context} normal domain");
+        assert_eq!(
+            normal_state["type"], "normal_code",
+            "{context} normal code type"
+        );
+        let values = normal_state["values"].as_object().unwrap();
+        let corner_order = normal_state.get("corner_order").and_then(Value::as_object);
+        let corner_count = mesh
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
+        let mut actual_codes = vec![Value::Null; corner_count];
+        let mut offset = 0;
+        for face in &mesh.faces {
+            let key = format!("f{}", face.id);
+            let row = values.get(&key).and_then(Value::as_array).unwrap();
+            let order = corner_order
+                .and_then(|orders| orders.get(&key))
+                .and_then(Value::as_array);
+            assert_eq!(
+                row.len(),
+                face.vertices.len(),
+                "{context} {key} normal code count"
+            );
+            for (corner, code) in row.iter().enumerate() {
+                let ordinal = order
+                    .and_then(|order| order.get(corner))
+                    .and_then(Value::as_u64)
+                    .map_or(offset + corner, |value| value as usize);
+                actual_codes[ordinal] = code.clone();
+            }
+            offset += face.vertices.len();
+        }
+        assert_eq!(
+            Value::Array(actual_codes),
+            Value::Array(expected_codes.clone()),
+            "{context} Blender INT16_2D custom-normal codes",
+        );
+    }
+
+    let expected_layer_names: Vec<String> =
+        serde_json::from_value(expected["color_layer_names"].clone()).unwrap();
+    let color_registry = mesh
+        .attributes
+        .get("color_layers")
+        .and_then(Value::as_object);
+    let actual_layer_names: Vec<String> = color_registry
+        .and_then(|registry| registry.get("layers"))
+        .and_then(Value::as_array)
+        .map(|layers| {
+            layers
+                .iter()
+                .map(|layer| layer.as_str().unwrap().to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        actual_layer_names, expected_layer_names,
+        "{context} color layer order"
+    );
+    for (name, expected_color) in expected["color_attributes"].as_object().unwrap() {
+        // These fixture names are not reserved, so the canonical storage key is the user name.
+        let attribute = mesh
+            .attributes
+            .get(name)
+            .unwrap_or_else(|| panic!("{context}: missing color layer {name}"));
+        assert_eq!(attribute["domain"], "corner", "{context} {name} domain");
+        assert_eq!(attribute["type"], "color", "{context} {name} type");
+        assert_eq!(
+            mesh.attributes["blender_metadata"]["color_data_types"][name],
+            expected_color["data_type"],
+            "{context} {name} source encoding",
+        );
+        let values = attribute["values"].as_object().unwrap();
+        let actual_values = mesh
+            .faces
+            .iter()
+            .flat_map(|face| {
+                values
+                    .get(&format!("f{}", face.id))
+                    .and_then(Value::as_array)
+                    .unwrap()
+                    .iter()
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        assert_numeric_rows(
+            &Value::Array(actual_values),
+            &expected_color["values"],
+            &format!("{context} color {name}"),
+        );
+    }
+    let expected_groups = expected["vertex_groups"].as_object().unwrap();
+    let actual_groups = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object);
+    assert_eq!(
+        actual_groups.map_or(0, serde_json::Map::len),
+        expected_groups.len(),
+        "{context} vertex-group count",
+    );
+    for (name, expected_weights) in expected_groups {
+        let expected_weights = expected_weights.as_array().unwrap();
+        let stored = actual_groups
+            .and_then(|groups| groups.get(name))
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{context}: missing vertex group {name}"));
+        assert_eq!(
+            mesh.vertices.len(),
+            expected_weights.len(),
+            "{context} {name} size"
+        );
+        for (index, vertex) in mesh.vertices.iter().enumerate() {
+            let actual = stored
+                .get(&format!("v{}", vertex.id))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let wanted = expected_weights[index].as_f64().unwrap();
+            assert!(
+                (actual - wanted).abs() <= MODIFIER_POSITION_TOLERANCE,
+                "{context}: {name} weight at vertex {index} differs: {actual} != {wanted}",
+            );
+        }
+    }
+}
+
+fn assert_snapshot_mesh_matches_blender(
+    document: &potter_core::model::SceneDoc,
+    object_id: &str,
+    frame: f64,
+    expected: &Value,
+    context: &str,
+) -> Result<(), Box<dyn Error>> {
+    let id = potter_core::model::Id::new(object_id.to_owned())?;
+    let snapshot = potter_core::eval::Snapshot::evaluate(
+        document,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(frame),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let mesh = snapshot
+        .meshes
+        .get(&id)
+        .ok_or("evaluated particle mesh is missing")?;
+    assert_ordered_mesh_matches_blender(mesh, expected, context);
+    Ok(())
+}
 #[test]
 fn particle_instance_transforms_and_explode_face_splitting_match_blender()
 -> Result<(), Box<dyn Error>> {
@@ -282,6 +673,8 @@ fn particle_instance_transforms_and_explode_face_splitting_match_blender()
         r"
 import bpy, json, os, sys
 from mathutils import Vector
+if tuple(bpy.app.version[:3]) != (5,2,2):
+    raise RuntimeError('particle parity requires Blender 5.2.2')
 root = sys.argv[sys.argv.index('--') + 1]
 
 def matrix_array(matrix):
@@ -314,6 +707,66 @@ def particle_states(system, births=None):
             state['birth_position'] = birth['position']
             state['birth_rotation'] = birth['rotation']
     return states
+def add_corner_data(mesh):
+    for material_index in range(3):
+        material = bpy.data.materials.new('FixtureMaterial%d' % material_index)
+        mesh.materials.append(material)
+    for polygon in mesh.polygons:
+        polygon.material_index = polygon.index % 3
+    source_uv = mesh.uv_layers.new(name='SourceUV')
+    particle_uv = mesh.uv_layers.new(name='ParticleUV')
+    for polygon in mesh.polygons:
+        for local_corner, loop_index in enumerate(range(polygon.loop_start, polygon.loop_start + polygon.loop_total)):
+            uv = (0.1 + 0.17 * polygon.index + 0.11 * local_corner,
+                  0.2 + 0.13 * polygon.index + 0.07 * local_corner)
+            source_uv.data[loop_index].uv = uv
+            particle_uv.data[loop_index].uv = (uv[0] + 0.031, uv[1] + 0.047)
+    corner_color = mesh.color_attributes.new(name='FixtureCornerColor', type='BYTE_COLOR', domain='CORNER')
+    fixture_colors = ((1,0,0,1), (0,1,0,1), (0,0,1,1), (1,1,1,1))
+    for polygon in mesh.polygons:
+        for local_corner, loop_index in enumerate(range(polygon.loop_start, polygon.loop_start + polygon.loop_total)):
+            corner_color.data[loop_index].color = fixture_colors[local_corner % len(fixture_colors)]
+    mesh.normals_split_custom_set([
+        Vector((0.13 * ((loop.index % 3) - 1), 0.09 * ((loop.index % 4) - 1.5), 1.0)).normalized()
+        for loop in mesh.loops
+    ])
+    mesh.update()
+def corner_normal_codes(mesh):
+    attribute = mesh.attributes.get('custom_normal')
+    if attribute is None:
+        return None
+    if attribute.domain != 'CORNER' or attribute.data_type != 'INT16_2D':
+        raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
+    codes = []
+    for item in attribute.data:
+        pair = [int(value) for value in item.vector]
+        codes.append(None if pair == [0,0] else pair)
+    return codes
+
+
+def mesh_snapshot(mesh, obj):
+    vertex_groups = {}
+    for group in obj.vertex_groups:
+        values = []
+        for vertex in mesh.vertices:
+            weight = next((item.weight for item in vertex.groups if item.group == group.index), 0.0)
+            values.append(weight)
+        vertex_groups[group.name] = values
+    return {
+        'positions':[list(vertex.co) for vertex in mesh.vertices],
+        'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+        'materials':[int(polygon.material_index) for polygon in mesh.polygons],
+        'uv_layers':{layer.name:[list(item.uv) for item in layer.data] for layer in mesh.uv_layers},
+        'custom_normal_codes':corner_normal_codes(mesh),
+        'color_layer_names':[layer.name for layer in mesh.color_attributes if layer.domain == 'CORNER'],
+        'color_attributes':{
+            layer.name:{'domain':layer.domain, 'data_type':layer.data_type,
+                        'values':[list(item.color) for item in layer.data]}
+            for layer in mesh.color_attributes if layer.domain == 'CORNER'
+        },
+        'vertex_groups':vertex_groups,
+    }
+
 
 emitter_mesh = bpy.data.meshes.new('asymmetric_emitter_mesh')
 emitter_mesh.from_pydata(
@@ -329,7 +782,10 @@ emitter.scale = (1,1,1)
 bpy.context.view_layer.objects.active = emitter
 emitter.select_set(True)
 bpy.ops.object.particle_system_add()
-particle_settings = emitter.particle_systems[0].settings
+emitter_system = emitter.particle_systems[0]
+emitter_system.seed = 17
+emitter_system.child_seed = 31
+particle_settings = emitter_system.settings
 particle_settings.count = 1
 particle_settings.frame_start = 1
 particle_settings.frame_end = 1
@@ -363,11 +819,13 @@ instance_mesh.from_pydata(
     [],
     [(0,1,2,3)],
 )
+add_corner_data(instance_mesh)
+instance_source_normal_codes = corner_normal_codes(instance_mesh)
 instance = bpy.data.objects.new('Instance', instance_mesh)
 scene.collection.objects.link(instance)
-instance.location = (-0.4,0.6,0.2)
-instance.rotation_euler = (0.17,-0.29,0.41)
-instance.scale = (1.3,0.8,1.1)
+instance.location = (0,0,0)
+instance.rotation_euler = (0,0,0)
+instance.scale = (1,1,1)
 instance.track_axis = 'POS_Z'
 modifier = instance.modifiers.new('Particle Instance', 'PARTICLE_INSTANCE')
 modifier.object = emitter
@@ -382,39 +840,21 @@ modifier.show_dead = False
 modifier.show_unborn = False
 modifier.space = 'WORLD'
 modifier.rotation = 0.0
+modifier.index_layer_name = 'InstanceIndex'
+modifier.value_layer_name = 'InstanceValue'
 depsgraph = bpy.context.evaluated_depsgraph_get()
 evaluated = instance.evaluated_get(depsgraph)
-evaluated_mesh = evaluated.to_mesh()
+evaluated_mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
 instance_points = [list(vertex.co) for vertex in evaluated_mesh.vertices]
+instance_mesh_snapshot = mesh_snapshot(evaluated_mesh, evaluated)
 instance_world_matrix = matrix_array(evaluated.matrix_world)
 evaluated.to_mesh_clear()
-instance_children = bpy.data.objects.new('InstanceChildren', instance_mesh)
-bpy.context.scene.collection.objects.link(instance_children)
-instance_children.location = (-0.4,0.6,0.2)
-instance_children.rotation_euler = (0.17,-0.29,0.41)
-instance_children.scale = (1.3,0.8,1.1)
-instance_children.track_axis = 'POS_Z'
-children_modifier = instance_children.modifiers.new('Child Particle Instance', 'PARTICLE_INSTANCE')
-children_modifier.object = emitter
-children_modifier.particle_system_index = 1
-children_modifier.axis = 'Z'
-children_modifier.use_normal = True
-children_modifier.use_children = True
-children_modifier.use_size = False
-children_modifier.show_alive = True
-children_modifier.show_dead = False
-children_modifier.show_unborn = False
-children_modifier.space = 'WORLD'
-children_eval = instance_children.evaluated_get(bpy.context.evaluated_depsgraph_get())
-children_mesh = children_eval.to_mesh()
-child_instance_points = [list(vertex.co) for vertex in children_mesh.vertices]
-children_eval.to_mesh_clear()
 
 instance_local = bpy.data.objects.new('InstanceLocal', instance_mesh)
 scene.collection.objects.link(instance_local)
-instance_local.location = (-0.4,0.6,0.2)
-instance_local.rotation_euler = (0.17,-0.29,0.41)
-instance_local.scale = (1.3,0.8,1.1)
+instance_local.location = (0,0,0)
+instance_local.rotation_euler = (0,0,0)
+instance_local.scale = (1,1,1)
 instance_local.track_axis = 'POS_Z'
 local_modifier = instance_local.modifiers.new('Local Particle Instance', 'PARTICLE_INSTANCE')
 local_modifier.object = emitter
@@ -427,18 +867,21 @@ local_modifier.show_alive = True
 local_modifier.show_dead = False
 local_modifier.show_unborn = False
 local_modifier.space = 'LOCAL'
+local_modifier.index_layer_name = 'InstanceIndex'
+local_modifier.value_layer_name = 'InstanceValue'
 depsgraph = bpy.context.evaluated_depsgraph_get()
 evaluated_local = instance_local.evaluated_get(depsgraph)
-local_mesh = evaluated_local.to_mesh()
+local_mesh = evaluated_local.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
 instance_local_points = [list(vertex.co) for vertex in local_mesh.vertices]
+instance_local_mesh_snapshot = mesh_snapshot(local_mesh, evaluated_local)
 instance_local_world_matrix = matrix_array(evaluated_local.matrix_world)
 evaluated_local.to_mesh_clear()
 def make_visibility_instance(name, show_alive, show_dead, show_unborn):
     obj = bpy.data.objects.new(name, instance_mesh)
     scene.collection.objects.link(obj)
-    obj.location = (-0.4,0.6,0.2)
-    obj.rotation_euler = (0.17,-0.29,0.41)
-    obj.scale = (1.3,0.8,1.1)
+    obj.location = (0,0,0)
+    obj.rotation_euler = (0,0,0)
+    obj.scale = (1,1,1)
     obj.track_axis = 'POS_Z'
     modifier = obj.modifiers.new(name, 'PARTICLE_INSTANCE')
     modifier.object = emitter
@@ -451,15 +894,25 @@ def make_visibility_instance(name, show_alive, show_dead, show_unborn):
     modifier.show_dead = show_dead
     modifier.show_unborn = show_unborn
     modifier.space = 'WORLD'
+    modifier.index_layer_name = 'InstanceIndex'
+    modifier.value_layer_name = 'InstanceValue'
     return obj
 
 def evaluated_points(obj):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
-    mesh = evaluated.to_mesh()
+    mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
     points = [list(vertex.co) for vertex in mesh.vertices]
     evaluated.to_mesh_clear()
     return points
+def evaluated_mesh_snapshot(obj):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+    snapshot = mesh_snapshot(mesh, evaluated)
+    evaluated.to_mesh_clear()
+    return snapshot
+
 
 unborn_instance = make_visibility_instance('InstanceUnborn', False, False, True)
 scene.frame_set(0)
@@ -469,6 +922,7 @@ unborn_particles = particle_states(
     emitter_births,
 )
 unborn_instance_points = evaluated_points(unborn_instance)
+unborn_instance_mesh_snapshot = evaluated_mesh_snapshot(unborn_instance)
 
 dead_instance = make_visibility_instance('InstanceDead', False, True, False)
 scene.frame_set(14)
@@ -478,6 +932,7 @@ dead_particles = particle_states(
     emitter_births,
 )
 dead_instance_points = evaluated_points(dead_instance)
+dead_instance_mesh_snapshot = evaluated_mesh_snapshot(dead_instance)
 
 emitter.select_set(True)
 bpy.context.view_layer.objects.active = emitter
@@ -494,15 +949,23 @@ explode_mesh_data.from_pydata(
     [],
     [(0,1,2,3)],
 )
+add_corner_data(explode_mesh_data)
 exploder = bpy.data.objects.new('Exploder', explode_mesh_data)
 scene.collection.objects.link(exploder)
+protect_group = exploder.vertex_groups.new(name='Protect')
+for vertex_index, weight in enumerate([0.0, 0.35, 0.0, 0.85]):
+    if weight > 0.0:
+        protect_group.add([vertex_index], weight, 'REPLACE')
 exploder.location = (0.4,-0.2,0.6)
 exploder.rotation_euler = (0.23,0.38,-0.19)
 exploder.scale = (1.2,0.8,1.1)
 bpy.context.view_layer.objects.active = exploder
 exploder.select_set(True)
 bpy.ops.object.particle_system_add()
-exploder_settings = exploder.particle_systems[0].settings
+explode_system = exploder.particle_systems[0]
+explode_system.seed = 23
+explode_system.child_seed = 37
+exploder_settings = explode_system.settings
 exploder_settings.count = 2
 exploder_settings.frame_start = 1
 exploder_settings.frame_end = 1
@@ -512,6 +975,14 @@ exploder_settings.physics_type = 'NEWTON'
 exploder_settings.normal_factor = 1.1
 explode = exploder.modifiers.new('Explode', 'EXPLODE')
 explode.use_edge_cut = True
+explode.use_size = True
+explode.show_alive = True
+explode.show_dead = False
+explode.show_unborn = False
+explode.vertex_group = 'Protect'
+explode.protect = 0.6
+explode.invert_vertex_group = True
+explode.particle_uv = 'ParticleUV'
 scene.frame_set(1)
 bpy.context.view_layer.update()
 birth_graph = bpy.context.evaluated_depsgraph_get()
@@ -524,11 +995,12 @@ explode_particle_states = particle_states(
     evaluated_exploder.particle_systems[0], explode_births
 )
 exploder_world_matrix = matrix_array(evaluated_exploder.matrix_world)
-exploded_mesh = evaluated_exploder.to_mesh()
+exploded_mesh = evaluated_exploder.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
 explode_world_points = [
     list(evaluated_exploder.matrix_world @ vertex.co) for vertex in exploded_mesh.vertices
 ]
 face_count = len(exploded_mesh.polygons)
+explode_mesh_snapshot = mesh_snapshot(exploded_mesh, evaluated_exploder)
 evaluated_exploder.to_mesh_clear()
 
 bpy.context.view_layer.objects.active = None
@@ -539,13 +1011,19 @@ cube_mesh_data.from_pydata(
     [],
     [(0,3,2,1), (4,5,6,7), (0,1,5,4), (1,2,6,5), (2,3,7,6), (3,0,4,7)],
 )
+add_corner_data(cube_mesh_data)
+cube_source_normal_codes = corner_normal_codes(cube_mesh_data)
 cube_exploder = bpy.data.objects.new('CubeExploder', cube_mesh_data)
 scene.collection.objects.link(cube_exploder)
 cube_exploder.rotation_euler = (-0.31,0.24,0.42)
 cube_exploder.scale = (0.9,1.25,0.75)
 bpy.context.view_layer.objects.active = cube_exploder
+cube_exploder.select_set(True)
 bpy.ops.object.particle_system_add()
-cube_settings = cube_exploder.particle_systems[0].settings
+cube_system = cube_exploder.particle_systems[0]
+cube_system.seed = 29
+cube_system.child_seed = 41
+cube_settings = cube_system.settings
 cube_settings.count = 2
 cube_settings.frame_start = 1
 cube_settings.frame_end = 1
@@ -555,6 +1033,11 @@ cube_settings.physics_type = 'NEWTON'
 cube_settings.normal_factor = 1.1
 cube_explode = cube_exploder.modifiers.new('Explode with edge cuts', 'EXPLODE')
 cube_explode.use_edge_cut = True
+cube_explode.use_size = True
+cube_explode.show_alive = True
+cube_explode.show_dead = False
+cube_explode.show_unborn = False
+cube_explode.particle_uv = 'ParticleUV'
 scene.frame_set(1)
 bpy.context.view_layer.update()
 cube_birth_graph = bpy.context.evaluated_depsgraph_get()
@@ -599,24 +1082,36 @@ cube_particles = particle_states(
     evaluated_cube_exploder.particle_systems[0], cube_births
 )
 cube_matrix = matrix_array(evaluated_cube_exploder.matrix_world)
-cube_mesh = evaluated_cube_exploder.to_mesh()
+cube_mesh = evaluated_cube_exploder.to_mesh(preserve_all_data_layers=True, depsgraph=cube_depsgraph)
 cube_world_points = [
     list(evaluated_cube_exploder.matrix_world @ vertex.co) for vertex in cube_mesh.vertices
 ]
 cube_face_count = len(cube_mesh.polygons)
+cube_mesh_snapshot = mesh_snapshot(cube_mesh, evaluated_cube_exploder)
 evaluated_cube_exploder.to_mesh_clear()
 with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as output:
     json.dump({
         'instance_points':instance_points,
+'instance_mesh':instance_mesh_snapshot,
+'instance_local_mesh':instance_local_mesh_snapshot,
+'unborn_instance_mesh':unborn_instance_mesh_snapshot,
+'dead_instance_mesh':dead_instance_mesh_snapshot,
+'explode_mesh':explode_mesh_snapshot,
+'cube_explode_mesh':cube_mesh_snapshot,
+'instance_source_normal_codes':instance_source_normal_codes,
+'cube_source_normal_codes':cube_source_normal_codes,
+        'instance_child_seed':emitter_system.child_seed,
         'instance_local_points':instance_local_points,
         'instance_particle_states':instance_particle_states,
-        'child_instance_points':child_instance_points,
         'child_particle_count':child_particle_count,
         'unborn_instance_points':unborn_instance_points,
         'unborn_particle_states':unborn_particles,
         'dead_instance_points':dead_instance_points,
         'dead_particle_states':dead_particles,
         'emitter_world_matrix':emitter_world_matrix,
+        'instance_seed':emitter_system.seed,
+        'explode_seed':explode_system.seed,
+        'cube_explode_seed':cube_system.seed,
         'instance_world_matrix':instance_world_matrix,
         'instance_local_world_matrix':instance_local_world_matrix,
         'exploder_world_matrix':exploder_world_matrix,
@@ -660,25 +1155,14 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let child_particle_count = blender["child_particle_count"]
         .as_u64()
         .ok_or("Blender child particle count is missing")?;
-    let child_particles = instance_particles
-        .iter()
-        .cloned()
-        .map(|mut particle| {
-            particle.is_child = true;
-            particle
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        child_particle_count,
-        u64::try_from(child_particles.len())?,
-        "the zero-radius Simple child fixture emits one child per parent",
+    assert!(
+        child_particle_count > 0,
+        "Blender's evaluated Simple-child system must contain children",
     );
-    let mut instance_and_children = instance_particles.clone();
-    instance_and_children.extend(child_particles.iter().cloned());
     let explode_particles = injected_particles(&blender["explode_particle_states"])?;
     assert_eq!(instance_particles.len(), 1);
     assert_eq!(explode_particles.len(), 2);
-    let instance_source = potter_core::geom::Mesh::from_positions_and_faces(
+    let mut instance_source = potter_core::geom::Mesh::from_positions_and_faces(
         vec![
             DVec3::new(-0.7, -0.3, 0.1),
             DVec3::new(1.1, -0.2, 0.0),
@@ -687,27 +1171,39 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         ],
         vec![vec![0, 1, 2, 3]],
     )?;
+    add_corner_fixture_data(
+        &mut instance_source,
+        &blender["instance_source_normal_codes"],
+        true,
+        false,
+    );
     let emitter_columns: [f64; 16] =
         serde_json::from_value(blender["emitter_world_matrix"].clone())?;
     let emitter_world = DMat4::from_cols_array(&emitter_columns);
-    let instance_columns: [f64; 16] =
-        serde_json::from_value(blender["instance_world_matrix"].clone())?;
-    let instance_world = DMat4::from_cols_array(&instance_columns);
-    let direct_instance = potter_core::geom::modifiers::simulation::particle_instance(
+    let instance_seed = blender["instance_seed"]
+        .as_u64()
+        .ok_or("Blender particle system seed is missing")? as u32;
+    let direct_instance = potter_core::geom::modifiers::particle_instance::particle_instance(
         &instance_source,
         &instance_particles,
+        instance_seed,
         emitter_world,
-        instance_world,
+        2,
         &Map::from_iter([
             ("use_normal".to_owned(), json!(true)),
             ("use_size".to_owned(), json!(true)),
             ("use_path".to_owned(), json!(false)),
             ("axis".to_owned(), json!("Z")),
             ("space".to_owned(), json!("WORLD")),
+            ("index_layer_name".to_owned(), json!("InstanceIndex")),
+            ("value_layer_name".to_owned(), json!("InstanceValue")),
         ]),
-        2.0,
-        24.0,
     )?;
+    assert_ordered_mesh_matches_blender(
+        &direct_instance,
+        &blender["instance_mesh"],
+        "Particle Instance",
+    );
     let direct_instance_points = direct_instance
         .vertices
         .iter()
@@ -726,21 +1222,27 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         instance_error <= MODIFIER_POSITION_TOLERANCE,
         "particle instance per-vertex error {instance_error} exceeds {MODIFIER_POSITION_TOLERANCE}; Potter={direct_instance_points:?}; Blender={blender_instance_points:?}; particles={instance_particles:?}",
     );
-    let direct_local_instance = potter_core::geom::modifiers::simulation::particle_instance(
+    let direct_local_instance = potter_core::geom::modifiers::particle_instance::particle_instance(
         &instance_source,
         &instance_particles,
+        instance_seed,
         emitter_world,
-        instance_world,
+        2,
         &Map::from_iter([
             ("use_normal".to_owned(), json!(true)),
             ("use_size".to_owned(), json!(true)),
             ("use_path".to_owned(), json!(false)),
             ("axis".to_owned(), json!("Z")),
             ("space".to_owned(), json!("LOCAL")),
+            ("index_layer_name".to_owned(), json!("InstanceIndex")),
+            ("value_layer_name".to_owned(), json!("InstanceValue")),
         ]),
-        2.0,
-        24.0,
     )?;
+    assert_ordered_mesh_matches_blender(
+        &direct_local_instance,
+        &blender["instance_local_mesh"],
+        "LOCAL Particle Instance",
+    );
     let direct_local_points = direct_local_instance
         .vertices
         .iter()
@@ -753,60 +1255,43 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         local_error <= MODIFIER_POSITION_TOLERANCE,
         "LOCAL particle instance per-vertex error {local_error} exceeds {MODIFIER_POSITION_TOLERANCE}; Potter={direct_local_points:?}; Blender={blender_local_points:?}; particle={instance_particles:?}",
     );
-    let direct_child_instance = potter_core::geom::modifiers::simulation::particle_instance(
-        &instance_source,
-        &instance_and_children,
-        emitter_world,
-        instance_world,
-        &Map::from_iter([
-            ("use_normal".to_owned(), json!(true)),
-            ("use_children".to_owned(), json!(true)),
-            ("use_size".to_owned(), json!(false)),
-            ("axis".to_owned(), json!("Z")),
-            ("space".to_owned(), json!("WORLD")),
-        ]),
-        2.0,
-        24.0,
-    )?;
-    let direct_child_points = direct_child_instance
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co)
-        .collect::<Vec<_>>();
-    let blender_child_points = blender_points(&blender["child_instance_points"])?;
-    assert_eq!(direct_child_points.len(), blender_child_points.len());
-    let child_error = max_corresponding_distance(&direct_child_points, &blender_child_points)?;
-    assert!(
-        child_error <= MODIFIER_POSITION_TOLERANCE,
-        "Simple-child instance per-vertex error {child_error} exceeds {MODIFIER_POSITION_TOLERANCE}",
-    );
-    for (states_key, points_key, show_dead, show_unborn) in [
+    for (states_key, points_key, mesh_key, show_dead, show_unborn) in [
         (
             "unborn_particle_states",
             "unborn_instance_points",
+            "unborn_instance_mesh",
             false,
             true,
         ),
-        ("dead_particle_states", "dead_instance_points", true, false),
+        (
+            "dead_particle_states",
+            "dead_instance_points",
+            "dead_instance_mesh",
+            true,
+            false,
+        ),
     ] {
         let lifecycle_particles = injected_particles(&blender[states_key])?;
-        let lifecycle_instance = potter_core::geom::modifiers::simulation::particle_instance(
-            &instance_source,
-            &lifecycle_particles,
-            emitter_world,
-            instance_world,
-            &Map::from_iter([
-                ("use_normal".to_owned(), json!(true)),
-                ("use_size".to_owned(), json!(true)),
-                ("show_alive".to_owned(), json!(false)),
-                ("show_dead".to_owned(), json!(show_dead)),
-                ("show_unborn".to_owned(), json!(show_unborn)),
-                ("axis".to_owned(), json!("Z")),
-                ("space".to_owned(), json!("WORLD")),
-            ]),
-            2.0,
-            24.0,
-        )?;
+        let lifecycle_instance =
+            potter_core::geom::modifiers::particle_instance::particle_instance(
+                &instance_source,
+                &lifecycle_particles,
+                instance_seed,
+                emitter_world,
+                2,
+                &Map::from_iter([
+                    ("use_normal".to_owned(), json!(true)),
+                    ("use_size".to_owned(), json!(true)),
+                    ("show_alive".to_owned(), json!(false)),
+                    ("show_dead".to_owned(), json!(show_dead)),
+                    ("show_unborn".to_owned(), json!(show_unborn)),
+                    ("axis".to_owned(), json!("Z")),
+                    ("space".to_owned(), json!("WORLD")),
+                    ("index_layer_name".to_owned(), json!("InstanceIndex")),
+                    ("value_layer_name".to_owned(), json!("InstanceValue")),
+                ]),
+            )?;
+        assert_ordered_mesh_matches_blender(&lifecycle_instance, &blender[mesh_key], states_key);
         let lifecycle_points = lifecycle_instance
             .vertices
             .iter()
@@ -825,35 +1310,6 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
             "{states_key} per-vertex instance error {lifecycle_error} exceeds {MODIFIER_POSITION_TOLERANCE}; Potter={lifecycle_points:?}, Blender={blender_lifecycle_points:?}, states={lifecycle_particles:?}",
         );
     }
-    let Err(path_error) = potter_core::geom::modifiers::simulation::particle_instance(
-        &instance_source,
-        &instance_particles,
-        emitter_world,
-        instance_world,
-        &Map::from_iter([("use_path".to_owned(), json!(true))]),
-        2.0,
-        24.0,
-    ) else {
-        return Err("sampled particle paths unexpectedly reported support".into());
-    };
-    assert_eq!(
-        path_error.code,
-        potter_core::error::ErrorCode::UnsupportedFeature
-    );
-    assert_eq!(
-        path_error.details["feature_id"],
-        "modifier.particle_instance.use_path"
-    );
-    let catalog = potter_core::catalog::feature_catalog();
-    let path_feature = catalog["features"]
-        .as_array()
-        .and_then(|features| {
-            features
-                .iter()
-                .find(|feature| feature["feature_id"] == "modifier.particle_instance.use_path")
-        })
-        .ok_or("sampled particle paths are missing from the capability catalog")?;
-    assert_eq!(path_feature["status"], "not_supported");
     let baseline_instance = instance_source
         .vertices
         .iter()
@@ -868,25 +1324,47 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
                 .fold(f64::INFINITY, f64::min)
         })
         .fold(0.0, f64::max);
-    assert!(
-        nontrivial_instance_displacement > 10.0 * MODIFIER_POSITION_TOLERANCE,
-        "particle instances must materially differ from the unmodified source",
+    let mut explode_source = instance_source.clone();
+    let protect_weights = instance_source
+        .vertices
+        .iter()
+        .zip([0.0, 0.35, 0.0, 0.85])
+        .map(|(vertex, weight)| (format!("v{}", vertex.id), json!(weight)))
+        .collect::<Map<_, _>>();
+    explode_source.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({"Protect":protect_weights}),
     );
-
-    let mut explode_params = Map::new();
-    explode_params.insert("use_edge_cut".to_owned(), json!(true));
-    let explode_source = instance_source.clone();
+    let explode_params = Map::from_iter([
+        ("use_edge_cut".to_owned(), json!(true)),
+        ("use_size".to_owned(), json!(true)),
+        ("show_alive".to_owned(), json!(true)),
+        ("show_dead".to_owned(), json!(false)),
+        ("show_unborn".to_owned(), json!(false)),
+        ("vertex_group".to_owned(), json!("Protect")),
+        ("protect".to_owned(), json!(0.6)),
+        ("invert_vertex_group".to_owned(), json!(true)),
+        ("particle_uv".to_owned(), json!("ParticleUV")),
+    ]);
     let exploder_columns: [f64; 16] =
         serde_json::from_value(blender["exploder_world_matrix"].clone())?;
     let exploder_world = DMat4::from_cols_array(&exploder_columns);
-    let direct_explode = potter_core::geom::modifiers::simulation::explode(
+    let explode_seed = blender["explode_seed"]
+        .as_u64()
+        .ok_or("Blender explode particle-system seed is missing")? as u32;
+    let direct_explode = potter_core::geom::modifiers::explode::explode(
         &explode_source,
         &explode_particles,
+        explode_seed,
         exploder_world,
         &explode_params,
         2.0,
-        12.0,
     )?;
+    assert_ordered_mesh_matches_blender(
+        &direct_explode,
+        &blender["explode_mesh"],
+        "Explode with UV, groups, materials, and normals",
+    );
     assert_eq!(
         direct_explode.faces.len(),
         blender["explode_face_count"],
@@ -918,7 +1396,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let cube_columns: [f64; 16] =
         serde_json::from_value(blender["cube_exploder_world_matrix"].clone())?;
     let cube_world = DMat4::from_cols_array(&cube_columns);
-    let cube_source = potter_core::geom::Mesh::from_positions_and_faces(
+    let mut cube_source = potter_core::geom::Mesh::from_positions_and_faces(
         vec![
             DVec3::new(-1.0, -1.0, -1.0),
             DVec3::new(1.0, -1.0, -1.0),
@@ -938,6 +1416,12 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
             vec![3, 0, 4, 7],
         ],
     )?;
+    add_corner_fixture_data(
+        &mut cube_source,
+        &blender["cube_source_normal_codes"],
+        true,
+        false,
+    );
     let cube_local_births = blender_points(&blender["cube_birth_local"])?;
     assert_eq!(cube_local_births.len(), cube_particles.len());
     for (particle, birth_position) in cube_particles.iter_mut().zip(&cube_local_births) {
@@ -1016,14 +1500,30 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         cube_masks, blender_cube_masks,
         "face split masks must match Blender's particle-owner classification",
     );
-    let cube_explode = potter_core::geom::modifiers::simulation::explode(
+    let cube_seed = blender["cube_explode_seed"]
+        .as_u64()
+        .ok_or("Blender cube explode particle-system seed is missing")? as u32;
+    let cube_explode_params = Map::from_iter([
+        ("use_edge_cut".to_owned(), json!(true)),
+        ("use_size".to_owned(), json!(true)),
+        ("show_alive".to_owned(), json!(true)),
+        ("show_dead".to_owned(), json!(false)),
+        ("show_unborn".to_owned(), json!(false)),
+        ("particle_uv".to_owned(), json!("ParticleUV")),
+    ]);
+    let cube_explode = potter_core::geom::modifiers::explode::explode(
         &cube_source,
         &cube_particles,
+        cube_seed,
         cube_world,
-        &explode_params,
+        &cube_explode_params,
         2.0,
-        12.0,
     )?;
+    assert_ordered_mesh_matches_blender(
+        &cube_explode,
+        &blender["cube_explode_mesh"],
+        "edge-cut cube Explode",
+    );
     assert_eq!(cube_explode.faces.len(), 10);
     assert_eq!(
         cube_explode.faces.len(),
@@ -1105,6 +1605,2195 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     assert!(
         exploded_faces > 6,
         "CLI explode should split the six source cube faces: {exploded_faces}",
+    );
+    let scene_document: Value = serde_json::from_slice(&fs::read(scene_path.join("scene.json"))?)?;
+    let revision = scene_document["revision"]
+        .as_u64()
+        .ok_or("scene revision is missing")?;
+    apply(
+        &scene_path,
+        &batch_path,
+        &json!([{"op":"modifier.apply","target":{"id":"c_exploder"},"modifier_id":"explode_faces"}]),
+        revision,
+    )?;
+    let applied_document: Value =
+        serde_json::from_slice(&fs::read(scene_path.join("scene.json"))?)?;
+    let exploder = &applied_document["nodes"]["c_exploder"];
+    let stack_after_apply = exploder["modifiers"]
+        .as_array()
+        .ok_or("applied Explode modifier stack is missing")?;
+    assert!(
+        stack_after_apply
+            .iter()
+            .any(|modifier| modifier["type"] == "particle_system")
+    );
+    assert!(
+        stack_after_apply
+            .iter()
+            .all(|modifier| modifier["id"] != "explode_faces")
+    );
+    let data_id = exploder["data"]
+        .as_str()
+        .ok_or("Explode mesh data ID is missing")?;
+    let persisted_mesh = &applied_document["data_blocks"][data_id]["mesh"];
+    let persisted_vertices = persisted_mesh["vertices"]
+        .as_array()
+        .ok_or("applied Explode vertices are missing")?;
+    let persisted_faces = persisted_mesh["faces"]
+        .as_array()
+        .ok_or("applied Explode faces are missing")?;
+    assert_eq!(persisted_faces.len() as u64, exploded_faces);
+    let applied_inspection = inspect(&scene_path, "c_exploder", "1")?;
+    let applied_item = &applied_inspection["result"]["items"][0];
+    let applied_stack = applied_item["modifiers"]
+        .as_array()
+        .ok_or("inspected Explode modifier stack is missing")?;
+    assert!(
+        applied_stack
+            .iter()
+            .any(|modifier| modifier["type"] == "particle_system")
+    );
+    assert!(
+        applied_stack
+            .iter()
+            .all(|modifier| modifier["id"] != "explode_faces")
+    );
+    assert_eq!(
+        applied_item["evaluated_geometry"]["face_count"],
+        exploded_faces
+    );
+    let persisted_positions = Value::Array(
+        persisted_vertices
+            .iter()
+            .map(|vertex| vertex["co"].clone())
+            .collect(),
+    );
+    assert_numeric_rows(
+        &persisted_positions,
+        &applied_item["evaluated_geometry"]["positions"],
+        "persisted Explode mesh positions",
+    );
+    let vertex_ids = persisted_vertices
+        .iter()
+        .map(|vertex| vertex["id"].as_u64().ok_or("Explode vertex ID is missing"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected_faces = Vec::with_capacity(persisted_faces.len());
+    for face in persisted_faces {
+        let vertices = face["v"]
+            .as_array()
+            .ok_or("applied Explode face vertices are missing")?;
+        let mut polygon = Vec::with_capacity(vertices.len());
+        for vertex in vertices {
+            let id = vertex.as_u64().ok_or("Explode face vertex ID is missing")?;
+            let index = vertex_ids
+                .iter()
+                .position(|candidate| *candidate == id)
+                .ok_or("Explode face references a missing vertex")?;
+            polygon.push(index);
+        }
+        expected_faces.push(polygon);
+    }
+    let expected_faces = json!(expected_faces);
+    let exported = root.join("explode_cli_roundtrip.blend");
+    let mut export = pot()
+        .arg("export")
+        .arg(&scene_path)
+        .args(["--format", "blend", "--out"])
+        .arg(&exported)
+        .arg("--blender")
+        .arg(&blender)
+        .arg("--json");
+    run(&mut export, "exporting applied Explode mesh")?;
+    let reopen_script = root.join("reopen_explode_cli.py");
+    let reopened_path = root.join("reopened_explode_cli.json");
+    fs::write(
+        &reopen_script,
+        r#"
+import bpy, json, sys
+output = sys.argv[sys.argv.index('--') + 1]
+obj = bpy.data.objects['c_exploder']
+result = {
+    'modifier_types':[modifier.type for modifier in obj.modifiers],
+    'positions':[list(vertex.co) for vertex in obj.data.vertices],
+    'faces':[list(polygon.vertices) for polygon in obj.data.polygons],
+}
+with open(output, 'w', encoding='utf-8') as handle:
+    json.dump(result, handle)
+"#,
+    )?;
+    let mut reopen = Command::new(&blender);
+    reopen
+        .args(["--background", "--disable-autoexec"])
+        .arg(&exported)
+        .args(["--python-exit-code", "1", "--python"])
+        .arg(&reopen_script)
+        .arg("--")
+        .arg(&reopened_path);
+    run(&mut reopen, "reopening applied Explode blend")?;
+    let reopened: Value = serde_json::from_slice(&fs::read(reopened_path)?)?;
+    let reopened_modifier_types = reopened["modifier_types"]
+        .as_array()
+        .ok_or("reopened Explode modifier types are missing")?;
+    assert!(
+        reopened_modifier_types
+            .iter()
+            .any(|kind| kind.as_str() == Some("PARTICLE_SYSTEM"))
+    );
+    assert!(
+        reopened_modifier_types
+            .iter()
+            .all(|kind| kind.as_str() != Some("EXPLODE"))
+    );
+    assert_numeric_rows(
+        &reopened["positions"],
+        &persisted_positions,
+        "reopened applied Explode mesh",
+    );
+    assert_eq!(reopened["faces"], expected_faces);
+    Ok(())
+}
+
+#[test]
+fn particle_instance_cli_frames_apply_export_reimport_preserves_track_axis()
+-> Result<(), Box<dyn Error>> {
+    let Some(blender_path) = blender_executable() else {
+        eprintln!("skipping particle CLI round-trip; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let fixture_script = root.join("particle_cli_fixture.py");
+    let expected_path = root.join("particle_cli_expected.json");
+    fs::write(
+        &fixture_script,
+        r#"
+import bpy, json, os, sys
+from mathutils import Vector
+if tuple(bpy.app.version[:3]) != (5,2,2):
+    raise RuntimeError('particle CLI parity requires Blender 5.2.2')
+root = sys.argv[sys.argv.index('--') + 1]
+scene = bpy.context.scene
+scene.use_gravity = False
+scene.frame_start = 1
+scene.frame_end = 3
+scene.frame_set(1)
+
+def add_corner_data(mesh):
+    for index in range(3):
+        mesh.materials.append(bpy.data.materials.new('CLI Material %d' % index))
+    for polygon in mesh.polygons:
+        polygon.material_index = polygon.index % 3
+    source_uv = mesh.uv_layers.new(name='SourceUV')
+    particle_uv = mesh.uv_layers.new(name='ParticleUV')
+    for polygon in mesh.polygons:
+        for corner, loop_index in enumerate(range(polygon.loop_start, polygon.loop_start + polygon.loop_total)):
+            uv = (0.1 + 0.17 * polygon.index + 0.11 * corner,
+                  0.2 + 0.13 * polygon.index + 0.07 * corner)
+            source_uv.data[loop_index].uv = uv
+            particle_uv.data[loop_index].uv = (uv[0] + 0.031, uv[1] + 0.047)
+    mesh.normals_split_custom_set([
+        Vector((0.13 * ((loop.index % 3) - 1), 0.09 * ((loop.index % 4) - 1.5), 1.0)).normalized()
+        for loop in mesh.loops
+    ])
+    mesh.update()
+def corner_normal_codes(mesh):
+    attribute = mesh.attributes.get('custom_normal')
+    if attribute is None:
+        return None
+    if attribute.domain != 'CORNER' or attribute.data_type != 'INT16_2D':
+        raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
+    return [None if list(item.vector) == [0,0] else [int(value) for value in item.vector]
+            for item in attribute.data]
+
+
+def mesh_snapshot(mesh):
+    return {
+        'positions':[list(vertex.co) for vertex in mesh.vertices],
+        'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+        'materials':[int(polygon.material_index) for polygon in mesh.polygons],
+        'uv_layers':{layer.name:[list(item.uv) for item in layer.data] for layer in mesh.uv_layers},
+        'custom_normal_codes':corner_normal_codes(mesh),
+        'color_layer_names':[layer.name for layer in mesh.color_attributes if layer.domain == 'CORNER'],
+        'color_attributes':{
+            layer.name:{'domain':layer.domain, 'data_type':layer.data_type,
+                        'values':[list(item.color) for item in layer.data]}
+            for layer in mesh.color_attributes if layer.domain == 'CORNER'
+        },
+        'vertex_groups':{},
+    }
+
+emitter_mesh = bpy.data.meshes.new('ParticleEmitterMesh')
+emitter_mesh.from_pydata([(-1,-1,0),(1,-1,0),(1,1,0),(-1,1,0)], [], [(0,1,2,3)])
+emitter = bpy.data.objects.new('ParticleEmitter', emitter_mesh)
+scene.collection.objects.link(emitter)
+emitter.location = (1.25,-0.75,0.5)
+for selected in list(bpy.context.selected_objects):
+    selected.select_set(False)
+emitter.select_set(True)
+bpy.context.view_layer.objects.active = emitter
+bpy.ops.object.particle_system_add()
+system = emitter.particle_systems[0]
+system.seed = 7
+system.child_seed = 67
+settings = system.settings
+settings.count = 4
+settings.emit_from = 'VERT'
+settings.frame_start = 1.0
+settings.frame_end = 2.0
+settings.lifetime = 8.0
+settings.physics_type = 'NEWTON'
+settings.normal_factor = 0.8
+settings.factor_random = 0.0
+settings.particle_size = 0.65
+settings.size_random = 0.0
+settings.child_type = 'INTERPOLATED'
+settings.child_percent = 25
+settings.rendered_child_count = 3
+settings.child_radius = 0.25
+settings.child_size = 0.8
+
+instance_mesh = bpy.data.meshes.new('ParticleInstancerMesh')
+instance_mesh.from_pydata([(-0.6,-0.2,0),(0.7,-0.15,0.1),(0.25,0.65,0.35),(-0.35,0.4,0.55)], [], [(0,1,2,3)])
+add_corner_data(instance_mesh)
+instancer = bpy.data.objects.new('ParticleInstancer', instance_mesh)
+scene.collection.objects.link(instancer)
+instancer.track_axis = 'POS_Z'
+modifier = instancer.modifiers.new('Particle Instance', 'PARTICLE_INSTANCE')
+modifier.object = emitter
+modifier.particle_system_index = 1
+modifier.axis = 'Z'
+modifier.space = 'WORLD'
+modifier.use_normal = True
+modifier.use_children = True
+modifier.particle_amount = 0.5
+modifier.particle_offset = 0.25
+modifier.use_path = False
+modifier.use_preserve_shape = False
+modifier.use_size = True
+modifier.position = 0.35
+modifier.random_position = 0.0
+modifier.rotation = 0.2
+modifier.random_rotation = 0.0
+modifier.show_alive = True
+modifier.show_dead = False
+modifier.show_unborn = False
+modifier.index_layer_name = 'InstanceIndex'
+modifier.value_layer_name = 'InstanceValue'
+
+def evaluated_mesh(obj, frame):
+    scene.frame_set(frame)
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+    try:
+        return mesh_snapshot(mesh)
+    finally:
+        evaluated.to_mesh_clear()
+
+frames = {str(frame):evaluated_mesh(instancer, frame) for frame in (1,2)}
+scene.frame_set(1)
+bpy.context.view_layer.update()
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_cli_source.blend'))
+with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8') as output:
+    json.dump({
+        'frames':frames,
+        'track_axis':instancer.track_axis,
+        'particle_seed':system.seed,
+        'child_seed':system.child_seed,
+        'child_percent':settings.child_percent,
+        'rendered_child_count':settings.rendered_child_count,
+    }, output)
+"#,
+    )?;
+    let mut create_fixture = Command::new(&blender_path);
+    create_fixture
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(&fixture_script)
+        .arg("--")
+        .arg(root);
+    let blender_output = run(&mut create_fixture, "Blender particle CLI fixture")?;
+    let blender: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+    assert_eq!(blender["track_axis"], "POS_Z");
+    assert_eq!(blender["child_seed"], 67);
+    assert_eq!(blender["child_percent"], 25);
+    assert_eq!(blender["rendered_child_count"], 3);
+    let blender_frame_one = &blender["frames"]["1"];
+    let blender_frame_two = &blender["frames"]["2"];
+    assert_ne!(
+        blender_frame_one["positions"],
+        blender_frame_two["positions"]
+    );
+    assert!(
+        blender_frame_two["positions"]
+            .as_array()
+            .is_some_and(|positions| positions.len() > 4),
+        "Blender fixture must evaluate parent and child instances",
+    );
+
+    let project = root.join("particle-project");
+    initialize(&project)?;
+    let mut import = pot()
+        .arg("import")
+        .arg(&project)
+        .arg("--file")
+        .arg(root.join("particle_cli_source.blend"))
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender_path)
+        .arg("--json");
+    let imported: Value =
+        serde_json::from_slice(&run(&mut import, "importing particle fixture")?.stdout)?;
+    assert_eq!(imported["result"]["losses"], json!([]), "{imported}");
+
+    let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let node_id_by_name = |name: &str| -> Result<String, Box<dyn Error>> {
+        document["nodes"]
+            .as_object()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|(_, node)| node["name"] == name)
+                    .map(|(id, _)| id.clone())
+            })
+            .ok_or_else(|| format!("imported Blender object `{name}` is missing").into())
+    };
+    let instancer_id = node_id_by_name("ParticleInstancer")?;
+    let emitter_id = node_id_by_name("ParticleEmitter")?;
+    let instancer_node = &document["nodes"][instancer_id.as_str()];
+    assert_eq!(
+        instancer_node["properties"]["blender_object_metadata"]["rna_properties"]["track_axis"],
+        "POS_Z",
+    );
+    let emitter_node = &document["nodes"][emitter_id.as_str()];
+    let particle_settings = emitter_node["properties"]["physics_particle_systems"]
+        .as_object()
+        .and_then(|systems| {
+            systems
+                .values()
+                .find(|settings| settings["seed"] == blender["particle_seed"])
+        })
+        .ok_or("imported particle-system settings are not serialized")?;
+    assert_eq!(particle_settings["child_seed"], blender["child_seed"]);
+    assert_eq!(particle_settings["child_percent"], blender["child_percent"]);
+    assert_eq!(
+        particle_settings["rendered_child_count"],
+        blender["rendered_child_count"]
+    );
+    let modifier = instancer_node["modifiers"]
+        .as_array()
+        .and_then(|modifiers| {
+            modifiers
+                .iter()
+                .find(|modifier| modifier["type"] == "particle_instance")
+        })
+        .ok_or("imported particle-instance modifier is missing")?;
+    let modifier_id = modifier["id"]
+        .as_str()
+        .ok_or("particle modifier ID is missing")?;
+    let typed_document: potter_core::model::SceneDoc = serde_json::from_value(document.clone())?;
+    assert_snapshot_mesh_matches_blender(
+        &typed_document,
+        &instancer_id,
+        1.0,
+        blender_frame_one,
+        "native child-instance frame 1 corner data",
+    )?;
+    assert_snapshot_mesh_matches_blender(
+        &typed_document,
+        &instancer_id,
+        2.0,
+        blender_frame_two,
+        "native child-instance frame 2 corner data",
+    )?;
+    let assert_cli_mesh = |actual: &Value, expected: &Value, context: &str| {
+        let geometry = &actual["result"]["items"][0]["evaluated_geometry"];
+        assert_numeric_rows(
+            &geometry["positions"],
+            &expected["positions"],
+            &format!("{context} positions"),
+        );
+        assert_eq!(
+            geometry["faces"], expected["faces"],
+            "{context} ordered faces"
+        );
+    };
+    let frame_one = inspect(&project, &instancer_id, "1")?;
+    let frame_two = inspect(&project, &instancer_id, "2")?;
+    assert_cli_mesh(&frame_one, blender_frame_one, "Potter CLI frame 1");
+    assert_cli_mesh(&frame_two, blender_frame_two, "Potter CLI frame 2");
+    assert_ne!(
+        frame_one["result"]["items"][0]["evaluated_geometry"]["positions"],
+        frame_two["result"]["items"][0]["evaluated_geometry"]["positions"],
+        "native particle evaluation must change across frames",
+    );
+
+    let revision = document["revision"]
+        .as_u64()
+        .ok_or("imported scene revision is missing")?;
+    let batch = root.join("apply_particle_instance.json");
+    apply(
+        &project,
+        &batch,
+        &json!([{"op":"modifier.apply","target":{"id":instancer_id},"modifier_id":modifier_id}]),
+        revision,
+    )?;
+    let applied_document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let typed_applied_document: potter_core::model::SceneDoc =
+        serde_json::from_value(applied_document.clone())?;
+    assert_snapshot_mesh_matches_blender(
+        &typed_applied_document,
+        &instancer_id,
+        1.0,
+        blender_frame_one,
+        "applied particle corner data",
+    )?;
+    assert_eq!(
+        applied_document["nodes"][instancer_id.as_str()]["properties"]["blender_object_metadata"]["rna_properties"]
+            ["track_axis"],
+        "POS_Z",
+    );
+    assert!(
+        applied_document["nodes"][instancer_id.as_str()]["modifiers"]
+            .as_array()
+            .is_some_and(|modifiers| modifiers
+                .iter()
+                .all(|modifier| modifier["id"] != modifier_id)),
+        "applying the particle modifier must persist its evaluated mesh and remove the stack entry",
+    );
+    let applied = inspect(&project, &instancer_id, "1")?;
+    assert_cli_mesh(&applied, blender_frame_one, "applied particle mesh");
+
+    let exported = root.join("particle_cli_roundtrip.blend");
+    let mut export = pot()
+        .arg("export")
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&exported)
+        .arg("--blender")
+        .arg(&blender_path)
+        .arg("--json");
+    run(&mut export, "exporting applied particle mesh")?;
+    let reopen_script = root.join("reopen_particle_cli.py");
+    let reopened_path = root.join("reopened_particle_cli.json");
+    fs::write(
+        &reopen_script,
+        r#"
+import bpy, json, sys
+output = sys.argv[sys.argv.index('--') + 1]
+obj = bpy.data.objects['ParticleInstancer']
+scene = bpy.context.scene
+scene.frame_set(1)
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = obj.evaluated_get(depsgraph)
+mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+try:
+    result = {
+        'track_axis':obj.track_axis,
+        'modifier_count':len(obj.modifiers),
+        'positions':[list(vertex.co) for vertex in mesh.vertices],
+        'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+    }
+finally:
+    evaluated.to_mesh_clear()
+with open(output, 'w', encoding='utf-8') as handle:
+    json.dump(result, handle)
+"#,
+    )?;
+    let mut reopen = Command::new(&blender_path);
+    reopen
+        .args(["--background", "--disable-autoexec"])
+        .arg(&exported)
+        .args(["--python-exit-code", "1", "--python"])
+        .arg(&reopen_script)
+        .arg("--")
+        .arg(&reopened_path);
+    run(&mut reopen, "reopening exported particle blend")?;
+    let reopened: Value = serde_json::from_slice(&fs::read(&reopened_path)?)?;
+    assert_eq!(reopened["track_axis"], "POS_Z");
+    assert_eq!(reopened["modifier_count"], 0);
+    assert_numeric_rows(
+        &reopened["positions"],
+        &blender_frame_one["positions"],
+        "reopened Blender mesh",
+    );
+    assert_eq!(reopened["faces"], blender_frame_one["faces"]);
+
+    let reimport_project = root.join("particle-reimport-project");
+    initialize(&reimport_project)?;
+    let mut reimport = pot()
+        .arg("import")
+        .arg(&reimport_project)
+        .arg("--file")
+        .arg(&exported)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender_path)
+        .arg("--json");
+    let reimported: Value =
+        serde_json::from_slice(&run(&mut reimport, "reimporting exported particle blend")?.stdout)?;
+    assert_eq!(reimported["result"]["losses"], json!([]), "{reimported}");
+    let reimported_document: Value =
+        serde_json::from_slice(&fs::read(reimport_project.join("scene.json"))?)?;
+    let typed_reimported_document: potter_core::model::SceneDoc =
+        serde_json::from_value(reimported_document.clone())?;
+    let reimported_instancer_id = reimported_document["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(_, node)| node["name"] == "ParticleInstancer")
+                .map(|(id, _)| id.clone())
+        })
+        .ok_or("reimported ParticleInstancer is missing")?;
+    assert_eq!(
+        reimported_document["nodes"][reimported_instancer_id.as_str()]["properties"]["blender_object_metadata"]
+            ["rna_properties"]["track_axis"],
+        "POS_Z",
+    );
+    assert!(
+        reimported_document["nodes"][reimported_instancer_id.as_str()]["modifiers"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "reimported applied particle object must stay modifier-free",
+    );
+    let after_reimport = inspect(&reimport_project, &reimported_instancer_id, "1")?;
+    assert_snapshot_mesh_matches_blender(
+        &typed_reimported_document,
+        &reimported_instancer_id,
+        1.0,
+        blender_frame_one,
+        "reimported applied corner data",
+    )?;
+    assert_cli_mesh(
+        &after_reimport,
+        blender_frame_one,
+        "Potter reimported applied mesh",
+    );
+    let _ = blender_output;
+    Ok(())
+}
+
+#[test]
+fn particle_instance_baked_path_velocity_matches_blender() -> Result<(), Box<dyn Error>> {
+    let Some(blender_path) = blender_executable() else {
+        eprintln!("skipping baked particle path parity; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let fixture_script = root.join("particle_baked_path.py");
+    let expected_path = root.join("particle_baked_path.json");
+    fs::write(
+        &fixture_script,
+        r#"
+import bpy, json, math, os, sys
+if tuple(bpy.app.version[:3]) != (5,2,2):
+    raise RuntimeError('baked particle path parity requires Blender 5.2.2')
+root = sys.argv[sys.argv.index('--') + 1]
+scene = bpy.context.scene
+scene.use_gravity = False
+scene.frame_start = 1
+scene.frame_end = 10
+scene.frame_set(1)
+
+emitter_mesh = bpy.data.meshes.new('BakedPathEmitterMesh')
+emitter_mesh.from_pydata([(0,0,0),(1,0,0),(0,1,0)], [], [(0,1,2)])
+emitter = bpy.data.objects.new('BakedPathEmitter', emitter_mesh)
+scene.collection.objects.link(emitter)
+for selected in list(bpy.context.selected_objects):
+    selected.select_set(False)
+emitter.select_set(True)
+bpy.context.view_layer.objects.active = emitter
+bpy.ops.object.particle_system_add()
+system = emitter.particle_systems[0]
+system.seed = 7
+settings = system.settings
+settings.count = 1
+settings.frame_start = 1.25
+settings.frame_end = 1.25
+settings.lifetime = 2.0
+settings.emit_from = 'FACE'
+settings.physics_type = 'NEWTON'
+settings.normal_factor = 1.25
+settings.factor_random = 0.0
+settings.particle_size = 1.0
+settings.size_random = 0.0
+settings.render_type = 'NONE'
+settings.child_type = 'NONE'
+cache = system.point_cache
+cache.frame_start = 1
+cache.frame_end = 10
+cache.frame_step = 1
+with bpy.context.temp_override(object=emitter, active_object=emitter, point_cache=cache):
+    result = bpy.ops.ptcache.bake(bake=True)
+if 'FINISHED' not in result or not cache.is_baked:
+    raise RuntimeError('failed to bake the particle point cache')
+
+instancer_mesh = bpy.data.meshes.new('BakedPathInstancerMesh')
+instancer_mesh.from_pydata([(0,0,0)], [], [])
+instancer = bpy.data.objects.new('BakedPathInstancer', instancer_mesh)
+scene.collection.objects.link(instancer)
+instancer.track_axis = 'POS_Z'
+modifier = instancer.modifiers.new('Baked Path Instance', 'PARTICLE_INSTANCE')
+modifier.object = emitter
+modifier.particle_system_index = 1
+modifier.axis = 'Z'
+modifier.space = 'WORLD'
+modifier.use_normal = True
+modifier.use_children = False
+modifier.use_size = False
+modifier.use_path = True
+modifier.use_preserve_shape = True
+modifier.position = 0.25
+modifier.random_position = 0.0
+modifier.rotation = 0.0
+modifier.random_rotation = 0.0
+modifier.particle_amount = 1.0
+modifier.particle_offset = 0.0
+modifier.show_alive = True
+modifier.show_dead = False
+modifier.show_unborn = False
+
+def evaluate_mesh(frame):
+    scene.frame_set(frame)
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = instancer.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+    try:
+        return {
+            'positions':[list(vertex.co) for vertex in mesh.vertices],
+            'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+        }
+    finally:
+        evaluated.to_mesh_clear()
+
+scene.frame_set(1)
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+particle = emitter.evaluated_get(depsgraph).particle_systems[0].particles[0]
+birth_time = float(particle.birth_time)
+die_time = float(particle.die_time)
+duration = die_time - birth_time
+time_tweak = float(getattr(settings, 'time_tweak', 1.0))
+particle_keys = list(getattr(particle, 'particle_keys', ()))
+path_keys = []
+path_source = 'particle_keys' if particle_keys else 'point_cache'
+if particle_keys:
+    time_start = float(particle_keys[0].time)
+    time_span = float(particle_keys[-1].time) - time_start
+    for key in particle_keys:
+        path_keys.append({
+            'time':((float(key.time) - time_start) / time_span if time_span else 0.0),
+            'position':[float(value) for value in key.location],
+            'velocity':[float(value) * time_span * 0.04 * time_tweak for value in key.velocity],
+        })
+else:
+    sample_times = [
+        float(frame)
+        for frame in range(cache.frame_start, cache.frame_end + 1, cache.frame_step)
+        if birth_time <= frame <= die_time
+    ]
+    for endpoint in (birth_time, die_time):
+        if cache.frame_start <= endpoint <= cache.frame_end and not any(
+                math.isclose(endpoint, sample_time, rel_tol=0.0, abs_tol=1e-6)
+                for sample_time in sample_times):
+            sample_times.append(endpoint)
+    sample_times.sort()
+    for sample_time in sample_times:
+        frame = math.floor(sample_time)
+        scene.frame_set(frame, subframe=float(sample_time - frame))
+        bpy.context.view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        particle = emitter.evaluated_get(depsgraph).particle_systems[0].particles[0]
+        path_keys.append({
+            'time':(sample_time - birth_time) / duration,
+            'position':[float(value) for value in particle.location],
+            'velocity':[float(value) * duration * 0.04 * time_tweak for value in particle.velocity],
+        })
+scene.frame_set(2)
+bpy.context.view_layer.update()
+with open(os.path.join(root, 'particle_baked_path.json'), 'w', encoding='utf-8') as output:
+    json.dump({
+        'path_source':path_source,
+        'birth_time':birth_time,
+        'die_time':die_time,
+        'time_tweak':time_tweak,
+        'cache':{'frame_start':cache.frame_start,'frame_end':cache.frame_end,'frame_step':cache.frame_step,'is_baked':cache.is_baked},
+        'path_keys':path_keys,
+        'mesh':evaluate_mesh(2),
+    }, output)
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_baked_path.blend'))
+"#,
+    )?;
+    let mut create_fixture = Command::new(&blender_path);
+    create_fixture
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(&fixture_script)
+        .arg("--")
+        .arg(root);
+    run(&mut create_fixture, "Blender baked particle path fixture")?;
+    let blender: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+    assert_eq!(blender["cache"]["is_baked"], true);
+    assert_eq!(blender["path_source"], "point_cache");
+    let expected_keys = blender["path_keys"]
+        .as_array()
+        .ok_or("Blender baked particle path keys are missing")?;
+    assert_eq!(
+        expected_keys.len(),
+        4,
+        "fixture includes birth/death endpoints and in-lifetime cache samples"
+    );
+
+    let project = root.join("particle-baked-path-project");
+    initialize(&project)?;
+    let mut import = pot()
+        .arg("import")
+        .arg(&project)
+        .arg("--file")
+        .arg(root.join("particle_baked_path.blend"))
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender_path)
+        .arg("--json");
+    let imported: Value =
+        serde_json::from_slice(&run(&mut import, "importing baked particle path fixture")?.stdout)?;
+    assert_eq!(imported["result"]["losses"], json!([]), "{imported}");
+    let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let node_id_by_name = |name: &str| -> Result<String, Box<dyn Error>> {
+        document["nodes"]
+            .as_object()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|(_, node)| node["name"] == name)
+                    .map(|(id, _)| id.clone())
+            })
+            .ok_or_else(|| format!("imported Blender object `{name}` is missing").into())
+    };
+    let emitter_id = node_id_by_name("BakedPathEmitter")?;
+    let instancer_id = node_id_by_name("BakedPathInstancer")?;
+    let emitter = &document["nodes"][emitter_id.as_str()];
+    let system_settings = emitter["properties"]["physics_particle_systems"]
+        .as_object()
+        .and_then(|systems| systems.values().find(|settings| settings["seed"] == 7))
+        .ok_or("imported baked particle system is missing")?;
+    let path_arrays = system_settings["_potter_path_keys"]
+        .as_array()
+        .ok_or("baked path keys were not captured by the bridge")?;
+    assert_eq!(path_arrays.len(), 1);
+    let actual_keys = path_arrays[0]
+        .as_array()
+        .ok_or("imported baked path is not an ordered key list")?;
+    assert_eq!(actual_keys.len(), expected_keys.len());
+    for (index, (actual, expected)) in actual_keys.iter().zip(expected_keys).enumerate() {
+        assert_numeric_rows(
+            &json!([[actual["time"]]]),
+            &json!([[expected["time"]]]),
+            &format!("baked path key {index} time"),
+        );
+        assert_numeric_rows(
+            &json!([actual["position"]]),
+            &json!([expected["position"]]),
+            &format!("baked path key {index} position"),
+        );
+        assert_numeric_rows(
+            &json!([actual["velocity"]]),
+            &json!([expected["velocity"]]),
+            &format!("baked path key {index} normalized velocity"),
+        );
+    }
+    let inspection = inspect(&project, &instancer_id, "2")?;
+    let geometry = &inspection["result"]["items"][0]["evaluated_geometry"];
+    assert_numeric_rows(
+        &geometry["positions"],
+        &blender["mesh"]["positions"],
+        "baked path CLI particle position",
+    );
+    assert_eq!(geometry["faces"], blender["mesh"]["faces"]);
+    Ok(())
+}
+#[test]
+fn particle_instance_hair_lifecycle_matches_blender() -> Result<(), Box<dyn Error>> {
+    let Some(blender_path) = blender_executable() else {
+        eprintln!("skipping Hair lifecycle Blender parity; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let fixture_script = root.join("particle_hair_lifecycle.py");
+    let expected_path = root.join("particle_hair_lifecycle.json");
+    fs::write(
+        &fixture_script,
+        r#"
+import bpy, json, os, sys
+if tuple(bpy.app.version[:3]) != (5,2,2):
+    raise RuntimeError('Hair lifecycle parity requires Blender 5.2.2')
+root = sys.argv[sys.argv.index('--') + 1]
+scene = bpy.context.scene
+scene.use_gravity = False
+scene.frame_start = 1
+scene.frame_end = 10
+scene.frame_set(1)
+
+emitter_mesh = bpy.data.meshes.new('HairLifecycleEmitterMesh')
+emitter_mesh.from_pydata([(-1,-1,0),(1,-1,0),(0,1,0)], [], [(0,1,2)])
+emitter = bpy.data.objects.new('HairLifecycleEmitter', emitter_mesh)
+scene.collection.objects.link(emitter)
+for selected in list(bpy.context.selected_objects):
+    selected.select_set(False)
+emitter.select_set(True)
+bpy.context.view_layer.objects.active = emitter
+bpy.ops.object.particle_system_add()
+system = emitter.particle_systems[0]
+system.seed = 29
+settings = system.settings
+settings.type = 'HAIR'
+settings.count = 4
+settings.frame_start = 1.0
+settings.frame_end = 10.0
+settings.hair_length = 1.0
+settings.hair_step = 2
+settings.particle_size = 0.6
+settings.size_random = 0.0
+settings.child_type = 'NONE'
+scene.frame_set(1)
+bpy.context.view_layer.update()
+
+instance_mesh = bpy.data.meshes.new('HairLifecycleInstancerMesh')
+instance_mesh.from_pydata([(0,0,0),(0.5,0,0),(0,0.5,0)], [], [(0,1,2)])
+instancer = bpy.data.objects.new('HairLifecycleInstancer', instance_mesh)
+scene.collection.objects.link(instancer)
+instancer.track_axis = 'POS_Z'
+modifier = instancer.modifiers.new('Hair Lifecycle Instance', 'PARTICLE_INSTANCE')
+modifier.object = emitter
+modifier.particle_system_index = 1
+modifier.axis = 'Z'
+modifier.space = 'WORLD'
+modifier.use_normal = True
+modifier.use_children = False
+modifier.use_size = False
+modifier.use_path = False
+modifier.show_alive = True
+modifier.show_dead = False
+modifier.show_unborn = False
+
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated_emitter = emitter.evaluated_get(depsgraph)
+particles = [
+    {'birth_time':float(particle.birth_time),
+     'die_time':float(particle.die_time),
+     'alive_state':particle.alive_state,
+     'position':list(particle.location),
+     'velocity':list(particle.velocity)}
+    for particle in evaluated_emitter.particle_systems[0].particles
+]
+evaluated_instancer = instancer.evaluated_get(depsgraph)
+mesh = evaluated_instancer.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+try:
+    expected_mesh = {
+        'positions':[list(vertex.co) for vertex in mesh.vertices],
+        'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+    }
+finally:
+    evaluated_instancer.to_mesh_clear()
+with open(os.path.join(root, 'particle_hair_lifecycle.json'), 'w', encoding='utf-8') as output:
+    json.dump({'particles':particles, 'mesh':expected_mesh}, output)
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_hair_lifecycle.blend'))
+"#,
+    )?;
+    let mut create_fixture = Command::new(&blender_path);
+    create_fixture
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(&fixture_script)
+        .arg("--")
+        .arg(root);
+    run(&mut create_fixture, "Blender Hair lifecycle fixture")?;
+    let blender: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+    let expected_particles = blender["particles"]
+        .as_array()
+        .ok_or("Blender Hair particle states are missing")?;
+    assert_eq!(expected_particles.len(), 4);
+    assert!(
+        expected_particles.iter().all(|particle| {
+            particle["birth_time"] == 0.0 && particle["alive_state"] == "ALIVE"
+        })
+    );
+
+    let project = root.join("particle-hair-lifecycle-project");
+    initialize(&project)?;
+    let mut import = pot()
+        .arg("import")
+        .arg(&project)
+        .arg("--file")
+        .arg(root.join("particle_hair_lifecycle.blend"))
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender_path)
+        .arg("--json");
+    let imported: Value =
+        serde_json::from_slice(&run(&mut import, "importing Hair lifecycle fixture")?.stdout)?;
+    assert_eq!(imported["result"]["losses"], json!([]), "{imported}");
+    let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let node_id_by_name = |name: &str| -> Result<potter_core::model::Id, Box<dyn Error>> {
+        let id = document["nodes"]
+            .as_object()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|(_, node)| node["name"] == name)
+                    .map(|(id, _)| id.clone())
+            })
+            .ok_or_else(|| format!("imported Blender object `{name}` is missing"))?;
+        Ok(potter_core::model::Id::new(id)?)
+    };
+    let emitter_id = node_id_by_name("HairLifecycleEmitter")?;
+    let instancer_id = node_id_by_name("HairLifecycleInstancer")?;
+    let typed_document: potter_core::model::SceneDoc = serde_json::from_value(document)?;
+    let matrices = std::collections::BTreeMap::from([
+        (emitter_id.clone(), DMat4::IDENTITY),
+        (instancer_id.clone(), DMat4::IDENTITY),
+    ]);
+    let evaluated = potter_core::sim::evaluate(
+        &typed_document,
+        &typed_document.active_scene,
+        1.0,
+        &matrices,
+        None,
+    )?
+    .ok_or("Hair lifecycle simulation state is missing")?;
+    let native_particles = evaluated
+        .particle_states
+        .get(&emitter_id)
+        .ok_or("native Hair ParticleStates are missing")?;
+    assert_eq!(native_particles.len(), expected_particles.len());
+    for (index, (actual, expected)) in native_particles.iter().zip(expected_particles).enumerate() {
+        let birth_time = expected["birth_time"]
+            .as_f64()
+            .ok_or("Blender Hair birth time is missing")?;
+        assert!((actual.birth_frame - birth_time).abs() <= MODIFIER_POSITION_TOLERANCE);
+        assert_eq!(
+            actual.life_state,
+            potter_core::sim::ParticleLifeState::Alive,
+            "Hair {index}"
+        );
+        assert_numeric_rows(
+            &json!([actual.position]),
+            &json!([expected["position"]]),
+            &format!("Hair {index} current position"),
+        );
+        assert_numeric_rows(
+            &json!([actual.velocity]),
+            &json!([expected["velocity"]]),
+            &format!("Hair {index} current velocity"),
+        );
+    }
+    let inspection = inspect(&project, &instancer_id.to_string(), "1")?;
+    let geometry = &inspection["result"]["items"][0]["evaluated_geometry"];
+    assert_numeric_rows(
+        &geometry["positions"],
+        &blender["mesh"]["positions"],
+        "native Hair lifecycle instance positions",
+    );
+    assert_eq!(geometry["faces"], blender["mesh"]["faces"]);
+    Ok(())
+}
+#[test]
+fn particle_instance_hair_path_preserve_shape_randomness_and_corners_match_blender()
+-> Result<(), Box<dyn Error>> {
+    let Some(blender_path) = blender_executable() else {
+        eprintln!("skipping hair path Blender parity; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let script = root.join("particle_hair_path.py");
+    let expected_path = root.join("particle_hair_path.json");
+    fs::write(
+        &script,
+        r#"
+import bpy, json, os, sys
+from mathutils import Matrix, Vector
+if tuple(bpy.app.version[:3]) != (5,2,2):
+    raise RuntimeError('hair path parity requires Blender 5.2.2')
+root = sys.argv[sys.argv.index('--') + 1]
+scene = bpy.context.scene
+scene.use_gravity = False
+scene.frame_set(1)
+
+def add_corner_data(mesh):
+    for material_index in range(3):
+        material = bpy.data.materials.new('HairSourceMaterial%d' % material_index)
+        mesh.materials.append(material)
+    for polygon in mesh.polygons:
+        polygon.material_index = polygon.index % 3
+    source_uv = mesh.uv_layers.new(name='SourceUV')
+    particle_uv = mesh.uv_layers.new(name='ParticleUV')
+    for polygon in mesh.polygons:
+        for local_corner, loop_index in enumerate(range(polygon.loop_start, polygon.loop_start + polygon.loop_total)):
+            uv = (0.1 + 0.17 * polygon.index + 0.11 * local_corner,
+                  0.2 + 0.13 * polygon.index + 0.07 * local_corner)
+            source_uv.data[loop_index].uv = uv
+            particle_uv.data[loop_index].uv = (uv[0] + 0.031, uv[1] + 0.047)
+    corner_color = mesh.color_attributes.new(name='HairCornerColor', type='FLOAT_COLOR', domain='CORNER')
+    for polygon in mesh.polygons:
+        for local_corner, loop_index in enumerate(range(polygon.loop_start, polygon.loop_start + polygon.loop_total)):
+            corner_color.data[loop_index].color = (
+                0.12 + 0.11 * polygon.index + 0.07 * local_corner,
+                0.21 + 0.09 * polygon.index + 0.05 * local_corner,
+                0.31 + 0.07 * polygon.index + 0.03 * local_corner,
+                1.0,
+            )
+    mesh.normals_split_custom_set([
+        Vector((0.13 * ((loop.index % 3) - 1), 0.09 * ((loop.index % 4) - 1.5), 1.0)).normalized()
+        for loop in mesh.loops
+    ])
+    mesh.update()
+
+def corner_normal_codes(mesh):
+    attribute = mesh.attributes.get('custom_normal')
+    if attribute is None:
+        return None
+    if attribute.domain != 'CORNER' or attribute.data_type != 'INT16_2D':
+        raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
+    return [None if list(item.vector) == [0,0] else [int(value) for value in item.vector]
+            for item in attribute.data]
+
+def mesh_snapshot(mesh):
+    return {
+        'positions':[list(vertex.co) for vertex in mesh.vertices],
+        'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+        'materials':[int(polygon.material_index) for polygon in mesh.polygons],
+        'uv_layers':{layer.name:[list(item.uv) for item in layer.data] for layer in mesh.uv_layers},
+        'custom_normal_codes':corner_normal_codes(mesh),
+        'color_layer_names':[layer.name for layer in mesh.color_attributes if layer.domain == 'CORNER'],
+        'color_attributes':{
+            layer.name:{'domain':layer.domain, 'data_type':layer.data_type,
+                        'values':[list(item.color) for item in layer.data]}
+            for layer in mesh.color_attributes if layer.domain == 'CORNER'
+        },
+        'vertex_groups':{},
+    }
+
+emitter_mesh = bpy.data.meshes.new('HairEmitterMesh')
+emitter_mesh.from_pydata([(0,0,0),(1,0,0),(1.2,1,0.3),(0.2,1,0.3)], [], [(0,1,2,3)])
+emitter = bpy.data.objects.new('HairEmitter', emitter_mesh)
+scene.collection.objects.link(emitter)
+bpy.context.view_layer.update()
+face_points = [Vector(emitter_mesh.vertices[index].co) for index in emitter_mesh.polygons[0].vertices]
+orig_space = [Vector((0,0)), Vector((1,0)), Vector((1,1))]
+du = orig_space[1] - orig_space[0]
+dv = orig_space[2] - orig_space[0]
+determinant = du.x * dv.y - dv.x * du.y
+edge_u = ((face_points[1] - face_points[0]) * dv.y - (face_points[2] - face_points[0]) * du.y) / determinant
+edge_v = ((face_points[2] - face_points[0]) * du.x - (face_points[1] - face_points[0]) * dv.x) / determinant
+edge_u.normalize()
+edge_v = edge_v - edge_u * edge_v.dot(edge_u)
+edge_v.normalize()
+face_normal = edge_u.cross(edge_v).normalized()
+face_x = edge_u.cross(face_normal).normalized()
+origspace_basis = Matrix((face_x, edge_u, face_normal)).transposed()
+root_basis_quaternion = (emitter.matrix_world.to_3x3() @ origspace_basis).to_quaternion()
+root_basis_frame = [root_basis_quaternion.x, root_basis_quaternion.y,
+                    root_basis_quaternion.z, root_basis_quaternion.w]
+for selected in list(bpy.context.selected_objects):
+    selected.select_set(False)
+emitter.select_set(True)
+bpy.context.view_layer.objects.active = emitter
+bpy.ops.object.particle_system_add()
+system = emitter.particle_systems[0]
+system.seed = 19
+settings = system.settings
+settings.type = 'HAIR'
+settings.count = 1
+settings.hair_length = 2.0
+settings.hair_step = 3
+settings.particle_size = 0.75
+settings.size_random = 0.0
+settings.child_type = 'NONE'
+render_mesh = bpy.data.meshes.new('HairRenderObjectMesh')
+render_mesh.from_pydata([(0,0,0),(0.1,0,0),(0,0.1,0)], [], [(0,1,2)])
+render_object = bpy.data.objects.new('HairRenderObject', render_mesh)
+scene.collection.objects.link(render_object)
+settings.render_type = 'OBJECT'
+settings.instance_object = render_object
+settings.display_step = 3
+scene.frame_set(1)
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated_emitter = emitter.evaluated_get(depsgraph)
+particle = evaluated_emitter.particle_systems[0].particles[0]
+for index, key in enumerate(particle.hair_keys):
+    t = float(index) / max(1, len(particle.hair_keys) - 1)
+    position = Vector(key.co)
+    position.x += 0.55 * t * t
+    position.y += 0.25 * t * t * (1.0 - t)
+    key.co = position
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated_emitter = emitter.evaluated_get(depsgraph)
+particle = evaluated_emitter.particle_systems[0].particles[0]
+root_basis_mesh = bpy.data.meshes.new('HairRootBasisMesh')
+root_basis_mesh.from_pydata(
+    [(0,0,0), (1,0,0), (0,1,0), (0,0,1)],
+    [],
+    [(0,1,2), (0,1,3), (0,2,3), (1,2,3)],
+)
+root_probe = bpy.data.objects.new('HairRootBasisProbe', root_basis_mesh)
+scene.collection.objects.link(root_probe)
+root_probe.track_axis = 'POS_Z'
+root_modifier = root_probe.modifiers.new('Hair Root Frame Probe', 'PARTICLE_INSTANCE')
+root_modifier.object = emitter
+root_modifier.particle_system_index = 1
+root_modifier.axis = 'Z'
+root_modifier.space = 'WORLD'
+root_modifier.use_normal = True
+root_modifier.use_children = False
+root_modifier.use_path = True
+root_modifier.use_preserve_shape = True
+root_modifier.use_size = False
+root_modifier.position = 0.0
+root_modifier.random_position = 0.0
+root_modifier.rotation = 0.0
+root_modifier.random_rotation = 0.0
+root_modifier.show_alive = True
+root_modifier.show_dead = True
+root_modifier.show_unborn = True
+def path_keys(evaluated_emitter, particle, particle_rotation, use_bspline):
+    hair_keys = list(particle.hair_keys)
+    times = [float(key.time) / 100.0 for key in hair_keys]
+    positions = [list(key.co) for key in hair_keys]
+    control_path = []
+    for index, (time, position) in enumerate(zip(times, positions)):
+        if index == 0:
+            interval = times[1] - times[0]
+            before, after = 0, 1
+            divisor = 2.0 * interval
+        elif index + 1 == len(times):
+            interval = times[-1] - times[-2]
+            before, after = index - 1, index
+            divisor = 2.0 * interval
+        else:
+            before, after = index - 1, index + 1
+            divisor = times[after] - times[before]
+        velocity = [0.0, 0.0, 0.0] if divisor <= 0.0 else [
+            (positions[after][axis] - positions[before][axis]) / divisor
+            for axis in range(3)
+        ]
+        # HairKey has no rotation payload; retain Particle.rotation as raw key state.
+        control_path.append({'time':time, 'position':position, 'velocity':velocity,
+                             'rotation':particle_rotation})
+
+    particle_system = evaluated_emitter.particle_systems[0]
+    segments = 1 << int(settings.display_step)
+    try:
+        cache_positions = [
+            [float(value) for value in particle_system.co_hair(evaluated_emitter, 0, step)]
+            for step in range(segments + 1)
+        ]
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        cache_positions = []
+    if cache_positions and any(value != 0.0 for position in cache_positions for value in position):
+        path = []
+        for step, position in enumerate(cache_positions):
+            previous = cache_positions[step - 1] if step else position
+            following = cache_positions[step + 1] if step == 0 else position
+            velocity = [(following[axis] - previous[axis]) * segments for axis in range(3)]
+            path.append({'time':float(step) / segments, 'position':position,
+                         'velocity':velocity, 'rotation':particle_rotation})
+        return path, 'hair_cache', control_path
+    return control_path, 'hair_bspline' if use_bspline else 'hair_cardinal', control_path
+
+hair_states = []
+hair_root_basis_probe_error = None
+hair_root_probe_frame = None
+hair_particle_rotation = None
+hair_world_matrix = None
+for use_bspline in (False, True):
+    settings.use_hair_bspline = use_bspline
+    scene.frame_set(1)
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated_emitter = emitter.evaluated_get(depsgraph)
+    particle = evaluated_emitter.particle_systems[0].particles[0]
+    particle_rotation = [particle.rotation.x, particle.rotation.y,
+                         particle.rotation.z, particle.rotation.w]
+    root_evaluated = root_probe.evaluated_get(depsgraph)
+    root_output = root_evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+    try:
+        root_basis_positions = [Vector(vertex.co) for vertex in root_output.vertices]
+    finally:
+        root_evaluated.to_mesh_clear()
+    root_axes = [root_basis_positions[index] - root_basis_positions[0] for index in (1,2,3)]
+    root_probe_quaternion = Matrix(root_axes).transposed().to_quaternion()
+    root_probe_frame = [root_probe_quaternion.x, root_probe_quaternion.y,
+                        root_probe_quaternion.z, root_probe_quaternion.w]
+    root_basis_probe_error = root_basis_quaternion.rotation_difference(root_probe_quaternion).angle
+    path, path_interpolation, control_path = path_keys(
+        evaluated_emitter, particle, particle_rotation, use_bspline)
+    hair_state = {
+        'position':list(particle.location),
+        'birth_position':list(particle.prev_location),
+        'normal':list(particle.rotation @ Vector((1,0,0))),
+        'rotation':particle_rotation,
+        'birth_rotation':[particle.prev_rotation.x, particle.prev_rotation.y,
+                          particle.prev_rotation.z, particle.prev_rotation.w],
+        'velocity':list(particle.velocity),
+        'birth_frame':float(particle.birth_time),
+        'death_frame':float(particle.die_time),
+        'life_state':particle.alive_state,
+        'size':float(particle.size),
+        'system_index':0,
+        'is_child':False,
+        'parent_index':None,
+        'path_root_rotation':root_probe_frame,
+        'path_interpolation':path_interpolation,
+        'control_path':control_path,
+        'hair_key_data':[{'time':float(key.time), 'weight':float(key.weight), 'co_local':[float(value) for value in key.co_local]} for key in particle.hair_keys],
+        'path':path,
+        'root_basis_probe_error':root_basis_probe_error,
+    }
+    hair_states.append(hair_state)
+    if not use_bspline:
+        hair_root_basis_probe_error = root_basis_probe_error
+        hair_root_probe_frame = root_probe_frame
+        hair_particle_rotation = particle_rotation
+        hair_world_matrix = [evaluated_emitter.matrix_world[row][column]
+                             for column in range(4) for row in range(4)]
+
+source_mesh = bpy.data.meshes.new('HairInstanceSourceMesh')
+source_mesh.from_pydata([(-0.7,-0.3,0.1),(1.1,-0.2,0),(0.3,0.9,0.2),(-0.4,0.4,0.6)], [], [(0,1,2,3)])
+add_corner_data(source_mesh)
+source_normal_codes = corner_normal_codes(source_mesh)
+cases = []
+cli_instancer = None
+for state_index, use_bspline in enumerate((False, True)):
+    settings.use_hair_bspline = use_bspline
+    scene.frame_set(1)
+    bpy.context.view_layer.update()
+    for preserve in (False, True):
+        name = ('hair_bspline_' if use_bspline else 'hair_cardinal_') + (
+            'preserve' if preserve else 'project')
+        obj = bpy.data.objects.new(name, source_mesh)
+        scene.collection.objects.link(obj)
+        obj.track_axis = 'POS_Z'
+        modifier = obj.modifiers.new(name, 'PARTICLE_INSTANCE')
+        modifier.object = emitter
+        modifier.particle_system_index = 1
+        modifier.axis = 'Z'
+        modifier.space = 'WORLD'
+        modifier.use_normal = True
+        modifier.use_children = False
+        modifier.use_path = True
+        modifier.use_preserve_shape = preserve
+        modifier.use_size = True
+        modifier.position = 0.45
+        modifier.random_position = 0.18
+        modifier.rotation = 0.27
+        modifier.random_rotation = 0.31
+        modifier.show_alive = True
+        modifier.show_dead = True
+        modifier.show_unborn = True
+        modifier.index_layer_name = 'InstanceIndex'
+        modifier.value_layer_name = 'InstanceValue'
+        bpy.context.view_layer.update()
+        if name == 'hair_bspline_preserve':
+            cli_instancer = obj
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+        try:
+            cases.append({
+                'name':name,
+                'particle_state_index':state_index,
+                'settings':{
+                    'use_preserve_shape':preserve,
+                    'use_hair_bspline':use_bspline,
+                    'position':modifier.position,
+                    'random_position':modifier.random_position,
+                    'rotation':modifier.rotation,
+                    'random_rotation':modifier.random_rotation,
+                },
+                'mesh':mesh_snapshot(mesh),
+            })
+        finally:
+            evaluated.to_mesh_clear()
+
+hair_collection = bpy.data.collections.new('HairPathRenderCollection')
+scene.collection.children.link(hair_collection)
+collection_render_mesh = bpy.data.meshes.new('HairCollectionRenderMesh')
+collection_render_mesh.from_pydata([(0,0,0),(0.1,0,0),(0,0.1,0)], [], [(0,1,2)])
+collection_render_object = bpy.data.objects.new('HairCollectionRenderObject', collection_render_mesh)
+hair_collection.objects.link(collection_render_object)
+collection_emitter_mesh = bpy.data.meshes.new('HairCollectionEmitterMesh')
+collection_emitter_mesh.from_pydata([(0,0,0),(1,0,0),(0,1,0)], [], [(0,1,2)])
+collection_emitter = bpy.data.objects.new('HairCollectionEmitter', collection_emitter_mesh)
+scene.collection.objects.link(collection_emitter)
+for selected in list(bpy.context.selected_objects):
+    selected.select_set(False)
+collection_emitter.select_set(True)
+bpy.context.view_layer.objects.active = collection_emitter
+bpy.ops.object.particle_system_add()
+collection_system = collection_emitter.particle_systems[0]
+collection_system.seed = 23
+collection_settings = collection_system.settings
+collection_settings.type = 'HAIR'
+collection_settings.count = 1
+collection_settings.hair_length = 1.0
+collection_settings.hair_step = 3
+collection_settings.child_type = 'NONE'
+collection_settings.render_type = 'COLLECTION'
+collection_settings.instance_collection = hair_collection
+collection_settings.display_step = 3
+scene.frame_set(1)
+bpy.context.view_layer.update()
+collection_depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated_collection_emitter = collection_emitter.evaluated_get(collection_depsgraph)
+collection_system_eval = evaluated_collection_emitter.particle_systems[0]
+collection_cache_positions = [
+    [float(value) for value in collection_system_eval.co_hair(
+        evaluated_collection_emitter, 0, step)]
+    for step in range((1 << collection_settings.display_step) + 1)
+]
+if not any(value != 0.0 for position in collection_cache_positions for value in position):
+    raise RuntimeError('Blender did not evaluate the Hair COLLECTION path cache')
+if cli_instancer is None:
+    raise RuntimeError('hair_bspline_preserve CLI instancer was not created')
+scene.frame_set(1)
+bpy.context.view_layer.update()
+for selected in list(bpy.context.selected_objects):
+    selected.select_set(False)
+cli_instancer.select_set(True)
+bpy.context.view_layer.objects.active = cli_instancer
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_hair_path_source.blend'))
+
+
+with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') as output:
+    json.dump({
+        'hair_seed':system.seed,
+        'collection_hair_seed':collection_system.seed,
+        'collection_cache_positions':collection_cache_positions,
+        'hair_world_matrix':hair_world_matrix,
+        'hair_root_basis_frame':root_basis_frame,
+        'hair_root_probe_frame':hair_root_probe_frame,
+        'hair_root_basis_probe_error':hair_root_basis_probe_error,
+        'hair_particle_rotation':hair_particle_rotation,
+        'source_normal_codes':source_normal_codes,
+        'hair_states':hair_states,
+        'cases':cases,
+    }, output)
+"#,
+    )?;
+    let mut command = Command::new(&blender_path);
+    command
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(&script)
+        .arg("--")
+        .arg(root);
+    run(&mut command, "Blender hair path fixture")?;
+    let blender: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
+    let particles = injected_particles(&blender["hair_states"])?;
+    assert_eq!(particles.len(), 2);
+    assert!(
+        particles.iter().all(|particle| particle.path.len() >= 2),
+        "Blender Hair keys must provide full paths",
+    );
+    assert!(
+        particles.iter().all(|particle| {
+            particle.path_interpolation == potter_core::sim::ParticlePathInterpolation::HairCache
+                && particle.path.len() == 9
+        }),
+        "Hair oracle must use nine evaluated pathcache samples in hair-cache mode",
+    );
+    let control_path: Vec<potter_core::sim::ParticlePathKey> =
+        serde_json::from_value(blender["hair_states"][0]["control_path"].clone())?;
+    let first_interval = control_path[1].time - control_path[0].time;
+    let first_slope = (DVec3::from_array(control_path[1].position)
+        - DVec3::from_array(control_path[0].position))
+        / (2.0 * first_interval);
+    assert!(
+        DVec3::from_array(control_path[0].velocity).distance(first_slope) < 1.0e-12,
+        "Hair control oracle must use the duplicated-endpoint half-slope at its root",
+    );
+    let last = control_path.len() - 1;
+    let last_interval = control_path[last].time - control_path[last - 1].time;
+    let last_slope = (DVec3::from_array(control_path[last].position)
+        - DVec3::from_array(control_path[last - 1].position))
+        / (2.0 * last_interval);
+    assert!(
+        DVec3::from_array(control_path[last].velocity).distance(last_slope) < 1.0e-12,
+        "Hair control oracle must use the duplicated-endpoint half-slope at its tip",
+    );
+    let root_basis_probe_error = blender["hair_root_basis_probe_error"]
+        .as_f64()
+        .ok_or("Blender Hair root basis probe error is missing")?;
+    assert!(
+        root_basis_probe_error <= MODIFIER_POSITION_TOLERANCE,
+        "OrigSpace-derived root={:?}, evaluated basis probe={:?}, Particle.rotation={:?}, angular error={root_basis_probe_error}",
+        blender["hair_root_basis_frame"],
+        blender["hair_root_probe_frame"],
+        blender["hair_particle_rotation"],
+    );
+    for (index, particle) in particles.iter().enumerate() {
+        let root_rotation: [f64; 4] =
+            serde_json::from_value(blender["hair_states"][index]["path_root_rotation"].clone())?;
+        assert_eq!(particle.path_root_rotation, Some(root_rotation));
+        let root_basis_probe_error = blender["hair_states"][index]["root_basis_probe_error"]
+            .as_f64()
+            .ok_or("Blender Hair root basis probe error is missing")?;
+        assert!(
+            root_basis_probe_error <= MODIFIER_POSITION_TOLERANCE,
+            "Hair root frame error {root_basis_probe_error} exceeds {MODIFIER_POSITION_TOLERANCE}",
+        );
+    }
+    let root_rotation: [f64; 4] = serde_json::from_value(blender["hair_root_probe_frame"].clone())?;
+    assert_eq!(particles[0].path_root_rotation, Some(root_rotation));
+    assert_numeric_rows(
+        &json!([particles[0].path[0].rotation]),
+        &json!([blender["hair_particle_rotation"]]),
+        "Hair ParticleKey rotation remains raw while path root is separate",
+    );
+    assert_numeric_rows(
+        &json!([particles[1].path[0].rotation]),
+        &json!([blender["hair_states"][1]["rotation"]]),
+        "Hair path keeps the raw particle quaternion",
+    );
+    let source = potter_core::geom::Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(-0.7, -0.3, 0.1),
+            DVec3::new(1.1, -0.2, 0.0),
+            DVec3::new(0.3, 0.9, 0.2),
+            DVec3::new(-0.4, 0.4, 0.6),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    let mut source = source;
+    add_corner_fixture_data(&mut source, &blender["source_normal_codes"], false, true);
+    let world_columns: [f64; 16] = serde_json::from_value(blender["hair_world_matrix"].clone())?;
+    let source_world = DMat4::from_cols_array(&world_columns);
+    let system_seed = blender["hair_seed"]
+        .as_u64()
+        .ok_or("hair system seed is missing")? as u32;
+    let emitter_mesh = potter_core::geom::Mesh::from_positions_and_faces(
+        vec![
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::new(1.2, 1.0, 0.3),
+            DVec3::new(0.2, 1.0, 0.3),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    let first_path = serde_json::to_value(&particles[0].path)?;
+    let path_interpolation = serde_json::to_value(particles[0].path_interpolation)?;
+    let simulation_settings = json!({
+        "type":"HAIR",
+        "count":1,
+        "frame_start":1.0,
+        "frame_end":1.0,
+        "lifetime":100.0,
+        "physics_type":"NO",
+        "_potter_path_interpolation":path_interpolation,
+        "_potter_path_keys":[first_path],
+    });
+    let simulated = potter_core::sim::particles::simulate_lifecycle(
+        &emitter_mesh,
+        &simulation_settings,
+        source_world,
+        1.0,
+        24.0,
+        DVec3::ZERO,
+        system_seed,
+        &[],
+        &[],
+    )?;
+    assert_eq!(simulated.len(), 1);
+    let native_root = DQuat::from_array(
+        simulated[0]
+            .path_root_rotation
+            .ok_or("native hair root frame is missing")?,
+    )
+    .normalize();
+    let oracle_root = DQuat::from_array(root_rotation).normalize();
+    let root_error = 2.0 * native_root.dot(oracle_root).abs().clamp(0.0, 1.0).acos();
+    assert!(
+        root_error <= MODIFIER_POSITION_TOLERANCE,
+        "native emitter root frame error {root_error} exceeds {MODIFIER_POSITION_TOLERANCE}",
+    );
+    let emitter_id = potter_core::model::Id::from_static("hair_emitter");
+    let data_id = potter_core::model::Id::from_static("hair_emitter_mesh");
+    let mut state_doc = potter_core::model::SceneDoc::new("hair-path-state".to_owned());
+    state_doc
+        .collections
+        .get_mut(&potter_core::model::Id::from_static("collection_root"))
+        .expect("default root collection")
+        .objects
+        .push(emitter_id.clone());
+    state_doc.data_blocks.insert(
+        data_id.clone(),
+        potter_core::model::DataBlock {
+            mesh: Some(emitter_mesh.clone()),
+            ..potter_core::model::DataBlock::default()
+        },
+    );
+    state_doc.nodes.insert(
+        emitter_id.clone(),
+        potter_core::model::Node {
+            name: "Hair emitter".to_owned(),
+            kind: "mesh".to_owned(),
+            data: Some(data_id),
+            properties: Map::from_iter([(
+                "physics_particle_emitter".to_owned(),
+                simulation_settings.clone(),
+            )]),
+            ..potter_core::model::Node::default()
+        },
+    );
+    let instancer_id = potter_core::model::Id::from_static("hair_instancer");
+    state_doc.nodes.insert(
+        instancer_id,
+        potter_core::model::Node {
+            name: "Hair instancer".to_owned(),
+            modifiers: vec![potter_core::model::Modifier {
+                id: potter_core::model::Id::from_static("hair_instance"),
+                modifier_type: "particle_instance".to_owned(),
+                name: "Hair path instance".to_owned(),
+                enabled: true,
+                params: Map::from_iter([
+                    ("object".to_owned(), json!("hair_emitter")),
+                    ("particle_system_index".to_owned(), json!(1)),
+                    ("use_path".to_owned(), json!(true)),
+                ]),
+                binding_data: None,
+                runtime: Default::default(),
+            }],
+            ..potter_core::model::Node::default()
+        },
+    );
+    let evaluated = potter_core::sim::evaluate(
+        &state_doc,
+        &state_doc.active_scene,
+        1.0,
+        &std::collections::BTreeMap::from([(emitter_id.clone(), source_world)]),
+        None,
+    )?
+    .ok_or("Hair path simulation state is missing")?;
+    let hair_state = evaluated
+        .particle_states
+        .get(&emitter_id)
+        .and_then(|states| states.first())
+        .ok_or("generated Hair ParticleState is missing")?;
+    assert_eq!(
+        hair_state.path_interpolation,
+        potter_core::sim::ParticlePathInterpolation::HairCache,
+    );
+    assert!(
+        !hair_state.path.is_empty(),
+        "Hair path mode must populate the state path"
+    );
+    let blender_rotation: [f64; 4] =
+        serde_json::from_value(blender["hair_particle_rotation"].clone())?;
+    let generated_rotation = DQuat::from_array(hair_state.rotation).normalize();
+    let blender_rotation = DQuat::from_array(blender_rotation).normalize();
+    let rotation_error = 2.0
+        * generated_rotation
+            .dot(blender_rotation)
+            .abs()
+            .clamp(0.0, 1.0)
+            .acos();
+    assert!(
+        rotation_error <= MODIFIER_POSITION_TOLERANCE,
+        "generated Hair current rotation error {rotation_error} exceeds {MODIFIER_POSITION_TOLERANCE}",
+    );
+    for case in blender["cases"]
+        .as_array()
+        .ok_or("Hair path cases are missing")?
+    {
+        let settings = &case["settings"];
+        let state_index = case["particle_state_index"]
+            .as_u64()
+            .ok_or("Hair path case particle state index is missing")?
+            as usize;
+        let particle = particles
+            .get(state_index)
+            .ok_or("Hair path case particle state index is out of range")?;
+        let result = potter_core::geom::modifiers::particle_instance::particle_instance(
+            &source,
+            std::slice::from_ref(particle),
+            system_seed,
+            source_world,
+            2,
+            &Map::from_iter([
+                ("use_normal".to_owned(), json!(true)),
+                ("use_children".to_owned(), json!(false)),
+                ("use_path".to_owned(), json!(true)),
+                (
+                    "use_preserve_shape".to_owned(),
+                    settings["use_preserve_shape"].clone(),
+                ),
+                ("use_size".to_owned(), json!(true)),
+                ("show_alive".to_owned(), json!(true)),
+                ("show_dead".to_owned(), json!(true)),
+                ("show_unborn".to_owned(), json!(true)),
+                ("position".to_owned(), settings["position"].clone()),
+                (
+                    "random_position".to_owned(),
+                    settings["random_position"].clone(),
+                ),
+                ("rotation".to_owned(), settings["rotation"].clone()),
+                (
+                    "random_rotation".to_owned(),
+                    settings["random_rotation"].clone(),
+                ),
+                ("axis".to_owned(), json!("Z")),
+                ("space".to_owned(), json!("WORLD")),
+                ("index_layer_name".to_owned(), json!("InstanceIndex")),
+                ("value_layer_name".to_owned(), json!("InstanceValue")),
+            ]),
+        )?;
+        assert_ordered_mesh_matches_blender(
+            &result,
+            &case["mesh"],
+            case["name"].as_str().unwrap_or("hair path"),
+        );
+    }
+    let cli_case = blender["cases"]
+        .as_array()
+        .and_then(|cases| {
+            cases
+                .iter()
+                .find(|case| case["name"] == "hair_bspline_preserve")
+        })
+        .ok_or("Blender B-spline preserve case is missing")?;
+    let project = root.join("particle-hair-path-project");
+    initialize(&project)?;
+    let mut import = pot()
+        .arg("import")
+        .arg(&project)
+        .arg("--file")
+        .arg(root.join("particle_hair_path_source.blend"))
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender_path)
+        .arg("--json");
+    let imported: Value =
+        serde_json::from_slice(&run(&mut import, "importing Hair path fixture")?.stdout)?;
+    assert_eq!(imported["result"]["losses"], json!([]), "{imported}");
+
+    let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let node_id_by_name = |name: &str| -> Result<String, Box<dyn Error>> {
+        document["nodes"]
+            .as_object()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|(_, node)| node["name"] == name)
+                    .map(|(id, _)| id.clone())
+            })
+            .ok_or_else(|| format!("imported Blender object `{name}` is missing").into())
+    };
+    let instancer_id = node_id_by_name("hair_bspline_preserve")?;
+    let emitter_id = node_id_by_name("HairEmitter")?;
+    let instancer_node = &document["nodes"][instancer_id.as_str()];
+    let modifier = instancer_node["modifiers"]
+        .as_array()
+        .and_then(|modifiers| {
+            modifiers.iter().find(|modifier| {
+                modifier["type"] == "particle_instance"
+                    && modifier["name"] == "hair_bspline_preserve"
+            })
+        })
+        .ok_or("imported Hair path particle-instance modifier is missing")?;
+    assert_eq!(modifier["params"]["use_path"], true);
+    assert_eq!(modifier["params"]["use_preserve_shape"], true);
+    let modifier_id = modifier["id"]
+        .as_str()
+        .ok_or("Hair path modifier ID is missing")?;
+    let emitter_node = &document["nodes"][emitter_id.as_str()];
+    let particle_settings = emitter_node["properties"]["physics_particle_systems"]
+        .as_object()
+        .and_then(|systems| {
+            systems
+                .values()
+                .find(|settings| settings["seed"] == blender["hair_seed"])
+        })
+        .ok_or("imported Hair particle-system settings are missing")?;
+    assert_eq!(
+        particle_settings["_potter_path_interpolation"],
+        "hair_cache"
+    );
+    let imported_paths = particle_settings["_potter_path_keys"]
+        .as_array()
+        .ok_or("Blender hair path cache was not serialized by the bridge")?;
+    assert_eq!(imported_paths.len(), 1);
+    let imported_path = imported_paths[0]
+        .as_array()
+        .ok_or("imported Hair path cache is not an ordered key list")?;
+    let blender_path_keys = blender["hair_states"][1]["path"]
+        .as_array()
+        .ok_or("Blender Hair path oracle is missing")?;
+    assert_eq!(
+        imported_path.len(),
+        9,
+        "bridge must capture the full path cache"
+    );
+    assert_eq!(imported_path.len(), blender_path_keys.len());
+    for (key_index, (actual, expected)) in imported_path.iter().zip(blender_path_keys).enumerate() {
+        assert_eq!(
+            actual["time"], expected["time"],
+            "bridge Hair path key {key_index} time",
+        );
+        assert_numeric_rows(
+            &json!([actual["position"]]),
+            &json!([expected["position"]]),
+            &format!("bridge Hair path key {key_index} position"),
+        );
+    }
+    let collection_emitter_id = node_id_by_name("HairCollectionEmitter")?;
+    let collection_emitter_node = &document["nodes"][collection_emitter_id.as_str()];
+    let collection_settings = collection_emitter_node["properties"]["physics_particle_systems"]
+        .as_object()
+        .and_then(|systems| {
+            systems
+                .values()
+                .find(|settings| settings["seed"] == blender["collection_hair_seed"])
+        })
+        .ok_or("imported Hair COLLECTION settings are missing")?;
+    assert_eq!(
+        collection_settings["_potter_path_interpolation"],
+        "hair_cache"
+    );
+    let collection_paths = collection_settings["_potter_path_keys"]
+        .as_array()
+        .and_then(|paths| paths.first())
+        .and_then(Value::as_array)
+        .ok_or("Hair COLLECTION cache path was not imported")?;
+    let collection_positions = blender["collection_cache_positions"]
+        .as_array()
+        .ok_or("Blender Hair COLLECTION cache positions are missing")?;
+    assert_eq!(collection_paths.len(), collection_positions.len());
+    assert_eq!(collection_paths.len(), 9);
+    for (index, (actual, expected_position)) in collection_paths
+        .iter()
+        .zip(collection_positions)
+        .enumerate()
+    {
+        assert_numeric_rows(
+            &json!([[actual["time"]]]),
+            &json!([[index as f64 / 8.0]]),
+            &format!("Hair COLLECTION cache key {index} time"),
+        );
+        assert_numeric_rows(
+            &json!([actual["position"]]),
+            &json!([expected_position]),
+            &format!("Hair COLLECTION cache key {index} position"),
+        );
+    }
+
+    let typed_document: potter_core::model::SceneDoc = serde_json::from_value(document.clone())?;
+    assert_snapshot_mesh_matches_blender(
+        &typed_document,
+        &instancer_id,
+        1.0,
+        &cli_case["mesh"],
+        "imported Hair path full corner snapshot",
+    )?;
+    let assert_cli_mesh = |actual: &Value, expected: &Value, context: &str| {
+        let geometry = &actual["result"]["items"][0]["evaluated_geometry"];
+        assert_numeric_rows(
+            &geometry["positions"],
+            &expected["positions"],
+            &format!("{context} ordered positions"),
+        );
+        assert_eq!(
+            geometry["faces"], expected["faces"],
+            "{context} ordered faces"
+        );
+    };
+    let inspected = inspect(&project, &instancer_id, "1")?;
+    assert_cli_mesh(&inspected, &cli_case["mesh"], "Hair path CLI frame 1");
+    let live_exported = root.join("particle_hair_path_live.blend");
+    let mut live_export = pot()
+        .arg("export")
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&live_exported)
+        .arg("--blender")
+        .arg(&blender_path)
+        .arg("--json");
+    run(&mut live_export, "exporting live Hair path modifier")?;
+    let live_project = root.join("particle-hair-path-live-reimport");
+    initialize(&live_project)?;
+    let mut live_import = pot()
+        .arg("import")
+        .arg(&live_project)
+        .arg("--file")
+        .arg(&live_exported)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender_path)
+        .arg("--json");
+    let live_imported: Value = serde_json::from_slice(
+        &run(&mut live_import, "reimporting live Hair path modifier")?.stdout,
+    )?;
+    assert_eq!(
+        live_imported["result"]["losses"],
+        json!([]),
+        "{live_imported}"
+    );
+    let live_document: Value = serde_json::from_slice(&fs::read(live_project.join("scene.json"))?)?;
+    let live_instancer_id = live_document["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(_, node)| node["name"] == "hair_bspline_preserve")
+                .map(|(id, _)| id.clone())
+        })
+        .ok_or("live Hair path instancer is missing after export")?;
+    let live_instancer = &live_document["nodes"][live_instancer_id.as_str()];
+    let live_modifier = live_instancer["modifiers"]
+        .as_array()
+        .and_then(|modifiers| {
+            modifiers
+                .iter()
+                .find(|modifier| modifier["type"] == "particle_instance")
+        })
+        .ok_or("live Hair path modifier did not survive Blender export")?;
+    assert_eq!(live_modifier["params"]["use_path"], true);
+    let typed_live_document: potter_core::model::SceneDoc =
+        serde_json::from_value(live_document.clone())?;
+    assert_snapshot_mesh_matches_blender(
+        &typed_live_document,
+        &live_instancer_id,
+        1.0,
+        &cli_case["mesh"],
+        "live Hair path export full corner snapshot",
+    )?;
+    let live_inspection = inspect(&live_project, &live_instancer_id, "1")?;
+    assert_cli_mesh(
+        &live_inspection,
+        &cli_case["mesh"],
+        "live Hair path export mesh",
+    );
+
+    let revision = document["revision"]
+        .as_u64()
+        .ok_or("imported Hair scene revision is missing")?;
+    let batch = root.join("apply_hair_path_particle_instance.json");
+    apply(
+        &project,
+        &batch,
+        &json!([{
+            "op":"modifier.apply",
+            "target":{"id":instancer_id},
+            "modifier_id":modifier_id
+        }]),
+        revision,
+    )?;
+    let applied_document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let applied_instancer = &applied_document["nodes"][instancer_id.as_str()];
+    assert!(
+        applied_instancer["modifiers"]
+            .as_array()
+            .is_some_and(|modifiers| modifiers
+                .iter()
+                .all(|modifier| modifier["id"] != modifier_id)),
+        "applying the Hair path modifier must remove its stack entry",
+    );
+    let applied_emitter = &applied_document["nodes"][emitter_id.as_str()];
+    let applied_particle_settings = applied_emitter["properties"]["physics_particle_systems"]
+        .as_object()
+        .and_then(|systems| {
+            systems
+                .values()
+                .find(|settings| settings["seed"] == blender["hair_seed"])
+        })
+        .ok_or("applying the instancer must preserve its source Hair particle system")?;
+    assert_eq!(
+        applied_particle_settings["_potter_path_keys"], particle_settings["_potter_path_keys"],
+        "applying the instancer must retain the source path cache",
+    );
+    assert_eq!(
+        applied_particle_settings["_potter_hair_key_data"],
+        particle_settings["_potter_hair_key_data"],
+        "applying the instancer must retain source Hair key controls",
+    );
+    let typed_applied_document: potter_core::model::SceneDoc =
+        serde_json::from_value(applied_document.clone())?;
+    assert_snapshot_mesh_matches_blender(
+        &typed_applied_document,
+        &instancer_id,
+        1.0,
+        &cli_case["mesh"],
+        "applied Hair path full corner snapshot",
+    )?;
+    let applied = inspect(&project, &instancer_id, "1")?;
+    assert_cli_mesh(&applied, &cli_case["mesh"], "applied Hair path mesh");
+
+    let exported = root.join("particle_hair_path_applied.blend");
+    let mut export = pot()
+        .arg("export")
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&exported)
+        .arg("--blender")
+        .arg(&blender_path)
+        .arg("--json");
+    run(&mut export, "exporting applied Hair path mesh")?;
+    let reopen_script = root.join("reopen_particle_hair_path.py");
+    let reopened_path = root.join("reopened_particle_hair_path.json");
+    fs::write(
+        &reopen_script,
+        r#"
+import bpy, json, sys
+output = sys.argv[sys.argv.index('--') + 1]
+obj = bpy.data.objects['hair_bspline_preserve']
+mesh = obj.data
+emitter = bpy.data.objects['HairEmitter']
+scene = bpy.context.scene
+scene.frame_set(1)
+bpy.context.view_layer.update()
+def corner_normal_codes(mesh):
+    attribute = mesh.attributes.get('custom_normal')
+    if attribute is None:
+        return None
+    if attribute.domain != 'CORNER' or attribute.data_type != 'INT16_2D':
+        raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
+    return [None if list(item.vector) == [0,0] else [int(value) for value in item.vector]
+            for item in attribute.data]
+result = {
+    'track_axis':obj.track_axis,
+    'modifier_count':len(obj.modifiers),
+    'emitter_particle_system_count':len(emitter.particle_systems),
+    'emitter_hair_key_data':[{'time':float(key.time), 'weight':float(key.weight), 'co_local':[float(value) for value in key.co_local]} for key in emitter.particle_systems[0].particles[0].hair_keys],
+    'positions':[list(vertex.co) for vertex in mesh.vertices],
+    'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+    'materials':[int(polygon.material_index) for polygon in mesh.polygons],
+    'uv_layers':{layer.name:[list(item.uv) for item in layer.data] for layer in mesh.uv_layers},
+    'custom_normal_codes':corner_normal_codes(mesh),
+    'color_layer_names':[layer.name for layer in mesh.color_attributes if layer.domain == 'CORNER'],
+    'color_attributes':{
+        layer.name:{'domain':layer.domain, 'data_type':layer.data_type,
+                    'values':[list(item.color) for item in layer.data]}
+        for layer in mesh.color_attributes if layer.domain == 'CORNER'
+    },
+}
+with open(output, 'w', encoding='utf-8') as handle:
+    json.dump(result, handle)
+"#,
+    )?;
+    let mut reopen = Command::new(&blender_path);
+    reopen
+        .args(["--background", "--disable-autoexec"])
+        .arg(&exported)
+        .args(["--python-exit-code", "1", "--python"])
+        .arg(&reopen_script)
+        .arg("--")
+        .arg(&reopened_path);
+    run(&mut reopen, "reopening exported Hair path blend")?;
+    let reopened: Value = serde_json::from_slice(&fs::read(&reopened_path)?)?;
+    assert_eq!(reopened["track_axis"], "POS_Z");
+    assert_eq!(reopened["modifier_count"], 0);
+    assert!(
+        reopened["emitter_particle_system_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "exported scene must retain the source Hair particle system",
+    );
+    let expected_hair_keys = blender["hair_states"][1]["hair_key_data"]
+        .as_array()
+        .ok_or("Blender Hair key source data is missing")?;
+    let exported_hair_keys = reopened["emitter_hair_key_data"]
+        .as_array()
+        .ok_or("exported Hair key data is missing")?;
+    assert_eq!(exported_hair_keys.len(), expected_hair_keys.len());
+    for (index, (actual, expected)) in exported_hair_keys
+        .iter()
+        .zip(expected_hair_keys)
+        .enumerate()
+    {
+        assert_numeric_rows(
+            &json!([[actual["time"]]]),
+            &json!([[expected["time"]]]),
+            &format!("reopened Hair key {index} time"),
+        );
+        assert_numeric_rows(
+            &json!([[actual["weight"]]]),
+            &json!([[expected["weight"]]]),
+            &format!("reopened Hair key {index} weight"),
+        );
+        assert_numeric_rows(
+            &json!([actual["co_local"]]),
+            &json!([expected["co_local"]]),
+            &format!("reopened Hair key {index} coordinates"),
+        );
+    }
+    assert_numeric_rows(
+        &reopened["positions"],
+        &cli_case["mesh"]["positions"],
+        "reopened Hair path static mesh vertices",
+    );
+    assert_eq!(reopened["faces"], cli_case["mesh"]["faces"]);
+    assert_eq!(reopened["materials"], cli_case["mesh"]["materials"]);
+    for (name, expected_uvs) in cli_case["mesh"]["uv_layers"]
+        .as_object()
+        .ok_or("Hair path UV layer oracle is missing")?
+    {
+        let actual_uvs = reopened["uv_layers"]
+            .get(name)
+            .ok_or_else(|| format!("reopened Hair mesh is missing UV layer {name}"))?;
+        assert_numeric_rows(
+            actual_uvs,
+            expected_uvs,
+            &format!("reopened Hair path UV {name}"),
+        );
+    }
+    assert_eq!(
+        reopened["custom_normal_codes"], cli_case["mesh"]["custom_normal_codes"],
+        "reopened Hair path corner custom normals",
+    );
+    assert_eq!(
+        reopened["color_layer_names"], cli_case["mesh"]["color_layer_names"],
+        "reopened Hair path corner color layer names",
+    );
+    for (name, expected_color) in cli_case["mesh"]["color_attributes"]
+        .as_object()
+        .ok_or("Hair path color attribute oracle is missing")?
+    {
+        let actual_color = &reopened["color_attributes"][name];
+        assert_eq!(actual_color["domain"], expected_color["domain"]);
+        assert_eq!(actual_color["data_type"], expected_color["data_type"]);
+        assert_numeric_rows(
+            &actual_color["values"],
+            &expected_color["values"],
+            &format!("reopened Hair path corner color {name}"),
+        );
+    }
+    let reimport_project = root.join("particle-hair-path-reimport");
+    initialize(&reimport_project)?;
+    let mut reimport = pot()
+        .arg("import")
+        .arg(&reimport_project)
+        .arg("--file")
+        .arg(&exported)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender_path)
+        .arg("--json");
+    let reimported: Value =
+        serde_json::from_slice(&run(&mut reimport, "reimporting applied Hair path blend")?.stdout)?;
+    assert_eq!(reimported["result"]["losses"], json!([]), "{reimported}");
+    let reimported_document: Value =
+        serde_json::from_slice(&fs::read(reimport_project.join("scene.json"))?)?;
+    let reimported_instancer_id = reimported_document["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(_, node)| node["name"] == "hair_bspline_preserve")
+                .map(|(id, _)| id.clone())
+        })
+        .ok_or("reimported Hair path instancer is missing")?;
+    let reimported_instancer = &reimported_document["nodes"][reimported_instancer_id.as_str()];
+    assert_eq!(
+        reimported_instancer["properties"]["blender_object_metadata"]["rna_properties"]["track_axis"],
+        "POS_Z",
+    );
+    assert!(
+        reimported_instancer["modifiers"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "reimported applied Hair path mesh must remain modifier-free",
+    );
+    let typed_reimported_document: potter_core::model::SceneDoc =
+        serde_json::from_value(reimported_document.clone())?;
+    assert_snapshot_mesh_matches_blender(
+        &typed_reimported_document,
+        &reimported_instancer_id,
+        1.0,
+        &cli_case["mesh"],
+        "reimported Hair path full corner snapshot",
+    )?;
+    let reimported_inspection = inspect(&reimport_project, &reimported_instancer_id, "1")?;
+    assert_cli_mesh(
+        &reimported_inspection,
+        &cli_case["mesh"],
+        "reimported Hair path mesh",
     );
     Ok(())
 }
@@ -2132,7 +4821,7 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
         &batch,
         &json!([
             {"op":"node.create","id":"a_emitter","kind":"plane","params":{}},
-            {"op":"physics.particle_emitter.create","target":{"id":"a_emitter"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":2.0,"lifetime":1.0,"physics_type":"NO","normal_factor":0.0,"particle_size":0.75,"child_nbr":2,"child_radius":0.6,"child_type":"SIMPLE","seed":11}},
+            {"op":"physics.particle_emitter.create","target":{"id":"a_emitter"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":2.0,"lifetime":1.0,"physics_type":"NO","normal_factor":0.0,"particle_size":0.75,"child_radius":0.6,"child_type":"SIMPLE","child_seed":31,"child_percent":2,"rendered_child_count":2,"seed":11}},
             {"op":"modifier.create","target":{"id":"a_emitter"},"id":"particles_second","type":"particle_system","params":{"settings_id":"particles_second"}},
             {"op":"node.create","id":"b_alive","kind":"plane","params":{}},
             {"op":"modifier.create","target":{"id":"b_alive"},"id":"alive_instances","type":"particle_instance","params":{"object":"a_emitter","particle_system_index":1,"use_normal":true,"use_children":true,"use_size":false,"show_alive":true,"show_dead":false,"show_unborn":false,"position":0,"random_position":0.0,"axis":"X","space":"WORLD","use_path":false}},
@@ -2150,6 +4839,11 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
         ]),
         0,
     )?;
+    let stored: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let child_settings = &stored["nodes"]["a_emitter"]["properties"]["physics_particle_emitter"];
+    assert_eq!(child_settings["child_seed"], 31);
+    assert_eq!(child_settings["child_percent"], 2);
+    assert_eq!(child_settings["rendered_child_count"], 2);
 
     for (object, frame, expected_faces) in [
         ("b_alive", "1", 3),
@@ -2188,7 +4882,13 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
     let frame_one_states = frame_one["particles"]["a_emitter"]
         .as_array()
         .ok_or("frame-one particle states are missing")?;
-    assert_eq!(frame_one_states.len(), 7);
+    assert_eq!(frame_one_states.len(), 6);
+    assert!(
+        frame_one_states
+            .iter()
+            .any(|state| state["is_child"] == true),
+        "baked particle states must retain native child instances",
+    );
     assert_eq!(
         frame_one_states
             .iter()

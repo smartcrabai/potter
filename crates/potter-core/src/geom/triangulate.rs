@@ -336,6 +336,20 @@ fn triangulate_ngon(corners: &[Vec3], method: NgonMethod) -> Vec<[usize; 3]> {
     triangles
 }
 
+/// Tessface triangulation uses Blender's polyfill order without beauty flips.
+pub(crate) fn tessellate_ngon(corners: &[[f32; 3]]) -> Vec<[usize; 3]> {
+    let mut normal = face_normal(corners);
+    if normal == [0.0; 3] {
+        normal[2] = 1.0;
+    }
+    let negated = [-normal[0], -normal[1], -normal[2]];
+    let projected: Vec<Vec2> = corners
+        .iter()
+        .map(|&corner| project(negated, corner))
+        .collect();
+    polyfill(&projected)
+}
+
 const CONCAVE: i8 = -1;
 const TANGENTIAL: i8 = 0;
 const CONVEX: i8 = 1;

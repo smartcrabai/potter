@@ -736,22 +736,46 @@ impl Mesh {
     ///
     /// Returns an error for invalid mesh topology, degenerate polygons, or ID exhaustion.
     pub fn triangulate(&self) -> Result<Vec<[u32; 3]>, MeshError> {
-        self.validate()?;
+        let positions = self.triangulation_positions()?;
         let capacity = self.faces.iter().try_fold(0_usize, |capacity, face| {
             capacity
                 .checked_add(face.vertices.len() - 2)
                 .ok_or(MeshError::IdExhausted)
         })?;
-        let positions: HashMap<_, _> = self
+        let mut result = Vec::with_capacity(capacity);
+        self.for_each_triangle_with_positions(&positions, |_, triangle| result.push(triangle))?;
+        Ok(result)
+    }
+
+    /// Visits each triangulated face and retains its source face index without a second triangle buffer.
+    pub(crate) fn for_each_triangle_with_face(
+        &self,
+        visit: impl FnMut(usize, [u32; 3]),
+    ) -> Result<(), MeshError> {
+        let positions = self.triangulation_positions()?;
+        self.for_each_triangle_with_positions(&positions, visit)
+    }
+
+    fn triangulation_positions(&self) -> Result<HashMap<u32, DVec3>, MeshError> {
+        self.validate()?;
+        Ok(self
             .vertices
             .iter()
             .map(|vertex| (vertex.id, vertex.co))
-            .collect();
-        let mut result = Vec::with_capacity(capacity);
-        for face in &self.faces {
-            result.extend(triangulate_face(face, &positions)?);
+            .collect())
+    }
+
+    fn for_each_triangle_with_positions(
+        &self,
+        positions: &HashMap<u32, DVec3>,
+        mut visit: impl FnMut(usize, [u32; 3]),
+    ) -> Result<(), MeshError> {
+        for (face_index, face) in self.faces.iter().enumerate() {
+            for triangle in triangulate_face(face, positions)? {
+                visit(face_index, triangle);
+            }
         }
-        Ok(result)
+        Ok(())
     }
 
     /// Create a Blender-default or customized box mesh.

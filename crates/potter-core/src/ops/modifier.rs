@@ -2386,7 +2386,7 @@ fn validate_particle_modifier_params(
     modifier_type: &str,
     params: &Map<String, Value>,
 ) -> Result<()> {
-    if modifier_type != "particle_instance" {
+    if !matches!(modifier_type, "particle_instance" | "explode") {
         return Ok(());
     }
     if modifier_type == "particle_instance" {
@@ -2426,6 +2426,13 @@ fn validate_particle_modifier_params(
                 "/params/particle_system_index",
             )
         })?;
+        if index == 0 || index > 32_767 {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "particle_system_index must be between 1 and 32767",
+                "/params/particle_system_index",
+            ));
+        }
         if modifier_type == "particle_instance" {
             let object_id = params
                 .get("object")
@@ -2461,7 +2468,9 @@ fn validate_particle_modifier_params(
         "show_dead",
         "show_unborn",
         "use_path",
+        "use_preserve_shape",
         "use_edge_cut",
+        "invert_vertex_group",
     ] {
         if params.get(field).is_some_and(|value| !value.is_boolean()) {
             return Err(engine.error(
@@ -2474,6 +2483,8 @@ fn validate_particle_modifier_params(
     for field in [
         "position",
         "random_position",
+        "particle_amount",
+        "particle_offset",
         "protect",
         "rotation",
         "random_rotation",
@@ -2485,6 +2496,19 @@ fn validate_particle_modifier_params(
             return Err(engine.error(
                 ErrorCode::InvalidOperation,
                 format!("{modifier_type} `{field}` must be finite"),
+                &format!("/params/{field}"),
+            ));
+        }
+    }
+    for field in ["position", "rotation", "particle_amount", "particle_offset"] {
+        if params
+            .get(field)
+            .and_then(Value::as_f64)
+            .is_some_and(|value| !(0.0..=1.0).contains(&value))
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("{modifier_type} `{field}` must be in [0, 1]"),
                 &format!("/params/{field}"),
             ));
         }
@@ -2542,13 +2566,35 @@ fn validate_particle_modifier_params(
     }
     if params
         .get("vertex_group")
-        .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
+        .is_some_and(|value| value.as_str().is_none())
     {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
-            format!("{modifier_type} `vertex_group` must be a non-empty group name"),
+            format!("{modifier_type} `vertex_group` must be a string"),
             "/params/vertex_group",
         ));
+    }
+    if params
+        .get("particle_uv")
+        .is_some_and(|value| value.as_str().is_none())
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "explode `particle_uv` must be a string",
+            "/params/particle_uv",
+        ));
+    }
+    for field in ["index_layer_name", "value_layer_name"] {
+        if params
+            .get(field)
+            .is_some_and(|value| value.as_str().is_none())
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("particle_instance `{field}` must be a string"),
+                &format!("/params/{field}"),
+            ));
+        }
     }
     Ok(())
 }
