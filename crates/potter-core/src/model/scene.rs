@@ -1275,6 +1275,10 @@ pub struct LightData {
     pub color: [f64; 3],
     pub energy: f64,
     pub radius: f64,
+    /// Blender's `use_soft_falloff` (Cycles `is_sphere = !soft_falloff`). When `true`, a point or
+    /// spot light with a radius is a disk oriented to the receiver; when `false`, a sphere.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub soft_falloff: bool,
     pub spot_size: f64,
     pub spot_blend: f64,
     pub area_shape: String,
@@ -1289,6 +1293,7 @@ impl Default for LightData {
             color: white_rgb(),
             energy: 1000.0,
             radius: 0.1,
+            soft_falloff: true,
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
             area_shape: "SQUARE".to_owned(),

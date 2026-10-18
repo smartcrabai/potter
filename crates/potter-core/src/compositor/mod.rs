@@ -145,7 +145,7 @@ fn evaluate_graph(
             }
             let image = input_image(node, &inputs, base)?;
             let output = match node.node_type.as_str() {
-                "CompositorNodeComposite" | "Composite" => {
+                "CompositorNodeComposite" | "Composite" | "NodeGroupOutput" => {
                     composite = Some(image.clone());
                     image
                 }
