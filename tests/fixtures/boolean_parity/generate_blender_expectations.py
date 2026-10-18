@@ -98,7 +98,9 @@ def face_center(verts, face):
 
 
 def canonical(co):
-    return tuple(round(c, 6) + 0.0 for c in co)
+    # Nine significant figures resolve f32 coordinates at any scale the corpus uses (Blender stores
+    # f32); six decimal places collapsed the 2^-30-scale tiny cases to zero.
+    return tuple(float(f"{c:.9g}") + 0.0 for c in co)
 
 def attribute_value(item, data_type):
     if data_type == "QUATERNION":

@@ -163,11 +163,54 @@ pub struct Canonical {
     volume: f64,
 }
 
+thread_local! {
+    /// `min(1, extent)` of the expected case's Blender bounding box, set by [`mismatches`].
+    static COORDINATE_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Coordinate match tolerance for the case being compared. Blender stores f32 coordinates, so the
+/// absolute `1e-5` applies to any case with extent at least one; a sub-unit case (for example the
+/// 2^-30-scale tiny cases) tightens to `1e-5 * extent`, since a looser tolerance would make every
+/// rotation of a sub-tolerance face match. The bound is `min(1, extent)` of the expected vertices.
+fn point_tolerance() -> f64 {
+    FLOAT_TOLERANCE * COORDINATE_SCALE.with(std::cell::Cell::get).min(1.0)
+}
+
+/// Largest bounding-box span over the expected vertices (faces, then edge endpoints). Returns 1 when
+/// the expectation has no coordinates, so the absolute tolerance applies unchanged.
+fn expected_extent(expected: &Canonical) -> f64 {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    let mut visit = |point: [f64; 3]| {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(point[axis]);
+            max[axis] = max[axis].max(point[axis]);
+        }
+    };
+    for face in expected.faces.iter().flatten() {
+        face.ring.iter().copied().for_each(&mut visit);
+    }
+    for edge in expected.edge_topology.iter().flatten() {
+        for point in edge {
+            visit(*point);
+        }
+    }
+    let extent = (0..3)
+        .map(|axis| max[axis] - min[axis])
+        .fold(0.0_f64, f64::max);
+    if extent.is_finite() && extent > 0.0 {
+        extent
+    } else {
+        1.0
+    }
+}
+
 fn point_matches(actual: [f64; 3], expected: [f64; 3]) -> bool {
+    let tolerance = point_tolerance();
     actual
         .into_iter()
         .zip(expected)
-        .all(|(actual, expected)| (actual - expected).abs() <= FLOAT_TOLERANCE)
+        .all(|(actual, expected)| (actual - expected).abs() <= tolerance)
 }
 
 fn value_matches(actual: f64, expected: f64, tolerance: f64) -> bool {
@@ -2420,6 +2463,7 @@ fn compare_vertex_groups(
 
 /// Differences between Potter's canonical result and a Blender expectation. Empty when they match.
 pub fn mismatches(actual: &Canonical, expected: &Canonical) -> Vec<String> {
+    COORDINATE_SCALE.with(|scale| scale.set(expected_extent(expected)));
     let mut differences = Vec::new();
     if actual.vertices != expected.vertices {
         differences.push(format!(
