@@ -1754,6 +1754,46 @@ fn vrm0_and_vrm1_export_actual_scene_indices_and_preserve_avatar_semantics() -> 
 }
 
 #[test]
+fn unapplied_boolean_operand_material_exports_to_glb_and_vrm() -> TestResult {
+    // The cutter's material exists only in the evaluated table (TRANSFER pools it onto the body's
+    // faces). Authoring slots do not name it, so export must resolve it from the evaluated table.
+    let mut operations = fixture_operations(FixtureOptions::default());
+    operations.extend([
+        json!({
+            "op": "material.create",
+            "id": "cutter_material",
+            "name": "Cutter Material",
+            "base_color": [0.1, 0.2, 0.9, 1.0],
+        }),
+        json!({"op": "node.create", "id": "cutter", "kind": "box", "params": {"size": 1.0}, "material": "cutter_material"}),
+        json!({"op": "node.update", "target": {"id": "cutter"}, "set": {"transform": {"translation": [0.5, 0.0, 0.0]}}}),
+        json!({
+            "op": "modifier.create",
+            "target": {"id": "body"},
+            "id": "cut_boolean",
+            "type": "boolean",
+            "params": {"object": "cutter", "operation": "UNION", "solver": "EXACT", "material_mode": "TRANSFER"},
+        }),
+    ]);
+    let (directory, project) = init_project()?;
+    apply_success(&project, 0, &operations)?;
+    for format in ["glb", "vrm"] {
+        let path = directory.path().join(format!("boolean.{format}"));
+        export(&project, format, &path)?;
+        let glb = parse_glb(&path)?;
+        let cutter = gltf_material_index(&glb.json, "cutter_material");
+        let bound = glb.json["meshes"]
+            .as_array()
+            .expect("glTF meshes are present")
+            .iter()
+            .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
+            .any(|primitive| primitive["material"].as_u64() == Some(cutter as u64));
+        assert!(bound, "{format}: no primitive binds the operand material");
+    }
+    Ok(())
+}
+
+#[test]
 fn vrm1_preserves_capsules_per_joint_settings_and_texture_transform_expressions() -> TestResult {
     let options = FixtureOptions {
         capsule: true,
