@@ -206,20 +206,22 @@ pub(super) fn bind_harmonic_grid(
 }
 
 /// Cage positions, polygon corners, and the cage ray structures. Mirrors Blender's `cagemesh_cache` and the
-/// cage tree (meshlaplacian.cc:1611-1619, bvhutils.cc), in `cage_bvh`.
+/// cage tree (meshlaplacian.cc:1611-1619, bvhutils.cc), in `cage_bvh`. Corner triangles are Blender's loop
+/// triangles from `Mesh::tessellate`.
 fn cage_geometry(cage: &Mesh) -> Result<CageGeometry> {
     let indices = id_indices(cage);
+    let storage_index = |id: &u32| {
+        indices.get(id).copied().ok_or_else(|| {
+            PotError::invalid_operation("mesh deform cage contains invalid face vertices")
+        })
+    };
     let points: Vec<DVec3> = cage.vertices.iter().map(|vertex| vertex.co).collect();
     let mut faces = Vec::with_capacity(cage.faces.len());
     for face in &cage.faces {
         let corners: Vec<usize> = face
             .vertices
             .iter()
-            .map(|id| {
-                indices.get(id).copied().ok_or_else(|| {
-                    PotError::invalid_operation("mesh deform cage contains invalid face vertices")
-                })
-            })
+            .map(storage_index)
             .collect::<Result<_>>()?;
         if corners.len() < 3 {
             return Err(PotError::invalid_operation(
@@ -233,8 +235,22 @@ fn cage_geometry(cage: &Mesh) -> Result<CageGeometry> {
             "mesh deform harmonic binding requires cage faces",
         ));
     }
+    let corner_tris = cage
+        .tessellate()
+        .map_err(|error| {
+            PotError::invalid_operation(format!("mesh deform cage triangulation failed: {error}"))
+        })?
+        .into_iter()
+        .map(|triangle| {
+            Ok([
+                storage_index(&triangle[0])?,
+                storage_index(&triangle[1])?,
+                storage_index(&triangle[2])?,
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
     let cage_points: Vec<Vec3> = points.iter().map(|&point| to_vec3(point)).collect();
-    let rays = CageRayCache::new(&cage_points, &faces);
+    let rays = CageRayCache::new(&cage_points, &faces, corner_tris)?;
     Ok(CageGeometry {
         points,
         faces,

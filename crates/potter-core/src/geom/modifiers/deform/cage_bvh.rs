@@ -2,9 +2,10 @@
 //!
 //! The chain is what `meshlaplacian.cc` reads through `mdb->cagemesh_cache` and `mdb->bvhtree`:
 //!
-//! - corner triangles: `mesh_calc_tessellation_for_face_impl` (`mesh_tessellate.cc`). A quad splits on the
-//!   `(0, 2)` diagonal unless `is_quad_flip_v3_first_third_fast` (`math_geom.cc`) says it folds, in which case
-//!   it splits on `(1, 3)`. Larger polygons use the polyfill (`triangulate_ngon`).
+//! - corner triangles: `Mesh::tessellate` (`geom/mod.rs`), the one Blender loop-triangle implementation
+//!   (`mesh_tessellate.cc`). This module takes them as input and does not triangulate. A quad splits on
+//!   the `(0, 2)` diagonal unless `is_quad_flip_v3_first_third_fast` (`math_geom.cc`) says it folds, in
+//!   which case it splits on `(1, 3)`.
 //! - the tree: `KdopTree` in `geom::bvh`, built over the corner triangles in triangle order. Leaf
 //!   `i` is corner triangle `i`, as `bvhtree_new_common` (`bvhutils.cc`) builds Blender's tree.
 //! - the ray cast: `closest_hit` runs `KdopTree::ray_cast` (`BLI_bvhtree_ray_cast_ex`) with the
@@ -14,9 +15,9 @@
 //!
 //! The inside rule is `meshdeform_inside_cage` (`meshlaplacian.cc:1060-1082`).
 
-use crate::geom::{
-    bvh::{KdopTree, Ray, RayHit, Vec3, cross, dot, normalize, sub},
-    triangulate::{NgonMethod, triangulate_ngon},
+use crate::{
+    error::{PotError, Result},
+    geom::bvh::{KdopTree, Ray, RayHit, Vec3, cross, dot, normalize, sub},
 };
 
 /// `isect_mdef.lambda` before the ray test (`meshdeform_ray_tree_intersect`).
@@ -30,30 +31,6 @@ const RAY_OFFSETS: [[i32; 3]; 6] = [
     [0, 0, 1],
     [0, 0, -1],
 ];
-
-/// `is_quad_flip_v3_first_third_fast` (`math_geom.cc`): the first and third triangles of a quad fold.
-fn quad_flip_first_third(p: [Vec3; 4]) -> bool {
-    let d12 = sub(p[1], p[0]);
-    let d13 = sub(p[2], p[0]);
-    let d14 = sub(p[3], p[0]);
-    dot(cross(d12, d13), cross(d14, d13)) > 0.0
-}
-
-/// Corner triangles of one polygon as indices into `corners` (`mesh_calc_tessellation_for_face_impl`).
-fn polygon_triangles(corners: &[Vec3]) -> Vec<[usize; 3]> {
-    match corners.len() {
-        3 => vec![[0, 1, 2]],
-        4 => {
-            let p = [corners[0], corners[1], corners[2], corners[3]];
-            if quad_flip_first_third(p) {
-                vec![[0, 1, 3], [1, 2, 3]]
-            } else {
-                vec![[0, 1, 2], [0, 2, 3]]
-            }
-        }
-        _ => triangulate_ngon(corners, NgonMethod::Clip),
-    }
-}
 
 /// Polygon normal as `face_normal` in `harmonic.rs` (quads: cross of diagonals; triangles: edge cross;
 /// larger polygons: Newell's method), normalized.
@@ -96,31 +73,38 @@ pub(super) struct CageRayCache {
 }
 
 impl CageRayCache {
-    /// `points` are cage vertices in cage space; `faces` are polygons as vertex indices, in mesh order.
-    pub(super) fn new(points: &[Vec3], faces: &[Vec<usize>]) -> Self {
-        let mut corner_tris = Vec::new();
-        let mut tri_face = Vec::new();
+    /// `points` are cage vertices in cage space. `faces` are polygons as vertex indices, in mesh
+    /// order, with at least three vertices each. `corner_tris` are their loop triangles as vertex
+    /// indices, in Blender's order (`Mesh::tessellate`): each polygon contributes `len - 2` triangles.
+    pub(super) fn new(
+        points: &[Vec3],
+        faces: &[Vec<usize>],
+        corner_tris: Vec<[usize; 3]>,
+    ) -> Result<Self> {
+        let mut tri_face = Vec::with_capacity(corner_tris.len());
         let mut face_normals = Vec::with_capacity(faces.len());
         for (face_index, face) in faces.iter().enumerate() {
+            tri_face.extend(std::iter::repeat_n(face_index, face.len() - 2));
             let corners: Vec<Vec3> = face.iter().map(|&vertex| points[vertex]).collect();
-            for [a, b, c] in polygon_triangles(&corners) {
-                corner_tris.push([face[a], face[b], face[c]]);
-                tri_face.push(face_index);
-            }
             face_normals.push(polygon_normal(&corners));
+        }
+        if tri_face.len() != corner_tris.len() {
+            return Err(PotError::invalid_operation(
+                "mesh deform cage triangles do not match its polygons",
+            ));
         }
         // Leaf `i` of the tree is corner triangle `i`.
         let leaf_bv: Vec<[f32; 6]> = corner_tris
             .iter()
             .map(|t| KdopTree::leaf_bounds_for_triangle([points[t[0]], points[t[1]], points[t[2]]]))
             .collect();
-        Self {
+        Ok(Self {
             points: points.to_vec(),
             corner_tris,
             tri_face,
             face_normals,
             tree: KdopTree::from_leaf_bounds(&leaf_bv),
-        }
+        })
     }
 
     /// The polygon that owns a cage triangle (`mdb->cagemesh_cache.tri_faces`).
@@ -213,17 +197,27 @@ mod tests {
     const VERTEX0: Vec3 = [0.348_456_95, -2.196_758_7, 0.636_363_6];
     const VERTEX1: Vec3 = [0.652_235_5, -1.927_082, 0.636_363_6];
 
+    /// Blender's loop triangles for `BOX_FACES` in face order. Each quad's diagonal is the split that
+    /// `Mesh::tessellate` (`mesh_tessellate.cc`) chooses, not one made in this module.
+    const CORNER_TRIS: [[usize; 3]; 12] = [
+        [0, 3, 2],
+        [0, 2, 1],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+    ];
+
     fn cage() -> CageRayCache {
         let faces: Vec<Vec<usize>> = BOX_FACES.iter().map(|face| face.to_vec()).collect();
-        CageRayCache::new(&ASYMMETRIC, &faces)
-    }
-
-    #[test]
-    fn bottom_quad_splits_on_the_polygon_start_diagonal() {
-        // Polygon 2 is [0, 1, 5, 4]: the (0, 2) corner diagonal is vertices 0 and 5.
-        let cage = cage();
-        assert_eq!(cage.corner_tris[4], [0, 1, 5]);
-        assert_eq!(cage.corner_tris[5], [0, 5, 4]);
+        CageRayCache::new(&ASYMMETRIC, &faces, CORNER_TRIS.to_vec())
+            .expect("the box cage is consistent")
     }
 
     #[test]
