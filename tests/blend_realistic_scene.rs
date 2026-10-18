@@ -15,10 +15,7 @@ use tempfile::tempdir;
 const SCENE_BUILDER: &str = include_str!("fixtures/blend_realistic_scene.py");
 const SCENE_DUMPER: &str = include_str!("fixtures/blend_realistic_scene_dump.py");
 const FRAME_TOLERANCE: f64 = 1.0e-5;
-const GATED_OBJECTS: [&str; 2] = [
-    "Gear_Array_Bevel_Subdivision_Normal",
-    "Housing_Boolean_Decimate_Solidify",
-];
+const GATED_OBJECTS: [&str; 1] = ["Housing_Boolean_Decimate_Solidify"];
 
 fn checked_output(mut command: Command, label: &str) -> Result<Output, Box<dyn Error>> {
     let output = command.output()?;
@@ -605,8 +602,7 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
         .as_str()
         .ok_or("render error lacks feature_id")?;
     let expected_object = match feature {
-        "modifier.bevel.high_valence_vertex_mesh" => GATED_OBJECTS[0],
-        "modifier.boolean.downstream_topology" => GATED_OBJECTS[1],
+        "modifier.boolean.downstream_topology" => GATED_OBJECTS[0],
         _ => return Err(format!("unexpected render feature {feature}").into()),
     };
     let node_id = details["node_id"]
@@ -622,14 +618,14 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     )?;
     assert_modifier_reference(
         &document,
-        GATED_OBJECTS[0],
+        "Gear_Array_Bevel_Subdivision_Normal",
         "02 | three-stage train with end cap",
         "end_cap",
         "Gear_Array_EndCap_Source",
     )?;
     assert_modifier_reference(
         &document,
-        GATED_OBJECTS[1],
+        GATED_OBJECTS[0],
         "01 | exact through-bore",
         "object",
         "Housing_Bore_Cutter",
@@ -648,12 +644,6 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
         &project,
         &document,
         GATED_OBJECTS[0],
-        "modifier.bevel.high_valence_vertex_mesh",
-    )?;
-    assert_gated_feature_error(
-        &project,
-        &document,
-        GATED_OBJECTS[1],
         "modifier.boolean.downstream_topology",
     )?;
 

@@ -461,27 +461,6 @@ pub fn feature_catalog() -> Value {
             [true, true, true, true, true, false, false],
         ),
         unsupported(
-            "modifier.bevel.high_valence_vertex_mesh",
-            "Bevel high-valence vertex meshes",
-            "BEVEL",
-            &["modifier.create"],
-            "Blender 5.2.2 bevels four-or-more-edge vertices with multiple selected edges using a BMesh ADJ vertex mesh that Potter does not reproduce; the stacked gear probe diverged by 2.760223e-2 in vertex position.",
-        ),
-        unsupported(
-            "modifier.bevel.mark_seam",
-            "Bevel mark seam on seamed edges",
-            "BEVEL",
-            &["modifier.create"],
-            "Blender copies the input's seam edges onto the new rung edges (check_edge_data_seam_sharp_edges); Potter does not, so a bevel with mark_seam on a mesh that has seam edges is refused. Without seam edges Blender changes nothing and Potter evaluates it.",
-        ),
-        unsupported(
-            "modifier.bevel.shading_segments",
-            "Bevel harden normals and sharp-edge marks outside single-segment edge bevels",
-            "BEVEL",
-            &["modifier.create"],
-            "harden_normals (any input) and mark_sharp on an input with sharp edges are evaluated only for one-segment EDGES bevels; other segment counts or VERTICES bevels with those settings are refused.",
-        ),
-        unsupported(
             "modifier.mirror.bisect",
             "Mirror bisect on a mirrored axis",
             "MIRROR",

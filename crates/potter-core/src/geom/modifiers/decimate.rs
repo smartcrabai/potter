@@ -30,14 +30,6 @@ mod quad;
 
 pub(super) use collapse::decimate_collapse;
 
-pub(super) fn decimate_face_normal(points: &[DVec3], face: &[usize]) -> DVec3 {
-    let mut normal = DVec3::ZERO;
-    for (first, second) in cyclic_pairs(face) {
-        normal += points[*first].cross(points[*second]);
-    }
-    normal.normalize_or_zero()
-}
-
 /// One `[u, v]` per UV layer, in the collapse's layer order.
 type CornerUv = Vec<[f64; 2]>;
 

@@ -12,7 +12,7 @@ use std::fmt::Display;
 use std::hash::Hash;
 use std::str::FromStr;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use serde_json::{Map, Value, json};
 
 use crate::error::{ErrorCode, PotError, Result};
@@ -23,6 +23,37 @@ use super::color_layers::{self, ColorDomain, ColorLayer};
 use super::uv_layers::{self, UvLayer};
 use super::{Mesh, edge_key};
 
+/// One ordered BMesh point-data interpolation callback during Bevel.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PointInterpolationEvent {
+    /// Output vertex written by the callback.
+    pub output_vertex: usize,
+    /// Input vertex also updated when the callback target is an original BMesh vertex.
+    pub mutated_source_vertex: Option<usize>,
+    /// Input point values and weights read from the source face's loops.
+    pub sources: Vec<(usize, f64)>,
+}
+
+/// Identity of one source FLOAT2 corner layer that Blender merges independently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CornerFloat2LayerKey {
+    /// Canonical `uv_layers` store layer.
+    Uv(String),
+    /// Top-level native or named mesh attribute storage key.
+    Attribute(String),
+    /// Raw `blender_attributes` entry name.
+    BlenderAttribute(String),
+}
+
+/// Per-output-corner source-loop origins after merging one FLOAT2 layer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CornerFloat2Sources {
+    /// Which source FLOAT2 layer has these corner origins.
+    pub key: CornerFloat2LayerKey,
+    /// One source-loop weight list per output corner, in output loop order.
+    pub corners: Vec<Vec<(usize, f64)>>,
+}
+
 /// Where each element of a rebuilt mesh came from, indexed by output storage order.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Origin {
@@ -32,6 +63,14 @@ pub(crate) struct Origin {
     /// Per output polygon, in the order passed to `build_mesh`: the input polygon storage index,
     /// or `None` for a generated polygon.
     pub faces: Vec<Option<usize>>,
+    /// Ordered `BM_loop_interp_from_face` writes for point-data attributes. `Some(empty)` means
+    /// Bevel performs no callback for any output point; `None` means no explicit event stream.
+    pub point_interpolation_events: Option<Vec<PointInterpolationEvent>>,
+    /// Per output loop, whether Bevel invoked source-face interpolation for corner data. `Some`
+    /// only when source CORNER quaternion attributes need copy distinction.
+    pub corner_interpolated: Option<Vec<bool>>,
+    /// Merged source corners per FLOAT2 layer; Blender computes connectivity independently per layer.
+    pub corner_float2_sources: Option<Vec<CornerFloat2Sources>>,
     /// Explicit source corners per output corner, in output order, as `(input corner index, weight)`
     /// with the input corner index counted as in [`corner_offsets`]. `None` derives corner sources
     /// from the vertex origins restricted to each output face's source polygon.
@@ -51,6 +90,7 @@ impl Origin {
                 .collect(),
             faces,
             corners: None,
+            ..Default::default()
         }
     }
 }
@@ -86,12 +126,80 @@ pub(crate) fn remap_attributes_skipping(
     origin: &Origin,
     skipped: &[&str],
 ) -> Result<()> {
-    if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
+    remap_attributes_with_edge_identity_and_skipping(source, output, origin, None, skipped)
+}
+
+/// [`remap_attributes`] with edges inheriting from `edge_identity` when given: the single source
+/// vertex each output point was created for, one entry per output point. Point-domain values
+/// normally use `origin`; Bevel quaternion events use these identities for initial copies, while
+/// edge-domain values use the source edge between each output edge's endpoint identities.
+///
+/// # Errors
+///
+/// Returns `INTERNAL_ERROR` when `origin` does not describe `output`, or when its point events or
+/// corner metadata do not match `source` and `output`.
+pub(crate) fn remap_attributes_with_edge_identity(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    edge_identity: Option<&[usize]>,
+) -> Result<()> {
+    remap_attributes_with_edge_identity_and_skipping(source, output, origin, edge_identity, &[])
+}
+
+/// Combined provenance remap with optional source-edge identity and omitted source attributes.
+fn remap_attributes_with_edge_identity_and_skipping(
+    source: &Mesh,
+    output: &mut Mesh,
+    origin: &Origin,
+    edge_identity: Option<&[usize]>,
+    skipped: &[&str],
+) -> Result<()> {
+    let invalid_point_events = origin
+        .point_interpolation_events
+        .as_ref()
+        .is_some_and(|events| {
+            edge_identity.is_none()
+                || edge_identity.is_some_and(|identity| {
+                    identity
+                        .iter()
+                        .any(|source_vertex| *source_vertex >= source.vertices.len())
+                })
+                || events.iter().any(|event| {
+                    event.output_vertex >= output.vertices.len()
+                        || event
+                            .mutated_source_vertex
+                            .is_some_and(|vertex| vertex >= source.vertices.len())
+                        || event
+                            .sources
+                            .iter()
+                            .any(|(vertex, _)| *vertex >= source.vertices.len())
+                })
+        });
+    let output_corners: usize = output.faces.iter().map(|face| face.vertices.len()).sum();
+    let invalid_corner_metadata = origin
+        .corner_interpolated
+        .as_ref()
+        .is_some_and(|flags| flags.len() != output_corners)
+        || origin.corner_float2_sources.as_ref().is_some_and(|layers| {
+            layers
+                .iter()
+                .any(|layer| layer.corners.len() != output_corners)
+        });
+    if edge_identity.is_some_and(|identity| identity.len() != output.vertices.len())
+        || origin.vertices.len() != output.vertices.len()
+        || origin.faces.len() != output.faces.len()
+        || invalid_point_events
+        || invalid_corner_metadata
+    {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "modifier provenance does not describe the rebuilt mesh",
         ));
     }
+    let identity_vertices: Option<Vec<Vec<(usize, f64)>>> =
+        edge_identity.map(|identity| identity.iter().map(|source| vec![(*source, 1.0)]).collect());
+    let edge_vertices = identity_vertices.as_deref().unwrap_or(&origin.vertices);
     if source.attributes.is_empty() {
         output.attributes.clear();
         return Ok(());
@@ -139,7 +247,7 @@ pub(crate) fn remap_attributes_skipping(
         HashMap::new()
     };
     let edge_origin = if needs_edges {
-        edge_sources(source, output, origin, &output_vertex_index)
+        edge_sources(source, output, edge_vertices, &output_vertex_index)
     } else {
         Vec::new()
     };
@@ -156,6 +264,7 @@ pub(crate) fn remap_attributes_skipping(
         source,
         output,
         origin,
+        point_identity: edge_identity,
         edge_origin: &edge_origin,
         corner_origin,
     };
@@ -237,8 +346,8 @@ pub(crate) fn remap_attributes_skipping(
                 .as_array()
                 .map(|flags| Value::Array(sources.polygon_smooth(flags))),
             _ => native_domain(value)
-                .map(|_| sources.native_attribute(value))
-                .or_else(|| sources.named_attribute(value)),
+                .map(|_| sources.native_attribute(key, value))
+                .or_else(|| sources.named_attribute(key, value)),
         };
         attributes.insert(key.clone(), remapped.unwrap_or_else(|| value.clone()));
     }
@@ -298,7 +407,7 @@ fn with_values(entry: &Value, values: Value) -> Value {
 fn edge_sources(
     source: &Mesh,
     output: &Mesh,
-    origin: &Origin,
+    vertices: &[Vec<(usize, f64)>],
     output_vertex_index: &HashMap<u32, usize>,
 ) -> Vec<Vec<(usize, f64)>> {
     let source_vertex_index: HashMap<u32, usize> = source
@@ -323,13 +432,13 @@ fn edge_sources(
         .map(|edge| {
             let Some(first) = output_vertex_index
                 .get(&edge.vertices[0])
-                .and_then(|index| origin.vertices.get(*index))
+                .and_then(|index| vertices.get(*index))
             else {
                 return Vec::new();
             };
             let Some(second) = output_vertex_index
                 .get(&edge.vertices[1])
-                .and_then(|index| origin.vertices.get(*index))
+                .and_then(|index| vertices.get(*index))
             else {
                 return Vec::new();
             };
@@ -555,11 +664,95 @@ struct Sources<'a> {
     source: &'a Mesh,
     output: &'a Mesh,
     origin: &'a Origin,
+    point_identity: Option<&'a [usize]>,
     edge_origin: &'a [Vec<(usize, f64)>],
     corner_origin: &'a [Vec<(usize, f64)>],
 }
 
 impl Sources<'_> {
+    /// Point quaternions replayed from Bevel's ordered callbacks. Each event mixes its sources' current
+    /// values, and a mutated source keeps the written value for later events. An output vertex takes
+    /// its identity's stored value unless an event wrote it, so a vertex without one has no entry.
+    /// `None` without an event stream.
+    fn point_quaternion_values(&self, stored: &[Option<&Value>]) -> Option<Vec<Option<Value>>> {
+        let events = self.origin.point_interpolation_events.as_ref()?;
+        let identities = self.point_identity?;
+        let mut source_values: Vec<Value> = stored
+            .iter()
+            .map(|value| {
+                (*value).map_or_else(|| default_value("QUATERNION"), |value| value.clone())
+            })
+            .collect();
+        let mut output_values: Vec<Option<Value>> = identities
+            .iter()
+            .map(|source| stored.get(*source).copied().flatten().cloned())
+            .collect();
+        for event in events {
+            let value = blend_quaternion(event.sources.iter().filter_map(|(source, weight)| {
+                source_values.get(*source).map(|value| (value, *weight))
+            }))
+            .unwrap_or_else(|| default_value("QUATERNION"));
+            if let Some(output) = output_values.get_mut(event.output_vertex) {
+                *output = Some(value.clone());
+            }
+            if let Some(source_vertex) = event.mutated_source_vertex
+                && let Some(source_value) = source_values.get_mut(source_vertex)
+            {
+                *source_value = value;
+            }
+        }
+        Some(output_values)
+    }
+
+    /// [`blend`] for output corner `corner`; Bevel's interpolated quaternion corners use the mixer
+    /// in [`blend_quaternion`].
+    fn blend_corner<'a>(
+        &self,
+        corner: usize,
+        items: impl Iterator<Item = (&'a Value, f64)>,
+        data_type: &str,
+    ) -> Option<Value> {
+        let interpolated = data_type == "QUATERNION"
+            && self
+                .origin
+                .corner_interpolated
+                .as_ref()
+                .and_then(|flags| flags.get(corner).copied())
+                == Some(true);
+        if interpolated {
+            blend_quaternion(items)
+        } else {
+            blend(items, data_type)
+        }
+    }
+
+    /// The corner origins of a FLOAT2 layer. Blender merges each layer's sources independently, so a
+    /// layer listed in `corner_float2_sources` uses its own origins; other data uses the shared ones.
+    fn corner_origins_for_layer(
+        &self,
+        data_type: &str,
+        key: &CornerFloat2LayerKey,
+    ) -> &[Vec<(usize, f64)>] {
+        if !data_type.eq_ignore_ascii_case("FLOAT2") {
+            return self.corner_origin;
+        }
+        self.origin
+            .corner_float2_sources
+            .as_deref()
+            .and_then(|layers| layers.iter().find(|layer| &layer.key == key))
+            .map_or(self.corner_origin, |layer| layer.corners.as_slice())
+    }
+
+    /// The FLOAT2 layer key of a `blender_attributes` corner entry: the `uv_layers` layer of that
+    /// name when one exists.
+    fn blender_attribute_corner_key(&self, name: &str) -> CornerFloat2LayerKey {
+        if uv_layers::read(self.source).index_of(name).is_some() {
+            CornerFloat2LayerKey::Uv(name.to_owned())
+        } else {
+            CornerFloat2LayerKey::BlenderAttribute(name.to_owned())
+        }
+    }
+
     /// Interpolated vertex-group weights keyed `v{output id}` under each group name.
     fn vertex_groups(&self, groups: &Map<String, Value>) -> Map<String, Value> {
         groups
@@ -712,7 +905,7 @@ impl Sources<'_> {
     /// its type's default for the missing key and no default is ever written. A corner row is written
     /// only when one of its corners blends a value; its other corners take the type's default. Booleans
     /// blend as OR over the positive-weight sources, and colors blend channel by channel.
-    fn native_attribute(&self, attribute: &Value) -> Value {
+    fn native_attribute(&self, name: &str, attribute: &Value) -> Value {
         let Some(values) = attribute.get("values").and_then(Value::as_object) else {
             return attribute.clone();
         };
@@ -726,12 +919,19 @@ impl Sources<'_> {
                     .iter()
                     .map(|vertex| values.get(&format!("v{}", vertex.id)))
                     .collect();
+                let replayed = (data_type == "QUATERNION")
+                    .then(|| self.point_quaternion_values(&stored))
+                    .flatten();
                 self.output
                     .vertices
                     .iter()
                     .zip(&self.origin.vertices)
-                    .filter_map(|(vertex, sources)| {
-                        let value = blend_sources(&stored, sources, data_type)?;
+                    .enumerate()
+                    .filter_map(|(index, (vertex, sources))| {
+                        let value = match &replayed {
+                            Some(replay) => replay.get(index)?.clone(),
+                            None => blend_sources(&stored, sources, data_type),
+                        }?;
                         Some((format!("v{}", vertex.id), value))
                     })
                     .collect()
@@ -766,6 +966,10 @@ impl Sources<'_> {
                 })
                 .collect(),
             "corner" => {
+                let corner_origins = self.corner_origins_for_layer(
+                    data_type,
+                    &CornerFloat2LayerKey::Attribute(name.to_owned()),
+                );
                 let corner_count: usize = self
                     .source
                     .faces
@@ -793,10 +997,19 @@ impl Sources<'_> {
                     .iter()
                     .zip(offsets)
                     .filter_map(|(face, offset)| {
-                        let sources = &self.corner_origin[offset..][..face.vertices.len()];
+                        let sources = &corner_origins[offset..][..face.vertices.len()];
                         let blended: Vec<Option<Value>> = sources
                             .iter()
-                            .map(|sources| blend_sources(&stored, sources, data_type))
+                            .enumerate()
+                            .map(|(corner, sources)| {
+                                self.blend_corner(
+                                    offset + corner,
+                                    sources.iter().filter_map(|(source, weight)| {
+                                        Some(((*stored.get(*source)?)?, *weight))
+                                    }),
+                                    data_type,
+                                )
+                            })
                             .collect();
                         if blended.iter().all(Option::is_none) {
                             return None;
@@ -821,6 +1034,17 @@ impl Sources<'_> {
         data_type: &str,
         default: impl Fn() -> Value,
     ) -> Vec<Value> {
+        if data_type == "QUATERNION" {
+            let stored: Vec<Option<&Value>> = (0..self.source.vertices.len())
+                .map(|index| values.get(index))
+                .collect();
+            if let Some(replayed) = self.point_quaternion_values(&stored) {
+                return replayed
+                    .into_iter()
+                    .map(|value| value.unwrap_or_else(&default))
+                    .collect();
+            }
+        }
         self.origin
             .vertices
             .iter()
@@ -868,11 +1092,28 @@ impl Sources<'_> {
                         .unwrap_or_else(default)
                 })
                 .collect(),
-            "CORNER" => self
-                .corner_origin
-                .iter()
-                .map(|sources| blend_indexed(values, sources, data_type).unwrap_or_else(&default))
-                .collect(),
+            "CORNER" => {
+                let corner_origins = if data_type.eq_ignore_ascii_case("FLOAT2") {
+                    let key = self.blender_attribute_corner_key(text(entry, "name"));
+                    self.corner_origins_for_layer(data_type, &key)
+                } else {
+                    self.corner_origin
+                };
+                corner_origins
+                    .iter()
+                    .enumerate()
+                    .map(|(corner, sources)| {
+                        self.blend_corner(
+                            corner,
+                            sources.iter().filter_map(|(source, weight)| {
+                                values.get(*source).map(|value| (value, *weight))
+                            }),
+                            data_type,
+                        )
+                        .unwrap_or_else(&default)
+                    })
+                    .collect()
+            }
             _ => return entry.clone(),
         };
         with_values(entry, Value::Array(remapped))
@@ -936,14 +1177,22 @@ impl Sources<'_> {
         }
         let mut faces: Vec<Option<Vec<[f64; 2]>>> = Vec::with_capacity(self.output.faces.len());
         let mut pinned: Vec<Option<Vec<bool>>> = Vec::with_capacity(self.output.faces.len());
+        let uv_corner_origins =
+            self.corner_origins_for_layer("FLOAT2", &CornerFloat2LayerKey::Uv(layer.name.clone()));
         for (face_index, face) in self.output.faces.iter().enumerate() {
             let corners = &self.corner_origin[output_offsets[face_index]..][..face.vertices.len()];
-            if !corners.iter().flatten().any(|(source, _)| filled[*source]) {
+            let uv_corners =
+                &uv_corner_origins[output_offsets[face_index]..][..face.vertices.len()];
+            if !uv_corners
+                .iter()
+                .flatten()
+                .any(|(source, _)| filled[*source])
+            {
                 faces.push(None);
                 pinned.push(None);
                 continue;
             }
-            let uv: Vec<[f64; 2]> = corners
+            let uv: Vec<[f64; 2]> = uv_corners
                 .iter()
                 .map(|sources| blend_uv(&flat, sources))
                 .collect();
@@ -977,7 +1226,7 @@ impl Sources<'_> {
     /// the output's IDs. Point and edge values blend over their source elements, a face value copies its
     /// source face's, and corner values (one array per face) blend over the source corners. Other domains
     /// are copied unchanged by the caller.
-    fn named_attribute(&self, attribute: &Value) -> Option<Value> {
+    fn named_attribute(&self, name: &str, attribute: &Value) -> Option<Value> {
         let domain = named_domain(attribute)?;
         let kind = text(attribute, "type").to_ascii_uppercase();
         let values = attribute.get("values").and_then(Value::as_object)?;
@@ -985,14 +1234,34 @@ impl Sources<'_> {
         match domain.as_str() {
             "point" => {
                 let by_id: HashMap<u32, &Value> = keyed_values(values, "v");
-                for (vertex, sources) in self.output.vertices.iter().zip(&self.origin.vertices) {
-                    let blended = blend(
-                        sources.iter().filter_map(|(index, weight)| {
-                            let id = self.source.vertices.get(*index)?.id;
-                            by_id.get(&id).map(|value| (*value, *weight))
-                        }),
-                        &kind,
-                    );
+                let replayed = (kind == "QUATERNION")
+                    .then(|| {
+                        let stored: Vec<Option<&Value>> = self
+                            .source
+                            .vertices
+                            .iter()
+                            .map(|vertex| by_id.get(&vertex.id).copied())
+                            .collect();
+                        self.point_quaternion_values(&stored)
+                    })
+                    .flatten();
+                for (position, (vertex, sources)) in self
+                    .output
+                    .vertices
+                    .iter()
+                    .zip(&self.origin.vertices)
+                    .enumerate()
+                {
+                    let blended = match &replayed {
+                        Some(replay) => replay.get(position).cloned().flatten(),
+                        None => blend(
+                            sources.iter().filter_map(|(index, weight)| {
+                                let id = self.source.vertices.get(*index)?.id;
+                                by_id.get(&id).map(|value| (*value, *weight))
+                            }),
+                            &kind,
+                        ),
+                    };
                     if let Some(value) = blended {
                         output.insert(format!("v{}", vertex.id), value);
                     }
@@ -1046,13 +1315,19 @@ impl Sources<'_> {
                 }
                 let output_offsets =
                     corner_offsets(self.output.faces.iter().map(|face| face.vertices.len()));
+                let corner_origins = self.corner_origins_for_layer(
+                    &kind,
+                    &CornerFloat2LayerKey::Attribute(name.to_owned()),
+                );
                 for (face_index, face) in self.output.faces.iter().enumerate() {
                     let corners =
-                        &self.corner_origin[output_offsets[face_index]..][..face.vertices.len()];
+                        &corner_origins[output_offsets[face_index]..][..face.vertices.len()];
                     let row: Vec<Option<Value>> = corners
                         .iter()
-                        .map(|sources| {
-                            blend(
+                        .enumerate()
+                        .map(|(corner, sources)| {
+                            self.blend_corner(
+                                output_offsets[face_index] + corner,
                                 sources.iter().filter_map(|(source, weight)| {
                                     authored
                                         .get(*source)
@@ -1188,6 +1463,65 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
         .map(|(value, _)| (*value).clone())
 }
 
+fn wrap_radians(angle: f32) -> f32 {
+    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+/// Blender's `Quaternion::expmap`: native JSON stores components in `[x, y, z, w]` order.
+fn quaternion_expmap(value: &Value) -> Option<Vec3> {
+    let [x, y, z, w] = value.as_array()?.as_slice() else {
+        return None;
+    };
+    let vector = Vec3::new(x.as_f64()? as f32, y.as_f64()? as f32, z.as_f64()? as f32);
+    let real = w.as_f64()? as f32;
+    if !vector.is_finite() || !real.is_finite() {
+        return None;
+    }
+    let sin_half = vector.length();
+    if sin_half < 0.0005 {
+        return Some(Vec3::ZERO);
+    }
+    let angle = 2.0 * sin_half.atan2(real);
+    Some((vector / sin_half) * angle)
+}
+
+/// Blender's `Quaternion::expmap` inverse, in native `[x, y, z, w]` JSON order.
+fn quaternion_from_expmap(value: Vec3) -> [f32; 4] {
+    let length_squared = value.length_squared();
+    if length_squared.is_nan() || length_squared <= 1.0e-35 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let angle = length_squared.sqrt();
+    let half_angle = wrap_radians(angle) * 0.5;
+    let normalized = value / angle;
+    let imaginary = normalized * half_angle.sin();
+    [imaginary.x, imaginary.y, imaginary.z, half_angle.cos()]
+}
+
+/// Bevel's quaternion mixer for point and interpolated-corner callbacks: a weighted sum in expmap
+/// space, mapped back to a quaternion. Other quaternion data keeps [`blend`]'s componentwise mix.
+/// `None` without sources or when a source is not a finite quaternion.
+fn blend_quaternion<'a>(items: impl Iterator<Item = (&'a Value, f64)>) -> Option<Value> {
+    let mut value = Vec3::ZERO;
+    let mut total_weight = 0.0_f32;
+    let mut has_source = false;
+    for (source, weight) in items {
+        has_source = true;
+        value += quaternion_expmap(source)? * (weight as f32);
+        total_weight += weight as f32;
+    }
+    if !has_source {
+        return None;
+    }
+    if total_weight > 0.0 {
+        Some(json!(quaternion_from_expmap(
+            value * (1.0_f32 / total_weight)
+        )))
+    } else {
+        Some(json!([0.0, 0.0, 0.0, 1.0]))
+    }
+}
+
 /// Value written for an element with no source, by Blender data type.
 pub(crate) fn default_value(data_type: &str) -> Value {
     match data_type {
@@ -1291,6 +1625,7 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
+            ..Default::default()
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let out_ids: Vec<u32> = output.vertices.iter().map(|vertex| vertex.id).collect();
@@ -1367,6 +1702,7 @@ mod tests {
             ],
             faces: vec![Some(0); 4],
             corners: None,
+            ..Default::default()
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let centre = output.vertices[8].id;
@@ -1413,6 +1749,7 @@ mod tests {
             vertices: vec![vec![(0, 0.5), (2, 0.5)], vec![(1, 0.5), (3, 0.5)]],
             faces: Vec::new(),
             corners: None,
+            ..Default::default()
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         assert_eq!(edge_flags(&output, "sharp"), vec![true]);
@@ -1454,6 +1791,7 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
+            ..Default::default()
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let out_vertex = format!("v{}", output.vertices[2].id);
@@ -1510,6 +1848,7 @@ mod tests {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
             faces: vec![Some(0)],
             corners: None,
+            ..Default::default()
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
 
@@ -1576,6 +1915,7 @@ mod tests {
                 vec![(0, 0.5), (1, 0.5)],
                 vec![(2, 1.0)],
             ]),
+            ..Default::default()
         };
         remap_attributes(&source, &mut output, &origin).expect("remap");
         let layers = uv_layers::read_layers(&output);
@@ -1631,6 +1971,7 @@ mod tests {
                 vec![(1, 0.5), (3, 0.5)],
                 Vec::new(),
             ]),
+            ..Default::default()
         };
 
         remap_attributes(&source, &mut output, &origin).expect("remap");
@@ -1639,5 +1980,196 @@ mod tests {
             uv_layers::read_layers(&output)[0].faces[0],
             Some(vec![[2.0, 4.0], [0.0, 1.0], [2.0, 3.5], [0.0, 1.0]])
         );
+    }
+
+    /// Bevel's point quaternion callbacks replay in order: a mutated source keeps its written value for
+    /// later events, and an output vertex without an event copies its identity's stored value.
+    #[test]
+    fn quaternion_point_callbacks_replay_mutated_source_values() {
+        let mut source = triangle();
+        let input_ids: Vec<u32> = source.vertices.iter().map(|vertex| vertex.id).collect();
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        let three_quarter_turn = json!([half, 0.0, 0.0, -half]);
+        let identity = json!([0.0, 0.0, 0.0, 1.0]);
+        let small_rotation = json!([(0.0002_f32).sin(), 0.0, 0.0, (0.0002_f32).cos()]);
+        source.attributes.insert(
+            "orientation".to_owned(),
+            json!({
+                "domain": "point",
+                "type": "quaternion",
+                "values": keyed(vec![
+                    (format!("v{}", input_ids[0]), three_quarter_turn),
+                    (format!("v{}", input_ids[1]), identity),
+                    (format!("v{}", input_ids[2]), small_rotation.clone()),
+                ]),
+            }),
+        );
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(0, 0.25), (1, 0.75)], vec![(2, 1.0)]],
+            faces: vec![Some(0)],
+            point_interpolation_events: Some(vec![
+                PointInterpolationEvent {
+                    output_vertex: 0,
+                    mutated_source_vertex: Some(0),
+                    sources: vec![(0, 1.0)],
+                },
+                PointInterpolationEvent {
+                    output_vertex: 1,
+                    mutated_source_vertex: None,
+                    sources: vec![(0, 0.25), (1, 0.75)],
+                },
+            ]),
+            ..Default::default()
+        };
+        let point_identity = vec![0, 1, 2];
+        remap_attributes_with_edge_identity(
+            &source,
+            &mut output,
+            &origin,
+            Some(point_identity.as_slice()),
+        )
+        .expect("remap");
+        let values = &output.attributes["orientation"]["values"];
+        let updated_source = values[format!("v{}", output.vertices[0].id)]
+            .as_array()
+            .expect("updated source quaternion");
+        let half = f64::from(std::f32::consts::FRAC_1_SQRT_2);
+        assert!((updated_source[0].as_f64().expect("x") + half).abs() < 1e-6);
+        assert!((updated_source[3].as_f64().expect("w") - half).abs() < 1e-6);
+        let mixed = values[format!("v{}", output.vertices[1].id)]
+            .as_array()
+            .expect("interpolated quaternion");
+        let expected_x = (-std::f32::consts::PI / 16.0).sin();
+        let expected_w = (-std::f32::consts::PI / 16.0).cos();
+        assert!((mixed[0].as_f64().expect("x") - f64::from(expected_x)).abs() < 1e-6);
+        assert!((mixed[3].as_f64().expect("w") - f64::from(expected_w)).abs() < 1e-6);
+        assert_eq!(
+            values[format!("v{}", output.vertices[2].id)],
+            small_rotation
+        );
+    }
+
+    /// Interpolated quaternion corners mix through the expmap; original corners copy their source value.
+    #[test]
+    fn quaternion_corner_callbacks_mix_one_hot_values_but_original_corners_copy() {
+        let mut source = triangle();
+        let face_id = source.faces[0].id;
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        let three_quarter_turn = json!([half, 0.0, 0.0, -half]);
+        let identity = json!([0.0, 0.0, 0.0, 1.0]);
+        let small_rotation = json!([(0.0002_f32).sin(), 0.0, 0.0, (0.0002_f32).cos()]);
+        source.attributes.insert(
+            "corner_orientation".to_owned(),
+            json!({
+                "domain": "corner",
+                "type": "quaternion",
+                "values": keyed(vec![(
+                    format!("f{face_id}"),
+                    json!([three_quarter_turn, identity.clone(), small_rotation.clone()]),
+                )]),
+            }),
+        );
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            faces: vec![Some(0)],
+            corner_interpolated: Some(vec![true, false, false]),
+            corners: Some(vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]]),
+            ..Default::default()
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+        let corners =
+            &output.attributes["corner_orientation"]["values"][format!("f{}", output.faces[0].id)];
+        let mixed = corners[0].as_array().expect("interpolated quaternion");
+        let half = f64::from(std::f32::consts::FRAC_1_SQRT_2);
+        assert!((mixed[0].as_f64().expect("x") + half).abs() < 1e-6);
+        assert!((mixed[3].as_f64().expect("w") - half).abs() < 1e-6);
+        assert_eq!(corners[1], identity);
+        assert_eq!(corners[2], small_rotation);
+    }
+
+    /// FLOAT2 corner attributes merge their own source corners, independently of other FLOAT2 layers.
+    #[test]
+    fn float2_corner_attributes_use_independent_merged_sources() {
+        let mut source = triangle();
+        let source_face = source.faces[0].id;
+        for (name, row) in [
+            ("corner_vector", json!([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])),
+            ("corner_other", json!([[0.0, 0.0], [0.0, 1.0], [1.0, 1.0]])),
+        ] {
+            source.attributes.insert(
+                name.to_owned(),
+                json!({
+                    "domain": "corner",
+                    "type": "float2",
+                    "values": keyed(vec![(format!("f{source_face}"), row)]),
+                }),
+            );
+        }
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            faces: vec![Some(0)],
+            corner_float2_sources: Some(vec![
+                CornerFloat2Sources {
+                    key: CornerFloat2LayerKey::Attribute("corner_vector".to_owned()),
+                    corners: vec![vec![(0, 0.25), (1, 0.75)], vec![(1, 1.0)], vec![(2, 1.0)]],
+                },
+                CornerFloat2Sources {
+                    key: CornerFloat2LayerKey::Attribute("corner_other".to_owned()),
+                    corners: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+                },
+            ]),
+            corners: Some(vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]]),
+            ..Default::default()
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+        let face_key = format!("f{}", output.faces[0].id);
+        assert_eq!(
+            output.attributes["corner_vector"]["values"][face_key.as_str()][0],
+            json!([0.75, 0.0])
+        );
+        assert_eq!(
+            output.attributes["corner_other"]["values"][face_key.as_str()][0],
+            json!([0.0, 0.0])
+        );
+    }
+
+    /// UV FLOAT2 data merges connected loop sources, while each loop's pin follows its own
+    /// unmerged source corner.
+    #[test]
+    fn uv_pins_follow_unmerged_source_corners() {
+        let mut source = triangle();
+        uv_layers::write_layers(
+            &mut source,
+            &[UvLayer {
+                name: "UVMap".to_owned(),
+                faces: vec![Some(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])],
+                pinned: vec![Some(vec![true, false, false])],
+            }],
+        );
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            faces: vec![Some(0)],
+            corner_float2_sources: Some(vec![CornerFloat2Sources {
+                key: CornerFloat2LayerKey::Uv("UVMap".to_owned()),
+                corners: vec![
+                    vec![(0, 0.5), (1, 0.5)],
+                    vec![(0, 0.5), (1, 0.5)],
+                    vec![(2, 1.0)],
+                ],
+            }]),
+            corners: Some(vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]]),
+            ..Default::default()
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap");
+        let layers = uv_layers::read_layers(&output);
+        assert_eq!(
+            layers[0].faces[0],
+            Some(vec![[0.5, 0.0], [0.5, 0.0], [0.0, 1.0]])
+        );
+        assert_eq!(layers[0].pinned[0], Some(vec![true, false, false]));
     }
 }

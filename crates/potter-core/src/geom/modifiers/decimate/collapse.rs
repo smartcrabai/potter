@@ -2401,6 +2401,7 @@ pub(in crate::geom::modifiers) fn decimate_collapse(
         vertices: output.origins,
         faces: output.faces,
         corners: None,
+        ..Default::default()
     };
     let mut out = super::super::decimate_compact(
         output.points,

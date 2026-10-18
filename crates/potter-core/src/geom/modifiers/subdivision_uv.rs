@@ -1509,6 +1509,7 @@ pub(super) fn subdivided_mesh(
             .flat_map(|(index, (face, _))| std::iter::repeat_n(Some(index), face.len()))
             .collect(),
         corners: None,
+        ..Default::default()
     };
     let mut output = build_mesh(points, output_polygons, output_loose_edges, &origin, mesh)?;
     encode_byte_colors(mesh, &origin, &mut output);
