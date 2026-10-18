@@ -22,7 +22,6 @@ use super::{
     usize_as_f64,
 };
 use crate::{
-    color::{linear_to_srgb, srgb_to_linear},
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
@@ -1599,46 +1598,12 @@ fn encode_byte_colors(source: &Mesh, origin: &Origin, output: &mut Mesh) {
         };
         layer.values = sources
             .iter()
-            .map(|sources| mix_byte_color(&source_layer.values, sources))
+            .map(|sources| color_layers::mix_byte_color(&source_layer.values, sources))
             .collect();
     }
     color_layers::write(output, &store);
 }
 
-/// One output value of a `BYTE_COLOR` layer: each source's stored byte times its origin weight, summed and
-/// truncated to a byte per channel, then decoded back to linear. A value with no source is opaque black, as
-/// the attribute remap's default.
-fn mix_byte_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [f64; 4] {
-    let mut bytes = [0.0_f64; 4];
-    let mut found = false;
-    for (index, weight) in sources {
-        let Some(value) = values.get(*index) else {
-            continue;
-        };
-        found = true;
-        for (channel, component) in value.iter().enumerate() {
-            let encoded = if channel < 3 {
-                linear_to_srgb(*component)
-            } else {
-                *component
-            };
-            bytes[channel] += weight * (encoded * 255.0).round();
-        }
-    }
-    if !found {
-        return [0.0, 0.0, 0.0, 1.0];
-    }
-    let mut color = [0.0; 4];
-    for (channel, &byte) in bytes.iter().enumerate() {
-        let unit = (byte + 1.0e-9).floor().clamp(0.0, 255.0) / 255.0;
-        color[channel] = if channel < 3 {
-            srgb_to_linear(unit)
-        } else {
-            unit
-        };
-    }
-    color
-}
 
 #[cfg(test)]
 mod tests {

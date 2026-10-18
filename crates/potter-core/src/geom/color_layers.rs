@@ -31,6 +31,7 @@ use serde_json::{Map, Value, json};
 
 use super::{Mesh, attribute_keys};
 use crate::error::{ErrorCode, PotError, Result};
+use crate::color::{linear_to_srgb, srgb_to_linear};
 
 /// Attribute name of the color layer store.
 pub(crate) const ATTRIBUTE: &str = "color_layers";
@@ -216,6 +217,33 @@ pub(crate) fn byte_color_decoded_components(bytes: [f32; 4]) -> [f64; 4] {
     })
 }
 
+/// Mix canonical linear colors with Blender's `ColorGeometry4bMixer`: encode and quantize source
+/// channels to stored bytes, accumulate the bytes by weight in `f32`, truncate the normalized result
+/// to bytes, then decode to canonical linear RGBA.
+pub(crate) fn mix_byte_color(values: &[[f64; 4]], sources: &[(usize, f64)]) -> [f64; 4] {
+    let mut sums = [0.0_f32; 4];
+    let mut total = 0.0_f32;
+    let mut found = false;
+    for (index, weight) in sources {
+        let Some(color) = values.get(*index) else {
+            continue;
+        };
+        found = true;
+        let channels = byte_color_encoded_components(*color)
+            .map(|channel| channel.round().clamp(0.0, 255.0));
+        let weight = *weight as f32;
+        total += weight;
+        for (sum, channel) in sums.iter_mut().zip(channels) {
+            *sum += channel * weight;
+        }
+    }
+    if !found || !(total > 0.0) {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let weight_inv = 1.0_f32 / total;
+    let bytes = sums.map(|sum| (sum * weight_inv).trunc().clamp(0.0, 255.0));
+    byte_color_decoded_components(bytes)
+}
 fn corner_key(face_id: u32) -> String {
     format!("f{face_id}")
 }

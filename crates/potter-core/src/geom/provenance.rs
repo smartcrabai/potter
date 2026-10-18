@@ -61,10 +61,10 @@ impl Origin {
 /// layer, and every element-domain `mesh.attributes` entry are remapped. Corner data blends over the
 /// source corners of each output corner (see [`corner_sources`]), so UVs follow the face corner they
 /// came from. Shading flags follow the same origins: `shade_smooth` and `blender_polygon_smooth` copy
-/// their source face's flag, and `sharp` and `seam` OR over source edges. Color layers are rebuilt by
-/// the canonical store, preserving order and active/render choices. `custom_normal` codes are never
-/// interpolated; [`crate::geom::clnor::transfer_custom_normals`] applies the shared code/basis rules.
-/// Elements without a source get no entry, so readers take their type's default; no key refers to a stale element.
+/// their source face's flag, and `sharp` and `seam` OR over source edges. Canonical ColorStore layers
+/// preserve order/designations and use their Blender FLOAT_COLOR/BYTE_COLOR mixer. `custom_normal`
+/// codes are never interpolated; [`crate::geom::clnor::transfer_custom_normals`] handles them.
+/// Elements without a source get no entry, so readers use their type's default; no key points to a stale element.
 ///
 /// # Errors
 ///
@@ -415,11 +415,8 @@ pub(crate) fn corner_sources(
     corners
 }
 
-/// Corner sources by Blender's mean-value interpolation. A corner of an output face whose source
-/// polygon is `Some(sf)` takes the corners of `sf` weighted by the mean-value coordinates of its
-/// output vertex, projected onto `sf`'s plane. Blender interpolates loops this way for vertices
-/// created inside a source face (bevel, boolean cuts). A face without a source polygon has no
-/// sources, so its corners take the domain default.
+/// Corner sources by Blender's `interp_weights_poly_v2`. New output corners are projected into the
+/// source face's float plane basis and snap to a source point/edge within Blender's scale-aware epsilon.
 pub(crate) fn mean_value_corners<'a>(
     source: &Mesh,
     points: &[DVec3],
@@ -441,17 +438,16 @@ pub(crate) fn mean_value_corners<'a>(
         let polygon: Option<Vec<DVec3>> = source.faces[index]
             .vertices
             .iter()
-            .map(|id| {
-                source_index
-                    .get(id)
-                    .map(|position| source.vertices[*position].co)
-            })
+            .map(|id| source_index.get(id).map(|position| source.vertices[*position].co))
             .collect();
+        let projected = polygon.as_deref().and_then(project_polygon);
         for &vertex in vertices {
-            let weights = polygon
-                .as_deref()
-                .and_then(|polygon| mean_value_weights(polygon, points[vertex]))
-                .unwrap_or_default();
+            let weights = match (projected.as_ref(), points.get(vertex)) {
+                (Some((polygon, axes)), Some(point)) => {
+                    mean_value_weights(polygon, project_point(*point, *axes)).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
             corners.push(
                 weights
                     .into_iter()
@@ -465,68 +461,205 @@ pub(crate) fn mean_value_corners<'a>(
     corners
 }
 
-/// Mean-value coordinates of `point` over `polygon`, projected onto the polygon's plane (Floater,
-/// 2003). A point on a polygon vertex or edge takes that vertex's or edge's linear weights. `None`
-/// for a degenerate polygon.
-fn mean_value_weights(polygon: &[DVec3], point: DVec3) -> Option<Vec<f64>> {
-    const COLLINEAR: f64 = 1.0e-9;
-    let count = polygon.len();
-    let normal = (0..count)
-        .fold(DVec3::ZERO, |sum, index| {
-            sum + polygon[index].cross(polygon[(index + 1) % count])
-        })
-        .normalize_or_zero();
-    if normal == DVec3::ZERO {
+type ProjectionAxes = ([f32; 3], [f32; 3]);
+
+fn sub3_f32(first: [f32; 3], second: [f32; 3]) -> [f32; 3] {
+    [first[0] - second[0], first[1] - second[1], first[2] - second[2]]
+}
+
+fn cross3_f32(first: [f32; 3], second: [f32; 3]) -> [f32; 3] {
+    [
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    ]
+}
+/// Blender's `face_normal_calc` (triangle, quad, or Newell) and dominant-axis projection, in f32.
+fn project_polygon(polygon: &[DVec3]) -> Option<(Vec<[f32; 2]>, ProjectionAxes)> {
+    if polygon.len() < 3 {
         return None;
     }
-    let plane_point = point - normal * (point - polygon[0]).dot(normal);
-    let offsets: Vec<DVec3> = polygon.iter().map(|corner| *corner - plane_point).collect();
-    let distances: Vec<f64> = offsets.iter().map(|offset| offset.length()).collect();
-    let scale = distances.iter().copied().fold(0.0, f64::max);
-    if let Some(index) = distances
+    let points: Vec<[f32; 3]> = polygon
         .iter()
-        .position(|distance| *distance <= COLLINEAR * scale)
-    {
-        let mut weights = vec![0.0; count];
-        weights[index] = 1.0;
-        return Some(weights);
+        .map(|point| [point.x as f32, point.y as f32, point.z as f32])
+        .collect();
+    let mut normal = match points.as_slice() {
+        [first, second, third] => {
+            cross3_f32(sub3_f32(*first, *second), sub3_f32(*second, *third))
+        }
+        [first, second, third, fourth] => {
+            cross3_f32(sub3_f32(*first, *third), sub3_f32(*second, *fourth))
+        }
+        _ => {
+            let mut normal = [0.0_f32; 3];
+            let mut previous = points[points.len() - 1];
+            for current in &points {
+                normal[0] += (previous[1] - current[1]) * (previous[2] + current[2]);
+                normal[1] += (previous[2] - current[2]) * (previous[0] + current[0]);
+                normal[2] += (previous[0] - current[0]) * (previous[1] + current[1]);
+                previous = *current;
+            }
+            normal
+        }
+    };
+    let length_squared = dot3_f32(normal, normal);
+    if length_squared > 1.0e-35 {
+        let inverse_length = 1.0 / length_squared.sqrt();
+        normal = normal.map(|component| component * inverse_length);
+    } else {
+        normal = [0.0, 0.0, 1.0];
     }
-    for index in 0..count {
-        let next = (index + 1) % count;
-        let sine = offsets[index].cross(offsets[next]).dot(normal);
-        let cosine = offsets[index].dot(offsets[next]);
-        if sine.abs() <= COLLINEAR * distances[index] * distances[next] && cosine < 0.0 {
-            let total = distances[index] + distances[next];
-            let mut weights = vec![0.0; count];
-            weights[index] = distances[next] / total;
-            weights[next] = distances[index] / total;
-            return Some(weights);
+    let axes = orthographic_projection_axes(normal);
+    let projected = points
+        .iter()
+        .map(|&point| project_point_f32(point, axes))
+        .collect();
+    Some((projected, axes))
+}
+
+fn orthographic_projection_axes(normal: [f32; 3]) -> ProjectionAxes {
+    let length_squared = normal[0] * normal[0] + normal[1] * normal[1];
+    if length_squared > f32::EPSILON {
+        let inverse_length = 1.0 / length_squared.sqrt();
+        let first = [normal[1] * inverse_length, -normal[0] * inverse_length, 0.0];
+        let second = [
+            -normal[2] * first[1],
+            normal[2] * first[0],
+            normal[0] * first[1] - normal[1] * first[0],
+        ];
+        (first, second)
+    } else {
+        (
+            [if normal[2] < 0.0 { -1.0 } else { 1.0 }, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        )
+    }
+}
+
+fn project_point(point: DVec3, axes: ProjectionAxes) -> [f32; 2] {
+    project_point_f32([point.x as f32, point.y as f32, point.z as f32], axes)
+}
+
+fn project_point_f32(point: [f32; 3], axes: ProjectionAxes) -> [f32; 2] {
+    [dot3_f32(axes.0, point), dot3_f32(axes.1, point)]
+}
+
+fn dot3_f32(first: [f32; 3], second: [f32; 3]) -> f32 {
+    first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
+}
+
+fn direction_to_point(vertex: [f32; 2], point: [f32; 2]) -> ([f64; 2], f64) {
+    let direction = [
+        f64::from(vertex[0]) - f64::from(point[0]),
+        f64::from(vertex[1]) - f64::from(point[1]),
+    ];
+    let length = (direction[0] * direction[0] + direction[1] * direction[1]).sqrt();
+    (direction, length)
+}
+
+fn half_tangent(current: ([f64; 2], f64), next: ([f64; 2], f64)) -> f64 {
+    let area = current.0[0] * next.0[1] - current.0[1] * next.0[0];
+    if area == 0.0 {
+        return 0.0;
+    }
+    let dot = current.0[0] * next.0[0] + current.0[1] * next.0[1];
+    let result = (current.1 * next.1 - dot) / area;
+    if result.is_finite() { result } else { 0.0 }
+}
+
+fn line_segment_distance_squared(point: [f32; 2], first: [f32; 2], second: [f32; 2]) -> f32 {
+    let direction = [second[0] - first[0], second[1] - first[1]];
+    let offset = [point[0] - first[0], point[1] - first[1]];
+    let denominator = direction[0] * direction[0] + direction[1] * direction[1];
+    let factor = if denominator == 0.0 {
+        0.0
+    } else {
+        (direction[0] * offset[0] + direction[1] * offset[1]) / denominator
+    };
+    let closest = if factor <= 0.0 {
+        first
+    } else if factor >= 1.0 {
+        second
+    } else {
+        [first[0] + direction[0] * factor, first[1] + direction[1] * factor]
+    };
+    let difference = [closest[0] - point[0], closest[1] - point[1]];
+    difference[0] * difference[0] + difference[1] * difference[1]
+}
+
+fn line_point_factor(point: [f32; 2], first: [f32; 2], second: [f32; 2]) -> f32 {
+    let direction = [second[0] - first[0], second[1] - first[1]];
+    let offset = [point[0] - first[0], point[1] - first[1]];
+    let denominator = direction[0] * direction[0] + direction[1] * direction[1];
+    if denominator == 0.0 {
+        0.0
+    } else {
+        (direction[0] * offset[0] + direction[1] * offset[1]) / denominator
+    }
+}
+
+/// Blender's `interp_weights_poly_v2`: f32 projected coordinates, 16*FLT_EPSILON scale-aware snapping,
+/// and double half-tangent math for the interior mean-value weights.
+fn mean_value_weights(polygon: &[[f32; 2]], point: [f32; 2]) -> Option<Vec<f64>> {
+    let count = polygon.len();
+    if count < 3 {
+        return None;
+    }
+    let mut max_value = 0.0_f32;
+    for vertex in polygon {
+        max_value = max_value.max((vertex[0] - point[0]).abs());
+        max_value = max_value.max((vertex[1] - point[1]).abs());
+    }
+    let epsilon = 16.0 * f32::EPSILON * max_value;
+    let epsilon_squared = epsilon * epsilon;
+    let mut weights = vec![0.0_f32; count];
+    let mut total_weight = 0.0_f32;
+    let mut current_index = count - 1;
+    let mut next_index = 0;
+    let mut current = polygon[current_index];
+    let mut next = polygon[next_index];
+    let mut current_direction = direction_to_point(polygon[count - 2], point);
+    let mut next_direction = direction_to_point(current, point);
+    let mut previous_half_tangent = half_tangent(current_direction, next_direction);
+    let mut snap = 0_u8;
+    while next_index < count {
+        if next_direction.1 < f64::from(epsilon) {
+            snap = 1;
+            break;
+        }
+        if line_segment_distance_squared(point, current, next) < epsilon_squared {
+            snap = 2;
+            break;
+        }
+        current_direction = next_direction;
+        next_direction = direction_to_point(next, point);
+        let tangent = half_tangent(current_direction, next_direction);
+        weights[current_index] = if current_direction.1 == 0.0 {
+            0.0
+        } else {
+            ((previous_half_tangent + tangent) / current_direction.1) as f32
+        };
+        total_weight += weights[current_index];
+        current_index = next_index;
+        next_index += 1;
+        current = next;
+        if next_index < count {
+            next = polygon[next_index];
+        }
+        previous_half_tangent = tangent;
+    }
+    if snap == 1 {
+        weights[current_index] = 1.0;
+    } else if snap == 2 {
+        let factor = line_point_factor(point, current, next).clamp(0.0, 1.0);
+        weights[current_index] = 1.0 - factor;
+        weights[next_index] = factor;
+    } else if total_weight != 0.0 {
+        for weight in &mut weights {
+            *weight /= total_weight;
         }
     }
-    let half_tangents: Vec<f64> = (0..count)
-        .map(|index| {
-            let next = (index + 1) % count;
-            let angle = offsets[index]
-                .cross(offsets[next])
-                .dot(normal)
-                .atan2(offsets[index].dot(offsets[next]));
-            (angle * 0.5).tan()
-        })
-        .collect();
-    let mut weights: Vec<f64> = (0..count)
-        .map(|index| {
-            let previous = (index + count - 1) % count;
-            (half_tangents[previous] + half_tangents[index]) / distances[index]
-        })
-        .collect();
-    let total: f64 = weights.iter().sum();
-    if !total.is_finite() || total.abs() <= f64::EPSILON {
-        return None;
-    }
-    for weight in &mut weights {
-        *weight /= total;
-    }
-    Some(weights)
+    Some(weights.into_iter().map(f64::from).collect())
 }
 
 #[expect(
@@ -729,8 +862,8 @@ impl Sources<'_> {
     /// its source face's value. An output element with no source value gets no entry, so a reader takes
     /// its type's default for the missing key and no default is ever written. A corner row is written
     /// only when one of its corners blends a value; its other corners take the type's default. Booleans
-    /// blend as OR over the positive-weight sources, and colors use Blender's FLOAT_COLOR or BYTE_COLOR
-    /// mixer, with the color type from `blender_metadata` for color attributes.
+    /// use Blender's `DefaultMixer<bool>` weighted threshold, and colors use the mixer for their source encoding,
+    /// selected by the `blender_metadata` color type.
     fn native_attribute(&self, key: &str, attribute: &Value) -> Value {
         let Some(values) = attribute.get("values").and_then(Value::as_object) else {
             return attribute.clone();
@@ -901,30 +1034,25 @@ impl Sources<'_> {
         };
         with_values(entry, Value::Array(remapped))
     }
-    /// One canonical color layer rebuilt in storage order and keyed by `color_layers::write`.
+    /// One canonical color layer rebuilt with the Blender mixer named in the source metadata.
     fn color_layer(&self, layer: &ColorLayer) -> ColorLayer {
         let data_type = self.color_data_type(&layer.name);
-        let blend_layer = |sources: &[(usize, f64)]| {
-            blend_rgba(
-                sources
-                    .iter()
-                    .filter_map(|(index, weight)| Some((*layer.values.get(*index)?, *weight))),
-                data_type,
-            )
-            .unwrap_or([0.0, 0.0, 0.0, 1.0])
+        let mix = |sources: &[(usize, f64)]| {
+            if data_type == "BYTE_COLOR" {
+                color_layers::mix_byte_color(&layer.values, sources)
+            } else {
+                blend_rgba(
+                    sources
+                        .iter()
+                        .filter_map(|(index, weight)| Some((*layer.values.get(*index)?, *weight))),
+                    data_type,
+                )
+                .unwrap_or([0.0, 0.0, 0.0, 1.0])
+            }
         };
         let values = match layer.domain {
-            ColorDomain::Point => self
-                .origin
-                .vertices
-                .iter()
-                .map(|sources| blend_layer(sources.as_slice()))
-                .collect(),
-            ColorDomain::Corner => self
-                .corner_origin
-                .iter()
-                .map(|sources| blend_layer(sources.as_slice()))
-                .collect(),
+            ColorDomain::Point => self.origin.vertices.iter().map(|sources| mix(sources)).collect(),
+            ColorDomain::Corner => self.corner_origin.iter().map(|sources| mix(sources)).collect(),
         };
         ColorLayer {
             name: layer.name.clone(),
@@ -1208,8 +1336,8 @@ fn blend_color(items: &[(&Value, f64)], data_type: &str) -> Option<Value> {
 }
 
 /// Blend values by weight: colors use Blender's FLOAT_COLOR/BYTE_COLOR mixers; numbers and equal-length
-/// number arrays interpolate componentwise (rounded for integer types); booleans OR over the
-/// positive-weight sources; anything else takes the value of the heaviest source.
+/// number arrays interpolate componentwise (rounded for integer types); booleans use
+/// `DefaultMixer<bool>`'s weighted threshold; anything else takes the value of the heaviest source.
 /// `None` when there are no sources.
 fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> Option<Value> {
     let items: Vec<(&Value, f64)> = items.collect();
@@ -1257,9 +1385,13 @@ fn blend<'a>(items: impl Iterator<Item = (&'a Value, f64)>, data_type: &str) -> 
         ));
     }
     if items.iter().all(|(value, _)| value.is_boolean()) {
-        return Some(json!(items.iter().any(|(value, weight)| {
-            *weight > 0.0 && value.as_bool() == Some(true)
-        })));
+        let mut sum = 0.0_f32;
+        let mut total = 0.0_f32;
+        for (value, weight) in &items {
+            sum += (if value.as_bool() == Some(true) { 1.0 } else { 0.0 }) * (*weight as f32);
+            total += *weight as f32;
+        }
+        return Some(json!(total > 0.0 && sum * (1.0 / total) >= 0.5));
     }
     items
         .iter()
@@ -1742,20 +1874,96 @@ mod tests {
     }
 
     #[test]
-    fn blend_ors_booleans_over_positive_weights() {
+    fn byte_color_corner_remap_uses_encoded_bytes_float_color_remains_linear() {
+        let mut source = triangle();
+        let black = [0.0, 0.0, 0.0, 1.0];
+        let white = [1.0, 1.0, 1.0, 1.0];
+        color_layers::write(
+            &mut source,
+            &ColorStore {
+                layers: vec![
+                    ColorLayer {
+                        name: "Byte".to_owned(),
+                        domain: ColorDomain::Corner,
+                        values: vec![black, white, black],
+                    },
+                    ColorLayer {
+                        name: "Float".to_owned(),
+                        domain: ColorDomain::Corner,
+                        values: vec![black, white, black],
+                    },
+                ],
+                active: Some("Float".to_owned()),
+                render: Some("Float".to_owned()),
+            },
+        );
+        source.attributes.insert(
+            "blender_metadata".to_owned(),
+            json!({"color_data_types":{"Byte":"BYTE_COLOR","Float":"FLOAT_COLOR"}}),
+        );
+        let mut output = triangle();
+        let origin = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            faces: vec![Some(0)],
+            corners: Some(vec![
+                vec![(0, 0.49), (1, 0.51)],
+                vec![(1, 1.0)],
+                vec![(2, 1.0)],
+            ]),
+        };
+        remap_attributes(&source, &mut output, &origin).expect("remap colors");
+        let result = color_layers::read(&output);
+        let byte = result
+            .layers
+            .iter()
+            .find(|layer| layer.name == "Byte")
+            .expect("byte layer");
+        let float = result
+            .layers
+            .iter()
+            .find(|layer| layer.name == "Float")
+            .expect("float layer");
+        let byte_channel = expected_byte_color([130.0; 4])[0];
+        assert!((byte.values[0][0] - byte_channel).abs() < 1.0e-12);
+        assert!((float.values[0][0] - 0.51).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn generic_boolean_uses_blenders_weighted_mixer_threshold() {
         let on = json!(true);
         let off = json!(false);
+        assert_eq!(
+            blend([(&on, 0.49), (&off, 0.51)].into_iter(), "BOOLEAN"),
+            Some(json!(false))
+        );
         assert_eq!(
             blend([(&on, 0.5), (&off, 0.5)].into_iter(), "BOOLEAN"),
             Some(json!(true))
         );
         assert_eq!(
-            blend([(&off, 0.5), (&on, 0.0)].into_iter(), "BOOLEAN"),
+            blend([(&off, 0.51), (&on, 0.49)].into_iter(), "BOOLEAN"),
             Some(json!(false))
         );
+    }
+
+    #[test]
+    fn mean_value_corners_use_blenders_scale_aware_edge_snap() {
+        let scale = 1_000_000.0;
+        let source = Mesh::from_positions_and_faces(
+            vec![
+                DVec3::ZERO,
+                DVec3::new(scale, 0.0, 0.0),
+                DVec3::new(scale, scale, 0.0),
+                DVec3::new(0.0, scale, 0.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )
+        .expect("source quad");
+        let query = [DVec3::new(scale * 0.5, 0.25, 0.0)];
+        let output_corners = [0];
         assert_eq!(
-            blend([(&off, 0.5), (&off, 0.5)].into_iter(), "BOOLEAN"),
-            Some(json!(false))
+            mean_value_corners(&source, &query, [(output_corners.as_slice(), Some(0))]),
+            vec![vec![(0, 0.5), (1, 0.5)]],
         );
     }
 
