@@ -1802,38 +1802,37 @@ fn unapplied_boolean_operand_material_exports_to_vrm() -> TestResult {
     apply_success(&project, 0, &operations)?;
     // glb cannot carry this fixture's VRM avatar settings, a legitimate loss the exporter reports, so
     // the binding is checked on the VRM export, which carries them.
-    for format in ["vrm"] {
-        let path = directory.path().join(format!("boolean.{format}"));
-        export(&project, format, &path)?;
-        let glb = parse_glb(&path)?;
-        let root = &glb.json;
-        let subject_node = gltf_node_index(root, "subject");
-        let subject_mesh = usize_field(&root["nodes"][subject_node]["mesh"]);
-        let primitives = root["meshes"][subject_mesh]["primitives"]
-            .as_array()
-            .expect("subject mesh has primitives");
-        let operand = gltf_material_index(root, "operand_material");
-        let overridden = gltf_material_index(root, "override_material");
-        let bound: Vec<Option<u64>> = primitives
-            .iter()
-            .map(|primitive| primitive["material"].as_u64())
-            .collect();
-        assert!(
-            bound.contains(&Some(operand as u64)),
-            "{format}: subject binds no primitive to the operand's data material; bound={bound:?}"
-        );
-        assert!(
-            !bound.contains(&Some(overridden as u64)),
-            "{format}: subject binds the operand's OBJECT override material"
-        );
-        let material = &root["materials"][operand];
-        assert_eq!(material["name"], "Operand Material");
-        assert_texture_ref(
-            root,
-            &material["pbrMetallicRoughness"]["baseColorTexture"],
-            "tex_albedo",
-        );
-    }
+    let format = "vrm";
+    let path = directory.path().join(format!("boolean.{format}"));
+    export(&project, format, &path)?;
+    let glb = parse_glb(&path)?;
+    let root = &glb.json;
+    let subject_node = gltf_node_index(root, "subject");
+    let subject_mesh = usize_field(&root["nodes"][subject_node]["mesh"]);
+    let primitives = root["meshes"][subject_mesh]["primitives"]
+        .as_array()
+        .expect("subject mesh has primitives");
+    let operand = gltf_material_index(root, "operand_material");
+    let overridden = gltf_material_index(root, "override_material");
+    let bound: Vec<Option<u64>> = primitives
+        .iter()
+        .map(|primitive| primitive["material"].as_u64())
+        .collect();
+    assert!(
+        bound.contains(&Some(operand as u64)),
+        "{format}: subject binds no primitive to the operand's data material; bound={bound:?}"
+    );
+    assert!(
+        !bound.contains(&Some(overridden as u64)),
+        "{format}: subject binds the operand's OBJECT override material"
+    );
+    let material = &root["materials"][operand];
+    assert_eq!(material["name"], "Operand Material");
+    assert_texture_ref(
+        root,
+        &material["pbrMetallicRoughness"]["baseColorTexture"],
+        "tex_albedo",
+    );
     Ok(())
 }
 
