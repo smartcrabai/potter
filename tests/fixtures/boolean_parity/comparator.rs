@@ -381,7 +381,9 @@ fn attribute_rows(mesh: &Mesh, domain: &str) -> TestResult<Option<Vec<AttributeV
     let mut names = HashSet::new();
 
     for (storage_name, attribute) in &mesh.attributes {
+        // Blender-internal state (`.select_*`, `.hide_*`) is not a user attribute; the generator skips it too.
         if storage_name == "custom_normal"
+            || user_attribute_name(storage_name).starts_with('.')
             || attribute.get("domain").and_then(Value::as_str) != Some(native_domain)
         {
             continue;
@@ -463,6 +465,9 @@ fn attribute_rows(mesh: &Mesh, domain: &str) -> TestResult<Option<Vec<AttributeV
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or("Potter Blender attribute name is missing")?;
+            if name.starts_with('.') {
+                continue;
+            }
             if !names.insert(name.to_owned()) {
                 continue;
             }
