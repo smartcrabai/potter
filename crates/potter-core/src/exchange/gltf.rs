@@ -6019,7 +6019,7 @@ fn material_textures(
 ) -> Result<material_graph::GraphTextures> {
     let slot = |info: &Value| -> Result<Option<material_graph::SlotTexture>> {
         let transform = texture_transform(info)?;
-        let wrap = texture_wrap(info, root)?;
+        let wrap = texture_wrap(info, root);
         Ok(
             import_texture_ref(info, root, image_ids)?.map(|mut texture| {
                 texture.extension = material_graph::uniform_extension(wrap);
@@ -6056,39 +6056,45 @@ fn uv_set_layer_name(set: usize) -> String {
 
 /// The wrap of each UV axis (S, T) of a glTF texture reference, as Blender's importer reads its sampler (`texture.py`).
 /// An absent wrap is REPEAT, CLAMP_TO_EDGE is EXTEND, and MIRRORED_REPEAT is MIRROR.
-fn texture_wrap(info: &Value, root: &Value) -> Result<[ImageExtension; 2]> {
+fn texture_wrap(info: &Value, root: &Value) -> [ImageExtension; 2] {
     match info["index"]
         .as_u64()
         .and_then(|index| usize::try_from(index).ok())
     {
         Some(index) => texture_wrap_at(root, index),
-        None => Ok([ImageExtension::Repeat; 2]),
+        None => [ImageExtension::Repeat; 2],
     }
 }
 
 /// The wrap of each UV axis of glTF texture `texture_index`, read from its sampler.
-pub(crate) fn texture_wrap_at(root: &Value, texture_index: usize) -> Result<[ImageExtension; 2]> {
+pub(crate) fn texture_wrap_at(root: &Value, texture_index: usize) -> [ImageExtension; 2] {
     let sampler = root["textures"]
         .get(texture_index)
         .and_then(|texture| texture["sampler"].as_u64())
         .and_then(|index| usize::try_from(index).ok())
         .and_then(|index| root["samplers"].get(index));
     let Some(sampler) = sampler else {
-        return Ok([ImageExtension::Repeat; 2]);
+        return [ImageExtension::Repeat; 2];
     };
-    Ok([
-        sampler_wrap_axis(&sampler["wrapS"])?,
-        sampler_wrap_axis(&sampler["wrapT"])?,
-    ])
+    [
+        sampler_wrap_axis(&sampler["wrapS"]),
+        sampler_wrap_axis(&sampler["wrapT"]),
+    ]
 }
 
-fn sampler_wrap_axis(value: &Value) -> Result<ImageExtension> {
+/// One axis's wrap. A value that is neither REPEAT nor MIRRORED_REPEAT matches none of Blender's importer branches, so
+/// the axis passes through under EXTEND and clamps; `gltf_import_losses` reports the value.
+fn sampler_wrap_axis(value: &Value) -> ImageExtension {
     match value.as_u64() {
-        None | Some(10497) => Ok(ImageExtension::Repeat),
-        Some(33071) => Ok(ImageExtension::Extend),
-        Some(33648) => Ok(ImageExtension::Mirror),
-        Some(_) => Err(import_error("glTF sampler wrap mode is invalid")),
+        Some(33648) => ImageExtension::Mirror,
+        Some(10497) => ImageExtension::Repeat,
+        _ if value.is_null() => ImageExtension::Repeat,
+        // CLAMP_TO_EDGE, and any unknown value Blender's importer clamps.
+        _ => ImageExtension::Extend,
     }
+}
+fn is_known_sampler_wrap(value: &Value) -> bool {
+    value.is_null() || matches!(value.as_u64(), Some(10497 | 33071 | 33648))
 }
 
 fn import_texture_ref(info: &Value, root: &Value, image_ids: &[Id]) -> Result<Option<TextureRef>> {
@@ -9720,6 +9726,27 @@ fn texcoord_past_limit(name: &str) -> bool {
 
 fn gltf_import_losses(root: &Value) -> Vec<crate::exchange::Loss> {
     let mut losses = Vec::new();
+    let unknown_wrap = root["textures"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|texture| {
+            texture["sampler"]
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| root["samplers"].get(index))
+        })
+        .any(|sampler| {
+            !is_known_sampler_wrap(&sampler["wrapS"]) || !is_known_sampler_wrap(&sampler["wrapT"])
+        });
+    if unknown_wrap {
+        losses.push(crate::exchange::Loss {
+            feature_id: feature_id::SAMPLER.to_owned(),
+            data_id: None,
+            reason: "glTF texture sampler has an unknown wrap value; that axis is imported as clamp to edge, as Blender does".to_owned(),
+            suggestion: Some("use REPEAT (10497), CLAMP_TO_EDGE (33071), or MIRRORED_REPEAT (33648)".to_owned()),
+        });
+    }
     if root["nodes"].as_array().is_some_and(|nodes| {
         nodes.iter().any(|node| {
             let Some(node_weights) = node["weights"].as_array() else {
@@ -15077,16 +15104,17 @@ mod tests {
         Ok(index.min(size - 1))
     }
 
-    /// One axis of a glTF sampler wrap applied to a texture coordinate, as the glTF specification defines it: REPEAT
-    /// (10497) takes the fraction, CLAMP_TO_EDGE (33071) clamps to the edge, and MIRRORED_REPEAT (33648) reflects.
+    /// One axis of a glTF sampler wrap: REPEAT (10497) takes the fraction, CLAMP_TO_EDGE (33071) clamps, and
+    /// MIRRORED_REPEAT (33648) reflects. Blender also clamps unknown wrap values in its mixed-wrap branch.
     fn gltf_wrapped(wrap: u64, coordinate: f64) -> f64 {
         match wrap {
-            33071 => coordinate.clamp(0.0, 1.0),
+            10497 => coordinate.rem_euclid(1.0),
             33648 => {
                 let period = coordinate.rem_euclid(2.0);
                 if period > 1.0 { 2.0 - period } else { period }
             }
-            _ => coordinate.rem_euclid(1.0),
+            // Explicit clamp and unknown values both pass through under Blender's EXTEND node.
+            _ => coordinate.clamp(0.0, 1.0),
         }
     }
 
@@ -15116,6 +15144,7 @@ mod tests {
         const REPEAT: u64 = 10497;
         const CLAMP: u64 = 33071;
         const MIRRORED: u64 = 33648;
+        const UNKNOWN: u64 = 42;
         // Coordinates off the texel edges, below 0 and above 1, so every wrap mode is exercised.
         let grid = [-0.4, -0.1, 0.1, 0.35, 0.6, 0.9, 1.2, 1.6];
         let names = ["UVMap".to_owned()];
@@ -15126,6 +15155,8 @@ mod tests {
             (CLAMP, REPEAT),
             (MIRRORED, CLAMP),
             (REPEAT, MIRRORED),
+            (UNKNOWN, REPEAT),
+            (REPEAT, UNKNOWN),
         ] {
             let mut edited = document.clone();
             edited["samplers"] =
@@ -15134,6 +15165,15 @@ mod tests {
             let path = root.path().join("wrap.gltf");
             std::fs::write(&path, serde_json::to_vec(&edited)?)?;
             let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+            if wrap_s == UNKNOWN || wrap_t == UNKNOWN {
+                assert!(
+                    imported
+                        .losses
+                        .iter()
+                        .any(|loss| loss.feature_id == "material.shader_graph.sampler"),
+                    "an unknown sampler wrap must be reported as a loss"
+                );
+            }
             export_imported_again(&imported, root.path())?;
             let mut images = BTreeMap::new();
             for (id, image) in &imported.doc.images {

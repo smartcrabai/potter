@@ -750,11 +750,11 @@ fn texture_source(
     } else {
         ImageInterpolation::Linear
     };
-    let wrap = crate::exchange::gltf::texture_wrap_at(&index.root, texture_index)?;
+    let wrap = crate::exchange::gltf::texture_wrap_at(&index.root, texture_index);
     if wrap[0] != wrap[1] {
         decoder.loss(
             "vrm.mtoon.texture_wrap",
-            "VRM 0.x MToon texture's glTF sampler wraps the S and T axes differently; a Potter texture holds one extension, so it is sampled as clamp to edge",
+            "VRM MToon texture's glTF sampler wraps the S and T axes differently; a Potter texture holds one extension, so it is sampled as clamp to edge",
             SUGGESTION,
         );
     }

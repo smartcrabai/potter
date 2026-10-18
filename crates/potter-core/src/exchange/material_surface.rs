@@ -474,6 +474,24 @@ fn fields_surface(
         }
     };
     let mut losses = Vec::new();
+    for (property, reference) in [
+        ("base colour", material.base_color_texture.as_ref()),
+        ("roughness", material.roughness_texture.as_ref()),
+        ("metallic", material.metallic_texture.as_ref()),
+        ("normal", material.normal_texture.as_ref()),
+    ] {
+        if reference.is_some_and(|reference| reference.extension == ImageExtension::Clip) {
+            push_loss(
+                &mut losses,
+                feature_id::SAMPLER,
+                material_id,
+                format!(
+                    "texture field `{property}` of material `{material_id}` uses `clip` extension; it is sampled as clamp to edge"
+                ),
+                None,
+            );
+        }
+    }
     let base_color = TexturedValue {
         factor: material.base_color,
         texture: material
@@ -2922,6 +2940,25 @@ mod tests {
         assert!(!surface.unlit);
         let fields = resolve_fields_surface(&doc, &id("mat")).unwrap();
         assert_eq!(fields, surface);
+    }
+    #[test]
+    fn clip_texture_field_reports_sampler_loss() {
+        let mut doc = document(None);
+        doc.materials
+            .get_mut(&id("mat"))
+            .unwrap()
+            .base_color_texture = Some(TextureRef {
+            image: id("img"),
+            uv_layer: None,
+            interpolation: ImageInterpolation::Linear,
+            extension: ImageExtension::Clip,
+        });
+        let (_, losses) = resolved(&doc);
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == feature_id::SAMPLER)
+        );
     }
 
     #[test]

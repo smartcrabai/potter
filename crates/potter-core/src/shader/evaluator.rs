@@ -705,8 +705,7 @@ fn sample_material_texture(
             json!({"image_id":image_id}),
         )
     })?;
-    // A material field stores no wrap, and Blender's Image Texture defaults to REPEAT, so the field samples
-    // through the same path as an Image Texture node with that extension.
+    // The field samples through the same path as an Image Texture node with the field's extension.
     let blender_uv = storage_to_blender_uv(layer_uv(hit_ctx, layer));
     let tile = if image.tiles.is_empty() { 0 } else { 1001 };
     let pixel = sample_image_texel(
@@ -714,7 +713,7 @@ fn sample_material_texture(
         blender_uv,
         tile,
         texture.interpolation,
-        ImageExtension::Repeat,
+        texture.extension,
     );
     if pixel.iter().any(|component| !component.is_finite()) {
         return Err(eval_error(format!(
@@ -2323,8 +2322,8 @@ mod tests {
 
     use crate::{
         graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
-        image::{ImageData, ImageInterpolation},
-        model::{Id, Material, Registry},
+        image::{ImageData, ImageExtension, ImageInterpolation},
+        model::{Id, Material, Registry, TextureRef},
     };
 
     use super::{
@@ -2420,6 +2419,66 @@ mod tests {
         )]);
         context = context.with_images(&images);
         evaluate_surface(&material, &context).unwrap().base_color
+    }
+
+    /// Red at storage U `u` of a plain field (no graph) whose texture uses `extension`. Pixels are 8 columns of
+    /// increasing red, so column 7 is the edge texel with red 1.0.
+    fn field_red_at(extension: ImageExtension, u: f64) -> f64 {
+        let material = Material {
+            base_color: [1.0; 4],
+            base_color_texture: Some(TextureRef {
+                image: Id::new("image".to_owned()).unwrap(),
+                uv_layer: None,
+                interpolation: ImageInterpolation::Closest,
+                extension,
+            }),
+            ..Material::default()
+        };
+        let names = vec!["UVMap".to_owned()];
+        let corners = vec![[[u, 0.5]; 3]];
+        let groups = Registry::new();
+        let context = HitContext::new(&groups).with_uv_layers(HitUvLayers {
+            names: &names,
+            corners: &corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric: [1.0 / 3.0; 3],
+            render: Some(0),
+            available_mask: None,
+        });
+        let mut pixels = Vec::with_capacity(64);
+        for _ in 0..8 {
+            for x in 0..8 {
+                pixels.push([f64::from(x) / 7.0, 0.0, 0.0, 1.0]);
+            }
+        }
+        let images = BTreeMap::from([(
+            "image".to_owned(),
+            ImageData {
+                width: 8,
+                height: 8,
+                pixels,
+                tiles: BTreeMap::new(),
+                interpolation: ImageInterpolation::Closest,
+            },
+        )]);
+        let context = context.with_images(&images);
+        evaluate_surface(&material, &context).unwrap().base_color[0]
+    }
+
+    #[test]
+    fn material_field_extension_sets_the_sample_past_its_edge() {
+        // Blender's Image Texture: extend holds the edge texel past the UV edge, repeat wraps around.
+        let edge = field_red_at(ImageExtension::Extend, 0.99);
+        assert!((edge - 1.0).abs() < 1e-12, "the edge texel is column 7");
+        assert!(
+            (field_red_at(ImageExtension::Extend, 1.25) - edge).abs() < 1e-12,
+            "extend past the edge equals the edge texel"
+        );
+        let wrapped = field_red_at(ImageExtension::Repeat, 1.25);
+        assert!(
+            (wrapped - 2.0 / 7.0).abs() < 1e-12,
+            "repeat wraps 1.25 to column 2, got {wrapped}"
+        );
     }
 
     fn insert_node(group: &mut NodeGroup, id: &str, node_type: &str, inputs: Value) {

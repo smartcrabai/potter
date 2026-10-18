@@ -1021,9 +1021,9 @@ fn missing_texture_uv_layers(
     missing
 }
 
-/// Textures whose requested or default render UV layer is unavailable on an evaluated mesh.
+/// FBX losses for texture wrap extensions and texture references to unavailable UV layers.
 pub(crate) fn uv_texture_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss> {
-    missing_texture_uv_layers(doc, snapshot)
+    let mut losses: Vec<Loss> = missing_texture_uv_layers(doc, snapshot)
         .into_iter()
         .filter_map(|((material, layer, node, render_layer), slot)| {
             render_layer.is_none().then_some(Loss {
@@ -1042,7 +1042,56 @@ pub(crate) fn uv_texture_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss
                 ),
             })
         })
-        .collect()
+        .collect();
+    losses.extend(texture_extension_losses(doc, snapshot));
+    losses
+}
+
+/// FBX has no mirror or clip wrap. Blender's exporter writes both as clamp, so each texture field on an exported
+/// material with one of those extensions reports `format.fbx.texture_extension`.
+pub(crate) fn texture_extension_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<Loss> {
+    let mut losses = Vec::new();
+    let mut seen = BTreeSet::<Id>::new();
+    for (node_id, node) in &doc.nodes {
+        if !snapshot.meshes.contains_key(node_id) {
+            continue;
+        }
+        for material_id in fbx_material_slots(doc, snapshot, node_id, node)
+            .into_iter()
+            .flatten()
+        {
+            if !seen.insert(material_id.clone()) {
+                continue;
+            }
+            let Some(material) = doc.materials.get(&material_id) else {
+                continue;
+            };
+            for (texture, property) in material_texture_refs(material)
+                .into_iter()
+                .zip(TEXTURE_PROPERTIES)
+            {
+                let Some(texture) = texture else {
+                    continue;
+                };
+                if matches!(
+                    texture.extension,
+                    crate::image::ImageExtension::Mirror | crate::image::ImageExtension::Clip
+                ) {
+                    losses.push(Loss {
+                        feature_id: "format.fbx.texture_extension".to_owned(),
+                        data_id: Some(material_id.to_string()),
+                        reason: format!(
+                            "material `{material_id}` samples its {property} texture with a mirror or clip extension, which FBX cannot represent; FBX writes it as clamp"
+                        ),
+                        suggestion: Some(
+                            "use the repeat or extend extension for FBX export".to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    losses
 }
 
 /// Empty material slots cannot be represented by FBX material connections.
@@ -3999,8 +4048,8 @@ mod tests {
         Ok(())
     }
 
-    /// One triangle whose base colour texture has `extension`, exported as ASCII FBX.
-    fn textured_triangle_fbx(extension: ImageExtension, root: &Path) -> TestResult<Vec<u8>> {
+    /// One triangle whose base colour texture has `extension`.
+    fn textured_triangle_scene(extension: ImageExtension, root: &Path) -> TestResult<SceneDoc> {
         let image_path = root.join("texture.pixels");
         let pixels = crate::image::encode_pixels(1, 1, &[[1.0, 1.0, 1.0, 1.0]])?;
         fs::write(&image_path, &pixels)?;
@@ -4055,6 +4104,11 @@ mod tests {
                 ..Node::default()
             },
         );
+        Ok(doc)
+    }
+
+    fn textured_triangle_fbx(extension: ImageExtension, root: &Path) -> TestResult<Vec<u8>> {
+        let doc = textured_triangle_scene(extension, root)?;
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         Ok(export_with_root_allow_lossy(&doc, &snapshot, root, true)?)
     }
@@ -4065,6 +4119,29 @@ mod tests {
             .find_map(|material| material.base_color_texture.as_ref())
             .map(|texture| texture.extension)
             .ok_or_else(|| "FBX test texture is missing".into())
+    }
+
+    #[test]
+    fn mirror_and_clip_texture_extensions_report_fbx_losses() -> TestResult {
+        let root = tempfile::tempdir()?;
+        for extension in [
+            ImageExtension::Repeat,
+            ImageExtension::Extend,
+            ImageExtension::Mirror,
+            ImageExtension::Clip,
+        ] {
+            let doc = textured_triangle_scene(extension, root.path())?;
+            let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+            let has_extension_loss = uv_texture_losses(&doc, &snapshot)
+                .iter()
+                .any(|loss| loss.feature_id == "format.fbx.texture_extension");
+            assert_eq!(
+                has_extension_loss,
+                matches!(extension, ImageExtension::Mirror | ImageExtension::Clip),
+                "unexpected FBX texture-extension loss for {extension:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
