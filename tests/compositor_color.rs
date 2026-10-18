@@ -5,6 +5,7 @@ use assert_cmd::Command;
 use potter_core::{
     color::{ColorManagement, ViewTransform, linear_to_srgb},
     compositor::{BlendMode, Image, gaussian_blur, mix_rgb},
+    error::ErrorCode,
 };
 use proptest::prelude::*;
 use tempfile::tempdir;
@@ -193,34 +194,41 @@ fn center_rgb_at(image: &[u8], x: usize, y: usize, width: usize) -> [u8; 3] {
 }
 
 #[test]
-fn exposure_plus_one_doubles_raw_linear_values() {
+fn exposure_plus_one_doubles_raw_linear_values() -> Result<(), Box<dyn Error>> {
     let settings = ColorManagement {
         view_transform: ViewTransform::Raw,
         exposure: 1.0,
         ..ColorManagement::default()
     };
-    let result = settings.transform_linear([0.25, 0.5, 0.75]);
-    assert_eq!(result, [0.5, 1.0, 1.5]);
+    let result = settings.display_encode([0.125, 0.25, 0.375])?;
+    assert_eq!(result, [0.25, 0.5, 0.75]);
+    Ok(())
 }
 
 #[test]
-fn view_transforms_look_gamma_and_srgb_encoding_are_applied() {
+fn view_transforms_look_gamma_and_srgb_encoding_are_applied() -> Result<(), Box<dyn Error>> {
     let sample = [0.25; 3];
-    let standard = ColorManagement::default().transform_linear(sample);
-    assert_eq!(standard, sample);
+    let standard = ColorManagement::default().display_encode(sample)?;
+    assert!(
+        (f64::from(standard[0]) - linear_to_srgb(0.25)).abs() < 1.0e-5,
+        "{standard:?}"
+    );
 
     let filmic = ColorManagement {
         view_transform: ViewTransform::Filmic,
         ..ColorManagement::default()
     }
-    .transform_linear(sample);
-    assert!(filmic[0] < standard[0]);
+    .display_encode(sample)?;
+    // The exact Blender Filmic output for 0.25 is about 0.564 (display-encoded), not the Standard
+    // encode of 0.537. The Blender display-processor test checks Filmic values against Blender; this
+    // only checks that the view changes the value.
+    assert!((filmic[0] - standard[0]).abs() > 1.0e-3, "{filmic:?}");
 
     let false_color = ColorManagement {
         view_transform: ViewTransform::FalseColor,
         ..ColorManagement::default()
     }
-    .transform_linear(sample);
+    .display_encode(sample)?;
     assert_ne!(false_color[0], false_color[2]);
 
     let gamma = ColorManagement {
@@ -228,32 +236,44 @@ fn view_transforms_look_gamma_and_srgb_encoding_are_applied() {
         gamma: 2.0,
         ..ColorManagement::default()
     }
-    .transform_linear(sample);
-    assert_eq!(gamma, [0.5; 3]);
+    .display_encode(sample)?;
+    assert!(
+        gamma.iter().all(|value| (value - 0.5).abs() < 1.0e-5),
+        "{gamma:?}"
+    );
 
-    let look = ColorManagement {
+    let unsupported_look = ColorManagement {
         view_transform: ViewTransform::Raw,
         look: "high_contrast".to_owned(),
         ..ColorManagement::default()
     }
-    .transform_linear([0.75; 3]);
-    assert!(look[0] > 0.75);
+    .display_encode([0.75; 3]);
+    assert!(matches!(
+        unsupported_look,
+        Err(error) if error.code == ErrorCode::UnsupportedFeature
+    ));
     assert!((linear_to_srgb(0.5) - 0.735_356_983_052_449_5).abs() < 1.0e-12);
+    Ok(())
 }
 
 proptest! {
     #[test]
-    fn agx_is_zero_preserving_and_monotonic(value in 0.0_f64..100.0, delta in 0.0_f64..10.0) {
+    fn agx_is_zero_preserving_and_monotonic(value in 0.0_f32..100.0, delta in 0.0_f32..10.0) {
         let settings = ColorManagement {
             view_transform: ViewTransform::AgX,
             ..ColorManagement::default()
         };
-        let zero = settings.transform_linear([0.0; 3]);
-        let lower = settings.transform_linear([value; 3]);
-        let upper = settings.transform_linear([value + delta; 3]);
-        prop_assert!(zero.iter().all(|channel| channel.abs() < 1.0e-12));
+        let encode = |rgb: [f32; 3]| {
+            settings
+                .display_encode(rgb)
+                .unwrap_or_else(|error| panic!("display_encode failed: {error}"))
+        };
+        let zero = encode([0.0; 3]);
+        let lower = encode([value; 3]);
+        let upper = encode([value + delta; 3]);
+        prop_assert!(zero.iter().all(|channel| channel.abs() < 1.0e-6));
         for (low, high) in lower.into_iter().zip(upper) {
-            prop_assert!(high + 1.0e-12 >= low);
+            prop_assert!(high + 1.0e-5 >= low);
         }
     }
 }
