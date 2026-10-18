@@ -78,6 +78,43 @@ pub(crate) fn corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVe
     shading_normals(mesh, positions).map(|shading| shading.corners)
 }
 
+/// Blender's `Mesh::vert_normals()`: each vertex's angle-weighted sum of its faces' geometric
+/// normals. Shading flags and custom normals never change it, so Shrinkwrap projects along it even
+/// on meshes that carry custom normals.
+///
+/// # Errors
+///
+/// Returns an error for invalid topology, or non-finite or mis-sized positions.
+pub(crate) fn geometric_vertex_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
+    check_shading_input(mesh, positions)?;
+    let index_by_id: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let mut sums = vec![DVec3::ZERO; mesh.vertices.len()];
+    for face in &mesh.faces {
+        let indices = face
+            .vertices
+            .iter()
+            .map(|id| {
+                index_by_id.get(id).copied().ok_or_else(|| {
+                    mesh_error(&MeshError::InvalidTopology(
+                        "face references a missing vertex",
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let points: Vec<DVec3> = indices.iter().map(|index| positions[*index]).collect();
+        let normal = face_normal(&points);
+        for (corner, index) in indices.iter().enumerate() {
+            sums[*index] += normal * corner_angle(&points, corner);
+        }
+    }
+    Ok(sums.into_iter().map(DVec3::normalize_or_zero).collect())
+}
+
 /// Corner and flat normals agree within this distance, matching the importers.
 const FLAT_TOLERANCE: f64 = 1.0e-4;
 

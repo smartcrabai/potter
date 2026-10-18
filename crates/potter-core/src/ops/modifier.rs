@@ -1106,11 +1106,10 @@ fn evaluate_modifier_output(
                             .iter()
                             .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
                 }
-                "shrinkwrap" | "surface_deform" | "mesh_deform" => {
-                    ["object", "collection", "target"]
-                        .iter()
-                        .any(|key| modifier.params.get(*key).is_some_and(Value::is_string))
-                }
+                "shrinkwrap" => modifier.params.get("target").is_some_and(Value::is_string),
+                "surface_deform" | "mesh_deform" => ["object", "collection", "target"]
+                    .iter()
+                    .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
                 "curve" | "hook" | "data_transfer" | "normal_edit" => ["object", "target"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),

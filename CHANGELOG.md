@@ -92,6 +92,7 @@
 - In DIFFERENCE, a cutter face reversed in the output negates its custom normal, as Blender does.
 - Operand-to-subject transforms are computed in f32 (the inverse subject matrix times the operand matrix, each product in f32), as Blender computes them, so operand vertices land on Blender's f32 positions.
 - Open operands and results that are not PWN after intersection use a BVH for the non-PWN ray tests instead of scanning every triangle.
+- Shrinkwrap follows Blender 5.2.2 `MOD_shrinkwrap.cc` and `shrinkwrap.cc` in float32: nearest surface point, nearest vertex, axis and implicit-normal projection with direction, culling, projection limit, auxiliary target, subdivision-limit positions, and TARGET_PROJECT with its boundary-edge fallback. Ray and nearest queries run on Blender's kdop BVH (`geom/bvh.rs`), so hits and tie-breaks follow Blender's traversal. Scene evaluation, `modifier.apply`, preview, and export resolve the target and auxiliary meshes with their object transforms; a non-mesh or self target is a no-op, as in Blender.
 
 ## 0.2.0 - 2026-10-13
 - `pot workflow refine` now requires `-p/--provider <NAME>` and `-m/--model <ID>`, sent to jcode as `<NAME>:<ID>` (examples: `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`) for the modeler and every reviewer; agents no longer fall back to jcode's default model.

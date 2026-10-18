@@ -26,11 +26,13 @@ use serde_json::{Map, Value};
 pub(crate) mod attribute_keys;
 pub(crate) mod blender_matrix;
 pub mod boolean;
+pub(crate) mod bvh;
 pub(crate) mod clnor;
 pub(crate) mod color_layers;
 pub(crate) mod concat;
 pub mod curve;
 pub mod edit;
+pub(crate) mod heap_simple;
 pub mod lattice;
 pub mod mesh_cache;
 pub mod metaball;
@@ -61,6 +63,9 @@ pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
 
 #[cfg(test)]
 mod shading_oracle;
+
+#[cfg(test)]
+mod shrinkwrap_oracle;
 
 /// Stable vertex record. `id` is persistent; its position in [`Mesh::vertices`] is not.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1480,6 +1480,10 @@ pub struct ModifierRuntime {
     pub target_mesh: Option<Value>,
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
+    #[doc(hidden)]
+    pub auxiliary_target_to_subject: Option<[f64; 16]>,
+    pub shrinkwrap_target_mesh: Option<Mesh>,
+    pub shrinkwrap_auxiliary_target_mesh: Option<Mesh>,
     pub operand_mesh: Option<Value>,
     /// Operands of the EXACT Boolean in the subject's space (subject excluded), in Blender order.
     pub boolean_operands: Vec<crate::geom::boolean::BooleanOperand>,

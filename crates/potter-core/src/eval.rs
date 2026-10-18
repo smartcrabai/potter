@@ -2103,27 +2103,20 @@ fn object_mesh_dependencies(
             }
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
                 "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => &["object"],
-                "shrinkwrap" => {
-                    if modifier
-                        .params
-                        .get("target")
-                        .is_some_and(|value| !value.is_null())
-                    {
-                        &["target"]
-                    } else {
-                        &["object"]
-                    }
-                }
+                "shrinkwrap" => &["target", "auxiliary_target"],
                 "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
                 "array" => &["start_cap", "end_cap"],
                 _ => &[],
             };
             for parameter in parameters {
-                add_mesh_operand_dependency(
-                    &mut dependencies.modifiers,
-                    owner_id,
-                    modifier.params.get(*parameter),
-                );
+                let value = modifier.params.get(*parameter);
+                // Blender disables a Shrinkwrap aimed at its own object: no dependency.
+                if modifier.modifier_type == "shrinkwrap"
+                    && value.and_then(serde_json::Value::as_str) == Some(owner_id.as_str())
+                {
+                    continue;
+                }
+                add_mesh_operand_dependency(&mut dependencies.modifiers, owner_id, value);
             }
         }
         if let Some(collection_id) = instance_collection_target(node)? {
@@ -2284,7 +2277,7 @@ pub(crate) fn resolve_modifier_object_operands(
         "boolean" | "curve" | "hook" | "data_transfer" | "mesh_deform" => &["object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],
-        "shrinkwrap" => &["target", "object"],
+        "shrinkwrap" => &["target", "auxiliary_target"],
         "vertex_weight_edit" | "vertex_weight_mix" => &["mask_tex_map_object"],
         "vertex_weight_proximity" => &["target", "mask_tex_map_object"],
         "normal_edit" | "surface_deform" => &["target"],
@@ -3233,6 +3226,104 @@ fn apply_volume_displace_modifier(
     )
 }
 
+/// Blender's Shrinkwrap projects onto a mesh target evaluated in the subject's space. A missing or
+/// self target, or a non-mesh target, leaves the subject unchanged; a self auxiliary target is
+/// ignored, and a non-mesh auxiliary target disables the modifier.
+fn apply_scene_shrinkwrap_modifier(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+) -> Result<()> {
+    let Some(target_id) = shrinkwrap_object_reference(modifier, "target")? else {
+        return Ok(());
+    };
+    if target_id == *subject_id || !is_scene_mesh_object(modifier, doc, &target_id)? {
+        return Ok(());
+    }
+    let auxiliary_id =
+        shrinkwrap_object_reference(modifier, "auxiliary_target")?.filter(|id| id != subject_id);
+    if let Some(auxiliary_id) = &auxiliary_id
+        && !is_scene_mesh_object(modifier, doc, auxiliary_id)?
+    {
+        return Ok(());
+    }
+    let mut operands = resolve_modifier_object_operands(
+        modifier,
+        subject_id,
+        doc,
+        world_matrices,
+        evaluated_meshes,
+    )?;
+    let target = operands
+        .remove("target")
+        .and_then(|mut operands| operands.pop())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "shrinkwrap target mesh was not resolved",
+                json!({"modifier_id":modifier.id,"target":target_id}),
+            )
+        })?;
+    let mut resolved = modifier.clone();
+    resolved.params.remove("target");
+    resolved.params.remove("auxiliary_target");
+    resolved.runtime.target_to_subject = Some(target.local_to_subject.to_cols_array());
+    resolved.runtime.shrinkwrap_target_mesh = Some(target.mesh);
+    if let Some(auxiliary_id) = auxiliary_id {
+        let auxiliary = operands
+            .remove("auxiliary_target")
+            .and_then(|mut operands| operands.pop())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "shrinkwrap auxiliary target mesh was not resolved",
+                    json!({"modifier_id":modifier.id,"auxiliary_target":auxiliary_id}),
+                )
+            })?;
+        resolved.runtime.auxiliary_target_to_subject =
+            Some(auxiliary.local_to_subject.to_cols_array());
+        resolved.runtime.shrinkwrap_auxiliary_target_mesh = Some(auxiliary.mesh);
+    }
+    *mesh = crate::geom::modifiers::evaluate_modifiers(mesh, &[resolved])?;
+    Ok(())
+}
+
+/// An object-reference parameter of a Shrinkwrap: `None` when the value is null or absent.
+fn shrinkwrap_object_reference(modifier: &Modifier, parameter: &str) -> Result<Option<Id>> {
+    match modifier.params.get(parameter) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Id::new(text.to_owned()).map(Some).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                error.message,
+                json!({"modifier_id":modifier.id,"parameter":parameter,"object":text}),
+            )
+        }),
+        Some(_) => Err(PotError::invalid_argument(format!(
+            "modifier `shrinkwrap` `{parameter}` must be an object ID"
+        ))),
+    }
+}
+
+fn is_scene_mesh_object(modifier: &Modifier, doc: &SceneDoc, object_id: &Id) -> Result<bool> {
+    let object = doc.nodes.get(object_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier operand object `{object_id}` was not found"),
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    Ok(object.kind == "mesh"
+        && object
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .is_some_and(|data| data.data_type == "mesh"))
+}
+
 fn apply_generic_scene_mesh_operand_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -3248,14 +3339,8 @@ fn apply_generic_scene_mesh_operand_modifier(
         world_matrices,
         evaluated_meshes,
     )?;
-    let object_parameter =
-        if modifier.modifier_type == "shrinkwrap" && modifier.params.contains_key("target") {
-            "target"
-        } else {
-            "object"
-        };
     let mut combined = None;
-    for operand in operands.get(object_parameter).into_iter().flatten() {
+    for operand in operands.get("object").into_iter().flatten() {
         let mut transformed = operand.mesh.clone();
         for vertex in &mut transformed.vertices {
             vertex.co = operand.local_to_subject.transform_point3(vertex.co);
@@ -3280,7 +3365,7 @@ fn apply_generic_scene_mesh_operand_modifier(
     let operand = serde_json::to_value(operand).map_err(|error| {
         PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
     })?;
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
+    if modifier.modifier_type == "curve" {
         resolved.runtime.target_mesh = Some(operand);
     } else {
         resolved.runtime.operand_mesh = Some(operand);
@@ -3299,6 +3384,16 @@ pub(crate) fn apply_scene_operand_modifier(
     evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
     material_slots: &mut Vec<Option<Id>>,
 ) -> Result<()> {
+    if modifier.modifier_type == "shrinkwrap" {
+        return apply_scene_shrinkwrap_modifier(
+            mesh,
+            modifier,
+            subject_id,
+            doc,
+            world_matrices,
+            evaluated_meshes,
+        );
+    }
     if modifier.modifier_type == "warp" {
         return apply_scene_warp_modifier(mesh, modifier, subject_id, doc, world_matrices);
     }
@@ -3327,10 +3422,8 @@ pub(crate) fn apply_scene_operand_modifier(
     {
         return Ok(());
     }
-    if matches!(
-        modifier.modifier_type.as_str(),
-        "boolean" | "shrinkwrap" | "curve"
-    ) && !modifier.params.contains_key("collection")
+    if matches!(modifier.modifier_type.as_str(), "boolean" | "curve")
+        && !modifier.params.contains_key("collection")
     {
         return apply_generic_scene_mesh_operand_modifier(
             mesh,
@@ -3343,34 +3436,20 @@ pub(crate) fn apply_scene_operand_modifier(
     }
     let mut object_ids = BTreeSet::new();
     let mut collection_id = None;
-    let object_parameter = if modifier.modifier_type == "shrinkwrap" {
-        "target"
-    } else {
-        "object"
-    };
-    if let Some(value) = modifier.params.get(object_parameter) {
+    if let Some(value) = modifier.params.get("object") {
         let text = value.as_str().ok_or_else(|| {
             PotError::invalid_argument(format!(
-                "modifier `{}` `{object_parameter}` must be an object ID",
+                "modifier `{}` `object` must be an object ID",
                 modifier.modifier_type
             ))
         })?;
         let object_id = Id::new(text).map_err(|_| {
             PotError::invalid_argument(format!(
-                "modifier `{}` `{object_parameter}` must be a valid object ID",
+                "modifier `{}` `object` must be a valid object ID",
                 modifier.modifier_type
             ))
         })?;
         object_ids.insert(object_id);
-    } else if modifier.modifier_type == "shrinkwrap"
-        && let Some(value) = modifier.params.get("object")
-    {
-        let text = value.as_str().ok_or_else(|| {
-            PotError::invalid_argument("shrinkwrap `object` must be an object ID")
-        })?;
-        object_ids.insert(Id::new(text).map_err(|_| {
-            PotError::invalid_argument("shrinkwrap `object` must be a valid object ID")
-        })?);
     }
     if let Some(value) = modifier.params.get("collection") {
         let text = value.as_str().ok_or_else(|| {
@@ -3404,7 +3483,7 @@ pub(crate) fn apply_scene_operand_modifier(
                 "modifier `{}` requires an object or collection operand",
                 modifier.modifier_type
             ),
-            json!({"modifier_id":modifier.id,"pointer":format!("/params/{object_parameter}")}),
+            json!({"modifier_id":modifier.id,"pointer":"/params/object"}),
         ));
     }
     let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
@@ -3504,7 +3583,7 @@ pub(crate) fn apply_scene_operand_modifier(
     let operand = serde_json::to_value(operand).map_err(|error| {
         PotError::invalid_argument(format!("modifier operand serialization failed: {error}"))
     })?;
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve") {
+    if modifier.modifier_type == "curve" {
         resolved.runtime.target_mesh = Some(operand);
     } else {
         resolved.runtime.operand_mesh = Some(operand);

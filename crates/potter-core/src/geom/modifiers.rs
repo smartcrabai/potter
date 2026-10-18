@@ -36,6 +36,7 @@ mod decimate;
 pub(crate) mod deform;
 mod ocean;
 mod remesh_modes;
+mod shrinkwrap;
 pub mod simulation;
 mod subdivision_limit;
 mod subdivision_loose;
@@ -174,10 +175,12 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         validate_boolean_topology_suffix(modifiers, modifier_index, &is_active)?;
         let scene_operand_modifier = (matches!(
             modifier.modifier_type.as_str(),
-            "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform"
+            "boolean" | "surface_deform" | "mesh_deform"
         ) && ["object", "collection", "target"]
             .iter()
             .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)))
+            || (modifier.modifier_type == "shrinkwrap"
+                && modifier.params.get("target").is_some_and(Value::is_string))
             || (matches!(
                 modifier.modifier_type.as_str(),
                 "curve" | "hook" | "data_transfer"
@@ -304,7 +307,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "smooth" => smooth(&evaluated, modifier)?,
             "simple_deform" => advanced::simple_deform(&evaluated, modifier)?,
             "screw" => advanced::screw(&evaluated, modifier, context)?,
-            "shrinkwrap" => advanced::shrinkwrap(&evaluated, modifier)?,
+            "shrinkwrap" => shrinkwrap::evaluate(&evaluated, modifier)?,
             "curve" => advanced::curve(&evaluated, modifier)?,
             "hook" => advanced::hook(&evaluated, modifier)?,
             "skin" => advanced::skin_with_warnings(&evaluated, modifier, &mut warnings)?,
@@ -503,7 +506,7 @@ pub(crate) fn validate_boolean_topology_suffix(
     ))
 }
 
-fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> PotError {
+pub(super) fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> PotError {
     let (name, pointer) = match parameter {
         "bind_data" | "binding_data" => ("binding_data", "/binding_data".to_owned()),
         _ => (parameter, format!("/params/{parameter}")),
@@ -678,7 +681,7 @@ fn mesh_error(error: &MeshError) -> PotError {
     )
 }
 
-fn validated(mesh: &Mesh) -> Result<()> {
+pub(super) fn validated(mesh: &Mesh) -> Result<()> {
     mesh.validate().map_err(|error| mesh_error(&error))
 }
 
@@ -707,7 +710,7 @@ fn schema_value<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a Value> {
     })
 }
 
-fn string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
+pub(super) fn string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
     string_param_with_expected(modifier, name, "a string")
 }
 
@@ -745,7 +748,7 @@ pub(super) fn bool_param(modifier: &Modifier, name: &str) -> Result<bool> {
         .ok_or_else(|| invalid_parameter(modifier, name, "a boolean"))
 }
 
-fn uint_param(modifier: &Modifier, name: &str) -> Result<u64> {
+pub(super) fn uint_param(modifier: &Modifier, name: &str) -> Result<u64> {
     schema_value(modifier, name)?
         .as_u64()
         .ok_or_else(|| invalid_parameter(modifier, name, "a non-negative integer"))
@@ -2812,6 +2815,59 @@ fn check_subdivision_budget(
         ));
     }
     Ok(())
+}
+
+/// Limit positions of Shrinkwrap's coarse source vertices at its requested subsurf isolation.
+/// Blender calls `deform_coarse_vertices` on the source mesh, so use the same base samples and
+/// limit-surface evaluator as subdivision rather than refined control points.
+fn shrinkwrap_subdivision_positions(mesh: &Mesh, levels: u64) -> Result<Vec<DVec3>> {
+    validated(mesh)?;
+    let source = polygons(mesh)?;
+    let first_level_faces = mesh
+        .faces
+        .iter()
+        .try_fold(0_usize, |count, face| count.checked_add(face.vertices.len()))
+        .ok_or_else(|| {
+            PotError::new(ErrorCode::LimitExceeded, "shrinkwrap subdivision face count overflows")
+        })?;
+    check_subdivision_budget(
+        first_level_faces,
+        mesh.vertices.len(),
+        mesh.edges.len(),
+        levels,
+        0,
+    )?;
+
+    let points = positions(mesh);
+    let creases = subdivision_uv::Creases::from_values(edge_crease_values(mesh, true)?);
+    let non_manifold = NonManifold::new(
+        points.len(),
+        source.iter().map(|(face, _)| face.as_slice()),
+    );
+    let edge_sharpness = non_manifold.sharpened(&creases.sharpness);
+    let non_manifold_vertices: Vec<bool> = (0..points.len())
+        .map(|vertex| non_manifold.corner(vertex))
+        .collect();
+    let vertex_creases = vertex_crease_sharpness(mesh, true)?;
+    let loose = loose_edges(mesh)?;
+    let sharpness = subdivision_limit::BaseSharpness::Creases {
+        edges: &edge_sharpness,
+        vertices: &vertex_creases,
+        non_manifold: &non_manifold_vertices,
+        loose_edges: &loose,
+        preserve_corners: false,
+    };
+    let isolation = usize::try_from(levels).map_err(|_| {
+        PotError::new(ErrorCode::LimitExceeded, "shrinkwrap subdivision level overflows")
+    })?;
+    let limit = subdivision_limit::LimitSurface::build(&source, &points, &sharpness, isolation);
+    let samples = subdivision_limit::Samples::base(&source, mesh.vertices.len());
+    let evaluated = limit.evaluate(&samples.vertices);
+    Ok(evaluated
+        .into_iter()
+        .enumerate()
+        .map(|(index, point)| point.unwrap_or(points[index]))
+        .collect())
 }
 
 const BLENDER_EDGE_CREASE_MAX_SHARPNESS: f64 = 10.0;
