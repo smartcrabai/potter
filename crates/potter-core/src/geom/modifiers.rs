@@ -2421,10 +2421,7 @@ fn subdivision(
     let use_custom_normals = bool_param(modifier, "use_custom_normals")?;
     let mut result = mesh.clone();
     if levels == 0 {
-        // Without levels, only Use Custom Normals keeps the custom-normal state.
-        if !use_custom_normals {
-            result.attributes.remove("custom_normal");
-        }
+        // Blender's zero-level subdivision returns the input unchanged, custom normals included.
         return Ok(result);
     }
     // Subsurf interpolates the evaluated input loop normals only when the source has a custom layer
