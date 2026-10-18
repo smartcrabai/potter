@@ -6055,7 +6055,7 @@ fn uv_set_layer_name(set: usize) -> String {
 }
 
 /// The wrap of each UV axis (S, T) of a glTF texture reference, as Blender's importer reads its sampler (`texture.py`).
-/// An absent wrap is REPEAT, CLAMP_TO_EDGE is EXTEND, and MIRRORED_REPEAT is MIRROR.
+/// An absent wrap is REPEAT, `CLAMP_TO_EDGE` is EXTEND, and `MIRRORED_REPEAT` is MIRROR.
 fn texture_wrap(info: &Value, root: &Value) -> [ImageExtension; 2] {
     match info["index"]
         .as_u64()
@@ -6082,7 +6082,7 @@ pub(crate) fn texture_wrap_at(root: &Value, texture_index: usize) -> [ImageExten
     ]
 }
 
-/// One axis's wrap. A value that is neither REPEAT nor MIRRORED_REPEAT matches none of Blender's importer branches, so
+/// One axis's wrap. A value that is neither REPEAT nor `MIRRORED_REPEAT` matches none of Blender's importer branches, so
 /// the axis passes through under EXTEND and clamps; `gltf_import_losses` reports the value.
 fn sampler_wrap_axis(value: &Value) -> ImageExtension {
     match value.as_u64() {
@@ -15331,8 +15331,8 @@ mod tests {
         Ok(index.min(size - 1))
     }
 
-    /// One axis of a glTF sampler wrap: REPEAT (10497) takes the fraction, CLAMP_TO_EDGE (33071) clamps, and
-    /// MIRRORED_REPEAT (33648) reflects. Blender also clamps unknown wrap values in its mixed-wrap branch.
+    /// One axis of a glTF sampler wrap: `REPEAT` (10497) takes the fraction, `CLAMP_TO_EDGE` (33071) clamps, and
+    /// `MIRRORED_REPEAT` (33648) reflects. Blender also clamps unknown wrap values in its mixed-wrap branch.
     fn gltf_wrapped(wrap: u64, coordinate: f64) -> f64 {
         match wrap {
             10497 => coordinate.rem_euclid(1.0),
@@ -15347,6 +15347,10 @@ mod tests {
 
     #[test]
     fn sampler_wrap_samples_each_axis_as_the_gltf_sampler_says() -> TestResult {
+        const REPEAT: u64 = 10497;
+        const CLAMP: u64 = 33071;
+        const MIRRORED: u64 = 33648;
+        const UNKNOWN: u64 = 42;
         // Each wrap pair is a glTF sampler, and its S and T axes must sample the texel the glTF specification gives. The
         // uniform pairs import as fields and the mixed pairs as a graph, so both routes are checked against the same
         // expectation. The image is 4 x 4 with a distinct texel at every position.
@@ -15368,10 +15372,6 @@ mod tests {
         )?;
         let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
         std::fs::write(root.path().join("scene.bin"), &binary)?;
-        const REPEAT: u64 = 10497;
-        const CLAMP: u64 = 33071;
-        const MIRRORED: u64 = 33648;
-        const UNKNOWN: u64 = 42;
         // Coordinates off the texel edges, below 0 and above 1, so every wrap mode is exercised.
         let grid = [-0.4, -0.1, 0.1, 0.35, 0.6, 0.9, 1.2, 1.6];
         let names = ["UVMap".to_owned()];

@@ -383,7 +383,7 @@ fn sampled_from_ref(
 }
 
 /// The glTF sampler wrap of a Potter extension, as Blender's exporter writes it (`exp/sampler.py`): EXTEND and CLIP are
-/// CLAMP_TO_EDGE (CLIP is the closest, since glTF has no clip), MIRROR is MIRRORED_REPEAT, and REPEAT is the default.
+/// `CLAMP_TO_EDGE` (CLIP is the closest, since glTF has no clip), MIRROR is `MIRRORED_REPEAT`, and REPEAT is the default.
 pub(crate) fn texture_wrap_of(extension: ImageExtension) -> TextureWrap {
     match extension {
         ImageExtension::Repeat => TextureWrap::Repeat,
@@ -895,14 +895,13 @@ impl<'a> GraphReducer<'a> {
                     ..UvSource::default()
                 })
             }
-            ("ShaderNodeCombineXYZ", "Vector") => match self.uv_wrap_pattern(&link.from_node) {
-                Some((feed, wrap)) => {
+            ("ShaderNodeCombineXYZ", "Vector") => {
+                if let Some((feed, wrap)) = self.uv_wrap_pattern(&link.from_node) {
                     let depth = self.deeper(&link.from_node, depth)?;
                     let mut uv = self.uv_source(tex_id, feed, depth)?;
                     uv.wrap = wrap;
                     Ok(uv)
-                }
-                None => {
+                } else {
                     self.unsupported(
                         &link.from_node,
                         &source.node_type,
@@ -910,7 +909,7 @@ impl<'a> GraphReducer<'a> {
                     );
                     Ok(UvSource::default())
                 }
-            },
+            }
             _ => {
                 self.unsupported(
                     &link.from_node,
@@ -924,7 +923,7 @@ impl<'a> GraphReducer<'a> {
 
     /// Blender's per-axis UV wrap: a Combine XYZ whose X and Y are each the matching axis of one Separate XYZ, passed
     /// through or wrapped by a Math node. A `WRAP` with max 0 and min 1 is REPEAT, and a `PINGPONG` of scale 1 is
-    /// MIRRORED_REPEAT, as the exporter recognises them. Returns the link that feeds the Separate XYZ, and each axis's
+    /// `MIRRORED_REPEAT`, as the exporter recognises them. Returns the link that feeds the Separate XYZ, and each axis's
     /// wrap, with `None` for an axis passed through. Any other shape is not the pattern.
     fn uv_wrap_pattern(
         &self,
@@ -947,9 +946,12 @@ impl<'a> GraphReducer<'a> {
                         source.inputs.get(socket).and_then(Value::as_f64)
                     };
                     let wrap = match prop_str(source, "operation")? {
-                        "PINGPONG" if constant("Value_001")? == 1.0 => TextureWrap::MirroredRepeat,
+                        "PINGPONG" if crate::float::equal_f64(constant("Value_001")?, 1.0) => {
+                            TextureWrap::MirroredRepeat
+                        }
                         "WRAP"
-                            if constant("Value_001")? == 0.0 && constant("Value_002")? == 1.0 =>
+                            if crate::float::equal_f64(constant("Value_001")?, 0.0)
+                                && crate::float::equal_f64(constant("Value_002")?, 1.0) =>
                         {
                             TextureWrap::Repeat
                         }

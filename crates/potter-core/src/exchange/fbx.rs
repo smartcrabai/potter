@@ -89,7 +89,7 @@ struct TextureExport {
     property: &'static str,
     path: String,
     uv_layer: Option<String>,
-    /// Blender's exporter writes WrapModeU and WrapModeV as clamp (1) for any extension but REPEAT (0).
+    /// Blender's exporter writes `WrapModeU` and `WrapModeV` as clamp (1) for any extension but REPEAT (0).
     clamp: bool,
 }
 
