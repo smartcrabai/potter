@@ -1098,7 +1098,7 @@ fn load_strip_image(
     let (image_width, image_height, pixels) =
         storage::decode_pixels(&bytes, ImageColorspace::Srgb)?;
     let data = ImageData {
-        storage: Default::default(),
+        storage: crate::image::ImageStorage::default(),
         width: image_width,
         height: image_height,
         srgb: storage::decodes_srgb(ImageColorspace::Srgb),

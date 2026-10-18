@@ -115,7 +115,7 @@ pub(crate) fn decodes_srgb(colorspace: ImageColorspace) -> bool {
 }
 
 /// The alpha mode Blender gives a loaded image of this encoding when the file says nothing else. Blender reads an EXR
-/// with the OpenEXR convention, associated (premultiplied) alpha, because `oiio:UnassociatedAlpha` is absent: a loaded
+/// with the `OpenEXR` convention, associated (premultiplied) alpha, because `oiio:UnassociatedAlpha` is absent: a loaded
 /// EXR reports `alpha_mode` PREMUL (`image_metadata.cpp` `ImageMetaData`, and the `alpha_texture` readback oracle).
 /// Every other encoding is straight.
 pub(crate) fn default_alpha_mode(bytes: &[u8]) -> ImageAlphaMode {

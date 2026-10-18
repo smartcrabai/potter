@@ -2675,7 +2675,7 @@ mod shading_normal_tests {
         let images = BTreeMap::from([(
             "asym".to_owned(),
             ImageData {
-                storage: Default::default(),
+                storage: crate::image::ImageStorage::default(),
                 width: 2,
                 height: 2,
                 pixels: pixel.to_vec(),

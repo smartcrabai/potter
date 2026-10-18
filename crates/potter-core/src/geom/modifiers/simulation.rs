@@ -1450,7 +1450,7 @@ mod tests {
         );
 
         let image = crate::image::ImageData {
-            storage: Default::default(),
+            storage: crate::image::ImageStorage::default(),
             width: 1,
             height: 1,
             pixels: vec![[1.0, 0.5, 0.5, 1.0]],

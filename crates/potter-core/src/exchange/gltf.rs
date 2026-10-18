@@ -430,7 +430,7 @@ fn pack_channels(
     Ok(PackedImage {
         name,
         pixels: ImageData {
-            storage: Default::default(),
+            storage: crate::image::ImageStorage::default(),
             width,
             height,
             pixels,
@@ -14986,7 +14986,7 @@ mod tests {
         let images = BTreeMap::from([(
             image_id,
             crate::image::ImageData {
-                storage: Default::default(),
+                storage: crate::image::ImageStorage::default(),
                 width: 2,
                 height: 1,
                 pixels: vec![[0.5, 0.25, 0.75, 1.0], [0.5, 0.9, 0.1, 1.0]],

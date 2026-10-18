@@ -288,7 +288,7 @@ fn unsupported_movie_and_unresolved_scene_strips_report_errors() -> Result<(), B
     Ok(())
 }
 
-/// Potter's EXR writer stores associated alpha, as Blender's OpenEXR path does (`openexr_api.cpp`): a straight colour
+/// Potter's EXR writer stores associated alpha, as Blender's `OpenEXR` path does (`openexr_api.cpp`): a straight colour
 /// `[0.8, 0.4, 0.2]` with alpha 0.5 is stored as `[0.4, 0.2, 0.1, 0.5]`. Reloading the file gives the stored values
 /// (premultiplied), and `straight_pixels` returns the straight colour again. The Blender side of this file is the
 /// `exr32` premultiplied oracle in `tests/fixtures/alpha_texture` with texels `potter` (`generate_alpha_oracle.py`).
