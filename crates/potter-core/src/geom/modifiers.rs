@@ -333,7 +333,10 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
             "edge_split" => advanced::edge_split(&evaluated, modifier)?,
             "mask" => advanced::mask(&evaluated, modifier)?,
             "wireframe" => {
-                advanced::wireframe(&evaluated, modifier, context.object_material_slots)?
+                let material_slot_count = context
+                    .material_slot_count
+                    .unwrap_or_else(|| contextless_material_slot_count(&evaluated));
+                advanced::wireframe(&evaluated, modifier, material_slot_count)?
             }
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,
@@ -355,6 +358,20 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         warnings,
     })
 }
+/// The object material slot count when no scene object supplies one: one more than the largest
+/// face material index, or 0 for a mesh without faces. Shared by every modifier that needs the
+/// slot count without scene context (Solidify and Wireframe).
+pub(crate) fn contextless_material_slot_count(mesh: &Mesh) -> usize {
+    mesh.faces
+        .iter()
+        .map(|face| {
+            usize::try_from(face.material_index)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        })
+        .max()
+        .unwrap_or(0)
+}
 
 /// Evaluate the enabled modifier stack over a source mesh without node-group context.
 ///
@@ -366,11 +383,11 @@ pub fn evaluate_modifiers_with_groups(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
 ) -> Result<ModifierEvaluation> {
-    evaluate_modifiers_with_groups_at_frame(mesh, modifiers, node_groups, 1.0, 0)
+    evaluate_modifiers_with_groups_at_frame(mesh, modifiers, node_groups, 1.0, None)
 }
 
-/// Evaluate the enabled modifier stack using the requested scene frame. `object_material_slots` is
-/// the owning object's material slot count; mesh-only callers pass 0.
+/// Evaluate the enabled modifier stack using the requested scene frame. `material_slot_count` is
+/// the owning object's material slot count; mesh-only callers pass `None`.
 ///
 /// # Errors
 ///
@@ -381,7 +398,7 @@ pub fn evaluate_modifiers_with_groups_at_frame(
     modifiers: &[Modifier],
     node_groups: &Registry<NodeGroup>,
     frame: f64,
-    object_material_slots: usize,
+    material_slot_count: Option<usize>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_scene_context(
         mesh.clone(),
@@ -394,7 +411,7 @@ pub fn evaluate_modifiers_with_groups_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         ModifierEvaluationContext {
-            object_material_slots,
+            material_slot_count,
             ..ModifierEvaluationContext::default()
         },
         |_, modifier| modifier.enabled,
@@ -1598,7 +1615,7 @@ fn array(
     }
     let fit_length = match fit_type {
         "FIT_LENGTH" => configured_fit_length,
-        "FIT_CURVE" => array_curve_length(modifier, curve_path_lengths)?
+        "FIT_CURVE" => array_curve_length(modifier, curve_path_lengths, object_world_matrices)?
             .unwrap_or(f64::from(configured_fit_length)) as f32,
         _ => 0.0,
     };
@@ -1683,6 +1700,8 @@ fn array(
             };
         }
     }
+    // MOD_array.cc: `max_verts_num = 1 << 26` ("about 67 million vertices max"); past it Blender
+    // keeps one copy and sets the warning. The memory budget below applies under this limit too.
     let total_vertices = u128::from(count) * source_points.len() as u128
         + start_cap_parts.as_ref().map_or(0, |parts| parts.0.len()) as u128
         + end_cap_parts.as_ref().map_or(0, |parts| parts.0.len()) as u128;
@@ -1706,6 +1725,30 @@ fn array(
         warnings.push(array_count_warning(modifier, feature_id, message));
     }
     let count_usize = usize::try_from(count).map_err(|_| mesh_error(&MeshError::IdExhausted))?;
+    // Blender's 2^26-vertex limit has applied above. This budget bounds the memory the copies
+    // need, estimated from the output element counts before any of it is allocated.
+    let copy_count = count_usize as u128;
+    let source_elements = array_chunk_elements(
+        source_points.len(),
+        source_edges.len() + source_loose_edges.len(),
+        &source_polygons,
+    );
+    let mut output_elements = source_elements.map(|element| element * copy_count);
+    for (points, polygons, loose_edges, edges) in start_cap_parts.iter().chain(end_cap_parts.iter())
+    {
+        let cap = array_chunk_elements(points.len(), edges.len() + loose_edges.len(), polygons);
+        for (total, element) in output_elements.iter_mut().zip(cap) {
+            *total += element;
+        }
+    }
+    check_evaluation_memory_budget(
+        "array",
+        output_elements[0],
+        output_elements[1],
+        output_elements[2],
+        output_elements[3],
+        crate::geom::uv_layers::layer_count(mesh),
+    )?;
     let caps: Vec<&Mesh> = start_cap.into_iter().chain(end_cap).collect();
     let provenance = (!caps.is_empty())
         .then(|| array_provenance_source(mesh, &caps))
@@ -2107,11 +2150,22 @@ fn array_cap_mesh<'a>(
         })
 }
 
-/// The FIT_CURVE length of the `curve` object, or `None` when no curve path is known for it; the
-/// caller then keeps the `fit_length` parameter, as Blender does.
+/// Output elements (vertices, edges, faces, corners) of one array chunk, a copy of the source or a
+/// cap. Copies keep every edge and loose edge; merging only removes elements, so this bounds them.
+fn array_chunk_elements(vertices: usize, edges: usize, polygons: &[Polygon]) -> [u128; 4] {
+    let corners: usize = polygons.iter().map(|(face, _)| face.len()).sum();
+    [vertices, edges, polygons.len(), corners].map(|count| count as u128)
+}
+
+/// The FIT_CURVE length of the `curve` object. Blender's MOD_array.cc starts from
+/// `length = amd->length` (the fit_length parameter) and replaces it only in the block
+/// `fit_type == MOD_ARR_FITCURVE && curve_ob != nullptr` with the curve's animation-path length, and
+/// only when that path exists. So a null curve, or an object with no curve path, keeps `fit_length`
+/// (`None`). A curve ID that names no object is a dangling reference and is an error.
 fn array_curve_length(
     modifier: &Modifier,
     curve_path_lengths: &BTreeMap<Id, f64>,
+    object_world_matrices: &BTreeMap<Id, DMat4>,
 ) -> Result<Option<f64>> {
     let Some(target) = optional_string_param(modifier, "curve")
         .map_err(|_| invalid_parameter(modifier, "curve", "a curve object ID or null"))?
@@ -2120,7 +2174,17 @@ fn array_curve_length(
     };
     let target_id =
         Id::new(target).map_err(|_| invalid_parameter(modifier, "curve", "a valid object ID"))?;
-    Ok(curve_path_lengths.get(&target_id).copied())
+    if let Some(length) = curve_path_lengths.get(&target_id) {
+        return Ok(Some(*length));
+    }
+    if object_world_matrices.contains_key(&target_id) {
+        return Ok(None);
+    }
+    Err(PotError::with_details(
+        ErrorCode::TargetNotFound,
+        "array fit curve object was not found",
+        json!({"modifier_id": modifier.id, "curve": target_id}),
+    ))
 }
 
 pub(crate) fn evaluated_curve_path_length(
@@ -3058,38 +3122,54 @@ fn check_subdivision_budget(
             "subdivision corner estimate overflows",
         )
     })?;
-    // Include simultaneous input/output mesh storage and subdivision adjacency indexes. Each UV
-    // layer adds face-varying channels and UV attribute copies, measured at about 260 bytes per
-    // output corner.
-    let uv_corners = estimated_corners
-        .checked_mul(convert(uv_layer_count)?)
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "subdivision UV estimate overflows",
-            )
-        })?;
+    check_evaluation_memory_budget(
+        "subdivision",
+        estimated_vertices,
+        estimated_edges,
+        face_count,
+        estimated_corners,
+        uv_layer_count,
+    )
+}
+
+/// The evaluated-memory estimate shared by every budgeted modifier: 64 bytes per vertex, 128 per
+/// edge and per face, 32 per corner, and 260 more per corner for each UV layer. The UV figure was
+/// measured for subdivision, whose estimate also covers the input mesh and adjacency indexes. The
+/// check runs before the output is allocated.
+fn check_evaluation_memory_budget(
+    label: &str,
+    vertices: u128,
+    edges: u128,
+    faces: u128,
+    corners: u128,
+    uv_layer_count: usize,
+) -> Result<()> {
+    let overflow = |what: &str| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            format!("{label} {what} estimate overflows"),
+        )
+    };
+    let uv_layers = u128::try_from(uv_layer_count).map_err(|_| overflow("UV"))?;
+    let uv_corners = corners
+        .checked_mul(uv_layers)
+        .ok_or_else(|| overflow("UV"))?;
     let estimated_bytes = [
-        (estimated_vertices, 64_u128),
-        (estimated_edges, 128_u128),
-        (face_count, 128_u128),
-        (estimated_corners, 32_u128),
+        (vertices, 64_u128),
+        (edges, 128_u128),
+        (faces, 128_u128),
+        (corners, 32_u128),
         (uv_corners, 260_u128),
     ]
     .into_iter()
     .try_fold(0_u128, |total, (count, bytes_per_element)| {
         total.checked_add(count.checked_mul(bytes_per_element)?)
     })
-    .ok_or_else(|| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "subdivision memory estimate overflows",
-        )
-    })?;
+    .ok_or_else(|| overflow("memory"))?;
     if estimated_bytes > MAX_SUBDIVISION_MEMORY_BYTES {
         return Err(PotError::new(
             ErrorCode::LimitExceeded,
-            "subdivision exceeds the 8-GiB estimated evaluation memory budget",
+            format!("{label} exceeds the 8-GiB estimated evaluation memory budget"),
         ));
     }
     Ok(())
@@ -6345,7 +6425,10 @@ mod tests {
         model::{CurveData, CurvePoint, CurveSpline, Id, Modifier},
     };
 
-    use super::{check_subdivision_budget, evaluate_modifiers, evaluated_curve_path_length};
+    use super::{
+        check_subdivision_budget, contextless_material_slot_count, evaluate_modifiers,
+        evaluated_curve_path_length,
+    };
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
         Modifier {
@@ -6516,6 +6599,80 @@ mod tests {
             evaluated_curve_path_length(&curve, DMat4::from_scale(DVec3::splat(1.5))).unwrap();
 
         assert!((length - 3.0).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn array_fit_curve_without_curve_keeps_fit_length() {
+        // MOD_array.cc starts from `length = amd->length`; only a set curve_ob replaces it.
+        let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let result = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "array",
+                json!({
+                    "fit_type": "FIT_CURVE",
+                    "curve": null,
+                    "fit_length": 2.0,
+                    "use_relative_offset": false,
+                    "use_constant_offset": true,
+                    "constant_offset_displace": [1.0, 0.0, 0.0],
+                }),
+            )],
+        )
+        .unwrap();
+        // floor((2 + 1e-6) / 1) + 1 = 3 copies of the 8-vertex box.
+        assert_eq!(result.vertices.len(), 24);
+    }
+
+    #[test]
+    fn array_fit_curve_with_dangling_curve_is_target_not_found() {
+        let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let error = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "array",
+                json!({
+                    "fit_type": "FIT_CURVE",
+                    "curve": "missing_curve",
+                    "fit_length": 2.0,
+                    "use_relative_offset": false,
+                    "use_constant_offset": true,
+                    "constant_offset_displace": [1.0, 0.0, 0.0],
+                }),
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::TargetNotFound);
+    }
+
+    #[test]
+    fn array_output_past_memory_budget_is_refused_before_allocating() {
+        // 2^22 copies of the 8-vertex box: 3.4e7 vertices, under Blender's 2^26 limit, but about
+        // 15 GB of estimated evaluation memory against the 8 GiB budget.
+        let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let error = evaluate_modifiers(
+            &mesh,
+            &[with_params(
+                "array",
+                json!({
+                    "fit_type": "FIXED_COUNT",
+                    "count": 1_u64 << 22,
+                    "use_relative_offset": false,
+                    "use_constant_offset": true,
+                    "constant_offset_displace": [1.0, 0.0, 0.0],
+                }),
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::LimitExceeded);
+    }
+
+    #[test]
+    fn contextless_slot_count_is_one_past_the_largest_face_material() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        assert_eq!(contextless_material_slot_count(&mesh), 1);
+        mesh.faces[1].material_index = 2;
+        assert_eq!(contextless_material_slot_count(&mesh), 3);
     }
 
     #[test]

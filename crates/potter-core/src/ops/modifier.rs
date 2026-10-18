@@ -1067,9 +1067,11 @@ fn evaluate_modifier_output(
 ) -> Result<(crate::geom::Mesh, Vec<Option<Id>>)> {
     let modifier_id = &target_modifier.id;
     let modifier_stack = std::slice::from_ref(target_modifier);
-    let object_material_slots = engine.doc.nodes.get(target).map_or(0, |node| {
-        node.material_slot_count(engine.doc.data_blocks.get(data_id))
-    });
+    let material_slot_count = engine
+        .doc
+        .nodes
+        .get(target)
+        .map(|node| node.material_slot_count(engine.doc.data_blocks.get(data_id)));
     let mut material_slots = engine
         .doc
         .data_blocks
@@ -1180,7 +1182,7 @@ fn evaluate_modifier_output(
                 modifier_stack,
                 &engine.doc.node_groups,
                 engine.evaluation_frame,
-                object_material_slots,
+                material_slot_count,
             )?;
             engine.warnings.extend(
                 evaluation
@@ -1296,7 +1298,7 @@ fn evaluate_modifier_output(
                     purpose: crate::eval::EvaluationPurpose::Preview,
                     project_root: engine.asset_root,
                     cache_directory: engine.cache_directory,
-                    object_material_slots,
+                    material_slot_count,
                 },
                 |_, modifier| modifier.enabled,
                 |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {

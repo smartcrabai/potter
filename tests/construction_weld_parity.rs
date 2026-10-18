@@ -546,7 +546,7 @@ fn weld_matches_blender_522_selection_topology_and_attributes() {
                 &[modifier],
                 &Registry::<NodeGroup>::new(),
                 1.0,
-                variant["material_slots"].as_u64().expect("material slots") as usize,
+                Some(variant["material_slots"].as_u64().expect("material slots") as usize),
             )
             .expect("Weld evaluation succeeds");
             compare_output(

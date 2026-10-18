@@ -497,9 +497,11 @@ fn run_fixture(document: &str, modifier_type: &str) {
                 std::slice::from_ref(&modifier),
                 &Registry::<NodeGroup>::new(),
                 frame,
-                variant["material_slots"]
-                    .as_u64()
-                    .expect("fixture slot count") as usize,
+                Some(
+                    variant["material_slots"]
+                        .as_u64()
+                        .expect("fixture slot count") as usize,
+                ),
             )
             .expect("modifier evaluation succeeds");
             let label = format!("{} frame {frame}", variant["name"].as_str().unwrap());
@@ -576,7 +578,7 @@ fn build_face_prefix_keeps_valid_custom_normal_corner_order() {
         &[modifier],
         &Registry::<NodeGroup>::new(),
         2.0,
-        0,
+        None,
     )
     .expect("Build preserves the corner-normal state on a face prefix")
     .mesh;
@@ -635,7 +637,7 @@ fn wireframe_material_offset_rejects_non_integer_values() {
             &[modifier],
             &Registry::<NodeGroup>::new(),
             1.0,
-            3,
+            Some(3),
         )
         .is_err()
     );
