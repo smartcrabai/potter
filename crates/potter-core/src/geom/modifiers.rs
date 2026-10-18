@@ -2652,20 +2652,7 @@ fn subdivision_with_samples(
 )> {
     validated(mesh)?;
     let multires_data = if modifier.modifier_type == "multires" {
-        let data = multires::read(mesh)?;
-        if let Some(data) = &data
-            && data.corner_grids.is_none()
-            && data.external_filepath.is_some()
-        {
-            return Err(PotError::new(
-                ErrorCode::FileNotFound,
-                format!(
-                    "multires displacement data is unavailable from external file `{}`",
-                    data.external_filepath.as_deref().unwrap_or_default()
-                ),
-            ));
-        }
-        data
+        multires::read(mesh)?
     } else {
         None
     };
@@ -2769,6 +2756,19 @@ fn subdivision_with_samples(
     if levels == 0 {
         // Blender's zero-level subdivision returns the input unchanged, custom normals included.
         return Ok((result, None, None));
+    }
+    // Blender reads external displacement only when it initialises the grids, which level 0 never does.
+    if let Some(data) = &multires_data
+        && data.corner_grids.is_none()
+        && data.external_filepath.is_some()
+    {
+        return Err(PotError::new(
+            ErrorCode::FileNotFound,
+            format!(
+                "multires displacement data is unavailable from external file `{}`",
+                data.external_filepath.as_deref().unwrap_or_default()
+            ),
+        ));
     }
     // Subsurf interpolates the evaluated input loop normals only when the source has a custom layer
     // and the option is enabled; automatic corners participate as their evaluated fan normals.
@@ -3983,6 +3983,48 @@ fn multires_sculpt_limit_surface(
     ))
 }
 
+/// The limit point of `sample` plus its multires displacement: the value each output corner that
+/// uses the sample accumulates.
+fn multires_sample_position(
+    source: &Mesh,
+    data: &multires::DisplacementData,
+    limit: &subdivision_limit::LimitSurface,
+    sample: subdivision_limit::Sample,
+) -> Result<DVec3> {
+    let target_ptex_face = multires::ptex_face_for_sample(source, data, sample.face, sample.ptex)?;
+    let (sample_u, sample_v) = (sample.u as f32, sample.v as f32);
+    let mut surface_point = None;
+    let mut derivatives = |evaluated_ptex_face: usize, u: f32, v: f32| {
+        let (face, ptex) = multires::ptex_sample_for_face(source, data, evaluated_ptex_face)?;
+        let surface_sample = subdivision_limit::Sample {
+            face,
+            ptex,
+            u: f64::from(u),
+            v: f64::from(v),
+        };
+        let (point, du, dv) = limit.point_and_derivatives(surface_sample)?;
+        if evaluated_ptex_face == target_ptex_face && u == sample_u && v == sample_v {
+            surface_point = Some(point);
+        }
+        Ok((du, dv))
+    };
+    let displacement = multires::evaluate_sample(
+        source,
+        data,
+        target_ptex_face,
+        sample_u,
+        sample_v,
+        &mut derivatives,
+    )?;
+    let point = surface_point.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "multires limit evaluator did not return the sample point",
+        )
+    })?;
+    Ok(point + displacement)
+}
+
 fn apply_multires_displacements(
     source: &Mesh,
     data: &multires::DisplacementData,
@@ -3998,6 +4040,7 @@ fn apply_multires_displacements(
         .collect();
     let mut positions = vec![DVec3::ZERO; output.vertices.len()];
     let mut counts = vec![0_usize; output.vertices.len()];
+    let mut evaluated = HashMap::<(usize, usize, u64, u64), DVec3>::new();
     if samples.corners.len() != output.faces.len() {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -4012,46 +4055,24 @@ fn apply_multires_displacements(
             ));
         }
         for (&vertex_id, sample) in face.vertices.iter().zip(face_samples) {
-            let target_ptex_face =
-                multires::ptex_face_for_sample(source, data, sample.face, sample.ptex)?;
-            let (sample_u, sample_v) = (sample.u as f32, sample.v as f32);
-            let mut surface_point = None;
-            let mut derivatives = |evaluated_ptex_face: usize, u: f32, v: f32| {
-                let (face, ptex) =
-                    multires::ptex_sample_for_face(source, data, evaluated_ptex_face)?;
-                let surface_sample = subdivision_limit::Sample {
-                    face,
-                    ptex,
-                    u: f64::from(u),
-                    v: f64::from(v),
-                };
-                let (point, du, dv) = limit.point_and_derivatives(surface_sample)?;
-                if evaluated_ptex_face == target_ptex_face && u == sample_u && v == sample_v {
-                    surface_point = Some(point);
+            // The limit point and displacement depend only on the sample, so output corners that share
+            // a sample reuse one evaluation and accumulate the same value in the same order.
+            let key = (sample.face, sample.ptex, sample.u.to_bits(), sample.v.to_bits());
+            let value = match evaluated.get(&key) {
+                Some(value) => *value,
+                None => {
+                    let value = multires_sample_position(source, data, limit, *sample)?;
+                    evaluated.insert(key, value);
+                    value
                 }
-                Ok((du, dv))
             };
-            let displacement = multires::evaluate_sample(
-                source,
-                data,
-                target_ptex_face,
-                sample_u,
-                sample_v,
-                &mut derivatives,
-            )?;
-            let point = surface_point.ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InternalError,
-                    "multires limit evaluator did not return the sample point",
-                )
-            })?;
             let vertex_index = index_by_id.get(&vertex_id).copied().ok_or_else(|| {
                 PotError::new(
                     ErrorCode::InternalError,
                     "multires output face references a missing vertex",
                 )
             })?;
-            positions[vertex_index] += point + displacement;
+            positions[vertex_index] += value;
             counts[vertex_index] = counts[vertex_index].checked_add(1).ok_or_else(|| {
                 PotError::new(ErrorCode::LimitExceeded, "multires corner count overflows")
             })?;
