@@ -330,7 +330,8 @@ fn jpeg_base_color_texture_appears_in_beauty_preview() -> Result<(), Box<dyn Err
 }
 
 #[test]
-fn exr_image_load_unpremultiplies_alpha_and_keeps_linear_values() -> Result<(), Box<dyn Error>> {
+fn exr_image_load_keeps_the_stored_premultiplied_values_of_a_multilayer_file()
+-> Result<(), Box<dyn Error>> {
     use exr::prelude::{
         Encoding, Image as ExrImage, ImageAttributes, IntegerBounds, Layer, LayerAttributes,
         SpecificChannels, Vec2, WritableImage,
@@ -370,7 +371,8 @@ fn exr_image_load_unpremultiplies_alpha_and_keeps_linear_values() -> Result<(), 
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert_pixel(&scene, "exr", [0.5, 0.2, 0.1, 0.5], 0.002)?;
+    // The Combined layer's stored values, as Blender's readback of a premultiplied EXR gives them (`alpha_texture`).
+    assert_pixel(&scene, "exr", [0.25, 0.1, 0.05, 0.5], 0.002)?;
     Ok(())
 }
 #[test]
@@ -400,7 +402,8 @@ fn half_float_exr_samples_decode_into_f64_pixels() -> Result<(), Box<dyn Error>>
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert_pixel(&scene, "half_exr", [0.5, 0.2, 0.1, 0.5], 0.002)?;
+    // Blender's readback of the same half values with alpha 0.5 is [0.25, 0.0999, 0.0500, 0.5]; a premultiplied EXR keeps them.
+    assert_pixel(&scene, "half_exr", [0.25, 0.1, 0.05, 0.5], 0.002)?;
     Ok(())
 }
 

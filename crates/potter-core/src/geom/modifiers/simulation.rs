@@ -684,6 +684,8 @@ fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
     if width == 0 || height == 0 || image.pixels.len() != pixel_count {
         return Err(invalid("image texture dimensions do not match its pixels"));
     }
+    // Straight colour, as Blender's texture reader sees it (`straight_pixels` converts a premultiplied image).
+    let pixels = image.straight_pixels();
     if uv.iter().any(|coordinate| !coordinate.is_finite()) {
         return Err(invalid("image texture coordinates must be finite"));
     }
@@ -706,7 +708,7 @@ fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
             .map_err(|_| invalid("image texture x coordinate is invalid"))?;
         let y = usize::try_from(y.rem_euclid(height_i64))
             .map_err(|_| invalid("image texture y coordinate is invalid"))?;
-        return Ok(image.pixels[y * width + x]);
+        return Ok(pixels[y * width + x]);
     }
     let x = uv[0].rem_euclid(1.0) * width_f64 - 0.5;
     let y = uv[1].rem_euclid(1.0) * height_f64 - 0.5;
@@ -733,13 +735,13 @@ fn sample_repeated_image(image: &ImageData, uv: [f64; 2]) -> Result<[f64; 4]> {
     let fraction_x = x - x_floor;
     let fraction_y = y - y_floor;
     let top: [f64; 4] = std::array::from_fn(|channel| {
-        let first = image.pixels[y0 * width + x0][channel];
-        let second = image.pixels[y0 * width + x1][channel];
+        let first = pixels[y0 * width + x0][channel];
+        let second = pixels[y0 * width + x1][channel];
         first + (second - first) * fraction_x
     });
     let bottom: [f64; 4] = std::array::from_fn(|channel| {
-        let first = image.pixels[y1 * width + x0][channel];
-        let second = image.pixels[y1 * width + x1][channel];
+        let first = pixels[y1 * width + x0][channel];
+        let second = pixels[y1 * width + x1][channel];
         first + (second - first) * fraction_x
     });
     Ok(std::array::from_fn(|channel| {

@@ -780,7 +780,11 @@ fn add_blender_image_pixels(document: &mut Value, project: &Project) -> Result<(
             project.path(),
             crate::image::ImageInterpolation::Linear,
         )?;
-        image_json["pixels"] = json!(blender_image_pixels(&image, data.width, &data.pixels));
+        image_json["pixels"] = json!(blender_image_pixels(
+            &image,
+            data.width,
+            &data.straight_pixels()
+        ));
         if let Some(png) = eight_bit_png_bytes(&image, project)? {
             image_json["png_bytes"] = json!(png);
         }

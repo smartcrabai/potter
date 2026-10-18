@@ -490,7 +490,8 @@ fn encode_png_with_colorspace(colorspace: ImageColorspace, pixels: &ImageData) -
         ));
     }
     let mut raw = Vec::with_capacity(pixel_count.saturating_mul(4));
-    for pixel in &pixels.pixels {
+    let straight = pixels.straight_pixels();
+    for pixel in straight.iter() {
         for (index, component) in pixel.iter().copied().enumerate() {
             if !component.is_finite() {
                 return Err(PotError::new(
