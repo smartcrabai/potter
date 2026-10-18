@@ -5807,12 +5807,54 @@ fn read_buffer_view_bytes(root: &Value, buffers: &[Vec<u8>], view_index: usize) 
         .ok_or_else(|| import_error("glTF image buffer data is truncated"))
 }
 
+/// The glTF image indices used as data: the metallic-roughness, normal and occlusion textures of every
+/// material a primitive references. Blender's importer creates a material only for a primitive that uses
+/// it, and sets `is_data` on the image of each data texture (`io_scene_gltf2` `blender/imp/texture.py`).
+/// Blender's image is shared by its colour uses too, and nothing resets `is_data`, so one data use makes
+/// the image Non-Color for every use.
+fn data_image_indices(root: &Value) -> BTreeSet<usize> {
+    let used_materials = root["meshes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
+        .filter_map(|primitive| primitive["material"].as_u64())
+        .collect::<BTreeSet<u64>>();
+    let mut images = BTreeSet::new();
+    for material_index in used_materials {
+        let Some(material) = usize::try_from(material_index)
+            .ok()
+            .and_then(|index| root["materials"].get(index))
+        else {
+            continue;
+        };
+        let data_slots = [
+            &material["pbrMetallicRoughness"]["metallicRoughnessTexture"],
+            &material["normalTexture"],
+            &material["occlusionTexture"],
+        ];
+        for info in data_slots {
+            let source = info["index"]
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| root["textures"].get(index))
+                .and_then(|texture| texture["source"].as_u64())
+                .and_then(|source| usize::try_from(source).ok());
+            if let Some(source) = source {
+                images.insert(source);
+            }
+        }
+    }
+    images
+}
+
 fn import_images(
     root: &Value,
     buffers: &[Vec<u8>],
     source_path: &Path,
     doc: &mut SceneDoc,
     assets: &mut Vec<(String, Vec<u8>)>,
+    data_images: &BTreeSet<usize>,
 ) -> Result<Vec<Id>> {
     let image_values = root["images"].as_array().map_or(&[][..], Vec::as_slice);
     let mut image_ids = Vec::with_capacity(image_values.len());
@@ -5898,7 +5940,11 @@ fn import_images(
             Image {
                 name,
                 source: ImageSource::Packed,
-                colorspace: ImageColorspace::Srgb,
+                colorspace: if data_images.contains(&index) {
+                    ImageColorspace::NonColor
+                } else {
+                    ImageColorspace::Srgb
+                },
                 width,
                 height,
                 tiles: Vec::new(),
@@ -6903,7 +6949,8 @@ pub(crate) fn import_indexed(
     }
 
     let mut doc = SceneDoc::new(scene_id);
-    let image_ids = import_images(&root, &binaries, path, &mut doc, &mut assets)?;
+    let data_images = data_image_indices(&root);
+    let image_ids = import_images(&root, &binaries, path, &mut doc, &mut assets, &data_images)?;
     if let Some(scene) = doc.scenes.get_mut(&doc.active_scene) {
         if let Some(fps) = root["extras"]["potter"]["fps"].as_u64() {
             scene.fps = u32::try_from(fps)
@@ -14777,6 +14824,63 @@ mod tests {
         assert_eq!(material.metallic, 1.0);
         assert_eq!(material.roughness, 1.0);
         assert_eq!(material.base_color, [1.0; 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn data_images_import_non_color_and_a_shared_image_follows_its_data_use() -> TestResult {
+        // Blender's importer sets `is_data` on the image of each data texture, and nothing resets it, so an
+        // image used as both base color and metallic-roughness is Non-Color everywhere. A colour-only image
+        // stays sRGB and a normal-map image is Non-Color.
+        let root = tempfile::tempdir()?;
+        let doc = scene_with_asset_root(
+            root.path(),
+            &json!([
+                {"op":"image.create","id":"paint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.5,0.25,0.75,1.0]},
+                {"op":"image.create","id":"tint","width":1,"height":1,"colorspace":"srgb","fill_color":[0.9,0.6,0.3,1.0]},
+                {"op":"image.create","id":"bump","width":1,"height":1,"colorspace":"linear","fill_color":[0.5,0.5,1.0,1.0]},
+                {"op":"material.create","id":"shared","base_color_texture":{"image":"paint"},"normal_texture":{"image":"bump"}},
+                {"op":"material.create","id":"tinted","base_color_texture":{"image":"tint"}},
+                {"op":"node.create","id":"sheet","kind":"plane","params":{"size":1.0},"material":"shared"},
+                {"op":"node.create","id":"other","kind":"plane","params":{"size":1.0},"material":"tinted"}
+            ]),
+        )?;
+        let imported = import_edited(&doc, |root, _| {
+            // Point the shared material's metallic-roughness at the same texture as its base color.
+            let materials = root["materials"]
+                .as_array_mut()
+                .ok_or("glTF materials are missing")?;
+            let shared = materials
+                .iter_mut()
+                .find(|material| material["extras"]["potter"]["id"] == "shared")
+                .ok_or("the shared material is missing")?;
+            let base = shared["pbrMetallicRoughness"]["baseColorTexture"].clone();
+            shared["pbrMetallicRoughness"]["metallicRoughnessTexture"] = base;
+            Ok(())
+        })??;
+        let colorspace = |name: &str| -> TestResult<crate::model::ImageColorspace> {
+            Ok(imported
+                .doc
+                .images
+                .get(&crate::model::Id::new(name)?)
+                .ok_or("the imported image is missing")?
+                .colorspace)
+        };
+        assert_eq!(
+            colorspace("paint")?,
+            crate::model::ImageColorspace::NonColor,
+            "an image also used as metallic-roughness data is Non-Color"
+        );
+        assert_eq!(
+            colorspace("bump")?,
+            crate::model::ImageColorspace::NonColor,
+            "a normal-map image is Non-Color"
+        );
+        assert_eq!(
+            colorspace("tint")?,
+            crate::model::ImageColorspace::Srgb,
+            "a colour-only image stays sRGB"
+        );
         Ok(())
     }
 
