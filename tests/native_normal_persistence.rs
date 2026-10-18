@@ -12,6 +12,9 @@
 //!   and Blender's own reference confirms every normal and Auto status.
 //! * `subdivision_level_two_keeps_only_the_loop_basis_until_authoring`: at level 2 the loop basis
 //!   differs from storage, so the saved layer holds only `corner_order`; authoring keeps that basis.
+//! * `mirror_raw_codes_round_trip_before_bisect_and_wave`: Blender applies X Mirror, Potter exports
+//!   the raw codes and loop basis, and a second project reimports them before Y-bisect Mirror and
+//!   Wave. The final geometry and corner normals match Blender's own X, Y-bisect, Wave reference.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -36,8 +39,9 @@ use blender_code_tolerance::code_within_beta_step;
 use native_oracle::{
     BYTE_TOLERANCE, FLOAT_TOLERANCE, NORMAL_TOLERANCE, StoredCorner, TestResult, apply_operations,
     assert_close, assert_floats, attribute, build_oracle, code_pair, dump_blend, dumped_object,
-    export, floats, has_normal_code_values, import_blend, mesh_of_node, node_id, normal_code_rows,
-    number, read_scene, run_blender, run_blender_arguments, vec3, vectors_close, write_script,
+    export, floats, has_normal_code_values, import_blend, losses, mesh_of_node, node_id,
+    normal_code_rows, number, read_scene, run_blender, run_blender_arguments, vec3, vectors_close,
+    write_script,
 };
 use serde_json::{Map, Value, json};
 use tempfile::tempdir;
@@ -1102,5 +1106,234 @@ fn nonmanifold_subdivision_auto_codes_match_blenders_evaluated_fan() -> TestResu
         }
     }
     assert_eq!(matched.len(), source_loops.len());
+    Ok(())
+}
+
+const MIRROR_BLEND_CHAIN: &str = r#"
+import bpy
+import json
+import sys
+
+fixture_path, base_path, mirror_path, bisect_path, expected_path = sys.argv[sys.argv.index("--") + 1:]
+with open(fixture_path, encoding="utf-8") as handle:
+    source = json.load(handle)["input"]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+mesh = bpy.data.meshes.new("SubjectMesh")
+mesh.from_pydata(source["vertices"], source.get("edges", []), source["faces"])
+mesh.update()
+for polygon, smooth in zip(mesh.polygons, source["face_smooth"]):
+    polygon.use_smooth = smooth
+edge_by_vertices = {tuple(sorted(edge.vertices)): edge for edge in mesh.edges}
+for a, b in source.get("sharp_edges", []):
+    edge_by_vertices[tuple(sorted((a, b)))].use_edge_sharp = True
+for a, b in source.get("seam_edges", []):
+    edge_by_vertices[tuple(sorted((a, b)))].use_seam = True
+mesh.update()
+corner_normals = []
+for row, polygon in zip(source["custom_normals"], mesh.polygons):
+    for corner in range(polygon.loop_total):
+        vector = row[corner]
+        corner_normals.append((0.0, 0.0, 0.0) if vector is None else tuple(vector))
+mesh.normals_split_custom_set(corner_normals)
+subject = bpy.data.objects.new("Subject", mesh)
+bpy.context.scene.collection.objects.link(subject)
+bpy.context.view_layer.objects.active = subject
+subject.select_set(True)
+bpy.ops.wm.save_as_mainfile(filepath=base_path)
+mirror_x = subject.modifiers.new("MirrorX", "MIRROR")
+mirror_x.use_axis = (True, False, False)
+bpy.ops.object.modifier_apply(modifier=mirror_x.name)
+bpy.ops.wm.save_as_mainfile(filepath=mirror_path)
+mirror_y = subject.modifiers.new("MirrorY", "MIRROR")
+mirror_y.use_axis = (False, True, False)
+mirror_y.use_bisect_axis = (False, True, False)
+bpy.ops.object.modifier_apply(modifier=mirror_y.name)
+bpy.ops.wm.save_as_mainfile(filepath=bisect_path)
+wave = subject.modifiers.new("Wave", "WAVE")
+wave.height = 0.2
+wave.width = 1.5
+wave.speed = 0.0
+wave.time_offset = 0.25
+bpy.ops.object.modifier_apply(modifier=wave.name)
+bpy.ops.wm.save_as_mainfile(filepath=expected_path)
+"#;
+
+fn codes_by_loop(mesh: &Value) -> TestResult<BTreeMap<usize, StoredCorner>> {
+    let codes = normal_code_rows(mesh)?;
+    let ordinals = loop_ordinals(mesh)?;
+    let mut result = BTreeMap::new();
+    for (code_row, ordinal_row) in codes.iter().zip(ordinals) {
+        for (code, ordinal) in code_row.iter().zip(ordinal_row) {
+            if result.insert(ordinal, *code).is_some() {
+                return Err(format!("duplicate custom-normal loop ordinal {ordinal}").into());
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn dumped_reference_loop_rows(object: &Value) -> TestResult<Vec<Value>> {
+    let vertices = object["vertices"]
+        .as_array()
+        .ok_or("dumped vertices are missing")?;
+    let loops = object["loops"]
+        .as_array()
+        .ok_or("dumped loops are missing")?;
+    let normals = object["corner_normals"]
+        .as_array()
+        .ok_or("dumped corner normals are missing")?;
+    let mut result = Vec::with_capacity(loops.len());
+    for face in object["faces"]
+        .as_array()
+        .ok_or("dumped faces are missing")?
+    {
+        let start = usize::try_from(face["loop_start"].as_u64().ok_or("loop start is missing")?)?;
+        let count = usize::try_from(face["loop_total"].as_u64().ok_or("loop count is missing")?)?;
+        let center = face.get("center").ok_or("face center is missing")?;
+        for loop_index in start..start + count {
+            let vertex = usize::try_from(
+                loops[loop_index]["vertex"]
+                    .as_u64()
+                    .ok_or("loop vertex is missing")?,
+            )?;
+            result.push(json!({
+                "co": vertices[vertex],
+                "center": center,
+                "normal": normals[loop_index],
+            }));
+        }
+    }
+    Ok(result)
+}
+
+#[test]
+fn mirror_raw_codes_round_trip_before_bisect_and_wave() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/pr18b_mirror/custom_chain_x_then_y_vertex.json");
+    let script = write_script(root.path(), "mirror_code_chain.py", MIRROR_BLEND_CHAIN)?;
+    let base = root.path().join("mirror_base.blend");
+    let expected_stage = root.path().join("mirror_x_reference.blend");
+    let expected_bisect = root.path().join("mirror_x_y_bisect_reference.blend");
+    let expected_final = root.path().join("mirror_x_y_wave_reference.blend");
+    run_blender_arguments(
+        &blender,
+        &script,
+        None,
+        &[
+            &fixture,
+            &base,
+            &expected_stage,
+            &expected_bisect,
+            &expected_final,
+        ],
+    )?;
+
+    let (project, imported) = import_blend(&blender, root.path(), "mirror_x", &base)?;
+    assert!(
+        losses(&imported).is_empty(),
+        "Mirror base import losses: {:?}",
+        losses(&imported)
+    );
+    let imported_scene = read_scene(&project)?;
+    let subject = node_id(&imported_scene, "Subject")?;
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op":"modifier.create","target":{"id":subject},"id":"mirror_x","type":"mirror","params":{"use_axis":[true,false,false]}},
+            {"op":"modifier.apply","target":{"id":subject},"modifier_id":"mirror_x"}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let stage_scene = read_scene(&project)?;
+    let stage_mesh = mesh_of_node(&stage_scene, "Subject")?;
+    let stage_codes = codes_by_loop(stage_mesh)?;
+    let stage_blend = root.path().join("potter_mirror_x.blend");
+    export(&blender, &project, "blend", &stage_blend)?;
+    let stage_dump = dump_blend(&blender, root.path(), &stage_blend, "potter_mirror_x")?;
+    check_codes_against_blender(
+        stage_mesh,
+        dumped_object(&stage_dump, "Subject")?,
+        "Mirror X output",
+    )?;
+
+    let (reloaded_project, _) =
+        import_blend(&blender, root.path(), "mirror_x_reloaded", &stage_blend)?;
+    let reloaded_scene = read_scene(&reloaded_project)?;
+    let reloaded_mesh = mesh_of_node(&reloaded_scene, "Subject")?;
+    assert_eq!(
+        codes_by_loop(reloaded_mesh)?,
+        stage_codes,
+        "raw Mirror codes across .blend reload"
+    );
+    let reloaded_subject = node_id(&reloaded_scene, "Subject")?;
+    let continued = apply_operations(
+        &reloaded_project,
+        root.path(),
+        json!([
+            {"op":"modifier.create","target":{"id":reloaded_subject},"id":"mirror_y","type":"mirror","params":{"use_axis":[false,true,false],"use_bisect_axis":[false,true,false]}},
+            {"op":"modifier.apply","target":{"id":reloaded_subject},"modifier_id":"mirror_y"},
+            {"op":"modifier.create","target":{"id":reloaded_subject},"id":"wave","type":"wave","params":{"height":0.2,"width":1.5,"speed":0.0,"time_offset":0.25}},
+            {"op":"modifier.apply","target":{"id":reloaded_subject},"modifier_id":"wave"}
+        ]),
+    )?;
+    assert_eq!(continued["ok"], true, "{continued}");
+    let continued_blend = root.path().join("potter_mirror_x_y_wave.blend");
+    export(&blender, &reloaded_project, "blend", &continued_blend)?;
+    let actual_dump = dump_blend(
+        &blender,
+        root.path(),
+        &continued_blend,
+        "potter_mirror_x_y_wave",
+    )?;
+    let expected_dump = dump_blend(
+        &blender,
+        root.path(),
+        &expected_final,
+        "blender_mirror_x_y_wave",
+    )?;
+    let bisect_dump = dump_blend(
+        &blender,
+        root.path(),
+        &expected_bisect,
+        "blender_mirror_x_y_bisect",
+    )?;
+    let bisected_object = dumped_object(&bisect_dump, "Subject")?;
+    let expected_object = dumped_object(&expected_dump, "Subject")?;
+    let before_wave = bisected_object["vertices"]
+        .as_array()
+        .ok_or("bisect vertices missing")?;
+    let after_wave = expected_object["vertices"]
+        .as_array()
+        .ok_or("wave vertices missing")?;
+    assert_eq!(
+        before_wave.len(),
+        after_wave.len(),
+        "Wave preserves Mirror topology"
+    );
+    let wave_changed_positions = before_wave
+        .iter()
+        .zip(after_wave)
+        .map(|(before, after)| -> TestResult<bool> {
+            Ok(corner_distance(vec3(before)?, vec3(after)?) > 1.0e-4)
+        })
+        .collect::<TestResult<Vec<_>>>()?
+        .into_iter()
+        .any(|changed| changed);
+    assert!(
+        wave_changed_positions,
+        "Wave must deform the bisected Mirror output"
+    );
+    let expected_loops = dumped_reference_loop_rows(expected_object)?;
+    let actual = blender_loops(dumped_object(&actual_dump, "Subject")?)?;
+    match_reference_normals(
+        &actual,
+        &expected_loops,
+        "reloaded Mirror X then Y bisect and Wave",
+    )?;
     Ok(())
 }

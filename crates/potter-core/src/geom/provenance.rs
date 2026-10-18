@@ -90,8 +90,8 @@ pub(crate) fn remap_attributes_skipping(
 }
 
 /// [`remap_attributes`] with each output edge's source edges given explicitly, in `output.edges`
-/// order. An empty entry is an edge with no source and takes the default for every edge attribute;
-/// [`remap_attributes`] derives the sources from the vertex origins instead.
+/// order. An empty entry is an edge with no source (a cut span or a chord) and takes the default for
+/// every edge attribute; [`remap_attributes`] derives the sources from the vertex origins instead.
 ///
 /// # Errors
 ///

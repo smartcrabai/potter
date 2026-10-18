@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glam::{DMat4, DVec3};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -36,6 +36,7 @@ mod bevel_shading;
 mod bevel_vmesh;
 mod decimate;
 pub(crate) mod deform;
+mod mirror;
 mod ocean;
 mod remesh_modes;
 pub mod simulation;
@@ -46,8 +47,6 @@ mod subdivision_normals;
 mod subdivision_uv;
 use subdivision_limit::Samples;
 type Polygon = (Vec<usize>, u32);
-/// Output edge index map and per-output-edge source edge index, for explicit edge provenance.
-type EdgeSourceIndex<'a> = (&'a HashMap<(usize, usize), usize>, &'a [usize]);
 type BevelEdgeFacesWithMaterial = BTreeMap<(usize, usize), Vec<(usize, usize, usize, u32)>>;
 /// Merged points, polygons, and edges, with the input element each output point and polygon came from.
 struct MergedGeometry {
@@ -312,7 +311,12 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         settle_custom_normals(&mut evaluated)?;
         let attributes_before = attribute_labels(&evaluated);
         evaluated = match modifier.modifier_type.as_str() {
-            "mirror" => mirror(&evaluated, modifier)?,
+            "mirror" => mirror::mirror(
+                &evaluated,
+                modifier,
+                owner_world_matrix,
+                object_world_matrices,
+            )?,
             "array" => array(
                 &evaluated,
                 modifier,
@@ -915,43 +919,11 @@ fn loose_edges(mesh: &Mesh) -> Result<Vec<[usize; 2]>> {
         .collect())
 }
 
-fn build_mesh(
+/// The vertices, polygons, and loose edges with no attributes; `build_mesh` carries them over.
+fn build_topology(
     points: Vec<DVec3>,
     polygons: Vec<Polygon>,
     loose_edges: Vec<[usize; 2]>,
-    origin: &Origin,
-    source: &Mesh,
-) -> Result<Mesh> {
-    build_mesh_inner(points, polygons, loose_edges, origin, source, None)
-}
-
-/// Rebuild with explicit edge sources; the index map and source slice share the caller's edge order.
-fn build_mesh_with_edge_sources(
-    points: Vec<DVec3>,
-    polygons: Vec<Polygon>,
-    loose_edges: Vec<[usize; 2]>,
-    origin: &Origin,
-    source: &Mesh,
-    output_edge_indices: &HashMap<(usize, usize), usize>,
-    output_edge_sources: &[usize],
-) -> Result<Mesh> {
-    build_mesh_inner(
-        points,
-        polygons,
-        loose_edges,
-        origin,
-        source,
-        Some((output_edge_indices, output_edge_sources)),
-    )
-}
-
-fn build_mesh_inner(
-    points: Vec<DVec3>,
-    polygons: Vec<Polygon>,
-    loose_edges: Vec<[usize; 2]>,
-    origin: &Origin,
-    source: &Mesh,
-    edge_sources: Option<EdgeSourceIndex<'_>>,
 ) -> Result<Mesh> {
     let mut result = Mesh::new();
     for point in points {
@@ -1004,29 +976,53 @@ fn build_mesh_inner(
                 .map_err(|error| mesh_error(&error))?;
         }
     }
-    if let Some((output_edge_indices, output_edge_sources)) = edge_sources {
-        let output_indices = id_indices(&result);
-        let edge_origins = result
-            .edges
-            .iter()
-            .map(|edge| {
-                output_indices
-                    .get(&edge.vertices[0])
-                    .copied()
-                    .zip(output_indices.get(&edge.vertices[1]).copied())
-                    .and_then(|(first, second)| {
-                        output_edge_indices
-                            .get(&edge_key(first, second))
-                            .and_then(|&index| output_edge_sources.get(index))
-                    })
-                    .map(|&source| vec![(source, 1.0)])
-                    .unwrap_or_default()
-            })
-            .collect();
-        remap_attributes_with_edges(source, &mut result, origin, edge_origins)?;
-    } else {
-        remap_attributes(source, &mut result, origin)?;
-    }
+    Ok(result)
+}
+
+fn build_mesh(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    loose_edges: Vec<[usize; 2]>,
+    origin: &Origin,
+    source: &Mesh,
+) -> Result<Mesh> {
+    let mut result = build_topology(points, polygons, loose_edges)?;
+    remap_attributes(source, &mut result, origin)?;
+    validated(&result)?;
+    Ok(result)
+}
+
+/// [`build_mesh`] with each output edge's source edge given explicitly. `output_edge_indices` maps a
+/// vertex-index pair to its position in `output_edge_sources`, the input edge that output edge copies.
+fn build_mesh_with_edge_sources(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    loose_edges: Vec<[usize; 2]>,
+    origin: &Origin,
+    source: &Mesh,
+    output_edge_indices: &HashMap<(usize, usize), usize>,
+    output_edge_sources: &[usize],
+) -> Result<Mesh> {
+    let mut result = build_topology(points, polygons, loose_edges)?;
+    let output_indices = id_indices(&result);
+    let edge_origins = result
+        .edges
+        .iter()
+        .map(|edge| {
+            output_indices
+                .get(&edge.vertices[0])
+                .copied()
+                .zip(output_indices.get(&edge.vertices[1]).copied())
+                .and_then(|(first, second)| {
+                    output_edge_indices
+                        .get(&edge_key(first, second))
+                        .and_then(|&index| output_edge_sources.get(index))
+                })
+                .map(|&source_edge| vec![(source_edge, 1.0)])
+                .unwrap_or_default()
+        })
+        .collect();
+    remap_attributes_with_edges(source, &mut result, origin, edge_origins)?;
     validated(&result)?;
     Ok(result)
 }
@@ -1115,96 +1111,6 @@ fn mean_origin(members: impl IntoIterator<Item = Option<usize>>) -> Vec<(usize, 
     blend_weights(members.into_iter().map(|member| (member, share)))
 }
 
-/// The group a mirrored copy takes weight from: the `.L`/`.R` side-swapped name when the mesh has
-/// that group, otherwise the name itself.
-fn mirrored_group_name(name: &str, groups: &Map<String, Value>, flipped: bool) -> String {
-    let swapped = name
-        .strip_suffix(".L")
-        .map(|stem| format!("{stem}.R"))
-        .or_else(|| name.strip_suffix(".R").map(|stem| format!("{stem}.L")));
-    match swapped {
-        Some(swapped) if flipped && groups.contains_key(&swapped) => swapped,
-        _ => name.to_owned(),
-    }
-}
-
-/// Rewrites `vertex_groups` of a mirrored `output`. `members[o]` lists the input points merged into
-/// output vertex `o`; input point `c * vertex_count + v` is copy `c` of source vertex `v`. A copy
-/// with an odd number of mirrored axes takes each group under its side-swapped name, and a merged
-/// point averages its members with absent weights counted as zero.
-fn mirror_vertex_groups(
-    source: &Mesh,
-    output: &mut Mesh,
-    members: &[Vec<usize>],
-    vertex_count: usize,
-) {
-    let Some(source_groups) = source
-        .attributes
-        .get("vertex_groups")
-        .and_then(Value::as_object)
-    else {
-        return;
-    };
-    let names: Vec<&str> = source_groups.keys().map(String::as_str).collect();
-    let position: HashMap<&str, usize> = names
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, name)| (name, index))
-        .collect();
-    let group_values: Vec<&Value> = source_groups.values().collect();
-    // `targets[usize::from(flipped)][group]`: the group a copy with that flip state takes weight from.
-    // A mirrored name is an existing group or the name itself, so the fallback is never taken.
-    let targets: [Vec<usize>; 2] = [false, true].map(|flipped| {
-        names
-            .iter()
-            .enumerate()
-            .map(|(group, name)| {
-                let target = mirrored_group_name(name, source_groups, flipped);
-                position.get(target.as_str()).copied().unwrap_or(group)
-            })
-            .collect()
-    });
-    let source_keys: Vec<String> = source
-        .vertices
-        .iter()
-        .map(|vertex| format!("v{}", vertex.id))
-        .collect();
-    // Summed weight per group and output vertex; `None` when no copy has an entry for the group.
-    let mut sums = vec![vec![None::<f64>; output.vertices.len()]; names.len()];
-    for (vertex, copies) in members.iter().enumerate().take(output.vertices.len()) {
-        let share = 1.0 / usize_as_f64(copies.len());
-        for &copy in copies {
-            let flipped = (copy / vertex_count).count_ones() % 2 == 1;
-            let source_key = source_keys[copy % vertex_count].as_str();
-            for (group, values) in group_values.iter().enumerate() {
-                let Some(weight) = values.get(source_key).and_then(Value::as_f64) else {
-                    continue;
-                };
-                let slot = &mut sums[targets[usize::from(flipped)][group]][vertex];
-                *slot = Some(slot.unwrap_or(0.0) + weight * share);
-            }
-        }
-    }
-    let groups: Map<String, Value> = names
-        .iter()
-        .zip(sums)
-        .map(|(name, sums)| {
-            let weights: Map<String, Value> = sums
-                .into_iter()
-                .enumerate()
-                .filter_map(|(vertex, sum)| {
-                    Some((format!("v{}", output.vertices[vertex].id), json!(sum?)))
-                })
-                .collect();
-            ((*name).to_owned(), Value::Object(weights))
-        })
-        .collect();
-    output
-        .attributes
-        .insert("vertex_groups".to_owned(), Value::Object(groups));
-}
-
 fn clean_polygon(vertices: Vec<usize>) -> Option<Vec<usize>> {
     let mut clean = Vec::with_capacity(vertices.len());
     for vertex in vertices {
@@ -1223,324 +1129,6 @@ fn clean_polygon(vertices: Vec<usize>) -> Option<Vec<usize>> {
 fn without_custom_normals(mut mesh: Mesh) -> Mesh {
     mesh.attributes.remove("custom_normal");
     mesh
-}
-
-/// `vector` mirrored across each axis `axes[bit]` whose bit is set in `mask`.
-fn reflect_vector(mut vector: DVec3, mask: usize, axes: &[usize]) -> DVec3 {
-    for (bit, &axis) in axes.iter().enumerate() {
-        if mask & (1 << bit) != 0 {
-            vector[axis] = -vector[axis];
-        }
-    }
-    vector
-}
-
-/// Blender's mirror loop numbering and reflected vectors for every copy corner, before the merge, in
-/// output polygon order (`mesh_mirror.cc`). Copy `c` is appended after the copies below its top axis
-/// bit `h`, so its loops start at `N * 2^h` plus the first loop of the copied face in that prefix. A
-/// reversed copy (odd reflection count) keeps its first corner and reverses the rest, as
-/// `mesh_flip_faces()` in `mesh_flip_faces.cc` and the `mirrorj` mapping in
-/// `BKE_mesh_mirror_apply_mirror_on_axis_for_modifier` (`mesh_mirror.cc`) assume: copy corner `m`
-/// holds source corner `(size - m) % size`.
-fn mirror_copy_states(
-    mesh: &Mesh,
-    source_order: &[usize],
-    source_vectors: Option<&[Option<DVec3>]>,
-    copy_count: usize,
-    axes: &[usize],
-) -> (Vec<usize>, Vec<Option<DVec3>>) {
-    let corners = source_order.len();
-    let mut ordinals = vec![0; copy_count * corners];
-    let mut vectors = vec![None; copy_count * corners];
-    for copy in 0..copy_count {
-        let reversed = copy.count_ones() % 2 == 1;
-        let (prefix, parent) = if copy == 0 {
-            (0, 0)
-        } else {
-            let top = copy.ilog2();
-            (corners << top, copy ^ (1 << top))
-        };
-        let mut start = 0;
-        for face in &mesh.faces {
-            let size = face.vertices.len();
-            let parent_first = if copy == 0 {
-                0
-            } else {
-                (start..start + size)
-                    .map(|corner| ordinals[parent * corners + corner])
-                    .min()
-                    .unwrap_or(0)
-            };
-            for m in 0..size {
-                let slot = copy * corners + start + m;
-                let source = start + if reversed { (size - m) % size } else { m };
-                ordinals[slot] = if copy == 0 {
-                    source_order[source]
-                } else {
-                    prefix + parent_first + m
-                };
-                vectors[slot] = source_vectors
-                    .and_then(|vectors| vectors[source])
-                    .map(|vector| reflect_vector(vector, copy, axes));
-            }
-            start += size;
-        }
-    }
-    (ordinals, vectors)
-}
-
-/// The merged output's vectors and loop basis. Each kept corner takes the vector and loop of the copy
-/// corner whose point merged into it; its loop is ranked among the kept corners, so the basis is a
-/// permutation of the output corners.
-fn mirror_output_states(
-    merged: &MergedGeometry,
-    copy_corners: &[Vec<usize>],
-    ordinals: &[usize],
-    vectors: &[Option<DVec3>],
-) -> Result<(Vec<Option<DVec3>>, Vec<usize>)> {
-    let mut offsets = Vec::with_capacity(copy_corners.len());
-    let mut total = 0;
-    for points in copy_corners {
-        offsets.push(total);
-        total += points.len();
-    }
-    let mut merged_vectors = Vec::new();
-    let mut merged_loops = Vec::new();
-    for ((polygon, _), &source) in merged.polygons.iter().zip(&merged.polygon_sources) {
-        for &point in polygon {
-            let members = &merged.point_members[point];
-            let corner = copy_corners[source]
-                .iter()
-                .position(|copy_point| members.contains(copy_point))
-                .ok_or_else(|| {
-                    PotError::new(ErrorCode::InternalError, "mirror merge lost a copy corner")
-                })?;
-            let copy = offsets[source] + corner;
-            merged_vectors.push(vectors[copy]);
-            merged_loops.push(ordinals[copy]);
-        }
-    }
-    let mut by_loop: Vec<usize> = (0..merged_loops.len()).collect();
-    by_loop.sort_unstable_by_key(|&corner| merged_loops[corner]);
-    let mut order = vec![0; merged_loops.len()];
-    for (rank, corner) in by_loop.into_iter().enumerate() {
-        order[corner] = rank;
-    }
-    Ok((merged_vectors, order))
-}
-
-fn mirror(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    validated(mesh)?;
-    let enabled = if let Some(value) = parameter_value(modifier, "use_axis") {
-        let values = value
-            .as_array()
-            .filter(|values| values.len() == 3)
-            .ok_or_else(|| invalid_parameter(modifier, "use_axis", "three booleans"))?;
-        [
-            values[0]
-                .as_bool()
-                .ok_or_else(|| invalid_parameter(modifier, "use_axis", "three booleans"))?,
-            values[1]
-                .as_bool()
-                .ok_or_else(|| invalid_parameter(modifier, "use_axis", "three booleans"))?,
-            values[2]
-                .as_bool()
-                .ok_or_else(|| invalid_parameter(modifier, "use_axis", "three booleans"))?,
-        ]
-    } else {
-        [true, false, false]
-    };
-    // Blender cuts the mesh at a mirrored axis's plane when that axis is bisected; a bisect on an
-    // axis that is not mirrored changes nothing, so only the mirrored case is refused.
-    let bisect: Vec<bool> = parameter_value(modifier, "use_bisect_axis")
-        .and_then(Value::as_array)
-        .map(|flags| {
-            flags
-                .iter()
-                .map(|flag| flag.as_bool() == Some(true))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(axis) = (0..3).find(|&axis| enabled[axis] && bisect.get(axis) == Some(&true)) {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "Blender mirror bisect on a mirrored axis is not supported",
-            json!({"feature_id": "modifier.mirror.bisect", "modifier_id": modifier.id, "axis": axis}),
-        ));
-    }
-    let selected: Vec<_> = enabled
-        .iter()
-        .enumerate()
-        .filter_map(|(i, value)| value.then_some(i))
-        .collect();
-    if selected.is_empty() {
-        return Ok(mesh.clone());
-    }
-    let merge = bool_param(modifier, "use_mirror_merge")?;
-    let threshold = number_param(modifier, "merge_threshold")?;
-    if threshold < 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "merge_threshold",
-            "a non-negative finite number",
-        ));
-    }
-    let source_points = positions(mesh);
-    let source_polygons = polygons(mesh)?;
-    let source_loose_edges = loose_edges(mesh)?;
-    let copy_count = 1_usize
-        .checked_shl(
-            u32::try_from(selected.len()).map_err(|_| mesh_error(&MeshError::IdExhausted))?,
-        )
-        .ok_or_else(|| mesh_error(&MeshError::IdExhausted))?;
-    let total_points = source_points
-        .len()
-        .checked_mul(copy_count)
-        .ok_or_else(|| mesh_error(&MeshError::IdExhausted))?;
-    let mut points = Vec::with_capacity(total_points);
-    let mut output_polygons = Vec::with_capacity(source_polygons.len().saturating_mul(copy_count));
-    let mut output_loose_edges =
-        Vec::with_capacity(source_loose_edges.len().saturating_mul(copy_count));
-    for mask in 0..copy_count {
-        let base = points.len();
-        for point in &source_points {
-            let mut reflected = *point;
-            for (bit, axis_index) in selected.iter().enumerate() {
-                if mask & (1 << bit) != 0 {
-                    reflected[*axis_index] = -reflected[*axis_index];
-                }
-            }
-            points.push(reflected);
-        }
-        let reverse = mask.count_ones() % 2 == 1;
-        for (face, material_index) in &source_polygons {
-            let mut mapped: Vec<_> = face.iter().map(|index| base + *index).collect();
-            if reverse && !mapped.is_empty() {
-                // Blender's flip keeps the first corner and reverses the rest: `mesh_flip_faces()`
-                // (`mesh_flip_faces.cc`), applied to the mirrored faces by
-                // `BKE_mesh_mirror_apply_mirror_on_axis_for_modifier` (`mesh_mirror.cc`).
-                mapped[1..].reverse();
-            }
-            output_polygons.push((mapped, *material_index));
-        }
-        output_loose_edges.extend(
-            source_loose_edges
-                .iter()
-                .map(|[a, b]| [base + *a, base + *b]),
-        );
-    }
-    // Blender numbers the mirror's loops after the source's and reflects each copy's custom normals
-    // (`mesh_mirror.cc`). The merged output keeps the loops of the corners that survive the merge.
-    let has_values = clnor::corner_codes(mesh)?.is_some();
-    let has_state = has_values || clnor::corner_order(mesh)?.is_some();
-    let copy_corners: Vec<Vec<usize>> = output_polygons
-        .iter()
-        .map(|(face, _)| face.clone())
-        .collect();
-    let copy_states = if has_state {
-        let source_order =
-            clnor::corner_order(mesh)?.unwrap_or_else(|| clnor::stored_corner_order(mesh));
-        let source_vectors = if has_values {
-            clnor::corner_custom_normals(mesh, &source_points, NormalCodeOptions::default())?
-        } else {
-            None
-        };
-        Some(mirror_copy_states(
-            mesh,
-            &source_order,
-            source_vectors.as_deref(),
-            copy_count,
-            &selected,
-        ))
-    } else {
-        None
-    };
-    let merged = if merge {
-        merge_geometry(&points, output_polygons, output_loose_edges, threshold)?
-    } else {
-        MergedGeometry::unmerged(points, output_polygons, output_loose_edges)
-    };
-    let merged_state = copy_states
-        .map(|(ordinals, vectors)| {
-            mirror_output_states(&merged, &copy_corners, &ordinals, &vectors)
-        })
-        .transpose()?;
-    // Blender's merge keeps one source edge's flags per merged edge (see `first_source_edges`).
-    let first_sources = if merge {
-        let edges = edge_pairs(mesh)?;
-        let pre_merge: Vec<[usize; 2]> = (0..copy_count)
-            .flat_map(|copy| {
-                let base = copy * source_points.len();
-                edges
-                    .iter()
-                    .map(move |[first, second]| [base + first, base + second])
-            })
-            .collect();
-        Some(first_source_edges(&merged, &pre_merge))
-    } else {
-        None
-    };
-    let vertex_count = source_points.len();
-    let origin = Origin {
-        vertices: merged
-            .point_members
-            .iter()
-            .map(|members| mean_origin(members.iter().map(|&point| Some(point % vertex_count))))
-            .collect(),
-        faces: merged
-            .polygon_sources
-            .iter()
-            .map(|&polygon| Some(polygon % source_polygons.len()))
-            .collect(),
-        corners: None,
-    };
-    // Each copy has one mirror pass per mirrored axis in its copy mask, so its UVs take that many
-    // passes; merged polygons keep the lowest copy they came from, as in the origin above.
-    let passes: Vec<usize> = merged
-        .polygon_sources
-        .iter()
-        .map(|&polygon| (polygon / source_polygons.len()).count_ones() as usize)
-        .collect();
-    let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
-    if let Some(first) = &first_sources {
-        let edge_count = mesh.edges.len();
-        apply_first_source_edge_flags(&mut result, mesh, first, |edge| edge % edge_count)?;
-    }
-    if let Some((vectors, order)) = &merged_state {
-        // build_mesh carried a provisional basis across; the mirror's own numbering replaces it.
-        result.attributes.remove("custom_normal");
-        let options = NormalCodeOptions {
-            corner_order: Some(order.as_slice()),
-            setter_input: clnor::SetterInput::NormalizeInput,
-        };
-        if has_values {
-            clnor::encode_vectors(&mut result, Some(vectors.as_slice()), options)?;
-        } else {
-            clnor::write_codes(&mut result, None, options)?;
-        }
-    }
-    if bool_param(modifier, "use_mirror_vertex_groups")? {
-        mirror_vertex_groups(mesh, &mut result, &merged.point_members, vertex_count);
-    }
-    let flip = [
-        bool_param(modifier, "use_mirror_u")?,
-        bool_param(modifier, "use_mirror_v")?,
-    ];
-    let mirror_offset = [
-        number_param(modifier, "mirror_offset_u")?,
-        number_param(modifier, "mirror_offset_v")?,
-    ];
-    let offset = [
-        number_param(modifier, "offset_u")?,
-        number_param(modifier, "offset_v")?,
-    ];
-    let udim = bool_param(modifier, "use_mirror_udim")?;
-    map_uv_values(&mut result, |face, _, uv| {
-        (0..passes[face]).fold(uv, |uv, _| {
-            mirror_uv_pass(uv, flip, mirror_offset, offset, udim)
-        })
-    });
-    Ok(result)
 }
 
 fn array(
@@ -2317,32 +1905,6 @@ fn apply_first_source_edge_flags(
         }
     }
     Ok(())
-}
-
-/// One mirror pass over a UV coordinate. A flipped axis is reflected about 0.5, or about the centre
-/// of its UDIM tile with `udim`; the mirror offset applies to flipped axes only. The UV offset applies
-/// to every copy.
-fn mirror_uv_pass(
-    uv: [f64; 2],
-    flip: [bool; 2],
-    mirror_offset: [f64; 2],
-    offset: [f64; 2],
-    udim: bool,
-) -> [f64; 2] {
-    std::array::from_fn(|axis| {
-        let value = if flip[axis] {
-            // Blender's UDIM reflection: a whole-number coordinate maps to itself.
-            let reflected = if udim {
-                uv[axis].ceil() - uv[axis] % 1.0
-            } else {
-                1.0 - uv[axis]
-            };
-            reflected + mirror_offset[axis]
-        } else {
-            uv[axis]
-        };
-        value + offset[axis]
-    })
 }
 
 fn merge_geometry_pairs(
@@ -5420,18 +4982,6 @@ mod tests {
         );
     }
 
-    /// Blender's UDIM mirror (values from a Blender 5.2.2 probe): whole-number coordinates map to
-    /// themselves, a tile's interior reflects about its centre, and negative values follow `fmod`.
-    #[test]
-    fn mirror_udim_reflection_matches_blender_on_tile_edges_and_negatives() {
-        let mirrored = |uv| super::mirror_uv_pass(uv, [true, true], [0.0, 0.0], [0.0, 0.0], true);
-        assert_eq!(mirrored([0.0, 0.0]), [0.0, 0.0]);
-        assert_eq!(mirrored([1.0, 1.0]), [1.0, 1.0]);
-        assert_eq!(mirrored([2.0, 0.5]), [2.0, 0.5]);
-        assert_eq!(mirrored([-0.25, 1.25]), [0.25, 1.75]);
-        assert_eq!(mirrored([1.25, 0.25]), [1.75, 0.75]);
-    }
-
     /// A UV warp followed by a mirror carries the warped store UVs into every mirrored face.
     #[test]
     fn uv_warp_then_mirror_rebuilds_every_store_face() {
@@ -5508,8 +5058,10 @@ mod tests {
             )],
         )
         .unwrap();
-        assert_eq!(result.vertices.len(), 8);
-        assert_eq!(result.faces.len(), 6);
+        // Blender merges each copy only into its own original, so the mirrored box keeps both
+        // copies of its coincident corners and faces (Blender fixture cube2_x: 16 vertices, 12 faces).
+        assert_eq!(result.vertices.len(), 16);
+        assert_eq!(result.faces.len(), 12);
         assert!(result.validate().is_ok());
 
         let plane_mesh = Mesh::from_positions_and_faces(
@@ -5845,15 +5397,6 @@ mod tests {
     fn shading_refusals_name_their_feature_only_where_blender_acts() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
 
-        let error = evaluate_modifiers(
-            &mesh,
-            &[with_params(
-                "mirror",
-                json!({"use_axis": [true, false, false], "use_bisect_axis": [true, false, false]}),
-            )],
-        )
-        .unwrap_err();
-        assert_eq!(refused_feature(&error), Some("modifier.mirror.bisect"));
         evaluate_modifiers(
             &mesh,
             &[with_params(
@@ -6061,7 +5604,7 @@ mod tests {
             ).unwrap();
             let result = evaluate_modifiers(
                 &mesh,
-                &[with_params("mirror", json!({"use_axis": [true, false, false], "use_mirror_merge": true, "merge_threshold": 0.0}))],
+                &[with_params("mirror", json!({"use_axis": [true, false, false], "use_mirror_merge": true, "merge_threshold": 0.001}))],
             ).unwrap();
             prop_assert_eq!(result.vertices.len(), mesh.vertices.len());
             prop_assert_eq!(result.faces.len(), mesh.faces.len());

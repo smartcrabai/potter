@@ -1132,6 +1132,10 @@ fn evaluate_modifier_output(
                 "warp" => ["object_from", "object_to"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
+                "mirror" => modifier
+                    .params
+                    .get("mirror_object")
+                    .is_some_and(Value::is_string),
                 "vertex_weight_edit" | "vertex_weight_mix" => modifier
                     .params
                     .get("mask_tex_map_object")
