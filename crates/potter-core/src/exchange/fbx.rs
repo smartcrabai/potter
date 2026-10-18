@@ -2446,21 +2446,12 @@ fn import_bytes_with_base(
             );
             color_layers::write(&mut mesh, &geometry.colors);
             for (face_index, face) in mesh.faces.iter_mut().enumerate() {
-                let slot = geometry
+                let raw = geometry
                     .material_indices
                     .get(face_index)
                     .copied()
                     .unwrap_or(0);
-                if (node_materials.is_empty() && slot != 0)
-                    || (!node_materials.is_empty() && slot as usize >= node_materials.len())
-                {
-                    return Err(PotError::with_details(
-                        ErrorCode::ImportFailed,
-                        "FBX face references a missing material slot",
-                        json!({"model_id":numeric_id,"face_index":face_index,"slot":slot}),
-                    ));
-                }
-                face.material_index = slot;
+                face.material_index = resolve_material_slot(raw, node_materials.len());
             }
             let mut data_block = DataBlock {
                 data_type: "mesh".to_owned(),
@@ -2559,7 +2550,7 @@ struct ImportedModel {
 struct ImportedGeometry {
     positions: Vec<[f64; 3]>,
     faces: Vec<Vec<usize>>,
-    material_indices: Vec<u32>,
+    material_indices: Vec<i64>,
     deformation: Option<Value>,
     /// Mesh-local corner normals in `faces` order, unit length; `None` when absent.
     normals: Option<Vec<DVec3>>,
@@ -2720,6 +2711,16 @@ fn parse_model(node: &FbxNode, numeric_id: i64) -> Result<ImportedModel> {
     })
 }
 
+/// Blender's `validate_material_indices` (`mesh_validate.cc`) resets a negative or past-the-end
+/// index to 0, the first connected material; a mesh with no materials still counts one slot.
+fn resolve_material_slot(raw: i64, material_count: usize) -> u32 {
+    usize::try_from(raw)
+        .ok()
+        .filter(|slot| *slot < material_count.max(1))
+        .and_then(|slot| u32::try_from(slot).ok())
+        .unwrap_or(0)
+}
+
 fn parse_geometry(
     node: &FbxNode,
     geometry_id: i64,
@@ -2792,13 +2793,7 @@ fn parse_geometry(
             ));
         }
         if let Some(values) = layer.child("Materials") {
-            material_indices = integer_array(values)?
-                .into_iter()
-                .map(|value| {
-                    u32::try_from(value)
-                        .map_err(|_| import_error("FBX material index is negative or too large"))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            material_indices = integer_array(values)?;
         }
         if !material_indices.is_empty() && material_indices.len() != faces.len() {
             return Err(import_error(
@@ -4011,8 +4006,8 @@ fn write_error(_: std::fmt::Error) -> PotError {
 mod tests {
     use super::{
         export_with_root, export_with_root_allow_lossy, import_bytes, lex, material_slot_losses,
-        parse_nodes, parse_uv_layers, uv_texture_losses, uv_texture_warnings, write_geometry,
-        write_uv_layers,
+        parse_geometry, parse_nodes, parse_uv_layers, resolve_material_slot, uv_texture_losses,
+        uv_texture_warnings, write_geometry, write_uv_layers,
     };
     use crate::{
         error::{ErrorCode, PotError, Result},
@@ -4297,6 +4292,221 @@ mod tests {
             "{exported}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn invalid_material_index_resolves_to_the_first_connected_material() {
+        // Blender's `validate_material_indices` (`mesh_validate.cc`) resets an index outside
+        // `0..max(count, 1)` to 0, and `import_fbx.py` runs it after linking the materials.
+        assert_eq!(resolve_material_slot(-1, 2), 0);
+        assert_eq!(resolve_material_slot(2, 2), 0);
+        assert_eq!(resolve_material_slot(1, 2), 1);
+        assert_eq!(resolve_material_slot(-1, 0), 0);
+        assert_eq!(resolve_material_slot(4, 0), 0);
+    }
+
+    #[test]
+    fn blender_written_material_layer_reads_its_index_array() -> TestResult<()> {
+        // Blender writes a `ByPolygon` `IndexToDirect` material layer of FBX material indices
+        // (`export_fbx_bin.py`, `LayerElementMaterial` block, lines 1462-1520). Two triangles of a quad.
+        let text = r#"Geometry: 1, "Geometry::Plane", "Mesh" {
+    Vertices: *12 {
+        a: 0,0,0,1,0,0,0,1,0,1,1,0
+    }
+    PolygonVertexIndex: *6 {
+        a: 0,1,-3,1,3,-3
+    }
+    LayerElementMaterial: 0 {
+        Version: 101
+        Name: ""
+        MappingInformationType: "ByPolygon"
+        ReferenceInformationType: "IndexToDirect"
+        Materials: *2 {
+            a: 1,0
+        }
+    }
+}
+"#;
+        let nodes = parse_nodes(&lex(text)?)?;
+        let geometry = nodes.first().ok_or("FBX test has no geometry")?;
+        let mut losses = Vec::<Loss>::new();
+        let imported = parse_geometry(geometry, 1, &mut losses)?;
+        assert!(losses.is_empty());
+        assert_eq!(imported.faces, vec![vec![0, 1, 2], vec![1, 3, 2]]);
+        assert_eq!(imported.material_indices, vec![1, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn imported_invalid_face_material_index_resolves_to_the_first_material() -> TestResult<()> {
+        let first_material = Id::new("first_material")?;
+        let second_material = Id::new("second_material")?;
+        let data_id = Id::new("mesh_data")?;
+        let node_id = Id::new("sheet")?;
+        let mut mesh = triangle()?;
+        mesh.faces[0].material_index = 1;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.materials
+            .insert(first_material.clone(), Material::default());
+        doc.materials
+            .insert(second_material.clone(), Material::default());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "Sheet".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                materials: vec![Some(first_material.clone()), Some(second_material.clone())],
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("FBX test root collection is missing")?
+            .objects
+            .push(node_id);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let exported = String::from_utf8(export_with_root_allow_lossy(
+            &doc,
+            &snapshot,
+            Path::new("."),
+            false,
+        )?)?;
+        let face_line = "Materials: *1 {\n\t\t\t\ta: 1";
+        assert!(exported.contains(face_line), "{exported}");
+
+        // The unmodified export keeps face 0 on the second material.
+        let round_trip = import_bytes(
+            exported.as_bytes(),
+            "00000000-0000-4000-8000-000000000001".to_owned(),
+        )?;
+        assert_eq!(imported_face_slots(&round_trip.doc)?, vec![1]);
+        assert_eq!(
+            resolved_material_id(&round_trip.doc, "Sheet", 1)?,
+            second_material
+        );
+
+        // Blender resets -1 and past-the-end indices to 0, the first connected material. The import
+        // never produces an empty slot for them and reports no material loss.
+        for invalid in ["-1", "7"] {
+            let text = exported.replace(
+                face_line,
+                &format!("Materials: *1 {{\n\t\t\t\ta: {invalid}"),
+            );
+            let imported = import_bytes(
+                text.as_bytes(),
+                "00000000-0000-4000-8000-000000000001".to_owned(),
+            )?;
+            assert_eq!(imported_face_slots(&imported.doc)?, vec![0], "{invalid}");
+            assert_eq!(
+                resolved_material_id(&imported.doc, "Sheet", 0)?,
+                first_material
+            );
+            assert!(
+                imported
+                    .losses
+                    .iter()
+                    .all(|loss| !loss.feature_id.contains("material")),
+                "{invalid}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unassigned_and_out_of_range_faces_export_the_first_exported_material_index() -> TestResult<()>
+    {
+        // Blender's exporter gives an empty or past-the-end face the first exported material's FBX
+        // index (`export_fbx_bin.py`, `def_me_blmaterial_idx`), never -1. With slots
+        // [empty, A, B], A is FBX index 0 and B is FBX index 1.
+        let first_material = Id::new("first_material")?;
+        let second_material = Id::new("second_material")?;
+        let data_id = Id::new("mesh_data")?;
+        let node_id = Id::new("sheet")?;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.materials
+            .insert(first_material.clone(), Material::default());
+        doc.materials
+            .insert(second_material.clone(), Material::default());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(triangle()?),
+                materials: vec![None, Some(first_material), Some(second_material)],
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "Sheet".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("FBX test root collection is missing")?
+            .objects
+            .push(node_id);
+
+        // (face slot, expected FBX index): the empty slot 0, A at slot 1, B at slot 2, past the end at 7.
+        for (face_slot, expected) in [(0_u32, 0_u32), (1, 0), (2, 1), (7, 0)] {
+            let mut face_doc = doc.clone();
+            face_doc
+                .data_blocks
+                .get_mut(&data_id)
+                .and_then(|data| data.mesh.as_mut())
+                .and_then(|mesh| mesh.faces.first_mut())
+                .ok_or("FBX test face is missing")?
+                .material_index = face_slot;
+            let snapshot = Snapshot::evaluate(&face_doc, &EvaluationContext::default())?;
+            let exported = String::from_utf8(export_with_root_allow_lossy(
+                &face_doc,
+                &snapshot,
+                Path::new("."),
+                true,
+            )?)?;
+            assert!(
+                exported.contains(&format!("Materials: *1 {{\n\t\t\t\ta: {expected}")),
+                "slot {face_slot}: {exported}"
+            );
+        }
+
+        // The empty slot still refuses strict export and is still reported as a loss.
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let losses = material_slot_losses(&doc, &snapshot);
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].feature_id, "format.fbx.material_slot_empty");
+        let Err(strict_error) =
+            export_with_root_allow_lossy(&doc, &snapshot, Path::new("."), false)
+        else {
+            return Err("strict FBX export must reject an empty material slot".into());
+        };
+        assert_eq!(
+            strict_error.details["feature_id"].as_str(),
+            Some("format.fbx.material_slot_empty")
+        );
+        Ok(())
+    }
+
+    fn imported_face_slots(doc: &SceneDoc) -> TestResult<Vec<u32>> {
+        let mesh = doc
+            .data_blocks
+            .values()
+            .find_map(|data| data.mesh.as_ref())
+            .ok_or("FBX test mesh is missing")?;
+        Ok(mesh.faces.iter().map(|face| face.material_index).collect())
     }
 
     fn add_member_mesh(

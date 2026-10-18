@@ -2,20 +2,26 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use glam::DVec3;
 use serde_json::json;
 
 use super::{
-    ExchangeMesh, ExchangeVertexGroup, Loss, obj_group_is_face_compatible, shading, single_uv_set,
-    srgb_decode, srgb_encode,
+    ExchangeMesh, ExchangeVertexGroup, ImportedGraph, Loss, gltf, import_graph_from_meshes,
+    material_surface::{
+        self, AlphaMode, ChannelSource, SampledTexture, Specular, TextureTransform, TextureWrap,
+    },
+    obj_group_is_face_compatible, shading, single_uv_set, srgb_decode, srgb_encode,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::color_layers::{ColorDomain, ColorLayer, ColorStore},
-    model::Id,
+    image::ImageInterpolation,
+    model::{
+        Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, Material, SceneDoc, TextureRef,
+    },
 };
 
 /// Material every file defines, and the `usemtl` of faces with no bound material slot.
@@ -34,7 +40,20 @@ fn from_obj_axes(value: [f64; 3]) -> [f64; 3] {
     [value[0], -value[2], value[1]]
 }
 
-pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
+/// What an OBJ export writes: the object and MTL text, the texture PNGs written beside the MTL as
+/// `(file name, bytes)`, and the losses of material parts the MTL format cannot carry.
+pub(crate) struct ObjExport {
+    pub(crate) object: Vec<u8>,
+    pub(crate) material: Vec<u8>,
+    pub(crate) textures: Vec<(String, Vec<u8>)>,
+    pub(crate) losses: Vec<Loss>,
+}
+
+pub(crate) fn export(
+    doc: &SceneDoc,
+    root_path: &Path,
+    meshes: &[ExchangeMesh],
+) -> Result<ObjExport> {
     let mut object = String::from("mtllib scene.mtl\n");
     let mut base = 0_usize;
     let mut normal_base = 0_usize;
@@ -42,8 +61,8 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
     // Whether the last `g` line written named groups. Groups stay in effect across `o` lines, so
     // an object that starts without groups must reset them.
     let mut groups_on = false;
-    // Names of the bound materials written so far, each with an MTL entry.
-    let mut bound_materials = BTreeSet::<String>::new();
+    // Bound materials written so far, by MTL name, each with an MTL entry.
+    let mut bound_materials = BTreeMap::<String, &Id>::new();
     for mesh in meshes {
         object.push_str("o ");
         object.push_str(&obj_name(&mesh.name));
@@ -149,8 +168,8 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
                 let name = material.map_or_else(|| DEFAULT_MATERIAL.to_owned(), mtl_name);
                 writeln!(object, "usemtl {name}")
                     .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
-                if material.is_some() {
-                    bound_materials.insert(name);
+                if let Some(id) = material {
+                    bound_materials.insert(name, id);
                 }
                 material_state = Some(material);
             }
@@ -230,11 +249,328 @@ pub(crate) fn export(meshes: &[ExchangeMesh]) -> Result<(Vec<u8>, Vec<u8>)> {
             .ok_or_else(|| PotError::new(ErrorCode::ExportFailed, "OBJ UV index overflow"))?;
     }
     let mut material = format!("newmtl {DEFAULT_MATERIAL}\n{MATERIAL_BODY}");
-    for name in &bound_materials {
-        write!(material, "newmtl {name}\n{MATERIAL_BODY}")
-            .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?;
+    let mut textures = Vec::new();
+    let mut losses = Vec::new();
+    for (name, &id) in &bound_materials {
+        let mut entry = MtlWriter {
+            doc,
+            root_path,
+            id,
+            name: name.as_str(),
+            textures: Vec::new(),
+            losses: Vec::new(),
+        };
+        material.push_str(&entry.material_mtl()?);
+        textures.append(&mut entry.textures);
+        losses.append(&mut entry.losses);
     }
-    Ok((object.into_bytes(), material.into_bytes()))
+    Ok(ObjExport {
+        object: object.into_bytes(),
+        material: material.into_bytes(),
+        textures,
+        losses,
+    })
+}
+
+/// One bound material's MTL entry under construction: its texture PNGs and the losses found.
+struct MtlWriter<'a> {
+    doc: &'a SceneDoc,
+    root_path: &'a Path,
+    id: &'a Id,
+    name: &'a str,
+    textures: Vec<(String, Vec<u8>)>,
+    losses: Vec<Loss>,
+}
+
+impl MtlWriter<'_> {
+    fn loss(&mut self, feature: &str, reason: &str) {
+        self.losses.push(Loss {
+            feature_id: feature.to_owned(),
+            data_id: Some(self.id.as_str().to_owned()),
+            reason: reason.to_owned(),
+            suggestion: None,
+        });
+    }
+
+    /// One `map_*` line. Its options are Blender's `-o`, `-s`, and `-bm`; its file is the texture
+    /// packed from `channels` and written as PNG beside the MTL.
+    fn map(
+        &mut self,
+        key: &str,
+        texture: &SampledTexture,
+        channels: [Option<ChannelSource>; 4],
+        bump: Option<f64>,
+    ) -> Result<String> {
+        let mut options = String::new();
+        if let Some(transform) = &texture.transform {
+            if transform.rotation != 0.0 {
+                self.loss(
+                    "material.mtl.texture_rotation",
+                    "MTL has no texture rotation option; the rotation is not written",
+                );
+            }
+            let (location, scale) = mtl_transform(transform);
+            if location != [0.0; 3] {
+                let [x, y, z] = location;
+                options.push_str(&format!(" -o {x:.6} {y:.6} {z:.6}"));
+            }
+            if scale != [1.0; 3] {
+                let [x, y, z] = scale;
+                options.push_str(&format!(" -s {x:.6} {y:.6} {z:.6}"));
+            }
+        }
+        if texture.wrap != [TextureWrap::Repeat; 2] {
+            self.loss(
+                "material.mtl.texture_wrap",
+                "MTL has no texture wrap option; the wrap mode is not written",
+            );
+        }
+        if let Some(strength) = bump
+            && strength > 0.0001
+        {
+            options.push_str(&format!(" -bm {strength:.6}"));
+        }
+        let file = format!("{}_{}.png", self.name, key.trim_start_matches("map_"));
+        let packed = gltf::pack_channels(&channels, texture.interpolation, self.doc, self.root_path)?;
+        let bytes = gltf::encode_png_with_colorspace(ImageColorspace::Linear, &packed.pixels)?;
+        self.textures.push((file.clone(), bytes));
+        Ok(format!("{key}{options} {file}\n"))
+    }
+
+    /// The MTL entry of this material, from the resolved surface with Blender's non-PBR rules
+    /// (`store_bsdf_properties` and `MTLWriter::write_bsdf_properties`, obj_export_mtl.cc and
+    /// obj_export_file_writer.cc). A map replaces its scalar line, and the maps follow the scalars
+    /// in Blender's `MTLTexMapType` order.
+    fn material_mtl(&mut self) -> Result<String> {
+        let (surface, surface_losses) = material_surface::resolve_surface(self.doc, self.id)?;
+        self.losses.extend(surface_losses);
+        let [red, green, blue, alpha] = surface.base_color.factor;
+        let metallic = surface.metallic;
+        let level = surface.specular.as_ref().map_or(0.5, specular_level);
+        let open = 1.0 - surface.roughness;
+        // Blender's empirical inverse of the importer's `roughness = 1 - sqrt(Ns / 1000)`.
+        let ns = open * (open * 1000.0);
+        let illum = illum_mode(level, metallic, alpha != 1.0);
+
+        let kd_map = match &surface.base_color.texture {
+            Some(texture) => Some(self.map(
+                "map_Kd",
+                texture,
+                rgb_channels(&texture.channels),
+                None,
+            )?),
+            None => None,
+        };
+        let ks_map = match surface.specular.as_ref().and_then(|specular| specular.texture.as_ref())
+        {
+            Some(texture) if texture.channels[3].is_some() => Some(self.map(
+                "map_Ks",
+                texture,
+                gray_channels(texture.channels[3].clone()),
+                None,
+            )?),
+            _ => None,
+        };
+        let ns_map = match &surface.metallic_roughness_texture {
+            Some(texture) if texture.channels[1].is_some() => Some(self.map(
+                "map_Ns",
+                texture,
+                gray_channels(texture.channels[1].clone()),
+                None,
+            )?),
+            _ => None,
+        };
+        if surface
+            .metallic_roughness_texture
+            .as_ref()
+            .is_some_and(|texture| texture.channels[2].is_some())
+        {
+            self.loss(
+                "material.mtl.metallic_texture",
+                "Blender's non-PBR MTL output omits the metallic map; only the roughness map is written",
+            );
+        }
+        let ke_map = match &surface.emissive.texture {
+            // Blender skips map_Ke when Emission Strength is zero.
+            // shortcut: Potter keeps only the emitted factor (colour times strength), so a textured
+            // emission with black colour and nonzero strength is not written, unlike Blender.
+            Some(texture) if surface.emissive.factor != [0.0; 3] => Some(self.map(
+                "map_Ke",
+                texture,
+                rgb_channels(&texture.channels),
+                None,
+            )?),
+            _ => None,
+        };
+        let d_map = match &surface.base_color.texture {
+            Some(texture)
+                if !matches!(surface.alpha_mode, AlphaMode::Opaque)
+                    && texture.channels[3].is_some() =>
+            {
+                Some(self.map(
+                    "map_d",
+                    texture,
+                    gray_channels(texture.channels[3].clone()),
+                    None,
+                )?)
+            }
+            _ => None,
+        };
+        let bump_map = match &surface.normal {
+            Some(normal) => Some(self.map(
+                "map_Bump",
+                &normal.texture,
+                normal.texture.channels.clone(),
+                Some(normal.scale),
+            )?),
+            None => None,
+        };
+
+        if surface.clearcoat.is_some() {
+            self.loss(
+                "material.mtl.clearcoat",
+                "Blender writes clearcoat only in PBR mode; the non-PBR MTL has no clearcoat",
+            );
+        }
+        if surface.sheen.is_some() {
+            self.loss(
+                "material.mtl.sheen",
+                "Blender writes sheen only in PBR mode; the non-PBR MTL has no sheen",
+            );
+        }
+        if surface.anisotropy.is_some() {
+            self.loss(
+                "material.mtl.anisotropy",
+                "Blender writes anisotropy only in PBR mode; the non-PBR MTL has no anisotropy",
+            );
+        }
+        if surface.transmission.is_some() {
+            self.loss(
+                "material.mtl.transmission",
+                "Blender writes transmission only in PBR mode; the non-PBR MTL has no transmission",
+            );
+        }
+        if surface.occlusion.is_some() {
+            self.loss(
+                "material.mtl.occlusion",
+                "MTL has no occlusion map; the occlusion texture is not written",
+            );
+        }
+        if surface.unlit {
+            self.loss(
+                "material.mtl.unlit",
+                "MTL has no unlit model; the material is written as a lit Principled surface",
+            );
+        }
+        if matches!(surface.alpha_mode, AlphaMode::Mask { .. }) {
+            self.loss(
+                "material.mtl.alpha_cutoff",
+                "MTL has no alpha cutoff; the alpha is written as d",
+            );
+        }
+        if let Some(specular) = &surface.specular {
+            // Blender's tint is white; a textured or tinted specular has no MTL form.
+            let expected = (2.0 * level).max(1.0);
+            if specular.color_texture.is_some()
+                || specular
+                    .color_factor
+                    .iter()
+                    .any(|channel| (*channel - expected).abs() > 1.0e-9)
+            {
+                self.loss(
+                    "material.mtl.specular_tint",
+                    "MTL has no specular tint; only the specular level is written",
+                );
+            }
+        }
+
+        let mut text = format!("newmtl {}\n", self.name);
+        if ns_map.is_none() {
+            text.push_str(&format!("Ns {ns:.6}\n"));
+        }
+        let ka = if metallic != 0.0 { metallic } else { 1.0 };
+        text.push_str(&format!("Ka {ka:.6} {ka:.6} {ka:.6}\n"));
+        if kd_map.is_none() {
+            text.push_str(&format!("Kd {red:.6} {green:.6} {blue:.6}\n"));
+        }
+        if ks_map.is_none() {
+            text.push_str(&format!("Ks {level:.6} {level:.6} {level:.6}\n"));
+        }
+        if ke_map.is_none() {
+            let [r, g, b] = surface.emissive.factor;
+            text.push_str(&format!("Ke {r:.6} {g:.6} {b:.6}\n"));
+        }
+        text.push_str(&format!("Ni {:.6}\n", surface.ior));
+        if d_map.is_none() {
+            text.push_str(&format!("d {alpha:.6}\n"));
+        }
+        text.push_str(&format!("illum {illum}\n"));
+        for line in [kd_map, ks_map, ns_map, ke_map, d_map, bump_map]
+            .into_iter()
+            .flatten()
+        {
+            text.push_str(&line);
+        }
+        Ok(text)
+    }
+}
+
+/// Blender's specular level from a Potter specular input. The exporter splits `2 * level` into
+/// `factor = min(2 * level, 1)` and a tint of `max(2 * level, 1)`, so the level is recovered from
+/// whichever holds it. `shortcut: assumes a white tint, which the MTL writer checks separately.`
+fn specular_level(specular: &Specular) -> f64 {
+    if specular.factor < 1.0 {
+        specular.factor / 2.0
+    } else {
+        mean3(specular.color_factor) / 2.0
+    }
+}
+
+/// Blender's `illum` for a material: 1 without specular, 3 for metal and 6 when that metal is
+/// transparent, 9 for transparent dielectrics, and 2 otherwise (`store_bsdf_properties`).
+fn illum_mode(specular: f64, metallic: f64, transparent: bool) -> u8 {
+    if specular == 0.0 {
+        1
+    } else if metallic > 0.0 {
+        if transparent { 6 } else { 3 }
+    } else if transparent {
+        9
+    } else {
+        2
+    }
+}
+
+/// Blender's `-o` location and `-s` scale for a texture transform: the inverse of the glTF
+/// transform built from a Blender point mapping (`point_transform` in material_surface.rs). Rotation
+/// has no MTL option, so the caller reports it.
+fn mtl_transform(transform: &TextureTransform) -> ([f64; 3], [f64; 3]) {
+    let (sin, cos) = transform.rotation.sin_cos();
+    let [scale_x, scale_y] = transform.scale;
+    let location = [
+        transform.offset[0] + scale_y * sin,
+        1.0 - transform.offset[1] - scale_y * cos,
+        0.0,
+    ];
+    (location, [scale_x, scale_y, 1.0])
+}
+
+/// Colour channels of a texture, with alpha unread (MTL maps are RGB).
+fn rgb_channels(channels: &[Option<ChannelSource>; 4]) -> [Option<ChannelSource>; 4] {
+    [
+        channels[0].clone(),
+        channels[1].clone(),
+        channels[2].clone(),
+        None,
+    ]
+}
+
+/// One source channel as grey RGB.
+fn gray_channels(source: Option<ChannelSource>) -> [Option<ChannelSource>; 4] {
+    [source.clone(), source.clone(), source, None]
+}
+
+fn mean3(values: [f64; 3]) -> f64 {
+    (values[0] + values[1] + values[2]) / 3.0
 }
 
 /// The active color layer as linear RGBA per vertex: a point layer as stored, and a corner layer as
@@ -361,7 +697,14 @@ fn empty_mesh(id: String, name: String) -> ExchangeMesh {
     }
 }
 
-pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
+/// What an OBJ file reads to: its objects, and the MTL materials of every library it names.
+struct ObjImport {
+    meshes: Vec<ExchangeMesh>,
+    losses: Vec<Loss>,
+    materials: BTreeMap<String, MtlMaterial>,
+}
+
+fn import(path: &Path) -> Result<ObjImport> {
     let text = fs::read_to_string(path).map_err(|error| PotError::io(&error))?;
     let mut positions = Vec::<[f64; 3]>::new();
     // Linear color of each `v` line, in file order (`v` indices are global).
@@ -394,6 +737,10 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
     // that has geometry; a file with no geometry imports each declared object empty, so
     // Potter's own empty-object exports re-read.
     let mut declared = Vec::<String>::new();
+    // Libraries named by `mtllib`, in file order; the last non-empty `o` name; faces read so far.
+    let mut libraries = Vec::<String>::new();
+    let mut last_object = None::<String>;
+    let mut face_count = 0_usize;
     for (line_number, line) in text.lines().enumerate() {
         let mut words = line.split_whitespace();
         let Some(kind) = words.next() else {
@@ -428,6 +775,9 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             "o" => {
                 let name = words.collect::<Vec<_>>().join(" ");
                 declared.push(name.clone());
+                if !name.is_empty() {
+                    last_object = Some(name.clone());
+                }
                 if !current.faces.is_empty() || !current.positions.is_empty() {
                     finish_object(
                         &mut current,
@@ -460,7 +810,31 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                 }
             }
             "g" => {
-                active_groups = words.map(str::to_owned).collect();
+                // Blender reads `g` as a group, not an object, when split groups are off
+                // (`geom_update_group`). Potter's exporter writes several names on one line, so the
+                // names are split. `off`, `null`, and `default` clear the group instead.
+                let names = words.map(str::to_owned).collect::<Vec<_>>();
+                active_groups = if names
+                    .iter()
+                    .any(|name| matches!(name.as_str(), "off" | "null" | "default"))
+                {
+                    Vec::new()
+                } else {
+                    names
+                };
+            }
+            "mtllib" => {
+                let name = words.collect::<Vec<_>>().join(" ");
+                // Blender strips quotes only when both ends are quoted (`add_mtl_library`).
+                let unquoted = name.len() > 2 && name.starts_with('"') && name.ends_with('"');
+                let name = if unquoted {
+                    name[1..name.len() - 1].to_owned()
+                } else {
+                    name
+                };
+                if !libraries.contains(&name) {
+                    libraries.push(name);
+                }
             }
             "usemtl" => {
                 let name = words.collect::<Vec<_>>().join(" ");
@@ -527,6 +901,7 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
                     corner_normals.extend(face_normals);
                     corner_uvs.extend(face_uvs);
                     smoothed |= group_on;
+                    face_count += 1;
                 }
             }
             _ => {}
@@ -545,7 +920,15 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
         finish_materials(&mut current, &face_materials, &material_names, &mut losses);
         meshes.push(current);
     }
-    if meshes.is_empty() {
+    if face_count == 0 && !positions.is_empty() {
+        // Blender's `use_all_vertices_if_no_faces`: with no faces anywhere, every `v` becomes one
+        // object, named by the last `o` or else by the file (`OBJParser::parse`).
+        let name = last_object.unwrap_or_else(|| file_stem(path));
+        let mut mesh = empty_mesh("object_0".to_owned(), name);
+        mesh.positions = positions;
+        finish_colors(&mut mesh, &position_colors, &mut losses);
+        meshes = vec![mesh];
+    } else if meshes.is_empty() {
         if declared.is_empty() {
             return Err(PotError::with_details(
                 ErrorCode::ImportFailed,
@@ -573,7 +956,44 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             })
             .collect();
     }
-    Ok((meshes, losses))
+    // The `.mtl` beside the `.obj` is read as well when it exists (`add_default_mtl_library`).
+    let default_library = path.with_extension("mtl");
+    if default_library.is_file()
+        && let Some(name) = default_library
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        && !libraries.contains(&name)
+    {
+        libraries.push(name);
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut materials = BTreeMap::new();
+    for name in &libraries {
+        let library_path = dir.join(name);
+        match fs::read(&library_path) {
+            Ok(bytes) => parse_mtl(
+                &String::from_utf8_lossy(&bytes),
+                library_path.parent().unwrap_or(dir),
+                &mut materials,
+            ),
+            Err(error) => losses.push(Loss {
+                feature_id: "material.library".to_owned(),
+                data_id: Some(name.clone()),
+                reason: format!("OBJ MTL library `{name}` cannot be read: {error}"),
+                suggestion: Some("place the .mtl file beside the .obj file".to_owned()),
+            }),
+        }
+    }
+    Ok(ObjImport {
+        meshes,
+        losses,
+        materials,
+    })
+}
+
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .map_or_else(|| "Object".to_owned(), |stem| stem.to_string_lossy().into_owned())
 }
 
 /// Resolves an OBJ index. Positive values count from 1; negative values count back from the end
@@ -827,27 +1247,789 @@ fn obj_name(value: &str) -> String {
         .collect()
 }
 
-pub(crate) fn imported_graph(
-    path: &Path,
-    scene_id: String,
-) -> Result<crate::exchange::ImportedGraph> {
-    let (meshes, losses) = import(path)?;
-    crate::exchange::import_graph_from_meshes(meshes, path, scene_id, "obj", losses)
+/// One `map_*` entry of an MTL material (Blender's `MTLTexMap`): the image as written, the MTL
+/// directory it resolves against, and its `-o`, `-s`, and `-type` options.
+#[derive(Clone, Debug)]
+struct MtlMap {
+    path: String,
+    dir: PathBuf,
+    translation: [f64; 3],
+    scale: [f64; 3],
+    sphere: bool,
+}
+
+impl MtlMap {
+    fn new(dir: &Path) -> Self {
+        Self {
+            path: String::new(),
+            dir: dir.to_path_buf(),
+            translation: [0.0; 3],
+            scale: [1.0; 3],
+            sphere: false,
+        }
+    }
+}
+
+/// The texture slots an MTL material names, in Blender's `MTLTexMapType` order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MapKind {
+    Color,
+    Metallic,
+    Specular,
+    SpecularExponent,
+    Roughness,
+    Sheen,
+    Reflection,
+    Emission,
+    Alpha,
+    Normal,
+}
+
+/// One MTL material as read (Blender's `MTLMaterial`). A value stays negative until the file sets
+/// it; Blender's importer then uses its default.
+#[derive(Clone, Debug)]
+struct MtlMaterial {
+    spec_exponent: f64,
+    ambient: [f64; 3],
+    color: [f64; 3],
+    spec: [f64; 3],
+    emission: [f64; 3],
+    ior: f64,
+    alpha: f64,
+    transmit: [f64; 3],
+    roughness: f64,
+    metallic: f64,
+    sheen: f64,
+    cc_thickness: f64,
+    cc_roughness: f64,
+    aniso: f64,
+    aniso_rot: f64,
+    illum: i32,
+    normal_strength: f64,
+    maps: BTreeMap<MapKind, MtlMap>,
+}
+
+impl Default for MtlMaterial {
+    fn default() -> Self {
+        Self {
+            spec_exponent: -1.0,
+            ambient: [-1.0; 3],
+            color: [-1.0; 3],
+            spec: [-1.0; 3],
+            emission: [-1.0; 3],
+            ior: -1.0,
+            alpha: -1.0,
+            transmit: [-1.0; 3],
+            roughness: -1.0,
+            metallic: -1.0,
+            sheen: -1.0,
+            cc_thickness: -1.0,
+            cc_roughness: -1.0,
+            aniso: -1.0,
+            aniso_rot: -1.0,
+            illum: -1,
+            normal_strength: -1.0,
+            maps: BTreeMap::new(),
+        }
+    }
+}
+
+/// Reads one MTL text into `library`, as Blender's `MTLParser::parse_and_store`: a `newmtl` opens
+/// or reopens a material, and each later key sets its value. Keys before any `newmtl` are ignored.
+fn parse_mtl(text: &str, dir: &Path, library: &mut BTreeMap<String, MtlMaterial>) {
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        let (key, rest) = split_word(line);
+        if key.is_empty() {
+            continue;
+        }
+        if key == "newmtl" {
+            let name = rest.trim().to_owned();
+            library.entry(name.clone()).or_default();
+            current = Some(name);
+            continue;
+        }
+        let Some(name) = current.as_deref() else {
+            continue;
+        };
+        let Some(material) = library.get_mut(name) else {
+            continue;
+        };
+        match key {
+            "Ns" => material.spec_exponent = number(rest, 324.0),
+            "Ka" => material.ambient = take_numbers::<3>(rest, 0.0).0,
+            "Kd" => material.color = take_numbers::<3>(rest, 0.8).0,
+            "Ks" => material.spec = take_numbers::<3>(rest, 0.5).0,
+            "Ke" => material.emission = take_numbers::<3>(rest, 0.0).0,
+            "Ni" => material.ior = number(rest, 1.45),
+            "d" => material.alpha = number(rest, 1.0),
+            // Some files write `illum` as a float (#60135); Blender truncates it.
+            "illum" => material.illum = number(rest, 1.0) as i32,
+            "Pr" => material.roughness = number(rest, 0.5),
+            "Pm" => material.metallic = number(rest, 0.0),
+            "Ps" => material.sheen = number(rest, 0.0),
+            "Pc" => material.cc_thickness = number(rest, 0.0),
+            "Pcr" => material.cc_roughness = number(rest, 0.0),
+            "aniso" => material.aniso = number(rest, 0.0),
+            "anisor" => material.aniso_rot = number(rest, 0.0),
+            "Kt" | "Tf" => material.transmit = take_numbers::<3>(rest, 0.0).0,
+            _ => {
+                if key.starts_with("map_") || key.starts_with("refl") || key.starts_with("bump") {
+                    parse_map(key, rest, dir, material);
+                }
+            }
+        }
+    }
+}
+
+/// Reads a texture line: the map kind from its key, then its options, then the image path, which
+/// is the rest of the line (`parse_texture_map` and `parse_texture_option`, obj_import_file_reader.cc).
+fn parse_map(key: &str, text: &str, dir: &Path, material: &mut MtlMaterial) {
+    let kind = match key {
+        "map_Kd" => MapKind::Color,
+        "map_Ks" => MapKind::Specular,
+        "map_Ns" => MapKind::SpecularExponent,
+        "map_d" => MapKind::Alpha,
+        "refl" | "map_refl" => MapKind::Reflection,
+        "map_Ke" => MapKind::Emission,
+        "bump" | "map_Bump" | "map_bump" => MapKind::Normal,
+        "map_Pr" => MapKind::Roughness,
+        "map_Pm" => MapKind::Metallic,
+        "map_Ps" => MapKind::Sheen,
+        _ => return,
+    };
+    let mut map = material
+        .maps
+        .get(&kind)
+        .cloned()
+        .unwrap_or_else(|| MtlMap::new(dir));
+    map.dir = dir.to_path_buf();
+    let mut rest = text;
+    loop {
+        let (word, after) = split_word(rest);
+        match word {
+            "-o" => {
+                let (values, next) = take_numbers::<3>(after, 0.0);
+                map.translation = values;
+                rest = next;
+            }
+            "-s" => {
+                let (values, next) = take_numbers::<3>(after, 1.0);
+                map.scale = values;
+                rest = next;
+            }
+            "-bm" => {
+                let (values, next) = take_numbers::<1>(after, 1.0);
+                material.normal_strength = values[0];
+                rest = next;
+            }
+            "-type" => {
+                map.sphere = true;
+                rest = skip_words(after, 1);
+            }
+            "-blendu" | "-blendv" | "-boost" | "-cc" | "-clamp" | "-imfchan" | "-texres" => {
+                rest = skip_words(after, 1);
+            }
+            "-mm" => rest = skip_words(after, 2),
+            "-t" => rest = skip_words(after, 3),
+            _ => break,
+        }
+    }
+    map.path = rest.trim().replace('"', "");
+    material.maps.insert(kind, map);
+}
+
+/// The first whitespace-separated word of `text` and the text after it.
+fn split_word(text: &str) -> (&str, &str) {
+    let text = text.trim_start();
+    match text.find(char::is_whitespace) {
+        Some(end) => (&text[..end], &text[end..]),
+        None => (text, ""),
+    }
+}
+
+/// The text after `count` words.
+fn skip_words(mut text: &str, count: usize) -> &str {
+    for _ in 0..count {
+        text = split_word(text).1;
+    }
+    text
+}
+
+fn parse_number(word: &str) -> Option<f64> {
+    word.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+/// The first number of `text`, or `default` when it is missing or not a number.
+fn number(text: &str, default: f64) -> f64 {
+    parse_number(split_word(text).0).unwrap_or(default)
+}
+
+/// Up to `N` leading numbers of `text`, with `default` for any that is missing, and the text after
+/// the numbers read.
+fn take_numbers<const N: usize>(text: &str, default: f64) -> ([f64; N], &str) {
+    let mut values = [default; N];
+    let mut rest = text;
+    for value in &mut values {
+        let (word, after) = split_word(rest);
+        let Some(number) = parse_number(word) else {
+            break;
+        };
+        *value = number;
+        rest = after;
+    }
+    (values, rest)
+}
+
+/// The MTL map of `kind` when it names a file.
+fn map_of(mtl: &MtlMaterial, kind: MapKind) -> Option<&MtlMap> {
+    mtl.maps.get(&kind).filter(|map| !map.path.is_empty())
+}
+
+/// The flags Blender's importer reads from `illum` (`set_bsdf_socket_values`, obj_import_mtl.cc).
+#[derive(Default)]
+struct IllumFlags {
+    highlight: bool,
+    transparency: bool,
+    reflection: bool,
+    glass: bool,
+}
+
+fn illum_flags(illum: i32) -> IllumFlags {
+    match illum {
+        2 => IllumFlags {
+            highlight: true,
+            ..IllumFlags::default()
+        },
+        3 | 5 | 8 => IllumFlags {
+            reflection: true,
+            ..IllumFlags::default()
+        },
+        4 => IllumFlags {
+            reflection: true,
+            transparency: true,
+            glass: true,
+            ..IllumFlags::default()
+        },
+        6 | 7 => IllumFlags {
+            reflection: true,
+            transparency: true,
+            ..IllumFlags::default()
+        },
+        9 => IllumFlags {
+            transparency: true,
+            glass: true,
+            ..IllumFlags::default()
+        },
+        _ => IllumFlags::default(),
+    }
+}
+
+fn import_loss(
+    losses: &mut Vec<Loss>,
+    id: &Id,
+    feature: &str,
+    reason: impl Into<String>,
+    suggestion: Option<&str>,
+) {
+    losses.push(Loss {
+        feature_id: feature.to_owned(),
+        data_id: Some(id.as_str().to_owned()),
+        reason: reason.into(),
+        suggestion: suggestion.map(str::to_owned),
+    });
+}
+
+/// The Potter material for one MTL entry, from Blender's `set_bsdf_socket_values`
+/// (obj_import_mtl.cc). A linked texture replaces its socket's value, so the matching factor is
+/// set to one. Values Potter's material fields cannot hold are losses.
+fn potter_material(
+    mtl: &MtlMaterial,
+    id: &Id,
+    doc: &mut SceneDoc,
+    images: &mut BTreeMap<PathBuf, Id>,
+    losses: &mut Vec<Loss>,
+) -> Result<Material> {
+    let flags = illum_flags(mtl.illum);
+    let mut material = Material {
+        name: id.as_str().to_owned(),
+        ..Material::default()
+    };
+
+    let mut specular = mean3(mtl.spec);
+    if specular < 0.0 {
+        specular = if flags.highlight { 1.0 } else { 0.0 };
+    }
+    if specular != 0.5 {
+        import_loss(
+            losses,
+            id,
+            "material.specular",
+            "MTL specular level has no Potter material field; it is not imported",
+            None,
+        );
+    }
+
+    let mut roughness = if mtl.spec_exponent < 0.0 {
+        if flags.highlight { 0.0 } else { 1.0 }
+    } else {
+        1.0 - (mtl.spec_exponent.clamp(0.0, 1000.0) / 1000.0).sqrt()
+    };
+    let mut metallic = if flags.reflection {
+        let ambient = mean3(mtl.ambient);
+        if ambient < 0.0 { 1.0 } else { ambient }
+    } else {
+        0.0
+    };
+    if mtl.roughness >= 0.0 {
+        roughness = mtl.roughness;
+    }
+    if mtl.metallic >= 0.0 {
+        metallic = mtl.metallic;
+    }
+    material.roughness = roughness.clamp(0.0, 1.0);
+    material.metallic = metallic.clamp(0.0, 1.0);
+
+    let transmission = mean3(mtl.transmit);
+    if transmission >= 0.0 {
+        material.transmission = transmission.clamp(0.0, 1.0);
+    }
+
+    let mut ior = mtl.ior;
+    if ior < 0.0 {
+        if flags.transparency {
+            ior = 1.0;
+        }
+        if flags.glass {
+            ior = 1.5;
+        }
+    }
+    if ior > 0.0 {
+        material.ior = ior;
+    }
+
+    if mtl.color.iter().all(|channel| *channel >= 0.0) {
+        material.base_color = [
+            mtl.color[0],
+            mtl.color[1],
+            mtl.color[2],
+            material.base_color[3],
+        ];
+    }
+    let mut alpha = mtl.alpha;
+    if flags.transparency && alpha < 0.0 {
+        alpha = 1.0;
+    }
+    if alpha != -1.0 {
+        material.base_color[3] = alpha.clamp(0.0, 1.0);
+    }
+    if flags.transparency || (0.0..1.0).contains(&alpha) {
+        material.alpha_mode = "blend".to_owned();
+    }
+
+    let color_path = resolve_map(map_of(mtl, MapKind::Color), id, losses);
+    let alpha_path = resolve_map(map_of(mtl, MapKind::Alpha), id, losses);
+    let color = texture_ref(doc, images, color_path.clone(), id, losses)?;
+    if let Some(reference) = color.clone() {
+        material.base_color_texture = Some(reference);
+        material.base_color = [1.0, 1.0, 1.0, material.base_color[3]];
+    }
+    if alpha_path.is_some() {
+        // Blender sets BLEND for an alpha map. Potter reads alpha from the base colour texture, so
+        // only the same image carries it.
+        material.alpha_mode = "blend".to_owned();
+        if color.is_some() && alpha_path == color_path {
+            material.base_color[3] = 1.0;
+        } else {
+            import_loss(
+                losses,
+                id,
+                "material.alpha_texture",
+                "MTL alpha texture is not the base colour texture; Potter reads alpha from the base colour texture, so only d is imported",
+                Some("use one image for map_Kd and map_d"),
+            );
+        }
+    }
+
+    // Reflection is linked to Metallic after Metallic (Blender's `MTLTexMapType` order).
+    let metallic_path = resolve_map(
+        map_of(mtl, MapKind::Reflection).or_else(|| map_of(mtl, MapKind::Metallic)),
+        id,
+        losses,
+    );
+    if let Some(reference) = texture_ref(doc, images, metallic_path, id, losses)? {
+        material.metallic_texture = Some(reference);
+        material.metallic = 1.0;
+    }
+    // Roughness is linked after SpecularExponent, so `map_Pr` wins over `map_Ns`.
+    let roughness_path = resolve_map(
+        map_of(mtl, MapKind::Roughness).or_else(|| map_of(mtl, MapKind::SpecularExponent)),
+        id,
+        losses,
+    );
+    if let Some(reference) = texture_ref(doc, images, roughness_path, id, losses)? {
+        material.roughness_texture = Some(reference);
+        material.roughness = 1.0;
+    }
+
+    if map_of(mtl, MapKind::Specular).is_some() {
+        import_loss(
+            losses,
+            id,
+            "material.specular_texture",
+            "MTL specular map has no Potter material field; it is not imported",
+            None,
+        );
+    }
+
+    let emission_map = map_of(mtl, MapKind::Emission).is_some();
+    // Blender's `set_bsdf_socket_values`: colours above 1 are split into a unit colour and a
+    // strength. A map sets the strength to one.
+    let (emission_color, emission_strength) = if mtl.emission.iter().all(|channel| *channel >= 0.0)
+    {
+        let peak = mtl.emission[0].max(mtl.emission[1]).max(mtl.emission[2]);
+        if peak > 1.0 {
+            (mtl.emission.map(|channel| channel / peak), peak)
+        } else {
+            (mtl.emission, 1.0)
+        }
+    } else {
+        ([0.0; 3], if emission_map { 1.0 } else { 0.0 })
+    };
+    material.emission_color = emission_color;
+    material.emission_strength = emission_strength;
+    if emission_map {
+        import_loss(
+            losses,
+            id,
+            "material.emission_texture",
+            "MTL emission map has no Potter material field; it is not imported",
+            None,
+        );
+    }
+
+    // Blender's Normal Map Strength is max(0, -bm), and no -bm leaves zero: a normal map with zero
+    // strength has no effect, so it is not imported.
+    let strength = mtl.normal_strength.max(0.0);
+    if strength > 0.0 {
+        let normal_path = resolve_map(map_of(mtl, MapKind::Normal), id, losses);
+        if let Some(reference) = texture_ref(doc, images, normal_path, id, losses)? {
+            material.normal_texture = Some(reference);
+            if strength != 1.0 {
+                import_loss(
+                    losses,
+                    id,
+                    "material.normal_strength",
+                    format!("MTL bump strength {strength} is not Potter's normal scale of 1; it is imported as 1"),
+                    None,
+                );
+            }
+        }
+    }
+
+    if map_of(mtl, MapKind::Sheen).is_some() || mtl.sheen >= 0.0 {
+        import_loss(
+            losses,
+            id,
+            "material.sheen",
+            "MTL sheen has no Potter material field; it is not imported",
+            None,
+        );
+    }
+    if mtl.cc_thickness >= 0.0 || mtl.cc_roughness >= 0.0 {
+        import_loss(
+            losses,
+            id,
+            "material.coat",
+            "MTL clearcoat has no Potter material field; it is not imported",
+            None,
+        );
+    }
+    if mtl.aniso >= 0.0 || mtl.aniso_rot >= 0.0 {
+        import_loss(
+            losses,
+            id,
+            "material.anisotropy",
+            "MTL anisotropy has no Potter material field; it is not imported",
+            None,
+        );
+    }
+    if mtl
+        .maps
+        .values()
+        .any(|map| map.translation != [0.0; 3] || map.scale != [1.0; 3])
+    {
+        import_loss(
+            losses,
+            id,
+            "material.texture_transform",
+            "MTL texture -o/-s options have no Potter texture field; the transform is not imported",
+            None,
+        );
+    }
+    if mtl.maps.values().any(|map| map.sphere) {
+        import_loss(
+            losses,
+            id,
+            "material.texture_projection",
+            "MTL sphere projection has no Potter texture field; the map is imported as flat",
+            None,
+        );
+    }
+    Ok(material)
+}
+
+/// The file a map names, found as Blender's `load_texture_image` finds it: beside the MTL as
+/// written, then as written, then with underscores as spaces, then by its basename beside the MTL.
+/// `None` when the map names no file or none of those exists (a loss).
+fn resolve_map(map: Option<&MtlMap>, id: &Id, losses: &mut Vec<Loss>) -> Option<PathBuf> {
+    let map = map?;
+    let written = map.path.as_str();
+    let basename = Path::new(written)
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let candidates = [
+        map.dir.join(written),
+        PathBuf::from(written),
+        map.dir.join(written.replace('_', " ")),
+        map.dir.join(basename),
+    ];
+    match candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+    {
+        Some(found) => Some(fs::canonicalize(&found).unwrap_or(found)),
+        None => {
+            losses.push(Loss {
+                feature_id: "material.texture_missing".to_owned(),
+                data_id: Some(id.as_str().to_owned()),
+                reason: format!("MTL texture `{written}` was not found; the map is not imported"),
+                suggestion: Some("place the image beside the .mtl file".to_owned()),
+            });
+            None
+        }
+    }
+}
+
+/// The texture reference for a resolved map file. Each file is loaded once, as an sRGB image like
+/// Blender's default colour space for loaded images (`load_image_at_path`).
+fn texture_ref(
+    doc: &mut SceneDoc,
+    images: &mut BTreeMap<PathBuf, Id>,
+    path: Option<PathBuf>,
+    id: &Id,
+    losses: &mut Vec<Loss>,
+) -> Result<Option<TextureRef>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if let Some(image) = images.get(&path) {
+        return Ok(Some(reference(image.clone())));
+    }
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            import_loss(
+                losses,
+                id,
+                "material.texture_missing",
+                format!("MTL texture `{}` cannot be read: {error}", path.display()),
+                None,
+            );
+            return Ok(None);
+        }
+    };
+    let (width, height, _) = match crate::image::decode_pixels(&bytes, ImageColorspace::Srgb) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            import_loss(
+                losses,
+                id,
+                "material.texture_codec",
+                format!(
+                    "MTL texture `{}` cannot be decoded: {}",
+                    path.display(),
+                    error.message
+                ),
+                None,
+            );
+            return Ok(None);
+        }
+    };
+    let name = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let image_id = unique_image_id(doc, &name)?;
+    doc.images.insert(
+        image_id.clone(),
+        Image {
+            name,
+            source: ImageSource::File,
+            colorspace: ImageColorspace::Srgb,
+            width,
+            height,
+            tiles: Vec::new(),
+            blob: None,
+            source_path: Some(path.to_string_lossy().into_owned()),
+            source_hash: Some(crate::hash::sha256(&bytes)),
+            alpha_mode: ImageAlphaMode::Straight,
+        },
+    );
+    images.insert(path, image_id.clone());
+    Ok(Some(reference(image_id)))
+}
+
+fn reference(image: Id) -> TextureRef {
+    TextureRef {
+        image,
+        uv_layer: None,
+        interpolation: ImageInterpolation::Linear,
+    }
+}
+
+/// A Potter image ID from a file stem: lowercase, `[a-z0-9_-]`, starting with a letter, and unused.
+fn unique_image_id(doc: &SceneDoc, name: &str) -> Result<Id> {
+    let mut base = name
+        .chars()
+        .map(|character| {
+            let character = character.to_ascii_lowercase();
+            if character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '_'
+                || character == '-'
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect::<String>();
+    if !base.starts_with(|character: char| character.is_ascii_lowercase()) {
+        base.insert_str(0, "image_");
+    }
+    let mut candidate = base.clone();
+    let mut suffix = 2_u32;
+    while doc.images.contains_key(&Id::new(candidate.clone())?) {
+        candidate = format!("{base}_{suffix}");
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "image ID counter overflow"))?;
+    }
+    Id::new(candidate)
+}
+
+/// Binds each imported object's material slots to its data block: the slot list, and each face's
+/// slot index. Objects follow the root collection in import order.
+fn bind_slots(doc: &mut SceneDoc, bindings: Vec<(Vec<Option<Id>>, Vec<u32>)>) -> Result<()> {
+    let root = Id::new("collection_root")?;
+    let objects = doc
+        .collections
+        .get(&root)
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "root collection is missing"))?
+        .objects
+        .clone();
+    for (node_id, (slots, indices)) in objects.iter().zip(bindings) {
+        let data_id = doc
+            .nodes
+            .get(node_id)
+            .and_then(|node| node.data.clone())
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "imported object has no data block")
+            })?;
+        let data = doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "imported data block is missing")
+        })?;
+        data.materials = slots;
+        if let Some(mesh) = data.mesh.as_mut() {
+            for (face, index) in mesh.faces.iter_mut().zip(indices) {
+                face.material_index = index;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn imported_graph(path: &Path, scene_id: String) -> Result<ImportedGraph> {
+    let ObjImport {
+        meshes,
+        losses,
+        materials: library,
+    } = import(path)?;
+    let bindings = meshes
+        .iter()
+        .map(|mesh| (mesh.material_slots.clone(), mesh.face_material_indices.clone()))
+        .collect::<Vec<_>>();
+    let slot_ids = meshes
+        .iter()
+        .flat_map(|mesh| mesh.material_slots.iter().flatten().cloned())
+        .collect::<BTreeSet<Id>>();
+    let mut graph = import_graph_from_meshes(meshes, path, scene_id, "obj", losses)?;
+    let mut images = BTreeMap::<PathBuf, Id>::new();
+    for id in &slot_ids {
+        // A usemtl name with no MTL entry gets the default material, as Blender creates one.
+        let mtl = library.get(id.as_str()).cloned().unwrap_or_default();
+        let material = potter_material(
+            &mtl,
+            id,
+            &mut graph.doc,
+            &mut images,
+            &mut graph.losses,
+        )?;
+        graph.doc.materials.insert(id.clone(), material);
+    }
+    bind_slots(&mut graph.doc, bindings)?;
+    graph.doc.validate()?;
+    Ok(graph)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{export, import};
+    use super::{
+        MtlMaterial, export, illum_flags, illum_mode, import, imported_graph, parse_mtl,
+        potter_material,
+    };
     use crate::{
         error::{ErrorCode, PotError, Result},
         exchange::test_support::triangle_with_layers,
+        model::{Id, Material, SceneDoc},
     };
-    use std::fs;
+    use std::{collections::BTreeMap, fs, path::Path};
+
+    const SCENE_ID: &str = "00000000-0000-4000-8000-000000000000";
+
+    fn empty_doc() -> SceneDoc {
+        SceneDoc::new(SCENE_ID.to_owned())
+    }
+
+    fn io<T>(result: std::io::Result<T>) -> Result<T> {
+        result.map_err(|error| PotError::io(&error))
+    }
+
+    /// A triangle bound to one material slot, and the document holding that material.
+    fn bound_triangle(material: Material) -> Result<(SceneDoc, crate::exchange::ExchangeMesh)> {
+        let id = Id::new("shiny")?;
+        let mut doc = empty_doc();
+        doc.materials.insert(id.clone(), material);
+        let mut mesh = triangle_with_layers();
+        mesh.material_slots = vec![Some(id)];
+        mesh.face_material_indices = vec![0; mesh.faces.len()];
+        Ok((doc, mesh))
+    }
+
+    fn mtl_block(text: &str, name: &str) -> Vec<String> {
+        text.lines()
+            .skip_while(|line| *line != format!("newmtl {name}"))
+            .map(str::to_owned)
+            .collect()
+    }
 
     #[test]
     fn writes_the_active_layer_as_blender_v_with_corner_indices() -> Result<()> {
-        let (object, _) = export(&[triangle_with_layers()])?;
-        let text = String::from_utf8_lossy(&object);
+        let exported = export(&empty_doc(), Path::new(""), &[triangle_with_layers()])?;
+        let text = String::from_utf8_lossy(&exported.object);
         let vt = text
             .lines()
             .filter(|line| line.starts_with("vt "))
@@ -880,11 +2062,11 @@ mod tests {
     #[test]
     fn imports_vt_as_the_uv_layer_in_storage_convention() -> Result<()> {
         let original = triangle_with_layers();
-        let (object, _) = export(std::slice::from_ref(&original))?;
+        let exported = export(&empty_doc(), Path::new(""), std::slice::from_ref(&original))?;
         let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
-        fs::write(file.path(), object).map_err(|error| PotError::io(&error))?;
-        let (imported, _) = import(file.path())?;
-        let layer = imported[0]
+        fs::write(file.path(), exported.object).map_err(|error| PotError::io(&error))?;
+        let imported = import(file.path())?;
+        let layer = imported.meshes[0]
             .uv_layers
             .first()
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "OBJ import has no UV layer"))?;
@@ -904,8 +2086,9 @@ mod tests {
     fn empty_declared_object_keeps_uv_metadata_when_texture_coordinates_exist() -> Result<()> {
         let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
         fs::write(file.path(), "o empty\nvt 0.25\n").map_err(|error| PotError::io(&error))?;
-        let (meshes, _) = import(file.path())?;
-        let mesh = meshes
+        let imported = import(file.path())?;
+        let mesh = imported
+            .meshes
             .first()
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "OBJ object is missing"))?;
         assert_eq!(mesh.faces, Vec::<Vec<usize>>::new());
@@ -914,6 +2097,186 @@ mod tests {
         assert_eq!(mesh.uv_layers[0].corners, Vec::<Vec<[f64; 2]>>::new());
         assert_eq!(mesh.uv_active, Some(0));
         assert_eq!(mesh.uv_render, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn vertices_without_faces_import_as_one_object_named_by_the_last_o() -> Result<()> {
+        let file = tempfile::NamedTempFile::new().map_err(|error| PotError::io(&error))?;
+        fs::write(file.path(), "o first\nv 0 0 0\no cloud\nv 1 0 0\nv 0 1 0\n")
+            .map_err(|error| PotError::io(&error))?;
+        let imported = import(file.path())?;
+        assert_eq!(imported.meshes.len(), 1);
+        let mesh = &imported.meshes[0];
+        assert_eq!(mesh.name, "cloud");
+        assert_eq!(mesh.positions.len(), 3);
+        assert!(mesh.faces.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn writes_blender_principled_values_as_mtl_lines() -> Result<()> {
+        let (doc, mesh) = bound_triangle(Material {
+            name: "shiny".to_owned(),
+            base_color: [0.1, 0.2, 0.3, 1.0],
+            roughness: 0.2,
+            ..Material::default()
+        })?;
+        let exported = export(&doc, Path::new(""), &[mesh])?;
+        let mtl = String::from_utf8(exported.material).map_err(|error| {
+            PotError::new(ErrorCode::InternalError, error.to_string())
+        })?;
+        // Ns = (1 - roughness)^2 * 1000 with roughness 0.2; Ka = 1 without metal; illum 2 for a
+        // specular dielectric that is opaque.
+        assert_eq!(
+            mtl_block(&mtl, "shiny"),
+            [
+                "newmtl shiny",
+                "Ns 640.000000",
+                "Ka 1.000000 1.000000 1.000000",
+                "Kd 0.100000 0.200000 0.300000",
+                "Ks 0.500000 0.500000 0.500000",
+                "Ke 0.000000 0.000000 0.000000",
+                "Ni 1.500000",
+                "d 1.000000",
+                "illum 2",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metal_transparency_selects_illum_six_and_writes_emission_and_alpha() -> Result<()> {
+        let (doc, mesh) = bound_triangle(Material {
+            name: "shiny".to_owned(),
+            base_color: [0.1, 0.2, 0.3, 0.5],
+            alpha_mode: "blend".to_owned(),
+            metallic: 1.0,
+            roughness: 0.0,
+            emission_color: [2.0, 1.0, 0.0],
+            emission_strength: 0.5,
+            ..Material::default()
+        })?;
+        let exported = export(&doc, Path::new(""), &[mesh])?;
+        let mtl = String::from_utf8(exported.material).map_err(|error| {
+            PotError::new(ErrorCode::InternalError, error.to_string())
+        })?;
+        // Ke is emission colour times strength, unnormalised; Ka is the metallic value.
+        assert_eq!(
+            mtl_block(&mtl, "shiny"),
+            [
+                "newmtl shiny",
+                "Ns 1000.000000",
+                "Ka 1.000000 1.000000 1.000000",
+                "Kd 0.100000 0.200000 0.300000",
+                "Ks 0.500000 0.500000 0.500000",
+                "Ke 1.000000 0.500000 0.000000",
+                "Ni 1.500000",
+                "d 0.500000",
+                "illum 6",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn illum_follows_blender_export_and_import_rules() {
+        // Export: 1 without specular, 3 or 6 for metal (6 when transparent), 9 transparent, else 2.
+        assert_eq!(illum_mode(0.0, 0.0, false), 1);
+        assert_eq!(illum_mode(0.5, 0.0, false), 2);
+        assert_eq!(illum_mode(0.5, 0.0, true), 9);
+        assert_eq!(illum_mode(0.5, 1.0, false), 3);
+        assert_eq!(illum_mode(0.5, 1.0, true), 6);
+        // Import: illum 6 is reflection plus refraction, 9 is glass without reflection.
+        let six = illum_flags(6);
+        assert!(six.reflection && six.transparency && !six.glass);
+        let nine = illum_flags(9);
+        assert!(nine.glass && nine.transparency && !nine.reflection);
+        assert!(illum_flags(2).highlight);
+        assert!(!illum_flags(1).reflection);
+    }
+
+    #[test]
+    fn imports_mtl_values_by_blender_formulas() -> Result<()> {
+        let mut library = BTreeMap::<String, MtlMaterial>::new();
+        parse_mtl(
+            "newmtl shiny\nNs 500\nKa 0.25 0.25 0.25\nKd 0.1 0.2 0.3\nKe 4 2 1\nNi 1.33\nd 0.5\nillum 3\n",
+            Path::new(""),
+            &mut library,
+        );
+        let id = Id::new("shiny")?;
+        let mut doc = empty_doc();
+        let mut images = BTreeMap::new();
+        let mut losses = Vec::new();
+        let material = potter_material(&library["shiny"], &id, &mut doc, &mut images, &mut losses)?;
+        // roughness = 1 - sqrt(Ns / 1000); illum 3 is reflection, so metallic is the Ka average.
+        assert!((material.roughness - (1.0 - 0.5_f64.sqrt())).abs() < 1.0e-9);
+        assert!((material.metallic - 0.25).abs() < 1.0e-9);
+        assert_eq!(material.base_color, [0.1, 0.2, 0.3, 0.5]);
+        // d below one is transparent, which Blender writes as BLEND.
+        assert_eq!(material.alpha_mode, "blend");
+        assert!((material.ior - 1.33).abs() < 1.0e-9);
+        // Ke above one is split into a unit colour and a strength of its peak.
+        assert_eq!(material.emission_color, [1.0, 0.5, 0.25]);
+        assert!((material.emission_strength - 4.0).abs() < 1.0e-9);
+        // Ks is absent, so Blender's specular is zero here, which Potter cannot hold.
+        assert!(losses.iter().any(|loss| loss.feature_id == "material.specular"));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_map_kd_and_map_d_image_becomes_the_base_colour_texture() -> Result<()> {
+        let dir = io(tempfile::tempdir())?;
+        let pixels = crate::image::encode_pixels(1, 1, &[[1.0, 0.0, 0.0, 0.5]])?;
+        io(fs::write(dir.path().join("tex.pixels"), pixels))?;
+        let mut library = BTreeMap::<String, MtlMaterial>::new();
+        parse_mtl(
+            "newmtl shiny\nmap_Kd tex.pixels\nmap_d tex.pixels\n",
+            dir.path(),
+            &mut library,
+        );
+        let id = Id::new("shiny")?;
+        let mut doc = empty_doc();
+        let mut images = BTreeMap::new();
+        let mut losses = Vec::new();
+        let material = potter_material(&library["shiny"], &id, &mut doc, &mut images, &mut losses)?;
+        let reference = material
+            .base_color_texture
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "base colour map missing"))?;
+        assert!(doc.images.contains_key(&reference.image));
+        assert_eq!(material.base_color, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(material.alpha_mode, "blend");
+        assert!(!losses.iter().any(|loss| loss.feature_id == "material.alpha_texture"));
+        Ok(())
+    }
+
+    #[test]
+    fn exported_mtl_imports_back_with_the_same_principled_values() -> Result<()> {
+        let (doc, mesh) = bound_triangle(Material {
+            name: "shiny".to_owned(),
+            base_color: [0.1, 0.2, 0.3, 1.0],
+            roughness: 0.2,
+            metallic: 0.5,
+            ..Material::default()
+        })?;
+        let exported = export(&doc, Path::new(""), &[mesh])?;
+        let dir = io(tempfile::tempdir())?;
+        io(fs::write(dir.path().join("scene.obj"), &exported.object))?;
+        io(fs::write(dir.path().join("scene.mtl"), &exported.material))?;
+        let graph = imported_graph(&dir.path().join("scene.obj"), SCENE_ID.to_owned())?;
+        let material = graph
+            .doc
+            .materials
+            .get(&Id::new("shiny")?)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "imported material missing"))?;
+        // Ns is written with six decimals, so the roughness comes back within 1e-5.
+        assert!((material.roughness - 0.2).abs() < 1.0e-5);
+        assert!((material.metallic - 0.5).abs() < 1.0e-6);
+        for (read, written) in material.base_color[..3].iter().zip([0.1, 0.2, 0.3]) {
+            assert!((read - written).abs() < 1.0e-6);
+        }
+        assert!((material.ior - 1.5).abs() < 1.0e-6);
+        assert_eq!(material.alpha_mode, "opaque");
         Ok(())
     }
 }

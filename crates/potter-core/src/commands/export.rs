@@ -136,6 +136,13 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             losses.extend(exchange::fbx::uv_texture_losses(&doc, &snapshot));
             warnings.extend(exchange::fbx::uv_texture_warnings(&doc, &snapshot));
         }
+        let obj_export = if format == "obj" {
+            let exported = exchange::obj::export(&doc, project.path(), &meshes)?;
+            losses.extend(exported.losses.iter().cloned());
+            Some(exported)
+        } else {
+            None
+        };
         if !losses.is_empty() && !args.allow_lossy {
             return Err(lossy_error(format, &losses));
         }
@@ -220,18 +227,30 @@ pub fn run(args: &ExportArgs) -> Result<(Option<SceneInfo>, Value)> {
             }
             "obj" => {
                 let sidecar = sidecar_path(&args.out, "mtl")?;
-                let (object, material) = exchange::obj::export(&meshes)?;
+                let Some(exported) = obj_export else {
+                    return Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "OBJ export was not prepared",
+                    ));
+                };
                 let mtl_name = sidecar
                     .file_name()
                     .and_then(|value| value.to_str())
                     .ok_or_else(|| {
                         PotError::new(ErrorCode::InvalidArgument, "material filename is not UTF-8")
                     })?;
-                let object = String::from_utf8(object)
+                let object = String::from_utf8(exported.object)
                     .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))?
                     .replace("scene.mtl", mtl_name)
                     .into_bytes();
-                vec![(sidecar, material), (args.out.clone(), object)]
+                let mut files = vec![(sidecar.clone(), exported.material), (args.out.clone(), object)];
+                files.extend(
+                    exported
+                        .textures
+                        .into_iter()
+                        .map(|(name, bytes)| (sidecar.with_file_name(name), bytes)),
+                );
+                files
             }
             "stl" => vec![(args.out.clone(), exchange::stl::export(&meshes)?)],
             "ply" => vec![(args.out.clone(), exchange::ply::export(&meshes)?)],
