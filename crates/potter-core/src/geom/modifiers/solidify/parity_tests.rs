@@ -7,9 +7,9 @@
 //!
 //! Blender and Potter order vertices, edges, and faces differently, so elements are matched by
 //! position: vertices by position and vertex-group weights; edges by endpoint positions (either
-//! order), sharp/seam flags, crease, and bevel weight; faces by oriented position rings (any
-//! rotation), with material, smooth flag, UV corners, named corner colors, and custom-normal
-//! corners. Counts are exact.
+//! order), sharp/seam flags, crease, and bevel weight; faces by their position ring in loop order,
+//! starting at the same corner, with material, smooth flag, UV corners, named corner colors, and
+//! custom-normal corners. Counts are exact.
 //!
 //! Tolerances: positions and UVs are compared at 1e-6. Group weights, colors, creases, and bevel
 //! weights are compared after f32 rounding. Blender's recorded output-normal codec error gets an
@@ -373,8 +373,8 @@ fn expected_corners(output: &Value, vertices: &[DVec3]) -> TestResult<Vec<Corner
         .collect()
 }
 
-/// Whether two faces match under some rotation of the ring. The rotation is shared by positions,
-/// UVs, and normals, so a corner's values are compared with the same corner of the other face.
+/// Whether two faces match corner for corner in loop order, including the ring start. Blender's
+/// loop start decides each output quad's diagonal, so a rotated ring is a different face here.
 fn corners_same(potter: &Corners, expected: &Corners, normal_tolerance: f64) -> bool {
     let count = expected.positions.len();
     if potter.positions.len() != count
@@ -383,37 +383,32 @@ fn corners_same(potter: &Corners, expected: &Corners, normal_tolerance: f64) -> 
     {
         return false;
     }
-    (0..count).any(|shift| {
-        let at = |corner: usize| (corner + shift) % count;
-        let rings = (0..count).all(|k| near(potter.positions[k], expected.positions[at(k)]));
-        let uvs = expected.uv.iter().all(|(name, values)| {
-            potter.uv.get(name).is_some_and(|mine| {
-                (0..count).all(|k| match (mine.get(k), values.get(at(k))) {
-                    (Some(a), Some(b)) => near_uv(*a, *b),
-                    _ => false,
-                })
-            })
-        });
-        let colors = expected.colors.iter().all(|(name, values)| {
-            potter.colors.get(name).is_some_and(|mine| {
-                (0..count).all(|k| match (mine.get(k), values.get(at(k))) {
-                    (Some(a), Some(b)) => {
-                        a.iter().zip(b).all(|(left, right)| same_f32(*left, *right))
-                    }
-                    _ => false,
-                })
-            })
-        });
-        let normals = match (&expected.normals, &potter.normals) {
-            (None, _) => true,
-            (Some(want), Some(mine)) => (0..count).all(|k| match (mine.get(k), want.get(at(k))) {
-                (Some(a), Some(b)) => near_normal(*a, *b, normal_tolerance),
+    let rings = (0..count).all(|k| near(potter.positions[k], expected.positions[k]));
+    let uvs = expected.uv.iter().all(|(name, values)| {
+        potter.uv.get(name).is_some_and(|mine| {
+            (0..count).all(|k| match (mine.get(k), values.get(k)) {
+                (Some(a), Some(b)) => near_uv(*a, *b),
                 _ => false,
-            }),
-            (Some(_), None) => false,
-        };
-        rings && uvs && colors && normals
-    })
+            })
+        })
+    });
+    let colors = expected.colors.iter().all(|(name, values)| {
+        potter.colors.get(name).is_some_and(|mine| {
+            (0..count).all(|k| match (mine.get(k), values.get(k)) {
+                (Some(a), Some(b)) => a.iter().zip(b).all(|(left, right)| same_f32(*left, *right)),
+                _ => false,
+            })
+        })
+    });
+    let normals = match (&expected.normals, &potter.normals) {
+        (None, _) => true,
+        (Some(want), Some(mine)) => (0..count).all(|k| match (mine.get(k), want.get(k)) {
+            (Some(a), Some(b)) => near_normal(*a, *b, normal_tolerance),
+            _ => false,
+        }),
+        (Some(_), None) => false,
+    };
+    rings && uvs && colors && normals
 }
 
 #[expect(
