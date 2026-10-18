@@ -251,25 +251,16 @@ pub fn sample_encoded(data: &ImageData, uv: [f64; 2], tile: u32) -> [f64; 4] {
     sample_image(data, uv, tile, data.interpolation, Read::Encoded)
 }
 
-/// Samples an image's colour as an Image Texture node does, with its Alpha output unlinked: the stored values are
-/// premultiplied (for a straight-alpha non-data image) and mixed encoded, then decoded for sRGB. Used by the world
-/// environment, whose Alpha output is not wired.
+/// Samples an environment image as Cycles' environment texture does (`EnvironmentTextureNode::image_params`): the Image
+/// Texture rule with the REPEAT extension, and an Alpha output that is not wired, so the colour is not unassociated.
+/// `uv` is Blender's V-up coordinate. The world reader converts its top-down equirectangular coordinate.
 #[must_use]
 pub fn sample_with_interpolation(
     data: &ImageData,
     uv: [f64; 2],
-    tile: u32,
     interpolation: ImageInterpolation,
 ) -> [f64; 4] {
-    sample_image(
-        data,
-        uv,
-        tile,
-        interpolation,
-        Read::Colour {
-            alpha_linked: false,
-        },
-    )
+    sample_with_extension_alpha(data, uv, 0, interpolation, ImageExtension::Repeat, false)
 }
 
 fn sample_image(
@@ -1105,7 +1096,7 @@ mod tests {
         // Cycles mixes an sRGB image's stored values and decodes the result. Halfway between encoded 0 and 1 is the
         // decoded encoded midpoint, not the midpoint of the linear values.
         let image = srgb_row([0.0, 1.0]);
-        let sampled = sample_with_interpolation(&image, [0.5, 0.5], 0, ImageInterpolation::Linear);
+        let sampled = sample_with_interpolation(&image, [0.5, 0.5], ImageInterpolation::Linear);
         let expected = cycles_decode(0.5);
         assert!(
             (sampled[0] - expected).abs() < 1e-6,
@@ -1122,7 +1113,7 @@ mod tests {
     #[test]
     fn srgb_closest_sampling_returns_the_decoded_texel() {
         let image = srgb_row([0.25, 1.0]);
-        let sampled = sample_with_interpolation(&image, [0.1, 0.5], 0, ImageInterpolation::Closest);
+        let sampled = sample_with_interpolation(&image, [0.1, 0.5], ImageInterpolation::Closest);
         assert!(
             (sampled[0] - cycles_decode(0.25)).abs() < 1e-6,
             "closest reads the texel through the same decode"
@@ -1206,7 +1197,7 @@ mod tests {
 
         assert_eq!(sample(&image, [0.5, 0.5], 0), [0.0, 1.0, 0.0, 1.0]);
         assert_eq!(
-            sample_with_interpolation(&image, [0.5, 0.5], 0, ImageInterpolation::Linear),
+            sample_with_interpolation(&image, [0.5, 0.5], ImageInterpolation::Linear),
             [0.5, 0.5, 0.0, 1.0],
         );
     }
@@ -1322,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn native_sampler_keeps_clamped_linear_edge_behavior() {
+    fn world_sampler_wraps_the_seam_as_cycles_environment_textures_do() {
         let image = data(
             2,
             1,
@@ -1331,8 +1322,8 @@ mod tests {
         );
 
         assert_eq!(
-            sample_with_interpolation(&image, [0.0, 0.5], 0, ImageInterpolation::Linear),
-            [1.0, 0.0, 0.0, 1.0],
+            sample_with_interpolation(&image, [0.0, 0.5], ImageInterpolation::Linear),
+            [0.5, 0.5, 0.0, 1.0],
         );
     }
 

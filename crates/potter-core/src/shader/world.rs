@@ -201,8 +201,8 @@ impl WorldEvaluator<'_> {
                 ];
                 Ok(WorldValue::Color(sample_with_interpolation(
                     image,
-                    uv,
-                    0,
+                    // Potter's equirectangular v runs top-down, from the zenith; the sampler takes Blender's V-up coordinate.
+                    [uv[0], 1.0 - uv[1]],
                     image.interpolation,
                 )))
             }
