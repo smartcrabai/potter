@@ -3978,6 +3978,7 @@ fn multires_sample_position(
     source: &Mesh,
     data: &multires::DisplacementData,
     limit: &subdivision_limit::LimitSurface,
+    patches: &mut subdivision_limit::PatchCache,
     sample: subdivision_limit::Sample,
 ) -> Result<DVec3> {
     let target_ptex_face = multires::ptex_face_for_sample(source, data, sample.face, sample.ptex)?;
@@ -3991,7 +3992,7 @@ fn multires_sample_position(
             u: f64::from(u),
             v: f64::from(v),
         };
-        let (point, du, dv) = limit.point_and_derivatives(surface_sample)?;
+        let (point, du, dv) = limit.point_and_derivatives_cached(surface_sample, patches)?;
         if evaluated_ptex_face == target_ptex_face && u == sample_u && v == sample_v {
             surface_point = Some(point);
         }
@@ -4030,6 +4031,7 @@ fn apply_multires_displacements(
     let mut positions = vec![DVec3::ZERO; output.vertices.len()];
     let mut counts = vec![0_usize; output.vertices.len()];
     let mut evaluated = HashMap::<(usize, usize, u64, u64), DVec3>::new();
+    let mut patches = subdivision_limit::PatchCache::default();
     if samples.corners.len() != output.faces.len() {
         return Err(PotError::new(
             ErrorCode::InternalError,
@@ -4055,7 +4057,7 @@ fn apply_multires_displacements(
             let value = match evaluated.get(&key) {
                 Some(value) => *value,
                 None => {
-                    let value = multires_sample_position(source, data, limit, *sample)?;
+                    let value = multires_sample_position(source, data, limit, &mut patches, *sample)?;
                     evaluated.insert(key, value);
                     value
                 }

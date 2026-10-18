@@ -13,7 +13,7 @@ mod level;
 mod patch;
 mod refine;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{ErrorCode, PotError, Result};
 
@@ -58,6 +58,13 @@ impl Sample {
             }
         }
     }
+}
+
+/// Leaf patches built by `LimitSurface::point_and_derivatives_cached`, keyed by `(level, face)`. A
+/// patch depends only on its leaf, so a cache serves one limit surface and must not outlive it.
+#[derive(Default)]
+pub(super) struct PatchCache {
+    patches: HashMap<(usize, usize), Patch>,
 }
 
 /// The refined levels of one mesh, with the selection that produced each level from the previous one.
@@ -249,6 +256,16 @@ impl LimitSurface {
 
     /// Evaluates the limit point and its object-space derivatives with respect to ptex-local `u` and `v`.
     pub(super) fn point_and_derivatives(&self, sample: Sample) -> Result<(DVec3, DVec3, DVec3)> {
+        self.point_and_derivatives_cached(sample, &mut PatchCache::default())
+    }
+
+    /// `point_and_derivatives`, with each leaf's patch built once per `cache` and reused by every later
+    /// sample on that leaf. The patch and the arithmetic are those of a fresh build.
+    pub(super) fn point_and_derivatives_cached(
+        &self,
+        sample: Sample,
+        cache: &mut PatchCache,
+    ) -> Result<(DVec3, DVec3, DVec3)> {
         let Some(&is_ngon) = self.ngon_root.get(sample.face) else {
             return Err(PotError::new(
                 ErrorCode::InvalidArgument,
@@ -271,13 +288,18 @@ impl LimitSurface {
         let (located, jacobian) =
             locate_with_jacobian(&self.ngon_root, &self.levels, &self.selected, sample);
         let refined = &self.levels[located.level];
-        let patch = Patch::new(
-            &refined.level,
-            located.face,
-            located.level,
-            self.has_irregular_faces,
-            leaf_corner,
-        );
+        let patch = cache
+            .patches
+            .entry((located.level, located.face))
+            .or_insert_with(|| {
+                Patch::new(
+                    &refined.level,
+                    located.face,
+                    located.level,
+                    self.has_irregular_faces,
+                    leaf_corner,
+                )
+            });
         let (point, ds, dt) =
             patch.evaluate_and_derivatives(&refined.positions, located.s, located.t);
         Ok((
