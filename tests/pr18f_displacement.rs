@@ -744,11 +744,14 @@ fn displace_texture_uses_named_native_uv_layer() -> Result<(), Box<dyn std::erro
     let mesh = scene_subject(&operations, None)?;
     // Blender 5.2.2 output of tests/fixtures/pr18f_displacement/generate_named_uv_exact_oracle.py
     // (box-projected corner UVs, V flipped to Blender's V-up; primitive UV layer removed first).
+    // Blender's primitive plane orders its corners (-1,-1), (1,-1), (-1,1), (1,1); Potter orders them
+    // (-1,-1), (1,-1), (1,1), (-1,1). The Blender values below are reindexed to Potter's order by rest
+    // position (Blender vertices 2 and 3 swap), so each position's displacement is unchanged.
     let expected = [
         [-0.5, -1.0, 0.0],
         [1.0, -1.0, 0.0],
-        [-1.0, 1.0, 0.0],
         [0.5, 1.0, 0.0],
+        [-1.0, 1.0, 0.0],
     ];
     assert_plane("displace texture named UV layer", &mesh, &expected);
     Ok(())
