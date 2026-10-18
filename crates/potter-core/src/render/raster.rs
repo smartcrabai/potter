@@ -826,6 +826,33 @@ fn pixel_in_bounds(width: u32, height: u32, x: u32, y: u32) -> bool {
     width != 0 && height != 0 && x < width && y < height
 }
 
+/// Cycles' equirectangular range for a panoramic camera's longitude and latitude limits, in radians
+/// (`intern/cycles/scene/camera.cpp`, `equirectangular_range`): `(longitude_min - longitude_max, -longitude_min,
+/// latitude_min - latitude_max, -latitude_min + π/2)`. The full sphere is `[-2π, π, -π, π]`.
+fn equirectangular_range(longitude: [f64; 2], latitude: [f64; 2]) -> [f64; 4] {
+    [
+        longitude[0] - longitude[1],
+        -longitude[0],
+        latitude[0] - latitude[1],
+        -latitude[0] + std::f64::consts::FRAC_PI_2,
+    ]
+}
+
+/// The camera-space direction of the equirectangular pixel at (u, v), where u and v are in [0, 1] and v runs bottom-up,
+/// as Cycles' `equirectangular_range_to_direction` gives it (`intern/cycles/kernel/camera/projection.h`): phi = range.x·u
+/// + range.y and theta = range.z·v + range.w. The direction is (−sin θ sin φ, cos θ, −sin θ cos φ) in the camera's basis
+/// (X right, Y up, −Z forward), which Blender's panorama camera uses with its pole on camera Y. Blender 5.2.2's renders
+/// fix this basis (`tests/fixtures/panorama_camera`).
+fn equirectangular_range_direction(u: f64, v: f64, range: [f64; 4]) -> DVec3 {
+    let phi = range[0] * u + range[1];
+    let theta = range[2] * v + range[3];
+    DVec3::new(
+        -theta.sin() * phi.sin(),
+        theta.cos(),
+        -theta.sin() * phi.cos(),
+    )
+}
+
 fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame> {
     if width == 0 || height == 0 {
         return Err(PotError::invalid_argument(
@@ -1063,12 +1090,16 @@ fn ray_for_subpixel_in_frame(
             Ray { origin, direction }
         }
         ProjectionFrame::Panorama { fisheye: false } => {
-            let longitude = ndc_x * std::f64::consts::PI;
-            let latitude = ndc_y * std::f64::consts::FRAC_PI_2;
+            let camera = equirectangular_range_direction(
+                (ndc_x + 1.0) * 0.5,
+                (ndc_y + 1.0) * 0.5,
+                equirectangular_range(
+                    [-std::f64::consts::PI, std::f64::consts::PI],
+                    [-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2],
+                ),
+            );
             let direction = safe_normalize(
-                frame.forward * (longitude.cos() * latitude.cos())
-                    + frame.right * (longitude.sin() * latitude.cos())
-                    + frame.up * latitude.sin(),
+                frame.right * camera.x + frame.up * camera.y - frame.forward * camera.z,
             )
             .ok_or_else(|| PotError::invalid_argument("panorama ray is out of range"))?;
             Ray { origin, direction }
@@ -2091,5 +2122,75 @@ mod smooth_shading_tests {
             super::smooth_shadow_origin(&flat, centre, [1.0 / 3.0; 3]),
             centre
         );
+    }
+}
+
+#[cfg(test)]
+mod equirectangular_camera_tests {
+    use super::*;
+
+    /// Blender 5.2.2's panorama camera rays (`tests/fixtures/panorama_camera/generate_panorama_camera_oracle.py`): a PANO
+    /// EQUIRECTANGULAR camera with non-default longitude and latitude limits, rotated and translated, at 32 x 16 pixel
+    /// centres. Each recorded world direction must match the Cycles mapping at 1e-4 (the rounding and the float raster
+    /// offset in Blender's render).
+    #[test]
+    fn equirectangular_camera_rays_match_blenders_render() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const TOLERANCE: f64 = 1.0e-4;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/panorama_camera/blender_panorama_camera.json");
+        let document: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let width = document["width"].as_u64().ok_or("width is missing")? as f64;
+        let height = document["height"].as_u64().ok_or("height is missing")? as f64;
+        let limits = |key: &str| -> Result<[f64; 2], Box<dyn std::error::Error>> {
+            let values = document[key].as_array().ok_or("range is missing")?;
+            Ok([
+                values[0].as_f64().ok_or("range value is not a number")?,
+                values[1].as_f64().ok_or("range value is not a number")?,
+            ])
+        };
+        let range = equirectangular_range(limits("longitude")?, limits("latitude")?);
+        let matrix = document["camera_to_world"]
+            .as_array()
+            .ok_or("matrix is missing")?;
+        let row = |index: usize| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+            matrix[index]
+                .as_array()
+                .ok_or("matrix row is missing")?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_f64()
+                        .ok_or_else(|| "matrix value is not a number".into())
+                })
+                .collect()
+        };
+        let (r0, r1, r2) = (row(0)?, row(1)?, row(2)?);
+        // Camera basis vectors in world space are the matrix columns.
+        let basis_x = DVec3::new(r0[0], r1[0], r2[0]);
+        let basis_y = DVec3::new(r0[1], r1[1], r2[1]);
+        let basis_z = DVec3::new(r0[2], r1[2], r2[2]);
+        let mut worst = 0.0_f64;
+        for record in document["records"]
+            .as_array()
+            .ok_or("records are missing")?
+        {
+            let value = |index: usize| -> Result<f64, Box<dyn std::error::Error>> {
+                Ok(record[index]
+                    .as_f64()
+                    .ok_or("record value is not a number")?)
+            };
+            let u = (value(0)? + 0.5) / width;
+            let v = (value(1)? + 0.5) / height;
+            let camera = equirectangular_range_direction(u, v, range);
+            let world = basis_x * camera.x + basis_y * camera.y + basis_z * camera.z;
+            let expected = DVec3::new(value(2)?, value(3)?, value(4)?);
+            worst = worst.max((world - expected).abs().max_element());
+        }
+        assert!(
+            worst <= TOLERANCE,
+            "worst direction residual {worst:e} exceeds {TOLERANCE:e}"
+        );
+        Ok(())
     }
 }
