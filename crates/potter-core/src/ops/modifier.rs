@@ -1094,7 +1094,7 @@ fn evaluate_modifier_output(
         let uses_volume_node = modifier_stack.iter().any(|modifier| {
             modifier.enabled
                 && modifier.modifier_type == "volume_to_mesh"
-                && modifier.params.get("volume").is_some_and(Value::is_string)
+                && modifier.params.get("object").is_some_and(Value::is_string)
         });
         let uses_scene_context = modifier_stack.iter().any(|modifier| {
             if !modifier.enabled {

@@ -856,6 +856,12 @@ impl Snapshot {
                             "lattice" => apply_lattice_modifier(
                                 mesh, modifier, id, data_block, doc, &matrices,
                             ),
+                            "mesh_to_volume" => Err(PotError::invalid_operation(
+                                "mesh_to_volume modifier can only be used on volume objects",
+                            )),
+                            "volume_displace" => Err(PotError::invalid_operation(
+                                "volume_displace modifier can only be used on volume objects",
+                            )),
                             "volume_to_mesh" => apply_volume_to_mesh_modifier(
                                 mesh,
                                 modifier,
@@ -1139,6 +1145,12 @@ impl Snapshot {
                             "lattice" => apply_lattice_modifier(
                                 mesh, modifier, id, data_block, doc, &matrices,
                             ),
+                            "mesh_to_volume" => Err(PotError::invalid_operation(
+                                "mesh_to_volume modifier can only be used on volume objects",
+                            )),
+                            "volume_displace" => Err(PotError::invalid_operation(
+                                "volume_displace modifier can only be used on volume objects",
+                            )),
                             "volume_to_mesh" => apply_volume_to_mesh_modifier(
                                 mesh,
                                 modifier,
