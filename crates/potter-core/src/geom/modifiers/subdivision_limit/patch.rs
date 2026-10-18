@@ -143,35 +143,41 @@ pub(super) fn bspline_weights(s: f64, t: f64, mask: u8) -> [f64; 16] {
             w[4 * row + col] = bs[col] * bt[row];
         }
     }
+    apply_boundary_mask(&mut w, mask);
+    w
+}
+
+/// Folds each singular boundary edge's weights onto its neighbours (`OpenSubdiv`
+/// `adjustBSplineBoundaryWeights`). Bit `i` of `mask` marks the edge from corner `i` to `i + 1`.
+fn apply_boundary_mask(weights: &mut [f64; 16], mask: u8) {
     if mask & 1 != 0 {
         for i in 0..4 {
-            w[i + 8] -= w[i];
-            w[i + 4] += 2.0 * w[i];
-            w[i] = 0.0;
+            weights[i + 8] -= weights[i];
+            weights[i + 4] += 2.0 * weights[i];
+            weights[i] = 0.0;
         }
     }
     if mask & 2 != 0 {
         for i in [0, 4, 8, 12] {
-            w[i + 1] -= w[i + 3];
-            w[i + 2] += 2.0 * w[i + 3];
-            w[i + 3] = 0.0;
+            weights[i + 1] -= weights[i + 3];
+            weights[i + 2] += 2.0 * weights[i + 3];
+            weights[i + 3] = 0.0;
         }
     }
     if mask & 4 != 0 {
         for i in 0..4 {
-            w[i + 4] -= w[i + 12];
-            w[i + 8] += 2.0 * w[i + 12];
-            w[i + 12] = 0.0;
+            weights[i + 4] -= weights[i + 12];
+            weights[i + 8] += 2.0 * weights[i + 12];
+            weights[i + 12] = 0.0;
         }
     }
     if mask & 8 != 0 {
         for i in [0, 4, 8, 12] {
-            w[i + 2] -= w[i];
-            w[i + 1] += 2.0 * w[i];
-            w[i] = 0.0;
+            weights[i + 2] -= weights[i];
+            weights[i + 1] += 2.0 * weights[i];
+            weights[i] = 0.0;
         }
     }
-    w
 }
 
 /// B-spline weights and their derivatives with respect to the patch's local `s` and `t`.
@@ -196,43 +202,22 @@ pub(super) fn bspline_weights_and_derivatives(
         }
     }
     for weights in [&mut w, &mut ws, &mut wt] {
-        if mask & 1 != 0 {
-            for i in 0..4 {
-                weights[i + 8] -= weights[i];
-                weights[i + 4] += 2.0 * weights[i];
-                weights[i] = 0.0;
-            }
-        }
-        if mask & 2 != 0 {
-            for i in [0, 4, 8, 12] {
-                weights[i + 1] -= weights[i + 3];
-                weights[i + 2] += 2.0 * weights[i + 3];
-                weights[i + 3] = 0.0;
-            }
-        }
-        if mask & 4 != 0 {
-            for i in 0..4 {
-                weights[i + 4] -= weights[i + 12];
-                weights[i + 8] += 2.0 * weights[i + 12];
-                weights[i + 12] = 0.0;
-            }
-        }
-        if mask & 8 != 0 {
-            for i in [0, 4, 8, 12] {
-                weights[i + 2] -= weights[i];
-                weights[i + 1] += 2.0 * weights[i];
-                weights[i] = 0.0;
-            }
-        }
+        apply_boundary_mask(weights, mask);
     }
     (w, ws, wt)
 }
 
-/// Gregory basis of the 20 control points of a quad with an irregular corner (`OpenSubdiv`
-/// `EvalBasisGregory`).
-pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
-    let bs = bezier_basis(s);
-    let bt = bezier_basis(t);
+/// Boundary Gregory slots: control-point index and the B-spline basis indices along `s` and `t`.
+const GREGORY_BOUNDARY_INDEX: [usize; 12] = [0, 1, 7, 5, 2, 6, 16, 12, 15, 17, 11, 10];
+const GREGORY_BOUNDARY_S: [usize; 12] = [0, 1, 2, 3, 0, 3, 0, 3, 0, 1, 2, 3];
+const GREGORY_BOUNDARY_T: [usize; 12] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3];
+/// Interior Gregory slots, indexed the same way as the boundary slots.
+const GREGORY_INTERIOR_INDEX: [usize; 8] = [3, 4, 8, 9, 13, 14, 18, 19];
+const GREGORY_INTERIOR_S: [usize; 8] = [1, 1, 2, 2, 2, 2, 1, 1];
+const GREGORY_INTERIOR_T: [usize; 8] = [1, 1, 1, 1, 2, 2, 2, 2];
+
+/// Rational blend factors of the eight interior Gregory points at `(s, t)`.
+fn gregory_blend(s: f64, t: f64) -> [f64; 8] {
     let (sc, tc) = (1.0 - s, 1.0 - t);
     let guard = |sum: f64| if sum > 0.0 { 1.0 / sum } else { 1.0 };
     let df0 = guard(s + t);
@@ -243,19 +228,22 @@ pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
     let g2 = t * df1;
     let g4 = sc * df2;
     let g6 = tc * df3;
-    let g = [g0, 1.0 - g0, g2, 1.0 - g2, g4, 1.0 - g4, g6, 1.0 - g6];
-    let boundary_index = [0, 1, 7, 5, 2, 6, 16, 12, 15, 17, 11, 10];
-    let boundary_s = [0, 1, 2, 3, 0, 3, 0, 3, 0, 1, 2, 3];
-    let boundary_t = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3];
-    let interior_index = [3, 4, 8, 9, 13, 14, 18, 19];
-    let interior_s = [1, 1, 2, 2, 2, 2, 1, 1];
-    let interior_t = [1, 1, 1, 1, 2, 2, 2, 2];
+    [g0, 1.0 - g0, g2, 1.0 - g2, g4, 1.0 - g4, g6, 1.0 - g6]
+}
+
+/// Gregory basis of the 20 control points of a quad with an irregular corner (`OpenSubdiv`
+/// `EvalBasisGregory`).
+pub(super) fn gregory_weights(s: f64, t: f64) -> [f64; 20] {
+    let bs = bezier_basis(s);
+    let bt = bezier_basis(t);
+    let g = gregory_blend(s, t);
     let mut w = [0.0; 20];
     for i in 0..12 {
-        w[boundary_index[i]] = bs[boundary_s[i]] * bt[boundary_t[i]];
+        w[GREGORY_BOUNDARY_INDEX[i]] = bs[GREGORY_BOUNDARY_S[i]] * bt[GREGORY_BOUNDARY_T[i]];
     }
     for i in 0..8 {
-        w[interior_index[i]] = bs[interior_s[i]] * bt[interior_t[i]] * g[i];
+        w[GREGORY_INTERIOR_INDEX[i]] =
+            bs[GREGORY_INTERIOR_S[i]] * bt[GREGORY_INTERIOR_T[i]] * g[i];
     }
     w
 }
@@ -267,36 +255,20 @@ pub(super) fn gregory_weights_and_derivatives(s: f64, t: f64) -> ([f64; 20], [f6
     let bt = bezier_basis(t);
     let ds = bezier_basis_derivative(s);
     let dt = bezier_basis_derivative(t);
-    let (sc, tc) = (1.0 - s, 1.0 - t);
-    let guard = |sum: f64| if sum > 0.0 { 1.0 / sum } else { 1.0 };
-    let df0 = guard(s + t);
-    let df1 = guard(sc + t);
-    let df2 = guard(sc + tc);
-    let df3 = guard(s + tc);
-    let g0 = s * df0;
-    let g2 = t * df1;
-    let g4 = sc * df2;
-    let g6 = tc * df3;
-    let g = [g0, 1.0 - g0, g2, 1.0 - g2, g4, 1.0 - g4, g6, 1.0 - g6];
-    let boundary_index = [0, 1, 7, 5, 2, 6, 16, 12, 15, 17, 11, 10];
-    let boundary_s = [0, 1, 2, 3, 0, 3, 0, 3, 0, 1, 2, 3];
-    let boundary_t = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3];
-    let interior_index = [3, 4, 8, 9, 13, 14, 18, 19];
-    let interior_s = [1, 1, 2, 2, 2, 2, 1, 1];
-    let interior_t = [1, 1, 1, 1, 2, 2, 2, 2];
+    let g = gregory_blend(s, t);
     let mut w = [0.0; 20];
     let mut ws = [0.0; 20];
     let mut wt = [0.0; 20];
     for i in 0..12 {
-        let dst = boundary_index[i];
-        let (s_index, t_index) = (boundary_s[i], boundary_t[i]);
+        let dst = GREGORY_BOUNDARY_INDEX[i];
+        let (s_index, t_index) = (GREGORY_BOUNDARY_S[i], GREGORY_BOUNDARY_T[i]);
         w[dst] = bs[s_index] * bt[t_index];
         ws[dst] = ds[s_index] * bt[t_index];
         wt[dst] = bs[s_index] * dt[t_index];
     }
     for i in 0..8 {
-        let dst = interior_index[i];
-        let (s_index, t_index) = (interior_s[i], interior_t[i]);
+        let dst = GREGORY_INTERIOR_INDEX[i];
+        let (s_index, t_index) = (GREGORY_INTERIOR_S[i], GREGORY_INTERIOR_T[i]);
         w[dst] = bs[s_index] * bt[t_index] * g[i];
         ws[dst] = ds[s_index] * bt[t_index] * g[i];
         wt[dst] = bs[s_index] * dt[t_index] * g[i];

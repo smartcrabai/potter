@@ -8,7 +8,7 @@ use std::{
     mem::size_of,
 };
 
-use glam::{DMat4, DVec2, DVec3};
+use glam::{DMat4, DVec3};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -302,6 +302,8 @@ pub(super) struct DicedTopology {
     pub(super) faces: Vec<Vec<usize>>,
     pub(super) samples: Samples,
     pub(super) positions: Vec<DVec3>,
+    /// Unit `dPdu × dPdv` per output vertex, aligned with `positions`.
+    pub(super) normals: Vec<DVec3>,
 }
 
 // Match the Cycles 5.2.2 `split_threshold` used by `DiagSplit::T` (split.cpp:105-114).
@@ -454,6 +456,7 @@ struct DicedBuilder {
     faces: Vec<Vec<usize>>,
     samples: Samples,
     local_positions: Vec<DVec3>,
+    normals: Vec<DVec3>,
     shared_vertices: HashMap<DicedVertexKey, usize>,
     estimated_bytes: u128,
 }
@@ -467,6 +470,7 @@ impl DicedBuilder {
                 corners: Vec::new(),
             },
             local_positions: Vec::new(),
+            normals: Vec::new(),
             shared_vertices: HashMap::new(),
             estimated_bytes: curve_bytes,
         }
@@ -550,7 +554,7 @@ impl DicedBuilder {
         surface: &LimitSurface,
     ) -> Result<usize> {
         self.check_capacity(1, 0, 0)?;
-        let position = surface.point_and_derivatives(sample)?.0;
+        let (position, du, dv) = surface.point_and_derivatives(sample)?;
         if !position.is_finite() {
             return Err(PotError::new(
                 ErrorCode::EvaluationFailed,
@@ -560,6 +564,8 @@ impl DicedBuilder {
         let index = self.samples.vertices.len();
         self.samples.vertices.push(Some(sample));
         self.local_positions.push(position);
+        // Cycles 5.2.2 EdgeDice::set_vertex stores the patch's normalized dPdu × dPdv.
+        self.normals.push(du.cross(dv).normalize_or_zero());
         self.shared_vertices.insert(key, index);
         self.estimated_bytes += diced_vertex_bytes();
         Ok(index)
@@ -636,6 +642,7 @@ pub(super) fn dice(
                 corners: Vec::new(),
             },
             positions: Vec::new(),
+            normals: Vec::new(),
         });
     }
     let camera_frame = config
@@ -865,22 +872,13 @@ pub(super) fn dice(
     let curve_bytes = curve_temporary_bytes(patch_bytes, curve_count, retained_curve_points, 0, 0)?;
     let mut builder = DicedBuilder::new(curve_bytes);
     for patch in &patches {
-        dice_patch(
-            patch,
-            base_faces,
-            &curve_points,
-            surface,
-            config,
-            camera_frame.as_ref(),
-            target_size,
-            max_segments,
-            &mut builder,
-        )?;
+        dice_patch(patch, base_faces, &curve_points, surface, &mut builder)?;
     }
     Ok(DicedTopology {
         faces: builder.faces,
         samples: builder.samples,
         positions: builder.local_positions,
+        normals: builder.normals,
     })
 }
 
@@ -1307,10 +1305,6 @@ fn dice_patch(
     base_faces: &[Vec<usize>],
     curve_points: &BTreeMap<CurveKey, Vec<f64>>,
     surface: &LimitSurface,
-    config: &AdaptiveDicingConfig,
-    camera_frame: Option<&CameraDicingFrame>,
-    target_size: f64,
-    max_segments: usize,
     builder: &mut DicedBuilder,
 ) -> Result<()> {
     let mut boundary_point_count = 0usize;
@@ -1413,59 +1407,15 @@ fn dice_patch(
         return builder.zip_boundaries(&top, &edge_vertices[0]);
     }
 
-    let area = patch_area(patch, surface, config, camera_frame)?;
-
-    let target_triangle_area = 0.5 * target_size * target_size;
-    if !target_triangle_area.is_finite() || target_triangle_area <= 0.0 {
-        return Err(PotError::invalid_argument(
-            "adaptive dicing target triangle area is not finite and positive",
-        ));
-    }
-    let n_tris = area / target_triangle_area;
-    let mu_f = mu as f64;
-    let mv_f = mv as f64;
-    let edge_segments_total: f64 = edge_segments.iter().map(|&count| count as f64).sum();
-    let n = 0.5 * (n_tris - edge_segments_total);
-    let discriminant = 4.0 * n * mu_f * mv_f + (mu_f + mv_f).powi(2);
-    let scale = (mu_f + mv_f + discriminant.max(0.0).sqrt()) / (2.0 * mu_f * mv_f);
-    if !area.is_finite() || !n_tris.is_finite() || !scale.is_finite() {
-        return Err(PotError::new(
-            ErrorCode::EvaluationFailed,
-            "adaptive patch area produced a non-finite interior grid scale",
-        ));
-    }
-
-    // Cycles split.cpp:130-147 halves the max edge factor for ptex patches originating in n-gons.
-    let grid_cap = if base_faces[patch.face].len() == 4 {
-        max_segments
-    } else {
-        (max_segments / 2).max(1)
-    };
-    let grid_mu = scaled_grid_factor(scale, mu, grid_cap)?;
-    let grid_mv = scaled_grid_factor(scale, mv, grid_cap)?;
-    if grid_mu == 1 || grid_mv == 1 {
-        let patch_triangles = edge_segments
-            .iter()
-            .try_fold(0usize, |total, &count| total.checked_add(count))
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::LimitExceeded,
-                    "adaptive patch fan triangle estimate overflows",
-                )
-            })?;
-        builder.check_capacity(1, patch_triangles, edge_temp_bytes)?;
-        return dice_patch_fan(patch, &edge_vertices, surface, builder);
-    }
-
-    // Cycles dice.cpp:63-97 estimates patch area from a 3x3 projected sample and solves an
-    // interior scale against edge factors; its grid is stitched to independently diced edges.
-    let grid_inner_vertices = (grid_mu - 1).checked_mul(grid_mv - 1).ok_or_else(|| {
+    // Cycles dice.cpp:370-396 always stitches the interior grid at the shared edge factors; its
+    // area-scaled grid is compiled out there (`#if 0`).
+    let grid_inner_vertices = (mu - 1).checked_mul(mv - 1).ok_or_else(|| {
         PotError::new(
             ErrorCode::LimitExceeded,
             "adaptive interior vertex estimate overflows",
         )
     })?;
-    let interior_cells = (grid_mu - 2).checked_mul(grid_mv - 2).ok_or_else(|| {
+    let interior_cells = (mu - 2).checked_mul(mv - 2).ok_or_else(|| {
         PotError::new(
             ErrorCode::LimitExceeded,
             "adaptive interior cell estimate overflows",
@@ -1477,9 +1427,9 @@ fn dice_patch(
             "adaptive interior triangle estimate overflows",
         )
     })?;
-    let inner_stitches = (grid_mu - 2)
+    let inner_stitches = (mu - 2)
         .checked_mul(2)
-        .and_then(|count| count.checked_add((grid_mv - 2).checked_mul(2)?))
+        .and_then(|count| count.checked_add((mv - 2).checked_mul(2)?))
         .ok_or_else(|| {
             PotError::new(
                 ErrorCode::LimitExceeded,
@@ -1504,13 +1454,13 @@ fn dice_patch(
                 "adaptive patch triangle estimate overflows",
             )
         })?;
-    let grid_rows = grid_mv.checked_add(1).ok_or_else(|| {
+    let grid_rows = mv.checked_add(1).ok_or_else(|| {
         PotError::new(
             ErrorCode::LimitExceeded,
             "adaptive grid row count overflows",
         )
     })?;
-    let grid_columns = grid_mu.checked_add(1).ok_or_else(|| {
+    let grid_columns = mu.checked_add(1).ok_or_else(|| {
         PotError::new(
             ErrorCode::LimitExceeded,
             "adaptive grid column count overflows",
@@ -1533,7 +1483,7 @@ fn dice_patch(
                 "adaptive grid memory estimate overflows",
             )
         })?;
-    let inner_edge_points = (grid_mu - 1).max(grid_mv - 1);
+    let inner_edge_points = (mu - 1).max(mv - 1);
     grid_temporary_bytes = grid_temporary_bytes
         .checked_add(dicing_buffer_bytes(
             inner_edge_points,
@@ -1564,22 +1514,22 @@ fn dice_patch(
             v: 0.0,
         },
     };
-    let mut grid = vec![vec![placeholder; grid_mu + 1]; grid_mv + 1];
-    for j in 1..grid_mv {
-        for i in 1..grid_mu {
+    let mut grid = vec![vec![placeholder; mu + 1]; mv + 1];
+    for j in 1..mv {
+        for i in 1..mu {
             let sample = Sample {
                 face: patch.face,
                 ptex: patch.ptex,
-                u: i as f64 / grid_mu as f64,
-                v: j as f64 / grid_mv as f64,
+                u: i as f64 / mu as f64,
+                v: j as f64 / mv as f64,
             };
             let key = DicedVertexKey::Interior(patch.face, patch.ptex, i, j);
             let index = builder.insert_vertex(key, sample, surface)?;
             grid[j][i] = GridVertex { index, sample };
         }
     }
-    for j in 1..(grid_mv - 1) {
-        for i in 1..(grid_mu - 1) {
+    for j in 1..(mv - 1) {
+        for i in 1..(mu - 1) {
             let a = grid[j][i];
             let b = grid[j][i + 1];
             let c = grid[j + 1][i + 1];
@@ -1592,10 +1542,10 @@ fn dice_patch(
     for edge in 0..4 {
         let mut inner = Vec::new();
         match edge {
-            0 => inner.extend((1..grid_mu).map(|i| grid[1][i])),
-            1 => inner.extend((1..grid_mv).map(|j| grid[j][grid_mu - 1])),
-            2 => inner.extend((1..grid_mu).rev().map(|i| grid[grid_mv - 1][i])),
-            _ => inner.extend((1..grid_mv).rev().map(|j| grid[j][1])),
+            0 => inner.extend((1..mu).map(|i| grid[1][i])),
+            1 => inner.extend((1..mv).map(|j| grid[j][mu - 1])),
+            2 => inner.extend((1..mu).rev().map(|i| grid[mv - 1][i])),
+            _ => inner.extend((1..mv).rev().map(|j| grid[j][1])),
         }
         builder.zip_boundaries(&inner, &edge_vertices[edge])?;
     }
@@ -1620,203 +1570,12 @@ fn check_strip_capacity(
     builder.check_capacity(0, triangles, edge_temp_bytes)
 }
 
-fn scaled_grid_factor(scale: f64, edge_factor: usize, cap: usize) -> Result<usize> {
-    let scaled = (scale * edge_factor as f64).ceil().max(1.0);
-    if !scaled.is_finite() {
-        return Err(PotError::new(
-            ErrorCode::EvaluationFailed,
-            "adaptive interior grid factor is not finite",
-        ));
-    }
-    Ok(if scaled >= cap as f64 {
-        cap
-    } else {
-        scaled as usize
-    })
-}
-
-fn patch_area(
-    patch: &Patch,
-    surface: &LimitSurface,
-    config: &AdaptiveDicingConfig,
-    camera_frame: Option<&CameraDicingFrame>,
-) -> Result<f64> {
-    let mut points = [[DVec3::ZERO; 3]; 3];
-    for (i, row) in points.iter_mut().enumerate() {
-        for (j, point) in row.iter_mut().enumerate() {
-            *point = patch_measure_point(
-                patch,
-                surface,
-                config,
-                camera_frame,
-                i as f64 * 0.5,
-                j as f64 * 0.5,
-            )?;
-        }
-    }
-    // Equirectangular longitude wraps at the raster seam (raster.rs:1041-1050); unwrap around the
-    // patch center so the 3x3 area estimate measures the local patch instead of a full-width jump.
-    if config.camera.as_ref().is_some_and(|camera| {
-        camera.projection == CameraProjection::Panorama && !camera_is_fisheye(camera)
-    }) {
-        let width = f64::from(config.camera.as_ref().expect("camera checked").resolution[0]);
-        let center_x = points[1][1].x;
-        for point in points.iter_mut().flatten() {
-            let delta = point.x - center_x;
-            if delta > 0.5 * width {
-                point.x -= width;
-            } else if delta < -0.5 * width {
-                point.x += width;
-            }
-        }
-    }
-    let largest_quad = quad_area(points[0][0], points[1][0], points[0][1], points[1][1])
-        .max(quad_area(
-            points[1][0],
-            points[2][0],
-            points[1][1],
-            points[2][1],
-        ))
-        .max(quad_area(
-            points[0][1],
-            points[1][1],
-            points[0][2],
-            points[1][2],
-        ))
-        .max(quad_area(
-            points[1][1],
-            points[2][1],
-            points[1][2],
-            points[2][2],
-        ));
-    Ok(largest_quad * 4.0)
-}
-
-fn patch_measure_point(
-    patch: &Patch,
-    surface: &LimitSurface,
-    config: &AdaptiveDicingConfig,
-    camera_frame: Option<&CameraDicingFrame>,
-    u: f64,
-    v: f64,
-) -> Result<DVec3> {
-    let point = surface
-        .point_and_derivatives(Sample {
-            face: patch.face,
-            ptex: patch.ptex,
-            u,
-            v,
-        })?
-        .0;
-    if !point.is_finite() {
-        return Err(PotError::new(
-            ErrorCode::EvaluationFailed,
-            "adaptive patch area sample is not finite",
-        ));
-    }
-    match config.space {
-        AdaptiveSpace::Object => Ok(point),
-        AdaptiveSpace::Pixel => {
-            let camera = config
-                .camera
-                .as_ref()
-                .expect("pixel dicing camera validated");
-            let world = config.object_to_world.transform_point3(point);
-            let camera_point = camera_frame
-                .expect("pixel dicing camera frame validated")
-                .world_to_camera
-                .transform_point3(world);
-            let raster = camera_raster_position(camera, camera_point);
-            if raster.is_finite() {
-                Ok(DVec3::new(raster.x, raster.y, 0.0))
-            } else {
-                Err(PotError::new(
-                    ErrorCode::EvaluationFailed,
-                    "adaptive camera projection produced a non-finite raster point",
-                ))
-            }
-        }
-    }
-}
-
-fn camera_raster_position(camera: &AdaptiveCamera, local: DVec3) -> DVec2 {
-    let width = f64::from(camera.resolution[0]);
-    let height = f64::from(camera.resolution[1]);
-    let ycor = height / width;
-    let horizontal_fit = match camera.sensor_fit.as_str() {
-        "HORIZONTAL" => true,
-        "VERTICAL" => false,
-        _ => ycor <= 1.0,
-    };
-    let view_factor = if horizontal_fit { 1.0 } else { ycor };
-    let ndc = match camera.projection {
-        CameraProjection::Orthographic => DVec2::new(
-            2.0 * local.x * view_factor / camera.ortho_scale - 2.0 * camera.shift_x * view_factor,
-            2.0 * local.y * view_factor / (ycor * camera.ortho_scale)
-                - 2.0 * camera.shift_y * view_factor / ycor,
-        ),
-        CameraProjection::Perspective => {
-            let depth = (-local.z).abs().max(f64::EPSILON);
-            let sensor_size = if horizontal_fit {
-                camera.sensor_width_mm
-            } else {
-                camera.sensor_height_mm
-            };
-            DVec2::new(
-                2.0 * local.x * view_factor * camera.lens_mm / (depth * sensor_size)
-                    - 2.0 * camera.shift_x * view_factor,
-                2.0 * local.y * view_factor * camera.lens_mm / (depth * ycor * sensor_size)
-                    - 2.0 * camera.shift_y * view_factor / ycor,
-            )
-        }
-        CameraProjection::Panorama | CameraProjection::Fisheye => {
-            let distance = local.length();
-            let direction = if distance > f64::EPSILON {
-                DVec3::new(local.x, local.y, -local.z) / distance
-            } else {
-                DVec3::Z
-            };
-            let projected = if camera_is_fisheye(camera) {
-                let radius = direction.z.clamp(-1.0, 1.0).acos() / std::f64::consts::PI;
-                let radial_length = direction.x.hypot(direction.y);
-                if radial_length > f64::EPSILON {
-                    DVec2::new(
-                        radius * direction.x / radial_length,
-                        radius * direction.y / radial_length,
-                    )
-                } else {
-                    DVec2::new(radius, 0.0)
-                }
-            } else {
-                DVec2::new(
-                    direction.x.atan2(direction.z) / std::f64::consts::PI,
-                    direction.y.clamp(-1.0, 1.0).asin() / std::f64::consts::FRAC_PI_2,
-                )
-            };
-            // Existing raster rays add 2*shift in NDC (raster.rs:1017-1019), so invert that
-            // operation when mapping a camera-space point back to raster coordinates.
-            DVec2::new(
-                projected.x - 2.0 * camera.shift_x,
-                projected.y - 2.0 * camera.shift_y,
-            )
-        }
-    };
-    DVec2::new((ndc.x + 1.0) * 0.5 * width, (1.0 - ndc.y) * 0.5 * height)
-}
 // Match render/preview.rs:462-465: stored panorama type selects equirectangular or equidistant;
 // the separate Fisheye projection maps to equidistant.
 fn camera_is_fisheye(camera: &AdaptiveCamera) -> bool {
     camera.projection == CameraProjection::Fisheye
         || (camera.projection == CameraProjection::Panorama
             && camera.panorama_type == "fisheye_equidistant")
-}
-
-fn quad_area(a: DVec3, b: DVec3, c: DVec3, d: DVec3) -> f64 {
-    triangle_area(a, b, d) + triangle_area(a, d, c)
-}
-
-fn triangle_area(a: DVec3, b: DVec3, c: DVec3) -> f64 {
-    0.5 * (b - a).cross(c - a).length()
 }
 
 fn shared_vertex_key(
@@ -1866,34 +1625,6 @@ fn shared_vertex_key(
     }
 }
 
-fn dice_patch_fan(
-    patch: &Patch,
-    edge_vertices: &[Vec<GridVertex>; 4],
-    surface: &LimitSurface,
-    builder: &mut DicedBuilder,
-) -> Result<()> {
-    let sample = Sample {
-        face: patch.face,
-        ptex: patch.ptex,
-        u: 0.5,
-        v: 0.5,
-    };
-    let center = GridVertex {
-        index: builder.insert_vertex(
-            DicedVertexKey::Interior(patch.face, patch.ptex, 0, 0),
-            sample,
-            surface,
-        )?,
-        sample,
-    };
-    for edge in edge_vertices {
-        for segment in edge.windows(2) {
-            builder.emit_triangle(center, segment[0], segment[1])?;
-        }
-    }
-    Ok(())
-}
-
 fn dice_single_quad(
     edge_vertices: &[Vec<GridVertex>; 4],
     builder: &mut DicedBuilder,
@@ -1921,7 +1652,7 @@ fn dice_single_quad(
     reason = "small deterministic adaptive camera checks"
 )]
 mod tests {
-    use super::{AdaptiveCamera, CameraDicingFrame, camera_raster_position, world_pixel_width};
+    use super::{AdaptiveCamera, CameraDicingFrame, world_pixel_width};
     use crate::model::CameraProjection;
     use glam::{DMat4, DVec3};
 
@@ -1995,12 +1726,5 @@ mod tests {
                 world_pixel_width(&scaled_camera, &scaled_frame, world, 1.0).unwrap();
             assert!((scaled_width - unit_width).abs() < 1.0e-12);
         }
-    }
-
-    #[test]
-    fn equirectangular_raster_y_uses_latitude() {
-        let camera = camera(CameraProjection::Panorama, DMat4::IDENTITY);
-        let raster = camera_raster_position(&camera, DVec3::new(0.0, 1.0, -1.0));
-        assert!((raster.y - 20.0).abs() < 1.0e-12);
     }
 }

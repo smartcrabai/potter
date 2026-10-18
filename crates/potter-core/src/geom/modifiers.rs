@@ -3237,16 +3237,6 @@ fn multires_sculpt_mask_values(source: &Mesh) -> Result<BTreeMap<u32, f32>> {
     Ok(source_masks)
 }
 
-fn multires_grid_side_at_level(level: u32) -> Result<usize> {
-    let shift = level
-        .checked_sub(1)
-        .ok_or_else(|| PotError::new(ErrorCode::InvalidArgument, "multires grid level is zero"))?;
-    1_usize
-        .checked_shl(shift)
-        .and_then(|side| side.checked_add(1))
-        .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "multires grid side overflows"))
-}
-
 fn ensure_multires_paint_masks(
     source: &Mesh,
     data: &mut multires::DisplacementData,
@@ -3257,7 +3247,7 @@ fn ensure_multires_paint_masks(
         return Ok(false);
     }
     // Blender creates the CCG mask layer once; later strokes keep that grid authoritative.
-    let side = multires_grid_side_at_level(sculpt_levels)?;
+    let side = multires::grid_side(sculpt_levels)?;
     let grid_area = side.checked_mul(side).ok_or_else(|| {
         PotError::new(
             ErrorCode::LimitExceeded,
@@ -3301,7 +3291,6 @@ fn ensure_multires_paint_masks(
         }
         grids.push(grid);
     }
-    data.paint_mask_level = Some(sculpt_levels);
     data.paint_mask_levels = Some(vec![sculpt_levels; corner_count]);
     data.paint_mask_grids = Some(grids);
     Ok(true)

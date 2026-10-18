@@ -1089,4 +1089,31 @@ mod tests {
         assert_eq!(faces[0].as_ref().map(Vec::len), Some(4));
         assert!(faces[1].is_none());
     }
+
+    #[test]
+    fn mixed_sharp_input_uses_corner_normals_but_all_sharp_is_face_domain() {
+        let mut mesh = Mesh::box_mesh(crate::geom::BoxParams::default()).expect("cube");
+        let sharp_edge_id = mesh.edges[0].id;
+        let edge_values = mesh
+            .edges
+            .iter()
+            .map(|edge| (format!("e{}", edge.id), json!(edge.id == sharp_edge_id)))
+            .collect::<Map<_, _>>();
+        mesh.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": edge_values}),
+        );
+        assert!(corner_normal_domain(&mesh).expect("mixed sharp domain"));
+
+        let edge_values = mesh
+            .edges
+            .iter()
+            .map(|edge| (format!("e{}", edge.id), json!(true)))
+            .collect::<Map<_, _>>();
+        mesh.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain": "edge", "type": "bool", "values": edge_values}),
+        );
+        assert!(!corner_normal_domain(&mesh).expect("all sharp domain"));
+    }
 }

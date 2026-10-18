@@ -4701,17 +4701,6 @@ fn multires_loop_layout_changed(source: &Mesh, target: &Mesh) -> bool {
             })
 }
 
-fn multires_grid_side(level: u32) -> Result<usize> {
-    if level == 0 {
-        return Ok(0);
-    }
-    let shift = level - 1;
-    1_usize
-        .checked_shl(shift)
-        .and_then(|side| side.checked_add(1))
-        .ok_or_else(|| invalid("multires grid side overflows"))
-}
-
 fn multires_face_center(mesh: &Mesh, face: &Face) -> Result<DVec3> {
     let mut center = DVec3::ZERO;
     for vertex_id in &face.vertices {
@@ -5139,7 +5128,7 @@ fn interpolate_multires(
                 .ok_or_else(|| invalid("multires target vertex normal is unavailable"))?;
             let target_patch = multires_corner_patch(target, target_face, corner, target_center)?;
             let side = if corner_grids.is_some() || hidden_grids.is_some() {
-                multires_grid_side(level)?
+                multires::grid_side(level)?
             } else {
                 0
             };
@@ -5189,7 +5178,7 @@ fn interpolate_multires(
                                     (target_grid.as_mut(), source_grids)
                                 {
                                     let source_side =
-                                        multires_grid_side(mdisp_level(data, sample.loop_index))?;
+                                        multires::grid_side(mdisp_level(data, sample.loop_index))?;
                                     let grid = grids.get(sample.loop_index).ok_or_else(|| {
                                         invalid("multires source grid mapping is invalid")
                                     })?;
@@ -5201,7 +5190,7 @@ fn interpolate_multires(
                                     (target_hidden.as_mut(), source_hidden)
                                 {
                                     let source_side =
-                                        multires_grid_side(mdisp_level(data, sample.loop_index))?;
+                                        multires::grid_side(mdisp_level(data, sample.loop_index))?;
                                     let grid = grids.get(sample.loop_index).ok_or_else(|| {
                                         invalid("multires source hidden-grid mapping is invalid")
                                     })?;
@@ -5338,7 +5327,7 @@ fn flip_multires(source: &Mesh, target: &Mesh, data: &mut MultiresGridData) -> R
                     .get(source_loop)
                     .ok_or_else(|| invalid("multires source grid mapping is invalid"))?;
                 output.push(if reversed {
-                    flip_mdisp_grid(grid, multires_grid_side(level)?)
+                    flip_mdisp_grid(grid, multires::grid_side(level)?)
                 } else {
                     grid.clone()
                 });

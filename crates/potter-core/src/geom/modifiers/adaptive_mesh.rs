@@ -36,6 +36,7 @@ pub(super) fn assemble(
     }
     if topology.faces.len() != topology.samples.corners.len()
         || topology.positions.len() != topology.samples.vertices.len()
+        || topology.normals.len() != topology.positions.len()
     {
         return Err(invalid_topology(
             "adaptive mesh topology buffers do not match",
@@ -74,15 +75,18 @@ pub(super) fn assemble(
         faces: Vec::with_capacity(topology.faces.len()),
         corners: Some(Vec::new()),
     };
-    for (&position, sample) in topology.positions.iter().zip(&topology.samples.vertices) {
+    for ((&position, sample), &normal) in topology
+        .positions
+        .iter()
+        .zip(&topology.samples.vertices)
+        .zip(&topology.normals)
+    {
         let sample = sample.ok_or_else(|| {
             invalid_topology("adaptive mesh vertex is missing its limit-surface sample")
         })?;
         validate_sample(base_faces, sample)?;
-        // Cycles 5.2.2 EdgeDice::set_vertex stores the patch's normalized dPdu × dPdv.
         if let Some(normals) = &mut adaptive_normals {
-            let (_, du, dv) = surface.point_and_derivatives(sample)?;
-            normals.push(Some(du.cross(dv).normalize_or_zero()));
+            normals.push(Some(normal));
         }
         if !position.is_finite() {
             return Err(PotError::new(
@@ -325,14 +329,6 @@ mod tests {
             .into_iter()
             .map(Option::unwrap)
             .collect();
-        let topology = DicedTopology {
-            faces: vec![vec![0, 1, 2]],
-            samples: Samples {
-                vertices: samples.iter().copied().map(Some).collect(),
-                corners: vec![samples.clone()],
-            },
-            positions: topology_positions,
-        };
         let expected: Vec<DVec3> = samples
             .iter()
             .map(|sample| {
@@ -340,6 +336,15 @@ mod tests {
                 du.cross(dv).normalize_or_zero()
             })
             .collect();
+        let topology = DicedTopology {
+            faces: vec![vec![0, 1, 2]],
+            samples: Samples {
+                vertices: samples.iter().copied().map(Some).collect(),
+                corners: vec![samples.clone()],
+            },
+            positions: topology_positions,
+            normals: expected.clone(),
+        };
         let (_, normals) = assemble(
             &source,
             &base_faces,

@@ -19,7 +19,6 @@ pub(super) struct DisplacementData {
     pub grid_levels: Option<Vec<u32>>,
     pub corner_grids: Option<Vec<Vec<[f32; 3]>>>,
     pub external_filepath: Option<String>,
-    pub paint_mask_level: Option<u32>,
     pub paint_mask_levels: Option<Vec<u32>>,
     pub paint_mask_grids: Option<Vec<Vec<f32>>>,
     pub hidden_grids: Option<Vec<Vec<bool>>>,
@@ -99,10 +98,8 @@ fn grid_paint_mask_value(
     if level == 0 {
         return Ok(0.0);
     }
-    if sculpt_level == 0 || sculpt_level > level {
-        return Err(invalid(
-            "sculpt level is incompatible with the stored paint-mask level",
-        ));
+    if sculpt_level == 0 {
+        return Err(invalid("sculpt level must be positive for paint-mask sampling"));
     }
     let side = grid_side(level)?;
     let sculpt_side = grid_side(sculpt_level)?;
@@ -111,23 +108,13 @@ fn grid_paint_mask_value(
             "multires paint-mask sample is outside its sculpt grid",
         ));
     }
-    let factor = 1_usize.checked_shl(level - sculpt_level).ok_or_else(|| {
-        PotError::new(ErrorCode::LimitExceeded, "paint-mask grid factor overflows")
-    })?;
-    let grid_index = y
-        .checked_mul(factor)
-        .and_then(|row| row.checked_mul(side))
-        .and_then(|row| {
-            x.checked_mul(factor)
-                .and_then(|column| row.checked_add(column))
-        })
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "paint-mask sample index overflows",
-            )
-        })?;
-    grid.get(grid_index)
+    // Blender's read_mask_grid rounds the grid coordinate into the stored mask grid at any level,
+    // so a sculpt level finer or coarser than the stored one maps through the same rounding.
+    let sculpt_maximum = (sculpt_side - 1) as f32;
+    let stored_maximum = (side - 1) as f32;
+    let stored_x = ((x as f32 / sculpt_maximum) * stored_maximum).round() as usize;
+    let stored_y = ((y as f32 / sculpt_maximum) * stored_maximum).round() as usize;
+    grid.get(stored_y * side + stored_x)
         .copied()
         .ok_or_else(|| invalid("multires paint-mask grid has an invalid size"))
 }
@@ -175,19 +162,15 @@ pub(super) fn read(mesh: &Mesh) -> Result<Option<DisplacementData>> {
             let level = grid_levels
                 .as_ref()
                 .map_or(total_levels, |levels| levels[index]);
-            if level == 0 {
-                return Ok(0);
-            }
-            super::super::multires_external::grid_vector_count(level)
+            corner_grid_samples(level)
         })
         .collect::<Result<Vec<_>>>()?;
-    let paint_mask_samples =
-        paint_mask_sample_count(record.get("paint_mask"), corner_count, total_levels)?;
-    let hidden_samples = hidden_sample_count(record.get("hidden"), &grid_vectors)?;
-    check_grid_capacity_for_grids(&grid_vectors, paint_mask_samples, hidden_samples, 0)?;
     let (paint_mask_levels, paint_mask_grids) =
         parse_paint_masks(record.get("paint_mask"), corner_count, total_levels)?;
     let hidden_grids = parse_hidden_grids(record.get("hidden"), &grid_vectors)?;
+    let paint_mask_samples = paint_mask_grids.as_deref().map(sample_count).transpose()?;
+    let hidden_samples = hidden_grids.as_deref().map(sample_count).transpose()?;
+    check_grid_capacity_for_grids(&grid_vectors, paint_mask_samples, hidden_samples, 0)?;
     let corner_grids = match record.get("values") {
         Some(_) if total_levels == 0 => {
             return Err(invalid(
@@ -197,25 +180,14 @@ pub(super) fn read(mesh: &Mesh) -> Result<Option<DisplacementData>> {
         Some(raw_values) => Some(read_values(mesh, raw_values, &grid_vectors)?),
         None => None,
     };
-    let paint_mask_level = paint_mask_levels.as_ref().and_then(|levels| {
-        levels
-            .first()
-            .copied()
-            .filter(|first| levels.iter().all(|level| level == first))
-    });
     let (face_loop_starts, face_ptex_starts, ptex_face_corners, loop_face_corners) =
         ptex_mapping(mesh)?;
-    let grid_side = if total_levels == 0 {
-        0
-    } else {
-        grid_side(total_levels)?
-    };
+    let grid_side = grid_side(total_levels)?;
     Ok(Some(DisplacementData {
         total_levels,
         grid_levels,
         corner_grids,
         external_filepath,
-        paint_mask_level,
         paint_mask_levels,
         paint_mask_grids,
         hidden_grids,
@@ -253,101 +225,6 @@ fn parse_grid_levels(
     .transpose()
 }
 
-fn paint_mask_sample_count(
-    raw: Option<&Value>,
-    corner_count: usize,
-    total_levels: u32,
-) -> Result<Option<u128>> {
-    raw.map(|raw| {
-        let masks = raw
-            .as_array()
-            .filter(|masks| masks.len() == corner_count)
-            .ok_or_else(|| invalid("multires_displacement.paint_mask must match mesh corners"))?;
-        masks
-            .iter()
-            .enumerate()
-            .try_fold(0_u128, |count, (index, mask)| {
-                let level = mask
-                    .get("level")
-                    .and_then(Value::as_u64)
-                    .and_then(|level| u32::try_from(level).ok())
-                    .filter(|level| *level <= 13 && *level <= total_levels)
-                    .ok_or_else(|| {
-                        invalid(format!(
-                            "multires paint-mask grid {index} has an invalid level"
-                        ))
-                    })?;
-                let values = mask
-                    .get("values")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        invalid(format!(
-                            "multires paint-mask grid {index} has invalid values"
-                        ))
-                    })?;
-                let expected = if level == 0 {
-                    0
-                } else {
-                    super::super::multires_external::grid_vector_count(level)?
-                };
-                if values.len() != expected
-                    || values.iter().any(|value| {
-                        value
-                            .as_f64()
-                            .is_none_or(|value| !value.is_finite() || !(value as f32).is_finite())
-                    })
-                {
-                    return Err(invalid(format!(
-                        "multires paint-mask grid {index} is invalid"
-                    )));
-                }
-                let samples = u128::try_from(values.len()).map_err(|_| {
-                    PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "paint-mask sample count exceeds u128",
-                    )
-                })?;
-                count.checked_add(samples).ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "paint-mask sample count overflows",
-                    )
-                })
-            })
-    })
-    .transpose()
-}
-
-fn hidden_sample_count(raw: Option<&Value>, grid_vectors: &[usize]) -> Result<Option<u128>> {
-    raw.map(|raw| {
-        let hidden = raw
-            .as_array()
-            .filter(|hidden| hidden.len() == grid_vectors.len())
-            .ok_or_else(|| invalid("multires_displacement.hidden must match mesh corners"))?;
-        hidden.iter().zip(grid_vectors).enumerate().try_fold(
-            0_u128,
-            |count, (index, (grid, expected))| {
-                let grid = grid
-                    .as_array()
-                    .filter(|grid| grid.len() == *expected)
-                    .ok_or_else(|| {
-                        invalid(format!("multires hidden grid {index} has an invalid size"))
-                    })?;
-                if grid.iter().any(|value| value.as_bool().is_none()) {
-                    return Err(invalid("multires hidden samples must be boolean"));
-                }
-                let samples = u128::try_from(grid.len()).map_err(|_| {
-                    PotError::new(ErrorCode::LimitExceeded, "hidden sample count exceeds u128")
-                })?;
-                count.checked_add(samples).ok_or_else(|| {
-                    PotError::new(ErrorCode::LimitExceeded, "hidden sample count overflows")
-                })
-            },
-        )
-    })
-    .transpose()
-}
-
 fn parse_paint_masks(
     raw: Option<&Value>,
     corner_count: usize,
@@ -381,11 +258,7 @@ fn parse_paint_masks(
                     "multires paint-mask grid {index} has invalid values"
                 ))
             })?;
-        let expected = if level == 0 {
-            0
-        } else {
-            super::super::multires_external::grid_vector_count(level)?
-        };
+        let expected = corner_grid_samples(level)?;
         if values.len() != expected {
             return Err(invalid(format!(
                 "multires paint-mask grid {index} has an invalid size"
@@ -457,15 +330,25 @@ pub(crate) fn read_grid_data(mesh: &Mesh) -> Result<Option<MultiresGridData>> {
     }))
 }
 
-fn grid_side(level: u32) -> Result<usize> {
-    let shift = level
-        .checked_sub(1)
-        .ok_or_else(|| invalid("multires displacement grid level is invalid"))?;
+/// Side length of a corner grid at `level` (`2^(level - 1) + 1`); level 0 stores no grid.
+pub(crate) fn grid_side(level: u32) -> Result<usize> {
+    if level == 0 {
+        return Ok(0);
+    }
     1_usize
-        .checked_shl(shift)
+        .checked_shl(level - 1)
         .and_then(|side| side.checked_add(1))
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "multires grid side overflows"))
 }
+
+/// Samples in one corner grid at `level`; level 0 stores no grid.
+fn corner_grid_samples(level: u32) -> Result<usize> {
+    if level == 0 {
+        return Ok(0);
+    }
+    super::super::multires_external::grid_vector_count(level)
+}
+
 fn grid_side_for_loop(data: &DisplacementData, loop_index: usize) -> Result<usize> {
     match data
         .grid_levels
@@ -1136,6 +1019,7 @@ pub(super) fn evaluate_sample(
     let mut displacement = tangent_to_object(du, dv, tangent_corner, tangent);
     match average {
         BoundaryAverage::All => {
+            // Blender's average_with_all folds each other corner in as a running half-average.
             for corner_delta in 1..corner_count {
                 let other = average_with_other(
                     mesh,
@@ -1146,9 +1030,8 @@ pub(super) fn evaluate_sample(
                     0.0,
                     &mut derivatives,
                 )?;
-                displacement += other;
+                displacement = (displacement + other) * 0.5;
             }
-            displacement = displacement / corner_count as f64;
         }
         BoundaryAverage::Previous => {
             let other = average_with_other(
@@ -1340,12 +1223,7 @@ fn write_grid_record(
     }
     let vectors_per_grid = levels
         .iter()
-        .map(|&level| {
-            if level == 0 {
-                return Ok(0);
-            }
-            super::super::multires_external::grid_vector_count(level)
-        })
+        .map(|&level| corner_grid_samples(level))
         .collect::<Result<Vec<_>>>()?;
     let paint_mask_samples = paint_mask_grids.map(sample_count).transpose()?;
     let hidden_samples = hidden_grids.map(sample_count).transpose()?;
@@ -1390,11 +1268,7 @@ fn write_grid_record(
         {
             let mut masks = Vec::with_capacity(corner_count);
             for (index, (level, grid)) in levels.iter().zip(grids).enumerate() {
-                let expected = if *level == 0 {
-                    0
-                } else {
-                    super::super::multires_external::grid_vector_count(*level)?
-                };
+                let expected = corner_grid_samples(*level)?;
                 if *level > 13
                     || *level > total_levels
                     || grid.len() != expected
@@ -1443,7 +1317,7 @@ mod tests {
     use glam::DVec3;
     use serde_json::{Map, json};
 
-    use crate::geom::{BoxParams, Mesh, normals::corner_normal_domain};
+    use crate::geom::{BoxParams, Mesh};
 
     use super::{
         MultiresGridData, add_sample_delta, evaluate_sample, grid_sample_location,
@@ -1560,8 +1434,9 @@ mod tests {
         assert_eq!(actual.paint_mask_grids, expected.paint_mask_grids);
         assert_eq!(actual.hidden_grids, expected.hidden_grids);
         assert_eq!(actual.paint_mask_value(0, 1, 2, 2).unwrap(), 22.0);
+        // Sculpt level 3 samples the stored level-2 mask through Blender's rounded grid mapping.
+        assert_eq!(actual.paint_mask_value(1, 4, 4, 3).unwrap(), 8.0);
         let displacement = read(&mesh).unwrap().unwrap();
-        assert_eq!(displacement.paint_mask_level, None);
         assert_eq!(displacement.paint_mask_value(0, 1, 2, 2).unwrap(), 22.0);
         assert_eq!(
             grid_sample_location(&mesh, &displacement, 0, 3)
@@ -1704,34 +1579,7 @@ mod tests {
             Ok((DVec3::X, DVec3::Y))
         })
         .unwrap();
-        assert_eq!(displacement, DVec3::new(0.0, 0.0, 2.5));
-    }
-
-    #[test]
-    fn mixed_sharp_input_uses_corner_normals_but_all_sharp_is_face_domain() {
-        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-        let sharp_edge_id = mesh.edges[0].id;
-        let edge_values = mesh
-            .edges
-            .iter()
-            .map(|edge| (format!("e{}", edge.id), json!(edge.id == sharp_edge_id)))
-            .collect::<Map<_, _>>();
-        mesh.attributes.insert(
-            "sharp".to_owned(),
-            json!({"domain": "edge", "type": "bool", "values": edge_values}),
-        );
-        assert!(corner_normal_domain(&mesh).unwrap());
-
-        let edge_values = mesh
-            .edges
-            .iter()
-            .map(|edge| (format!("e{}", edge.id), json!(true)))
-            .collect::<Map<_, _>>();
-        mesh.attributes.insert(
-            "sharp".to_owned(),
-            json!({"domain": "edge", "type": "bool", "values": edge_values}),
-        );
-        assert!(!corner_normal_domain(&mesh).unwrap());
+        assert_eq!(displacement, DVec3::new(0.0, 0.0, 3.125));
     }
 
     #[test]
