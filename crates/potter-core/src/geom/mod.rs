@@ -60,6 +60,8 @@ pub fn corner_normal_vectors(mesh: &Mesh) -> crate::error::Result<Vec<DVec3>> {
 }
 
 #[cfg(test)]
+mod mirror_oracle;
+#[cfg(test)]
 mod shading_oracle;
 
 /// Stable vertex record. `id` is persistent; its position in [`Mesh::vertices`] is not.
