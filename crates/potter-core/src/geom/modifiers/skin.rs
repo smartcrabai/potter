@@ -209,7 +209,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         edge_endpoints.push([first, second]);
     }
     let mut edge_chains = Vec::with_capacity(mesh.edges.len());
-    for (edge_index, [first, second]) in edge_endpoints.iter().copied().enumerate() {
+    for [first, second] in edge_endpoints.iter().copied() {
         let first_radius = node_radii[first];
         let second_radius = node_radii[second];
         // Blender's `calc_edge_subdivisions`: `half_v2` of each end, summed, over the f32 length.
