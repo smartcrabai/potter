@@ -89,6 +89,8 @@ struct TextureExport {
     property: &'static str,
     path: String,
     uv_layer: Option<String>,
+    /// Blender's exporter writes WrapModeU and WrapModeV as clamp (1) for any extension but REPEAT (0).
+    clamp: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -493,9 +495,10 @@ pub(crate) fn export_with_root_allow_lossy(
                     quote(layer)
                 )
             });
+        let wrap_mode = i32::from(texture.clamp);
         writeln!(
             output,
-            "\tTexture: {}, \"Texture::{}\", \"TextureVideoClip\" {{\n\t\tType: \"TextureVideoClip\"\n\t\tVersion: 202\n\t\tTextureName: \"Texture::{}\"\n\t\tProperties70:  {{\n{}{default_name_property}\t\t\tP: \"potter:property\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}\n\t\tFileName: \"{}\"\n\t\tRelativeFilename: \"{}\"\n\t\tModelUVTranslation: 0,0\n\t\tModelUVScaling: 1,1\n\t\tTexture_Alpha_Source: \"None\"\n\t\tCropping: 0,0,0,0\n\t}}",
+            "\tTexture: {}, \"Texture::{}\", \"TextureVideoClip\" {{\n\t\tType: \"TextureVideoClip\"\n\t\tVersion: 202\n\t\tTextureName: \"Texture::{}\"\n\t\tProperties70:  {{\n{}{default_name_property}\t\t\tP: \"WrapModeU\", \"enum\", \"\", \"\", {wrap_mode}\n\t\t\tP: \"WrapModeV\", \"enum\", \"\", \"\", {wrap_mode}\n\t\t\tP: \"potter:property\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}\n\t\tFileName: \"{}\"\n\t\tRelativeFilename: \"{}\"\n\t\tModelUVTranslation: 0,0\n\t\tModelUVScaling: 1,1\n\t\tTexture_Alpha_Source: \"None\"\n\t\tCropping: 0,0,0,0\n\t}}",
             texture.id,
             quote(&material.name),
             quote(&material.name),
@@ -968,6 +971,9 @@ fn build_texture_exports(
                 property,
                 path: path.clone(),
                 uv_layer: material_export.uv_layers[index].clone(),
+                clamp: texture.as_ref().is_some_and(|texture| {
+                    texture.extension != crate::image::ImageExtension::Repeat
+                }),
             });
         }
     }
@@ -2291,7 +2297,7 @@ fn import_bytes_with_base(
             image: image_id,
             uv_layer: texture.uv_layer.clone(),
             interpolation: crate::image::ImageInterpolation::Linear,
-            extension: crate::image::ImageExtension::Repeat,
+            extension: texture.extension,
         };
         match property {
             "DiffuseColor" => material.base_color_texture = Some(texture_ref),
@@ -2519,6 +2525,8 @@ struct ImportedTexture {
     file_name: String,
     uv_layer: Option<String>,
     property: Option<String>,
+    /// `EXTEND` when either wrap mode is a clamp, as Blender's importer sets it (`import_fbx.py` `texture_mapping_set`).
+    extension: crate::image::ImageExtension,
 }
 #[derive(Clone, Debug)]
 struct Connection {
@@ -3050,11 +3058,19 @@ fn parse_texture(node: &FbxNode, numeric_id: i64) -> Result<ImportedTexture> {
         read_string_property(properties, "UVSet")
             .filter(|value| !value.is_empty() && value != "default")
     });
+    // Blender's importer sets EXTEND when either wrap mode is a clamp (1); REPEAT (0) keeps the default.
+    let clamp = read_scalar_property(properties, "WrapModeU", 0.0)? != 0.0
+        || read_scalar_property(properties, "WrapModeV", 0.0)? != 0.0;
     Ok(ImportedTexture {
         numeric_id,
         file_name,
         uv_layer,
         property: read_string_property(properties, "potter:property"),
+        extension: if clamp {
+            crate::image::ImageExtension::Extend
+        } else {
+            crate::image::ImageExtension::Repeat
+        },
     })
 }
 

@@ -15189,6 +15189,61 @@ mod tests {
     }
 
     #[test]
+    fn mixed_wrap_round_trips_through_the_exporters_per_axis_pattern() -> TestResult {
+        // A sampler whose axes wrap differently imports as Blender's per-axis UV graph. The exporter recognises that
+        // graph and writes the same sampler back, so the sampler is identical after the round trip.
+        for (wrap_s, wrap_t) in [(33071_u64, 10497_u64), (33648, 33071), (10497, 33648)] {
+            let root = tempfile::tempdir()?;
+            let png = root.path().join("texels.png");
+            ::image::RgbaImage::from_pixel(2, 2, ::image::Rgba([10, 20, 30, 255])).save(&png)?;
+            let png_path = png.to_string_lossy().into_owned();
+            let doc = scene_with_asset_root(
+                root.path(),
+                &json!([
+                    {"op":"image.load","id":"tex","path":png_path,"colorspace":"non_color"},
+                    {"op":"material.create","id":"wrapped","base_color":[1.0,1.0,1.0,1.0],"base_color_texture":{"image":"tex","interpolation":"closest"}},
+                    {"op":"node.create","id":"sheet","kind":"plane","params":{"size":1.0},"material":"wrapped"},
+                    {"op":"uv.unwrap","target":{"id":"sheet"},"method":"box"}
+                ]),
+            )?;
+            let (document, binary) = export_root_and_binary_at_root(&doc, root.path())?;
+            std::fs::write(root.path().join("scene.bin"), &binary)?;
+            let sampler =
+                json!({"magFilter": 9728, "minFilter": 9984, "wrapS": wrap_s, "wrapT": wrap_t});
+            let mut edited = document.clone();
+            edited["samplers"] = json!([sampler.clone()]);
+            edited["textures"][0]["sampler"] = json!(0);
+            let path = root.path().join("mixed.gltf");
+            std::fs::write(&path, serde_json::to_vec(&edited)?)?;
+            let imported = import(&path, uuid::Uuid::new_v4().to_string())?;
+            let material = imported
+                .doc
+                .materials
+                .get(&crate::model::Id::new("wrapped")?)
+                .ok_or("the material is missing")?;
+            assert!(
+                material.node_tree.is_some(),
+                "a mixed wrap imports as a material graph"
+            );
+            export_imported_again(&imported, root.path())?;
+            let (reexport, _) = export_root_and_binary_at_root(&imported.doc, root.path())?;
+            let texture =
+                reexport["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                    .as_u64()
+                    .ok_or("the base colour texture is missing")?;
+            let sampler_index = reexport["textures"][usize::try_from(texture)?]["sampler"]
+                .as_u64()
+                .ok_or("the texture has no sampler")?;
+            assert_eq!(
+                reexport["samplers"][usize::try_from(sampler_index)?],
+                sampler,
+                "the exported sampler differs from the imported one for wrap ({wrap_s}, {wrap_t})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn texture_extension_round_trips_through_the_gltf_sampler() -> TestResult {
         // An extension exports as its glTF sampler wrap, and the sampler imports back as the same extension.
         let root = tempfile::tempdir()?;

@@ -532,14 +532,23 @@ fn fields_surface(
 /// Graph recursion limit; deeper graphs are treated as cyclic and rejected.
 const MAX_GRAPH_DEPTH: usize = 128;
 
-/// Texture sampling state of one `ShaderNodeTexImage`.
+/// Texture sampling state of one `ShaderNodeTexImage`. `wrap` is the wrap of each UV axis (S, T).
 #[derive(Clone, Debug, PartialEq)]
 struct TexBase {
     image: Id,
     uv_layer: Option<String>,
     interpolation: ImageInterpolation,
-    wrap: TextureWrap,
+    wrap: [TextureWrap; 2],
     transform: Option<TextureTransform>,
+}
+
+/// The UV an image texture reads: its layer, its transform, and the wrap of each axis that Blender's per-axis wrap
+/// pattern sets (`None` where the pattern passes the axis through, or where there is no pattern).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct UvSource {
+    uv_layer: Option<String>,
+    transform: Option<TextureTransform>,
+    wrap: [Option<TextureWrap>; 2],
 }
 
 /// One texture read. `channel == None` is the Color output: the consuming slot decides which
@@ -624,7 +633,7 @@ fn sampled_texture(base: &TexBase, channels: [Option<ChannelSource>; 4]) -> Samp
         channels,
         uv_layer: base.uv_layer.clone(),
         interpolation: base.interpolation,
-        wrap: [base.wrap; 2],
+        wrap: base.wrap,
         transform: base.transform.clone(),
     }
 }
@@ -837,29 +846,123 @@ impl<'a> GraphReducer<'a> {
             .unwrap_or(default)
     }
 
-    /// UV layer and transform of an image texture's `Vector` input.
-    fn tex_vector(
+    /// UV layer, transform and per-axis wrap of an image texture's `Vector` input.
+    fn tex_vector(&mut self, tex_id: &Id, depth: usize) -> crate::error::Result<UvSource> {
+        let Some(link) = self.link_into(tex_id, "Vector") else {
+            return Ok(UvSource::default());
+        };
+        self.uv_source(tex_id, link, depth)
+    }
+
+    /// The UV source a link feeds: a UV Map, a Texture Coordinate, a Mapping, or Blender's per-axis wrap pattern
+    /// (`exp/sampler.py` `detect_manual_uv_wrapping`), which wraps the source's coordinates on each axis.
+    fn uv_source(
         &mut self,
         tex_id: &Id,
+        link: &GraphLink,
         depth: usize,
-    ) -> crate::error::Result<(Option<String>, Option<TextureTransform>)> {
-        let Some(link) = self.link_into(tex_id, "Vector") else {
-            return Ok((None, None));
-        };
+    ) -> crate::error::Result<UvSource> {
         let source = self.node(&link.from_node)?;
         match (source.node_type.as_str(), link.from_socket.as_str()) {
-            ("ShaderNodeUVMap", "UV") => Ok((uv_map_layer(source), None)),
-            ("ShaderNodeTexCoord", "UV") => Ok((None, None)),
-            ("ShaderNodeMapping", "Vector") => self.mapping(&link.from_node, depth),
+            ("ShaderNodeUVMap", "UV") => Ok(UvSource {
+                uv_layer: uv_map_layer(source),
+                ..UvSource::default()
+            }),
+            ("ShaderNodeTexCoord", "UV") => Ok(UvSource::default()),
+            ("ShaderNodeMapping", "Vector") => {
+                let (uv_layer, transform) = self.mapping(&link.from_node, depth)?;
+                Ok(UvSource {
+                    uv_layer,
+                    transform,
+                    ..UvSource::default()
+                })
+            }
+            ("ShaderNodeCombineXYZ", "Vector") => match self.uv_wrap_pattern(&link.from_node) {
+                Some((feed, wrap)) => {
+                    let depth = self.deeper(&link.from_node, depth)?;
+                    let mut uv = self.uv_source(tex_id, feed, depth)?;
+                    uv.wrap = wrap;
+                    Ok(uv)
+                }
+                None => {
+                    self.unsupported(
+                        &link.from_node,
+                        &source.node_type,
+                        &format!("the Vector of `{tex_id}`"),
+                    );
+                    Ok(UvSource::default())
+                }
+            },
             _ => {
                 self.unsupported(
                     &link.from_node,
                     &source.node_type,
                     &format!("the Vector of `{tex_id}`"),
                 );
-                Ok((None, None))
+                Ok(UvSource::default())
             }
         }
+    }
+
+    /// Blender's per-axis UV wrap: a Combine XYZ whose X and Y are each the matching axis of one Separate XYZ, passed
+    /// through or wrapped by a Math node. A `WRAP` with max 0 and min 1 is REPEAT, and a `PINGPONG` of scale 1 is
+    /// MIRRORED_REPEAT, as the exporter recognises them. Returns the link that feeds the Separate XYZ, and each axis's
+    /// wrap, with `None` for an axis passed through. Any other shape is not the pattern.
+    fn uv_wrap_pattern(
+        &self,
+        combine_id: &Id,
+    ) -> Option<(&'a GraphLink, [Option<TextureWrap>; 2])> {
+        let mut separate: Option<Id> = None;
+        let mut axes = [None; 2];
+        for (index, axis) in ["X", "Y"].into_iter().enumerate() {
+            let link = self.link_into(combine_id, axis)?;
+            let source = self.node(&link.from_node).ok()?;
+            let (feed_axis, wrap, sep_id) = match source.node_type.as_str() {
+                "ShaderNodeSeparateXYZ" => {
+                    (link.from_socket.as_str(), None, link.from_node.clone())
+                }
+                "ShaderNodeMath" => {
+                    let constant = |socket: &str| -> Option<f64> {
+                        if self.link_into(&link.from_node, socket).is_some() {
+                            return None;
+                        }
+                        source.inputs.get(socket).and_then(Value::as_f64)
+                    };
+                    let wrap = match prop_str(source, "operation")? {
+                        "PINGPONG" if constant("Value_001")? == 1.0 => TextureWrap::MirroredRepeat,
+                        "WRAP"
+                            if constant("Value_001")? == 0.0 && constant("Value_002")? == 1.0 =>
+                        {
+                            TextureWrap::Repeat
+                        }
+                        _ => return None,
+                    };
+                    let feed = self.link_into(&link.from_node, "Value")?;
+                    if self.node(&feed.from_node).ok()?.node_type != "ShaderNodeSeparateXYZ" {
+                        return None;
+                    }
+                    (
+                        feed.from_socket.as_str(),
+                        Some(wrap),
+                        feed.from_node.clone(),
+                    )
+                }
+                _ => return None,
+            };
+            // X must come from X and Y from Y, and both from one Separate XYZ.
+            if feed_axis != axis {
+                return None;
+            }
+            match &separate {
+                None => separate = Some(sep_id),
+                Some(first) if *first == sep_id => {}
+                Some(_) => return None,
+            }
+            axes[index] = wrap;
+        }
+        let separate = separate?;
+        let feed = self.link_into(&separate, "Vector")?;
+        Some((feed, axes))
     }
 
     /// `ShaderNodeMapping` as `KHR_texture_transform`, plus the UV layer of its input.
@@ -996,14 +1099,15 @@ impl<'a> GraphReducer<'a> {
                 None,
             ),
         }
-        let (uv_layer, transform) = self.tex_vector(tex_id, depth)?;
+        let uv = self.tex_vector(tex_id, depth)?;
         Ok(Sample {
             base: TexBase {
                 image,
-                uv_layer,
+                uv_layer: uv.uv_layer,
                 interpolation,
-                wrap,
-                transform,
+                // An axis the wrap pattern passes through keeps the node's extension, as Blender's exporter reads it.
+                wrap: uv.wrap.map(|axis| axis.unwrap_or(wrap)),
+                transform: uv.transform,
             },
             channel,
         })

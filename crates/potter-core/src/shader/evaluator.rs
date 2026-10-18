@@ -1570,9 +1570,16 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_> {
                 }
             }
             "PINGPONG" => {
-                let scale = second.abs().max(f64::MIN_POSITIVE);
-                let value = first.rem_euclid(2.0 * scale);
-                scale - (value - scale).abs()
+                // Blender's `pingpongf(value, scale)` (`math_base_inline.cc`): a zero scale gives 0, and otherwise the
+                // triangle wave of the signed scale, `|fract((value - scale) / (2 scale)) * 2 scale - scale|`.
+                let wave = if crate::float::equal_f64(second, 0.0) {
+                    0.0
+                } else {
+                    let period = second * 2.0;
+                    let ratio = (first - second) / period;
+                    (ratio - ratio.floor()) * period - second
+                };
+                wave.abs()
             }
             other => return Err(unsupported_node(id, &format!("Math:{other}"))),
         };
@@ -2822,6 +2829,65 @@ mod tests {
                     "extension {extension:?}: expected {expected:?}, got {actual:?}"
                 );
             }
+        }
+    }
+
+    /// The Roughness a Math node drives on a material, for `Value`, `Value_001` and `Value_002`.
+    fn math_roughness(operation: &str, value: f64, second: f64, third: f64) -> f64 {
+        let mut graph = NodeGroup::new("Math", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({}),
+        );
+        insert_node(
+            &mut graph,
+            "math",
+            "ShaderNodeMath",
+            json!({"Value": value, "Value_001": second, "Value_002": third}),
+        );
+        set_properties(&mut graph, "math", json!({"operation": operation}));
+        link(&mut graph, "math", "Value", "principled", "Roughness");
+        link(&mut graph, "principled", "BSDF", "output", "Surface");
+        let graph_id = Id::new("math_shader".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        evaluate_surface(&material, &HitContext::new(&groups))
+            .unwrap()
+            .roughness
+    }
+
+    #[test]
+    fn math_wrap_and_pingpong_match_blenders_wrapf_and_pingpongf() {
+        // Blender's `wrapf(value, max, min)` takes the second input as the maximum and the third as the minimum, and
+        // `pingpongf(value, scale)` is the triangle wave of the signed scale (`math_base_inline.cc`).
+        let cases = [
+            // The importer's REPEAT wrap (max 0, min 1) maps the negative and the overflowing input into [0, 1].
+            ("WRAP", -0.3, 0.0, 1.0, 0.7),
+            ("WRAP", 1.3, 0.0, 1.0, 0.3),
+            ("WRAP", -0.3, 1.0, 0.0, 0.7),
+            ("WRAP", 0.4, 1.0, 0.0, 0.4),
+            // A zero range returns the minimum.
+            ("WRAP", 0.4, 0.0, 0.0, 0.0),
+            ("PINGPONG", -0.4, 1.0, 0.0, 0.4),
+            ("PINGPONG", 2.5, 1.0, 0.0, 0.5),
+            // The signed scale: a negative scale gives the same wave.
+            ("PINGPONG", -0.4, -1.0, 0.0, 0.4),
+            // A zero scale returns zero.
+            ("PINGPONG", 0.5, 0.0, 0.0, 0.0),
+        ];
+        for (operation, value, second, third, expected) in cases {
+            let actual = math_roughness(operation, value, second, third);
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "{operation}({value}, {second}, {third}): expected {expected}, got {actual}"
+            );
         }
     }
 
