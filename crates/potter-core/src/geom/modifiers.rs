@@ -2500,6 +2500,32 @@ fn subdivision(
             );
         }
     }
+    // Blender stores each output face from its first emitted loop (the smallest loop ordinal). The
+    // face normal of the fan spaces starts its Newell sum at that vertex, so the output faces take
+    // that start. `corner_perm[c]` is the canonical corner now at position `c`; samples keep their
+    // canonical order, and every per-corner array is permuted through it.
+    let mut corner_perm: Vec<usize> = Vec::new();
+    let mut face_starts: Vec<usize> = Vec::new();
+    if let Some(samples) = samples.as_ref() {
+        let sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
+        let ordinals =
+            subdivision_normals::corner_numbering(&samples.corners, &sizes, levels as u32);
+        let mut offset = 0;
+        for face in result.faces.iter_mut() {
+            let count = face.vertices.len();
+            let start = (0..count)
+                .min_by_key(|&corner| ordinals[offset + corner])
+                .unwrap_or(0);
+            face.vertices.rotate_left(start);
+            corner_perm.extend((0..count).map(|corner| offset + (corner + start) % count));
+            face_starts.push(start);
+            offset += count;
+        }
+    }
+    // Corner attributes the rebuild carried over are in canonical corner order too.
+    if !corner_perm.is_empty() {
+        rotate_corner_attributes(&mut result, &face_starts, &corner_perm);
+    }
     // Positions and UVs share the base level of the limit surface. SIMPLE is evaluated at isolation 1
     // whatever the quality; without `use_limit_surface` only the base level serves the UVs.
     let limit_samples = samples.as_ref().filter(|_| simple || use_limit_surface);
@@ -2564,7 +2590,19 @@ fn subdivision(
                             levels as usize,
                         ),
                     };
-                    (layer.name, values, layer.pins)
+                    let values: Vec<_> = corner_perm.iter().map(|&corner| values[corner]).collect();
+                    let pins: Vec<Option<Vec<bool>>> = layer
+                        .pins
+                        .into_iter()
+                        .enumerate()
+                        .map(|(face, row)| {
+                            row.map(|mut flags| {
+                                flags.rotate_left(face_starts[face]);
+                                flags
+                            })
+                        })
+                        .collect();
+                    (layer.name, values, pins)
                 })
                 .collect();
             subdivision_uv::write_loop_uvs(&mut result, loops)?;
@@ -2579,8 +2617,12 @@ fn subdivision(
         )
     })?;
     let face_sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
-    let numbering =
+    let canonical =
         subdivision_normals::corner_numbering(&samples.corners, &face_sizes, levels as u32);
+    let numbering: Vec<usize> = corner_perm
+        .iter()
+        .map(|&corner| canonical[corner])
+        .collect();
     let identity = numbering
         .iter()
         .enumerate()
@@ -2588,7 +2630,10 @@ fn subdivision(
     match input_normals {
         Some(normals) => {
             let loops = subdivision_normals::loop_normals(&normals, &face_sizes, &samples.corners);
-            let vectors: Vec<Option<DVec3>> = loops.into_iter().map(Some).collect();
+            let vectors: Vec<Option<DVec3>> = corner_perm
+                .iter()
+                .map(|&corner| Some(loops[corner]))
+                .collect();
             clnor::encode_vectors(
                 &mut result,
                 Some(&vectors),
@@ -2608,6 +2653,52 @@ fn subdivision(
         )?,
     }
     Ok(result)
+}
+
+/// Rotates the corner-domain attributes of a subdivided mesh whose faces took `face_starts` rotation
+/// and whose corners are now ordered by `corner_perm`. Per-face rows (`values["f<id>"]`) rotate within
+/// their face; flat `CORNER` entries of `blender_attributes` permute with `corner_perm`. UV layers are
+/// written after this, in the rotated order.
+fn rotate_corner_attributes(mesh: &mut Mesh, face_starts: &[usize], corner_perm: &[usize]) {
+    let face_rotation: HashMap<String, usize> = mesh
+        .faces
+        .iter()
+        .zip(face_starts)
+        .map(|(face, &start)| (format!("f{}", face.id), start))
+        .collect();
+    for (key, attribute) in mesh.attributes.iter_mut() {
+        if key == "uv_layers" {
+            continue;
+        }
+        if key == "blender_attributes" {
+            for entry in attribute.as_array_mut().into_iter().flatten() {
+                let is_corner = entry.get("domain").and_then(Value::as_str) == Some("CORNER");
+                let Some(values) = entry.get_mut("values").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                if is_corner && values.len() == corner_perm.len() {
+                    *values = corner_perm
+                        .iter()
+                        .map(|&corner| values[corner].clone())
+                        .collect();
+                }
+            }
+            continue;
+        }
+        if attribute.get("domain").and_then(Value::as_str) != Some("corner") {
+            continue;
+        }
+        let Some(values) = attribute.get_mut("values").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (face_key, row) in values.iter_mut() {
+            let (Some(&start), Some(corners)) = (face_rotation.get(face_key), row.as_array_mut())
+            else {
+                continue;
+            };
+            corners.rotate_left(start);
+        }
+    }
 }
 
 fn check_subdivision_budget(

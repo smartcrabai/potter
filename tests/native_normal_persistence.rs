@@ -1,15 +1,15 @@
 //! PR9 normal-code persistence against Blender 5.2.2.
 //!
 //! * `subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend`: a Subdivision with Use
-//!   Custom Normals stores its codes with a nonidentity `corner_order`. The same loop basis must
-//!   carry the UV, color, and generic face/corner data. The test exports `.blend`, reopens it in
-//!   Blender, reimports it into a second project, exports again, and then continues with Displace.
-//!   Every value is compared by corner identity (position and face center), never by raw index.
-//!   The expected values come from Blender's own Subdivision evaluation of the same file.
-//! * `subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_allocates_the_layer`:
-//!   a Subdivision without Use Custom Normals allocates no `values` layer but keeps its
-//!   `corner_order` basis. After save and reload, `mesh.set_custom_normals` allocates the layer
-//!   through that basis, and Blender's own reference confirms every normal and Auto status.
+//!   Custom Normals stores its codes in Blender's loop order (the identity basis). The same loop
+//!   order must carry the UV, color, and generic face/corner data. The test exports `.blend`,
+//!   reopens it in Blender, reimports it into a second project, exports again, and then continues
+//!   with Displace. Every value is compared by corner identity (position and face center), never by
+//!   raw index. The expected values come from Blender's own Subdivision evaluation of the same file.
+//! * `subdivision_without_custom_normals_writes_no_layer_and_later_authoring_allocates_it`: a
+//!   Subdivision without Use Custom Normals writes no `custom_normal` layer, as Blender. After save
+//!   and reload, `mesh.set_custom_normals` allocates the layer in Blender's loop order, and Blender's
+//!   own reference confirms every normal and Auto status.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -636,12 +636,12 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
 
-    // The Subdivision result stores its codes with a nonidentity loop basis.
+    // Blender's own Subdivision stores these codes in loop order, so the basis is the identity.
     let subdivided = read_scene(&project)?;
     let subdivided_mesh = mesh_of_node(&subdivided, "Regress")?;
     assert!(
-        !is_identity(&loop_ordinals(subdivided_mesh)?),
-        "the Subdivision result must store a nonidentity corner_order"
+        is_identity(&loop_ordinals(subdivided_mesh)?),
+        "the Subdivision result must store the identity corner order of Blender's loops"
     );
     let (authored, automatic) = stored_counts(subdivided_mesh)?;
     assert!(
@@ -711,7 +711,7 @@ fn subdivision_codes_and_corner_data_follow_one_loop_basis_through_blend() -> Te
 }
 
 #[test]
-fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_allocates_the_layer()
+fn subdivision_without_custom_normals_writes_no_layer_and_later_authoring_allocates_it()
 -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
@@ -734,26 +734,13 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
 
-    // The saved project, read back from disk: no value layer, but the nonidentity basis remains.
+    // Blender's Subdivision without custom normals writes no custom_normal layer, and the saved
+    // project reads back the same way.
     let saved = read_scene(&project)?;
     let saved_mesh = mesh_of_node(&saved, "Regress")?;
-    let layer = attribute(saved_mesh, "custom_normal")?;
-    assert_eq!(layer["domain"], "corner");
-    assert_eq!(layer["type"], "normal_code");
     assert!(
-        layer.get("values").is_none(),
-        "Subdivision without use_custom_normals must not allocate a value layer"
-    );
-    assert!(
-        layer.as_object().is_some_and(|fields| fields
-            .keys()
-            .all(|key| matches!(key.as_str(), "domain" | "type" | "corner_order"))),
-        "basis-only state holds only domain, type and corner_order"
-    );
-    let basis = loop_ordinals(saved_mesh)?;
-    assert!(
-        layer.get("corner_order").is_some() && !is_identity(&basis),
-        "the Subdivision result must store a nonidentity corner_order"
+        saved_mesh["attributes"].get("custom_normal").is_none(),
+        "Subdivision without use_custom_normals must not store a custom_normal layer"
     );
 
     // Author normals through the saved basis. Each Potter corner takes Blender's input vector for
@@ -789,10 +776,9 @@ fn subdivision_without_custom_normals_keeps_loop_basis_and_later_authoring_alloc
 
     let authored_state = read_scene(&project)?;
     let authored_mesh = mesh_of_node(&authored_state, "Regress")?;
-    assert_eq!(
-        loop_ordinals(authored_mesh)?,
-        basis,
-        "authoring must keep the stored loop basis"
+    assert!(
+        is_identity(&loop_ordinals(authored_mesh)?),
+        "authoring allocates the layer in Blender's loop order"
     );
     let (authored, automatic) = stored_counts(authored_mesh)?;
     assert_eq!(
