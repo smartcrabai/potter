@@ -1,46 +1,44 @@
 #![expect(
     clippy::float_cmp,
-    reason = "asserting exact identity of display transforms"
+    reason = "asserting exact identity of the Raw display transform inside the display range"
 )]
 
 use potter_core::color::{ColorManagement, ViewTransform, linear_to_srgb};
 use proptest::prelude::*;
 
-/// Runs `transform_linear` for settings that are supported (sRGB display, look `none`).
-fn transform(settings: &ColorManagement, rgb: [f64; 3]) -> [f64; 3] {
+/// Runs `display_encode` for settings that are supported (sRGB display, look `none`).
+fn encode(settings: &ColorManagement, rgb: [f32; 3]) -> [f32; 3] {
     settings
-        .transform_linear(rgb)
-        .unwrap_or_else(|error| panic!("transform_linear failed: {error}"))
+        .display_encode(rgb)
+        .unwrap_or_else(|error| panic!("display_encode failed: {error}"))
 }
 
 proptest! {
     #[test]
-    fn raw_and_standard_transforms_are_identity_for_finite_channels(
-        rgb in prop::array::uniform3(-1000.0_f64..1000.0)
+    fn raw_is_identity_inside_the_display_range_and_clamps_outside(
+        rgb in prop::array::uniform3(-1000.0_f32..1000.0)
     ) {
-        for view_transform in [ViewTransform::Raw, ViewTransform::Standard] {
-            let settings = ColorManagement {
-                view_transform,
-                ..ColorManagement::default()
-            };
-            prop_assert_eq!(transform(&settings, rgb), rgb);
-        }
+        let settings = ColorManagement {
+            view_transform: ViewTransform::Raw,
+            ..ColorManagement::default()
+        };
+        prop_assert_eq!(encode(&settings, rgb), rgb.map(|value| value.clamp(0.0, 1.0)));
     }
 
     #[test]
     fn agx_filmic_gamma_and_srgb_are_monotone(
-        value in 0.0_f64..100.0,
-        delta in 0.0_f64..10.0
+        value in 0.0_f32..100.0,
+        delta in 0.0_f32..10.0
     ) {
         for view_transform in [ViewTransform::AgX, ViewTransform::Filmic] {
             let settings = ColorManagement {
                 view_transform,
                 ..ColorManagement::default()
             };
-            let lower = transform(&settings, [value; 3]);
-            let upper = transform(&settings, [value + delta; 3]);
+            let lower = encode(&settings, [value; 3]);
+            let upper = encode(&settings, [value + delta; 3]);
             for (low, high) in lower.into_iter().zip(upper) {
-                prop_assert!(high + 1.0e-12 >= low);
+                prop_assert!(high + 1.0e-5 >= low, "{view_transform:?}: {high} < {low}");
             }
         }
 
@@ -49,18 +47,19 @@ proptest! {
             gamma: 2.5,
             ..ColorManagement::default()
         };
-        let lower = gamma.display_encode([value; 3]).unwrap_or_else(|error| panic!("{error}"));
-        let upper = gamma.display_encode([value + delta; 3]).unwrap_or_else(|error| panic!("{error}"));
+        let lower = encode(&gamma, [value; 3]);
+        let upper = encode(&gamma, [value + delta; 3]);
         for (low, high) in lower.into_iter().zip(upper) {
-            prop_assert!(high + 1.0e-12 >= low);
+            prop_assert!(high + 1.0e-5 >= low);
         }
-        prop_assert!(linear_to_srgb(value + delta) + 1.0e-12 >= linear_to_srgb(value));
+        let (lo, hi) = (f64::from(value), f64::from(value + delta));
+        prop_assert!(linear_to_srgb(hi) + 1.0e-12 >= linear_to_srgb(lo));
     }
 
     #[test]
     fn monotone_curve_preserves_channel_order(
-        lower in 0.0_f64..0.9,
-        delta in 0.0_f64..0.1
+        lower in 0.0_f32..0.9,
+        delta in 0.0_f32..0.1
     ) {
         let upper = (lower + delta).min(1.0);
         let settings = ColorManagement {
@@ -68,10 +67,10 @@ proptest! {
             curve: vec![[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]],
             ..ColorManagement::default()
         };
-        let lower = transform(&settings, [lower; 3]);
-        let upper = transform(&settings, [upper; 3]);
+        let lower = encode(&settings, [lower; 3]);
+        let upper = encode(&settings, [upper; 3]);
         for (low, high) in lower.into_iter().zip(upper) {
-            prop_assert!(high + 1.0e-12 >= low);
+            prop_assert!(high + 1.0e-6 >= low);
         }
     }
 }

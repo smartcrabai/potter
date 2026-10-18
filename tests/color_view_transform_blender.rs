@@ -4,12 +4,14 @@
 //! The Blender side builds the chain Blender's display processor builds
 //! (`libocio_display_processor.cc`): a scene-linear exposure matrix `2^exposure`, the
 //! `DisplayViewTransform`, then an `ExponentTransform` `1/gamma` appended only when gamma is not 1.
-//! The view curve is not part of the OCIO processor (Blender applies it before exposure in
+//! It uses Blender's default CPU processor (`OPTIMIZATION_DEFAULT`), which is the one Blender renders
+//! with. The view curve is not part of the OCIO processor (Blender applies it before exposure in
 //! `colormanagement.cc`), so this test runs with an identity curve. It does not run a camera render.
 //!
 //! The samples include a grid that reaches all six tetrahedral branches of the `AgX`, `Filmic`, and
 //! `FalseColor` LUTs, plus off-lattice values. Floats are compared before byte quantisation. The float
-//! tolerance covers only f32 OCIO arithmetic against Potter's f64; the byte check is kept as well.
+//! bound per view is set from the fused-versus-unfused spread of Potter's float32 emulation (see
+//! `color/ocio.rs`). The one-byte check is the binding criterion.
 
 use std::{collections::BTreeMap, error::Error, fs, io, process::Command};
 
@@ -23,23 +25,9 @@ use blender_file::blender_executable;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// Float comparison bound for display values in [0, 1]. The largest residual measured outside the
-/// optimiser band is 2.13e-5 (`AgX`, gamma 2, sample `[0, 0.07, 0.07]`, red). Emulating the chain in
-/// f32 does not explain it, so the bound is set above that residual and is not a claim that f32
-/// arithmetic accounts for it. The one-byte check below is the binding criterion.
-const FLOAT_TOLERANCE: f64 = 3.0e-5;
-
-/// Blender's default processor and its lossless chain differ by more than this for a channel only
-/// where OCIO's default optimiser resamples the False Color palette (measured 1.1e-2 at one sample).
-const OPTIMIZER_SENSITIVITY: f64 = 1.0e-4;
-
-/// Potter against Blender's lossless chain at those channels. Measured: Blender's lossless f32 output
-/// differs from Potter by 6.2e-5 there, because the palette slope is about 2000 per unit of position.
-const LOSSLESS_TOLERANCE: f64 = 1.0e-4;
-
 /// Named scene-linear samples: greys across the exposure range, a saturated colour, and an
 /// out-of-gamut colour with a large blue channel.
-const SAMPLES: [[f64; 3]; 7] = [
+const SAMPLES: [[f32; 3]; 7] = [
     [0.0, 0.0, 0.0],
     [0.05, 0.05, 0.05],
     [0.18, 0.18, 0.18],
@@ -51,7 +39,7 @@ const SAMPLES: [[f64; 3]; 7] = [
 
 /// Grid levels per channel. Every ordering of the three channels appears, with values between
 /// lattice nodes, so each tetrahedral branch of the view LUTs is exercised.
-const GRID_LEVELS: [f64; 5] = [0.0, 0.07, 0.3, 1.1, 4.5];
+const GRID_LEVELS: [f32; 5] = [0.0, 0.07, 0.3, 1.1, 4.5];
 
 /// Exposure (stops) and gamma pairs. `(0, 1)` is the default; `(0.75, 2)` exercises both.
 const SETTINGS: [(f64, f64); 2] = [(0.0, 1.0), (0.75, 2.0)];
@@ -64,6 +52,19 @@ const VIEWS: [(ViewTransform, &str, &str); 5] = [
     (ViewTransform::Raw, "raw", "Raw"),
     (ViewTransform::FalseColor, "false_color", "False Color"),
 ];
+
+/// Float bound for display values in `[0, 1]`, per view. Each bound is about 2.5 times the largest
+/// fused-versus-unfused difference measured over these samples and settings, or at least `1e-6`.
+/// The 3e-3 `FalseColor` bound covers the palette step, where the lerp slope is about 2000 per unit.
+/// Linux x86_64 may round the scalar paths differently from macOS arm64; CI decides whether the bound
+/// holds there, and the one-byte check is kept as well.
+fn float_tolerance(view: ViewTransform) -> f64 {
+    match view {
+        ViewTransform::AgX => 2.5e-6,
+        ViewTransform::Standard | ViewTransform::Filmic | ViewTransform::Raw => 1.0e-6,
+        ViewTransform::FalseColor => 3.0e-3,
+    }
+}
 
 const BLENDER_SCRIPT: &str = r#"
 import bpy
@@ -102,23 +103,17 @@ for case in spec["cases"]:
         group.appendTransform(gamma)
     processor = config.getProcessor(group)
     cpu = processor.getDefaultCPUProcessor()
-    lossless = processor.getOptimizedCPUProcessor(OCIO.OPTIMIZATION_LOSSLESS)
     encoded = []
-    exact = []
     for sample in spec["samples"]:
         pixel = numpy.array(sample, dtype=numpy.float32)
         cpu.applyRGB(pixel)
         encoded.append([float(value) for value in pixel])
-        pixel = numpy.array(sample, dtype=numpy.float32)
-        lossless.applyRGB(pixel)
-        exact.append([float(value) for value in pixel])
     result[case["name"]] = encoded
-    result[case["name"] + "__lossless"] = exact
 with open(os.path.join(root, "blender_display.json"), "w", encoding="utf-8") as destination:
     json.dump(result, destination)
 "#;
 
-fn grid() -> Vec<[f64; 3]> {
+fn grid() -> Vec<[f32; 3]> {
     let mut samples = Vec::new();
     for &red in &GRID_LEVELS {
         for &green in &GRID_LEVELS {
@@ -140,7 +135,7 @@ fn display_views_match_blender_ocio_display_processor() -> TestResult {
         eprintln!("skipping color view transform Blender parity: Blender is unavailable");
         return Ok(());
     };
-    let samples: Vec<[f64; 3]> = SAMPLES.iter().copied().chain(grid()).collect();
+    let samples: Vec<[f32; 3]> = SAMPLES.iter().copied().chain(grid()).collect();
 
     let mut cases = Vec::new();
     for (_, key, view) in VIEWS {
@@ -178,13 +173,11 @@ fn display_views_match_blender_ocio_display_processor() -> TestResult {
         serde_json::from_slice(&fs::read(root.join("blender_display.json"))?)?;
 
     let mut worst = (0.0_f64, String::new());
-    let mut optimizer_sensitive = 0_usize;
     for (view, key, _) in VIEWS {
+        let tolerance = float_tolerance(view);
         for (index, (exposure, gamma)) in SETTINGS.iter().copied().enumerate() {
             let name = format!("{key}_{index}");
-            let default_rows = case_rows(&blender_views, &name, samples.len())?;
-            let exact_rows =
-                case_rows(&blender_views, &format!("{name}__lossless"), samples.len())?;
+            let blender_rows = case_rows(&blender_views, &name, samples.len())?;
             let management = ColorManagement {
                 view_transform: view,
                 exposure,
@@ -194,55 +187,30 @@ fn display_views_match_blender_ocio_display_processor() -> TestResult {
             for (sample_index, sample) in samples.iter().enumerate() {
                 let potter_rgb = management.display_encode(*sample)?;
                 for channel in 0..3 {
-                    let default_value = default_rows[sample_index][channel].clamp(0.0, 1.0);
-                    let exact_value = exact_rows[sample_index][channel].clamp(0.0, 1.0);
-                    let potter_value = potter_rgb[channel];
-                    let reference = if (default_value - exact_value).abs() > OPTIMIZER_SENSITIVITY {
-                        // Blender's default processor differs from its own lossless chain here
-                        // (OCIO resamples the palette step): compare with the lossless chain, which
-                        // Potter ports, and only for the False Color palette.
-                        assert_eq!(
-                            key, "false_color",
-                            "{name}, sample {sample:?}: optimiser-sensitive outside False Color"
-                        );
-                        assert!(
-                            (potter_value - exact_value).abs() <= LOSSLESS_TOLERANCE,
-                            "{name}, sample {sample:?}, channel {channel}: Potter {potter_value} vs Blender lossless {exact_value} differ by more than {LOSSLESS_TOLERANCE:e}",
-                        );
-                        optimizer_sensitive += 1;
-                        exact_value
-                    } else {
-                        let difference = (potter_value - default_value).abs();
-                        if difference > worst.0 {
-                            worst = (
-                                difference,
-                                format!(
-                                    "{name}, sample {sample:?}, channel {channel}: Potter {potter_value} vs Blender {default_value}"
-                                ),
-                            );
-                        }
-                        default_value
-                    };
-                    assert!(
-                        (byte(potter_value) - byte(reference)).abs() <= 1,
-                        "{name}, sample {sample:?}, channel {channel}: byte {} vs {}",
-                        byte(potter_value),
-                        byte(reference),
+                    let blender_value = blender_rows[sample_index][channel].clamp(0.0, 1.0);
+                    let potter_value = f64::from(potter_rgb[channel]);
+                    let difference = (potter_value - blender_value).abs();
+                    let message = format!(
+                        "{name}, sample {sample:?}, channel {channel}: Potter {potter_value} vs Blender {blender_value}"
                     );
+                    assert!(
+                        difference <= tolerance,
+                        "{message}: difference {difference:e} exceeds {tolerance:e}"
+                    );
+                    assert!(
+                        (byte(potter_value) - byte(blender_value)).abs() <= 1,
+                        "{message}: byte {} vs {}",
+                        byte(potter_value),
+                        byte(blender_value),
+                    );
+                    if difference > worst.0 {
+                        worst = (difference, message);
+                    }
                 }
             }
         }
     }
-    eprintln!(
-        "largest float difference outside the optimiser-sensitive band {:.3e} at {}; {optimizer_sensitive} channel values compared with Blender's lossless chain",
-        worst.0, worst.1
-    );
-    assert!(
-        worst.0 <= FLOAT_TOLERANCE,
-        "largest float difference {:.3e} exceeds {FLOAT_TOLERANCE:e}: {}",
-        worst.0,
-        worst.1
-    );
+    eprintln!("largest float difference {:.3e} at {}", worst.0, worst.1);
     Ok(())
 }
 

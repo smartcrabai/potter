@@ -44,55 +44,28 @@ impl Default for ColorManagement {
 }
 
 impl ColorManagement {
-    /// Applies the RGB curve, exposure, and the selected view transform to scene-linear RGB. The
-    /// returned channels are display-linear; the sRGB encode and gamma are in [`Self::display_encode`].
-    ///
-    /// Order, as Blender 5.2.2 applies it on the sRGB display with look `None` (curve mapping:
-    /// `colormanagement.cc:3610-3621`; exposure `2^exposure`: `libocio_display_processor.cc:480-493`):
-    /// 1. the view curve, per channel, on scene-linear values;
-    /// 2. exposure;
-    /// 3. the view transform:
-    ///    - `Standard`: identity.
-    ///    - `AgX`: E-Gamut matrix, `lg2` window, tetrahedral `AgX_Base_sRGB` LUT, Rec.1886 decode.
-    ///    - `Filmic`: `lg2` window, tetrahedral `filmic_desat_33` LUT, uniform `[0, 0.66]`, 1D
-    ///      `filmic_to_0-70_1-03` LUT, sRGB decode.
-    ///    - `Raw`: identity.
-    ///    - `FalseColor`: E-Gamut matrix, `lg2` window, tetrahedral Rec.2020 `AgX_Base` LUT, Rec.2020
-    ///      luma `^(1/2.5)`, 1D `AgX_False_Color` palette, Rec.1886 decode.
+    /// Returns the display values for scene-linear `rgb`, in Blender's order: the RGB curve on
+    /// scene-linear values (`colormanagement.cc`), exposure `2^exposure`, the view (which ends in its
+    /// sRGB encode, except `Raw`), then gamma `encoded^(1/gamma)` on the encoded value
+    /// (`libocio_display_processor.cc`), clamped to `[0, 1]`. The arithmetic is float32 and follows
+    /// OCIO's fast paths; see `ocio` for the operation order.
     ///
     /// Errors with [`ErrorCode::UnsupportedFeature`] for any display other than `sRGB` or any look
     /// other than `none`, and with [`ErrorCode::InternalError`] if a vendored LUT fails to load.
-    pub fn transform_linear(&self, rgb: [f64; 3]) -> Result<[f64; 3]> {
+    pub fn display_encode(&self, rgb: [f32; 3]) -> Result<[f32; 3]> {
         self.ensure_supported()?;
         let curved = if self.curve.is_empty() {
             rgb
         } else {
-            rgb.map(|value| sample_curve(value, &self.curve))
+            rgb.map(|value| sample_curve(f64::from(value), &self.curve) as f32)
         };
-        let exposure = 2.0_f64.powf(self.exposure);
-        let exposed = curved.map(|value| value * exposure);
-        Ok(match self.view_transform {
-            ViewTransform::Standard | ViewTransform::Raw => exposed,
-            ViewTransform::AgX => ocio::agx_display_linear(exposed)?,
-            ViewTransform::Filmic => ocio::filmic_display_linear(exposed)?,
-            ViewTransform::FalseColor => ocio::false_color_display_linear(exposed)?,
-        })
-    }
-
-    /// Returns the display buffer values for `rgb`, in Blender's order (`libocio_display_processor.cc`
-    /// 505-520): the sRGB OETF of [`Self::transform_linear`] (none for `Raw`), then gamma as
-    /// `encoded^(1/gamma)` on the encoded value, then clamping to `[0, 1]`.
-    pub fn display_encode(&self, rgb: [f64; 3]) -> Result<[f64; 3]> {
-        let linear = self.transform_linear(rgb)?;
-        let encoded = match self.view_transform {
-            ViewTransform::Raw => linear,
-            _ => linear.map(linear_to_srgb),
-        };
+        let encoded = ocio::display_view(self.view_transform, self.exposure, curved)?;
         let graded = if self.gamma.is_finite()
             && self.gamma > 0.0
             && (self.gamma - 1.0).abs() > f64::EPSILON
         {
-            encoded.map(|value| value.max(0.0).powf(1.0 / self.gamma))
+            let exponent = (1.0 / self.gamma) as f32;
+            encoded.map(|value| ocio::fast_pow(value, exponent))
         } else {
             encoded
         };
@@ -201,31 +174,325 @@ mod tests {
 
     use super::*;
 
+    /// One committed float32 emulation vector: the display output of `view` after `exposure` and `gamma`
+    /// for `input`, as bit patterns. The vectors come from the numpy emulation of OCIO's default
+    /// processor on macOS arm64 (fused where that build fuses), not from a run of OCIO itself.
+    struct Vector {
+        exposure: f64,
+        gamma: f64,
+        view: ViewTransform,
+        input: [f32; 3],
+        output: [u32; 3],
+    }
+
+    const VECTORS: [Vector; 40] = [
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Standard,
+            input: [0.05, 0.05, 0.05],
+            output: [0x3e7dbf6e, 0x3e7dbf6e, 0x3e7dbf6e],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Standard,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3eec36ac, 0x3eec36ac, 0x3eec36ac],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Standard,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f800000, 0x00000000, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Standard,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3e1b583c, 0x3f3c406d, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::AgX,
+            input: [0.05, 0.05, 0.05],
+            output: [0x3e68a8e6, 0x3e68a8a0, 0x3e68aeb2],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::AgX,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3eec322a, 0x3eec31ec, 0x3eec36aa],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::AgX,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f7c1ed7, 0x3f2d5cf2, 0x3f467a7b],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::AgX,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3f19190e, 0x3f396e41, 0x3f742c65],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Filmic,
+            input: [0.05, 0.05, 0.05],
+            output: [0x3e8bd0d7, 0x3e8bd0d7, 0x3e8bd0d7],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Filmic,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3f000dd9, 0x3f000dd9, 0x3f000dd9],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Filmic,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f74e3f9, 0x3777f0f8, 0x3f521541],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Filmic,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3e23093e, 0x3f31e876, 0x3f730add],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Raw,
+            input: [0.05, 0.05, 0.05],
+            output: [0x3d4ccccd, 0x3d4ccccd, 0x3d4ccccd],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Raw,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3e3851ec, 0x3e3851ec, 0x3e3851ec],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Raw,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f800000, 0x00000000, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::Raw,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3ca3d70a, 0x3f000000, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::FalseColor,
+            input: [0.05, 0.05, 0.05],
+            output: [0x00000000, 0x3f800000, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::FalseColor,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3ef1ec06, 0x3ef1ec06, 0x3ef1ec06],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::FalseColor,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f800000, 0x3f1e3760, 0x00000000],
+        },
+        Vector {
+            exposure: 0.00,
+            gamma: 1.0,
+            view: ViewTransform::FalseColor,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3f800000, 0x3f800000, 0x00000000],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Standard,
+            input: [0.05, 0.05, 0.05],
+            output: [0x3f110cc6, 0x3f110cc6, 0x3f110cc6],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Standard,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3f4402b6, 0x3f4402b6, 0x3f4402b6],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Standard,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f800000, 0x00000000, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Standard,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3ee5f154, 0x3f766a32, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::AgX,
+            input: [0.05, 0.05, 0.05],
+            output: [0x3f0e1678, 0x3f0e1662, 0x3f0e181c],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::AgX,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3f419908, 0x3f4198f6, 0x3f419a68],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::AgX,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f7fd186, 0x3f5efb65, 0x3f6a466d],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::AgX,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3f556099, 0x3f643692, 0x3f7e2f69],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Filmic,
+            input: [0.05, 0.05, 0.05],
+            output: [0x3f190bac, 0x3f190bac, 0x3f190bac],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Filmic,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3f46848c, 0x3f46848c, 0x3f46848c],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Filmic,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f7d93ca, 0x3b7befef, 0x3f70b71e],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Filmic,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3eef3314, 0x3f62506f, 0x3f7cfb5c],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Raw,
+            input: [0.05, 0.05, 0.05],
+            output: [0x3e947894, 0x3e947894, 0x3e947894],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Raw,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3f0cda28, 0x3f0cda28, 0x3f0cda28],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Raw,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f800000, 0x00000000, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::Raw,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3e3bcd22, 0x3f6ac124, 0x3f800000],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::FalseColor,
+            input: [0.05, 0.05, 0.05],
+            output: [0x00000000, 0x3f800000, 0x3f2ff8a0],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::FalseColor,
+            input: [0.18, 0.18, 0.18],
+            output: [0x3f2ff8a0, 0x3f800000, 0x00000000],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::FalseColor,
+            input: [4.5, 0.0, 1.1],
+            output: [0x3f800000, 0x3f2ff8a0, 0x00000000],
+        },
+        Vector {
+            exposure: 0.75,
+            gamma: 2.0,
+            view: ViewTransform::FalseColor,
+            input: [0.02, 0.5, 4.0],
+            output: [0x3f800000, 0x3f2ff8a0, 0x00000000],
+        },
+    ];
+
     #[test]
     fn curve_is_applied_before_exposure() -> Result<(), Box<dyn Error>> {
-        // Blender applies the curve on scene-linear input first, then exposure. Curve 0->0, 1->0.5
-        // maps 0.5 to 0.25, and +1 stop doubles it to 0.5. The reverse order would give 0.5.
+        // The curve maps scene-linear 0.5 to 0.25 (curve 0->0, 1->0.5); +1 stop doubles it to 0.5.
+        // Applying exposure first would give curve(1.0) = 0.5.
         let settings = ColorManagement {
             view_transform: ViewTransform::Raw,
             exposure: 1.0,
             curve: vec![[0.0, 0.0], [1.0, 0.5]],
             ..ColorManagement::default()
         };
-        let out = settings.transform_linear([0.5; 3])?;
-        assert!((out[0] - 0.5).abs() < 1.0e-12, "got {out:?}");
+        let out = settings.display_encode([0.5; 3])?;
+        assert!((out[0] - 0.5).abs() < 1.0e-6, "got {out:?}");
         Ok(())
     }
 
     #[test]
     fn gamma_is_applied_to_the_encoded_value() -> Result<(), Box<dyn Error>> {
-        // Blender raises the sRGB-encoded value to 1/gamma. Gamma on linear light would differ.
+        // Gamma raises the sRGB-encoded value to 1/gamma; on linear light the result would differ.
         let settings = ColorManagement {
             gamma: 2.0,
             ..ColorManagement::default()
         };
         let out = settings.display_encode([0.25; 3])?;
         assert!(
-            (out[0] - linear_to_srgb(0.25).sqrt()).abs() < 1.0e-12,
+            (out[0] - linear_to_srgb(0.25).sqrt() as f32).abs() < 1.0e-5,
             "got {out:?}"
         );
         Ok(())
@@ -239,7 +506,33 @@ mod tests {
             ..ColorManagement::default()
         };
         let out = settings.display_encode([0.25; 3])?;
-        assert!((out[0] - 0.5).abs() < 1.0e-12, "got {out:?}");
+        assert!((out[0] - 0.5).abs() < 1.0e-6, "got {out:?}");
         Ok(())
+    }
+
+    #[test]
+    fn display_encode_matches_committed_f32_emulation_vectors() {
+        for vector in VECTORS {
+            let settings = ColorManagement {
+                view_transform: vector.view,
+                exposure: vector.exposure,
+                gamma: vector.gamma,
+                ..ColorManagement::default()
+            };
+            let output = settings
+                .display_encode(vector.input)
+                .unwrap_or_else(|error| panic!("display_encode failed: {error}"));
+            for channel in 0..3 {
+                assert_eq!(
+                    output[channel].to_bits(),
+                    vector.output[channel],
+                    "{:?} exposure {} gamma {} input {:?} channel {channel}",
+                    vector.view,
+                    vector.exposure,
+                    vector.gamma,
+                    vector.input,
+                );
+            }
+        }
     }
 }
