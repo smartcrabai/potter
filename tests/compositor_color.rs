@@ -216,7 +216,10 @@ fn view_transforms_look_gamma_and_srgb_encoding_are_applied() -> Result<(), Box<
         ..ColorManagement::default()
     }
     .transform_linear(sample)?;
-    assert!(filmic[0] < standard[0]);
+    // Exact Blender Filmic maps 0.25 to about 0.278 display-linear, above Standard's 0.25. The
+    // Blender display-processor test checks Filmic values against Blender; this only checks that
+    // the view changes the value.
+    assert!((filmic[0] - standard[0]).abs() > 1.0e-3, "{filmic:?}");
 
     let false_color = ColorManagement {
         view_transform: ViewTransform::FalseColor,
@@ -230,8 +233,11 @@ fn view_transforms_look_gamma_and_srgb_encoding_are_applied() -> Result<(), Box<
         gamma: 2.0,
         ..ColorManagement::default()
     }
-    .transform_linear(sample)?;
-    assert_eq!(gamma, [0.5; 3]);
+    .display_encode(sample)?;
+    assert!(
+        gamma.iter().all(|value| (value - 0.5).abs() < 1.0e-12),
+        "{gamma:?}"
+    );
 
     let unsupported_look = ColorManagement {
         view_transform: ViewTransform::Raw,

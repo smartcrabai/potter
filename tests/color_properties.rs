@@ -49,8 +49,8 @@ proptest! {
             gamma: 2.5,
             ..ColorManagement::default()
         };
-        let lower = transform(&gamma, [value; 3]);
-        let upper = transform(&gamma, [value + delta; 3]);
+        let lower = gamma.display_encode([value; 3]).unwrap_or_else(|error| panic!("{error}"));
+        let upper = gamma.display_encode([value + delta; 3]).unwrap_or_else(|error| panic!("{error}"));
         for (low, high) in lower.into_iter().zip(upper) {
             prop_assert!(high + 1.0e-12 >= low);
         }

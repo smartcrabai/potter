@@ -1,19 +1,12 @@
-//! Blender 5.2.2 OpenColorIO view transforms.
+//! Blender 5.2.2 `OpenColorIO` display views for the `sRGB` display.
 //!
-//! Ports the `Standard`, `AgX Base Rec.1886`, `Filmic sRGB`, and `AgX False Color Rec.709` views of
-//! Blender 5.2.2's bundled OCIO config (OCIO 2.5.0, display `sRGB`, look `None`). Sampling follows
-//! OpenColorIO 2.5.0 branch for branch: `lg2` and `uniform` allocations without clamping, tetrahedral
-//! 3D LUT interpolation (`Lut3DOpCPU`), and linear 1D LUT interpolation (`Lut1DOpCPU`), with the
-//! coordinate clamped to the LUT domain.
+//! Ports the `AgX Base Rec.1886`, `Filmic sRGB`, and `AgX False Color Rec.709` views of Blender
+//! 5.2.2's bundled OCIO config (`OpenColorIO` 2.5.0). Sampling follows `OpenColorIO` 2.5.0: the
+//! `lg2` allocation has no clamp (callers clamp to the LUT domain), 3D LUTs use tetrahedral
+//! interpolation (`Lut3DOpCPU`), and 1D LUTs use linear interpolation (`Lut1DOpCPU`).
 //!
-//! Vendored LUTs in `color/luts/` are byte-for-byte copies of Blender 5.2.2's
-//! `release/datafiles/colormanagement/luts/` and `release/datafiles/colormanagement/filmic/`
-//! (blender/blender tag v5.2.2):
-//! - `AgX_Base_sRGB.cube`, `AgX_Base_Rec2020.cube`, `AgX_False_Color.spi1d`: AgX by Troy Sobotka and EaryChow.
-//! - `filmic_desat_33.cube`, `filmic_to_0-70_1-03.spi1d`: Filmic by Troy Sobotka.
-//!
-//! Attribution, file checksums, and licence status are in `color/luts/NOTICE`. The LUT terms the
-//! upstream AgX authors attached are unverified there; Blender's own distribution is GPL-3.0-or-later.
+//! The LUTs in `color/luts/` are byte-for-byte copies of Blender 5.2.2 data. Source, SHA-256,
+//! authors, and licence status are recorded in `color/luts/NOTICE`.
 
 use std::sync::LazyLock;
 
@@ -37,7 +30,7 @@ static FILMIC_DESAT_33: LazyLock<Result<Lut3d, String>> =
 static FILMIC_TO_0_70: LazyLock<Result<Lut1d, String>> =
     LazyLock::new(|| parse_spi1d(FILMIC_TO_0_70_SPI1D));
 
-/// `lg2` allocation window of the AgX views (`AgX Base Rec.1886`, `AgX False Color Rec.709`).
+/// `lg2` allocation window of the `AgX` views (`AgX Base Rec.1886`, `AgX False Color Rec.709`).
 const AGX_LOG2_MIN: f64 = -12.473_93;
 const AGX_LOG2_MAX: f64 = 12.526_068_811_7;
 /// `lg2` allocation window of the Filmic view (`Filmic sRGB`), span 25.0.
@@ -49,7 +42,7 @@ const FILMIC_UNIFORM_MAX: f64 = 0.66;
 const REC1886_EXPONENT: f64 = 2.4;
 const FALSE_COLOR_EXPONENT: f64 = 2.5;
 
-/// Rec.709 linear to FilmLight E-Gamut linear: `XYZ(D65)->E-Gamut * inverse(XYZ(D65)->Rec.709)`,
+/// Rec.709 linear to `FilmLight` E-Gamut linear: `XYZ(D65)->E-Gamut * inverse(XYZ(D65)->Rec.709)`,
 /// computed numerically from the Blender 5.2.2 config matrices `XYZ (D65) -> Linear Rec.709` and
 /// `XYZ (D65) -> Linear FilmLight E-Gamut`, rounded to 12 decimals. Row sums are 1 within 1e-7.
 const REC709_TO_E_GAMUT: [[f64; 3]; 3] = [
@@ -65,30 +58,29 @@ const FALSE_COLOR_LUMA: [f64; 3] = [
     0.130_577_929_824_362_84,
 ];
 
-/// AgX display-linear for `AgX Base Rec.1886`: E-Gamut, `lg2` window, tetrahedral `AgX_Base_sRGB`
-/// lookup, then the Rec.1886 decode (`^2.4`). The sRGB encode of the result returns the LUT output.
+/// `AgX Base Rec.1886` display-linear: E-Gamut, `lg2` window, tetrahedral `AgX_Base_sRGB` lookup
+/// (its output is Rec.1886 encoded), then the 2.4 power decode. The caller's sRGB encode is the
+/// display value.
 pub(super) fn agx_display_linear(rgb: [f64; 3]) -> Result<[f64; 3]> {
     let lut = loaded(LazyLock::force(&AGX_BASE_SRGB))?;
     Ok(lut.sample(agx_position(rgb)).map(rec1886_decode))
 }
 
-/// Filmic display-linear for `Filmic sRGB`: `lg2` window, tetrahedral `filmic_desat_33` lookup,
-/// `uniform` allocation over `[0, 0.66]`, the 1D `filmic_to_0-70_1-03` curve, then an sRGB decode so
-/// that the sRGB encode returns the curve output. Input is already Rec.709, so no ACES leg applies.
+/// `Filmic sRGB` display-linear: `lg2` window, tetrahedral `filmic_desat_33` lookup, `uniform`
+/// allocation over `[0, 0.66]`, the 1D `filmic_to_0-70_1-03` curve, then an sRGB decode so that
+/// the caller's sRGB encode returns the curve output. The input is already Rec.709, so no ACES leg
+/// applies.
 pub(super) fn filmic_display_linear(rgb: [f64; 3]) -> Result<[f64; 3]> {
     let desaturation = loaded(LazyLock::force(&FILMIC_DESAT_33))?;
     let curve = loaded(LazyLock::force(&FILMIC_TO_0_70))?;
     let desaturated =
         desaturation.sample(rgb.map(|value| lg2_index(value, FILMIC_LOG2_MIN, FILMIC_LOG2_MAX)));
-    Ok(desaturated.map(|value| {
-        let encoded = curve.sample(value / FILMIC_UNIFORM_MAX)[0];
-        srgb_to_linear(encoded)
-    }))
+    Ok(desaturated.map(|value| srgb_to_linear(curve.sample(value / FILMIC_UNIFORM_MAX)[0])))
 }
 
-/// AgX display-linear for `AgX False Color Rec.709`: E-Gamut and `lg2` window, tetrahedral Rec.2020
-/// `AgX_Base` lookup, Rec.2020 linear luma, `^(1/2.5)`, then the per-channel `AgX_False_Color`
-/// palette and the Rec.1886 decode.
+/// `AgX False Color Rec.709` display-linear: E-Gamut and `lg2` window, tetrahedral Rec.2020
+/// `AgX_Base` lookup, Rec.2020 linear luma, `^(1/2.5)`, the per-channel `AgX_False_Color` palette,
+/// then the 2.4 power decode.
 pub(super) fn false_color_display_linear(rgb: [f64; 3]) -> Result<[f64; 3]> {
     let lut = loaded(LazyLock::force(&AGX_BASE_REC2020))?;
     let palette = loaded(LazyLock::force(&AGX_FALSE_COLOR))?;
@@ -118,8 +110,8 @@ fn rec1886_decode(value: f64) -> f64 {
     value.max(0.0).powf(REC1886_EXPONENT)
 }
 
-/// `lg2` allocation forward (`log2`, then linear map of `[min, max]` to `[0, 1]`) with the clamp
-/// applied by the view transforms. NaN and non-positive inputs map to 0.
+/// `lg2` allocation forward: `log2`, then a linear map of `[min, max]` to `[0, 1]`, clamped to
+/// `[0, 1]` as the LUT domain requires. NaN and non-positive inputs map to 0.
 fn lg2_index(value: f64, min: f64, max: f64) -> f64 {
     if value.is_nan() || value <= 0.0 {
         return 0.0;
@@ -128,7 +120,7 @@ fn lg2_index(value: f64, min: f64, max: f64) -> f64 {
 }
 
 /// Clamps `value` to the lattice `[0, last]` (NaN maps to 0) and splits it into the lower and upper
-/// node indices and the fractional weight, as OpenColorIO's LUT ops do.
+/// node indices and the fractional weight.
 fn lattice_position(value: f64, last: usize) -> (usize, usize, f64) {
     let last = last as f64;
     let position = if value.is_nan() {
@@ -160,63 +152,63 @@ impl Lut3d {
         self.data[red + self.size * (green + self.size * blue)]
     }
 
-    /// Tetrahedral interpolation, branch for branch with OpenColorIO 2.5.0 `Lut3DOpCPU`.
+    /// Tetrahedral interpolation, branch for branch with `OpenColorIO` 2.5.0 `Lut3DOpCPU`. Each
+    /// branch reads only the four corners it blends.
     fn sample(&self, rgb: [f64; 3]) -> [f64; 3] {
         let last = self.size - 1;
         let (r0, r1, fx) = lattice_position(rgb[0], last);
         let (g0, g1, fy) = lattice_position(rgb[1], last);
         let (b0, b1, fz) = lattice_position(rgb[2], last);
-        let n000 = self.node(r0, g0, b0);
-        let n100 = self.node(r1, g0, b0);
-        let n010 = self.node(r0, g1, b0);
-        let n001 = self.node(r0, g0, b1);
-        let n110 = self.node(r1, g1, b0);
-        let n101 = self.node(r1, g0, b1);
-        let n011 = self.node(r0, g1, b1);
-        let n111 = self.node(r1, g1, b1);
+        let corner = |red: bool, green: bool, blue: bool| {
+            self.node(
+                if red { r1 } else { r0 },
+                if green { g1 } else { g0 },
+                if blue { b1 } else { b0 },
+            )
+        };
         if fx > fy {
             if fy > fz {
                 weighted([
-                    (1.0 - fx, n000),
-                    (fx - fy, n100),
-                    (fy - fz, n110),
-                    (fz, n111),
+                    (1.0 - fx, corner(false, false, false)),
+                    (fx - fy, corner(true, false, false)),
+                    (fy - fz, corner(true, true, false)),
+                    (fz, corner(true, true, true)),
                 ])
             } else if fx > fz {
                 weighted([
-                    (1.0 - fx, n000),
-                    (fx - fz, n100),
-                    (fz - fy, n101),
-                    (fy, n111),
+                    (1.0 - fx, corner(false, false, false)),
+                    (fx - fz, corner(true, false, false)),
+                    (fz - fy, corner(true, false, true)),
+                    (fy, corner(true, true, true)),
                 ])
             } else {
                 weighted([
-                    (1.0 - fz, n000),
-                    (fz - fx, n001),
-                    (fx - fy, n101),
-                    (fy, n111),
+                    (1.0 - fz, corner(false, false, false)),
+                    (fz - fx, corner(false, false, true)),
+                    (fx - fy, corner(true, false, true)),
+                    (fy, corner(true, true, true)),
                 ])
             }
         } else if fz > fy {
             weighted([
-                (1.0 - fz, n000),
-                (fz - fy, n001),
-                (fy - fx, n011),
-                (fx, n111),
+                (1.0 - fz, corner(false, false, false)),
+                (fz - fy, corner(false, false, true)),
+                (fy - fx, corner(false, true, true)),
+                (fx, corner(true, true, true)),
             ])
         } else if fz > fx {
             weighted([
-                (1.0 - fy, n000),
-                (fy - fz, n010),
-                (fz - fx, n011),
-                (fx, n111),
+                (1.0 - fy, corner(false, false, false)),
+                (fy - fz, corner(false, true, false)),
+                (fz - fx, corner(false, true, true)),
+                (fx, corner(true, true, true)),
             ])
         } else {
             weighted([
-                (1.0 - fy, n000),
-                (fy - fx, n010),
-                (fx - fz, n110),
-                (fz, n111),
+                (1.0 - fy, corner(false, false, false)),
+                (fy - fx, corner(false, true, false)),
+                (fx - fz, corner(true, true, false)),
+                (fz, corner(true, true, true)),
             ])
         }
     }
@@ -228,7 +220,7 @@ struct Lut1d {
 }
 
 impl Lut1d {
-    /// Linear interpolation, matching OpenColorIO 2.5.0 `Lut1DOpCPU`.
+    /// Linear interpolation, matching `OpenColorIO` 2.5.0 `Lut1DOpCPU`.
     fn sample(&self, value: f64) -> [f64; 3] {
         let (low, high, fraction) = lattice_position(value, self.rows.len() - 1);
         std::array::from_fn(|channel| {
@@ -237,8 +229,8 @@ impl Lut1d {
     }
 }
 
-/// Maps a lazily parsed LUT load failure to an internal error; the vendored data is compiled in,
-/// so a failure is a build defect rather than user input.
+/// Maps a lazily parsed LUT load failure to an internal error. The LUTs are compiled in, so a
+/// failure is a build defect rather than user input.
 fn loaded<T>(lut: &'static Result<T, String>) -> Result<&'static T> {
     lut.as_ref().map_err(|message| {
         PotError::new(
@@ -248,153 +240,64 @@ fn loaded<T>(lut: &'static Result<T, String>) -> Result<&'static T> {
     })
 }
 
-const TOLERANCE: f64 = 1.0e-12;
-
-fn parse_number(token: &str) -> Result<f64, String> {
-    token
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| format!("invalid number `{token}`"))
+fn parse_triple(values: &[f64]) -> [f64; 3] {
+    [values[0], values[1], values[2]]
 }
 
-fn parse_triple(tokens: &[&str]) -> Result<[f64; 3], String> {
-    match tokens {
-        [red, green, blue] => Ok([
-            parse_number(red)?,
-            parse_number(green)?,
-            parse_number(blue)?,
-        ]),
-        _ => Err(format!(
-            "expected three values, found `{}`",
-            tokens.join(" ")
-        )),
-    }
-}
-
-/// Parses a `.cube` 3D LUT with `LUT_3D_SIZE N` and exactly `N^3` data rows. `TITLE` and `#`
-/// comment lines are ignored. `DOMAIN_MIN 0 0 0` and `DOMAIN_MAX 1 1 1` must match when present;
-/// when absent OpenColorIO uses that domain by default, and `filmic_desat_33.cube` omits them.
+/// Parses a `.cube` 3D LUT: the `LUT_3D_SIZE N` header and exactly `N^3` rows of three numbers.
+/// Other lines (`TITLE`, `DOMAIN_*`, comments) are skipped; the vendored files use the `[0, 1]`
+/// domain.
 fn parse_cube(source: &str) -> Result<Lut3d, String> {
     let mut size = None;
     let mut data = Vec::new();
-    for line in source.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') || line.starts_with("TITLE ") {
+    for line in source.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if let ["LUT_3D_SIZE", value] = tokens.as_slice() {
+            size = Some(value.parse::<usize>().map_err(|error| error.to_string())?);
             continue;
         }
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        match tokens.as_slice() {
-            ["LUT_3D_SIZE", value] => {
-                if size.is_some() {
-                    return Err("duplicate LUT_3D_SIZE".to_owned());
-                }
-                let parsed = value
-                    .parse::<usize>()
-                    .map_err(|error| format!("invalid LUT_3D_SIZE `{value}`: {error}"))?;
-                if parsed < 2 {
-                    return Err(format!("LUT_3D_SIZE must be at least 2, found {parsed}"));
-                }
-                size = Some(parsed);
-            }
-            ["DOMAIN_MIN", rest @ ..] => expect_domain(rest, 0.0)?,
-            ["DOMAIN_MAX", rest @ ..] => expect_domain(rest, 1.0)?,
-            [_, _, _] => {
-                if size.is_none() {
-                    return Err("data row before LUT_3D_SIZE".to_owned());
-                }
-                data.push(parse_triple(&tokens)?);
-            }
-            _ => return Err(format!("unrecognised cube line `{line}`")),
+        match parse_numbers(&tokens) {
+            Ok(values) if values.len() == 3 => data.push(parse_triple(&values)),
+            _ => {}
         }
     }
     let size = size.ok_or_else(|| "missing LUT_3D_SIZE".to_owned())?;
-    let expected = size
-        .checked_pow(3)
-        .ok_or_else(|| format!("LUT_3D_SIZE {size} is too large"))?;
-    if data.len() != expected {
+    if size < 2 || data.len() != size.pow(3) {
         return Err(format!(
-            "expected {expected} LUT entries, found {}",
+            "expected {} LUT rows, found {}",
+            size.pow(3),
             data.len()
         ));
     }
     Ok(Lut3d { size, data })
 }
 
-fn expect_domain(tokens: &[&str], expected: f64) -> Result<(), String> {
-    let domain = parse_triple(tokens)?;
-    if domain
-        .iter()
-        .any(|value| (value - expected).abs() > TOLERANCE)
-    {
-        return Err(format!(
-            "unsupported LUT domain `{}`; expected {expected} per channel",
-            tokens.join(" ")
-        ));
-    }
-    Ok(())
-}
-
-/// Parses a `.spi1d` 1D LUT: requires `From 0.0 1.0`, `Length` (at least 2), and `Components 1|3`,
-/// with exactly `Length` data rows of `Components` values.
+/// Parses a `.spi1d` 1D LUT: the `Length N` header and exactly `N` rows of one or three numbers.
+/// Other lines (`Version`, `From`, `Components`, braces) are skipped.
 fn parse_spi1d(source: &str) -> Result<Lut1d, String> {
-    let mut domain_seen = false;
     let mut length = None;
-    let mut components = None;
     let mut rows = Vec::new();
-    for line in source.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
+    for line in source.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if let ["Length", value] = tokens.as_slice() {
+            length = Some(value.parse::<usize>().map_err(|error| error.to_string())?);
             continue;
         }
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        match tokens.as_slice() {
-            ["Version", "1"] | ["{"] | ["}"] => {}
-            ["From", low, high] => {
-                let low = parse_number(low)?;
-                let high = parse_number(high)?;
-                if low.abs() > TOLERANCE || (high - 1.0).abs() > TOLERANCE {
-                    return Err(format!("unsupported spi1d domain `{line}`"));
-                }
-                domain_seen = true;
-            }
-            ["Length", value] => {
-                let parsed = value
-                    .parse::<usize>()
-                    .map_err(|error| format!("invalid Length `{value}`: {error}"))?;
-                if parsed < 2 {
-                    return Err(format!("Length must be at least 2, found {parsed}"));
-                }
-                length = Some(parsed);
-            }
-            ["Components", value] => {
-                let parsed = value
-                    .parse::<usize>()
-                    .map_err(|error| format!("invalid Components `{value}`: {error}"))?;
-                if parsed != 1 && parsed != 3 {
-                    return Err(format!("Components must be 1 or 3, found {parsed}"));
-                }
-                components = Some(parsed);
-            }
-            _ => {
-                let row = match tokens.as_slice() {
-                    [value] if components == Some(1) => [parse_number(value)?; 3],
-                    [_, _, _] if components == Some(3) => parse_triple(&tokens)?,
-                    _ => return Err(format!("row `{line}` does not match Components")),
-                };
-                rows.push(row);
-            }
+        match parse_numbers(&tokens).as_deref() {
+            Ok([value]) => rows.push([*value; 3]),
+            Ok([red, green, blue]) => rows.push([*red, *green, *blue]),
+            _ => {}
         }
     }
-    if !domain_seen {
-        return Err("missing `From 0.0 1.0` header".to_owned());
-    }
     let length = length.ok_or_else(|| "missing Length header".to_owned())?;
-    if components.is_none() {
-        return Err("missing Components header".to_owned());
-    }
-    if rows.len() != length {
+    if length < 2 || rows.len() != length {
         return Err(format!("expected {length} rows, found {}", rows.len()));
     }
     Ok(Lut1d { rows })
+}
+
+fn parse_numbers(tokens: &[&str]) -> std::result::Result<Vec<f64>, std::num::ParseFloatError> {
+    tokens.iter().map(|token| token.parse::<f64>()).collect()
 }
 
 #[cfg(test)]
