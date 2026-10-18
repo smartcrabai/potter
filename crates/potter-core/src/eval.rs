@@ -2543,6 +2543,9 @@ fn apply_mesh_cache_modifier(
     fps: u32,
     fps_base: f64,
 ) -> Result<()> {
+    if crate::geom::modifiers::attributes::mesh_cache_is_disabled(modifier) {
+        return Ok(());
+    }
     let resource_text = modifier
         .params
         .get("resource")

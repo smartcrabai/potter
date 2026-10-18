@@ -272,13 +272,8 @@ pub fn evaluate_mesh_cache(
             "a finite scene frame and positive frame rate",
         ));
     }
-    let format = string(modifier, "cache_format")?;
-    let samples = match format {
-        "PC2" => read_pc2(bytes, modifier)?,
-        "MDD" => read_mdd(bytes, modifier)?,
-        _ => return Err(invalid(modifier, "cache_format", "PC2 or MDD")),
-    };
-    if samples.points.first().map_or(0, Vec::len) != mesh.vertices.len() {
+    let cache = CacheFile::parse(bytes, string(modifier, "cache_format")?, modifier)?;
+    if cache.count != mesh.vertices.len() {
         return Err(invalid(
             modifier,
             "resource",
@@ -295,59 +290,46 @@ pub fn evaluate_mesh_cache(
     if !matches!(time_mode, "FRAME" | "TIME" | "FACTOR") {
         return Err(invalid(modifier, "time_mode", "FRAME, TIME, or FACTOR"));
     }
-    let custom = play_mode == "CUSTOM";
     let interpolation = string(modifier, "interpolation")?;
     if !matches!(interpolation, "NONE" | "LINEAR") {
         return Err(invalid(modifier, "interpolation", "NONE or LINEAR"));
     }
-    let interpolate = interpolation == "LINEAR";
-    let (first, second, factor) = match time_mode {
-        "FRAME" => {
-            let evaluation_frame = if custom {
-                number(modifier, "eval_frame")?
-            } else {
-                frame
-            };
-            let cache_frame = frame_start + evaluation_frame * frame_scale;
-            let cache_time = if format == "MDD" {
-                cache_frame * fps_base / f64::from(fps)
-            } else {
-                cache_frame
-            };
-            select_cache_samples(&samples.times, cache_time, interpolate)
+    let deform_mode = string(modifier, "deform_mode")?;
+    if !matches!(deform_mode, "OVERWRITE" | "INTEGRATE") {
+        return Err(invalid(modifier, "deform_mode", "OVERWRITE or INTEGRATE"));
+    }
+    // Blender's scene frames_per_second is fps / fps_base.
+    let fps_real = f64::from(fps) / fps_base;
+    let time = if play_mode == "CUSTOM" {
+        match time_mode {
+            "FRAME" => number(modifier, "eval_frame")?,
+            "TIME" => number(modifier, "eval_time")?,
+            _ => number(modifier, "eval_factor")?,
         }
-        "TIME" => {
-            let evaluation_time = if custom {
-                number(modifier, "eval_time")?
-            } else {
-                frame * fps_base / f64::from(fps) * frame_scale - frame_start
-            };
-            if format == "PC2" {
-                let start = samples
-                    .pc2_time_start
-                    .ok_or_else(|| invalid(modifier, "resource", "PC2 time metadata"))?;
-                let sampling = samples
-                    .pc2_sampling
-                    .ok_or_else(|| invalid(modifier, "resource", "PC2 sampling metadata"))?;
-                let cache_frame = (evaluation_time / f64::from(fps) - start) / sampling;
-                select_cache_frame(cache_frame, samples.points.len(), interpolate)
-            } else {
-                select_cache_samples(&samples.times, evaluation_time, interpolate)
-            }
-        }
-        _ => {
-            let evaluation_factor = if custom {
-                number(modifier, "eval_factor")?
-            } else {
-                frame * fps_base / f64::from(fps) * frame_scale - frame_start
-            };
-            let frame_count = cache_frame_count(samples.points.len(), modifier)?;
-            select_cache_frame(
-                evaluation_factor.clamp(0.0, 1.0) * frame_count,
-                samples.points.len(),
-                interpolate,
-            )
-        }
+    } else {
+        let scene_time = if time_mode == "FRAME" {
+            frame
+        } else {
+            frame / fps_real
+        };
+        frame_scale * scene_time - frame_start
+    };
+    let cache_frame = match time_mode {
+        "FRAME" => time,
+        "TIME" => cache.frame_for_time(time, fps_real),
+        _ => time.clamp(0.0, 1.0) * index_as_f64(cache.frames),
+    };
+    if !cache_frame.is_finite() {
+        return Err(invalid(modifier, "frame", "a finite cache frame"));
+    }
+    let (first, second, weight) =
+        select_cache_frame(cache_frame, cache.frames, interpolation == "LINEAR");
+    let amount = number(modifier, "factor")?.clamp(0.0, 1.0);
+    let invert_group = boolean(modifier, "invert_vertex_group")?;
+    // Blender ignores a missing group, but a present group only deforms when the mesh has weights.
+    let weights = match optional_string(modifier, "vertex_group")? {
+        Some(name) if mesh_has_vertex_group(mesh, name) => Some(get_group_weights(mesh, name)?),
+        _ => None,
     };
     let forward = string(modifier, "forward_axis")?;
     let up = string(modifier, "up_axis")?;
@@ -357,32 +339,32 @@ pub fn evaluate_mesh_cache(
         .map(|value| axis_flip_set(value, modifier))
         .transpose()?
         .unwrap_or([false; 3]);
-    let deform_mode = string(modifier, "deform_mode")?;
-    if !matches!(deform_mode, "OVERWRITE" | "INTEGRATE") {
-        return Err(invalid(modifier, "deform_mode", "OVERWRITE or INTEGRATE"));
-    }
-    let amount = number(modifier, "factor")?.clamp(0.0, 1.0);
-    let group = optional_string(modifier, "vertex_group")?;
-    let weights = group
-        .map(|name| get_group_weights(mesh, name))
-        .transpose()?;
-    let invert_group = boolean(modifier, "invert_vertex_group")?;
     let basis = mesh
         .vertices
         .iter()
         .map(|vertex| vertex.co)
         .collect::<Vec<_>>();
-    let sampled = samples.points[first]
-        .iter()
-        .enumerate()
-        .map(|(index, point)| {
-            if first == second {
-                *point
-            } else {
-                point.lerp(samples.points[second][index], factor)
-            }
-        })
-        .collect::<Vec<_>>();
+    let first_points = cache.frame_points(modifier, first)?;
+    let sampled = if first == second {
+        first_points
+    } else {
+        cache
+            .frame_points(modifier, second)?
+            .into_iter()
+            .zip(first_points)
+            .map(|(next, current)| current.lerp(next, weight))
+            .collect()
+    };
+    if deform_mode == "INTEGRATE" && mesh.faces.is_empty() {
+        return Err(invalid(
+            modifier,
+            "deform_mode",
+            "a mesh with faces for INTEGRATE",
+        ));
+    }
+    if weights.is_some() && !mesh_has_vertex_group_weights(mesh) {
+        return Ok(());
+    }
     let mut desired = if deform_mode == "INTEGRATE" {
         integrate_cache_samples(mesh, &basis, &sampled)
     } else {
@@ -394,12 +376,22 @@ pub fn evaluate_mesh_cache(
     for (index, vertex) in mesh.vertices.iter_mut().enumerate() {
         let mut influence = amount;
         if let Some(weights) = &weights {
-            let weight = weights.get(&vertex.id).copied().unwrap_or(0.0);
-            influence *= if invert_group { 1.0 - weight } else { weight };
+            let group_weight = weights.get(&vertex.id).copied().unwrap_or(0.0);
+            influence *= if invert_group {
+                1.0 - group_weight
+            } else {
+                group_weight
+            };
         }
         vertex.co = basis[index].lerp(desired[index], influence);
     }
     Ok(())
+}
+
+/// Blender disables Mesh Cache when its factor is zero/below or the filepath is empty.
+pub(crate) fn mesh_cache_is_disabled(modifier: &Modifier) -> bool {
+    number(modifier, "factor").is_ok_and(|factor| factor <= 0.0)
+        || optional_string(modifier, "resource").is_ok_and(|value| value.is_none())
 }
 
 fn integrate_cache_samples(mesh: &Mesh, basis: &[DVec3], samples: &[DVec3]) -> Vec<DVec3> {
@@ -479,175 +471,231 @@ fn transform_cache_point_by_triangle(
     transformed
 }
 
-struct CacheSamples {
-    times: Vec<f64>,
-    points: Vec<Vec<DVec3>>,
-    pc2_time_start: Option<f64>,
-    pc2_sampling: Option<f64>,
+const FRAME_SNAP_EPS: f64 = 1.0e-4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheFormat {
+    Pc2,
+    Mdd,
 }
 
-fn read_pc2(bytes: &[u8], modifier: &Modifier) -> Result<CacheSamples> {
-    if bytes.len() < 32 || &bytes[..12] != b"POINTCACHE2\0" {
-        return Err(invalid(modifier, "resource", "a valid PC2 file"));
-    }
-    let version =
-        le_i32(bytes, 12).ok_or_else(|| invalid(modifier, "resource", "a valid PC2 header"))?;
-    let count = le_i32(bytes, 16).and_then(|value| usize::try_from(value).ok());
-    let start = le_f32(bytes, 20).map(f64::from);
-    let rate = le_f32(bytes, 24).map(f64::from);
-    let frames = le_i32(bytes, 28).and_then(|value| usize::try_from(value).ok());
-    let (Some(count), Some(start), Some(rate), Some(frames)) = (count, start, rate, frames) else {
-        return Err(invalid(modifier, "resource", "a valid PC2 header"));
-    };
-    let size = count
-        .checked_mul(frames)
-        .and_then(|value| value.checked_mul(12))
-        .and_then(|value| value.checked_add(32));
-    if version != 1 || !rate.is_finite() || rate <= 0.0 || size != Some(bytes.len()) {
-        return Err(invalid(
-            modifier,
-            "resource",
-            "a valid PC2 version 1 point cache",
-        ));
-    }
-    let mut points = Vec::with_capacity(frames);
-    for frame_index in 0..frames {
-        let mut frame = Vec::with_capacity(count);
-        for point_index in 0..count {
-            let offset = 32 + (frame_index * count + point_index) * 12;
-            let x = le_f32(bytes, offset).map(f64::from);
-            let y = le_f32(bytes, offset + 4).map(f64::from);
-            let z = le_f32(bytes, offset + 8).map(f64::from);
-            let (Some(x), Some(y), Some(z)) = (x, y, z) else {
-                return Err(invalid(modifier, "resource", "valid PC2 point samples"));
-            };
-            let point = DVec3::new(x, y, z);
-            if !point.is_finite() {
-                return Err(invalid(modifier, "resource", "finite PC2 point samples"));
-            }
-            frame.push(point);
+enum CacheTiming {
+    Pc2 { start: f64, sampling: f64 },
+    Mdd { times: Vec<f64> },
+}
+
+/// A validated PC2 or MDD header. Point data is decoded only for the frames an evaluation needs.
+struct CacheFile<'a> {
+    bytes: &'a [u8],
+    format: CacheFormat,
+    frames: usize,
+    count: usize,
+    timing: CacheTiming,
+}
+
+impl<'a> CacheFile<'a> {
+    fn parse(bytes: &'a [u8], format: &str, modifier: &Modifier) -> Result<Self> {
+        match format {
+            "PC2" => Self::parse_pc2(bytes, modifier),
+            "MDD" => Self::parse_mdd(bytes, modifier),
+            _ => Err(invalid(modifier, "cache_format", "PC2 or MDD")),
         }
-        points.push(frame);
     }
-    Ok(CacheSamples {
-        times: (0..frames)
-            .map(|index| start + f64::from(u32::try_from(index).unwrap_or(u32::MAX)) * rate)
-            .collect(),
-        points,
-        pc2_time_start: Some(start),
-        pc2_sampling: Some(rate),
-    })
-}
 
-fn read_mdd(bytes: &[u8], modifier: &Modifier) -> Result<CacheSamples> {
-    if bytes.len() < 8 {
-        return Err(invalid(modifier, "resource", "a valid MDD file"));
-    }
-    let frames = be_i32(bytes, 0).and_then(|value| usize::try_from(value).ok());
-    let count = be_i32(bytes, 4).and_then(|value| usize::try_from(value).ok());
-    let (Some(frames), Some(count)) = (frames, count) else {
-        return Err(invalid(modifier, "resource", "a valid MDD header"));
-    };
-    let sample_bytes = frames
-        .checked_mul(count)
-        .and_then(|value| value.checked_mul(12));
-    let time_bytes = frames.checked_mul(4);
-    if frames == 0
-        || count == 0
-        || time_bytes.and_then(|time| time.checked_add(sample_bytes?)) != Some(bytes.len() - 8)
-    {
-        return Err(invalid(
-            modifier,
-            "resource",
-            "a valid MDD frame and point table",
-        ));
-    }
-    let mut times = Vec::with_capacity(frames);
-    for index in 0..frames {
-        let time = be_f32(bytes, 8 + index * 4).map(f64::from);
-        let Some(time) = time.filter(|time| time.is_finite()) else {
-            return Err(invalid(modifier, "resource", "finite MDD frame times"));
+    fn parse_pc2(bytes: &'a [u8], modifier: &Modifier) -> Result<Self> {
+        if bytes.len() < 32 || &bytes[..12] != b"POINTCACHE2\0" {
+            return Err(invalid(modifier, "resource", "a valid PC2 file"));
+        }
+        let header = || invalid(modifier, "resource", "a valid PC2 header");
+        let version = le_i32(bytes, 12).ok_or_else(header)?;
+        let count = le_i32(bytes, 16).and_then(|value| usize::try_from(value).ok());
+        let start = le_f32(bytes, 20).map(f64::from);
+        let sampling = le_f32(bytes, 24).map(f64::from);
+        let frames = le_i32(bytes, 28)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|frames| *frames > 0);
+        let (Some(count), Some(start), Some(sampling), Some(frames)) =
+            (count, start, sampling, frames)
+        else {
+            return Err(header());
         };
-        times.push(time);
-    }
-    if times.windows(2).any(|pair| pair[1] < pair[0]) {
-        return Err(invalid(modifier, "resource", "ordered MDD frame times"));
-    }
-    let data_start = 8 + frames * 4;
-    let mut points = Vec::with_capacity(frames);
-    for frame_index in 0..frames {
-        let mut frame = Vec::with_capacity(count);
-        for point_index in 0..count {
-            let offset = data_start + (frame_index * count + point_index) * 12;
-            let x = be_f32(bytes, offset).map(f64::from);
-            let y = be_f32(bytes, offset + 4).map(f64::from);
-            let z = be_f32(bytes, offset + 8).map(f64::from);
-            let (Some(x), Some(y), Some(z)) = (x, y, z) else {
-                return Err(invalid(modifier, "resource", "valid MDD point samples"));
-            };
-            let point = DVec3::new(x, y, z);
-            if !point.is_finite() {
-                return Err(invalid(modifier, "resource", "finite MDD point samples"));
-            }
-            frame.push(point);
+        let size = count
+            .checked_mul(frames)
+            .and_then(|value| value.checked_mul(12))
+            .and_then(|value| value.checked_add(32));
+        if version != 1
+            || !start.is_finite()
+            || !sampling.is_finite()
+            || sampling <= 0.0
+            || size != Some(bytes.len())
+        {
+            return Err(invalid(
+                modifier,
+                "resource",
+                "a valid PC2 version 1 point cache",
+            ));
         }
-        points.push(frame);
+        Ok(Self {
+            bytes,
+            format: CacheFormat::Pc2,
+            frames,
+            count,
+            timing: CacheTiming::Pc2 { start, sampling },
+        })
     }
-    Ok(CacheSamples {
-        times,
-        points,
-        pc2_time_start: None,
-        pc2_sampling: None,
-    })
+
+    fn parse_mdd(bytes: &'a [u8], modifier: &Modifier) -> Result<Self> {
+        let header = || invalid(modifier, "resource", "a valid MDD header");
+        let frames = be_i32(bytes, 0)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|frames| *frames > 0);
+        let count = be_i32(bytes, 4)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|count| *count > 0);
+        let (Some(frames), Some(count)) = (frames, count) else {
+            return Err(header());
+        };
+        let time_bytes = frames.checked_mul(4);
+        let sample_bytes = frames
+            .checked_mul(count)
+            .and_then(|value| value.checked_mul(12));
+        if time_bytes.and_then(|time| sample_bytes.and_then(|samples| time.checked_add(samples)))
+            != Some(bytes.len() - 8)
+        {
+            return Err(invalid(
+                modifier,
+                "resource",
+                "a valid MDD frame and point table",
+            ));
+        }
+        let times = (0..frames)
+            .map(|index| {
+                be_f32(bytes, 8 + index * 4)
+                    .map(f64::from)
+                    .filter(|time| time.is_finite())
+                    .ok_or_else(|| invalid(modifier, "resource", "finite MDD frame times"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if times.windows(2).any(|pair| pair[1] < pair[0]) {
+            return Err(invalid(modifier, "resource", "ordered MDD frame times"));
+        }
+        Ok(Self {
+            bytes,
+            format: CacheFormat::Mdd,
+            frames,
+            count,
+            timing: CacheTiming::Mdd { times },
+        })
+    }
+
+    fn data_start(&self) -> usize {
+        match self.format {
+            CacheFormat::Pc2 => 32,
+            CacheFormat::Mdd => 8 + self.frames * 4,
+        }
+    }
+
+    /// Blender's fractional cache frame for a time value in seconds.
+    fn frame_for_time(&self, time: f64, fps: f64) -> f64 {
+        match &self.timing {
+            CacheTiming::Pc2 { start, sampling } => ((time / fps) - start) / sampling,
+            CacheTiming::Mdd { times } => mdd_frame_for_time(times, time),
+        }
+    }
+
+    fn frame_points(&self, modifier: &Modifier, frame: usize) -> Result<Vec<DVec3>> {
+        let first = self.data_start() + frame * self.count * 12;
+        (0..self.count)
+            .map(|point| {
+                let offset = first + point * 12;
+                let read = |at: usize| {
+                    match self.format {
+                        CacheFormat::Pc2 => le_f32(self.bytes, at),
+                        CacheFormat::Mdd => be_f32(self.bytes, at),
+                    }
+                    .map(f64::from)
+                };
+                let (Some(x), Some(y), Some(z)) =
+                    (read(offset), read(offset + 4), read(offset + 8))
+                else {
+                    return Err(invalid(modifier, "resource", "valid cache point samples"));
+                };
+                let point = DVec3::new(x, y, z);
+                if !point.is_finite() {
+                    return Err(invalid(modifier, "resource", "finite cache point samples"));
+                }
+                Ok(point)
+            })
+            .collect()
+    }
 }
 
-fn select_cache_samples(times: &[f64], time: f64, interpolate: bool) -> (usize, usize, f64) {
-    if time <= times[0] {
-        return (0, 0, 0.0);
-    }
-    let last = times.len() - 1;
-    if time >= times[last] {
-        return (last, last, 0.0);
-    }
-    let upper = times.partition_point(|sample| *sample < time);
-    let lower = upper - 1;
-    if !interpolate {
-        return (lower, lower, 0.0);
-    }
-    let width = times[upper] - times[lower];
-    let factor = if width > 0.0 {
-        (time - times[lower]) / width
-    } else {
-        0.0
+fn index_as_f64(index: usize) -> f64 {
+    f64::from(u32::try_from(index).unwrap_or(u32::MAX))
+}
+
+/// Blender's MDD time lookup: a fractional frame between the samples that bracket `time`.
+fn mdd_frame_for_time(times: &[f64], time: f64) -> f64 {
+    let Some(upper) = times.iter().position(|sample| *sample >= time) else {
+        return index_as_f64(times.len() - 1);
     };
-    (lower, upper, factor)
+    if upper == 0 {
+        return 0.0;
+    }
+    let previous = times[upper - 1];
+    let range = times[upper] - previous;
+    if range <= FRAME_SNAP_EPS {
+        index_as_f64(upper)
+    } else {
+        index_as_f64(upper - 1) + (time - previous) / range
+    }
 }
 
+/// Blender's `MOD_meshcache_calc_range`: the nearest frame, or the bracketing pair and its blend.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the frame is bounded to 0..count before conversion to an index"
+)]
 fn select_cache_frame(frame: f64, count: usize, interpolate: bool) -> (usize, usize, f64) {
-    let last_index = count.saturating_sub(1);
-    let last_frame = f64::from(u32::try_from(last_index).unwrap_or(u32::MAX));
-    let frame = frame.clamp(0.0, last_frame);
-    let index_frame = if interpolate {
-        frame.floor()
-    } else {
-        frame.round()
-    };
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the finite, clamped cache frame is bounded by its signed 32-bit file header"
-    )]
-    let first = index_frame as usize;
-    if !interpolate || first == last_index {
-        return (first, first, 0.0);
+    let last = count - 1;
+    if !interpolate {
+        let index = frame.round().clamp(0.0, index_as_f64(last)) as usize;
+        return (index, index, 1.0);
     }
-    (first, first + 1, frame.fract())
+    let whole = frame.floor();
+    let range = frame - whole;
+    let (lower, upper, factor) = if range <= FRAME_SNAP_EPS {
+        (whole, whole, 1.0)
+    } else {
+        (whole, whole + 1.0, range)
+    };
+    if lower >= index_as_f64(count) || upper >= index_as_f64(count) {
+        (last, last, 1.0)
+    } else if lower < 0.0 || upper < 0.0 {
+        (0, 0, 1.0)
+    } else {
+        (lower as usize, upper as usize, factor)
+    }
 }
 
-fn cache_frame_count(count: usize, modifier: &Modifier) -> Result<f64> {
-    let count = u32::try_from(count)
-        .map_err(|_| invalid(modifier, "resource", "a bounded cache frame count"))?;
-    Ok(f64::from(count))
+fn mesh_has_vertex_group(mesh: &Mesh, group: &str) -> bool {
+    mesh.attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .is_some_and(|groups| groups.contains_key(group))
+}
+
+/// Blender only deforms with vertex groups when some vertex of the mesh has a group weight.
+fn mesh_has_vertex_group_weights(mesh: &Mesh) -> bool {
+    mesh.attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .is_some_and(|groups| {
+            groups
+                .values()
+                .any(|values| values.as_object().is_some_and(|values| !values.is_empty()))
+        })
 }
 
 fn apply_cache_axes(
