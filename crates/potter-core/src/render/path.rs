@@ -25,13 +25,13 @@ use super::{
     },
     scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
 };
-use super::principled_bsdf::{continuous_density, evaluate as evaluate_bsdf, lobe_probabilities};
+use super::principled_bsdf::{
+    continuous_density, evaluate as evaluate_bsdf, lobe_probabilities, unevaluated_inputs,
+};
 
 const RAY_EPSILON: f64 = 1.0e-5;
 const MAX_VOLUME_STEPS: usize = 2048;
 const MAX_SHADOW_LAYERS: usize = 16;
-// Calibrated against the Blender-gated Cycles VDB comparison; surface lighting uses its own energy convention.
-const VOLUME_DIRECT_LIGHT_SCALE: f64 = 0.75;
 
 #[derive(Clone, Copy)]
 struct PointLight {
@@ -1269,6 +1269,7 @@ fn make_surface(
     if params.normal.dot(-direction) < 0.0 {
         params.normal = -params.normal;
     }
+    record_unevaluated_inputs(&params, &geometry.shader_warnings);
     Ok(Surface {
         point,
         normal: params.normal,
@@ -1279,6 +1280,25 @@ fn make_surface(
         element_index: triangle.element_index,
         distance: hit.distance,
     })
+}
+
+/// Records `UNSUPPORTED_FEATURE` for each Principled input this surface's lobe model does not
+/// evaluate, once per distinct warning, in the same list the render output reports.
+fn record_unevaluated_inputs(params: &BsdfParams, warnings: &RefCell<Vec<serde_json::Value>>) {
+    for (feature_id, input) in unevaluated_inputs(params) {
+        let warning = serde_json::json!({
+            "code": "UNSUPPORTED_FEATURE",
+            "feature_id": feature_id,
+            "input": input,
+            "message": format!(
+                "Principled input '{input}' is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
+            ),
+        });
+        let mut recorded = warnings.borrow_mut();
+        if !recorded.contains(&warning) {
+            recorded.push(warning);
+        }
+    }
 }
 
 pub(super) fn object_for_index(
@@ -1417,7 +1437,7 @@ fn direct_volume_lighting(
             evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(sample.direction), event.anisotropy);
-        contribution += sample.radiance * (phase * visibility * VOLUME_DIRECT_LIGHT_SCALE);
+        contribution += sample.radiance * (phase * visibility);
     }
     let (direction, pdf) = if let Some(sampler) = importance {
         sampler.sample(rng)
