@@ -1955,7 +1955,7 @@ mod tests {
         .unwrap();
         assert!(outcome.doc.materials.is_empty());
         let node_materials = &outcome.doc.nodes.values().next().unwrap().materials;
-        assert!(node_materials.is_empty(), "{node_materials:?}");
+        assert_eq!(node_materials.as_slice(), &[None]);
         assert_eq!(outcome.changes["materials"]["created"], json!([]));
         assert_eq!(outcome.changes["materials"]["deleted"], json!([]));
         let reassigned = apply_batch(

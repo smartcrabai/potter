@@ -18,6 +18,7 @@ use crate::{
 
 use super::{
     Mesh,
+    color_layers::{self, ColorDomain, ColorLayer},
     uv_layers::{self, UvLayer},
 };
 
@@ -320,8 +321,8 @@ fn apply_cache_attributes(
     if read.color
         && let Some((scope, colors)) = &sample.colors
     {
-        let attribute = color_attribute(mesh, scope, colors, modifier)?;
-        mesh.attributes.insert("color".to_owned(), attribute);
+        let (domain, values) = cache_colors(mesh, scope, colors, modifier)?;
+        write_cache_colors(mesh, domain, values);
     }
     if velocity_scale != 0.0
         && let Some((scope, velocities)) = &sample.velocities
@@ -492,22 +493,25 @@ fn validate_cache_output(mesh: &Mesh, modifier: &Modifier) -> Result<()> {
     })
 }
 
-fn color_attribute(
+/// The color layer that Alembic colors fill. It shares the default layer name of vertex painting.
+const CACHE_COLOR_LAYER: &str = "color";
+
+/// The cache's colors as one layer's values in storage order. Point scopes give one value per vertex.
+/// Uniform colors (one per face) become one value per corner, which the corner domain can hold.
+/// Colors are stored unchanged, since Alembic colors are linear.
+fn cache_colors(
     mesh: &Mesh,
     scope: &str,
     colors: &[Vec<f64>],
     modifier: &Modifier,
-) -> Result<Value> {
-    let mut values = serde_json::Map::new();
-    let domain = match scope {
+) -> Result<(ColorDomain, Vec<[f64; 4]>)> {
+    match scope {
         "constant" => {
             let color = colors
                 .first()
                 .ok_or_else(|| invalid_color_count(modifier, 0, 1))?;
-            for vertex in &mesh.vertices {
-                values.insert(format!("v{}", vertex.id), rgba_color(color, modifier)?);
-            }
-            "point"
+            let color = rgba_color(color, modifier)?;
+            Ok((ColorDomain::Point, vec![color; mesh.vertices.len()]))
         }
         "vertex" | "varying" => {
             if colors.len() != mesh.vertices.len() {
@@ -517,10 +521,11 @@ fn color_attribute(
                     mesh.vertices.len(),
                 ));
             }
-            for (vertex, color) in mesh.vertices.iter().zip(colors) {
-                values.insert(format!("v{}", vertex.id), rgba_color(color, modifier)?);
-            }
-            "point"
+            let values = colors
+                .iter()
+                .map(|color| rgba_color(color, modifier))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((ColorDomain::Point, values))
         }
         "uniform" => {
             if colors.len() != mesh.faces.len() {
@@ -530,10 +535,12 @@ fn color_attribute(
                     mesh.faces.len(),
                 ));
             }
+            let mut values = Vec::new();
             for (face, color) in mesh.faces.iter().zip(colors) {
-                values.insert(format!("f{}", face.id), rgba_color(color, modifier)?);
+                let color = rgba_color(color, modifier)?;
+                values.extend(vec![color; face.vertices.len()]);
             }
-            "face"
+            Ok((ColorDomain::Corner, values))
         }
         "facevarying" => {
             let corner_count = mesh
@@ -544,41 +551,54 @@ fn color_attribute(
             if colors.len() != corner_count {
                 return Err(invalid_color_count(modifier, colors.len(), corner_count));
             }
-            let mut colors = colors.iter();
-            for face in &mesh.faces {
-                let face_colors = colors
-                    .by_ref()
-                    .take(face.vertices.len())
-                    .map(|color| rgba_color(color, modifier))
-                    .collect::<Result<Vec<_>>>()?;
-                values.insert(format!("f{}", face.id), Value::Array(face_colors));
-            }
-            "corner"
+            let values = colors
+                .iter()
+                .map(|color| rgba_color(color, modifier))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((ColorDomain::Corner, values))
         }
-        _ => {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "Alembic cache color scope is unsupported",
-                json!({"modifier_id":modifier.id,"scope":scope}),
-            ));
-        }
-    };
-    Ok(json!({"domain":domain,"type":"color","values":values}))
+        _ => Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic cache color scope is unsupported",
+            json!({"modifier_id":modifier.id,"scope":scope}),
+        )),
+    }
 }
 
-fn rgba_color(color: &[f64], modifier: &Modifier) -> Result<Value> {
-    let rgba = match color {
-        [red, green, blue] => [*red, *green, *blue, 1.0],
-        [red, green, blue, alpha] => [*red, *green, *blue, *alpha],
-        _ => {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "Alembic cache color tuple must have three or four components",
-                json!({"modifier_id":modifier.id,"component_count":color.len()}),
-            ));
-        }
-    };
-    Ok(json!(rgba))
+/// Writes the cache colors as the `color` layer of the color store, replacing a layer of that name.
+/// The layer becomes the active or render layer only when the store has none.
+fn write_cache_colors(mesh: &mut Mesh, domain: ColorDomain, values: Vec<[f64; 4]>) {
+    let mut store = color_layers::read(mesh);
+    store.layers.retain(|layer| layer.name != CACHE_COLOR_LAYER);
+    store.layers.push(ColorLayer {
+        name: CACHE_COLOR_LAYER.to_owned(),
+        domain,
+        values,
+    });
+    if store.render_index().is_none() {
+        store.render = Some(CACHE_COLOR_LAYER.to_owned());
+    }
+    if store
+        .active
+        .as_deref()
+        .and_then(|active| store.index_of(active))
+        .is_none()
+    {
+        store.active = Some(CACHE_COLOR_LAYER.to_owned());
+    }
+    color_layers::write(mesh, &store);
+}
+
+fn rgba_color(color: &[f64], modifier: &Modifier) -> Result<[f64; 4]> {
+    match color {
+        [red, green, blue] => Ok([*red, *green, *blue, 1.0]),
+        [red, green, blue, alpha] => Ok([*red, *green, *blue, *alpha]),
+        _ => Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "Alembic cache color tuple must have three or four components",
+            json!({"modifier_id":modifier.id,"component_count":color.len()}),
+        )),
+    }
 }
 
 fn invalid_color_count(modifier: &Modifier, actual: usize, expected: usize) -> PotError {
@@ -761,7 +781,6 @@ fn lerp_position(first: [f64; 3], second: [f64; 3], factor: f64) -> [f64; 3] {
 mod tests {
 
     use proptest::prelude::*;
-    use serde_json::{Value, json};
 
     use super::{lerp_position, topology_matches};
     use crate::geom::Mesh;
@@ -787,7 +806,7 @@ mod tests {
     #[test]
     fn cache_colors_map_to_point_and_corner_mesh_domains() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mesh = super::Mesh::from_positions_and_faces(
+        let mut mesh = super::Mesh::from_positions_and_faces(
             vec![glam::DVec3::ZERO, glam::DVec3::X, glam::DVec3::Y],
             vec![vec![0, 1, 2]],
         )?;
@@ -802,52 +821,43 @@ mod tests {
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        let point = super::color_attribute(
-            &mesh,
-            "vertex",
-            &[
-                vec![1.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0],
-                vec![0.0, 0.0, 1.0],
-            ],
-            &modifier,
-        )?;
-        assert_eq!(point.get("domain").and_then(Value::as_str), Some("point"));
-        let point_values = point
-            .get("values")
-            .and_then(Value::as_object)
-            .ok_or("point colors have no values")?;
-        assert_eq!(point_values.get("v0"), Some(&json!([1.0, 0.0, 0.0, 1.0])));
+        let point_values = [
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let (domain, values) = super::cache_colors(&mesh, "vertex", &point_values, &modifier)?;
+        assert_eq!(domain, super::ColorDomain::Point);
+        super::write_cache_colors(&mut mesh, domain, values);
+        let point = super::color_layers::read(&mesh);
+        let point_layer = point.layers.first().ok_or("point color layer is missing")?;
+        assert_eq!(point_layer.name, "color");
+        assert_eq!(point_layer.domain, super::ColorDomain::Point);
+        assert_eq!(point_layer.values[0], [1.0, 0.0, 0.0, 1.0]);
 
-        let corner = super::color_attribute(
-            &mesh,
-            "facevarying",
-            &[
-                vec![1.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0],
-                vec![0.0, 0.0, 1.0],
-            ],
-            &modifier,
-        )?;
-        assert_eq!(corner.get("domain").and_then(Value::as_str), Some("corner"));
-        let face_id = mesh
-            .faces
+        let corner_values = [
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let (domain, values) =
+            super::cache_colors(&mesh, "facevarying", &corner_values, &modifier)?;
+        assert_eq!(domain, super::ColorDomain::Corner);
+        super::write_cache_colors(&mut mesh, domain, values);
+        let corner = super::color_layers::read(&mesh);
+        let corner_layer = corner
+            .layers
             .first()
-            .ok_or("test triangle face is missing")?
-            .id;
-        let corner_values = corner
-            .get("values")
-            .and_then(Value::as_object)
-            .and_then(|values| values.get(&format!("f{face_id}")))
-            .and_then(Value::as_array)
-            .ok_or("corner colors have no face value array")?;
+            .ok_or("corner color layer is missing")?;
+        assert_eq!(corner_layer.name, "color");
+        assert_eq!(corner_layer.domain, super::ColorDomain::Corner);
         assert_eq!(
-            Value::Array(corner_values.clone()),
-            json!([
+            corner_layer.values,
+            vec![
                 [1.0, 0.0, 0.0, 1.0],
                 [0.0, 1.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0, 1.0]
-            ])
+                [0.0, 0.0, 1.0, 1.0],
+            ]
         );
         Ok(())
     }

@@ -7,17 +7,20 @@ use crate::{
     eval::Snapshot,
     geom::volume::{VolumeData, sample_density, sample_density_checked},
     image::{ImageData, ImageInterpolation},
-    model::{Id, LightType, SceneDoc},
-    shader::{BsdfParams, HitContext, HitUvLayers, evaluate_surface, height_gradient},
+    model::{Id, LightData, LightType, SceneDoc},
+    shader::{
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, dielectric_f0,
+        evaluate_surface_with_workspace, height_gradient,
+    },
 };
 
 use super::{
     bvh::{Bvh, BvhHit},
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, blend_uv, camera_eye,
+        Camera, Mode, RasterOutput, StereoMode, blend_corner_normals, camera_eye,
         rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
     },
-    scene::{Geometry, ObjectRecord},
+    scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
 };
 
 const RAY_EPSILON: f64 = 1.0e-5;
@@ -36,6 +39,20 @@ struct PointLight {
     radius: f64,
     spot_size: f64,
     spot_blend: f64,
+    /// The emitting shape of an area light; `None` for every other light type.
+    area: Option<AreaShape>,
+}
+
+/// A Blender area light's emitting shape in world space: unit axes, half extents with the
+/// object scale applied, whether it is an ellipse, and its area.
+#[derive(Clone, Copy)]
+struct AreaShape {
+    axis_u: DVec3,
+    axis_v: DVec3,
+    half_u: f64,
+    half_v: f64,
+    ellipse: bool,
+    area: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -349,6 +366,7 @@ pub(super) fn render(
             DVec3::from_array(world.color) * world.strength
         });
     let bvh = Bvh::build(&geometry.triangles)?;
+    let mut evaluator_workspace = EvaluatorWorkspace::default();
     let lights = collect_lights(doc, snapshot);
     let volumes = collect_volumes(
         doc,
@@ -418,6 +436,7 @@ pub(super) fn render(
                         environment,
                         max_bounces,
                         &mut left_rng,
+                        &mut evaluator_workspace,
                     )?;
                     let (right, right_alpha) = trace_path(
                         doc,
@@ -433,6 +452,7 @@ pub(super) fn render(
                         environment,
                         max_bounces,
                         &mut right_rng,
+                        &mut evaluator_workspace,
                     )?;
                     (
                         DVec3::new(left.x, right.y, right.z),
@@ -455,6 +475,7 @@ pub(super) fn render(
                         environment,
                         max_bounces,
                         &mut rng,
+                        &mut evaluator_workspace,
                     )?
                 };
                 sum += radiance;
@@ -494,6 +515,7 @@ pub(super) fn render(
         height,
         film_transparent,
         &mut output,
+        &mut evaluator_workspace,
     )?;
     overlay_rasterized_lines(
         geometry,
@@ -743,6 +765,7 @@ fn trace_path(
     environment: DVec3,
     max_bounces: u32,
     rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, f64)> {
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
@@ -783,6 +806,7 @@ fn trace_path(
                     direction,
                     environment,
                     rng,
+                    evaluator_workspace,
                 )?;
             if bounce == max_bounces {
                 break;
@@ -797,7 +821,16 @@ fn trace_path(
             radiance += throughput * environment * environment_weight;
             break;
         };
-        let surface = make_surface(doc, snapshot, geometry, hit, origin, direction, images)?;
+        let surface = make_surface(
+            doc,
+            snapshot,
+            geometry,
+            hit,
+            origin,
+            direction,
+            images,
+            evaluator_workspace,
+        )?;
         if surface.params.volume_density > 0.0
             && let Some(boundary) = closest_hit(
                 geometry,
@@ -847,13 +880,11 @@ fn trace_path(
             }
             continue;
         }
-        if bounce == 0 {
-            alpha = 1.0;
-        }
         if rng.next_f64() >= surface.params.alpha.clamp(0.0, 1.0) {
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
+        alpha = 1.0;
         radiance += throughput
             * DVec3::from_array(surface.params.emission_color)
             * surface.params.emission_strength.max(0.0);
@@ -871,6 +902,7 @@ fn trace_path(
                 direction,
                 environment,
                 rng,
+                evaluator_workspace,
             )?;
         if bounce == max_bounces {
             break;
@@ -916,6 +948,7 @@ fn write_center_passes(
     height: u32,
     film_transparent: bool,
     output: &mut RasterOutput,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<()> {
     let camera_forward = (camera.target - camera.position).normalize_or_zero();
     for y in 0..height {
@@ -946,7 +979,16 @@ fn write_center_passes(
                 }
                 continue;
             };
-            let surface = make_surface(doc, snapshot, geometry, hit, origin, direction, images)?;
+            let surface = make_surface(
+                doc,
+                snapshot,
+                geometry,
+                hit,
+                origin,
+                direction,
+                images,
+                evaluator_workspace,
+            )?;
             if surface.params.alpha <= 0.0 {
                 continue;
             }
@@ -1107,6 +1149,7 @@ fn make_surface(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
     let triangle = geometry.triangles.get(hit.triangle_index).ok_or_else(|| {
         PotError::new(
@@ -1134,7 +1177,7 @@ fn make_surface(
             }
         }
     };
-    let uv = blend_uv(&triangle.uv, hit.barycentric);
+
     let object = object_for_index(&geometry.objects, triangle.object_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1150,28 +1193,12 @@ fn make_surface(
                 "triangle references an unmapped material",
             )
         })?;
-    let matrix = snapshot
-        .nodes
-        .get(&object.node_id)
-        .map_or(DMat4::IDENTITY, |node| {
-            DMat4::from_cols_array(&node.world_matrix)
-        });
-    let world_to_local = matrix.inverse();
-    let local_is_finite = world_to_local
-        .to_cols_array()
-        .iter()
-        .all(|value| value.is_finite());
-    let object_position = if local_is_finite {
-        world_to_local.transform_point3(point)
-    } else {
-        point
-    };
     let element = triangle
         .element_index
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
         .and_then(|index| geometry.elements.get(index));
-    let layers = HitUvLayers {
+    let uv_layers = HitUvLayers {
         names: &object.uv_layers,
         corners: &triangle.layer_uvs,
         positions: triangle.positions,
@@ -1179,17 +1206,25 @@ fn make_surface(
         render: element.map_or(object.uv_render, |element| element.uv_render),
         available_mask: element.and_then(|element| element.uv_available_mask),
     };
-    let mut context = HitContext::new(&doc.node_groups)
-        .with_images(images)
-        .with_uv_layers(layers)
-        .with_warnings(&geometry.shader_warnings);
-    context.uv = uv;
-    context.generated = object_position;
-    context.position = point;
-    context.object = object_position;
-    context.normal = normal;
-    context.view_direction = -direction;
-    let mut params = evaluate_surface(material, &context)?;
+    let mut tables = LayerTables::new();
+    let context = layered_context(
+        doc,
+        images,
+        &geometry.shader_warnings,
+        object,
+        triangle,
+        HitPose {
+            point,
+            object: object_space(snapshot, object, point),
+            normal,
+            view: -direction,
+            barycentric: hit.barycentric,
+        },
+        None,
+        uv_layers,
+        &mut tables,
+    )?;
+    let mut params = evaluate_surface_with_workspace(material, &context, evaluator_workspace)?;
     params.alpha = match material.alpha_mode.as_str() {
         "opaque" => 1.0,
         "clip" => {
@@ -1203,7 +1238,8 @@ fn make_surface(
     };
     if params.displacement_height != 0.0 && material.displacement_method != "displacement" {
         let gradient = height_gradient(&context, normal, |sample| {
-            evaluate_surface(material, sample).map(|surface| surface.displacement_height)
+            evaluate_surface_with_workspace(material, sample, evaluator_workspace)
+                .map(|surface| surface.displacement_height)
         })?;
         params.normal = normal - gradient;
     }
@@ -1227,7 +1263,10 @@ fn make_surface(
     })
 }
 
-fn object_for_index(objects: &[ObjectRecord], object_index: u32) -> Option<&ObjectRecord> {
+pub(super) fn object_for_index(
+    objects: &[ObjectRecord],
+    object_index: u32,
+) -> Option<&ObjectRecord> {
     object_index
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
@@ -1251,6 +1290,7 @@ fn direct_lighting(
     incoming_direction: DVec3,
     environment: DVec3,
     rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
     let normal = surface.normal;
     let geometric = surface.geometric_normal;
@@ -1276,6 +1316,7 @@ fn direct_lighting(
             sample.direction,
             sample.distance,
             rng,
+            evaluator_workspace,
         )?;
         if visibility <= 0.0 {
             continue;
@@ -1301,6 +1342,7 @@ fn direct_lighting(
             direction,
             f64::INFINITY,
             rng,
+            evaluator_workspace,
         )?;
         let environment_pdf = importance.map_or(0.0, |sampler| sampler.pdf(direction));
         let weight = importance.map_or(1.0, |_| power_heuristic(cosine_pdf, environment_pdf));
@@ -1326,6 +1368,7 @@ fn direct_lighting(
                 direction,
                 f64::INFINITY,
                 rng,
+                evaluator_workspace,
             )?;
             let cosine_pdf = cosine / std::f64::consts::PI;
             let weight = power_heuristic(environment_pdf, cosine_pdf);
@@ -1354,6 +1397,7 @@ fn direct_volume_lighting(
     incoming_direction: DVec3,
     environment: DVec3,
     rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
     let mut contribution = DVec3::ZERO;
     for light in lights {
@@ -1375,6 +1419,7 @@ fn direct_volume_lighting(
             sample.direction,
             sample.distance,
             rng,
+            evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(sample.direction), event.anisotropy);
         contribution += sample.radiance * (phase * visibility * VOLUME_DIRECT_LIGHT_SCALE);
@@ -1398,6 +1443,7 @@ fn direct_volume_lighting(
             direction,
             f64::INFINITY,
             rng,
+            evaluator_workspace,
         )?;
         let phase = henyey_greenstein(incoming_direction.dot(direction), event.anisotropy);
         contribution += incoming * (phase * visibility * 0.5 / pdf);
@@ -1437,6 +1483,7 @@ fn shadow_transmittance(
     direction: DVec3,
     distance: f64,
     rng: &mut Pcg32,
+    evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
     let mut transmittance = 1.0;
     let mut origin = offset_origin(point, direction, normal);
@@ -1450,7 +1497,16 @@ fn shadow_transmittance(
         else {
             break;
         };
-        let surface = make_surface(doc, snapshot, geometry, hit, origin, direction, images)?;
+        let surface = make_surface(
+            doc,
+            snapshot,
+            geometry,
+            hit,
+            origin,
+            direction,
+            images,
+            evaluator_workspace,
+        )?;
         let alpha = surface.params.alpha.clamp(0.0, 1.0);
         let transmission = surface.params.transmission.clamp(0.0, 1.0);
         if alpha >= 1.0 && transmission <= 0.0 {
@@ -1493,17 +1549,10 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
             radiance: light.color * light.energy,
         });
     }
-    let target = if light.kind == LightType::Area && light.radius > 0.0 {
-        let tangent = if light.direction.z.abs() < 0.9 {
-            light.direction.cross(DVec3::Z).normalize_or_zero()
-        } else {
-            light.direction.cross(DVec3::Y).normalize_or_zero()
-        };
-        let bitangent = light.direction.cross(tangent).normalize_or_zero();
-        let radius = light.radius * rng.next_f64().sqrt();
-        let angle = rng.next_f64() * std::f64::consts::TAU;
-        light.position + tangent * (radius * angle.cos()) + bitangent * (radius * angle.sin())
-    } else if light.kind == LightType::Point && light.radius > 0.0 {
+    if light.kind == LightType::Area {
+        return sample_area_light(light, point, rng);
+    }
+    let target = if light.kind == LightType::Point && light.radius > 0.0 {
         let z = 1.0 - 2.0 * rng.next_f64();
         let angle = rng.next_f64() * std::f64::consts::TAU;
         let radial = (1.0 - z * z).max(0.0).sqrt();
@@ -1540,11 +1589,87 @@ fn sample_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<Lig
     })
 }
 
+/// Samples a point uniformly over an area light and returns its direct-light estimator.
+///
+/// Blender's area light has radiance `L = strength * invarea / π`, with `invarea = 1 / area` for
+/// a non-normalised area (`intern/cycles/scene/light.cpp`, `AreaLight::copy_to_kernel`), and its
+/// kernel evaluates `eval_fac = M_1_PI_F * invarea` (`intern/cycles/kernel/light/area.h`,
+/// `area_light_eval`). The light emits from its front side only (`area_light_sample` rejects
+/// points behind the plane). Uniform area sampling has pdf `1 / area`, and converting to solid
+/// angle gives pdf `d² / (area · cos_light)`, so the estimator is `L · area · cos_light / d²`.
+fn sample_area_light(light: &PointLight, point: DVec3, rng: &mut Pcg32) -> Option<LightSample> {
+    let shape = light.area?;
+    if shape.area <= 0.0 {
+        return None;
+    }
+    let (local_u, local_v) = if shape.ellipse {
+        let radius = rng.next_f64().sqrt();
+        let angle = rng.next_f64() * std::f64::consts::TAU;
+        (radius * angle.cos(), radius * angle.sin())
+    } else {
+        (2.0 * rng.next_f64() - 1.0, 2.0 * rng.next_f64() - 1.0)
+    };
+    let target = light.position
+        + shape.axis_u * (shape.half_u * local_u)
+        + shape.axis_v * (shape.half_v * local_v);
+    let offset = target - point;
+    let distance_squared = offset.length_squared();
+    if distance_squared <= f64::EPSILON || !distance_squared.is_finite() {
+        return None;
+    }
+    let distance = distance_squared.sqrt();
+    let direction = offset / distance;
+    let cos_light = light.direction.dot(-direction);
+    if cos_light <= 0.0 {
+        return None;
+    }
+    let emitted = light.color * (light.energy / (std::f64::consts::PI * shape.area));
+    Some(LightSample {
+        direction,
+        distance,
+        radiance: emitted * (shape.area * cos_light / distance_squared),
+    })
+}
+
+/// The shape of a Blender area light in world space (`intern/cycles/blender/light.cpp`,
+/// `BlenderSync::sync_light`, and `intern/cycles/scene/light.cpp`, `AreaLight::copy_to_kernel`).
+///
+/// Both sides take `area_size`, except that RECTANGLE and ELLIPSE take `area_size_y` for the
+/// second. DISK and ELLIPSE are ellipses, whose area is `π/4` of the bounding rectangle
+/// (`AreaLight::area`). The object transform scales the extents.
+fn area_shape(data: &LightData, matrix: &DMat4) -> AreaShape {
+    let square_or_disk = matches!(data.area_shape.as_str(), "SQUARE" | "DISK");
+    let size_v = if square_or_disk {
+        data.area_size
+    } else {
+        data.area_size_y
+    };
+    let extent_u = matrix.transform_vector3(DVec3::X) * data.area_size;
+    let extent_v = matrix.transform_vector3(DVec3::Y) * size_v;
+    let half_u = extent_u.length() * 0.5;
+    let half_v = extent_v.length() * 0.5;
+    let ellipse = matches!(data.area_shape.as_str(), "DISK" | "ELLIPSE");
+    let rectangle_area = 4.0 * half_u * half_v;
+    AreaShape {
+        axis_u: extent_u.normalize_or_zero(),
+        axis_v: extent_v.normalize_or_zero(),
+        half_u,
+        half_v,
+        ellipse,
+        area: if ellipse {
+            rectangle_area * std::f64::consts::FRAC_PI_4
+        } else {
+            rectangle_area
+        },
+    }
+}
+
 fn sample_bsdf(params: &BsdfParams, view: DVec3, rng: &mut Pcg32) -> (DVec3, DVec3, bool) {
     let diffuse_weight = ((1.0 - params.metallic) * (1.0 - params.transmission)).max(0.0);
     let transmission_weight = params.transmission.clamp(0.0, 1.0);
     let specular_weight = (params.metallic.clamp(0.0, 1.0)
-        + 0.04 * (1.0 - params.metallic.clamp(0.0, 1.0)))
+        + dielectric_f0(params.ior, params.specular_ior_level)
+            * (1.0 - params.metallic.clamp(0.0, 1.0)))
     .max(1.0e-4);
     let total = diffuse_weight + transmission_weight + specular_weight;
     let p_diffuse = diffuse_weight / total;
@@ -1560,7 +1685,8 @@ fn sample_bsdf(params: &BsdfParams, view: DVec3, rng: &mut Pcg32) -> (DVec3, DVe
         );
         return (
             direction,
-            tint * (transmission_weight / p_transmission.max(1.0e-8)),
+            tint * (params.reflectance.clamp(0.0, 1.0) * transmission_weight
+                / p_transmission.max(1.0e-8)),
             false,
         );
     }
@@ -1601,7 +1727,8 @@ fn evaluate_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) 
         params.base_color[2],
     )
     .max(DVec3::ZERO);
-    let f0 = DVec3::splat(0.04 * params.specular_ior_level.clamp(0.0, 2.0))
+    // The dielectric reflectance is the shared Principled rule (`shader::dielectric_f0`).
+    let f0 = DVec3::splat(dielectric_f0(params.ior, params.specular_ior_level))
         .lerp(albedo, params.metallic.clamp(0.0, 1.0));
     let fresnel = f0 + (DVec3::ONE - f0) * (1.0 - v_dot_h).powi(5);
     let alpha = params.roughness.clamp(0.02, 1.0).powi(2);
@@ -1616,7 +1743,9 @@ fn evaluate_bsdf(params: &BsdfParams, normal: DVec3, view: DVec3, light: DVec3) 
     let diffuse = albedo
         * ((1.0 - params.metallic.clamp(0.0, 1.0)) * (1.0 - params.transmission.clamp(0.0, 1.0))
             / std::f64::consts::PI);
-    diffuse + specular
+    // Emission contributes no reflection; `reflectance` weights the reflective closures
+    // (Cycles' `EmissionNode::compile`, intern/cycles/scene/shader_nodes.cpp:3071-3098).
+    (diffuse + specular) * params.reflectance.clamp(0.0, 1.0)
 }
 
 fn smith_g1(cosine: f64, alpha_squared: f64) -> f64 {
@@ -1695,6 +1824,7 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 radius: data.radius.max(0.0),
                 spot_size: data.spot_size,
                 spot_blend: data.spot_blend,
+                area: (data.light_type == LightType::Area).then(|| area_shape(data, &matrix)),
             })
         })
         .collect()
@@ -1708,6 +1838,7 @@ fn collect_volumes<'a>(
     warnings: &RefCell<Vec<serde_json::Value>>,
 ) -> Result<Vec<VolumeInstance<'a>>> {
     let mut volumes = Vec::new();
+    let mut evaluator_workspace = EvaluatorWorkspace::default();
     for (node_id, node) in &doc.nodes {
         if !node.visible || !node.render_visible {
             continue;
@@ -1771,9 +1902,7 @@ fn collect_volumes<'a>(
                 (grid.origin, bounds_max, grid.voxel_size, density_range)
             };
         let material = snapshot
-            .material_slots(node_id, node)
-            .first()
-            .and_then(Option::as_ref)
+            .slot_material(node_id, node, Some(data_block), 0)
             .and_then(|material_id| doc.materials.get(material_id));
         let evaluated_material = if let Some(material) = material {
             let local_center = (bounds_min + bounds_max) * 0.5;
@@ -1783,7 +1912,11 @@ fn collect_volumes<'a>(
             context.object = local_center;
             context.generated = local_center;
             context.position = matrix.transform_point3(local_center);
-            Some(evaluate_surface(material, &context)?)
+            Some(evaluate_surface_with_workspace(
+                material,
+                &context,
+                &mut evaluator_workspace,
+            )?)
         } else {
             None
         };
@@ -2412,6 +2545,50 @@ mod volume_extinction_tests {
         let single_scatter = environment * (1.0 - transmittance);
         let outgoing = environment * transmittance + single_scatter;
         assert!((outgoing - environment).length() <= 1.0e-12);
+    }
+
+    #[test]
+    fn area_light_estimator_matches_power_over_pi_distance_squared_and_faces_one_way() {
+        const SAMPLE_COUNT: usize = 10_000;
+        let power = 1_000.0;
+        let distance = 10.0;
+        // A unit square at distance 10 subtends 0.25% less than 1 / d², within the 1% tolerance.
+        // Sampling noise at this sample count is far smaller.
+        let light = PointLight {
+            position: DVec3::ZERO,
+            direction: DVec3::Z,
+            kind: LightType::Area,
+            color: DVec3::ONE,
+            energy: power,
+            radius: 0.0,
+            spot_size: 0.0,
+            spot_blend: 0.0,
+            area: Some(AreaShape {
+                axis_u: DVec3::X,
+                axis_v: DVec3::Y,
+                half_u: 0.5,
+                half_v: 0.5,
+                ellipse: false,
+                area: 1.0,
+            }),
+        };
+        let mut rng = Pcg32::for_sample(0x5eed, 0, 0, 0);
+        let front = DVec3::new(0.0, 0.0, distance);
+        let mut sum = 0.0;
+        for _ in 0..SAMPLE_COUNT {
+            sum +=
+                sample_area_light(&light, front, &mut rng).map_or(0.0, |sample| sample.radiance.x);
+        }
+        let mean = sum / SAMPLE_COUNT as f64;
+        let expected = power / (std::f64::consts::PI * distance * distance);
+        assert!(
+            (mean - expected).abs() <= 0.01 * expected,
+            "area light mean {mean:.6} should match P/(pi*d^2) = {expected:.6} within 1%"
+        );
+        let behind = DVec3::new(0.0, 0.0, -distance);
+        for _ in 0..SAMPLE_COUNT {
+            assert!(sample_area_light(&light, behind, &mut rng).is_none());
+        }
     }
 
     fn hg_cdf(cosine: f64, anisotropy: f64) -> f64 {

@@ -211,18 +211,14 @@ fn count(value: &Value, name: &str) -> TestResult<usize> {
     Ok(usize::try_from(count)?)
 }
 
-/// The per-face values of a FACE `blender_attributes` entry, in `mesh.faces` order.
-fn face_values<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a [Value]> {
-    let entries = mesh.attributes.get("blender_attributes")?.as_array()?;
-    entries
-        .iter()
-        .find(|entry| {
-            entry.get("name").and_then(Value::as_str) == Some(name)
-                && entry.get("domain").and_then(Value::as_str) == Some("FACE")
-        })?
-        .get("values")?
-        .as_array()
-        .map(Vec::as_slice)
+/// The values of the native face-domain attribute `name`, keyed `f<id>`. Potter's import stores FACE
+/// INT and FLOAT attributes this way, not in `blender_attributes`.
+fn face_values<'a>(mesh: &'a Mesh, name: &str) -> Option<&'a serde_json::Map<String, Value>> {
+    let attribute = mesh.attributes.get(name)?;
+    if attribute.get("domain").and_then(Value::as_str) != Some("face") {
+        return None;
+    }
+    attribute.get("values")?.as_object()
 }
 
 /// Per-face UV corners of layer `UVMap`, in `mesh.faces` order, read from the `uv_layers` store (the
@@ -279,11 +275,16 @@ fn potter_canonical(mesh: &Mesh, world: DMat4) -> TestResult<Canonical> {
         .collect();
     let fids = face_values(mesh, "fid");
     let uv_faces = uv_map_faces(mesh)?;
-    let normal_rows = mesh
+    // Presence follows the Blender custom-normal layer, which exists when its `values` do. The
+    // values are evaluated through the public API, so the comparison sees vectors, not codes.
+    let evaluated = mesh
         .attributes
         .get("custom_normal")
         .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object);
+        .map(|_| potter_core::geom::corner_normal_vectors(mesh))
+        .transpose()
+        .map_err(|error| format!("{error:?}"))?;
+    let mut corner_base = 0;
     let mut faces = Vec::with_capacity(mesh.faces.len());
     let mut rings = Vec::with_capacity(mesh.faces.len());
     let mut face_sizes = BTreeMap::new();
@@ -299,13 +300,14 @@ fn potter_canonical(mesh: &Mesh, world: DMat4) -> TestResult<Canonical> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let fid = fids
-            .and_then(|values| values.get(index))
+            .and_then(|values| values.get(&format!("f{}", face.id)))
             .and_then(Value::as_i64);
         let uv = uv_faces[index].as_deref();
-        let normals = normal_rows
-            .and_then(|rows| rows.get(&format!("f{}", face.id)))
-            .map(points_from_json)
-            .transpose()?;
+        let corners = face.vertices.len();
+        let normals = evaluated
+            .as_ref()
+            .map(|all| all[corner_base..corner_base + corners].to_vec());
+        corner_base += corners;
         faces.push(canonical_face(
             &ring,
             u64::from(face.material_index),

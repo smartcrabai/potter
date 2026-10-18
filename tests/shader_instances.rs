@@ -227,6 +227,9 @@ fn add_shader_combines_emission_and_surface_shaders() {
     assert_eq!(bsdf.base_color, [0.2, 0.3, 0.0, 1.0]);
     assert_eq!(bsdf.emission_color, [0.0, 0.3, 0.0]);
     assert_eq!(bsdf.emission_strength, 2.0);
+    // Principled reflects with weight 1 and Emission with 0 (Cycles `EmissionNode::compile`,
+    // intern/cycles/scene/shader_nodes.cpp:3071-3098); Add sums them, clamped to 1.
+    assert_eq!(bsdf.reflectance, 1.0);
 }
 #[test]
 fn material_create_accepts_inline_shader_node_tree() {

@@ -14,7 +14,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Aabb, CylinderParams, IcosphereParams, Mesh,
-        concat::{Part, concatenate, rotate_corner_normals},
+        concat::{Part, concatenate},
         normals::SHADING_ATTRIBUTES,
         uv_layers::{self, UvLayer},
     },
@@ -82,8 +82,9 @@ pub struct EvaluatedNode {
     pub bounds: Option<Aabb>,
     /// World-space bounds size, or null for geometry-free nodes.
     pub dimensions: Option<[f64; 3]>,
-    /// Material slots after the node's modifier stack: its own slots unless a Boolean changed them
-    /// (the TRANSFER pool). Null entries are empty slots. Not serialized, like `Snapshot::meshes`.
+    /// Effective material slots after the node's modifier stack: each slot resolved under its OBJECT
+    /// or DATA link, or replaced by a Boolean TRANSFER pool. This is the only evaluated slot table;
+    /// face material indices refer to it. Null entries are empty slots. Not serialized.
     #[serde(skip)]
     pub materials: Vec<Option<Id>>,
 }
@@ -198,24 +199,39 @@ impl Snapshot {
         &'a self,
         node_id: &Id,
         node: &'a Node,
+        data: Option<&'a DataBlock>,
         slot: usize,
     ) -> Option<&'a Id> {
         if self.slot_bindings.contains_key(node_id) {
-            self.slot_binding(node_id, node, slot)
-                .and_then(|binding| binding.material.as_ref())
-        } else {
-            let slots = self.material_slots(node_id, node);
-            let last = slots.len().checked_sub(1)?;
-            slots.get(slot.min(last)).and_then(Option::as_ref)
+            return self
+                .slot_binding(node_id, node, slot)
+                .and_then(|binding| binding.material.as_ref());
+        }
+        match self.nodes.get(node_id) {
+            Some(evaluated) => {
+                let table = evaluated.materials.as_slice();
+                table.get(slot.min(table.len().checked_sub(1)?))?.as_ref()
+            }
+            None => crate::model::resolve_material_slot(
+                node.materials.as_slice(),
+                data.map_or(&[][..], |data| data.materials.as_slice()),
+                node.material_links.as_slice(),
+                slot,
+            ),
         }
     }
 
-    /// Number of material slots a face may index; collection instances may bind empty slots.
+    /// Number of effective material slots: the evaluated table's length, or the authoring count
+    /// for a node without an evaluated entry.
     #[must_use]
-    pub fn slot_count(&self, node_id: &Id, node: &Node) -> usize {
-        self.slot_bindings
-            .get(node_id)
-            .map_or(self.material_slots(node_id, node).len(), Vec::len)
+    pub fn slot_count(&self, node_id: &Id, node: &Node, data: Option<&DataBlock>) -> usize {
+        if let Some(bindings) = self.slot_bindings.get(node_id) {
+            bindings.len()
+        } else if let Some(evaluated) = self.nodes.get(node_id) {
+            evaluated.materials.len()
+        } else {
+            node.material_slot_count(data)
+        }
     }
 }
 
@@ -710,7 +726,13 @@ impl Snapshot {
             let node = doc.nodes.get(id).ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "mesh evaluation node is missing")
             })?;
-            let mut node_materials = node.materials.clone();
+            let node_data = node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id));
+            // The mesh's own material array (DATA). Modifiers replace it (the Boolean TRANSFER pool);
+            // the evaluated table is resolved from it once the stack has run.
+            let mut node_materials = node_data.map_or_else(Vec::new, |data| data.materials.clone());
             let matrix = matrices.get(id).copied().ok_or_else(|| {
                 PotError::new(
                     ErrorCode::InternalError,
@@ -777,16 +799,7 @@ impl Snapshot {
                                 json!({"node_id":id}),
                             ));
                         }
-                        let values = rigged_source
-                            .vertices
-                            .iter()
-                            .zip(colors)
-                            .map(|(vertex, color)| (format!("v{}", vertex.id), json!(color)))
-                            .collect::<Map<_, _>>();
-                        rigged_source.attributes.insert(
-                            "color".to_owned(),
-                            json!({"domain":"vertices","values":values}),
-                        );
+                        inject_dynamic_paint_colors(&mut rigged_source, colors);
                     }
                     if !has_stack_modifier(node, "dynamic_paint")
                         && let Some(weights) = paint_weights.get(id)
@@ -807,7 +820,7 @@ impl Snapshot {
                             .map(|(vertex, weight)| (format!("v{}", vertex.id), json!(weight)))
                             .collect::<Map<_, _>>();
                         rigged_source.attributes.insert(
-                            "weight".to_owned(),
+                            crate::geom::attribute_keys::storage_key("weight").into_owned(),
                             json!({"domain":"vertices","type":"float","values":values}),
                         );
                     }
@@ -1415,7 +1428,7 @@ impl Snapshot {
                     world_matrix: matrix.to_cols_array(),
                     bounds,
                     dimensions,
-                    materials: node_materials,
+                    materials: effective_material_slots(node, &node_materials),
                 },
             );
         }
@@ -1569,19 +1582,29 @@ impl Snapshot {
             warnings: modifier_warnings,
         })
     }
+}
 
-    /// The slot table that the evaluated mesh's face material indices refer to. A TRANSFER Boolean
-    /// replaces its subject's slots with the operand pool, so anything that draws or exports
-    /// `meshes` must resolve face slots here rather than through the document node. Falls back to
-    /// `node.materials` when the snapshot holds no evaluated entry for `node_id`.
-    #[must_use]
-    pub fn material_slots<'a>(&'a self, node_id: &Id, node: &'a Node) -> &'a [Option<Id>] {
-        self.nodes
-            .get(node_id)
-            .map_or(node.materials.as_slice(), |evaluated| {
-                evaluated.materials.as_slice()
-            })
-    }
+/// The effective material slots of one node: each slot resolved under its OBJECT or DATA link by the
+/// model's `resolve_material_slot`, matching Blender `BKE_object_material_get_eval`
+/// (blenkernel/intern/material.cc:772): an object slot whose matbit is set and holds a material wins,
+/// otherwise the DATA slot. `mesh_materials` is the mesh's material array after the modifier stack:
+/// its DATA table, or the Boolean TRANSFER pool that replaced it. This is the evaluated table.
+pub(crate) fn effective_material_slots(
+    node: &Node,
+    mesh_materials: &[Option<Id>],
+) -> Vec<Option<Id>> {
+    let count = crate::model::material_slot_count(node.materials.len(), mesh_materials.len());
+    (0..count)
+        .map(|slot| {
+            crate::model::resolve_material_slot(
+                &node.materials,
+                mesh_materials,
+                &node.material_links,
+                slot,
+            )
+            .cloned()
+        })
+        .collect()
 }
 
 fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
@@ -3708,16 +3731,16 @@ fn world_matrix_f32(matrix: DMat4) -> glam::Mat4 {
 /// One Boolean operand object: its mesh (the evaluated mesh when present, else the data mesh with
 /// its vertex groups) and its transform into the subject's space: Blender's f32 product from
 /// `geom::blender_matrix` when it applies, else the f64 fallback. Also returns its material slots.
-fn boolean_operand<'d>(
+fn boolean_operand(
     modifier: &Modifier,
-    doc: &'d SceneDoc,
+    doc: &SceneDoc,
     object_id: &Id,
     subject_inverse: glam::Mat4,
     subject_id: &Id,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
-    evaluated_nodes: &'d BTreeMap<Id, EvaluatedNode>,
-) -> Result<(crate::geom::boolean::BooleanOperand, &'d [Option<Id>])> {
+    evaluated_nodes: &BTreeMap<Id, EvaluatedNode>,
+) -> Result<(crate::geom::boolean::BooleanOperand, Vec<Option<Id>>)> {
     let object = doc.nodes.get(object_id).ok_or_else(|| {
         PotError::with_details(
             ErrorCode::TargetNotFound,
@@ -3781,15 +3804,16 @@ fn boolean_operand<'d>(
         to_subject,
         material_remap: Vec::new(),
     };
-    let materials = match evaluated_meshes.get(object_id) {
-        Some(_) => evaluated_nodes
-            .get(object_id)
-            .map_or(object.materials.as_slice(), |node| {
-                node.materials.as_slice()
-            }),
-        None => object.materials.as_slice(),
+    // An evaluated operand contributes its evaluated table (after its own modifiers, e.g. a TRANSFER
+    // pool); an operand without one contributes its effective authoring slots.
+    let slots = match evaluated_meshes.get(object_id) {
+        Some(_) => evaluated_nodes.get(object_id).map_or_else(
+            || effective_material_slots(object, &data.materials),
+            |node| node.materials.clone(),
+        ),
+        None => effective_material_slots(object, &data.materials),
     };
-    Ok((operand, materials))
+    Ok((operand, slots))
 }
 
 /// The Boolean operands of an EXACT (or MANIFOLD, refused by the modifier) solver. The subject is
@@ -3847,6 +3871,11 @@ fn apply_boolean_operands_modifier(
         operands.push(operand);
         operand_slots.push(slots);
     }
+    // Blender `non_float_boolean_mesh` (source/blender/modifiers/intern/MOD_boolean.cc, v5.2.2):
+    // the TRANSFER pool starts from the subject mesh's own material array (`mesh->mat`, the DATA
+    // slots, here `subject_slots`), and each operand's slots come from `get_material_remap_transfer`,
+    // which reads `BKE_object_material_get_eval` (blenkernel/intern/material.cc:772), i.e. the
+    // effective slots `operand_slots` holds. The subject keeps its own indices in both modes.
     let subject_refs: Vec<Option<&Id>> = subject_slots.iter().map(Option::as_ref).collect();
     let operand_refs: Vec<Vec<Option<&Id>>> = operand_slots
         .iter()
@@ -4767,12 +4796,20 @@ fn append_collection_geometry<'a>(
                     .collect();
                 let uv_coverage = uv_face_coverage(&uv_store.layers, source_mesh.faces.len());
                 let color_names = color_layer_names(source_mesh);
-                let materials = nodes
-                    .get(object_id)
-                    .map_or(source_node.materials.as_slice(), |evaluated| {
-                        evaluated.materials.as_slice()
-                    });
-                let slots = member_slot_bindings(materials, source_mesh, &uv_store, &color_names);
+                let source_data = source_node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id));
+                let materials = nodes.get(object_id).map_or_else(
+                    || {
+                        effective_material_slots(
+                            source_node,
+                            source_data.map_or(&[][..], |data| data.materials.as_slice()),
+                        )
+                    },
+                    |evaluated| evaluated.materials.clone(),
+                );
+                let slots = member_slot_bindings(&materials, source_mesh, &uv_store, &color_names);
                 (
                     Cow::Borrowed(source_mesh),
                     vec![vec![object_id.clone()]],
@@ -4829,6 +4866,22 @@ fn append_collection_geometry<'a>(
     Ok(())
 }
 
+/// Injects the dynamic-paint colors of one canvas (one per vertex, in storage order) into the evaluation
+/// copy as the point color layer `color`, and renders that layer. A `color` layer already on the mesh is
+/// replaced. Other color layers are kept.
+fn inject_dynamic_paint_colors(mesh: &mut Mesh, colors: &[[f64; 4]]) {
+    let mut store = crate::geom::color_layers::read(mesh);
+    store.layers.retain(|layer| layer.name != "color");
+    store.layers.push(crate::geom::color_layers::ColorLayer {
+        name: "color".to_owned(),
+        domain: crate::geom::color_layers::ColorDomain::Point,
+        values: colors.to_vec(),
+    });
+    store.render = Some("color".to_owned());
+    crate::geom::color_layers::write(mesh, &store);
+}
+
+/// Instances copy each source's attributes, remapping the face- and edge-keyed shading ones.
 /// Particle copies: each template's attributes, with its face- and edge-keyed shading remapped.
 fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> Result<()> {
     if output.vertices.is_empty() {
@@ -4884,19 +4937,17 @@ fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> R
             .map_err(|error| PotError::new(ErrorCode::EvaluationFailed, error.to_string()))?;
         face_ids.insert(face.id, id);
     }
-    merge_shading(output, source, &face_ids, &edge_ids, matrix)
+    merge_shading(output, source, &face_ids, &edge_ids)
 }
 
 /// Copies one source's shading attributes into the combined instance mesh under remapped IDs.
-/// Custom normals rotate with the instance matrix, using the inverse transpose of its linear part.
+/// Custom-normal codes are relative to each fan, so they copy unchanged.
 fn merge_shading(
     output: &mut Mesh,
     source: &Mesh,
     face_ids: &BTreeMap<u32, u32>,
     edge_ids: &BTreeMap<u32, u32>,
-    matrix: DMat4,
 ) -> Result<()> {
-    let normal_matrix = crate::geom::normals::normal_matrix(matrix);
     for name in SHADING_ATTRIBUTES {
         let Some(source_attribute) = source.attributes.get(name) else {
             continue;
@@ -4938,12 +4989,7 @@ fn merge_shading(
             else {
                 continue;
             };
-            let value = if name == "custom_normal" {
-                rotate_corner_normals(value, normal_matrix)
-            } else {
-                value.clone()
-            };
-            values.insert(format!("{prefix}{id}"), value);
+            values.insert(format!("{prefix}{id}"), value.clone());
         }
     }
     Ok(())
@@ -5145,7 +5191,7 @@ mod tests {
         },
         model::{
             Collection, DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer,
-            GreasePencilPoint, GreasePencilStroke, Id, Node, SceneDoc, Transform,
+            GreasePencilPoint, GreasePencilStroke, Id, MaterialLink, Node, SceneDoc, Transform,
         },
     };
 
@@ -5565,6 +5611,36 @@ mod tests {
         assert!(Snapshot::evaluate(&doc, &EvaluationContext::default()).is_err());
     }
 
+    #[test]
+    fn dynamic_paint_colors_become_the_render_point_layer() {
+        use crate::geom::color_layers::{self, ColorDomain, ColorLayer};
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+        let mut store = color_layers::read(&mesh);
+        store.layers.push(ColorLayer {
+            name: "color".to_owned(),
+            domain: ColorDomain::Corner,
+            values: vec![[1.0; 4]; corners],
+        });
+        color_layers::write(&mut mesh, &store);
+        let colors: Vec<[f64; 4]> = (0..mesh.vertices.len())
+            .map(|index| [index as f64 / 10.0, 0.25, 0.0, 1.0])
+            .collect();
+
+        super::inject_dynamic_paint_colors(&mut mesh, &colors);
+
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.render.as_deref(), Some("color"));
+        let layer = &store.layers[store.index_of("color").unwrap()];
+        assert_eq!(layer.domain, ColorDomain::Point);
+        assert_eq!(layer.values, colors);
+        assert_eq!(
+            mesh.attributes["color"]["domain"],
+            serde_json::json!("point")
+        );
+        assert!(color_layers::validate(&mesh).is_ok());
+    }
+
     fn member_mesh(layers: &[(&str, [f64; 2], Option<usize>)], render: &str, color: &str) -> Mesh {
         let mut mesh = Mesh::box_mesh(BoxParams {
             size: DVec3::splat(2.0),
@@ -5834,12 +5910,12 @@ mod tests {
             ..Node::default()
         };
         assert_eq!(
-            snapshot.slot_material(&ordinary_id, &ordinary, usize::MAX),
+            snapshot.slot_material(&ordinary_id, &ordinary, None, usize::MAX),
             Some(&last)
         );
         assert!(
             snapshot
-                .slot_material(&ordinary_id, &Node::default(), 0)
+                .slot_material(&ordinary_id, &Node::default(), None, 0)
                 .is_none()
         );
 
@@ -5869,7 +5945,11 @@ mod tests {
                 .material
                 .is_none()
         );
-        assert!(snapshot.slot_material(&instance_id, &instance, 0).is_none());
+        assert!(
+            snapshot
+                .slot_material(&instance_id, &instance, None, 0)
+                .is_none()
+        );
         assert_eq!(
             snapshot
                 .slot_binding(&instance_id, &instance, usize::MAX)
@@ -5879,7 +5959,7 @@ mod tests {
             Some(&last)
         );
         assert_eq!(
-            snapshot.slot_material(&instance_id, &instance, usize::MAX),
+            snapshot.slot_material(&instance_id, &instance, None, usize::MAX),
             Some(&last)
         );
         let empty_id = Id::new("empty_instance").unwrap();
@@ -5891,8 +5971,67 @@ mod tests {
         );
         assert!(
             snapshot
-                .slot_material(&empty_id, &instance, usize::MAX)
+                .slot_material(&empty_id, &instance, None, usize::MAX)
                 .is_none()
         );
+    }
+    #[test]
+    fn material_slots_resolve_object_data_links_and_null_fallback() {
+        let snapshot = Snapshot::evaluate(
+            &SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned()),
+            &EvaluationContext::default(),
+        )
+        .unwrap();
+        let data_first = Id::new("data_first").unwrap();
+        let object_override = Id::new("object_override").unwrap();
+        let data_last = Id::new("data_last").unwrap();
+        let data = DataBlock {
+            materials: vec![Some(data_first.clone()), None, Some(data_last.clone())],
+            ..DataBlock::default()
+        };
+        let node_id = Id::new("mixed_links").unwrap();
+        let node = Node {
+            materials: vec![None, Some(object_override.clone()), None],
+            material_links: vec![
+                MaterialLink::Object,
+                MaterialLink::Data,
+                MaterialLink::Object,
+            ],
+            ..Node::default()
+        };
+
+        assert_eq!(node.material_slot_count(Some(&data)), 3);
+        assert_eq!(node.material_slot(Some(&data), 0), Some(&data_first));
+        assert_eq!(node.material_slot(Some(&data), 1), None);
+        assert_eq!(node.material_slot(Some(&data), 2), Some(&data_last));
+        assert_eq!(
+            snapshot.slot_material(&node_id, &node, Some(&data), 0),
+            Some(&data_first),
+            "a null OBJECT slot falls back to the DATA material at the same index"
+        );
+        assert_eq!(
+            snapshot.slot_material(&node_id, &node, Some(&data), 2),
+            Some(&data_last)
+        );
+        assert_eq!(
+            snapshot.slot_material(&node_id, &node, Some(&data), 1),
+            None,
+            "a DATA-linked empty middle slot keeps its numeric index"
+        );
+        assert_eq!(
+            snapshot.slot_material(&node_id, &node, Some(&data), usize::MAX),
+            Some(&data_last),
+            "out-of-range access clamps to the last evaluated slot"
+        );
+
+        let legacy = Node {
+            materials: vec![Some(object_override.clone())],
+            ..Node::default()
+        };
+        assert_eq!(legacy.material_link(0), MaterialLink::Object);
+        assert_eq!(legacy.material_link(1), MaterialLink::Data);
+        assert_eq!(legacy.material_slot(Some(&data), 0), Some(&object_override));
+        assert_eq!(legacy.material_slot(Some(&data), 1), None);
+        assert_eq!(legacy.material_slot(Some(&data), 2), Some(&data_last));
     }
 }

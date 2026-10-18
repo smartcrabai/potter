@@ -214,6 +214,10 @@ fn write_node(
             "USD node disappeared during export",
         )
     })?;
+    let data_block = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
     if node.rigid_body.is_some() {
         return Err(unsupported(
             "physics.rigid_body",
@@ -322,19 +326,19 @@ fn write_node(
             node.selectable
         ),
     );
+    let materials = (0..snapshot.slot_count(id, node, data_block))
+        .map(|slot| {
+            snapshot
+                .slot_material(id, node, data_block, slot)
+                .map_or_else(String::new, ToString::to_string)
+        })
+        .collect::<Vec<_>>();
     line(
         output,
         &format!(
             "{}custom string[] potter:materials = {}",
             spaces(child_depth),
-            string_array(
-                // An empty slot is written as an empty string, since USD string arrays cannot hold null.
-                &node
-                    .materials
-                    .iter()
-                    .map(|slot| slot.as_ref().map_or_else(String::new, ToString::to_string))
-                    .collect::<Vec<_>>()
-            )?
+            string_array(&materials)?
         ),
     );
     if let Some(target) = instance_target {
@@ -464,10 +468,6 @@ fn write_node(
         let evaluated_mesh = snapshot.meshes.get(id).ok_or_else(|| {
             PotError::new(ErrorCode::EvaluationFailed, "USD evaluated mesh is missing")
         })?;
-        let data_block = node
-            .data
-            .as_ref()
-            .and_then(|data_id| doc.data_blocks.get(data_id));
         let preserves_source_features = data_block.is_some_and(|data| {
             data.shape_keys
                 .as_ref()
@@ -509,17 +509,15 @@ fn write_node(
             output,
             doc,
             snapshot,
-            id,
             node,
+            id,
             exchange,
             evaluated_mesh,
             &positions,
             child_depth,
         )?;
     }
-    if let Some(data_id) = &node.data
-        && let Some(data) = doc.data_blocks.get(data_id)
-    {
+    if let Some(data) = data_block {
         if let Some(armature) = &data.armature {
             write_skeleton(output, armature, child_depth)?;
         }
@@ -552,8 +550,8 @@ fn write_mesh(
     output: &mut String,
     doc: &SceneDoc,
     snapshot: &Snapshot,
-    id: &Id,
     node: &Node,
+    node_id: &Id,
     exchange: &ExchangeMesh,
     source: &crate::geom::Mesh,
     positions: &[[f64; 3]],
@@ -671,11 +669,11 @@ fn write_mesh(
         ),
     );
     write_deformation(output, doc, snapshot, node, &exchange.id, d)?;
-    let bound_material = snapshot
-        .material_slots(id, node)
-        .first()
-        .and_then(Option::as_ref);
-    if let Some(material_id) = bound_material {
+    let data_block = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
+    if let Some(material_id) = snapshot.slot_material(node_id, node, data_block, 0) {
         if !doc.materials.contains_key(material_id) {
             return Err(PotError::new(
                 ErrorCode::SceneInvalid,
@@ -1938,7 +1936,7 @@ fn import_node_tree(
         }
     });
     let mut data_id = None;
-    let mut node_materials = Vec::new();
+    let mut node_materials = Vec::<Option<Id>>::new();
     if let Some(mesh_prim) = mesh_prim {
         let (positions, faces, normals, (uv_layers, uv_active, uv_render)) =
             import_mesh(mesh_prim, losses)?;
@@ -1991,22 +1989,28 @@ fn import_node_tree(
             node_materials.push(Some(material.clone()));
         }
         if let Some(list) = property_strings(prim, "potter:materials") {
+            let mut slot_materials = Vec::with_capacity(list.len());
             for raw in list {
-                // An empty string is an empty slot (see the potter:materials writer).
-                let slot = if raw.is_empty() {
-                    None
-                } else {
-                    let material =
-                        Id::new(raw).map_err(|_| import_error("USD material ID is invalid"))?;
-                    if !doc.materials.contains_key(&material) {
-                        return Err(import_error("USD node references a missing material"));
-                    }
-                    Some(material)
-                };
-                if !node_materials.contains(&slot) {
-                    node_materials.push(slot);
+                if raw.is_empty() {
+                    slot_materials.push(None);
+                    continue;
                 }
+                let material =
+                    Id::new(raw).map_err(|_| import_error("USD material ID is invalid"))?;
+                if !doc.materials.contains_key(&material) {
+                    return Err(import_error("USD node references a missing material"));
+                }
+                slot_materials.push(Some(material));
             }
+            if let Some(material) = node_materials.iter().flatten().next().cloned()
+                && !slot_materials
+                    .iter()
+                    .flatten()
+                    .any(|slot| slot == &material)
+            {
+                slot_materials.push(Some(material));
+            }
+            node_materials = slot_materials;
         }
     } else if let Some(camera_prim) = camera_prim {
         let camera = import_camera(camera_prim)?;
@@ -3799,7 +3803,7 @@ fn get_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_uv_primvars;
+    use super::{all_strings, string_array, write_uv_primvars};
     use crate::{error::Result, exchange::test_support::triangle_with_layers};
 
     #[test]
@@ -3826,6 +3830,18 @@ mod tests {
         let mut output = String::new();
         write_uv_primvars(&mut output, &mesh, 0)?;
         assert_eq!(output, "");
+        Ok(())
+    }
+
+    #[test]
+    fn material_metadata_keeps_nullable_slot_order() -> Result<()> {
+        let slots = vec![
+            String::new(),
+            "metal".to_owned(),
+            String::new(),
+            "metal".to_owned(),
+        ];
+        assert_eq!(all_strings(&string_array(&slots)?), slots);
         Ok(())
     }
 }

@@ -815,23 +815,29 @@ fn has_texture_field(material: &Material) -> bool {
         || material.normal_texture.is_some()
 }
 
-/// The meshes of the objects that use `material_id` in a slot.
+/// The meshes of objects whose effective slots resolve to `material_id`.
 fn material_users<'a>(doc: &'a SceneDoc, material_id: &Id) -> Vec<&'a Mesh> {
     doc.nodes
         .values()
-        .filter(|node| node.materials.iter().flatten().any(|id| id == material_id))
         .filter_map(|node| {
-            node.data
+            let data = node
+                .data
                 .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .and_then(|data_id| doc.data_blocks.get(data_id))?;
+            let slot_count = node.material_slot_count(Some(data));
+            (0..slot_count)
+                .any(|slot| node.material_slot(Some(data), slot) == Some(material_id))
+                .then_some(data)
         })
         .filter_map(|data| data.mesh.as_ref())
         .collect()
 }
 
-/// A texture reference with the layer Blender should sample. An unnamed reference is the render layer, which Texture
-/// Coordinate `UV` reads on each object, so it stays unnamed. A named layer stays when every user mesh has it. A mesh
-/// without it samples its render layer, which is reported; a name the users resolve differently is a loss.
+/// A texture reference with the layer Blender should sample. An unnamed reference is the render layer, so it names the
+/// render layer of each user mesh, as the export's UV Map node does (spec: "or the render layer when null"). A named
+/// layer stays when every user mesh has it. A mesh without it samples its render layer, which is reported. When the
+/// users resolve the reference to different layers, one UV Map node cannot name them all: the export keeps the
+/// requested name (none when unnamed) and reports a loss.
 fn export_reference(
     stores: &[UvStore],
     material_id: &Id,
@@ -839,20 +845,14 @@ fn export_reference(
     reference: &TextureRef,
     losses: &mut Vec<Loss>,
 ) -> TextureRef {
-    let Some(name) = reference
+    let requested = reference
         .uv_layer
         .as_deref()
-        .filter(|name| !name.is_empty())
-    else {
-        return TextureRef {
-            uv_layer: None,
-            ..reference.clone()
-        };
-    };
+        .filter(|name| !name.is_empty());
     let mut resolved = BTreeSet::<Option<String>>::new();
     let mut missing = false;
     for store in stores {
-        let (index, unknown) = store.resolve(Some(name));
+        let (index, unknown) = store.resolve(requested);
         missing |= unknown.is_some();
         resolved.insert(
             index
@@ -871,11 +871,12 @@ fn export_reference(
         });
     }
     let uv_layer = if resolved.len() <= 1 {
+        // No user mesh with a layer leaves the reference unnamed, as before.
         resolved
             .into_iter()
             .next()
             .flatten()
-            .or_else(|| Some(name.to_owned()))
+            .or_else(|| requested.map(str::to_owned))
     } else {
         losses.push(Loss {
             feature_id: feature_id::MESH_UV_LAYER.to_owned(),
@@ -885,7 +886,7 @@ fn export_reference(
             ),
             suggestion: None,
         });
-        Some(name.to_owned())
+        requested.map(str::to_owned)
     };
     TextureRef {
         uv_layer,
@@ -1216,6 +1217,32 @@ fn channel_texture(
 mod tests {
     use super::*;
     use crate::model::{DataBlock, Node};
+
+    #[test]
+    fn material_users_includes_data_linked_meshes() -> Result<()> {
+        let material_id = Id::new("data_material")?;
+        let data_id = Id::new("mesh_data")?;
+        let mut doc = SceneDoc::default();
+        doc.data_blocks.insert(
+            data_id.clone(),
+            crate::model::DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(Mesh::default()),
+                materials: vec![Some(material_id.clone())],
+                ..crate::model::DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            Id::new("mesh")?,
+            crate::model::Node {
+                data: Some(data_id),
+                ..crate::model::Node::default()
+            },
+        );
+
+        assert_eq!(material_users(&doc, &material_id).len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn insert_refuses_a_node_name_that_is_already_used() {

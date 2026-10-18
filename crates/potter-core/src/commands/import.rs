@@ -464,11 +464,7 @@ fn append_graph(
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "node ID mapping is missing"))?;
         node.data = remap_option(node.data, &data_map);
         node.parent = remap_option(node.parent, &node_map);
-        node.materials = node
-            .materials
-            .into_iter()
-            .map(|slot| remap_option(slot, &material_map))
-            .collect();
+        node.materials = remap_vec_owned(node.materials, &material_map);
         node.action = remap_option(node.action, &action_map);
         for track in &mut node.nla_tracks {
             for strip in &mut track.strips {
@@ -501,6 +497,9 @@ fn append_graph(
                     }
                 }
             }
+        }
+        for material in &mut data.materials {
+            *material = remap_option(material.take(), &material_map);
         }
         if let Some(shape_keys) = &mut data.shape_keys {
             shape_keys.action = remap_option(shape_keys.action.clone(), &action_map);
@@ -601,8 +600,28 @@ fn append_graph(
     for (key, value) in std::mem::take(&mut imported.compatibility) {
         compatibility.insert(format!("{namespace}_{key}"), value);
     }
+    let imported_scene = imported.scenes.get(&imported.active_scene).cloned();
     imported.active_scene = base.active_scene.clone();
-    imported.scenes = base.scenes.clone();
+    // Append keeps the base scene. Its camera and world come from the imported active scene only where
+    // the base scene has none, so an existing scene's own references are never overwritten.
+    let mut scenes = base.scenes.clone();
+    if let Some(scene) = scenes.get_mut(&base.active_scene) {
+        if scene.world.is_none() {
+            scene.world = imported_scene
+                .as_ref()
+                .and_then(|source| source.world.as_ref())
+                .and_then(|id| world_map.get(id))
+                .cloned();
+        }
+        if scene.camera.is_none() {
+            scene.camera = imported_scene
+                .as_ref()
+                .and_then(|source| source.camera.as_ref())
+                .and_then(|id| node_map.get(id))
+                .cloned();
+        }
+    }
+    imported.scenes = scenes;
     if !attach_avatar {
         imported.avatar.clone_from(&base.avatar);
     }
@@ -709,6 +728,13 @@ fn remap_vec(values: &mut Vec<Id>, mapping: &BTreeMap<Id, Id>) {
     }
 }
 
+fn remap_vec_owned(values: Vec<Option<Id>>, mapping: &BTreeMap<Id, Id>) -> Vec<Option<Id>> {
+    values
+        .into_iter()
+        .map(|id| id.map(|id| mapping.get(&id).cloned().unwrap_or(id)))
+        .collect()
+}
+
 fn mapping_value(mapping: &BTreeMap<Id, Id>) -> Value {
     Value::Object(
         mapping
@@ -717,4 +743,79 @@ fn mapping_value(mapping: &BTreeMap<Id, Id>) -> Value {
             .map(|(old, new)| (old.to_string(), json!(new)))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "fixed valid material ID remap fixture")]
+    use super::*;
+
+    #[test]
+    fn remapping_nullable_material_slots_preserves_empty_positions() {
+        let source = Id::new("source_material").unwrap();
+        let target = Id::new("imported_material").unwrap();
+        let mapping = std::collections::BTreeMap::from([(source.clone(), target.clone())]);
+        assert_eq!(
+            remap_vec_owned(vec![Some(source.clone()), None, Some(source)], &mapping),
+            vec![Some(target.clone()), None, Some(target)]
+        );
+    }
+
+    #[test]
+    fn append_takes_the_imported_camera_and_world_when_the_base_scene_has_none() {
+        let base = SceneDoc::new("base".to_owned());
+        let mut imported = SceneDoc::new("imported".to_owned());
+        let world = Id::new("world_source").unwrap();
+        let camera = Id::new("node_camera").unwrap();
+        imported
+            .worlds
+            .insert(world.clone(), crate::model::World::default());
+        imported.nodes.insert(
+            camera.clone(),
+            crate::model::Node {
+                name: "Camera".to_owned(),
+                ..crate::model::Node::default()
+            },
+        );
+        let active = imported.active_scene.clone();
+        let source = imported.scenes.get_mut(&active).unwrap();
+        source.world = Some(world);
+        source.camera = Some(camera);
+        append_graph(&mut imported, &base, Path::new("source.blend"), false).unwrap();
+        let scene = imported.scenes.get(&base.active_scene).unwrap();
+        assert!(
+            scene
+                .world
+                .as_ref()
+                .is_some_and(|id| imported.worlds.contains_key(id))
+        );
+        assert!(
+            scene
+                .camera
+                .as_ref()
+                .is_some_and(|id| imported.nodes.contains_key(id))
+        );
+    }
+
+    #[test]
+    fn append_keeps_the_base_scene_world_and_camera_when_it_has_them() {
+        let mut base = SceneDoc::new("base".to_owned());
+        let base_world = Id::new("world_base").unwrap();
+        let base_camera = Id::new("node_base_camera").unwrap();
+        let base_active = base.active_scene.clone();
+        let base_scene = base.scenes.get_mut(&base_active).unwrap();
+        base_scene.world = Some(base_world.clone());
+        base_scene.camera = Some(base_camera.clone());
+        let mut imported = SceneDoc::new("imported".to_owned());
+        let world = Id::new("world_source").unwrap();
+        imported
+            .worlds
+            .insert(world.clone(), crate::model::World::default());
+        let active = imported.active_scene.clone();
+        imported.scenes.get_mut(&active).unwrap().world = Some(world);
+        append_graph(&mut imported, &base, Path::new("source.blend"), false).unwrap();
+        let scene = imported.scenes.get(&base.active_scene).unwrap();
+        assert_eq!(scene.world, Some(base_world));
+        assert_eq!(scene.camera, Some(base_camera));
+    }
 }

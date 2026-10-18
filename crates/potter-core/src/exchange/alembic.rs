@@ -79,6 +79,10 @@ pub(crate) fn export(
         ));
     }
     for (id, node) in &doc.nodes {
+        let data_block = node
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id));
         if node
             .parent
             .as_ref()
@@ -111,10 +115,8 @@ pub(crate) fn export(
             ));
         }
         if !allow_lossy
-            && snapshot
-                .material_slots(id, node)
-                .iter()
-                .any(Option::is_some)
+            && (0..snapshot.slot_count(id, node, data_block))
+                .any(|slot| snapshot.slot_material(id, node, data_block, slot).is_some())
         {
             return Err(unsupported(
                 "material.binding",
@@ -3183,7 +3185,6 @@ fn uv_layer_names(parameters: &[&ParsedProperty]) -> Vec<String> {
 fn uv_to_storage(corners: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
     corners.into_iter().map(|[u, v]| [u, 1.0 - v]).collect()
 }
-
 fn geomparam_values_property(parameter: &ParsedProperty) -> Result<&ParsedProperty> {
     let values = match parameter.property_type {
         0 => property(&parameter.children, ".vals")

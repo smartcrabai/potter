@@ -141,10 +141,9 @@ const EXPECTATIONS: &[Expectation] = &[
         ],
         ..BASE
     },
+    // The Vertex Color multiplies the base color: glTF takes it as COLOR_0, so it is no loss.
     Expectation {
         name: "P15_VertexColorMultiply",
-        kind: Kind::Loss,
-        losses: &["material.shader_graph.vertex_color"],
         ..BASE
     },
     // Divergence: sheen color is tint x weight (Blender emits the tint only).
@@ -298,8 +297,6 @@ const EXPECTATIONS: &[Expectation] = &[
     },
     Expectation {
         name: "P40_VertexColorBaseColorOnly",
-        kind: Kind::Loss,
-        losses: &["material.shader_graph.vertex_color"],
         ..BASE
     },
     Expectation {
@@ -1150,19 +1147,15 @@ fn graph_materials_match_blender_probe_export() -> TestResult {
         "the probe scene exported without --allow-lossy although it contains losses"
     );
     let attributed = attribute_losses(&project, &reported_losses(&strict)?)?;
-    // Blender color layers are reported per mesh until COLOR_0 export exists: only P15 and P40 have one.
-    let mut colors: Vec<String> = reported_losses(&strict)?
+    // Every probe color layer that a material reads is written as COLOR_n, so none is a loss.
+    let colors: Vec<String> = reported_losses(&strict)?
         .iter()
         .filter(|loss| loss["feature_id"] == "mesh.color_attribute")
         .filter_map(|loss| loss["data_id"].as_str().map(str::to_owned))
         .collect();
-    colors.sort();
-    assert_eq!(colors.len(), 2, "color layers reported: {colors:?}");
     assert!(
-        colors
-            .iter()
-            .all(|id| id.contains("p15_") || id.contains("p40_")),
-        "color layers reported on unexpected meshes: {colors:?}"
+        colors.is_empty(),
+        "representable color layers reported as losses: {colors:?}"
     );
 
     let potter_glb = root.path().join("potter.glb");

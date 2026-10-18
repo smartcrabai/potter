@@ -5,7 +5,12 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{Mesh, sculpt as sculpt_geom, uv_layers},
+    geom::{
+        Mesh,
+        attribute_keys::{storage_key, user_name},
+        color_layers::{self, ColorDomain, ColorLayer},
+        sculpt as sculpt_geom, uv_layers,
+    },
     image::{ImageData, ImageInterpolation, encode_pixels, load_image_data_with_staged},
     model::{DataBlock, Id, ImageSource, ImageTile},
 };
@@ -89,39 +94,7 @@ fn vertex(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             .mesh
             .as_mut()
             .ok_or_else(|| PotError::new(ErrorCode::InvalidOperation, "target data has no mesh"))?;
-        let corner_influences = mesh
-            .faces
-            .iter()
-            .flat_map(|face| {
-                face.vertices.iter().filter_map(|vertex_id| {
-                    let amount = influences
-                        .get(vertex_id)
-                        .copied()
-                        .unwrap_or(0.0)
-                        .clamp(0.0, 1.0);
-                    (amount > 0.0).then_some((face.id, *vertex_id, amount))
-                })
-            })
-            .collect::<Vec<_>>();
-        let colors = attribute_values(mesh, "color", "corners")?;
-        let values = colors.as_object_mut().ok_or_else(|| {
-            PotError::invalid_argument("color attribute values must be an object")
-        })?;
-        let mut data_changed = false;
-        for (face_id, vertex_id, amount) in corner_influences {
-            let key = format!("f{face_id}:v{vertex_id}");
-            let current = parse_color(values.get(&key)).unwrap_or([0.0; 4]);
-            let painted = blend_color(current, color, amount, blend);
-            if current
-                .iter()
-                .zip(painted)
-                .any(|(before, after)| (*before - after).abs() > f64::EPSILON)
-            {
-                values.insert(key, json!(painted));
-                data_changed = true;
-            }
-        }
-        if data_changed {
+        if paint_vertex_colors(mesh, &influences, color, blend) {
             engine.mark("data_blocks", &data_id, ChangeKind::Updated);
             changed = true;
         }
@@ -288,15 +261,75 @@ fn color_value(engine: &Engine<'_>, value: Option<&Value>, pointer: &str) -> Res
     }
 }
 
-fn parse_color(value: Option<&Value>) -> Option<[f64; 4]> {
-    let values = value?.as_array()?;
-    let [r, g, b, a] = [
-        values.first()?.as_f64()?,
-        values.get(1)?.as_f64()?,
-        values.get(2)?.as_f64()?,
-        values.get(3)?.as_f64()?,
-    ];
-    Some([r, g, b, a])
+/// The color layer that vertex painting writes. Blender names its default paint layer the same way.
+const PAINT_LAYER: &str = "color";
+
+/// Blender's default color: opaque black. Elements a new layer has not painted take it.
+const DEFAULT_COLOR: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+
+/// Paints `color` onto the `color` layer of `mesh`, creating a corner layer when there is none. Each
+/// vertex's influence blends into its values: a corner layer takes it at every face corner of that
+/// vertex, and a point layer takes it at the vertex. The store is written only when a value changed.
+/// Returns whether any value changed.
+fn paint_vertex_colors(
+    mesh: &mut Mesh,
+    influences: &BTreeMap<u32, f64>,
+    color: [f64; 4],
+    blend: &str,
+) -> bool {
+    let mut store = color_layers::read(mesh);
+    let index = store.index_of(PAINT_LAYER).unwrap_or_else(|| {
+        let corners = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+        store.layers.push(ColorLayer {
+            name: PAINT_LAYER.to_owned(),
+            domain: ColorDomain::Corner,
+            values: vec![DEFAULT_COLOR; corners],
+        });
+        store.layers.len() - 1
+    });
+    let layer = &mut store.layers[index];
+    let mut changed = false;
+    match layer.domain {
+        ColorDomain::Point => {
+            for (vertex, value) in mesh.vertices.iter().zip(layer.values.iter_mut()) {
+                let amount = influence(influences, vertex.id);
+                if amount > 0.0 {
+                    changed |= paint_value(value, color, amount, blend);
+                }
+            }
+        }
+        ColorDomain::Corner => {
+            let corner_vertices = mesh.faces.iter().flat_map(|face| face.vertices.iter());
+            for (vertex_id, value) in corner_vertices.zip(layer.values.iter_mut()) {
+                let amount = influence(influences, *vertex_id);
+                if amount > 0.0 {
+                    changed |= paint_value(value, color, amount, blend);
+                }
+            }
+        }
+    }
+    if changed {
+        color_layers::write(mesh, &store);
+    }
+    changed
+}
+
+/// The clamped paint influence of vertex `id`.
+fn influence(influences: &BTreeMap<u32, f64>, id: u32) -> f64 {
+    influences.get(&id).copied().unwrap_or(0.0).clamp(0.0, 1.0)
+}
+
+/// Blends `color` into `current` by `amount`. Returns whether a channel changed.
+fn paint_value(current: &mut [f64; 4], color: [f64; 4], amount: f64, blend: &str) -> bool {
+    let painted = blend_color(*current, color, amount, blend);
+    let changed = current
+        .iter()
+        .zip(painted)
+        .any(|(before, after)| (*before - after).abs() > f64::EPSILON);
+    if changed {
+        *current = painted;
+    }
+    changed
 }
 
 fn blend_color(current: [f64; 4], color: [f64; 4], amount: f64, mode: &str) -> [f64; 4] {
@@ -312,7 +345,8 @@ fn blend_color(current: [f64; 4], color: [f64; 4], amount: f64, mode: &str) -> [
 }
 
 fn attribute_values<'a>(mesh: &'a mut Mesh, name: &str, domain: &str) -> Result<&'a mut Value> {
-    super::sculpt::attribute_values(mesh, name, domain)
+    let storage = storage_key(name);
+    super::sculpt::attribute_values(mesh, &storage, domain)
 }
 fn paint_weight_attribute(
     mesh: &mut Mesh,
@@ -390,8 +424,10 @@ fn normalize_vertex_weights(mesh: &mut Mesh, touched: &[u32]) -> bool {
     let names = mesh
         .attributes
         .keys()
-        .filter(|name| name.starts_with("weight:"))
-        .cloned()
+        .filter_map(|key| {
+            let name = user_name(key)?;
+            name.starts_with("weight:").then(|| key.clone())
+        })
         .collect::<Vec<_>>();
     let mut changed = false;
     for vertex_id in touched {
@@ -1073,4 +1109,79 @@ fn stage_image_blob(engine: &mut Engine<'_>, bytes: Vec<u8>) -> String {
     let digest = crate::hash::sha256(&bytes);
     engine.pending_assets.insert(digest.clone(), bytes);
     digest
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "paint fixtures")]
+
+    use std::collections::BTreeMap;
+
+    use crate::geom::{
+        BoxParams, Mesh,
+        color_layers::{self, ColorDomain, ColorLayer},
+    };
+
+    use super::{DEFAULT_COLOR, paint_vertex_colors};
+
+    fn full_influence(mesh: &Mesh, amount: f64) -> BTreeMap<u32, f64> {
+        mesh.vertices
+            .iter()
+            .map(|vertex| (vertex.id, amount))
+            .collect()
+    }
+
+    #[test]
+    fn paint_creates_a_corner_layer_named_color_and_writes_once() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
+        let influences = full_influence(&mesh, 1.0);
+        let red = [1.0, 0.0, 0.0, 1.0];
+
+        assert!(paint_vertex_colors(&mut mesh, &influences, red, "mix"));
+        let store = color_layers::read(&mesh);
+        assert_eq!(store.render.as_deref(), Some("color"));
+        let layer = &store.layers[store.index_of("color").unwrap()];
+        assert_eq!(layer.domain, ColorDomain::Corner);
+        assert_eq!(layer.values.len(), corners);
+        assert!(layer.values.iter().all(|value| *value == red));
+        assert!(color_layers::validate(&mesh).is_ok());
+        assert_eq!(
+            mesh.attributes["color"]["domain"],
+            serde_json::json!("corner")
+        );
+
+        // Painting the same color again changes nothing, so the store is not rewritten.
+        assert!(!paint_vertex_colors(&mut mesh, &influences, red, "mix"));
+    }
+
+    #[test]
+    fn paint_takes_a_point_layer_per_vertex() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        let first_vertex = mesh.vertices[0].id;
+        let mut store = color_layers::read(&mesh);
+        store.layers.push(ColorLayer {
+            name: "color".to_owned(),
+            domain: ColorDomain::Point,
+            values: vec![DEFAULT_COLOR; mesh.vertices.len()],
+        });
+        color_layers::write(&mut mesh, &store);
+        let influences = BTreeMap::from([(first_vertex, 0.5)]);
+
+        assert!(paint_vertex_colors(
+            &mut mesh,
+            &influences,
+            [1.0, 1.0, 1.0, 1.0],
+            "mix"
+        ));
+        let store = color_layers::read(&mesh);
+        let layer = &store.layers[store.index_of("color").unwrap()];
+        assert_eq!(layer.domain, ColorDomain::Point);
+        assert_eq!(layer.values[0], [0.5, 0.5, 0.5, 1.0]);
+        assert!(
+            layer.values[1..]
+                .iter()
+                .all(|value| *value == DEFAULT_COLOR)
+        );
+    }
 }

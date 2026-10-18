@@ -513,6 +513,8 @@ mod tests {
                         uv: [[0.0; 2]; 3],
                         layer_uvs: Vec::new(),
                         normals: None,
+                        layer_colors: Vec::new(),
+                        lit_per_pixel: false,
                     }
                 })
                 .collect::<Vec<_>>();

@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{DMat4, DVec3};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Mesh,
+        Mesh, attribute_keys, color_layers,
         uv_layers::{self, UvLayer, UvStore},
     },
     model::{DataBlock, Id, Node, SceneDoc, Transform},
@@ -304,6 +305,103 @@ pub(crate) fn evaluated_meshes(
         });
     }
     Ok(output)
+}
+
+/// Loss entries for the color layers and generic element attributes of the exported meshes that
+/// `format` cannot write. Writers never receive these attributes, so the loss is the only record:
+/// strict export refuses on it, and `--allow-lossy` permits it.
+pub(crate) fn attribute_losses(
+    format: &str,
+    doc: &SceneDoc,
+    snapshot: &crate::eval::Snapshot,
+) -> Result<Vec<Loss>> {
+    let visible_nodes = render_visible_nodes(doc, snapshot)?;
+    let mut losses = Vec::new();
+    for (node_id, node) in &doc.nodes {
+        if !node.visible
+            || !node.render_visible
+            || node.data.is_none()
+            || !visible_nodes.contains(node_id)
+        {
+            continue;
+        }
+        let Some(source) = snapshot.meshes.get(node_id) else {
+            continue;
+        };
+        losses.extend(mesh_attribute_losses(format, &node_id.to_string(), source));
+    }
+    Ok(losses)
+}
+
+/// Losses for one evaluated mesh. Shading keys go through the shared shading path, whose format
+/// limits `shading_losses` reports, and UV keys through `uv_layer_losses`. Dot-prefixed
+/// `blender_attributes` are Blender selection and hide state, not mesh data, so they are not
+/// reported. Every other Blender attribute is user data and is reported.
+pub(crate) fn mesh_attribute_losses(format: &str, mesh_id: &str, mesh: &Mesh) -> Vec<Loss> {
+    let color = color_layers::read(mesh);
+    let mut losses = Vec::new();
+    for layer in &color.layers {
+        losses.push(Loss {
+            feature_id: "mesh.color_attribute".to_owned(),
+            data_id: Some(mesh_id.to_owned()),
+            reason: format!("{format} does not write color layer `{}`", layer.name),
+            suggestion: Some("export as blend to keep color layers".to_owned()),
+        });
+    }
+    for key in mesh.attributes.keys() {
+        // Potter's shading, UV, color, and Blender bookkeeping stores have their own losses or
+        // writers. Any other internal store (`seam`, `vertex_groups`, ...) is data no exchange
+        // writer carries, so it is reported under its key.
+        let name = match attribute_keys::user_name(key) {
+            Some(name) => name,
+            None if matches!(
+                key.as_str(),
+                uv_layers::ATTRIBUTE
+                    | color_layers::ATTRIBUTE
+                    | "blender_attributes"
+                    | "blender_metadata"
+                    | "custom_normal"
+                    | "shade_smooth"
+                    | "sharp"
+            ) || (format == "alembic" && key == "alembic_normals") =>
+            {
+                continue;
+            }
+            None => key.as_str(),
+        };
+        if color.layers.iter().any(|layer| layer.name == name) {
+            continue;
+        }
+        losses.push(Loss {
+            feature_id: "mesh.attribute".to_owned(),
+            data_id: Some(mesh_id.to_owned()),
+            reason: format!("{format} does not write mesh attribute `{name}`"),
+            suggestion: Some("export as blend to keep mesh attributes".to_owned()),
+        });
+    }
+    let blender_entries = mesh
+        .attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for entry in blender_entries {
+        let Some(name) = entry["name"].as_str().filter(|name| !name.starts_with('.')) else {
+            continue;
+        };
+        let (feature_id, kind) = if gltf::is_color_attribute(entry) {
+            ("mesh.color_attribute", "color attribute")
+        } else {
+            ("mesh.attribute", "attribute")
+        };
+        losses.push(Loss {
+            feature_id: feature_id.to_owned(),
+            data_id: Some(mesh_id.to_owned()),
+            reason: format!("{format} does not write Blender {kind} `{name}`"),
+            suggestion: Some("export as blend to keep mesh attributes".to_owned()),
+        });
+    }
+    losses
 }
 
 pub(crate) fn render_visible_nodes(
@@ -624,11 +722,68 @@ pub(crate) mod test_support {
             uv_render: Some(0),
         }
     }
+
+    /// One triangle with color layers `Col` (point, active and render) and `Corner` (corner), a
+    /// point float attribute `weight`, and `blender_attributes`: a byte color `Blender Col`, a user
+    /// int `Pinned`, and the selection internal `.select_vert`.
+    pub(crate) fn triangle_with_attributes() -> crate::error::Result<crate::geom::Mesh> {
+        use crate::geom::color_layers::{self, ColorDomain, ColorLayer, ColorStore};
+        use glam::DVec3;
+        use serde_json::json;
+
+        let mut mesh = crate::geom::Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            vec![vec![0, 1, 2]],
+        )
+        .map_err(|error| {
+            crate::error::PotError::new(crate::error::ErrorCode::InternalError, error.to_string())
+        })?;
+        color_layers::write(
+            &mut mesh,
+            &ColorStore {
+                layers: vec![
+                    ColorLayer {
+                        name: "Col".to_owned(),
+                        domain: ColorDomain::Point,
+                        values: vec![[1.0, 0.5, 0.25, 1.0]; 3],
+                    },
+                    ColorLayer {
+                        name: "Corner".to_owned(),
+                        domain: ColorDomain::Corner,
+                        values: vec![[0.0, 0.0, 1.0, 1.0]; 3],
+                    },
+                ],
+                active: Some("Col".to_owned()),
+                render: Some("Col".to_owned()),
+            },
+        );
+        mesh.attributes.insert(
+            "weight".to_owned(),
+            json!({
+                "domain": "point",
+                "type": "float",
+                "values": {"v0": 0.5, "v1": 0.5, "v2": 0.5}
+            }),
+        );
+        mesh.attributes.insert(
+            "blender_attributes".to_owned(),
+            json!([
+                {"name": "Blender Col", "domain": "POINT", "data_type": "BYTE_COLOR", "values": []},
+                {"name": "Pinned", "domain": "POINT", "data_type": "INT", "values": []},
+                {"name": ".select_vert", "domain": "POINT", "data_type": "BOOLEAN", "values": []}
+            ]),
+        );
+        Ok(mesh)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{test_support::triangle_with_layers, uv_layer_losses};
+    use super::{
+        mesh_attribute_losses,
+        test_support::{triangle_with_attributes, triangle_with_layers},
+        uv_layer_losses,
+    };
 
     #[test]
     fn obj_and_ply_lose_every_layer_except_the_active_one() {
@@ -658,5 +813,107 @@ mod tests {
         assert_eq!(losses.len(), 1);
         assert_eq!(losses[0].feature_id, "mesh.uv_layer");
         assert!(losses[0].reason.contains("`P`"), "{}", losses[0].reason);
+    }
+
+    #[test]
+    fn every_non_gltf_format_reports_color_and_generic_attributes() -> crate::error::Result<()> {
+        let mesh = triangle_with_attributes()?;
+        let formats = [
+            "fbx",
+            "fbx-binary",
+            "alembic",
+            "obj",
+            "ply",
+            "stl",
+            "usda",
+            "usdc",
+            "usdz",
+        ];
+        for format in formats {
+            let losses = mesh_attribute_losses(format, "triangle", &mesh);
+            let colors = losses
+                .iter()
+                .filter(|loss| loss.feature_id == "mesh.color_attribute")
+                .map(|loss| loss.reason.as_str())
+                .collect::<Vec<_>>();
+            let generic = losses
+                .iter()
+                .filter(|loss| loss.feature_id == "mesh.attribute")
+                .map(|loss| loss.reason.as_str())
+                .collect::<Vec<_>>();
+            // Two native layers and one Blender color; `weight` and `Pinned`. `.select_vert` is
+            // selection state and is not reported.
+            assert_eq!(colors.len(), 3, "{format}: {colors:?}");
+            assert_eq!(generic.len(), 2, "{format}: {generic:?}");
+            assert!(colors[0].contains(&format!("{format} does not write color layer `Col`")));
+            assert!(colors[1].contains("color layer `Corner`"), "{format}");
+            assert!(
+                colors[2].contains("Blender color attribute `Blender Col`"),
+                "{format}"
+            );
+            assert!(generic[0].contains("mesh attribute `weight`"), "{format}");
+            assert!(
+                generic[1].contains("Blender attribute `Pinned`"),
+                "{format}"
+            );
+            assert!(
+                losses
+                    .iter()
+                    .all(|loss| loss.data_id.as_deref() == Some("triangle"))
+            );
+            assert!(
+                losses
+                    .iter()
+                    .all(|loss| !loss.reason.contains("select_vert"))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shading_and_uv_keys_are_not_attribute_losses() -> crate::error::Result<()> {
+        let mut mesh = triangle_with_attributes()?;
+        mesh.attributes.insert(
+            "shade_smooth".to_owned(),
+            serde_json::json!({"domain": "face", "type": "bool", "values": {}}),
+        );
+        mesh.attributes.insert(
+            "sharp".to_owned(),
+            serde_json::json!({"domain": "edge", "type": "bool", "values": {}}),
+        );
+        let losses = mesh_attribute_losses("obj", "triangle", &mesh);
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("`shade_smooth`"))
+        );
+        assert!(losses.iter().all(|loss| !loss.reason.contains("`sharp`")));
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("`uv_layers`"))
+        );
+        assert!(
+            losses
+                .iter()
+                .all(|loss| !loss.reason.contains("`color_layers`"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn escaped_user_names_are_reported_by_their_user_name() -> crate::error::Result<()> {
+        let mut mesh = triangle_with_attributes()?;
+        mesh.attributes.insert(
+            "user:sharp".to_owned(),
+            serde_json::json!({"domain": "point", "type": "float", "values": {}}),
+        );
+        let losses = mesh_attribute_losses("obj", "triangle", &mesh);
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.reason.ends_with("mesh attribute `sharp`"))
+        );
+        Ok(())
     }
 }

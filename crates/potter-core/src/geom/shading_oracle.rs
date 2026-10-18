@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     Mesh,
+    clnor::{self, NormalCodeOptions, SetterInput},
     normals::{corner_normals, sharp_edge_flags, smooth_face_flags},
 };
 use crate::{
@@ -228,15 +229,35 @@ fn input_mesh(input: &Value) -> TestResult<Mesh> {
         json!({"domain":"face","type":"bool","values":smooth_values}),
     );
     if let Some(custom) = input["custom_normals"].as_array() {
-        let values: Map<String, Value> = custom
-            .iter()
-            .enumerate()
-            .map(|(index, corners)| (format!("f{index}"), corners.clone()))
-            .collect();
-        mesh.attributes.insert(
-            "custom_normal".to_owned(),
-            json!({"domain":"corner","type":"float3","values":values}),
-        );
+        // Fixture rows are vectors or null per corner. The shared setter stores them as codes.
+        let mut vectors: Vec<Option<DVec3>> = Vec::new();
+        for (index, face) in mesh.faces.iter().enumerate() {
+            let row: &[Value] = match custom.get(index) {
+                None | Some(Value::Null) => &[],
+                Some(value) => value
+                    .as_array()
+                    .ok_or("custom_normals rows must be arrays or null")?
+                    .as_slice(),
+            };
+            if row.len() > face.vertices.len() {
+                return Err("custom_normals row exceeds the face corners".into());
+            }
+            for corner in 0..face.vertices.len() {
+                vectors.push(match row.get(corner) {
+                    None => None,
+                    Some(value) if value.is_null() => None,
+                    Some(value) => Some(point(value)?),
+                });
+            }
+        }
+        clnor::encode_vectors(
+            &mut mesh,
+            Some(&vectors),
+            NormalCodeOptions {
+                corner_order: None,
+                setter_input: SetterInput::NormalizeInput,
+            },
+        )?;
     }
     if let Some(groups) = input["vertex_groups"].as_object() {
         let mut attribute = Map::new();
@@ -613,10 +634,11 @@ fn report_all_shading_fixtures() -> TestResult {
 fn exact_shading_fixtures_match_blender() -> TestResult {
     let mut failures = Vec::new();
     for name in EXACT {
-        match evaluate_fixture(name)? {
-            Some(report) if report.exact() => {}
-            Some(report) => failures.push(format!("{name}: {report:?}")),
-            None => failures.push(format!("{name}: fixture refused by Blender")),
+        match evaluate_fixture(name) {
+            Ok(Some(report)) if report.exact() => {}
+            Ok(Some(report)) => failures.push(format!("{name}: {report:?}")),
+            Ok(None) => failures.push(format!("{name}: fixture refused by Blender")),
+            Err(error) => failures.push(format!("{name}: {error}")),
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

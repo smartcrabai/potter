@@ -4,7 +4,7 @@ use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh,
+        Mesh, edit,
         modifiers::{
             attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
             evaluate_modifiers,
@@ -17,6 +17,12 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_file.rs"]
 mod blender_file;
+#[path = "common/exchange_normals.rs"]
+#[expect(
+    dead_code,
+    reason = "this test binary uses only the quantized normal tolerance from the shared helper"
+)]
+mod exchange_normals;
 
 use blender_file::blender_executable;
 
@@ -131,7 +137,8 @@ fn weighted_normal_writes_unit_corner_normals() -> Result<(), Box<dyn Error>> {
             json!({"mode":"FACE_AREA","weight":50}),
         )?],
     )?;
-    let normals = result.attributes["custom_normal"]["values"]["f0"]
+    let evaluated = evaluated_face_normals(&result, "f0")?;
+    let normals = evaluated
         .as_array()
         .ok_or("custom corner normals missing")?;
     assert_eq!(normals.len(), 3);
@@ -331,11 +338,11 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
         }),
     )?;
     let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
-    let normal = result.attributes["custom_normal"]["values"]["f0"][0]
-        .as_array()
-        .ok_or("custom normal missing")?;
-    assert!((normal[0].as_f64().ok_or("normal x missing")? + 1.0).abs() < 1.0e-12);
-    assert!(normal[1].as_f64().ok_or("normal y missing")?.abs() < 1.0e-12);
+    let evaluated = evaluated_face_normals(&result, "f0")?;
+    let normal = evaluated[0].as_array().ok_or("custom normal missing")?;
+    let tolerance = exchange_normals::normal_tolerance(true);
+    assert!((normal[0].as_f64().ok_or("normal x missing")? + 1.0).abs() < tolerance);
+    assert!(normal[1].as_f64().ok_or("normal y missing")?.abs() < tolerance);
     Ok(())
 }
 
@@ -1591,7 +1598,13 @@ fn blender_quantize_loop_normals(
     let script_path = root.join("normal_quantization.py");
     fs::write(&script_path, BLENDER_LOOP_NORMAL_QUANTIZATION_SCRIPT)?;
     let output = Command::new(blender)
-        .args(["--background", "--factory-startup", "--python"])
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
         .arg(script_path)
         .args(["--"])
         .arg(root)
@@ -1923,7 +1936,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &blender,
         &root,
         &weighted_mesh,
-        &corner_normals(&weighted)?,
+        &corner_normal_vectors_json(&weighted)?,
     )?;
     assert_normal_stimulus(
         "weighted_normal FACE_AREA",
@@ -1935,7 +1948,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "weighted_normal FACE_AREA",
         &weighted_corners,
         &expected["weighted_normal"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let sharp_mesh = weighted_normal_mesh(true)?;
@@ -1958,10 +1971,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &blender,
             &root,
             &sharp_mesh,
-            &corner_normals(&weighted_sharp)?,
+            &corner_normal_vectors_json(&weighted_sharp)?,
         )?,
         &expected["weighted_normal_sharp"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let mut weighted_face_mesh = weighted_mesh.clone();
@@ -1988,10 +2001,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             &blender,
             &root,
             &weighted_face_mesh,
-            &corner_normals(&weighted_face)?,
+            &corner_normal_vectors_json(&weighted_face)?,
         )?,
         &expected["weighted_normal_face_influence"],
-        1.0e-5,
+        exchange_normals::normal_tolerance(true),
     )?;
 
     let mut normal_operands = BTreeMap::new();
@@ -2017,7 +2030,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_normal_parity(
         "normal_edit RADIAL/COPY",
-        &normals.attributes["custom_normal"]["values"]["f0"],
+        &evaluated_face_normals(&normals, "f0")?,
         &expected["normal_edit"],
         1.0e-4,
     )?;
@@ -2047,7 +2060,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
     )?;
     assert_normal_parity(
         "normal_edit DIRECTIONAL/ADD",
-        &directional_result.attributes["custom_normal"]["values"]["f0"],
+        &evaluated_face_normals(&directional_result, "f0")?,
         &expected["normal_edit_directional"],
         1.0e-4,
     )?;
@@ -2378,13 +2391,21 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.75,"e1":0.0,"e2":0.0,"e3":0.0}}),
     );
-    domain_source.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}}),
-    );
+    edit::apply(
+        &mut domain_source,
+        "set_custom_normals",
+        &json!({
+            "elements":{"domain":"face","ids":["f0"]},
+            "normals":{"f0":[[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]}
+        }),
+    )?;
     domain_source.attributes.insert(
         "color".to_owned(),
         json!({"domain":"corner","type":"color","values":{"f0":[[0.2,0.3,0.4,1.0],[0.3,0.3,0.4,1.0],[0.4,0.3,0.4,1.0],[0.5,0.3,0.4,1.0]]}}),
+    );
+    domain_source.attributes.insert(
+        "color_layers".to_owned(),
+        json!({"layers":["color"],"active":"color","render":"color"}),
     );
     domain_source.attributes.insert(
         "smooth".to_owned(),
@@ -2791,22 +2812,16 @@ fn uv_project_mesh_for_parity() -> Result<Mesh, Box<dyn Error>> {
     Ok(mesh)
 }
 
-fn corner_normals(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
-    let values = mesh
-        .attributes
-        .get("custom_normal")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object)
-        .ok_or("custom corner normals missing")?;
-    let mut result = Vec::new();
-    for face in &mesh.faces {
-        let corners = values
-            .get(&format!("f{}", face.id))
-            .and_then(Value::as_array)
-            .ok_or("custom face corner normals missing")?;
-        result.extend(corners.iter().cloned());
-    }
-    Ok(Value::Array(result))
+/// The evaluated corner vectors of `mesh` in flattened face order, as JSON. The stored custom normals are
+/// `normal_code` pairs, which are not vectors, so they decode through the public evaluator first.
+fn corner_normal_vectors_json(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
+    let normals = potter_core::geom::corner_normal_vectors(mesh)?;
+    Ok(Value::Array(
+        normals
+            .iter()
+            .map(|normal| json!(normal.to_array()))
+            .collect(),
+    ))
 }
 
 fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
@@ -2835,20 +2850,17 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         "crease_edge".to_owned(),
         json!({"domain":"edge","type":"float","values":{"e0":0.0,"e1":0.0,"e2":0.0,"e3":0.0,"e4":0.0}}),
     );
-    mesh.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain":"corner","type":"float3","values":{
-            "f0":[[1,0,0],[1,0,0],[1,0,0]],
-            "f1":[[1,0,0],[1,0,0],[1,0,0]]
-        }}),
-    );
-    mesh.attributes.insert(
-        "color".to_owned(),
-        json!({"domain":"corner","type":"color","values":{
-            "f0":[[0,0,0,1],[0,0,0,1],[0,0,0,1]],
-            "f1":[[0,0,0,1],[0,0,0,1],[0,0,0,1]]
-        }}),
-    );
+    edit::apply(
+        &mut mesh,
+        "set_custom_normals",
+        &json!({
+            "elements":{"domain":"face","ids":["f0","f1"]},
+            "normals":{
+                "f0":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]],
+                "f1":[[1.0,0.0,0.0],[1.0,0.0,0.0],[1.0,0.0,0.0]]
+            }
+        }),
+    )?;
     mesh.attributes.insert(
         "smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),
@@ -2961,10 +2973,28 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         "crease":crease,
         "uv":uv,
         "color":corner_values("color")?,
-        "normal":corner_normals(mesh)?,
+        "normal":corner_normal_vectors_json(mesh)?,
         "smooth":face_values("smooth")?,
         "freestyle":face_values("freestyle_face")?
     }))
+}
+
+/// The evaluated corner normals of face `face` (`f<id>`) as JSON vectors, through the public evaluator.
+fn evaluated_face_normals(mesh: &Mesh, face: &str) -> Result<Value, Box<dyn Error>> {
+    let normals = potter_core::geom::corner_normal_vectors(mesh)?;
+    let mut base = 0;
+    for mesh_face in &mesh.faces {
+        let count = mesh_face.vertices.len();
+        if format!("f{}", mesh_face.id) == face {
+            let corners: Vec<[f64; 3]> = normals[base..base + count]
+                .iter()
+                .map(DVec3::to_array)
+                .collect();
+            return Ok(json!(corners));
+        }
+        base += count;
+    }
+    Err(format!("face {face} is missing").into())
 }
 
 fn assert_normal_parity(

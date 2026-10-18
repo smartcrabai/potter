@@ -41,6 +41,10 @@ fn face_materials(
 ) -> TestResult<Vec<Option<String>>> {
     let node_id = Id::new(id.to_owned())?;
     let node = doc.nodes.get(&node_id).ok_or("node is missing")?;
+    let data = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
     let mesh = snapshot
         .meshes
         .get(&node_id)
@@ -50,7 +54,7 @@ fn face_materials(
         .iter()
         .map(|face| {
             snapshot
-                .slot_material(&node_id, node, face.material_index as usize)
+                .slot_material(&node_id, node, data, face.material_index as usize)
                 .map(|material| material.as_str().to_owned())
         })
         .collect())

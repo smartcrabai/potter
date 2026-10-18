@@ -7,6 +7,13 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
+#[path = "common/exchange_normals.rs"]
+#[expect(
+    dead_code,
+    reason = "this test binary uses only the quantized normal tolerance from the shared helper"
+)]
+mod exchange_normals;
+
 fn create_cli_scene() -> Result<(TempDir, std::path::PathBuf), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
@@ -252,15 +259,30 @@ fn individual_extrusion_and_face_corner_shading_attributes_are_persisted() {
     )
     .unwrap();
     assert_eq!(mesh.attributes["custom_normal"]["domain"], json!("corner"));
-    assert_eq!(
-        mesh.attributes["custom_normal"]["values"]["f6"],
-        json!([
-            [0.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0]
-        ])
-    );
+    // The stored custom normals are code pairs; the vectors are the public evaluator's decoded corners.
+    let decoded = potter_core::geom::corner_normal_vectors(&mesh).unwrap();
+    let mut corner_base = 0;
+    let mut f6_corners = None;
+    for face in &mesh.faces {
+        let count = face.vertices.len();
+        if face.id == 6 {
+            f6_corners = Some(corner_base..corner_base + count);
+        }
+        corner_base += count;
+    }
+    let Some(f6_corners) = f6_corners else {
+        panic!("face f6 is missing");
+    };
+    assert_eq!(decoded[f6_corners.clone()].len(), 4);
+    let tolerance = exchange_normals::normal_tolerance(true);
+    for corner in &decoded[f6_corners] {
+        assert!(
+            corner.x.abs() < tolerance
+                && corner.y.abs() < tolerance
+                && (corner.z - 1.0).abs() < tolerance,
+            "{corner:?}"
+        );
+    }
 }
 
 #[test]

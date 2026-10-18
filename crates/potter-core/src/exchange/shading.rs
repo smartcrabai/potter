@@ -17,6 +17,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
+        clnor::{self, NormalCodeOptions, SetterInput},
         normals::{close, face_normal, normal_matrix},
     },
 };
@@ -215,30 +216,25 @@ pub(super) fn import_shading_flags(
         );
     }
     let computed = crate::geom::normals::corner_normals(mesh, &points).ok();
-    let mut custom_values = serde_json::Map::new();
-    let mut corner = 0;
-    for (face, face_corners) in mesh.faces.iter().zip(&corners) {
-        let end = corner + face_corners.len();
-        let mismatch = match &computed {
-            Some(expected) => (corner..end).any(|index| !close(expected[index], normals[index])),
-            None => true,
-        };
-        if mismatch {
-            let values = normals[corner..end]
-                .iter()
-                .map(|normal| normal.normalize_or_zero().to_array())
-                .collect::<Vec<_>>();
-            custom_values.insert(format!("f{}", face.id), json!(values));
-        }
-        corner = end;
-    }
-    if !custom_values.is_empty() {
-        mesh.attributes.insert(
-            "custom_normal".to_owned(),
-            json!({ "domain": "corner", "type": "float3", "values": custom_values }),
-        );
-    }
-    Ok(())
+    // A corner matching the computed normal is automatic; a differing one is authored.
+    let vectors: Vec<Option<DVec3>> = (0..normals.len())
+        .map(|index| {
+            let differs = match &computed {
+                Some(expected) => !close(expected[index], normals[index]),
+                None => true,
+            };
+            differs.then_some(normals[index])
+        })
+        .collect();
+    let any_authored = vectors.iter().any(Option::is_some);
+    clnor::encode_vectors(
+        mesh,
+        any_authored.then_some(vectors.as_slice()),
+        NormalCodeOptions {
+            corner_order: None,
+            setter_input: SetterInput::NormalizeInput,
+        },
+    )
 }
 
 /// Loss entries for a format whose normal layout cannot carry every corner normal.

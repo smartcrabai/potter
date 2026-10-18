@@ -48,6 +48,9 @@ fn base(title: &str) -> Value {
 fn id_schema() -> Value {
     json!({"type":"string","pattern":"^[a-z][a-z0-9_-]{0,63}$"})
 }
+fn nullable_id_array_schema() -> Value {
+    json!({"type":"array","items":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}})
+}
 
 fn vec_schema(size: usize) -> Value {
     json!({"type":"array","items":{"type":"number"},"minItems":size,"maxItems":size})
@@ -86,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":2},
+        "schema_version":{"const":3},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -114,7 +117,7 @@ fn scene_schema() -> Value {
         "unit":{"type":"object","required":["system","scale_length"],"properties":{"system":{"type":"string"},"scale_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false},
         "view_layer":{"type":"object","required":["name","excluded_collections"],"properties":{"name":{"type":"string"},"excluded_collections":{"type":"array","items":{"$ref":"#/$defs/id"}}},"additionalProperties":false},
         "scene":{"type":"object","required":["name","root_collection","view_layers","frame_current","frame_start","frame_end","fps","fps_base","camera","world","unit","markers","render","rigid_body_world"],"properties":{"name":{"type":"string"},"root_collection":{"$ref":"#/$defs/id"},"view_layers":registry_schema("view_layer"),"frame_current":{"type":"number"},"frame_start":{"type":"integer"},"frame_end":{"type":"integer"},"fps":{"type":"integer","minimum":1},"fps_base":{"type":"number","exclusiveMinimum":0},"camera":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"world":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"unit":{"$ref":"#/$defs/unit"},"render":{"$ref":"#/$defs/render_settings"},"markers":{"type":"array","items":{"$ref":"#/$defs/marker"}},"rigid_body_world":{"oneOf":[{"$ref":"#/$defs/rigid_body_world"},{"type":"null"}]}},"additionalProperties":false},
-        "render_settings":{"type":"object","required":["resolution_x","resolution_y","resolution_percentage","samples","seed","max_bounces","film_transparent","engine","use_sequencer","audio_codec","passes"],"properties":{"resolution_x":{"type":"integer","minimum":1,"maximum":16384},"resolution_y":{"type":"integer","minimum":1,"maximum":16384},"resolution_percentage":{"type":"integer","minimum":1,"maximum":100},"samples":{"type":"integer","minimum":1,"maximum":1_000_000},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX},"max_bounces":{"type":"integer","minimum":0,"maximum":1024},"film_transparent":{"type":"boolean"},"engine":{"enum":["path","realtime"]},"use_sequencer":{"type":"boolean"},"audio_codec":{"enum":["wav","flac"]},"passes":{"type":"array","items":{"type":"string"}}},"additionalProperties":false},
+        "render_settings":{"type":"object","required":["resolution_x","resolution_y","resolution_percentage","samples","seed","max_bounces","film_transparent","engine","use_sequencer","audio_codec","passes"],"properties":{"resolution_x":{"type":"integer","minimum":1,"maximum":16384},"resolution_y":{"type":"integer","minimum":1,"maximum":16384},"resolution_percentage":{"type":"integer","minimum":1,"maximum":100},"samples":{"type":"integer","minimum":1,"maximum":1_000_000},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX},"max_bounces":{"type":"integer","minimum":0,"maximum":1024},"film_transparent":{"type":"boolean"},"engine":{"enum":["path","realtime"]},"use_sequencer":{"type":"boolean"},"audio_codec":{"enum":["wav","flac"]},"passes":{"type":"array","items":{"type":"string"}},"cryptomatte_accurate":{"type":"boolean"}},"additionalProperties":false},
         "marker":{"type":"object","required":["id","name","frame"],"properties":{"id":{"$ref":"#/$defs/id"},"name":{"type":"string"},"frame":{"type":"number"}},"additionalProperties":false},
         "rigid_body_world":{"type":"object","properties":{"enabled":{"type":"boolean"},"gravity":{"$ref":"#/$defs/vec3"},"substeps":{"type":"integer","minimum":1,"maximum":128},"solver_iterations":{"type":"integer","minimum":1,"maximum":128},"frame_start":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"frame_end":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"seed":{"type":"integer","minimum":0,"maximum":u32::MAX}},"additionalProperties":false},
         "rigid_body":{"type":"object","properties":{"type":{"enum":["active","passive"]},"mass":{"type":"number","minimum":0},"friction":{"type":"number","minimum":0},"restitution":{"type":"number","minimum":0,"maximum":1},"shape":{"enum":["box","sphere","convex_hull","mesh"]},"linear_damping":{"type":"number","minimum":0},"angular_damping":{"type":"number","minimum":0},"initial_velocity":{"$ref":"#/$defs/vec3"}},"additionalProperties":false},
@@ -167,6 +170,12 @@ fn scene_schema() -> Value {
     });
     root["$defs"]["node"]["properties"]["constraints"]["items"] =
         json!({"$ref":"#/$defs/constraint"});
+    root["$defs"]["node"]["properties"]["materials"] = nullable_id_array_schema();
+    root["$defs"]["node"]["properties"]["material_links"] = json!({
+        "type":"array",
+        "items":{"enum":["data","object"]}
+    });
+    root["$defs"]["data_block"]["properties"]["materials"] = nullable_id_array_schema();
     complete_scene_schema(&mut root);
     root
 }
@@ -323,12 +332,10 @@ fn texture_ref_schema() -> Value {
 fn nullable_texture_ref_schema() -> Value {
     json!({"oneOf":[texture_ref_schema(),{"type":"null"}]})
 }
-
 /// A UV layer name: a non-empty string.
 fn layer_name_schema() -> Value {
     json!({"type":"string","minLength":1})
 }
-
 fn avatar_settings_schema() -> Value {
     let id = id_schema();
     let nullable_id = json!({"oneOf":[id.clone(),{"type":"null"}]});
@@ -1944,7 +1951,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
         return json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI,"default":std::f64::consts::FRAC_PI_4});
     }
     if operation == "mesh.set_custom_normals" && field == "normals" {
-        return json!({"type":"object","propertyNames":{"pattern":"^f[0-9]+$"},"additionalProperties":{"type":"array","items":vec_schema(3)}});
+        return json!({"type":"object","propertyNames":{"pattern":"^f[0-9]+$"},"additionalProperties":{"type":"array","items":{"oneOf":[vec_schema(3),{"type":"null"}]}}});
     }
     if operation.starts_with("sculpt.") {
         return match field {
@@ -2085,7 +2092,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
             json!({"enum":params::type_names(ParameterFamily::Modifier)})
         }
         "type" if operation == "mesh.attribute_create" => {
-            json!({"enum":["float","int","float2","float3","color","byte_color","bool","quaternion"]})
+            json!({"enum":["float","int","float2","float3","color","bool","quaternion"]})
         }
         "type" if operation == "physics.force_field.create" => {
             json!({"enum":["wind","vortex","force"]})
@@ -2114,7 +2121,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
         "params" | "properties" => json!({"type":"object"}),
         "positions" if operation == "shape_key.create" => json!({"type":"object"}),
         "head" | "tail" if operation.starts_with("bone.") => vec_schema(3),
-        "materials" => json!({"type":"array","items":{"oneOf":[id_schema(),{"type":"null"}]}}),
+        "materials" => nullable_id_array_schema(),
         "base_color" => {
             json!({"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4})
         }
@@ -2234,7 +2241,7 @@ fn elements_schema() -> Value {
 }
 
 fn set_schema(operation: &str) -> Value {
-    let properties = match operation {
+    let mut properties = match operation {
         "scene.update" => json!({
             "name":{"type":"string"},"frame_current":{"type":"number"},
             "frame_start":{"type":"integer"},"frame_end":{"type":"integer"},
@@ -2320,6 +2327,10 @@ fn set_schema(operation: &str) -> Value {
         }),
         _ => json!({}),
     };
+    if operation == "node.update" {
+        properties["materials"] = nullable_id_array_schema();
+    }
+
     json!({"type":"object","properties":properties,"minProperties":1,"additionalProperties":false})
 }
 
@@ -2609,6 +2620,23 @@ mod tests {
                     .as_array()
                     .is_some_and(|values| values.iter().any(|value| value == "TRACK_Z"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn attribute_create_type_accepts_color_and_rejects_byte_color() -> crate::error::Result<()> {
+        let create = schema("operations", Some("mesh.attribute_create"))?;
+        let types = &create["properties"]["type"]["enum"];
+        assert!(
+            types
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "color"))
+        );
+        assert!(
+            types
+                .as_array()
+                .is_some_and(|types| types.iter().all(|value| value != "byte_color"))
+        );
         Ok(())
     }
 
