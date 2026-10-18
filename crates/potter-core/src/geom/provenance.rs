@@ -791,17 +791,19 @@ impl Sources<'_> {
             return attribute.clone();
         }
         let source_flags = edge_flags(self.source, name);
+        // Sparse, as the source attribute is: an output edge carries an entry only when a source edge
+        // with the flag set contributes to it, and absence reads as false.
         let remapped: Map<String, Value> = self
             .output
             .edges
             .iter()
             .zip(self.edge_origin)
-            .map(|(edge, sources)| {
-                let value = sources.iter().any(|(index, weight)| {
-                    *weight > 0.0 && source_flags.get(*index) == Some(&true)
-                });
-                (format!("e{}", edge.id), json!(value))
+            .filter(|(_, sources)| {
+                sources
+                    .iter()
+                    .any(|(index, weight)| *weight > 0.0 && source_flags.get(*index) == Some(&true))
             })
+            .map(|(edge, _)| (format!("e{}", edge.id), json!(true)))
             .collect();
         with_values(attribute, Value::Object(remapped))
     }
