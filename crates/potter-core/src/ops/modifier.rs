@@ -1792,16 +1792,18 @@ fn validate_modifier_resource(
         engine.operation_index,
         &format!("{}/resource", base_pointer.trim_start_matches('/')),
     );
-    let resource_text = params
-        .get("resource")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            engine.error(
-                ErrorCode::InvalidArgument,
-                "resource must be a Potter resource ID",
-                &resource_pointer,
-            )
-        })?;
+    let resource_text = params.get("resource").and_then(Value::as_str);
+    if modifier_type == "mesh_cache" && resource_text.is_none_or(str::is_empty) {
+        // Blender's MeshCache is_disabled: an empty filepath evaluates as a no-op.
+        return Ok(());
+    }
+    let resource_text = resource_text.ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidArgument,
+            "resource must be a Potter resource ID",
+            &resource_pointer,
+        )
+    })?;
     let resource_id = Id::new(resource_text.to_owned()).map_err(|_| {
         engine.error(
             ErrorCode::InvalidArgument,

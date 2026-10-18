@@ -409,13 +409,11 @@
         },
         "resource": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
-          "description": "Potter resource ID for the cache filepath."
+          "default": "",
+          "pattern": "^([a-z][a-z0-9_-]{0,63})?$",
+          "description": "Potter resource ID for the cache filepath. An empty or absent resource disables the modifier, as Blender's MeshCache is_disabled does for an empty filepath."
         }
-      },
-      "required": [
-        "resource"
-      ]
+      }
     },
     "mesh_sequence_cache": {
       "properties": {
