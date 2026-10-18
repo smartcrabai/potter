@@ -112,10 +112,13 @@ fn main() -> io::Result<()> {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    println!(
-        "cargo:rustc-env=POTTER_BUILD_IDENTITY={:x}",
-        hasher.finalize()
-    );
+    let mut identity = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        identity.push(char::from(HEX[usize::from(byte >> 4)]));
+        identity.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    println!("cargo:rustc-env=POTTER_BUILD_IDENTITY={identity}");
     Ok(())
 }
 
