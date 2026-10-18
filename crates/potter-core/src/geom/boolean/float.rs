@@ -391,6 +391,16 @@ fn build_float_output(subject: &Mesh, operand: &Mesh, state: &State) -> Result<F
             loose_edges.push((edge, usize::try_from(source).ok()));
         }
     }
+    // Cut edges no output face uses stay in the result as loose edges (Blender keeps the wire
+    // edges left by the splice step), in sorted order so the output is deterministic.
+    let mut leftover_wire: Vec<EdgeKey> = state
+        .wire_edges
+        .iter()
+        .copied()
+        .filter(|edge| !face_edges.contains(edge) && !loose_edges.iter().any(|(e, _)| e == edge))
+        .collect();
+    leftover_wire.sort_unstable();
+    loose_edges.extend(leftover_wire.into_iter().map(|edge| (edge, None)));
 
     let mut loose_vertices: HashSet<usize> = state
         .verts
@@ -2877,6 +2887,178 @@ fn cached_edge_tri_vertex(
     id
 }
 
+/// A face corner, the Potter counterpart of Blender's `BMLoop`. `pos` indexes `verts` of `face`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Corner {
+    face: usize,
+    pos: usize,
+}
+
+impl Corner {
+    fn vert(self, state: &State) -> usize {
+        state.faces[self.face].verts[self.pos]
+    }
+
+    fn next(self, state: &State) -> Self {
+        let len = state.faces[self.face].verts.len();
+        Self {
+            face: self.face,
+            pos: (self.pos + 1) % len,
+        }
+    }
+
+    fn prev(self, state: &State) -> Self {
+        let len = state.faces[self.face].verts.len();
+        Self {
+            face: self.face,
+            pos: (self.pos + len - 1) % len,
+        }
+    }
+}
+
+/// Every face corner at `vertex` (Blender's loops around a vertex).
+fn vertex_corners(state: &State, vertex: usize) -> Vec<Corner> {
+    let mut corners = Vec::new();
+    for (face, data) in state.faces.iter().enumerate() {
+        for (pos, &v) in data.verts.iter().enumerate() {
+            if v == vertex {
+                corners.push(Corner { face, pos });
+            }
+        }
+    }
+    corners
+}
+
+/// Vertices joined to `vertex` by an edge: face-ring neighbours and wire (cut) edges.
+fn vertex_neighbours(state: &State, vertex: usize) -> HashSet<usize> {
+    let mut neighbours = HashSet::new();
+    for corner in vertex_corners(state, vertex) {
+        neighbours.insert(corner.prev(state).vert(state));
+        neighbours.insert(corner.next(state).vert(state));
+    }
+    for &(a, b) in &state.wire_edges {
+        if a == vertex {
+            neighbours.insert(b);
+        } else if b == vertex {
+            neighbours.insert(a);
+        }
+    }
+    neighbours
+}
+
+/// Blender `BM_vert_pair_share_face_check`.
+fn vertices_share_face(state: &State, a: usize, b: usize) -> bool {
+    state
+        .faces
+        .iter()
+        .any(|face| face.verts.contains(&a) && face.verts.contains(&b))
+}
+
+/// Blender `BM_vert_splice_check_double_edge`: both vertices reach a common vertex by an edge.
+fn splice_double_edge(state: &State, a: usize, b: usize) -> bool {
+    let neighbours_a = vertex_neighbours(state, a);
+    vertex_neighbours(state, b)
+        .iter()
+        .any(|vertex| neighbours_a.contains(vertex))
+}
+
+/// Blender `BM_face_pair_overlap_check_subset_{same,swap}_winding`: walk both corner runs in step
+/// (backwards on `b` when `swap`) and require the same vertex at every step.
+fn corner_run_matches(
+    state: &State,
+    mut a: Corner,
+    a_end: Corner,
+    mut b: Corner,
+    swap: bool,
+) -> bool {
+    let bound = state.faces[a.face].verts.len() + 1;
+    for _ in 0..bound {
+        if b.vert(state) != a.vert(state) {
+            return false;
+        }
+        if a == a_end {
+            return true;
+        }
+        a = a.next(state);
+        b = if swap { b.prev(state) } else { b.next(state) };
+    }
+    false
+}
+
+/// Blender `BM_vert_splice_check_double_face`: the vertices sit on matching corners of faces of
+/// equal length, with the same neighbours (in either winding) and the same run of vertices.
+fn splice_double_face(state: &State, a: usize, b: usize) -> bool {
+    let corners_a = vertex_corners(state, a);
+    let corners_b = vertex_corners(state, b);
+    for &la in &corners_a {
+        for &lb in &corners_b {
+            if state.faces[la.face].verts.len() != state.faces[lb.face].verts.len() {
+                continue;
+            }
+            let (an, ap) = (la.next(state), la.prev(state));
+            let (bn, bp) = (lb.next(state), lb.prev(state));
+            if an.vert(state) == bn.vert(state) && ap.vert(state) == bp.vert(state) {
+                if corner_run_matches(state, an.next(state), ap.prev(state), bn.next(state), false)
+                {
+                    return true;
+                }
+            } else if an.vert(state) == bp.vert(state)
+                && ap.vert(state) == bn.vert(state)
+                && corner_run_matches(state, an.next(state), ap.prev(state), bp.prev(state), true)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Blender `BM_edge_split` on the current segment `tail..end`: `split` joins every face that holds
+/// the segment, and a wire segment is replaced by its two halves.
+fn insert_split_vertex(state: &mut State, tail: usize, end: usize, split: usize, wire: bool) {
+    let segment = edge_key_usize(tail, end);
+    for face in &mut state.faces {
+        let len = face.verts.len();
+        if let Some(i) =
+            (0..len).find(|&i| edge_key_usize(face.verts[i], face.verts[(i + 1) % len]) == segment)
+        {
+            face.verts.insert(i + 1, split);
+        }
+    }
+    if wire {
+        state.wire_edges.remove(&segment);
+        state.wire_edges.insert(edge_key_usize(tail, split));
+        state.wire_edges.insert(edge_key_usize(split, end));
+    }
+}
+
+/// Blender `BM_vert_splice(bm, keep, split)`: `split`'s faces and edges move to `keep`.
+fn splice_split_vertex(state: &mut State, split: usize, keep: usize) {
+    for face in &mut state.faces {
+        for v in &mut face.verts {
+            if *v == split {
+                *v = keep;
+            }
+        }
+    }
+    let moved: Vec<EdgeKey> = state
+        .wire_edges
+        .iter()
+        .copied()
+        .filter(|&(a, b)| a == split || b == split)
+        .collect();
+    for (a, b) in moved {
+        state.wire_edges.remove(&(a, b));
+        let other = if a == split { b } else { a };
+        state.wire_edges.insert(edge_key_usize(keep, other));
+    }
+}
+
+/// Blender's `USE_SPLICE` loop (`bmesh_intersect.cc` `BM_mesh_intersect`), run per input edge in
+/// order. Each point splits the current segment at a new vertex `split`. The point then replaces
+/// `split` when no edge, shared face, double edge or double face joins them; otherwise `split`
+/// takes the point's coordinates and stays in the ring, the point is left out of the ring, and
+/// the remaining points on this edge are not reached.
 fn split_input_edges(state: &mut State) {
     let mut edge_splits = std::mem::take(&mut state.edge_splits);
     let edges: Vec<(EdgeKey, i32, usize, Vec<usize>, bool)> = state
@@ -2889,24 +3071,6 @@ fn split_input_edges(state: &mut State) {
             Some((key, source, start, points, state.wire_edges.contains(&key)))
         })
         .collect();
-    let mut incident_faces: HashMap<EdgeKey, Vec<usize>> = HashMap::new();
-    for (face_index, face) in state.faces.iter().enumerate() {
-        for i in 0..face.verts.len() {
-            let edge = edge_key_usize(face.verts[i], face.verts[(i + 1) % face.verts.len()]);
-            incident_faces.entry(edge).or_default().push(face_index);
-        }
-    }
-    let mut face_reserve = vec![0; state.faces.len()];
-    for (edge, _, _, points, _) in &edges {
-        if let Some(faces) = incident_faces.get(edge) {
-            for &face in faces {
-                face_reserve[face] += points.len();
-            }
-        }
-    }
-    for (face, extra) in state.faces.iter_mut().zip(face_reserve) {
-        face.verts.reserve(extra);
-    }
 
     for (key, source, start, mut points, wire) in edges {
         let end = if key.0 == start { key.1 } else { key.0 };
@@ -2919,42 +3083,37 @@ fn split_input_edges(state: &mut State) {
         if points.is_empty() {
             continue;
         }
-        if let Some(faces) = incident_faces.get(&key) {
-            for &face_index in faces {
-                let face = &mut state.faces[face_index];
-                let face_len = face.verts.len();
-                for i in 0..face_len {
-                    let a = face.verts[i];
-                    let b = face.verts[(i + 1) % face_len];
-                    if edge_key_usize(a, b) == key {
-                        let insert_at = i + 1;
-                        if a == start {
-                            face.verts
-                                .splice(insert_at..insert_at, points.iter().copied());
-                        } else {
-                            face.verts
-                                .splice(insert_at..insert_at, points.iter().rev().copied());
-                        }
-                        break;
-                    }
-                }
+        let mut chain = Vec::with_capacity(points.len());
+        let mut tail = start;
+        for vi in points {
+            let split = state.verts.len();
+            let point = state.verts[vi].clone();
+            state.verts.push(point);
+            insert_split_vertex(state, tail, end, split, wire);
+            let touching = vertex_neighbours(state, split).contains(&vi);
+            if !touching
+                && !vertices_share_face(state, split, vi)
+                && !splice_double_edge(state, split, vi)
+                && !splice_double_face(state, split, vi)
+            {
+                splice_split_vertex(state, split, vi);
+                state.verts.pop();
+                chain.push(vi);
+                tail = vi;
+            } else {
+                chain.push(split);
+                break;
             }
         }
         state.edge_orig.remove(&key);
         state.edge_start.remove(&key);
         let mut previous = start;
-        for &point in points.iter().chain(std::iter::once(&end)) {
+        for &point in chain.iter().chain(std::iter::once(&end)) {
             let segment = edge_key_usize(previous, point);
             state.edge_orig.insert(segment, source);
             state.edge_start.insert(segment, previous);
             state.edge_order.push(segment);
-            if wire {
-                state.wire_edges.insert(segment);
-            }
             previous = point;
-        }
-        if wire {
-            state.wire_edges.remove(&key);
         }
     }
 }
