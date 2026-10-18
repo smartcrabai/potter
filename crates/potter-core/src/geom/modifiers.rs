@@ -2551,7 +2551,7 @@ fn subdivision(
     let origin = subdivision_origin::build(
         mesh,
         &base_polygons,
-        &base_edges,
+        &order.edge_sources,
         &loop_starts,
         &samples,
         &loose,

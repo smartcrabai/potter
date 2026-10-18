@@ -20,8 +20,6 @@
 //! stored ends by `(1 - u, u)` (`subdiv_mesh_vert_of_loose_edge_interpolate`, `subdiv_mesh.cc:1434`), and a
 //! loose end point copies its vertex (`subdiv_mesh_vert_loose`, `subdiv_mesh.cc:1357`).
 
-use std::collections::HashMap;
-
 use serde_json::{Map, Value};
 
 use super::subdivision_limit::{Sample, Samples};
@@ -29,7 +27,7 @@ use super::subdivision_loose::LooseEdges;
 use super::{Polygon, blend_weights, usize_as_f64};
 use crate::error::{ErrorCode, PotError, Result};
 use crate::geom::provenance::Origin;
-use crate::geom::{Edge, Mesh, edge_key, uv_layers};
+use crate::geom::{Mesh, uv_layers};
 
 /// Keys subdivision writes itself, so the remap skips them and their output entries are kept.
 /// `crease_edge` holds the subdivided creases (`subdivision_uv::subdivided_mesh`), `uv_layers` the limit
@@ -52,12 +50,12 @@ pub(super) fn restore_written(mesh: &mut Mesh, written: Vec<(&'static str, Value
 }
 
 /// The origin of every element of `output`, the subdivided mesh before its storage is permuted into
-/// Blender's order. `polygons`, `edges`, and `loop_starts` describe `mesh` as subdivision read it, and
-/// `samples` and `loose` place each output element on it. Indices are pre-permutation output storage.
+/// Blender's order. `polygons` and `loop_starts` describe `mesh` as subdivision read it; `edge_sources`
+/// is the order builder's coarse-edge map, and `samples` and `loose` place each output element on it.
 pub(super) fn build(
     mesh: &Mesh,
     polygons: &[Polygon],
-    edges: &[[usize; 2]],
+    edge_sources: &[Option<usize>],
     loop_starts: &[usize],
     samples: &Samples,
     loose: &LooseEdges,
@@ -114,37 +112,6 @@ pub(super) fn build(
             )
         })
         .collect();
-    let edge_index: HashMap<(usize, usize), usize> = {
-        let mut index = HashMap::with_capacity(edges.len());
-        for (position, &[first, second]) in edges.iter().enumerate() {
-            index.entry(edge_key(first, second)).or_insert(position);
-        }
-        index
-    };
-    let vertex_of_id: HashMap<u32, usize> = output
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect();
-    // An output edge lies on a base edge when both ends blend only that edge's two vertices (its
-    // subedges, Blender's boundary copies). Any other output edge has no source.
-    let source_edge = |edge: &Edge| -> Option<usize> {
-        let first = *vertex_of_id.get(&edge.vertices[0])?;
-        let second = *vertex_of_id.get(&edge.vertices[1])?;
-        let mut ends: Vec<usize> = vertex_sources[first]
-            .iter()
-            .chain(&vertex_sources[second])
-            .map(|(source, _)| *source)
-            .collect();
-        ends.sort_unstable();
-        ends.dedup();
-        match ends[..] {
-            [a, b] => edge_index.get(&edge_key(a, b)).copied(),
-            _ => None,
-        }
-    };
-    let edge_sources: Vec<Option<usize>> = output.edges.iter().map(source_edge).collect();
     Ok(Origin {
         vertices: vertex_sources,
         faces: samples
@@ -153,7 +120,7 @@ pub(super) fn build(
             .map(|corners| corners.first().map(|sample| sample.face))
             .collect(),
         corners: Some(corner_sources),
-        edges: Some(edge_sources),
+        edges: Some(edge_sources.to_vec()),
     })
 }
 

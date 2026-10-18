@@ -239,12 +239,16 @@ def fixture_set():
     meshes["mixed_rotated_storage"] = make_mesh(mixed["vertices"], mixed["faces"],
                                                 [(0, 1), (3, 0), (6, 7)], [(1, 2, 0.5)],
                                                 rotated_storage=True)
-    meshes["mixed_rotated_storage"]["order_attributes"] = [
+    # Generic attributes whose values identify each element, so the oracle pins inner face vertices
+    # (quad grids and n-gon patches) and edge vertices at every level, as Blender interpolates them.
+    order_attributes = [
         {"name": "OrderPoint", "domain": "POINT"},
         {"name": "OrderEdge", "domain": "EDGE"},
         {"name": "OrderFace", "domain": "FACE"},
         {"name": "OrderCorner", "domain": "CORNER"},
     ]
+    for name in ("quad", "ngon", "curved_grid", "mixed_rotated_storage"):
+        meshes[name]["order_attributes"] = order_attributes
     meshes["vertex_crease_grid"] = make_mesh(grid_vertices, grid_faces, grid_seams,
                                              vertex_creases=[(5, 1.0), (6, 0.5), (1, 0.3)])
     meshes["vertex_crease_cube"] = make_mesh(cube_vertices, cube_faces, cube_seams,

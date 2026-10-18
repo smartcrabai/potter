@@ -25,6 +25,8 @@ pub(super) struct OutputOrder {
     pub(super) corners: Vec<usize>,
     /// Per face in Potter's pre-permutation storage order.
     pub(super) face_starts: Vec<usize>,
+    /// Per output edge in pre-permutation storage: the base edge it copies, or `None` if inner.
+    pub(super) edge_sources: Vec<Option<usize>>,
 }
 
 /// Builds Blender's order from the base topology and the final ptex samples.
@@ -235,6 +237,14 @@ pub(super) fn build(
     if edge_new_to_old.contains(&usize::MAX) {
         return Err("Blender edge order is not a permutation of the output edges");
     }
+    // subdiv_foreach_boundary_edges (subdiv_foreach.cc L941-966) emits `resolution - 1` edges per coarse
+    // edge with that coarse index. Inner edges carry ORIGINDEX_NONE, and subdiv_copy_edge_data
+    // (subdiv_mesh.cc L1199-1222) gives them defaults instead of copying.
+    let mut edge_sources = vec![None; output.edges.len()];
+    for (new_edge, &old_edge) in edge_new_to_old.iter().enumerate() {
+        edge_sources[old_edge] =
+            (new_edge < boundary_edge_count).then(|| new_edge / (resolution - 1));
+    }
     Ok(OutputOrder {
         vertices: vertex_new_to_old,
         edges: edge_new_to_old,
@@ -242,6 +252,7 @@ pub(super) fn build(
         faces: face_new_to_old,
         corners: corner_new_to_old,
         face_starts,
+        edge_sources,
     })
 }
 
