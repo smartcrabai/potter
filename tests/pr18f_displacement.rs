@@ -742,9 +742,8 @@ fn displace_texture_uses_named_native_uv_layer() -> Result<(), Box<dyn std::erro
         json!({"op":"modifier.create","target":{"id":"subject"},"id":"deform","type":"displace","params":{"direction":"X","strength":1.0,"mid_level":0.5,"texture":"blend_tex","texture_coords":"UV","uv_layer":"UVMap"}}),
     ];
     let mesh = scene_subject(&operations, None)?;
-    // Derived from pinned Blender 5.2.2 MOD_util (uv*2-1, first-face rule), BLEND DIAGONAL tin
-    // (2+x+y)/4 and displace delta (tin-mid)*strength, with Potter's V-down UVs converted to
-    // Blender's V-up. Pending confirmation by tests/fixtures/pr18f_displacement/generate_named_uv_exact_oracle.py.
+    // Blender 5.2.2 output of tests/fixtures/pr18f_displacement/generate_named_uv_exact_oracle.py
+    // (box-projected corner UVs, V flipped to Blender's V-up; primitive UV layer removed first).
     let expected = [
         [-0.5, -1.0, 0.0],
         [1.0, -1.0, 0.0],
