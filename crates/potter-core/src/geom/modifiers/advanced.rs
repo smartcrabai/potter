@@ -18,7 +18,7 @@ use super::{
     validated, vec3_param,
 };
 use crate::{
-    error::{PotError, Result},
+    error::{ErrorCode, PotError, Result},
     geom::{
         Mesh,
         clnor::{self, NormalCodeOptions},
@@ -1689,94 +1689,227 @@ pub(super) fn wireframe(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
+/// Blender `MOD_curve.cc` with `BKE_curve_deform_coords` (bounds off, no stretch): the deform axis is the
+/// unbounded arc length along the path, and the other two coordinates place the vertex in the path frame.
 pub(super) fn curve(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let target =
-        modifier.runtime.target_mesh.as_ref().ok_or_else(|| {
-            invalid_parameter(modifier, "object", "a curve or mesh object operand")
-        })?;
-    let axis = curve_axis_param(modifier, "deform_axis")?;
-    let mut cumulative = Vec::with_capacity(target.vertices.len());
-    cumulative.push(0.0);
-    for pair in target.vertices.windows(2) {
-        let length = pair[0].co.distance(pair[1].co);
-        if length <= f64::EPSILON {
-            return Err(invalid_parameter(
-                modifier,
-                "object",
-                "a curve without zero-length segments",
-            ));
-        }
-        cumulative.push(cumulative.last().copied().unwrap_or(0.0) + length);
-    }
-    let total_length = cumulative.last().copied().unwrap_or(0.0);
-    if target.vertices.len() < 2 || total_length <= f64::EPSILON {
-        return Err(invalid_parameter(
-            modifier,
-            "object",
-            "a curve with at least two distinct points",
-        ));
-    }
-    let source_positions = positions(mesh);
-    let mut minimum = f64::INFINITY;
-    let mut maximum = f64::NEG_INFINITY;
-    for point in &source_positions {
-        let along = point.dot(axis);
-        minimum = minimum.min(along);
-        maximum = maximum.max(along);
-    }
-    let extent = maximum - minimum;
-    if extent <= f64::EPSILON {
+    let Some(target) = modifier.runtime.target_mesh.as_ref() else {
+        // Blender disables the modifier without a curve object.
         return Ok(mesh.clone());
-    }
-    let reference = if axis.abs().dot(DVec3::Z) > 0.9 {
-        DVec3::Y
-    } else {
-        DVec3::Z
     };
-    let source_side = axis.cross(reference).normalize_or_zero();
-    let source_up = axis.cross(source_side).normalize_or_zero();
+    let (axis, negative) = curve_deform_axis(modifier)?;
+    let object = reference_matrix(modifier).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::DependencyMissing,
+            "curve modifier object transform is missing",
+        )
+    })?;
+    // The path and the vertices are measured in curve-local space, where the deform axis is defined.
+    let to_curve = object.inverse();
+    let path: Vec<DVec3> = target
+        .vertices
+        .iter()
+        .map(|vertex| to_curve.transform_point3(vertex.co))
+        .collect();
+    let arc_at_point = curve_arc_lengths(modifier, &path)?;
+    let frames = bevel_frames(&path);
+    let weights = deform_group_weights(mesh, modifier)?;
     let mut result = mesh.clone();
     for (index, vertex) in result.vertices.iter_mut().enumerate() {
-        let along = (source_positions[index].dot(axis) - minimum).clamp(0.0, total_length);
-        let segment = cumulative
-            .windows(2)
-            .position(|range| along <= range[1])
-            .unwrap_or(cumulative.len() - 2);
-        let first = target.vertices[segment].co;
-        let second = target.vertices[segment + 1].co;
-        let tangent = (second - first).normalize_or_zero();
-        let reference = if tangent.abs().dot(DVec3::Z) > 0.9 {
-            DVec3::Y
+        let weight = group_weight(weights.as_deref(), index);
+        if weight <= 0.0 {
+            continue;
+        }
+        let local = to_curve.transform_point3(vertex.co);
+        let (arc, cross) = if negative {
+            (
+                -local[axis],
+                DVec3::new(-local[(axis + 2) % 3], -local[(axis + 1) % 3], 0.0),
+            )
         } else {
-            DVec3::Z
+            (
+                local[axis],
+                DVec3::new(local[(axis + 1) % 3], local[(axis + 2) % 3], 0.0),
+            )
         };
-        let side = tangent.cross(reference).normalize_or_zero();
-        let up = tangent.cross(side).normalize_or_zero();
-        let fraction =
-            (along - cumulative[segment]) / (cumulative[segment + 1] - cumulative[segment]);
-        let centerline = first.lerp(second, fraction);
-        let perpendicular = source_positions[index] - axis * source_positions[index].dot(axis);
-        vertex.co =
-            centerline + side * perpendicular.dot(source_side) + up * perpendicular.dot(source_up);
+        let (position, rotation) = path_frame_at(&path, &frames, &arc_at_point, arc)?;
+        let deformed = position + rotation * cross;
+        vertex.co = object.transform_point3(local.lerp(deformed, weight));
     }
+
     validated(&result)?;
     Ok(result)
 }
 
-fn curve_axis_param(modifier: &Modifier, name: &str) -> Result<DVec3> {
-    let axis = string_param(modifier, name)?.to_ascii_uppercase();
+/// The deform axis index and whether the axis is negative (Blender `POS_X`..`NEG_Z`).
+fn curve_deform_axis(modifier: &Modifier) -> Result<(usize, bool)> {
+    let axis = string_param(modifier, "deform_axis")?.to_ascii_uppercase();
     match axis.as_str() {
-        "POS_X" => Ok(DVec3::X),
-        "NEG_X" => Ok(-DVec3::X),
-        "POS_Y" => Ok(DVec3::Y),
-        "NEG_Y" => Ok(-DVec3::Y),
-        "POS_Z" => Ok(DVec3::Z),
-        "NEG_Z" => Ok(-DVec3::Z),
+        "POS_X" => Ok((0, false)),
+        "NEG_X" => Ok((0, true)),
+        "POS_Y" => Ok((1, false)),
+        "NEG_Y" => Ok((1, true)),
+        "POS_Z" => Ok((2, false)),
+        "NEG_Z" => Ok((2, true)),
         _ => Err(invalid_parameter(
             modifier,
-            name,
+            "deform_axis",
             "POS_X, NEG_X, POS_Y, NEG_Y, POS_Z, or NEG_Z",
         )),
+    }
+}
+
+/// Cumulative arc length at every path point (Blender `BKE_anim_path_calc_data`).
+fn curve_arc_lengths(modifier: &Modifier, path: &[DVec3]) -> Result<Vec<f64>> {
+    let invalid = || {
+        invalid_parameter(
+            modifier,
+            "object",
+            "a curve with at least two distinct points",
+        )
+    };
+    if path.len() < 2 {
+        return Err(invalid());
+    }
+    let mut arc = Vec::with_capacity(path.len());
+    arc.push(0.0);
+    let mut total = 0.0;
+    for pair in path.windows(2) {
+        if let [from, to] = pair {
+            let length = from.distance(*to);
+            if length <= f64::EPSILON {
+                return Err(invalid());
+            }
+            total += length;
+            arc.push(total);
+        }
+    }
+    Ok(arc)
+}
+
+/// Blender `BKE_where_on_path` for poly paths: the path position and frame at arc length `arc`,
+/// interpolated linearly (position) and by slerp (frame), extended past both ends.
+fn path_frame_at(
+    path: &[DVec3],
+    frames: &[DQuat],
+    arc_at_point: &[f64],
+    arc: f64,
+) -> Result<(DVec3, DQuat)> {
+    let total = arc_at_point.last().copied().unwrap_or(0.0);
+    let segment_count = arc_at_point.len().saturating_sub(1);
+    let index = if arc <= 0.0 {
+        0
+    } else if arc >= total {
+        segment_count.saturating_sub(1)
+    } else {
+        arc_at_point
+            .partition_point(|&length| length <= arc)
+            .saturating_sub(1)
+    };
+    let (
+        Some(&start_arc),
+        Some(&end_arc),
+        Some(&from),
+        Some(&to),
+        Some(&from_frame),
+        Some(&to_frame),
+    ) = (
+        arc_at_point.get(index),
+        arc_at_point.get(index + 1),
+        path.get(index),
+        path.get(index + 1),
+        frames.get(index),
+        frames.get(index + 1),
+    )
+    else {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "curve path lookup is out of range",
+        ));
+    };
+    let fraction = (arc - start_arc) / (end_arc - start_arc);
+    let position = from.lerp(to, fraction);
+    let rotation = if fraction <= 0.0 {
+        from_frame
+    } else if fraction >= 1.0 {
+        to_frame
+    } else {
+        let end_frame = if from_frame.dot(to_frame) < 0.0 {
+            -to_frame
+        } else {
+            to_frame
+        };
+        from_frame.slerp(end_frame, fraction)
+    };
+    Ok((position, rotation))
+}
+
+/// Blender's bevel frames for a 3D poly path with minimum twist: bisected tangents, end frames from the
+/// tangent alone, and interior frames carried along by the minimal rotation between tangents.
+fn bevel_frames(path: &[DVec3]) -> Vec<DQuat> {
+    let segments: Vec<DVec3> = path
+        .windows(2)
+        .filter_map(|pair| match pair {
+            [from, to] => Some((*to - *from).normalize_or_zero()),
+            _ => None,
+        })
+        .collect();
+    let mut tangents = Vec::with_capacity(path.len());
+    tangents.extend(segments.first().copied());
+    tangents.extend(
+        segments
+            .iter()
+            .zip(segments.iter().skip(1))
+            .map(|(before, after)| (*before + *after).normalize_or_zero()),
+    );
+    tangents.extend(segments.last().copied());
+    let count = tangents.len();
+    let mut frames = Vec::with_capacity(count);
+    let mut previous: Option<(DVec3, DQuat)> = None;
+    for (index, tangent) in tangents.into_iter().enumerate() {
+        let frame = match previous {
+            Some((prior_tangent, prior_frame)) if index + 1 < count => {
+                transport_frame(prior_frame, prior_tangent, tangent)
+            }
+            _ => track_frame(tangent),
+        };
+        frames.push(frame);
+        previous = Some((tangent, frame));
+    }
+    frames
+}
+
+/// Blender's `vec_to_quat(tangent, -Z, Y)`: local Z follows the tangent, local X and Y are the normal and binormal.
+fn track_frame(tangent: DVec3) -> DQuat {
+    let tangent = tangent.normalize_or_zero();
+    if tangent == DVec3::ZERO {
+        return DQuat::IDENTITY;
+    }
+    let mut axis = DVec3::new(-tangent.y, tangent.x, 0.0);
+    if axis.length_squared() <= 1.0e-12 {
+        axis = DVec3::X;
+    }
+    let align = DQuat::from_axis_angle(axis.normalize(), tangent.z.clamp(-1.0, 1.0).acos());
+    let roll_angle = if tangent.x.abs() < 1.0e-12 && tangent.y.abs() < 1.0e-12 {
+        // Vertical tangents use Blender's fixed roll for either direction.
+        if tangent.z > 0.0 {
+            std::f64::consts::PI
+        } else {
+            0.0
+        }
+    } else {
+        -(-tangent.x).atan2(-tangent.y)
+    };
+    (DQuat::from_axis_angle(tangent, roll_angle) * align).normalize()
+}
+
+/// Blender's minimal-twist step: rotate the frame from one tangent onto the next.
+fn transport_frame(frame: DQuat, from: DVec3, to: DVec3) -> DQuat {
+    let angle = from.dot(to).clamp(-1.0, 1.0).acos();
+    let axis = from.cross(to).normalize_or_zero();
+    if angle > 0.0 && axis != DVec3::ZERO {
+        DQuat::from_axis_angle(axis, angle) * frame
+    } else {
+        frame
     }
 }
 
@@ -2516,7 +2649,9 @@ mod tests {
         let start = curve_mesh.insert_vertex(glam::DVec3::ZERO).unwrap();
         let end = curve_mesh.insert_vertex(glam::DVec3::Z * 2.0).unwrap();
         curve_mesh.insert_edge([start, end]).unwrap();
-        let modifier = modifier_with_target("curve", json!({"deform_axis":"POS_X"}), curve_mesh);
+        let mut modifier =
+            modifier_with_target("curve", json!({"deform_axis":"POS_X"}), curve_mesh);
+        modifier.runtime.object_matrix = Some(glam::DMat4::IDENTITY.to_cols_array());
         let result = curve(&source, &modifier).unwrap();
         assert!(result.vertex(first).unwrap().co.distance(glam::DVec3::ZERO) < 1.0e-12);
         assert!(result.vertex(second).unwrap().co.distance(glam::DVec3::Z) < 1.0e-12);

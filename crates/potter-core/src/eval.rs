@@ -3830,8 +3830,12 @@ fn apply_generic_scene_mesh_operand_modifier(
             "object"
         };
     let mut combined = None;
+    let mut curve_object_matrix = None;
     for operand in operands.get(object_parameter).into_iter().flatten() {
         let local_to_subject = operand.local_to_subject;
+        if modifier.modifier_type == "curve" && curve_object_matrix.is_none() {
+            curve_object_matrix = Some(local_to_subject.to_cols_array());
+        }
         let mut transformed = operand.mesh.clone();
         for vertex in &mut transformed.vertices {
             vertex.co = local_to_subject.transform_point3(vertex.co);
@@ -3858,6 +3862,9 @@ fn apply_generic_scene_mesh_operand_modifier(
     } else {
         resolved.runtime.operand_mesh =
             Some(serde_json::to_value(operand).map_err(PotError::internal_json)?);
+    }
+    if let Some(matrix) = curve_object_matrix {
+        resolved.runtime.object_matrix = Some(matrix);
     }
     *mesh = crate::geom::modifiers::evaluate_modifiers(
         mesh,
@@ -4007,6 +4014,7 @@ pub(crate) fn apply_scene_operand_modifier(
         ));
     }
     let mut combined: Option<Mesh> = None;
+    let mut curve_object_matrix = None;
     for object_id in object_ids {
         let object = doc.nodes.get(&object_id).ok_or_else(|| {
             PotError::with_details(
@@ -4072,6 +4080,9 @@ pub(crate) fn apply_scene_operand_modifier(
             )
         })?;
         let to_subject = subject_inverse * object_world;
+        if modifier.modifier_type == "curve" && curve_object_matrix.is_none() {
+            curve_object_matrix = Some(to_subject.to_cols_array());
+        }
         for vertex in &mut operand.vertices {
             vertex.co = to_subject.transform_point3(vertex.co);
         }
@@ -4093,6 +4104,9 @@ pub(crate) fn apply_scene_operand_modifier(
     } else {
         resolved.runtime.operand_mesh =
             Some(serde_json::to_value(operand).map_err(PotError::internal_json)?);
+    }
+    if let Some(matrix) = curve_object_matrix {
+        resolved.runtime.object_matrix = Some(matrix);
     }
     *mesh = crate::geom::modifiers::evaluate_modifiers(
         mesh,
