@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use serde::de::DeserializeOwned;
 
 use super::{
-    ExchangeUvLayer, ImportedGraph, Loss, import_error, import_uv_layers, shading, unique_uv_name,
-    uv_import_loss,
+    ExchangeUvLayer, ImportedGraph, Loss, decode_byte_color, encode_byte_color, import_error,
+    import_uv_layers, shading, unique_uv_name, uv_import_loss,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -1892,9 +1892,16 @@ fn write_normal_layer(output: &mut String, mesh: &Mesh) -> Result<()> {
     Ok(())
 }
 
-/// Writes each color layer as a `LayerElementColor` in its own domain, with linear RGBA values.
-/// Point layers use `ByVertice`, FBX's control-point mapping; corner layers use `ByPolygonVertex`,
-/// which Blender reads as CORNER. Equal values share one `ColorIndex` entry.
+fn fbx_encode_color(value: [f64; 4]) -> [f64; 4] {
+    std::array::from_fn(|channel| encode_byte_color(value[channel], channel == 3))
+}
+
+fn fbx_decode_color(value: [f64; 4]) -> [f64; 4] {
+    std::array::from_fn(|channel| decode_byte_color(value[channel], channel == 3))
+}
+/// Writes FBX BYTE_COLOR values: RGB is sRGB encoded, alpha is linear, and all channels are
+/// nearest-byte quantized. POINT colors use Blender's `ByVertice`/`Direct` mapping; CORNER colors
+/// use `ByPolygonVertex`/`IndexToDirect`.
 fn write_color_layers(output: &mut String, mesh: &Mesh, store: &ColorStore) -> Result<()> {
     for (layer_index, layer) in store.layers.iter().enumerate() {
         let expected = match layer.domain {
@@ -1922,21 +1929,33 @@ fn write_color_layers(output: &mut String, mesh: &Mesh, store: &ColorStore) -> R
                 json!({"layer": layer.name, "expected": expected, "actual": layer.values.len()}),
             ));
         }
-        let mut unique = BTreeMap::<[u64; 4], usize>::new();
-        let mut values = Vec::<[f64; 4]>::new();
-        let mut indices = Vec::<usize>::with_capacity(layer.values.len());
-        for value in &layer.values {
-            // Adding 0.0 maps -0.0 onto 0.0, so the two share one entry.
-            let key = value.map(|component| (component + 0.0).to_bits());
-            let index = *unique.entry(key).or_insert_with(|| {
-                values.push(*value);
-                values.len() - 1
-            });
-            indices.push(index);
-        }
-        let mapping = match layer.domain {
-            ColorDomain::Point => "ByVertice",
-            ColorDomain::Corner => "ByPolygonVertex",
+        let (mapping, reference, values, indices) = match layer.domain {
+            ColorDomain::Point => (
+                "ByVertice",
+                "Direct",
+                layer
+                    .values
+                    .iter()
+                    .copied()
+                    .map(fbx_encode_color)
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+            ColorDomain::Corner => {
+                let mut unique = BTreeMap::<[u64; 4], usize>::new();
+                let mut values = Vec::<[f64; 4]>::new();
+                let mut indices = Vec::<usize>::with_capacity(layer.values.len());
+                for value in &layer.values {
+                    let encoded = fbx_encode_color(*value);
+                    let key = encoded.map(f64::to_bits);
+                    let index = *unique.entry(key).or_insert_with(|| {
+                        values.push(encoded);
+                        values.len() - 1
+                    });
+                    indices.push(index);
+                }
+                ("ByPolygonVertex", "IndexToDirect", values, Some(indices))
+            }
         };
         let component_count = values.len().checked_mul(4).ok_or_else(|| {
             PotError::new(
@@ -1946,7 +1965,7 @@ fn write_color_layers(output: &mut String, mesh: &Mesh, store: &ColorStore) -> R
         })?;
         write!(
             output,
-            "\t\tLayerElementColor: {layer_index} {{\n\t\t\tVersion: 101\n\t\t\tName: \"{}\"\n\t\t\tMappingInformationType: \"{mapping}\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\t\t\tColors: *{component_count} {{\n\t\t\t\ta: ",
+            "\t\tLayerElementColor: {layer_index} {{\n\t\t\tVersion: 101\n\t\t\tName: \"{}\"\n\t\t\tMappingInformationType: \"{mapping}\"\n\t\t\tReferenceInformationType: \"{reference}\"\n\t\t\tColors: *{component_count} {{\n\t\t\t\ta: ",
             quote(&layer.name)
         )
         .map_err(write_error)?;
@@ -1958,20 +1977,24 @@ fn write_color_layers(output: &mut String, mesh: &Mesh, store: &ColorStore) -> R
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        write!(
-            output,
-            "\n\t\t\t}}\n\t\t\tColorIndex: *{} {{\n\t\t\t\ta: ",
-            indices.len()
-        )
-        .map_err(write_error)?;
-        output.push_str(
-            &indices
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        output.push_str("\n\t\t\t}\n\t\t}\n");
+        output.push_str("\n\t\t\t}\n");
+        if let Some(indices) = indices {
+            write!(
+                output,
+                "\t\t\tColorIndex: *{} {{\n\t\t\t\ta: ",
+                indices.len()
+            )
+            .map_err(write_error)?;
+            output.push_str(
+                &indices
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            output.push_str("\n\t\t\t}\n");
+        }
+        output.push_str("\t\t}\n");
     }
     Ok(())
 }
@@ -2126,6 +2149,7 @@ fn import_bytes_with_base(
     let connections = parse_connections(connections_node)?;
 
     let mut models = BTreeMap::<i64, ImportedModel>::new();
+    let mut model_order = Vec::<i64>::new();
     let mut geometries = BTreeMap::<i64, ImportedGeometry>::new();
     let mut materials = BTreeMap::<i64, ImportedMaterial>::new();
     let mut textures = BTreeMap::<i64, ImportedTexture>::new();
@@ -2135,11 +2159,13 @@ fn import_bytes_with_base(
         match object.name.as_str() {
             "Model" => {
                 let id = object_id(object)?;
-                if models.insert(id, parse_model(object, id)?).is_some() {
+                let model = parse_model(object, id)?;
+                if models.insert(id, model).is_some() {
                     return Err(import_error(
                         "FBX Objects section contains a duplicate object ID",
                     ));
                 }
+                model_order.push(id);
             }
             "Geometry" => {
                 let id = object_id(object)?;
@@ -2299,6 +2325,34 @@ fn import_bytes_with_base(
         }
     }
 
+    // Blender shares one mesh material table per Geometry object. Connections are processed in
+    // Model object order; later models can add trailing mesh slots, and a model with fewer links
+    // still sees those slots on the shared mesh.
+    let mut geometry_material_slots = BTreeMap::<i64, Vec<i64>>::new();
+    for model_id in &model_order {
+        let Some(geometry_id) = geometry_by_model.get(model_id) else {
+            continue;
+        };
+        let model_slots = material_links.get(model_id).map_or(&[][..], Vec::as_slice);
+        let shared_slots = geometry_material_slots.entry(*geometry_id).or_default();
+        if model_slots.len() > shared_slots.len() {
+            shared_slots.extend_from_slice(&model_slots[shared_slots.len()..]);
+        }
+    }
+    let mut effective_material_links = BTreeMap::<i64, Vec<i64>>::new();
+    for model_id in &model_order {
+        let Some(geometry_id) = geometry_by_model.get(model_id) else {
+            continue;
+        };
+        let mut model_slots = material_links.get(model_id).cloned().unwrap_or_default();
+        if let Some(shared_slots) = geometry_material_slots.get(geometry_id)
+            && model_slots.len() < shared_slots.len()
+        {
+            model_slots.extend_from_slice(&shared_slots[model_slots.len()..]);
+        }
+        effective_material_links.insert(*model_id, model_slots);
+    }
+
     let mut used_image_ids = BTreeSet::<Id>::new();
     let mut images_by_source = BTreeMap::<(String, bool), Id>::new();
     for connection in connections.iter().filter(|connection| {
@@ -2408,7 +2462,7 @@ fn import_bytes_with_base(
             .get(numeric_id)
             .and_then(|parent| model_ids.get(parent).cloned());
         let mut node_materials = Vec::<Option<Id>>::new();
-        if let Some(material_numbers) = material_links.get(numeric_id) {
+        if let Some(material_numbers) = effective_material_links.get(numeric_id) {
             for material_number in material_numbers {
                 if let Some(id) = material_ids.get(material_number) {
                     node_materials.push(Some(id.clone()));
@@ -3213,11 +3267,10 @@ fn parse_color_layers(
                     .map_err(|_| import_error("FBX LayerElementColor index is negative"))?,
                 None => element,
             };
-            values.push(
-                *direct
-                    .get(direct_index)
-                    .ok_or_else(|| import_error("FBX LayerElementColor index is outside Colors"))?,
-            );
+            let encoded = *direct
+                .get(direct_index)
+                .ok_or_else(|| import_error("FBX LayerElementColor index is outside Colors"))?;
+            values.push(fbx_decode_color(encoded));
         }
         let raw_name = if raw_name.is_empty() {
             "Color"
@@ -4028,8 +4081,9 @@ fn write_error(_: std::fmt::Error) -> PotError {
 mod tests {
     use super::{
         export_with_root, export_with_root_allow_lossy, import_bytes, lex, material_slot_losses,
-        parse_geometry, parse_nodes, parse_uv_layers, resolve_material_slot, uv_texture_losses,
-        uv_texture_warnings, write_geometry, write_uv_layers,
+        numeric_array, parse_color_layers, parse_geometry, parse_nodes, parse_uv_layers,
+        resolve_material_slot, uv_texture_losses, uv_texture_warnings, write_color_layers,
+        write_geometry, write_uv_layers,
     };
     use crate::{
         error::{ErrorCode, PotError, Result},
@@ -4037,6 +4091,7 @@ mod tests {
         exchange::Loss,
         geom::{
             Mesh,
+            color_layers::{ColorDomain, ColorLayer, ColorStore},
             uv_layers::{self, UvLayer, UvStore},
         },
         image::ImageInterpolation,
@@ -4063,6 +4118,68 @@ mod tests {
                 "{left:?} != {right:?}"
             );
         }
+    }
+
+    #[test]
+    fn blender_written_byte_color_decodes_srgb_rgb_and_linear_alpha() -> TestResult<()> {
+        // The FBX add-on writes BYTE_COLOR as normalized bytes. Its 128 RGB byte decodes from
+        // sRGB to ~0.21586; alpha byte 128 remains linear 128/255.
+        let text = r#"Geometry: 1, "Geometry::Triangle", "Mesh" {
+    LayerElementColor: 0 {
+        Version: 101
+        Name: "Paint"
+        MappingInformationType: "ByVertice"
+        ReferenceInformationType: "Direct"
+        Colors: *12 {
+            a: 0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255,0.5019607843137255
+        }
+    }
+}
+"#;
+        let nodes = parse_nodes(&lex(text)?)?;
+        let geometry = nodes.first().ok_or("FBX test has no geometry")?;
+        let mut losses = Vec::new();
+        let colors = parse_color_layers(geometry, 3, &[vec![0, 1, 2]], 1, None, &mut losses)?;
+        assert!(losses.is_empty());
+        assert_eq!(colors.layers[0].domain, ColorDomain::Point);
+        assert!((colors.layers[0].values[0][0] - 0.21586050011389926).abs() < 1.0e-12);
+        assert!((colors.layers[0].values[0][3] - 128.0 / 255.0).abs() < 1.0e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn point_color_writer_uses_byvertice_direct_and_blender_byte_encoding() -> TestResult<()> {
+        let mesh = triangle()?;
+        let store = ColorStore {
+            layers: vec![ColorLayer {
+                name: "Paint".to_owned(),
+                domain: ColorDomain::Point,
+                values: vec![[0.5, 0.5, 0.5, 0.5]; 3],
+            }],
+            active: Some("Paint".to_owned()),
+            render: Some("Paint".to_owned()),
+        };
+        let mut text = String::new();
+        write_color_layers(&mut text, &mesh, &store)?;
+        assert!(text.contains("MappingInformationType: \"ByVertice\""));
+        assert!(text.contains("ReferenceInformationType: \"Direct\""));
+        assert!(!text.contains("ColorIndex"));
+        let wrapped = format!("Geometry: 1, \"Geometry::Triangle\", \"Mesh\" {{\n{text}}}\n");
+        let nodes = parse_nodes(&lex(&wrapped)?)?;
+        let geometry = nodes.first().ok_or("FBX test has no geometry")?;
+        let raw = numeric_array(
+            geometry
+                .child("LayerElementColor")
+                .and_then(|layer| layer.child("Colors"))
+                .ok_or("FBX color array missing")?,
+        )?;
+        assert!((raw[0] - 188.0 / 255.0).abs() < 1.0e-12);
+        assert!((raw[3] - 128.0 / 255.0).abs() < 1.0e-12);
+        let mut losses = Vec::new();
+        let colors = parse_color_layers(geometry, 3, &[vec![0, 1, 2]], 1, None, &mut losses)?;
+        assert!((colors.layers[0].values[0][0] - 0.5028864580325687).abs() < 1.0e-9);
+        assert!((colors.layers[0].values[0][3] - 128.0 / 255.0).abs() < 1.0e-12);
+        Ok(())
     }
 
     #[test]
@@ -4574,6 +4691,121 @@ mod tests {
             1,
             "a dropped link must not create an empty slot"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_geometry_inherits_trailing_material_slots_in_model_order() -> TestResult<()> {
+        // Blender's importer builds a shared mesh material table in Model processing order. The
+        // second model has one connection but still sees the first model's trailing slot on shared
+        // geometry, so face index 1 continues to name the second material.
+        let first_material = Id::new("first_material")?;
+        let second_material = Id::new("second_material")?;
+        let first_node = Id::new("first_node")?;
+        let second_node = Id::new("second_node")?;
+        let data_id = Id::new("shared_mesh")?;
+        let first = Material {
+            name: "FirstMaterial".to_owned(),
+            ..Material::default()
+        };
+        let second = Material {
+            name: "SecondMaterial".to_owned(),
+            ..Material::default()
+        };
+        let mut mesh = triangle()?;
+        mesh.faces[0].material_index = 1;
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.materials.insert(first_material.clone(), first);
+        doc.materials.insert(second_material.clone(), second);
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(mesh),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            first_node.clone(),
+            Node {
+                name: "First".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                materials: vec![Some(first_material.clone()), Some(second_material.clone())],
+                ..Node::default()
+            },
+        );
+        doc.nodes.insert(
+            second_node.clone(),
+            Node {
+                name: "Second".to_owned(),
+                kind: "mesh".to_owned(),
+                data: Some(data_id),
+                materials: vec![Some(first_material)],
+                ..Node::default()
+            },
+        );
+        let root = doc
+            .collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("FBX test root collection is missing")?;
+        root.objects.extend([first_node, second_node]);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let exported = String::from_utf8(export_with_root_allow_lossy(
+            &doc,
+            &snapshot,
+            Path::new("."),
+            false,
+        )?)?;
+        let object_id = |kind: &str, name: &str| -> TestResult<String> {
+            let prefix = format!("\t{kind}: ");
+            let marker = format!("::{name}\"");
+            let line = exported
+                .lines()
+                .find(|line| line.starts_with(&prefix) && line.contains(&marker))
+                .ok_or("FBX object is missing")?;
+            let object_id = line
+                .strip_prefix(&prefix)
+                .ok_or("FBX object line has no ID")?
+                .split(',')
+                .next()
+                .ok_or("FBX object ID is missing")?;
+            Ok(object_id.to_owned())
+        };
+        let first_geometry = object_id("Geometry", "First")?;
+        let second_geometry = object_id("Geometry", "Second")?;
+        let second_model = object_id("Model", "Second")?;
+        let original_link = format!("\tC: \"OO\",{second_geometry},{second_model}");
+        assert!(exported.contains(&original_link), "{exported}");
+        let shared_link = format!("\tC: \"OO\",{first_geometry},{second_model}");
+        let shared = exported.replacen(&original_link, &shared_link, 1);
+        let imported = import_bytes(
+            shared.as_bytes(),
+            "00000000-0000-4000-8000-000000000001".to_owned(),
+        )?;
+        let second_node = imported
+            .doc
+            .nodes
+            .values()
+            .find(|node| node.name == "Second")
+            .ok_or("second FBX node is missing")?;
+        assert_eq!(second_node.materials.len(), 2);
+        let data = imported
+            .doc
+            .data_blocks
+            .get(
+                second_node
+                    .data
+                    .as_ref()
+                    .ok_or("second mesh data is missing")?,
+            )
+            .ok_or("second mesh data is missing")?;
+        let mesh = data.mesh.as_ref().ok_or("second mesh is missing")?;
+        assert_eq!(mesh.faces[0].material_index, 1);
+        let second_slot = second_node.materials[1]
+            .as_ref()
+            .ok_or("inherited material slot is empty")?;
+        assert_eq!(imported.doc.materials[second_slot].name, "SecondMaterial");
         Ok(())
     }
 

@@ -560,17 +560,24 @@ fn mesh_sample(mesh: &Mesh, allow_lossy: bool) -> Result<MeshSample> {
     })
 }
 
-/// The color layers of `store` in Alembic space: point values as they are, and corner values in the
-/// reversed corner order that `reversed_faces` gives. `faces` are the mesh's faces in Potter order.
+/// The color layers of `store` in Alembic space: Blender BYTE_COLOR values (sRGB RGB, linear
+/// alpha), quantized to bytes. Corner values follow the reversed corner order that
+/// `reversed_faces` gives. `faces` are in Potter order.
 fn export_color_layers(faces: &[Vec<usize>], store: ColorStore) -> Result<Vec<ColorSample>> {
     store
         .layers
         .into_iter()
         .map(|layer| {
-            let values = match layer.domain {
+            let mut values = match layer.domain {
                 ColorDomain::Point => layer.values,
                 ColorDomain::Corner => reverse_corner_runs(faces, layer.values)?,
             };
+            for [red, green, blue, alpha] in &mut values {
+                *red = super::encode_byte_color(*red, false);
+                *green = super::encode_byte_color(*green, false);
+                *blue = super::encode_byte_color(*blue, false);
+                *alpha = super::encode_byte_color(*alpha, true);
+            }
             Ok(ColorSample {
                 name: layer.name,
                 domain: layer.domain,
@@ -3431,9 +3438,9 @@ fn import_color_layers(
     Ok(())
 }
 
-/// Potter's color values for one parameter's `scope`, from the tuples `geomparam_values` returns in
-/// that scope. `vertex`, `varying`, and `constant` scopes give one value per point; `facevarying`
-/// and `uniform` give one value per corner, in Potter's corner order. RGB tuples are opaque.
+/// Potter's linear RGBA values for one parameter's scope. Blender's Alembic importer stores every
+/// color `GeomParam` as a CORNER BYTE_COLOR attribute, expanding vertex/varying values through each
+/// face's point indices and decoding sRGB RGB while leaving alpha linear.
 fn canonical_color_values(
     faces: &[Vec<usize>],
     point_count: usize,
@@ -3451,16 +3458,33 @@ fn canonical_color_values(
             if value.iter().any(|component| !component.is_finite()) {
                 return Err(import_error("Alembic color value is not finite"));
             }
-            Ok(value)
+            Ok([
+                super::decode_byte_color(value[0], false),
+                super::decode_byte_color(value[1], false),
+                super::decode_byte_color(value[2], false),
+                super::decode_byte_color(value[3], true),
+            ])
         })
         .collect::<Result<Vec<_>>>()?;
     match scope {
-        "vertex" | "varying" => Ok((ColorDomain::Point, rgba)),
+        "vertex" | "varying" => {
+            if rgba.len() != point_count {
+                return Err(import_error(
+                    "Alembic vertex color count does not match point count",
+                ));
+            }
+            Ok((ColorDomain::Corner, point_color_corners(faces, &rgba)?))
+        }
         "constant" => {
             let value = *rgba
                 .first()
                 .ok_or_else(|| import_error("Alembic constant color is missing"))?;
-            Ok((ColorDomain::Point, vec![value; point_count]))
+            let corner_count = faces
+                .iter()
+                .try_fold(0_usize, |count, face| count.checked_add(face.len()));
+            let corner_count =
+                corner_count.ok_or_else(|| import_error("Alembic color corner count overflow"))?;
+            Ok((ColorDomain::Corner, vec![value; corner_count]))
         }
         "facevarying" => Ok((ColorDomain::Corner, reverse_corner_runs(faces, rgba)?)),
         "uniform" => Ok((
@@ -3476,6 +3500,27 @@ fn canonical_color_values(
             format!("Alembic color scope `{other}` is unsupported"),
         )),
     }
+}
+
+/// Blender imports Alembic vertex colors into CORNER storage and resolves each corner through its
+/// control-point index. Potter faces reverse Alembic winding, so colors follow that same reversal.
+fn point_color_corners(faces: &[Vec<usize>], point_colors: &[[f64; 4]]) -> Result<Vec<[f64; 4]>> {
+    let corner_count = faces
+        .iter()
+        .try_fold(0_usize, |count, face| count.checked_add(face.len()));
+    let corner_count =
+        corner_count.ok_or_else(|| import_error("Alembic color corner count overflow"))?;
+    let mut colors = Vec::with_capacity(corner_count);
+    for face in faces {
+        for &point in face.iter().rev() {
+            colors.push(
+                *point_colors
+                    .get(point)
+                    .ok_or_else(|| import_error("Alembic color face references a missing point"))?,
+            );
+        }
+    }
+    Ok(colors)
 }
 
 /// `name`, or `name.001`-style with the first suffix that no earlier layer uses.
@@ -4817,6 +4862,97 @@ mod tests {
             static_samples
                 .iter()
                 .all(|sample| !sample.has_multiple_topology_samples)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn imports_blender_byte_rgba_as_linear_corner_values() -> Result<()> {
+        let faces = vec![vec![0, 1, 2]];
+        let tuples = vec![
+            vec![0.5, 0.0, 1.0, 0.5],
+            vec![0.0, 0.5, 0.0, 0.25],
+            vec![1.0, 1.0, 1.0, 1.0],
+        ];
+        let (domain, values) = canonical_color_values(&faces, 3, "facevarying", &tuples)?;
+
+        assert!(matches!(domain, ColorDomain::Corner));
+        assert_eq!(values.len(), 3);
+        let decoded = values
+            .last()
+            .ok_or_else(|| import_error("imported corner color is missing"))?;
+        assert!((decoded[0] - 0.215_860_500_113_899_26).abs() < 1.0e-12);
+        assert_eq!(decoded[3], 128.0 / 255.0);
+        Ok(())
+    }
+
+    #[test]
+    fn imports_blender_vertex_scope_colors_as_reversed_corner_values() -> Result<()> {
+        let faces = vec![vec![0, 1, 2], vec![2, 1, 3]];
+        let tuples = vec![
+            vec![0.5, 0.0, 0.0, 1.0],
+            vec![1.0, 0.0, 0.0, 0.5],
+            vec![0.0, 0.0, 1.0, 0.25],
+            vec![0.25, 0.5, 0.0, 1.0],
+        ];
+        let (domain, values) = canonical_color_values(&faces, 4, "vertex", &tuples)?;
+
+        assert_eq!(domain, ColorDomain::Corner);
+        assert_eq!(values.len(), 6);
+        assert_eq!(values[0], [0.0, 0.0, 1.0, 64.0 / 255.0]);
+        assert_eq!(values[1], [1.0, 0.0, 0.0, 128.0 / 255.0]);
+        assert!((values[2][0] - 0.215_860_500_113_899_26).abs() < 1.0e-12);
+        assert_eq!(values[4], values[1]);
+        Ok(())
+    }
+
+    #[test]
+    fn exports_blender_byte_rgba_without_changing_color_scope_or_order() -> Result<()> {
+        let colors = export_color_layers(
+            &[vec![0, 1, 2]],
+            ColorStore {
+                layers: vec![
+                    ColorLayer {
+                        name: "Corners".to_owned(),
+                        domain: ColorDomain::Corner,
+                        values: vec![
+                            [0.5, 0.0, 1.0, 0.5],
+                            [0.0, 0.5, 1.0, 0.25],
+                            [1.5, 0.5, -0.25, 128.0 / 255.0],
+                        ],
+                    },
+                    ColorLayer {
+                        name: "Points".to_owned(),
+                        domain: ColorDomain::Point,
+                        values: vec![[0.5, 0.0, 1.0, 0.5], [1.0, 1.0, 0.0, 0.25]],
+                    },
+                ],
+                active: None,
+                render: None,
+            },
+        )?;
+        let corners = colors
+            .first()
+            .ok_or_else(|| import_error("exported corner color layer is missing"))?;
+        assert_eq!(corners.domain, ColorDomain::Corner);
+        assert_eq!(
+            corners.values,
+            [
+                [1.0, 188.0 / 255.0, 0.0, 128.0 / 255.0],
+                [0.0, 188.0 / 255.0, 1.0, 64.0 / 255.0],
+                [188.0 / 255.0, 0.0, 1.0, 128.0 / 255.0],
+            ]
+        );
+        let points = colors
+            .get(1)
+            .ok_or_else(|| import_error("exported point color layer is missing"))?;
+        assert_eq!(points.domain, ColorDomain::Point);
+        assert_eq!(
+            points.values,
+            [
+                [188.0 / 255.0, 0.0, 1.0, 128.0 / 255.0],
+                [1.0, 1.0, 0.0, 64.0 / 255.0],
+            ]
         );
         Ok(())
     }
