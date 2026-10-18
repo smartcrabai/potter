@@ -1,0 +1,46 @@
+Vendored colour-management data: attribution and licence notice
+================================================================
+
+The five files in this directory are byte-for-byte copies (not modified) of data shipped by
+Blender 5.2.2. Each file is named as in Blender's tree and is loaded by ../ocio.rs.
+
+Files and SHA-256
+-----------------
+  e707a36f3e90ee79bc342332febf91334c02ce3974cac700ece00ca9d4507491  AgX_Base_sRGB.cube
+  e0ea8fcba273798517baa5ee877197b36cb471fefab188756815af82e8424a3a  AgX_Base_Rec2020.cube
+  77fb04f881f17a64f0cc1905d82372380ee6bcfeb29e09679fe501665463eea1  AgX_False_Color.spi1d
+  77776b30ffc12d3d2a377039aa6a4faec083a5391cb77881244a5fb7f7d31908  filmic_desat_33.cube
+  ff0e4cd3745c3d6857c163ee33caa2c796d6c5bddd91859e4646518110bf5b13  filmic_to_0-70_1-03.spi1d
+
+Source
+------
+Blender 5.2.2, release/datafiles/colormanagement/luts/ (AgX_*) and
+release/datafiles/colormanagement/filmic/ (filmic_*), at blender/blender tag v5.2.2.
+The bytes were copied from the Blender 5.2.2 application bundle
+(Contents/Resources/5.2/datafiles/colormanagement/). The GitHub file reader refuses files over
+1 MB, so the tag itself was not byte-compared.
+
+Authors (from the header of Blender's config.ocio, release/datafiles/colormanagement/config.ocio)
+------------------------------------------------------------------------------------------------
+  AgX LUTs: AgX by Troy James Sobotka (https://github.com/sobotka/AgX), further developed by
+  Zijun Eary Zhou, Mark Faderbauer, and Sakari Kapanen (https://github.com/EaryChow/AgX).
+  Filmic LUTs: Filmic by Troy James Sobotka, with thanks to the contributors named in the same
+  config header.
+
+Licence
+-------
+- Blender 5.2.2 is distributed under GPL-3.0-or-later, Copyright (C) 2011-2026 Blender Foundation
+  (Blender's bundled text/license/license.md). These data files ship in that distribution, and
+  Potter is GPL-3.0-or-later, so the redistribution terms of Blender cover them here.
+- UNVERIFIED: config.ocio says "See ocio-license.txt for details". That file is not in the Blender
+  5.2.2 bundle, and it is not at release/datafiles/colormanagement/ocio-license.txt on the v5.2.2
+  tag. The upstream LICENSE files of sobotka/AgX and EaryChow/AgX could not be retrieved, so any
+  licence the upstream authors attached to these LUTs is not confirmed. Confirm before publishing
+  these files outside Blender's distribution.
+
+OpenColorIO
+-----------
+../ocio.rs re-implements the allocation and LUT interpolation of OpenColorIO 2.5.0 (the version
+bundled with Blender 5.2.2), following the source of AcademySoftwareFoundation/OpenColorIO v2.5.0.
+That source is licensed under BSD-3-Clause, Copyright Contributors to the OpenColorIO Project
+(for example, the SPDX header of src/OpenColorIO/ops/allocation/AllocationOp.cpp).

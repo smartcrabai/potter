@@ -1,22 +1,21 @@
 //! `MToon` import: inverts the `MToon` exporter in `exchange/vrm/mtoon.rs`. VRM 1.0 reads
 //! `VRMC_materials_mtoon` (`mtoon::v1`); VRM 0.x reads the `VRM/MToon` entries of `materialProperties` (`mtoon::v0`).
 
-use std::{collections::BTreeMap, collections::BTreeSet, f64::consts::TAU};
+use std::{collections::BTreeMap, f64::consts::TAU};
 
 use serde_json::Value;
 
 use crate::{
     error::Result,
     exchange::{
-        gltf::{GltfIndex, imported_uv_layer, texture_info_set},
-        material_graph::{GraphTextures, move_textures_to_graph},
+        gltf::{imported_uv_layer, texture_info_set},
         material_surface::TextureTransform,
     },
     float::equal_f64,
     image::ImageInterpolation,
     model::{
         AvatarMtoon, AvatarMtoonShadingShiftTexture, AvatarOutlineWidthMode,
-        AvatarTextureTransform, AvatarVersion, Id, SceneDoc, TextureRef,
+        AvatarTextureTransform, AvatarVersion, Id, TextureRef,
     },
 };
 
@@ -556,7 +555,6 @@ fn decode_v0_material(
 /// Reports VRM 0.x `MToon` values Potter cannot store: unknown properties, and known ones whose value
 /// differs from what the exporter writes.
 fn report_unrepresented_v0(decoder: &mut Decoder<'_>, material: &Id, property: &Value) {
-    let moved = decoder.moved_main_textures.contains(material);
     let mut names: Vec<&str> = Vec::new();
     if let Some(floats) = property["floatProperties"].as_object() {
         for (name, value) in floats {
@@ -584,19 +582,36 @@ fn report_unrepresented_v0(decoder: &mut Decoder<'_>, material: &Id, property: &
             if texture_named && is_vector(value, &[0.0, 0.0, 1.0, 1.0]) {
                 continue;
             }
-            // A non-identity `_MainTex` the pre-pass moved into the material graph is applied.
-            if name == "_MainTex" && moved {
+            // The main texture transform (`_MainTex` or `_MainTex_ST`) is reported below.
+            if name == "_MainTex" {
                 continue;
             }
             names.push(name);
         }
     }
-    // `_MainTex_ST` is applied when it is the transform the pre-pass moved (`_MainTex` was identity).
-    let main_identity = field(&property["vectorProperties"], "_MainTex")
-        .is_none_or(|value| is_vector(value, &[0.0, 0.0, 1.0, 1.0]));
-    if field(&property["vectorProperties"], "_MainTex_ST")
-        .is_some_and(|value| !is_vector(value, &[1.0, 1.0, 0.0, 0.0]))
-        && !(moved && main_identity)
+    // The main texture transform is applied to the base color texture when the material has one. It is
+    // reported when there is no base texture to carry it, or when it replaced the texture's own transform.
+    let vectors = &property["vectorProperties"];
+    let main_present =
+        field(vectors, "_MainTex").is_some() || field(vectors, "_MainTex_ST").is_some();
+    if main_present {
+        let main_source = if field(vectors, "_MainTex").is_some() {
+            "_MainTex"
+        } else {
+            "main_tex_transform"
+        };
+        let non_identity =
+            main_texture_transform(vectors).is_some_and(|transform| !transform.is_identity());
+        let applied = decoder.index.main_texture_transforms.contains(material);
+        let replaced = decoder.index.discarded_base_transforms.contains(material);
+        if (non_identity && !applied) || replaced {
+            names.push(main_source);
+        }
+    }
+    // Potter reads `_MainTex_ST` only when `_MainTex` is absent, so one beside `_MainTex` is not represented.
+    if field(vectors, "_MainTex").is_some()
+        && field(vectors, "_MainTex_ST")
+            .is_some_and(|value| !is_vector(value, &[1.0, 1.0, 0.0, 0.0]))
     {
         names.push("main_tex_transform");
     }
@@ -907,76 +922,23 @@ fn boolean(object: &Value, key: &str, default: bool) -> Result<bool> {
     }
 }
 
-/// Moves the base color texture of each VRM 0.x `MToon` material with a non-identity main texture
-/// transform into a material graph. Returns the materials that moved; the others keep the texture and
-/// report the transform as a loss. `_MainTex` is preferred over `_MainTex_ST`.
-pub(super) fn move_main_texture_transforms(
-    doc: &mut SceneDoc,
-    index: &GltfIndex,
-    extension: &Value,
-) -> Result<BTreeSet<Id>> {
-    let mut moved = BTreeSet::new();
-    let properties = extension["materialProperties"]
-        .as_array()
-        .map_or(&[][..], Vec::as_slice);
-    for (material_index, property) in properties.iter().enumerate() {
-        if property["shader"].as_str() != Some("VRM/MToon") {
-            continue;
-        }
-        let Some(transform) = main_texture_transform(&property["vectorProperties"]) else {
-            continue;
-        };
-        let Some(material_id) = index.material_ids.get(material_index) else {
-            continue;
-        };
-        let textures = match doc.materials.get(material_id) {
-            Some(material)
-                if material.node_tree.is_none() && material.base_color_texture.is_some() =>
-            {
-                GraphTextures::from_fields(material, Some(transform))
-            }
-            _ => continue,
-        };
-        move_textures_to_graph(doc, material_id, &textures)?;
-        if let Some(variants) = index.color_material_variants.get(material_id) {
-            let source_graph_id = doc
-                .materials
-                .get(material_id)
-                .and_then(|material| material.node_tree.as_ref())
-                .cloned()
-                .ok_or_else(|| import_error("VRM 0.x main texture graph is missing"))?;
-            let source_graph = doc
-                .node_groups
-                .get(&source_graph_id)
-                .cloned()
-                .ok_or_else(|| import_error("VRM 0.x main texture shader graph is missing"))?;
-            for (layer, variant_id) in variants {
-                let variant_material = doc
-                    .materials
-                    .get(variant_id)
-                    .cloned()
-                    .ok_or_else(|| import_error("glTF color material variant is missing"))?;
-                let variant_graph_id = variant_material
-                    .node_tree
-                    .clone()
-                    .ok_or_else(|| import_error("glTF color material graph is missing"))?;
-                let mut graph = source_graph.clone();
-                crate::exchange::gltf::bind_imported_vertex_color(
-                    &mut graph,
-                    layer,
-                    &variant_material,
-                )?;
-                doc.node_groups.insert(variant_graph_id, graph);
-            }
-        }
-        moved.insert(material_id.clone());
+/// The VRM 0.x `MToon` main texture transform of glTF material `material_index`, if the material has one.
+/// The glTF import replaces the base color texture's own `KHR_texture_transform` with it, as the VRM add-on does.
+pub(super) fn v0_main_texture_transform(
+    root: &Value,
+    material_index: usize,
+) -> Option<TextureTransform> {
+    let property = &root["extensions"]["VRM"]["materialProperties"][material_index];
+    if property["shader"].as_str() != Some("VRM/MToon") {
+        return None;
     }
-    Ok(moved)
+    main_texture_transform(&property["vectorProperties"])
 }
 
-/// The non-identity main texture transform of a VRM 0.x material. The VRM Add-on writes `_MainTex` as
-/// (offset x, stored offset y, scale x, scale y); Potter writes `_MainTex_ST` as (scale x, scale y,
-/// offset x, stored offset y). The stored offset y is `1 - offset y - scale y`.
+/// The main texture transform of a VRM 0.x material. The VRM Add-on reads `_MainTex` as (offset x, stored
+/// offset y, scale x, scale y). Potter writes `_MainTex_ST` as (scale x, scale y, offset x, stored offset y)
+/// and reads it when `_MainTex` is absent. As the add-on does, a scale whose magnitude is below
+/// `f64::EPSILON` is 1, and the stored offset y is `1 - offset y - scale y`.
 fn main_texture_transform(vectors: &Value) -> Option<TextureTransform> {
     let numbers = |value: &Value| -> Option<[f64; 4]> {
         let items = value.as_array().filter(|items| items.len() == 4)?;
@@ -986,22 +948,24 @@ fn main_texture_transform(vectors: &Value) -> Option<TextureTransform> {
         }
         Some(output)
     };
-    let (offset_x, stored_y, scale_x, scale_y) = match (
-        numbers(&vectors["_MainTex"])
-            .filter(|value| !crate::float::equal_f64_array(value, &[0.0, 0.0, 1.0, 1.0])),
-        numbers(&vectors["_MainTex_ST"])
-            .filter(|value| !crate::float::equal_f64_array(value, &[1.0, 1.0, 0.0, 0.0])),
-    ) {
-        (Some([offset_x, stored_y, scale_x, scale_y]), _) => (offset_x, stored_y, scale_x, scale_y),
-        (None, Some([scale_x, scale_y, offset_x, stored_y])) => {
+    let (offset_x, stored_y, scale_x, scale_y) =
+        if let Some([offset_x, stored_y, scale_x, scale_y]) = numbers(&vectors["_MainTex"]) {
             (offset_x, stored_y, scale_x, scale_y)
+        } else {
+            let [scale_x, scale_y, offset_x, stored_y] = numbers(&vectors["_MainTex_ST"])?;
+            (offset_x, stored_y, scale_x, scale_y)
+        };
+    let guard = |scale: f64| {
+        if scale.abs() < f64::EPSILON {
+            1.0
+        } else {
+            scale
         }
-        _ => return None,
     };
-    let transform = TextureTransform {
-        offset: [offset_x, 1.0 - stored_y - scale_y],
+    let scale = [guard(scale_x), guard(scale_y)];
+    Some(TextureTransform {
+        offset: [offset_x, 1.0 - stored_y - scale[1]],
         rotation: 0.0,
-        scale: [scale_x, scale_y],
-    };
-    (!transform.is_identity()).then_some(transform)
+        scale,
+    })
 }

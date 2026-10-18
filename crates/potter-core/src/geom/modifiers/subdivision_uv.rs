@@ -8,7 +8,7 @@
 //! vertices: a position vertex splits wherever its UVs differ between faces. Each layer's limit is
 //! evaluated by `subdivision_limit::face_varying`, on the leaves of the position limit surface.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glam::{DVec2, DVec3};
 use serde_json::{Map, Value, json};
@@ -39,17 +39,16 @@ pub(super) enum FvarLinear {
     CornersOnly,
     /// `uv_smooth` PRESERVE_CORNERS_AND_JUNCTIONS: corners and junctions stay put.
     CornersPlus1,
-    /// `uv_smooth` PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE: corners, junctions, and concave corners.
+    /// `uv_smooth` `PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE`: corners, junctions, and concave corners.
     CornersPlus2,
-    /// `uv_smooth` PRESERVE_BOUNDARIES (Blender's default): UV boundaries stay put.
+    /// `uv_smooth` `PRESERVE_BOUNDARIES` (Blender's default): UV boundaries stay put.
     Boundaries,
 }
 
 impl FvarLinear {
-    /// The option for a validated `uv_smooth` value; SIMPLE subdivision is always linear.
-    pub(super) fn from_uv_smooth(uv_smooth: &str, simple: bool) -> Self {
+    /// The option for a validated `uv_smooth` value.
+    pub(super) fn from_uv_smooth(uv_smooth: &str) -> Self {
         match uv_smooth {
-            _ if simple => Self::All,
             "NONE" => Self::All,
             "SMOOTH_ALL" => Self::SmoothAll,
             "PRESERVE_CORNERS" => Self::CornersOnly,
@@ -67,15 +66,15 @@ pub(super) struct ValueMap {
     pub(super) corners: Vec<Vec<usize>>,
     /// The position vertex each value belongs to.
     pub(super) vertex: Vec<usize>,
-    /// The UV of each value: the UV of its first corner.
+    /// The UV of each value: that of its last corner in face order, the one Blender's upload
+    /// writes last.
     pub(super) uvs: Vec<DVec2>,
 }
 
-/// A UV layer's name, value map, and level-0 pins.
+/// A UV layer's name, value map, and face-local pin state.
 pub(super) struct UvLayerValues {
     pub(super) name: String,
     pub(super) map: ValueMap,
-    /// The pin flags of each base face, kept only where they cover the face's corners.
     pub(super) pins: Vec<Option<Vec<bool>>>,
 }
 
@@ -84,16 +83,11 @@ pub(super) struct Position {
     pub(super) starts: Vec<usize>,
     pub(super) face_of: Vec<usize>,
     pub(super) corner_vertex: Vec<usize>,
-    pub(super) edge_starts: Vec<usize>,
-    pub(super) edge_sides: Vec<usize>,
     pub(super) edge_ends: Vec<(usize, usize)>,
     pub(super) edge_order: Vec<usize>,
     pub(super) edge_sharp: Vec<f64>,
     pub(super) vertex_starts: Vec<usize>,
     pub(super) vertex_corners: Vec<usize>,
-    pub(super) vertex_edge_starts: Vec<usize>,
-    pub(super) vertex_edges: Vec<usize>,
-    pub(super) non_manifold_corners: Vec<bool>,
 }
 
 /// Groups the indices `0..keys.len()` by `keys[index]` into `buckets` buckets: bucket `b` holds
@@ -139,38 +133,25 @@ impl Position {
             starts.push(corner_vertex.len());
         }
 
-        let mut edge_index: HashMap<(usize, usize), usize> =
-            HashMap::with_capacity(total / 2 + loose_edges.len());
+        let mut seen: HashSet<(usize, usize)> =
+            HashSet::with_capacity(total / 2 + loose_edges.len());
         let mut edge_ends = Vec::with_capacity(total / 2 + loose_edges.len());
         let mut edge_sharp = Vec::new();
-        let mut corner_edge = Vec::with_capacity(total);
+        let mut add_edge = |key: (usize, usize)| {
+            if seen.insert(key) {
+                edge_ends.push(key);
+                edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
+            }
+        };
         for (poly, _) in polys {
             for corner in 0..poly.len() {
-                let key = edge_key(poly[corner], poly[(corner + 1) % poly.len()]);
-                let edge = *edge_index.entry(key).or_insert_with(|| {
-                    edge_ends.push(key);
-                    edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
-                    edge_ends.len() - 1
-                });
-                corner_edge.push(edge);
+                add_edge(edge_key(poly[corner], poly[(corner + 1) % poly.len()]));
             }
         }
         for &[first, second] in loose_edges {
-            let key = edge_key(first, second);
-            edge_index.entry(key).or_insert_with(|| {
-                edge_ends.push(key);
-                edge_sharp.push(sharpness.get(&key).copied().unwrap_or(0.0));
-                edge_ends.len() - 1
-            });
+            add_edge(edge_key(first, second));
         }
-        let (edge_starts, edge_sides) = group(&corner_edge, edge_ends.len());
         let (vertex_starts, vertex_corners) = group(&corner_vertex, vertex_count);
-        let endpoints = edge_ends
-            .iter()
-            .flat_map(|(first, second)| [*first, *second])
-            .collect::<Vec<_>>();
-        let (vertex_edge_starts, endpoint_slots) = group(&endpoints, vertex_count);
-        let vertex_edges: Vec<usize> = endpoint_slots.into_iter().map(|slot| slot / 2).collect();
         let mut edge_order: Vec<usize> = (0..edge_ends.len()).collect();
         edge_order.sort_unstable_by_key(|edge| edge_ends[*edge]);
 
@@ -178,18 +159,11 @@ impl Position {
             starts,
             face_of,
             corner_vertex,
-            edge_starts,
-            edge_sides,
             edge_ends,
             edge_order,
             edge_sharp,
             vertex_starts,
             vertex_corners,
-            vertex_edge_starts,
-            vertex_edges,
-            non_manifold_corners: (0..vertex_count)
-                .map(|vertex| non_manifold.corner(vertex))
-                .collect(),
         }
     }
 
@@ -220,8 +194,9 @@ fn uv_winding(uvs: &[DVec2]) -> bool {
 }
 
 /// The value map of one layer. Corners at a position vertex share a value when their UVs connect and
-/// their face windings agree (Blender's `calc_uv_verts` with winding), grouped greedily in corner
-/// order. A value keeps the UV of its first corner.
+/// their face windings agree (Blender's `BKE_mesh_uv_vert_map_create` with winding). Groups seed from
+/// the last corner at each vertex, as Blender's prepended vertex list does. A value's UV is that of
+/// its last corner in face order, which Blender's face-varying upload writes last.
 fn value_map(position: &Position, corner_uv: &[DVec2]) -> ValueMap {
     let winding: Vec<bool> = position
         .starts
@@ -230,19 +205,17 @@ fn value_map(position: &Position, corner_uv: &[DVec2]) -> ValueMap {
         .collect();
     let mut value_of = vec![usize::MAX; corner_uv.len()];
     let mut vertex = Vec::new();
-    let mut uvs = Vec::new();
     for position_vertex in 0..position.vertex_starts.len() - 1 {
         let at_vertex = position.corners_at(position_vertex);
-        for (index, &corner) in at_vertex.iter().enumerate() {
+        for (index, &corner) in at_vertex.iter().enumerate().rev() {
             if value_of[corner] != usize::MAX {
                 continue;
             }
-            let value = uvs.len();
+            let value = vertex.len();
             let uv = corner_uv[corner];
-            uvs.push(uv);
             vertex.push(position_vertex);
             value_of[corner] = value;
-            for &other in &at_vertex[index + 1..] {
+            for &other in at_vertex[..index].iter().rev() {
                 let other_uv = corner_uv[other];
                 if value_of[other] == usize::MAX
                     && (other_uv.x - uv.x).abs() < UV_CONNECT_LIMIT
@@ -253,6 +226,10 @@ fn value_map(position: &Position, corner_uv: &[DVec2]) -> ValueMap {
                 }
             }
         }
+    }
+    let mut uvs = vec![DVec2::ZERO; vertex.len()];
+    for (corner, &value) in value_of.iter().enumerate() {
+        uvs[value] = corner_uv[corner];
     }
     let corners = position
         .starts
@@ -266,14 +243,16 @@ fn value_map(position: &Position, corner_uv: &[DVec2]) -> ValueMap {
     }
 }
 
-/// One layer's corner UVs in global corner order, zero where the layer has no value.
+/// One layer's corner UVs in global corner order, zero where the layer has no value. UVs are
+/// converted to Blender's V-up convention.
 fn corner_uvs(position: &Position, layer: &UvLayer) -> Vec<DVec2> {
     let mut uvs = vec![DVec2::ZERO; position.corner_count()];
     for (face, values) in layer.faces.iter().enumerate() {
         if let Some(values) = values {
             let start = position.starts[face];
             for (corner, uv) in values.iter().enumerate() {
-                uvs[start + corner] = DVec2::new(uv[0], uv[1]);
+                // The mesh UV store is glTF V-down; Blender's face-varying math is V-up.
+                uvs[start + corner] = DVec2::new(uv[0], 1.0 - uv[1]);
             }
         }
     }
@@ -284,32 +263,16 @@ fn corner_uvs(position: &Position, layer: &UvLayer) -> Vec<DVec2> {
 pub(super) fn value_maps(mesh: &Mesh, position: &Position) -> Vec<UvLayerValues> {
     uv_layers::read_layers(mesh)
         .into_iter()
-        .map(|layer| {
-            let map = value_map(position, &corner_uvs(position, &layer));
-            let pins = map
-                .corners
-                .iter()
-                .enumerate()
-                .map(|(face, corners)| {
-                    layer
-                        .pinned
-                        .get(face)
-                        .cloned()
-                        .flatten()
-                        .filter(|pins| pins.len() == corners.len())
-                })
-                .collect();
-            UvLayerValues {
-                name: layer.name,
-                map,
-                pins,
-            }
+        .map(|layer| UvLayerValues {
+            map: value_map(position, &corner_uvs(position, &layer)),
+            name: layer.name,
+            pins: layer.pinned,
         })
         .collect()
 }
 
-/// Refines loop pins like Blender's boolean corner interpolation: any pinned source with a
-/// positive contribution pins the child corner.
+/// Blender's face-local boolean corner interpolation: any source pin with a positive weight pins
+/// the child corner. Rows stay in the same face/corner order as subdivision topology refinement.
 pub(super) fn refine_pins(
     pins: Vec<Option<Vec<bool>>>,
     starts: &[usize],
@@ -340,6 +303,35 @@ pub(super) fn refine_pins(
     child
 }
 
+type UvLayerInput = (String, Vec<DVec2>, Vec<Option<Vec<bool>>>);
+
+/// Writes one UV layer per entry. UV values are loop-ordered; pin rows are face-ordered.
+pub(super) fn write_loop_uvs(mesh: &mut Mesh, layers: Vec<UvLayerInput>) -> Result<()> {
+    let mut written_layers = Vec::with_capacity(layers.len());
+    for (name, loops, pinned) in layers {
+        if pinned.len() != mesh.faces.len() {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "subdivision UV pin rows do not match the output faces",
+            ));
+        }
+        let mut rest = loops.as_slice();
+        let faces = mesh
+            .faces
+            .iter()
+            .map(|face| {
+                let (own, tail) = rest.split_at(face.vertices.len());
+                rest = tail;
+                Some(own.iter().map(|uv| [uv.x, 1.0 - uv.y]).collect())
+            })
+            .collect();
+        let mut layer = UvLayer::new(name, faces);
+        layer.pinned = pinned;
+        written_layers.push(layer);
+    }
+    uv_layers::write_layers(mesh, &written_layers);
+    Ok(())
+}
 /// The pins of layer `name` that the rebuild carried onto `faces`. A face keeps its pins when they
 /// cover its corners; otherwise it has none.
 pub(super) fn carried_pins(
@@ -360,33 +352,6 @@ pub(super) fn carried_pins(
                 .filter(|pins| pins.len() == corners)
         })
         .collect()
-}
-
-/// Writes one UV layer per entry on the output mesh. Each `loops` lists the UV of every output loop,
-/// in face and corner order, and each `pins` lists the pin flags of every output face.
-pub(super) fn write_loop_uvs(
-    mesh: &mut Mesh,
-    layers: Vec<(String, Vec<DVec2>, Vec<Option<Vec<bool>>>)>,
-) {
-    let layers: Vec<UvLayer> = layers
-        .into_iter()
-        .map(|(name, loops, pins)| {
-            let mut rest = loops.as_slice();
-            let faces = mesh
-                .faces
-                .iter()
-                .map(|face| {
-                    let (own, tail) = rest.split_at(face.vertices.len());
-                    rest = tail;
-                    Some(own.iter().map(|uv| [uv.x, uv.y]).collect())
-                })
-                .collect();
-            let mut layer = UvLayer::new(name, faces);
-            layer.pinned = pins;
-            layer
-        })
-        .collect();
-    uv_layers::write_layers(mesh, &layers);
 }
 
 /// Blender's crease state of one level. Sharpness decays by one level per subdivision and drives the
@@ -440,6 +405,8 @@ impl Creases {
     }
 }
 
+pub(super) type SimpleSubdivision = (Mesh, Creases, BTreeMap<(usize, usize), usize>);
+
 pub(super) fn subdivide_simple_once(
     mesh: &Mesh,
     position: &Position,
@@ -447,7 +414,7 @@ pub(super) fn subdivide_simple_once(
     source_edges: &[[usize; 2]],
     creases: &Creases,
     use_creases: bool,
-) -> Result<(Mesh, Creases, BTreeMap<(usize, usize), usize>)> {
+) -> Result<SimpleSubdivision> {
     let source_points = positions(mesh);
     let face_points: Vec<DVec3> = source_polygons
         .iter()
@@ -483,6 +450,7 @@ pub(super) fn subdivide_simple_once(
 /// Every source corner becomes one quad `[corner, next edge point, face point, previous edge point]`,
 /// faces in source order. Loose edges split at their edge point, and each output vertex records its
 /// source origin. `output_creases` maps output edge endpoints to Blender's canonical crease value.
+/// `BYTE_COLOR` layers are re-blended from their sources' bytes (see [`encode_byte_colors`]).
 pub(super) fn subdivided_mesh(
     mesh: &Mesh,
     points: Vec<DVec3>,

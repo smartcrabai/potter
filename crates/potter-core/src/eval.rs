@@ -184,8 +184,9 @@ pub struct EvaluatedNode {
     /// World-space bounds size, or null for geometry-free nodes.
     pub dimensions: Option<[f64; 3]>,
     /// Effective material slots after the node's modifier stack: each slot resolved under its OBJECT
-    /// or DATA link, or replaced by a Boolean TRANSFER pool. This is the only evaluated slot table;
-    /// face material indices refer to it. Null entries are empty slots. Not serialized.
+    /// or DATA link, or replaced by a Boolean TRANSFER pool. Face material indices refer to it;
+    /// out-of-range indices clamp to its last entry (`BKE_object_material_get_eval`). Null entries are
+    /// empty slots. Not serialized.
     #[serde(skip)]
     pub materials: Vec<Option<Id>>,
 }

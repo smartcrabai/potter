@@ -12,12 +12,38 @@ use serde_json::{Map, Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+type UvLayerRecord = (String, BTreeMap<u64, (Vec<[f64; 2]>, Vec<bool>)>);
+type EdgeRecords = BTreeMap<(usize, usize), Vec<(bool, bool, f64)>>;
+
+// Blender's custom-normal codes vary by one beta step across platforms; see
+// tests/common/blender_code_tolerance.rs.
+#[path = "common/blender_code_tolerance.rs"]
+mod blender_code_tolerance;
+use blender_code_tolerance::code_within_beta_step;
+
 const ORACLE: &str = include_str!("fixtures/pr16_subdivision/oracle.json");
-// Blender f32 output is rounded to seven fixture decimals; generation measured a maximum
-// serialization error of 5.000000003e-8. These bounds cover f32/OpenSubdiv arithmetic only.
+/// One stored custom-normal code: `null` is Auto, otherwise an authored `[i64, i64]` pair. Auto
+/// matches only Auto; an authored pair must match alpha exactly and beta within one step.
+fn codes_within_beta_step(actual: &Value, expected: &Value) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let pair = |value: &Value| -> Option<[i64; 2]> {
+        let [first, second] = value.as_array()?.as_slice() else {
+            return None;
+        };
+        Some([first.as_i64()?, second.as_i64()?])
+    };
+    match (pair(actual), pair(expected)) {
+        (Some(a), Some(e)) => code_within_beta_step(a, e),
+        _ => false,
+    }
+}
+
+// Fixture values are rounded to seven decimals, a serialization error of at most 5e-8. These
+// bounds cover f32/OpenSubdiv arithmetic only.
 const POSITION_TOLERANCE: f64 = 3.0e-6;
 const UV_TOLERANCE: f64 = 2.0e-6;
-const NORMAL_TOLERANCE: f64 = 2.0e-6;
 const CREASE_TOLERANCE: f64 = 1.0e-6;
 // Non-manifold splits put several Blender vertices at one position; vertices closer than this
 // are one position, and each position must have the same multiplicity on both sides.
@@ -91,23 +117,26 @@ fn edge_key(first: usize, second: usize) -> (usize, usize) {
 #[derive(Clone)]
 struct FaceRecord {
     vertices: Vec<usize>,
+    material_index: u32,
     smooth: bool,
     uv: BTreeMap<String, Vec<[f64; 2]>>,
-    normals: Option<Vec<DVec3>>,
+    uv_pins: BTreeMap<String, Vec<bool>>,
+    normal_codes: Option<Vec<Value>>,
 }
 
 struct EdgeRecord {
     vertices: [usize; 2],
     seam: bool,
+    sharp: bool,
     crease: f64,
 }
-
 /// A mesh compared by position: only point coordinates and index relations are read.
 struct Shape {
     points: Vec<DVec3>,
     faces: Vec<FaceRecord>,
     edges: Vec<EdgeRecord>,
     has_custom_normals: bool,
+    vertex_groups: BTreeMap<String, Vec<f64>>,
 }
 
 fn oracle_shape(expected: &Value) -> TestResult<Shape> {
@@ -132,24 +161,42 @@ fn oracle_shape(expected: &Value) -> TestResult<Shape> {
                     .collect::<TestResult<Vec<_>>>()?;
                 uv_layers.insert(layer.clone(), values);
             }
-            let normals = match face.get("normals") {
+            let pins = face["uv_pins"]
+                .as_object()
+                .ok_or("oracle UV pins missing")?
+                .iter()
+                .map(|(layer, corners)| -> TestResult<(String, Vec<bool>)> {
+                    let pins = corners
+                        .as_array()
+                        .ok_or("oracle UV pin row missing")?
+                        .iter()
+                        .map(|value| value.as_bool().ok_or("oracle UV pin must be boolean"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((layer.clone(), pins))
+                })
+                .collect::<TestResult<BTreeMap<_, _>>>()?;
+            let normal_codes = match face.get("normal_codes") {
                 Some(values) => Some(
                     values
                         .as_array()
-                        .ok_or("oracle custom normals missing")?
-                        .iter()
-                        .map(point)
-                        .collect::<TestResult<Vec<_>>>()?,
+                        .ok_or("oracle custom normal codes missing")?
+                        .clone(),
                 ),
                 None => None,
             };
             Ok(FaceRecord {
                 vertices: indices(&face["v"])?,
+                material_index: u32::try_from(
+                    face["material"]
+                        .as_u64()
+                        .ok_or("oracle material index missing")?,
+                )?,
                 smooth: face["smooth"]
                     .as_bool()
                     .ok_or("oracle smooth flag missing")?,
                 uv: uv_layers,
-                normals,
+                uv_pins: pins,
+                normal_codes,
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
@@ -165,14 +212,33 @@ fn oracle_shape(expected: &Value) -> TestResult<Shape> {
             Ok(EdgeRecord {
                 vertices: [pair[0], pair[1]],
                 seam: edge["seam"].as_bool().ok_or("oracle seam flag missing")?,
+                sharp: edge["sharp"].as_bool().ok_or("oracle sharp flag missing")?,
                 crease: number(&edge["crease"])?,
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
+    let vertex_groups = expected["vertex_groups"]
+        .as_object()
+        .ok_or("oracle vertex groups missing")?
+        .iter()
+        .map(|(name, values)| -> TestResult<(String, Vec<f64>)> {
+            let values = values
+                .as_array()
+                .ok_or("oracle vertex-group weights missing")?
+                .iter()
+                .map(number)
+                .collect::<TestResult<Vec<_>>>()?;
+            if values.len() != points.len() {
+                return Err(format!("oracle group {name} has a wrong vertex count").into());
+            }
+            Ok((name.clone(), values))
+        })
+        .collect::<TestResult<BTreeMap<_, _>>>()?;
     Ok(Shape {
         points,
         faces,
         edges,
+        vertex_groups,
         has_custom_normals: expected["has_custom_normals"]
             .as_bool()
             .ok_or("oracle custom-normal flag missing")?,
@@ -186,6 +252,34 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
         .enumerate()
         .map(|(index, vertex)| (vertex.id, index))
         .collect();
+    let vertex_groups = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|(name, values)| -> TestResult<(String, Vec<f64>)> {
+                    let values = values
+                        .as_object()
+                        .ok_or("output vertex group must be a map")?;
+                    let weights = mesh
+                        .vertices
+                        .iter()
+                        .map(|vertex| {
+                            values
+                                .get(&format!("v{}", vertex.id))
+                                .map(number)
+                                .transpose()
+                                .map(|weight| weight.unwrap_or(0.0))
+                        })
+                        .collect::<TestResult<Vec<_>>>()?;
+                    Ok((name.clone(), weights))
+                })
+                .collect::<TestResult<BTreeMap<_, _>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let points = mesh
         .vertices
         .iter()
@@ -193,39 +287,58 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
         .collect::<Vec<_>>();
     let uv_layers = mesh
         .attributes
-        .get("blender_uv_layers")
+        .get("uv_layers")
+        .and_then(|store| store.get("layers"))
         .and_then(Value::as_array)
         .ok_or("output UV layers missing")?
         .iter()
-        .map(|layer| -> TestResult<(String, Vec<[f64; 2]>)> {
+        .map(|layer| -> TestResult<UvLayerRecord> {
             let name = layer["name"]
                 .as_str()
                 .ok_or("output UV layer name missing")?;
-            let values = layer["values"]
-                .as_array()
-                .ok_or("output UV values missing")?
-                .iter()
-                .map(uv)
-                .collect::<TestResult<Vec<_>>>()?;
-            Ok((name.to_owned(), values))
+            let mut faces = BTreeMap::new();
+            for face in layer["faces"].as_array().ok_or("output UV faces missing")? {
+                let face_id = face["face_id"]
+                    .as_u64()
+                    .ok_or("output UV face ID missing")?;
+                let values = face["uv"]
+                    .as_array()
+                    .ok_or("output UV corners missing")?
+                    .iter()
+                    .map(|value| -> TestResult<[f64; 2]> {
+                        let [u, v] = uv(value)?;
+                        Ok([u, 1.0 - v])
+                    })
+                    .collect::<TestResult<Vec<_>>>()?;
+                let pins = face
+                    .get("pinned")
+                    .map(|pins| -> TestResult<Vec<bool>> {
+                        let mut flags = Vec::new();
+                        for value in pins.as_array().ok_or("output UV pin row missing")? {
+                            flags.push(value.as_bool().ok_or("output UV pin must be boolean")?);
+                        }
+                        Ok(flags)
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| vec![false; values.len()]);
+                faces.insert(face_id, (values, pins));
+            }
+            Ok((name.to_owned(), faces))
         })
         .collect::<TestResult<Vec<_>>>()?;
     let smooth = mesh
         .attributes
-        .get("blender_polygon_smooth")
-        .and_then(Value::as_array)
-        .ok_or("output polygon smooth flags missing")?;
-    if smooth.len() != mesh.faces.len() {
-        return Err("output smooth flag count differs from face count".into());
-    }
+        .get("shade_smooth")
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(Value::as_object)
+        .ok_or("output shade_smooth attribute missing")?;
     let custom = mesh
         .attributes
         .get("custom_normal")
         .and_then(|attribute| attribute.get("values"))
         .and_then(Value::as_object);
-    let mut loop_offset = 0;
     let mut faces = Vec::with_capacity(mesh.faces.len());
-    for (face_index, face) in mesh.faces.iter().enumerate() {
+    for face in &mesh.faces {
         let vertices = face
             .vertices
             .iter()
@@ -236,76 +349,83 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
                     .ok_or("output face references a missing vertex")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let end = loop_offset + vertices.len();
         let mut uv_map = BTreeMap::new();
-        for (name, values) in &uv_layers {
-            if end > values.len() {
-                return Err(format!("UV layer {name} is shorter than face loops").into());
+        let mut uv_pins = BTreeMap::new();
+        for (name, layer_faces) in &uv_layers {
+            let (values, pins) = layer_faces
+                .get(&u64::from(face.id))
+                .ok_or_else(|| format!("UV layer {name} is missing output face {}", face.id))?;
+            if values.len() != vertices.len() || pins.len() != vertices.len() {
+                return Err(format!(
+                    "UV layer {name} has a wrong corner or pin count for face {}",
+                    face.id
+                )
+                .into());
             }
-            uv_map.insert(name.clone(), values[loop_offset..end].to_vec());
+            uv_map.insert(name.clone(), values.clone());
+            uv_pins.insert(name.clone(), pins.clone());
         }
-        let normals = match custom {
+        let normal_codes = match custom {
             Some(values) => Some(
                 values
                     .get(&format!("f{}", face.id))
                     .and_then(Value::as_array)
-                    .ok_or("custom normals missing for output face")?
-                    .iter()
-                    .map(point)
-                    .collect::<TestResult<Vec<_>>>()?,
+                    .ok_or("custom normal codes missing for output face")?
+                    .clone(),
             ),
             None => None,
         };
         faces.push(FaceRecord {
             vertices,
-            smooth: smooth[face_index]
-                .as_bool()
-                .ok_or("output smooth flag is not boolean")?,
+            material_index: face.material_index,
+            smooth: smooth
+                .get(&format!("f{}", face.id))
+                .and_then(Value::as_bool)
+                .ok_or("output shade_smooth value is missing")?,
             uv: uv_map,
-            normals,
+            uv_pins,
+            normal_codes,
         });
-        loop_offset = end;
     }
-    for (name, values) in &uv_layers {
-        if loop_offset != values.len() {
-            return Err(format!(
-                "UV layer {name} has {} loops, faces have {loop_offset}",
-                values.len()
-            )
-            .into());
-        }
-    }
-    let flags = mesh
+    let sharp_values = mesh
         .attributes
-        .get("blender_edge_flags")
-        .and_then(Value::as_array)
-        .ok_or("output edge flags missing")?;
-    if flags.len() != mesh.edges.len() {
-        return Err("output edge flag count differs from edge count".into());
-    }
+        .get("sharp")
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(Value::as_object);
+    let seam_values = mesh
+        .attributes
+        .get("seam")
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(Value::as_object);
     let crease_values = mesh
         .attributes
         .get("crease_edge")
         .and_then(|attribute| attribute.get("values"))
         .and_then(Value::as_object);
     let mut edges = Vec::with_capacity(mesh.edges.len());
-    for (edge_index, edge) in mesh.edges.iter().enumerate() {
+    for edge in &mesh.edges {
         let mut endpoints = [0; 2];
         for (slot, id) in edge.vertices.iter().enumerate() {
             endpoints[slot] = *vertex_index
                 .get(id)
                 .ok_or("output edge references a missing vertex")?;
         }
+        let key = format!("e{}", edge.id);
         let crease = crease_values
-            .and_then(|values| values.get(&format!("e{}", edge.id)))
+            .and_then(|values| values.get(&key))
             .map(number)
             .transpose()?
             .unwrap_or(0.0);
         edges.push(EdgeRecord {
             vertices: endpoints,
-            seam: flags[edge_index]["seam"]
-                .as_bool()
-                .ok_or("output seam flag is not boolean")?,
+            seam: seam_values
+                .and_then(|values| values.get(&key))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            sharp: sharp_values
+                .and_then(|values| values.get(&key))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             crease,
         });
     }
@@ -313,6 +433,7 @@ fn potter_shape(mesh: &Mesh) -> TestResult<Shape> {
         points,
         faces,
         edges,
+        vertex_groups,
         has_custom_normals: custom.is_some(),
     })
 }
@@ -324,13 +445,70 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
         .iter()
         .map(point)
         .collect::<TestResult<Vec<_>>>()?;
-    let faces = spec["faces"]
+    let logical_faces: Vec<Vec<usize>> = spec["faces"]
         .as_array()
         .ok_or("mesh faces missing")?
         .iter()
         .map(indices)
-        .collect::<TestResult<Vec<_>>>()?;
+        .collect::<TestResult<_>>()?;
+    // A rotated-storage input stores face f's corners rotated by (f + 1) mod n and attaches
+    // Blender's loop order as corner_order. Blender's result for the unrotated mesh is the reference.
+    let rotated_storage = spec["rotated_storage"]
+        .as_bool()
+        .ok_or("mesh rotated_storage flag missing")?;
+    let shifts: Vec<usize> = logical_faces
+        .iter()
+        .enumerate()
+        .map(|(index, face)| {
+            if rotated_storage {
+                (index + 1) % face.len()
+            } else {
+                0
+            }
+        })
+        .collect();
+    let faces: Vec<Vec<usize>> = logical_faces
+        .iter()
+        .zip(&shifts)
+        .map(|(face, &shift)| rotated(face, shift))
+        .collect();
     let mut mesh = Mesh::from_positions_and_faces(vertices, faces)?;
+    let material_values = spec["materials"]
+        .as_array()
+        .ok_or("mesh material indices missing")?;
+    if material_values.len() != mesh.faces.len() {
+        return Err("mesh material index count differs from face count".into());
+    }
+    for (face, material) in mesh.faces.iter_mut().zip(material_values) {
+        face.material_index = u32::try_from(
+            material
+                .as_u64()
+                .ok_or("mesh material index must be unsigned")?,
+        )?;
+    }
+    if let Some(group_specs) = spec.get("vertex_groups").and_then(Value::as_object) {
+        let mut groups = Map::new();
+        for (name, weights) in group_specs {
+            let weights = weights
+                .as_array()
+                .ok_or("mesh vertex-group weights missing")?;
+            if weights.len() != mesh.vertices.len() {
+                return Err(format!("mesh group {name} has a wrong vertex count").into());
+            }
+            let mut members = Map::new();
+            for (vertex, weight) in mesh.vertices.iter().zip(weights) {
+                let weight = number(weight)?;
+                if weight > 0.0 {
+                    members.insert(format!("v{}", vertex.id), json!(weight));
+                }
+            }
+            groups.insert(name.clone(), Value::Object(members));
+        }
+        if !groups.is_empty() {
+            mesh.attributes
+                .insert("vertex_groups".to_owned(), Value::Object(groups));
+        }
+    }
     for loose in spec["loose_edges"]
         .as_array()
         .ok_or("mesh loose edges missing")?
@@ -369,49 +547,178 @@ fn input_mesh(spec: &Value) -> TestResult<Mesh> {
             Ok((edge_key(first, second), number(&values[2])?))
         })
         .collect::<TestResult<BTreeMap<_, _>>>()?;
-    let mut flags = Vec::with_capacity(mesh.edges.len());
+    let sharp_edges = spec["sharp_edges"]
+        .as_array()
+        .ok_or("mesh sharp edges missing")?
+        .iter()
+        .map(indices)
+        .map(|edge| {
+            let edge = edge?;
+            if edge.len() != 2 {
+                return Err("sharp edge must reference two vertices".into());
+            }
+            Ok(edge_key(edge[0], edge[1]))
+        })
+        .collect::<TestResult<BTreeSet<_>>>()?;
+    let mut sharp_values = Map::new();
+    let mut seam_values = Map::new();
     let mut crease_values = Map::new();
     for edge in &mesh.edges {
         let endpoints = edge_key(edge.vertices[0] as usize, edge.vertices[1] as usize);
-        flags.push(json!({"sharp": false, "seam": seams.contains(&endpoints)}));
+        let sharp = sharp_edges.contains(&endpoints);
+        let seam = seams.contains(&endpoints);
+        sharp_values.insert(format!("e{}", edge.id), json!(sharp));
+        seam_values.insert(format!("e{}", edge.id), json!(seam));
         if let Some(value) = crease_pairs.get(&endpoints) {
             crease_values.insert(format!("e{}", edge.id), json!(value));
         }
     }
-    mesh.attributes
-        .insert("blender_edge_flags".to_owned(), Value::Array(flags));
-    mesh.attributes
-        .insert("blender_polygon_smooth".to_owned(), spec["smooth"].clone());
-    mesh.attributes
-        .insert("blender_uv_layers".to_owned(), spec["uv_layers"].clone());
+    let mut uv_layers = Vec::new();
+    let mut active_uv = None;
+    for layer in spec["uv_layers"]
+        .as_array()
+        .ok_or("input UV layers missing")?
+    {
+        let name = layer["name"]
+            .as_str()
+            .ok_or("input UV layer name missing")?;
+        let values = layer["values"]
+            .as_array()
+            .ok_or("input UV values missing")?
+            .iter()
+            .map(|value| -> TestResult<[f64; 2]> {
+                let [u, v] = uv(value)?;
+                Ok([u, 1.0 - v])
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let pins = layer
+            .get("pinned")
+            .map(|values| {
+                values
+                    .as_array()
+                    .ok_or("input UV pins missing")
+                    .and_then(|values| {
+                        values
+                            .iter()
+                            .map(|value| value.as_bool().ok_or("input UV pin must be boolean"))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+            })
+            .transpose()?;
+        if pins.as_ref().is_some_and(|pins| pins.len() != values.len()) {
+            return Err(format!("UV layer {name} has a wrong pin count").into());
+        }
+        let mut offset = 0;
+        let mut layer_faces = Vec::with_capacity(mesh.faces.len());
+        for (face, &shift) in mesh.faces.iter().zip(&shifts) {
+            let end = offset + face.vertices.len();
+            if end > values.len() {
+                return Err(format!("UV layer {name} is shorter than input loops").into());
+            }
+            let mut entry = json!({"face_id": face.id, "uv": rotated(&values[offset..end], shift)});
+            if let Some(pins) = &pins {
+                entry["pinned"] = json!(rotated(&pins[offset..end], shift));
+            }
+            layer_faces.push(entry);
+            offset = end;
+        }
+        if offset != values.len() {
+            return Err(format!("UV layer {name} has extra input loops").into());
+        }
+        active_uv.get_or_insert(name);
+        uv_layers.push(json!({"name": name, "faces": layer_faces}));
+    }
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        json!({"layers": uv_layers, "active": active_uv, "render": active_uv}),
+    );
+    let smooth_values: Map<String, Value> = mesh
+        .faces
+        .iter()
+        .zip(
+            spec["smooth"]
+                .as_array()
+                .ok_or("mesh smooth flags missing")?,
+        )
+        .map(|(face, smooth)| (format!("f{}", face.id), smooth.clone()))
+        .collect();
+    mesh.attributes.insert(
+        "shade_smooth".to_owned(),
+        json!({"domain": "face", "type": "bool", "values": smooth_values}),
+    );
+    mesh.attributes.insert(
+        "sharp".to_owned(),
+        json!({"domain": "edge", "type": "bool", "values": sharp_values}),
+    );
+    mesh.attributes.insert(
+        "seam".to_owned(),
+        json!({"domain": "edge", "type": "bool", "values": seam_values}),
+    );
     mesh.attributes.insert(
         "crease_edge".to_owned(),
         json!({"domain": "edge", "type": "float", "values": crease_values}),
     );
 
-    let source_normals = spec["custom_normals"]
+    let source_codes = spec["custom_normal_codes"]
         .as_array()
-        .ok_or("mesh custom normals missing")?;
+        .ok_or("mesh custom normal codes missing")?;
     let mut corner = 0;
     let mut normal_values = Map::new();
-    for face in &mesh.faces {
-        let end = corner + face.vertices.len();
-        if end > source_normals.len() {
-            return Err("source custom normals do not cover every corner".into());
+    let mut corner_order = Map::new();
+    for (face, &shift) in mesh.faces.iter().zip(&shifts) {
+        let len = face.vertices.len();
+        let end = corner + len;
+        if end > source_codes.len() {
+            return Err("source custom normal codes do not cover every corner".into());
         }
         normal_values.insert(
             format!("f{}", face.id),
-            Value::Array(source_normals[corner..end].to_vec()),
+            Value::Array(rotated(&source_codes[corner..end], shift)),
+        );
+        corner_order.insert(
+            format!("f{}", face.id),
+            Value::Array(
+                (0..len)
+                    .map(|k| json!(corner + (k + shift) % len))
+                    .collect(),
+            ),
         );
         corner = end;
     }
-    if corner != source_normals.len() {
-        return Err("source custom normals contain extra corners".into());
+    if corner != source_codes.len() {
+        return Err("source custom normal codes contain extra corners".into());
     }
-    mesh.attributes.insert(
-        "custom_normal".to_owned(),
-        json!({"domain": "corner", "type": "float3", "values": normal_values}),
-    );
+    let mut layer = json!({"domain": "corner", "type": "normal_code", "values": normal_values});
+    if rotated_storage {
+        layer["corner_order"] = Value::Object(corner_order);
+    }
+    mesh.attributes.insert("custom_normal".to_owned(), layer);
+
+    let vertex_creases = spec["vertex_creases"]
+        .as_array()
+        .ok_or("mesh vertex creases missing")?
+        .iter()
+        .map(|item| -> TestResult<(usize, f64)> {
+            let values = item.as_array().ok_or("vertex crease must be an array")?;
+            if values.len() != 2 {
+                return Err("vertex crease must have a vertex and a value".into());
+            }
+            let vertex = usize::try_from(values[0].as_u64().ok_or("vertex crease index missing")?)?;
+            Ok((vertex, number(&values[1])?))
+        })
+        .collect::<TestResult<BTreeMap<_, _>>>()?;
+    if !vertex_creases.is_empty() {
+        let mut values = Map::new();
+        for (index, vertex) in mesh.vertices.iter().enumerate() {
+            if let Some(&value) = vertex_creases.get(&index) {
+                values.insert(format!("v{}", vertex.id), json!(value));
+            }
+        }
+        mesh.attributes.insert(
+            "crease_vert".to_owned(),
+            json!({"domain": "point", "type": "float", "values": values}),
+        );
+    }
     Ok(mesh)
 }
 
@@ -446,18 +753,15 @@ fn cluster_positions(points: &[DVec3]) -> (Vec<usize>, Vec<DVec3>, Vec<usize>) {
                 }
             }
         }
-        let cluster = match found {
-            Some(cluster) => {
-                multiplicities[cluster] += 1;
-                cluster
-            }
-            None => {
-                representatives.push(*point);
-                multiplicities.push(1);
-                let cluster = representatives.len() - 1;
-                grid.entry((x, y, z)).or_default().push(cluster);
-                cluster
-            }
+        let cluster = if let Some(cluster) = found {
+            multiplicities[cluster] += 1;
+            cluster
+        } else {
+            representatives.push(*point);
+            multiplicities.push(1);
+            let cluster = representatives.len() - 1;
+            grid.entry((x, y, z)).or_default().push(cluster);
+            cluster
         };
         assignment.push(cluster);
     }
@@ -468,7 +772,6 @@ fn cluster_positions(points: &[DVec3]) -> (Vec<usize>, Vec<DVec3>, Vec<usize>) {
 struct Errors {
     position: f64,
     uv: f64,
-    normal: f64,
     crease: f64,
 }
 
@@ -543,6 +846,54 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
             errors.position
         ));
     }
+    if actual.vertex_groups.keys().collect::<Vec<_>>()
+        != expected.vertex_groups.keys().collect::<Vec<_>>()
+    {
+        return Err("vertex-group sets differ".to_owned());
+    }
+    for (name, actual_weights) in &actual.vertex_groups {
+        let expected_weights = expected
+            .vertex_groups
+            .get(name)
+            .ok_or_else(|| format!("Blender vertex group {name} missing"))?;
+        if actual_weights.len() != actual.points.len()
+            || expected_weights.len() != expected.points.len()
+        {
+            return Err(format!(
+                "vertex group {name} has a wrong output vertex count"
+            ));
+        }
+        let mut actual_by_target = vec![Vec::new(); expected_reps.len()];
+        for (vertex, weight) in actual_weights.iter().enumerate() {
+            let target = to_expected[actual_clusters[vertex]];
+            actual_by_target[target].push(*weight);
+        }
+        let mut expected_by_target = vec![Vec::new(); expected_reps.len()];
+        for (vertex, weight) in expected_weights.iter().enumerate() {
+            expected_by_target[expected_clusters[vertex]].push(*weight);
+        }
+        for (target, (actual_values, expected_values)) in actual_by_target
+            .iter_mut()
+            .zip(&mut expected_by_target)
+            .enumerate()
+        {
+            actual_values.sort_by(f64::total_cmp);
+            expected_values.sort_by(f64::total_cmp);
+            if actual_values.len() != expected_values.len() {
+                return Err(format!(
+                    "vertex group {name} multiplicity differs at position {target}"
+                ));
+            }
+            for (actual_weight, expected_weight) in actual_values.iter().zip(expected_values.iter())
+            {
+                if (actual_weight - expected_weight).abs() > 1.0e-6 {
+                    return Err(format!(
+                        "vertex group {name} weight {actual_weight:.9} != Blender {expected_weight:.9}"
+                    ));
+                }
+            }
+        }
+    }
 
     let mut actual_faces: BTreeMap<Vec<usize>, Vec<(&FaceRecord, usize)>> = BTreeMap::new();
     for face in &actual.faces {
@@ -585,8 +936,22 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
         for ((actual_face, actual_rotation), (expected_face, expected_rotation)) in
             actual_list.iter().zip(expected_list)
         {
+            // Both faces must start at the same corner, so their per-corner data lines up.
+            if to_expected[actual_clusters[actual_face.vertices[0]]]
+                != expected_clusters[expected_face.vertices[0]]
+            {
+                return Err(format!(
+                    "face {cycle:?} starts at a different corner than Blender's face"
+                ));
+            }
             if actual_face.smooth != expected_face.smooth {
                 return Err(format!("face {cycle:?} polygon interpolation flag differs"));
+            }
+            if actual_face.material_index != expected_face.material_index {
+                return Err(format!(
+                    "face {cycle:?} material index {} != Blender {}",
+                    actual_face.material_index, expected_face.material_index
+                ));
             }
             if actual_face.uv.keys().collect::<Vec<_>>()
                 != expected_face.uv.keys().collect::<Vec<_>>()
@@ -603,18 +968,42 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
                         .max((actual_uv[1] - expected_uv[1]).abs());
                 }
             }
-            match (&actual_face.normals, &expected_face.normals) {
-                (Some(actual_normals), Some(expected_normals)) => {
-                    let actual_normals = rotated(actual_normals, *actual_rotation);
-                    let expected_normals = rotated(expected_normals, *expected_rotation);
-                    for (actual_normal, expected_normal) in
-                        actual_normals.iter().zip(&expected_normals)
-                    {
-                        errors.normal = errors.normal.max(actual_normal.distance(*expected_normal));
+            if actual_face.uv_pins.keys().collect::<Vec<_>>()
+                != expected_face.uv_pins.keys().collect::<Vec<_>>()
+            {
+                return Err(format!("face {cycle:?} UV pin layer set differs"));
+            }
+            for (layer, expected_pins) in &expected_face.uv_pins {
+                let actual_pins = rotated(&actual_face.uv_pins[layer], *actual_rotation);
+                let expected_pins = rotated(expected_pins, *expected_rotation);
+                if actual_pins != expected_pins {
+                    return Err(format!(
+                        "face {cycle:?} UV pin flags differ in layer {layer}: {actual_pins:?} != {expected_pins:?}"
+                    ));
+                }
+            }
+            match (&actual_face.normal_codes, &expected_face.normal_codes) {
+                (Some(actual_codes), Some(expected_codes)) => {
+                    let actual_codes = rotated(actual_codes, *actual_rotation);
+                    let expected_codes = rotated(expected_codes, *expected_rotation);
+                    // Platform variance: see tests/common/blender_code_tolerance.rs.
+                    let within_variance = actual_codes.len() == expected_codes.len()
+                        && actual_codes
+                            .iter()
+                            .zip(&expected_codes)
+                            .all(|(actual, expected)| codes_within_beta_step(actual, expected));
+                    if !within_variance {
+                        return Err(format!(
+                            "face {cycle:?} custom-normal codes outside Blender's platform variance (alpha exact, beta ±1): {actual_codes:?} != {expected_codes:?}"
+                        ));
                     }
                 }
                 (None, None) => {}
-                _ => return Err(format!("face {cycle:?} custom-normal presence differs")),
+                _ => {
+                    return Err(format!(
+                        "face {cycle:?} custom-normal layer presence differs"
+                    ));
+                }
             }
         }
     }
@@ -624,23 +1013,17 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
             errors.uv
         ));
     }
-    if errors.normal > NORMAL_TOLERANCE {
-        return Err(format!(
-            "max custom-normal error {:.9e} exceeds {NORMAL_TOLERANCE:.9e}",
-            errors.normal
-        ));
-    }
 
-    let mut actual_edges: BTreeMap<(usize, usize), Vec<(bool, f64)>> = BTreeMap::new();
+    let mut actual_edges: EdgeRecords = BTreeMap::new();
     for edge in &actual.edges {
         let first = to_expected[actual_clusters[edge.vertices[0]]];
         let second = to_expected[actual_clusters[edge.vertices[1]]];
         actual_edges
             .entry(edge_key(first, second))
             .or_default()
-            .push((edge.seam, edge.crease));
+            .push((edge.seam, edge.sharp, edge.crease));
     }
-    let mut expected_edges: BTreeMap<(usize, usize), Vec<(bool, f64)>> = BTreeMap::new();
+    let mut expected_edges: EdgeRecords = BTreeMap::new();
     for edge in &expected.edges {
         expected_edges
             .entry(edge_key(
@@ -648,7 +1031,7 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
                 expected_clusters[edge.vertices[1]],
             ))
             .or_default()
-            .push((edge.seam, edge.crease));
+            .push((edge.seam, edge.sharp, edge.crease));
     }
     if actual_edges.keys().collect::<Vec<_>>() != expected_edges.keys().collect::<Vec<_>>() {
         return Err("canonical edge topology differs".to_owned());
@@ -673,11 +1056,16 @@ fn compare_shapes(actual: &Shape, expected: &Shape) -> Result<Errors, String> {
                 expected_list.len()
             ));
         }
-        for ((actual_seam, actual_crease), (expected_seam, expected_crease)) in
-            actual_list.iter().zip(&expected_list)
+        for (
+            (actual_seam, actual_sharp, actual_crease),
+            (expected_seam, expected_sharp, expected_crease),
+        ) in actual_list.iter().zip(&expected_list)
         {
             if actual_seam != expected_seam {
                 return Err(format!("seam flag differs on edge {key:?}"));
+            }
+            if actual_sharp != expected_sharp {
+                return Err(format!("sharp flag differs on edge {key:?}"));
             }
             errors.crease = errors.crease.max((actual_crease - expected_crease).abs());
         }
@@ -700,6 +1088,8 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
         modifier_type: "subdivision".to_owned(),
         name: "Subdivision oracle".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params,
         binding_data: None,
         runtime: ModifierRuntime::default(),
@@ -715,14 +1105,6 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
     let oracle: Value = serde_json::from_str(ORACLE)?;
     assert_eq!(oracle["blender_version"], "5.2.2 LTS");
     assert_eq!(oracle["round_digits"], 7);
-    let max_serialization_error = oracle["max_serialization_rounding_error"]
-        .as_str()
-        .ok_or("fixture rounding metadata missing")?
-        .parse::<f64>()?;
-    assert!(
-        max_serialization_error <= 5.1e-8,
-        "fixture max serialization rounding error {max_serialization_error:.9e} exceeds the seven-decimal bound"
-    );
     let meshes = oracle["meshes"]
         .as_object()
         .ok_or("oracle mesh inputs missing")?;
@@ -743,7 +1125,6 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
             Ok(Ok(errors)) => {
                 worst.position = worst.position.max(errors.position);
                 worst.uv = worst.uv.max(errors.uv);
-                worst.normal = worst.normal.max(errors.normal);
                 worst.crease = worst.crease.max(errors.crease);
             }
             Ok(Err(error)) => failures.push(format!("{case_name}: {error}")),
@@ -765,11 +1146,10 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
         failures.join("\n")
     );
     eprintln!(
-        "subdivision corpus: {} cases; worst position {:.3e}, UV {:.3e}, normal {:.3e}, crease {:.3e}",
+        "subdivision corpus: {} cases; worst position {:.3e}, UV {:.3e}, crease {:.3e}; custom-normal codes within alpha-exact, beta ±1",
         cases.len(),
         worst.position,
         worst.uv,
-        worst.normal,
         worst.crease
     );
     Ok(())
@@ -778,9 +1158,16 @@ fn subdivision_surface_matches_blender_522_across_the_modifier_matrix() -> TestR
 /// Measures which settings, mesh classes, and crease inputs the corpus exercises. A missing
 /// combination fails the test, so the corpus cannot silently narrow.
 fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestResult {
+    assert_eq!(
+        cases.len(),
+        186,
+        "the complete Blender oracle corpus is required"
+    );
     let mut levels = BTreeSet::new();
     let mut qualities = BTreeSet::new();
+    let mut quad_level_quality_pairs = BTreeSet::new();
     let mut uv_modes = BTreeSet::new();
+    let mut uv_mesh_pairs = BTreeSet::new();
     let mut boundary_modes = BTreeSet::new();
     let mut uv_boundary_pairs = BTreeSet::new();
     let mut limit_settings = BTreeSet::new();
@@ -789,7 +1176,9 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
     let mut crease_dependent_uv_modes = BTreeSet::new();
     let mut custom_normal_settings = BTreeSet::new();
     let mut used_meshes = BTreeSet::new();
+    let mut material_indices = BTreeSet::new();
     let mut crease_values = BTreeSet::new();
+    let mut default_uv_levels = BTreeSet::new();
     let mut cube_above_quality = false;
     for case in cases {
         let params = &case["params"];
@@ -807,14 +1196,37 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         let limit = params["use_limit_surface"]
             .as_bool()
             .ok_or("limit flag missing")?;
+        if matches!(
+            case["name"].as_str(),
+            Some("quad_default_uv_l4" | "quad_default_uv_l5")
+        ) {
+            if mesh != "quad"
+                || quality != 2
+                || boundary != "ALL"
+                || uv != "PRESERVE_BOUNDARIES"
+                || !limit
+            {
+                return Err("default UV L4/L5 cases must use the Blender default settings".into());
+            }
+            default_uv_levels.insert(level);
+        }
+        if mesh == "quad" && limit && (1..=5).contains(&level) && (1..=6).contains(&quality) {
+            quad_level_quality_pairs.insert((level, quality));
+        }
         levels.insert(level);
         qualities.insert(quality);
         uv_boundary_pairs.insert((uv.clone(), boundary.clone()));
-        if uv == "PRESERVE_CORNERS_AND_JUNCTIONS" || uv == "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE"
+        if (uv == "PRESERVE_CORNERS_AND_JUNCTIONS"
+            || uv == "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE")
+            && params["use_creases"].as_bool() == Some(true)
         {
-            if params["use_creases"].as_bool() == Some(true) {
-                crease_dependent_uv_modes.insert(uv.clone());
-            }
+            crease_dependent_uv_modes.insert(uv.clone());
+        }
+        if matches!(
+            mesh,
+            "cube" | "curved_grid" | "ngon" | "nonmanifold" | "mixed"
+        ) {
+            uv_mesh_pairs.insert((mesh.to_owned(), uv.clone()));
         }
         uv_modes.insert(uv);
         boundary_modes.insert(boundary);
@@ -844,12 +1256,34 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         {
             crease_values.insert((number(&crease[2])? * 100.0).round() as i64);
         }
+        for face in case["expected"]["faces"]
+            .as_array()
+            .ok_or("oracle expected faces missing")?
+        {
+            material_indices.insert(
+                face["material"]
+                    .as_u64()
+                    .ok_or("oracle material index missing")?,
+            );
+        }
     }
     assert_eq!(levels, BTreeSet::from([0, 1, 2, 3, 4, 5]), "levels");
     assert_eq!(
         qualities,
         BTreeSet::from([1, 2, 3, 4, 5, 6, 10]),
         "qualities"
+    );
+    assert_eq!(
+        default_uv_levels,
+        BTreeSet::from([4, 5]),
+        "default UV interpolation must cover levels 4 and 5"
+    );
+    let expected_quad_pairs: BTreeSet<(u64, u64)> = (1_u64..=5)
+        .flat_map(|level| (1_u64..=6).map(move |quality| (level, quality)))
+        .collect();
+    assert_eq!(
+        quad_level_quality_pairs, expected_quad_pairs,
+        "every quality 1–6 must cover every quad output level 1–5"
     );
     let all_uv_modes = [
         "NONE",
@@ -859,6 +1293,16 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         "PRESERVE_BOUNDARIES",
         "SMOOTH_ALL",
     ];
+    let mut expected_uv_mesh_pairs = BTreeSet::new();
+    for mesh_name in ["cube", "curved_grid", "ngon", "nonmanifold", "mixed"] {
+        for &mode in &all_uv_modes {
+            expected_uv_mesh_pairs.insert((mesh_name.to_owned(), mode.to_owned()));
+        }
+    }
+    assert_eq!(
+        uv_mesh_pairs, expected_uv_mesh_pairs,
+        "all six UV modes must cover extraordinary, grid, n-gon, non-manifold, and mixed topology"
+    );
     assert_eq!(
         uv_modes,
         all_uv_modes.iter().map(|mode| (*mode).to_owned()).collect(),
@@ -896,8 +1340,82 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
     );
     assert_eq!(
         crease_values,
-        BTreeSet::from([10, 25, 30, 50, 60, 75, 80, 90, 100]),
+        BTreeSet::from([10, 20, 25, 30, 50, 60, 75, 80, 90, 100]),
         "crease input values"
+    );
+    assert_eq!(
+        material_indices,
+        BTreeSet::from([0, 1, 2]),
+        "multiple material indices must be exercised"
+    );
+    let pinned_case = cases
+        .iter()
+        .find(|case| case["name"] == "level_1_quality_1")
+        .ok_or("pinned quad case missing")?;
+    let input_ramp = meshes["quad"]["vertex_groups"]["Ramp"]
+        .as_array()
+        .ok_or("quad Ramp input weights missing")?;
+    assert_eq!(input_ramp.len(), 4, "Ramp must vary over every quad corner");
+    let distinct_input_weights: BTreeSet<i64> = input_ramp
+        .iter()
+        .map(|weight| Ok((number(weight)? * 1000.0).round() as i64))
+        .collect::<TestResult<_>>()?;
+    assert_eq!(
+        distinct_input_weights.len(),
+        4,
+        "input vertex-group ramp must vary"
+    );
+    let output_ramp = pinned_case["expected"]["vertex_groups"]["Ramp"]
+        .as_array()
+        .ok_or("Blender Subsurf Ramp output missing")?;
+    assert_eq!(
+        output_ramp.len(),
+        9,
+        "level-one quad must carry nine group weights"
+    );
+    let distinct_weights: BTreeSet<i64> = output_ramp
+        .iter()
+        .map(|weight| Ok((number(weight)? * 1000.0).round() as i64))
+        .collect::<TestResult<_>>()?;
+    assert!(
+        distinct_weights.len() >= 5,
+        "Blender Subsurf must interpolate the non-uniform vertex-group ramp"
+    );
+    let expected = &pinned_case["expected"];
+    let positions = expected["vertices"]
+        .as_array()
+        .ok_or("pinned quad output positions missing")?;
+    let mut pin_count = 0;
+    let mut pinned_pairs = BTreeSet::new();
+    for face in expected["faces"]
+        .as_array()
+        .ok_or("pinned quad output faces missing")?
+    {
+        let vertices = indices(&face["v"])?;
+        let uvs = face["uvs"]["UVMap"]
+            .as_array()
+            .ok_or("pinned quad UV output missing")?;
+        let pins = face["uv_pins"]["UVMap"]
+            .as_array()
+            .ok_or("pinned quad pin output missing")?;
+        for ((vertex, uv), pin) in vertices.iter().zip(uvs).zip(pins) {
+            if pin.as_bool() == Some(true) {
+                pin_count += 1;
+                pinned_pairs.insert(serde_json::to_string(&(
+                    positions[*vertex].clone(),
+                    uv.clone(),
+                ))?);
+            }
+        }
+    }
+    assert_eq!(
+        pin_count, 9,
+        "Blender Subsurf must propagate the pinned corner to nine loops"
+    );
+    assert_eq!(
+        pinned_pairs.len(),
+        4,
+        "pinned output must preserve four unique position/UV pairs"
     );
     assert_eq!(
         crease_dependent_uv_modes,
@@ -923,9 +1441,40 @@ fn assert_matrix_coverage(cases: &[Value], meshes: &Map<String, Value>) -> TestR
         "dependent_uv_plus2",
         "loose",
         "curved_grid",
+        "l_sharp_plane",
+        "plane_crease",
+        "plane_border_crease",
+        "cube_crease_0_2",
+        "quad_all_crease",
+        "loose_corner",
+        "uv_group",
+        "cube_rotated_storage",
+        "ngon_rotated_storage",
+        "mixed_rotated_storage",
+        "vertex_crease_grid",
+        "vertex_crease_cube",
     ] {
         assert!(used_meshes.contains(mesh), "{mesh} must be in the corpus");
     }
+    for mesh in [
+        "cube_rotated_storage",
+        "ngon_rotated_storage",
+        "mixed_rotated_storage",
+    ] {
+        assert_eq!(
+            meshes[mesh]["rotated_storage"],
+            json!(true),
+            "{mesh} must store rotated corners"
+        );
+    }
+    let sharp_inputs = meshes["l_sharp_plane"]["sharp_edges"]
+        .as_array()
+        .ok_or("L-crease sharp edges missing")?;
+    assert_eq!(
+        sharp_inputs.len(),
+        2,
+        "the L-shaped crease needs two sharp edges"
+    );
     for mesh in ["curved_grid", "cube", "ngon", "nonmanifold", "mixed"] {
         let seams = meshes[mesh]["seams"]
             .as_array()

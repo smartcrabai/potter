@@ -4,7 +4,7 @@
 
 //! Gregory endcap control points for a leaf quad, built from the level's vertices. Each row is a
 //! sparse combination of level vertices. A corner's ring is either closed (interior) or an open span
-//! bounded by singular edges (boundaries and infinitely sharp creases), following OpenSubdiv's
+//! bounded by singular edges (boundaries and infinitely sharp creases), following `OpenSubdiv`'s
 //! corner spans.
 
 use std::f64::consts::PI;
@@ -19,10 +19,10 @@ pub(super) fn is_singular_edge(level: &Level, edge: usize) -> bool {
 }
 
 /// The faces around a leaf corner that form its span, in order from the face at the corner's
-/// outgoing side to the face at its incoming side. `face_in_span` is the leaf's index among them.
+/// outgoing side to the face at its incoming side. `leaf_index` is the leaf's index among them.
 pub(super) struct Span {
     pub(super) faces: Vec<usize>,
-    pub(super) face_in_span: usize,
+    pub(super) leaf_index: usize,
     /// The span is bounded by singular edges (a boundary or sharp crease), not closed.
     pub(super) open: bool,
 }
@@ -61,7 +61,7 @@ fn walk(level: &Level, face: usize, vertex: usize, start_edge: usize) -> (Vec<us
     }
 }
 
-/// The span of `face` at `vertex` (OpenSubdiv `identifyManifoldCornerSpan`).
+/// The span of `face` at `vertex` (`OpenSubdiv` `identifyManifoldCornerSpan`).
 pub(super) fn corner_span(level: &Level, face: usize, vertex: usize) -> Span {
     let corner = level.corner_of(face, vertex);
     let n = level.faces[face].len();
@@ -73,7 +73,7 @@ pub(super) fn corner_span(level: &Level, face: usize, vertex: usize) -> Span {
         faces.extend(toward_incoming);
         return Span {
             faces,
-            face_in_span: 0,
+            leaf_index: 0,
             open: false,
         };
     }
@@ -84,7 +84,7 @@ pub(super) fn corner_span(level: &Level, face: usize, vertex: usize) -> Span {
     faces.extend(toward_incoming);
     Span {
         faces,
-        face_in_span,
+        leaf_index: face_in_span,
         open: true,
     }
 }
@@ -109,7 +109,7 @@ pub(super) struct Corner {
     pub(super) cos_face_angle: f64,
 }
 
-/// Builds the endcap description of the leaf's corner `vertex` (OpenSubdiv
+/// Builds the endcap description of the leaf's corner `vertex` (`OpenSubdiv`
 /// `assembleIrregularSourcePatch` and `GetIrregularPatchCornerSpans`).
 pub(super) fn leaf_corner(level: &Level, face: usize, vertex: usize) -> Corner {
     let tag = level.vtags[vertex];
@@ -120,7 +120,7 @@ pub(super) fn leaf_corner(level: &Level, face: usize, vertex: usize) -> Corner {
     let test_inf_sharp_edges = tag.inf_sharp_edges && tag.rule != RULE_DART;
     let (num_faces, face_in_ring, boundary, span_faces) =
         if test_inf_sharp_edges || tag.non_manifold {
-            (k, span.face_in_span, span.open, span.faces.clone())
+            (k, span.leaf_index, span.open, span.faces.clone())
         } else {
             let ring = fan(level, face, vertex);
             let index = ring.iter().position(|&f| f == face).unwrap_or(0);
@@ -161,7 +161,7 @@ pub(super) fn leaf_corner(level: &Level, face: usize, vertex: usize) -> Corner {
     }
 }
 
-/// Face-varying corner endcap. OpenSubdiv's non-manifold span walk uses the face-edge index after
+/// Face-varying corner endcap. `OpenSubdiv`'s non-manifold span walk uses the face-edge index after
 /// crossing an edge, which is observably different from a manifold fan walk on inconsistent winding.
 pub(super) fn leaf_corner_fvar(level: &Level, face: usize, vertex: usize) -> Corner {
     if !level.vtags[vertex].non_manifold {
@@ -196,14 +196,18 @@ pub(super) fn leaf_corner_fvar(level: &Level, face: usize, vertex: usize) -> Cor
 
 struct NonManifoldSpan {
     faces: Vec<usize>,
-    /// The local face-edge indices used by OpenSubdiv's non-manifold ring traversal.
+    /// The local face-edge indices used by `OpenSubdiv`'s non-manifold ring traversal.
     corners: Vec<usize>,
     face_in_span: usize,
     open: bool,
 }
 
-/// OpenSubdiv's `identifyNonManifoldCornerSpan`, including its edge-index traversal for winding
+/// `OpenSubdiv`'s `identifyNonManifoldCornerSpan`, including its edge-index traversal for winding
 /// configurations that cannot use the manifold vertex-face ordering.
+#[expect(
+    clippy::unwrap_used,
+    reason = "a non-manifold corner span walks a face that has at least one corner"
+)]
 fn non_manifold_corner_span(level: &Level, face: usize, vertex: usize) -> NonManifoldSpan {
     let corner = level.corner_of(face, vertex);
     let n = level.faces[face].len();
@@ -389,7 +393,7 @@ fn weighted_row(corner: &Corner, weights: &[f64]) -> Row {
 }
 
 /// Control points of a Gregory patch: `[P_c, ep_c, em_c, fp_c, fm_c]` for each corner `c` at index
-/// `5 * c + k`, following OpenSubdiv's `GregoryConverter::Convert`.
+/// `5 * c + k`, following `OpenSubdiv`'s `GregoryConverter::Convert`.
 pub(super) fn control_points(corners: &[Corner; 4]) -> [Row; 20] {
     let edge_points: Vec<(Row, Row, Row)> = (0..4).map(|c| edge_points(corners, c)).collect();
     let mut out: [Row; 20] = std::array::from_fn(|_| Vec::new());
@@ -435,9 +439,9 @@ pub(super) fn control_points(corners: &[Corner; 4]) -> [Row; 20] {
         let fp = if fp_copied { fm.clone() } else { fp };
         let fm = if fm_copied { fp.clone() } else { fm };
         let (p, ep, em) = &edge_points[c];
-        out[5 * c] = p.clone();
-        out[5 * c + 1] = ep.clone();
-        out[5 * c + 2] = em.clone();
+        out[5 * c].clone_from(p);
+        out[5 * c + 1].clone_from(ep);
+        out[5 * c + 2].clone_from(em);
         out[5 * c + 3] = fp;
         out[5 * c + 4] = fm;
     }
@@ -478,7 +482,7 @@ fn edge_points(corners: &[Corner; 4], c: usize) -> (Row, Row, Row) {
     }
 }
 
-/// Regular interior corner (OpenSubdiv `assignRegularEdgePoints`, interior branch).
+/// Regular interior corner (`OpenSubdiv` `assignRegularEdgePoints`, interior branch).
 fn regular_interior_edge_points(corner: &Corner) -> (Row, Row, Row) {
     let r = &corner.ring;
     let p_c = corner.point;
@@ -512,7 +516,7 @@ fn regular_interior_edge_points(corner: &Corner) -> (Row, Row, Row) {
     (p, ep, em)
 }
 
-/// Regular boundary corner (two faces; OpenSubdiv `assignRegularEdgePoints`, boundary branch).
+/// Regular boundary corner (two faces; `OpenSubdiv` `assignRegularEdgePoints`, boundary branch).
 fn regular_boundary_edge_points(corner: &Corner) -> (Row, Row, Row) {
     let r = &corner.ring;
     let p_c = corner.point;
@@ -537,7 +541,7 @@ fn regular_boundary_edge_points(corner: &Corner) -> (Row, Row, Row) {
     }
 }
 
-/// Irregular interior corner (OpenSubdiv `ComputeInteriorPointWeights`), with the leaf at ring index
+/// Irregular interior corner (`OpenSubdiv` `ComputeInteriorPointWeights`), with the leaf at ring index
 /// `face_in_ring`.
 fn irregular_interior_edge_points(corner: &Corner) -> (Row, Row, Row) {
     let n = corner.valence;
@@ -583,7 +587,7 @@ fn irregular_interior_edge_points(corner: &Corner) -> (Row, Row, Row) {
     )
 }
 
-/// Irregular boundary corner (OpenSubdiv `ComputeBoundaryPointWeights`).
+/// Irregular boundary corner (`OpenSubdiv` `ComputeBoundaryPointWeights`).
 fn irregular_boundary_edge_points(corner: &Corner) -> (Row, Row, Row) {
     let (p_w, ep_w, em_w) = boundary_point_weights(corner.valence, corner.face_in_ring);
     (
@@ -660,7 +664,7 @@ fn boundary_point_weights(valence: usize, face_in_ring: usize) -> (Vec<f64>, Vec
     (p, ep, em)
 }
 
-/// Regular face point (OpenSubdiv `assignRegularFacePoints`).
+/// Regular face point (`OpenSubdiv` `assignRegularFacePoints`).
 fn regular_face_point(corners: &[Corner; 4], c: usize) -> Row {
     row(&[
         (corners[c].point, 4.0 / 9.0),
@@ -670,7 +674,7 @@ fn regular_face_point(corners: &[Corner; 4], c: usize) -> Row {
     ])
 }
 
-/// Irregular face point (OpenSubdiv `computeIrregularFacePoint`): the face beside corner `c` toward
+/// Irregular face point (`OpenSubdiv` `computeIrregularFacePoint`): the face beside corner `c` toward
 /// `far`, shifted by the ring corrections of the spokes around the near corner.
 fn irregular_face_point(
     corners: &[Corner; 4],

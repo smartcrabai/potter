@@ -4,7 +4,8 @@
 // Portions derived from Blender (https://www.blender.org) source/blender/blenkernel/intern/subdiv_eval.cc, GPL-2.0-or-later.
 
 //! Blender's limit-surface evaluation: sparse adaptive refinement to the isolation depth, then a
-//! patch per leaf quad (B-spline or Gregory), evaluated at ptex samples.
+//! patch per leaf quad (B-spline or Gregory), evaluated at ptex samples. Without `use_limit_surface`
+//! Blender outputs the uniformly refined control points instead (`UniformPoints`).
 
 mod face_varying;
 mod gregory;
@@ -15,21 +16,22 @@ mod refine;
 use std::collections::BTreeMap;
 
 use crate::error::{ErrorCode, PotError, Result};
+
 use glam::{DVec2, DVec3};
 
 use self::{
-    gregory::{control_points, corner_span, is_singular_edge, leaf_corner, leaf_corner_fvar},
-    level::{Level, SHARPNESS_INFINITE, VTag},
-    patch::{
-        Row, boundary_mask, bspline_weights, bspline_weights_and_derivatives, gregory_weights,
-        gregory_weights_and_derivatives, is_regular_leaf, regular_grid,
+    gregory::{leaf_corner, leaf_corner_fvar},
+    level::{Level, SHARPNESS_INFINITE},
+    patch::{CornerBuilder, Patch},
+    refine::{
+        Children, Point, Refined, refine, refine_values, refine_values_adaptive, select_features,
     },
-    refine::{Point, Refined, refine, refine_values, refine_values_adaptive, select_features},
 };
+use super::Polygon;
 use super::subdivision_uv::{FvarLinear, ValueMap};
 
 /// A grid sample: the base face, the ptex sub-face (corner index of an n-gon, 0 for a quad), and the
-/// ptex coordinates within it.
+/// ptex coordinates within it. Samples are in the canonical corner order of their base face.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Sample {
     pub(super) face: usize,
@@ -38,7 +40,27 @@ pub(super) struct Sample {
     pub(super) v: f64,
 }
 
-/// Refined levels of one mesh, with the selection that produced each level from the previous one.
+impl Sample {
+    /// The sample in Blender's loop frame, where the face's first loop is at corner `start`: canonical
+    /// corner `k` is ptex corner `(k - start) mod size`. `size` is the corner count of the base face.
+    pub(super) fn in_loop_frame(self, start: usize, size: usize) -> Sample {
+        if size == 4 {
+            // One quarter turn maps corner `k` of the unit square to corner `k - 1`.
+            let (mut u, mut v) = (self.u, self.v);
+            for _ in 0..start % 4 {
+                (u, v) = (v, 1.0 - u);
+            }
+            Sample { u, v, ..self }
+        } else {
+            Sample {
+                ptex: (self.ptex + size - start % size) % size,
+                ..self
+            }
+        }
+    }
+}
+
+/// The refined levels of one mesh, with the selection that produced each level from the previous one.
 pub(super) struct LimitSurface {
     levels: Vec<Refined<DVec3>>,
     /// `selected[l][f]`: face `f` of level `l` was split into level `l + 1`.
@@ -50,24 +72,17 @@ pub(super) struct LimitSurface {
     has_irregular_faces: bool,
 }
 
-#[derive(Clone, Copy)]
-struct LocatedSample {
-    level: usize,
-    face: usize,
-    s: f64,
-    t: f64,
-    /// Rows are leaf s/t; columns are ptex u/v.
-    jacobian: [[f64; 2]; 2],
-}
-
 /// The base-mesh sharpness that a limit surface is built with.
 pub(super) enum BaseSharpness<'a> {
-    /// Blender's edge creases (`10 c^2`), with the non-manifold edges already infinitely sharp.
-    /// `preserve_corners` sharpens single-face boundary corners; `non_manifold[v]` marks the
-    /// vertices that are infinitely sharp corners because of non-manifold topology.
+    /// Blender's creases, already converted to sharpness (`10 c^2`). `edges` maps sorted endpoints to
+    /// edge sharpness and `vertices[v]` is the sharpness of vertex `v`. Vertices on a loose edge are
+    /// infinitely sharp. `non_manifold[v]` marks the vertices that are infinitely sharp corners because
+    /// of non-manifold topology. `preserve_corners` sharpens single-face boundary corners.
     Creases {
         edges: &'a BTreeMap<(usize, usize), f64>,
+        vertices: &'a [f64],
         non_manifold: &'a [bool],
+        loose_edges: &'a [[usize; 2]],
         preserve_corners: bool,
     },
     /// SIMPLE subdivision. Blender refines it as Catmull-Clark with every edge and every vertex
@@ -75,41 +90,118 @@ pub(super) enum BaseSharpness<'a> {
     Simple,
 }
 
-/// Builds the adaptive refinement to the isolation depth (Blender's quality). Without
-/// `use_limit_surface` Blender outputs the refined control positions, so this is not used there.
+/// The base level of a mesh: its topology with the sharpness and tags of `sharpness`, and the points.
+fn base_level(polygons: &[Polygon], points: &[DVec3], sharpness: &BaseSharpness) -> Refined<DVec3> {
+    let faces = polygons.iter().map(|(face, _)| face.clone()).collect();
+    let mut level = Level::from_faces(faces, points.len());
+    let no_non_manifold = vec![false; points.len()];
+    let (preserve_corners, non_manifold) = match sharpness {
+        BaseSharpness::Creases {
+            edges,
+            vertices,
+            non_manifold,
+            loose_edges,
+            preserve_corners,
+        } => {
+            for edge in 0..level.edge_count() {
+                let [a, b] = level.edges[edge];
+                level.edge_sharpness[edge] = edges.get(&(a, b)).copied().unwrap_or(0.0);
+            }
+            level.vertex_sharpness.clone_from_slice(vertices);
+            // Blender's `assignComponentTags` (intern/opensubdiv/internal/topology/
+            // topology_refiner_factory.cc:238-244): a vertex with two edges adds the smaller of their
+            // sharpnesses to its own (`crease_vert`), clamped to 10. It reads the edge sharpness set
+            // from `crease_edge` before `derive_base_tags` makes boundary edges infinite.
+            for (vertex, edges_at) in level.vertex_edges.iter().enumerate() {
+                if let &[a, b] = edges_at.as_slice() {
+                    let crease = level.edge_sharpness[a].min(level.edge_sharpness[b]);
+                    level.vertex_sharpness[vertex] =
+                        (level.vertex_sharpness[vertex] + crease).min(SHARPNESS_INFINITE);
+                }
+            }
+            // Endpoints of loose edges are infinitely sharp (subdiv_converter_mesh.cc:346-353 sets
+            // `infinite_sharp_vertices_map`; topology_refiner_factory.cc:221-225 applies it).
+            for &[a, b] in *loose_edges {
+                level.vertex_sharpness[a] = SHARPNESS_INFINITE;
+                level.vertex_sharpness[b] = SHARPNESS_INFINITE;
+            }
+            (*preserve_corners, *non_manifold)
+        }
+        BaseSharpness::Simple => {
+            level.edge_sharpness.fill(SHARPNESS_INFINITE);
+            level.vertex_sharpness.fill(SHARPNESS_INFINITE);
+            (false, no_non_manifold.as_slice())
+        }
+    };
+    level.derive_base_tags(preserve_corners, non_manifold);
+    Refined {
+        level,
+        positions: points.to_vec(),
+        face_children: Vec::new(),
+        dependent_source: Vec::new(),
+        children: Children::default(),
+    }
+}
+
+/// One uniform Catmull-Clark step of a base mesh (`use_limit_surface` off, or without the limit
+/// surface's levels). The result is in the caller's numbering, so the caller can build the next step
+/// from its own topology.
+pub(super) struct UniformPoints {
+    /// The child vertex of each input point on some face; a point on no face keeps its position.
+    pub(super) vertices: Vec<DVec3>,
+    /// The child vertex at the midpoint of each face edge, keyed by its sorted endpoints.
+    pub(super) edges: BTreeMap<(usize, usize), DVec3>,
+    /// The child vertex at the center of each face.
+    pub(super) faces: Vec<DVec3>,
+}
+
+/// Refines every face of the base mesh once, with the masks of the refinement levels.
+pub(super) fn uniform_points(
+    polygons: &[Polygon],
+    points: &[DVec3],
+    sharpness: &BaseSharpness,
+) -> UniformPoints {
+    let base = base_level(polygons, points, sharpness);
+    let selected = vec![true; polygons.len()];
+    let child = refine(&base.level, &base.positions, &selected, 0);
+    let vertices = points
+        .iter()
+        .enumerate()
+        .map(|(vertex, &point)| {
+            child.children.vertex[vertex].map_or(point, |index| child.positions[index])
+        })
+        .collect();
+    let edges = base
+        .level
+        .edges
+        .iter()
+        .enumerate()
+        .filter_map(|(edge, &[a, b])| {
+            child.children.edge[edge].map(|index| (edge_key(a, b), child.positions[index]))
+        })
+        .collect();
+    let faces = child
+        .children
+        .face
+        .iter()
+        .filter_map(|index| index.map(|index| child.positions[index]))
+        .collect();
+    UniformPoints {
+        vertices,
+        edges,
+        faces,
+    }
+}
+
 impl LimitSurface {
-    /// Builds the refined levels for the base mesh with its sharpness and boundary/corner options.
+    /// Builds the refined levels of a base mesh to the isolation depth (Blender's quality).
     pub(super) fn build(
-        faces: &[Vec<usize>],
+        polygons: &[Polygon],
         points: &[DVec3],
-        sharpness: BaseSharpness,
+        sharpness: &BaseSharpness,
         isolation: usize,
     ) -> LimitSurface {
-        let mut base = Level::from_faces(faces.to_vec(), points.len());
-        let (preserve_corners, non_manifold) = match sharpness {
-            BaseSharpness::Creases {
-                edges,
-                non_manifold,
-                preserve_corners,
-            } => {
-                for (edge, [a, b]) in base.edges.clone().into_iter().enumerate() {
-                    base.edge_sharpness[edge] = edges.get(&(a, b)).copied().unwrap_or(0.0);
-                }
-                (preserve_corners, non_manifold.to_vec())
-            }
-            BaseSharpness::Simple => {
-                base.edge_sharpness.fill(SHARPNESS_INFINITE);
-                base.vertex_sharpness.fill(SHARPNESS_INFINITE);
-                (false, vec![false; points.len()])
-            }
-        };
-        base.derive_base_tags(preserve_corners, &non_manifold);
-        let mut levels = vec![Refined {
-            level: base,
-            positions: points.to_vec(),
-            face_children: Vec::new(),
-            dependent_source: Vec::new(),
-        }];
+        let mut levels = vec![base_level(polygons, points, sharpness)];
         let mut selected = Vec::new();
         for l in 0..isolation {
             let selection = select_features(&levels[l].level, l);
@@ -120,7 +212,7 @@ impl LimitSurface {
             selected.push(selection);
             levels.push(next);
         }
-        let ngon_root: Vec<bool> = faces.iter().map(|face| face.len() != 4).collect();
+        let ngon_root: Vec<bool> = polygons.iter().map(|(face, _)| face.len() != 4).collect();
         let has_irregular_faces = ngon_root.iter().any(|&irregular| irregular);
         LimitSurface {
             levels,
@@ -131,24 +223,31 @@ impl LimitSurface {
         }
     }
 
-    /// Evaluates the limit at a sample (Blender's `evaluateLimit`): the leaf that holds the sample,
-    /// evaluated at its local coordinates.
-    pub(super) fn evaluate(&self, sample: Sample) -> DVec3 {
-        let located = self.locate(sample, false);
-        let refined = &self.levels[located.level];
-        leaf_point(
-            &refined.level,
-            &refined.positions,
-            located.face,
-            located.level,
-            self.has_irregular_faces,
-            located.s,
-            located.t,
-        )
+    /// The limit point of each sample (Blender's `evaluateLimit`): the leaf that holds the sample,
+    /// evaluated at its local coordinates. A `None` sample stays `None`.
+    pub(super) fn evaluate(&self, samples: &[Option<Sample>]) -> Vec<Option<DVec3>> {
+        let mut slots = Vec::new();
+        let mut leaves = Vec::new();
+        for (slot, sample) in samples.iter().enumerate() {
+            if let Some(sample) = *sample {
+                slots.push(slot);
+                leaves.push(locate(
+                    &self.ngon_root,
+                    &self.levels,
+                    &self.selected,
+                    sample,
+                ));
+            }
+        }
+        let values = evaluate_leaves(&self.levels, &leaves, self.has_irregular_faces, leaf_corner);
+        let mut out = vec![None; samples.len()];
+        for (slot, value) in slots.into_iter().zip(values) {
+            out[slot] = Some(value);
+        }
+        out
     }
 
-    /// Evaluates the limit point and its object-space derivatives with respect to the sample's
-    /// ptex-local `u` and `v`, using OpenSubdiv's patch basis derivative rules.
+    /// Evaluates the limit point and its object-space derivatives with respect to ptex-local `u` and `v`.
     pub(super) fn point_and_derivatives(&self, sample: Sample) -> Result<(DVec3, DVec3, DVec3)> {
         let Some(&is_ngon) = self.ngon_root.get(sample.face) else {
             return Err(PotError::new(
@@ -169,18 +268,18 @@ impl LimitSurface {
                 "subdivision sample has invalid ptex coordinates",
             ));
         }
-        let located = self.locate(sample, true);
+        let (located, jacobian) =
+            locate_with_jacobian(&self.ngon_root, &self.levels, &self.selected, sample);
         let refined = &self.levels[located.level];
-        let (point, ds, dt) = leaf_point_and_derivatives(
+        let patch = Patch::new(
             &refined.level,
-            &refined.positions,
             located.face,
             located.level,
             self.has_irregular_faces,
-            located.s,
-            located.t,
+            leaf_corner,
         );
-        let jacobian = located.jacobian;
+        let (point, ds, dt) =
+            patch.evaluate_and_derivatives(&refined.positions, located.s, located.t);
         Ok((
             point,
             ds * jacobian[0][0] + dt * jacobian[1][0],
@@ -198,6 +297,33 @@ impl LimitSurface {
         map: &ValueMap,
         samples: &Samples,
     ) -> Vec<DVec2> {
+        let (levels, selected) = self.face_varying_levels(linear, preserve_corners, map);
+        let leaves: Vec<Leaf> = samples
+            .corners
+            .iter()
+            .flatten()
+            .map(|&sample| locate(&self.ngon_root, &levels, &selected, sample))
+            .collect();
+        if linear == FvarLinear::All {
+            leaves
+                .iter()
+                .map(|leaf| {
+                    let values = &levels[leaf.level];
+                    bilinear(&values.level, &values.positions, leaf.face, leaf.s, leaf.t)
+                })
+                .collect()
+        } else {
+            evaluate_leaves(&levels, &leaves, self.has_irregular_faces, leaf_corner_fvar)
+        }
+    }
+
+    /// The face-varying levels of a UV layer, and for each level the faces split into the next one.
+    fn face_varying_levels(
+        &self,
+        linear: FvarLinear,
+        preserve_corners: bool,
+        map: &ValueMap,
+    ) -> (Vec<Refined<DVec2>>, Vec<Vec<bool>>) {
         let mut levels = vec![face_varying::base(
             &self.levels[0].level,
             linear,
@@ -226,48 +352,57 @@ impl LimitSurface {
                 levels.push(child);
             }
         } else {
+            // Each value face's position face, through the parent/child links of both refinements.
+            let mut positions: Vec<Option<usize>> =
+                (0..levels[0].level.faces.len()).map(Some).collect();
             for depth in 0..self.isolation {
-                let parent = levels.last().expect("base fvar level exists");
-                let position_selected = self
-                    .selected
-                    .get(depth)
-                    .map_or(&[][..], |selection| selection.as_slice());
+                let parent = &levels[depth];
+                let extra: Vec<bool> = positions
+                    .iter()
+                    .map(|position| match (position, self.selected.get(depth)) {
+                        (Some(position), Some(selection)) => selection[*position],
+                        _ => false,
+                    })
+                    .collect();
                 let Some((selection, child)) = refine_values_adaptive(
                     &parent.level,
                     &parent.positions,
                     depth,
                     false,
                     &parent.dependent_source,
-                    position_selected,
+                    &extra,
                 ) else {
                     break;
                 };
+                positions = self.position_links(&child, &positions, depth);
                 selected.push(selection);
                 levels.push(child);
             }
         }
-        samples
-            .corners
-            .iter()
-            .flatten()
-            .map(|&sample| {
-                let (level, face, s, t) = self.locate_fvar(sample, &levels, &selected);
-                let values = &levels[level];
-                if linear == FvarLinear::All {
-                    bilinear(&values.level, &values.positions, face, s, t)
-                } else {
-                    leaf_fvar_point(
-                        &values.level,
-                        &values.positions,
-                        face,
-                        level,
-                        self.has_irregular_faces,
-                        s,
-                        t,
-                    )
+        (levels, selected)
+    }
+
+    /// The position face that each face of a value child covers at level `depth + 1`: the position child
+    /// at the same corner of its value parent's position face, when the position refinement has it.
+    fn position_links(
+        &self,
+        child: &Refined<DVec2>,
+        parent: &[Option<usize>],
+        depth: usize,
+    ) -> Vec<Option<usize>> {
+        debug_assert_eq!(parent.len(), child.face_children.len());
+        let position_level = self.levels.get(depth + 1);
+        let mut links = vec![None; child.level.faces.len()];
+        for (value_parent, children) in child.face_children.iter().enumerate() {
+            for (corner, &value_child) in children.iter().enumerate() {
+                if let Some(value_child) = value_child {
+                    links[value_child] = parent[value_parent].and_then(|position| {
+                        position_level.and_then(|level| level.face_children[position][corner])
+                    });
                 }
-            })
-            .collect()
+            }
+        }
+        links
     }
 
     /// The UV layer's value at every output loop when `use_limit_surface` is off: the layer is refined
@@ -306,87 +441,92 @@ impl LimitSurface {
             .map(|&value| current.positions[value])
             .collect()
     }
-
-    /// The leaf that holds `sample` (Blender's quadtree lookup): its level and face, and the sample's
-    /// local coordinates and ptex-to-leaf Jacobian.
-    fn locate(&self, sample: Sample, track_jacobian: bool) -> LocatedSample {
-        let (mut level, mut face, mut s, mut t) = if self.ngon_root[sample.face] {
-            let child = self.levels[1].face_children[sample.face][sample.ptex]
-                .expect("n-gon sub-faces are refined at the first level");
-            (1, child, sample.u, sample.v)
-        } else {
-            (0, sample.face, sample.u, sample.v)
-        };
-        let mut jacobian = [[1.0, 0.0], [0.0, 1.0]];
-        while level + 1 < self.levels.len() && self.selected[level][face] {
-            let quadrant = match (s >= 0.5, t >= 0.5) {
-                (false, false) => 0,
-                (true, false) => 1,
-                (true, true) => 2,
-                (false, true) => 3,
-            };
-            let child = self.levels[level + 1].face_children[face][quadrant]
-                .expect("a selected face has all of its child quads");
-            let (child_s, child_t, child_jacobian) = child_coordinates(quadrant, s, t);
-            if track_jacobian {
-                jacobian = compose_jacobian(child_jacobian, jacobian);
-            }
-            (s, t) = (child_s, child_t);
-            face = child;
-            level += 1;
-        }
-        LocatedSample {
-            level,
-            face,
-            s,
-            t,
-            jacobian,
-        }
-    }
-
-    /// The leaf holding a sample in a channel's fvar-specific isolation tree.
-    fn locate_fvar(
-        &self,
-        sample: Sample,
-        levels: &[Refined<DVec2>],
-        selected: &[Vec<bool>],
-    ) -> (usize, usize, f64, f64) {
-        let (mut level, mut face, mut s, mut t) = if self.ngon_root[sample.face] {
-            let child = levels[1].face_children[sample.face][sample.ptex]
-                .expect("n-gon fvar sub-faces are refined at the first level");
-            (1, child, sample.u, sample.v)
-        } else {
-            (0, sample.face, sample.u, sample.v)
-        };
-        while level + 1 < levels.len() && selected[level][face] {
-            let quadrant = match (s >= 0.5, t >= 0.5) {
-                (false, false) => 0,
-                (true, false) => 1,
-                (true, true) => 2,
-                (false, true) => 3,
-            };
-            let child = levels[level + 1].face_children[face][quadrant]
-                .expect("a selected fvar face has all child quads");
-            (s, t, _) = child_coordinates(quadrant, s, t);
-            face = child;
-            level += 1;
-        }
-        (level, face, s, t)
-    }
 }
 
-/// Local coordinates and their Jacobian in child quad `quadrant` of its parent, in the child's own
-/// frame (whose corner 0 is the parent's corner `quadrant`).
-fn child_coordinates(quadrant: usize, s: f64, t: f64) -> (f64, f64, [[f64; 2]; 2]) {
+/// A sample's leaf: the level and face that hold it, and its local coordinates in that face.
+#[derive(Clone, Copy)]
+struct Leaf {
+    level: usize,
+    face: usize,
+    s: f64,
+    t: f64,
+}
+
+fn locate<T>(
+    ngon_root: &[bool],
+    levels: &[Refined<T>],
+    selected: &[Vec<bool>],
+    sample: Sample,
+) -> Leaf {
+    locate_inner::<T, false>(ngon_root, levels, selected, sample).0
+}
+
+fn locate_with_jacobian<T>(
+    ngon_root: &[bool],
+    levels: &[Refined<T>],
+    selected: &[Vec<bool>],
+    sample: Sample,
+) -> (Leaf, [[f64; 2]; 2]) {
+    locate_inner::<T, true>(ngon_root, levels, selected, sample)
+}
+
+/// The leaf that holds `sample` (Blender's quadtree lookup) and its ptex-to-leaf Jacobian.
+#[expect(
+    clippy::expect_used,
+    reason = "a sampled n-gon sub-face is refined at the first level, and every selected leaf has child quads"
+)]
+fn locate_inner<T, const TRACK_JACOBIAN: bool>(
+    ngon_root: &[bool],
+    levels: &[Refined<T>],
+    selected: &[Vec<bool>],
+    sample: Sample,
+) -> (Leaf, [[f64; 2]; 2]) {
+    let (mut level, mut face, mut s, mut t) = if ngon_root[sample.face] {
+        let child = levels[1].face_children[sample.face][sample.ptex]
+            .expect("n-gon sub-faces are refined at the first level");
+        (1, child, sample.u, sample.v)
+    } else {
+        (0, sample.face, sample.u, sample.v)
+    };
+    let mut jacobian = [[1.0, 0.0], [0.0, 1.0]];
+    while level + 1 < levels.len() && selected[level][face] {
+        let quadrant = match (s >= 0.5, t >= 0.5) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, true) => 3,
+        };
+        let child = levels[level + 1].face_children[face][quadrant]
+            .expect("a selected face has all of its child quads");
+        if TRACK_JACOBIAN {
+            jacobian = compose_jacobian(child_coordinates_jacobian(quadrant), jacobian);
+        }
+        (s, t) = child_coordinates(quadrant, s, t);
+        face = child;
+        level += 1;
+    }
+    (Leaf { level, face, s, t }, jacobian)
+}
+/// Local coordinates of a point in child quad `quadrant` of its parent, in the child's own frame
+/// (whose corner 0 is the parent's corner `quadrant`).
+fn child_coordinates(quadrant: usize, s: f64, t: f64) -> (f64, f64) {
     match quadrant {
-        0 => (2.0 * s, 2.0 * t, [[2.0, 0.0], [0.0, 2.0]]),
-        1 => (2.0 * t, 2.0 - 2.0 * s, [[0.0, 2.0], [-2.0, 0.0]]),
-        2 => (2.0 - 2.0 * s, 2.0 - 2.0 * t, [[-2.0, 0.0], [0.0, -2.0]]),
-        _ => (2.0 - 2.0 * t, 2.0 * s, [[0.0, -2.0], [2.0, 0.0]]),
+        0 => (2.0 * s, 2.0 * t),
+        1 => (2.0 * t, 2.0 - 2.0 * s),
+        2 => (2.0 - 2.0 * s, 2.0 - 2.0 * t),
+        _ => (2.0 - 2.0 * t, 2.0 * s),
     }
 }
 
-/// Compose a child-local mapping with its parent's ptex-local mapping.
+fn child_coordinates_jacobian(quadrant: usize) -> [[f64; 2]; 2] {
+    match quadrant {
+        0 => [[2.0, 0.0], [0.0, 2.0]],
+        1 => [[0.0, 2.0], [-2.0, 0.0]],
+        2 => [[-2.0, 0.0], [0.0, -2.0]],
+        _ => [[0.0, -2.0], [2.0, 0.0]],
+    }
+}
+
 fn compose_jacobian(child: [[f64; 2]; 2], parent: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
     [
         [
@@ -400,175 +540,61 @@ fn compose_jacobian(child: [[f64; 2]; 2], parent: [[f64; 2]; 2]) -> [[f64; 2]; 2
     ]
 }
 
-/// Evaluates a leaf quad at local coordinates: a B-spline when the patch is regular, otherwise the
-/// Gregory endcap.
-fn leaf_point<T: Point>(
-    level: &Level,
-    positions: &[T],
-    face: usize,
-    depth: usize,
+/// The values at `leaves`, in their order. Leaves are visited grouped by level and face, so each
+/// leaf's patch is built once.
+fn evaluate_leaves<T: Point>(
+    levels: &[Refined<T>],
+    leaves: &[Leaf],
     has_irregular_faces: bool,
-    s: f64,
-    t: f64,
-) -> T {
-    if is_regular_leaf(level, face, depth, has_irregular_faces) {
-        let mask = boundary_mask(level, face);
-        let grid = regular_grid(level, face, mask);
-        let weights = bspline_weights(s, t, mask);
-        weighted_rows(&grid, &weights, positions)
-    } else {
-        let corners = std::array::from_fn(|c| leaf_corner(level, face, level.faces[face][c]));
-        let rows = control_points(&corners);
-        let weights = gregory_weights(s, t);
-        weighted_rows(&rows, &weights, positions)
+    corner: CornerBuilder,
+) -> Vec<T> {
+    let mut order: Vec<usize> = (0..leaves.len()).collect();
+    order.sort_unstable_by_key(|&index| (leaves[index].level, leaves[index].face));
+    let mut values = vec![T::default(); leaves.len()];
+    let mut built: Option<((usize, usize), Patch)> = None;
+    for index in order {
+        let leaf = leaves[index];
+        let key = (leaf.level, leaf.face);
+        let patch = match built.take() {
+            Some((built_key, patch)) if built_key == key => patch,
+            _ => Patch::new(
+                &levels[leaf.level].level,
+                leaf.face,
+                leaf.level,
+                has_irregular_faces,
+                corner,
+            ),
+        };
+        values[index] = patch.evaluate(&levels[leaf.level].positions, leaf.s, leaf.t);
+        built = Some((key, patch));
     }
+    values
 }
 
-/// Evaluates a position patch and OpenSubdiv's default (approximate Gregory) derivatives in local
-/// patch coordinates. The point-only path remains separate and does not compute unused derivatives.
-fn leaf_point_and_derivatives(
-    level: &Level,
-    positions: &[DVec3],
-    face: usize,
-    depth: usize,
-    has_irregular_faces: bool,
-    s: f64,
-    t: f64,
-) -> (DVec3, DVec3, DVec3) {
-    if is_regular_leaf(level, face, depth, has_irregular_faces) {
-        let mask = boundary_mask(level, face);
-        let grid = regular_grid(level, face, mask);
-        let (weights, ds, dt) = bspline_weights_and_derivatives(s, t, mask);
-        (
-            weighted_rows(&grid, &weights, positions),
-            weighted_rows(&grid, &ds, positions),
-            weighted_rows(&grid, &dt, positions),
-        )
-    } else {
-        let corners = std::array::from_fn(|c| leaf_corner(level, face, level.faces[face][c]));
-        let rows = control_points(&corners);
-        let (weights, ds, dt) = gregory_weights_and_derivatives(s, t);
-        (
-            weighted_rows(&rows, &weights, positions),
-            weighted_rows(&rows, &ds, positions),
-            weighted_rows(&rows, &dt, positions),
-        )
-    }
-}
-
-/// Face-varying endcaps use OpenSubdiv's non-manifold span walk; position endcaps keep the
-/// orientation-independent fan used by `leaf_point`.
-fn leaf_fvar_point<T: Point>(
-    level: &Level,
-    positions: &[T],
-    face: usize,
-    depth: usize,
-    has_irregular_faces: bool,
-    s: f64,
-    t: f64,
-) -> T {
-    if is_regular_fvar_leaf(level, face, depth, has_irregular_faces) {
-        let mask = boundary_mask(level, face);
-        let grid = regular_grid(level, face, mask);
-        let weights = bspline_weights(s, t, mask);
-        weighted_rows(&grid, &weights, positions)
-    } else {
-        let corners = std::array::from_fn(|c| leaf_corner_fvar(level, face, level.faces[face][c]));
-        let rows = control_points(&corners);
-        let weights = gregory_weights(s, t);
-        weighted_rows(&rows, &weights, positions)
-    }
-}
-
-/// OpenSubdiv's fvar `IsPatchRegular` adds a span test for non-manifold corners. The position
-/// classifier remains unchanged; this channel-specific variant permits a regular endcap when the
-/// non-manifold value's face span is regular.
-fn is_regular_fvar_leaf(
-    level: &Level,
-    face: usize,
-    depth: usize,
-    has_irregular_faces: bool,
-) -> bool {
-    let corners = &level.faces[face];
-    let tags: Vec<_> = corners.iter().map(|&vertex| level.vtags[vertex]).collect();
-    let combined = VTag::combine(&tags);
-    if !combined.inf_sharp && !combined.inf_sharp_edges {
-        return !combined.xordinary;
-    }
-    let irregular = combined.non_manifold || combined.xordinary || combined.inf_irregular;
-    if !irregular {
-        return true;
-    }
-    let needs_extra_level = combined.xordinary && has_irregular_faces;
-    if depth > usize::from(needs_extra_level) {
-        let requires_inspection = combined.non_manifold
-            || (combined.xordinary && combined.boundary)
-            || (combined.inf_irregular && combined.inf_sharp_edges);
-        if !requires_inspection {
-            return !combined.inf_irregular;
-        }
-    }
-    for (corner, tag) in tags.iter().enumerate() {
-        if !(tag.non_manifold || tag.xordinary || tag.inf_irregular) {
-            continue;
-        }
-        if tag.non_manifold {
-            let num_span_faces = corner_span(level, face, corners[corner]).faces.len();
-            let expected = if tag.inf_sharp { 1 } else { 2 };
-            if num_span_faces != expected {
-                return false;
-            }
-            continue;
-        }
-        if tag.xordinary {
-            if !tag.inf_sharp_edges {
-                return false;
-            }
-            if tag.boundary && !tag.inf_sharp {
-                let previous = (corner + 3) % 4;
-                let out_boundary = is_singular_edge(level, level.face_edges[face][corner]);
-                let in_boundary = is_singular_edge(level, level.face_edges[face][previous]);
-                if out_boundary && in_boundary {
-                    continue;
-                }
-            }
-        }
-        if tag.inf_irregular {
-            if !tag.inf_sharp_edges || (tag.inf_sharp_crease && tag.boundary) {
-                return false;
-            }
-            let span_faces = corner_span(level, face, corners[corner]).faces.len();
-            let expected = if tag.inf_sharp_crease { 2 } else { 1 };
-            if span_faces != expected {
-                return false;
-            }
-        }
-    }
-    true
-}
+/// Corner coordinates of a quad sub-face, in corner order.
+const QUAD_CORNERS: [(f64, f64); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
 
 /// Grid samples of one level: the sample of each vertex that some face uses, and of each corner of
 /// every face in the level's face order. A ptex coordinate is only meaningful in its own sub-face,
 /// so midpoints and centers are averaged within one sub-face.
 #[derive(Clone, Debug)]
 pub(super) struct Samples {
+    /// The sample of each vertex on some face; `None` for a vertex on no face.
     pub(super) vertices: Vec<Option<Sample>>,
     pub(super) corners: Vec<Vec<Sample>>,
 }
 
-/// Corner coordinates of a quad sub-face, in corner order.
-const QUAD_CORNERS: [(f64, f64); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-
 impl Samples {
     /// Samples of the base mesh. A quad's corners are its ptex corners; an n-gon's corner `k` is the
     /// corner of its sub-face `k`, and its center is the `(1, 1)` corner of sub-face 0.
-    pub(super) fn base(faces: &[Vec<usize>], vertex_count: usize) -> Samples {
+    pub(super) fn base(polygons: &[Polygon], vertex_count: usize) -> Samples {
         let mut vertices = vec![None; vertex_count];
-        let mut corners = Vec::with_capacity(faces.len());
-        for (face, corner_vertices) in faces.iter().enumerate() {
-            let mut face_corners = Vec::with_capacity(corner_vertices.len());
+        let mut corners = Vec::with_capacity(polygons.len());
+        for (face, (corner_vertices, _)) in polygons.iter().enumerate() {
+            let n = corner_vertices.len();
+            let mut face_corners = Vec::with_capacity(n);
             for (k, &vertex) in corner_vertices.iter().enumerate() {
-                let sample = if corner_vertices.len() == 4 {
+                let sample = if n == 4 {
                     let (u, v) = QUAD_CORNERS[k];
                     Sample {
                         face,
@@ -594,16 +620,16 @@ impl Samples {
 
     /// Samples of the next level, in the caller's point numbering: each old vertex keeps its sample,
     /// each new edge point (`edge_points`, keyed by sorted endpoints) takes the sample of its edge,
-    /// and each new face point, after the edge points, takes its face center. `faces` are the
-    /// current level's corner lists.
+    /// and each new face point, after the edge points, takes its face center. `polygons` are the
+    /// current level's faces.
     pub(super) fn next(
         &self,
-        faces: &[Vec<usize>],
+        polygons: &[Polygon],
         edge_points: &BTreeMap<(usize, usize), usize>,
         base_level: bool,
     ) -> Samples {
         let mut edge_samples = BTreeMap::new();
-        for (face, corner_vertices) in faces.iter().enumerate() {
+        for (face, (corner_vertices, _)) in polygons.iter().enumerate() {
             let n = corner_vertices.len();
             for j in 0..n {
                 let key = edge_key(corner_vertices[j], corner_vertices[(j + 1) % n]);
@@ -622,13 +648,13 @@ impl Samples {
             }
         }
         let face_base = self.vertices.len() + edge_points.len();
-        let mut vertices = vec![None; face_base + faces.len()];
+        let mut vertices = vec![None; face_base + polygons.len()];
         vertices[..self.vertices.len()].copy_from_slice(&self.vertices);
         for (key, &index) in edge_points {
             vertices[index] = edge_samples.get(key).copied();
         }
-        let mut children = Vec::with_capacity(faces.len());
-        for (face, corner_vertices) in faces.iter().enumerate() {
+        let mut children = Vec::with_capacity(self.corners.iter().map(Vec::len).sum());
+        for (face, (corner_vertices, _)) in polygons.iter().enumerate() {
             let n = corner_vertices.len();
             let corners = &self.corners[face];
             vertices[face_base + face] = Some(if base_level && n != 4 {
@@ -676,12 +702,12 @@ fn midpoint(a: Sample, b: Sample) -> Sample {
     Sample {
         face: a.face,
         ptex: a.ptex,
-        u: 0.5 * (a.u + b.u),
-        v: 0.5 * (a.v + b.v),
+        u: f64::midpoint(a.u, b.u),
+        v: f64::midpoint(a.v, b.v),
     }
 }
 
-/// Center of four corner samples of one sub-face.
+/// Center of the corner samples of one sub-face.
 fn center(corners: &[Sample]) -> Sample {
     let first = corners[0];
     let (u, v) = corners
@@ -700,22 +726,7 @@ fn edge_key(a: usize, b: usize) -> (usize, usize) {
     (a.min(b), a.max(b))
 }
 
-/// `sum_k weights[k] * (sum_j row_k[j].weight * positions[row_k[j].vertex])`.
-fn weighted_rows<T: Point, const N: usize>(
-    rows: &[Row; N],
-    weights: &[f64; N],
-    positions: &[T],
-) -> T {
-    let mut point = T::default();
-    for (row, &weight) in rows.iter().zip(weights) {
-        for &(vertex, w) in row {
-            point = point + positions[vertex] * (weight * w);
-        }
-    }
-    point
-}
-
-/// Bilinear value of a linear channel's leaf quad at local coordinates (OpenSubdiv's `QUADS` patches).
+/// Bilinear value of a linear channel's leaf quad at local coordinates (`OpenSubdiv`'s `QUADS` patches).
 fn bilinear(level: &Level, positions: &[DVec2], face: usize, s: f64, t: f64) -> DVec2 {
     let weights = [(1.0 - s) * (1.0 - t), s * (1.0 - t), s * t, (1.0 - s) * t];
     level.faces[face]
@@ -728,7 +739,7 @@ fn bilinear(level: &Level, positions: &[DVec2], face: usize, s: f64, t: f64) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{child_coordinates, compose_jacobian};
+    use super::{child_coordinates, child_coordinates_jacobian, compose_jacobian};
 
     fn child_quadrant(s: f64, t: f64) -> usize {
         match (s >= 0.5, t >= 0.5) {
@@ -750,7 +761,7 @@ mod tests {
 
     fn map_path(path: &[usize], mut s: f64, mut t: f64) -> (f64, f64) {
         for &quadrant in path {
-            (s, t, _) = child_coordinates(quadrant, s, t);
+            (s, t) = child_coordinates(quadrant, s, t);
         }
         (s, t)
     }
@@ -774,9 +785,8 @@ mod tests {
             let mut jacobian = [[1.0, 0.0], [0.0, 1.0]];
             for quadrant in path {
                 assert_eq!(child_quadrant(local.0, local.1), quadrant);
-                let (s, t, child_jacobian) = child_coordinates(quadrant, local.0, local.1);
-                jacobian = compose_jacobian(child_jacobian, jacobian);
-                local = (s, t);
+                jacobian = compose_jacobian(child_coordinates_jacobian(quadrant), jacobian);
+                local = child_coordinates(quadrant, local.0, local.1);
             }
             assert!((local.0 - leaf.0).abs() < 1.0e-12);
             assert!((local.1 - leaf.1).abs() < 1.0e-12);

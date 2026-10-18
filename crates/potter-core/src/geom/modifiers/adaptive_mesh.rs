@@ -171,7 +171,7 @@ pub(super) fn assemble(
                 )
             })
             .collect();
-        subdivision_uv::write_loop_uvs(&mut result, loops);
+        subdivision_uv::write_loop_uvs(&mut result, loops)?;
     }
 
     let normal_options = NormalCodeOptions {
@@ -286,19 +286,20 @@ mod tests {
         )
         .unwrap();
         let base_faces = vec![vec![0, 1, 2, 3]];
+        let base_polygons = vec![(base_faces[0].clone(), 0)];
         let positions: Vec<DVec3> = source.vertices.iter().map(|vertex| vertex.co).collect();
         let edge_sharpness = BTreeMap::new();
+        let vertex_sharpness = [0.0; 4];
         let non_manifold = [false; 4];
-        let surface = LimitSurface::build(
-            &base_faces,
-            &positions,
-            BaseSharpness::Creases {
-                edges: &edge_sharpness,
-                non_manifold: &non_manifold,
-                preserve_corners: false,
-            },
-            1,
-        );
+        let loose_edges: [[usize; 2]; 0] = [];
+        let sharpness = BaseSharpness::Creases {
+            edges: &edge_sharpness,
+            vertices: &vertex_sharpness,
+            non_manifold: &non_manifold,
+            loose_edges: &loose_edges,
+            preserve_corners: false,
+        };
+        let surface = LimitSurface::build(&base_polygons, &positions, &sharpness, 1);
         let samples = vec![
             Sample {
                 face: 0,
@@ -319,16 +320,18 @@ mod tests {
                 v: 0.8,
             },
         ];
+        let topology_positions = surface
+            .evaluate(&samples.iter().copied().map(Some).collect::<Vec<_>>())
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
         let topology = DicedTopology {
             faces: vec![vec![0, 1, 2]],
             samples: Samples {
                 vertices: samples.iter().copied().map(Some).collect(),
                 corners: vec![samples.clone()],
             },
-            positions: samples
-                .iter()
-                .map(|sample| surface.evaluate(*sample))
-                .collect(),
+            positions: topology_positions,
         };
         let expected: Vec<DVec3> = samples
             .iter()

@@ -550,7 +550,7 @@ impl DicedBuilder {
         surface: &LimitSurface,
     ) -> Result<usize> {
         self.check_capacity(1, 0, 0)?;
-        let position = surface.evaluate(sample);
+        let position = surface.point_and_derivatives(sample)?.0;
         if !position.is_finite() {
             return Err(PotError::new(
                 ErrorCode::EvaluationFailed,
@@ -1069,11 +1069,14 @@ fn append_edge_dicing(
         sample_on_edge(patch, edge_index, midpoint),
         sample_on_edge(patch, edge_index, end),
     ];
-    let points = [
-        surface.evaluate(samples[0]),
-        surface.evaluate(samples[1]),
-        surface.evaluate(samples[2]),
-    ];
+    let evaluated = surface.evaluate(&samples.map(Some));
+    let [Some(first), Some(middle), Some(last)] = evaluated.as_slice() else {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "adaptive edge evaluation did not return all limit samples",
+        ));
+    };
+    let points = [*first, *middle, *last];
     if points.iter().any(|point| !point.is_finite()) {
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
@@ -1697,12 +1700,14 @@ fn patch_measure_point(
     u: f64,
     v: f64,
 ) -> Result<DVec3> {
-    let point = surface.evaluate(Sample {
-        face: patch.face,
-        ptex: patch.ptex,
-        u,
-        v,
-    });
+    let point = surface
+        .point_and_derivatives(Sample {
+            face: patch.face,
+            ptex: patch.ptex,
+            u,
+            v,
+        })?
+        .0;
     if !point.is_finite() {
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,

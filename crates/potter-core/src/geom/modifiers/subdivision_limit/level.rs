@@ -2,11 +2,11 @@
 //
 // Portions derived from OpenSubdiv (https://graphics.pixar.com/opensubdiv) vtr/level.h, far/topologyRefinerFactory.cpp, sdc/crease.h, Apache-2.0.
 
-//! One Catmull-Clark topology level with OpenSubdiv's per-component tags.
+//! One Catmull-Clark topology level with `OpenSubdiv`'s per-component tags.
 
 use std::collections::BTreeMap;
 
-/// Sharpness at or above this value is infinitely sharp (OpenSubdiv `SHARPNESS_INFINITE`).
+/// Sharpness at or above this value is infinitely sharp (`OpenSubdiv` `SHARPNESS_INFINITE`).
 pub(super) const SHARPNESS_INFINITE: f64 = 10.0;
 
 /// Vertex rule bits, combined by bitwise OR over a face's corners.
@@ -15,7 +15,7 @@ pub(super) const RULE_DART: u8 = 2;
 pub(super) const RULE_CREASE: u8 = 4;
 pub(super) const RULE_CORNER: u8 = 8;
 
-/// Per-vertex tags (OpenSubdiv `Vtr::Level::VTag`).
+/// Per-vertex tags (`OpenSubdiv` `Vtr::Level::VTag`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct VTag {
     pub(super) non_manifold: bool,
@@ -34,7 +34,7 @@ pub(super) struct VTag {
 }
 
 impl VTag {
-    /// Bitwise OR of the tags of a set of corners (OpenSubdiv `VTag::BitwiseOr`).
+    /// Bitwise OR of the tags of a set of corners (`OpenSubdiv` `VTag::BitwiseOr`).
     pub(super) fn combine<'a>(tags: impl IntoIterator<Item = &'a VTag>) -> VTag {
         tags.into_iter().fold(VTag::default(), |mut acc, tag| {
             acc.non_manifold |= tag.non_manifold;
@@ -55,7 +55,7 @@ impl VTag {
     }
 }
 
-/// Per-edge tags (OpenSubdiv `Vtr::Level::ETag`).
+/// Per-edge tags (`OpenSubdiv` `Vtr::Level::ETag`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ETag {
     pub(super) non_manifold: bool,
@@ -81,7 +81,7 @@ pub(super) fn is_semi_sharp(sharpness: f64) -> bool {
     sharpness > 0.0 && sharpness < SHARPNESS_INFINITE
 }
 
-/// Uniform crease decay per level (OpenSubdiv `Crease::decrementSharpness`).
+/// Uniform crease decay per level (`OpenSubdiv` `Crease::decrementSharpness`).
 pub(super) fn decrement(sharpness: f64) -> f64 {
     if sharpness <= 0.0 {
         0.0
@@ -95,7 +95,7 @@ pub(super) fn decrement(sharpness: f64) -> f64 {
 }
 
 /// Vertex rule from its own sharpness and its count of sharp incident edges
-/// (OpenSubdiv `Crease::DetermineVertexVertexRule`).
+/// (`OpenSubdiv` `Crease::DetermineVertexVertexRule`).
 pub(super) fn vertex_rule(sharpness: f64, sharp_edges: usize) -> u8 {
     if is_sharp(sharpness) || sharp_edges > 2 {
         RULE_CORNER
@@ -217,7 +217,7 @@ impl Level {
         if a == vertex { b } else { a }
     }
 
-    /// Base-level tags, following OpenSubdiv's `prepareComponentTagsAndSharpness`.
+    /// Base-level tags, following `OpenSubdiv`'s `prepareComponentTagsAndSharpness`.
     pub(super) fn derive_base_tags(
         &mut self,
         preserve_corners: bool,
@@ -238,17 +238,16 @@ impl Level {
                 linear: false,
             };
         }
-        for vertex in 0..self.vertex_count() {
+        for (vertex, &non_manifold) in non_manifold_vertices.iter().enumerate() {
             let edges = self.vertex_edges[vertex].clone();
             let faces = self.vertex_faces[vertex].len();
             let boundary_count = edges.iter().filter(|&&e| self.etags[e].boundary).count();
             let inf_count = edges.iter().filter(|&&e| self.etags[e].inf_sharp).count();
             let semi_count = edges.iter().filter(|&&e| self.etags[e].semi_sharp).count();
-            let non_manifold = non_manifold_vertices[vertex];
             let topological_corner = faces == 1 && edges.len() == 2;
-            if topological_corner && preserve_corners {
-                self.vertex_sharpness[vertex] = SHARPNESS_INFINITE;
-            } else if non_manifold && !is_infinite(self.vertex_sharpness[vertex]) {
+            if (topological_corner && preserve_corners)
+                || (non_manifold && !is_infinite(self.vertex_sharpness[vertex]))
+            {
                 self.vertex_sharpness[vertex] = SHARPNESS_INFINITE;
             }
             let sharpness = self.vertex_sharpness[vertex];
@@ -272,8 +271,16 @@ impl Level {
                         if boundary_count > 0 {
                             inf_irregular = false;
                         } else if edges.len() == 4 {
-                            inf_irregular =
-                                self.etags[edges[0]].inf_sharp != self.etags[edges[2]].inf_sharp;
+                            // Two sharp edges are a regular crease only when they are opposite in the
+                            // ring, that is when no face holds both (OpenSubdiv compares opposite edges).
+                            let mut sharp =
+                                edges.iter().copied().filter(|&e| self.etags[e].inf_sharp);
+                            if let (Some(first), Some(second)) = (sharp.next(), sharp.next()) {
+                                inf_irregular = self.vertex_faces[vertex].iter().any(|&f| {
+                                    self.face_edges[f].contains(&first)
+                                        && self.face_edges[f].contains(&second)
+                                });
+                            }
                         }
                     }
                 } else if inf_rule == RULE_CORNER

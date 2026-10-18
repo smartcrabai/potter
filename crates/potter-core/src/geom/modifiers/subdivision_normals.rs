@@ -94,11 +94,13 @@ fn midpoint(a: Vec3, b: Vec3) -> Vec3 {
 /// Blender's corner numbering of the subdivided mesh, one number per output corner in output face
 /// order. Output face `f` gets the block `4 * E..4 * E + 4`, where `E` is the emission index of the
 /// face: the faces of each base face form one block, in base face order. `loops[f]` holds the four
-/// ptex samples of output face `f`, `base_sizes` the corner count of each base face, and `levels` is
-/// at least one.
+/// ptex samples of output face `f`, `base_sizes` the corner count of each base face, `loop_starts`
+/// the corner holding each base face's first loop, and `levels` is at least one. The samples stay in
+/// canonical geometry; each is moved into its base face's loop frame before its cell is located.
 pub(super) fn corner_numbering(
     loops: &[Vec<Sample>],
     base_sizes: &[usize],
+    loop_starts: &[usize],
     levels: u32,
 ) -> Vec<usize> {
     let grid = 1_i64 << levels;
@@ -118,24 +120,39 @@ pub(super) fn corner_numbering(
     }
     let mut numbering = Vec::with_capacity(loops.len() * 4);
     for face_loops in loops {
-        let first = face_loops[0];
+        let frame: [Sample; 4] = std::array::from_fn(|k| {
+            let sample = face_loops[k];
+            sample.in_loop_frame(loop_starts[sample.face], base_sizes[sample.face])
+        });
+        let first = frame[0];
         let size = base_sizes[first.face];
         let cells = if size == 4 { grid } else { ptex_grid };
-        let cell = |coordinate: fn(&Sample) -> f64| {
-            let low = face_loops
-                .iter()
-                .map(coordinate)
-                .fold(f64::INFINITY, f64::min);
-            (low * cells as f64).round() as i64
-        };
-        let (x, y) = (cell(|sample| sample.u), cell(|sample| sample.v));
+        let low_u = frame
+            .iter()
+            .map(|sample| sample.u)
+            .fold(f64::INFINITY, f64::min);
+        let low_v = frame
+            .iter()
+            .map(|sample| sample.v)
+            .fold(f64::INFINITY, f64::min);
+        let x = (low_u * cells as f64).round() as i64;
+        let y = (low_v * cells as f64).round() as i64;
         let emitted = if size == 4 {
             quad_cell_index(x, y, grid)
         } else {
             ngon_cell_index(x, y, first.ptex as i64, size as i64, ptex_grid)
         };
         let face = starts[first.face] + emitted;
-        for corner in 0..4 {
+        for sample in &frame {
+            let local_u = ((sample.u - low_u) * cells as f64).round() as i64;
+            let local_v = ((sample.v - low_v) * cells as f64).round() as i64;
+            let corner = match (local_u, local_v) {
+                (0, 0) => 0,
+                (1, 0) => 1,
+                (1, 1) => 2,
+                (0, 1) => 3,
+                _ => unreachable!("a Subsurf face loop is one of four grid corners"),
+            };
             numbering.push(4 * face as usize + corner);
         }
     }
@@ -181,7 +198,10 @@ fn ngon_cell_index(x: i64, y: i64, ptex: i64, size: i64, g: i64) -> i64 {
     if g >= 2 && x == g - 1 && y == g - 1 {
         return center_base + ptex;
     }
-    let strip_base = center_base + size;
+    // `subdiv_foreach_loops_special` emits the per-corner center loops only when
+    // `ptex_face_resolution >= 3`, that is `g >= 2`; a one-cell ptex face has none.
+    let centers = if g >= 2 { size } else { 0 };
+    let strip_base = center_base + centers;
     let per_ptex = 2 * g - 1;
     strip_base + ptex * per_ptex + if y == 0 { x } else { g + (y - 1) }
 }

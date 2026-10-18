@@ -43,6 +43,7 @@ mod ocean;
 mod remesh_modes;
 pub mod simulation;
 mod subdivision_limit;
+mod subdivision_loose;
 mod subdivision_normals;
 mod subdivision_uv;
 use subdivision_limit::Samples;
@@ -2560,19 +2561,22 @@ fn adaptive_subdivision(
     let non_manifold_vertices: Vec<bool> = (0..mesh.vertices.len())
         .map(|vertex| non_manifold.corner(vertex))
         .collect();
+    let vertex_creases = vertex_crease_sharpness(mesh, options.use_creases)?;
     let sharpness = if simple {
         subdivision_limit::BaseSharpness::Simple
     } else {
         subdivision_limit::BaseSharpness::Creases {
             edges: &edge_sharpness,
+            vertices: &vertex_creases,
             non_manifold: &non_manifold_vertices,
+            loose_edges: &source_edges,
             preserve_corners: options.preserve_corners,
         }
     };
     let limit = subdivision_limit::LimitSurface::build(
-        &base_faces,
+        &source_polygons,
         &positions(mesh),
-        sharpness,
+        &sharpness,
         if simple { 1 } else { quality as usize },
     );
     let camera = if space == adaptive_dicing::AdaptiveSpace::Pixel {
@@ -2630,7 +2634,7 @@ fn adaptive_subdivision(
         &topology,
         &limit,
         &uv_maps,
-        subdivision_uv::FvarLinear::from_uv_smooth(uv_smooth, simple),
+        subdivision_uv::FvarLinear::from_uv_smooth(uv_smooth),
         options.preserve_corners,
         input_normals.as_deref(),
         !simple,
@@ -2729,11 +2733,12 @@ fn subdivision_with_samples(
         preserve_corners: boundary_smooth == "PRESERVE_CORNERS",
         use_creases: bool_param(modifier, "use_creases")?,
     };
-    let linear = subdivision_uv::FvarLinear::from_uv_smooth(uv_smooth, simple);
+    let linear = subdivision_uv::FvarLinear::from_uv_smooth(uv_smooth);
     // Multires displacement is defined relative to the limit surface.
-    let use_limit_surface = levels > 0
-        && !simple
-        && (modifier.modifier_type == "multires" || bool_param(modifier, "use_limit_surface")?);
+    let multires_unset =
+        modifier.modifier_type == "multires" && !modifier.params.contains_key("use_limit_surface");
+    let use_limit_surface =
+        levels > 0 && !simple && (multires_unset || bool_param(modifier, "use_limit_surface")?);
     let uv_layer_count = uv_layers::layer_count(mesh);
     if levels > 0 {
         let first_level_faces = mesh
@@ -2755,83 +2760,55 @@ fn subdivision_with_samples(
     }
     let use_custom_normals = bool_param(modifier, "use_custom_normals")?;
     let mut result = mesh.clone();
-    // With levels, the subdivided normals own the custom-normal state; with none, only Use Custom
-    // Normals keeps it.
-    if levels > 0 || !use_custom_normals {
-        result.attributes.remove("custom_normal");
-    }
     if levels == 0 {
+        // Blender's zero-level subdivision returns the input unchanged, custom normals included.
         return Ok((result, None, None));
     }
-    let input_normals = if use_custom_normals && corner_normal_domain(mesh)? {
-        match clnor::corner_codes(mesh)? {
-            Some(codes) => Some(clnor::evaluate_codes(
-                mesh,
-                &codes,
-                &positions(mesh),
-                NormalCodeOptions {
-                    corner_order: None,
-                    setter_input: SetterInput::AlreadyNormalized,
-                },
-            )?),
-            None => Some(corner_normals(mesh, &positions(mesh))?),
-        }
+    // Subsurf interpolates the evaluated input loop normals only when the source has a custom layer
+    // and the option is enabled; automatic corners participate as their evaluated fan normals.
+    let input_normals = if use_custom_normals && clnor::corner_codes(mesh)?.is_some() {
+        Some(corner_normals(mesh, &positions(mesh))?)
     } else {
         None
     };
-    let (mut source_polygons, mut source_edges, mut edge_creases, mut position, uv_maps) = if levels
-        > 0
-    {
-        let source_polygons = polygons(&result)?;
-        let source_edges = loose_edges(&result)?;
-        let edge_creases =
-            subdivision_uv::Creases::from_values(edge_crease_values(&result, options.use_creases)?);
-        let position = subdivision_uv::Position::new(
-            &source_polygons,
-            &source_edges,
-            &edge_creases.sharpness,
-            result.vertices.len(),
-        );
-        let uv_maps = subdivision_uv::value_maps(mesh, &position);
-        (
-            source_polygons,
-            source_edges,
-            edge_creases,
-            Some(position),
-            uv_maps,
-        )
-    } else {
-        (
-            Vec::new(),
-            Vec::new(),
-            subdivision_uv::Creases::default(),
-            None,
-            Vec::new(),
-        )
-    };
-    // Each UV layer's pins, carried level by level like its corner values (`refine_pins`).
-    let mut pins: Vec<Vec<Option<Vec<bool>>>> =
-        uv_maps.iter().map(|layer| layer.pins.clone()).collect();
+    // Blender's ptex grid of each face starts at the face's first loop, which the input's loop order
+    // can place anywhere in the face. The custom-normal layer that stores that order is removed below.
+    let sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
+    let loop_order = clnor::corner_order(mesh)?.unwrap_or_else(|| clnor::stored_corner_order(mesh));
+    let loop_starts = first_loop_starts(&sizes, &loop_order);
+    // With levels, the output custom normals are re-encoded from the subdivided loop normals below.
+    result.attributes.remove("custom_normal");
+    let mut source_polygons = polygons(&result)?;
+    let mut source_edges = loose_edges(&result)?;
+    let mut edge_creases =
+        subdivision_uv::Creases::from_values(edge_crease_values(&result, options.use_creases)?);
+    let mut position = subdivision_uv::Position::new(
+        &source_polygons,
+        &source_edges,
+        &edge_creases.sharpness,
+        result.vertices.len(),
+    );
+    let mut uv_maps = subdivision_uv::value_maps(mesh, &position);
     // Blender refines SIMPLE as Catmull-Clark with infinitely sharp edges and vertices, so its
     // positions are limit points too (see `BaseSharpness::Simple`). Loop normals use the same grid.
-    let mut samples = (levels > 0).then(|| {
-        let base_faces: Vec<Vec<usize>> = source_polygons
-            .iter()
-            .map(|(face, _)| face.clone())
-            .collect();
-        Samples::base(&base_faces, result.vertices.len())
-    });
+    let mut samples = Samples::base(&source_polygons, result.vertices.len());
+    // Vertex creases start from the input and decay one level per subdivision, as edge creases do.
+    let mut vertex_creases = vertex_crease_sharpness(mesh, options.use_creases)?;
+    // Loose-edge vertices are placed from the base mesh at the end, so their `u` is tracked per level.
+    let mut loose = subdivision_loose::LooseEdges::new(
+        edge_pairs(mesh)?,
+        &loose_edges(mesh)?,
+        &source_polygons,
+        mesh.vertices.len(),
+    );
     for level in 0..levels {
-        let level_position = position.as_ref().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "subdivision topology is missing for a requested level",
-            )
-        })?;
+        // Without the limit surface every point is read; with it, only loose edges read the refined
+        // positions of their endpoints.
+        let refined = !use_limit_surface || !source_edges.is_empty();
         let (next, edge_points) = if simple {
             let (next, next_creases, edge_points) = subdivision_uv::subdivide_simple_once(
                 &result,
-                level_position,
+                &position,
                 &source_polygons,
                 &source_edges,
                 &edge_creases,
@@ -2843,66 +2820,89 @@ fn subdivision_with_samples(
             let (next, edge_points, next_creases) = subdivide_once(
                 &result,
                 options,
-                level_position,
+                &position,
                 &source_polygons,
                 &source_edges,
                 &edge_creases,
+                &vertex_creases,
+                refined,
             )?;
             edge_creases = next_creases;
+            vertex_creases = decay_vertex_creases(&vertex_creases, next.vertices.len());
             (next, edge_points)
         };
-        samples = samples.map(|samples| {
-            let faces: Vec<Vec<usize>> = source_polygons
-                .iter()
-                .map(|(face, _)| face.clone())
-                .collect();
-            samples.next(&faces, &edge_points, level == 0)
-        });
-        // Pins follow the corners of the parent level, as Blender's boolean corner interpolation.
-        let mut total = 0;
-        let mut starts = vec![0];
-        for (face, _) in &source_polygons {
-            total += face.len();
-            starts.push(total);
-        }
-        for layer_pins in &mut pins {
-            *layer_pins = subdivision_uv::refine_pins(std::mem::take(layer_pins), &starts);
+        loose.split(&edge_points, next.vertices.len());
+        samples = samples.next(&source_polygons, &edge_points, level == 0);
+        for layer in &mut uv_maps {
+            layer.pins =
+                subdivision_uv::refine_pins(std::mem::take(&mut layer.pins), &position.starts);
         }
         result = next;
         if level + 1 < levels {
             source_polygons = polygons(&result)?;
             source_edges = loose_edges(&result)?;
-            position = Some(subdivision_uv::Position::new(
+            position = subdivision_uv::Position::new(
                 &source_polygons,
                 &source_edges,
                 &edge_creases.sharpness,
                 result.vertices.len(),
-            ));
+            );
         }
     }
+    // Blender stores each output face from its first emitted loop (the smallest loop ordinal). The
+    // face normal of the fan spaces starts its Newell sum at that vertex, so the output faces take
+    // that start. `corner_perm[c]` is the canonical corner now at position `c`; samples keep their
+    // canonical order, and every per-corner array is permuted through it.
+    let ordinals = subdivision_normals::corner_numbering(
+        &samples.corners,
+        &sizes,
+        &loop_starts,
+        levels as u32,
+    );
+    let output_sizes: Vec<usize> = result
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .collect();
+    let face_starts = first_loop_starts(&output_sizes, &ordinals);
+    let mut corner_perm = Vec::with_capacity(ordinals.len());
+    let mut offset = 0;
+    for (face, &start) in result.faces.iter_mut().zip(&face_starts) {
+        let count = face.vertices.len();
+        face.vertices.rotate_left(start);
+        corner_perm.extend((0..count).map(|corner| offset + (corner + start) % count));
+        offset += count;
+    }
+    // Corner attributes the rebuild carried over are in canonical corner order too.
+    rotate_corner_attributes(&mut result, &face_starts, &corner_perm);
     // Positions and UVs share the base level of the limit surface. SIMPLE is evaluated at isolation 1
     // whatever the quality; without `use_limit_surface` only the base level serves the UVs.
-    let limit_samples = samples.as_ref().filter(|_| simple || use_limit_surface);
+    let limit_samples = (simple || use_limit_surface).then_some(&samples);
     let mut limit_surface = None;
-    if levels > 0 && (simple || use_limit_surface || !uv_maps.is_empty()) {
-        let base_faces: Vec<Vec<usize>> =
-            polygons(mesh)?.into_iter().map(|(face, _)| face).collect();
+    if simple || use_limit_surface || !uv_maps.is_empty() {
+        let base = polygons(mesh)?;
         let creases =
             subdivision_uv::Creases::from_values(edge_crease_values(mesh, options.use_creases)?)
                 .sharpness;
         // OpenSubdiv sharpens non-manifold edges and corners infinitely (as for the positions).
-        let non_manifold =
-            NonManifold::new(mesh.vertices.len(), base_faces.iter().map(Vec::as_slice));
+        let non_manifold = NonManifold::new(
+            mesh.vertices.len(),
+            base.iter().map(|(face, _)| face.as_slice()),
+        );
         let edge_sharpness = non_manifold.sharpened(&creases);
         let non_manifold_vertices: Vec<bool> = (0..mesh.vertices.len())
             .map(|vertex| non_manifold.corner(vertex))
             .collect();
+        let base_vertex_creases = vertex_crease_sharpness(mesh, options.use_creases)?;
+        let base_loose_edges = loose_edges(mesh)?;
         let sharpness = if simple {
             subdivision_limit::BaseSharpness::Simple
         } else {
             subdivision_limit::BaseSharpness::Creases {
                 edges: &edge_sharpness,
+                vertices: &base_vertex_creases,
                 non_manifold: &non_manifold_vertices,
+                loose_edges: &base_loose_edges,
                 preserve_corners: options.preserve_corners,
             }
         };
@@ -2914,16 +2914,13 @@ fn subdivision_with_samples(
         } else {
             0
         };
-        let limit = subdivision_limit::LimitSurface::build(
-            &base_faces,
-            &positions(mesh),
-            sharpness,
-            isolation,
-        );
+        let limit =
+            subdivision_limit::LimitSurface::build(&base, &positions(mesh), &sharpness, isolation);
         if let Some(samples) = limit_samples {
-            for (vertex, sample) in result.vertices.iter_mut().zip(&samples.vertices) {
-                if let Some(sample) = sample {
-                    vertex.co = limit.evaluate(*sample);
+            let points = limit.evaluate(&samples.vertices);
+            for (vertex, point) in result.vertices.iter_mut().zip(points) {
+                if let Some(point) = point {
+                    vertex.co = point;
                 }
             }
         }
@@ -2937,8 +2934,7 @@ fn subdivision_with_samples(
         if !uv_maps.is_empty() {
             let loops: Vec<_> = uv_maps
                 .into_iter()
-                .zip(pins)
-                .map(|(layer, layer_pins)| {
+                .map(|layer| {
                     let values = match limit_samples {
                         Some(samples) => limit.face_varying_loops(
                             linear,
@@ -2953,41 +2949,63 @@ fn subdivision_with_samples(
                             levels as usize,
                         ),
                     };
-                    (layer.name, values, layer_pins)
+                    let values: Vec<_> = corner_perm.iter().map(|&corner| values[corner]).collect();
+                    let pins: Vec<Option<Vec<bool>>> = layer
+                        .pins
+                        .into_iter()
+                        .enumerate()
+                        .map(|(face, row)| {
+                            row.map(|mut flags| {
+                                flags.rotate_left(face_starts[face]);
+                                flags
+                            })
+                        })
+                        .collect();
+                    (layer.name, values, pins)
                 })
                 .collect();
-            subdivision_uv::write_loop_uvs(&mut result, loops);
+            subdivision_uv::write_loop_uvs(&mut result, loops)?;
         }
         limit_surface = Some(limit);
     }
-    let face_sizes: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
-    let subdivided_levels = u32::try_from(levels).map_err(|_| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "subdivision level does not fit its sample mapping",
-        )
-    })?;
-    let sample_map = samples.as_ref().ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "subdivision sample map is missing",
-        )
-    })?;
-    let numbering =
-        subdivision_normals::corner_numbering(&sample_map.corners, &face_sizes, subdivided_levels);
-    let normal_options = NormalCodeOptions {
-        corner_order: Some(&numbering),
-        setter_input: SetterInput::AlreadyNormalized,
-    };
-    if let Some(input_normals) = input_normals {
-        let loops =
-            subdivision_normals::loop_normals(&input_normals, &face_sizes, &sample_map.corners);
-        let loop_normals: Vec<Option<DVec3>> = loops.into_iter().map(Some).collect();
-        clnor::encode_vectors(&mut result, Some(&loop_normals), normal_options)?;
-    } else {
-        clnor::write_codes(&mut result, None, normal_options)?;
+    // Loose-edge vertices come from their base edges, whether or not the limit surface is on
+    // (Blender's `subdiv_mesh_vert_of_loose_edge`). Only the limit's face samples touch other points.
+    for (vertex, position) in loose.positions(&positions(mesh), simple) {
+        result.vertices[vertex].co = position;
     }
-    Ok((result, samples, limit_surface))
+    // Loop normals follow the final positions: Blender's fan spaces are measured on them. The loop
+    // basis (corner order) is stored with or without custom normals, as main does.
+    let numbering: Vec<usize> = corner_perm.iter().map(|&corner| ordinals[corner]).collect();
+    let identity = numbering
+        .iter()
+        .enumerate()
+        .all(|(index, &ordinal)| index == ordinal);
+    match input_normals {
+        Some(normals) => {
+            let loops = subdivision_normals::loop_normals(&normals, &sizes, &samples.corners);
+            let vectors: Vec<Option<DVec3>> = corner_perm
+                .iter()
+                .map(|&corner| Some(loops[corner]))
+                .collect();
+            clnor::encode_vectors(
+                &mut result,
+                Some(&vectors),
+                NormalCodeOptions {
+                    corner_order: Some(&numbering),
+                    setter_input: clnor::SetterInput::AlreadyNormalized,
+                },
+            )?;
+        }
+        None => clnor::write_codes(
+            &mut result,
+            None,
+            NormalCodeOptions {
+                corner_order: (!identity).then_some(numbering.as_slice()),
+                setter_input: clnor::SetterInput::AlreadyNormalized,
+            },
+        )?,
+    }
+    Ok((result, Some(samples), limit_surface))
 }
 
 #[derive(Clone, Copy)]
@@ -3923,21 +3941,28 @@ fn multires_sculpt_limit_surface(
         preserve_corners: boundary_smooth == "PRESERVE_CORNERS",
         use_creases: bool_param(modifier, "use_creases")?,
     };
-    let faces: Vec<Vec<usize>> = polygons(mesh)?.into_iter().map(|(face, _)| face).collect();
+    let faces = polygons(mesh)?;
+    let loose_edges = loose_edges(mesh)?;
     let creases =
         subdivision_uv::Creases::from_values(edge_crease_values(mesh, options.use_creases)?)
             .sharpness;
-    let non_manifold = NonManifold::new(mesh.vertices.len(), faces.iter().map(Vec::as_slice));
+    let non_manifold = NonManifold::new(
+        mesh.vertices.len(),
+        faces.iter().map(|(face, _)| face.as_slice()),
+    );
     let edge_sharpness = non_manifold.sharpened(&creases);
     let non_manifold_vertices: Vec<bool> = (0..mesh.vertices.len())
         .map(|vertex| non_manifold.corner(vertex))
         .collect();
+    let vertex_creases = vertex_crease_sharpness(mesh, options.use_creases)?;
     let sharpness = if simple {
         subdivision_limit::BaseSharpness::Simple
     } else {
         subdivision_limit::BaseSharpness::Creases {
             edges: &edge_sharpness,
+            vertices: &vertex_creases,
             non_manifold: &non_manifold_vertices,
+            loose_edges: &loose_edges,
             preserve_corners: options.preserve_corners,
         }
     };
@@ -3948,7 +3973,7 @@ fn multires_sculpt_limit_surface(
             .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "subdivision quality overflows"))?
     };
     Ok(subdivision_limit::LimitSurface::build(
-        &faces, points, sharpness, isolation,
+        &faces, points, &sharpness, isolation,
     ))
 }
 
@@ -4034,6 +4059,54 @@ fn apply_multires_displacements(
     Ok(())
 }
 
+/// Rotates the corner-domain attributes of a subdivided mesh whose faces took `face_starts` rotation
+/// and whose corners are now ordered by `corner_perm`. Per-face rows (`values["f<id>"]`) rotate within
+/// their face; flat `CORNER` entries of `blender_attributes` permute with `corner_perm`. UV layers are
+/// written after this, in the rotated order.
+fn rotate_corner_attributes(mesh: &mut Mesh, face_starts: &[usize], corner_perm: &[usize]) {
+    let faces = &mesh.faces;
+    let mut face_rotation: Option<HashMap<String, usize>> = None;
+    for (key, attribute) in &mut mesh.attributes {
+        if key == "uv_layers" {
+            continue;
+        }
+        if key == "blender_attributes" {
+            for entry in attribute.as_array_mut().into_iter().flatten() {
+                let is_corner = entry.get("domain").and_then(Value::as_str) == Some("CORNER");
+                let Some(values) = entry.get_mut("values").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                if is_corner && values.len() == corner_perm.len() {
+                    *values = corner_perm
+                        .iter()
+                        .map(|&corner| values[corner].clone())
+                        .collect();
+                }
+            }
+            continue;
+        }
+        if attribute.get("domain").and_then(Value::as_str) != Some("corner") {
+            continue;
+        }
+        let Some(values) = attribute.get_mut("values").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let rotation = face_rotation.get_or_insert_with(|| {
+            faces
+                .iter()
+                .zip(face_starts)
+                .map(|(face, &start)| (format!("f{}", face.id), start))
+                .collect()
+        });
+        for (face_key, row) in values.iter_mut() {
+            let (Some(&start), Some(corners)) = (rotation.get(face_key), row.as_array_mut()) else {
+                continue;
+            };
+            corners.rotate_left(start);
+        }
+    }
+}
+
 fn check_subdivision_budget(
     first_level_faces: usize,
     input_vertices: usize,
@@ -4103,9 +4176,9 @@ fn check_subdivision_budget(
             "subdivision corner estimate overflows",
         )
     })?;
-    // Include simultaneous input/output mesh storage and subdivision adjacency indexes. Each UV
-    // layer adds face-varying channels and UV attribute copies, measured at about 260 bytes per
-    // output corner.
+    // Each UV layer adds face-varying channels and UV attribute copies. Measured with `pot preview` on
+    // a 224x224 grid at level 2: one layer raised peak RSS from 2.29 GB to 3.04 GB over 802,816 output
+    // corners, about 935 bytes per corner. The other per-element constants are not measured.
     let uv_corners = estimated_corners
         .checked_mul(convert(uv_layer_count)?)
         .ok_or_else(|| {
@@ -4119,7 +4192,7 @@ fn check_subdivision_budget(
         (estimated_edges, 128_u128),
         (face_count, 128_u128),
         (estimated_corners, 32_u128),
-        (uv_corners, 260_u128),
+        (uv_corners, 1_024_u128),
     ]
     .into_iter()
     .try_fold(0_u128, |total, (count, bytes_per_element)| {
@@ -4145,6 +4218,7 @@ const BLENDER_EDGE_CREASE_MAX_SHARPNESS: f64 = 10.0;
 fn blender_edge_crease_sharpness(crease: f64) -> f64 {
     BLENDER_EDGE_CREASE_MAX_SHARPNESS * crease * crease
 }
+
 fn edge_crease_values(mesh: &Mesh, enabled: bool) -> Result<BTreeMap<(usize, usize), f64>> {
     if !enabled {
         return Ok(BTreeMap::new());
@@ -4190,6 +4264,68 @@ fn edge_crease_values(mesh: &Mesh, enabled: bool) -> Result<BTreeMap<(usize, usi
         }
     }
     Ok(creases)
+}
+
+/// Blender's per-vertex sharpness from the `crease_vert` attribute (`crease_to_sharpness`, as for
+/// edges), zero where a vertex has no crease. Read only with `use_creases`.
+fn vertex_crease_sharpness(mesh: &Mesh, enabled: bool) -> Result<Vec<f64>> {
+    let mut sharpness = vec![0.0; mesh.vertices.len()];
+    let values = mesh
+        .attributes
+        .get("crease_vert")
+        .filter(|_| enabled)
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(Value::as_object);
+    let Some(values) = values else {
+        return Ok(sharpness);
+    };
+    for (index, vertex) in mesh.vertices.iter().enumerate() {
+        let Some(value) = values
+            .get(&format!("v{}", vertex.id))
+            .and_then(Value::as_f64)
+        else {
+            continue;
+        };
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(PotError::invalid_argument(
+                "subdivision vertex creases must be finite values in [0, 1]",
+            ));
+        }
+        sharpness[index] = blender_edge_crease_sharpness(value);
+    }
+    Ok(sharpness)
+}
+
+/// The next level's vertex sharpness: each vertex keeps its index and decays one level, as
+/// `Crease::SubdivideVertexSharpness` does; the edge and face points it gains are smooth.
+fn decay_vertex_creases(sharpness: &[f64], vertex_count: usize) -> Vec<f64> {
+    let mut next = vec![0.0; vertex_count];
+    for (slot, &value) in next.iter_mut().zip(sharpness) {
+        *slot = if value >= BLENDER_EDGE_CREASE_MAX_SHARPNESS {
+            value
+        } else if value > 1.0 {
+            value - 1.0
+        } else {
+            0.0
+        };
+    }
+    next
+}
+
+/// The corner each face starts at: the one holding its smallest loop ordinal, which is Blender's
+/// first loop of the face. `ordinals` holds one loop ordinal per corner, in face corner order.
+fn first_loop_starts(sizes: &[usize], ordinals: &[usize]) -> Vec<usize> {
+    let mut offset = 0;
+    sizes
+        .iter()
+        .map(|&count| {
+            let start = (0..count)
+                .min_by_key(|&corner| ordinals[offset + corner])
+                .unwrap_or(0);
+            offset += count;
+            start
+        })
+        .collect()
 }
 
 /// Non-manifold topology, which `OpenSubdiv` sharpens infinitely
@@ -4377,6 +4513,15 @@ fn edge_index(polygon: &[usize], edge: (usize, usize)) -> Option<usize> {
         .find(|&index| edge_key(polygon[index], polygon[(index + 1) % polygon.len()]) == edge)
 }
 
+type SubdivideOnce = (
+    Mesh,
+    BTreeMap<(usize, usize), usize>,
+    subdivision_uv::Creases,
+);
+
+/// One Catmull-Clark level. Refined points come from `subdivision_limit::uniform_points` (`OpenSubdiv`'s
+/// masks), and the topology from `subdivided_mesh`. Without `refined` the points are linear stand-ins:
+/// the limit surface replaces every point a face uses, and no loose edge reads them.
 fn subdivide_once(
     mesh: &Mesh,
     options: SubdivisionOptions,
@@ -4384,137 +4529,55 @@ fn subdivide_once(
     source_polygons: &[Polygon],
     source_edges: &[[usize; 2]],
     edge_creases: &subdivision_uv::Creases,
-) -> Result<(
-    Mesh,
-    BTreeMap<(usize, usize), usize>,
-    subdivision_uv::Creases,
-)> {
+    vertex_creases: &[f64],
+    refined: bool,
+) -> Result<SubdivideOnce> {
     let source_points = positions(mesh);
-    let mut face_points = Vec::with_capacity(source_polygons.len());
-    for (face, _) in source_polygons {
-        face_points.push(
-            face.iter()
-                .fold(DVec3::ZERO, |sum, index| sum + source_points[*index])
-                / usize_as_f64(face.len()),
+    let (mut updated_points, refined_edges, face_points) = if refined {
+        let edge_sharpness: BTreeMap<(usize, usize), f64> = position
+            .edge_ends
+            .iter()
+            .copied()
+            .zip(position.edge_sharp.iter().copied())
+            .collect();
+        let non_manifold = NonManifold::new(
+            mesh.vertices.len(),
+            source_polygons.iter().map(|(face, _)| face.as_slice()),
         );
-    }
-
-    let mut updated_points =
-        Vec::with_capacity(source_points.len() + position.edge_ends.len() + source_polygons.len());
-    for (index, point) in source_points.iter().enumerate() {
-        let edges = &position.vertex_edges
-            [position.vertex_edge_starts[index]..position.vertex_edge_starts[index + 1]];
-        let corners = &position.vertex_corners
-            [position.vertex_starts[index]..position.vertex_starts[index + 1]];
-        let mut boundary_neighbors = [0_usize; 2];
-        let mut boundary_count = 0;
-        for &edge in edges {
-            let sides =
-                &position.edge_sides[position.edge_starts[edge]..position.edge_starts[edge + 1]];
-            if sides.len() == 1 {
-                if boundary_count < boundary_neighbors.len() {
-                    let ends = position.edge_ends[edge];
-                    boundary_neighbors[boundary_count] =
-                        if ends.0 == index { ends.1 } else { ends.0 };
-                }
-                boundary_count += 1;
-            }
-        }
-        let smooth = if boundary_count == 2 {
-            *point * 0.75
-                + (source_points[boundary_neighbors[0]] + source_points[boundary_neighbors[1]])
-                    * 0.125
-        } else if !edges.is_empty() && !corners.is_empty() {
-            let face_average = corners.iter().fold(DVec3::ZERO, |sum, corner| {
-                sum + face_points[position.face_of[*corner]]
-            }) / usize_as_f64(corners.len());
-            let edge_midpoint_average = edges.iter().fold(DVec3::ZERO, |sum, edge| {
-                let ends = position.edge_ends[*edge];
-                sum + (source_points[ends.0] + source_points[ends.1]) * 0.5
-            }) / usize_as_f64(edges.len());
-            let valence = usize_as_f64(edges.len());
-            (face_average + edge_midpoint_average * 2.0 + *point * (valence - 3.0)) / valence
-        } else {
-            *point
-        };
-
-        let mut crease_neighbors = [(0_usize, 0.0_f64); 3];
-        let mut crease_count = 0_usize;
-        for &edge in edges {
-            // OpenSubdiv sharpens boundary edges infinitely, so they are creases of the vertex rule.
-            let sides =
-                &position.edge_sides[position.edge_starts[edge]..position.edge_starts[edge + 1]];
-            let sharpness = if sides.len() == 1 {
-                BLENDER_EDGE_CREASE_MAX_SHARPNESS
-            } else {
-                position.edge_sharp[edge]
-            };
-            if sharpness <= 0.0 {
-                continue;
-            }
-            let ends = position.edge_ends[edge];
-            let neighbor = if ends.0 == index { ends.1 } else { ends.0 };
-            let mut slot = 0;
-            while slot < crease_neighbors.len() && sharpness <= crease_neighbors[slot].1 {
-                slot += 1;
-            }
-            if slot < crease_neighbors.len() {
-                for next in (slot + 1..crease_neighbors.len()).rev() {
-                    crease_neighbors[next] = crease_neighbors[next - 1];
-                }
-                crease_neighbors[slot] = (neighbor, sharpness);
-            }
-            crease_count = (crease_count + 1).min(crease_neighbors.len());
-        }
-        // A topological corner of a preserved boundary is an infinitely sharp corner.
-        let topological_corner = corners.len() == 1 && edges.len() == 2;
-        let updated = if position.non_manifold_corners[index]
-            || (options.preserve_corners && topological_corner)
-        {
-            *point
-        } else if crease_count >= 3 {
-            let crease = *point * 0.75
-                + (source_points[crease_neighbors[0].0] + source_points[crease_neighbors[1].0])
-                    * 0.125;
-            let crease_weight = crease_neighbors[0].1.min(crease_neighbors[1].1).min(1.0);
-            let corner_weight = crease_neighbors[0]
-                .1
-                .min(crease_neighbors[1].1)
-                .min(crease_neighbors[2].1)
-                .min(1.0);
-            smooth
-                .lerp(crease, crease_weight)
-                .lerp(*point, corner_weight)
-        } else if crease_count == 2 {
-            let sharpness = crease_neighbors[0].1.min(crease_neighbors[1].1).min(1.0);
-            let crease = *point * 0.75
-                + (source_points[crease_neighbors[0].0] + source_points[crease_neighbors[1].0])
-                    * 0.125;
-            smooth.lerp(crease, sharpness)
-        } else {
-            smooth
-        };
-        updated_points.push(updated);
-    }
-
+        let non_manifold_vertices: Vec<bool> = (0..mesh.vertices.len())
+            .map(|vertex| non_manifold.corner(vertex))
+            .collect();
+        let points = subdivision_limit::uniform_points(
+            source_polygons,
+            &source_points,
+            &subdivision_limit::BaseSharpness::Creases {
+                edges: &edge_sharpness,
+                vertices: vertex_creases,
+                non_manifold: &non_manifold_vertices,
+                loose_edges: source_edges,
+                preserve_corners: options.preserve_corners,
+            },
+        );
+        (points.vertices, points.edges, points.faces)
+    } else {
+        let centers = source_polygons
+            .iter()
+            .map(|(face, _)| {
+                face.iter()
+                    .fold(DVec3::ZERO, |sum, index| sum + source_points[*index])
+                    / usize_as_f64(face.len())
+            })
+            .collect();
+        (source_points.clone(), BTreeMap::new(), centers)
+    };
     let mut edge_point_indices = BTreeMap::new();
     for &edge_index in &position.edge_order {
         let edge = position.edge_ends[edge_index];
-        let midpoint = (source_points[edge.0] + source_points[edge.1]) * 0.5;
-        let sides = &position.edge_sides
-            [position.edge_starts[edge_index]..position.edge_starts[edge_index + 1]];
-        let smooth = if sides.len() == 2 {
-            let first_face = position.face_of[sides[0]];
-            let second_face = position.face_of[sides[1]];
-            (source_points[edge.0]
-                + source_points[edge.1]
-                + face_points[first_face]
-                + face_points[second_face])
-                * 0.25
-        } else {
-            midpoint
-        };
-        let point = smooth.lerp(midpoint, position.edge_sharp[edge_index].min(1.0));
+        // A loose edge has no refined point; its midpoint of the level's positions stands in.
+        let point = refined_edges
+            .get(&edge)
+            .copied()
+            .unwrap_or_else(|| (source_points[edge.0] + source_points[edge.1]) * 0.5);
         edge_point_indices.insert(edge, updated_points.len());
         updated_points.push(point);
     }
@@ -7456,11 +7519,12 @@ mod tests {
 
     #[test]
     fn subdivision_budget_counts_uv_layers() {
-        // A 50x50 quad grid at level 5: 10_000 corners, about 2.82e9 bytes without UVs and 2.66e9 per
-        // UV layer. Two layers still fit the 8 GiB budget; four do not.
-        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 5, 0).is_ok());
-        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 5, 2).is_ok());
-        let error = check_subdivision_budget(10_000, 2_601, 5_100, 5, 4).unwrap_err();
+        // A 50x50 quad grid at level 4: 2.56M output corners, about 0.70e9 bytes without UVs and
+        // 2.62e9 per UV layer at 1,024 bytes per corner. Two layers still fit the 8 GiB budget; four
+        // do not.
+        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 4, 0).is_ok());
+        assert!(check_subdivision_budget(10_000, 2_601, 5_100, 4, 2).is_ok());
+        let error = check_subdivision_budget(10_000, 2_601, 5_100, 4, 4).unwrap_err();
         assert_eq!(error.code, ErrorCode::LimitExceeded);
     }
 
