@@ -263,7 +263,8 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             let index = node_positions.len();
             let position = skin_float_interp(first_position, second_position, t);
             node_positions.push(skin_float_widen(position));
-            node_origins.push(vec![(first, f64::from(1.0 - t)), (second, f64::from(t))]);
+            let weight = f64::from(t);
+            node_origins.push(vec![(first, 1.0 - weight), (second, weight)]);
             let radius = skin_float_interp(first_radius32, second_radius32, t);
             node_radii.push(radius.map(f64::from));
             chain.push(index);
