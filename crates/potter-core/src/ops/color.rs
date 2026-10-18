@@ -115,39 +115,14 @@ fn color_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
                     &operation_pointer(engine.operation_index, "set/look"),
                 )
             })?;
-            let supported = matches!(
-                look,
-                "none"
-                    | "None"
-                    | "AgX - None"
-                    | "high_contrast"
-                    | "High Contrast"
-                    | "AgX - High Contrast"
-                    | "AgX - Punchy"
-                    | "medium_high_contrast"
-                    | "Medium High Contrast"
-                    | "AgX - Medium High Contrast"
-                    | "medium_low_contrast"
-                    | "Medium Low Contrast"
-                    | "AgX - Medium Low Contrast"
-                    | "low_contrast"
-                    | "Low Contrast"
-                    | "AgX - Low Contrast"
-                    | "very_low_contrast"
-                    | "Very Low Contrast"
-                    | "AgX - Very Low Contrast"
-                    | "very_high_contrast"
-                    | "Very High Contrast"
-                    | "AgX - Very High Contrast"
-            );
-            if !supported {
+            if !matches!(look, "none" | "None") {
                 return Err(engine.error(
                     ErrorCode::UnsupportedFeature,
-                    format!("color look `{look}` is not supported"),
+                    format!("color look `{look}` is not supported; only `none` is implemented"),
                     &operation_pointer(engine.operation_index, "set/look"),
                 ));
             }
-            Ok::<String, crate::error::PotError>(look.to_owned())
+            Ok::<String, crate::error::PotError>("none".to_owned())
         })
         .transpose()?;
     let exposure = numeric_setting(engine, set, "exposure")?;
