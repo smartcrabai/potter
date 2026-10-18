@@ -432,31 +432,6 @@ pub fn validate_with_context(
 
         if let Some(mesh) = &data.mesh {
             inspect_mesh(mesh, data_id, &mut issues);
-            for (node_id, node) in doc
-                .nodes
-                .iter()
-                .filter(|(_, node)| node.data.as_ref() == Some(data_id))
-            {
-                let slot_count = node.material_slot_count(Some(data));
-                if slot_count == 0 {
-                    continue;
-                }
-                for face in &mesh.faces {
-                    if usize::try_from(face.material_index)
-                        .map_or(true, |index| index >= slot_count)
-                    {
-                        issue(
-                            &mut issues,
-                            "error",
-                            "INVALID_INDEX",
-                            "Face material_index is outside the effective material slots.",
-                            Some(data_id.to_string()),
-                            Some(format!("/data_blocks/{data_id}/mesh/faces/{}", face.id)),
-                            json!({"node_id":node_id,"material_index":face.material_index,"slot_count":slot_count}),
-                        );
-                    }
-                }
-            }
         }
     }
     for (id, material) in &doc.materials {
