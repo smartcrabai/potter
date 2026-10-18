@@ -72,7 +72,10 @@ def subject_grid(name):
 
 
 def cage_box(name, corners, transform=True):
-    faces = [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]
+    # Winding is reversed so the face normals point outward. Mesh Deform's inside test needs outward
+    # normals: with the opposite winding, Blender classifies every subject vertex as outside and the
+    # bound subject never moves. Vertex indices are unchanged, so the Rust cage moves still apply.
+    faces = [(3, 2, 1, 0), (5, 6, 7, 4), (1, 5, 4, 0), (2, 6, 5, 1), (3, 7, 6, 2), (0, 4, 7, 3)]
     mesh = bpy.data.meshes.new(name + "Mesh")
     mesh.from_pydata(list(corners), [], faces)
     obj = bpy.data.objects.new(name, mesh)
@@ -99,15 +102,16 @@ def evaluated_positions(obj):
 
 
 def bind_and_read(label, source, cage, precision, dynamic, invert, moves, group_weights):
-    group = source.vertex_groups.new(name="Influence")
-    for index, weight in enumerate(group_weights):
-        group.add([index], weight, 'REPLACE')
     md = source.modifiers.new("MeshDeform", "MESH_DEFORM")
     md.object = cage
     md.precision = precision
     md.use_dynamic_bind = dynamic
-    md.vertex_group = group.name
     md.invert_vertex_group = invert
+    if group_weights is not None:
+        group = source.vertex_groups.new(name="Influence")
+        for index, weight in enumerate(group_weights):
+            group.add([index], weight, 'REPLACE')
+        md.vertex_group = group.name
     activate(source)
     bpy.ops.object.meshdeform_bind(modifier=md.name)
     bpy.context.view_layer.update()
@@ -126,10 +130,10 @@ def run_asymmetric(label, precision, dynamic, invert):
 
 def run_nonuniform_translation(label):
     source = subject_grid("Subject_" + label)
-    # Rust: box size 6.0 with the cage transform above; no Influence group (all vertices weighted 1).
+    # Rust: box size 6.0 with the cage transform, no vertex group (all vertices weighted), precision 3.
     cage = cage_box("Cage_" + label, [tuple(c * 1.5 for c in corner) for corner in BASE])
     moves = {index: TRANSLATION_CAGE_MOVE for index in range(8)}
-    return bind_and_read(label, source, cage, 3, False, False, moves, [1.0] * 25)
+    return bind_and_read(label, source, cage, 3, False, False, moves, None)
 
 
 def reset():
