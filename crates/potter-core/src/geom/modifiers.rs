@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glam::{DMat4, DVec3};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
