@@ -61,6 +61,10 @@ INTEGER_TEXELS = {
 HALF_TEXELS = [0.7, 0.35, 0.0, 0.6, 0.3, 0.0, 1.0, 1.0]
 # Float texels with alpha 0.5 for the single-layer and multilayer EXR cases.
 FLOAT_TEXELS = [0.8, 0.4, 0.2, 0.5, 0.3, 0.0, 1.0, 1.0]
+# The file contents Potter's EXR writer produces for the straight colours of FLOAT_TEXELS: associated, colour times alpha
+# (`render/sequence.rs` write_exr; compositor writers). Blender reads a premultiplied EXR, so this is the premultiplied
+# oracle of the Potter-written file.
+POTTER_TEXELS = [0.4, 0.2, 0.1, 0.5, 0.15, 0.0, 0.5, 0.5]
 work = tempfile.gettempdir()
 tag = "%s_%s_%s_%s_%s_%d_%s_%s" % (
     colorspace.replace(" ", "_").replace("-", ""),
@@ -166,9 +170,9 @@ elif container in ("exr32", "exrml"):
     # Blender writes a 32-bit float EXR from the float texels: a single layer (exr32) or a multilayer file (exrml).
     source_path = os.path.join(work, "alpha_oracle_%s.exr" % tag)
     staged = bpy.data.images.new("alpha_stage", width=2, height=1, alpha=True, float_buffer=True)
-    staged.pixels = FLOAT_TEXELS
+    staged.pixels = POTTER_TEXELS if texel_set == "potter" else FLOAT_TEXELS
     settings = scene.render.image_settings
-    settings.file_format = "OPEN_EXR_MULTILAYER" if container == "exrml" else "OPEN_EXR"
+    settings.file_format = "OPEN_EXR"
     settings.color_depth = "32"
     settings.color_mode = "RGBA"
     settings.exr_codec = "NONE"

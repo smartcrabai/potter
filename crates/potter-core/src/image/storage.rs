@@ -132,6 +132,8 @@ fn image_storage(image: &Image, bytes: &[u8]) -> ImageStorage {
     ImageStorage {
         data: image.colorspace == ImageColorspace::NonColor,
         straight_alpha: image.alpha_mode == ImageAlphaMode::Straight,
+        // Blender's `IMA_ALPHA_IGNORE` is the None alpha mode: the alpha of the file is ignored (`image_metadata.cpp`).
+        ignore_alpha: image.alpha_mode == ImageAlphaMode::None,
         precision: source_precision(bytes),
     }
 }

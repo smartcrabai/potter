@@ -1473,7 +1473,14 @@ fn write_exr(path: &Path, rgba: &[[f32; 4]], width: u32, height: u32) -> Result<
     }
     exr::prelude::write_rgba_file(path, width_usize, height_usize, |x, y| {
         let pixel = rgba[y * width_usize + x];
-        (pixel[0], pixel[1], pixel[2], pixel[3])
+        // EXR stores associated alpha: Blender reads an EXR as premultiplied (its default `alpha_mode` for a file
+        // without `oiio:UnassociatedAlpha`), so the colour is multiplied by alpha, as its OpenEXR writer expects.
+        (
+            pixel[0] * pixel[3],
+            pixel[1] * pixel[3],
+            pixel[2] * pixel[3],
+            pixel[3],
+        )
     })
     .map_err(|error| {
         PotError::new(

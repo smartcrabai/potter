@@ -852,7 +852,14 @@ pub(crate) fn write_multilayer_exr(
                             output
                                 .linear_rgba
                                 .iter()
-                                .map(|pixel| pixel[index])
+                                .map(|pixel| {
+                                    // Associated alpha, as Blender's EXR reader expects: colour times alpha, alpha as is.
+                                    if index < 3 {
+                                        pixel[index] * pixel[3]
+                                    } else {
+                                        pixel[index]
+                                    }
+                                })
                                 .collect(),
                         ),
                     )
@@ -1015,7 +1022,13 @@ fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
             image.height as usize,
             |x, y| {
                 let pixel = image.pixels[y * image.width as usize + x];
-                (pixel[0], pixel[1], pixel[2], pixel[3])
+                // Associated alpha, as Blender's EXR reader expects (the colour is multiplied by alpha).
+                (
+                    pixel[0] * pixel[3],
+                    pixel[1] * pixel[3],
+                    pixel[2] * pixel[3],
+                    pixel[3],
+                )
             },
         )
         .map_err(|error| {

@@ -6021,6 +6021,9 @@ def export_doc(doc, target, pack, scene_hash, context):
             image.colorspace_settings.name = colorspace
         pixels = item.get("pixels")
         if sidecar is None and png_bytes is None and pixels is not None:
+            image.alpha_mode = {"straight": "STRAIGHT", "premultiplied": "PREMUL", "none": "NONE"}[
+                item.get("alpha_mode", "straight")
+            ]
             _pack_image(image, [channel for pixel in pixels for channel in pixel])
         if item.get("source") == "packed" and image.packed_file is None:
             image.pack()
