@@ -1067,16 +1067,16 @@ fn evaluate_modifier_output(
 ) -> Result<(crate::geom::Mesh, Vec<Option<Id>>)> {
     let modifier_id = &target_modifier.id;
     let modifier_stack = std::slice::from_ref(target_modifier);
-    let material_slot_count = engine
-        .doc
-        .nodes
-        .get(target)
-        .map(|node| node.material_slot_count(engine.doc.data_blocks.get(data_id)));
     let mut material_slots = engine
         .doc
         .data_blocks
         .get(data_id)
         .map_or_else(Vec::new, |data| data.materials.clone());
+    let object_material_count = engine
+        .doc
+        .nodes
+        .get(target)
+        .map_or(0, |node| node.materials.len());
     let evaluated = {
         let data_block = engine.doc.data_blocks.get(data_id).ok_or_else(|| {
             PotError::new(
@@ -1298,88 +1298,101 @@ fn evaluate_modifier_output(
                     purpose: crate::eval::EvaluationPurpose::Preview,
                     project_root: engine.asset_root,
                     cache_directory: engine.cache_directory,
-                    material_slot_count,
+                    material_slot_count: Some(crate::model::material_slot_count(
+                        object_material_count,
+                        material_slots.len(),
+                    )),
                 },
                 |_, modifier| modifier.enabled,
-                |mesh, modifier, modifier_warnings| match modifier.modifier_type.as_str() {
-                    "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
-                        mesh,
-                        data_block,
-                        modifier,
-                        object_world,
-                        engine.doc,
-                        frame,
-                        &world_matrices,
-                        &driver_values,
-                        engine.asset_root,
-                        engine
-                            .doc
-                            .scenes
-                            .get(&engine.doc.active_scene)
-                            .map_or(24, |scene| scene.fps),
-                        engine
-                            .doc
-                            .scenes
-                            .get(&engine.doc.active_scene)
-                            .map_or(1.0, |scene| scene.fps_base),
-                        evaluated_operand_meshes,
-                    ),
-                    "lattice" => apply_lattice_modifier(
-                        mesh,
-                        data_block,
-                        target,
-                        modifier,
-                        engine.doc,
-                        &world_matrices,
-                    ),
-                    "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
-                        mesh,
-                        modifier,
-                        target,
-                        engine.doc,
-                        &world_matrices,
-                        &volume_data,
-                    ),
-                    "surface_deform" | "mesh_deform" => crate::eval::apply_scene_deform_modifier(
-                        mesh,
-                        modifier,
-                        target,
-                        engine.doc,
-                        &world_matrices,
-                        evaluated_operand_meshes,
-                        modifier_warnings,
-                    ),
-                    "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
-                        crate::eval::apply_scene_operand_modifier(
+                |mesh, modifier, modifier_warnings| {
+                    let result = match modifier.modifier_type.as_str() {
+                        "armature" => crate::eval::rig::apply_armature_modifier_with_drivers(
+                            mesh,
+                            data_block,
+                            modifier,
+                            object_world,
+                            engine.doc,
+                            frame,
+                            &world_matrices,
+                            &driver_values,
+                            engine.asset_root,
+                            engine
+                                .doc
+                                .scenes
+                                .get(&engine.doc.active_scene)
+                                .map_or(24, |scene| scene.fps),
+                            engine
+                                .doc
+                                .scenes
+                                .get(&engine.doc.active_scene)
+                                .map_or(1.0, |scene| scene.fps_base),
+                            evaluated_operand_meshes,
+                        ),
+                        "lattice" => apply_lattice_modifier(
+                            mesh,
+                            data_block,
+                            target,
+                            modifier,
+                            engine.doc,
+                            &world_matrices,
+                        ),
+                        "volume_to_mesh" => crate::eval::apply_volume_to_mesh_modifier(
+                            mesh,
+                            modifier,
+                            target,
+                            engine.doc,
+                            &world_matrices,
+                            &volume_data,
+                        ),
+                        "surface_deform" | "mesh_deform" => {
+                            crate::eval::apply_scene_deform_modifier(
+                                mesh,
+                                modifier,
+                                target,
+                                engine.doc,
+                                &world_matrices,
+                                evaluated_operand_meshes,
+                                modifier_warnings,
+                            )
+                        }
+                        "boolean" | "shrinkwrap" | "curve" | "hook" | "warp" => {
+                            crate::eval::apply_scene_operand_modifier(
+                                mesh,
+                                modifier,
+                                target,
+                                engine.doc,
+                                &world_matrices,
+                                evaluated_operand_meshes,
+                                evaluated_operand_nodes,
+                                &mut material_slots,
+                            )
+                        }
+                        "vertex_weight_edit"
+                        | "vertex_weight_mix"
+                        | "vertex_weight_proximity"
+                        | "normal_edit"
+                        | "uv_project"
+                        | "uv_warp"
+                        | "data_transfer" => crate::eval::apply_scene_attribute_modifier(
                             mesh,
                             modifier,
                             target,
                             engine.doc,
                             &world_matrices,
                             evaluated_operand_meshes,
-                            evaluated_operand_nodes,
-                            &mut material_slots,
-                        )
-                    }
-                    "vertex_weight_edit"
-                    | "vertex_weight_mix"
-                    | "vertex_weight_proximity"
-                    | "normal_edit"
-                    | "uv_project"
-                    | "uv_warp"
-                    | "data_transfer" => crate::eval::apply_scene_attribute_modifier(
-                        mesh,
-                        modifier,
-                        target,
-                        engine.doc,
-                        &world_matrices,
-                        evaluated_operand_meshes,
-                        engine.asset_root,
-                    ),
-                    _ => Err(PotError::new(
-                        ErrorCode::InternalError,
-                        "custom modifier callback received an unexpected type",
-                    )),
+                            engine.asset_root,
+                        ),
+                        _ => Err(PotError::new(
+                            ErrorCode::InternalError,
+                            "custom modifier callback received an unexpected type",
+                        )),
+                    };
+                    result.map(|()| {
+                        Some(crate::model::material_slot_count(
+                            object_material_count,
+                            material_slots.len(),
+                        ))
+                    })
                 },
             )?;
             let (forwarded, blocking): (Vec<PotError>, Vec<PotError>) =
