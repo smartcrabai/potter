@@ -2881,7 +2881,12 @@ fn cached_edge_tri_vertex(
         let id = state.add_vertex(co, NO_INDEX);
         let key = if side < 3 { keys[side + 1] } else { keys[0] };
         state.edge_tri_cache.insert(key, id);
-        state.dissolve_verts.push(id);
+        // Blender adds the vertex to the dissolve list only when the cut segment has no BMEdge
+        // (`bmesh_intersect.cc:440-447`); a point on a real or wire edge is spliced instead.
+        let segment = edge_key_usize(a, b);
+        if !state.edge_orig.contains_key(&segment) && !state.wire_edges.contains(&segment) {
+            state.dissolve_verts.push(id);
+        }
         id
     };
     if side < 3 {
@@ -3183,6 +3188,13 @@ fn split_faces(state: &mut State) {
     state.dangling_edges = dangling;
 }
 
+/// The edges of a face ring, each as a sorted key.
+fn ring_edges(verts: &[usize]) -> Vec<EdgeKey> {
+    (0..verts.len())
+        .map(|i| edge_key_usize(verts[i], verts[(i + 1) % verts.len()]))
+        .collect()
+}
+
 fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &Bvh) {
     let mut edge_faces = HashMap::<EdgeKey, Vec<usize>>::new();
     for (fi, face) in state.faces.iter().enumerate() {
@@ -3265,14 +3277,26 @@ fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &
         }
     }
     let mut output = Vec::new();
+    let mut removed_edges: HashSet<EdgeKey> = HashSet::new();
     for (index, mut face) in state.faces.drain(..).enumerate() {
         if removed[index] {
+            removed_edges.extend(ring_edges(&face.verts));
             continue;
         }
         if flipped[index] && face.verts.len() > 2 {
             face.verts[1..].reverse();
         }
         output.push(face);
+    }
+    // Blender's `BM_face_kill_loose` (bmesh_core.cc:1001) kills an edge that loses its last loop
+    // when its face is removed. An edge with no loop from the start is a chord and survives.
+    let mut kept_edges: HashSet<EdgeKey> = HashSet::new();
+    for face in &output {
+        kept_edges.extend(ring_edges(&face.verts));
+    }
+    for edge in removed_edges.difference(&kept_edges) {
+        state.wire_edges.remove(edge);
+        state.dangling_edges.remove(edge);
     }
     state.faces = output;
 }
