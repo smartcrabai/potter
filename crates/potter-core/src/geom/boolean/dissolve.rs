@@ -279,6 +279,276 @@ fn splice_faces(fms: &mut FaceMergeState, me_index: usize, left: usize, right: u
     fms.edge[me_index].right_face = None;
 }
 
+/// libstdc++ `_S_threshold`: ranges up to this length are finished by insertion sort.
+const SORT_THRESHOLD: usize = 16;
+
+/// Sorts `a` as libstdc++'s `std::sort` does (GCC 14, `bits/stl_algo.h`, `bits/stl_heap.h`).
+/// Blender's `do_dissolve` uses `std::ranges::sort`, which is unstable; on Linux (Blender 5.2.2)
+/// that is this algorithm, so equal lengths keep Blender's order. `less(x, y)`: `x` sorts first.
+/// Verified against the real libstdc++ `std::ranges::sort`, including the heap fallback.
+fn libstdcxx_sort_by<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], less: &F) {
+    if a.is_empty() {
+        return;
+    }
+    let len = a.len();
+    introsort_loop(a, 0, len, 2 * lg(len), less);
+    final_insertion_sort(a, 0, len, less);
+}
+
+/// `__lg`: floor(log2(n)) for n >= 1.
+fn lg(n: usize) -> usize {
+    (usize::BITS - 1 - n.leading_zeros()) as usize
+}
+
+/// `__introsort_loop`: quicksort partitions until a range is at most `SORT_THRESHOLD` long, or
+/// falls back to a heap sort once `depth` runs out.
+fn introsort_loop<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    mut last: usize,
+    mut depth: usize,
+    less: &F,
+) {
+    while last - first > SORT_THRESHOLD {
+        if depth == 0 {
+            partial_sort(a, first, last, last, less);
+            return;
+        }
+        depth -= 1;
+        let cut = unguarded_partition_pivot(a, first, last, less);
+        introsort_loop(a, cut, last, depth, less);
+        last = cut;
+    }
+}
+
+/// `__unguarded_partition_pivot`: median-of-three pivot moved to `first`, then partition the rest.
+fn unguarded_partition_pivot<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    last: usize,
+    less: &F,
+) -> usize {
+    let mid = first + (last - first) / 2;
+    move_median_to_first(a, first, first + 1, mid, last - 1, less);
+    unguarded_partition(a, first + 1, last, first, less)
+}
+
+/// `__move_median_to_first`: swaps the median of `a[x]`, `a[y]`, `a[z]` into `a[result]`.
+fn move_median_to_first<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    result: usize,
+    x: usize,
+    y: usize,
+    z: usize,
+    less: &F,
+) {
+    let median = if less(a[x], a[y]) {
+        if less(a[y], a[z]) {
+            y
+        } else if less(a[x], a[z]) {
+            z
+        } else {
+            x
+        }
+    } else if less(a[x], a[z]) {
+        x
+    } else if less(a[y], a[z]) {
+        z
+    } else {
+        y
+    };
+    a.swap(result, median);
+}
+
+/// `__unguarded_partition`: Hoare-style partition of `[first, last)` around `a[pivot]`.
+fn unguarded_partition<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    mut first: usize,
+    mut last: usize,
+    pivot: usize,
+    less: &F,
+) -> usize {
+    loop {
+        while less(a[first], a[pivot]) {
+            first += 1;
+        }
+        last -= 1;
+        while less(a[pivot], a[last]) {
+            last -= 1;
+        }
+        if first >= last {
+            return first;
+        }
+        a.swap(first, last);
+        first += 1;
+    }
+}
+
+/// `__final_insertion_sort`.
+fn final_insertion_sort<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    last: usize,
+    less: &F,
+) {
+    if last - first > SORT_THRESHOLD {
+        insertion_sort(a, first, first + SORT_THRESHOLD, less);
+        unguarded_insertion_sort(a, first + SORT_THRESHOLD, last, less);
+    } else {
+        insertion_sort(a, first, last, less);
+    }
+}
+
+/// `__insertion_sort`.
+fn insertion_sort<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], first: usize, last: usize, less: &F) {
+    for i in first + 1..last {
+        if less(a[i], a[first]) {
+            let value = a[i];
+            a.copy_within(first..i, first + 1);
+            a[first] = value;
+        } else {
+            unguarded_linear_insert(a, i, less);
+        }
+    }
+}
+
+/// `__unguarded_insertion_sort`.
+fn unguarded_insertion_sort<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    last: usize,
+    less: &F,
+) {
+    for i in first..last {
+        unguarded_linear_insert(a, i, less);
+    }
+}
+
+/// `__unguarded_linear_insert`: libstdc++ relies on an element at or before `last` that stops the
+/// backward scan, so the scan never passes index 0.
+fn unguarded_linear_insert<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], mut last: usize, less: &F) {
+    let value = a[last];
+    let mut next = last - 1;
+    while less(value, a[next]) {
+        a[last] = a[next];
+        last = next;
+        next -= 1;
+    }
+    a[last] = value;
+}
+
+/// `__partial_sort`: the heap fallback used when `__introsort_loop` runs out of depth.
+fn partial_sort<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    middle: usize,
+    last: usize,
+    less: &F,
+) {
+    heap_select(a, first, middle, last, less);
+    sort_heap(a, first, middle, less);
+}
+
+/// `__heap_select`.
+fn heap_select<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    middle: usize,
+    last: usize,
+    less: &F,
+) {
+    make_heap(a, first, middle, less);
+    for i in middle..last {
+        if less(a[i], a[first]) {
+            pop_heap(a, first, middle, i, less);
+        }
+    }
+}
+
+/// `__make_heap`.
+fn make_heap<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], first: usize, last: usize, less: &F) {
+    if last - first < 2 {
+        return;
+    }
+    let len = last - first;
+    let mut parent = (len - 2) / 2;
+    loop {
+        let value = a[first + parent];
+        adjust_heap(a, first, parent, len, value, less);
+        if parent == 0 {
+            return;
+        }
+        parent -= 1;
+    }
+}
+
+/// `__adjust_heap`: sifts `value` down from `hole`, then pushes it back up.
+fn adjust_heap<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    mut hole: usize,
+    len: usize,
+    value: T,
+    less: &F,
+) {
+    let top = hole;
+    let mut second = hole;
+    while second < (len - 1) / 2 {
+        second = 2 * (second + 1);
+        if less(a[first + second], a[first + second - 1]) {
+            second -= 1;
+        }
+        a[first + hole] = a[first + second];
+        hole = second;
+    }
+    if len.is_multiple_of(2) && second == (len - 2) / 2 {
+        second = 2 * (second + 1);
+        a[first + hole] = a[first + second - 1];
+        hole = second - 1;
+    }
+    push_heap(a, first, hole, top, value, less);
+}
+
+/// `__push_heap`.
+fn push_heap<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    mut hole: usize,
+    top: usize,
+    value: T,
+    less: &F,
+) {
+    let parent_of = |index: usize| if index == 0 { 0 } else { (index - 1) / 2 };
+    let mut parent = parent_of(hole);
+    while hole > top && less(a[first + parent], value) {
+        a[first + hole] = a[first + parent];
+        hole = parent;
+        parent = parent_of(hole);
+    }
+    a[first + hole] = value;
+}
+
+/// `__pop_heap`: moves the top of the heap `[first, last)` to `a[result]`.
+fn pop_heap<T: Copy, F: Fn(T, T) -> bool>(
+    a: &mut [T],
+    first: usize,
+    last: usize,
+    result: usize,
+    less: &F,
+) {
+    let value = a[result];
+    a[result] = a[first];
+    adjust_heap(a, first, 0, last - first, value, less);
+}
+
+/// `__sort_heap`.
+fn sort_heap<T: Copy, F: Fn(T, T) -> bool>(a: &mut [T], first: usize, mut last: usize, less: &F) {
+    while last - first > 1 {
+        last -= 1;
+        pop_heap(a, first, last, last, less);
+    }
+}
+
 /// Blender `do_dissolve`: dissolves dissolvable edges, longest first, while the result stays a
 /// valid polygon set.
 fn do_dissolve(fms: &mut FaceMergeState) {
@@ -289,8 +559,11 @@ fn do_dissolve(fms: &mut FaceMergeState) {
         .filter(|(_, me)| me.dissolvable)
         .map(|(e, _)| e)
         .collect();
-    // Blender uses `std::ranges::sort`, which is unstable; equal lengths keep creation order here.
-    dissolve_edges.sort_by(|&a, &b| fms.edge[b].len_squared.total_cmp(&fms.edge[a].len_squared));
+    // Blender's `std::ranges::sort` is unstable; `libstdcxx_sort_by` reproduces its tie order
+    // for equal lengths on Linux (Blender 5.2.2).
+    libstdcxx_sort_by(&mut dissolve_edges, &|a: usize, b: usize| {
+        fms.edge[a].len_squared > fms.edge[b].len_squared
+    });
     for me_index in dissolve_edges {
         let me = fms.edge[me_index];
         let (Some(left), Some(right)) = (me.left_face, me.right_face) else {
