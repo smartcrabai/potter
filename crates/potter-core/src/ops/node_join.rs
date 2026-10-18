@@ -226,7 +226,7 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         .map(|slot| destination_slots.link(slot))
         .collect::<Vec<_>>();
     let mut merged_effective_materials = destination.slot_materials.clone();
-    validate_material_indices(engine, destination, destination_mesh)?;
+    clamp_face_material_indices(&mut merged_mesh, destination_slot_count);
     let mut merged_data = destination.data.clone();
     merged_data.materials = destination_slots.data.to_vec();
     merged_data.materials.resize(destination_slot_count, None);
@@ -243,7 +243,6 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
                 &operation_pointer(engine.operation_index, "target"),
             )
         })?;
-        validate_material_indices(engine, source, source_mesh)?;
         let source_to_destination = destination_inverse * source.world;
         if !source_to_destination
             .to_cols_array()
@@ -565,26 +564,14 @@ fn append_mesh(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let material_index = match material_remap.get(face.material_index as usize) {
-            Some(index) => u32::try_from(*index).map_err(|_| {
+        let material_index =
+            joined_material_index(&material_remap, face.material_index).map_err(|_| {
                 engine.error(
                     ErrorCode::LimitExceeded,
                     "joined material slot index exceeds u32",
                     &operation_pointer(engine.operation_index, "target"),
                 )
-            })?,
-            None if source_slots.slot_materials.is_empty() && face.material_index == 0 => 0,
-            None => {
-                return Err(engine.error(
-                    ErrorCode::SceneInvalid,
-                    format!(
-                        "source face f{} references an unavailable material slot",
-                        face.id
-                    ),
-                    &operation_pointer(engine.operation_index, "target"),
-                ));
-            }
-        };
+            })?;
         mapping.faces.insert(face.id, id);
         destination.faces.push(Face {
             id,
@@ -673,22 +660,33 @@ fn merge_material_slots(
         .collect()
 }
 
-fn validate_material_indices(engine: &Engine<'_>, input: &JoinInput, mesh: &Mesh) -> Result<()> {
-    for face in &mesh.faces {
-        let valid = if input.slot_materials.is_empty() {
-            face.material_index == 0
-        } else {
-            (face.material_index as usize) < input.slot_materials.len()
-        };
-        if !valid {
-            return Err(engine.error(
-                ErrorCode::SceneInvalid,
-                format!("face f{} references an unavailable material slot", face.id),
-                &operation_pointer(engine.operation_index, "target"),
-            ));
+/// Blender `join_materials` (`editors/mesh/mesh_join.cc`): a face index past the source's slots
+/// clamps to its last slot before the remap. A source without slots keeps the raw index.
+fn joined_material_index(
+    material_remap: &[usize],
+    material_index: u32,
+) -> std::result::Result<u32, std::num::TryFromIntError> {
+    match material_remap.len().checked_sub(1) {
+        None => Ok(material_index),
+        Some(last) => {
+            let slot = usize::try_from(material_index).unwrap_or(last).min(last);
+            u32::try_from(material_remap.get(slot).copied().unwrap_or(last))
         }
     }
-    Ok(())
+}
+
+/// Clamps the destination's face material indices to its slots, as Blender's `join_materials`
+/// does for the active object. A destination without slots keeps its raw indices.
+fn clamp_face_material_indices(mesh: &mut Mesh, slot_count: usize) {
+    let Some(last) = slot_count
+        .checked_sub(1)
+        .and_then(|last| u32::try_from(last).ok())
+    else {
+        return;
+    };
+    for face in &mut mesh.faces {
+        face.material_index = face.material_index.min(last);
+    }
 }
 
 /// Merges the source mesh's UV layers into `destination` by name. Source face `i` was appended at
@@ -1574,6 +1572,58 @@ mod tests {
             Some(&id("source_data_fallback"))
         );
         assert_eq!(data.mesh.as_ref().unwrap().faces[1].material_index, 4);
+    }
+
+    #[test]
+    fn join_clamps_an_out_of_range_source_face_to_its_last_slot() {
+        // Blender `join_materials` (mesh_join.cc): an index past the source's slots clamps to the last.
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        add_mesh(
+            &mut doc,
+            "target",
+            "target_data",
+            mesh(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], 0),
+            [0.0; 3],
+        );
+        add_mesh(
+            &mut doc,
+            "source",
+            "source_data",
+            mesh(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], 0),
+            [1.0, 0.0, 0.0],
+        );
+        let id = |text| Id::new(text).unwrap();
+        add_material(&mut doc, "source_first");
+        add_material(&mut doc, "source_last");
+        let source_data = doc.data_blocks.get_mut(&id("source_data")).unwrap();
+        source_data.materials = vec![Some(id("source_first")), Some(id("source_last"))];
+        source_data.mesh.as_mut().unwrap().faces[0].material_index = 5;
+        doc.collections
+            .get_mut(&id("collection_root"))
+            .unwrap()
+            .objects = vec![id("target"), id("source")];
+
+        let operation = json!({"op":"node.join","targets":["target","source"]});
+        let mut engine = Engine {
+            doc: &mut doc,
+            changes: ChangeSet::default(),
+            id_mappings: Map::new(),
+            operation_index: 0,
+            evaluation_frame: 1.0,
+            asset_root: None,
+            cache_directory: None,
+            pending_assets: BTreeMap::default(),
+            warnings: Vec::new(),
+        };
+        assert!(apply(&mut engine, operation.as_object().unwrap()).unwrap());
+
+        let target = &engine.doc.nodes[&id("target")];
+        let data = &engine.doc.data_blocks[target.data.as_ref().unwrap()];
+        assert_eq!(
+            data.materials,
+            vec![Some(id("source_first")), Some(id("source_last"))]
+        );
+        assert_eq!(data.mesh.as_ref().unwrap().faces[1].material_index, 1);
     }
 
     #[test]
