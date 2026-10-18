@@ -130,8 +130,9 @@ pub fn apply_stroke_with_dyntopo(
         let mut delta = DVec3::ZERO;
         let mut motion = trajectory;
         let mut radius = 0.0;
+        let mut strength = 0.0_f64;
         for sample in &mirrors {
-            let (closest, pressure, sample_radius, strength, sample_delta) =
+            let (closest, pressure, sample_radius, sample_strength, sample_delta) =
                 sample_influence(vertex.co, sample);
             if sample_radius <= 0.0 {
                 continue;
@@ -140,13 +141,14 @@ pub fn apply_stroke_with_dyntopo(
             if distance > sample_radius {
                 continue;
             }
-            let amount = stroke.falloff.weight(distance / sample_radius) * pressure * strength;
+            let amount = stroke.falloff.weight(distance / sample_radius) * pressure * sample_strength;
             if amount > influence {
                 influence = amount;
                 center = closest;
                 delta = sample_delta;
                 motion = sample.to - sample.from;
                 radius = sample_radius;
+                strength = sample_strength;
             }
         }
         let mask = mask_values
@@ -167,6 +169,7 @@ pub fn apply_stroke_with_dyntopo(
                 motion,
                 radius,
                 influence,
+                strength,
                 adjacency.get(&vertex.id).map(Vec::as_slice),
                 boundary_adjacency.get(&vertex.id).map(Vec::as_slice),
                 &positions,
@@ -215,6 +218,7 @@ fn deform_vertex(
     stroke_motion: DVec3,
     radius: f64,
     influence: f64,
+    strength: f64,
     neighbors: Option<&[u32]>,
     boundary_neighbors: Option<&[u32]>,
     positions: &std::collections::BTreeMap<u32, DVec3>,
@@ -225,7 +229,15 @@ fn deform_vertex(
         stroke_motion
     };
     match stroke.brush {
-        Brush::Draw | Brush::ClayStrips | Brush::Inflate | Brush::Layer => {
+        Brush::Draw => {
+            // Blender 5.2.2 Draw (draw.cc:194-197): offset = normal * radius * scale * bstrength.
+            // bstrength = strength^2 * pressure * overlap * flip * feather (sculpt.cc:2338-2360).
+            // `influence` holds falloff * pressure * strength, so radius * strength * influence is
+            // Blender's product for one unmasked dab (overlap, flip, feather = 1).
+            let deterministic = deterministic_scale(stroke.seed, point, &stroke.symmetry);
+            point + normal * (radius * strength * influence * deterministic)
+        }
+        Brush::ClayStrips | Brush::Inflate | Brush::Layer => {
             let multiplier = if stroke.brush == Brush::ClayStrips {
                 0.75
             } else {
